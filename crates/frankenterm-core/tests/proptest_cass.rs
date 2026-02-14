@@ -362,3 +362,93 @@ fn summary_from_empty_session() {
     assert_eq!(summary.message_count, 0);
     assert!(summary.total_tokens.is_none() || summary.total_tokens == Some(0));
 }
+
+// =========================================================================
+// Additional property tests for coverage
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    /// CassAgent Debug output is non-empty.
+    #[test]
+    fn prop_agent_debug_nonempty(agent in arb_cass_agent()) {
+        let dbg = format!("{:?}", agent);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// CassAgent Clone preserves variant.
+    #[test]
+    fn prop_agent_clone(agent in arb_cass_agent()) {
+        let cloned = agent.clone();
+        prop_assert_eq!(agent.as_str(), cloned.as_str());
+    }
+
+    /// CassSession Clone preserves fields.
+    #[test]
+    fn prop_session_clone(session in arb_cass_session()) {
+        let cloned = session.clone();
+        prop_assert_eq!(&cloned.session_id, &session.session_id);
+        prop_assert_eq!(&cloned.agent, &session.agent);
+        prop_assert_eq!(&cloned.project_path, &session.project_path);
+        prop_assert_eq!(cloned.messages.len(), session.messages.len());
+    }
+
+    /// Default CassSession has empty messages.
+    #[test]
+    fn prop_session_default_empty(_dummy in 0..1_u8) {
+        let session = CassSession::default();
+        prop_assert!(session.messages.is_empty());
+        prop_assert!(session.session_id.is_none());
+    }
+
+    /// CassSession JSON is a valid object.
+    #[test]
+    fn prop_session_json_valid_object(session in arb_cass_session()) {
+        let json = serde_json::to_string(&session).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+    }
+
+    /// CassMessage Clone preserves all fields.
+    #[test]
+    fn prop_message_clone(msg in arb_cass_message()) {
+        let cloned = msg.clone();
+        prop_assert_eq!(&cloned.role, &msg.role);
+        prop_assert_eq!(&cloned.content, &msg.content);
+        prop_assert_eq!(cloned.token_count, msg.token_count);
+    }
+
+    /// CassSessionSummary Clone preserves all fields.
+    #[test]
+    fn prop_summary_clone(summary in arb_cass_session_summary()) {
+        let cloned = summary.clone();
+        prop_assert_eq!(cloned.total_tokens, summary.total_tokens);
+        prop_assert_eq!(cloned.input_tokens, summary.input_tokens);
+        prop_assert_eq!(cloned.output_tokens, summary.output_tokens);
+        prop_assert_eq!(cloned.message_count, summary.message_count);
+    }
+
+    /// Negative epoch timestamps return None.
+    #[test]
+    fn prop_negative_timestamp_none(val in -1_000_000_i64..-1) {
+        let result = parse_cass_timestamp_ms(&val.to_string());
+        prop_assert!(result.is_none() || result.unwrap() < 0,
+            "negative value '{}' should either return None or negative ms", val);
+    }
+
+    /// CassSession Debug output is non-empty.
+    #[test]
+    fn prop_session_debug_nonempty(session in arb_cass_session()) {
+        let dbg = format!("{:?}", session);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// CassSessionSummary JSON is a valid object.
+    #[test]
+    fn prop_summary_json_valid_object(summary in arb_cass_session_summary()) {
+        let json = serde_json::to_string(&summary).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+    }
+}

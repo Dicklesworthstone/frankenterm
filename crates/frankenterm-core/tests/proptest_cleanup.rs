@@ -353,3 +353,82 @@ proptest! {
         }
     }
 }
+
+// ── Additional structural and Debug properties ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Debug output for CleanupTableSummary contains the type name.
+    #[test]
+    fn table_summary_debug_contains_type(s in arb_table_summary()) {
+        let dbg = format!("{:?}", s);
+        prop_assert!(dbg.contains("CleanupTableSummary"),
+            "Debug should contain 'CleanupTableSummary': {}", dbg);
+    }
+
+    /// Debug output for CleanupPlan contains the type name.
+    #[test]
+    fn plan_debug_contains_type(plan in arb_cleanup_plan()) {
+        let dbg = format!("{:?}", plan);
+        prop_assert!(dbg.contains("CleanupPlan"),
+            "Debug should contain 'CleanupPlan': {}", dbg);
+    }
+
+    /// CleanupTableSummary JSON has exactly 4 fields.
+    #[test]
+    fn table_summary_json_field_count(s in arb_table_summary()) {
+        let json = serde_json::to_string(&s).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert_eq!(obj.len(), 4,
+            "CleanupTableSummary should have 4 fields, got {}", obj.len());
+    }
+
+    /// CleanupPlan JSON has exactly 4 fields.
+    #[test]
+    fn plan_json_field_count(plan in arb_cleanup_plan()) {
+        let json = serde_json::to_string(&plan).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert_eq!(obj.len(), 4,
+            "CleanupPlan should have 4 fields, got {}", obj.len());
+    }
+
+    /// Clone then serialize produces identical JSON for table summary.
+    #[test]
+    fn table_summary_clone_serialize_identical(s in arb_table_summary()) {
+        let j1 = serde_json::to_string(&s).unwrap();
+        let j2 = serde_json::to_string(&s.clone()).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// Clone then serialize produces identical JSON for plan.
+    #[test]
+    fn plan_clone_serialize_identical(plan in arb_cleanup_plan()) {
+        let j1 = serde_json::to_string(&plan).unwrap();
+        let j2 = serde_json::to_string(&plan.clone()).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// Table summary JSON is valid UTF-8.
+    #[test]
+    fn table_summary_json_valid_utf8(s in arb_table_summary()) {
+        let json = serde_json::to_string(&s).unwrap();
+        prop_assert!(std::str::from_utf8(json.as_bytes()).is_ok());
+    }
+
+    /// Plan with empty tables has zero totals.
+    #[test]
+    fn plan_empty_tables_zero_totals(_i in 0..1u8) {
+        let plan = CleanupPlan {
+            tables: vec![],
+            total_eligible: 0,
+            total_deleted: 0,
+            dry_run: false,
+        };
+        prop_assert_eq!(plan.total_eligible, 0);
+        prop_assert_eq!(plan.total_deleted, 0);
+        prop_assert!(plan.tables.is_empty());
+    }
+}

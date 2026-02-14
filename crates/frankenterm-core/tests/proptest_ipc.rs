@@ -363,3 +363,100 @@ fn response_error_serde() {
     assert!(!back.ok);
     assert_eq!(back.error, Some("something broke".to_string()));
 }
+
+// =========================================================================
+// Additional property tests for coverage
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// IpcRequest Clone roundtrip preserves Debug representation.
+    #[test]
+    fn prop_request_clone(request in arb_ipc_request()) {
+        let cloned = request.clone();
+        prop_assert_eq!(format!("{:?}", request), format!("{:?}", cloned));
+    }
+
+    /// IpcResponse Clone preserves all fields.
+    #[test]
+    fn prop_response_clone(response in arb_ipc_response()) {
+        let cloned = response.clone();
+        prop_assert_eq!(cloned.ok, response.ok);
+        prop_assert_eq!(&cloned.error, &response.error);
+        prop_assert_eq!(&cloned.error_code, &response.error_code);
+        prop_assert_eq!(&cloned.hint, &response.hint);
+        prop_assert_eq!(cloned.elapsed_ms, response.elapsed_ms);
+        prop_assert_eq!(&cloned.version, &response.version);
+        prop_assert_eq!(cloned.now, response.now);
+    }
+
+    /// IpcRequest Debug output is non-empty.
+    #[test]
+    fn prop_request_debug_nonempty(request in arb_ipc_request()) {
+        let dbg = format!("{:?}", request);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// IpcResponse Debug output is non-empty.
+    #[test]
+    fn prop_response_debug_nonempty(response in arb_ipc_response()) {
+        let dbg = format!("{:?}", response);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// IpcResponse JSON always contains the "ok" field.
+    #[test]
+    fn prop_response_json_has_ok(response in arb_ipc_response()) {
+        let json = serde_json::to_string(&response).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.get("ok").is_some(), "JSON should have 'ok' field");
+    }
+
+    /// IpcResponse JSON always contains the "version" field.
+    #[test]
+    fn prop_response_json_has_version(response in arb_ipc_response()) {
+        let json = serde_json::to_string(&response).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.get("version").is_some(), "JSON should have 'version' field");
+    }
+
+    /// IpcResponse JSON always contains the "now" field.
+    #[test]
+    fn prop_response_json_has_now(response in arb_ipc_response()) {
+        let json = serde_json::to_string(&response).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.get("now").is_some(), "JSON should have 'now' field");
+    }
+
+    /// IpcRequest JSON is valid UTF-8.
+    #[test]
+    fn prop_request_json_valid_utf8(request in arb_ipc_request()) {
+        let json = serde_json::to_string(&request).unwrap();
+        prop_assert!(std::str::from_utf8(json.as_bytes()).is_ok());
+    }
+
+    /// IpcResponse JSON is valid UTF-8.
+    #[test]
+    fn prop_response_json_valid_utf8(response in arb_ipc_response()) {
+        let json = serde_json::to_string(&response).unwrap();
+        prop_assert!(std::str::from_utf8(json.as_bytes()).is_ok());
+    }
+
+    /// IpcRequest pretty JSON is also valid.
+    #[test]
+    fn prop_request_pretty_json(request in arb_ipc_request()) {
+        let json = serde_json::to_string_pretty(&request).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+    }
+
+    /// IpcResponse ok() has ok=true, error() has ok=false.
+    #[test]
+    fn prop_response_ok_vs_error(msg in "[a-z ]{5,20}") {
+        let ok_resp = IpcResponse::ok();
+        prop_assert!(ok_resp.ok);
+        let err_resp = IpcResponse::error(&msg);
+        prop_assert!(!err_resp.ok);
+    }
+}
