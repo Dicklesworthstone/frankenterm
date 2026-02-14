@@ -77,6 +77,57 @@ proptest! {
             "distance {} should be < page_size {}", distance, page
         );
     }
+
+    /// page_size=1 is the identity function: every offset is already 1-aligned.
+    #[test]
+    fn page_align_down_unit_page_is_identity(offset in any::<u64>()) {
+        let aligned = page_align_down(offset, 1);
+        prop_assert_eq!(
+            aligned, offset,
+            "page_size=1 should return offset unchanged: got {}, expected {}", aligned, offset
+        );
+    }
+
+    /// offset=0 always aligns to 0 regardless of page_size.
+    #[test]
+    fn page_align_down_zero_offset(page in 1u64..1_000_000u64) {
+        let aligned = page_align_down(0, page);
+        prop_assert_eq!(
+            aligned, 0,
+            "offset=0 should always align to 0, got {} for page={}", aligned, page
+        );
+    }
+
+    /// page_align_down is order-preserving: if a <= b then align(a) <= align(b).
+    #[test]
+    fn page_align_down_order_preserving(
+        a in any::<u64>(),
+        b in any::<u64>(),
+        page in 1u64..65536u64,
+    ) {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let aligned_lo = page_align_down(lo, page);
+        let aligned_hi = page_align_down(hi, page);
+        prop_assert!(
+            aligned_lo <= aligned_hi,
+            "align({}) = {} should be <= align({}) = {} for page={}",
+            lo, aligned_lo, hi, aligned_hi, page
+        );
+    }
+
+    /// Offsets in the same aligned block map to the same aligned value.
+    #[test]
+    fn page_align_down_same_block(base in 0u64..u64::MAX / 2, rem in 0u64..4096u64, page in 1u64..4096u64) {
+        let aligned_base = page_align_down(base, page);
+        let offset_in_block = rem % page;
+        let test_offset = aligned_base.saturating_add(offset_in_block);
+        let result = page_align_down(test_offset, page);
+        prop_assert_eq!(
+            result, aligned_base,
+            "offset {} in block starting at {} should align to {}, got {}",
+            test_offset, aligned_base, aligned_base, result
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +216,64 @@ proptest! {
             "last_offset({}) + last_length({}) should equal total({})",
             last_offset, last_length, total
         );
+    }
+
+    /// All-zero lengths produce all-zero offsets.
+    #[test]
+    fn build_offsets_all_zero_lengths(count in 1usize..256usize) {
+        let lengths = vec![0u64; count];
+        let offsets = build_offsets_from_lengths(&lengths);
+        for (i, off) in offsets.iter().enumerate() {
+            prop_assert_eq!(
+                *off, LineOffset(0),
+                "all-zero lengths: offset[{}] should be 0, got {:?}", i, off
+            );
+        }
+    }
+
+    /// Single-element input always produces [LineOffset(0)].
+    #[test]
+    fn build_offsets_single_element(length in 0u64..u64::MAX) {
+        let offsets = build_offsets_from_lengths(&[length]);
+        prop_assert_eq!(offsets.len(), 1, "single input should produce single output");
+        prop_assert_eq!(
+            offsets[0], LineOffset(0),
+            "single-element offset should be 0, got {:?}", offsets[0]
+        );
+    }
+
+    /// Prefix stability: offsets for the first k elements are unchanged by appending more.
+    #[test]
+    fn build_offsets_prefix_stability(
+        prefix in prop::collection::vec(0u64..4096u64, 1..128),
+        suffix in prop::collection::vec(0u64..4096u64, 1..128),
+    ) {
+        let offsets_prefix = build_offsets_from_lengths(&prefix);
+        let mut combined = prefix.clone();
+        combined.extend_from_slice(&suffix);
+        let offsets_combined = build_offsets_from_lengths(&combined);
+
+        for (i, (a, b)) in offsets_prefix.iter().zip(offsets_combined.iter()).enumerate() {
+            prop_assert_eq!(
+                a, b,
+                "prefix offset[{}] changed after appending: {:?} vs {:?}", i, a, b
+            );
+        }
+    }
+
+    /// Strictly positive lengths produce strictly increasing offsets.
+    #[test]
+    fn build_offsets_strictly_increasing_for_positive(
+        lengths in prop::collection::vec(1u64..4096u64, 2..256)
+    ) {
+        let offsets = build_offsets_from_lengths(&lengths);
+        for pair in offsets.windows(2) {
+            prop_assert!(
+                pair[0] < pair[1],
+                "positive lengths should give strictly increasing offsets: {:?} >= {:?}",
+                pair[0], pair[1]
+            );
+        }
     }
 }
 
@@ -363,5 +472,141 @@ proptest! {
                 "tail line {} mismatch: got '{}', expected '{}'", i, got, expected
             );
         }
+    }
+
+    /// tail_lines(1) always returns exactly the last appended line.
+    #[test]
+    fn store_tail_lines_one_returns_last(
+        lines in prop::collection::vec("[a-zA-Z0-9]{1,40}", 2..15)
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = MmapStoreConfig::new(dir.path().to_path_buf());
+        let mut store = MmapScrollbackStore::new(config).unwrap();
+        let pane_id = 1u64;
+
+        for line in &lines {
+            store.append_line(pane_id, line).unwrap();
+        }
+
+        let result = store.tail_lines(pane_id, 1).unwrap();
+        prop_assert_eq!(result.len(), 1, "tail_lines(1) should return 1 line");
+        prop_assert_eq!(
+            &result[0], lines.last().unwrap(),
+            "tail_lines(1) should return the last line: got '{}', expected '{}'",
+            result[0], lines.last().unwrap()
+        );
+    }
+
+    /// Interleaved writes across panes preserve per-pane ordering.
+    #[test]
+    fn store_interleaved_writes_preserve_order(
+        lines_a in prop::collection::vec("[a-z]{1,15}", 2..8),
+        lines_b in prop::collection::vec("[A-Z]{1,15}", 2..8),
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = MmapStoreConfig::new(dir.path().to_path_buf());
+        let mut store = MmapScrollbackStore::new(config).unwrap();
+        let pane_a = 10u64;
+        let pane_b = 20u64;
+
+        // Interleave writes: a, b, a, b, ...
+        let max_len = lines_a.len().max(lines_b.len());
+        for i in 0..max_len {
+            if i < lines_a.len() {
+                store.append_line(pane_a, &lines_a[i]).unwrap();
+            }
+            if i < lines_b.len() {
+                store.append_line(pane_b, &lines_b[i]).unwrap();
+            }
+        }
+
+        let result_a = store.tail_lines(pane_a, lines_a.len()).unwrap();
+        let result_b = store.tail_lines(pane_b, lines_b.len()).unwrap();
+
+        for (i, (got, expected)) in result_a.iter().zip(lines_a.iter()).enumerate() {
+            prop_assert_eq!(
+                got, expected,
+                "interleaved pane_a line {} mismatch: got '{}', expected '{}'", i, got, expected
+            );
+        }
+        for (i, (got, expected)) in result_b.iter().zip(lines_b.iter()).enumerate() {
+            prop_assert_eq!(
+                got, expected,
+                "interleaved pane_b line {} mismatch: got '{}', expected '{}'", i, got, expected
+            );
+        }
+    }
+
+    /// Appending additional lines extends tail_lines results correctly.
+    #[test]
+    fn store_append_extends_tail(
+        first_batch in prop::collection::vec("[a-z]{1,20}", 1..8),
+        second_batch in prop::collection::vec("[A-Z]{1,20}", 1..8),
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = MmapStoreConfig::new(dir.path().to_path_buf());
+        let mut store = MmapScrollbackStore::new(config).unwrap();
+        let pane_id = 5u64;
+
+        for line in &first_batch {
+            store.append_line(pane_id, line).unwrap();
+        }
+        let count_after_first = store.line_count(pane_id);
+
+        for line in &second_batch {
+            store.append_line(pane_id, line).unwrap();
+        }
+        let count_after_second = store.line_count(pane_id);
+
+        prop_assert_eq!(
+            count_after_second, count_after_first + second_batch.len(),
+            "count after second batch: expected {}, got {}",
+            count_after_first + second_batch.len(), count_after_second
+        );
+
+        // All lines should be recoverable in order
+        let total = first_batch.len() + second_batch.len();
+        let result = store.tail_lines(pane_id, total).unwrap();
+        let mut expected_all: Vec<&str> = first_batch.iter().map(|s| s.as_str()).collect();
+        expected_all.extend(second_batch.iter().map(|s| s.as_str()));
+
+        for (i, (got, expected)) in result.iter().zip(expected_all.iter()).enumerate() {
+            prop_assert_eq!(
+                got, expected,
+                "combined line {} mismatch: got '{}', expected '{}'", i, got, expected
+            );
+        }
+    }
+
+    /// MmapStoreConfig implements Debug and Clone.
+    #[test]
+    fn store_config_debug_clone(suffix in "[a-z]{1,20}") {
+        let path = std::path::PathBuf::from(format!("/tmp/test_{}", suffix));
+        let config = MmapStoreConfig::new(path.clone());
+        let debug_str = format!("{:?}", config);
+        prop_assert!(
+            debug_str.contains("MmapStoreConfig"),
+            "Debug should contain type name, got: {}", debug_str
+        );
+        let cloned = config.clone();
+        prop_assert_eq!(
+            cloned.base_dir, config.base_dir,
+            "cloned base_dir should match original"
+        );
+    }
+
+    /// LineOffset ordering is consistent with the inner u64 ordering.
+    #[test]
+    fn line_offset_ordering_consistent(a in any::<u64>(), b in any::<u64>()) {
+        let lo_a = LineOffset(a);
+        let lo_b = LineOffset(b);
+        prop_assert_eq!(
+            lo_a.cmp(&lo_b), a.cmp(&b),
+            "LineOffset ordering should match u64: {:?} vs {:?}", lo_a, lo_b
+        );
+        prop_assert_eq!(
+            lo_a == lo_b, a == b,
+            "LineOffset equality should match u64: {:?} vs {:?}", lo_a, lo_b
+        );
     }
 }

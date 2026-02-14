@@ -15,6 +15,8 @@
 //! 10. AdmitDecision is_allowed: Allowed and Warned are allowed, Refused is not
 //! 11. Serde roundtrips for FdBudgetConfig, FdSnapshot, AuditResult,
 //!     SystemLimits, LimitValidation, LimitCheck
+//! 12. Additional type trait coverage (Debug, Clone)
+//! 13. Reverse-order unregister, empty budget, breakdown sum
 
 use proptest::prelude::*;
 
@@ -654,5 +656,200 @@ proptest! {
         // Either behavior is valid — just verify consistency.
         prop_assert!(snap2.total_allocated >= snap1.total_allocated,
             "double register should not decrease allocation");
+    }
+}
+
+// =============================================================================
+// Property: Empty budget snapshot has zero allocation
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn empty_budget_snapshot(
+        limit in arb_limit(),
+    ) {
+        let budget = FdBudget::with_limit(FdBudgetConfig::default(), limit);
+        let snap = budget.snapshot();
+        prop_assert_eq!(snap.total_allocated, 0, "empty budget should have 0 allocation");
+        prop_assert_eq!(snap.pane_count, 0, "empty budget should have 0 panes");
+        prop_assert_eq!(snap.effective_limit, limit);
+        prop_assert!((snap.budget_ratio - 0.0).abs() < 1e-10, "empty budget ratio should be 0");
+    }
+
+    /// Budget with_limit stores the correct effective limit.
+    #[test]
+    fn budget_with_limit_stores_limit(
+        limit in arb_limit(),
+    ) {
+        let budget = FdBudget::with_limit(FdBudgetConfig::default(), limit);
+        let snap = budget.snapshot();
+        prop_assert_eq!(
+            snap.effective_limit, limit,
+            "effective_limit {} should match provided limit {}", snap.effective_limit, limit
+        );
+    }
+}
+
+// =============================================================================
+// Property: Reverse-order unregister
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn reverse_order_unregister(
+        fds_per_pane in arb_fds_per_pane(),
+        n in 2_usize..20,
+    ) {
+        let config = FdBudgetConfig {
+            fds_per_pane,
+            ..FdBudgetConfig::default()
+        };
+        let budget = FdBudget::with_limit(config, 1_000_000);
+
+        let pane_ids: Vec<u64> = (0..n as u64).collect();
+        for &id in &pane_ids {
+            budget.register_pane(id);
+        }
+
+        // Unregister in reverse order
+        for &id in pane_ids.iter().rev() {
+            budget.unregister_pane(id);
+        }
+
+        let snap = budget.snapshot();
+        prop_assert_eq!(snap.total_allocated, 0, "reverse unregister should reach 0");
+        prop_assert_eq!(snap.pane_count, 0);
+    }
+}
+
+// =============================================================================
+// Property: Breakdown sum equals total_allocated
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn breakdown_sum_equals_total(
+        fds_per_pane in arb_fds_per_pane(),
+        pane_ids in proptest::collection::hash_set(arb_pane_id(), 1..15),
+    ) {
+        let config = FdBudgetConfig {
+            fds_per_pane,
+            ..FdBudgetConfig::default()
+        };
+        let budget = FdBudget::with_limit(config, 1_000_000);
+
+        for &id in &pane_ids {
+            budget.register_pane(id);
+        }
+
+        let snap = budget.snapshot();
+        let breakdown = budget.pane_breakdown();
+        let breakdown_sum: u64 = breakdown.values().sum();
+
+        prop_assert_eq!(
+            breakdown_sum, snap.total_allocated,
+            "breakdown sum {} should equal total_allocated {}",
+            breakdown_sum, snap.total_allocated
+        );
+    }
+}
+
+// =============================================================================
+// Property: Type trait coverage (Debug, Clone)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    /// FdBudgetConfig Clone preserves all fields.
+    #[test]
+    fn prop_config_clone(config in arb_fd_budget_config()) {
+        let cloned = config.clone();
+        prop_assert!((cloned.warn_threshold - config.warn_threshold).abs() < 1e-15);
+        prop_assert!((cloned.refuse_threshold - config.refuse_threshold).abs() < 1e-15);
+        prop_assert_eq!(cloned.fds_per_pane, config.fds_per_pane);
+        prop_assert_eq!(cloned.min_nofile_limit, config.min_nofile_limit);
+        prop_assert_eq!(cloned.audit_interval_secs, config.audit_interval_secs);
+        prop_assert_eq!(cloned.leak_detection_count, config.leak_detection_count);
+    }
+
+    /// FdBudgetConfig Debug contains type name.
+    #[test]
+    fn prop_config_debug(config in arb_fd_budget_config()) {
+        let debug = format!("{:?}", config);
+        prop_assert!(
+            debug.contains("FdBudgetConfig"),
+            "Debug should contain type name, got: {}", debug
+        );
+    }
+
+    /// FdSnapshot Debug representation is non-empty.
+    #[test]
+    fn prop_snapshot_debug(snap in arb_fd_snapshot()) {
+        let debug = format!("{:?}", snap);
+        prop_assert!(
+            debug.contains("FdSnapshot"),
+            "Debug should contain type name, got: {}", debug
+        );
+    }
+
+    /// AuditResult Debug representation is non-empty.
+    #[test]
+    fn prop_audit_result_debug(audit in arb_audit_result()) {
+        let debug = format!("{:?}", audit);
+        prop_assert!(
+            debug.contains("AuditResult"),
+            "Debug should contain type name, got: {}", debug
+        );
+    }
+
+    /// SystemLimits hard >= soft after strategy construction.
+    #[test]
+    fn prop_system_limits_hard_gte_soft(limits in arb_system_limits()) {
+        prop_assert!(
+            limits.nofile_hard >= limits.nofile_soft,
+            "hard {} should be >= soft {}", limits.nofile_hard, limits.nofile_soft
+        );
+    }
+
+    /// AdmitDecision Debug representation is non-empty.
+    #[test]
+    fn prop_admit_decision_debug(
+        current in 0_u64..1000,
+        limit in 1000_u64..10000,
+    ) {
+        let allowed_debug = format!("{:?}", AdmitDecision::Allowed);
+        prop_assert!(!allowed_debug.is_empty());
+
+        let warned_debug = format!("{:?}", AdmitDecision::Warned {
+            current_fds: current,
+            limit,
+            usage_ratio: current as f64 / limit as f64,
+        });
+        prop_assert!(warned_debug.contains("Warned"));
+
+        let refused_debug = format!("{:?}", AdmitDecision::Refused {
+            current_fds: current,
+            limit,
+            projected: current + 25,
+        });
+        prop_assert!(refused_debug.contains("Refused"));
+    }
+
+    /// Empty can_admit on fresh budget always returns Allowed.
+    #[test]
+    fn prop_fresh_budget_admits(limit in 10000_u64..1_000_000) {
+        let budget = FdBudget::with_limit(FdBudgetConfig::default(), limit);
+        let decision = budget.can_admit_pane();
+        prop_assert!(
+            decision.is_allowed(),
+            "fresh budget should always admit, got {:?}", decision
+        );
     }
 }

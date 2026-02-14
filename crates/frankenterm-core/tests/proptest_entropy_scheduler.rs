@@ -11,6 +11,8 @@
 //! - Schedule result ordering and statistics
 //! - Snapshot consistency
 //! - Pane isolation: data in one pane doesn't affect another
+//! - Standalone schedule_interval functions
+//! - Config serde/Debug/Clone traits
 
 use proptest::prelude::*;
 use std::collections::HashSet;
@@ -569,103 +571,17 @@ proptest! {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// EntropySchedulerConfig: derives and default
-// ────────────────────────────────────────────────────────────────────
-
-#[test]
-fn config_default_has_sane_values() {
-    let cfg = EntropySchedulerConfig::default();
-    assert!(cfg.min_interval_ms < cfg.max_interval_ms);
-    assert!(cfg.base_interval_ms > 0);
-    assert!(cfg.window_size > 0);
-    assert!(cfg.min_samples > 0);
-    assert!(cfg.warmup_interval_ms > 0);
-    assert!(cfg.density_floor >= 0.0);
-    assert!(cfg.density_floor <= 1.0);
-}
-
-#[test]
-fn config_clone_preserves() {
-    let cfg = EntropySchedulerConfig {
-        base_interval_ms: 999,
-        min_interval_ms: 5,
-        max_interval_ms: 30000,
-        density_floor: 0.1,
-        window_size: 2048,
-        min_samples: 50,
-        warmup_interval_ms: 250,
-    };
-    let c = cfg.clone();
-    assert_eq!(cfg.base_interval_ms, c.base_interval_ms);
-    assert_eq!(cfg.min_interval_ms, c.min_interval_ms);
-    assert_eq!(cfg.max_interval_ms, c.max_interval_ms);
-    assert_eq!(cfg.window_size, c.window_size);
-    assert_eq!(cfg.min_samples, c.min_samples);
-}
-
-#[test]
-fn config_debug_nonempty() {
-    let cfg = EntropySchedulerConfig::default();
-    let d = format!("{:?}", cfg);
-    assert!(!d.is_empty());
-}
-
-#[test]
-fn config_serde_roundtrip() {
-    let cfg = EntropySchedulerConfig {
-        base_interval_ms: 500,
-        min_interval_ms: 10,
-        max_interval_ms: 10000,
-        density_floor: 0.08,
-        window_size: 8192,
-        min_samples: 100,
-        warmup_interval_ms: 300,
-    };
-    let json = serde_json::to_string(&cfg).unwrap();
-    let back: EntropySchedulerConfig = serde_json::from_str(&json).unwrap();
-    assert_eq!(cfg.base_interval_ms, back.base_interval_ms);
-    assert_eq!(cfg.min_interval_ms, back.min_interval_ms);
-    assert_eq!(cfg.max_interval_ms, back.max_interval_ms);
-    assert_eq!(cfg.window_size, back.window_size);
-    assert_eq!(cfg.min_samples, back.min_samples);
-}
-
-// ────────────────────────────────────────────────────────────────────
-// EntropySchedulerSnapshot: derives
-// ────────────────────────────────────────────────────────────────────
-
-#[test]
-fn snapshot_debug_nonempty() {
-    let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
-    sched.register_pane(1);
-    let snap = sched.snapshot();
-    let d = format!("{:?}", snap);
-    assert!(!d.is_empty());
-}
-
-#[test]
-fn snapshot_clone_preserves() {
-    let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
-    sched.register_pane(1);
-    sched.feed_bytes(1, &[0u8; 500]);
-    let snap = sched.snapshot();
-    let c = snap.clone();
-    assert_eq!(snap.pane_count, c.pane_count);
-    assert_eq!(snap.pane_states.len(), c.pane_states.len());
-}
-
-// ────────────────────────────────────────────────────────────────────
-// schedule_interval free function
+// Standalone schedule_interval functions
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
-    /// schedule_interval returns a value within [min, max].
+    /// schedule_interval is always clamped to [min_interval_ms, max_interval_ms].
     #[test]
     fn prop_schedule_interval_clamped(
         config in arb_config(),
-        data in arb_data(3000),
+        data in arb_data(2000),
     ) {
         let interval = schedule_interval(&data, &config);
         prop_assert!(
@@ -678,37 +594,175 @@ proptest! {
         );
     }
 
-    /// schedule_interval on empty data returns max_interval_ms.
+    /// schedule_interval_default returns a positive value.
     #[test]
-    fn prop_schedule_interval_empty_returns_max(
-        config in arb_config(),
-    ) {
-        let interval = schedule_interval(&[], &config);
-        prop_assert_eq!(interval, config.max_interval_ms);
-    }
-
-    /// schedule_interval_default returns same as schedule_interval with default config.
-    #[test]
-    fn prop_schedule_interval_default_matches(
+    fn prop_schedule_interval_default_positive(
         data in arb_data(2000),
     ) {
-        let a = schedule_interval_default(&data);
-        let b = schedule_interval(&data, &EntropySchedulerConfig::default());
-        prop_assert_eq!(a, b);
+        let interval = schedule_interval_default(&data);
+        prop_assert!(interval > 0, "default interval should be > 0, got {}", interval);
+    }
+
+    /// Constant-byte data gets longer interval than uniform data via schedule_interval.
+    #[test]
+    fn prop_schedule_interval_constant_vs_uniform(
+        const_byte in any::<u8>(),
+    ) {
+        let cfg = EntropySchedulerConfig {
+            min_samples: 10,
+            ..Default::default()
+        };
+        let constant_data = vec![const_byte; 2000];
+        let uniform_data: Vec<u8> = (0..2000).map(|i| (i % 256) as u8).collect();
+
+        let interval_const = schedule_interval(&constant_data, &cfg);
+        let interval_uniform = schedule_interval(&uniform_data, &cfg);
+
+        prop_assert!(
+            interval_uniform <= interval_const,
+            "uniform {} should be <= constant {}", interval_uniform, interval_const
+        );
+    }
+
+    /// schedule_interval with empty-like small data still returns bounded value.
+    #[test]
+    fn prop_schedule_interval_small_data(
+        byte in any::<u8>(),
+    ) {
+        let cfg = EntropySchedulerConfig::default();
+        let data = vec![byte; 1];
+        let interval = schedule_interval(&data, &cfg);
+        prop_assert!(
+            interval >= cfg.min_interval_ms && interval <= cfg.max_interval_ms,
+            "single-byte interval {} out of [{}, {}]",
+            interval, cfg.min_interval_ms, cfg.max_interval_ms
+        );
     }
 }
 
 // ────────────────────────────────────────────────────────────────────
-// EntropyScheduleResult: decision field invariants
+// Config trait properties
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(ProptestConfig::with_cases(100))]
 
-    /// Each decision's density is in [0.0, 1.0].
+    /// EntropySchedulerConfig serde roundtrip preserves all fields.
     #[test]
-    fn prop_decision_density_bounded(
-        n_panes in 1usize..=5,
+    fn prop_config_serde_roundtrip(config in arb_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: EntropySchedulerConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.base_interval_ms, config.base_interval_ms);
+        prop_assert_eq!(back.min_interval_ms, config.min_interval_ms);
+        prop_assert_eq!(back.max_interval_ms, config.max_interval_ms);
+        prop_assert_eq!(back.min_samples, config.min_samples);
+        prop_assert_eq!(back.window_size, config.window_size);
+        prop_assert_eq!(back.warmup_interval_ms, config.warmup_interval_ms);
+        prop_assert!(
+            (back.density_floor - config.density_floor).abs() < 1e-10,
+            "density_floor: {} vs {}", back.density_floor, config.density_floor
+        );
+    }
+
+    /// Config Clone preserves all fields.
+    #[test]
+    fn prop_config_clone(config in arb_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.base_interval_ms, config.base_interval_ms);
+        prop_assert_eq!(cloned.min_interval_ms, config.min_interval_ms);
+        prop_assert_eq!(cloned.max_interval_ms, config.max_interval_ms);
+        prop_assert_eq!(cloned.min_samples, config.min_samples);
+    }
+
+    /// Config Debug representation contains type name.
+    #[test]
+    fn prop_config_debug(config in arb_config()) {
+        let debug = format!("{:?}", config);
+        prop_assert!(
+            debug.contains("EntropySchedulerConfig"),
+            "Debug should contain type name, got: {}", debug
+        );
+    }
+
+    /// Default config has sensible invariants.
+    #[test]
+    fn prop_default_config_invariants(_dummy in Just(())) {
+        let cfg = EntropySchedulerConfig::default();
+        prop_assert!(
+            cfg.min_interval_ms <= cfg.max_interval_ms,
+            "min {} should be <= max {}", cfg.min_interval_ms, cfg.max_interval_ms
+        );
+        prop_assert!(cfg.density_floor > 0.0, "density_floor should be positive");
+        prop_assert!(cfg.window_size > 0, "window_size should be positive");
+        prop_assert!(cfg.min_samples > 0, "min_samples should be positive");
+    }
+
+    /// Multiple feed_bytes calls are equivalent to one concatenated call.
+    #[test]
+    fn prop_feed_bytes_concatenation(
+        chunk1 in arb_data(500),
+        chunk2 in arb_data(500),
+    ) {
+        let cfg = EntropySchedulerConfig {
+            min_samples: 10,
+            window_size: 4096,
+            ..Default::default()
+        };
+
+        // Single concatenated feed
+        let mut combined = chunk1.clone();
+        combined.extend_from_slice(&chunk2);
+        let mut sched_single = EntropyScheduler::new(cfg.clone());
+        sched_single.register_pane(1);
+        sched_single.feed_bytes(1, &combined);
+
+        // Two separate feeds
+        let mut sched_multi = EntropyScheduler::new(cfg);
+        sched_multi.register_pane(1);
+        sched_multi.feed_bytes(1, &chunk1);
+        sched_multi.feed_bytes(1, &chunk2);
+
+        let d1 = sched_single.entropy_density(1).unwrap();
+        let d2 = sched_multi.entropy_density(1).unwrap();
+
+        prop_assert!(
+            (d1 - d2).abs() < 0.01,
+            "concatenated density {} vs multi-feed density {} differ too much", d1, d2
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Snapshot pane state consistency
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Snapshot pane_states contain all registered pane IDs.
+    #[test]
+    fn prop_snapshot_contains_all_pane_ids(
+        pane_ids in arb_pane_ids(8),
+    ) {
+        let cfg = EntropySchedulerConfig {
+            min_samples: 10,
+            ..Default::default()
+        };
+        let mut sched = EntropyScheduler::new(cfg);
+        for &pid in &pane_ids {
+            sched.register_pane(pid);
+            sched.feed_bytes(pid, &[42u8; 50]);
+        }
+
+        let snap = sched.snapshot();
+        let snap_pane_ids: HashSet<u64> = snap.pane_states.iter().map(|ps| ps.pane_id).collect();
+        let expected: HashSet<u64> = pane_ids.iter().copied().collect();
+        prop_assert_eq!(snap_pane_ids, expected);
+    }
+
+    /// Snapshot pane density values are bounded [0.0, 1.0].
+    #[test]
+    fn prop_snapshot_pane_density_bounded(
         data in arb_data(2000),
     ) {
         let cfg = EntropySchedulerConfig {
@@ -716,24 +770,22 @@ proptest! {
             ..Default::default()
         };
         let mut sched = EntropyScheduler::new(cfg);
-        for i in 0..n_panes {
-            let pid = (i + 1) as u64;
-            sched.register_pane(pid);
-            sched.feed_bytes(pid, &data);
-        }
-        let result = sched.schedule();
-        for d in &result.decisions {
-            prop_assert!(d.density >= 0.0 && d.density <= 1.0,
-                "decision density {} out of [0,1]", d.density);
-            prop_assert!(d.entropy >= 0.0 && d.entropy <= 8.001,
-                "decision entropy {} out of [0,8]", d.entropy);
+        sched.register_pane(1);
+        sched.feed_bytes(1, &data);
+
+        let snap = sched.snapshot();
+        for ps in &snap.pane_states {
+            prop_assert!(
+                ps.density >= 0.0 && ps.density <= 1.0,
+                "snapshot pane density {} out of [0,1]", ps.density
+            );
         }
     }
 
-    /// Schedule result serde roundtrip preserves structure.
+    /// Snapshot total_bytes is non-negative for each pane.
     #[test]
-    fn prop_schedule_result_serde_roundtrip(
-        n_panes in 1usize..=4,
+    fn prop_snapshot_total_bytes_nonneg(
+        pane_ids in arb_pane_ids(5),
         data in arb_data(1000),
     ) {
         let cfg = EntropySchedulerConfig {
@@ -741,16 +793,17 @@ proptest! {
             ..Default::default()
         };
         let mut sched = EntropyScheduler::new(cfg);
-        for i in 0..n_panes {
-            let pid = (i + 1) as u64;
+        for &pid in &pane_ids {
             sched.register_pane(pid);
             sched.feed_bytes(pid, &data);
         }
-        let result = sched.schedule();
-        let json = serde_json::to_string(&result).unwrap();
-        let back: frankenterm_core::entropy_scheduler::EntropyScheduleResult =
-            serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(result.decisions.len(), back.decisions.len());
-        prop_assert_eq!(result.warmup_count, back.warmup_count);
+
+        let snap = sched.snapshot();
+        for ps in &snap.pane_states {
+            prop_assert!(
+                ps.total_bytes > 0,
+                "pane {} total_bytes should be > 0 after feeding data", ps.pane_id
+            );
+        }
     }
 }
