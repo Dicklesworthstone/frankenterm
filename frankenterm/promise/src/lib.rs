@@ -398,4 +398,144 @@ mod tests {
         // It will be Pending since the result was consumed
         let _ = StdFuture::poll(Pin::new(&mut f2), &mut cx);
     }
+
+    // ── Promise double-resolve ────────────────────────────────
+
+    #[test]
+    fn promise_ok_twice_overwrites() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut p: Promise<i32> = Promise::new();
+        let mut fut = p.get_future().unwrap();
+        p.ok(1);
+        p.ok(2); // overwrites
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Ok(val)) => assert_eq!(val, 2),
+            other => panic!("{}", format!("expected Ready(Ok(2)), got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn promise_err_then_ok_overwrites() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut p: Promise<i32> = Promise::new();
+        let mut fut = p.get_future().unwrap();
+        p.err(anyhow::anyhow!("first"));
+        p.ok(42); // overwrites the error
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Ok(val)) => assert_eq!(val, 42),
+            other => panic!("{}", format!("expected Ready(Ok(42)), got {other:?}")),
+        }
+    }
+
+    // ── Future Debug ──────────────────────────────────────────
+
+    #[test]
+    fn future_is_debug() {
+        let fut = Future::ok(42i32);
+        let debug = format!("{fut:?}");
+        assert!(debug.contains("Future"));
+    }
+
+    // ── Promise drop without resolve ──────────────────────────
+
+    #[test]
+    fn promise_drop_without_resolve_leaves_future_pending() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut;
+        {
+            let mut p: Promise<i32> = Promise::new();
+            fut = p.get_future().unwrap();
+            // p drops here without resolve
+        }
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut fut), &mut cx),
+            Poll::Pending
+        ));
+    }
+
+    // ── Cross-thread with err ─────────────────────────────────
+
+    #[test]
+    fn promise_err_from_another_thread() {
+        let mut p: Promise<i32> = Promise::new();
+        let mut fut = p.get_future().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            p.err(anyhow::anyhow!("thread error"));
+        });
+
+        handle.join().unwrap();
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Err(e)) => assert_eq!(e.to_string(), "thread error"),
+            other => panic!("{}", format!("expected Ready(Err), got {other:?}")),
+        }
+    }
+
+    // ── Type flexibility additional ───────────────────────────
+
+    #[test]
+    fn promise_with_bool_type() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut p: Promise<bool> = Promise::new();
+        let mut fut = p.get_future().unwrap();
+        p.ok(true);
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Ok(val)) => assert!(val),
+            other => panic!("{}", format!("expected Ready(Ok(true)), got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn promise_with_option_type() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut p: Promise<Option<String>> = Promise::new();
+        let mut fut = p.get_future().unwrap();
+        p.ok(Some("value".to_string()));
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Ok(Some(val))) => assert_eq!(val, "value"),
+            other => panic!("{}", format!("expected Ready(Ok(Some)), got {other:?}")),
+        }
+    }
+
+    // ── Multiple pending polls ────────────────────────────────
+
+    #[test]
+    fn multiple_pending_polls_then_ready() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut p: Promise<i32> = Promise::new();
+        let mut fut = p.get_future().unwrap();
+
+        // Poll multiple times while pending
+        for _ in 0..5 {
+            assert!(matches!(
+                StdFuture::poll(Pin::new(&mut fut), &mut cx),
+                Poll::Pending
+            ));
+        }
+
+        p.ok(42);
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Ok(val)) => assert_eq!(val, 42),
+            other => panic!("{}", format!("expected Ready(Ok(42)), got {other:?}")),
+        }
+    }
+
+    // ── Broken promise error traits ───────────────────────────
+
+    #[test]
+    fn broken_promise_is_error_trait() {
+        let err = BrokenPromise {};
+        // Verify it implements std::error::Error via anyhow
+        let anyhow_err: anyhow::Error = err.into();
+        assert!(anyhow_err.to_string().contains("Promise was dropped"));
+    }
 }

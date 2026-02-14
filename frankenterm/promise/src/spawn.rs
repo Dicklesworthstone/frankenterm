@@ -417,4 +417,127 @@ mod tests {
         assert_eq!(result.unwrap(), 55);
         drop(exec);
     }
+
+    // ── Additional block_on tests ────────────────────────────
+
+    #[test]
+    fn block_on_with_nested_async() {
+        let result = block_on(async {
+            let inner = async { 10 };
+            inner.await + 5
+        });
+        assert_eq!(result, 15);
+    }
+
+    #[test]
+    fn block_on_with_unit() {
+        block_on(async {});
+    }
+
+    #[test]
+    fn block_on_with_vec() {
+        let result = block_on(async { vec![1, 2, 3] });
+        assert_eq!(result, vec![1, 2, 3]);
+    }
+
+    // ── Scoped executor additional tests ─────────────────────
+
+    #[test]
+    fn scoped_executor_runs_multiple_futures() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let t1 = spawn_into_main_thread(async { 1 });
+        let t2 = spawn_into_main_thread(async { 2 });
+        let t3 = spawn_into_main_thread(async { 3 });
+        let result = block_on(exec.run(async {
+            t1.await + t2.await + t3.await
+        }));
+        assert_eq!(result, 6);
+        drop(exec);
+    }
+
+    #[test]
+    fn scoped_executor_chained_async() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let result = block_on(exec.run(async {
+            let a = async { 10 }.await;
+            let b = async { 20 }.await;
+            a + b
+        }));
+        assert_eq!(result, 30);
+        drop(exec);
+    }
+
+    #[test]
+    fn scoped_executor_spawn_low_priority_with_computation() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_main_thread_with_low_priority(async {
+            let sum: i32 = (1..=5).sum();
+            sum
+        });
+        let result = block_on(exec.run(task));
+        assert_eq!(result, 15);
+        drop(exec);
+    }
+
+    // ── spawn_into_new_thread additional tests ───────────────
+
+    #[test]
+    fn spawn_into_new_thread_with_sleep() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_new_thread(|| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            Ok(String::from("delayed"))
+        });
+        let result = block_on(exec.run(task));
+        assert_eq!(result.unwrap(), "delayed");
+        drop(exec);
+    }
+
+    #[test]
+    fn spawn_multiple_threads() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let t1 = spawn_into_new_thread(|| Ok(1i32));
+        let t2 = spawn_into_new_thread(|| Ok(2i32));
+        let t3 = spawn_into_new_thread(|| Ok(3i32));
+        let result = block_on(exec.run(async {
+            let a = t1.await.unwrap();
+            let b = t2.await.unwrap();
+            let c = t3.await.unwrap();
+            a + b + c
+        }));
+        assert_eq!(result, 6);
+        drop(exec);
+    }
+
+    #[test]
+    fn spawn_into_new_thread_returns_vec() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_new_thread(|| Ok(vec![1u8, 2, 3, 4, 5]));
+        let result = block_on(exec.run(task));
+        assert_eq!(result.unwrap(), vec![1, 2, 3, 4, 5]);
+        drop(exec);
+    }
+
+    // ── get_scoped helper ────────────────────────────────────
+
+    #[test]
+    fn get_scoped_none_without_executor() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        // Ensure no scoped executor is active
+        SCOPED_EXECUTOR.lock().unwrap().take();
+        assert!(get_scoped().is_none());
+    }
+
+    #[test]
+    fn get_scoped_some_with_executor() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _exec = ScopedExecutor::new();
+        assert!(get_scoped().is_some());
+    }
 }
