@@ -32,6 +32,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    time::Instant,
+};
 
 use rusqlite::{Connection, OptionalExtension, params, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
@@ -39,6 +44,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Result, StorageError};
 use crate::events::event_identity_key;
+use crate::lru_cache::LruCache;
 use crate::policy::Redactor;
 use crate::search::{HybridSearchService, SearchMode};
 
@@ -1427,6 +1433,12 @@ pub struct HybridSearchResult {
     /// Semantic rank position (0-based), when available.
     #[serde(default)]
     pub semantic_rank: Option<usize>,
+    /// Lexical lane contribution to fusion score, if applicable.
+    #[serde(default)]
+    pub lexical_contribution: Option<f64>,
+    /// Semantic lane contribution to fusion score, if applicable.
+    #[serde(default)]
+    pub semantic_contribution: Option<f64>,
     /// Fused rank position (0-based).
     pub fusion_rank: usize,
     /// Fused ranking score used for ordering.
@@ -1438,12 +1450,36 @@ pub struct HybridSearchResult {
 pub struct HybridSearchBundle {
     /// Search mode used for fusion.
     pub mode: String,
+    /// Mode requested by the caller.
+    pub requested_mode: String,
+    /// Why a lexical fallback occurred (if any).
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
     /// RRF parameter used for fusion.
     pub rrf_k: u32,
+    /// Lexical lane weight used by fusion.
+    pub lexical_weight: f32,
+    /// Semantic lane weight used by fusion.
+    pub semantic_weight: f32,
     /// Number of lexical candidates considered.
     pub lexical_candidates: usize,
     /// Number of semantic candidates considered.
     pub semantic_candidates: usize,
+    /// Whether semantic lane results were served from cache.
+    #[serde(default)]
+    pub semantic_cache_hit: bool,
+    /// Semantic lane latency in milliseconds for this query.
+    #[serde(default)]
+    pub semantic_latency_ms: u64,
+    /// Number of semantic candidate rows scanned for this query.
+    #[serde(default)]
+    pub semantic_rows_scanned: usize,
+    /// Semantic budget state for this query (`active`, `cache_hit`, `backoff`, etc.).
+    #[serde(default)]
+    pub semantic_budget_state: String,
+    /// Active semantic backoff deadline (epoch ms) if budget controls paused semantic execution.
+    #[serde(default)]
+    pub semantic_backoff_until_ms: Option<i64>,
     /// Final ranked results.
     pub results: Vec<HybridSearchResult>,
 }
@@ -3922,7 +3958,7 @@ fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> Result<()> {
         ))
     })?;
 
-    let result = match step.direction {
+    let result: Result<()> = match step.direction {
         MigrationDirection::Up => {
             if migration.version == 4 {
                 ensure_workflow_step_logs_audit_action_id(conn)?;
@@ -4854,6 +4890,8 @@ pub struct StorageHandle {
     db_path: Arc<String>,
     /// Writer thread join handle (for shutdown) - shared to allow Clone
     writer_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Semantic budget state for hybrid search guardrails/telemetry.
+    semantic_budget_state: Arc<Mutex<SemanticBudgetState>>,
 }
 
 impl StorageHandle {
@@ -4872,6 +4910,34 @@ impl StorageHandle {
     #[must_use]
     pub fn db_path(&self) -> &str {
         self.db_path.as_str()
+    }
+
+    /// Update semantic latency/cost budget configuration.
+    pub fn set_semantic_budget_config(&self, config: SemanticBudgetConfig) {
+        if let Ok(mut state) = self.semantic_budget_state.lock() {
+            state.configure(config);
+        }
+    }
+
+    /// Return semantic budget telemetry snapshot for operator dashboards.
+    #[must_use]
+    pub fn semantic_budget_snapshot(&self) -> SemanticBudgetSnapshot {
+        match self.semantic_budget_state.lock() {
+            Ok(state) => state.snapshot(),
+            Err(_) => SemanticBudgetSnapshot {
+                config: SemanticBudgetConfig::default(),
+                metrics: SemanticBudgetMetrics::default(),
+                ewma_semantic_latency_ms: 0.0,
+                backoff_until_ms: None,
+                cache_entries: 0,
+            },
+        }
+    }
+
+    fn invalidate_semantic_cache(&self) {
+        if let Ok(mut state) = self.semantic_budget_state.lock() {
+            state.invalidate_cache();
+        }
     }
 
     /// Create a storage handle with custom configuration
@@ -4912,6 +4978,9 @@ impl StorageHandle {
             write_tx,
             db_path: Arc::new(db_path.to_string()),
             writer_handle: Arc::new(Mutex::new(Some(writer_handle))),
+            semantic_budget_state: Arc::new(Mutex::new(SemanticBudgetState::new(
+                SemanticBudgetConfig::default(),
+            ))),
         })
     }
 
@@ -6420,7 +6489,7 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
         let vector = vector.to_vec();
 
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> std::result::Result<(), StorageError> {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open connection: {e}"))
             })?;
@@ -6435,7 +6504,10 @@ impl StorageHandle {
             Ok(())
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))??;
+
+        self.invalidate_semantic_cache();
+        Ok(())
     }
 
     /// Get segment IDs that have no embedding for the given embedder.
@@ -6598,6 +6670,7 @@ impl StorageHandle {
         rrf_k: u32,
     ) -> Result<HybridSearchBundle> {
         let db_path = Arc::clone(&self.db_path);
+        let semantic_budget_state = Arc::clone(&self.semantic_budget_state);
         let query = query.to_string();
         let embedder_id = embedder_id.to_string();
         let query_vector = query_vector.to_vec();
@@ -6614,6 +6687,7 @@ impl StorageHandle {
                 &query_vector,
                 mode,
                 rrf_k,
+                &semantic_budget_state,
             )
         })
         .await
@@ -7389,6 +7463,355 @@ pub struct SearchOptions {
     pub highlight_prefix: Option<String>,
     /// Snippet highlight suffix (default: "<<<")
     pub highlight_suffix: Option<String>,
+}
+
+/// Semantic lane budget/caching controls for hybrid retrieval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticBudgetConfig {
+    /// Maximum allowed semantic-lane latency before adaptive backoff activates.
+    pub max_semantic_latency_ms: u64,
+    /// Cooldown duration applied after budget overruns.
+    pub semantic_backoff_cooldown_ms: i64,
+    /// Maximum semantic queries allowed per rate-limit window.
+    pub max_semantic_queries_per_window: u32,
+    /// Rate-limit window size in milliseconds.
+    pub rate_limit_window_ms: i64,
+    /// Maximum semantic query cache entries.
+    pub cache_capacity: usize,
+    /// Time-to-live for semantic cache entries.
+    pub cache_ttl_ms: i64,
+    /// Maximum candidate rows scanned per semantic query.
+    pub max_semantic_scan_rows: usize,
+    /// EWMA smoothing factor for adaptive latency tracking in [0.0, 1.0].
+    pub latency_ewma_alpha: f64,
+}
+
+impl Default for SemanticBudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_semantic_latency_ms: 75,
+            semantic_backoff_cooldown_ms: 5_000,
+            max_semantic_queries_per_window: 32,
+            rate_limit_window_ms: 1_000,
+            cache_capacity: 256,
+            cache_ttl_ms: 30_000,
+            max_semantic_scan_rows: 4_000,
+            latency_ewma_alpha: 0.25,
+        }
+    }
+}
+
+/// Aggregate semantic budget telemetry for operator observability.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SemanticBudgetMetrics {
+    /// Total semantic-lane requests evaluated.
+    pub total_semantic_requests: u64,
+    /// Semantic searches executed against storage.
+    pub semantic_queries_executed: u64,
+    /// Semantic requests served from cache.
+    pub semantic_cache_hits: u64,
+    /// Semantic cache misses.
+    pub semantic_cache_misses: u64,
+    /// Semantic cache entries invalidated (stale generation/ttl).
+    pub semantic_cache_invalidations: u64,
+    /// Cache evictions due to bounded capacity.
+    pub semantic_cache_evictions: u64,
+    /// Semantic requests skipped due to active budget backoff.
+    pub semantic_skipped_backoff: u64,
+    /// Semantic requests skipped due to semantic rate limiting.
+    pub semantic_skipped_rate_limited: u64,
+    /// Semantic executions that exceeded latency budget.
+    pub semantic_latency_exceeded: u64,
+    /// Backoff activations triggered by latency/rate controls.
+    pub semantic_backoff_activations: u64,
+    /// Total candidate rows scanned across semantic executions.
+    pub semantic_rows_scanned_total: u64,
+    /// Total semantic hits returned across executions.
+    pub semantic_hits_returned_total: u64,
+    /// Last observed semantic-lane latency.
+    pub last_semantic_latency_ms: u64,
+    /// Last observed semantic candidate rows scanned.
+    pub last_semantic_rows_scanned: usize,
+    /// Whether the last semantic response came from cache.
+    pub last_semantic_cache_hit: bool,
+    /// Last semantic fallback reason when semantic lane was unavailable.
+    pub last_fallback_reason: Option<String>,
+}
+
+/// Snapshot of semantic budget configuration and live telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticBudgetSnapshot {
+    /// Effective semantic budget controls.
+    pub config: SemanticBudgetConfig,
+    /// Collected telemetry counters.
+    pub metrics: SemanticBudgetMetrics,
+    /// EWMA latency tracker for adaptive guardrails.
+    pub ewma_semantic_latency_ms: f64,
+    /// Active backoff deadline (epoch ms) if semantic lane is paused.
+    pub backoff_until_ms: Option<i64>,
+    /// Current semantic cache entry count.
+    pub cache_entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SemanticQueryCacheKey {
+    embedder_id: String,
+    pane_id: Option<u64>,
+    since: Option<i64>,
+    until: Option<i64>,
+    limit: usize,
+    query_vector_hash: u64,
+    query_vector_len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSemanticHits {
+    hits: Vec<SemanticSearchHit>,
+    expires_at_ms: i64,
+    generation: u64,
+}
+
+#[derive(Debug)]
+enum SemanticBudgetDecision {
+    Execute {
+        key: SemanticQueryCacheKey,
+        max_scan_rows: usize,
+    },
+    UseCache {
+        hits: Vec<SemanticSearchHit>,
+    },
+    Skip {
+        reason: String,
+        budget_state: String,
+        backoff_until_ms: Option<i64>,
+    },
+}
+
+#[derive(Debug)]
+struct SemanticBudgetState {
+    config: SemanticBudgetConfig,
+    metrics: SemanticBudgetMetrics,
+    ewma_semantic_latency_ms: f64,
+    backoff_until_ms: Option<i64>,
+    rate_window_started_at_ms: i64,
+    rate_window_queries: u32,
+    generation: u64,
+    cache: LruCache<SemanticQueryCacheKey, CachedSemanticHits>,
+}
+
+impl SemanticBudgetState {
+    fn new(config: SemanticBudgetConfig) -> Self {
+        let cache_capacity = config.cache_capacity.max(1);
+        Self {
+            config,
+            metrics: SemanticBudgetMetrics::default(),
+            ewma_semantic_latency_ms: 0.0,
+            backoff_until_ms: None,
+            rate_window_started_at_ms: 0,
+            rate_window_queries: 0,
+            generation: 0,
+            cache: LruCache::new(cache_capacity),
+        }
+    }
+
+    fn snapshot(&self) -> SemanticBudgetSnapshot {
+        SemanticBudgetSnapshot {
+            config: self.config.clone(),
+            metrics: self.metrics.clone(),
+            ewma_semantic_latency_ms: self.ewma_semantic_latency_ms,
+            backoff_until_ms: self.backoff_until_ms,
+            cache_entries: self.cache.len(),
+        }
+    }
+
+    fn configure(&mut self, config: SemanticBudgetConfig) {
+        self.config = config;
+        self.cache = LruCache::new(self.config.cache_capacity.max(1));
+        self.backoff_until_ms = None;
+        self.rate_window_started_at_ms = 0;
+        self.rate_window_queries = 0;
+        self.ewma_semantic_latency_ms = 0.0;
+    }
+
+    fn invalidate_cache(&mut self) {
+        let removed = self.cache.len();
+        self.cache.clear();
+        self.generation = self.generation.wrapping_add(1);
+        if removed > 0 {
+            self.metrics.semantic_cache_invalidations = self
+                .metrics
+                .semantic_cache_invalidations
+                .saturating_add(u64::try_from(removed).unwrap_or(u64::MAX));
+        }
+    }
+
+    fn begin_semantic_lane(
+        &mut self,
+        now_ms: i64,
+        options: &SearchOptions,
+        embedder_id: &str,
+        query_vector: &[f32],
+    ) -> SemanticBudgetDecision {
+        self.metrics.total_semantic_requests =
+            self.metrics.total_semantic_requests.saturating_add(1);
+
+        if let Some(until_ms) = self.backoff_until_ms {
+            if now_ms < until_ms {
+                self.metrics.semantic_skipped_backoff =
+                    self.metrics.semantic_skipped_backoff.saturating_add(1);
+                self.metrics.last_semantic_cache_hit = false;
+                self.metrics.last_fallback_reason = Some("semantic_budget_backoff".to_string());
+                return SemanticBudgetDecision::Skip {
+                    reason: "semantic_budget_backoff".to_string(),
+                    budget_state: "backoff".to_string(),
+                    backoff_until_ms: Some(until_ms),
+                };
+            }
+            self.backoff_until_ms = None;
+        }
+
+        if self.config.max_semantic_queries_per_window > 0 && self.config.rate_limit_window_ms > 0 {
+            if self.rate_window_started_at_ms == 0
+                || now_ms.saturating_sub(self.rate_window_started_at_ms)
+                    >= self.config.rate_limit_window_ms
+            {
+                self.rate_window_started_at_ms = now_ms;
+                self.rate_window_queries = 0;
+            }
+
+            if self.rate_window_queries >= self.config.max_semantic_queries_per_window {
+                self.metrics.semantic_skipped_rate_limited =
+                    self.metrics.semantic_skipped_rate_limited.saturating_add(1);
+                self.metrics.last_semantic_cache_hit = false;
+                self.metrics.last_fallback_reason = Some("semantic_rate_limited".to_string());
+                let backoff_until_ms =
+                    now_ms.saturating_add(self.config.semantic_backoff_cooldown_ms.max(0));
+                self.backoff_until_ms = Some(backoff_until_ms);
+                self.metrics.semantic_backoff_activations =
+                    self.metrics.semantic_backoff_activations.saturating_add(1);
+                return SemanticBudgetDecision::Skip {
+                    reason: "semantic_rate_limited".to_string(),
+                    budget_state: "rate_limited".to_string(),
+                    backoff_until_ms: self.backoff_until_ms,
+                };
+            }
+            self.rate_window_queries = self.rate_window_queries.saturating_add(1);
+        }
+
+        let key = semantic_query_cache_key(embedder_id, options, query_vector);
+        if let Some(entry) = self.cache.get(&key).cloned() {
+            if entry.generation == self.generation && entry.expires_at_ms >= now_ms {
+                self.metrics.semantic_cache_hits =
+                    self.metrics.semantic_cache_hits.saturating_add(1);
+                self.metrics.last_semantic_cache_hit = true;
+                self.metrics.last_fallback_reason = None;
+                self.metrics.last_semantic_latency_ms = 0;
+                self.metrics.last_semantic_rows_scanned = 0;
+                return SemanticBudgetDecision::UseCache { hits: entry.hits };
+            }
+
+            let _ = self.cache.remove(&key);
+            self.metrics.semantic_cache_invalidations =
+                self.metrics.semantic_cache_invalidations.saturating_add(1);
+        }
+
+        self.metrics.semantic_cache_misses = self.metrics.semantic_cache_misses.saturating_add(1);
+        self.metrics.last_semantic_cache_hit = false;
+
+        let configured_scan = self.config.max_semantic_scan_rows.max(1);
+        let requested_limit = options.limit.unwrap_or(100).max(1);
+        let max_scan_rows = configured_scan.max(requested_limit);
+
+        SemanticBudgetDecision::Execute { key, max_scan_rows }
+    }
+
+    fn complete_semantic_lane(
+        &mut self,
+        now_ms: i64,
+        key: SemanticQueryCacheKey,
+        hits: &[SemanticSearchHit],
+        latency_ms: u64,
+        rows_scanned: usize,
+    ) -> Option<i64> {
+        self.metrics.semantic_queries_executed =
+            self.metrics.semantic_queries_executed.saturating_add(1);
+        self.metrics.last_semantic_latency_ms = latency_ms;
+        self.metrics.last_semantic_rows_scanned = rows_scanned;
+        self.metrics.last_fallback_reason = None;
+        self.metrics.semantic_rows_scanned_total = self
+            .metrics
+            .semantic_rows_scanned_total
+            .saturating_add(u64::try_from(rows_scanned).unwrap_or(u64::MAX));
+        self.metrics.semantic_hits_returned_total = self
+            .metrics
+            .semantic_hits_returned_total
+            .saturating_add(u64::try_from(hits.len()).unwrap_or(u64::MAX));
+
+        let alpha = self.config.latency_ewma_alpha.clamp(0.0, 1.0);
+        if self.metrics.semantic_queries_executed == 1 || self.ewma_semantic_latency_ms <= 0.0 {
+            self.ewma_semantic_latency_ms = latency_ms as f64;
+        } else {
+            self.ewma_semantic_latency_ms =
+                alpha * latency_ms as f64 + (1.0 - alpha) * self.ewma_semantic_latency_ms;
+        }
+
+        let latency_limit = self.config.max_semantic_latency_ms;
+        if latency_ms >= latency_limit {
+            self.metrics.semantic_latency_exceeded =
+                self.metrics.semantic_latency_exceeded.saturating_add(1);
+            let backoff_until_ms =
+                now_ms.saturating_add(self.config.semantic_backoff_cooldown_ms.max(0));
+            self.backoff_until_ms = Some(backoff_until_ms);
+            self.metrics.semantic_backoff_activations =
+                self.metrics.semantic_backoff_activations.saturating_add(1);
+        }
+
+        let ttl_ms = self.config.cache_ttl_ms.max(1);
+        let expires_at_ms = now_ms.saturating_add(ttl_ms);
+        let evicted = self.cache.put(
+            key,
+            CachedSemanticHits {
+                hits: hits.to_vec(),
+                expires_at_ms,
+                generation: self.generation,
+            },
+        );
+        if evicted.is_some() {
+            self.metrics.semantic_cache_evictions =
+                self.metrics.semantic_cache_evictions.saturating_add(1);
+        }
+
+        self.backoff_until_ms
+    }
+
+    fn note_semantic_fallback_reason(&mut self, reason: &str) {
+        self.metrics.last_fallback_reason = Some(reason.to_string());
+    }
+}
+
+fn semantic_query_cache_key(
+    embedder_id: &str,
+    options: &SearchOptions,
+    query_vector: &[f32],
+) -> SemanticQueryCacheKey {
+    SemanticQueryCacheKey {
+        embedder_id: embedder_id.to_string(),
+        pane_id: options.pane_id,
+        since: options.since,
+        until: options.until,
+        limit: options.limit.unwrap_or(100),
+        query_vector_hash: hash_query_vector(query_vector),
+        query_vector_len: query_vector.len(),
+    }
+}
+
+fn hash_query_vector(query_vector: &[f32]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    query_vector.len().hash(&mut hasher);
+    for value in query_vector {
+        value.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Severity level for query lint findings.
@@ -11259,6 +11682,14 @@ fn reciprocal_rank_score(rank: usize) -> f32 {
     1.0 / (rank as f32 + 1.0)
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn rrf_component_contribution(rank: usize, rrf_k: u32, weight: f32) -> f64 {
+    if weight <= 0.0 {
+        return 0.0;
+    }
+    f64::from(weight) / (f64::from(rrf_k) + rank as f64 + 1.0)
+}
+
 fn encode_f32_embedding_blob(vector: &[f32]) -> Result<Vec<u8>> {
     if vector.iter().any(|v| !v.is_finite()) {
         return Err(StorageError::Database(
@@ -11321,14 +11752,37 @@ fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> Option<f32> {
     Some(dot / denom)
 }
 
+#[derive(Debug, Clone)]
+struct SemanticLaneResolution {
+    hits: Vec<SemanticSearchHit>,
+    unavailable_reason: Option<String>,
+    cache_hit: bool,
+    latency_ms: u64,
+    rows_scanned: usize,
+    budget_state: String,
+    backoff_until_ms: Option<i64>,
+}
+
 fn search_semantic_sync(
     conn: &Connection,
     embedder_id: &str,
     query_vector: &[f32],
     options: &SearchOptions,
 ) -> Result<Vec<SemanticSearchHit>> {
+    let (hits, _) =
+        search_semantic_sync_with_scan_limit(conn, embedder_id, query_vector, options, None)?;
+    Ok(hits)
+}
+
+fn search_semantic_sync_with_scan_limit(
+    conn: &Connection,
+    embedder_id: &str,
+    query_vector: &[f32],
+    options: &SearchOptions,
+    scan_limit_rows: Option<usize>,
+) -> Result<(Vec<SemanticSearchHit>, usize)> {
     if query_vector.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     if query_vector.iter().any(|v| !v.is_finite()) {
         return Err(
@@ -11364,6 +11818,14 @@ fn search_semantic_sync(
 
     // Stable base order before similarity sort.
     sql.push_str(" ORDER BY s.id ASC");
+    if let Some(scan_limit) = scan_limit_rows {
+        let bounded_scan_limit = scan_limit.max(limit).max(1);
+        sql.push_str(" LIMIT ?");
+        params_vec.push(Box::new(usize_to_i64(
+            bounded_scan_limit,
+            "semantic scan limit",
+        )?));
+    }
 
     let params_refs: Vec<&dyn rusqlite::ToSql> =
         params_vec.iter().map(std::convert::AsRef::as_ref).collect();
@@ -11380,7 +11842,9 @@ fn search_semantic_sync(
         .map_err(|e| StorageError::Database(format!("semantic_search query failed: {e}")))?;
 
     let mut hits = Vec::new();
+    let mut rows_scanned = 0usize;
     for row in rows {
+        rows_scanned = rows_scanned.saturating_add(1);
         let (segment_id, vector_blob) =
             row.map_err(|e| StorageError::Database(format!("semantic_search row error: {e}")))?;
         let candidate = decode_f32_embedding_blob(&vector_blob, query_vector.len())?;
@@ -11400,7 +11864,142 @@ fn search_semantic_sync(
             .then_with(|| a.segment_id.cmp(&b.segment_id))
     });
     hits.truncate(limit);
-    Ok(hits)
+    Ok((hits, rows_scanned))
+}
+
+fn resolve_semantic_lane(
+    conn: &Connection,
+    options: &SearchOptions,
+    embedder_id: &str,
+    query_vector: &[f32],
+    requested_mode: SearchMode,
+    semantic_budget_state: &Arc<Mutex<SemanticBudgetState>>,
+) -> Result<SemanticLaneResolution> {
+    if !matches!(requested_mode, SearchMode::Hybrid | SearchMode::Semantic) {
+        return Ok(SemanticLaneResolution {
+            hits: Vec::new(),
+            unavailable_reason: None,
+            cache_hit: false,
+            latency_ms: 0,
+            rows_scanned: 0,
+            budget_state: "disabled".to_string(),
+            backoff_until_ms: None,
+        });
+    }
+
+    if query_vector.is_empty() {
+        if let Ok(mut state) = semantic_budget_state.lock() {
+            state.note_semantic_fallback_reason("semantic_query_empty");
+        }
+        return Ok(SemanticLaneResolution {
+            hits: Vec::new(),
+            unavailable_reason: Some("semantic_query_empty".to_string()),
+            cache_hit: false,
+            latency_ms: 0,
+            rows_scanned: 0,
+            budget_state: "invalid_query".to_string(),
+            backoff_until_ms: None,
+        });
+    }
+
+    if query_vector.iter().any(|v| !v.is_finite()) {
+        if let Ok(mut state) = semantic_budget_state.lock() {
+            state.note_semantic_fallback_reason("semantic_query_non_finite");
+        }
+        return Ok(SemanticLaneResolution {
+            hits: Vec::new(),
+            unavailable_reason: Some("semantic_query_non_finite".to_string()),
+            cache_hit: false,
+            latency_ms: 0,
+            rows_scanned: 0,
+            budget_state: "invalid_query".to_string(),
+            backoff_until_ms: None,
+        });
+    }
+
+    let now = now_ms();
+    let decision = match semantic_budget_state.lock() {
+        Ok(mut state) => state.begin_semantic_lane(now, options, embedder_id, query_vector),
+        Err(_) => SemanticBudgetDecision::Skip {
+            reason: "semantic_budget_poisoned".to_string(),
+            budget_state: "error".to_string(),
+            backoff_until_ms: None,
+        },
+    };
+
+    match decision {
+        SemanticBudgetDecision::UseCache { hits } => {
+            let unavailable_reason = if hits.is_empty() {
+                Some("semantic_no_hits".to_string())
+            } else {
+                None
+            };
+            if unavailable_reason.is_some() {
+                if let Ok(mut state) = semantic_budget_state.lock() {
+                    state.note_semantic_fallback_reason("semantic_no_hits");
+                }
+            }
+            Ok(SemanticLaneResolution {
+                hits,
+                unavailable_reason,
+                cache_hit: true,
+                latency_ms: 0,
+                rows_scanned: 0,
+                budget_state: "cache_hit".to_string(),
+                backoff_until_ms: None,
+            })
+        }
+        SemanticBudgetDecision::Skip {
+            reason,
+            budget_state,
+            backoff_until_ms,
+        } => Ok(SemanticLaneResolution {
+            hits: Vec::new(),
+            unavailable_reason: Some(reason),
+            cache_hit: false,
+            latency_ms: 0,
+            rows_scanned: 0,
+            budget_state,
+            backoff_until_ms,
+        }),
+        SemanticBudgetDecision::Execute { key, max_scan_rows } => {
+            let started = Instant::now();
+            let (hits, rows_scanned) = search_semantic_sync_with_scan_limit(
+                conn,
+                embedder_id,
+                query_vector,
+                options,
+                Some(max_scan_rows),
+            )?;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let now_after = now_ms();
+            let backoff_until_ms = match semantic_budget_state.lock() {
+                Ok(mut state) => {
+                    state.complete_semantic_lane(now_after, key, &hits, elapsed_ms, rows_scanned)
+                }
+                Err(_) => None,
+            };
+
+            let unavailable_reason = if hits.is_empty() {
+                if let Ok(mut state) = semantic_budget_state.lock() {
+                    state.note_semantic_fallback_reason("semantic_no_hits");
+                }
+                Some("semantic_no_hits".to_string())
+            } else {
+                None
+            };
+
+            Ok(SemanticLaneResolution {
+                hits,
+                unavailable_reason,
+                cache_hit: false,
+                latency_ms: elapsed_ms,
+                rows_scanned,
+                budget_state: "active".to_string(),
+                backoff_until_ms,
+            })
+        }
+    }
 }
 
 fn hybrid_search_with_results_sync(
@@ -11411,18 +12010,41 @@ fn hybrid_search_with_results_sync(
     query_vector: &[f32],
     mode: SearchMode,
     rrf_k: u32,
+    semantic_budget_state: &Arc<Mutex<SemanticBudgetState>>,
 ) -> Result<HybridSearchBundle> {
     let top_k = options.limit.unwrap_or(100);
 
-    let semantic_hits = if query_vector.is_empty() || query_vector.iter().any(|v| !v.is_finite()) {
-        Vec::new()
-    } else {
-        search_semantic_sync(conn, embedder_id, query_vector, options)?
-    };
-    let effective_mode = if semantic_hits.is_empty() && matches!(mode, SearchMode::Hybrid) {
+    let requested_mode = mode;
+    let lexical_weight = 1.0f32;
+    let semantic_weight = 1.0f32;
+
+    let semantic_lane = resolve_semantic_lane(
+        conn,
+        options,
+        embedder_id,
+        query_vector,
+        requested_mode,
+        semantic_budget_state,
+    )?;
+    let semantic_hits = semantic_lane.hits.clone();
+
+    let effective_mode = if semantic_hits.is_empty() && matches!(requested_mode, SearchMode::Hybrid)
+    {
         SearchMode::Lexical
     } else {
-        mode
+        requested_mode
+    };
+    let fallback_reason = if matches!(requested_mode, SearchMode::Hybrid)
+        && matches!(effective_mode, SearchMode::Lexical)
+    {
+        Some(
+            semantic_lane
+                .unavailable_reason
+                .clone()
+                .unwrap_or_else(|| "semantic_unavailable".to_string()),
+        )
+    } else {
+        None
     };
 
     let mut lexical_options = options.clone();
@@ -11455,6 +12077,7 @@ fn hybrid_search_with_results_sync(
     let mut fused = HybridSearchService::new()
         .with_mode(effective_mode)
         .with_rrf_k(rrf_k)
+        .with_rrf_weights(lexical_weight, semantic_weight)
         .fuse(&lexical_ranked, &semantic_ranked, top_k);
     // Make tie behavior deterministic despite internal HashMap aggregation.
     fused.sort_by(|a, b| {
@@ -11499,22 +12122,42 @@ fn hybrid_search_with_results_sync(
         let semantic_score = semantic_by_id.get(&segment_id).map(|(_, score)| *score);
         let lexical_rank = lexical_by_id.get(&segment_id).map(|(rank, _)| *rank);
         let semantic_rank = semantic_by_id.get(&segment_id).map(|(rank, _)| *rank);
+        let fusion_score = f64::from(item.score);
+        let (lexical_contribution, semantic_contribution) = match effective_mode {
+            SearchMode::Lexical => (Some(fusion_score), None),
+            SearchMode::Semantic => (None, Some(fusion_score)),
+            SearchMode::Hybrid => (
+                lexical_rank.map(|rank| rrf_component_contribution(rank, rrf_k, lexical_weight)),
+                semantic_rank.map(|rank| rrf_component_contribution(rank, rrf_k, semantic_weight)),
+            ),
+        };
 
         results.push(HybridSearchResult {
             result: search_result,
             semantic_score,
             lexical_rank,
             semantic_rank,
+            lexical_contribution,
+            semantic_contribution,
             fusion_rank,
-            fusion_score: f64::from(item.score),
+            fusion_score,
         });
     }
 
     Ok(HybridSearchBundle {
         mode: search_mode_label(effective_mode).to_string(),
+        requested_mode: search_mode_label(requested_mode).to_string(),
+        fallback_reason,
         rrf_k,
+        lexical_weight,
+        semantic_weight,
         lexical_candidates: lexical_ranked.len(),
         semantic_candidates: semantic_ranked.len(),
+        semantic_cache_hit: semantic_lane.cache_hit,
+        semantic_latency_ms: semantic_lane.latency_ms,
+        semantic_rows_scanned: semantic_lane.rows_scanned,
+        semantic_budget_state: semantic_lane.budget_state,
+        semantic_backoff_until_ms: semantic_lane.backoff_until_ms,
         results,
     })
 }
@@ -18667,13 +19310,23 @@ mod storage_handle_tests {
             .unwrap();
 
         assert_eq!(bundle.mode, "hybrid");
+        assert_eq!(bundle.requested_mode, "hybrid");
+        assert_eq!(bundle.fallback_reason, None);
         assert_eq!(bundle.rrf_k, 60);
+        assert!((bundle.lexical_weight - 1.0).abs() < f32::EPSILON);
+        assert!((bundle.semantic_weight - 1.0).abs() < f32::EPSILON);
         assert!(bundle.lexical_candidates >= 2);
         assert!(bundle.semantic_candidates >= 2);
         assert!(!bundle.results.is_empty());
 
         for (idx, hit) in bundle.results.iter().enumerate() {
             assert_eq!(hit.fusion_rank, idx);
+            let expected =
+                hit.lexical_contribution.unwrap_or(0.0) + hit.semantic_contribution.unwrap_or(0.0);
+            assert!(
+                (hit.fusion_score - expected).abs() < 1e-6,
+                "fusion score should equal lane contributions"
+            );
         }
 
         let ids: Vec<i64> = bundle.results.iter().map(|h| h.result.segment.id).collect();
@@ -18687,6 +19340,8 @@ mod storage_handle_tests {
             .unwrap();
         assert!(lexical_only_hit.lexical_rank.is_some());
         assert!(lexical_only_hit.semantic_score.is_none());
+        assert!(lexical_only_hit.lexical_contribution.is_some());
+        assert!(lexical_only_hit.semantic_contribution.is_none());
 
         let semantic_only_hit = bundle
             .results
@@ -18695,6 +19350,240 @@ mod storage_handle_tests {
             .unwrap();
         assert!(semantic_only_hit.semantic_score.is_some());
         assert!(semantic_only_hit.lexical_rank.is_none());
+        assert!(semantic_only_hit.semantic_contribution.is_some());
+        assert!(semantic_only_hit.lexical_contribution.is_none());
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_hybrid_search_falls_back_to_lexical_when_semantic_degraded() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        handle
+            .append_segment(1, "needle only in lexical lane", None)
+            .await
+            .unwrap();
+        handle
+            .append_segment(1, "another needle record", None)
+            .await
+            .unwrap();
+
+        // Empty query vector degrades semantic lane deterministically.
+        let bundle = handle
+            .hybrid_search_with_results(
+                "needle",
+                SearchOptions {
+                    limit: Some(3),
+                    include_snippets: Some(false),
+                    ..SearchOptions::default()
+                },
+                "hash",
+                &[],
+                crate::search::SearchMode::Hybrid,
+                60,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(bundle.requested_mode, "hybrid");
+        assert_eq!(bundle.mode, "lexical");
+        assert_eq!(
+            bundle.fallback_reason.as_deref(),
+            Some("semantic_query_empty")
+        );
+        assert_eq!(bundle.semantic_candidates, 0);
+        assert!(bundle.lexical_candidates >= 1);
+        assert!(!bundle.results.is_empty());
+
+        for hit in &bundle.results {
+            assert!(hit.semantic_score.is_none());
+            assert!(hit.semantic_rank.is_none());
+            assert!(hit.semantic_contribution.is_none());
+            assert!(hit.lexical_contribution.is_some());
+            assert!((hit.fusion_score - hit.lexical_contribution.unwrap_or_default()).abs() < 1e-6);
+        }
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_hybrid_search_uses_semantic_cache_and_invalidation() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        let seg_a = handle
+            .append_segment(1, "needle from lexical and semantic lane", None)
+            .await
+            .unwrap();
+        let seg_b = handle
+            .append_segment(1, "another needle candidate", None)
+            .await
+            .unwrap();
+
+        handle
+            .store_embedding_f32(seg_a.id, "hash", &[1.0, 0.0])
+            .await
+            .unwrap();
+        handle
+            .store_embedding_f32(seg_b.id, "hash", &[0.9, 0.1])
+            .await
+            .unwrap();
+
+        let options = SearchOptions {
+            limit: Some(5),
+            include_snippets: Some(false),
+            ..SearchOptions::default()
+        };
+
+        let first = handle
+            .hybrid_search_with_results(
+                "needle",
+                options.clone(),
+                "hash",
+                &[1.0, 0.0],
+                crate::search::SearchMode::Hybrid,
+                60,
+            )
+            .await
+            .unwrap();
+        assert!(!first.semantic_cache_hit);
+        assert!(first.semantic_rows_scanned > 0);
+        assert_eq!(first.semantic_budget_state, "active");
+
+        let second = handle
+            .hybrid_search_with_results(
+                "needle",
+                options.clone(),
+                "hash",
+                &[1.0, 0.0],
+                crate::search::SearchMode::Hybrid,
+                60,
+            )
+            .await
+            .unwrap();
+        assert!(second.semantic_cache_hit);
+        assert_eq!(second.semantic_rows_scanned, 0);
+        assert_eq!(second.semantic_budget_state, "cache_hit");
+
+        // Storing a new embedding invalidates semantic cache generation.
+        handle
+            .store_embedding_f32(seg_b.id, "hash", &[0.0, 1.0])
+            .await
+            .unwrap();
+
+        let third = handle
+            .hybrid_search_with_results(
+                "needle",
+                options,
+                "hash",
+                &[1.0, 0.0],
+                crate::search::SearchMode::Hybrid,
+                60,
+            )
+            .await
+            .unwrap();
+        assert!(!third.semantic_cache_hit);
+        assert!(third.semantic_rows_scanned > 0);
+
+        let snapshot = handle.semantic_budget_snapshot();
+        assert!(snapshot.metrics.semantic_cache_hits >= 1);
+        assert!(snapshot.metrics.semantic_cache_invalidations >= 1);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_hybrid_search_applies_latency_backoff_budget() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.set_semantic_budget_config(SemanticBudgetConfig {
+            max_semantic_latency_ms: 0,
+            semantic_backoff_cooldown_ms: 60_000,
+            max_semantic_queries_per_window: 100,
+            rate_limit_window_ms: 60_000,
+            cache_capacity: 32,
+            cache_ttl_ms: 1,
+            max_semantic_scan_rows: 1_000,
+            latency_ewma_alpha: 0.5,
+        });
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        let seg_a = handle
+            .append_segment(1, "needle baseline", None)
+            .await
+            .unwrap();
+        let seg_b = handle
+            .append_segment(1, "needle fallback target", None)
+            .await
+            .unwrap();
+        handle
+            .store_embedding_f32(seg_a.id, "hash", &[1.0, 0.0])
+            .await
+            .unwrap();
+        handle
+            .store_embedding_f32(seg_b.id, "hash", &[0.9, 0.1])
+            .await
+            .unwrap();
+
+        let first = handle
+            .hybrid_search_with_results(
+                "needle",
+                SearchOptions {
+                    limit: Some(3),
+                    include_snippets: Some(false),
+                    ..SearchOptions::default()
+                },
+                "hash",
+                &[1.0, 0.0],
+                crate::search::SearchMode::Hybrid,
+                60,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.mode, "hybrid");
+        assert_eq!(first.semantic_budget_state, "active");
+
+        // Use a different query vector key to bypass cache and trigger backoff skip.
+        let second = handle
+            .hybrid_search_with_results(
+                "needle",
+                SearchOptions {
+                    limit: Some(3),
+                    include_snippets: Some(false),
+                    ..SearchOptions::default()
+                },
+                "hash",
+                &[0.8, 0.2],
+                crate::search::SearchMode::Hybrid,
+                60,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second.requested_mode, "hybrid");
+        assert_eq!(second.mode, "lexical");
+        assert_eq!(
+            second.fallback_reason.as_deref(),
+            Some("semantic_budget_backoff")
+        );
+        assert_eq!(second.semantic_budget_state, "backoff");
+        assert_eq!(second.semantic_candidates, 0);
+        assert!(!second.results.is_empty());
+
+        let snapshot = handle.semantic_budget_snapshot();
+        assert!(snapshot.metrics.semantic_backoff_activations >= 1);
+        assert!(snapshot.metrics.semantic_skipped_backoff >= 1);
+        assert!(snapshot.backoff_until_ms.is_some());
 
         handle.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);

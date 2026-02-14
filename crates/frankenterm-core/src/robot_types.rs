@@ -438,6 +438,8 @@ pub struct SearchData {
     pub pane_filter: Option<u64>,
     #[serde(default)]
     pub since_filter: Option<i64>,
+    #[serde(default)]
+    pub until_filter: Option<i64>,
     /// Search mode used (fts5, lexical, semantic, hybrid, two-tier).
     #[serde(default)]
     pub mode: Option<String>,
