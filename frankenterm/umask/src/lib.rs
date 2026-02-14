@@ -344,6 +344,202 @@ mod tests {
         unsafe { umask(original) };
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn individual_permission_bits_owner_read() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+        unsafe { umask(0o400) }; // owner read denied
+        {
+            let _saver = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(0o400));
+        }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o400);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn individual_permission_bits_group_write() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+        unsafe { umask(0o020) }; // group write denied
+        {
+            let _saver = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(0o020));
+        }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o020);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn individual_permission_bits_other_execute() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+        unsafe { umask(0o001) }; // other execute denied
+        {
+            let _saver = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(0o001));
+        }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o001);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rapid_create_drop_with_changing_masks() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        let masks = [0o000, 0o111, 0o222, 0o333, 0o444, 0o555, 0o666, 0o777];
+        for &mask in &masks {
+            unsafe { umask(mask) };
+            let _saver = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(mask));
+            drop(_saver);
+            // After drop, should restore to mask
+            let restored = unsafe { umask(mask) };
+            assert_eq!(restored, mask);
+        }
+
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_umask_is_none_between_savers() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        SAVED_UMASK.lock().unwrap().take();
+        assert!(UmaskSaver::saved_umask().is_none());
+
+        {
+            let _saver = UmaskSaver::new();
+            assert!(UmaskSaver::saved_umask().is_some());
+        }
+        assert!(UmaskSaver::saved_umask().is_none());
+
+        {
+            let _saver = UmaskSaver::new();
+            assert!(UmaskSaver::saved_umask().is_some());
+        }
+        assert!(UmaskSaver::saved_umask().is_none());
+
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saver_mask_field_captures_prior_value() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o055) };
+
+        let saver = UmaskSaver::new();
+        // The saver's mask field should hold 0o055 (the prior mask)
+        // We can verify through saved_umask() which reads from the global
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o055));
+        drop(saver);
+
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_clears_global_even_with_nonzero_mask() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o123) };
+
+        {
+            let _saver = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(0o123));
+        }
+        // Drop must clear the global
+        assert!(UmaskSaver::saved_umask().is_none());
+
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mask_value_077_is_active_during_saver_lifetime() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o000) };
+
+        let _saver = UmaskSaver::new();
+        // Query current mask (set-and-restore pattern)
+        let active = unsafe { umask(0o077) };
+        unsafe { umask(active) };
+        assert_eq!(active, 0o077, "UmaskSaver should set mask to 0o077");
+
+        drop(_saver);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn triple_nested_savers() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        let _outer = UmaskSaver::new();
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o022));
+
+        let _mid = UmaskSaver::new();
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o077));
+
+        let _inner = UmaskSaver::new();
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o077));
+
+        drop(_inner);
+        drop(_mid);
+        drop(_outer);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saver_from_each_permission_category() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        // Test all three permission categories independently
+        for &mask in &[0o700, 0o070, 0o007] {
+            unsafe { umask(mask) };
+            {
+                let _saver = UmaskSaver::new();
+                assert_eq!(UmaskSaver::saved_umask(), Some(mask));
+            }
+            let restored = unsafe { umask(mask) };
+            assert_eq!(restored, mask);
+        }
+
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_drop_preserves_umask_value_end_to_end() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o027) };
+
+        // Create, verify active mask, drop, verify restoration
+        let saver = UmaskSaver::new();
+        let during = unsafe { umask(0o077) };
+        unsafe { umask(during) };
+        assert_eq!(during, 0o077);
+        drop(saver);
+
+        let after = unsafe { umask(0o027) };
+        assert_eq!(after, 0o027);
+
+        unsafe { umask(original) };
+    }
+
     #[cfg(not(unix))]
     #[test]
     fn non_unix_new_does_not_panic() {
