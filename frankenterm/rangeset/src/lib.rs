@@ -954,4 +954,139 @@ mod tests {
         assert_eq!(set.len(), 1);
         assert_eq!(collect(&set), vec![5..6]);
     }
+
+    // ── intersection commutativity ───────────────────────────
+
+    #[test]
+    fn intersection_is_commutative() {
+        let mut a = RangeSet::new();
+        a.add_range(1..10);
+        a.add_range(20..30);
+
+        let mut b = RangeSet::new();
+        b.add_range(5..25);
+
+        assert_eq!(collect(&a.intersection(&b)), collect(&b.intersection(&a)));
+    }
+
+    #[test]
+    fn intersection_with_empty_is_empty() {
+        let mut set = RangeSet::new();
+        set.add_range(1..100);
+        let empty: RangeSet<i32> = RangeSet::new();
+        assert!(set.intersection(&empty).is_empty());
+    }
+
+    #[test]
+    fn intersection_multi_range_overlap() {
+        let mut a = RangeSet::new();
+        a.add_range(1..5);
+        a.add_range(10..15);
+
+        let mut b = RangeSet::new();
+        b.add_range(3..12);
+
+        let inter = a.intersection(&b);
+        assert_eq!(collect(&inter), vec![3..5, 10..12]);
+    }
+
+    // ── len after mutations ──────────────────────────────────
+
+    #[test]
+    fn len_decreases_after_remove() {
+        let mut set = RangeSet::new();
+        set.add_range(1..11);
+        assert_eq!(set.len(), 10);
+        set.remove(5);
+        assert_eq!(set.len(), 9);
+    }
+
+    #[test]
+    fn len_of_disjoint_ranges() {
+        let mut set = RangeSet::new();
+        set.add_range(0..5);
+        set.add_range(100..110);
+        set.add_range(1000..1003);
+        assert_eq!(set.len(), 18);
+    }
+
+    // ── remove_range crossing multiple ranges ────────────────
+
+    #[test]
+    fn remove_range_spanning_multiple_ranges() {
+        let mut set = RangeSet::new();
+        set.add_range(1..5);
+        set.add_range(10..15);
+        set.add_range(20..25);
+        set.remove_range(3..22);
+        assert_eq!(collect(&set), vec![1..3, 22..25]);
+    }
+
+    #[test]
+    fn remove_all_ranges() {
+        let mut set = RangeSet::new();
+        set.add_range(1..5);
+        set.add_range(10..15);
+        set.remove_range(0..100);
+        assert!(set.is_empty());
+    }
+
+    // ── add_range_unchecked then add_range triggers sort ─────
+
+    #[test]
+    fn add_range_unchecked_then_add_range_sorts() {
+        let mut set = RangeSet::new();
+        set.add_range_unchecked(20..25);
+        set.add_range_unchecked(1..5);
+        // add_range calls sort_if_needed
+        set.add_range(10..15);
+        assert_eq!(collect(&set), vec![1..5, 10..15, 20..25]);
+    }
+
+    // ── iter_values with single-element ranges ───────────────
+
+    #[test]
+    fn iter_values_single_element_ranges() {
+        let mut set = RangeSet::new();
+        set.add(1);
+        set.add(3);
+        set.add(5);
+        let values: Vec<i32> = set.iter_values().collect();
+        assert_eq!(values, vec![1, 3, 5]);
+    }
+
+    // ── contains after complex mutations ─────────────────────
+
+    #[test]
+    fn contains_boundary_after_split() {
+        let mut set = RangeSet::new();
+        set.add_range(1..10);
+        set.remove(5);
+        assert!(set.contains(4));
+        assert!(!set.contains(5));
+        assert!(set.contains(6));
+    }
+
+    // ── difference with multi-range sets ─────────────────────
+
+    #[test]
+    fn difference_multi_range_both_sides() {
+        let mut a = RangeSet::new();
+        a.add_range(1..5);
+        a.add_range(10..20);
+
+        let mut b = RangeSet::new();
+        b.add_range(3..12);
+
+        let diff = a.difference(&b);
+        assert_eq!(collect(&diff), vec![1..3, 12..20]);
+    }
+
+    #[test]
+    fn difference_empty_minus_nonempty_is_empty() {
+        let empty: RangeSet<i32> = RangeSet::new();
+        let mut nonempty = RangeSet::new();
+        nonempty.add_range(1..10);
+        assert!(empty.difference(&nonempty).is_empty());
+    }
 }
