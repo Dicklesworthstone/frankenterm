@@ -106,6 +106,19 @@ Operational interpretation:
 - `resize_single_pane_scrollback` carries the largest isolated spike (`3,766,917 ns`), indicating an outlier-heavy path.
 - `mixed_scale_soak` has the heaviest sustained tail pressure (`logical_reflow.p95=530,000 ns`, highest multi-pane presentation tails), making it the best near-term gating workload for intervention A/B comparisons.
 
+### Estimated impact targets (next execution window)
+
+These estimates are intentionally conservative and tied to currently measured tails:
+
+| Target lane | Baseline metric | Candidate intervention(s) | Target metric | Estimated improvement |
+|---|---|---|---|---:|
+| `B2` outlier suppression (single-pane scrollback) | `logical_reflow.max=3,766,917 ns` (`resize_single_pane_scrollback`) | viewport-first incremental reflow + cold backlog completion (`wa-1u90p.3.2` family), adaptive buffer headroom (`wa-1u90p.3.5`/allocation controls) | `logical_reflow.max <= 1,200,000 ns` | ~68% max-tail reduction |
+| `B2` sustained tail (mixed soak) | `logical_reflow.p95=530,000 ns` (`mixed_scale_soak`) | two-phase transaction control plane + latest-intent cancelation (`wa-1u90p.2.*`) plus bounded DP/fallback wrap controls (`wa-1u90p.3.12+`) | `logical_reflow.p95 <= 300,000 ns` | ~43% p95 reduction |
+| `B4` presentation tail (mixed soak) | `presentation.p95=38,875 ns`, `max=118,250 ns` | dirty-span-aware render diffing + strategy selector (`wa-1u90p.4.*`) | `presentation.p95 <= 20,000 ns`, `max <= 70,000 ns` | ~49% p95, ~41% max reduction |
+| `B1` queue depth under fanout | `queue.max_before=28` (`mixed_scale_soak`) | scheduler fairness tuning + coalescing guardrails (`wa-1u90p.2.3`, `wa-1u90p.2.7`) | preserve `max_before <= 28`, force `min_after=0` under repeated storms | stability target (avoid queue-growth regression) |
+
+These become the first measurable go/no-go targets for downstream slices and should be enforced in the perf regression suite (`wa-1u90p.7.4`) once that harness is finalized.
+
 ### Latest `wa-1u90p.1.3` intake (2026-02-14)
 Primary report received:
 - `docs/resize-lock-memory-profile-wa-1u90p.1.3.md`
