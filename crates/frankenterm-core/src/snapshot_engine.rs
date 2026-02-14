@@ -2110,7 +2110,7 @@ mod tests {
         let p1 = make_test_pane(1, 24, 80);
         let p2 = make_test_pane(2, 30, 120);
 
-        let h1 = compute_state_hash(&[p1.clone()]);
+        let h1 = compute_state_hash(std::slice::from_ref(&p1));
         let h2 = compute_state_hash(&[p1, p2]);
         assert_ne!(h1, h2);
     }

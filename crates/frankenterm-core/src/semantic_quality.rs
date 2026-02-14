@@ -555,14 +555,14 @@ mod tests {
 
     #[test]
     fn compute_metrics_top_k_zero_returns_default() {
-        let relevant: HashSet<u64> = [1].into_iter().collect();
+        let relevant: HashSet<u64> = HashSet::from([1]);
         let m = compute_metrics(&[1], &relevant, 0);
         assert!(m.precision_at_k.abs() < f64::EPSILON);
     }
 
     #[test]
     fn compute_metrics_mrr_first_hit_at_position_2() {
-        let relevant: HashSet<u64> = [2].into_iter().collect();
+        let relevant: HashSet<u64> = HashSet::from([2]);
         let ranked = vec![1, 2, 3]; // first relevant at idx 1 → MRR = 1/2
         let m = compute_metrics(&ranked, &relevant, 3);
         assert!((m.mrr - 0.5).abs() < f64::EPSILON);

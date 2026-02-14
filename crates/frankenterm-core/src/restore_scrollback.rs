@@ -868,7 +868,7 @@ mod tests {
 
     #[test]
     fn build_content_with_empty_string_elements() {
-        let content = build_injection_content(&["".into(), "".into()]);
+        let content = build_injection_content(&[String::new(), String::new()]);
         assert!(content.starts_with("\x1b[0m\x1b[H\x1b[2J"));
         // Two empty lines with newline between them
         assert!(content.contains("\n"));
@@ -882,7 +882,7 @@ mod tests {
 
     #[test]
     fn build_content_single_empty_line() {
-        let content = build_injection_content(&["".into()]);
+        let content = build_injection_content(&[String::new()]);
         // Just reset prefix + empty string
         assert_eq!(content, "\x1b[0m\x1b[H\x1b[2J");
     }
