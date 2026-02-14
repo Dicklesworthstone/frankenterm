@@ -319,11 +319,30 @@ proptest! {
         }
     }
 
-    /// Greedy budget invariant: every non-selected batch would exceed the budget
-    /// if added to the current frame_spent at the point it was evaluated.
-    /// The planner processes batches in order, greedily selecting those that fit.
+    /// Selected batches form a contiguous prefix: once a non-selected batch
+    /// appears, all subsequent batches must also be non-selected. This ensures
+    /// higher-priority work nearest the viewport is never displaced by smaller
+    /// cold scrollback chunks that happen to fit within remaining budget.
     #[test]
-    fn non_selected_would_exceed_budget(input in arb_any_input()) {
+    fn selected_batches_are_contiguous_prefix(input in arb_any_input()) {
+        let result = plan(&input);
+        let mut seen_deselected = false;
+        for (idx, batch) in result.batches.iter().enumerate() {
+            if !batch.selected_for_frame {
+                seen_deselected = true;
+            } else if seen_deselected {
+                prop_assert!(false,
+                    "batch {} is selected after a deselected batch — non-contiguous selection",
+                    idx
+                );
+            }
+        }
+    }
+
+    /// Greedy prefix budget invariant: selected batches fit the budget;
+    /// the first non-selected batch (the cutoff) would exceed it.
+    #[test]
+    fn cutoff_batch_exceeds_budget(input in arb_any_input()) {
         let result = plan(&input);
         let lpu = input.lines_per_work_unit.max(1);
         let mut frame_spent = 0_u32;
@@ -332,12 +351,10 @@ proptest! {
             let lines = (batch.range.end_line_exclusive - batch.range.start_line).max(1);
             let work_units = lines.div_ceil(lpu).max(1);
             if first {
-                // First batch always selected
                 prop_assert!(batch.selected_for_frame, "first batch must be selected");
                 frame_spent = frame_spent.saturating_add(work_units);
                 first = false;
             } else if batch.selected_for_frame {
-                // Selected batch must fit within budget
                 prop_assert!(
                     frame_spent.saturating_add(work_units) <= result.frame_budget_units,
                     "selected batch with work_units={} would put frame_spent={} over budget={}",
@@ -345,12 +362,14 @@ proptest! {
                 );
                 frame_spent = frame_spent.saturating_add(work_units);
             } else {
-                // Non-selected batch must NOT fit within budget
+                // The first non-selected batch must exceed the budget —
+                // after that, remaining batches are skipped regardless of size.
                 prop_assert!(
                     frame_spent.saturating_add(work_units) > result.frame_budget_units,
-                    "non-selected batch with work_units={} would fit (frame_spent={}, budget={})",
+                    "cutoff batch with work_units={} would fit (frame_spent={}, budget={})",
                     work_units, frame_spent, result.frame_budget_units
                 );
+                break;
             }
         }
     }

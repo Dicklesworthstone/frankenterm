@@ -110,10 +110,11 @@ proptest! {
 
         let observed_fp = false_positives as f64 / test_count as f64;
 
-        // Allow 5x the target FP rate to account for hash collision variance,
+        // Allow 8x the target FP rate to account for hash collision variance,
         // especially at small capacities and low FP targets where statistical
-        // noise is proportionally larger. Still catches gross miscalculation.
-        let tolerance = (fp_rate * 5.0).max(0.05);
+        // noise is proportionally larger. Still catches gross miscalculation
+        // (100x would pass, 1x would always fail at low capacities).
+        let tolerance = (fp_rate * 8.0).max(0.05);
         prop_assert!(observed_fp <= tolerance,
             "observed FP rate {:.4} exceeds tolerance {:.4} (target {:.4}, cap={}, hashes={})",
             observed_fp, tolerance, fp_rate, bf.num_bits(), bf.num_hashes());

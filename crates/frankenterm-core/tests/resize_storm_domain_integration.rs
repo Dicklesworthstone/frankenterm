@@ -13,7 +13,7 @@
 //! Bead: wa-1u90p.7.1
 
 use frankenterm_core::resize_invariants::{
-    check_scheduler_snapshot_invariants, ResizeInvariantReport,
+    ResizeInvariantReport, check_scheduler_snapshot_invariants,
 };
 use frankenterm_core::resize_scheduler::{
     ResizeDomain, ResizeIntent, ResizeScheduler, ResizeSchedulerConfig, ResizeWorkClass,

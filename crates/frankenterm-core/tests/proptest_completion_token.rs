@@ -678,12 +678,16 @@ proptest! {
     /// End-to-end: create token, advance all subsystems Ok → Completed.
     #[test]
     fn prop_e2e_happy_path(subs in prop::collection::vec(arb_subsystem_name(), 1..=4)) {
-        let refs: Vec<&str> = subs.iter().map(|s| s.as_str()).collect();
+        // Deduplicate subsystem names — boundaries treat duplicates as one subsystem
+        let mut unique: Vec<String> = subs.clone();
+        unique.sort();
+        unique.dedup();
+        let refs: Vec<&str> = unique.iter().map(|s| s.as_str()).collect();
         let boundary = CompletionBoundary::new(&refs);
         let mut tracker = CompletionTracker::new(CompletionTrackerConfig::default());
         let id = tracker.begin("test_op", boundary).unwrap();
 
-        for sub in &subs {
+        for sub in &unique {
             tracker.advance(&id, sub, StepOutcome::Ok, "ok");
         }
 
@@ -694,25 +698,34 @@ proptest! {
     /// End-to-end: first Error → Failed.
     #[test]
     fn prop_e2e_first_error_fails(subs in prop::collection::vec(arb_subsystem_name(), 1..=4)) {
-        let refs: Vec<&str> = subs.iter().map(|s| s.as_str()).collect();
+        let mut unique: Vec<String> = subs.clone();
+        unique.sort();
+        unique.dedup();
+        let refs: Vec<&str> = unique.iter().map(|s| s.as_str()).collect();
         let boundary = CompletionBoundary::new(&refs);
         let mut tracker = CompletionTracker::new(CompletionTrackerConfig::default());
         let id = tracker.begin("test_op", boundary).unwrap();
 
-        tracker.advance(&id, &subs[0], StepOutcome::Error, "error");
+        tracker.advance(&id, &unique[0], StepOutcome::Error, "error");
         prop_assert_eq!(tracker.state(&id), Some(CompletionState::Failed));
     }
 
-    /// End-to-end: Ok then Error → PartialFailure.
+    /// End-to-end: Ok on first subsystem then Error on second → PartialFailure.
+    /// Requires at least 2 unique subsystem names.
     #[test]
     fn prop_e2e_partial_failure(subs in prop::collection::vec(arb_subsystem_name(), 2..=4)) {
-        let refs: Vec<&str> = subs.iter().map(|s| s.as_str()).collect();
+        let mut unique: Vec<String> = subs.clone();
+        unique.sort();
+        unique.dedup();
+        // Need at least 2 unique subsystems for partial failure
+        prop_assume!(unique.len() >= 2);
+        let refs: Vec<&str> = unique.iter().map(|s| s.as_str()).collect();
         let boundary = CompletionBoundary::new(&refs);
         let mut tracker = CompletionTracker::new(CompletionTrackerConfig::default());
         let id = tracker.begin("test_op", boundary).unwrap();
 
-        tracker.advance(&id, &subs[0], StepOutcome::Ok, "ok");
-        tracker.advance(&id, &subs[1], StepOutcome::Error, "failed");
+        tracker.advance(&id, &unique[0], StepOutcome::Ok, "ok");
+        tracker.advance(&id, &unique[1], StepOutcome::Error, "failed");
         prop_assert_eq!(tracker.state(&id), Some(CompletionState::PartialFailure));
     }
 

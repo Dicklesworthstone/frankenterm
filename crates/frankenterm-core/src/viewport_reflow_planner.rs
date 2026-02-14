@@ -257,6 +257,7 @@ impl ViewportReflowPlanner {
 
         let mut frame_spent = 0_u32;
         let mut any_selected = false;
+        let mut budget_exhausted = false;
         let mut batches = Vec::with_capacity(ordered_ranges.len());
         for (range, priority) in ordered_ranges {
             let lines = range.len().max(1);
@@ -266,10 +267,16 @@ impl ViewportReflowPlanner {
                 any_selected = true;
                 frame_spent = frame_spent.saturating_add(work_units);
                 true
-            } else if frame_spent.saturating_add(work_units) <= frame_budget_units {
+            } else if !budget_exhausted
+                && frame_spent.saturating_add(work_units) <= frame_budget_units
+            {
                 frame_spent = frame_spent.saturating_add(work_units);
                 true
             } else {
+                // Once any batch doesn't fit, stop selecting — selected batches
+                // form a contiguous prefix in priority order so higher-priority
+                // work nearest the viewport is never displaced by smaller cold chunks.
+                budget_exhausted = true;
                 false
             };
 
