@@ -26,19 +26,19 @@ fn arb_value() -> impl Strategy<Value = Value> {
 /// Graph operation for random graph construction.
 #[derive(Debug, Clone)]
 enum GraphOp {
-    AddSource(String, Value),
-    AddMap(String, Vec<usize>), // indices into existing nodes
-    AddEdge(usize, usize),      // indices into existing nodes
+    Source(String, Value),
+    Map(String, Vec<usize>), // indices into existing nodes
+    Edge(usize, usize),      // indices into existing nodes
 }
 
 /// Generate a sequence of graph-building operations.
 fn arb_graph_ops(max_ops: usize) -> impl Strategy<Value = Vec<GraphOp>> {
     prop::collection::vec(
         prop_oneof![
-            (("[a-z]{1,8}"), arb_value()).prop_map(|(label, val)| GraphOp::AddSource(label, val)),
+            (("[a-z]{1,8}"), arb_value()).prop_map(|(label, val)| GraphOp::Source(label, val)),
             ("[a-z]{1,8}", prop::collection::vec(0..50usize, 0..4))
-                .prop_map(|(label, inputs)| GraphOp::AddMap(label, inputs)),
-            (0..50usize, 0..50usize).prop_map(|(from, to)| GraphOp::AddEdge(from, to)),
+                .prop_map(|(label, inputs)| GraphOp::Map(label, inputs)),
+            (0..50usize, 0..50usize).prop_map(|(from, to)| GraphOp::Edge(from, to)),
         ],
         1..max_ops,
     )
@@ -51,11 +51,11 @@ fn build_graph_from_ops(ops: &[GraphOp]) -> (DataflowGraph, Vec<NodeId>) {
 
     for op in ops {
         match op {
-            GraphOp::AddSource(label, value) => {
+            GraphOp::Source(label, value) => {
                 let id = graph.add_source(label, value.clone());
                 nodes.push(id);
             }
-            GraphOp::AddMap(label, input_indices) => {
+            GraphOp::Map(label, input_indices) => {
                 let inputs: Vec<NodeId> = input_indices
                     .iter()
                     .filter_map(|&idx| nodes.get(idx % nodes.len().max(1)).copied())
@@ -74,7 +74,7 @@ fn build_graph_from_ops(ops: &[GraphOp]) -> (DataflowGraph, Vec<NodeId>) {
                     nodes.push(id);
                 }
             }
-            GraphOp::AddEdge(from_idx, to_idx) => {
+            GraphOp::Edge(from_idx, to_idx) => {
                 if nodes.len() < 2 {
                     continue;
                 }
@@ -148,16 +148,16 @@ proptest! {
         let mut graph = DataflowGraph::new();
         let s = graph.add_source("s", Value::Int(0));
         let left = graph.add_map("left", vec![s], |i| match &i[0] {
-            Value::Int(v) => Value::Int(v + 1),
+            Value::Int(v) => Value::Int(v.saturating_add(1)),
             _ => Value::None,
         });
         let right = graph.add_map("right", vec![s], |i| match &i[0] {
-            Value::Int(v) => Value::Int(v * 2),
+            Value::Int(v) => Value::Int(v.saturating_mul(2)),
             _ => Value::None,
         });
         let join = graph.add_combine("join", vec![left, right], |i| {
             match (&i[0], &i[1]) {
-                (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
+                (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_add(*b)),
                 _ => Value::None,
             }
         });
@@ -167,9 +167,9 @@ proptest! {
         let _ = graph.update_source(s, Value::Int(val));
         graph.propagate();
 
-        let expected_left = val + 1;
-        let expected_right = val * 2;
-        let expected_join = expected_left + expected_right;
+        let expected_left = val.saturating_add(1);
+        let expected_right = val.saturating_mul(2);
+        let expected_join = expected_left.saturating_add(expected_right);
 
         prop_assert_eq!(graph.get_value(left), Some(&Value::Int(expected_left)));
         prop_assert_eq!(graph.get_value(right), Some(&Value::Int(expected_right)));
@@ -225,7 +225,7 @@ proptest! {
                 let offset = i as i64;
                 graph.add_map(&format!("m{i}"), vec![s], move |inputs| {
                     match &inputs[0] {
-                        Value::Int(v) => Value::Int(v + offset),
+                        Value::Int(v) => Value::Int(v.saturating_add(offset)),
                         _ => Value::None,
                     }
                 })
@@ -237,7 +237,7 @@ proptest! {
         for (i, &m) in maps.iter().enumerate() {
             prop_assert_eq!(
                 graph.get_value(m),
-                Some(&Value::Int(val + i as i64))
+                Some(&Value::Int(val.saturating_add(i as i64)))
             );
         }
     }
@@ -248,21 +248,21 @@ proptest! {
         let mut graph = DataflowGraph::new();
         let s = graph.add_source("s", Value::Int(val));
         let a = graph.add_map("a", vec![s], |i| match &i[0] {
-            Value::Int(v) => Value::Int(v + 1),
+            Value::Int(v) => Value::Int(v.saturating_add(1)),
             _ => Value::None,
         });
         let b = graph.add_map("b", vec![s], |i| match &i[0] {
-            Value::Int(v) => Value::Int(v * 2),
+            Value::Int(v) => Value::Int(v.saturating_mul(2)),
             _ => Value::None,
         });
         graph.propagate();
 
         // Remove a — b should still work.
         graph.remove_node(a).unwrap();
-        let _ = graph.update_source(s, Value::Int(val + 10));
+        let _ = graph.update_source(s, Value::Int(val.saturating_add(10)));
         graph.propagate();
 
-        prop_assert_eq!(graph.get_value(b), Some(&Value::Int((val + 10) * 2)));
+        prop_assert_eq!(graph.get_value(b), Some(&Value::Int(val.saturating_add(10).saturating_mul(2))));
         prop_assert!(graph.get_value(a).is_none());
     }
 
@@ -336,6 +336,10 @@ proptest! {
     #[test]
     fn value_display_no_panic(val in arb_value()) {
         let s = format!("{val}");
-        prop_assert!(!s.is_empty());
+        // Empty text values produce empty display strings, which is correct.
+        match &val {
+            Value::Text(t) if t.is_empty() => prop_assert!(s.is_empty()),
+            _ => prop_assert!(!s.is_empty()),
+        }
     }
 }

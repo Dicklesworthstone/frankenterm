@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7ea0bae255bd4924329549d3955c82e25a7785d7c02890911a17ca9c6fc5c513 # shrinks to input = "status: OK\nProcessing step 1/100\nProcessing step 1/100\n  A  AAaaLA", config = CompressionConfig { similarity_threshold: 0.86, min_group_size: 2, max_templates: 1 }
+cc fe566f095ae94e4aee24bded321c995522f39fcbb63950d04fc55533ebabd2e1 # shrinks to stats = CompressionStats { input_lines: 0, input_bytes: 34841, template_count: 0, templated_lines: 0, literal_lines: 0, compressed_bytes: 34232, ratio: 1.0177903715821455 }

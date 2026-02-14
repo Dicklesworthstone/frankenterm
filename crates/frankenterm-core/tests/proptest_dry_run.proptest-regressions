@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 58e4b2f977c91c1743b1d5f66ff45db8796c2f9cc91518b91ddddc8233434b41 # shrinks to report = DryRunReport { command: "", target_resolution: None, policy_evaluation: None, expected_actions: [], warnings: [] }

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 352c82cd9820424aea9d6289ea3bf5c2984089fae889604a1cae32502cb40a85 # shrinks to obs = Observation { pane_states: [PaneState { has_new_output: false, time_since_focus_s: 0.0, output_rate: 0.0, error_count: 0, process_active: false, scroll_depth: 0.0, interaction_count: 0, pane_id: 1 }], current_pane_id: 1, action: FocusPane(1) }
