@@ -1,4 +1,4 @@
-use frankenterm_core::simulation::{ExpectationKind, ResizeTimelineStage, Scenario};
+use frankenterm_core::simulation::{EventAction, ExpectationKind, ResizeTimelineStage, Scenario};
 use frankenterm_core::wezterm::{MockWezterm, WeztermInterface};
 
 struct SuiteFixture {
@@ -39,6 +39,14 @@ const FIXTURES: &[SuiteFixture] = &[
         expected_panes: 12,
         min_events: 30,
     },
+    SuiteFixture {
+        name: "mixed_workload_interactive_streaming",
+        yaml: include_str!(
+            "../../../fixtures/simulations/resize_baseline/mixed_workload_interactive_streaming.yaml"
+        ),
+        expected_panes: 4,
+        min_events: 24,
+    },
 ];
 
 #[test]
@@ -68,6 +76,49 @@ fn resize_suite_fixtures_parse_and_validate() {
             scenario.reproducibility_key()
         );
     }
+}
+
+#[test]
+fn mixed_workload_fixture_covers_interactive_streaming_and_scrollback() {
+    let fixture = FIXTURES
+        .iter()
+        .find(|fixture| fixture.name == "mixed_workload_interactive_streaming")
+        .expect("mixed workload fixture should be present");
+    let scenario =
+        Scenario::from_yaml(fixture.yaml).expect("mixed workload fixture should parse cleanly");
+
+    let mut has_append = false;
+    let mut has_resize = false;
+    let mut has_font_churn = false;
+    let mut has_scrollback = false;
+
+    for event in &scenario.events {
+        match event.action {
+            EventAction::Append => has_append = true,
+            EventAction::Resize => has_resize = true,
+            EventAction::SetFontSize => has_font_churn = true,
+            EventAction::GenerateScrollback => has_scrollback = true,
+            _ => {}
+        }
+    }
+
+    assert!(
+        has_append,
+        "fixture must include interactive append activity"
+    );
+    assert!(has_resize, "fixture must include resize churn");
+    assert!(has_font_churn, "fixture must include font-size churn");
+    assert!(
+        has_scrollback,
+        "fixture must include large scrollback generation"
+    );
+    assert_eq!(
+        scenario
+            .metadata
+            .get("workload_profile")
+            .map(String::as_str),
+        Some("interactive_log_streaming_large_scrollback")
+    );
 }
 
 #[tokio::test]

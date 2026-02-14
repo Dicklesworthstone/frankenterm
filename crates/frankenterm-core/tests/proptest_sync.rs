@@ -1,3 +1,4 @@
+#![cfg(feature = "sync")]
 //! Property-based tests for the sync module.
 //!
 //! Verifies path deny/allow rules, snapshot filename roundtrip, live DB

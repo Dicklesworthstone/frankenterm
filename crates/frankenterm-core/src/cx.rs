@@ -26,6 +26,7 @@
 //! visible at every layer.
 
 use std::future::Future;
+use std::time::Duration;
 
 pub use asupersync::runtime::{JoinHandle, Runtime, RuntimeConfig, RuntimeHandle, SpawnError};
 pub use asupersync::{Budget, Cx, Scope};
@@ -182,4 +183,51 @@ where
 {
     let child_cx = cx.clone();
     handle.try_spawn(async move { task(child_cx).await })
+}
+
+/// Spawn a batch of child tasks with explicit `Cx` threading and bounded
+/// concurrency.
+///
+/// This helper keeps spawn fan-out deterministic and avoids unbounded
+/// task bursts while preserving input order in the collected outputs.
+pub async fn spawn_bounded_with_cx<F, Fut, T>(
+    handle: &RuntimeHandle,
+    cx: &Cx,
+    max_concurrency: usize,
+    tasks: Vec<F>,
+) -> Vec<T>
+where
+    F: FnOnce(Cx) -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    use asupersync::stream::{StreamExt, iter};
+
+    let limit = max_concurrency.max(1);
+
+    iter(
+        tasks
+            .into_iter()
+            .map(|task| spawn_with_cx(handle, cx, task)),
+    )
+    .buffered(limit)
+    .collect::<Vec<_>>()
+    .await
+}
+
+/// Spawn a child task with explicit `Cx` threading and wait for it with a timeout.
+///
+/// Returns an error string when the timeout elapses before completion.
+pub async fn spawn_with_timeout<F, Fut, T>(
+    handle: &RuntimeHandle,
+    cx: &Cx,
+    timeout: Duration,
+    task: F,
+) -> Result<T, String>
+where
+    F: FnOnce(Cx) -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    crate::runtime_compat::timeout(timeout, spawn_with_cx(handle, cx, task)).await
 }

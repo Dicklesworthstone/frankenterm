@@ -65,6 +65,8 @@ e2e-artifacts/
     ├── summary.txt                  # Human-readable summary
     ├── ft_config_effective.toml     # Resolved configuration
     ├── scenario_01_capture_search/
+    │   ├── test_artifacts_manifest.json # Canonical artifact schema (wa.test_artifacts.v1)
+    │   ├── correlation.jsonl        # Correlation + timing row for this scenario
     │   ├── ft_watch.log             # Watcher stdout/stderr
     │   ├── ft_watch.jsonl           # JSON-lines structured logs
     │   ├── robot_state.json         # Final pane state
@@ -97,6 +99,8 @@ temp_workspace: /tmp/ft-e2e-abc123
 ```json
 {
   "version": "1",
+  "schema_version": "wa.e2e.summary.v2",
+  "test_artifact_schema_version": "wa.test_artifacts.v1",
   "timestamp": "2026-01-19T09:00:00Z",
   "duration_secs": 45.2,
   "total": 3,
@@ -108,18 +112,66 @@ temp_workspace: /tmp/ft-e2e-abc123
       "name": "capture_search",
       "status": "passed",
       "duration_secs": 12.3,
-      "artifacts_dir": "scenario_01_capture_search"
+      "artifacts_dir": "scenario_01_capture_search",
+      "test_artifacts_manifest": "scenario_01_capture_search/test_artifacts_manifest.json"
     },
     {
       "name": "compaction_workflow",
       "status": "failed",
       "duration_secs": 20.1,
       "error": "Timeout waiting for workflow completion",
-      "artifacts_dir": "scenario_02_compaction_workflow"
+      "artifacts_dir": "scenario_02_compaction_workflow",
+      "test_artifacts_manifest": "scenario_02_compaction_workflow/test_artifacts_manifest.json"
     }
   ]
 }
 ```
+
+### `test_artifacts_manifest.json` Schema (Per Scenario)
+
+Each scenario directory includes a canonical machine-parseable artifact manifest:
+
+```json
+{
+  "schema_version": "wa.test_artifacts.v1",
+  "run_id": "2026-01-19T09-00-00Z_capture_search",
+  "generated_at_ms": 1768813200000,
+  "outcome": "passed|failed|aborted",
+  "correlation": {
+    "test_case_id": "capture_search",
+    "resize_transaction_id": "2026-01-19T09-00-00Z-capture_search-1",
+    "pane_id": 12,
+    "tab_id": null,
+    "sequence_no": 1,
+    "scheduler_decision": "e2e_harness",
+    "frame_id": null
+  },
+  "timing": {
+    "queue_wait_ms": 0.0,
+    "reflow_ms": 12.3,
+    "render_ms": 12.3,
+    "present_ms": 12.3,
+    "p50_ms": 12.3,
+    "p95_ms": 12.3,
+    "p99_ms": 12.3
+  },
+  "artifacts": [
+    {
+      "kind": "structured_log",
+      "format": "json_lines",
+      "path": "correlation.jsonl",
+      "bytes": 320,
+      "sha256": "abcd...",
+      "redacted": true
+    }
+  ]
+}
+```
+
+Failure cases MUST include artifact kinds:
+- `trace_bundle`
+- `frame_histogram`
+- `failure_signature`
 
 ---
 

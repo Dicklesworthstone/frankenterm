@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc fc5c87d73cbe746e60b8e698ec4b391c09450b36d72af2a6d85a2a9a9a9bc726 # shrinks to input = ReflowPlannerInput { total_logical_lines: 21942, viewport_top: 745, viewport_height: 130, overscan_lines: 87, max_batch_lines: 123, lines_per_work_unit: 6, frame_budget_units: 31 }

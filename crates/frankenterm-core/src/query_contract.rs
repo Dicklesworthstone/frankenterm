@@ -428,4 +428,422 @@ mod tests {
             .expect_err("hybrid should be unsupported");
         assert_eq!(err.code(), "search.unsupported_mode");
     }
+
+    // ── UnifiedSearchMode ──────────────────────────────────────────────
+
+    #[test]
+    fn unified_search_mode_as_str_all_variants() {
+        assert_eq!(UnifiedSearchMode::Lexical.as_str(), "lexical");
+        assert_eq!(UnifiedSearchMode::Semantic.as_str(), "semantic");
+        assert_eq!(UnifiedSearchMode::Hybrid.as_str(), "hybrid");
+    }
+
+    #[test]
+    fn unified_search_mode_default_is_lexical() {
+        assert_eq!(UnifiedSearchMode::default(), UnifiedSearchMode::Lexical);
+    }
+
+    #[test]
+    fn unified_search_mode_serde_roundtrip() {
+        for mode in [
+            UnifiedSearchMode::Lexical,
+            UnifiedSearchMode::Semantic,
+            UnifiedSearchMode::Hybrid,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let restored: UnifiedSearchMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, mode);
+        }
+    }
+
+    #[test]
+    fn unified_search_mode_serde_snake_case() {
+        let json = serde_json::to_string(&UnifiedSearchMode::Lexical).unwrap();
+        assert_eq!(json, "\"lexical\"");
+        let json = serde_json::to_string(&UnifiedSearchMode::Semantic).unwrap();
+        assert_eq!(json, "\"semantic\"");
+        let json = serde_json::to_string(&UnifiedSearchMode::Hybrid).unwrap();
+        assert_eq!(json, "\"hybrid\"");
+    }
+
+    // ── SearchQueryDefaults ────────────────────────────────────────────
+
+    #[test]
+    fn search_query_defaults_values() {
+        let defaults = SearchQueryDefaults::default();
+        assert_eq!(defaults.limit, SEARCH_LIMIT_DEFAULT);
+        assert!(defaults.snippets);
+        assert_eq!(defaults.mode, UnifiedSearchMode::Lexical);
+        assert_eq!(defaults.max_limit, SEARCH_LIMIT_MAX);
+    }
+
+    // ── Constants ──────────────────────────────────────────────────────
+
+    #[test]
+    fn search_constants_are_reasonable() {
+        assert!(SEARCH_LIMIT_DEFAULT > 0);
+        assert!(SEARCH_LIMIT_DEFAULT <= SEARCH_LIMIT_MAX);
+        assert!(SEARCH_SNIPPET_MAX_TOKENS > 0);
+        assert!(!SEARCH_HIGHLIGHT_PREFIX.is_empty());
+        assert!(!SEARCH_HIGHLIGHT_SUFFIX.is_empty());
+    }
+
+    // ── SearchQueryValidationError ─────────────────────────────────────
+
+    #[test]
+    fn validation_error_invalid_limit_code_message_hint() {
+        let err = SearchQueryValidationError::InvalidLimit {
+            provided: 5000,
+            max_limit: 1000,
+        };
+        assert_eq!(err.code(), "search.invalid_limit");
+        assert!(err.message().contains("5000"));
+        assert!(err.message().contains("1000"));
+        let hint = err.hint().expect("hint present");
+        assert!(hint.contains("1000"));
+        assert!(!err.is_query_lint_error());
+        assert!(err.lints().is_none());
+    }
+
+    #[test]
+    fn validation_error_invalid_time_range_code_message_hint() {
+        let err = SearchQueryValidationError::InvalidTimeRange {
+            since: 200,
+            until: 100,
+        };
+        assert_eq!(err.code(), "search.invalid_time_range");
+        assert!(err.message().contains("200"));
+        assert!(err.message().contains("100"));
+        let hint = err.hint().expect("hint present");
+        assert!(hint.contains("--since"));
+        assert!(!err.is_query_lint_error());
+        assert!(err.lints().is_none());
+    }
+
+    #[test]
+    fn validation_error_invalid_query_code_message_hint() {
+        let lint = SearchLint {
+            code: "fts.leading_operator".to_string(),
+            severity: SearchLintSeverity::Error,
+            message: "Leading AND".to_string(),
+            suggestion: Some("Remove leading AND".to_string()),
+        };
+        let err = SearchQueryValidationError::InvalidQuery { lints: vec![lint] };
+        assert_eq!(err.code(), "search.invalid_query");
+        assert_eq!(err.message(), "Invalid search query.");
+        assert!(err.is_query_lint_error());
+        let lints = err.lints().expect("lints present");
+        assert_eq!(lints.len(), 1);
+        let hint = err.hint().expect("hint present");
+        assert!(hint.contains("Leading AND"));
+        assert!(hint.contains("suggestion: Remove leading AND"));
+    }
+
+    #[test]
+    fn validation_error_unsupported_mode_with_empty_supported() {
+        let err = SearchQueryValidationError::UnsupportedMode {
+            mode: UnifiedSearchMode::Hybrid,
+            supported: vec![],
+        };
+        assert_eq!(err.code(), "search.unsupported_mode");
+        assert!(err.message().contains("hybrid"));
+        assert!(err.hint().is_none());
+    }
+
+    #[test]
+    fn validation_error_unsupported_mode_with_supported_list() {
+        let err = SearchQueryValidationError::UnsupportedMode {
+            mode: UnifiedSearchMode::Hybrid,
+            supported: vec![UnifiedSearchMode::Lexical, UnifiedSearchMode::Semantic],
+        };
+        let hint = err.hint().expect("hint present");
+        assert!(hint.contains("lexical"));
+        assert!(hint.contains("semantic"));
+    }
+
+    #[test]
+    fn validation_error_display_matches_message() {
+        let err = SearchQueryValidationError::InvalidLimit {
+            provided: 0,
+            max_limit: 1000,
+        };
+        assert_eq!(format!("{err}"), err.message());
+    }
+
+    #[test]
+    fn validation_error_is_std_error() {
+        let err = SearchQueryValidationError::InvalidLimit {
+            provided: 0,
+            max_limit: 1000,
+        };
+        let _: &dyn std::error::Error = &err;
+    }
+
+    // ── lints_have_errors ──────────────────────────────────────────────
+
+    #[test]
+    fn lints_have_errors_empty_is_false() {
+        assert!(!lints_have_errors(&[]));
+    }
+
+    #[test]
+    fn lints_have_errors_warnings_only_is_false() {
+        let lints = vec![SearchLint {
+            code: "w1".to_string(),
+            severity: SearchLintSeverity::Warning,
+            message: "warn".to_string(),
+            suggestion: None,
+        }];
+        assert!(!lints_have_errors(&lints));
+    }
+
+    #[test]
+    fn lints_have_errors_mixed_is_true() {
+        let lints = vec![
+            SearchLint {
+                code: "w1".to_string(),
+                severity: SearchLintSeverity::Warning,
+                message: "warn".to_string(),
+                suggestion: None,
+            },
+            SearchLint {
+                code: "e1".to_string(),
+                severity: SearchLintSeverity::Error,
+                message: "err".to_string(),
+                suggestion: None,
+            },
+        ];
+        assert!(lints_have_errors(&lints));
+    }
+
+    // ── format_lint_hint ───────────────────────────────────────────────
+
+    #[test]
+    fn format_lint_hint_empty_returns_none() {
+        assert!(format_lint_hint(&[]).is_none());
+    }
+
+    #[test]
+    fn format_lint_hint_single_without_suggestion() {
+        let lints = vec![SearchLint {
+            code: "c1".to_string(),
+            severity: SearchLintSeverity::Warning,
+            message: "Unbalanced paren".to_string(),
+            suggestion: None,
+        }];
+        let hint = format_lint_hint(&lints).expect("hint present");
+        assert_eq!(hint, "Unbalanced paren");
+    }
+
+    #[test]
+    fn format_lint_hint_single_with_suggestion() {
+        let lints = vec![SearchLint {
+            code: "c1".to_string(),
+            severity: SearchLintSeverity::Warning,
+            message: "Unbalanced paren".to_string(),
+            suggestion: Some("Add closing )".to_string()),
+        }];
+        let hint = format_lint_hint(&lints).expect("hint present");
+        assert!(hint.contains("Unbalanced paren"));
+        assert!(hint.contains("suggestion: Add closing )"));
+    }
+
+    #[test]
+    fn format_lint_hint_truncates_at_three() {
+        let lints: Vec<SearchLint> = (0..5)
+            .map(|i| SearchLint {
+                code: format!("c{i}"),
+                severity: SearchLintSeverity::Warning,
+                message: format!("lint{i}"),
+                suggestion: None,
+            })
+            .collect();
+        let hint = format_lint_hint(&lints).expect("hint present");
+        assert!(hint.contains("lint0"));
+        assert!(hint.contains("lint1"));
+        assert!(hint.contains("lint2"));
+        assert!(!hint.contains("lint3"));
+        assert!(!hint.contains("lint4"));
+        // Pipe-separated
+        assert_eq!(hint.matches(" | ").count(), 2);
+    }
+
+    // ── ensure_mode_supported ──────────────────────────────────────────
+
+    #[test]
+    fn ensure_mode_supported_succeeds() {
+        ensure_mode_supported(
+            UnifiedSearchMode::Lexical,
+            &[UnifiedSearchMode::Lexical, UnifiedSearchMode::Hybrid],
+        )
+        .expect("lexical should be supported");
+    }
+
+    #[test]
+    fn ensure_mode_supported_all_modes() {
+        let all = [
+            UnifiedSearchMode::Lexical,
+            UnifiedSearchMode::Semantic,
+            UnifiedSearchMode::Hybrid,
+        ];
+        for mode in &all {
+            ensure_mode_supported(*mode, &all).expect("all modes supported");
+        }
+    }
+
+    // ── to_storage_search_options ──────────────────────────────────────
+
+    #[test]
+    fn to_storage_search_options_maps_fields() {
+        let query = UnifiedSearchQuery {
+            query: "test".to_string(),
+            limit: 50,
+            pane: Some(7),
+            since: Some(100),
+            until: Some(200),
+            snippets: true,
+            mode: UnifiedSearchMode::Lexical,
+        };
+        let opts = to_storage_search_options(&query);
+        assert_eq!(opts.limit, Some(50));
+        assert_eq!(opts.pane_id, Some(7));
+        assert_eq!(opts.since, Some(100));
+        assert_eq!(opts.until, Some(200));
+        assert_eq!(opts.include_snippets, Some(true));
+        assert_eq!(opts.snippet_max_tokens, Some(SEARCH_SNIPPET_MAX_TOKENS));
+        assert_eq!(
+            opts.highlight_prefix.as_deref(),
+            Some(SEARCH_HIGHLIGHT_PREFIX)
+        );
+        assert_eq!(
+            opts.highlight_suffix.as_deref(),
+            Some(SEARCH_HIGHLIGHT_SUFFIX)
+        );
+    }
+
+    #[test]
+    fn to_storage_search_options_none_fields() {
+        let query = UnifiedSearchQuery {
+            query: "test".to_string(),
+            limit: 20,
+            pane: None,
+            since: None,
+            until: None,
+            snippets: false,
+            mode: UnifiedSearchMode::Lexical,
+        };
+        let opts = to_storage_search_options(&query);
+        assert!(opts.pane_id.is_none());
+        assert!(opts.since.is_none());
+        assert!(opts.until.is_none());
+        assert_eq!(opts.include_snippets, Some(false));
+    }
+
+    // ── parse_unified_search_query extras ──────────────────────────────
+
+    #[test]
+    fn parse_trims_whitespace() {
+        let parsed = parse_unified_search_query(
+            SearchQueryInput {
+                query: "  hello world  ".to_string(),
+                ..SearchQueryInput::default()
+            },
+            SearchQueryDefaults::default(),
+        )
+        .expect("parse query");
+        assert_eq!(parsed.query.query, "hello world");
+    }
+
+    #[test]
+    fn parse_allows_equal_since_and_until() {
+        let parsed = parse_unified_search_query(
+            SearchQueryInput {
+                query: "test".to_string(),
+                since: Some(100),
+                until: Some(100),
+                ..SearchQueryInput::default()
+            },
+            SearchQueryDefaults::default(),
+        )
+        .expect("equal since/until should be valid");
+        assert_eq!(parsed.query.since, Some(100));
+        assert_eq!(parsed.query.until, Some(100));
+    }
+
+    #[test]
+    fn parse_limit_at_max_boundary_succeeds() {
+        let parsed = parse_unified_search_query(
+            SearchQueryInput {
+                query: "test".to_string(),
+                limit: Some(SEARCH_LIMIT_MAX),
+                ..SearchQueryInput::default()
+            },
+            SearchQueryDefaults::default(),
+        )
+        .expect("max limit should be valid");
+        assert_eq!(parsed.query.limit, SEARCH_LIMIT_MAX);
+    }
+
+    #[test]
+    fn parse_limit_one_succeeds() {
+        let parsed = parse_unified_search_query(
+            SearchQueryInput {
+                query: "test".to_string(),
+                limit: Some(1),
+                ..SearchQueryInput::default()
+            },
+            SearchQueryDefaults::default(),
+        )
+        .expect("limit 1 should be valid");
+        assert_eq!(parsed.query.limit, 1);
+    }
+
+    // ── UnifiedSearchQuery serde ───────────────────────────────────────
+
+    #[test]
+    fn unified_search_query_serde_roundtrip() {
+        let query = UnifiedSearchQuery {
+            query: "hello world".to_string(),
+            limit: 50,
+            pane: Some(7),
+            since: Some(100),
+            until: Some(200),
+            snippets: true,
+            mode: UnifiedSearchMode::Hybrid,
+        };
+        let json = serde_json::to_string(&query).unwrap();
+        let restored: UnifiedSearchQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, query);
+    }
+
+    #[test]
+    fn unified_search_query_skip_serializing_none_fields() {
+        let query = UnifiedSearchQuery {
+            query: "test".to_string(),
+            limit: 20,
+            pane: None,
+            since: None,
+            until: None,
+            snippets: false,
+            mode: UnifiedSearchMode::Lexical,
+        };
+        let json = serde_json::to_string(&query).unwrap();
+        assert!(!json.contains("pane"));
+        assert!(!json.contains("since"));
+        assert!(!json.contains("until"));
+    }
+
+    // ── SearchQueryInput ───────────────────────────────────────────────
+
+    #[test]
+    fn search_query_input_default() {
+        let input = SearchQueryInput::default();
+        assert!(input.query.is_empty());
+        assert!(input.limit.is_none());
+        assert!(input.pane.is_none());
+        assert!(input.since.is_none());
+        assert!(input.until.is_none());
+        assert!(input.snippets.is_none());
+        assert!(input.mode.is_none());
+    }
 }

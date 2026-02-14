@@ -14,6 +14,7 @@ Related contract:
 - `fixtures/simulations/resize_baseline/resize_multi_tab_storm.yaml`
 - `fixtures/simulations/resize_baseline/font_churn_multi_pane.yaml`
 - `fixtures/simulations/resize_baseline/mixed_scale_soak.yaml`
+- `fixtures/simulations/resize_baseline/mixed_workload_interactive_streaming.yaml`
 
 ## Metadata Contract
 
@@ -35,6 +36,12 @@ Additional simulation actions used by this suite:
 - `generate_scrollback`: synthesizes deterministic scrollback (`LINES` or `LINESxWIDTH`)
 
 The mock simulation runtime encodes these as append markers/content so expectations and timeline replay remain deterministic.
+
+The scenario pack now explicitly includes a mixed-workload profile that combines:
+- interactive editing append bursts
+- live log-stream append churn
+- large synthetic scrollback generation
+- coordinated resize and font-size transitions
 
 ## Resize Timeline Instrumentation
 

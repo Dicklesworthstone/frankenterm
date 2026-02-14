@@ -6,6 +6,7 @@
 //!
 //! Contributes to wa-1u90p.7.1 (unit test expansion).
 
+use frankenterm_core::degradation::ResizeDegradationTier;
 use frankenterm_core::resize_invariants::{ResizeInvariantReport, ResizeInvariantTelemetry};
 use frankenterm_core::resize_scheduler::{
     ResizeControlPlaneGateState, ResizeExecutionPhase, ResizeSchedulerConfig,
@@ -13,8 +14,10 @@ use frankenterm_core::resize_scheduler::{
     ResizeSchedulerSnapshot, ResizeStalledTransaction,
 };
 use frankenterm_core::runtime::{
-    ResizeWatchdogAssessment, ResizeWatchdogSeverity, evaluate_resize_watchdog,
+    ResizeWatchdogAssessment, ResizeWatchdogSeverity, derive_resize_degradation_ladder,
+    evaluate_resize_watchdog,
 };
+use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -65,7 +68,6 @@ fn gate_safe_mode() -> ResizeControlPlaneGateState {
     }
 }
 
-
 /// A pane with an active transaction started at `started_at_ms`.
 fn active_pane(pane_id: u64, intent_seq: u64, started_at_ms: u64) -> ResizeSchedulerPaneSnapshot {
     ResizeSchedulerPaneSnapshot {
@@ -96,8 +98,16 @@ fn idle_pane(pane_id: u64) -> ResizeSchedulerPaneSnapshot {
     }
 }
 
+fn watchdog_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 /// Publish a snapshot globally and evaluate the watchdog at `now_ms`.
 fn evaluate_with(snapshot: ResizeSchedulerDebugSnapshot, now_ms: u64) -> ResizeWatchdogAssessment {
+    let _guard = watchdog_test_lock()
+        .lock()
+        .expect("watchdog test lock should not be poisoned");
     ResizeSchedulerDebugSnapshot::update_global(snapshot);
     evaluate_resize_watchdog(now_ms).expect("snapshot was just published")
 }
@@ -187,6 +197,25 @@ fn safe_mode_active_severity_when_emergency_disable_is_set() {
         result.recommended_action,
         "safe_mode_active_monitor_and_recover"
     );
+}
+
+#[test]
+fn degradation_ladder_quality_reduced_for_warning_severity() {
+    let snap = snapshot_with_panes(vec![active_pane(1, 1, 97_000)]);
+    let result = evaluate_with(snap, 100_000);
+    let ladder = derive_resize_degradation_ladder(&result);
+    assert_eq!(ladder.tier, ResizeDegradationTier::QualityReduced);
+}
+
+#[test]
+fn degradation_ladder_emergency_compatibility_for_safe_mode_active() {
+    let snap = snapshot_with_panes_and_gate(
+        vec![active_pane(1, 1, 90_000), active_pane(2, 1, 91_000)],
+        gate_safe_mode(),
+    );
+    let result = evaluate_with(snap, 100_000);
+    let ladder = derive_resize_degradation_ladder(&result);
+    assert_eq!(ladder.tier, ResizeDegradationTier::EmergencyCompatibility);
 }
 
 // ===========================================================================

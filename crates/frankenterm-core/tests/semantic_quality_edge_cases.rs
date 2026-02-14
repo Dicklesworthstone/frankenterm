@@ -14,7 +14,8 @@
 
 use frankenterm_core::semantic_quality::{
     LaneEvaluation, QualitySummary, RankingMetrics, RegressionThresholds, SemanticEvalQuery,
-    SemanticQualityHarness, SemanticQualityReport, ThresholdViolation, default_semantic_eval_queries,
+    SemanticQualityHarness, SemanticQualityReport, ThresholdViolation,
+    default_semantic_eval_queries,
 };
 
 const EPS: f64 = 1e-9;
@@ -68,10 +69,7 @@ fn default_queries_have_valid_structure() {
         assert!(!q.name.is_empty(), "query name must be non-empty");
         assert!(q.top_k > 0, "top_k must be positive");
         assert!(!q.relevant_ids.is_empty(), "must have relevant ids");
-        assert!(
-            !q.lexical_ranked.is_empty(),
-            "must have lexical candidates"
-        );
+        assert!(!q.lexical_ranked.is_empty(), "must have lexical candidates");
         assert!(
             !q.semantic_ranked.is_empty(),
             "must have semantic candidates"
@@ -90,7 +88,10 @@ fn default_threshold_values() {
         (t.min_hybrid_precision_at_k - 0.25).abs() < EPS,
         "default precision floor"
     );
-    assert!((t.min_hybrid_recall_at_k - 0.25).abs() < EPS, "default recall floor");
+    assert!(
+        (t.min_hybrid_recall_at_k - 0.25).abs() < EPS,
+        "default recall floor"
+    );
 }
 
 #[test]
@@ -166,10 +167,7 @@ fn no_relevant_results() {
         qr.lexical.metrics.ndcg_at_k.abs() < EPS,
         "no relevant = zero NDCG"
     );
-    assert!(
-        qr.lexical.metrics.mrr.abs() < EPS,
-        "no relevant = zero MRR"
-    );
+    assert!(qr.lexical.metrics.mrr.abs() < EPS, "no relevant = zero MRR");
 }
 
 #[test]
@@ -343,13 +341,7 @@ fn top_k_one() {
 #[test]
 fn top_k_zero_clamped_to_one() {
     // top_k=0 is clamped to 1 in evaluate_query
-    let q = make_query(
-        "top0",
-        vec![(1, 1.0)],
-        vec![(1, 1.0)],
-        vec![1],
-        0,
-    );
+    let q = make_query("top0", vec![(1, 1.0)], vec![(1, 1.0)], vec![1], 0);
     let report = SemanticQualityHarness::new(vec![q]).run();
     let qr = &report.queries[0];
 
@@ -420,7 +412,10 @@ fn strict_ndcg_threshold_causes_violation() {
 
     assert!(!report.passed);
     assert!(
-        report.violations.iter().any(|v| v.metric == "hybrid_vs_lexical_ndcg_delta"),
+        report
+            .violations
+            .iter()
+            .any(|v| v.metric == "hybrid_vs_lexical_ndcg_delta"),
         "should have NDCG violations"
     );
 }
@@ -438,7 +433,10 @@ fn strict_precision_threshold_causes_violation() {
 
     assert!(!report.passed);
     assert!(
-        report.violations.iter().any(|v| v.metric == "hybrid_precision_at_k"),
+        report
+            .violations
+            .iter()
+            .any(|v| v.metric == "hybrid_precision_at_k"),
         "should have precision violations"
     );
 }
@@ -456,7 +454,10 @@ fn strict_recall_threshold_causes_violation() {
 
     assert!(!report.passed);
     assert!(
-        report.violations.iter().any(|v| v.metric == "hybrid_recall_at_k"),
+        report
+            .violations
+            .iter()
+            .any(|v| v.metric == "hybrid_recall_at_k"),
         "should have recall violations"
     );
 }
@@ -474,8 +475,11 @@ fn all_strict_thresholds_cause_multiple_violations() {
 
     assert!(!report.passed);
     // Should have violations from multiple metrics
-    let unique_metrics: std::collections::HashSet<_> =
-        report.violations.iter().map(|v| v.metric.as_str()).collect();
+    let unique_metrics: std::collections::HashSet<_> = report
+        .violations
+        .iter()
+        .map(|v| v.metric.as_str())
+        .collect();
     assert!(
         unique_metrics.len() >= 2,
         "multiple metric types should be violated"
@@ -558,9 +562,7 @@ fn summary_single_query() {
         (s.mean_hybrid_precision_at_k - qr.hybrid.metrics.precision_at_k).abs() < 1e-9,
         "single-query mean should equal individual"
     );
-    assert!(
-        (s.mean_hybrid_ndcg_at_k - qr.hybrid.metrics.ndcg_at_k).abs() < 1e-9
-    );
+    assert!((s.mean_hybrid_ndcg_at_k - qr.hybrid.metrics.ndcg_at_k).abs() < 1e-9);
 }
 
 #[test]
@@ -605,15 +607,13 @@ fn hybrid_delta_signs_are_consistent() {
     let report = SemanticQualityHarness::new(default_semantic_eval_queries()).run();
 
     for qr in &report.queries {
-        let expected_ndcg_delta =
-            qr.hybrid.metrics.ndcg_at_k - qr.lexical.metrics.ndcg_at_k;
+        let expected_ndcg_delta = qr.hybrid.metrics.ndcg_at_k - qr.lexical.metrics.ndcg_at_k;
         assert!(
             (qr.hybrid_vs_lexical_ndcg_delta - expected_ndcg_delta).abs() < 1e-9,
             "NDCG delta should match manual computation"
         );
 
-        let expected_semantic_delta =
-            qr.hybrid.metrics.ndcg_at_k - qr.semantic.metrics.ndcg_at_k;
+        let expected_semantic_delta = qr.hybrid.metrics.ndcg_at_k - qr.semantic.metrics.ndcg_at_k;
         assert!(
             (qr.hybrid_vs_semantic_ndcg_delta - expected_semantic_delta).abs() < 1e-9,
             "semantic NDCG delta should match"
@@ -639,9 +639,7 @@ fn rrf_k_affects_hybrid_ranking() {
     let report_k10 = SemanticQualityHarness::new(queries.clone())
         .with_rrf_k(10)
         .run();
-    let report_k1000 = SemanticQualityHarness::new(queries)
-        .with_rrf_k(1000)
-        .run();
+    let report_k1000 = SemanticQualityHarness::new(queries).with_rrf_k(1000).run();
 
     // Different k values should produce different hybrid metrics
     // (same lexical/semantic but different fusion weights)
@@ -774,10 +772,7 @@ fn serde_roundtrip_full_report() {
     let json = serde_json::to_string(&report).unwrap();
     let restored: SemanticQualityReport = serde_json::from_str(&json).unwrap();
     assert_eq!(restored.queries.len(), report.queries.len());
-    assert_eq!(
-        restored.summary.total_queries,
-        report.summary.total_queries
-    );
+    assert_eq!(restored.summary.total_queries, report.summary.total_queries);
     assert_eq!(restored.passed, report.passed);
     assert_eq!(restored.violations.len(), report.violations.len());
 }
@@ -913,7 +908,7 @@ fn metrics_are_in_valid_range() {
 fn empty_lexical_candidates() {
     let q = make_query(
         "empty_lex",
-        vec![],                   // no lexical results
+        vec![], // no lexical results
         vec![(1, 1.0), (2, 0.9)],
         vec![1, 2],
         3,
@@ -933,7 +928,7 @@ fn empty_semantic_candidates() {
     let q = make_query(
         "empty_sem",
         vec![(1, 1.0), (2, 0.9)],
-        vec![],                   // no semantic results
+        vec![], // no semantic results
         vec![1, 2],
         3,
     );
@@ -980,13 +975,7 @@ fn harness_deterministic_across_runs() {
 
 #[test]
 fn summary_averages_across_queries() {
-    let q1 = make_query(
-        "q1",
-        vec![(1, 1.0)],
-        vec![(1, 1.0)],
-        vec![1],
-        1,
-    );
+    let q1 = make_query("q1", vec![(1, 1.0)], vec![(1, 1.0)], vec![1], 1);
     let q2 = make_query(
         "q2",
         vec![(10, 1.0)],
@@ -1005,7 +994,8 @@ fn summary_averages_across_queries() {
     let q1_metrics = &report.queries[0].hybrid.metrics;
     let q2_metrics = &report.queries[1].hybrid.metrics;
 
-    let expected_mean_precision = f64::midpoint(q1_metrics.precision_at_k, q2_metrics.precision_at_k);
+    let expected_mean_precision =
+        f64::midpoint(q1_metrics.precision_at_k, q2_metrics.precision_at_k);
     assert!(
         (s.mean_hybrid_precision_at_k - expected_mean_precision).abs() < 1e-9,
         "mean precision should be average of individual queries"

@@ -467,6 +467,37 @@ pub fn evaluate_resize_watchdog(now_ms: u64) -> Option<ResizeWatchdogAssessment>
     })
 }
 
+/// Derive ordered resize degradation ladder state from watchdog assessment.
+///
+/// Escalation order is enforced by `degradation::evaluate_resize_degradation_ladder`:
+/// quality reductions first, correctness guards second, emergency compatibility last.
+#[must_use]
+pub fn derive_resize_degradation_ladder(
+    watchdog: &ResizeWatchdogAssessment,
+) -> crate::degradation::ResizeDegradationAssessment {
+    crate::degradation::evaluate_resize_degradation_ladder(
+        crate::degradation::ResizeDegradationSignals {
+            stalled_total: watchdog.stalled_total,
+            stalled_critical: watchdog.stalled_critical,
+            warning_threshold_ms: watchdog.warning_threshold_ms,
+            critical_threshold_ms: watchdog.critical_threshold_ms,
+            critical_stalled_limit: watchdog.critical_stalled_limit,
+            safe_mode_recommended: watchdog.safe_mode_recommended,
+            safe_mode_active: watchdog.safe_mode_active,
+            legacy_fallback_enabled: watchdog.legacy_fallback_enabled,
+        },
+    )
+}
+
+/// Evaluate resize degradation ladder from the latest global scheduler snapshot.
+#[must_use]
+pub fn evaluate_resize_degradation_ladder_state(
+    now_ms: u64,
+) -> Option<crate::degradation::ResizeDegradationAssessment> {
+    let watchdog = evaluate_resize_watchdog(now_ms)?;
+    Some(derive_resize_degradation_ladder(&watchdog))
+}
+
 #[derive(Debug)]
 pub struct RuntimeMetrics {
     /// Count of segments persisted
@@ -2826,6 +2857,10 @@ impl RuntimeHandle {
             if let Some(line) = resize_watchdog.warning_line() {
                 warnings.push(line);
             }
+            let ladder = derive_resize_degradation_ladder(&resize_watchdog);
+            if let Some(line) = ladder.warning_line() {
+                warnings.push(line);
+            }
         }
 
         let snapshot = HealthSnapshot {
@@ -3897,6 +3932,52 @@ mod tests {
         let json = serde_json::to_string(&assessment).unwrap();
         let parsed: ResizeWatchdogAssessment = serde_json::from_str(&json).unwrap();
         assert_eq!(assessment, parsed);
+    }
+
+    #[test]
+    fn derive_resize_degradation_ladder_uses_quality_tier_for_warning() {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Warning,
+            stalled_total: 2,
+            stalled_critical: 0,
+            warning_threshold_ms: 2_000,
+            critical_threshold_ms: 8_000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+            recommended_action: "monitor_stalled_transactions".into(),
+            sample_stalled: vec![],
+        };
+
+        let ladder = derive_resize_degradation_ladder(&assessment);
+        assert_eq!(
+            ladder.tier,
+            crate::degradation::ResizeDegradationTier::QualityReduced
+        );
+    }
+
+    #[test]
+    fn derive_resize_degradation_ladder_uses_emergency_tier_when_safe_mode_active() {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::SafeModeActive,
+            stalled_total: 3,
+            stalled_critical: 2,
+            warning_threshold_ms: 2_000,
+            critical_threshold_ms: 8_000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: true,
+            legacy_fallback_enabled: true,
+            recommended_action: "safe_mode_active_monitor_and_recover".into(),
+            sample_stalled: vec![],
+        };
+
+        let ladder = derive_resize_degradation_ladder(&assessment);
+        assert_eq!(
+            ladder.tier,
+            crate::degradation::ResizeDegradationTier::EmergencyCompatibility
+        );
     }
 
     // =========================================================================

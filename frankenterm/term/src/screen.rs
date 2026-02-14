@@ -60,6 +60,8 @@ pub struct Screen {
     cursor_consistency_telemetry: CursorConsistencyTelemetry,
     last_good_frame: Option<LastGoodFrame>,
     last_good_frame_lifecycle: LastGoodFrameLifecycle,
+    #[cfg(test)]
+    forced_rollback_cause: Option<LastGoodFrameRollbackCause>,
 }
 
 const MAX_WRAP_CACHE_ENTRIES: usize = 6;
@@ -88,11 +90,29 @@ impl LastGoodFrameTransition {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastGoodFrameRollbackCause {
+    ResizeCommitValidation,
+    #[cfg(test)]
+    ForcedFailureInjection,
+}
+
+impl LastGoodFrameRollbackCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ResizeCommitValidation => "resize_commit_validation",
+            #[cfg(test)]
+            Self::ForcedFailureInjection => "forced_failure_injection",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LastGoodFrame {
     visible_lines: Vec<Line>,
     cols: usize,
     rows: usize,
+    dpi: u32,
     layout_signature: u64,
     captured_seqno: SequenceNo,
     estimated_bytes: usize,
@@ -104,6 +124,8 @@ struct LastGoodFrameLifecycle {
     capture_count: u64,
     invalidation_count: u64,
     drop_over_budget_count: u64,
+    rollback_count: u64,
+    rollback_missing_snapshot_count: u64,
     current_retained_bytes: usize,
     peak_retained_bytes: usize,
     last_budget_bytes: usize,
@@ -578,6 +600,8 @@ impl Screen {
             cursor_consistency_telemetry: CursorConsistencyTelemetry::default(),
             last_good_frame: None,
             last_good_frame_lifecycle: LastGoodFrameLifecycle::default(),
+            #[cfg(test)]
+            forced_rollback_cause: None,
         }
     }
 
@@ -600,13 +624,23 @@ impl Screen {
         self.last_resize_wrap_gate_payload.as_deref()
     }
 
+    #[cfg(test)]
+    fn force_resize_commit_rollback(&mut self, cause: LastGoodFrameRollbackCause) {
+        self.forced_rollback_cause = Some(cause);
+    }
+
     fn scrollback_size(&self) -> usize {
         scrollback_size(&self.config, self.allow_scrollback)
     }
 
     fn visible_frame_snapshot(&self) -> Vec<Line> {
         let start = self.lines.len().saturating_sub(self.physical_rows);
-        self.lines.iter().skip(start).take(self.physical_rows).cloned().collect()
+        self.lines
+            .iter()
+            .skip(start)
+            .take(self.physical_rows)
+            .cloned()
+            .collect()
     }
 
     fn estimate_frame_bytes(lines: &[Line]) -> usize {
@@ -717,6 +751,7 @@ impl Screen {
             visible_lines,
             cols: self.physical_cols,
             rows: self.physical_rows,
+            dpi: self.dpi,
             layout_signature,
             captured_seqno: seqno,
             estimated_bytes,
@@ -737,6 +772,57 @@ impl Screen {
             prior_dims,
             prior_signature
         );
+    }
+
+    fn rollback_to_last_good_frame(
+        &mut self,
+        seqno: SequenceNo,
+        cause: LastGoodFrameRollbackCause,
+    ) -> bool {
+        let Some(frame) = self.last_good_frame.clone() else {
+            self.last_good_frame_lifecycle
+                .rollback_missing_snapshot_count = self
+                .last_good_frame_lifecycle
+                .rollback_missing_snapshot_count
+                .saturating_add(1);
+            warn!(
+                "last_good_frame_rollback cause={} action=missing_snapshot seqno={}",
+                cause.as_str(),
+                seqno
+            );
+            return false;
+        };
+
+        let prior_rows = self.physical_rows;
+        let prior_cols = self.physical_cols;
+        let prior_dpi = self.dpi;
+        let old_visible_start = self.lines.len().saturating_sub(prior_rows);
+        self.lines.truncate(old_visible_start);
+        self.lines.extend(frame.visible_lines.iter().cloned());
+        self.physical_rows = frame.rows;
+        self.physical_cols = frame.cols;
+        self.dpi = frame.dpi;
+        self.mark_visible_lines_dirty(seqno);
+        self.last_good_frame_lifecycle.rollback_count = self
+            .last_good_frame_lifecycle
+            .rollback_count
+            .saturating_add(1);
+        debug!(
+            "last_good_frame_rollback cause={} action=applied seqno={} prior_dims={}x{} prior_dpi={} restored_dims={}x{} restored_dpi={} lineage_id={} signature={} bytes={} visible_lines={}",
+            cause.as_str(),
+            seqno,
+            prior_cols,
+            prior_rows,
+            prior_dpi,
+            frame.cols,
+            frame.rows,
+            frame.dpi,
+            frame.lineage_id,
+            frame.layout_signature,
+            frame.estimated_bytes,
+            frame.visible_lines.len()
+        );
+        true
     }
 
     fn mark_visible_lines_dirty(&mut self, seqno: SequenceNo) {
@@ -1581,6 +1667,22 @@ impl Screen {
             // computes its new VisibleRowIndex given the new viewport size.
             new_cursor_y = cursor_y as VisibleRowIndex
                 - (self.lines.len() as VisibleRowIndex - physical_rows as VisibleRowIndex);
+        }
+
+        if self.lines.len() < physical_rows
+            && self.rollback_to_last_good_frame(
+                seqno,
+                LastGoodFrameRollbackCause::ResizeCommitValidation,
+            )
+        {
+            return cursor;
+        }
+
+        #[cfg(test)]
+        if let Some(cause) = self.forced_rollback_cause.take() {
+            if self.rollback_to_last_good_frame(seqno, cause) {
+                return cursor;
+            }
         }
 
         self.physical_rows = physical_rows;
@@ -2871,7 +2973,10 @@ mod tests {
         assert_eq!(frame.cols, 3);
         assert_eq!(frame.rows, 3);
         assert_eq!(frame.captured_seqno, 8);
-        assert_eq!(frame.lineage_id, screen.last_good_frame_lifecycle.last_lineage_id);
+        assert_eq!(
+            frame.lineage_id,
+            screen.last_good_frame_lifecycle.last_lineage_id
+        );
         assert!(
             frame.estimated_bytes <= screen.last_good_frame_lifecycle.last_budget_bytes,
             "retained frame must fit within configured byte budget"
@@ -2925,6 +3030,61 @@ mod tests {
         assert!(screen.last_good_frame.is_none());
         assert_eq!(screen.last_good_frame_lifecycle.drop_over_budget_count, 1);
         assert_eq!(screen.last_good_frame_lifecycle.current_retained_bytes, 0);
+    }
+
+    #[test]
+    fn last_good_frame_rolls_back_after_forced_resize_commit_failure() {
+        let mut screen = test_screen(3, 4, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("abcd", &attrs, 0, None),
+            Line::from_text("efgh", &attrs, 0, None),
+            Line::from_text("ijkl", &attrs, 0, None),
+        ]);
+
+        let cursor = test_cursor(1, 1, 10);
+        let before_lines: Vec<String> = screen
+            .visible_lines()
+            .into_iter()
+            .map(|line| line.as_str().to_string())
+            .collect();
+        let before_dims = (screen.physical_cols, screen.physical_rows, screen.dpi);
+
+        screen.force_resize_commit_rollback(LastGoodFrameRollbackCause::ForcedFailureInjection);
+        let returned_cursor = screen.resize(test_size(4, 3, 144), cursor, 11, false);
+
+        assert_eq!(returned_cursor, cursor);
+        assert_eq!(
+            (screen.physical_cols, screen.physical_rows, screen.dpi),
+            before_dims
+        );
+        let after_lines: Vec<String> = screen
+            .visible_lines()
+            .into_iter()
+            .map(|line| line.as_str().to_string())
+            .collect();
+        assert_eq!(after_lines, before_lines);
+        assert_eq!(screen.last_good_frame_lifecycle.rollback_count, 1);
+        assert_eq!(
+            screen
+                .last_good_frame_lifecycle
+                .rollback_missing_snapshot_count,
+            0
+        );
+    }
+
+    #[test]
+    fn last_good_frame_rollback_tracks_missing_snapshot_failures() {
+        let mut screen = test_screen(2, 2, 96);
+        assert!(!screen
+            .rollback_to_last_good_frame(2, LastGoodFrameRollbackCause::ResizeCommitValidation));
+        assert_eq!(screen.last_good_frame_lifecycle.rollback_count, 0);
+        assert_eq!(
+            screen
+                .last_good_frame_lifecycle
+                .rollback_missing_snapshot_count,
+            1
+        );
     }
 
     #[test]

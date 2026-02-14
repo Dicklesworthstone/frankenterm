@@ -769,6 +769,16 @@ async fn handle_request_with_context(
                 payload["resize_control_plane"] = serde_json::Value::Null;
                 payload["resize_control_plane_stalled"] = serde_json::Value::Null;
             }
+            if let Some(watchdog) = crate::runtime::evaluate_resize_watchdog(now_ms()) {
+                payload["resize_control_plane_watchdog"] =
+                    serde_json::to_value(&watchdog).unwrap_or(serde_json::Value::Null);
+                let ladder = crate::runtime::derive_resize_degradation_ladder(&watchdog);
+                payload["resize_degradation_ladder"] =
+                    serde_json::to_value(ladder).unwrap_or(serde_json::Value::Null);
+            } else {
+                payload["resize_control_plane_watchdog"] = serde_json::Value::Null;
+                payload["resize_degradation_ladder"] = serde_json::Value::Null;
+            }
             IpcResponse::ok_with_data(payload)
         }
         IpcRequest::PaneState { pane_id } => handle_pane_state(pane_id, ctx).await,

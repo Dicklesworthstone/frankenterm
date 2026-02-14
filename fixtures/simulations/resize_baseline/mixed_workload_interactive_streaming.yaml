@@ -1,0 +1,151 @@
+name: mixed_workload_interactive_streaming
+description: "Interactive editing + live log stream + large scrollback under coordinated resize/font churn"
+duration: "9s"
+metadata:
+  suite: resize_baseline
+  suite_version: "2026-02-14"
+  seed: "1005"
+  scale_profile: mixed_workload_interactive_streaming
+  workload_profile: interactive_log_streaming_large_scrollback
+  pane_count: "4"
+  tab_count: "2"
+  scrollback_lines: "12000"
+  font_steps: "6"
+  regression_case: "resize_wrap_jitter_2026_02"
+panes:
+  - id: 40
+    title: "editor"
+    window_id: 0
+    tab_id: 0
+    cols: 120
+    rows: 34
+    initial_content: "$ vim src/main.rs\n"
+  - id: 41
+    title: "log-stream"
+    window_id: 0
+    tab_id: 0
+    cols: 120
+    rows: 34
+    initial_content: "tail -f app.log\n"
+  - id: 42
+    title: "scrollback-heavy"
+    window_id: 0
+    tab_id: 1
+    cols: 120
+    rows: 34
+  - id: 43
+    title: "control"
+    window_id: 0
+    tab_id: 1
+    cols: 120
+    rows: 34
+events:
+  - at: "0.1s"
+    pane: 42
+    action: generate_scrollback
+    content: "12000x96"
+  - at: "0.2s"
+    pane: 40
+    action: append
+    content: "fn main() {\n"
+  - at: "0.3s"
+    pane: 41
+    action: append
+    content: "INFO stream[0001] boot complete\n"
+  - at: "0.4s"
+    pane: 41
+    action: append
+    content: "INFO stream[0002] listening on :8080\n"
+  - at: "0.5s"
+    pane: 40
+    action: append
+    content: "    println!(\"hello swarm\");\n}\n"
+  - at: "0.6s"
+    pane: 41
+    action: append
+    content: "WARN stream[0003] backpressure=moderate\n"
+  - at: "0.7s"
+    pane: 41
+    action: append
+    content: "INFO stream[0004] recovered queue_depth=3\n"
+  - at: "0.8s"
+    pane: 41
+    action: append
+    content: "INFO stream[0005] p99_latency_ms=14.2\n"
+  - at: "0.9s"
+    pane: 43
+    action: marker
+    name: workload_warm
+  - at: "1.2s"
+    pane: 40
+    action: resize
+    content: "160x48"
+  - at: "1.3s"
+    pane: 41
+    action: resize
+    content: "160x48"
+  - at: "1.4s"
+    pane: 42
+    action: resize
+    content: "160x48"
+  - at: "1.5s"
+    pane: 43
+    action: resize
+    content: "160x48"
+  - at: "1.9s"
+    pane: 40
+    action: set_font_size
+    content: "1.10"
+  - at: "2.0s"
+    pane: 41
+    action: set_font_size
+    content: "1.10"
+  - at: "2.1s"
+    pane: 42
+    action: set_font_size
+    content: "1.10"
+  - at: "2.2s"
+    pane: 43
+    action: set_font_size
+    content: "1.10"
+  - at: "2.7s"
+    pane: 40
+    action: resize
+    content: "92x26"
+  - at: "2.8s"
+    pane: 41
+    action: resize
+    content: "92x26"
+  - at: "2.9s"
+    pane: 42
+    action: resize
+    content: "92x26"
+  - at: "3.0s"
+    pane: 43
+    action: resize
+    content: "92x26"
+  - at: "3.4s"
+    pane: 41
+    action: append
+    content: "ERROR stream[0006] transient shard timeout\n"
+  - at: "3.5s"
+    pane: 41
+    action: append
+    content: "INFO stream[0007] retry succeeded in 42ms\n"
+  - at: "3.8s"
+    pane: 43
+    action: marker
+    name: workload_stable
+expectations:
+  - contains:
+      pane: 40
+      text: "println!(\"hello swarm\");"
+  - contains:
+      pane: 41
+      text: "stream[0007] retry succeeded"
+  - contains:
+      pane: 42
+      text: "[scrollback:000000]"
+  - contains:
+      pane: 43
+      text: "[MARKER:workload_stable]"

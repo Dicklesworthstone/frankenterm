@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 use crate::config::PaneFilterConfig;
 use crate::error::Result;
@@ -1056,6 +1057,74 @@ pub struct PersistedCapture {
     pub gap: Option<Gap>,
 }
 
+/// Safety rail for persisted capture payload size.
+///
+/// This keeps per-segment storage, FTS, and regex detection work bounded even
+/// if a pane emits pathological bursts of output.
+const DEFAULT_MAX_PERSIST_SEGMENT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentSizeEnforcement {
+    original_bytes: usize,
+    kept_bytes: usize,
+    max_bytes: usize,
+}
+
+fn trim_utf8_tail_to_max_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
+}
+
+fn enforce_segment_size_for_persistence(
+    captured: &CapturedSegment,
+    max_segment_bytes: usize,
+) -> (CapturedSegment, Option<SegmentSizeEnforcement>) {
+    if max_segment_bytes == 0 || captured.content.len() <= max_segment_bytes {
+        return (captured.clone(), None);
+    }
+
+    let truncated_content = trim_utf8_tail_to_max_bytes(&captured.content, max_segment_bytes);
+    let detail = SegmentSizeEnforcement {
+        original_bytes: captured.content.len(),
+        kept_bytes: truncated_content.len(),
+        max_bytes: max_segment_bytes,
+    };
+    let truncation_reason = format!(
+        "segment_truncated:original_bytes={},max_bytes={}",
+        detail.original_bytes, detail.max_bytes
+    );
+
+    let kind = match &captured.kind {
+        CapturedSegmentKind::Gap { reason } => CapturedSegmentKind::Gap {
+            reason: format!("{reason};{truncation_reason}"),
+        },
+        CapturedSegmentKind::Delta => CapturedSegmentKind::Gap {
+            reason: truncation_reason,
+        },
+    };
+
+    (
+        CapturedSegment {
+            pane_id: captured.pane_id,
+            seq: captured.seq,
+            content: truncated_content,
+            kind,
+            captured_at: captured.captured_at,
+        },
+        Some(detail),
+    )
+}
+
 /// Persist a captured segment and optional gap into storage.
 ///
 /// The pane must already exist in storage (use `upsert_pane` elsewhere).
@@ -1074,25 +1143,50 @@ pub async fn persist_captured_segment(
     storage: &StorageHandle,
     captured: &CapturedSegment,
 ) -> Result<PersistedCapture> {
+    let (bounded_segment, truncation) =
+        enforce_segment_size_for_persistence(captured, DEFAULT_MAX_PERSIST_SEGMENT_BYTES);
+
+    if let Some(detail) = truncation.as_ref() {
+        warn!(
+            pane_id = bounded_segment.pane_id,
+            seq = bounded_segment.seq,
+            original_bytes = detail.original_bytes,
+            kept_bytes = detail.kept_bytes,
+            max_bytes = detail.max_bytes,
+            "Captured segment exceeded max bytes and was truncated with explicit GAP"
+        );
+    }
+
     // Record gap if the captured segment itself represents a discontinuity (overlap failure)
-    let mut gap = match &captured.kind {
-        CapturedSegmentKind::Gap { reason } => storage.record_gap(captured.pane_id, reason).await?,
+    let mut gap = match &bounded_segment.kind {
+        CapturedSegmentKind::Gap { reason } => {
+            storage.record_gap(bounded_segment.pane_id, reason).await?
+        }
         CapturedSegmentKind::Delta => None,
     };
 
     let stored = storage
-        .append_segment(captured.pane_id, &captured.content, None)
+        .append_segment(bounded_segment.pane_id, &bounded_segment.content, None)
         .await?;
 
+    // If this was the very first segment in a pane, `record_gap` above returns
+    // `None` (no prior sequence context). For truncation-driven gaps, emit the
+    // gap now that a first segment exists so data loss is always explicit.
+    if gap.is_none() && truncation.is_some() {
+        if let CapturedSegmentKind::Gap { reason } = &bounded_segment.kind {
+            gap = storage.record_gap(bounded_segment.pane_id, reason).await?;
+        }
+    }
+
     // Check for sequence discontinuity between cursor and storage
-    if stored.seq != captured.seq {
+    if stored.seq != bounded_segment.seq {
         // Record gap for the discontinuity (this is in addition to any overlap-failure gap)
         let discontinuity_reason = format!(
             "seq_discontinuity:expected={},actual={}",
-            captured.seq, stored.seq
+            bounded_segment.seq, stored.seq
         );
         let discontinuity_gap = storage
-            .record_gap(captured.pane_id, &discontinuity_reason)
+            .record_gap(bounded_segment.pane_id, &discontinuity_reason)
             .await?;
 
         // If we didn't already have a gap, use this one; otherwise the overlap gap takes precedence
@@ -2454,6 +2548,72 @@ mod tests {
         assert_eq!(persisted2.segment.seq, 2);
         // No gap this time since we resynced
         assert!(persisted2.gap.is_none());
+
+        handle.shutdown().await.unwrap();
+        cleanup_db(&db_path);
+    }
+
+    #[test]
+    fn enforce_segment_size_for_persistence_promotes_delta_to_gap() {
+        let captured = CapturedSegment {
+            pane_id: 1,
+            seq: 3,
+            content: "abc0123456789".to_string(),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 0,
+        };
+
+        let (bounded, enforcement) = enforce_segment_size_for_persistence(&captured, 5);
+        let enforcement = enforcement.expect("size enforcement expected");
+
+        assert_eq!(enforcement.original_bytes, captured.content.len());
+        assert_eq!(enforcement.kept_bytes, bounded.content.len());
+        assert_eq!(enforcement.max_bytes, 5);
+        assert_eq!(bounded.content, "56789");
+        assert_eq!(bounded.seq, captured.seq);
+        assert_eq!(bounded.pane_id, captured.pane_id);
+        match bounded.kind {
+            CapturedSegmentKind::Gap { reason } => {
+                assert!(reason.contains("segment_truncated:original_bytes="));
+                assert!(reason.contains("max_bytes=5"));
+            }
+            CapturedSegmentKind::Delta => panic!("oversized segment must be promoted to gap"),
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_captured_oversized_delta_records_truncation_gap() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+        handle.upsert_pane(test_pane_record(1)).await.unwrap();
+
+        let oversized_content = format!(
+            "HEADER:{}",
+            "x".repeat(DEFAULT_MAX_PERSIST_SEGMENT_BYTES + 32)
+        );
+        let expected_tail =
+            trim_utf8_tail_to_max_bytes(&oversized_content, DEFAULT_MAX_PERSIST_SEGMENT_BYTES);
+        let oversized = CapturedSegment {
+            pane_id: 1,
+            seq: 0,
+            content: oversized_content,
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 0,
+        };
+
+        let persisted = persist_captured_segment(&handle, &oversized).await.unwrap();
+        let gap = persisted.gap.expect("truncation should record gap");
+        assert!(
+            gap.reason.contains("segment_truncated:original_bytes="),
+            "gap reason should include truncation marker: {}",
+            gap.reason
+        );
+        assert!(gap.reason.contains("max_bytes=65536"));
+        assert_eq!(persisted.segment.content, expected_tail);
+        assert_eq!(
+            persisted.segment.content.len(),
+            DEFAULT_MAX_PERSIST_SEGMENT_BYTES
+        );
 
         handle.shutdown().await.unwrap();
         cleanup_db(&db_path);

@@ -65,6 +65,7 @@ PASSED=0
 FAILED=0
 SKIPPED=0
 START_TIME=""
+declare -a SCENARIO_SUMMARIES=()
 
 # ==============================================================================
 # Logging
@@ -473,6 +474,7 @@ setup_artifacts() {
 
     mkdir -p "$RUN_ARTIFACTS_DIR"
     SUMMARY_FILE="$RUN_ARTIFACTS_DIR/summary.json"
+    SCENARIO_SUMMARIES=()
 
     # Write environment snapshot
     cat > "$RUN_ARTIFACTS_DIR/env.txt" <<EOF
@@ -501,17 +503,24 @@ cleanup_artifacts() {
 write_summary() {
     local duration
     duration=$(( $(date +%s) - START_TIME ))
+    local scenarios_json="[]"
+
+    for scenario_entry in "${SCENARIO_SUMMARIES[@]}"; do
+        scenarios_json=$(jq -c --argjson item "$scenario_entry" '. + [$item]' <<< "$scenarios_json")
+    done
 
     cat > "$SUMMARY_FILE" <<EOF
 {
   "version": "1",
+  "schema_version": "wa.e2e.summary.v2",
+  "test_artifact_schema_version": "wa.test_artifacts.v1",
   "timestamp": "$TIMESTAMP",
   "duration_secs": $duration,
   "total": $TOTAL,
   "passed": $PASSED,
   "failed": $FAILED,
   "skipped": $SKIPPED,
-  "scenarios": []
+  "scenarios": $scenarios_json
 }
 EOF
 
@@ -577,6 +586,370 @@ wait_for_condition() {
     done
 }
 
+current_time_ms() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+    else
+        echo $(( $(date +%s) * 1000 ))
+    fi
+}
+
+file_size_bytes() {
+    local path="$1"
+    stat -f%z "$path" 2>/dev/null || stat -c%s "$path" 2>/dev/null || echo 0
+}
+
+sha256_file() {
+    local path="$1"
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$path" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$path" | awk '{print $1}'
+    else
+        echo ""
+    fi
+}
+
+infer_artifact_kind() {
+    local file_name="$1"
+    case "$file_name" in
+        *trace_bundle*.json)
+            echo "trace_bundle"
+            ;;
+        *frame_histogram*.json)
+            echo "frame_histogram"
+            ;;
+        *failure_signature*.json|*failure_signature*.txt)
+            echo "failure_signature"
+            ;;
+        *events*.json|*events*.jsonl)
+            echo "event_stream"
+            ;;
+        *audit*.json|*audit*.jsonl)
+            echo "audit_extract"
+            ;;
+        *flame*.*|*.svg)
+            echo "flamegraph"
+            ;;
+        *.jsonl|*.log|*.txt|*.stderr|*.stdout)
+            echo "structured_log"
+            ;;
+        *)
+            echo "raw_data"
+            ;;
+    esac
+}
+
+infer_artifact_format() {
+    local file_name="$1"
+    case "$file_name" in
+        *.json)
+            echo "json"
+            ;;
+        *.jsonl)
+            echo "json_lines"
+            ;;
+        *.txt|*.log|*.stderr|*.stdout)
+            echo "text"
+            ;;
+        *.csv)
+            echo "csv"
+            ;;
+        *.html)
+            echo "html"
+            ;;
+        *.svg)
+            echo "svg"
+            ;;
+        *.png)
+            echo "png"
+            ;;
+        *)
+            echo "binary"
+            ;;
+    esac
+}
+
+infer_artifact_redacted() {
+    local file_name="$1"
+    case "$file_name" in
+        *.log|*.txt|*.json|*.jsonl|*.csv|*.toml)
+            echo "true"
+            ;;
+        *)
+            echo "false"
+            ;;
+    esac
+}
+
+extract_primary_pane_id() {
+    local scenario_dir="$1"
+    local pane_id=""
+    local scenario_log="$scenario_dir/scenario.log"
+    if [[ -f "$scenario_log" ]]; then
+        pane_id=$(grep -Eo '(pane_id|agent_pane_id|alt_screen_pane_id):[[:space:]]*[0-9]+' "$scenario_log" \
+            | head -1 \
+            | grep -Eo '[0-9]+' \
+            || true)
+    fi
+    echo "$pane_id"
+}
+
+derive_failure_signature() {
+    local scenario_dir="$1"
+    if grep -Eiq "timeout|timed out" "$scenario_dir"/*.log "$scenario_dir"/*.txt 2>/dev/null; then
+        echo "timeout"
+    elif grep -Eiq "policy|denied|blocked" "$scenario_dir"/*.log "$scenario_dir"/*.txt 2>/dev/null; then
+        echo "policy_denied"
+    elif grep -Eiq "panic|assert|failed" "$scenario_dir"/*.log "$scenario_dir"/*.txt 2>/dev/null; then
+        echo "assertion_or_runtime_failure"
+    else
+        echo "scenario_failure"
+    fi
+}
+
+ensure_failure_artifacts() {
+    local scenario_name="$1"
+    local scenario_dir="$2"
+    local duration_ms="$3"
+    local signature="$4"
+    local generated_at
+    generated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    local trace_file="$scenario_dir/trace_bundle.json"
+    if [[ ! -f "$trace_file" ]]; then
+        local scenario_tail=""
+        local watch_tail=""
+        if [[ -f "$scenario_dir/scenario.log" ]]; then
+            scenario_tail=$(tail -n 200 "$scenario_dir/scenario.log" 2>/dev/null || true)
+        fi
+        if [[ -f "$scenario_dir/wa_watch.log" ]]; then
+            watch_tail=$(tail -n 200 "$scenario_dir/wa_watch.log" 2>/dev/null || true)
+        fi
+        jq -n \
+            --arg schema_version "wa.trace_bundle.v1" \
+            --arg generated_at "$generated_at" \
+            --arg test_case_id "$scenario_name" \
+            --arg signature "$signature" \
+            --arg scenario_log_tail "$scenario_tail" \
+            --arg watch_log_tail "$watch_tail" \
+            --argjson duration_ms "$duration_ms" \
+            '{
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                test_case_id: $test_case_id,
+                failure_signature: $signature,
+                duration_ms: $duration_ms,
+                tails: {
+                    scenario_log: $scenario_log_tail,
+                    watch_log: $watch_log_tail
+                }
+            }' > "$trace_file"
+    fi
+
+    local histogram_file="$scenario_dir/frame_histogram.json"
+    if [[ ! -f "$histogram_file" ]]; then
+        jq -n \
+            --arg schema_version "wa.frame_histogram.v1" \
+            --arg generated_at "$generated_at" \
+            --arg test_case_id "$scenario_name" \
+            --arg signature "$signature" \
+            --argjson duration_ms "$duration_ms" \
+            '{
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                test_case_id: $test_case_id,
+                failure_signature: $signature,
+                duration_ms: $duration_ms,
+                histogram: {
+                    frame_count: 0,
+                    dropped_frame_count: 0,
+                    bucket_ms: []
+                }
+            }' > "$histogram_file"
+    fi
+
+    local signature_file="$scenario_dir/failure_signature.json"
+    if [[ ! -f "$signature_file" ]]; then
+        jq -n \
+            --arg schema_version "wa.failure_signature.v1" \
+            --arg generated_at "$generated_at" \
+            --arg test_case_id "$scenario_name" \
+            --arg signature "$signature" \
+            --argjson duration_ms "$duration_ms" \
+            '{
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                test_case_id: $test_case_id,
+                signature: $signature,
+                duration_ms: $duration_ms
+            }' > "$signature_file"
+    fi
+}
+
+build_scenario_artifacts_json() {
+    local scenario_dir="$1"
+    local entries="[]"
+
+    while IFS= read -r file_path; do
+        local file_name=""
+        local kind=""
+        local format=""
+        local bytes=0
+        local sha256=""
+        local redacted="false"
+        file_name=$(basename "$file_path")
+        kind=$(infer_artifact_kind "$file_name")
+        format=$(infer_artifact_format "$file_name")
+        bytes=$(file_size_bytes "$file_path")
+        sha256=$(sha256_file "$file_path")
+        redacted=$(infer_artifact_redacted "$file_name")
+
+        entries=$(jq -c \
+            --arg kind "$kind" \
+            --arg format "$format" \
+            --arg path "$file_name" \
+            --argjson bytes "$bytes" \
+            --arg sha256 "$sha256" \
+            --argjson redacted "$redacted" \
+            '. + [{
+                kind: $kind,
+                format: $format,
+                path: $path,
+                bytes: $bytes,
+                sha256: (if $sha256 == "" then null else $sha256 end),
+                redacted: $redacted
+            }]' <<< "$entries")
+    done < <(find "$scenario_dir" -maxdepth 1 -type f | LC_ALL=C sort)
+
+    echo "$entries"
+}
+
+emit_scenario_artifact_manifest() {
+    local scenario_name="$1"
+    local scenario_num="$2"
+    local scenario_dir="$3"
+    local scenario_result="$4"
+    local duration_secs="$5"
+
+    local duration_ms=$((duration_secs * 1000))
+    local outcome="passed"
+    if [[ "$scenario_result" -ne 0 ]]; then
+        outcome="failed"
+    fi
+
+    local pane_id=""
+    pane_id=$(extract_primary_pane_id "$scenario_dir")
+
+    local sequence_no="$scenario_num"
+    local resize_transaction_id="${TIMESTAMP}-${scenario_name}-${scenario_num}"
+    local scheduler_decision="e2e_harness"
+    local frame_id=""
+    local tab_id=""
+    local failure_signature=""
+    if [[ "$outcome" != "passed" ]]; then
+        failure_signature=$(derive_failure_signature "$scenario_dir")
+        ensure_failure_artifacts "$scenario_name" "$scenario_dir" "$duration_ms" "$failure_signature"
+    fi
+
+    local queue_wait_ms=0
+    local reflow_ms="$duration_ms"
+    local render_ms="$duration_ms"
+    local present_ms="$duration_ms"
+    local p50_ms="$duration_ms"
+    local p95_ms="$duration_ms"
+    local p99_ms="$duration_ms"
+    local generated_at_ms=""
+    generated_at_ms=$(current_time_ms)
+
+    local correlation_jsonl="$scenario_dir/correlation.jsonl"
+    jq -cn \
+        --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg test_case_id "$scenario_name" \
+        --arg resize_transaction_id "$resize_transaction_id" \
+        --arg pane_id "$pane_id" \
+        --arg tab_id "$tab_id" \
+        --arg sequence_no "$sequence_no" \
+        --arg scheduler_decision "$scheduler_decision" \
+        --arg frame_id "$frame_id" \
+        --argjson queue_wait_ms "$queue_wait_ms" \
+        --argjson reflow_ms "$reflow_ms" \
+        --argjson render_ms "$render_ms" \
+        --argjson present_ms "$present_ms" \
+        --argjson p50_ms "$p50_ms" \
+        --argjson p95_ms "$p95_ms" \
+        --argjson p99_ms "$p99_ms" \
+        '{
+            timestamp: $timestamp,
+            test_case_id: $test_case_id,
+            resize_transaction_id: $resize_transaction_id,
+            pane_id: (if $pane_id == "" then null else ($pane_id | tonumber) end),
+            tab_id: (if $tab_id == "" then null else ($tab_id | tonumber) end),
+            sequence_no: (if $sequence_no == "" then null else ($sequence_no | tonumber) end),
+            scheduler_decision: $scheduler_decision,
+            frame_id: (if $frame_id == "" then null else ($frame_id | tonumber) end),
+            queue_wait_ms: $queue_wait_ms,
+            reflow_ms: $reflow_ms,
+            render_ms: $render_ms,
+            present_ms: $present_ms,
+            p50_ms: $p50_ms,
+            p95_ms: $p95_ms,
+            p99_ms: $p99_ms
+        }' > "$correlation_jsonl"
+
+    local artifacts_json=""
+    artifacts_json=$(build_scenario_artifacts_json "$scenario_dir")
+    local manifest_path="$scenario_dir/test_artifacts_manifest.json"
+    jq -n \
+        --arg schema_version "wa.test_artifacts.v1" \
+        --arg run_id "${TIMESTAMP}_${scenario_name}" \
+        --argjson generated_at_ms "$generated_at_ms" \
+        --arg outcome "$outcome" \
+        --arg test_case_id "$scenario_name" \
+        --arg resize_transaction_id "$resize_transaction_id" \
+        --arg pane_id "$pane_id" \
+        --arg tab_id "$tab_id" \
+        --arg sequence_no "$sequence_no" \
+        --arg scheduler_decision "$scheduler_decision" \
+        --arg frame_id "$frame_id" \
+        --argjson queue_wait_ms "$queue_wait_ms" \
+        --argjson reflow_ms "$reflow_ms" \
+        --argjson render_ms "$render_ms" \
+        --argjson present_ms "$present_ms" \
+        --argjson p50_ms "$p50_ms" \
+        --argjson p95_ms "$p95_ms" \
+        --argjson p99_ms "$p99_ms" \
+        --argjson artifacts "$artifacts_json" \
+        '{
+            schema_version: $schema_version,
+            run_id: $run_id,
+            generated_at_ms: $generated_at_ms,
+            outcome: $outcome,
+            correlation: {
+                test_case_id: $test_case_id,
+                resize_transaction_id: $resize_transaction_id,
+                pane_id: (if $pane_id == "" then null else ($pane_id | tonumber) end),
+                tab_id: (if $tab_id == "" then null else ($tab_id | tonumber) end),
+                sequence_no: (if $sequence_no == "" then null else ($sequence_no | tonumber) end),
+                scheduler_decision: $scheduler_decision,
+                frame_id: (if $frame_id == "" then null else ($frame_id | tonumber) end)
+            },
+            timing: {
+                queue_wait_ms: $queue_wait_ms,
+                reflow_ms: $reflow_ms,
+                render_ms: $render_ms,
+                present_ms: $present_ms,
+                p50_ms: $p50_ms,
+                p95_ms: $p95_ms,
+                p99_ms: $p99_ms
+            },
+            artifacts: $artifacts
+        }' > "$manifest_path"
+}
+
 # ==============================================================================
 # Scenario Runners
 # ==============================================================================
@@ -603,21 +976,21 @@ run_scenario_capture_search() {
     cleanup_capture_search() {
         log_verbose "Cleaning up capture_search scenario"
         # Kill ft watch if running
-        if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+        if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
             log_verbose "Stopping ft watch (pid $ft_pid)"
             kill "$ft_pid" 2>/dev/null || true
             wait "$ft_pid" 2>/dev/null || true
         fi
         # Close dummy pane if it exists
-        if [[ -n "$pane_id" ]]; then
+        if [[ -n "${pane_id:-}" ]]; then
             log_verbose "Closing dummy pane $pane_id"
             wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
         fi
         # Copy artifacts before cleanup
-        if [[ -d "$temp_workspace" ]]; then
+        if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace"
+        rm -rf "${temp_workspace:-}"
     }
     trap cleanup_capture_search EXIT
 
@@ -8016,14 +8389,18 @@ run_scenario() {
 
     local duration=$(( $(date +%s) - start_time ))
 
+    local status="passed"
+    local failure_signature=""
     if [[ $result -eq 0 ]]; then
         touch "$scenario_dir/PASS"
         log_pass "Scenario $name: PASSED (${duration}s)"
         ((PASSED++))
     else
+        status="failed"
         touch "$scenario_dir/FAIL"
         log_fail "Scenario $name: FAILED (${duration}s)"
         ((FAILED++))
+        failure_signature=$(derive_failure_signature "$scenario_dir")
 
         # Print failure details
         echo ""
@@ -8035,6 +8412,25 @@ run_scenario() {
         echo "Artifacts saved to: $scenario_dir/"
         echo ""
     fi
+
+    emit_scenario_artifact_manifest "$name" "$scenario_num" "$scenario_dir" "$result" "$duration"
+
+    local summary_entry=""
+    summary_entry=$(jq -cn \
+        --arg name "$name" \
+        --arg status "$status" \
+        --argjson duration_secs "$duration" \
+        --arg artifacts_dir "$(basename "$scenario_dir")" \
+        --arg test_artifacts_manifest "$(basename "$scenario_dir")/test_artifacts_manifest.json" \
+        --arg failure_signature "$failure_signature" \
+        '{
+            name: $name,
+            status: $status,
+            duration_secs: $duration_secs,
+            artifacts_dir: $artifacts_dir,
+            test_artifacts_manifest: $test_artifacts_manifest
+        } + (if $status == "failed" and $failure_signature != "" then {error: $failure_signature} else {} end)')
+    SCENARIO_SUMMARIES+=("$summary_entry")
 
     return $result
 }

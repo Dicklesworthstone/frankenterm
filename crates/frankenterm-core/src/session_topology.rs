@@ -927,4 +927,451 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, vec![5, 10, 15]);
     }
+
+    // ── Constants ──────────────────────────────────────────────────────
+
+    #[test]
+    fn topology_schema_version_is_one() {
+        assert_eq!(TOPOLOGY_SCHEMA_VERSION, 1);
+    }
+
+    // ── TopologySnapshot::empty ────────────────────────────────────────
+
+    #[test]
+    fn empty_snapshot_fields() {
+        let snap = TopologySnapshot::empty(42);
+        assert_eq!(snap.schema_version, TOPOLOGY_SCHEMA_VERSION);
+        assert_eq!(snap.captured_at, 42);
+        assert!(snap.workspace_id.is_none());
+        assert!(snap.windows.is_empty());
+        assert_eq!(snap.pane_count(), 0);
+        assert!(snap.pane_ids().is_empty());
+    }
+
+    #[test]
+    fn empty_snapshot_roundtrips_json() {
+        let snap = TopologySnapshot::empty(99);
+        let json = snap.to_json().unwrap();
+        let restored = TopologySnapshot::from_json(&json).unwrap();
+        assert_eq!(snap, restored);
+    }
+
+    // ── PaneNode helpers ───────────────────────────────────────────────
+
+    #[test]
+    fn pane_node_leaf_count_is_one() {
+        let leaf = PaneNode::Leaf {
+            pane_id: 1,
+            rows: 24,
+            cols: 80,
+            cwd: None,
+            title: None,
+            is_active: false,
+        };
+        assert_eq!(leaf.pane_count(), 1);
+    }
+
+    #[test]
+    fn pane_node_hsplit_count() {
+        let node = PaneNode::HSplit {
+            children: vec![
+                (
+                    0.5,
+                    PaneNode::Leaf {
+                        pane_id: 1,
+                        rows: 12,
+                        cols: 80,
+                        cwd: None,
+                        title: None,
+                        is_active: true,
+                    },
+                ),
+                (
+                    0.5,
+                    PaneNode::Leaf {
+                        pane_id: 2,
+                        rows: 12,
+                        cols: 80,
+                        cwd: None,
+                        title: None,
+                        is_active: false,
+                    },
+                ),
+            ],
+        };
+        assert_eq!(node.pane_count(), 2);
+    }
+
+    #[test]
+    fn pane_node_vsplit_nested_count() {
+        let node = PaneNode::VSplit {
+            children: vec![
+                (
+                    0.5,
+                    PaneNode::HSplit {
+                        children: vec![
+                            (
+                                0.5,
+                                PaneNode::Leaf {
+                                    pane_id: 1,
+                                    rows: 12,
+                                    cols: 40,
+                                    cwd: None,
+                                    title: None,
+                                    is_active: false,
+                                },
+                            ),
+                            (
+                                0.5,
+                                PaneNode::Leaf {
+                                    pane_id: 2,
+                                    rows: 12,
+                                    cols: 40,
+                                    cwd: None,
+                                    title: None,
+                                    is_active: false,
+                                },
+                            ),
+                        ],
+                    },
+                ),
+                (
+                    0.5,
+                    PaneNode::Leaf {
+                        pane_id: 3,
+                        rows: 24,
+                        cols: 40,
+                        cwd: None,
+                        title: None,
+                        is_active: true,
+                    },
+                ),
+            ],
+        };
+        assert_eq!(node.pane_count(), 3);
+    }
+
+    #[test]
+    fn pane_node_collect_ids_nested() {
+        let node = PaneNode::VSplit {
+            children: vec![
+                (
+                    0.5,
+                    PaneNode::Leaf {
+                        pane_id: 10,
+                        rows: 24,
+                        cols: 40,
+                        cwd: None,
+                        title: None,
+                        is_active: false,
+                    },
+                ),
+                (
+                    0.5,
+                    PaneNode::HSplit {
+                        children: vec![
+                            (
+                                0.5,
+                                PaneNode::Leaf {
+                                    pane_id: 20,
+                                    rows: 12,
+                                    cols: 40,
+                                    cwd: None,
+                                    title: None,
+                                    is_active: false,
+                                },
+                            ),
+                            (
+                                0.5,
+                                PaneNode::Leaf {
+                                    pane_id: 30,
+                                    rows: 12,
+                                    cols: 40,
+                                    cwd: None,
+                                    title: None,
+                                    is_active: true,
+                                },
+                            ),
+                        ],
+                    },
+                ),
+            ],
+        };
+        let mut ids = Vec::new();
+        node.collect_pane_ids(&mut ids);
+        assert_eq!(ids, vec![10, 20, 30]);
+    }
+
+    // ── InferenceQuality ───────────────────────────────────────────────
+
+    #[test]
+    fn inference_quality_eq() {
+        assert_eq!(InferenceQuality::Inferred, InferenceQuality::Inferred);
+        assert_eq!(
+            InferenceQuality::FlatFallback,
+            InferenceQuality::FlatFallback
+        );
+        assert_ne!(InferenceQuality::Inferred, InferenceQuality::FlatFallback);
+    }
+
+    // ── PaneNode serde ─────────────────────────────────────────────────
+
+    #[test]
+    fn pane_node_leaf_serde_roundtrip() {
+        let leaf = PaneNode::Leaf {
+            pane_id: 42,
+            rows: 24,
+            cols: 80,
+            cwd: Some("/home".to_string()),
+            title: Some("bash".to_string()),
+            is_active: true,
+        };
+        let json = serde_json::to_string(&leaf).unwrap();
+        assert!(json.contains("\"type\":\"Leaf\""));
+        let restored: PaneNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, leaf);
+    }
+
+    #[test]
+    fn pane_node_hsplit_serde_roundtrip() {
+        let node = PaneNode::HSplit {
+            children: vec![(
+                1.0,
+                PaneNode::Leaf {
+                    pane_id: 1,
+                    rows: 24,
+                    cols: 80,
+                    cwd: None,
+                    title: None,
+                    is_active: false,
+                },
+            )],
+        };
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains("\"type\":\"HSplit\""));
+        let restored: PaneNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, node);
+    }
+
+    #[test]
+    fn pane_node_vsplit_serde_roundtrip() {
+        let node = PaneNode::VSplit {
+            children: vec![(
+                1.0,
+                PaneNode::Leaf {
+                    pane_id: 1,
+                    rows: 24,
+                    cols: 80,
+                    cwd: None,
+                    title: None,
+                    is_active: false,
+                },
+            )],
+        };
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains("\"type\":\"VSplit\""));
+        let restored: PaneNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, node);
+    }
+
+    // ── from_panes extras ──────────────────────────────────────────────
+
+    #[test]
+    fn from_panes_captures_workspace_id() {
+        let mut pane = make_pane(0, 0, 0, 24, 80, None, None, true);
+        pane.workspace = Some("my-workspace".to_string());
+        let (snapshot, _) = TopologySnapshot::from_panes(&[pane], 1000);
+        assert_eq!(snapshot.workspace_id.as_deref(), Some("my-workspace"));
+    }
+
+    #[test]
+    fn from_panes_active_tab_index_points_to_active_pane() {
+        let panes = vec![
+            make_pane(0, 0, 0, 24, 80, None, None, false),
+            make_pane(1, 1, 0, 24, 80, None, None, true),
+        ];
+        let (snapshot, _) = TopologySnapshot::from_panes(&panes, 1000);
+        assert_eq!(snapshot.windows.len(), 1);
+        // Tab 1 (index 1) has the active pane
+        assert_eq!(snapshot.windows[0].active_tab_index, Some(1));
+    }
+
+    #[test]
+    fn from_panes_no_active_pane_no_active_tab() {
+        let mut pane = make_pane(0, 0, 0, 24, 80, None, None, false);
+        pane.is_active = false;
+        let (snapshot, _) = TopologySnapshot::from_panes(&[pane], 1000);
+        assert!(snapshot.windows[0].active_tab_index.is_none());
+    }
+
+    #[test]
+    fn from_panes_tab_title_from_active_pane() {
+        let panes = vec![
+            make_pane(0, 0, 0, 24, 80, None, Some("inactive"), false),
+            make_pane(1, 0, 0, 24, 80, None, Some("active-title"), true),
+        ];
+        let (snapshot, _) = TopologySnapshot::from_panes(&panes, 1000);
+        assert_eq!(
+            snapshot.windows[0].tabs[0].title.as_deref(),
+            Some("active-title")
+        );
+    }
+
+    // ── split inference extras ─────────────────────────────────────────
+
+    #[test]
+    fn infer_single_pane_is_leaf() {
+        let panes = [make_pane(1, 0, 0, 24, 80, None, None, true)];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        let (tree, quality) = infer_split_tree(&refs);
+        assert_eq!(quality, InferenceQuality::Inferred);
+        assert!(matches!(tree, PaneNode::Leaf { pane_id: 1, .. }));
+    }
+
+    #[test]
+    fn infer_hsplit_different_heights_same_width() {
+        let panes = [
+            make_pane(0, 0, 0, 10, 80, None, None, true),
+            make_pane(1, 0, 0, 14, 80, None, None, false),
+        ];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        let (tree, quality) = infer_split_tree(&refs);
+        assert_eq!(quality, InferenceQuality::Inferred);
+        match tree {
+            PaneNode::HSplit { children } => {
+                assert_eq!(children.len(), 2);
+                // Proportions based on rows: 10/24 and 14/24
+                let (p0, _) = &children[0];
+                let (p1, _) = &children[1];
+                assert!((p0 - 10.0 / 24.0).abs() < 0.01);
+                assert!((p1 - 14.0 / 24.0).abs() < 0.01);
+            }
+            _ => panic!("Expected HSplit, got {:?}", tree),
+        }
+    }
+
+    #[test]
+    fn infer_vsplit_different_widths_same_height() {
+        let panes = [
+            make_pane(0, 0, 0, 24, 30, None, None, true),
+            make_pane(1, 0, 0, 24, 50, None, None, false),
+        ];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        let (tree, quality) = infer_split_tree(&refs);
+        assert_eq!(quality, InferenceQuality::Inferred);
+        match tree {
+            PaneNode::VSplit { children } => {
+                assert_eq!(children.len(), 2);
+                let (p0, _) = &children[0];
+                let (p1, _) = &children[1];
+                assert!((p0 - 30.0 / 80.0).abs() < 0.01);
+                assert!((p1 - 50.0 / 80.0).abs() < 0.01);
+            }
+            _ => panic!("Expected VSplit, got {:?}", tree),
+        }
+    }
+
+    // ── match_panes extras ─────────────────────────────────────────────
+
+    #[test]
+    fn match_panes_empty_old_snapshot() {
+        let (old_snapshot, _) = TopologySnapshot::from_panes(&[], 1000);
+        let new_panes = vec![make_pane(1, 0, 0, 24, 80, None, None, true)];
+        let mapping = match_panes(&old_snapshot, &new_panes);
+        assert!(mapping.mappings.is_empty());
+        assert!(mapping.unmatched_old.is_empty());
+        assert_eq!(mapping.unmatched_new, vec![1]);
+    }
+
+    #[test]
+    fn match_panes_empty_new_panes() {
+        let old_panes = vec![make_pane(1, 0, 0, 24, 80, Some("/a"), None, true)];
+        let (old_snapshot, _) = TopologySnapshot::from_panes(&old_panes, 1000);
+        let mapping = match_panes(&old_snapshot, &[]);
+        assert!(mapping.mappings.is_empty());
+        assert_eq!(mapping.unmatched_old, vec![1]);
+        assert!(mapping.unmatched_new.is_empty());
+    }
+
+    #[test]
+    fn match_panes_by_title_only() {
+        let old_panes = vec![make_pane(10, 0, 0, 24, 80, None, Some("vim"), true)];
+        let (old_snapshot, _) = TopologySnapshot::from_panes(&old_panes, 1000);
+
+        let new_panes = vec![make_pane(20, 0, 0, 24, 80, None, Some("vim"), true)];
+        let mapping = match_panes(&old_snapshot, &new_panes);
+        assert_eq!(mapping.mappings.get(&10), Some(&20));
+        assert!(mapping.unmatched_old.is_empty());
+        assert!(mapping.unmatched_new.is_empty());
+    }
+
+    #[test]
+    fn match_panes_no_match_when_all_none() {
+        let old_panes = vec![make_pane(10, 0, 0, 24, 80, None, None, true)];
+        let (old_snapshot, _) = TopologySnapshot::from_panes(&old_panes, 1000);
+
+        let new_panes = vec![make_pane(20, 0, 0, 24, 80, None, None, true)];
+        let mapping = match_panes(&old_snapshot, &new_panes);
+        // No cwd and no title → no match possible
+        assert!(mapping.mappings.is_empty());
+        assert_eq!(mapping.unmatched_old, vec![10]);
+        assert_eq!(mapping.unmatched_new, vec![20]);
+    }
+
+    // ── WindowSnapshot serde ───────────────────────────────────────────
+
+    #[test]
+    fn window_snapshot_serde_with_optional_fields() {
+        let window = WindowSnapshot {
+            window_id: 1,
+            title: Some("Main".to_string()),
+            position: Some((100, 200)),
+            size: Some((800, 600)),
+            tabs: vec![],
+            active_tab_index: Some(0),
+        };
+        let json = serde_json::to_string(&window).unwrap();
+        let restored: WindowSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, window);
+    }
+
+    #[test]
+    fn window_snapshot_serde_defaults_none_fields() {
+        let json = r#"{"window_id":1,"tabs":[]}"#;
+        let window: WindowSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(window.window_id, 1);
+        assert!(window.title.is_none());
+        assert!(window.position.is_none());
+        assert!(window.size.is_none());
+        assert!(window.active_tab_index.is_none());
+    }
+
+    // ── CaptureReport ──────────────────────────────────────────────────
+
+    #[test]
+    fn capture_report_single_pane_fields() {
+        let panes = vec![make_pane(1, 0, 0, 24, 80, None, None, true)];
+        let (_, report) = TopologySnapshot::from_panes(&panes, 1000);
+        assert_eq!(report.window_count, 1);
+        assert_eq!(report.tab_count, 1);
+        assert_eq!(report.pane_count, 1);
+        assert_eq!(
+            report.inference_quality.get(&0),
+            Some(&InferenceQuality::Inferred)
+        );
+    }
+
+    #[test]
+    fn capture_report_multi_window_tab_counts() {
+        let panes = vec![
+            make_pane(0, 0, 0, 24, 80, None, None, true),
+            make_pane(1, 1, 0, 24, 80, None, None, false),
+            make_pane(2, 0, 1, 24, 80, None, None, false),
+            make_pane(3, 1, 1, 24, 80, None, None, false),
+        ];
+        let (_, report) = TopologySnapshot::from_panes(&panes, 1000);
+        assert_eq!(report.window_count, 2);
+        assert_eq!(report.tab_count, 4);
+        assert_eq!(report.pane_count, 4);
+    }
 }

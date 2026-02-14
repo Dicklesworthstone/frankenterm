@@ -14,9 +14,9 @@
 #
 # Artifact Directory Layout:
 #   <run_dir>/
-#   ├── manifest.json           # Stable manifest with metadata
+#   ├── manifest.json           # Legacy-compatible run manifest (v2 fields)
+#   ├── summary.json            # Canonical run summary (wa.e2e.summary.v2)
 #   ├── env.json                # Environment snapshot
-#   ├── summary.json            # Run summary with timing and results
 #   ├── scenarios/
 #   │   └── <scenario_name>/
 #   │       ├── stdout.log      # Captured stdout
@@ -24,7 +24,12 @@
 #   │       ├── combined.log    # Interleaved stdout/stderr
 #   │       ├── exit_code       # Exit code (contents: integer)
 #   │       ├── duration_ms     # Duration in milliseconds
-#   │       └── *.json          # Any JSON outputs collected
+#   │       ├── correlation.jsonl           # Correlation + timing row
+#   │       ├── test_artifacts_manifest.json # Canonical scenario manifest
+#   │       ├── trace_bundle.json           # Failure-only trace bundle
+#   │       ├── frame_histogram.json        # Failure-only frame metrics
+#   │       ├── failure_signature.json      # Failure-only signature
+#   │       └── *.json                      # Any JSON outputs collected
 #   └── redacted/               # Redacted copies (if secrets found)
 
 set -euo pipefail
@@ -44,6 +49,10 @@ E2E_REDACT_SECRETS="${E2E_REDACT_SECRETS:-true}"
 
 # Patterns to redact (newline-separated regex patterns)
 E2E_REDACT_PATTERNS="${E2E_REDACT_PATTERNS:-}"
+
+# Canonical artifact schemas
+E2E_TEST_ARTIFACT_SCHEMA_VERSION="${E2E_TEST_ARTIFACT_SCHEMA_VERSION:-wa.test_artifacts.v1}"
+E2E_TEST_SUMMARY_SCHEMA_VERSION="${E2E_TEST_SUMMARY_SCHEMA_VERSION:-wa.e2e.summary.v2}"
 
 # Internal state (use global variables that survive across function calls)
 # These are deliberately NOT local - they need to persist
@@ -132,6 +141,351 @@ _e2e_warn() {
 
 _e2e_error() {
     _e2e_log "ERROR" "$@"
+}
+
+_e2e_file_size_bytes() {
+    local path="$1"
+    stat -f%z "$path" 2>/dev/null || stat -c%s "$path" 2>/dev/null || echo 0
+}
+
+_e2e_sha256_file() {
+    local path="$1"
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$path" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$path" | awk '{print $1}'
+    else
+        echo ""
+    fi
+}
+
+_e2e_infer_artifact_kind() {
+    local file_name="$1"
+    case "$file_name" in
+        *trace_bundle*.json)
+            echo "trace_bundle"
+            ;;
+        *frame_histogram*.json)
+            echo "frame_histogram"
+            ;;
+        *failure_signature*.json|*failure_signature*.txt)
+            echo "failure_signature"
+            ;;
+        *events*.json|*events*.jsonl)
+            echo "event_stream"
+            ;;
+        *audit*.json|*audit*.jsonl)
+            echo "audit_extract"
+            ;;
+        *screenshot*.png|*.png|*.jpg|*.jpeg)
+            echo "screenshot"
+            ;;
+        *flame*.*|*.svg)
+            echo "flamegraph"
+            ;;
+        *.jsonl|*.log|*.txt|*.stderr|*.stdout)
+            echo "structured_log"
+            ;;
+        *)
+            echo "raw_data"
+            ;;
+    esac
+}
+
+_e2e_infer_artifact_format() {
+    local file_name="$1"
+    case "$file_name" in
+        *.json)
+            echo "json"
+            ;;
+        *.jsonl)
+            echo "json_lines"
+            ;;
+        *.txt|*.log|*.stderr|*.stdout)
+            echo "text"
+            ;;
+        *.csv)
+            echo "csv"
+            ;;
+        *.html)
+            echo "html"
+            ;;
+        *.svg)
+            echo "svg"
+            ;;
+        *.png)
+            echo "png"
+            ;;
+        *)
+            echo "binary"
+            ;;
+    esac
+}
+
+_e2e_infer_artifact_redacted() {
+    local file_name="$1"
+    case "$file_name" in
+        *.log|*.txt|*.json|*.jsonl|*.csv|*.toml)
+            echo "true"
+            ;;
+        *)
+            echo "false"
+            ;;
+    esac
+}
+
+_e2e_extract_pane_id() {
+    local scenario_dir="$1"
+    local pane_id=""
+    local scenario_log="$scenario_dir/scenario.log"
+    if [[ -f "$scenario_log" ]]; then
+        pane_id=$(grep -Eo '(pane_id|agent_pane_id|alt_screen_pane_id):[[:space:]]*[0-9]+' "$scenario_log" \
+            | head -1 \
+            | grep -Eo '[0-9]+' \
+            || true)
+    fi
+    echo "$pane_id"
+}
+
+_e2e_derive_failure_signature() {
+    local scenario_dir="$1"
+    if grep -Eiq "timeout|timed out" "$scenario_dir"/*.log "$scenario_dir"/*.txt 2>/dev/null; then
+        echo "timeout"
+    elif grep -Eiq "policy|denied|blocked" "$scenario_dir"/*.log "$scenario_dir"/*.txt 2>/dev/null; then
+        echo "policy_denied"
+    elif grep -Eiq "panic|assert|failed" "$scenario_dir"/*.log "$scenario_dir"/*.txt 2>/dev/null; then
+        echo "assertion_or_runtime_failure"
+    else
+        echo "scenario_failure"
+    fi
+}
+
+_e2e_ensure_failure_artifacts() {
+    local scenario_name="$1"
+    local scenario_dir="$2"
+    local duration_ms="$3"
+    local signature="$4"
+    local generated_at
+    generated_at=$(_e2e_timestamp)
+
+    local trace_file="$scenario_dir/trace_bundle.json"
+    if [[ ! -f "$trace_file" ]]; then
+        local stdout_tail=""
+        local stderr_tail=""
+        local combined_tail=""
+        if [[ -f "$scenario_dir/stdout.log" ]]; then
+            stdout_tail=$(tail -n 200 "$scenario_dir/stdout.log" 2>/dev/null || true)
+        fi
+        if [[ -f "$scenario_dir/stderr.log" ]]; then
+            stderr_tail=$(tail -n 200 "$scenario_dir/stderr.log" 2>/dev/null || true)
+        fi
+        if [[ -f "$scenario_dir/combined.log" ]]; then
+            combined_tail=$(tail -n 200 "$scenario_dir/combined.log" 2>/dev/null || true)
+        fi
+        jq -n \
+            --arg schema_version "wa.trace_bundle.v1" \
+            --arg generated_at "$generated_at" \
+            --arg test_case_id "$scenario_name" \
+            --arg failure_signature "$signature" \
+            --arg stdout_tail "$stdout_tail" \
+            --arg stderr_tail "$stderr_tail" \
+            --arg combined_tail "$combined_tail" \
+            --argjson duration_ms "$duration_ms" \
+            '{
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                test_case_id: $test_case_id,
+                failure_signature: $failure_signature,
+                duration_ms: $duration_ms,
+                tails: {
+                    stdout: $stdout_tail,
+                    stderr: $stderr_tail,
+                    combined: $combined_tail
+                }
+            }' > "$trace_file"
+    fi
+
+    local histogram_file="$scenario_dir/frame_histogram.json"
+    if [[ ! -f "$histogram_file" ]]; then
+        jq -n \
+            --arg schema_version "wa.frame_histogram.v1" \
+            --arg generated_at "$generated_at" \
+            --arg test_case_id "$scenario_name" \
+            --arg failure_signature "$signature" \
+            --argjson duration_ms "$duration_ms" \
+            '{
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                test_case_id: $test_case_id,
+                failure_signature: $failure_signature,
+                duration_ms: $duration_ms,
+                histogram: {
+                    frame_count: 0,
+                    dropped_frame_count: 0,
+                    bucket_ms: []
+                }
+            }' > "$histogram_file"
+    fi
+
+    local signature_file="$scenario_dir/failure_signature.json"
+    if [[ ! -f "$signature_file" ]]; then
+        jq -n \
+            --arg schema_version "wa.failure_signature.v1" \
+            --arg generated_at "$generated_at" \
+            --arg test_case_id "$scenario_name" \
+            --arg signature "$signature" \
+            --argjson duration_ms "$duration_ms" \
+            '{
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                test_case_id: $test_case_id,
+                signature: $signature,
+                duration_ms: $duration_ms
+            }' > "$signature_file"
+    fi
+}
+
+_e2e_build_scenario_artifacts_json() {
+    local scenario_dir="$1"
+    local entries="[]"
+    while IFS= read -r file_path; do
+        local file_name
+        local kind
+        local format
+        local bytes
+        local sha256
+        local redacted
+        file_name=$(basename "$file_path")
+        kind=$(_e2e_infer_artifact_kind "$file_name")
+        format=$(_e2e_infer_artifact_format "$file_name")
+        bytes=$(_e2e_file_size_bytes "$file_path")
+        sha256=$(_e2e_sha256_file "$file_path")
+        redacted=$(_e2e_infer_artifact_redacted "$file_name")
+        entries=$(jq -c \
+            --arg kind "$kind" \
+            --arg format "$format" \
+            --arg path "$file_name" \
+            --argjson bytes "$bytes" \
+            --arg sha256 "$sha256" \
+            --argjson redacted "$redacted" \
+            '. + [{
+                kind: $kind,
+                format: $format,
+                path: $path,
+                bytes: $bytes,
+                sha256: (if $sha256 == "" then null else $sha256 end),
+                redacted: $redacted
+            }]' <<< "$entries")
+    done < <(find "$scenario_dir" -maxdepth 1 -type f | LC_ALL=C sort)
+
+    echo "$entries"
+}
+
+_e2e_emit_scenario_manifest() {
+    local scenario_name="$1"
+    local scenario_index="$2"
+    local exit_code="$3"
+    local duration_ms="$4"
+    local scenario_dir="$5"
+    local outcome="passed"
+    local failure_signature=""
+    if [[ "$exit_code" -ne 0 ]]; then
+        outcome="failed"
+    fi
+
+    local pane_id=""
+    pane_id=$(_e2e_extract_pane_id "$scenario_dir")
+    local resize_transaction_id
+    resize_transaction_id="$(basename "$E2E_RUN_DIR")-${scenario_name}-${scenario_index}"
+    local sequence_no="$scenario_index"
+    local scheduler_decision="e2e_artifacts"
+
+    if [[ "$outcome" != "passed" ]]; then
+        failure_signature=$(_e2e_derive_failure_signature "$scenario_dir")
+        _e2e_ensure_failure_artifacts "$scenario_name" "$scenario_dir" "$duration_ms" "$failure_signature"
+    fi
+
+    local correlation_jsonl="$scenario_dir/correlation.jsonl"
+    jq -cn \
+        --arg timestamp "$(_e2e_timestamp)" \
+        --arg test_case_id "$scenario_name" \
+        --arg resize_transaction_id "$resize_transaction_id" \
+        --arg pane_id "$pane_id" \
+        --arg sequence_no "$sequence_no" \
+        --arg scheduler_decision "$scheduler_decision" \
+        --argjson queue_wait_ms 0 \
+        --argjson reflow_ms "$duration_ms" \
+        --argjson render_ms "$duration_ms" \
+        --argjson present_ms "$duration_ms" \
+        --argjson p50_ms "$duration_ms" \
+        --argjson p95_ms "$duration_ms" \
+        --argjson p99_ms "$duration_ms" \
+        '{
+            timestamp: $timestamp,
+            test_case_id: $test_case_id,
+            resize_transaction_id: $resize_transaction_id,
+            pane_id: (if $pane_id == "" then null else ($pane_id | tonumber) end),
+            tab_id: null,
+            sequence_no: (if $sequence_no == "" then null else ($sequence_no | tonumber) end),
+            scheduler_decision: $scheduler_decision,
+            frame_id: null,
+            queue_wait_ms: $queue_wait_ms,
+            reflow_ms: $reflow_ms,
+            render_ms: $render_ms,
+            present_ms: $present_ms,
+            p50_ms: $p50_ms,
+            p95_ms: $p95_ms,
+            p99_ms: $p99_ms
+        }' > "$correlation_jsonl"
+
+    local artifacts_json
+    artifacts_json=$(_e2e_build_scenario_artifacts_json "$scenario_dir")
+    local manifest_path="$scenario_dir/test_artifacts_manifest.json"
+    jq -n \
+        --arg schema_version "$E2E_TEST_ARTIFACT_SCHEMA_VERSION" \
+        --arg run_id "$(basename "$E2E_RUN_DIR")_${scenario_name}" \
+        --argjson generated_at_ms "$(_e2e_time_ms)" \
+        --arg outcome "$outcome" \
+        --arg test_case_id "$scenario_name" \
+        --arg resize_transaction_id "$resize_transaction_id" \
+        --arg pane_id "$pane_id" \
+        --arg sequence_no "$sequence_no" \
+        --arg scheduler_decision "$scheduler_decision" \
+        --argjson queue_wait_ms 0 \
+        --argjson reflow_ms "$duration_ms" \
+        --argjson render_ms "$duration_ms" \
+        --argjson present_ms "$duration_ms" \
+        --argjson p50_ms "$duration_ms" \
+        --argjson p95_ms "$duration_ms" \
+        --argjson p99_ms "$duration_ms" \
+        --argjson artifacts "$artifacts_json" \
+        '{
+            schema_version: $schema_version,
+            run_id: $run_id,
+            generated_at_ms: $generated_at_ms,
+            outcome: $outcome,
+            correlation: {
+                test_case_id: $test_case_id,
+                resize_transaction_id: $resize_transaction_id,
+                pane_id: (if $pane_id == "" then null else ($pane_id | tonumber) end),
+                tab_id: null,
+                sequence_no: (if $sequence_no == "" then null else ($sequence_no | tonumber) end),
+                scheduler_decision: $scheduler_decision,
+                frame_id: null
+            },
+            timing: {
+                queue_wait_ms: $queue_wait_ms,
+                reflow_ms: $reflow_ms,
+                render_ms: $render_ms,
+                present_ms: $present_ms,
+                p50_ms: $p50_ms,
+                p95_ms: $p95_ms,
+                p99_ms: $p99_ms
+            },
+            artifacts: $artifacts
+        }' > "$manifest_path"
+
+    echo "$failure_signature"
 }
 
 # ==============================================================================
@@ -547,26 +901,47 @@ e2e_finalize() {
 
     # Build manifest JSON
     local manifest_file="$E2E_RUN_DIR/manifest.json"
+    local summary_json_file="$E2E_RUN_DIR/summary.json"
 
-    # Build scenarios array for manifest
+    # Build scenarios array for manifest/summary and emit per-scenario manifests.
     local scenarios_json="[]"
+    local scenario_index=1
     for entry in "${E2E_SCENARIOS[@]}"; do
         IFS=':' read -r name exit_code duration <<< "$entry"
         local status="passed"
         [[ $exit_code -ne 0 ]] && status="failed"
+        local scenario_dir="$E2E_SCENARIOS_DIR/$name"
+        local failure_signature=""
+        if [[ -d "$scenario_dir" ]]; then
+            failure_signature=$(_e2e_emit_scenario_manifest \
+                "$name" "$scenario_index" "$exit_code" "$duration" "$scenario_dir")
+        fi
 
-        scenarios_json=$(echo "$scenarios_json" | jq \
+        scenarios_json=$(echo "$scenarios_json" | jq -c \
             --arg name "$name" \
             --arg status "$status" \
             --argjson exit_code "$exit_code" \
             --argjson duration "$duration" \
-            '. + [{name: $name, status: $status, exit_code: $exit_code, duration_ms: $duration}]')
+            --arg artifacts_dir "scenarios/$name" \
+            --arg test_artifacts_manifest "scenarios/$name/test_artifacts_manifest.json" \
+            --arg failure_signature "$failure_signature" \
+            '. + [{
+                name: $name,
+                status: $status,
+                exit_code: $exit_code,
+                duration_ms: $duration,
+                artifacts_dir: $artifacts_dir,
+                test_artifacts_manifest: $test_artifacts_manifest
+            } + (if $status == "failed" and $failure_signature != "" then {error: $failure_signature} else {} end)]')
+        ((scenario_index++))
     done
 
     cat > "$manifest_file" <<EOF
 {
   "version": "1.0.0",
-  "schema": "https://github.com/Dicklesworthstone/frankenterm/e2e-manifest-v1",
+  "schema_version": "$E2E_TEST_SUMMARY_SCHEMA_VERSION",
+  "test_artifact_schema_version": "$E2E_TEST_ARTIFACT_SCHEMA_VERSION",
+  "schema": "https://github.com/Dicklesworthstone/frankenterm/e2e-manifest-v2",
   "generated_at": "$(_e2e_timestamp)",
   "generator": "e2e_artifacts.sh",
   "run": {
@@ -585,12 +960,28 @@ e2e_finalize() {
   "files": {
     "env": "env.json",
     "manifest": "manifest.json",
+    "summary": "summary.json",
     "scenarios_dir": "scenarios"
   },
   "settings": {
     "max_file_size": $E2E_MAX_FILE_SIZE,
     "redact_secrets": $E2E_REDACT_SECRETS
   }
+}
+EOF
+
+    cat > "$summary_json_file" <<EOF
+{
+  "version": "1",
+  "schema_version": "$E2E_TEST_SUMMARY_SCHEMA_VERSION",
+  "test_artifact_schema_version": "$E2E_TEST_ARTIFACT_SCHEMA_VERSION",
+  "timestamp": "$(_e2e_timestamp)",
+  "duration_secs": $((total_duration_ms / 1000)),
+  "total": $total_scenarios,
+  "passed": $E2E_PASSED,
+  "failed": $E2E_FAILED,
+  "skipped": 0,
+  "scenarios": $scenarios_json
 }
 EOF
 

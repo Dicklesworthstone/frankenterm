@@ -44,124 +44,156 @@ fn validate_token_rejects_missing_presented_token() {
 #[test]
 fn validate_token_passes_matching_simple_tokens() {
     assert!(
-        validate_token(DistributedAuthMode::Token, Some("abc123"), Some("abc123"), None).is_ok()
+        validate_token(
+            DistributedAuthMode::Token,
+            Some("abc123"),
+            Some("abc123"),
+            None
+        )
+        .is_ok()
     );
 }
 
 #[test]
 fn validate_token_rejects_mismatched_simple_tokens() {
     assert!(
-        validate_token(DistributedAuthMode::Token, Some("abc123"), Some("wrong"), None).is_err()
+        validate_token(
+            DistributedAuthMode::Token,
+            Some("abc123"),
+            Some("wrong"),
+            None
+        )
+        .is_err()
     );
 }
 
 #[test]
 fn validate_token_passes_matching_identity_tokens() {
     // identity:secret format
-    assert!(validate_token(
-        DistributedAuthMode::Token,
-        Some("agent-1:secret123"),
-        Some("agent-1:secret123"),
-        None,
-    )
-    .is_ok());
+    assert!(
+        validate_token(
+            DistributedAuthMode::Token,
+            Some("agent-1:secret123"),
+            Some("agent-1:secret123"),
+            None,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
 fn validate_token_rejects_mismatched_identity() {
-    assert!(validate_token(
-        DistributedAuthMode::Token,
-        Some("agent-1:secret123"),
-        Some("agent-2:secret123"),
-        None,
-    )
-    .is_err());
+    assert!(
+        validate_token(
+            DistributedAuthMode::Token,
+            Some("agent-1:secret123"),
+            Some("agent-2:secret123"),
+            None,
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn validate_token_rejects_mismatched_secret_with_identity() {
-    assert!(validate_token(
-        DistributedAuthMode::Token,
-        Some("agent-1:secret123"),
-        Some("agent-1:wrong"),
-        None,
-    )
-    .is_err());
+    assert!(
+        validate_token(
+            DistributedAuthMode::Token,
+            Some("agent-1:secret123"),
+            Some("agent-1:wrong"),
+            None,
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn validate_token_identity_matching_is_case_insensitive() {
-    assert!(validate_token(
-        DistributedAuthMode::Token,
-        Some("Agent-1:secret"),
-        Some("agent-1:secret"),
-        None,
-    )
-    .is_ok());
+    assert!(
+        validate_token(
+            DistributedAuthMode::Token,
+            Some("Agent-1:secret"),
+            Some("agent-1:secret"),
+            None,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
 fn validate_token_validates_client_identity_against_token_identity() {
     // Client identity must match token identity
-    assert!(validate_token(
-        DistributedAuthMode::Token,
-        Some("agent-1:secret"),
-        Some("agent-1:secret"),
-        Some("agent-1"),
-    )
-    .is_ok());
+    assert!(
+        validate_token(
+            DistributedAuthMode::Token,
+            Some("agent-1:secret"),
+            Some("agent-1:secret"),
+            Some("agent-1"),
+        )
+        .is_ok()
+    );
 
     // Client identity doesn't match
-    assert!(validate_token(
-        DistributedAuthMode::Token,
-        Some("agent-1:secret"),
-        Some("agent-1:secret"),
-        Some("agent-2"),
-    )
-    .is_err());
+    assert!(
+        validate_token(
+            DistributedAuthMode::Token,
+            Some("agent-1:secret"),
+            Some("agent-1:secret"),
+            Some("agent-2"),
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn validate_token_client_identity_case_insensitive() {
-    assert!(validate_token(
-        DistributedAuthMode::Token,
-        Some("AGENT-1:secret"),
-        Some("agent-1:secret"),
-        Some("Agent-1"),
-    )
-    .is_ok());
+    assert!(
+        validate_token(
+            DistributedAuthMode::Token,
+            Some("AGENT-1:secret"),
+            Some("agent-1:secret"),
+            Some("Agent-1"),
+        )
+        .is_ok()
+    );
 }
 
 #[test]
 fn validate_token_works_with_token_and_mtls_mode() {
-    assert!(validate_token(
-        DistributedAuthMode::TokenAndMtls,
-        Some("secret"),
-        Some("secret"),
-        None,
-    )
-    .is_ok());
+    assert!(
+        validate_token(
+            DistributedAuthMode::TokenAndMtls,
+            Some("secret"),
+            Some("secret"),
+            None,
+        )
+        .is_ok()
+    );
 
-    assert!(validate_token(
-        DistributedAuthMode::TokenAndMtls,
-        Some("secret"),
-        Some("wrong"),
-        None,
-    )
-    .is_err());
+    assert!(
+        validate_token(
+            DistributedAuthMode::TokenAndMtls,
+            Some("secret"),
+            Some("wrong"),
+            None,
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn validate_token_empty_identity_part_treated_as_no_identity() {
     // ":secret" should parse as identity=None, secret=":secret" (whole thing)
     // because the identity part is empty after trim
-    assert!(validate_token(
-        DistributedAuthMode::Token,
-        Some(":secret"),
-        Some(":secret"),
-        None,
-    )
-    .is_ok());
+    assert!(
+        validate_token(
+            DistributedAuthMode::Token,
+            Some(":secret"),
+            Some(":secret"),
+            None,
+        )
+        .is_ok()
+    );
 }
 
 // =============================================================================
@@ -309,7 +341,10 @@ fn resolve_expected_token_rejects_missing_env_var() {
     config.token_env = Some("FT_NONEXISTENT_TOKEN_VAR_12345".to_string());
 
     let err = resolve_expected_token(&config).unwrap_err();
-    assert!(matches!(err, DistributedCredentialError::TokenEnvMissing(_)));
+    assert!(matches!(
+        err,
+        DistributedCredentialError::TokenEnvMissing(_)
+    ));
 }
 
 #[test]
@@ -319,7 +354,10 @@ fn resolve_expected_token_rejects_nonexistent_file() {
     config.token_path = Some("/nonexistent/path/to/token".to_string());
 
     let err = resolve_expected_token(&config).unwrap_err();
-    assert!(matches!(err, DistributedCredentialError::TokenFileRead { .. }));
+    assert!(matches!(
+        err,
+        DistributedCredentialError::TokenFileRead { .. }
+    ));
 }
 
 #[test]
@@ -498,10 +536,7 @@ fn readiness_agent_allowlist_is_advisory() {
         .find(|i| i.id == "security.agent_allowlist")
         .unwrap();
     assert!(!item.required, "agent allowlist should be advisory");
-    assert!(
-        !item.pass,
-        "empty allowlist should fail advisory check"
-    );
+    assert!(!item.pass, "empty allowlist should fail advisory check");
 }
 
 #[test]
@@ -613,7 +648,11 @@ fn readiness_aggregate_counts_are_correct() {
     // Verify aggregate counts match items
     let actual_required_pass = report.items.iter().filter(|i| i.required && i.pass).count();
     let actual_required_total = report.items.iter().filter(|i| i.required).count();
-    let actual_advisory_pass = report.items.iter().filter(|i| !i.required && i.pass).count();
+    let actual_advisory_pass = report
+        .items
+        .iter()
+        .filter(|i| !i.required && i.pass)
+        .count();
     let actual_advisory_total = report.items.iter().filter(|i| !i.required).count();
 
     assert_eq!(report.required_pass, actual_required_pass);
@@ -674,15 +713,42 @@ fn readiness_localhost_detected_as_loopback() {
 fn security_error_codes_are_stable() {
     use frankenterm_core::distributed::DistributedSecurityError;
 
-    assert_eq!(DistributedSecurityError::MissingToken.code(), "dist.auth_failed");
-    assert_eq!(DistributedSecurityError::AuthFailed.code(), "dist.auth_failed");
-    assert_eq!(DistributedSecurityError::ReplayDetected.code(), "dist.replay_detected");
-    assert_eq!(DistributedSecurityError::SessionLimitReached.code(), "dist.session_limit");
-    assert_eq!(DistributedSecurityError::ConnectionLimitReached.code(), "dist.connection_limit");
-    assert_eq!(DistributedSecurityError::MessageTooLarge.code(), "dist.message_too_large");
-    assert_eq!(DistributedSecurityError::RateLimited.code(), "dist.rate_limited");
-    assert_eq!(DistributedSecurityError::HandshakeTimeout.code(), "dist.handshake_timeout");
-    assert_eq!(DistributedSecurityError::MessageTimeout.code(), "dist.message_timeout");
+    assert_eq!(
+        DistributedSecurityError::MissingToken.code(),
+        "dist.auth_failed"
+    );
+    assert_eq!(
+        DistributedSecurityError::AuthFailed.code(),
+        "dist.auth_failed"
+    );
+    assert_eq!(
+        DistributedSecurityError::ReplayDetected.code(),
+        "dist.replay_detected"
+    );
+    assert_eq!(
+        DistributedSecurityError::SessionLimitReached.code(),
+        "dist.session_limit"
+    );
+    assert_eq!(
+        DistributedSecurityError::ConnectionLimitReached.code(),
+        "dist.connection_limit"
+    );
+    assert_eq!(
+        DistributedSecurityError::MessageTooLarge.code(),
+        "dist.message_too_large"
+    );
+    assert_eq!(
+        DistributedSecurityError::RateLimited.code(),
+        "dist.rate_limited"
+    );
+    assert_eq!(
+        DistributedSecurityError::HandshakeTimeout.code(),
+        "dist.handshake_timeout"
+    );
+    assert_eq!(
+        DistributedSecurityError::MessageTimeout.code(),
+        "dist.message_timeout"
+    );
 }
 
 #[test]
@@ -785,44 +851,47 @@ fn validate_token_colon_only_token() {
     // This should fail because empty secret after identity
     // The parser treats ":something" as identity=None, secret=":something"
     // And ":" as identity=None, secret=":"
-    assert!(validate_token(
-        DistributedAuthMode::Token,
-        Some(":"),
-        Some(":"),
-        None,
-    )
-    .is_ok(), "matching colon-only tokens should pass");
+    assert!(
+        validate_token(DistributedAuthMode::Token, Some(":"), Some(":"), None,).is_ok(),
+        "matching colon-only tokens should pass"
+    );
 }
 
 #[test]
 fn validate_token_whitespace_identity() {
     // " :secret" — identity is whitespace-only, treated as no identity
-    assert!(validate_token(
-        DistributedAuthMode::Token,
-        Some(" :secret"),
-        Some(" :secret"),
-        None,
-    )
-    .is_ok());
+    assert!(
+        validate_token(
+            DistributedAuthMode::Token,
+            Some(" :secret"),
+            Some(" :secret"),
+            None,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
 fn validate_token_multiple_colons() {
     // "identity:part1:part2" — identity="identity", secret="part1:part2"
-    assert!(validate_token(
-        DistributedAuthMode::Token,
-        Some("agent:pass:extra"),
-        Some("agent:pass:extra"),
-        None,
-    )
-    .is_ok());
+    assert!(
+        validate_token(
+            DistributedAuthMode::Token,
+            Some("agent:pass:extra"),
+            Some("agent:pass:extra"),
+            None,
+        )
+        .is_ok()
+    );
 
     // Different secret after first colon
-    assert!(validate_token(
-        DistributedAuthMode::Token,
-        Some("agent:pass:extra"),
-        Some("agent:pass:different"),
-        None,
-    )
-    .is_err());
+    assert!(
+        validate_token(
+            DistributedAuthMode::Token,
+            Some("agent:pass:extra"),
+            Some("agent:pass:different"),
+            None,
+        )
+        .is_err()
+    );
 }

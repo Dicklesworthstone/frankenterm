@@ -16,13 +16,13 @@ use frankenterm_core::viewport_reflow_planner::{
 /// Generates realistic planner inputs with controlled parameter ranges.
 fn arb_planner_input() -> impl Strategy<Value = ReflowPlannerInput> {
     (
-        1_u32..20_000,  // total_logical_lines
-        0_u32..20_000,  // viewport_top
-        1_u32..500,     // viewport_height
-        0_u32..200,     // overscan_lines
-        1_u32..256,     // max_batch_lines
-        1_u32..128,     // lines_per_work_unit
-        1_u32..100,     // frame_budget_units
+        1_u32..20_000, // total_logical_lines
+        0_u32..20_000, // viewport_top
+        1_u32..500,    // viewport_height
+        0_u32..200,    // overscan_lines
+        1_u32..256,    // max_batch_lines
+        1_u32..128,    // lines_per_work_unit
+        1_u32..100,    // frame_budget_units
     )
         .prop_map(|(total, top, height, overscan, max_batch, lpu, budget)| {
             ReflowPlannerInput {

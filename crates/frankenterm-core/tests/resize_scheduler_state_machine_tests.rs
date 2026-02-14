@@ -67,7 +67,12 @@ fn full_lifecycle_single_pane_happy_path() {
 
     // Submit
     let outcome = sched.submit_intent(intent(1, 1, 2));
-    assert!(matches!(outcome, SubmitOutcome::Accepted { replaced_pending_seq: None }));
+    assert!(matches!(
+        outcome,
+        SubmitOutcome::Accepted {
+            replaced_pending_seq: None
+        }
+    ));
     assert_eq!(sched.pending_total(), 1);
     assert_eq!(sched.active_total(), 0);
 
@@ -134,7 +139,12 @@ fn supersession_cancels_active_and_schedules_newer() {
 
     // Submit newer seq=2 while seq=1 is active
     let outcome = sched.submit_intent(intent(1, 2, 2));
-    assert!(matches!(outcome, SubmitOutcome::Accepted { replaced_pending_seq: None }));
+    assert!(matches!(
+        outcome,
+        SubmitOutcome::Accepted {
+            replaced_pending_seq: None
+        }
+    ));
     assert!(sched.active_is_superseded(1));
 
     // Cancel active
@@ -182,7 +192,12 @@ fn pending_supersession_replaces_pending_intent() {
 
     sched.submit_intent(intent(1, 1, 2));
     let outcome = sched.submit_intent(intent(1, 2, 3));
-    assert!(matches!(outcome, SubmitOutcome::Accepted { replaced_pending_seq: Some(1) }));
+    assert!(matches!(
+        outcome,
+        SubmitOutcome::Accepted {
+            replaced_pending_seq: Some(1)
+        }
+    ));
     assert_eq!(sched.pending_total(), 1);
     assert_eq!(sched.metrics().superseded_intents, 1);
 
@@ -201,7 +216,10 @@ fn non_monotonic_intent_rejected() {
 
     sched.submit_intent(intent(1, 5, 2));
     let outcome = sched.submit_intent(intent(1, 3, 2));
-    assert!(matches!(outcome, SubmitOutcome::RejectedNonMonotonic { latest_seq: 5 }));
+    assert!(matches!(
+        outcome,
+        SubmitOutcome::RejectedNonMonotonic { latest_seq: 5 }
+    ));
     assert_eq!(sched.metrics().rejected_non_monotonic, 1);
 }
 
@@ -211,7 +229,10 @@ fn equal_sequence_rejected_as_non_monotonic() {
 
     sched.submit_intent(intent(1, 5, 2));
     let outcome = sched.submit_intent(intent(1, 5, 2));
-    assert!(matches!(outcome, SubmitOutcome::RejectedNonMonotonic { .. }));
+    assert!(matches!(
+        outcome,
+        SubmitOutcome::RejectedNonMonotonic { .. }
+    ));
 }
 
 // ──────────────────────────────────────────────────────────
@@ -224,7 +245,12 @@ fn emergency_disable_suppresses_submit() {
     sched.set_emergency_disable(true);
 
     let outcome = sched.submit_intent(intent(1, 1, 2));
-    assert!(matches!(outcome, SubmitOutcome::SuppressedByKillSwitch { legacy_fallback: true }));
+    assert!(matches!(
+        outcome,
+        SubmitOutcome::SuppressedByKillSwitch {
+            legacy_fallback: true
+        }
+    ));
     assert_eq!(sched.metrics().suppressed_by_gate, 1);
 }
 
@@ -234,7 +260,10 @@ fn disabled_control_plane_suppresses_submit() {
     sched.set_control_plane_enabled(false);
 
     let outcome = sched.submit_intent(intent(1, 1, 2));
-    assert!(matches!(outcome, SubmitOutcome::SuppressedByKillSwitch { .. }));
+    assert!(matches!(
+        outcome,
+        SubmitOutcome::SuppressedByKillSwitch { .. }
+    ));
 }
 
 #[test]
@@ -365,7 +394,13 @@ fn overload_rejects_when_queue_full() {
 
     // Third pane should be rejected
     let outcome = sched.submit_intent(bg_intent(3, 1, 1));
-    assert!(matches!(outcome, SubmitOutcome::DroppedOverload { pending_total: 2, .. }));
+    assert!(matches!(
+        outcome,
+        SubmitOutcome::DroppedOverload {
+            pending_total: 2,
+            ..
+        }
+    ));
     assert_eq!(sched.metrics().overload_rejected, 1);
 }
 
@@ -503,7 +538,10 @@ fn stalled_transactions_detected_above_threshold() {
     assert_eq!(stalled.len(), 1);
     assert_eq!(stalled[0].pane_id, 1);
     assert_eq!(stalled[0].age_ms, 4000);
-    assert_eq!(stalled[0].active_phase, Some(ResizeExecutionPhase::Reflowing));
+    assert_eq!(
+        stalled[0].active_phase,
+        Some(ResizeExecutionPhase::Reflowing)
+    );
 }
 
 #[test]
@@ -826,10 +864,17 @@ fn schedule_frame_result_serialization_round_trip() {
 #[test]
 fn submit_outcome_serialization_variants() {
     let variants = vec![
-        SubmitOutcome::Accepted { replaced_pending_seq: Some(3) },
+        SubmitOutcome::Accepted {
+            replaced_pending_seq: Some(3),
+        },
         SubmitOutcome::RejectedNonMonotonic { latest_seq: 5 },
-        SubmitOutcome::DroppedOverload { pending_total: 128, evicted_pending: None },
-        SubmitOutcome::SuppressedByKillSwitch { legacy_fallback: true },
+        SubmitOutcome::DroppedOverload {
+            pending_total: 128,
+            evicted_pending: None,
+        },
+        SubmitOutcome::SuppressedByKillSwitch {
+            legacy_fallback: true,
+        },
     ];
     for v in variants {
         let json = serde_json::to_string(&v).unwrap();
@@ -896,11 +941,17 @@ fn lifecycle_events_bounded_by_config() {
 fn domain_keys_are_consistent() {
     assert_eq!(ResizeDomain::Local.key(), "local");
     assert_eq!(
-        ResizeDomain::Ssh { host: "box1".to_string() }.key(),
+        ResizeDomain::Ssh {
+            host: "box1".to_string()
+        }
+        .key(),
         "ssh:box1"
     );
     assert_eq!(
-        ResizeDomain::Mux { endpoint: "ep1".to_string() }.key(),
+        ResizeDomain::Mux {
+            endpoint: "ep1".to_string()
+        }
+        .key(),
         "mux:ep1"
     );
 }
@@ -931,7 +982,10 @@ fn re_enable_after_emergency_disable_resumes_scheduling() {
 
     sched.set_emergency_disable(true);
     let outcome = sched.submit_intent(intent(1, 1, 2));
-    assert!(matches!(outcome, SubmitOutcome::SuppressedByKillSwitch { .. }));
+    assert!(matches!(
+        outcome,
+        SubmitOutcome::SuppressedByKillSwitch { .. }
+    ));
 
     sched.set_emergency_disable(false);
     let outcome = sched.submit_intent(intent(1, 2, 2));

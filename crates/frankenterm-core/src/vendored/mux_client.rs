@@ -613,6 +613,8 @@ pub enum PaneDelta {
         title: String,
         /// Number of dirty line ranges reported.
         dirty_range_count: usize,
+        /// Total number of dirty rows across all ranges.
+        dirty_row_count: usize,
     },
     /// A gap was detected (polling too slow or reconnect).
     Gap { pane_id: u64, reason: String },
@@ -726,11 +728,13 @@ pub fn subscribe_pane_output(
 
                     // Only emit Output delta if there are dirty lines
                     if has_dirty {
+                        let dirty_row_count = total_dirty_rows(&changes.dirty_lines);
                         let delta = PaneDelta::Output {
                             pane_id,
                             seqno,
                             title: changes.title,
                             dirty_range_count: changes.dirty_lines.len(),
+                            dirty_row_count,
                         };
 
                         // Bounded send — if the channel is full, emit a gap
@@ -788,6 +792,18 @@ pub fn subscribe_pane_output(
         receiver: rx,
         cancel: cancel_tx,
     }
+}
+
+fn total_dirty_rows(ranges: &[std::ops::Range<isize>]) -> usize {
+    ranges.iter().fold(0usize, |acc, range| {
+        let span = if range.end > range.start {
+            range.end - range.start
+        } else {
+            0
+        };
+        let span_usize = usize::try_from(span).unwrap_or(usize::MAX);
+        acc.saturating_add(span_usize)
+    })
 }
 
 #[cfg(test)]
@@ -1493,12 +1509,25 @@ mod tests {
     }
 
     #[test]
+    fn total_dirty_rows_sums_range_spans() {
+        let ranges: Vec<std::ops::Range<isize>> = vec![-4..-2, 10..13, 20..21];
+        assert_eq!(total_dirty_rows(&ranges), 6);
+    }
+
+    #[test]
+    fn total_dirty_rows_ignores_descending_ranges() {
+        let ranges: Vec<std::ops::Range<isize>> = vec![5..2, 3..3, 7..9];
+        assert_eq!(total_dirty_rows(&ranges), 2);
+    }
+
+    #[test]
     fn pane_delta_output_debug_format() {
         let delta = PaneDelta::Output {
             pane_id: 42,
             seqno: 7,
             title: "bash".to_string(),
             dirty_range_count: 3,
+            dirty_row_count: 9,
         };
         let dbg = format!("{delta:?}");
         assert!(dbg.contains("Output"));
@@ -1535,10 +1564,119 @@ mod tests {
             seqno: 99,
             title: "zsh".to_string(),
             dirty_range_count: 1,
+            dirty_row_count: 1,
         };
         let cloned = delta.clone();
         // Clone should produce identical debug output
         assert_eq!(format!("{delta:?}"), format!("{cloned:?}"));
+    }
+
+    #[tokio::test]
+    async fn subscription_output_delta_reports_dirty_counts() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp_dir.path().join("dirty-counts.sock");
+        let listener = compat_unix::bind(&socket_path).await.expect("bind");
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut read_buf = Vec::new();
+            let mut emitted_output = false;
+
+            loop {
+                let mut temp = vec![0u8; 4096];
+                let read = match stream.read(&mut temp).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                read_buf.extend_from_slice(&temp[..read]);
+                while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                    let response = match decoded.pdu {
+                        Pdu::GetCodecVersion(_) => {
+                            Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                codec_vers: CODEC_VERSION,
+                                version_string: "test".to_string(),
+                                executable_path: PathBuf::from("/bin/wezterm"),
+                                config_file_path: None,
+                            })
+                        }
+                        Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                        Pdu::GetPaneRenderChanges(_) => {
+                            let (dirty_lines, seqno) = if emitted_output {
+                                (Vec::new(), 2)
+                            } else {
+                                emitted_output = true;
+                                (vec![0isize..2isize, 4isize..7isize], 1)
+                            };
+
+                            Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                pane_id: 7,
+                                mouse_grabbed: false,
+                                cursor_position: mux::renderable::StableCursorPosition::default(),
+                                dimensions: mux::renderable::RenderableDimensions {
+                                    cols: 80,
+                                    viewport_rows: 24,
+                                    scrollback_rows: 0,
+                                    physical_top: 0,
+                                    scrollback_top: 0,
+                                    dpi: 96,
+                                    pixel_width: 0,
+                                    pixel_height: 0,
+                                    reverse_video: false,
+                                },
+                                dirty_lines,
+                                title: "test".to_string(),
+                                working_dir: None,
+                                bonus_lines: Vec::new().into(),
+                                input_serial: None,
+                                seqno,
+                            })
+                        }
+                        _ => continue,
+                    };
+                    let mut out = Vec::new();
+                    response.encode(&mut out, decoded.serial).expect("encode");
+                    stream.write_all(&out).await.expect("write");
+                }
+            }
+        });
+
+        let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+        let client = DirectMuxClient::connect(config).await.expect("connect");
+        let mut sub = subscribe_pane_output(
+            client,
+            7,
+            SubscriptionConfig {
+                poll_interval: Duration::from_millis(10),
+                min_poll_interval: Duration::from_millis(5),
+                channel_capacity: 8,
+            },
+        );
+
+        let mut observed = None;
+        for _ in 0..20 {
+            match timeout(Duration::from_millis(200), sub.next()).await {
+                Ok(Some(PaneDelta::Output {
+                    pane_id,
+                    dirty_range_count,
+                    dirty_row_count,
+                    ..
+                })) => {
+                    observed = Some((pane_id, dirty_range_count, dirty_row_count));
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+
+        let (pane_id, dirty_range_count, dirty_row_count) =
+            observed.expect("expected output delta with dirty counts");
+        assert_eq!(pane_id, 7);
+        assert_eq!(dirty_range_count, 2);
+        assert_eq!(dirty_row_count, 5);
+        sub.cancel();
     }
 
     #[tokio::test]

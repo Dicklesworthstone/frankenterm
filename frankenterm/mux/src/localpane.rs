@@ -203,6 +203,7 @@ impl ResizeQueueState {
 
 #[derive(Clone, Copy)]
 struct ResizeApplyMetrics {
+    commit_id: u64,
     current_size: TerminalSize,
     target_size: TerminalSize,
     probe_lock_wait: Duration,
@@ -210,9 +211,11 @@ struct ResizeApplyMetrics {
     pty_resize_elapsed: Duration,
     pty_resize_attempts: usize,
     pty_retry_backoff_elapsed: Duration,
+    swap_barrier_wait: Duration,
     terminal_apply_lock_wait: Duration,
     terminal_resize_elapsed: Duration,
     noop: bool,
+    rejected_frame: bool,
     cancelled: bool,
     cancelled_stage: Option<&'static str>,
     superseded_by_seq: Option<u64>,
@@ -1204,6 +1207,7 @@ impl LocalPane {
                             pane_id,
                             terminal.as_ref(),
                             pty.as_ref(),
+                            pending.seq,
                             pending.size,
                             pending.pty_size,
                             || {
@@ -1214,9 +1218,11 @@ impl LocalPane {
                             Ok(metrics) => {
                                 if metrics.cancelled {
                                     log::trace!(
-                                        "LocalPane::resize cancelled pane_id={} seq={} superseded_by_seq={} stage={} queue_wait_us={} completion_us={} current={}x{} target={}x{} probe_lock_wait_us={} pty_lock_wait_us={} pty_resize_us={} pty_resize_attempts={} pty_retry_backoff_us={} terminal_apply_lock_wait_us={} terminal_resize_us={}",
+                                        "LocalPane::resize cancelled pane_id={} seq={} commit_id={} rejected_frame={} superseded_by_seq={} stage={} queue_wait_us={} completion_us={} current={}x{} target={}x{} probe_lock_wait_us={} pty_lock_wait_us={} pty_resize_us={} pty_resize_attempts={} pty_retry_backoff_us={} swap_barrier_wait_us={} terminal_apply_lock_wait_us={} terminal_resize_us={}",
                                         pane_id,
                                         pending.seq,
+                                        metrics.commit_id,
+                                        metrics.rejected_frame,
                                         metrics.superseded_by_seq.unwrap_or_default(),
                                         metrics.cancelled_stage.unwrap_or("unknown"),
                                         queue_wait.as_micros(),
@@ -1230,14 +1236,17 @@ impl LocalPane {
                                         metrics.pty_resize_elapsed.as_micros(),
                                         metrics.pty_resize_attempts,
                                         metrics.pty_retry_backoff_elapsed.as_micros(),
+                                        metrics.swap_barrier_wait.as_micros(),
                                         metrics.terminal_apply_lock_wait.as_micros(),
                                         metrics.terminal_resize_elapsed.as_micros(),
                                     );
                                 } else {
                                     log::trace!(
-                                        "LocalPane::resize complete pane_id={} seq={} queue_wait_us={} completion_us={} noop={} current={}x{} target={}x{} probe_lock_wait_us={} pty_lock_wait_us={} pty_resize_us={} pty_resize_attempts={} pty_retry_backoff_us={} terminal_apply_lock_wait_us={} terminal_resize_us={}",
+                                        "LocalPane::resize complete pane_id={} seq={} commit_id={} rejected_frame={} queue_wait_us={} completion_us={} noop={} current={}x{} target={}x{} probe_lock_wait_us={} pty_lock_wait_us={} pty_resize_us={} pty_resize_attempts={} pty_retry_backoff_us={} swap_barrier_wait_us={} terminal_apply_lock_wait_us={} terminal_resize_us={}",
                                         pane_id,
                                         pending.seq,
+                                        metrics.commit_id,
+                                        metrics.rejected_frame,
                                         queue_wait.as_micros(),
                                         completion_start.elapsed().as_micros(),
                                         metrics.noop,
@@ -1250,6 +1259,7 @@ impl LocalPane {
                                         metrics.pty_resize_elapsed.as_micros(),
                                         metrics.pty_resize_attempts,
                                         metrics.pty_retry_backoff_elapsed.as_micros(),
+                                        metrics.swap_barrier_wait.as_micros(),
                                         metrics.terminal_apply_lock_wait.as_micros(),
                                         metrics.terminal_resize_elapsed.as_micros(),
                                     );
@@ -1284,6 +1294,7 @@ impl LocalPane {
         pane_id: PaneId,
         terminal: &Mutex<Terminal>,
         pty: &Mutex<Box<dyn MasterPty>>,
+        commit_id: u64,
         size: TerminalSize,
         pty_size: PtySize,
         mut superseded_by: impl FnMut() -> Option<u64>,
@@ -1294,6 +1305,7 @@ impl LocalPane {
 
         if current_size == size {
             return Ok(ResizeApplyMetrics {
+                commit_id,
                 current_size,
                 target_size: size,
                 probe_lock_wait: terminal_probe_lock_wait,
@@ -1301,9 +1313,11 @@ impl LocalPane {
                 pty_resize_elapsed: Duration::default(),
                 pty_resize_attempts: 0,
                 pty_retry_backoff_elapsed: Duration::default(),
+                swap_barrier_wait: Duration::default(),
                 terminal_apply_lock_wait: Duration::default(),
                 terminal_resize_elapsed: Duration::default(),
                 noop: true,
+                rejected_frame: false,
                 cancelled: false,
                 cancelled_stage: None,
                 superseded_by_seq: None,
@@ -1312,6 +1326,7 @@ impl LocalPane {
 
         if let Some(superseded_by_seq) = superseded_by() {
             return Ok(ResizeApplyMetrics {
+                commit_id,
                 current_size,
                 target_size: size,
                 probe_lock_wait: terminal_probe_lock_wait,
@@ -1319,9 +1334,11 @@ impl LocalPane {
                 pty_resize_elapsed: Duration::default(),
                 pty_resize_attempts: 0,
                 pty_retry_backoff_elapsed: Duration::default(),
+                swap_barrier_wait: Duration::default(),
                 terminal_apply_lock_wait: Duration::default(),
                 terminal_resize_elapsed: Duration::default(),
                 noop: false,
+                rejected_frame: true,
                 cancelled: true,
                 cancelled_stage: Some("before_pty_resize"),
                 superseded_by_seq: Some(superseded_by_seq),
@@ -1362,6 +1379,7 @@ impl LocalPane {
 
         if let Some(superseded_by_seq) = superseded_by() {
             return Ok(ResizeApplyMetrics {
+                commit_id,
                 current_size,
                 target_size: size,
                 probe_lock_wait: terminal_probe_lock_wait,
@@ -1369,9 +1387,11 @@ impl LocalPane {
                 pty_resize_elapsed,
                 pty_resize_attempts: retry_stats.attempts,
                 pty_retry_backoff_elapsed: retry_stats.backoff_elapsed,
+                swap_barrier_wait: Duration::default(),
                 terminal_apply_lock_wait: Duration::default(),
                 terminal_resize_elapsed: Duration::default(),
                 noop: false,
+                rejected_frame: true,
                 cancelled: true,
                 cancelled_stage: Some("before_terminal_apply"),
                 superseded_by_seq: Some(superseded_by_seq),
@@ -1381,11 +1401,32 @@ impl LocalPane {
         let terminal_apply_lock_start = Instant::now();
         let mut terminal = terminal.lock();
         let terminal_apply_lock_wait = terminal_apply_lock_start.elapsed();
+        if let Some(superseded_by_seq) = superseded_by() {
+            return Ok(ResizeApplyMetrics {
+                commit_id,
+                current_size,
+                target_size: size,
+                probe_lock_wait: terminal_probe_lock_wait,
+                pty_lock_wait,
+                pty_resize_elapsed,
+                pty_resize_attempts: retry_stats.attempts,
+                pty_retry_backoff_elapsed: retry_stats.backoff_elapsed,
+                swap_barrier_wait: terminal_apply_lock_wait,
+                terminal_apply_lock_wait,
+                terminal_resize_elapsed: Duration::default(),
+                noop: false,
+                rejected_frame: true,
+                cancelled: true,
+                cancelled_stage: Some("before_present_commit"),
+                superseded_by_seq: Some(superseded_by_seq),
+            });
+        }
         let terminal_resize_start = Instant::now();
         terminal.resize(size);
         let terminal_resize_elapsed = terminal_resize_start.elapsed();
 
         Ok(ResizeApplyMetrics {
+            commit_id,
             current_size,
             target_size: size,
             probe_lock_wait: terminal_probe_lock_wait,
@@ -1393,9 +1434,11 @@ impl LocalPane {
             pty_resize_elapsed,
             pty_resize_attempts: retry_stats.attempts,
             pty_retry_backoff_elapsed: retry_stats.backoff_elapsed,
+            swap_barrier_wait: terminal_apply_lock_wait,
             terminal_apply_lock_wait,
             terminal_resize_elapsed,
             noop: false,
+            rejected_frame: false,
             cancelled: false,
             cancelled_stage: None,
             superseded_by_seq: None,
@@ -1589,8 +1632,11 @@ mod tests {
     struct ResizeReplayHarness {
         queue: ResizeQueueState,
         in_flight: Option<PendingResize>,
+        presented_seq: Option<u64>,
+        presented_size: Option<TerminalSize>,
         completed: Vec<u64>,
         cancelled: Vec<u64>,
+        rejected_frames: Vec<u64>,
         causality: Vec<String>,
     }
 
@@ -1630,6 +1676,31 @@ mod tests {
             ));
             self.completed.push(completed.seq);
             Some(completed)
+        }
+
+        fn commit_current_with_present_barrier(&mut self) -> Option<bool> {
+            let active = self.in_flight?;
+            let token = ResizeCancellationToken::new(active.seq);
+
+            if let Some(superseded_by_seq) = self.queue.superseded_by(token) {
+                let rejected = self.in_flight.take().expect("in-flight resize must exist");
+                self.cancelled.push(rejected.seq);
+                self.rejected_frames.push(rejected.seq);
+                self.causality.push(format!(
+                    "reject_frame commit_id={} superseded_by={} swap_barrier_wait_us={}",
+                    rejected.seq, superseded_by_seq, 0
+                ));
+                return Some(false);
+            }
+
+            let committed = self.complete_current()?;
+            self.presented_seq = Some(committed.seq);
+            self.presented_size = Some(committed.size);
+            self.causality.push(format!(
+                "commit_frame commit_id={} rejected_frame=false swap_barrier_wait_us={}",
+                committed.seq, 0
+            ));
+            Some(true)
         }
 
         fn boundary_cancel_current_if_superseded(&mut self) -> bool {
@@ -1913,5 +1984,61 @@ mod tests {
             "expected at least one coalescing replacement entry"
         );
         assert!(replay.causality_contains(&format!("complete seq={}", latest.seq)));
+    }
+
+    #[test]
+    fn replay_present_commit_barrier_rejects_superseded_commit() {
+        let mut replay = ResizeReplayHarness::default();
+
+        replay.enqueue(80, 24);
+        let started = replay.start_next().expect("first intent should start");
+        assert_eq!(started.seq, 1);
+
+        replay.enqueue(120, 40);
+        assert_eq!(
+            replay.commit_current_with_present_barrier(),
+            Some(false),
+            "superseded frame should be rejected at present-commit barrier"
+        );
+        assert_eq!(replay.presented_seq, None);
+        assert_eq!(replay.rejected_frames, vec![1]);
+        assert!(replay.causality_contains("reject_frame commit_id=1 superseded_by=2"));
+
+        let coalesced = replay.start_next().expect("latest intent should run");
+        assert_eq!(coalesced.seq, 2);
+        assert_eq!(replay.commit_current_with_present_barrier(), Some(true));
+        assert_eq!(replay.presented_seq, Some(2));
+        assert_eq!(
+            replay.presented_size.map(|size| (size.cols, size.rows)),
+            Some((120, 40))
+        );
+        assert!(replay.causality_contains("commit_frame commit_id=2 rejected_frame=false"));
+    }
+
+    #[test]
+    fn replay_presented_frame_updates_only_on_commit() {
+        let mut replay = ResizeReplayHarness::default();
+
+        replay.enqueue(90, 30);
+        replay.start_next().expect("first intent should start");
+        assert_eq!(replay.presented_seq, None);
+        assert_eq!(replay.presented_size, None);
+
+        replay.enqueue(100, 35);
+        assert_eq!(replay.commit_current_with_present_barrier(), Some(false));
+        assert_eq!(
+            replay.presented_seq, None,
+            "rejected frame must not become visible"
+        );
+        assert_eq!(replay.presented_size, None);
+
+        replay.start_next().expect("coalesced intent should start");
+        assert_eq!(replay.presented_seq, None);
+        assert_eq!(replay.commit_current_with_present_barrier(), Some(true));
+        assert_eq!(replay.presented_seq, Some(2));
+        assert_eq!(
+            replay.presented_size.map(|size| (size.cols, size.rows)),
+            Some((100, 35))
+        );
     }
 }

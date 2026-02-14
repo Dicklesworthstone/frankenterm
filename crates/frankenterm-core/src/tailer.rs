@@ -1001,6 +1001,10 @@ pub struct StreamingBridge {
     events_processed: u64,
     /// Number of fallback-to-polling transitions.
     fallback_count: u64,
+    /// Aggregate dirty range count observed from render-change deltas.
+    dirty_range_total: u64,
+    /// Aggregate dirty row count observed from render-change deltas.
+    dirty_row_total: u64,
 }
 
 impl StreamingBridge {
@@ -1011,6 +1015,8 @@ impl StreamingBridge {
             ingester: crate::ingest::StreamIngester::new(),
             events_processed: 0,
             fallback_count: 0,
+            dirty_range_total: 0,
+            dirty_row_total: 0,
         }
     }
 
@@ -1033,12 +1039,23 @@ impl StreamingBridge {
                 seqno: _,
                 title,
                 dirty_range_count,
-            } => StreamEvent::OutputData {
-                pane_id,
-                data: format!("[render_changes: {dirty_range_count} dirty ranges, title={title}]"),
-                received_at: now_ms,
-                overflow: false,
-            },
+                dirty_row_count,
+            } => {
+                self.dirty_range_total = self
+                    .dirty_range_total
+                    .saturating_add(u64::try_from(dirty_range_count).unwrap_or(u64::MAX));
+                self.dirty_row_total = self
+                    .dirty_row_total
+                    .saturating_add(u64::try_from(dirty_row_count).unwrap_or(u64::MAX));
+                StreamEvent::OutputData {
+                    pane_id,
+                    data: format!(
+                        "[render_changes: {dirty_range_count} dirty ranges, {dirty_row_count} dirty rows, title={title}]"
+                    ),
+                    received_at: now_ms,
+                    overflow: false,
+                }
+            }
             crate::vendored::PaneDelta::Gap { pane_id, reason: _ } => {
                 // A gap from the subscription → treat as overflow so ingester
                 // emits a proper GAP segment.
@@ -1074,6 +1091,18 @@ impl StreamingBridge {
         self.fallback_count
     }
 
+    /// Aggregate number of dirty ranges observed from output deltas.
+    #[must_use]
+    pub fn dirty_range_total(&self) -> u64 {
+        self.dirty_range_total
+    }
+
+    /// Aggregate number of dirty rows observed from output deltas.
+    #[must_use]
+    pub fn dirty_row_total(&self) -> u64 {
+        self.dirty_row_total
+    }
+
     /// Access the underlying ingester for diagnostics.
     #[must_use]
     pub fn ingester(&self) -> &crate::ingest::StreamIngester {
@@ -1094,6 +1123,10 @@ pub struct StreamingHealth {
     pub mode: TailerMode,
     /// Events processed through the streaming bridge.
     pub events_processed: u64,
+    /// Aggregate dirty range count observed from output deltas.
+    pub dirty_ranges_total: u64,
+    /// Aggregate dirty row count observed from output deltas.
+    pub dirty_rows_total: u64,
     /// Gaps emitted through the streaming bridge.
     pub gaps_emitted: u64,
     /// Number of times streaming fell back to polling.
@@ -2293,6 +2326,8 @@ mod tests {
         let bridge = StreamingBridge::new();
         assert_eq!(bridge.events_processed(), 0);
         assert_eq!(bridge.fallback_count(), 0);
+        assert_eq!(bridge.dirty_range_total(), 0);
+        assert_eq!(bridge.dirty_row_total(), 0);
         assert_eq!(bridge.ingester().active_panes(), 0);
     }
 
@@ -2302,6 +2337,8 @@ mod tests {
         let b = StreamingBridge::default();
         assert_eq!(a.events_processed(), b.events_processed());
         assert_eq!(a.fallback_count(), b.fallback_count());
+        assert_eq!(a.dirty_range_total(), b.dirty_range_total());
+        assert_eq!(a.dirty_row_total(), b.dirty_row_total());
     }
 
     #[test]
@@ -2325,6 +2362,7 @@ mod tests {
             seqno: 5,
             title: "bash".to_string(),
             dirty_range_count: 2,
+            dirty_row_count: 8,
         };
 
         let segments = bridge.process_delta(delta);
@@ -2332,7 +2370,10 @@ mod tests {
         assert_eq!(segments[0].pane_id, 1);
         assert_eq!(segments[0].seq, 0); // first segment for this pane
         assert!(segments[0].content.contains("dirty ranges"));
+        assert!(segments[0].content.contains("dirty rows"));
         assert_eq!(bridge.events_processed(), 1);
+        assert_eq!(bridge.dirty_range_total(), 2);
+        assert_eq!(bridge.dirty_row_total(), 8);
     }
 
     #[cfg(feature = "vendored")]
@@ -2348,6 +2389,7 @@ mod tests {
             seqno: 1,
             title: "bash".to_string(),
             dirty_range_count: 1,
+            dirty_row_count: 4,
         };
         bridge.process_delta(output);
 
@@ -2379,6 +2421,7 @@ mod tests {
             seqno: 1,
             title: "bash".to_string(),
             dirty_range_count: 1,
+            dirty_row_count: 4,
         };
         bridge.process_delta(output);
 
@@ -2412,11 +2455,14 @@ mod tests {
                 seqno: 1,
                 title: format!("pane-{pane_id}"),
                 dirty_range_count: 1,
+                dirty_row_count: 4,
             };
             bridge.process_delta(delta);
         }
 
         assert_eq!(bridge.events_processed(), 3);
+        assert_eq!(bridge.dirty_range_total(), 3);
+        assert_eq!(bridge.dirty_row_total(), 12);
         assert_eq!(bridge.ingester().active_panes(), 3);
     }
 
@@ -2426,12 +2472,16 @@ mod tests {
         let health = StreamingHealth {
             mode: TailerMode::Streaming,
             events_processed: bridge.events_processed(),
+            dirty_ranges_total: bridge.dirty_range_total(),
+            dirty_rows_total: bridge.dirty_row_total(),
             gaps_emitted: bridge.ingester().total_gaps(),
             fallback_count: bridge.fallback_count(),
             active_panes: bridge.ingester().active_panes(),
         };
         assert_eq!(health.mode, TailerMode::Streaming);
         assert_eq!(health.events_processed, 0);
+        assert_eq!(health.dirty_ranges_total, 0);
+        assert_eq!(health.dirty_rows_total, 0);
         assert_eq!(health.active_panes, 0);
     }
 }

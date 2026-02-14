@@ -33,20 +33,22 @@ fn arb_relevant_ids() -> impl Strategy<Value = Vec<u64>> {
 /// Generate a complete SemanticEvalQuery with controlled parameters.
 fn arb_eval_query() -> impl Strategy<Value = SemanticEvalQuery> {
     (
-        "[a-z]{3,10}",                // name
-        arb_ranked_list(20),          // lexical_ranked
-        arb_ranked_list(20),          // semantic_ranked
-        arb_relevant_ids(),           // relevant_ids
-        1_usize..=20,                 // top_k
+        "[a-z]{3,10}",       // name
+        arb_ranked_list(20), // lexical_ranked
+        arb_ranked_list(20), // semantic_ranked
+        arb_relevant_ids(),  // relevant_ids
+        1_usize..=20,        // top_k
     )
-        .prop_map(|(name, lexical, semantic, relevant, top_k)| SemanticEvalQuery {
-            name,
-            description: String::new(),
-            lexical_ranked: lexical,
-            semantic_ranked: semantic,
-            relevant_ids: relevant,
-            top_k,
-        })
+        .prop_map(
+            |(name, lexical, semantic, relevant, top_k)| SemanticEvalQuery {
+                name,
+                description: String::new(),
+                lexical_ranked: lexical,
+                semantic_ranked: semantic,
+                relevant_ids: relevant,
+                top_k,
+            },
+        )
 }
 
 /// Generate a query where all ranked items are relevant (perfect ranking).
@@ -70,10 +72,8 @@ fn arb_perfect_query() -> impl Strategy<Value = SemanticEvalQuery> {
 fn arb_zero_hit_query() -> impl Strategy<Value = SemanticEvalQuery> {
     (1_usize..=10, 1_usize..=10).prop_map(|(k, n_ranked)| {
         // Ranked IDs: 1..=n_ranked, relevant IDs: 1000..1010 (no overlap)
-        let lexical: Vec<(u64, f32)> =
-            (1..=n_ranked as u64).map(|id| (id, 0.8)).collect();
-        let semantic: Vec<(u64, f32)> =
-            (1..=n_ranked as u64).map(|id| (id, 0.85)).collect();
+        let lexical: Vec<(u64, f32)> = (1..=n_ranked as u64).map(|id| (id, 0.8)).collect();
+        let semantic: Vec<(u64, f32)> = (1..=n_ranked as u64).map(|id| (id, 0.85)).collect();
         let relevant: Vec<u64> = (1000..1010).collect();
         SemanticEvalQuery {
             name: "zero_hit".to_string(),
@@ -89,9 +89,9 @@ fn arb_zero_hit_query() -> impl Strategy<Value = SemanticEvalQuery> {
 /// Generate regression thresholds in [0, 1] range.
 fn arb_thresholds() -> impl Strategy<Value = RegressionThresholds> {
     (
-        -1.0_f64..1.0,  // min_hybrid_ndcg_delta_vs_lexical
-        0.0_f64..1.0,   // min_hybrid_precision_at_k
-        0.0_f64..1.0,   // min_hybrid_recall_at_k
+        -1.0_f64..1.0, // min_hybrid_ndcg_delta_vs_lexical
+        0.0_f64..1.0,  // min_hybrid_precision_at_k
+        0.0_f64..1.0,  // min_hybrid_recall_at_k
     )
         .prop_map(|(ndcg_delta, precision, recall)| RegressionThresholds {
             min_hybrid_ndcg_delta_vs_lexical: ndcg_delta,
@@ -668,5 +668,9 @@ fn default_corpus_is_nonempty_and_valid() {
 #[test]
 fn default_corpus_passes_default_thresholds() {
     let report = SemanticQualityHarness::new(default_semantic_eval_queries()).run();
-    assert!(report.passed, "default corpus should pass default thresholds: {:?}", report.violations);
+    assert!(
+        report.passed,
+        "default corpus should pass default thresholds: {:?}",
+        report.violations
+    );
 }

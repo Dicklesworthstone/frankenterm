@@ -971,14 +971,57 @@ impl Surface {
     /// calling `draw_from_screen` and restores them after applying the changes
     /// from the other surface.
     pub fn draw_from_screen(&mut self, other: &Surface, x: usize, y: usize) -> SequenceNo {
+        self.draw_from_screen_with_dirty_rects(other, x, y).0
+    }
+
+    /// Like [`Surface::draw_from_screen`], but returns the dirty rectangles
+    /// for the drawn region in destination coordinates.
+    pub fn draw_from_screen_with_dirty_rects(
+        &mut self,
+        other: &Surface,
+        x: usize,
+        y: usize,
+    ) -> (SequenceNo, Vec<DirtyRect>) {
         let attrs = self.attributes.clone();
         let cursor = (self.xpos, self.ypos);
+        let dirty_rects = self.dirty_rects_region(x, y, other.width, other.height, other, 0, 0);
         let changes = self.diff_region(x, y, other.width, other.height, other, 0, 0);
         let seq = self.add_changes(changes);
         self.xpos = cursor.0;
         self.ypos = cursor.1;
         self.attributes = attrs;
-        seq
+        (seq, dirty_rects)
+    }
+
+    /// Like [`Surface::draw_from_screen_with_dirty_rects`], but returns tile-aligned
+    /// dirty regions suitable for partial upload staging.
+    pub fn draw_from_screen_with_dirty_tiles(
+        &mut self,
+        other: &Surface,
+        x: usize,
+        y: usize,
+        tile_width: usize,
+        tile_height: usize,
+    ) -> (SequenceNo, Vec<DirtyRect>) {
+        let attrs = self.attributes.clone();
+        let cursor = (self.xpos, self.ypos);
+        let dirty_tiles = self.dirty_tiles_region(
+            x,
+            y,
+            other.width,
+            other.height,
+            other,
+            0,
+            0,
+            tile_width,
+            tile_height,
+        );
+        let changes = self.diff_region(x, y, other.width, other.height, other, 0, 0);
+        let seq = self.add_changes(changes);
+        self.xpos = cursor.0;
+        self.ypos = cursor.1;
+        self.attributes = attrs;
+        (seq, dirty_tiles)
     }
 
     /// Copy the contents of the specified region to the same sized
@@ -1804,6 +1847,60 @@ mod test {
              34  \n\
              \x20\x20XY\n\
              \x20\x20ZA\n"
+        );
+    }
+
+    #[test]
+    fn draw_from_screen_with_dirty_rects_reports_regions() {
+        let mut dest = Surface::new(6, 4);
+        let mut src = Surface::new(2, 2);
+        src.add_change("ABCD");
+
+        let (_seq, rects) = dest.draw_from_screen_with_dirty_rects(&src, 2, 1);
+
+        assert_eq!(
+            rects,
+            vec![DirtyRect {
+                x: 2,
+                y: 1,
+                width: 2,
+                height: 2,
+            }]
+        );
+        assert_eq!(
+            dest.screen_chars_to_string(),
+            "      \n  AB  \n  CD  \n      \n"
+        );
+    }
+
+    #[test]
+    fn draw_from_screen_with_dirty_tiles_reports_tile_aligned_regions() {
+        let mut dest = Surface::new(10, 6);
+        let mut src = Surface::new(4, 2);
+        src.add_change("WXYZ1234");
+
+        let (_seq, tiles) = dest.draw_from_screen_with_dirty_tiles(&src, 3, 1, 4, 3);
+
+        assert_eq!(
+            tiles,
+            vec![
+                DirtyRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 3,
+                },
+                DirtyRect {
+                    x: 4,
+                    y: 0,
+                    width: 4,
+                    height: 3,
+                },
+            ]
+        );
+        assert_eq!(
+            dest.screen_chars_to_string(),
+            "          \n   WXYZ   \n   1234   \n          \n          \n          \n"
         );
     }
 

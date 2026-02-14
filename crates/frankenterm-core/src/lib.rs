@@ -193,6 +193,7 @@ pub mod tantivy_quality;
 pub mod tantivy_query;
 pub mod tantivy_reindex;
 pub mod telemetry;
+pub mod test_artifacts;
 pub mod token_bucket;
 pub mod undo;
 pub mod user_preferences;

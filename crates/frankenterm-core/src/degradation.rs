@@ -163,6 +163,232 @@ pub struct DegradationReport {
     pub paused_workflow_count: usize,
 }
 
+/// Ordered resize degradation tiers.
+///
+/// The ladder is intentionally monotonic in severity:
+/// 1. `FullQuality` - best visual quality and throughput.
+/// 2. `QualityReduced` - trade visual quality before touching correctness.
+/// 3. `CorrectnessGuarded` - enable stricter correctness guards before reducing availability.
+/// 4. `EmergencyCompatibility` - safe-mode compatibility path for availability under pathological load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResizeDegradationTier {
+    /// No active degradation signals.
+    FullQuality,
+    /// Quality reductions are active; correctness semantics remain intact.
+    QualityReduced,
+    /// Correctness-preserving guardrails are active.
+    CorrectnessGuarded,
+    /// Emergency safe-mode compatibility path is active.
+    EmergencyCompatibility,
+}
+
+impl ResizeDegradationTier {
+    /// Severity rank for telemetry sorting and quick comparisons.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::FullQuality => 0,
+            Self::QualityReduced => 1,
+            Self::CorrectnessGuarded => 2,
+            Self::EmergencyCompatibility => 3,
+        }
+    }
+}
+
+impl std::fmt::Display for ResizeDegradationTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FullQuality => write!(f, "full_quality"),
+            Self::QualityReduced => write!(f, "quality_reduced"),
+            Self::CorrectnessGuarded => write!(f, "correctness_guarded"),
+            Self::EmergencyCompatibility => write!(f, "emergency_compatibility"),
+        }
+    }
+}
+
+/// Signals used to evaluate the resize degradation ladder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResizeDegradationSignals {
+    /// Number of stalled resize transactions above warning threshold.
+    pub stalled_total: usize,
+    /// Number of stalled resize transactions above critical threshold.
+    pub stalled_critical: usize,
+    /// Warning threshold used for stall detection.
+    pub warning_threshold_ms: u64,
+    /// Critical threshold used for stall detection.
+    pub critical_threshold_ms: u64,
+    /// Critical stall count that triggers safe-mode recommendation.
+    pub critical_stalled_limit: usize,
+    /// Watchdog recommendation to enable safe mode.
+    pub safe_mode_recommended: bool,
+    /// Whether safe-mode is already active.
+    pub safe_mode_active: bool,
+    /// Whether legacy fallback path is available under safe mode.
+    pub legacy_fallback_enabled: bool,
+}
+
+/// Structured resize degradation ladder assessment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResizeDegradationAssessment {
+    /// Selected degradation tier.
+    pub tier: ResizeDegradationTier,
+    /// Numeric rank for the selected tier.
+    pub tier_rank: u8,
+    /// Trigger condition that selected this tier.
+    pub trigger_condition: String,
+    /// Recovery rule for returning to a lower-severity tier.
+    pub recovery_rule: String,
+    /// Suggested operator/runtime action.
+    pub recommended_action: String,
+    /// Quality-focused reductions active in this tier.
+    pub quality_reductions: Vec<String>,
+    /// Correctness guardrails active in this tier.
+    pub correctness_guards: Vec<String>,
+    /// Availability-impacting compatibility changes active in this tier.
+    pub availability_changes: Vec<String>,
+    /// Raw input signals used for triage/debugging.
+    pub signals: ResizeDegradationSignals,
+}
+
+impl ResizeDegradationAssessment {
+    /// Human-readable health warning line when degraded tiers are active.
+    #[must_use]
+    pub fn warning_line(&self) -> Option<String> {
+        match self.tier {
+            ResizeDegradationTier::FullQuality => None,
+            ResizeDegradationTier::QualityReduced => Some(format!(
+                "Resize degradation ladder: quality-reduced tier active ({} stalled >= {}ms)",
+                self.signals.stalled_total, self.signals.warning_threshold_ms
+            )),
+            ResizeDegradationTier::CorrectnessGuarded => Some(format!(
+                "Resize degradation ladder: correctness-guarded tier active ({} critical stalled >= {}ms)",
+                self.signals.stalled_critical, self.signals.critical_threshold_ms
+            )),
+            ResizeDegradationTier::EmergencyCompatibility => Some(format!(
+                "Resize degradation ladder: emergency compatibility tier active{}",
+                if self.signals.legacy_fallback_enabled {
+                    " with legacy fallback"
+                } else {
+                    ""
+                }
+            )),
+        }
+    }
+}
+
+/// Evaluate ordered resize degradation tiering from watchdog signals.
+///
+/// Escalation ordering is strict: quality reductions first, then correctness
+/// guardrails, and only then emergency compatibility mode.
+#[must_use]
+pub fn evaluate_resize_degradation_ladder(
+    signals: ResizeDegradationSignals,
+) -> ResizeDegradationAssessment {
+    let tier = if signals.safe_mode_active {
+        ResizeDegradationTier::EmergencyCompatibility
+    } else if signals.safe_mode_recommended || signals.stalled_critical > 0 {
+        ResizeDegradationTier::CorrectnessGuarded
+    } else if signals.stalled_total > 0 {
+        ResizeDegradationTier::QualityReduced
+    } else {
+        ResizeDegradationTier::FullQuality
+    };
+
+    let trigger_condition = match tier {
+        ResizeDegradationTier::FullQuality => "no_active_resize_stall_signals".to_string(),
+        ResizeDegradationTier::QualityReduced => format!(
+            "warning_stalls_detected:{}@{}ms",
+            signals.stalled_total, signals.warning_threshold_ms
+        ),
+        ResizeDegradationTier::CorrectnessGuarded => {
+            if signals.safe_mode_recommended {
+                format!(
+                    "safe_mode_recommended:{}_critical_stalls>={}",
+                    signals.stalled_critical, signals.critical_stalled_limit
+                )
+            } else {
+                format!(
+                    "critical_stalls_detected:{}@{}ms",
+                    signals.stalled_critical, signals.critical_threshold_ms
+                )
+            }
+        }
+        ResizeDegradationTier::EmergencyCompatibility => {
+            "safe_mode_active_emergency_disable".to_string()
+        }
+    };
+
+    let recovery_rule = match tier {
+        ResizeDegradationTier::FullQuality => {
+            "stay_full_quality_while_warning_and_critical_stalls_remain_zero".to_string()
+        }
+        ResizeDegradationTier::QualityReduced => {
+            "return_to_full_quality_after_warning_stalls_clear".to_string()
+        }
+        ResizeDegradationTier::CorrectnessGuarded => {
+            "return_to_quality_reduced_after_critical_stalls_clear_and_safe_mode_not_recommended"
+                .to_string()
+        }
+        ResizeDegradationTier::EmergencyCompatibility => {
+            "return_to_correctness_guarded_after_safe_mode_disabled_and_critical_stalls_clear"
+                .to_string()
+        }
+    };
+
+    let recommended_action = match tier {
+        ResizeDegradationTier::FullQuality => "none",
+        ResizeDegradationTier::QualityReduced => "reduce_visual_quality_preserve_correctness",
+        ResizeDegradationTier::CorrectnessGuarded => {
+            "enforce_correctness_guards_prepare_emergency_compatibility"
+        }
+        ResizeDegradationTier::EmergencyCompatibility => "run_emergency_compatibility_mode",
+    }
+    .to_string();
+
+    let quality_reductions = if tier >= ResizeDegradationTier::QualityReduced {
+        vec![
+            "reduce_batch_sizes_and_overscan".to_string(),
+            "defer_noncritical_background_reflow".to_string(),
+            "prioritize_viewport_first_updates".to_string(),
+        ]
+    } else {
+        Vec::new()
+    };
+
+    let correctness_guards = if tier >= ResizeDegradationTier::CorrectnessGuarded {
+        vec![
+            "enforce_atomic_present_commit_barriers".to_string(),
+            "prefer_last_good_frame_rollbacks_on_commit_failure".to_string(),
+            "suppress_speculative_resize_paths".to_string(),
+        ]
+    } else {
+        Vec::new()
+    };
+
+    let availability_changes = if tier >= ResizeDegradationTier::EmergencyCompatibility {
+        vec![
+            "enable_safe_mode_control_plane_killswitch".to_string(),
+            "activate_legacy_compatibility_fallback_when_available".to_string(),
+            "pause_nonessential_resize_work".to_string(),
+        ]
+    } else {
+        Vec::new()
+    };
+
+    ResizeDegradationAssessment {
+        tier,
+        tier_rank: tier.rank(),
+        trigger_condition,
+        recovery_rule,
+        recommended_action,
+        quality_reductions,
+        correctness_guards,
+        availability_changes,
+        signals,
+    }
+}
+
 /// Tracks the degradation state of all subsystems.
 pub struct DegradationManager {
     states: BTreeMap<Subsystem, DegradationLevel>,
@@ -1048,5 +1274,96 @@ mod tests {
         // Recording recovery attempt on normal subsystem is a no-op
         dm.record_recovery_attempt(Subsystem::DbWrite);
         assert_eq!(*dm.level(Subsystem::DbWrite), DegradationLevel::Normal);
+    }
+
+    #[test]
+    fn resize_degradation_ladder_orders_quality_correctness_availability() {
+        let full = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 0,
+            stalled_critical: 0,
+            warning_threshold_ms: 2_000,
+            critical_threshold_ms: 8_000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+        });
+        assert_eq!(full.tier, ResizeDegradationTier::FullQuality);
+        assert!(full.warning_line().is_none());
+
+        let quality = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 2,
+            stalled_critical: 0,
+            warning_threshold_ms: 2_000,
+            critical_threshold_ms: 8_000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+        });
+        assert_eq!(quality.tier, ResizeDegradationTier::QualityReduced);
+        assert!(quality.warning_line().unwrap().contains("quality-reduced"));
+
+        let correctness = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 3,
+            stalled_critical: 1,
+            warning_threshold_ms: 2_000,
+            critical_threshold_ms: 8_000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+        });
+        assert_eq!(correctness.tier, ResizeDegradationTier::CorrectnessGuarded);
+        assert!(
+            correctness
+                .warning_line()
+                .unwrap()
+                .contains("correctness-guarded")
+        );
+
+        let emergency = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 3,
+            stalled_critical: 3,
+            warning_threshold_ms: 2_000,
+            critical_threshold_ms: 8_000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: true,
+            safe_mode_active: true,
+            legacy_fallback_enabled: true,
+        });
+        assert_eq!(
+            emergency.tier,
+            ResizeDegradationTier::EmergencyCompatibility
+        );
+        assert!(
+            emergency
+                .warning_line()
+                .unwrap()
+                .contains("emergency compatibility")
+        );
+
+        assert!(full.tier < quality.tier);
+        assert!(quality.tier < correctness.tier);
+        assert!(correctness.tier < emergency.tier);
+    }
+
+    #[test]
+    fn resize_degradation_ladder_serde_roundtrip() {
+        let assessment = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 5,
+            stalled_critical: 2,
+            warning_threshold_ms: 2_000,
+            critical_threshold_ms: 8_000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: true,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        });
+
+        let json = serde_json::to_string(&assessment).unwrap();
+        let parsed: ResizeDegradationAssessment = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, assessment);
+        assert_eq!(parsed.tier, ResizeDegradationTier::CorrectnessGuarded);
     }
 }
