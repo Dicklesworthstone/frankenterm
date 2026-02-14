@@ -191,6 +191,7 @@ pub mod telemetry;
 pub mod token_bucket;
 pub mod undo;
 pub mod user_preferences;
+pub mod viewport_reflow_planner;
 pub mod voi;
 pub mod wait;
 pub mod watchdog;
