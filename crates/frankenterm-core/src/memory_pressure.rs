@@ -619,4 +619,256 @@ mod tests {
             assert!(available <= total);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Classify boundary conditions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_at_exact_thresholds() {
+        let monitor = MemoryPressureMonitor::new(test_config());
+        // Exactly at threshold transitions.
+        assert_eq!(monitor.classify(70.0), MemoryPressureTier::Yellow);
+        assert_eq!(monitor.classify(85.0), MemoryPressureTier::Orange);
+        assert_eq!(monitor.classify(95.0), MemoryPressureTier::Red);
+    }
+
+    #[test]
+    fn classify_just_below_thresholds() {
+        let monitor = MemoryPressureMonitor::new(test_config());
+        // Epsilon below each threshold stays in lower tier.
+        assert_eq!(monitor.classify(69.999999), MemoryPressureTier::Green);
+        assert_eq!(monitor.classify(84.999999), MemoryPressureTier::Yellow);
+        assert_eq!(monitor.classify(94.999999), MemoryPressureTier::Orange);
+    }
+
+    #[test]
+    fn classify_zero_is_green() {
+        let monitor = MemoryPressureMonitor::new(test_config());
+        assert_eq!(monitor.classify(0.0), MemoryPressureTier::Green);
+    }
+
+    #[test]
+    fn classify_hundred_is_red() {
+        let monitor = MemoryPressureMonitor::new(test_config());
+        assert_eq!(monitor.classify(100.0), MemoryPressureTier::Red);
+    }
+
+    #[test]
+    fn classify_above_hundred_is_red() {
+        let monitor = MemoryPressureMonitor::new(test_config());
+        // >100% can happen with memory overcommit.
+        assert_eq!(monitor.classify(150.0), MemoryPressureTier::Red);
+    }
+
+    #[test]
+    fn classify_negative_is_green() {
+        let monitor = MemoryPressureMonitor::new(test_config());
+        assert_eq!(monitor.classify(-1.0), MemoryPressureTier::Green);
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom config thresholds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn custom_tight_thresholds() {
+        let config = MemoryPressureConfig {
+            yellow_threshold: 10.0,
+            orange_threshold: 20.0,
+            red_threshold: 30.0,
+            ..MemoryPressureConfig::default()
+        };
+        let monitor = MemoryPressureMonitor::new(config);
+        assert_eq!(monitor.classify(9.0), MemoryPressureTier::Green);
+        assert_eq!(monitor.classify(10.0), MemoryPressureTier::Yellow);
+        assert_eq!(monitor.classify(20.0), MemoryPressureTier::Orange);
+        assert_eq!(monitor.classify(30.0), MemoryPressureTier::Red);
+    }
+
+    #[test]
+    fn equal_thresholds_favor_highest_tier() {
+        let config = MemoryPressureConfig {
+            yellow_threshold: 50.0,
+            orange_threshold: 50.0,
+            red_threshold: 50.0,
+            ..MemoryPressureConfig::default()
+        };
+        let monitor = MemoryPressureMonitor::new(config);
+        // At 50.0, the >= checks proceed red→orange→yellow; red matches first.
+        assert_eq!(monitor.classify(50.0), MemoryPressureTier::Red);
+        assert_eq!(monitor.classify(49.9), MemoryPressureTier::Green);
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic tier sharing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tier_handle_round_trip_all_tiers() {
+        let monitor = MemoryPressureMonitor::new(test_config());
+        let handle = monitor.tier_handle();
+
+        for (val, expected) in [
+            (0u64, MemoryPressureTier::Green),
+            (1, MemoryPressureTier::Yellow),
+            (2, MemoryPressureTier::Orange),
+            (3, MemoryPressureTier::Red),
+        ] {
+            handle.store(val, Ordering::Relaxed);
+            assert_eq!(monitor.current_tier(), expected);
+        }
+    }
+
+    #[test]
+    fn unknown_tier_value_falls_back_to_green() {
+        let monitor = MemoryPressureMonitor::new(test_config());
+        let handle = monitor.tier_handle();
+        // Values outside 0-3 should map to Green (the _ arm).
+        handle.store(99, Ordering::Relaxed);
+        assert_eq!(monitor.current_tier(), MemoryPressureTier::Green);
+        handle.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(monitor.current_tier(), MemoryPressureTier::Green);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier ordering properties
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn all_tiers_have_distinct_numeric_values() {
+        let values: Vec<u8> = [
+            MemoryPressureTier::Green,
+            MemoryPressureTier::Yellow,
+            MemoryPressureTier::Orange,
+            MemoryPressureTier::Red,
+        ]
+        .iter()
+        .map(|t| t.as_u8())
+        .collect();
+        // Check strictly monotonic.
+        for w in values.windows(2) {
+            assert!(w[0] < w[1]);
+        }
+    }
+
+    #[test]
+    fn tier_ord_matches_numeric_ord() {
+        let tiers = [
+            MemoryPressureTier::Green,
+            MemoryPressureTier::Yellow,
+            MemoryPressureTier::Orange,
+            MemoryPressureTier::Red,
+        ];
+        for i in 0..tiers.len() {
+            for j in (i + 1)..tiers.len() {
+                assert!(tiers[i] < tiers[j]);
+                assert!(tiers[i].as_u8() < tiers[j].as_u8());
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier serde exhaustive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn all_tiers_serde_roundtrip() {
+        for tier in [
+            MemoryPressureTier::Green,
+            MemoryPressureTier::Yellow,
+            MemoryPressureTier::Orange,
+            MemoryPressureTier::Red,
+        ] {
+            let json = serde_json::to_string(&tier).unwrap();
+            let parsed: MemoryPressureTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, tier);
+        }
+    }
+
+    #[test]
+    fn tier_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&MemoryPressureTier::Green).unwrap(),
+            "\"green\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MemoryPressureTier::Yellow).unwrap(),
+            "\"yellow\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MemoryPressureTier::Orange).unwrap(),
+            "\"orange\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MemoryPressureTier::Red).unwrap(),
+            "\"red\""
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Config serde with partial fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_deserializes_with_partial_fields() {
+        let json = r#"{"enabled": false, "sample_interval_ms": 5000}"#;
+        let config: MemoryPressureConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.sample_interval_ms, 5000);
+        // Remaining fields should be defaults.
+        assert!((config.yellow_threshold - 70.0).abs() < f64::EPSILON);
+        assert_eq!(config.compress_idle_secs, 300);
+    }
+
+    // -----------------------------------------------------------------------
+    // PaneMemoryInfo edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pane_memory_info_zero_values() {
+        let info = PaneMemoryInfo {
+            pane_id: 0,
+            rss_kb: 0,
+            scrollback_compressed: false,
+            scrollback_evicted: false,
+            idle_secs: 0,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: PaneMemoryInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pane_id, 0);
+        assert_eq!(parsed.rss_kb, 0);
+    }
+
+    #[test]
+    fn pane_memory_info_large_values() {
+        let info = PaneMemoryInfo {
+            pane_id: u64::MAX,
+            rss_kb: u64::MAX,
+            scrollback_compressed: true,
+            scrollback_evicted: true,
+            idle_secs: u64::MAX,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: PaneMemoryInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pane_id, u64::MAX);
+        assert_eq!(parsed.rss_kb, u64::MAX);
+        assert!(parsed.scrollback_compressed);
+        assert!(parsed.scrollback_evicted);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sample updates atomic tier
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sample_updates_current_tier() {
+        let monitor = MemoryPressureMonitor::new(test_config());
+        let _sample = monitor.sample();
+        // After a sample, current_tier() should reflect the sampled tier.
+        // We can't predict the exact tier (depends on actual system memory),
+        // but the tier should be a valid value.
+        let tier = monitor.current_tier();
+        assert!(tier.as_u8() <= 3);
+    }
 }

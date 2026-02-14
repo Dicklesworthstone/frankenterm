@@ -186,4 +186,181 @@ mod tests {
             prop_assert_eq!(scan.logical_line_count(bytes), text.lines().count());
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Edge cases: empty and single-byte inputs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_input_yields_zero_metrics() {
+        let scan = scan_newlines_and_ansi(b"");
+        assert_eq!(scan.newline_count, 0);
+        assert_eq!(scan.ansi_byte_count, 0);
+        assert_eq!(scan.logical_line_count(b""), 0);
+        assert!(scan.ansi_density(0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn single_newline() {
+        let scan = scan_newlines_and_ansi(b"\n");
+        assert_eq!(scan.newline_count, 1);
+        assert_eq!(scan.ansi_byte_count, 0);
+        // "\n".lines().count() == 0 but our semantic: trailing-\n means newline_count lines.
+        assert_eq!(scan.logical_line_count(b"\n"), 1);
+    }
+
+    #[test]
+    fn single_esc_byte_counted_as_ansi() {
+        let scan = scan_newlines_and_ansi(b"\x1b");
+        assert_eq!(scan.ansi_byte_count, 1);
+        assert_eq!(scan.newline_count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // ANSI escape edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn incomplete_csi_at_end_stays_in_escape() {
+        // ESC [ without a final byte — the entire sequence is counted as ANSI bytes.
+        let data = b"hello\x1b[";
+        let scan = scan_newlines_and_ansi(data);
+        // ESC and '[' are both counted.
+        assert_eq!(scan.ansi_byte_count, 2);
+    }
+
+    #[test]
+    fn csi_with_parameters_counts_all_ansi_bytes() {
+        // ESC [ 3 8 ; 5 ; 1 9 6 m  => CSI with extended color
+        let data = b"\x1b[38;5;196m";
+        let scan = scan_newlines_and_ansi(data);
+        // All bytes from ESC to 'm' inclusive.
+        assert_eq!(scan.ansi_byte_count, data.len());
+    }
+
+    #[test]
+    fn back_to_back_escape_sequences() {
+        // Two complete CSI sequences: ESC[1m (bold) + ESC[0m (reset)
+        let data = b"\x1b[1m\x1b[0m";
+        let scan = scan_newlines_and_ansi(data);
+        // ESC[1m = 4 bytes, ESC[0m = 4 bytes
+        assert_eq!(scan.ansi_byte_count, 8);
+        assert_eq!(scan.newline_count, 0);
+    }
+
+    #[test]
+    fn esc_followed_by_single_letter_is_two_byte_sequence() {
+        // ESC M (reverse index) — single-char final byte.
+        let data = b"\x1bM";
+        let scan = scan_newlines_and_ansi(data);
+        assert_eq!(scan.ansi_byte_count, 2);
+    }
+
+    #[test]
+    fn newline_inside_ansi_gap_counted_separately() {
+        // Newline between two escape sequences.
+        let data = b"\x1b[1m\nhello\x1b[0m";
+        let scan = scan_newlines_and_ansi(data);
+        assert_eq!(scan.newline_count, 1);
+        assert_eq!(scan.ansi_byte_count, 8); // 4 + 4
+    }
+
+    // -----------------------------------------------------------------------
+    // Logical line count edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn all_newlines_input() {
+        let data = b"\n\n\n\n\n";
+        let scan = scan_newlines_and_ansi(data);
+        assert_eq!(scan.newline_count, 5);
+        assert_eq!(scan.logical_line_count(data), 5);
+    }
+
+    #[test]
+    fn text_without_trailing_newline_gets_extra_line() {
+        let data = b"line1\nline2";
+        let scan = scan_newlines_and_ansi(data);
+        assert_eq!(scan.newline_count, 1);
+        assert_eq!(scan.logical_line_count(data), 2);
+    }
+
+    #[test]
+    fn text_with_trailing_newline_no_extra_line() {
+        let data = b"line1\nline2\n";
+        let scan = scan_newlines_and_ansi(data);
+        assert_eq!(scan.newline_count, 2);
+        assert_eq!(scan.logical_line_count(data), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // ANSI density calculations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn all_ansi_input_density_is_one() {
+        let data = b"\x1b[0m";
+        let scan = scan_newlines_and_ansi(data);
+        assert_eq!(scan.ansi_byte_count, data.len());
+        assert!((scan.ansi_density(data.len()) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ansi_density_mixed_content() {
+        // "hi" + ESC[0m = 2 plain + 4 ANSI = 6 total, density = 4/6
+        let data = b"hi\x1b[0m";
+        let scan = scan_newlines_and_ansi(data);
+        assert_eq!(scan.ansi_byte_count, 4);
+        let expected_density = 4.0 / 6.0;
+        assert!((scan.ansi_density(data.len()) - expected_density).abs() < 1e-10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Scalar/memchr parity on crafted inputs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scalar_and_memchr_agree_on_dense_ansi() {
+        // Dense ANSI: alternating escape sequences and text
+        let mut data = Vec::new();
+        for i in 0..100 {
+            data.extend_from_slice(b"\x1b[");
+            data.extend_from_slice(format!("{i}").as_bytes());
+            data.push(b'm');
+            data.extend_from_slice(b"txt\n");
+        }
+        let fast = scan_newlines_and_ansi_memchr(&data);
+        let scalar = scan_newlines_and_ansi_scalar(&data);
+        assert_eq!(fast, scalar);
+    }
+
+    #[test]
+    fn scalar_and_memchr_agree_on_binary_noise() {
+        // All byte values 0..=255 repeated
+        let data: Vec<u8> = (0..=255u8).collect();
+        let fast = scan_newlines_and_ansi_memchr(&data);
+        let scalar = scan_newlines_and_ansi_scalar(&data);
+        assert_eq!(fast, scalar);
+    }
+
+    #[test]
+    fn scalar_and_memchr_agree_on_only_esc_bytes() {
+        let data = vec![0x1b; 256];
+        let fast = scan_newlines_and_ansi_memchr(&data);
+        let scalar = scan_newlines_and_ansi_scalar(&data);
+        assert_eq!(fast, scalar);
+        // Each ESC starts escape mode; next ESC restarts. All bytes are ANSI.
+        assert_eq!(fast.ansi_byte_count, 256);
+    }
+
+    // -----------------------------------------------------------------------
+    // OutputScanMetrics Default
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metrics_default_is_zero() {
+        let m = OutputScanMetrics::default();
+        assert_eq!(m.newline_count, 0);
+        assert_eq!(m.ansi_byte_count, 0);
+    }
 }
