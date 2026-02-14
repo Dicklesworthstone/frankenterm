@@ -9,6 +9,15 @@
 //! - **upsert_pane p95 < 1ms** (metadata write)
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use frankenterm_core::recorder_storage::{
+    AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
+    RecorderStorage,
+};
+use frankenterm_core::recording::{
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
+    RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
+};
+use frankenterm_core::search::SearchMode;
 use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};
 #[cfg(feature = "distributed")]
 use frankenterm_core::wire_protocol::{
@@ -39,6 +48,22 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "upsert_pane_p95",
         budget: "p95 < 1ms (metadata write)",
+    },
+    bench_common::BenchBudget {
+        name: "recorder_append_log_profile/append_batch_cycle",
+        budget: "append-log backend sustains swarm-shaped batch ingest cycles across 8/24/48 pane synthetic workloads",
+    },
+    bench_common::BenchBudget {
+        name: "recorder_swarm_load_profile/ingest_index_query_cycle",
+        budget: "sustained ingest + index-health + lexical/hybrid query cycle remains within interactive bounds at 8/24/48 pane concurrency",
+    },
+    bench_common::BenchBudget {
+        name: "recorder_swarm_load_profile/indexing_lag",
+        budget: "trigger-driven indexing keeps lag (total_segments-total_fts_rows) at 0 under steady-state load",
+    },
+    bench_common::BenchBudget {
+        name: "recorder_swarm_load_profile/hybrid_query_latency",
+        budget: "hybrid query latency stays in the same order of magnitude as lexical query during ingest pressure",
     },
     bench_common::BenchBudget {
         name: "aggregator_merge_single_agent/bench_aggregator_merge_single_agent",
@@ -90,6 +115,49 @@ fn test_pane(pane_id: u64) -> PaneRecord {
         observed: true,
         ignore_reason: None,
         last_decision_at: None,
+    }
+}
+
+fn append_log_config(path: &std::path::Path) -> AppendLogStorageConfig {
+    AppendLogStorageConfig {
+        data_path: path.join("recorder-events.log"),
+        state_path: path.join("recorder-state.json"),
+        queue_capacity: 1024,
+        max_batch_events: 8192,
+        max_batch_bytes: 8 * 1024 * 1024,
+        max_idempotency_entries: 2048,
+    }
+}
+
+fn bench_recorder_event(
+    pane_id: u64,
+    sequence: u64,
+    cycle: u64,
+    event_idx: usize,
+) -> RecorderEvent {
+    let ts = u64::try_from(now_ms()).unwrap_or_default();
+    RecorderEvent {
+        schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+        event_id: format!("bench-recorder-{pane_id}-{cycle}-{event_idx}"),
+        pane_id,
+        session_id: Some("bench-session".to_string()),
+        workflow_id: Some("bench-workflow".to_string()),
+        correlation_id: Some(format!("cycle-{cycle}")),
+        source: RecorderEventSource::RobotMode,
+        occurred_at_ms: ts,
+        recorded_at_ms: ts,
+        sequence,
+        causality: RecorderEventCausality {
+            parent_event_id: None,
+            trigger_event_id: None,
+            root_event_id: None,
+        },
+        payload: RecorderEventPayload::IngressText {
+            text: format!("LOAD_QUERY_MARKER pane={pane_id} cycle={cycle} event={event_idx}"),
+            encoding: RecorderTextEncoding::Utf8,
+            redaction: RecorderRedactionLevel::None,
+            ingress_kind: RecorderIngressKind::SendText,
+        },
     }
 }
 
@@ -394,7 +462,199 @@ fn bench_append_scaling(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Group 6: Aggregator merge/persist/query benchmarks (distributed feature)
+// Group 6: Recorder append-log baseline profile (minimal backend)
+// ---------------------------------------------------------------------------
+
+fn bench_recorder_append_log_profile(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("recorder_append_log_profile");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(15));
+
+    // (pane_count, events_per_pane, label)
+    let scenarios: &[(u64, usize, &str)] = &[(8, 32, "8x32"), (24, 24, "24x24"), (48, 16, "48x16")];
+
+    for &(pane_count, events_per_pane, label) in scenarios {
+        let dir = TempDir::new().expect("create temp dir");
+        let storage =
+            AppendLogRecorderStorage::open(append_log_config(dir.path())).expect("open append-log");
+        let cycle_counter = std::sync::atomic::AtomicU64::new(0);
+        let events_per_cycle = pane_count.saturating_mul(events_per_pane as u64);
+        group.throughput(Throughput::Elements(events_per_cycle));
+
+        group.bench_with_input(
+            BenchmarkId::new("append_batch_cycle", label),
+            &(pane_count, events_per_pane),
+            |b, &(pane_count, events_per_pane)| {
+                b.to_async(&rt).iter(|| {
+                    let storage_ref = &storage;
+                    let cycle = cycle_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async move {
+                        let mut events =
+                            Vec::with_capacity((pane_count as usize) * events_per_pane);
+                        let mut sequence: u64 = cycle.saturating_mul(events_per_cycle);
+                        for pane_id in 1..=pane_count {
+                            for event_idx in 0..events_per_pane {
+                                events.push(bench_recorder_event(
+                                    pane_id, sequence, cycle, event_idx,
+                                ));
+                                sequence = sequence.saturating_add(1);
+                            }
+                        }
+
+                        let append_started = std::time::Instant::now();
+                        let response = storage_ref
+                            .append_batch(AppendRequest {
+                                batch_id: format!("append-log-{cycle}"),
+                                events,
+                                required_durability: DurabilityLevel::Appended,
+                                producer_ts_ms: u64::try_from(now_ms()).unwrap_or_default(),
+                            })
+                            .await
+                            .expect("append batch");
+                        let append_elapsed = append_started.elapsed();
+
+                        let health_started = std::time::Instant::now();
+                        let health = storage_ref.health().await;
+                        let health_elapsed = health_started.elapsed();
+
+                        black_box((
+                            append_elapsed,
+                            health_elapsed,
+                            response.accepted_count,
+                            health,
+                        ));
+                    }
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Group 7: Recorder swarm-load profile (ingest/index lag/query latency)
+// ---------------------------------------------------------------------------
+
+fn bench_recorder_swarm_load_profile(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("recorder_swarm_load_profile");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(20));
+
+    // (pane_count, events_per_pane, label)
+    let scenarios: &[(u64, usize, &str)] = &[(8, 32, "8x32"), (24, 24, "24x24"), (48, 16, "48x16")];
+
+    for &(pane_count, events_per_pane, label) in scenarios {
+        let (_dir, db_path) = temp_db();
+        let storage = rt.block_on(async {
+            let s = StorageHandle::new(&db_path).await.expect("create storage");
+            for pane_id in 1..=pane_count {
+                s.upsert_pane(test_pane(pane_id))
+                    .await
+                    .expect("upsert pane");
+            }
+            s
+        });
+
+        let round = std::sync::atomic::AtomicU64::new(0);
+        let events_per_cycle = pane_count.saturating_mul(events_per_pane as u64);
+        group.throughput(Throughput::Elements(events_per_cycle));
+
+        group.bench_with_input(
+            BenchmarkId::new("ingest_index_query_cycle", label),
+            &(pane_count, events_per_pane),
+            |b, &(pane_count, events_per_pane)| {
+                b.to_async(&rt).iter(|| {
+                    let storage_ref = &storage;
+                    let cycle = round.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async move {
+                        let ingest_started = std::time::Instant::now();
+                        for pane_id in 1..=pane_count {
+                            for event_idx in 0..events_per_pane {
+                                let content = format!(
+                                    "LOAD_QUERY_MARKER pane={pane_id} cycle={cycle} event={event_idx}"
+                                );
+                                let segment = storage_ref
+                                    .append_segment(pane_id, &content, None)
+                                    .await
+                                    .expect("append segment");
+
+                                // Keep semantic lane warm without embedding every single row.
+                                if event_idx == 0 && pane_id % 4 == 1 {
+                                    let pane_component = pane_id as f32 / pane_count as f32;
+                                    storage_ref
+                                        .store_embedding_f32(
+                                            segment.id,
+                                            "swarm-bench",
+                                            &[1.0, pane_component],
+                                        )
+                                        .await
+                                        .expect("store embedding");
+                                }
+                            }
+                        }
+                        let ingest_elapsed = ingest_started.elapsed();
+
+                        let index_started = std::time::Instant::now();
+                        let indexing_health = storage_ref
+                            .get_indexing_health()
+                            .await
+                            .expect("indexing health");
+                        let index_elapsed = index_started.elapsed();
+                        let indexing_lag = indexing_health
+                            .total_segments
+                            .saturating_sub(indexing_health.total_fts_rows);
+
+                        let lexical_opts = SearchOptions {
+                            limit: Some(20),
+                            include_snippets: Some(false),
+                            ..Default::default()
+                        };
+                        let lexical_started = std::time::Instant::now();
+                        let lexical_hits = storage_ref
+                            .search_with_options("LOAD_QUERY_MARKER", lexical_opts.clone())
+                            .await
+                            .expect("lexical search");
+                        let lexical_elapsed = lexical_started.elapsed();
+
+                        let hybrid_started = std::time::Instant::now();
+                        let hybrid_bundle = storage_ref
+                            .hybrid_search_with_results(
+                                "LOAD_QUERY_MARKER",
+                                lexical_opts,
+                                "swarm-bench",
+                                &[1.0, 0.25],
+                                SearchMode::Hybrid,
+                                60,
+                            )
+                            .await
+                            .expect("hybrid search");
+                        let hybrid_elapsed = hybrid_started.elapsed();
+
+                        black_box((
+                            ingest_elapsed,
+                            index_elapsed,
+                            indexing_lag,
+                            lexical_elapsed,
+                            hybrid_elapsed,
+                            lexical_hits.len(),
+                            hybrid_bundle.results.len(),
+                        ));
+                    }
+                });
+            },
+        );
+
+        rt.block_on(storage.shutdown()).expect("shutdown");
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Group 8: Aggregator merge/persist/query benchmarks (distributed feature)
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "distributed")]
@@ -641,6 +901,8 @@ criterion_group!(
         bench_fts_regression,
         bench_upsert_pane,
         bench_append_scaling,
+        bench_recorder_append_log_profile,
+        bench_recorder_swarm_load_profile,
         bench_aggregator_merge_single_agent,
         bench_aggregator_merge_multi_agent,
         bench_aggregator_persist_latency,
