@@ -19,7 +19,7 @@ ft get-text <pane_id> [--escapes]   # stub (not yet implemented)
 ### Search and events
 
 ```bash
-ft search "<fts query>" [--pane <id>] [--limit <n>] [--since <epoch_ms>]
+ft search "<fts query>" [--pane <id>] [--limit <n>] [--since <epoch_ms>] [--until <epoch_ms>] [--mode <lexical|semantic|hybrid>]
 ft query "<fts query>"             # alias for ft search
 ft events [--unhandled] [--pane-id <id>] [--rule-id <id>] [--event-type <type>]
 ft events annotate <event_id> --note "<text>" [--by <actor>]
@@ -149,7 +149,7 @@ ft robot state [--domain <name>] [--agent <type>]
 ft robot get-text <pane_id> [--tail <n>] [--escapes]
 ft robot send <pane_id> "<text>" [--dry-run] [--wait-for "<pat>"] [--timeout-secs <n>]
 ft robot wait-for <pane_id> "<pat>" [--timeout-secs <n>] [--regex]
-ft robot search "<fts query>" [--pane <id>] [--since <epoch_ms>] [--limit <n>]
+ft robot search "<fts query>" [--pane <id>] [--since <epoch_ms>] [--until <epoch_ms>] [--limit <n>] [--snippets[=<true|false>]] [--mode <lexical|semantic|hybrid>]
 ft robot events [--unhandled] [--pane <id>] [--rule-id <id>] [--event-type <type>] [--triage-state <state>] [--label <label>]
 ft robot events annotate <event_id> --note "<text>" [--by <actor>]
 ft robot events annotate <event_id> --clear [--by <actor>]

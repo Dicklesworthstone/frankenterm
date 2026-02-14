@@ -3,7 +3,7 @@
 Date: 2026-02-14  
 Author: `MaroonGlacier` (interim pass; based on prior scaffold by `GentleBrook`)  
 Parent track: `wa-1u90p.1`  
-Status: In progress, dependency-bound. This revision sharpens code-linked attribution and sequencing while final numeric calibration remains blocked by `wa-1u90p.1.3`.
+Status: In progress, dependency-bound. Compile and scenario replay blockers from `wa-1u90p.1.3` are cleared; this revision adds fresh timeline rollups and narrows remaining closure gap to live lock/memory percentile capture.
 
 ## Scope
 This dossier is the source of truth for ranking and sequencing resize/reflow interventions.  
@@ -82,9 +82,29 @@ Unblocked prework/implementation guidance now:
 3. Add instrumentation-backed evidence capture templates to avoid ad-hoc profiling outputs.
 
 Still blocked for final closeout of `wa-1u90p.1.5`:
-1. Final lock contention + memory growth attribution from `wa-1u90p.1.3`.
-2. Consolidated tiered percentile rollups (`R1..R4`) for `M1`/`M2`.
-3. Artifact incidence trend lines mapped to `M3`.
+1. Final lock contention + memory growth attribution from live runtime telemetry in `wa-1u90p.1.3`.
+2. Artifact incidence trend lines mapped to `M3` budgets for repeated long-haul runs.
+
+### Fresh quantitative baseline rollup (2026-02-14)
+
+Source:
+
+- `evidence/wa-1u90p.1.3/summaries/resize_baseline_timeline_rollup_2026-02-14.json`
+
+This rollup now provides consolidated stage percentiles/maxima and queue-depth peaks across all canonical baseline fixtures:
+
+| Scenario | Events | Queue max before | `logical_reflow.p95_ns` | `logical_reflow.max_ns` | `presentation.p95_ns` | `presentation.max_ns` |
+|---|---:|---:|---:|---:|---:|---:|
+| `resize_single_pane_scrollback` | 8 | 8 | 3,000 | 3,766,917 | 4,458 | 234,708 |
+| `resize_multi_tab_storm` | 24 | 24 | 285,833 | 325,917 | 12,875 | 15,750 |
+| `font_churn_multi_pane` | 24 | 24 | 190,834 | 216,084 | 8,792 | 10,708 |
+| `mixed_scale_soak` | 28 | 28 | 530,000 | 671,167 | 38,875 | 118,250 |
+
+Operational interpretation:
+
+- `logical_reflow` remains the dominant latency lane (`B2`) in every scenario.
+- `resize_single_pane_scrollback` carries the largest isolated spike (`3,766,917 ns`), indicating an outlier-heavy path.
+- `mixed_scale_soak` has the heaviest sustained tail pressure (`logical_reflow.p95=530,000 ns`, highest multi-pane presentation tails), making it the best near-term gating workload for intervention A/B comparisons.
 
 ### Latest `wa-1u90p.1.3` intake (2026-02-14)
 Primary report received:
@@ -94,19 +114,28 @@ Bundle received:
 - `evidence/wa-1u90p.1.3/summaries/simulate_cli_parse.log`
 - `evidence/wa-1u90p.1.3/summaries/simulation_harness_build.log`
 - `evidence/wa-1u90p.1.3/summaries/simulation_harness_build_error_summary.txt`
+- `evidence/wa-1u90p.1.3/summaries/simulate_cli_parse_2026-02-14.log`
+- `evidence/wa-1u90p.1.3/summaries/simulation_resize_suite_no_run_2026-02-14.log`
+- `evidence/wa-1u90p.1.3/summaries/resize_single_pane_timeline.json`
+- `evidence/wa-1u90p.1.3/summaries/resize_multi_tab_storm_timeline.json`
+- `evidence/wa-1u90p.1.3/summaries/font_churn_multi_pane_timeline.json`
+- `evidence/wa-1u90p.1.3/summaries/mixed_scale_soak_timeline.json`
+- `evidence/wa-1u90p.1.3/summaries/resize_baseline_timeline_rollup_2026-02-14.json`
 - `evidence/wa-1u90p.1.3/summaries/runtime_lock_memory_telemetry_refs.txt`
 - `evidence/wa-1u90p.1.3/summaries/localpane_resize_telemetry_refs.txt`
 - `evidence/wa-1u90p.1.3/summaries/docs_cross_refs.txt`
 
-Interim blocker categories from this intake:
-- Baseline CLI replay mismatch: `generate_scrollback` action rejected in current `ft simulate run` path.
-- Harness compile blockers prevent fresh percentile extraction:
-  - `E0308` (20): `std::time::Instant` vs `tokio::time::Instant`
-  - `E0277` (6): `u64: FromSql` gaps in search vector store paths
-  - `E0609` (1): missing `RuntimeHandle` field
-  - `E0658` (1): const-trait call restriction
+Historical blocker categories from earlier intake are now resolved:
 
-Implication: ranking confidence for `B1`/`B2`/`B3` remains partially evidence-bound until these blockers clear and scenario percentile exports are rerun.
+- Baseline CLI replay mismatch (`generate_scrollback`) was caused by stale binary invocation and is cleared when running current source via `cargo run -p frankenterm -- simulate ...`.
+- Harness compile blockers that previously prevented percentile extraction (`E0308`/`E0277`/`E0609`/`E0658` classes) are cleared in current checks.
+
+Current blocker status (verified 2026-02-14):
+- `CARGO_TARGET_DIR=target-violetdune cargo check --all-targets` succeeds.
+- `CARGO_TARGET_DIR=target-violetdune cargo test -p frankenterm-core --test simulation_resize_suite -- --nocapture` succeeds (`4/4`).
+- `CARGO_TARGET_DIR=target-violetdune cargo run -p frankenterm -- simulate run fixtures/simulations/resize_baseline/resize_single_pane_scrollback.yaml --json` succeeds (includes `GenerateScrollback` events).
+
+Implication: ranking confidence for `B1`/`B2`/`B3` is no longer blocked by replay/compile failures; remaining uncertainty is concentrated in live lock/memory growth curves (`B5`) and long-haul artifact incidence trends.
 
 ## Closure Artifact Contract (Must-Have)
 - Per workload class (`R1..R4`) p50/p95/p99 for end-to-end resize interaction latency.
@@ -134,3 +163,5 @@ cargo test -p frankenterm-core warning_threshold_fires -- --nocapture
 - 2026-02-13: Initial scaffold with scoring rubric and first-pass ranking.
 - 2026-02-14: Interim dependency-aware ranking update with code-linked evidence map, clarified blocked/unblocked sequencing, and explicit closure artifact contract.
 - 2026-02-14 (later): Incorporated fresh `wa-1u90p.1.3` artifact intake and explicit blocker taxonomy from profiling handoff.
+- 2026-02-14 (latest): Added post-unblock verification artifacts showing simulation harness compile path is green; narrowed active blocker set to scenario replay schema mismatch.
+- 2026-02-14 (latest+1): Added consolidated 4-scenario timeline rollup with queue-depth and stage-tail metrics; updated blocker model to focus on remaining live lock/memory percentile capture.

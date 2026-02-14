@@ -100,7 +100,7 @@ All tools accept an optional `format?: "json" | "toon"` parameter (default: `jso
   - Params: `{ pane_id: u64, pattern: string, timeout_secs?: u64=30, tail?: u64=200, regex?: bool=false }`
 
 - `wa.search`
-  - Params: `{ query: string, limit?: u64=20, pane?: u64, since?: i64, snippets?: bool=false }`
+  - Params: `{ query: string, limit?: u64=20, pane?: u64, since?: i64, until?: i64, snippets?: bool=true, mode?: "lexical"|"semantic"|"hybrid"="lexical" }`
 
 - `wa.events`
   - Params: `{ limit?: u64=20, pane?: u64, rule_id?: string, event_type?: string, triage_state?: string, label?: string, unhandled?: bool=false, since?: i64, would_handle?: bool=false, dry_run?: bool=false }`

@@ -35,6 +35,15 @@
     "since_filter": {
       "type": "integer",
       "description": "If set, results were filtered to segments after this timestamp (epoch ms)"
+    },
+    "until_filter": {
+      "type": "integer",
+      "description": "If set, results were filtered to segments before this timestamp (epoch ms)"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["lexical", "semantic", "hybrid"],
+      "description": "Search mode used for query execution"
     }
   },
   "additionalProperties": false,
