@@ -138,6 +138,22 @@ contract fixture for transitions and cancellation semantics. It validates:
 - storm coalescing where only latest intent commits
 - stale-commit prevention via boundary cancellation
 
+## Executable Invariant Contract
+
+The state machine contract is additionally enforced through executable
+invariant checks in `crates/frankenterm-core/src/resize_invariants.rs`:
+
+- `check_scheduler_snapshot_invariants(...)`
+- `check_lifecycle_event_invariants(...)`
+
+These are exercised against real scheduler outputs in:
+
+- `crates/frankenterm-core/tests/resize_invariant_contract.rs`
+
+This keeps the ADR normative while ensuring status/debug surfaces remain
+machine-checkable for monotonicity, stage/detail alignment, and aggregate
+snapshot consistency.
+
 ## Downstream Usage
 
 This ADR is normative for:
@@ -146,4 +162,3 @@ This ADR is normative for:
 - `wa-1u90p.2.3` (global scheduler work classes)
 - `wa-1u90p.5.1` and `wa-1u90p.5.7` (async LocalPane resize + lock graph)
 - `wa-1u90p.6.1` (enforceable invariants)
-

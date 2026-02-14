@@ -1259,6 +1259,7 @@ impl ResizeScheduler {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn evaluate_invariants(
         &self,
         snapshot: &ResizeSchedulerSnapshot,
