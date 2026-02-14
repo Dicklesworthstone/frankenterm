@@ -452,3 +452,283 @@ proptest! {
             "posterior should have all {} states, got {}", PaneState::COUNT, result.posterior.len());
     }
 }
+
+// =============================================================================
+// Property: PaneState — name, Display, serde, Clone
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn state_name_non_empty(state in arb_state()) {
+        prop_assert!(!state.name().is_empty());
+    }
+
+    #[test]
+    fn state_display_non_empty(state in arb_state()) {
+        let display = format!("{}", state);
+        prop_assert!(!display.is_empty());
+    }
+
+    #[test]
+    fn state_debug_non_empty(state in arb_state()) {
+        let debug = format!("{:?}", state);
+        prop_assert!(!debug.is_empty());
+    }
+
+    #[test]
+    fn state_serde_roundtrip(state in arb_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let back: PaneState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(state, back);
+    }
+
+    #[test]
+    fn state_clone_preserves(state in arb_state()) {
+        let cloned = state;
+        prop_assert_eq!(state, cloned);
+        prop_assert_eq!(state.index(), cloned.index());
+    }
+}
+
+// =============================================================================
+// Property: PaneState — ALL constant and COUNT
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    #[test]
+    fn state_all_has_count_elements(_dummy in 0..1u8) {
+        prop_assert_eq!(PaneState::ALL.len(), PaneState::COUNT);
+    }
+
+    #[test]
+    fn state_all_indices_unique(_dummy in 0..1u8) {
+        let mut indices: Vec<usize> = PaneState::ALL.iter().map(|s| s.index()).collect();
+        indices.sort();
+        indices.dedup();
+        prop_assert_eq!(indices.len(), PaneState::COUNT);
+    }
+
+    #[test]
+    fn state_all_names_unique(_dummy in 0..1u8) {
+        let mut names: Vec<&str> = PaneState::ALL.iter().map(|s| s.name()).collect();
+        names.sort();
+        names.dedup();
+        prop_assert_eq!(names.len(), PaneState::COUNT);
+    }
+}
+
+// =============================================================================
+// Property: Evidence — Clone, Debug, serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn evidence_debug_non_empty(ev in arb_evidence()) {
+        let debug = format!("{:?}", ev);
+        prop_assert!(!debug.is_empty());
+    }
+
+    #[test]
+    fn evidence_serde_roundtrip(ev in arb_evidence()) {
+        let json = serde_json::to_string(&ev).unwrap();
+        let _back: Evidence = serde_json::from_str(&json).unwrap();
+        // Just verify deserialization succeeds — f64 precision loss in JSON
+        // means re-serialization may differ at the last digit
+        prop_assert!(!json.is_empty());
+    }
+
+    #[test]
+    fn evidence_clone_stable(ev in arb_evidence()) {
+        let cloned = ev.clone();
+        let json1 = serde_json::to_string(&ev).unwrap();
+        let json2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+}
+
+// =============================================================================
+// Property: LedgerConfig — Clone, Debug, serde, default
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    #[test]
+    fn config_clone_preserves(
+        min_obs in 1_usize..20,
+        bf_thresh in 1.0_f64..100.0,
+        alpha in 0.1_f64..10.0,
+        max_entries in 10_usize..500,
+    ) {
+        let config = LedgerConfig {
+            min_observations: min_obs,
+            bayes_factor_threshold: bf_thresh,
+            dirichlet_alpha: alpha,
+            max_ledger_entries: max_entries,
+        };
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.min_observations, config.min_observations);
+        prop_assert!((cloned.bayes_factor_threshold - config.bayes_factor_threshold).abs() < f64::EPSILON);
+        prop_assert!((cloned.dirichlet_alpha - config.dirichlet_alpha).abs() < f64::EPSILON);
+        prop_assert_eq!(cloned.max_ledger_entries, config.max_ledger_entries);
+    }
+
+    #[test]
+    fn config_serde_roundtrip(
+        min_obs in 1_usize..20,
+        bf_thresh in 1.0_f64..100.0,
+        alpha in 0.1_f64..10.0,
+        max_entries in 10_usize..500,
+    ) {
+        let config = LedgerConfig {
+            min_observations: min_obs,
+            bayes_factor_threshold: bf_thresh,
+            dirichlet_alpha: alpha,
+            max_ledger_entries: max_entries,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: LedgerConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.min_observations, config.min_observations);
+        prop_assert_eq!(back.max_ledger_entries, config.max_ledger_entries);
+    }
+
+    #[test]
+    fn config_debug_contains_type(
+        min_obs in 1_usize..20,
+    ) {
+        let config = LedgerConfig {
+            min_observations: min_obs,
+            ..Default::default()
+        };
+        let debug = format!("{:?}", config);
+        prop_assert!(debug.contains("LedgerConfig"));
+    }
+
+    #[test]
+    fn config_default_known_values(_dummy in 0..1u8) {
+        let c = LedgerConfig::default();
+        prop_assert!(c.min_observations > 0);
+        prop_assert!(c.bayes_factor_threshold > 0.0);
+        prop_assert!(c.dirichlet_alpha > 0.0);
+        prop_assert!(c.max_ledger_entries > 0);
+    }
+}
+
+// =============================================================================
+// Property: Classification — confident flag and bayes_factor consistency
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn classification_confident_implies_high_bf(
+        evidence in proptest::collection::vec(arb_evidence(), 5..30),
+    ) {
+        let config = LedgerConfig {
+            min_observations: 1,
+            ..Default::default()
+        };
+        let mut clf = BayesianClassifier::new(config.clone());
+        for ev in &evidence {
+            clf.update(1, ev.clone());
+        }
+        let result = clf.classify(1).unwrap();
+        if result.confident {
+            prop_assert!(result.bayes_factor >= config.bayes_factor_threshold,
+                "confident=true but bf {} < threshold {}", result.bayes_factor, config.bayes_factor_threshold);
+        }
+    }
+
+    #[test]
+    fn classification_result_has_valid_state(
+        evidence in proptest::collection::vec(arb_evidence(), 1..10),
+    ) {
+        let mut clf = BayesianClassifier::new(LedgerConfig::default());
+        for ev in evidence {
+            clf.update(1, ev);
+        }
+        let result = clf.classify(1).unwrap();
+        // Classification should be one of the known states
+        prop_assert!(PaneState::from_index(result.classification.index()).is_some());
+    }
+}
+
+// =============================================================================
+// Property: Snapshot — config preserved, counts match
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn snapshot_config_preserved(
+        max_entries in 10_usize..100,
+    ) {
+        let config = LedgerConfig {
+            max_ledger_entries: max_entries,
+            ..Default::default()
+        };
+        let mut clf = BayesianClassifier::new(config.clone());
+        clf.update(1, Evidence::OutputRate(5.0));
+        let snap = clf.snapshot();
+        prop_assert_eq!(snap.config.max_ledger_entries, max_entries);
+    }
+
+    #[test]
+    fn snapshot_feedback_count_matches(
+        n in 1_usize..20,
+    ) {
+        let mut clf = BayesianClassifier::new(LedgerConfig::default());
+        for _ in 0..n {
+            clf.record_feedback(1, PaneState::Active);
+        }
+        let snap = clf.snapshot();
+        prop_assert_eq!(snap.feedback_count, n as u64);
+    }
+
+    #[test]
+    fn snapshot_serde_roundtrip(
+        n_panes in 1_usize..5,
+    ) {
+        let mut clf = BayesianClassifier::new(LedgerConfig::default());
+        for id in 0..n_panes as u64 {
+            clf.update(id, Evidence::OutputRate(5.0));
+        }
+        let snap = clf.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: frankenterm_core::bayesian_ledger::ClassifierSnapshot =
+            serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_count, snap.pane_count);
+        prop_assert_eq!(back.panes.len(), snap.panes.len());
+    }
+}
+
+// =============================================================================
+// Property: Remove non-existent pane is no-op
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn remove_nonexistent_noop(pane_id in 100_u64..200) {
+        let mut clf = BayesianClassifier::new(LedgerConfig::default());
+        clf.update(1, Evidence::OutputRate(5.0));
+        let count_before = clf.pane_count();
+        clf.remove_pane(pane_id); // doesn't exist
+        prop_assert_eq!(clf.pane_count(), count_before);
+    }
+
+    #[test]
+    fn classify_unknown_pane_returns_none(pane_id in 100_u64..200) {
+        let clf = BayesianClassifier::new(LedgerConfig::default());
+        prop_assert!(clf.classify(pane_id).is_none());
+    }
+}

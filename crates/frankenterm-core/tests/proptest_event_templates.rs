@@ -417,3 +417,251 @@ fn rendered_event_from_fallback_has_info_severity() {
     let rendered = registry.render(&event);
     assert_eq!(rendered.severity, Severity::Info);
 }
+
+// =========================================================================
+// EventTemplate — Clone, Debug
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn prop_template_clone_preserves(
+        event_type in "[a-z.]{3,15}",
+        summary in "[A-Za-z ]{3,20}",
+        description in "[A-Za-z ]{3,30}",
+        sev in arb_severity(),
+    ) {
+        let t = EventTemplate::new(&event_type, &summary, &description, sev);
+        let cloned = t.clone();
+        prop_assert_eq!(&cloned.event_type, &t.event_type);
+        prop_assert_eq!(&cloned.summary, &t.summary);
+        prop_assert_eq!(&cloned.description, &t.description);
+        prop_assert_eq!(cloned.severity, t.severity);
+        prop_assert_eq!(cloned.context_keys.len(), t.context_keys.len());
+        prop_assert_eq!(cloned.suggestions.len(), t.suggestions.len());
+    }
+
+    #[test]
+    fn prop_template_debug_non_empty(
+        event_type in "[a-z.]{3,15}",
+        sev in arb_severity(),
+    ) {
+        let t = EventTemplate::new(&event_type, "s", "d", sev);
+        let debug = format!("{:?}", t);
+        prop_assert!(!debug.is_empty());
+    }
+}
+
+// =========================================================================
+// ContextKey — Clone, Debug, fields
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn prop_context_key_clone(
+        key in "[a-z_]{3,10}",
+        desc in "[A-Za-z ]{3,20}",
+        example in "[a-z0-9]{3,10}",
+    ) {
+        let k = ContextKey::new(&key, &desc, &example);
+        let cloned = k.clone();
+        prop_assert_eq!(&cloned.key, &k.key);
+        prop_assert_eq!(&cloned.description, &k.description);
+        prop_assert_eq!(&cloned.example, &k.example);
+    }
+
+    #[test]
+    fn prop_context_key_debug(
+        key in "[a-z_]{3,10}",
+    ) {
+        let k = ContextKey::new(&key, "desc", "example");
+        let debug = format!("{:?}", k);
+        prop_assert!(!debug.is_empty());
+    }
+}
+
+// =========================================================================
+// Suggestion — Clone, Debug
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn prop_suggestion_clone(text in "[A-Za-z ]{3,20}") {
+        let s = Suggestion::text(&text);
+        let cloned = s.clone();
+        prop_assert_eq!(&cloned.text, &s.text);
+        prop_assert_eq!(&cloned.command, &s.command);
+        prop_assert_eq!(&cloned.doc_link, &s.doc_link);
+    }
+
+    #[test]
+    fn prop_suggestion_debug(text in "[A-Za-z ]{3,20}") {
+        let s = Suggestion::text(&text);
+        let debug = format!("{:?}", s);
+        prop_assert!(!debug.is_empty());
+    }
+
+    #[test]
+    fn prop_suggestion_with_both(
+        text in "[A-Za-z ]{3,20}",
+        cmd in "[a-z ]{3,20}",
+        doc in "[a-z./:]{5,30}",
+    ) {
+        let s1 = Suggestion::with_command(&text, &cmd);
+        let s2 = Suggestion::with_doc(&text, &doc);
+        // with_command sets command, not doc_link
+        prop_assert!(s1.command.is_some());
+        prop_assert!(s1.doc_link.is_none());
+        // with_doc sets doc_link, not command
+        prop_assert!(s2.command.is_none());
+        prop_assert!(s2.doc_link.is_some());
+    }
+}
+
+// =========================================================================
+// RenderedEvent — Clone, Debug, non-empty fields
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn prop_rendered_clone(event in arb_stored_event()) {
+        let registry = TemplateRegistry::new(HashMap::new(), make_fallback_template());
+        let rendered = registry.render(&event);
+        let cloned = rendered.clone();
+        prop_assert_eq!(&cloned.summary, &rendered.summary);
+        prop_assert_eq!(&cloned.description, &rendered.description);
+        prop_assert_eq!(cloned.severity, rendered.severity);
+        prop_assert_eq!(cloned.suggestions.len(), rendered.suggestions.len());
+    }
+
+    #[test]
+    fn prop_rendered_debug(event in arb_stored_event()) {
+        let registry = TemplateRegistry::new(HashMap::new(), make_fallback_template());
+        let rendered = registry.render(&event);
+        let debug = format!("{:?}", rendered);
+        prop_assert!(!debug.is_empty());
+    }
+
+    #[test]
+    fn prop_rendered_summary_non_empty(event in arb_stored_event()) {
+        let registry = TemplateRegistry::new(HashMap::new(), make_fallback_template());
+        let rendered = registry.render(&event);
+        prop_assert!(!rendered.summary.is_empty(), "summary should be non-empty");
+        prop_assert!(!rendered.description.is_empty(), "description should be non-empty");
+    }
+}
+
+// =========================================================================
+// TemplateRegistry — Clone, Debug, multiple templates
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn prop_registry_clone(
+        event_types in prop::collection::vec("[a-z.]{3,15}", 1..5),
+    ) {
+        let mut templates = HashMap::new();
+        for et in &event_types {
+            templates.insert(
+                et.clone(),
+                EventTemplate::new(et, "summary", "desc", Severity::Info),
+            );
+        }
+        let registry = TemplateRegistry::new(templates, make_fallback_template());
+        let cloned = registry.clone();
+        for et in &event_types {
+            prop_assert_eq!(registry.has_template(et), cloned.has_template(et));
+        }
+    }
+
+    #[test]
+    fn prop_registry_debug(
+        n in 0_usize..3,
+    ) {
+        let mut templates = HashMap::new();
+        for i in 0..n {
+            let et = format!("type.{}", i);
+            templates.insert(
+                et.clone(),
+                EventTemplate::new(&et, "s", "d", Severity::Info),
+            );
+        }
+        let registry = TemplateRegistry::new(templates, make_fallback_template());
+        let debug = format!("{:?}", registry);
+        prop_assert!(!debug.is_empty());
+    }
+
+    #[test]
+    fn prop_registry_get_returns_correct_template(
+        event_type in "[a-z.]{3,15}",
+        summary in "[A-Za-z]{3,15}",
+    ) {
+        let template = EventTemplate::new(&event_type, &summary, "desc", Severity::Warning);
+        let mut templates = HashMap::new();
+        templates.insert(event_type.clone(), template);
+        let registry = TemplateRegistry::new(templates, make_fallback_template());
+        let got = registry.get(&event_type);
+        prop_assert_eq!(&got.event_type, &event_type);
+        prop_assert_eq!(&got.summary, &summary);
+    }
+
+    #[test]
+    fn prop_registry_get_unknown_returns_fallback(
+        unknown_type in "[a-z]{10,20}",
+    ) {
+        let registry = TemplateRegistry::new(HashMap::new(), make_fallback_template());
+        let got = registry.get(&unknown_type);
+        prop_assert_eq!(&got.event_type, "fallback");
+    }
+}
+
+// =========================================================================
+// Severity — serde roundtrip
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn prop_severity_serde_roundtrip(sev in arb_severity()) {
+        let json = serde_json::to_string(&sev).unwrap();
+        let back: Severity = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(sev, back);
+    }
+
+    #[test]
+    fn prop_severity_debug(sev in arb_severity()) {
+        let debug = format!("{:?}", sev);
+        prop_assert!(!debug.is_empty());
+    }
+}
+
+// =========================================================================
+// Global registry
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    #[test]
+    fn prop_global_registry_exists(_dummy in 0..1u8) {
+        // get_event_template should not panic for unknown types
+        let t = frankenterm_core::event_templates::get_event_template("nonexistent.type");
+        prop_assert!(!t.event_type.is_empty());
+    }
+
+    #[test]
+    fn prop_render_event_global(event in arb_stored_event()) {
+        let rendered = frankenterm_core::event_templates::render_event(&event);
+        prop_assert!(!rendered.summary.is_empty());
+    }
+}
