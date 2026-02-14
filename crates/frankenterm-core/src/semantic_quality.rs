@@ -454,4 +454,287 @@ mod tests {
         let parsed: SemanticQualityReport = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.summary.total_queries, report.summary.total_queries);
     }
+
+    // -----------------------------------------------------------------------
+    // RankingMetrics defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ranking_metrics_default_is_zeroed() {
+        let m = RankingMetrics::default();
+        assert!(m.precision_at_k.abs() < f64::EPSILON);
+        assert!(m.recall_at_k.abs() < f64::EPSILON);
+        assert!(m.ndcg_at_k.abs() < f64::EPSILON);
+        assert!(m.mrr.abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // RegressionThresholds defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn regression_thresholds_default_values() {
+        let t = RegressionThresholds::default();
+        assert!(t.min_hybrid_ndcg_delta_vs_lexical.abs() < f64::EPSILON);
+        assert!((t.min_hybrid_precision_at_k - 0.25).abs() < f64::EPSILON);
+        assert!((t.min_hybrid_recall_at_k - 0.25).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // ranked_ids helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ranked_ids_truncates_to_top_k() {
+        let ranked = vec![(1, 0.9), (2, 0.8), (3, 0.7), (4, 0.6)];
+        let ids = ranked_ids(&ranked, 2);
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn ranked_ids_deduplicates() {
+        let ranked = vec![(1, 0.9), (1, 0.85), (2, 0.8), (2, 0.7), (3, 0.6)];
+        let ids = ranked_ids(&ranked, 3);
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn ranked_ids_empty_input() {
+        let ids = ranked_ids(&[], 5);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn ranked_ids_top_k_larger_than_input() {
+        let ranked = vec![(1, 0.9), (2, 0.8)];
+        let ids = ranked_ids(&ranked, 10);
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_metrics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_metrics_perfect_ranking() {
+        let relevant: HashSet<u64> = [1, 2, 3].into_iter().collect();
+        let ranked = vec![1, 2, 3];
+        let m = compute_metrics(&ranked, &relevant, 3);
+        assert!((m.precision_at_k - 1.0).abs() < f64::EPSILON);
+        assert!((m.recall_at_k - 1.0).abs() < f64::EPSILON);
+        assert!((m.ndcg_at_k - 1.0).abs() < f64::EPSILON);
+        assert!((m.mrr - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_metrics_no_relevant_hits() {
+        let relevant: HashSet<u64> = [10, 20].into_iter().collect();
+        let ranked = vec![1, 2, 3];
+        let m = compute_metrics(&ranked, &relevant, 3);
+        assert!(m.precision_at_k.abs() < f64::EPSILON);
+        assert!(m.recall_at_k.abs() < f64::EPSILON);
+        assert!(m.ndcg_at_k.abs() < f64::EPSILON);
+        assert!(m.mrr.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_metrics_empty_relevant_set() {
+        let relevant: HashSet<u64> = HashSet::new();
+        let ranked = vec![1, 2, 3];
+        let m = compute_metrics(&ranked, &relevant, 3);
+        assert!(m.recall_at_k.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_metrics_empty_ranked() {
+        let relevant: HashSet<u64> = [1, 2].into_iter().collect();
+        let m = compute_metrics(&[], &relevant, 3);
+        assert!(m.precision_at_k.abs() < f64::EPSILON);
+        assert!(m.recall_at_k.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_metrics_top_k_zero_returns_default() {
+        let relevant: HashSet<u64> = [1].into_iter().collect();
+        let m = compute_metrics(&[1], &relevant, 0);
+        assert!(m.precision_at_k.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_metrics_mrr_first_hit_at_position_2() {
+        let relevant: HashSet<u64> = [2].into_iter().collect();
+        let ranked = vec![1, 2, 3]; // first relevant at idx 1 → MRR = 1/2
+        let m = compute_metrics(&ranked, &relevant, 3);
+        assert!((m.mrr - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_metrics_partial_recall() {
+        let relevant: HashSet<u64> = [1, 2, 3, 4].into_iter().collect();
+        let ranked = vec![1, 5, 3]; // 2 out of 4 relevant
+        let m = compute_metrics(&ranked, &relevant, 3);
+        assert!((m.recall_at_k - 0.5).abs() < f64::EPSILON);
+        assert!((m.precision_at_k - 2.0 / 3.0).abs() < 1e-10);
+    }
+
+    // -----------------------------------------------------------------------
+    // summarize
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_empty_queries() {
+        let s = summarize(&[]);
+        assert_eq!(s.total_queries, 0);
+        assert!(s.mean_hybrid_precision_at_k.abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_violations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn collect_violations_none_when_thresholds_met() {
+        let comparison = QueryComparison {
+            name: "test".to_string(),
+            description: String::new(),
+            top_k: 3,
+            lexical: LaneEvaluation {
+                ranked_ids: vec![1],
+                metrics: RankingMetrics::default(),
+            },
+            semantic: LaneEvaluation {
+                ranked_ids: vec![1],
+                metrics: RankingMetrics::default(),
+            },
+            hybrid: LaneEvaluation {
+                ranked_ids: vec![1],
+                metrics: RankingMetrics {
+                    precision_at_k: 0.5,
+                    recall_at_k: 0.5,
+                    ndcg_at_k: 0.5,
+                    mrr: 0.5,
+                },
+            },
+            hybrid_vs_lexical_ndcg_delta: 0.5,
+            hybrid_vs_semantic_ndcg_delta: 0.3,
+            hybrid_vs_lexical_precision_delta: 0.2,
+        };
+        let thresholds = RegressionThresholds::default();
+        let mut violations = Vec::new();
+        collect_violations(&comparison, &thresholds, &mut violations);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn collect_violations_detects_all_three_threshold_types() {
+        let comparison = QueryComparison {
+            name: "bad".to_string(),
+            description: String::new(),
+            top_k: 3,
+            lexical: LaneEvaluation {
+                ranked_ids: vec![],
+                metrics: RankingMetrics::default(),
+            },
+            semantic: LaneEvaluation {
+                ranked_ids: vec![],
+                metrics: RankingMetrics::default(),
+            },
+            hybrid: LaneEvaluation {
+                ranked_ids: vec![],
+                metrics: RankingMetrics {
+                    precision_at_k: 0.0,
+                    recall_at_k: 0.0,
+                    ndcg_at_k: 0.0,
+                    mrr: 0.0,
+                },
+            },
+            hybrid_vs_lexical_ndcg_delta: -1.0,
+            hybrid_vs_semantic_ndcg_delta: -1.0,
+            hybrid_vs_lexical_precision_delta: -1.0,
+        };
+        let thresholds = RegressionThresholds {
+            min_hybrid_ndcg_delta_vs_lexical: 0.0,
+            min_hybrid_precision_at_k: 0.25,
+            min_hybrid_recall_at_k: 0.25,
+        };
+        let mut violations = Vec::new();
+        collect_violations(&comparison, &thresholds, &mut violations);
+        assert_eq!(violations.len(), 3);
+        let metrics: Vec<&str> = violations.iter().map(|v| v.metric.as_str()).collect();
+        assert!(metrics.contains(&"hybrid_vs_lexical_ndcg_delta"));
+        assert!(metrics.contains(&"hybrid_precision_at_k"));
+        assert!(metrics.contains(&"hybrid_recall_at_k"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Harness configuration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn harness_with_rrf_k_produces_valid_reports() {
+        let queries = default_semantic_eval_queries();
+        let report_k1 = SemanticQualityHarness::new(queries.clone())
+            .with_rrf_k(1)
+            .run();
+        let report_k60 = SemanticQualityHarness::new(queries).with_rrf_k(60).run();
+        // Both should pass with default thresholds regardless of k.
+        assert!(report_k1.passed);
+        assert!(report_k60.passed);
+        assert_eq!(report_k1.summary.total_queries, 4);
+        assert_eq!(report_k60.summary.total_queries, 4);
+    }
+
+    #[test]
+    fn harness_empty_queries_passes() {
+        let report = SemanticQualityHarness::new(vec![]).run();
+        assert!(report.passed);
+        assert_eq!(report.summary.total_queries, 0);
+        assert!(report.violations.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Serde roundtrip for data types
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn semantic_eval_query_serde_roundtrip() {
+        let query = SemanticEvalQuery {
+            name: "test".to_string(),
+            description: "desc".to_string(),
+            lexical_ranked: vec![(1, 0.9), (2, 0.8)],
+            semantic_ranked: vec![(3, 0.95)],
+            relevant_ids: vec![1, 3],
+            top_k: 2,
+        };
+        let json = serde_json::to_string(&query).unwrap();
+        let back: SemanticEvalQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "test");
+        assert_eq!(back.top_k, 2);
+        assert_eq!(back.relevant_ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn threshold_violation_serde_roundtrip() {
+        let v = ThresholdViolation {
+            query: "q1".to_string(),
+            metric: "precision".to_string(),
+            actual: 0.1,
+            required: 0.5,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: ThresholdViolation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.query, "q1");
+        assert!((back.actual - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn default_eval_queries_are_nonempty() {
+        let queries = default_semantic_eval_queries();
+        assert!(!queries.is_empty());
+        for q in &queries {
+            assert!(!q.name.is_empty());
+            assert!(q.top_k > 0);
+            assert!(!q.relevant_ids.is_empty());
+        }
+    }
 }
