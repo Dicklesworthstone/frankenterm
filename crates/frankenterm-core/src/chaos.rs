@@ -526,7 +526,7 @@ fn epoch_ms() -> u64 {
 
 /// Pre-built chaos scenarios for common resilience tests.
 pub mod scenarios {
-    use super::*;
+    use super::{ChaosAssertion, ChaosScenario, FaultMode, FaultPoint};
 
     /// Scenario 1: Database writes fail repeatedly.
     ///

@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use crate::runtime_compat::mpsc;
@@ -946,7 +946,8 @@ pub enum PollOutcome {
 // ---------------------------------------------------------------------------
 
 /// Capture mode for a pane — either polling-based or streaming-based.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TailerMode {
     /// Traditional get_text polling with adaptive intervals.
     Polling,
@@ -1006,6 +1007,8 @@ pub struct StreamingBridge {
     /// Aggregate dirty row count observed from render-change deltas.
     dirty_row_total: u64,
 }
+
+static GLOBAL_STREAMING_HEALTH: OnceLock<StdRwLock<Option<StreamingHealth>>> = OnceLock::new();
 
 impl StreamingBridge {
     /// Create a new streaming bridge.
@@ -1071,12 +1074,15 @@ impl StreamingBridge {
             }
         };
 
-        self.ingester.process(event)
+        let segments = self.ingester.process(event);
+        StreamingHealth::update_global(self.snapshot_health());
+        segments
     }
 
     /// Record that a fallback to polling occurred.
     pub fn record_fallback(&mut self) {
         self.fallback_count += 1;
+        StreamingHealth::update_global(self.snapshot_health());
     }
 
     /// Number of events processed.
@@ -1108,6 +1114,18 @@ impl StreamingBridge {
     pub fn ingester(&self) -> &crate::ingest::StreamIngester {
         &self.ingester
     }
+
+    fn snapshot_health(&self) -> StreamingHealth {
+        StreamingHealth {
+            mode: TailerMode::Streaming,
+            events_processed: self.events_processed,
+            dirty_ranges_total: self.dirty_range_total,
+            dirty_rows_total: self.dirty_row_total,
+            gaps_emitted: self.ingester.total_gaps(),
+            fallback_count: self.fallback_count,
+            active_panes: self.ingester.active_panes(),
+        }
+    }
 }
 
 impl Default for StreamingBridge {
@@ -1117,7 +1135,7 @@ impl Default for StreamingBridge {
 }
 
 /// Health snapshot for streaming diagnostics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StreamingHealth {
     /// Current capture mode.
     pub mode: TailerMode,
@@ -1133,6 +1151,23 @@ pub struct StreamingHealth {
     pub fallback_count: u64,
     /// Active panes in the streaming ingester.
     pub active_panes: usize,
+}
+
+impl StreamingHealth {
+    /// Update the latest global streaming health snapshot.
+    pub fn update_global(snapshot: Self) {
+        let lock = GLOBAL_STREAMING_HEALTH.get_or_init(|| StdRwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = Some(snapshot);
+        }
+    }
+
+    /// Get the latest global streaming health snapshot.
+    #[must_use]
+    pub fn get_global() -> Option<Self> {
+        let lock = GLOBAL_STREAMING_HEALTH.get_or_init(|| StdRwLock::new(None));
+        lock.read().ok().and_then(|guard| guard.clone())
+    }
 }
 
 #[cfg(test)]

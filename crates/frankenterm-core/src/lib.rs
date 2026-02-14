@@ -60,7 +60,6 @@ pub mod build_coord;
 pub mod cass;
 pub mod causal_dag;
 pub mod caut;
-#[cfg(test)]
 pub mod chaos;
 pub mod circuit_breaker;
 pub mod cleanup;
