@@ -584,3 +584,453 @@ proptest! {
         prop_assert_eq!(&event.schema_version, RECORDER_EVENT_SCHEMA_VERSION_V1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// RecorderEvent: Clone and Debug
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn recorder_event_clone_preserves(
+        pane_id in arb_pane_id(),
+        seq in 0u64..1000,
+        ts in arb_timestamp(),
+        source in arb_event_source(),
+        payload in arb_payload(),
+    ) {
+        let event = make_event_for_prop(pane_id, seq, ts, source, payload);
+        let cloned = event.clone();
+        prop_assert_eq!(&cloned.event_id, &event.event_id);
+        prop_assert_eq!(cloned.pane_id, event.pane_id);
+        prop_assert_eq!(cloned.sequence, event.sequence);
+        prop_assert_eq!(cloned.occurred_at_ms, event.occurred_at_ms);
+        prop_assert_eq!(cloned.recorded_at_ms, event.recorded_at_ms);
+        prop_assert_eq!(&cloned.schema_version, &event.schema_version);
+        prop_assert_eq!(&cloned.session_id, &event.session_id);
+    }
+
+    #[test]
+    fn recorder_event_debug_non_empty(
+        pane_id in arb_pane_id(),
+        ts in arb_timestamp(),
+    ) {
+        let event = make_event_for_prop(
+            pane_id, 0, ts,
+            RecorderEventSource::RobotMode,
+            RecorderEventPayload::IngressText {
+                text: "debug".into(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                ingress_kind: RecorderIngressKind::SendText,
+            },
+        );
+        let debug = format!("{:?}", event);
+        prop_assert!(!debug.is_empty());
+        prop_assert!(debug.contains("RecorderEvent"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RecorderEventSource: Clone, Debug, serde
+// ---------------------------------------------------------------------------
+
+fn arb_all_sources() -> impl Strategy<Value = RecorderEventSource> {
+    prop_oneof![
+        Just(RecorderEventSource::WeztermMux),
+        Just(RecorderEventSource::RobotMode),
+        Just(RecorderEventSource::WorkflowEngine),
+        Just(RecorderEventSource::OperatorAction),
+        Just(RecorderEventSource::RecoveryFlow),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn recorder_event_source_clone_eq(src in arb_all_sources()) {
+        let cloned = src;
+        prop_assert_eq!(src, cloned);
+    }
+
+    #[test]
+    fn recorder_event_source_debug(src in arb_all_sources()) {
+        let debug = format!("{:?}", src);
+        prop_assert!(!debug.is_empty());
+    }
+
+    #[test]
+    fn recorder_event_source_serde_roundtrip(src in arb_all_sources()) {
+        let json = serde_json::to_string(&src).unwrap();
+        let back: RecorderEventSource = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(src, back);
+    }
+
+    #[test]
+    fn recorder_event_source_serde_snake_case(src in arb_all_sources()) {
+        let json = serde_json::to_string(&src).unwrap();
+        let inner = json.trim_matches('"');
+        prop_assert!(
+            inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "serialized source '{}' should be snake_case", inner
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RecorderEventCausality: Clone, Debug, serde
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn causality_clone_preserves(
+        parent in proptest::option::of("[a-f0-9]{16}"),
+        trigger in proptest::option::of("[a-f0-9]{16}"),
+        root in proptest::option::of("[a-f0-9]{16}"),
+    ) {
+        let causality = RecorderEventCausality {
+            parent_event_id: parent.clone(),
+            trigger_event_id: trigger.clone(),
+            root_event_id: root.clone(),
+        };
+        let cloned = causality.clone();
+        prop_assert_eq!(&cloned.parent_event_id, &causality.parent_event_id);
+        prop_assert_eq!(&cloned.trigger_event_id, &causality.trigger_event_id);
+        prop_assert_eq!(&cloned.root_event_id, &causality.root_event_id);
+    }
+
+    #[test]
+    fn causality_serde_roundtrip(
+        parent in proptest::option::of("[a-f0-9]{16}"),
+        trigger in proptest::option::of("[a-f0-9]{16}"),
+    ) {
+        let causality = RecorderEventCausality {
+            parent_event_id: parent,
+            trigger_event_id: trigger,
+            root_event_id: None,
+        };
+        let json = serde_json::to_string(&causality).unwrap();
+        let back: RecorderEventCausality = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.parent_event_id, &causality.parent_event_id);
+        prop_assert_eq!(&back.trigger_event_id, &causality.trigger_event_id);
+        prop_assert_eq!(&back.root_event_id, &causality.root_event_id);
+    }
+
+    #[test]
+    fn causality_debug_non_empty(
+        parent in proptest::option::of("[a-f0-9]{16}"),
+    ) {
+        let causality = RecorderEventCausality {
+            parent_event_id: parent,
+            trigger_event_id: None,
+            root_event_id: None,
+        };
+        let debug = format!("{:?}", causality);
+        prop_assert!(!debug.is_empty());
+        prop_assert!(debug.contains("RecorderEventCausality"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RecorderEventPayload: Clone and serde
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn payload_clone_preserves(payload in arb_payload()) {
+        let cloned = payload.clone();
+        prop_assert_eq!(cloned, payload);
+    }
+
+    #[test]
+    fn ingress_payload_serde_roundtrip(
+        text in arb_text(),
+    ) {
+        let payload = RecorderEventPayload::IngressText {
+            text,
+            encoding: RecorderTextEncoding::Utf8,
+            redaction: RecorderRedactionLevel::None,
+            ingress_kind: RecorderIngressKind::SendText,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let back: RecorderEventPayload = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn egress_payload_serde_roundtrip(
+        text in arb_text(),
+        is_gap in any::<bool>(),
+    ) {
+        let payload = RecorderEventPayload::EgressOutput {
+            text,
+            encoding: RecorderTextEncoding::Utf8,
+            redaction: RecorderRedactionLevel::None,
+            segment_kind: if is_gap { RecorderSegmentKind::Gap } else { RecorderSegmentKind::Delta },
+            is_gap,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let back: RecorderEventPayload = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, payload);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enum serde roundtrips: encoding, redaction, ingress kind, segment kind
+// ---------------------------------------------------------------------------
+
+fn arb_encoding() -> impl Strategy<Value = RecorderTextEncoding> {
+    Just(RecorderTextEncoding::Utf8)
+}
+
+fn arb_redaction() -> impl Strategy<Value = RecorderRedactionLevel> {
+    prop_oneof![
+        Just(RecorderRedactionLevel::None),
+        Just(RecorderRedactionLevel::Partial),
+        Just(RecorderRedactionLevel::Full),
+    ]
+}
+
+fn arb_ingress_kind() -> impl Strategy<Value = RecorderIngressKind> {
+    prop_oneof![
+        Just(RecorderIngressKind::SendText),
+        Just(RecorderIngressKind::Paste),
+        Just(RecorderIngressKind::WorkflowAction),
+    ]
+}
+
+fn arb_segment_kind() -> impl Strategy<Value = RecorderSegmentKind> {
+    prop_oneof![
+        Just(RecorderSegmentKind::Delta),
+        Just(RecorderSegmentKind::Gap),
+        Just(RecorderSegmentKind::Snapshot),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn encoding_serde_roundtrip(e in arb_encoding()) {
+        let json = serde_json::to_string(&e).unwrap();
+        let back: RecorderTextEncoding = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(e, back);
+    }
+
+    #[test]
+    fn redaction_serde_roundtrip(r in arb_redaction()) {
+        let json = serde_json::to_string(&r).unwrap();
+        let back: RecorderRedactionLevel = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(r, back);
+    }
+
+    #[test]
+    fn ingress_kind_serde_roundtrip(k in arb_ingress_kind()) {
+        let json = serde_json::to_string(&k).unwrap();
+        let back: RecorderIngressKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(k, back);
+    }
+
+    #[test]
+    fn segment_kind_serde_roundtrip(k in arb_segment_kind()) {
+        let json = serde_json::to_string(&k).unwrap();
+        let back: RecorderSegmentKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(k, back);
+    }
+
+    #[test]
+    fn redaction_serde_snake_case(r in arb_redaction()) {
+        let json = serde_json::to_string(&r).unwrap();
+        let inner = json.trim_matches('"');
+        prop_assert!(
+            inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "redaction '{}' should be snake_case", inner
+        );
+    }
+
+    #[test]
+    fn segment_kind_serde_snake_case(k in arb_segment_kind()) {
+        let json = serde_json::to_string(&k).unwrap();
+        let inner = json.trim_matches('"');
+        prop_assert!(
+            inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "segment kind '{}' should be snake_case", inner
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RecorderEvent JSON structure
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn recorder_event_json_has_expected_fields(
+        pane_id in arb_pane_id(),
+        seq in 0u64..100,
+        ts in arb_timestamp(),
+    ) {
+        let event = make_event_for_prop(
+            pane_id, seq, ts,
+            RecorderEventSource::RobotMode,
+            RecorderEventPayload::IngressText {
+                text: "fields".into(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                ingress_kind: RecorderIngressKind::SendText,
+            },
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert!(obj.contains_key("schema_version"));
+        prop_assert!(obj.contains_key("event_id"));
+        prop_assert!(obj.contains_key("pane_id"));
+        prop_assert!(obj.contains_key("source"));
+        prop_assert!(obj.contains_key("occurred_at_ms"));
+        prop_assert!(obj.contains_key("sequence"));
+        // Flattened payload field
+        prop_assert!(obj.contains_key("event_type"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InvariantCheckerConfig: defaults and construction
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    #[test]
+    fn invariant_checker_default_config(_dummy in 0..1u8) {
+        let config = InvariantCheckerConfig::default();
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+    }
+
+    #[test]
+    fn invariant_checker_accepts_single_event(
+        pane_id in arb_pane_id(),
+        ts in arb_timestamp(),
+    ) {
+        let event = make_event_for_prop(
+            pane_id, 0, ts,
+            RecorderEventSource::RobotMode,
+            RecorderEventPayload::IngressText {
+                text: "single".into(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                ingress_kind: RecorderIngressKind::SendText,
+            },
+        );
+        let config = InvariantCheckerConfig {
+            check_merge_order: true,
+            check_causality: false,
+            expected_schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        let report = checker.check(&[event]);
+        prop_assert!(report.passed, "single event should pass: {:?}", report.violations);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SequenceAssigner: additional invariants
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// First assignment for any pane starts at sequence 0.
+    #[test]
+    fn sequence_assigner_starts_at_zero(pane_id in arb_pane_id()) {
+        let assigner = SequenceAssigner::new();
+        let (pane_seq, _global) = assigner.assign(pane_id);
+        prop_assert_eq!(pane_seq, 0, "first pane_seq should be 0, got {}", pane_seq);
+    }
+
+    /// Multiple panes have independent per-pane counters.
+    #[test]
+    fn sequence_assigner_independent_panes(
+        p1 in 0u64..10,
+        p2 in 10u64..20,
+        n in 1usize..10,
+    ) {
+        let assigner = SequenceAssigner::new();
+        // Assign n to pane p1
+        for _ in 0..n {
+            assigner.assign(p1);
+        }
+        // First assignment to p2 should still be 0 (independent counter)
+        let (pane_seq, _) = assigner.assign(p2);
+        prop_assert_eq!(pane_seq, 0,
+            "first seq for pane {} should be 0 after {} assigns to pane {}", p2, n, p1);
+    }
+
+    /// Global sequence is always >= pane sequence.
+    #[test]
+    fn sequence_assigner_global_gte_pane(
+        schedule in prop::collection::vec(arb_pane_id(), 1..50),
+    ) {
+        let assigner = SequenceAssigner::new();
+        for &pane_id in &schedule {
+            let (pane_seq, global_seq) = assigner.assign(pane_id);
+            prop_assert!(global_seq >= pane_seq,
+                "global {} < pane {} for pane_id {}", global_seq, pane_seq, pane_id);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Merge key: antisymmetry
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn merge_key_antisymmetric(
+        p1 in arb_pane_id(),
+        p2 in arb_pane_id(),
+        s1 in 0u64..100,
+        s2 in 0u64..100,
+        ts1 in arb_timestamp(),
+        ts2 in arb_timestamp(),
+    ) {
+        let e1 = make_event_for_prop(
+            p1, s1, ts1,
+            RecorderEventSource::RobotMode,
+            RecorderEventPayload::IngressText {
+                text: "a".into(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                ingress_kind: RecorderIngressKind::SendText,
+            },
+        );
+        let e2 = make_event_for_prop(
+            p2, s2, ts2,
+            RecorderEventSource::RobotMode,
+            RecorderEventPayload::IngressText {
+                text: "b".into(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                ingress_kind: RecorderIngressKind::SendText,
+            },
+        );
+        let k1 = RecorderMergeKey::from_event(&e1);
+        let k2 = RecorderMergeKey::from_event(&e2);
+        // Antisymmetry: if k1 <= k2 and k2 <= k1, then k1 == k2
+        if k1 <= k2 && k2 <= k1 {
+            prop_assert_eq!(&k1, &k2, "antisymmetry violated");
+        }
+    }
+}

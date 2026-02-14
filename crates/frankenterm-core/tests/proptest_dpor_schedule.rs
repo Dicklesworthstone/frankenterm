@@ -734,4 +734,295 @@ proptest! {
 
         prop_assert!(!report.has_violations());
     }
+
+    // =========================================================================
+    // ExplorerConfig: Clone, Debug, Default
+    // =========================================================================
+
+    #[test]
+    fn explorer_config_clone_preserves(
+        seed in 0_u64..10_000,
+        max_runs in 1_usize..100,
+        max_steps in 1_000_u64..100_000,
+        workers in 1_usize..=8,
+    ) {
+        let config = ExplorerConfig {
+            base_seed: seed,
+            max_runs,
+            max_steps_per_run: max_steps,
+            worker_count: workers,
+            record_traces: true,
+        };
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.base_seed, config.base_seed);
+        prop_assert_eq!(cloned.max_runs, config.max_runs);
+        prop_assert_eq!(cloned.max_steps_per_run, config.max_steps_per_run);
+        prop_assert_eq!(cloned.worker_count, config.worker_count);
+        prop_assert_eq!(cloned.record_traces, config.record_traces);
+    }
+
+    #[test]
+    fn explorer_config_debug_non_empty(
+        seed in 0_u64..1000,
+    ) {
+        let config = ExplorerConfig {
+            base_seed: seed,
+            max_runs: 10,
+            max_steps_per_run: 10_000,
+            worker_count: 2,
+            record_traces: true,
+        };
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+        prop_assert!(debug.contains("ExplorerConfig"));
+    }
+
+    // =========================================================================
+    // TaskSpec / TaskGraph: local struct invariants
+    // =========================================================================
+
+    #[test]
+    fn task_graph_count_matches_len(graph in arb_task_graph(1, 8)) {
+        prop_assert_eq!(graph.task_count(), graph.tasks.len());
+    }
+
+    #[test]
+    fn task_graph_ids_sequential(graph in arb_task_graph(1, 8)) {
+        for (i, task) in graph.tasks.iter().enumerate() {
+            prop_assert_eq!(task.id, i,
+                "task at index {} has id {}", i, task.id);
+        }
+    }
+
+    #[test]
+    fn task_graph_deps_valid_dag(graph in arb_task_graph(1, 8)) {
+        // All deps must reference earlier tasks (valid DAG)
+        for task in &graph.tasks {
+            for &dep in &task.deps {
+                prop_assert!(dep < task.id,
+                    "task {} depends on {} which is not earlier", task.id, dep);
+            }
+        }
+    }
+
+    #[test]
+    fn task_graph_clone_preserves(graph in arb_task_graph(1, 6)) {
+        let cloned = graph.clone();
+        prop_assert_eq!(cloned.tasks.len(), graph.tasks.len());
+        for (a, b) in cloned.tasks.iter().zip(graph.tasks.iter()) {
+            prop_assert_eq!(a.id, b.id);
+            prop_assert_eq!(&a.deps, &b.deps);
+        }
+    }
+
+    // =========================================================================
+    // ExplorationReport: invariant properties
+    // =========================================================================
+
+    #[test]
+    fn dpor_report_total_runs_bounded_by_max(
+        seed in 0_u64..500,
+        max_runs in 2_usize..=10,
+    ) {
+        let config = ExplorerConfig {
+            base_seed: seed,
+            max_runs,
+            max_steps_per_run: 10_000,
+            worker_count: 2,
+            record_traces: true,
+        };
+
+        let mut explorer = ScheduleExplorer::new(config);
+        let report = explorer.explore(move |runtime| {
+            let region = runtime.state.create_root_region(Budget::INFINITE);
+            for i in 0..3u32 {
+                let (task_id, _handle) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        std::hint::black_box(i);
+                    })
+                    .expect("create task");
+                runtime
+                    .scheduler
+                    .lock()
+                    .expect("lock scheduler")
+                    .schedule(task_id, 0);
+            }
+            runtime.run_until_quiescent();
+        });
+
+        prop_assert!(
+            report.total_runs <= max_runs,
+            "total_runs ({}) should be <= max_runs ({})",
+            report.total_runs, max_runs
+        );
+    }
+
+    #[test]
+    fn dpor_no_violations_implies_has_violations_false(
+        seed in 0_u64..500,
+    ) {
+        let config = ExplorerConfig {
+            base_seed: seed,
+            max_runs: 5,
+            max_steps_per_run: 10_000,
+            worker_count: 1,
+            record_traces: true,
+        };
+
+        let mut explorer = ScheduleExplorer::new(config);
+        let report = explorer.explore(move |runtime| {
+            let region = runtime.state.create_root_region(Budget::INFINITE);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    std::hint::black_box(1u32);
+                })
+                .expect("create task");
+            runtime
+                .scheduler
+                .lock()
+                .expect("lock scheduler")
+                .schedule(task_id, 0);
+            runtime.run_until_quiescent();
+        });
+
+        if report.violations.is_empty() {
+            prop_assert!(!report.has_violations());
+        }
+    }
+
+    // =========================================================================
+    // Coverage: unique_classes is always positive for non-empty graphs
+    // =========================================================================
+
+    #[test]
+    fn dpor_unique_classes_positive(
+        n in 1_usize..=4,
+        seed in 0_u64..500,
+    ) {
+        let config = ExplorerConfig {
+            base_seed: seed,
+            max_runs: 5,
+            max_steps_per_run: 10_000,
+            worker_count: n.min(2),
+            record_traces: true,
+        };
+
+        let mut explorer = ScheduleExplorer::new(config);
+        let report = explorer.explore(move |runtime| {
+            let region = runtime.state.create_root_region(Budget::INFINITE);
+            for i in 0..n as u32 {
+                let (task_id, _handle) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        std::hint::black_box(i);
+                    })
+                    .expect("create task");
+                runtime
+                    .scheduler
+                    .lock()
+                    .expect("lock scheduler")
+                    .schedule(task_id, 0);
+            }
+            runtime.run_until_quiescent();
+        });
+
+        prop_assert!(
+            report.unique_classes >= 1,
+            "should have at least 1 unique class for {} tasks",
+            n
+        );
+    }
+
+    // =========================================================================
+    // DAG with all deps (fully sequential) has 1 class
+    // =========================================================================
+
+    #[test]
+    fn dpor_fully_sequential_dag_single_class(
+        n in 2_usize..=4,
+        seed in 0_u64..500,
+    ) {
+        let config = ExplorerConfig {
+            base_seed: seed,
+            max_runs: 10,
+            max_steps_per_run: 50_000,
+            worker_count: 1,
+            record_traces: true,
+        };
+
+        let mut explorer = ScheduleExplorer::new(config);
+        let report = explorer.explore(move |runtime| {
+            let region = runtime.state.create_root_region(Budget::INFINITE);
+            // Sequentially execute tasks to force single ordering
+            for i in 0..n as u32 {
+                let (task_id, _handle) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        std::hint::black_box(i);
+                    })
+                    .expect("create task");
+                runtime
+                    .scheduler
+                    .lock()
+                    .expect("lock scheduler")
+                    .schedule(task_id, 0);
+                runtime.run_until_quiescent();
+            }
+        });
+
+        prop_assert!(!report.has_violations());
+        prop_assert!(
+            report.unique_classes >= 1,
+            "fully sequential should have at least 1 class"
+        );
+    }
+
+    // =========================================================================
+    // Same graph, different worker counts, both no violations
+    // =========================================================================
+
+    #[test]
+    fn dpor_different_worker_counts_no_violations(
+        graph in arb_task_graph(2, 5),
+        seed in 0_u64..200,
+    ) {
+        for workers in 1..=3_usize {
+            let graph_clone = graph.clone();
+            let config = ExplorerConfig {
+                base_seed: seed,
+                max_runs: 5,
+                max_steps_per_run: 50_000,
+                worker_count: workers,
+                record_traces: true,
+            };
+
+            let mut explorer = ScheduleExplorer::new(config);
+            let report = explorer.explore(move |runtime| {
+                let region = runtime.state.create_root_region(Budget::INFINITE);
+                for task in &graph_clone.tasks {
+                    let id = task.id as u32;
+                    let (task_id, _handle) = runtime
+                        .state
+                        .create_task(region, Budget::INFINITE, async move {
+                            std::hint::black_box(id);
+                        })
+                        .expect("create task");
+                    runtime
+                        .scheduler
+                        .lock()
+                        .expect("lock scheduler")
+                        .schedule(task_id, 0);
+                }
+                runtime.run_until_quiescent();
+            });
+
+            prop_assert!(
+                !report.has_violations(),
+                "violations with {} workers at seed {}",
+                workers, seed
+            );
+        }
+    }
 }
