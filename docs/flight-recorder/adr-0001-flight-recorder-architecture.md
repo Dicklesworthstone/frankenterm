@@ -103,6 +103,8 @@ Primary bead mapping:
   - invariants/replay determinism
   - security/privacy regression suite
 - Rollout uses phase gates and rollback criteria, not big-bang enablement.
+- Phase-gate/rollback execution contract:
+  - `docs/flight-recorder/rollout-plan-wa-oegrb-8-1.md`
 
 Primary bead mapping:
 - Validation: `ft-oegrb.7.1`..`.7.6`
