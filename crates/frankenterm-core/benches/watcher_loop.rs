@@ -7,12 +7,12 @@
 //! - Watcher loop overhead (idle): **< 100µs per pane check**
 
 use base64::Engine as _;
-use criterion::black_box;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankenterm_core::config::{PaneFilterConfig, PaneFilterRule};
 use frankenterm_core::ingest::PaneFingerprint;
 use frankenterm_core::wezterm::PaneInfo;
 use serde::Deserialize;
+use std::hint::black_box;
 use std::process::Command;
 use std::time::Duration;
 

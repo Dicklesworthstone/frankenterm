@@ -9,12 +9,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::patterns::AgentType;
 use frankenterm_core::sharding::{
     AssignmentStrategy, ShardBackend, ShardId, ShardedWeztermClient, assign_pane_with_strategy,
 };
 use frankenterm_core::wezterm::{MockWezterm, WeztermHandle};
+use std::hint::black_box;
 
 mod bench_common;
 

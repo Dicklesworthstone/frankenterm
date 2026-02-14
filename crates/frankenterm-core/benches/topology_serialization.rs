@@ -6,10 +6,12 @@
 //! - JSON roundtrip: **< 50µs** per snapshot
 //! - Pane matching: **< 200µs** for 50-pane topology
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::session_topology::TopologySnapshot;
 use frankenterm_core::wezterm::{PaneInfo, PaneSize};
 use std::collections::HashMap;
+#[cfg(feature = "mcp-server")]
+use std::hint::black_box;
 
 #[cfg(feature = "mcp-server")]
 use serde_json::{Value, json};

@@ -8,7 +8,7 @@
 //! - **FTS search p95 < 15ms** (common query, DB ~100K segments)
 //! - **upsert_pane p95 < 1ms** (metadata write)
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
     RecorderStorage,
@@ -23,6 +23,7 @@ use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};
 use frankenterm_core::wire_protocol::{
     Aggregator, IngestResult, PaneDelta, WireEnvelope, WirePayload,
 };
+use std::hint::black_box;
 #[cfg(feature = "distributed")]
 use std::sync::Mutex;
 #[cfg(feature = "distributed")]

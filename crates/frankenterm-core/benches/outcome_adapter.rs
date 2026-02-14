@@ -6,11 +6,12 @@
 //! Target: zero measurable overhead (same order of magnitude as bare Result ops).
 
 use asupersync::{CancelKind, CancelReason, Outcome, PanicPayload, RegionId, Time};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use frankenterm_core::Error;
 use frankenterm_core::outcome::{
     FtOutcome, OutcomeExt, ResultExt, ft_outcome_to_result, ft_result_to_outcome,
 };
+use std::hint::black_box;
 
 fn test_cancel(kind: CancelKind) -> CancelReason {
     CancelReason {

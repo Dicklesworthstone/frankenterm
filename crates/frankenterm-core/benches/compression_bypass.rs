@@ -12,10 +12,11 @@ use std::time::Duration;
 use codec::{
     CODEC_VERSION, CompressionMode, GetCodecVersionResponse, Pdu, UnitResponse, WriteToPane,
 };
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::config::VendoredCompressionMode;
 use frankenterm_core::runtime_compat::timeout;
 use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig};
+use std::hint::black_box;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod bench_common;

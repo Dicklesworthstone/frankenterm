@@ -86,16 +86,16 @@ async fn connect_accept_once() -> io::Result<()> {
 
 async fn stream_throughput_once(
     payload_size: usize,
-    frames: usize,
-    framed: bool,
+    frame_count: usize,
+    use_framing: bool,
 ) -> io::Result<usize> {
     let (mut writer, mut reader) = tokio::net::UnixStream::pair()?;
     let payload = vec![0xA5u8; payload_size];
 
     let read_task = tokio::spawn(async move {
         let mut bytes_read = 0usize;
-        for _ in 0..frames {
-            if framed {
+        for _ in 0..frame_count {
+            if use_framing {
                 let mut len_buf = [0_u8; 4];
                 reader.read_exact(&mut len_buf).await?;
                 let frame_len = usize::try_from(u32::from_be_bytes(len_buf)).unwrap_or(0);
@@ -111,8 +111,8 @@ async fn stream_throughput_once(
         Ok::<usize, io::Error>(bytes_read)
     });
 
-    for _ in 0..frames {
-        if framed {
+    for _ in 0..frame_count {
+        if use_framing {
             let len = u32::try_from(payload_size)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "payload too large"))?;
             writer.write_all(&len.to_be_bytes()).await?;
