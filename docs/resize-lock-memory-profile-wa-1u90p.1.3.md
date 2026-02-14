@@ -23,6 +23,10 @@ Produce lock-contention and memory-attribution evidence for resize/reflow paths,
 - `evidence/wa-1u90p.1.3/summaries/mixed_scale_soak_timeline.json`
 - `evidence/wa-1u90p.1.3/summaries/resize_baseline_timeline_rollup_2026-02-14.json`
 - `evidence/wa-1u90p.1.3/summaries/runtime_lock_memory_telemetry_refs.txt`
+- `evidence/wa-1u90p.1.3/summaries/runtime_lock_memory_samples_2026-02-14T0625Z.jsonl`
+- `evidence/wa-1u90p.1.3/summaries/runtime_lock_memory_percentiles_2026-02-14T0625Z.json`
+- `evidence/wa-1u90p.1.3/summaries/runtime_lock_memory_samples_2026-02-14T0633Z.jsonl`
+- `evidence/wa-1u90p.1.3/summaries/runtime_lock_memory_percentiles_2026-02-14T0633Z.json`
 - `evidence/wa-1u90p.1.3/summaries/localpane_resize_telemetry_refs.txt`
 - `evidence/wa-1u90p.1.3/summaries/docs_cross_refs.txt`
 
@@ -155,8 +159,71 @@ From `frankenterm/mux/src/localpane.rs` and reference extract:
 
 This instrumentation is sufficient for per-phase lock attribution once harness execution is unblocked.
 
+## Live Runtime Lock/Memory Percentile Capture (2026-02-14, `CalmOwl`)
+
+Captured a timed sample window from the live watcher status surface:
+
+- command surface: `target-calmowl/debug/ft status --health -f json`
+- sampling window: 30 samples at 1s interval
+- watcher state: `watcher_running=true` for all samples
+- artifact files:
+  - `evidence/wa-1u90p.1.3/summaries/runtime_lock_memory_samples_2026-02-14T0625Z.jsonl`
+  - `evidence/wa-1u90p.1.3/summaries/runtime_lock_memory_percentiles_2026-02-14T0625Z.json`
+
+Observed percentile summary (from `runtime_lock_memory_percentiles_2026-02-14T0625Z.json`):
+
+| Metric | p50 | p95 | max |
+|---|---:|---:|---:|
+| `avg_storage_lock_wait_ms` | 0.001 | 0.001 | 0.001 |
+| `max_storage_lock_wait_ms` | 0.001 | 0.001 | 0.002 |
+| `storage_lock_contention_events` | 0 | 0 | 0 |
+| `avg_storage_lock_hold_ms` | 0.019 | 0.019 | 0.2667 |
+| `max_storage_lock_hold_ms` | 0.019 | 0.019 | 0.781 |
+| `cursor_snapshot_bytes_last` | 0 | 0 | 0 |
+| `cursor_snapshot_bytes_max` | 0 | 0 | 0 |
+| `avg_cursor_snapshot_bytes` | 0.0 | 0.0 | 0.0 |
+
+Environment caveat:
+
+- This sample window is runtime-valid but idle-biased: the watcher had no observed panes (`observed_panes=0`) because WezTerm CLI was unavailable in PATH on this host during capture.
+- Interpretation: this confirms the machine-readable telemetry export path and provides an idle baseline; active-pane percentile curves remain a follow-up capture requirement when WezTerm pane discovery is available.
+
+## Live Runtime Lock/Memory Percentile Capture (2026-02-14, `CloudyRaven`, active panes)
+
+Captured a second timed sample window after fixing WezTerm CLI discovery for this host.
+
+- command surface: `target-swiftdeer/debug/ft status --health -f json`
+- required environment for this host:
+  - `PATH=/Applications/WezTerm.app/Contents/MacOS:$PATH`
+  - `WEZTERM_UNIX_SOCKET=/Users/jemanuel/.local/share/wezterm/sock`
+- sampling window: 30 samples at 1s interval
+- watcher state: `watcher_running=true` for all samples
+- observed panes: `p50=12`, `p95=12`, `max=12`
+- artifact files:
+  - `evidence/wa-1u90p.1.3/summaries/runtime_lock_memory_samples_2026-02-14T0633Z.jsonl`
+  - `evidence/wa-1u90p.1.3/summaries/runtime_lock_memory_percentiles_2026-02-14T0633Z.json`
+
+Observed percentile summary (from `runtime_lock_memory_percentiles_2026-02-14T0633Z.json`):
+
+| Metric | p50 | p95 | max |
+|---|---:|---:|---:|
+| `avg_storage_lock_wait_ms` | 0.000975 | 0.001135 | 0.001135 |
+| `max_storage_lock_wait_ms` | 0.007 | 0.018 | 0.018 |
+| `storage_lock_contention_events` | 0 | 0 | 0 |
+| `avg_storage_lock_hold_ms` | 2.4145 | 2.8103 | 2.8103 |
+| `max_storage_lock_hold_ms` | 41.086 | 41.086 | 41.086 |
+| `cursor_snapshot_bytes_last` | 196452 | 198308 | 198308 |
+| `cursor_snapshot_bytes_max` | 196452 | 198308 | 198308 |
+| `avg_cursor_snapshot_bytes` | 98226.0 | 131586.6667 | 131586.6667 |
+
+Interpretation:
+
+- Active-pane telemetry export is now confirmed under real pane observation (`observed_panes=12`) rather than idle-only conditions.
+- This closes the environment/discovery blocker that previously forced `observed_panes=0` captures.
+- Remaining follow-up is workload-shaping (collecting additional windows during explicit resize storms) rather than telemetry path readiness.
+
 ## Immediate Next Steps
 
-1. Feed rollup metrics from `resize_baseline_timeline_rollup_2026-02-14.json` into `docs/resize-baseline-bottleneck-dossier.md` to update intervention ranking inputs for `wa-1u90p.1.5`.
-2. Add lock/memory percentile captures from live runtime telemetry surfaces (using existing runtime metrics fields) to complete the final lock/memory growth curve requirement for this bead.
+1. Repeat this capture during explicit resize-storm workloads (`R2`/`R4`) to compare against the active-pane baseline and capture stress deltas.
+2. Merge the active-pane percentile deltas into `docs/resize-baseline-bottleneck-dossier.md` and downgrade `B5` from discovery-blocked to stress-window refinement.
 3. Keep `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` issues tracked separately as repo-wide hygiene debt (not specific blockers for this profiling run).

@@ -2,7 +2,7 @@
 
 **Parent track:** `wa-1u90p.1`  
 **Related tasks:** `wa-1u90p.1.2`, `wa-1u90p.1.3`, `wa-1u90p.1.4`, `wa-1u90p.1.5`  
-**Status:** Candidate v1.0 (numeric contract frozen; refresh calibration pending `wa-1u90p.1.3` replay unblock)
+**Status:** Candidate v1.1 (numeric contract frozen; refresh calibration now pending live percentile capture from `wa-1u90p.1.3` telemetry surfaces)
 
 This document defines hard SLO targets and release gates for resize/reflow behavior.
 It is the authoritative baseline used by CI, soak, and go/no-go review for the zero-hitch resize program.
@@ -46,8 +46,8 @@ Workload classes map directly to deterministic scenarios in `docs/resize-baselin
 | Per-event resize latency | `ResizeTimelineEvent.total_duration_ns` from `execute_all_with_resize_timeline` | Programmatic/test harness using `Scenario::execute_all_with_resize_timeline` | Source of truth for M1 p50/p95/p99 |
 | Stage latency and queue attribution | `ResizeTimelineStageSample` + `ResizeQueueMetrics` + `ResizeTimeline::stage_summary()` | Programmatic/test harness | Stage names: `input_intent`, `scheduler_queueing`, `logical_reflow`, `render_prep`, `presentation` |
 | Flamegraph rows for attribution | `ResizeTimeline::flame_samples()` | Programmatic/test harness | Used for hotspot inspection and regression triage |
-| Lock contention and hold-time telemetry | `RuntimeMetrics::{avg,max}_storage_lock_wait_ms`, `storage_lock_contention_events`, `RuntimeMetrics::{avg,max}_storage_lock_hold_ms` in `crates/frankenterm-core/src/runtime.rs` | Runtime health snapshot path (`RuntimeHandle::update_health_snapshot`) | Current warning thresholds: wait `15.0ms`, hold `75.0ms` |
-| Cursor snapshot memory telemetry | `RuntimeMetrics::{cursor_snapshot_bytes_last,cursor_snapshot_bytes_max,avg_cursor_snapshot_bytes}` | Runtime health snapshot path | Current warning threshold: `64 MiB` |
+| Lock contention and hold-time telemetry | `RuntimeMetrics::{avg,p50,p95,max}_storage_lock_wait_ms`, `storage_lock_contention_events`, `RuntimeMetrics::{avg,p50,p95,max}_storage_lock_hold_ms` in `crates/frankenterm-core/src/runtime.rs` | Runtime health snapshot path (`RuntimeHandle::update_health_snapshot`) | Current warning thresholds: wait `15.0ms`, hold `75.0ms` |
+| Cursor snapshot memory telemetry | `RuntimeMetrics::{cursor_snapshot_bytes_last,p50_cursor_snapshot_bytes,p95_cursor_snapshot_bytes,cursor_snapshot_bytes_max,avg_cursor_snapshot_bytes}` | Runtime health snapshot path | Current warning threshold: `64 MiB` |
 
 ## Collection Commands (Current Tree)
 
@@ -77,14 +77,12 @@ Latest lock/memory profiling intake from `wa-1u90p.1.3`:
 - `evidence/wa-1u90p.1.3/summaries/runtime_lock_memory_telemetry_refs.txt`
 - `evidence/wa-1u90p.1.3/summaries/localpane_resize_telemetry_refs.txt`
 
-Current blockers to fresh percentile extraction:
-- `ft simulate run ... --json` path rejects `generate_scrollback` in baseline fixture replay.
-- `workflows.rs` has `std::time::Instant` vs `tokio::time::Instant` mismatches (`E0308`).
-- `search/chunk_vector_store.rs` has `u64: FromSql` type mismatches (`E0277`).
-- `runtime.rs` references missing `RuntimeHandle` field (`E0609`).
+Replay/build blocker status:
+- prior `generate_scrollback` parse failures were due to stale `target/debug/ft`; replay is green from current source via `cargo run -p frankenterm -- simulate ...`.
+- historical compile blockers (`E0308`, `E0277`, `E0609`) from earlier intake are resolved in current tree.
 
-Recently cleared blocker:
-- `wa-1u90p.2.3` resolved prior `resize_scheduler` const-trait compile break (`E0658`) by removing const-only path from work-unit normalization.
+Remaining blocker to full calibration refresh:
+- live runtime collection still needs to be executed long enough to populate and publish refreshed percentile tables from lock/memory telemetry snapshots.
 
 ## Primary SLO Metrics
 
@@ -158,13 +156,13 @@ Required outputs for each gate:
 - queue attribution (`ResizeTimeline.events[*].stages[*].queue_metrics.depth_before/depth_after`)
 - stage aggregates (`ResizeTimeline::stage_summary()` -> `avg_duration_ns`, `p95_duration_ns`, `max_duration_ns`)
 - flame rows (`ResizeTimeline::flame_samples()`)
-- lock/memory telemetry (`max_storage_lock_wait_ms`, `avg_storage_lock_wait_ms`, `storage_lock_contention_events`, `max_storage_lock_hold_ms`, `cursor_snapshot_bytes_last`, `cursor_snapshot_bytes_max`)
+- lock/memory telemetry (`avg_storage_lock_wait_ms`, `p50_storage_lock_wait_ms`, `p95_storage_lock_wait_ms`, `max_storage_lock_wait_ms`, `storage_lock_contention_events`, `avg_storage_lock_hold_ms`, `p50_storage_lock_hold_ms`, `p95_storage_lock_hold_ms`, `max_storage_lock_hold_ms`, `cursor_snapshot_bytes_last`, `p50_cursor_snapshot_bytes`, `p95_cursor_snapshot_bytes`, `cursor_snapshot_bytes_max`)
 - health warning snapshot (`HealthSnapshot.warnings`) + crash/timeout report
 
 ## Current Gaps and Near-Term Closure
 
 - Full timeline artifacts are available via `ft simulate run --json --resize-timeline-json`; plain `--json` mode remains metadata/event playback oriented.
-- Numeric p50/p99 refresh and artifact incidence rollups remain blocked on the `wa-1u90p.1.3` replay/build blockers listed above.
+- Numeric p50/p99 refresh and artifact incidence rollups remain pending live runtime percentile captures and refreshed rollups from `wa-1u90p.1.3`.
 - `wa-1u90p.1.5` consumes this contract as the normative threshold baseline and will tighten ranking confidence after replay unblock.
 
 ## Degradation and Rollback Policy
@@ -192,7 +190,7 @@ Rollback/degradation can be lifted only after:
 
 Thresholds in this document are explicit and enforceable now.
 Refresh-calibration is dependency-bound to:
-- `wa-1u90p.1.3`: unblock replay/build path, then publish fresh `R1..R4` percentile rollups
+- `wa-1u90p.1.3`: publish fresh `R1..R4` percentile rollups from live runtime telemetry + simulation timeline artifacts
 - `wa-1u90p.1.5`: incorporate refreshed rollups into final intervention ranking package
 
 When replay/build blockers clear, update this document with refreshed percentile
