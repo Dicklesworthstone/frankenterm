@@ -556,12 +556,19 @@ proptest! {
 // NEW: Density is zero for data without ESC bytes
 // =============================================================================
 
+/// Strategy for bytes that never include ESC (0x1b).
+fn arb_non_esc_bytes(max_len: usize) -> impl Strategy<Value = Vec<u8>> {
+    proptest::collection::vec(
+        any::<u8>().prop_filter("no ESC byte", |b| *b != 0x1b),
+        0..max_len,
+    )
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
     #[test]
-    fn no_esc_means_zero_density(data in arb_bytes(2000)) {
-        prop_assume!(!data.contains(&0x1b));
+    fn no_esc_means_zero_density(data in arb_non_esc_bytes(2000)) {
         let scan = scan_newlines_and_ansi(&data);
         prop_assert_eq!(
             scan.ansi_byte_count,
