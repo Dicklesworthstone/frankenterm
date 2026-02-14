@@ -868,18 +868,14 @@ impl DataflowGraph {
         if from == to {
             return true;
         }
-        // BFS from `from` following reverse edges (inputs): can we reach `to`?
-        // Actually, we need: is `from` reachable from `to` via outputs?
-        // If so, adding to->from direction (from is output of to) creates a cycle.
-        // Wait: we're adding from->to, meaning `to` gets `from` as input.
-        // Cycle exists if `from` is already reachable from `to` via outputs.
+        // We're adding from->to, meaning `to` gets `from` as input.
+        // A cycle exists if `from` is already reachable from `to` via outputs.
+        // BFS from `to` following outputs: can we reach `from`?
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
-        queue.push_back(from);
+        queue.push_back(to);
         while let Some(current) = queue.pop_front() {
-            if current == to {
-                // We can reach `to` from `from` via outputs, so adding
-                // from->to (to has from as input) would close the cycle.
+            if current == from {
                 return true;
             }
             if !visited.insert(current) {
@@ -1125,8 +1121,8 @@ mod tests {
     fn remove_node_cleans_edges() {
         let mut g = DataflowGraph::new();
         let a = g.add_source("a", Value::Int(1));
-        let b = g.add_map("b", vec![a], |i| i[0].clone());
-        let c = g.add_map("c", vec![b], |i| i[0].clone());
+        let b = g.add_map("b", vec![a], |i| i.first().cloned().unwrap_or(Value::None));
+        let c = g.add_map("c", vec![b], |i| i.first().cloned().unwrap_or(Value::None));
 
         g.remove_node(b).unwrap();
         assert_eq!(g.node_count(), 2);

@@ -196,16 +196,18 @@ fn next_hourly(now: DateTime<Local>, minute: u32) -> Result<DateTime<Local>> {
             "hourly minute must be 0-59".to_string(),
         )));
     }
-    let mut candidate = now
+    // Use UTC arithmetic to avoid DST transition failures, then convert back.
+    let now_utc = now.with_timezone(&chrono::Utc);
+    let mut candidate_utc = now_utc
         .with_minute(minute)
         .and_then(|t| t.with_second(0))
         .and_then(|t| t.with_nanosecond(0))
         .ok_or_else(|| Error::Runtime("Failed to compute hourly schedule time".to_string()))?;
 
-    if candidate <= now {
-        candidate += ChronoDuration::hours(1);
+    if candidate_utc <= now_utc {
+        candidate_utc += ChronoDuration::hours(1);
     }
-    Ok(candidate)
+    Ok(candidate_utc.with_timezone(&Local))
 }
 
 fn next_daily(now: DateTime<Local>, hour: u32, minute: u32) -> Result<DateTime<Local>> {
@@ -214,16 +216,23 @@ fn next_daily(now: DateTime<Local>, hour: u32, minute: u32) -> Result<DateTime<L
             "daily schedule time must be in 24h range".to_string(),
         )));
     }
-    let mut candidate = now
-        .with_hour(hour)
-        .and_then(|t| t.with_minute(minute))
-        .and_then(|t| t.with_second(0))
-        .and_then(|t| t.with_nanosecond(0))
-        .ok_or_else(|| Error::Runtime("Failed to compute daily schedule time".to_string()))?;
+    // Try today first; if the local time doesn't exist (DST gap), try tomorrow.
+    let try_date = |base: DateTime<Local>| -> Option<DateTime<Local>> {
+        base.with_hour(hour)
+            .and_then(|t| t.with_minute(minute))
+            .and_then(|t| t.with_second(0))
+            .and_then(|t| t.with_nanosecond(0))
+    };
 
-    if candidate <= now {
-        candidate += ChronoDuration::days(1);
+    if let Some(candidate) = try_date(now) {
+        if candidate > now {
+            return Ok(candidate);
+        }
     }
+    // Try tomorrow.
+    let tomorrow = now + ChronoDuration::days(1);
+    let candidate = try_date(tomorrow)
+        .ok_or_else(|| Error::Runtime("Failed to compute daily schedule time".to_string()))?;
     Ok(candidate)
 }
 
@@ -251,9 +260,10 @@ fn next_weekly(
         .and_hms_opt(hour, minute, 0)
         .ok_or_else(|| Error::Runtime("Failed to compute weekly schedule time".to_string()))?;
     candidate += ChronoDuration::days(days_ahead);
+    // Use `earliest()` to handle ambiguous DST fall-back times (picks first occurrence).
     let candidate = Local
         .from_local_datetime(&candidate)
-        .single()
+        .earliest()
         .ok_or_else(|| Error::Runtime("Failed to localize weekly schedule time".to_string()))?;
 
     if candidate <= now {

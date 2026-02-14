@@ -93,7 +93,7 @@ pub struct ChunkVectorHit {
 }
 
 /// Drift report comparing vector lifecycle state with lexical progress.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkVectorDriftReport {
     pub profile_id: String,
     pub generation_id: String,
@@ -669,7 +669,7 @@ fn direction_from_str(value: &str) -> Result<ChunkDirection> {
 }
 
 fn encode_f32_embedding_blob(vector: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(vector.len() * std::mem::size_of::<f32>());
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
     for &value in vector {
         bytes.extend_from_slice(&value.to_le_bytes());
     }

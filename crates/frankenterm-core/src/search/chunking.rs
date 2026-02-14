@@ -310,7 +310,6 @@ pub fn build_semantic_chunks(
 
             if should_soft_split {
                 flush_current(&mut current, &mut chunks, &mut previous_finalized);
-                allow_overlap_on_next_start = true;
                 let overlap = previous_finalized.as_ref().and_then(|previous| {
                     overlap_from_previous(previous, &contribution, config.overlap_chars)
                 });
