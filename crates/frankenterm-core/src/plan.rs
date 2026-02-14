@@ -1968,4 +1968,342 @@ mod tests {
         assert!(err4.to_string().contains("99"));
         assert!(err4.to_string().contains('1'));
     }
+
+    // ========================================================================
+    // Batch 12 — PearlSpring wa-1u90p.7.1 builder, edge-case, serde tests
+    // ========================================================================
+
+    #[test]
+    fn plan_id_from_hash_strips_sha256_prefix() {
+        let id = PlanId::from_hash("sha256:abcdef");
+        assert_eq!(id.0, "plan:abcdef");
+    }
+
+    #[test]
+    fn plan_id_from_hash_no_prefix_passes_through() {
+        let id = PlanId::from_hash("rawvalue");
+        assert_eq!(id.0, "plan:rawvalue");
+    }
+
+    #[test]
+    fn plan_id_placeholder_is_detected() {
+        let placeholder = PlanId::placeholder();
+        assert!(placeholder.is_placeholder());
+        assert_eq!(placeholder.0, "plan:pending");
+    }
+
+    #[test]
+    fn plan_id_equality() {
+        let a = PlanId::from_hash("abc");
+        let b = PlanId::from_hash("abc");
+        let c = PlanId::from_hash("xyz");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn plan_id_serde_roundtrip() {
+        let id = PlanId::from_hash("test123");
+        let json = serde_json::to_string(&id).unwrap();
+        let back: PlanId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, back);
+    }
+
+    #[test]
+    fn idempotency_key_serde_roundtrip() {
+        let key = IdempotencyKey::from_hash("abc123");
+        let json = serde_json::to_string(&key).unwrap();
+        let back: IdempotencyKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(key, back);
+    }
+
+    #[test]
+    fn step_plan_with_key_constructor() {
+        let key = IdempotencyKey::from_hash("custom_key");
+        let step = StepPlan::with_key(
+            1,
+            key.clone(),
+            StepAction::ReleaseLock {
+                lock_name: "test".into(),
+            },
+            "Release test lock",
+        );
+        assert_eq!(step.step_id, key);
+        assert_eq!(step.step_number, 1);
+        assert!(!step.idempotent);
+        assert!(step.preconditions.is_empty());
+        assert!(step.verification.is_none());
+        assert!(step.on_failure.is_none());
+        assert!(step.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn step_plan_builder_chain() {
+        let step = StepPlan::new(
+            1,
+            StepAction::SendText {
+                pane_id: 0,
+                text: "x".into(),
+                paste_mode: None,
+            },
+            "Send x",
+        )
+        .with_precondition(Precondition::PaneExists { pane_id: 0 })
+        .with_verification(Verification::pane_idle(5000))
+        .with_on_failure(OnFailure::skip())
+        .with_timeout_ms(10000)
+        .idempotent();
+
+        assert!(step.idempotent);
+        assert_eq!(step.preconditions.len(), 1);
+        assert!(step.verification.is_some());
+        assert!(step.on_failure.is_some());
+        assert_eq!(step.timeout_ms, Some(10000));
+    }
+
+    #[test]
+    fn verification_builders() {
+        let v = Verification::pattern_match("my_rule")
+            .with_description("Check pattern")
+            .with_timeout_ms(5000);
+        assert_eq!(v.description.as_deref(), Some("Check pattern"));
+        assert_eq!(v.timeout_ms, Some(5000));
+        assert!(matches!(
+            v.strategy,
+            VerificationStrategy::PatternMatch { .. }
+        ));
+    }
+
+    #[test]
+    fn verification_pane_idle_builder() {
+        let v = Verification::pane_idle(3000);
+        assert!(v.description.is_none());
+        assert!(v.timeout_ms.is_none());
+        if let VerificationStrategy::PaneIdle {
+            idle_threshold_ms, ..
+        } = v.strategy
+        {
+            assert_eq!(idle_threshold_ms, 3000);
+        } else {
+            panic!("Expected PaneIdle strategy");
+        }
+    }
+
+    #[test]
+    fn builder_add_steps_multiple() {
+        let steps = vec![
+            StepPlan::new(
+                1,
+                StepAction::AcquireLock {
+                    lock_name: "a".into(),
+                    timeout_ms: None,
+                },
+                "Acquire",
+            ),
+            StepPlan::new(
+                2,
+                StepAction::ReleaseLock {
+                    lock_name: "a".into(),
+                },
+                "Release",
+            ),
+        ];
+        let plan = ActionPlan::builder("Multi", "ws").add_steps(steps).build();
+        assert_eq!(plan.step_count(), 2);
+        assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_plan_validates() {
+        let plan = ActionPlan::builder("Empty", "ws").build();
+        assert_eq!(plan.step_count(), 0);
+        assert!(!plan.has_preconditions());
+        assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn plan_schema_version_is_set() {
+        let plan = ActionPlan::builder("Test", "ws").build();
+        assert_eq!(plan.plan_version, PLAN_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn on_failure_abort_message() {
+        let f = OnFailure::abort_with_message("oops");
+        if let OnFailure::Abort { message } = &f {
+            assert_eq!(message.as_deref(), Some("oops"));
+        } else {
+            panic!("Expected Abort variant");
+        }
+    }
+
+    #[test]
+    fn on_failure_retry_defaults() {
+        let f = OnFailure::retry(5, 2000);
+        if let OnFailure::Retry {
+            max_attempts,
+            initial_delay_ms,
+            max_delay_ms,
+            backoff_multiplier,
+        } = &f
+        {
+            assert_eq!(*max_attempts, 5);
+            assert_eq!(*initial_delay_ms, 2000);
+            assert!(max_delay_ms.is_none());
+            assert!(backoff_multiplier.is_none());
+        } else {
+            panic!("Expected Retry variant");
+        }
+    }
+
+    #[test]
+    fn on_failure_skip_defaults() {
+        let f = OnFailure::skip();
+        if let OnFailure::Skip { warn } = &f {
+            assert_eq!(*warn, Some(true));
+        } else {
+            panic!("Expected Skip variant");
+        }
+    }
+
+    #[test]
+    fn nested_plan_action_canonical_string() {
+        let inner = ActionPlan::builder("Inner", "ws")
+            .add_step(StepPlan::new(
+                1,
+                StepAction::MarkEventHandled { event_id: 1 },
+                "Mark",
+            ))
+            .build();
+        let action = StepAction::NestedPlan {
+            plan: Box::new(inner),
+        };
+        let s = action.canonical_string();
+        assert!(s.starts_with("nested_plan:hash=sha256:"));
+        assert_eq!(action.action_type_name(), "nested_plan");
+    }
+
+    #[test]
+    fn approval_scope_ref_serde() {
+        let scope = ApprovalScopeRef {
+            workspace_id: "ws-1".to_string(),
+            action_kind: "send_text".to_string(),
+            pane_id: Some(42),
+        };
+        let json = serde_json::to_string(&scope).unwrap();
+        let back: ApprovalScopeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.workspace_id, "ws-1");
+        assert_eq!(back.action_kind, "send_text");
+        assert_eq!(back.pane_id, Some(42));
+    }
+
+    #[test]
+    fn approval_valid_precondition_canonical() {
+        let precond = Precondition::ApprovalValid {
+            scope: ApprovalScopeRef {
+                workspace_id: "ws".to_string(),
+                action_kind: "send_text".to_string(),
+                pane_id: None,
+            },
+        };
+        let s = precond.canonical_string();
+        assert!(s.contains("approval_valid"));
+        assert!(s.contains("ws"));
+        assert!(s.contains("send_text"));
+        assert!(s.contains("any")); // pane_id is None
+    }
+
+    #[test]
+    fn on_failure_fallback_canonical_string() {
+        let fallback_steps = vec![StepPlan::new(
+            1,
+            StepAction::SendText {
+                pane_id: 0,
+                text: "fallback".into(),
+                paste_mode: None,
+            },
+            "Fallback step",
+        )];
+        let f = OnFailure::Fallback {
+            steps: fallback_steps,
+        };
+        let s = f.canonical_string();
+        assert!(s.starts_with("fallback:"));
+    }
+
+    #[test]
+    fn on_failure_require_approval_canonical() {
+        let f = OnFailure::RequireApproval {
+            summary: "Need help".into(),
+        };
+        let s = f.canonical_string();
+        assert!(s.contains("require_approval"));
+        assert!(s.contains("Need help"));
+    }
+
+    #[test]
+    fn step_action_send_text_paste_mode_variations() {
+        let a1 = StepAction::SendText {
+            pane_id: 0,
+            text: "x".into(),
+            paste_mode: None,
+        };
+        let a2 = StepAction::SendText {
+            pane_id: 0,
+            text: "x".into(),
+            paste_mode: Some(true),
+        };
+        let a3 = StepAction::SendText {
+            pane_id: 0,
+            text: "x".into(),
+            paste_mode: Some(false),
+        };
+        assert!(a1.canonical_string().contains("paste=none"));
+        assert!(a2.canonical_string().contains("paste=true"));
+        assert!(a3.canonical_string().contains("paste=false"));
+    }
+
+    #[test]
+    fn step_action_wait_for_pane_none() {
+        let a = StepAction::WaitFor {
+            pane_id: None,
+            condition: WaitCondition::External {
+                key: "signal".into(),
+            },
+            timeout_ms: 1000,
+        };
+        let s = a.canonical_string();
+        assert!(s.contains("pane=any"));
+    }
+
+    #[test]
+    fn step_action_run_workflow_no_params() {
+        let a = StepAction::RunWorkflow {
+            workflow_id: "wf".into(),
+            params: None,
+        };
+        let s = a.canonical_string();
+        assert!(s.contains("run_workflow"));
+        assert!(s.contains("wf"));
+    }
+
+    #[test]
+    fn step_action_acquire_lock_no_timeout() {
+        let a = StepAction::AcquireLock {
+            lock_name: "my_lock".into(),
+            timeout_ms: None,
+        };
+        let s = a.canonical_string();
+        assert!(s.contains("timeout=none"));
+    }
+
+    #[test]
+    fn plan_validation_error_is_error_trait() {
+        let err = PlanValidationError::InvalidStepNumber {
+            expected: 1,
+            actual: 2,
+        };
+        // PlanValidationError implements std::error::Error
+        let _: &dyn std::error::Error = &err;
+    }
 }

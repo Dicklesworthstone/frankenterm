@@ -1469,4 +1469,568 @@ mod tests {
         assert_eq!(manifest.stats.panes, 2);
         assert!(!manifest.db_checksum.is_empty());
     }
+
+    // ========================================================================
+    // Batch 12 — PearlSpring wa-1u90p.7.1 pure-function & edge-case tests
+    // ========================================================================
+
+    #[test]
+    fn backup_stats_default_is_all_zeros() {
+        let stats = BackupStats::default();
+        assert_eq!(stats.panes, 0);
+        assert_eq!(stats.segments, 0);
+        assert_eq!(stats.events, 0);
+        assert_eq!(stats.audit_actions, 0);
+        assert_eq!(stats.workflow_executions, 0);
+    }
+
+    #[test]
+    fn backup_stats_serde_roundtrip() {
+        let stats = BackupStats {
+            panes: 10,
+            segments: 200,
+            events: 30,
+            audit_actions: 5,
+            workflow_executions: 3,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: BackupStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.panes, 10);
+        assert_eq!(back.segments, 200);
+        assert_eq!(back.events, 30);
+        assert_eq!(back.audit_actions, 5);
+        assert_eq!(back.workflow_executions, 3);
+    }
+
+    #[test]
+    fn export_options_default_values() {
+        let opts = ExportOptions::default();
+        assert!(opts.output.is_none());
+        assert!(!opts.include_sql_dump);
+        assert!(opts.verify);
+    }
+
+    #[test]
+    fn import_options_default_values() {
+        let opts = ImportOptions::default();
+        assert!(!opts.dry_run);
+        assert!(!opts.yes);
+        assert!(!opts.no_safety_backup);
+    }
+
+    #[test]
+    fn sha256_bytes_known_value() {
+        // SHA-256 of empty string
+        let hash = sha256_bytes(b"");
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn sha256_bytes_different_inputs_produce_different_hashes() {
+        let h1 = sha256_bytes(b"abc");
+        let h2 = sha256_bytes(b"abd");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn days_to_ymd_leap_year_feb29() {
+        // 2024-02-29 is day 19782 (2024 is a leap year)
+        let (y, m, d) = days_to_ymd(19_782);
+        assert_eq!((y, m, d), (2024, 2, 29));
+    }
+
+    #[test]
+    fn days_to_ymd_y2k_boundary() {
+        // 2000-01-01 is day 10957
+        let (y, m, d) = days_to_ymd(10_957);
+        assert_eq!((y, m, d), (2000, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_dec31() {
+        // 2025-12-31 is day 20453
+        let (y, m, d) = days_to_ymd(20_453);
+        assert_eq!((y, m, d), (2025, 12, 31));
+    }
+
+    #[test]
+    fn format_timestamp_compact_epoch() {
+        let s = format_timestamp_compact(0);
+        assert_eq!(s, "19700101_000000");
+    }
+
+    #[test]
+    fn format_timestamp_compact_known() {
+        // 2025-01-15 12:30:45 UTC = 1736944245
+        let s = format_timestamp_compact(1_736_944_245);
+        assert!(s.starts_with("2025"));
+        assert!(s.contains('_'));
+        assert_eq!(s.len(), 15); // YYYYMMDD_HHMMSS
+    }
+
+    #[test]
+    fn format_iso8601_known_date() {
+        // 2025-01-01T00:00:00Z = 1735689600
+        let s = format_iso8601(1_735_689_600);
+        assert_eq!(s, "2025-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn parse_cron_field_wildcard() {
+        assert_eq!(parse_cron_field("*", 0, 59).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_cron_field_valid_value() {
+        assert_eq!(parse_cron_field("30", 0, 59).unwrap(), Some(30));
+    }
+
+    #[test]
+    fn parse_cron_field_min_boundary() {
+        assert_eq!(parse_cron_field("0", 0, 23).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn parse_cron_field_max_boundary() {
+        assert_eq!(parse_cron_field("23", 0, 23).unwrap(), Some(23));
+    }
+
+    #[test]
+    fn parse_cron_field_out_of_range() {
+        assert!(parse_cron_field("60", 0, 59).is_err());
+        assert!(parse_cron_field("24", 0, 23).is_err());
+    }
+
+    #[test]
+    fn parse_cron_field_invalid_text() {
+        assert!(parse_cron_field("abc", 0, 59).is_err());
+    }
+
+    #[test]
+    fn schedule_display_label_hourly() {
+        let sched = BackupSchedule::parse("hourly").unwrap();
+        assert_eq!(sched.display_label(), "hourly");
+    }
+
+    #[test]
+    fn schedule_display_label_daily() {
+        let sched = BackupSchedule::parse("daily").unwrap();
+        assert_eq!(sched.display_label(), "daily");
+    }
+
+    #[test]
+    fn schedule_display_label_weekly() {
+        let sched = BackupSchedule::parse("weekly").unwrap();
+        assert_eq!(sched.display_label(), "weekly");
+    }
+
+    #[test]
+    fn schedule_display_label_cron() {
+        let sched = BackupSchedule::parse("0 3 * * *").unwrap();
+        assert!(sched.display_label().starts_with("cron:"));
+        assert!(sched.display_label().contains("0 3 * * *"));
+    }
+
+    #[test]
+    fn schedule_parse_case_insensitive() {
+        assert!(BackupSchedule::parse("HOURLY").is_ok());
+        assert!(BackupSchedule::parse("Daily").is_ok());
+        assert!(BackupSchedule::parse("WEEKLY").is_ok());
+    }
+
+    #[test]
+    fn schedule_parse_invalid() {
+        assert!(BackupSchedule::parse("biweekly").is_err());
+        assert!(BackupSchedule::parse("1 2 3").is_err()); // only 3 fields
+    }
+
+    #[test]
+    fn schedule_cron_with_all_wildcards() {
+        let sched = BackupSchedule::parse("* * * * *").unwrap();
+        if let BackupSchedule::Cron(cron) = &sched {
+            assert!(cron.minute.is_none());
+            assert!(cron.hour.is_none());
+            assert!(cron.day_of_month.is_none());
+            assert!(cron.month.is_none());
+            assert!(cron.day_of_week.is_none());
+        } else {
+            panic!("Expected Cron variant");
+        }
+    }
+
+    #[test]
+    fn schedule_cron_with_all_values() {
+        let sched = BackupSchedule::parse("15 3 1 6 0").unwrap();
+        if let BackupSchedule::Cron(cron) = &sched {
+            assert_eq!(cron.minute, Some(15));
+            assert_eq!(cron.hour, Some(3));
+            assert_eq!(cron.day_of_month, Some(1));
+            assert_eq!(cron.month, Some(6));
+            assert_eq!(cron.day_of_week, Some(0));
+        } else {
+            panic!("Expected Cron variant");
+        }
+    }
+
+    #[test]
+    fn schedule_hourly_defaults() {
+        let sched = BackupSchedule::parse("hourly").unwrap();
+        assert_eq!(sched, BackupSchedule::Hourly { minute: 0 });
+    }
+
+    #[test]
+    fn schedule_daily_defaults() {
+        let sched = BackupSchedule::parse("daily").unwrap();
+        assert_eq!(sched, BackupSchedule::Daily { hour: 3, minute: 0 });
+    }
+
+    #[test]
+    fn schedule_weekly_defaults() {
+        let sched = BackupSchedule::parse("weekly").unwrap();
+        assert_eq!(
+            sched,
+            BackupSchedule::Weekly {
+                weekday: Weekday::Sun,
+                hour: 3,
+                minute: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn schedule_next_hourly_in_future() {
+        let sched = BackupSchedule::Hourly { minute: 30 };
+        let now = Local
+            .with_ymd_and_hms(2026, 2, 14, 10, 15, 0)
+            .single()
+            .unwrap();
+        let next = sched.next_after(now).unwrap();
+        assert!(next > now);
+        assert_eq!(next.minute(), 30);
+    }
+
+    #[test]
+    fn schedule_next_hourly_when_past_minute() {
+        let sched = BackupSchedule::Hourly { minute: 10 };
+        let now = Local
+            .with_ymd_and_hms(2026, 2, 14, 10, 30, 0)
+            .single()
+            .unwrap();
+        let next = sched.next_after(now).unwrap();
+        assert!(next > now);
+        assert_eq!(next.minute(), 10);
+        assert_eq!(next.hour(), 11);
+    }
+
+    #[test]
+    fn schedule_next_weekly_advance() {
+        let sched = BackupSchedule::Weekly {
+            weekday: Weekday::Mon,
+            hour: 3,
+            minute: 0,
+        };
+        let now = Local
+            .with_ymd_and_hms(2026, 2, 14, 12, 0, 0)
+            .single()
+            .unwrap(); // Saturday
+        let next = sched.next_after(now).unwrap();
+        assert!(next > now);
+        assert_eq!(next.weekday(), Weekday::Mon);
+    }
+
+    #[test]
+    fn expand_tilde_bare() {
+        let path = expand_tilde("~");
+        // Should expand to home directory (not literal ~)
+        assert_ne!(path, PathBuf::from("~"));
+    }
+
+    #[test]
+    fn expand_tilde_with_suffix() {
+        let path = expand_tilde("~/backups");
+        assert!(path.to_string_lossy().contains("backups"));
+        assert!(!path.to_string_lossy().starts_with('~'));
+    }
+
+    #[test]
+    fn expand_tilde_absolute_unchanged() {
+        let path = expand_tilde("/tmp/backups");
+        assert_eq!(path, PathBuf::from("/tmp/backups"));
+    }
+
+    #[test]
+    fn expand_tilde_relative_unchanged() {
+        let path = expand_tilde("relative/path");
+        assert_eq!(path, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn resolve_destination_root_default() {
+        let root = PathBuf::from("/workspace");
+        let result = resolve_destination_root(&root, None);
+        assert_eq!(result, PathBuf::from("/workspace/.ft/backups"));
+    }
+
+    #[test]
+    fn resolve_destination_root_absolute() {
+        let root = PathBuf::from("/workspace");
+        let result = resolve_destination_root(&root, Some("/custom/backups"));
+        assert_eq!(result, PathBuf::from("/custom/backups"));
+    }
+
+    #[test]
+    fn resolve_destination_root_relative() {
+        let root = PathBuf::from("/workspace");
+        let result = resolve_destination_root(&root, Some("my_backups"));
+        assert_eq!(result, PathBuf::from("/workspace/my_backups"));
+    }
+
+    #[test]
+    fn unique_backup_path_first_try() {
+        let tmp = TempDir::new().unwrap();
+        let result = unique_backup_path(tmp.path(), "test_backup");
+        assert_eq!(result, tmp.path().join("test_backup"));
+    }
+
+    #[test]
+    fn unique_backup_path_increments_on_collision() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("test_backup")).unwrap();
+        let result = unique_backup_path(tmp.path(), "test_backup");
+        assert_eq!(result, tmp.path().join("test_backup_01"));
+    }
+
+    #[test]
+    fn compare_backup_entries_both_timestamps() {
+        let a = BackupEntry {
+            path: PathBuf::from("/a"),
+            created_at: None,
+            created_ts: Some(100),
+            total_size_bytes: 0,
+        };
+        let b = BackupEntry {
+            path: PathBuf::from("/b"),
+            created_at: None,
+            created_ts: Some(200),
+            total_size_bytes: 0,
+        };
+        assert_eq!(compare_backup_entries(&a, &b), Ordering::Less);
+        assert_eq!(compare_backup_entries(&b, &a), Ordering::Greater);
+        assert_eq!(compare_backup_entries(&a, &a), Ordering::Equal);
+    }
+
+    #[test]
+    fn compare_backup_entries_one_missing_ts() {
+        let with_ts = BackupEntry {
+            path: PathBuf::from("/a"),
+            created_at: None,
+            created_ts: Some(100),
+            total_size_bytes: 0,
+        };
+        let without_ts = BackupEntry {
+            path: PathBuf::from("/b"),
+            created_at: None,
+            created_ts: None,
+            total_size_bytes: 0,
+        };
+        assert_eq!(
+            compare_backup_entries(&with_ts, &without_ts),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_backup_entries(&without_ts, &with_ts),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn compare_backup_entries_both_missing_ts_uses_path() {
+        let a = BackupEntry {
+            path: PathBuf::from("/aaa"),
+            created_at: None,
+            created_ts: None,
+            total_size_bytes: 0,
+        };
+        let b = BackupEntry {
+            path: PathBuf::from("/bbb"),
+            created_at: None,
+            created_ts: None,
+            total_size_bytes: 0,
+        };
+        assert_eq!(compare_backup_entries(&a, &b), Ordering::Less);
+    }
+
+    #[test]
+    fn dir_size_empty_dir() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(dir_size(tmp.path()), 0);
+    }
+
+    #[test]
+    fn dir_size_nonexistent() {
+        assert_eq!(dir_size(Path::new("/nonexistent/dir/xyz")), 0);
+    }
+
+    #[test]
+    fn dir_size_with_files() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+        fs::write(tmp.path().join("b.txt"), "world!").unwrap();
+        let size = dir_size(tmp.path());
+        assert!(size > 0);
+    }
+
+    #[test]
+    fn parse_manifest_timestamp_valid_rfc3339() {
+        let ts = parse_manifest_timestamp("2026-01-15T12:30:45Z");
+        assert!(ts.is_some());
+        assert!(ts.unwrap() > 0);
+    }
+
+    #[test]
+    fn parse_manifest_timestamp_invalid() {
+        assert!(parse_manifest_timestamp("not-a-date").is_none());
+        assert!(parse_manifest_timestamp("").is_none());
+    }
+
+    #[test]
+    fn format_local_datetime_format() {
+        let dt = Local
+            .with_ymd_and_hms(2026, 2, 14, 9, 5, 30)
+            .single()
+            .unwrap();
+        let s = format_local_datetime(dt);
+        assert_eq!(s, "2026-02-14T09:05:30");
+    }
+
+    #[test]
+    fn backup_manifest_serde_roundtrip() {
+        let manifest = BackupManifest {
+            wa_version: "0.1.0".to_string(),
+            schema_version: 7,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            db_size_bytes: 4096,
+            db_checksum: "abcdef1234567890".to_string(),
+            stats: BackupStats {
+                panes: 2,
+                segments: 10,
+                events: 5,
+                audit_actions: 1,
+                workflow_executions: 0,
+            },
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let back: BackupManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.wa_version, "0.1.0");
+        assert_eq!(back.schema_version, 7);
+        assert_eq!(back.db_size_bytes, 4096);
+        assert_eq!(back.stats.panes, 2);
+    }
+
+    #[test]
+    fn list_backup_entries_empty_dir() {
+        let tmp = TempDir::new().unwrap();
+        let entries = list_backup_entries(tmp.path()).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn list_backup_entries_nonexistent_dir() {
+        let entries = list_backup_entries(Path::new("/nonexistent/backup/dir")).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn list_backup_entries_skips_files() {
+        let tmp = TempDir::new().unwrap();
+        // Create a regular file (not a directory) — should be skipped
+        fs::write(tmp.path().join("not_a_backup"), "data").unwrap();
+        let entries = list_backup_entries(tmp.path()).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn prune_backups_empty_dir() {
+        let tmp = TempDir::new().unwrap();
+        let now = Local
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .single()
+            .unwrap();
+        let summary = prune_backups(tmp.path(), 30, 10, now).unwrap();
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.kept, 0);
+    }
+
+    #[test]
+    fn scheduled_backup_status_serde() {
+        let status = ScheduledBackupStatus {
+            enabled: true,
+            schedule: "daily".to_string(),
+            next_backup_at: Some("2026-02-15T03:00:00".to_string()),
+            last_backup_at: Some("2026-02-14T03:00:00".to_string()),
+            last_backup_size_bytes: Some(8192),
+            backups_kept: 5,
+            max_backups: Some(10),
+            destination: "/tmp/backups".to_string(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"enabled\":true"));
+        assert!(json.contains("\"daily\""));
+    }
+
+    #[test]
+    fn export_result_serde_roundtrip() {
+        let manifest = BackupManifest {
+            wa_version: "0.1.0".to_string(),
+            schema_version: 7,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            workspace: "/ws".to_string(),
+            db_size_bytes: 1024,
+            db_checksum: "abc".to_string(),
+            stats: BackupStats::default(),
+        };
+        let result = ExportResult {
+            output_path: "/backup/dir".to_string(),
+            manifest,
+            total_size_bytes: 2048,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ExportResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total_size_bytes, 2048);
+        assert_eq!(back.output_path, "/backup/dir");
+    }
+
+    #[test]
+    fn import_result_serde_roundtrip() {
+        let manifest = BackupManifest {
+            wa_version: "0.1.0".to_string(),
+            schema_version: 7,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            workspace: "/ws".to_string(),
+            db_size_bytes: 1024,
+            db_checksum: "abc".to_string(),
+            stats: BackupStats::default(),
+        };
+        let result = ImportResult {
+            source_path: "/backup".to_string(),
+            manifest,
+            safety_backup_path: Some("/safety".to_string()),
+            dry_run: false,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ImportResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.source_path, "/backup");
+        assert!(!back.dry_run);
+        assert_eq!(back.safety_backup_path.unwrap(), "/safety");
+    }
+
+    #[test]
+    fn load_manifest_missing_dir_returns_error() {
+        let result = load_backup_manifest(Path::new("/nonexistent/backup"));
+        assert!(result.is_err());
+    }
 }
