@@ -542,3 +542,254 @@ proptest! {
         prop_assert_eq!(handles.sequence, fresh_handles.sequence);
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEW: Config Debug non-empty
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn config_debug_nonempty(memory in arb_writer_memory()) {
+        let cfg = LexicalIndexerConfig {
+            index_dir: std::path::PathBuf::from("/tmp/test"),
+            writer_memory_bytes: memory,
+        };
+        let dbg = format!("{:?}", cfg);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("LexicalIndexerConfig"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Error SchemaFingerprintMismatch Debug non-empty
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn error_schema_mismatch_debug(
+        expected in "[a-f0-9]{10,20}",
+        found in "[a-f0-9]{10,20}",
+    ) {
+        let err = LexicalIngestError::SchemaFingerprintMismatch {
+            expected: expected.clone(),
+            found: found.clone(),
+        };
+        let dbg = format!("{:?}", err);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("SchemaFingerprintMismatch"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Error From<io::Error> conversion
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn error_io_from_conversion(
+        msg in "[a-zA-Z0-9 ]{1,30}",
+    ) {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, msg.clone());
+        let ingest_err: LexicalIngestError = io_err.into();
+        let display = ingest_err.to_string();
+        prop_assert!(display.contains("I/O"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Default config always has valid path
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn default_config_has_path(_seed in any::<u64>()) {
+        let cfg = LexicalIndexerConfig::default();
+        prop_assert!(!cfg.index_dir.as_os_str().is_empty(),
+            "default config should have a non-empty path");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Writer empty commit has zero docs
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(5))]
+
+    #[test]
+    fn writer_empty_commit_zero(_seed in any::<u64>()) {
+        let dir = tempdir().expect("tempdir");
+        let config = LexicalIndexerConfig {
+            index_dir: dir.path().join("idx"),
+            writer_memory_bytes: 15_000_000,
+        };
+        let indexer = LexicalIndexer::open(config).unwrap();
+        let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
+        let stats = writer.commit().unwrap();
+        prop_assert_eq!(stats.docs_added, 0);
+        prop_assert_eq!(stats.docs_deleted, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Fingerprint length is reasonable
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(5))]
+
+    #[test]
+    fn fingerprint_has_reasonable_length(_seed in any::<u64>()) {
+        let dir = tempdir().expect("tempdir");
+        let config = LexicalIndexerConfig {
+            index_dir: dir.path().join("idx"),
+            writer_memory_bytes: 15_000_000,
+        };
+        let indexer = LexicalIndexer::open(config).unwrap();
+        let fp = indexer.fingerprint();
+        prop_assert!(fp.len() >= 8, "fingerprint should be at least 8 chars, got {}", fp.len());
+        prop_assert!(fp.len() <= 128, "fingerprint should be at most 128 chars, got {}", fp.len());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Handles accessor called twice returns same result
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(5))]
+
+    #[test]
+    fn handles_accessor_stable(_seed in any::<u64>()) {
+        let dir = tempdir().expect("tempdir");
+        let config = LexicalIndexerConfig {
+            index_dir: dir.path().join("idx"),
+            writer_memory_bytes: 15_000_000,
+        };
+        let indexer = LexicalIndexer::open(config).unwrap();
+        let h1 = indexer.handles();
+        let h2 = indexer.handles();
+        prop_assert_eq!(h1.event_id, h2.event_id);
+        prop_assert_eq!(h1.pane_id, h2.pane_id);
+        prop_assert_eq!(h1.text, h2.text);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: LEXICAL_SCHEMA_VERSION is non-empty
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn schema_version_nonempty(_seed in any::<u64>()) {
+        prop_assert!(!LEXICAL_SCHEMA_VERSION.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Multiple writers created sequentially work
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(5))]
+
+    #[test]
+    fn multiple_sequential_writers(_seed in any::<u64>()) {
+        let dir = tempdir().expect("tempdir");
+        let config = LexicalIndexerConfig {
+            index_dir: dir.path().join("idx"),
+            writer_memory_bytes: 15_000_000,
+        };
+        let indexer = LexicalIndexer::open(config).unwrap();
+
+        // First writer
+        {
+            let mut w1 = indexer.create_writer_with_memory(15_000_000).unwrap();
+            let fields = IndexDocumentFields {
+                schema_version: "ft.recorder.v1".to_string(),
+                lexical_schema_version: LEXICAL_SCHEMA_VERSION.to_string(),
+                event_id: "ev-seq-0".to_string(),
+                pane_id: 1,
+                session_id: None,
+                workflow_id: None,
+                correlation_id: None,
+                source: "test".to_string(),
+                event_type: "ingress_text".to_string(),
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+                ingress_kind: None,
+                segment_kind: None,
+                control_marker_type: None,
+                lifecycle_phase: None,
+                is_gap: false,
+                redaction: None,
+                occurred_at_ms: 1_700_000_000_000,
+                recorded_at_ms: 1_700_000_000_001,
+                sequence: 0,
+                log_offset: 0,
+                text: "first".to_string(),
+                text_symbols: "first".to_string(),
+                details_json: "{}".to_string(),
+            };
+            w1.add_document(&fields).unwrap();
+            w1.commit().unwrap();
+        }
+
+        // Second writer
+        {
+            let mut w2 = indexer.create_writer_with_memory(15_000_000).unwrap();
+            let fields = IndexDocumentFields {
+                schema_version: "ft.recorder.v1".to_string(),
+                lexical_schema_version: LEXICAL_SCHEMA_VERSION.to_string(),
+                event_id: "ev-seq-1".to_string(),
+                pane_id: 1,
+                session_id: None,
+                workflow_id: None,
+                correlation_id: None,
+                source: "test".to_string(),
+                event_type: "ingress_text".to_string(),
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+                ingress_kind: None,
+                segment_kind: None,
+                control_marker_type: None,
+                lifecycle_phase: None,
+                is_gap: false,
+                redaction: None,
+                occurred_at_ms: 1_700_000_000_000,
+                recorded_at_ms: 1_700_000_000_001,
+                sequence: 1,
+                log_offset: 0,
+                text: "second".to_string(),
+                text_symbols: "second".to_string(),
+                details_json: "{}".to_string(),
+            };
+            w2.add_document(&fields).unwrap();
+            w2.commit().unwrap();
+        }
+
+        prop_assert_eq!(indexer.doc_count().unwrap(), 2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Error Display for all variants is non-empty
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn error_display_all_variants_nonempty(_seed in any::<u64>()) {
+        let mismatch = LexicalIngestError::SchemaFingerprintMismatch {
+            expected: "abc".to_string(),
+            found: "xyz".to_string(),
+        };
+        prop_assert!(!mismatch.to_string().is_empty());
+
+        let io_err = LexicalIngestError::Io(
+            std::io::Error::new(std::io::ErrorKind::Other, "test")
+        );
+        prop_assert!(!io_err.to_string().is_empty());
+    }
+}

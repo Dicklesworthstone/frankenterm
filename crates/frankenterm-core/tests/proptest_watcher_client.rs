@@ -558,3 +558,210 @@ proptest! {
         prop_assert!(!result, "mirrored client should not be able to set focus");
     }
 }
+
+// =============================================================================
+// NEW: ClientRole serde roundtrip
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn client_role_serde_roundtrip(
+        _dummy in 0..1u8,
+    ) {
+        for role in [ClientRole::Interactive, ClientRole::Watcher] {
+            let json = serde_json::to_string(&role).unwrap();
+            let back: ClientRole = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(back, role);
+        }
+    }
+}
+
+// =============================================================================
+// NEW: ClientRole serializes to snake_case
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn client_role_snake_case(_dummy in 0..1u8) {
+        let i_json = serde_json::to_string(&ClientRole::Interactive).unwrap();
+        let w_json = serde_json::to_string(&ClientRole::Watcher).unwrap();
+        prop_assert_eq!(i_json, "\"interactive\"");
+        prop_assert_eq!(w_json, "\"watcher\"");
+    }
+}
+
+// =============================================================================
+// NEW: ViewMode default is Independent
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn view_mode_default_independent(_dummy in 0..1u8) {
+        let mode = ViewMode::default();
+        prop_assert_eq!(mode, ViewMode::Independent);
+    }
+}
+
+// =============================================================================
+// NEW: ViewMode serde roundtrip
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn view_mode_serde_roundtrip(_dummy in 0..1u8) {
+        for mode in [ViewMode::Independent, ViewMode::Mirrored] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: ViewMode = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(back, mode);
+        }
+    }
+}
+
+// =============================================================================
+// NEW: ClientId Display non-empty
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn client_id_display_nonempty(_dummy in 0..1u8) {
+        let id = ClientId("cl-test-0001".to_string());
+        let display = format!("{}", id);
+        prop_assert!(!display.is_empty());
+        prop_assert!(display.contains("cl-"));
+    }
+}
+
+// =============================================================================
+// NEW: ClientId Clone/PartialEq/Hash consistent
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn client_id_clone_eq(
+        suffix in "[a-z0-9]{5,15}",
+    ) {
+        let id = ClientId(format!("cl-{}", suffix));
+        let cloned = id.clone();
+        prop_assert_eq!(&id, &cloned);
+        // Same hash
+        use std::hash::{Hash, Hasher};
+        let mut h1 = std::collections::hash_map::DefaultHasher::new();
+        let mut h2 = std::collections::hash_map::DefaultHasher::new();
+        id.hash(&mut h1);
+        cloned.hash(&mut h2);
+        prop_assert_eq!(h1.finish(), h2.finish());
+    }
+}
+
+// =============================================================================
+// NEW: ClientRegistryConfig Default has expected values
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn registry_config_default(_dummy in 0..1u8) {
+        let config = ClientRegistryConfig::default();
+        prop_assert!(config.max_clients > 0);
+        prop_assert!(config.max_watchers > 0);
+        prop_assert!(config.max_watchers <= config.max_clients);
+    }
+}
+
+// =============================================================================
+// NEW: ClientRegistryConfig Clone preserves
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn registry_config_clone_preserves(
+        max_clients in 1_usize..100,
+        max_watchers in 1_usize..100,
+    ) {
+        let config = ClientRegistryConfig { max_clients, max_watchers };
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.max_clients, max_clients);
+        prop_assert_eq!(cloned.max_watchers, max_watchers);
+    }
+}
+
+// =============================================================================
+// NEW: ClientRegistryConfig Debug non-empty
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn registry_config_debug_nonempty(
+        max_clients in 1_usize..100,
+        max_watchers in 1_usize..100,
+    ) {
+        let config = ClientRegistryConfig { max_clients, max_watchers };
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("ClientRegistryConfig"));
+    }
+}
+
+// =============================================================================
+// NEW: ClientPolicyDecision Clone preserves
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn policy_decision_clone(_dummy in 0..1u8) {
+        let allow = ClientPolicyDecision::Allow;
+        let cloned = allow.clone();
+        prop_assert_eq!(cloned, allow);
+
+        let denied = ClientPolicyDecision::DeniedWatcher {
+            action: ActionKind::SendText,
+            client_id: ClientId("cl-test".to_string()),
+        };
+        let cloned_d = denied.clone();
+        prop_assert_eq!(cloned_d, denied);
+    }
+}
+
+// =============================================================================
+// NEW: Set leader to interactive works
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn set_leader_interactive_succeeds(
+        n in 2_usize..5,
+    ) {
+        let config = ClientRegistryConfig { max_clients: 20, max_watchers: 10 };
+        let mut reg = ClientRegistry::new(config);
+        let mut ids = Vec::new();
+        for i in 0..n {
+            if let Some(id) = reg.connect(&format!("i{}", i), ClientRole::Interactive) {
+                ids.push(id);
+            }
+        }
+        // First is leader
+        prop_assert_eq!(reg.leader(), Some(&ids[0]));
+        // Set second as leader
+        prop_assert!(reg.set_leader(&ids[1]));
+        prop_assert_eq!(reg.leader(), Some(&ids[1]));
+    }
+}
+
+// =============================================================================
+// NEW: ClientRegistryConfig serde roundtrip
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn registry_config_serde_roundtrip(
+        max_clients in 1_usize..1000,
+        max_watchers in 1_usize..1000,
+    ) {
+        let config = ClientRegistryConfig { max_clients, max_watchers };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ClientRegistryConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.max_clients, max_clients);
+        prop_assert_eq!(back.max_watchers, max_watchers);
+    }
+}
