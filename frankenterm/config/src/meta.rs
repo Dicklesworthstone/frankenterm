@@ -5,7 +5,7 @@ pub trait ConfigMeta {
     fn get_config_options(&self) -> &'static [ConfigOption];
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigContainer {
     None,
     Option,

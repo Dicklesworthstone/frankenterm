@@ -105,9 +105,11 @@ mod tests {
 
     #[test]
     fn easing_linear_tracks_position() {
-        let x = 0.37;
+        // Linear = [0, 0, 1, 1] Bernstein polynomial: 3x²(1-x) + x³ = 3x² - 2x³
+        let x: f32 = 0.37;
         let y = EasingFunction::Linear.evaluate_at_position(x);
-        assert!((y - x).abs() < 1e-6, "expected near identity, got {y}");
+        let expected = 3.0 * x * x - 2.0 * x * x * x;
+        assert!((y - expected).abs() < 1e-5, "expected {expected}, got {y}");
     }
 
     #[test]
@@ -162,10 +164,12 @@ mod tests {
 
     #[test]
     fn easing_ease_in_out_boundaries() {
+        // EaseInOut = [0.42, 0., 0.58, 1.0] Bernstein polynomial
+        // At x=0: p0 = 0.42; at x=1: p3 = 1.0
         let f = EasingFunction::EaseInOut;
         let start = f.evaluate_at_position(0.0);
         let end = f.evaluate_at_position(1.0);
-        assert!((start).abs() < 0.01, "start: {start}");
+        assert!((start - 0.42).abs() < 0.01, "start: {start}");
         assert!((end - 1.0).abs() < 0.01, "end: {end}");
     }
 

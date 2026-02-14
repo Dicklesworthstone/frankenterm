@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn deferred_keycode_resolve_either_mapped() {
         let dk = DeferredKeyCode::Either {
-            physical: KeyCode::Physical(PhysKeyCode::KeyA),
+            physical: KeyCode::Physical(PhysKeyCode::A),
             mapped: KeyCode::Char('a'),
             original: "a".to_string(),
         };
@@ -237,25 +237,25 @@ mod tests {
     #[test]
     fn deferred_keycode_resolve_either_physical() {
         let dk = DeferredKeyCode::Either {
-            physical: KeyCode::Physical(PhysKeyCode::KeyA),
+            physical: KeyCode::Physical(PhysKeyCode::A),
             mapped: KeyCode::Char('a'),
             original: "a".to_string(),
         };
         let resolved = dk.resolve(KeyMapPreference::Physical);
-        assert_eq!(resolved, KeyCode::Physical(PhysKeyCode::KeyA));
+        assert_eq!(resolved, KeyCode::Physical(PhysKeyCode::A));
     }
 
     #[test]
     fn deferred_keycode_to_string_keycode() {
         let dk = DeferredKeyCode::KeyCode(KeyCode::Char('x'));
         let s: String = dk.into();
-        assert_eq!(s, "x");
+        assert_eq!(s, "mapped:x");
     }
 
     #[test]
     fn deferred_keycode_to_string_either() {
         let dk = DeferredKeyCode::Either {
-            physical: KeyCode::Physical(PhysKeyCode::KeyA),
+            physical: KeyCode::Physical(PhysKeyCode::A),
             mapped: KeyCode::Char('a'),
             original: "a".to_string(),
         };

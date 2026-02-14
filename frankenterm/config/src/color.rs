@@ -878,7 +878,7 @@ brights = [ "#8ca6a6" ,"#e5164a" ,"#00b368" ,"#b3694d" ,"#0094f0" ,"#ff5792" ,"#
         let attr: ColorAttribute = ColorSpec::AnsiColor(AnsiColor::Blue).into();
         match attr {
             ColorAttribute::PaletteIndex(idx) => {
-                assert_eq!(idx, AnsiColor::Blue.into());
+                assert_eq!(idx, Into::<u8>::into(AnsiColor::Blue));
             }
             other => panic!("expected PaletteIndex, got {:?}", other),
         }
