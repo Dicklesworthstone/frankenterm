@@ -10,7 +10,8 @@ use frankenterm_core::recording::{
     RecorderTextEncoding,
 };
 use frankenterm_core::tantivy_ingest::{
-    IndexDocumentFields, LEXICAL_SCHEMA_VERSION, map_event_to_document,
+    IndexCommitStats, IndexDocumentFields, IndexerConfig, IndexerLagSnapshot, IndexerRunResult,
+    LEXICAL_SCHEMA_VERSION, map_event_to_document,
 };
 use proptest::prelude::*;
 
@@ -616,6 +617,194 @@ proptest! {
         prop_assert_eq!(doc.parent_event_id.as_deref(), Some(parent.as_str()));
         prop_assert_eq!(doc.trigger_event_id.as_deref(), Some(trigger.as_str()));
         prop_assert!(doc.root_event_id.is_none());
+    }
+}
+
+// =========================================================================
+// Unit tests
+// =========================================================================
+
+// =========================================================================
+// NEW: IndexDocumentFields Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn document_debug_nonempty(doc in arb_index_document()) {
+        let dbg = format!("{:?}", doc);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("IndexDocumentFields"));
+    }
+}
+
+// =========================================================================
+// NEW: IndexDocumentFields PartialEq reflexive
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn document_eq_reflexive(doc in arb_index_document()) {
+        prop_assert_eq!(&doc, &doc);
+    }
+}
+
+// =========================================================================
+// NEW: IndexCommitStats Clone/PartialEq
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn commit_stats_clone_eq(
+        added in 0_u64..1000,
+        deleted in 0_u64..1000,
+        segments in 0_u64..100,
+    ) {
+        let stats = IndexCommitStats { docs_added: added, docs_deleted: deleted, segment_count: segments };
+        let cloned = stats.clone();
+        prop_assert_eq!(cloned, stats);
+    }
+}
+
+// =========================================================================
+// NEW: IndexCommitStats Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn commit_stats_debug_nonempty(
+        added in 0_u64..1000,
+        deleted in 0_u64..1000,
+    ) {
+        let stats = IndexCommitStats { docs_added: added, docs_deleted: deleted, segment_count: 1 };
+        let dbg = format!("{:?}", stats);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("IndexCommitStats"));
+    }
+}
+
+// =========================================================================
+// NEW: IndexerConfig Default has expected values
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn indexer_config_default(_dummy in 0..1u8) {
+        let config = IndexerConfig::default();
+        prop_assert!(config.batch_size > 0, "batch_size should be positive");
+        prop_assert!(!config.consumer_id.is_empty(), "consumer_id should not be empty");
+    }
+}
+
+// =========================================================================
+// NEW: IndexerConfig Clone preserves
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn indexer_config_clone_preserves(_dummy in 0..1u8) {
+        let config = IndexerConfig::default();
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.batch_size, config.batch_size);
+        prop_assert_eq!(cloned.consumer_id, config.consumer_id);
+        prop_assert_eq!(cloned.dedup_on_replay, config.dedup_on_replay);
+        prop_assert_eq!(cloned.data_path, config.data_path);
+    }
+}
+
+// =========================================================================
+// NEW: IndexerConfig Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn indexer_config_debug_nonempty(_dummy in 0..1u8) {
+        let config = IndexerConfig::default();
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("IndexerConfig"));
+    }
+}
+
+// =========================================================================
+// NEW: IndexerRunResult Clone/PartialEq
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn run_result_clone_eq(
+        read in 0_u64..1000,
+        indexed in 0_u64..1000,
+        skipped in 0_u64..1000,
+        batches in 0_u64..100,
+    ) {
+        let result = IndexerRunResult {
+            events_read: read,
+            events_indexed: indexed,
+            events_skipped: skipped,
+            batches_committed: batches,
+            final_ordinal: Some(read),
+            caught_up: true,
+        };
+        let cloned = result.clone();
+        prop_assert_eq!(cloned, result);
+    }
+}
+
+// =========================================================================
+// NEW: IndexerRunResult Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn run_result_debug_nonempty(
+        read in 0_u64..1000,
+    ) {
+        let result = IndexerRunResult {
+            events_read: read,
+            events_indexed: read,
+            events_skipped: 0,
+            batches_committed: 1,
+            final_ordinal: None,
+            caught_up: false,
+        };
+        let dbg = format!("{:?}", result);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// =========================================================================
+// NEW: IndexerLagSnapshot Clone/PartialEq
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn lag_snapshot_clone_eq(
+        head in proptest::option::of(0_u64..100_000),
+        indexer in proptest::option::of(0_u64..100_000),
+        behind in 0_u64..100_000,
+        caught_up in any::<bool>(),
+    ) {
+        let snap = IndexerLagSnapshot {
+            log_head_ordinal: head,
+            indexer_ordinal: indexer,
+            records_behind: behind,
+            caught_up,
+        };
+        let cloned = snap.clone();
+        prop_assert_eq!(cloned, snap);
+    }
+}
+
+// =========================================================================
+// NEW: LEXICAL_SCHEMA_VERSION non-empty and contains expected prefix
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn lexical_schema_version_valid(_dummy in 0..1u8) {
+        prop_assert!(!LEXICAL_SCHEMA_VERSION.is_empty());
+        prop_assert!(LEXICAL_SCHEMA_VERSION.contains("lexical"),
+            "LEXICAL_SCHEMA_VERSION should contain 'lexical': {}", LEXICAL_SCHEMA_VERSION);
     }
 }
 

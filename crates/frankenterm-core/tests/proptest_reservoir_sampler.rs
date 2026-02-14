@@ -495,3 +495,172 @@ proptest! {
         prop_assert_eq!(rs.seen(), items.len() as u64);
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Capacity accessor returns constructor arg
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn sampler_capacity_accessor(capacity in arb_capacity()) {
+        let rs = ReservoirSampler::<i32>::new(capacity);
+        prop_assert_eq!(rs.capacity(), capacity);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: is_empty initially true
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn sampler_is_empty_initially(capacity in arb_capacity()) {
+        let rs = ReservoirSampler::<i32>::new(capacity);
+        prop_assert!(rs.is_empty());
+        prop_assert_eq!(rs.len(), 0);
+        prop_assert_eq!(rs.seen(), 0);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Not empty after observe
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn sampler_not_empty_after_observe(capacity in arb_capacity()) {
+        let mut rs = ReservoirSampler::new(capacity);
+        rs.observe(42);
+        prop_assert!(!rs.is_empty());
+        prop_assert_eq!(rs.len(), 1);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Debug output non-empty
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn sampler_debug_nonempty(capacity in arb_capacity()) {
+        let rs = ReservoirSampler::<i32>::new(capacity);
+        let dbg = format!("{:?}", rs);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: WeightedReservoir capacity accessor
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn weighted_capacity_accessor(capacity in arb_capacity()) {
+        let wr = WeightedReservoir::<i32>::new(capacity);
+        prop_assert_eq!(wr.capacity(), capacity);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: WeightedReservoir is_empty initially
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn weighted_is_empty_initially(capacity in arb_capacity()) {
+        let wr = WeightedReservoir::<i32>::new(capacity);
+        prop_assert!(wr.is_empty());
+        prop_assert_eq!(wr.len(), 0);
+        prop_assert_eq!(wr.seen(), 0);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: WeightedReservoir not empty after observe
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn weighted_not_empty_after_observe(capacity in arb_capacity()) {
+        let mut wr = WeightedReservoir::new(capacity);
+        wr.observe(42, 1.0);
+        prop_assert!(!wr.is_empty());
+        prop_assert_eq!(wr.len(), 1);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: WeightedReservoir Debug non-empty
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn weighted_debug_nonempty(capacity in arb_capacity()) {
+        let wr = WeightedReservoir::<i32>::new(capacity);
+        let dbg = format!("{:?}", wr);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: SamplerStats Debug non-empty
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn stats_debug_nonempty(capacity in arb_capacity()) {
+        let rs = ReservoirSampler::<i32>::new(capacity);
+        let stats = rs.stats();
+        let dbg = format!("{:?}", stats);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("SamplerStats"));
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: SamplerStats Clone preserves
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn stats_clone_preserves(
+        capacity in arb_capacity(),
+        items in arb_items(30),
+    ) {
+        let mut rs = ReservoirSampler::new(capacity);
+        for &item in &items {
+            rs.observe(item);
+        }
+        let stats = rs.stats();
+        let cloned = stats.clone();
+        prop_assert_eq!(cloned.capacity, stats.capacity);
+        prop_assert_eq!(cloned.current_size, stats.current_size);
+        prop_assert_eq!(cloned.total_seen, stats.total_seen);
+        prop_assert!((cloned.sampling_rate - stats.sampling_rate).abs() < 1e-15);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: SamplerStats serde deterministic
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn stats_serde_deterministic(
+        capacity in arb_capacity(),
+        items in arb_items(20),
+    ) {
+        let mut rs = ReservoirSampler::new(capacity);
+        for &item in &items {
+            rs.observe(item);
+        }
+        let stats = rs.stats();
+        let j1 = serde_json::to_string(&stats).unwrap();
+        let j2 = serde_json::to_string(&stats).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}
