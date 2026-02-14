@@ -917,8 +917,10 @@ fn compute_position_change(current: usize, pos: &Position, limit: usize) -> usiz
 #[cfg(test)]
 mod test {
     use super::*;
+    #[cfg(feature = "use_image")]
     use alloc::sync::Arc;
     use frankenterm_cell::color::AnsiColor;
+    #[cfg(feature = "use_image")]
     use frankenterm_cell::image::ImageData;
     use frankenterm_cell::{AttributeChange, Intensity};
 
@@ -1651,6 +1653,7 @@ mod test {
         assert_eq!(s.screen_chars_to_string(), "A\u{200b}B \n");
     }
 
+    #[cfg(feature = "use_image")]
     #[test]
     fn images() {
         // a dummy image blob with nonsense content

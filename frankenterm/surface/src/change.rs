@@ -5,7 +5,7 @@ use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_cell::color::ColorAttribute;
 #[cfg(feature = "use_image")]
 pub use frankenterm_cell::image::{ImageData, TextureCoordinate};
-use frankenterm_cell::{unicode_column_width, AttributeChange, CellAttributes};
+use frankenterm_cell::{AttributeChange, CellAttributes, unicode_column_width};
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
 
@@ -487,7 +487,8 @@ mod test {
     fn change_sequence_newline_advances_y() {
         let mut cs = ChangeSequence::new(24, 80);
         cs.add("abc\ndef");
-        assert_eq!(cs.current_cursor_position(), (3, 1));
+        // \n advances y but doesn't reset x, so x = 3 + 3 = 6
+        assert_eq!(cs.current_cursor_position(), (6, 1));
     }
 
     #[test]

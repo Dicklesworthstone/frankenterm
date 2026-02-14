@@ -80,9 +80,10 @@ mod test {
     use std::collections::hash_map::RandomState;
 
     fn make_cell(text: &str) -> Cell {
-        Cell::new_grapheme(text, CellAttributes::default())
+        Cell::new_grapheme(text, CellAttributes::default(), None)
     }
 
+    #[allow(dead_code)]
     fn make_wide_cell(text: &str, width: usize) -> Cell {
         Cell::new_grapheme_with_width(text, width, CellAttributes::default())
     }
