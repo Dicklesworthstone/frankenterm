@@ -653,4 +653,267 @@ mod tests {
         assert_eq!(parsed.capture_depth, 500);
         assert_eq!(parsed.paused_panes, vec![1, 5]);
     }
+
+    // -----------------------------------------------------------------------
+    // Tier serde
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tier_serde_roundtrip_all_variants() {
+        for tier in [
+            BackpressureTier::Green,
+            BackpressureTier::Yellow,
+            BackpressureTier::Red,
+            BackpressureTier::Black,
+        ] {
+            let json = serde_json::to_string(&tier).unwrap();
+            let back: BackpressureTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, tier);
+        }
+    }
+
+    #[test]
+    fn tier_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&BackpressureTier::Green).unwrap(),
+            "\"green\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackpressureTier::Black).unwrap(),
+            "\"black\""
+        );
+    }
+
+    #[test]
+    fn tier_as_u8_matches_ord() {
+        let tiers = [
+            BackpressureTier::Green,
+            BackpressureTier::Yellow,
+            BackpressureTier::Red,
+            BackpressureTier::Black,
+        ];
+        for w in tiers.windows(2) {
+            assert!(w[0].as_u8() < w[1].as_u8());
+            assert!(w[0] < w[1]);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Config serde
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let config = BackpressureConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: BackpressureConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.enabled, config.enabled);
+        assert!((back.yellow_capture - config.yellow_capture).abs() < f64::EPSILON);
+        assert!((back.red_capture - config.red_capture).abs() < f64::EPSILON);
+        assert_eq!(back.hysteresis_ms, config.hysteresis_ms);
+        assert_eq!(back.max_buffered_segments, config.max_buffered_segments);
+    }
+
+    #[test]
+    fn config_partial_json_uses_defaults() {
+        let json = r#"{"enabled": false}"#;
+        let config: BackpressureConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.enabled);
+        // All other fields should be defaults.
+        let def = BackpressureConfig::default();
+        assert!((config.yellow_capture - def.yellow_capture).abs() < f64::EPSILON);
+        assert_eq!(config.check_interval_ms, def.check_interval_ms);
+    }
+
+    // -----------------------------------------------------------------------
+    // Classify boundary conditions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_just_below_yellow_capture_is_green() {
+        let m = default_manager();
+        // 49.9% capture → Green (threshold is 50%)
+        let d = depths(511, 1024, 0, 10_000);
+        assert_eq!(m.classify(&d), BackpressureTier::Green);
+    }
+
+    #[test]
+    fn classify_just_below_red_capture_is_yellow() {
+        let m = default_manager();
+        // 74.9% capture → Yellow (red threshold is 75%)
+        let d = depths(767, 1024, 0, 10_000);
+        assert_eq!(m.classify(&d), BackpressureTier::Yellow);
+    }
+
+    #[test]
+    fn classify_both_queues_elevated_uses_worst() {
+        let m = default_manager();
+        // Capture at Yellow level, write at Red level → Red wins.
+        let d = depths(512, 1024, 8000, 10_000);
+        assert_eq!(m.classify(&d), BackpressureTier::Red);
+    }
+
+    #[test]
+    fn classify_black_exactly_at_saturation_boundary() {
+        let m = default_manager();
+        // Capture: capacity - 5 exactly → Black.
+        let d = depths(1019, 1024, 0, 10_000);
+        assert_eq!(m.classify(&d), BackpressureTier::Black);
+        // One less → not saturated.
+        let d2 = depths(1018, 1024, 0, 10_000);
+        assert_ne!(m.classify(&d2), BackpressureTier::Black);
+    }
+
+    #[test]
+    fn classify_write_saturation_boundary_at_100() {
+        let m = default_manager();
+        // Write: capacity - 100 exactly → Black.
+        let d = depths(0, 1024, 9900, 10_000);
+        assert_eq!(m.classify(&d), BackpressureTier::Black);
+        // One less → not saturated via this check.
+        let d2 = depths(0, 1024, 9899, 10_000);
+        assert_ne!(m.classify(&d2), BackpressureTier::Black);
+    }
+
+    #[test]
+    fn classify_full_capacity_is_black() {
+        let m = default_manager();
+        let d = depths(1024, 1024, 10_000, 10_000);
+        assert_eq!(m.classify(&d), BackpressureTier::Black);
+    }
+
+    // -----------------------------------------------------------------------
+    // QueueDepths edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn queue_depths_one_capacity_full() {
+        let d = depths(1, 1, 1, 1);
+        assert!((d.capture_ratio() - 1.0).abs() < f64::EPSILON);
+        assert!((d.write_ratio() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn queue_depths_empty_queues() {
+        let d = depths(0, 1024, 0, 10_000);
+        assert!(d.capture_ratio().abs() < f64::EPSILON);
+        assert!(d.write_ratio().abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Evaluate: multiple upgrades
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn evaluate_multiple_upgrades_without_hysteresis_block() {
+        let m = default_manager();
+
+        // Green → Yellow
+        let d_y = depths(512, 1024, 0, 10_000);
+        let r = m.evaluate(&d_y);
+        assert_eq!(r, Some((BackpressureTier::Green, BackpressureTier::Yellow)));
+
+        // Yellow → Red (upgrade is immediate)
+        let d_r = depths(768, 1024, 0, 10_000);
+        let r = m.evaluate(&d_r);
+        assert_eq!(r, Some((BackpressureTier::Yellow, BackpressureTier::Red)));
+
+        // Red → Black (upgrade is immediate)
+        let d_b = depths(1022, 1024, 0, 10_000);
+        let r = m.evaluate(&d_b);
+        assert_eq!(r, Some((BackpressureTier::Red, BackpressureTier::Black)));
+        assert_eq!(m.current_tier(), BackpressureTier::Black);
+    }
+
+    // -----------------------------------------------------------------------
+    // Metrics accumulation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metrics_black_entry_counted() {
+        let m = default_manager();
+        let d = depths(1022, 1024, 0, 10_000); // Black
+        m.evaluate(&d);
+        assert_eq!(m.metrics.black_entries.load(Ordering::Relaxed), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pane management edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resume_nonexistent_pane_is_no_op() {
+        let m = default_manager();
+        m.resume_pane(42); // should not panic
+        assert!(m.paused_pane_ids().is_empty());
+    }
+
+    #[test]
+    fn pause_same_pane_twice_is_idempotent() {
+        let m = default_manager();
+        m.pause_pane(7);
+        m.pause_pane(7);
+        assert_eq!(m.paused_pane_ids(), vec![7]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Config accessor methods
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_accessor_methods_reflect_config() {
+        let mut config = BackpressureConfig::default();
+        config.idle_poll_backoff_factor = 4.0;
+        config.skip_detection_ratio = 0.33;
+        config.pause_ratio = 0.75;
+        config.max_buffered_segments = 42;
+        config.recovery_resume_interval_ms = 1234;
+        let m = BackpressureManager::new(config);
+
+        assert!((m.idle_poll_backoff_factor() - 4.0).abs() < f64::EPSILON);
+        assert!((m.skip_detection_ratio() - 0.33).abs() < f64::EPSILON);
+        assert!((m.pause_ratio() - 0.75).abs() < f64::EPSILON);
+        assert_eq!(m.max_buffered_segments(), 42);
+        assert_eq!(m.recovery_resume_interval_ms(), 1234);
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshot edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_green_with_no_paused_panes() {
+        let m = default_manager();
+        let d = depths(10, 1024, 100, 10_000);
+        let snap = m.snapshot(&d);
+        assert_eq!(snap.tier, BackpressureTier::Green);
+        assert!(snap.paused_panes.is_empty());
+        assert_eq!(snap.transitions, 0);
+        assert!(snap.timestamp_epoch_ms > 0);
+    }
+
+    #[test]
+    fn snapshot_serde_all_tiers() {
+        for tier in [
+            BackpressureTier::Green,
+            BackpressureTier::Yellow,
+            BackpressureTier::Red,
+            BackpressureTier::Black,
+        ] {
+            let snap = BackpressureSnapshot {
+                tier,
+                timestamp_epoch_ms: 1_000,
+                capture_depth: 0,
+                capture_capacity: 100,
+                write_depth: 0,
+                write_capacity: 100,
+                duration_in_tier_ms: 0,
+                transitions: 0,
+                paused_panes: vec![],
+            };
+            let json = serde_json::to_string(&snap).unwrap();
+            let back: BackpressureSnapshot = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.tier, tier);
+        }
+    }
 }
