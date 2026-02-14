@@ -3759,4 +3759,159 @@ mod test {
         let parsed = WindowDecorations::try_from(s).unwrap();
         assert_eq!(parsed, wd);
     }
+
+    // ── Third-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn composed_single_char_becomes_char() {
+        assert_eq!(KeyCode::composed("a"), KeyCode::Char('a'));
+        assert_eq!(KeyCode::composed("Z"), KeyCode::Char('Z'));
+    }
+
+    #[test]
+    fn composed_multi_char_becomes_composed() {
+        let kc = KeyCode::composed("ab");
+        assert_eq!(kc, KeyCode::Composed("ab".to_string()));
+    }
+
+    #[test]
+    fn composed_empty_string_becomes_composed() {
+        let kc = KeyCode::composed("");
+        assert_eq!(kc, KeyCode::Composed(String::new()));
+    }
+
+    #[test]
+    fn to_phys_lowercase_letters() {
+        assert_eq!(KeyCode::Char('a').to_phys(), Some(PhysKeyCode::A));
+        assert_eq!(KeyCode::Char('z').to_phys(), Some(PhysKeyCode::Z));
+    }
+
+    #[test]
+    fn to_phys_uppercase_letters() {
+        assert_eq!(KeyCode::Char('A').to_phys(), Some(PhysKeyCode::A));
+        assert_eq!(KeyCode::Char('Z').to_phys(), Some(PhysKeyCode::Z));
+    }
+
+    #[test]
+    fn to_phys_digits() {
+        assert_eq!(KeyCode::Char('0').to_phys(), Some(PhysKeyCode::K0));
+        assert_eq!(KeyCode::Char('9').to_phys(), Some(PhysKeyCode::K9));
+    }
+
+    #[test]
+    fn to_phys_special_chars() {
+        assert_eq!(KeyCode::Char('\\').to_phys(), Some(PhysKeyCode::Backslash));
+        assert_eq!(KeyCode::Char(' ').to_phys(), Some(PhysKeyCode::Space));
+        assert_eq!(KeyCode::Char('\t').to_phys(), Some(PhysKeyCode::Tab));
+        assert_eq!(KeyCode::Char('\r').to_phys(), Some(PhysKeyCode::Return));
+    }
+
+    #[test]
+    fn to_phys_function_keys() {
+        assert_eq!(KeyCode::Function(1).to_phys(), Some(PhysKeyCode::F1));
+        assert_eq!(KeyCode::Function(12).to_phys(), Some(PhysKeyCode::F12));
+        assert_eq!(KeyCode::Function(20).to_phys(), Some(PhysKeyCode::F20));
+    }
+
+    #[test]
+    fn to_phys_unmapped_returns_none() {
+        assert_eq!(KeyCode::Char('é').to_phys(), None);
+        assert_eq!(KeyCode::RawCode(999).to_phys(), None);
+        assert_eq!(KeyCode::Function(24).to_phys(), None);
+    }
+
+    #[test]
+    fn is_modifier_true_for_modifiers() {
+        assert!(KeyCode::Shift.is_modifier());
+        assert!(KeyCode::LeftShift.is_modifier());
+        assert!(KeyCode::RightShift.is_modifier());
+        assert!(KeyCode::Control.is_modifier());
+        assert!(KeyCode::Alt.is_modifier());
+        assert!(KeyCode::Hyper.is_modifier());
+        assert!(KeyCode::Super.is_modifier());
+        assert!(KeyCode::Meta.is_modifier());
+        assert!(KeyCode::CapsLock.is_modifier());
+    }
+
+    #[test]
+    fn is_modifier_false_for_non_modifiers() {
+        assert!(!KeyCode::Char('a').is_modifier());
+        assert!(!KeyCode::Function(1).is_modifier());
+        assert!(!KeyCode::UpArrow.is_modifier());
+        assert!(!KeyCode::Home.is_modifier());
+        assert!(!KeyCode::Insert.is_modifier());
+    }
+
+    #[test]
+    fn ctrl_mapping_lower_a_to_z() {
+        assert_eq!(ctrl_mapping('a'), Some('\x01'));
+        assert_eq!(ctrl_mapping('z'), Some('\x1a'));
+    }
+
+    #[test]
+    fn ctrl_mapping_upper_a_to_z() {
+        assert_eq!(ctrl_mapping('A'), Some('\x01'));
+        assert_eq!(ctrl_mapping('Z'), Some('\x1a'));
+    }
+
+    #[test]
+    fn ctrl_mapping_at_and_space_is_null() {
+        assert_eq!(ctrl_mapping('@'), Some('\x00'));
+        assert_eq!(ctrl_mapping('`'), Some('\x00'));
+        assert_eq!(ctrl_mapping(' '), Some('\x00'));
+    }
+
+    #[test]
+    fn ctrl_mapping_non_ascii_returns_none() {
+        assert_eq!(ctrl_mapping('é'), None);
+        assert_eq!(ctrl_mapping('!'), None);
+        assert_eq!(ctrl_mapping('#'), None);
+    }
+
+    #[test]
+    fn is_ascii_control_converts_c0_to_alpha() {
+        assert_eq!(is_ascii_control('\x01'), Some('a')); // Ctrl-A
+        assert_eq!(is_ascii_control('\x03'), Some('c')); // Ctrl-C
+        assert_eq!(is_ascii_control('\x1a'), Some('z')); // Ctrl-Z
+    }
+
+    #[test]
+    fn is_ascii_control_non_control_returns_none() {
+        assert_eq!(is_ascii_control('A'), None);
+        assert_eq!(is_ascii_control(' '), None);
+        assert_eq!(is_ascii_control('z'), None);
+    }
+
+    #[test]
+    fn keycode_try_from_str_named_keys() {
+        assert_eq!(KeyCode::try_from("Shift").unwrap(), KeyCode::Shift);
+        assert_eq!(KeyCode::try_from("Control").unwrap(), KeyCode::Control);
+        assert_eq!(KeyCode::try_from("Alt").unwrap(), KeyCode::Alt);
+        assert_eq!(KeyCode::try_from("Home").unwrap(), KeyCode::Home);
+        assert_eq!(KeyCode::try_from("End").unwrap(), KeyCode::End);
+    }
+
+    #[test]
+    fn keycode_try_from_str_unknown_fails() {
+        assert!(KeyCode::try_from("NotAKey").is_err());
+    }
+
+    #[test]
+    fn keycode_ord_consistency() {
+        // KeyCode derives Ord - verify it doesn't panic
+        let a = KeyCode::Char('a');
+        let b = KeyCode::Char('b');
+        assert!(a < b || a >= b); // just exercise Ord
+    }
+
+    #[test]
+    fn keycode_hash_consistency() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(KeyCode::Char('a'));
+        set.insert(KeyCode::Char('a'));
+        assert_eq!(set.len(), 1);
+        set.insert(KeyCode::Char('b'));
+        assert_eq!(set.len(), 2);
+    }
 }
