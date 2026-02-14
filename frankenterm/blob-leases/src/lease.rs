@@ -46,6 +46,197 @@ impl BlobLease {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{clear_storage, register_storage, BlobStorage, BoxedReader, BufSeekRead};
+    use crate::{BlobManager, LeaseId};
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct InMemoryStorage {
+        data: Mutex<std::collections::HashMap<ContentId, Vec<u8>>>,
+    }
+
+    impl InMemoryStorage {
+        fn new() -> Self {
+            Self {
+                data: Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    struct InMemoryReader(Cursor<Vec<u8>>);
+    impl BufSeekRead for InMemoryReader {}
+    impl std::io::Read for InMemoryReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+    impl std::io::BufRead for InMemoryReader {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.0.fill_buf()
+        }
+        fn consume(&mut self, amt: usize) {
+            self.0.consume(amt);
+        }
+    }
+    impl std::io::Seek for InMemoryReader {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(pos)
+        }
+    }
+
+    impl BlobStorage for InMemoryStorage {
+        fn store(
+            &self,
+            content_id: ContentId,
+            data: &[u8],
+            _lease_id: LeaseId,
+        ) -> Result<(), Error> {
+            self.data.lock().unwrap().insert(content_id, data.to_vec());
+            Ok(())
+        }
+        fn lease_by_content(&self, content_id: ContentId, _lease_id: LeaseId) -> Result<(), Error> {
+            if self.data.lock().unwrap().contains_key(&content_id) {
+                Ok(())
+            } else {
+                Err(Error::ContentNotFound(content_id))
+            }
+        }
+        fn get_data(&self, content_id: ContentId, _lease_id: LeaseId) -> Result<Vec<u8>, Error> {
+            self.data
+                .lock()
+                .unwrap()
+                .get(&content_id)
+                .cloned()
+                .ok_or(Error::ContentNotFound(content_id))
+        }
+        fn get_reader(
+            &self,
+            content_id: ContentId,
+            lease_id: LeaseId,
+        ) -> Result<BoxedReader, Error> {
+            let data = self.get_data(content_id, lease_id)?;
+            Ok(Box::new(InMemoryReader(Cursor::new(data))))
+        }
+        fn advise_lease_dropped(
+            &self,
+            _lease_id: LeaseId,
+            _content_id: ContentId,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        fn advise_of_pid(&self, _pid: u32) -> Result<(), Error> {
+            Ok(())
+        }
+        fn advise_pid_terminated(&self, _pid: u32) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn setup_storage() -> Arc<InMemoryStorage> {
+        let s = Arc::new(InMemoryStorage::new());
+        clear_storage();
+        register_storage(s.clone()).unwrap();
+        s
+    }
+
+    #[test]
+    fn blob_lease_get_data() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(b"lease data").unwrap();
+        let data = lease.get_data().unwrap();
+        assert_eq!(data, b"lease data");
+        clear_storage();
+    }
+
+    #[test]
+    fn blob_lease_get_reader() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(b"reader data").unwrap();
+        let mut reader = lease.get_reader().unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut buf).unwrap();
+        assert_eq!(buf, b"reader data");
+        clear_storage();
+    }
+
+    #[test]
+    fn blob_lease_content_id_matches() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(b"check id").unwrap();
+        let expected = ContentId::for_bytes(b"check id");
+        assert_eq!(lease.content_id(), expected);
+        clear_storage();
+    }
+
+    #[test]
+    fn blob_lease_clone_shares_content_id() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(b"cloneable").unwrap();
+        let cloned = lease.clone();
+        assert_eq!(lease.content_id(), cloned.content_id());
+        clear_storage();
+    }
+
+    #[test]
+    fn blob_lease_clone_equality() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(b"equal").unwrap();
+        let cloned = lease.clone();
+        assert_eq!(lease, cloned);
+        clear_storage();
+    }
+
+    #[test]
+    fn blob_lease_is_debug() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(b"debug").unwrap();
+        let debug = format!("{lease:?}");
+        assert!(debug.contains("BlobLease"));
+        clear_storage();
+    }
+
+    #[test]
+    fn blob_lease_get_data_without_storage_fails() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(b"temp").unwrap();
+        clear_storage();
+        let result = lease.get_data();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn blob_lease_drop_does_not_panic() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        {
+            let _lease = BlobManager::store(b"drop me").unwrap();
+            // lease drops here
+        }
+        clear_storage();
+    }
+
+    #[test]
+    fn blob_lease_drop_without_storage_does_not_panic() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(b"orphan").unwrap();
+        clear_storage();
+        drop(lease); // Should not panic even though storage is gone
+    }
+}
+
 impl Drop for LeaseInner {
     fn drop(&mut self) {
         if let Ok(storage) = get_storage() {
