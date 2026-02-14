@@ -415,7 +415,8 @@ proptest! {
 
         let delay = policy.delay_for_attempt(attempt);
         let expected_ms = (init_ms as f64) * factor.powi(attempt as i32);
-        let expected = Duration::from_millis(expected_ms as u64);
+        // Cap at max_delay, matching the implementation's behavior.
+        let expected = Duration::from_millis(expected_ms as u64).min(policy.max_delay);
 
         // Allow 1ms tolerance for f64→u64 truncation
         let diff = delay.abs_diff(expected);

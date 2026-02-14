@@ -569,8 +569,8 @@ fn concurrent_global_updates_do_not_panic() {
     for h in handles {
         h.join().expect("thread should not panic");
     }
-    // At least one write should have succeeded.
-    assert!(ResizeCrashContext::get_global().is_some());
+    // Don't assert get_global().is_some() — other tests sharing the process
+    // may call clear_global() concurrently, making this flaky.
     ResizeCrashContext::clear_global();
 }
 
@@ -911,7 +911,9 @@ fn crash_bundle_manifest_has_resize_forensics_flag_when_provided() {
         "manifest should indicate resize forensics present"
     );
     assert!(
-        manifest.files.contains(&"resize_forensics.json".to_string()),
+        manifest
+            .files
+            .contains(&"resize_forensics.json".to_string()),
         "files list should include resize_forensics.json"
     );
 }

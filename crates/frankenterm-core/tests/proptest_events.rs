@@ -458,10 +458,16 @@ proptest! {
         dedup.clear();
         prop_assert!(dedup.is_empty(), "should be empty after clear");
         prop_assert_eq!(dedup.len(), 0, "len should be 0 after clear");
-        // All keys should return New again
+        // Each unique key should return New on its first post-clear check.
+        // Deduplicate so we only check each key once (duplicate keys in the
+        // vector would register on the first iteration, making subsequent
+        // iterations return Duplicate — which is correct behavior).
+        let mut seen = std::collections::HashSet::new();
         for key in &keys {
-            prop_assert_eq!(dedup.check(key), DedupeVerdict::New,
-                "key {} should be New after clear", key);
+            if seen.insert(key) {
+                prop_assert_eq!(dedup.check(key), DedupeVerdict::New,
+                    "key {} should be New after clear", key);
+            }
         }
     }
 
@@ -583,12 +589,18 @@ proptest! {
         prop_assert!(!cd.is_empty(), "should not be empty before clear");
         cd.clear();
         prop_assert!(cd.is_empty(), "should be empty after clear");
+        // Each unique key should return Send(0) on its first post-clear
+        // check.  Deduplicate so duplicate keys in the vector don't trigger
+        // a legitimate Suppress on their second iteration.
+        let mut seen = std::collections::HashSet::new();
         for key in &keys {
-            prop_assert_eq!(
-                cd.check(key),
-                CooldownVerdict::Send { suppressed_since_last: 0 },
-                "key {} should Send(0) after clear", key
-            );
+            if seen.insert(key) {
+                prop_assert_eq!(
+                    cd.check(key),
+                    CooldownVerdict::Send { suppressed_since_last: 0 },
+                    "key {} should Send(0) after clear", key
+                );
+            }
         }
     }
 
