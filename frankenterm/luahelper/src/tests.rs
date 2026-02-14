@@ -692,3 +692,202 @@ fn value_printer_object_table() {
     assert!(debug.contains("key"));
     assert!(debug.contains("value"));
 }
+
+// ── to_lua / from_lua wrapper functions ─────────────────────
+
+#[test]
+fn to_lua_with_bool() {
+    let l = lua();
+    let result = to_lua(&l, true).unwrap();
+    assert_eq!(result, LuaValue::Boolean(true));
+}
+
+#[test]
+fn to_lua_with_string() {
+    let l = lua();
+    let result = to_lua(&l, "hello".to_string()).unwrap();
+    if let LuaValue::String(s) = result {
+        assert_eq!(s.to_str().unwrap(), "hello");
+    } else {
+        panic!("expected String");
+    }
+}
+
+#[test]
+fn to_lua_with_i64() {
+    let l = lua();
+    let result = to_lua(&l, 42i64).unwrap();
+    match result {
+        LuaValue::Integer(n) => assert_eq!(n, 42),
+        _ => panic!("expected Integer"),
+    }
+}
+
+#[test]
+fn from_lua_bool() {
+    let result: bool = from_lua(LuaValue::Boolean(false)).unwrap();
+    assert!(!result);
+}
+
+#[test]
+fn from_lua_integer_to_i64() {
+    let result: i64 = from_lua(LuaValue::Integer(99)).unwrap();
+    assert_eq!(result, 99);
+}
+
+#[test]
+fn from_lua_string() {
+    let l = lua();
+    let s = l.create_string("world").unwrap();
+    let result: String = from_lua(LuaValue::String(s)).unwrap();
+    assert_eq!(result, "world");
+}
+
+// ── from_lua_value_dynamic ──────────────────────────────────
+
+#[test]
+fn from_lua_value_dynamic_bool() {
+    let result: bool = from_lua_value_dynamic(LuaValue::Boolean(true)).unwrap();
+    assert!(result);
+}
+
+#[test]
+fn from_lua_value_dynamic_integer() {
+    let result: i64 = from_lua_value_dynamic(LuaValue::Integer(123)).unwrap();
+    assert_eq!(result, 123);
+}
+
+// ── lua_value_to_dynamic: Thread error ──────────────────────
+
+#[test]
+fn lua_thread_to_dynamic_fails() {
+    let l = lua();
+    let func = l.create_function(|_, ()| Ok(())).unwrap();
+    let thread = l.create_thread(func).unwrap();
+    let result = lua_value_to_dynamic(LuaValue::Thread(thread));
+    assert!(result.is_err());
+}
+
+// ── lua_value_to_dynamic: mixed table error ─────────────────
+
+#[test]
+fn lua_array_with_string_key_errors() {
+    let l = lua();
+    let t = l.create_table().unwrap();
+    t.set(1, "a").unwrap();
+    t.set("extra", "b").unwrap();
+    let result = lua_value_to_dynamic(LuaValue::Table(t));
+    assert!(result.is_err());
+}
+
+// ── ValuePrinter: circular reference ────────────────────────
+
+#[test]
+fn value_printer_circular_table() {
+    let l = lua();
+    let t = l.create_table().unwrap();
+    t.set("self_ref", t.clone()).unwrap();
+    let debug = format!("{:?}", ValuePrinter(LuaValue::Table(t)));
+    // Should not panic; circular reference handled
+    assert!(!debug.is_empty());
+}
+
+// ── ValuePrinter: empty table ───────────────────────────────
+
+#[test]
+fn value_printer_empty_table() {
+    let l = lua();
+    let t = l.create_table().unwrap();
+    let debug = format!("{:?}", ValuePrinter(LuaValue::Table(t)));
+    assert!(!debug.is_empty());
+}
+
+// ── ValuePrinter: function value ────────────────────────────
+
+#[test]
+fn value_printer_function() {
+    let l = lua();
+    let func = l.create_function(|_, ()| Ok(())).unwrap();
+    let debug = format!("{:?}", ValuePrinter(LuaValue::Function(func)));
+    assert!(!debug.is_empty());
+}
+
+// ── Roundtrip: empty string ─────────────────────────────────
+
+#[test]
+fn roundtrip_empty_string() {
+    let l = lua();
+    let original = DynValue::String(String::new());
+    let lua_val = dynamic_to_lua_value(&l, original.clone()).unwrap();
+    let back = lua_value_to_dynamic(lua_val).unwrap();
+    assert_eq!(back, original);
+}
+
+// ── Roundtrip: empty array ──────────────────────────────────
+
+#[test]
+fn roundtrip_empty_array() {
+    let l = lua();
+    let arr: frankenterm_dynamic::Array = vec![].into();
+    let original = DynValue::Array(arr);
+    let lua_val = dynamic_to_lua_value(&l, original).unwrap();
+    let back = lua_value_to_dynamic(lua_val).unwrap();
+    // Empty Lua table has no key=1, so it becomes an empty Object
+    assert!(matches!(back, DynValue::Object(_)));
+}
+
+// ── Roundtrip: empty object ─────────────────────────────────
+
+#[test]
+fn roundtrip_empty_object() {
+    let l = lua();
+    let obj: frankenterm_dynamic::Object = BTreeMap::new().into();
+    let original = DynValue::Object(obj);
+    let lua_val = dynamic_to_lua_value(&l, original.clone()).unwrap();
+    let back = lua_value_to_dynamic(lua_val).unwrap();
+    assert_eq!(back, original);
+}
+
+// ── f64 edge values ─────────────────────────────────────────
+
+#[test]
+fn f64_zero_to_lua() {
+    let l = lua();
+    let result = dynamic_to_lua_value(&l, DynValue::F64(OrderedFloat(0.0))).unwrap();
+    match result {
+        LuaValue::Number(n) => assert_eq!(n, 0.0),
+        LuaValue::Integer(n) => assert_eq!(n, 0),
+        _ => panic!("expected numeric"),
+    }
+}
+
+#[test]
+fn f64_negative_to_lua() {
+    let l = lua();
+    let result = dynamic_to_lua_value(&l, DynValue::F64(OrderedFloat(-99.5))).unwrap();
+    if let LuaValue::Number(n) = result {
+        assert!((n + 99.5).abs() < 1e-10);
+    } else {
+        panic!("expected Number");
+    }
+}
+
+#[test]
+fn value_printer_nested_table() {
+    let l = lua();
+    let inner = l.create_table().unwrap();
+    inner.set(1, "deep").unwrap();
+    let outer = l.create_table().unwrap();
+    outer.set("child", inner).unwrap();
+    let debug = format!("{:?}", ValuePrinter(LuaValue::Table(outer)));
+    assert!(debug.contains("deep"));
+}
+
+#[test]
+fn roundtrip_bool_false() {
+    let l = lua();
+    let original = DynValue::Bool(false);
+    let lua_val = dynamic_to_lua_value(&l, original.clone()).unwrap();
+    let back = lua_value_to_dynamic(lua_val).unwrap();
+    assert_eq!(back, original);
+}
