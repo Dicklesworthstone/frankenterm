@@ -89,15 +89,14 @@ fn arb_relevance_assertion() -> impl Strategy<Value = RelevanceAssertion> {
         (0_u64..100_000).prop_map(RelevanceAssertion::MinTotalHits),
         (0_u64..100_000).prop_map(RelevanceAssertion::MaxTotalHits),
         (0_u64..100_000).prop_map(RelevanceAssertion::ExactTotalHits),
-        ("[a-z0-9-]{5,20}", 1_usize..100).prop_map(|(id, n)| RelevanceAssertion::InTopN {
-            event_id: id,
-            n,
-        }),
-        ("[a-z0-9-]{5,20}", "[a-z0-9-]{5,20}")
-            .prop_map(|(h, l)| RelevanceAssertion::RankedBefore {
+        ("[a-z0-9-]{5,20}", 1_usize..100)
+            .prop_map(|(id, n)| RelevanceAssertion::InTopN { event_id: id, n }),
+        ("[a-z0-9-]{5,20}", "[a-z0-9-]{5,20}").prop_map(|(h, l)| {
+            RelevanceAssertion::RankedBefore {
                 higher: h,
                 lower: l,
-            }),
+            }
+        }),
         "[a-z0-9-]{5,20}".prop_map(|id| RelevanceAssertion::FirstResult { event_id: id }),
         prop::collection::vec(0_u64..1000, 1..5)
             .prop_map(|v| RelevanceAssertion::AllMatchFilter(SearchFilter::PaneId { values: v })),

@@ -36,13 +36,15 @@ fn arb_model_info() -> impl Strategy<Value = ModelInfo> {
         0u64..10_000_000,
         prop::option::of(arb_cache_dir()),
     )
-        .prop_map(|(name, version, dimension, size_bytes, cache_path)| ModelInfo {
-            name,
-            version,
-            dimension,
-            size_bytes,
-            cache_path,
-        })
+        .prop_map(
+            |(name, version, dimension, size_bytes, cache_path)| ModelInfo {
+                name,
+                version,
+                dimension,
+                size_bytes,
+                cache_path,
+            },
+        )
 }
 
 fn arb_model_info_with_name(name: String) -> impl Strategy<Value = ModelInfo> {
@@ -52,13 +54,15 @@ fn arb_model_info_with_name(name: String) -> impl Strategy<Value = ModelInfo> {
         0u64..10_000_000,
         prop::option::of(arb_cache_dir()),
     )
-        .prop_map(move |(version, dimension, size_bytes, cache_path)| ModelInfo {
-            name: name.clone(),
-            version,
-            dimension,
-            size_bytes,
-            cache_path,
-        })
+        .prop_map(
+            move |(version, dimension, size_bytes, cache_path)| ModelInfo {
+                name: name.clone(),
+                version,
+                dimension,
+                size_bytes,
+                cache_path,
+            },
+        )
 }
 
 // ────────────────────────────────────────────────────────────────────

@@ -19,8 +19,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::fd_budget::{
-    AdmitDecision, AuditResult, FdBudget, FdBudgetConfig, FdSnapshot, LimitCheck,
-    LimitValidation, SystemLimits,
+    AdmitDecision, AuditResult, FdBudget, FdBudgetConfig, FdSnapshot, LimitCheck, LimitValidation,
+    SystemLimits,
 };
 
 // =============================================================================
@@ -41,12 +41,12 @@ fn arb_limit() -> impl Strategy<Value = u64> {
 
 fn arb_fd_budget_config() -> impl Strategy<Value = FdBudgetConfig> {
     (
-        0.5_f64..0.9,    // warn_threshold
-        0.9_f64..1.0,    // refuse_threshold
-        1_u64..100,      // fds_per_pane
+        0.5_f64..0.9,     // warn_threshold
+        0.9_f64..1.0,     // refuse_threshold
+        1_u64..100,       // fds_per_pane
         1000_u64..200000, // min_nofile_limit
-        5_u64..120,      // audit_interval_secs
-        1_usize..20,     // leak_detection_count
+        5_u64..120,       // audit_interval_secs
+        1_usize..20,      // leak_detection_count
     )
         .prop_map(|(warn, refuse, fpp, mnl, ais, ldc)| {
             let warn = warn.min(refuse - 0.01);
@@ -63,52 +63,56 @@ fn arb_fd_budget_config() -> impl Strategy<Value = FdBudgetConfig> {
 
 fn arb_fd_snapshot() -> impl Strategy<Value = FdSnapshot> {
     (
-        0_u64..10_000,   // current_open
-        0_u64..10_000,   // total_allocated
+        0_u64..10_000,    // current_open
+        0_u64..10_000,    // total_allocated
         1000_u64..100000, // effective_limit
-        0_usize..200,    // pane_count
+        0_usize..200,     // pane_count
     )
-        .prop_map(|(current_open, total_allocated, effective_limit, pane_count)| {
-            let usage_ratio = current_open as f64 / effective_limit as f64;
-            let budget_ratio = total_allocated as f64 / effective_limit as f64;
-            FdSnapshot {
-                current_open,
-                total_allocated,
-                effective_limit,
-                pane_count,
-                usage_ratio,
-                budget_ratio,
-            }
-        })
+        .prop_map(
+            |(current_open, total_allocated, effective_limit, pane_count)| {
+                let usage_ratio = current_open as f64 / effective_limit as f64;
+                let budget_ratio = total_allocated as f64 / effective_limit as f64;
+                FdSnapshot {
+                    current_open,
+                    total_allocated,
+                    effective_limit,
+                    pane_count,
+                    usage_ratio,
+                    budget_ratio,
+                }
+            },
+        )
 }
 
 fn arb_audit_result() -> impl Strategy<Value = AuditResult> {
     (
-        0_u64..10_000,   // current_fds
+        0_u64..10_000,    // current_fds
         1000_u64..100000, // effective_limit
-        any::<bool>(),   // leak_detected
-        any::<bool>(),   // warning
-        0_usize..100,    // audit_count
+        any::<bool>(),    // leak_detected
+        any::<bool>(),    // warning
+        0_usize..100,     // audit_count
     )
-        .prop_map(|(current_fds, effective_limit, leak_detected, warning, audit_count)| {
-            let usage_ratio = current_fds as f64 / effective_limit as f64;
-            AuditResult {
-                current_fds,
-                effective_limit,
-                usage_ratio,
-                leak_detected,
-                warning,
-                audit_count,
-            }
-        })
+        .prop_map(
+            |(current_fds, effective_limit, leak_detected, warning, audit_count)| {
+                let usage_ratio = current_fds as f64 / effective_limit as f64;
+                AuditResult {
+                    current_fds,
+                    effective_limit,
+                    usage_ratio,
+                    leak_detected,
+                    warning,
+                    audit_count,
+                }
+            },
+        )
 }
 
 fn arb_system_limits() -> impl Strategy<Value = SystemLimits> {
     (
-        1000_u64..100_000,                        // nofile_soft
-        100_000_u64..1_000_000,                   // nofile_hard
+        1000_u64..100_000,                             // nofile_soft
+        100_000_u64..1_000_000,                        // nofile_hard
         proptest::option::of(100_000_u64..10_000_000), // system_max_files
-        0_u64..5000,                              // current_open_fds
+        0_u64..5000,                                   // current_open_fds
     )
         .prop_map(|(soft, hard, sys_max, current)| {
             let hard = hard.max(soft);

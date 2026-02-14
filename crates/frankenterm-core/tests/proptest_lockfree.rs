@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use frankenterm_core::concurrent_map::{PaneMap, ShardedMap};
-use frankenterm_core::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax, ShardedSnapshot};
+use frankenterm_core::sharded_counter::{
+    ShardedCounter, ShardedGauge, ShardedMax, ShardedSnapshot,
+};
 
 // ===========================================================================
 // Strategies

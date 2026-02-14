@@ -1,10 +1,14 @@
 //! Property-based tests for the reactive dataflow graph.
 //!
 //! Tests invariants: acyclicity, topological propagation order, glitch-freedom,
-//! incremental recomputation, and value consistency.
+//! incremental recomputation, value consistency, error handling, merge, query
+//! API, and serde roundtrips.
 
 use frankenterm_core::dataflow::{DataflowError, DataflowGraph, NodeId, Value};
 use proptest::prelude::*;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 // =============================================================================
 // Strategies
@@ -90,7 +94,7 @@ fn build_graph_from_ops(ops: &[GraphOp]) -> (DataflowGraph, Vec<NodeId>) {
 }
 
 // =============================================================================
-// Property tests
+// Property tests — core graph invariants
 // =============================================================================
 
 proptest! {
@@ -341,5 +345,290 @@ proptest! {
             Value::Text(t) if t.is_empty() => prop_assert!(s.is_empty()),
             _ => prop_assert!(!s.is_empty()),
         }
+    }
+}
+
+// =============================================================================
+// Property tests — Value serde and equality
+// =============================================================================
+
+proptest! {
+    /// Value serde roundtrip preserves equality.
+    #[test]
+    fn value_serde_roundtrip(val in arb_value()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: Value = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back, &val);
+    }
+
+    /// Value JSON has a "type" tag.
+    #[test]
+    fn value_json_has_type_tag(val in arb_value()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(
+            parsed.get("type").is_some(),
+            "Value JSON should have a 'type' field: {}", json
+        );
+        let tag = parsed["type"].as_str().unwrap();
+        let expected_tag = match &val {
+            Value::Bool(_) => "bool",
+            Value::Float(_) => "float",
+            Value::Int(_) => "int",
+            Value::Text(_) => "text",
+            Value::None => "none",
+        };
+        prop_assert_eq!(tag, expected_tag);
+    }
+
+    /// Value equality is reflexive.
+    #[test]
+    fn value_equality_reflexive(val in arb_value()) {
+        prop_assert_eq!(&val, &val);
+    }
+
+    /// Value clone equals original.
+    #[test]
+    fn value_clone_equals(val in arb_value()) {
+        let cloned = val.clone();
+        prop_assert_eq!(&cloned, &val);
+    }
+}
+
+// =============================================================================
+// Property tests — query API
+// =============================================================================
+
+proptest! {
+    /// get_label returns the correct label for each node.
+    #[test]
+    fn get_label_correct(label in "[a-z]{1,10}", val in arb_value()) {
+        let mut graph = DataflowGraph::new();
+        let id = graph.add_source(&label, val);
+        prop_assert_eq!(graph.get_label(id), Some(label.as_str()));
+    }
+
+    /// is_stable returns true after propagation.
+    #[test]
+    fn is_stable_after_propagation(ops in arb_graph_ops(30)) {
+        let (mut graph, _) = build_graph_from_ops(&ops);
+        graph.propagate();
+        prop_assert!(graph.is_stable(), "should be stable after propagation");
+    }
+
+    /// node_ids returns all node IDs in the graph.
+    #[test]
+    fn node_ids_complete(ops in arb_graph_ops(30)) {
+        let (graph, created_nodes) = build_graph_from_ops(&ops);
+        let ids = graph.node_ids();
+        let id_set: HashSet<NodeId> = ids.into_iter().collect();
+        for &n in &created_nodes {
+            prop_assert!(id_set.contains(&n), "missing node ID");
+        }
+        prop_assert_eq!(id_set.len(), graph.node_count());
+    }
+
+    /// propagation_count increments with each propagation.
+    #[test]
+    fn propagation_count_increments(n in 1..10usize) {
+        let mut graph = DataflowGraph::new();
+        let s = graph.add_source("s", Value::Int(0));
+        prop_assert_eq!(graph.propagation_count(), 0);
+        for i in 0..n {
+            let _ = graph.update_source(s, Value::Int(i as i64));
+            graph.propagate();
+        }
+        prop_assert_eq!(graph.propagation_count(), n as u64);
+    }
+
+    /// NodeId Display format contains "node:".
+    #[test]
+    fn node_id_display_format(_dummy in 0..1u8) {
+        let mut graph = DataflowGraph::new();
+        let id = graph.add_source("test", Value::None);
+        let display = format!("{}", id);
+        prop_assert!(display.starts_with("node:"), "NodeId display should start with 'node:', got '{}'", display);
+    }
+}
+
+// =============================================================================
+// Property tests — error handling
+// =============================================================================
+
+proptest! {
+    /// update_source on a map node returns NotASource error.
+    #[test]
+    fn update_source_on_map_returns_error(val in arb_value()) {
+        let mut graph = DataflowGraph::new();
+        let s = graph.add_source("s", Value::None);
+        let m = graph.add_map("m", vec![s], |i| i[0].clone());
+        let result = graph.update_source(m, val);
+        prop_assert!(
+            matches!(result, Err(DataflowError::NotASource(_))),
+            "update_source on map should return NotASource"
+        );
+    }
+
+    /// Cycle detection across 2 nodes: A→B→A is rejected.
+    #[test]
+    fn cycle_across_two_nodes_rejected(val in arb_value()) {
+        let mut graph = DataflowGraph::new();
+        let a = graph.add_source("a", val.clone());
+        let b = graph.add_map("b", vec![a], |i| i[0].clone());
+        // b already depends on a; adding a→b would create a cycle
+        // (well, a already feeds b, so edge b→a would create the cycle)
+        let result = graph.add_edge(b, a);
+        prop_assert!(
+            matches!(result, Err(DataflowError::CycleDetected { .. })),
+            "adding b->a when a->b exists should detect a cycle"
+        );
+    }
+
+    /// Duplicate edge returns DuplicateEdge error.
+    #[test]
+    fn duplicate_edge_rejected(_dummy in 0..1u8) {
+        let mut graph = DataflowGraph::new();
+        let a = graph.add_source("a", Value::None);
+        let b = graph.add_source("b", Value::None);
+        graph.add_edge(a, b).unwrap();
+        let result = graph.add_edge(a, b);
+        prop_assert!(
+            matches!(result, Err(DataflowError::DuplicateEdge { .. })),
+            "adding duplicate edge should return DuplicateEdge"
+        );
+    }
+
+    /// DataflowError Display is non-empty for all variants.
+    #[test]
+    fn error_display_non_empty(_dummy in 0..1u8) {
+        let mut graph = DataflowGraph::new();
+        let s = graph.add_source("s", Value::None);
+
+        let err1 = graph.add_edge(s, s).unwrap_err();
+        prop_assert!(!err1.to_string().is_empty());
+
+        let m = graph.add_map("m", vec![s], |i| i[0].clone());
+        let err2 = graph.update_source(m, Value::None).unwrap_err();
+        prop_assert!(!err2.to_string().is_empty());
+    }
+
+    /// remove_node on unknown ID returns NodeNotFound.
+    #[test]
+    fn remove_unknown_node_errors(_dummy in 0..1u8) {
+        let mut graph = DataflowGraph::new();
+        let s = graph.add_source("s", Value::None);
+        graph.remove_node(s).unwrap();
+        // Now s is gone; removing again should fail
+        let result = graph.remove_node(s);
+        prop_assert!(matches!(result, Err(DataflowError::NodeNotFound(_))));
+    }
+}
+
+// =============================================================================
+// Property tests — sink and merge
+// =============================================================================
+
+proptest! {
+    /// add_sink fires callback on value change.
+    #[test]
+    fn sink_fires_on_change(initial in any::<i64>(), updated in any::<i64>()) {
+        let mut graph = DataflowGraph::new();
+        let s = graph.add_source("s", Value::Int(initial));
+        let m = graph.add_map("m", vec![s], |i| i[0].clone());
+        graph.propagate();
+
+        let fire_count = Arc::new(AtomicUsize::new(0));
+        let fc = Arc::clone(&fire_count);
+        graph.add_sink(m, move |_val| {
+            fc.fetch_add(1, Ordering::Relaxed);
+        }).unwrap();
+
+        let _ = graph.update_source(s, Value::Int(updated));
+        graph.propagate();
+
+        if initial != updated {
+            prop_assert!(
+                fire_count.load(Ordering::Relaxed) >= 1,
+                "sink should fire when value changes"
+            );
+        }
+    }
+
+    /// add_sink on unknown node returns NodeNotFound.
+    #[test]
+    fn sink_unknown_node_errors(_dummy in 0..1u8) {
+        let mut graph = DataflowGraph::new();
+        let s = graph.add_source("s", Value::None);
+        graph.remove_node(s).unwrap();
+        let result = graph.add_sink(s, |_| {});
+        prop_assert!(matches!(result, Err(DataflowError::NodeNotFound(_))));
+    }
+
+    /// Merge increases node count by the other graph's node count.
+    #[test]
+    fn merge_increases_node_count(
+        n1 in 1..10usize,
+        n2 in 1..10usize,
+    ) {
+        let mut g1 = DataflowGraph::new();
+        for i in 0..n1 {
+            g1.add_source(&format!("g1_s{}", i), Value::Int(i as i64));
+        }
+
+        let mut g2 = DataflowGraph::new();
+        for i in 0..n2 {
+            g2.add_source(&format!("g2_s{}", i), Value::Int(i as i64));
+        }
+
+        let before = g1.node_count();
+        let id_map = g1.merge(&g2);
+
+        prop_assert_eq!(g1.node_count(), before + n2);
+        prop_assert_eq!(id_map.len(), n2, "id_map should have one entry per merged node");
+    }
+
+    /// Merge preserves values from the merged graph.
+    #[test]
+    fn merge_preserves_values(val in any::<i64>()) {
+        let mut g1 = DataflowGraph::new();
+        g1.add_source("g1_s", Value::Int(0));
+
+        let mut g2 = DataflowGraph::new();
+        let g2_s = g2.add_source("g2_s", Value::Int(val));
+
+        let id_map = g1.merge(&g2);
+        let new_id = id_map[&g2_s];
+
+        prop_assert_eq!(g1.get_value(new_id), Some(&Value::Int(val)));
+        prop_assert_eq!(g1.get_label(new_id), Some("g2_s"));
+    }
+
+    /// Merge remaps edges correctly.
+    #[test]
+    fn merge_remaps_edges(_dummy in 0..1u8) {
+        let mut g1 = DataflowGraph::new();
+        g1.add_source("g1_s", Value::Int(0));
+
+        let mut g2 = DataflowGraph::new();
+        let g2_s = g2.add_source("g2_s", Value::Int(1));
+        let g2_m = g2.add_map("g2_m", vec![g2_s], |i| i[0].clone());
+        g2.propagate();
+
+        let edges_before = g1.edge_count();
+        let id_map = g1.merge(&g2);
+
+        // Should have at least one new edge (g2_s → g2_m)
+        prop_assert!(g1.edge_count() > edges_before, "merge should add edges");
+
+        // Merged graph should remain acyclic
+        prop_assert!(g1.is_acyclic(), "merged graph should be acyclic");
+
+        // Values should be accessible via remapped IDs
+        let new_s = id_map[&g2_s];
+        let new_m = id_map[&g2_m];
+        prop_assert_eq!(g1.get_value(new_s), Some(&Value::Int(1)));
+        // g2_m was computed from g2_s; after merge, nodes become sources
+        // but retain their last-computed value
+        prop_assert_eq!(g1.get_value(new_m), Some(&Value::Int(1)));
     }
 }

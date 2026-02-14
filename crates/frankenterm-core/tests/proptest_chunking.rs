@@ -12,18 +12,18 @@
 //! - Overlap metadata consistency
 //! - Content hash and chunk_id determinism
 
-use proptest::prelude::*;
 use proptest::collection::vec as arb_vec;
+use proptest::prelude::*;
 
 use frankenterm_core::recorder_storage::RecorderOffset;
 use frankenterm_core::recording::{
-    RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
-    RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
-    RecorderControlMarkerType, RecorderLifecyclePhase,
+    RecorderControlMarkerType, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
+    RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
+    RecorderSegmentKind, RecorderTextEncoding,
 };
 use frankenterm_core::search::{
-    ChunkDirection, ChunkInputEvent, ChunkPolicyConfig, SemanticChunk,
-    RECORDER_CHUNKING_POLICY_V1, build_semantic_chunks,
+    ChunkDirection, ChunkInputEvent, ChunkPolicyConfig, RECORDER_CHUNKING_POLICY_V1, SemanticChunk,
+    build_semantic_chunks,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -175,13 +175,13 @@ fn arb_pane_id() -> impl Strategy<Value = u64> {
 /// Generate a valid ChunkPolicyConfig with reasonable parameter ranges.
 fn arb_chunk_policy_config() -> impl Strategy<Value = ChunkPolicyConfig> {
     (
-        200usize..=4000,   // max_chunk_chars
-        4usize..=100,      // max_chunk_events
+        200usize..=4000,     // max_chunk_chars
+        4usize..=100,        // max_chunk_events
         10_000u64..=300_000, // max_window_ms
-        5_000u64..=60_000, // hard_gap_ms
-        10usize..=200,     // min_chunk_chars
-        1_000u64..=30_000, // merge_window_ms
-        0usize..=300,      // overlap_chars
+        5_000u64..=60_000,   // hard_gap_ms
+        10usize..=200,       // min_chunk_chars
+        1_000u64..=30_000,   // merge_window_ms
+        0usize..=300,        // overlap_chars
     )
         .prop_map(
             |(

@@ -27,9 +27,8 @@ use frankenterm_core::recorder_query::{
 };
 use frankenterm_core::recorder_retention::SensitivityTier;
 use frankenterm_core::recording::{
-    RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
-    RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
-    RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
+    RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
 
 // =============================================================================

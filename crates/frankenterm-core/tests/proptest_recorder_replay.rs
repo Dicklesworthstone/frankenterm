@@ -72,19 +72,21 @@ fn arb_events(
 
 fn arb_replay_config() -> impl Strategy<Value = ReplayConfig> {
     (
-        0.5_f64..4.0,      // speed
-        1000_u64..60_000,   // max_delay_ms
-        any::<bool>(),      // skip_empty
-        any::<bool>(),      // include_markers
+        0.5_f64..4.0,     // speed
+        1000_u64..60_000, // max_delay_ms
+        any::<bool>(),    // skip_empty
+        any::<bool>(),    // include_markers
     )
-        .prop_map(|(speed, max_delay_ms, skip_empty, include_markers)| ReplayConfig {
-            speed,
-            max_delay_ms,
-            skip_empty,
-            include_markers,
-            pane_filter: Vec::new(),
-            kind_filter: Vec::new(),
-        })
+        .prop_map(
+            |(speed, max_delay_ms, skip_empty, include_markers)| ReplayConfig {
+                speed,
+                max_delay_ms,
+                skip_empty,
+                include_markers,
+                pane_filter: Vec::new(),
+                kind_filter: Vec::new(),
+            },
+        )
 }
 
 fn arb_replay_state() -> impl Strategy<Value = ReplayState> {

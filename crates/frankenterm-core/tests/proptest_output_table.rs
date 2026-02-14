@@ -19,21 +19,21 @@ fn arb_alignment() -> impl Strategy<Value = Alignment> {
 
 fn arb_column() -> impl Strategy<Value = Column> {
     (
-        "[A-Za-z _]{1,15}",   // header
+        "[A-Za-z _]{1,15}", // header
         arb_alignment(),
-        0usize..20,            // min_width
-        0usize..50,            // max_width
+        0usize..20, // min_width
+        0usize..50, // max_width
     )
         .prop_map(|(header, alignment, min_width, max_width)| {
-            Column::new(header).align(alignment).min_width(min_width).max_width(max_width)
+            Column::new(header)
+                .align(alignment)
+                .min_width(min_width)
+                .max_width(max_width)
         })
 }
 
 fn arb_output_format() -> impl Strategy<Value = OutputFormat> {
-    prop_oneof![
-        Just(OutputFormat::Plain),
-        Just(OutputFormat::Json),
-    ]
+    prop_oneof![Just(OutputFormat::Plain), Just(OutputFormat::Json),]
 }
 
 // ── Alignment: Default ──────────────────────────────────────────────────────
