@@ -347,3 +347,230 @@ fn tls_modes_are_distinct() {
         }
     }
 }
+
+// =========================================================================
+// NEW: EmailNotifyConfig Clone preserves all fields
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn prop_config_clone_preserves(config in arb_valid_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.enabled, config.enabled);
+        prop_assert_eq!(&cloned.smtp_host, &config.smtp_host);
+        prop_assert_eq!(cloned.smtp_port, config.smtp_port);
+        prop_assert_eq!(&cloned.username, &config.username);
+        prop_assert_eq!(&cloned.password, &config.password);
+        prop_assert_eq!(&cloned.from, &config.from);
+        prop_assert_eq!(&cloned.to, &config.to);
+        prop_assert_eq!(&cloned.subject_prefix, &config.subject_prefix);
+        prop_assert_eq!(cloned.tls, config.tls);
+        prop_assert_eq!(cloned.timeout_secs, config.timeout_secs);
+    }
+}
+
+// =========================================================================
+// NEW: EmailNotifyConfig Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn prop_config_debug_nonempty(config in arb_valid_config()) {
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("EmailNotifyConfig"));
+    }
+}
+
+// =========================================================================
+// NEW: EmailTlsMode Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn prop_tls_mode_debug_nonempty(mode in arb_tls_mode()) {
+        let dbg = format!("{:?}", mode);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// =========================================================================
+// NEW: EmailTlsMode Copy roundtrip
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn prop_tls_mode_copy_eq(mode in arb_tls_mode()) {
+        let copied = mode;
+        prop_assert_eq!(mode, copied);
+    }
+}
+
+// =========================================================================
+// NEW: Valid config remains valid after clone
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn prop_valid_config_clone_still_valid(config in arb_valid_config()) {
+        prop_assert!(config.validate().is_ok());
+        let cloned = config.clone();
+        prop_assert!(cloned.validate().is_ok());
+    }
+}
+
+// =========================================================================
+// NEW: Config with no credentials (both None) validates when enabled
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn prop_no_credentials_validates(
+        host in "[a-z]{3,10}\\.[a-z]{2,4}",
+        from in arb_valid_email(),
+        to in proptest::collection::vec(arb_valid_email(), 1..3),
+    ) {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: host,
+            smtp_port: 587,
+            username: None,
+            password: None,
+            from,
+            to,
+            ..Default::default()
+        };
+        prop_assert!(config.validate().is_ok(),
+            "no-credentials config should validate");
+    }
+}
+
+// =========================================================================
+// NEW: Timeout preserved in serde roundtrip
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn prop_timeout_preserved_serde(timeout in 1u64..=3600) {
+        let config = EmailNotifyConfig {
+            timeout_secs: timeout,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: EmailNotifyConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.timeout_secs, timeout);
+    }
+}
+
+// =========================================================================
+// NEW: Default config timeout is reasonable
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn prop_default_timeout_reasonable(_dummy in 0..1u8) {
+        let config = EmailNotifyConfig::default();
+        prop_assert!(config.timeout_secs > 0, "timeout should be > 0");
+        prop_assert!(config.timeout_secs <= 60, "timeout should be <= 60s");
+    }
+}
+
+// =========================================================================
+// NEW: Config JSON contains expected keys
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn prop_config_json_has_expected_keys(config in arb_valid_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(json.contains("\"enabled\""));
+        prop_assert!(json.contains("\"smtp_host\""));
+        prop_assert!(json.contains("\"smtp_port\""));
+        prop_assert!(json.contains("\"from\""));
+        prop_assert!(json.contains("\"to\""));
+        prop_assert!(json.contains("\"tls\""));
+        prop_assert!(json.contains("\"timeout_secs\""));
+    }
+}
+
+// =========================================================================
+// NEW: Bad to-address in list is rejected
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn prop_invalid_to_address_rejected(
+        host in "[a-z]{3,10}\\.[a-z]{2,4}",
+        from in arb_valid_email(),
+        bad_to in "[a-z]{3,10}",  // no @ sign
+    ) {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: host,
+            smtp_port: 587,
+            from,
+            to: vec![bad_to],
+            ..Default::default()
+        };
+        prop_assert!(config.validate().is_err(),
+            "invalid to-address should fail validation");
+    }
+}
+
+// =========================================================================
+// NEW: Multiple valid to-addresses all pass
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn prop_multiple_valid_to_accepted(
+        host in "[a-z]{3,10}\\.[a-z]{2,4}",
+        from in arb_valid_email(),
+        to in proptest::collection::vec(arb_valid_email(), 2..5),
+    ) {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: host,
+            smtp_port: 587,
+            from,
+            to,
+            ..Default::default()
+        };
+        prop_assert!(config.validate().is_ok());
+    }
+}
+
+// =========================================================================
+// NEW: Empty password string with username fails
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn prop_empty_password_with_user_rejected(
+        host in "[a-z]{3,10}\\.[a-z]{2,4}",
+        from in arb_valid_email(),
+        to in proptest::collection::vec(arb_valid_email(), 1..3),
+        user in "[a-z]{3,10}",
+    ) {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: host,
+            smtp_port: 587,
+            username: Some(user),
+            password: Some(String::new()),
+            from,
+            to,
+            ..Default::default()
+        };
+        prop_assert!(config.validate().is_err(),
+            "empty password with username should fail");
+    }
+}

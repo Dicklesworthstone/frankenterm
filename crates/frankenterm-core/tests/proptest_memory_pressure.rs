@@ -338,3 +338,228 @@ fn action_severity(action: MemoryAction) -> u8 {
         MemoryAction::EmergencyCleanup => 3,
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: MemoryPressureTier Clone/Copy preserves
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_tier_copy_preserves(t in arb_tier()) {
+        let copied = t;
+        prop_assert_eq!(t, copied);
+        prop_assert_eq!(t.as_u8(), copied.as_u8());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: MemoryPressureTier Debug non-empty
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_tier_debug_nonempty(t in arb_tier()) {
+        let dbg = format!("{:?}", t);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: MemoryPressureTier total ordering transitive
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_tier_ordering_transitive(
+        a in arb_tier(),
+        b in arb_tier(),
+        c in arb_tier(),
+    ) {
+        if a <= b && b <= c {
+            prop_assert!(a <= c, "ordering should be transitive: {:?} <= {:?} <= {:?}", a, b, c);
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: MemoryPressureTier as_u8 values are distinct
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_tier_as_u8_distinct(_dummy in 0..1u8) {
+        let tiers = [
+            MemoryPressureTier::Green,
+            MemoryPressureTier::Yellow,
+            MemoryPressureTier::Orange,
+            MemoryPressureTier::Red,
+        ];
+        for i in 0..tiers.len() {
+            for j in (i + 1)..tiers.len() {
+                prop_assert_ne!(tiers[i].as_u8(), tiers[j].as_u8(),
+                    "{:?} and {:?} should have different as_u8()", tiers[i], tiers[j]);
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: MemoryAction Clone/Copy preserves
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_action_copy_preserves(a in arb_action()) {
+        let copied = a;
+        prop_assert_eq!(a, copied);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: MemoryAction Debug non-empty
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_action_debug_nonempty(a in arb_action()) {
+        let dbg = format!("{:?}", a);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: MemoryPressureConfig Clone preserves fields
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_config_clone_preserves(c in arb_config()) {
+        let cloned = c.clone();
+        prop_assert_eq!(cloned.enabled, c.enabled);
+        prop_assert_eq!(cloned.sample_interval_ms, c.sample_interval_ms);
+        prop_assert!((cloned.yellow_threshold - c.yellow_threshold).abs() < 1e-15);
+        prop_assert!((cloned.orange_threshold - c.orange_threshold).abs() < 1e-15);
+        prop_assert!((cloned.red_threshold - c.red_threshold).abs() < 1e-15);
+        prop_assert_eq!(cloned.compress_idle_secs, c.compress_idle_secs);
+        prop_assert_eq!(cloned.evict_idle_secs, c.evict_idle_secs);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: MemoryPressureConfig Debug non-empty
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_config_debug_nonempty(c in arb_config()) {
+        let dbg = format!("{:?}", c);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: PaneMemoryInfo Clone preserves fields
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_pane_info_clone_preserves(info in arb_pane_memory_info()) {
+        let cloned = info.clone();
+        prop_assert_eq!(cloned.pane_id, info.pane_id);
+        prop_assert_eq!(cloned.rss_kb, info.rss_kb);
+        prop_assert_eq!(cloned.scrollback_compressed, info.scrollback_compressed);
+        prop_assert_eq!(cloned.scrollback_evicted, info.scrollback_evicted);
+        prop_assert_eq!(cloned.idle_secs, info.idle_secs);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: PaneMemoryInfo Debug non-empty
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_pane_info_debug_nonempty(info in arb_pane_memory_info()) {
+        let dbg = format!("{:?}", info);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("PaneMemoryInfo"));
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Yellow suggested_action is CompressIdle
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_yellow_compress_idle(_dummy in 0..1u8) {
+        prop_assert_eq!(
+            MemoryPressureTier::Yellow.suggested_action(),
+            MemoryAction::CompressIdle
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Orange suggested_action is EvictToDisk
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_orange_evict_to_disk(_dummy in 0..1u8) {
+        prop_assert_eq!(
+            MemoryPressureTier::Orange.suggested_action(),
+            MemoryAction::EvictToDisk
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: MemoryPressureMonitor tier_handle initially Green (0)
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_tier_handle_initially_green(c in arb_config()) {
+        let monitor = MemoryPressureMonitor::new(c);
+        let handle = monitor.tier_handle();
+        prop_assert_eq!(handle.load(Ordering::Relaxed), 0,
+            "tier_handle should initially be 0 (Green)");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: MemoryPressureTier Hash consistent with Eq
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_tier_hash_consistent(t1 in arb_tier(), t2 in arb_tier()) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        if t1 == t2 {
+            let mut h1 = DefaultHasher::new();
+            let mut h2 = DefaultHasher::new();
+            t1.hash(&mut h1);
+            t2.hash(&mut h2);
+            prop_assert_eq!(h1.finish(), h2.finish(),
+                "equal tiers should have equal hashes");
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: MemoryAction serde snake_case check
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_action_serde_snake_case(a in arb_action()) {
+        let json = serde_json::to_string(&a).unwrap();
+        let inner = json.trim_matches('"');
+        prop_assert!(
+            inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "serialized action should be snake_case, got '{}'", inner
+        );
+    }
+}
