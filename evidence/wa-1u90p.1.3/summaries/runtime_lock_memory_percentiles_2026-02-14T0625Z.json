@@ -1,0 +1,48 @@
+{
+  "collected": 30,
+  "watcher_running_true": 30,
+  "window_start_ms": 1771050286331,
+  "window_end_ms": 1771050346334,
+  "metrics": {
+    "avg_storage_lock_wait_ms": {
+      "p50": 0.001,
+      "p95": 0.001,
+      "max": 0.001
+    },
+    "max_storage_lock_wait_ms": {
+      "p50": 0.001,
+      "p95": 0.001,
+      "max": 0.002
+    },
+    "storage_lock_contention_events": {
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    },
+    "avg_storage_lock_hold_ms": {
+      "p50": 0.019,
+      "p95": 0.019,
+      "max": 0.26666666666666666
+    },
+    "max_storage_lock_hold_ms": {
+      "p50": 0.019,
+      "p95": 0.019,
+      "max": 0.781
+    },
+    "cursor_snapshot_bytes_last": {
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    },
+    "cursor_snapshot_bytes_max": {
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    },
+    "avg_cursor_snapshot_bytes": {
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    }
+  }
+}
