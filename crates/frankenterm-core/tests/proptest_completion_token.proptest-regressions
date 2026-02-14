@@ -4,5 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 4cdeceeeef942732db36b4f9d07a067e715976c2e1e86abfa5df9c85fe88869c # shrinks to capacity = 2129, fp_rate = 0.049
-cc b248cd685d78dcec61b53bc04d5a1871ad89bd68c03419d2d22e42ffc777df26 # shrinks to capacity = 221, fp_rate = 0.032
+cc f8c45d64c6948f1c601c7c2a26c0a0fb68498f49d762ef6718fbdfbc696d69c6 # shrinks to subs = ["__", "__"]

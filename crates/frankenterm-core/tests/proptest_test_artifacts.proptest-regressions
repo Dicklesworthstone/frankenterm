@@ -4,5 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 4cdeceeeef942732db36b4f9d07a067e715976c2e1e86abfa5df9c85fe88869c # shrinks to capacity = 2129, fp_rate = 0.049
-cc b248cd685d78dcec61b53bc04d5a1871ad89bd68c03419d2d22e42ffc777df26 # shrinks to capacity = 221, fp_rate = 0.032
+cc dde87cbbec66af54ddcf42a45210b3ec6447176ce209317b3cbdf8f44fc01c38 # shrinks to timing = StageTimingMetrics { queue_wait_ms: None, reflow_ms: None, render_ms: None, present_ms: None, p50_ms: Some(0.0), p95_ms: Some(0.0), p99_ms: Some(26.603934923706106) }

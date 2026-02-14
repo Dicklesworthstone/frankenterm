@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dae5798dbd64df7d7add5b144a9375730a5b66ade4bec046641ff9ded29dcf6d # shrinks to age = 9223372036854775808, prefix = "a"
+cc 011e8fd7ad5ba0ced76c994df88b0e498e7d97ef7a4586618317b71ec0aa68d4 # shrinks to snap = MetricsSnapshot { uptime_seconds: 0.0, observed_panes: 0, capture_queue_depth: 0, capture_queue_capacity: 0, write_queue_depth: 0, segments_persisted: 0, events_recorded: 0, ingest_lag_avg_ms: 0.0, ingest_lag_max_ms: 0, ingest_lag_sum_ms: 0, ingest_lag_count: 0, db_last_write_age_ms: None, native_output_input_events: 0, native_output_batches_emitted: 0, native_output_input_bytes: 0, native_output_emitted_bytes: 0, native_output_max_batch_events: 0, native_output_max_batch_bytes: 0, native_output_coalesce_ratio: 0.0, event_bus: Some(EventBusSnapshot { events_published: 0, events_dropped_no_subscribers: 0, active_subscribers: 0, subscriber_lag_events: 0, capacity: 0, delta_queued: 0, detection_queued: 651, signal_queued: 5303, delta_subscribers: 69, detection_subscribers: 8, signal_subscribers: 99, delta_oldest_lag_ms: None, detection_oldest_lag_ms: None, signal_oldest_lag_ms: Some(2702060334896166342) }) }, prefix = "3RUC_cH"
