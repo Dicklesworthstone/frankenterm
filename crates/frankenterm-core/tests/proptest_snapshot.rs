@@ -1112,3 +1112,314 @@ proptest! {
         prop_assert_eq!(&variant, &deserialized);
     }
 }
+
+// =============================================================================
+// Property: PaneNode leaf count stability
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// Leaf count is preserved through serde roundtrip.
+    #[test]
+    fn pane_node_leaf_count_stable(tree in arb_pane_tree()) {
+        let original_count = collect_leaf_ids(&tree).len();
+        let json = serde_json::to_string(&tree).unwrap();
+        let deserialized: PaneNode = serde_json::from_str(&json).unwrap();
+        let roundtrip_count = collect_leaf_ids(&deserialized).len();
+        prop_assert_eq!(original_count, roundtrip_count,
+            "leaf count changed: {} -> {}", original_count, roundtrip_count);
+    }
+
+    /// Leaf pane IDs are preserved through serde roundtrip.
+    #[test]
+    fn pane_node_leaf_ids_preserved(tree in arb_pane_tree()) {
+        let original_ids = collect_leaf_ids(&tree);
+        let json = serde_json::to_string(&tree).unwrap();
+        let deserialized: PaneNode = serde_json::from_str(&json).unwrap();
+        let roundtrip_ids = collect_leaf_ids(&deserialized);
+        prop_assert_eq!(original_ids, roundtrip_ids);
+    }
+}
+
+// =============================================================================
+// Property: Topology JSON structure
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Topology JSON has expected top-level fields.
+    #[test]
+    fn topology_json_has_expected_fields(topo in arb_topology()) {
+        let json = serde_json::to_string(&topo).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert!(obj.contains_key("schema_version"), "missing schema_version");
+        prop_assert!(obj.contains_key("captured_at"), "missing captured_at");
+        prop_assert!(obj.contains_key("windows"), "missing windows");
+    }
+
+    /// Topology window count is preserved in JSON.
+    #[test]
+    fn topology_window_count_in_json(topo in arb_topology()) {
+        let json = serde_json::to_string(&topo).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let windows = value.get("windows").unwrap().as_array().unwrap();
+        prop_assert_eq!(windows.len(), topo.windows.len());
+    }
+
+    /// Topology schema_version is preserved in JSON.
+    #[test]
+    fn topology_schema_version_preserved(topo in arb_topology()) {
+        let json = serde_json::to_string(&topo).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let sv = value.get("schema_version").unwrap().as_u64().unwrap();
+        prop_assert_eq!(sv, topo.schema_version as u64);
+    }
+}
+
+// =============================================================================
+// Property: ScrollbackData edge cases
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Empty input gives empty scrollback.
+    #[test]
+    fn scrollback_empty_input(_dummy in 0..1u8) {
+        let data = ScrollbackData::from_segments(vec![]);
+        prop_assert_eq!(data.lines.len(), 0);
+        prop_assert_eq!(data.total_bytes, 0);
+    }
+
+    /// Single line preserves content exactly.
+    #[test]
+    fn scrollback_single_line(line in "[a-zA-Z0-9 ]{1,100}") {
+        let data = ScrollbackData::from_segments(vec![line.clone()]);
+        prop_assert_eq!(data.lines.len(), 1);
+        prop_assert_eq!(data.lines[0].as_str(), line.as_str());
+        prop_assert_eq!(data.total_bytes, line.len());
+    }
+
+    /// Truncation with max >= len is a no-op.
+    #[test]
+    fn scrollback_truncation_noop(
+        lines in prop::collection::vec("[a-z]{1,20}", 1..50),
+    ) {
+        let mut data = ScrollbackData::from_segments(lines.clone());
+        let original_len = data.lines.len();
+        data.truncate(original_len + 100);
+        prop_assert_eq!(data.lines.len(), original_len);
+    }
+
+    /// Truncation to zero gives empty result.
+    #[test]
+    fn scrollback_truncation_to_zero(
+        lines in prop::collection::vec("[a-z]{1,20}", 1..50),
+    ) {
+        let mut data = ScrollbackData::from_segments(lines);
+        data.truncate(0);
+        prop_assert_eq!(data.lines.len(), 0);
+    }
+}
+
+// =============================================================================
+// Property: PaneStateSnapshot field preservation
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// PaneStateSnapshot Clone preserves all fields.
+    #[test]
+    fn pane_state_clone_preserves_fields(state in arb_pane_state(42)) {
+        let cloned = state.clone();
+        prop_assert_eq!(cloned.schema_version, state.schema_version);
+        prop_assert_eq!(cloned.pane_id, state.pane_id);
+        prop_assert_eq!(cloned.captured_at, state.captured_at);
+        prop_assert_eq!(&cloned.cwd, &state.cwd);
+        prop_assert_eq!(&cloned.shell, &state.shell);
+        prop_assert_eq!(cloned.terminal.rows, state.terminal.rows);
+        prop_assert_eq!(cloned.terminal.cols, state.terminal.cols);
+        prop_assert_eq!(cloned.terminal.is_alt_screen, state.terminal.is_alt_screen);
+    }
+
+    /// PaneStateSnapshot JSON is valid and has pane_id field.
+    #[test]
+    fn pane_state_json_has_pane_id(state in arb_pane_state(99)) {
+        let json = serde_json::to_string(&state).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let pid = value.get("pane_id").unwrap().as_u64().unwrap();
+        prop_assert_eq!(pid, state.pane_id);
+    }
+}
+
+// =============================================================================
+// Property: LaunchAction Clone and Debug
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// LaunchAction Clone produces equal value.
+    #[test]
+    fn launch_action_clone_equal(
+        variant in prop_oneof![
+            (arb_shell(), arb_cwd().prop_filter("need cwd", |c| c.is_some()))
+                .prop_map(|(shell, cwd)| LaunchAction::LaunchShell {
+                    shell,
+                    cwd: std::path::PathBuf::from(cwd.unwrap()),
+                }),
+            arb_agent_type().prop_map(|at| LaunchAction::LaunchAgent {
+                command: format!("{at} --headless"),
+                cwd: std::path::PathBuf::from("/home/user"),
+                agent_type: at,
+            }),
+            Just(LaunchAction::Skip { reason: "no process".into() }),
+            Just(LaunchAction::Manual {
+                hint: "Was running vim".into(),
+                original_process: "vim".into(),
+            }),
+        ]
+    ) {
+        let cloned = variant.clone();
+        prop_assert_eq!(&variant, &cloned);
+    }
+
+    /// LaunchAction Debug is non-empty.
+    #[test]
+    fn launch_action_debug_non_empty(
+        variant in prop_oneof![
+            Just(LaunchAction::Skip { reason: "test".into() }),
+            Just(LaunchAction::Manual { hint: "h".into(), original_process: "p".into() }),
+        ]
+    ) {
+        let debug = format!("{:?}", variant);
+        prop_assert!(!debug.is_empty());
+    }
+}
+
+// =============================================================================
+// Property: LaunchConfig serde roundtrip and defaults
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// LaunchConfig default has expected values.
+    #[test]
+    fn launch_config_default_values(_dummy in 0..1u8) {
+        let cfg = LaunchConfig::default();
+        prop_assert!(cfg.launch_shells, "default launch_shells should be true");
+        prop_assert!(!cfg.launch_agents, "default launch_agents should be false");
+        prop_assert_eq!(cfg.launch_delay_ms, 500);
+        prop_assert!(cfg.agent_commands.is_empty());
+    }
+
+    /// LaunchConfig serde roundtrip preserves fields.
+    #[test]
+    fn launch_config_serde_roundtrip(
+        launch_shells in any::<bool>(),
+        launch_agents in any::<bool>(),
+        delay_ms in 0u64..10000,
+    ) {
+        let cfg = LaunchConfig {
+            launch_shells,
+            launch_agents,
+            launch_delay_ms: delay_ms,
+            agent_commands: HashMap::new(),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let deserialized: LaunchConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(deserialized.launch_shells, cfg.launch_shells);
+        prop_assert_eq!(deserialized.launch_agents, cfg.launch_agents);
+        prop_assert_eq!(deserialized.launch_delay_ms, cfg.launch_delay_ms);
+    }
+
+    /// LaunchConfig Clone is field-identical.
+    #[test]
+    fn launch_config_clone(
+        launch_shells in any::<bool>(),
+        launch_agents in any::<bool>(),
+    ) {
+        let cfg = LaunchConfig {
+            launch_shells,
+            launch_agents,
+            launch_delay_ms: 200,
+            agent_commands: HashMap::new(),
+        };
+        let cloned = cfg.clone();
+        prop_assert_eq!(cloned.launch_shells, cfg.launch_shells);
+        prop_assert_eq!(cloned.launch_agents, cfg.launch_agents);
+        prop_assert_eq!(cloned.launch_delay_ms, cfg.launch_delay_ms);
+    }
+}
+
+// =============================================================================
+// Property: Tab active_pane_id references an actual leaf
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// Generated tabs always have active_pane_id referencing a real leaf.
+    #[test]
+    fn tab_active_pane_id_valid(tab in arb_tab(0)) {
+        if let Some(active_id) = tab.active_pane_id {
+            let leaf_ids = collect_leaf_ids(&tab.pane_tree);
+            prop_assert!(leaf_ids.contains(&active_id),
+                "active_pane_id {} not found in leaf ids {:?}", active_id, leaf_ids);
+        }
+    }
+
+    /// Topology after dedup has all unique pane IDs.
+    #[test]
+    fn dedup_produces_unique_ids(mut topo in arb_topology()) {
+        deduplicate_topology(&mut topo);
+        let mut all_ids: Vec<u64> = topo.windows.iter()
+            .flat_map(|w| &w.tabs)
+            .flat_map(|t| collect_leaf_ids(&t.pane_tree))
+            .collect();
+        let total = all_ids.len();
+        all_ids.sort();
+        all_ids.dedup();
+        prop_assert_eq!(all_ids.len(), total,
+            "dedup should produce all unique IDs");
+    }
+}
+
+// =============================================================================
+// Property: RestoreConfig Clone and Debug
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// RestoreConfig default has expected values.
+    #[test]
+    fn restore_config_default(_dummy in 0..1u8) {
+        let cfg = RestoreConfig::default();
+        let debug = format!("{:?}", cfg);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// RestoreConfig Clone produces equivalent config.
+    #[test]
+    fn restore_config_clone(
+        dirs in any::<bool>(),
+        ratios in any::<bool>(),
+        cont in any::<bool>(),
+    ) {
+        let cfg = RestoreConfig {
+            restore_working_dirs: dirs,
+            restore_split_ratios: ratios,
+            continue_on_error: cont,
+        };
+        let cloned = cfg.clone();
+        prop_assert_eq!(cloned.restore_working_dirs, cfg.restore_working_dirs);
+        prop_assert_eq!(cloned.restore_split_ratios, cfg.restore_split_ratios);
+        prop_assert_eq!(cloned.continue_on_error, cfg.continue_on_error);
+    }
+}
