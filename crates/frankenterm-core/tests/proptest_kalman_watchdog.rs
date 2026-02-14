@@ -8,11 +8,113 @@
 //! 3. Adaptive threshold is always >= the Kalman estimate (for k >= 0)
 //! 4. z-scores are monotonically non-decreasing with distance from estimate
 //! 5. Health status ordering: Healthy < Degraded < Critical < Hung
+//! 6. Serde roundtrips for AdaptiveWatchdogConfig, HealthClassification,
+//!    AdaptiveHealthReport, ComponentClassification
+//! 7. ComponentTracker observation_count tracking
+//! 8. AdaptiveWatchdog component-level health report consistency
+//! 9. Kalman filter std_dev relationship to variance
 
 use proptest::prelude::*;
 
-use frankenterm_core::kalman_watchdog::{AdaptiveWatchdogConfig, ComponentTracker, KalmanFilter};
-use frankenterm_core::watchdog::HealthStatus;
+use frankenterm_core::kalman_watchdog::{
+    AdaptiveHealthReport, AdaptiveWatchdog, AdaptiveWatchdogConfig, ComponentClassification,
+    ComponentTracker, HealthClassification, KalmanFilter,
+};
+use frankenterm_core::watchdog::{Component, HealthStatus};
+
+// =============================================================================
+// Strategies
+// =============================================================================
+
+fn arb_adaptive_config() -> impl Strategy<Value = AdaptiveWatchdogConfig> {
+    (
+        0.5f64..10.0,    // sensitivity_k
+        0.01f64..1000.0, // process_noise
+        0.01f64..10000.0, // measurement_noise
+        1usize..20,      // min_observations
+        0.5f64..5.0,     // degraded_z
+        1.0f64..8.0,     // critical_z
+        2.0f64..15.0,    // hung_z
+    )
+        .prop_map(|(k, pn, mn, mo, dz, cz, hz)| {
+            // Ensure degraded_z < critical_z < hung_z
+            let dz = dz;
+            let cz = dz + (cz - 1.0).abs() + 0.1;
+            let hz = cz + (hz - 2.0).abs() + 0.1;
+            AdaptiveWatchdogConfig {
+                sensitivity_k: k,
+                process_noise: pn,
+                measurement_noise: mn,
+                min_observations: mo,
+                degraded_z: dz,
+                critical_z: cz,
+                hung_z: hz,
+            }
+        })
+}
+
+fn arb_health_status() -> impl Strategy<Value = HealthStatus> {
+    prop_oneof![
+        Just(HealthStatus::Healthy),
+        Just(HealthStatus::Degraded),
+        Just(HealthStatus::Critical),
+        Just(HealthStatus::Hung),
+    ]
+}
+
+fn arb_health_classification() -> impl Strategy<Value = HealthClassification> {
+    (
+        arb_health_status(),
+        proptest::option::of(-10.0f64..20.0),  // z_score
+        proptest::option::of(100.0f64..60000.0), // adaptive_threshold_ms
+        proptest::option::of(100.0f64..60000.0), // estimated_interval_ms
+        proptest::option::of(1.0f64..500.0),     // estimated_std_dev_ms
+        0usize..200,                              // observations
+        any::<bool>(),                            // adaptive_mode
+    )
+        .prop_map(|(status, z, threshold, interval, std_dev, obs, adaptive)| {
+            HealthClassification {
+                status,
+                z_score: z,
+                adaptive_threshold_ms: threshold,
+                estimated_interval_ms: interval,
+                estimated_std_dev_ms: std_dev,
+                observations: obs,
+                adaptive_mode: adaptive,
+            }
+        })
+}
+
+fn arb_component() -> impl Strategy<Value = Component> {
+    prop_oneof![
+        Just(Component::Discovery),
+        Just(Component::Capture),
+        Just(Component::Persistence),
+        Just(Component::Maintenance),
+    ]
+}
+
+fn arb_component_classification() -> impl Strategy<Value = ComponentClassification> {
+    (arb_component(), arb_health_classification()).prop_map(|(component, classification)| {
+        ComponentClassification {
+            component,
+            classification,
+        }
+    })
+}
+
+fn arb_adaptive_health_report() -> impl Strategy<Value = AdaptiveHealthReport> {
+    (
+        0u64..2_000_000_000,
+        arb_health_status(),
+        prop::collection::vec(arb_component_classification(), 0..8),
+    )
+        .prop_map(|(timestamp_ms, overall, components)| AdaptiveHealthReport {
+            timestamp_ms,
+            overall,
+            components,
+        })
+}
 
 // =============================================================================
 // 1. Kalman convergence
@@ -216,7 +318,7 @@ proptest! {
 }
 
 // =============================================================================
-// 6. Additional robustness properties
+// 6. Robustness properties
 // =============================================================================
 
 proptest! {
@@ -289,6 +391,305 @@ proptest! {
                 "threshold at k={} ({}) should be >= threshold at k={} ({})",
                 k2, t2, k1, t1
             );
+        }
+    }
+}
+
+// =============================================================================
+// 7. Serde roundtrips
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(150))]
+
+    /// AdaptiveWatchdogConfig serde roundtrip preserves all fields.
+    #[test]
+    fn proptest_config_serde_roundtrip(config in arb_adaptive_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: AdaptiveWatchdogConfig = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.sensitivity_k - config.sensitivity_k).abs() < 1e-10,
+            "sensitivity_k mismatch");
+        prop_assert!((back.process_noise - config.process_noise).abs() < 1e-10,
+            "process_noise mismatch");
+        prop_assert!((back.measurement_noise - config.measurement_noise).abs() < 1e-10,
+            "measurement_noise mismatch");
+        prop_assert_eq!(back.min_observations, config.min_observations);
+        prop_assert!((back.degraded_z - config.degraded_z).abs() < 1e-10,
+            "degraded_z mismatch");
+        prop_assert!((back.critical_z - config.critical_z).abs() < 1e-10,
+            "critical_z mismatch");
+        prop_assert!((back.hung_z - config.hung_z).abs() < 1e-10,
+            "hung_z mismatch");
+    }
+
+    /// HealthClassification serde roundtrip preserves all fields.
+    #[test]
+    fn proptest_health_classification_serde_roundtrip(hc in arb_health_classification()) {
+        let json = serde_json::to_string(&hc).unwrap();
+        let back: HealthClassification = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.status, hc.status);
+        prop_assert_eq!(back.observations, hc.observations);
+        prop_assert_eq!(back.adaptive_mode, hc.adaptive_mode);
+        // Compare Options with float tolerance
+        match (back.z_score, hc.z_score) {
+            (Some(a), Some(b)) => prop_assert!((a - b).abs() < 1e-10, "z_score mismatch"),
+            (None, None) => {}
+            _ => prop_assert!(false, "z_score None/Some mismatch"),
+        }
+        match (back.adaptive_threshold_ms, hc.adaptive_threshold_ms) {
+            (Some(a), Some(b)) => prop_assert!((a - b).abs() < 1e-10,
+                "adaptive_threshold_ms mismatch"),
+            (None, None) => {}
+            _ => prop_assert!(false, "adaptive_threshold_ms None/Some mismatch"),
+        }
+    }
+
+    /// AdaptiveHealthReport serde roundtrip preserves structure.
+    #[test]
+    fn proptest_health_report_serde_roundtrip(report in arb_adaptive_health_report()) {
+        let json = serde_json::to_string(&report).unwrap();
+        let back: AdaptiveHealthReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.timestamp_ms, report.timestamp_ms);
+        prop_assert_eq!(back.overall, report.overall);
+        prop_assert_eq!(back.components.len(), report.components.len());
+        for (b, r) in back.components.iter().zip(report.components.iter()) {
+            prop_assert_eq!(b.component, r.component);
+            prop_assert_eq!(b.classification.status, r.classification.status);
+            prop_assert_eq!(b.classification.observations, r.classification.observations);
+        }
+    }
+
+    /// ComponentClassification serde roundtrip preserves component and status.
+    #[test]
+    fn proptest_component_classification_serde_roundtrip(cc in arb_component_classification()) {
+        let json = serde_json::to_string(&cc).unwrap();
+        let back: ComponentClassification = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.component, cc.component);
+        prop_assert_eq!(back.classification.status, cc.classification.status);
+        prop_assert_eq!(back.classification.adaptive_mode, cc.classification.adaptive_mode);
+        prop_assert_eq!(back.classification.observations, cc.classification.observations);
+    }
+}
+
+// =============================================================================
+// 8. ComponentTracker behavioral properties
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(150))]
+
+    /// observation_count tracks the number of inter-heartbeat intervals observed.
+    /// The first observe() sets the baseline; each subsequent one increments the count.
+    #[test]
+    fn proptest_observation_count_tracks(
+        intervals in prop::collection::vec(100u64..5000, 2..50),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut tracker = ComponentTracker::new(&config, 5_000);
+
+        prop_assert_eq!(tracker.observation_count(), 0);
+
+        let mut t = 0u64;
+        for (i, &interval) in intervals.iter().enumerate() {
+            t += interval;
+            tracker.observe(t);
+            // First observe sets baseline (no interval computed), subsequent ones increment
+            if i == 0 {
+                prop_assert_eq!(tracker.observation_count(), 0,
+                    "first observe should not increment count");
+            } else {
+                prop_assert_eq!(tracker.observation_count(), i,
+                    "observation_count should be {} after {} observes", i, i + 1);
+            }
+        }
+    }
+
+    /// After enough observations, estimated_interval returns Some.
+    #[test]
+    fn proptest_estimated_interval_available_after_warmup(
+        intervals in prop::collection::vec(100u64..5000, 3..30),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut tracker = ComponentTracker::new(&config, 5_000);
+
+        let mut t = 0u64;
+        for &interval in &intervals {
+            t += interval;
+            tracker.observe(t);
+        }
+
+        // After at least 2 observes (1 baseline + 1 interval), filter should be initialized
+        if intervals.len() >= 2 {
+            prop_assert!(
+                tracker.estimated_interval().is_some(),
+                "estimated_interval should be Some after {} observations",
+                tracker.observation_count()
+            );
+        }
+    }
+
+    /// tracker.reset() clears observation_count and estimated_interval.
+    #[test]
+    fn proptest_tracker_reset_clears_state(
+        intervals in prop::collection::vec(100u64..5000, 3..20),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut tracker = ComponentTracker::new(&config, 5_000);
+
+        let mut t = 0u64;
+        for &interval in &intervals {
+            t += interval;
+            tracker.observe(t);
+        }
+        prop_assert!(tracker.observation_count() > 0);
+
+        tracker.reset();
+        prop_assert_eq!(tracker.observation_count(), 0);
+        prop_assert!(tracker.estimated_interval().is_none());
+        prop_assert!(tracker.adaptive_threshold(3.0).is_none());
+    }
+}
+
+// =============================================================================
+// 9. Kalman filter std_dev and variance relationship
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// std_dev is always the square root of variance.
+    #[test]
+    fn proptest_std_dev_is_sqrt_variance(
+        observations in prop::collection::vec(0.1f64..1000.0, 1..100),
+    ) {
+        let mut kf = KalmanFilter::new(1.0, 1.0);
+        for &z in &observations {
+            kf.update(z);
+            let expected_sd = kf.variance().sqrt();
+            prop_assert!(
+                (kf.std_dev() - expected_sd).abs() < 1e-12,
+                "std_dev {} != sqrt(variance) {}",
+                kf.std_dev(), expected_sd
+            );
+        }
+    }
+
+    /// After a constant signal, estimate converges and std_dev decreases.
+    #[test]
+    fn proptest_constant_signal_decreasing_variance(
+        true_val in 10.0f64..10000.0,
+        n in 10usize..100,
+    ) {
+        let mut kf = KalmanFilter::new(0.01, 100.0); // Low Q, high R
+
+        let mut variances = Vec::with_capacity(n);
+        for _ in 0..n {
+            kf.update(true_val);
+            variances.push(kf.variance());
+        }
+
+        // Variance should generally decrease (or stabilize) for constant signal
+        // Check that the last variance is less than the first
+        if variances.len() >= 2 {
+            prop_assert!(
+                variances.last().unwrap() <= variances.first().unwrap(),
+                "variance should decrease for constant signal: first={}, last={}",
+                variances.first().unwrap(), variances.last().unwrap()
+            );
+        }
+    }
+}
+
+// =============================================================================
+// 10. AdaptiveWatchdog integration properties
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    /// check_health produces a report with exactly 4 components (the default set).
+    #[test]
+    fn proptest_health_report_has_all_components(
+        current_ms in 10000u64..100000,
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let watchdog = AdaptiveWatchdog::new(config);
+        let report = watchdog.check_health(current_ms);
+
+        prop_assert_eq!(report.components.len(), 4,
+            "default watchdog should track 4 components");
+        prop_assert_eq!(report.timestamp_ms, current_ms);
+    }
+
+    /// Overall health is the worst (max) of all component health statuses.
+    #[test]
+    fn proptest_overall_is_worst_component(
+        heartbeats in prop::collection::vec(1000u64..10000, 5..20),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        // Feed heartbeats to Discovery component
+        let mut t = 0u64;
+        for &interval in &heartbeats {
+            t += interval;
+            watchdog.observe(Component::Discovery, t);
+        }
+
+        let report = watchdog.check_health(t + 100);
+        let worst = report.components.iter()
+            .map(|c| c.classification.status)
+            .max()
+            .unwrap_or(HealthStatus::Healthy);
+
+        prop_assert_eq!(report.overall, worst,
+            "overall should be the worst component status");
+    }
+
+    /// Components in check_health are sorted deterministically.
+    #[test]
+    fn proptest_health_report_components_sorted(
+        current_ms in 10000u64..100000,
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let watchdog = AdaptiveWatchdog::new(config);
+        let report = watchdog.check_health(current_ms);
+
+        // Components should be sorted: Discovery, Capture, Persistence, Maintenance
+        let component_order: Vec<Component> = report.components.iter()
+            .map(|c| c.component)
+            .collect();
+        let expected = vec![
+            Component::Discovery,
+            Component::Capture,
+            Component::Persistence,
+            Component::Maintenance,
+        ];
+        prop_assert_eq!(component_order, expected,
+            "components should be in deterministic order");
+    }
+
+    /// After reset, all components report healthy with 0 observations.
+    #[test]
+    fn proptest_watchdog_reset_all(
+        heartbeats in prop::collection::vec(1000u64..10000, 5..20),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        let mut t = 0u64;
+        for &interval in &heartbeats {
+            t += interval;
+            watchdog.observe(Component::Discovery, t);
+            watchdog.observe(Component::Capture, t);
+        }
+
+        watchdog.reset();
+        let report = watchdog.check_health(t + 100);
+
+        for comp in &report.components {
+            prop_assert_eq!(comp.classification.observations, 0,
+                "observations should be 0 after reset for {:?}", comp.component);
         }
     }
 }
