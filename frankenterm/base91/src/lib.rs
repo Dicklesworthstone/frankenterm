@@ -925,4 +925,206 @@ mod test {
             .join("\r\n");
         assert_eq!(decode(wrapped.as_bytes()), data);
     }
+
+    // ── Second-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn decode_ignores_high_bytes_128_to_255() {
+        let encoded = encode(b"high byte test");
+        let mut with_junk = Vec::new();
+        for &b in &encoded {
+            with_junk.push(b);
+            with_junk.push(0x80); // high byte, should be skipped
+        }
+        assert_eq!(decode(&with_junk), b"high byte test");
+    }
+
+    #[test]
+    fn enctab_excludes_single_quote() {
+        assert!(!ENCTAB.contains(&b'\''));
+    }
+
+    #[test]
+    fn enctab_excludes_backslash() {
+        assert!(!ENCTAB.contains(&b'\\'));
+    }
+
+    #[test]
+    fn enctab_excludes_dash() {
+        assert!(!ENCTAB.contains(&b'-'));
+    }
+
+    #[test]
+    fn dectab_single_quote_is_invalid() {
+        assert_eq!(DECTAB[b'\'' as usize], INV);
+    }
+
+    #[test]
+    fn dectab_backslash_is_invalid() {
+        assert_eq!(DECTAB[b'\\' as usize], INV);
+    }
+
+    #[test]
+    fn roundtrip_power_of_two_boundaries() {
+        for exp in 0..=12 {
+            let len = 1usize << exp;
+            let data: Vec<u8> = (0..len).map(|i| (i * 41 % 256) as u8).collect();
+            assert_eq!(
+                decode(&encode(&data)),
+                data,
+                "roundtrip failed at 2^{exp} = {len} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn roundtrip_13_byte_boundary() {
+        // 13 bits is a key threshold in the encoder
+        for len in 12..=15 {
+            let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            assert_eq!(decode(&encode(&data)), data);
+        }
+    }
+
+    #[test]
+    fn roundtrip_alternating_ff_00() {
+        let data: Vec<u8> = (0..128).map(|i| if i % 2 == 0 { 0xFF } else { 0x00 }).collect();
+        assert_eq!(decode(&encode(&data)), data);
+    }
+
+    #[test]
+    fn encode_concat_not_same_as_encode_whole() {
+        let a = b"hello";
+        let b = b"world";
+        let mut combined = Vec::new();
+        combined.extend_from_slice(a);
+        combined.extend_from_slice(b);
+        let enc_whole = encode(&combined);
+        let mut enc_parts = encode(a);
+        enc_parts.extend_from_slice(&encode(b));
+        // Concatenating two independently encoded segments generally
+        // differs from encoding the whole because of internal state
+        assert_ne!(enc_parts, enc_whole);
+        // But each segment still decodes correctly on its own
+        assert_eq!(decode(&encode(a)), a.as_slice());
+        assert_eq!(decode(&encode(b)), b.as_slice());
+    }
+
+    #[test]
+    fn decode_single_valid_char_produces_output_after_flush() {
+        // A single valid alphabet char should produce at least something when flushed
+        let mut result = Vec::new();
+        {
+            let mut decoder = Base91Decoder::new(&mut result);
+            // 'A' maps to DECTAB['A'] = 0, which is a valid entry
+            decoder.write_all(b"A").unwrap();
+            decoder.flush().unwrap();
+        }
+        // With only one valid char, the decoder has a pending value
+        // Flush should emit something
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn decode_two_valid_chars_produces_output() {
+        let mut result = Vec::new();
+        {
+            let mut decoder = Base91Decoder::new(&mut result);
+            decoder.write_all(b"AB").unwrap();
+            decoder.flush().unwrap();
+        }
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn encoder_write_all_empty_no_output() {
+        let mut result = Vec::new();
+        {
+            let mut encoder = Base91Encoder::new(&mut result);
+            encoder.write_all(b"").unwrap();
+            encoder.flush().unwrap();
+        }
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn decoder_write_all_empty_no_output() {
+        let mut result = Vec::new();
+        {
+            let mut decoder = Base91Decoder::new(&mut result);
+            decoder.write_all(b"").unwrap();
+            decoder.flush().unwrap();
+        }
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn roundtrip_50kb_pseudo_random() {
+        let mut data = Vec::with_capacity(50000);
+        let mut state: u32 = 0xDEAD_BEEF;
+        for _ in 0..50000 {
+            // Simple LCG
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            data.push((state >> 16) as u8);
+        }
+        assert_eq!(decode(&encode(&data)), data);
+    }
+
+    #[test]
+    fn encoded_length_grows_with_input() {
+        let small = encode(&[0x42; 10]);
+        let large = encode(&[0x42; 1000]);
+        assert!(large.len() > small.len());
+    }
+
+    #[test]
+    fn roundtrip_just_below_and_above_val_88_threshold() {
+        // The encoder uses 88 as a threshold: val > 88 takes 13 bits, else 14 bits
+        // Exercise data patterns that produce values near this boundary
+        let data_low: Vec<u8> = vec![0x58; 50]; // values that tend to produce val <= 88
+        let data_high: Vec<u8> = vec![0xFF; 50]; // values that tend to produce val > 88
+        assert_eq!(decode(&encode(&data_low)), data_low);
+        assert_eq!(decode(&encode(&data_high)), data_high);
+    }
+
+    #[test]
+    fn encode_is_pure_function() {
+        // encode() should not have side effects; calling it twice on
+        // different data should not interfere
+        let a = encode(b"first");
+        let b = encode(b"second");
+        let a2 = encode(b"first");
+        assert_eq!(a, a2);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn decode_is_pure_function() {
+        let enc = encode(b"pure decode test");
+        let d1 = decode(&enc);
+        let d2 = decode(&enc);
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn enctab_first_26_are_uppercase() {
+        for i in 0..26 {
+            assert!(
+                ENCTAB[i].is_ascii_uppercase(),
+                "ENCTAB[{i}] = {} is not uppercase",
+                ENCTAB[i] as char
+            );
+        }
+    }
+
+    #[test]
+    fn enctab_next_26_are_lowercase() {
+        for i in 26..52 {
+            assert!(
+                ENCTAB[i].is_ascii_lowercase(),
+                "ENCTAB[{i}] = {} is not lowercase",
+                ENCTAB[i] as char
+            );
+        }
+    }
 }
