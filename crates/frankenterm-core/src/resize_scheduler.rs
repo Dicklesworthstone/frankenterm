@@ -1212,7 +1212,7 @@ impl ResizeScheduler {
         detail: ResizeLifecycleDetail,
     ) {
         self.next_lifecycle_event_seq = self.next_lifecycle_event_seq.wrapping_add(1);
-        let state = self.panes.get(&pane_id);
+        let pane_state = self.panes.get(&pane_id);
         self.lifecycle_events
             .push_back(ResizeTransactionLifecycleEvent {
                 event_seq: self.next_lifecycle_event_seq,
@@ -1220,9 +1220,9 @@ impl ResizeScheduler {
                 pane_id,
                 intent_seq,
                 observed_at_ms,
-                latest_seq: state.and_then(|s| s.latest_seq),
-                pending_seq: state.and_then(|s| s.pending.as_ref().map(|p| p.intent_seq)),
-                active_seq: state.and_then(|s| s.active_seq),
+                latest_seq: pane_state.and_then(|s| s.latest_seq),
+                pending_seq: pane_state.and_then(|s| s.pending.as_ref().map(|p| p.intent_seq)),
+                active_seq: pane_state.and_then(|s| s.active_seq),
                 stage,
                 detail,
             });
