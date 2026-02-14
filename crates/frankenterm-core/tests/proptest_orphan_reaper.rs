@@ -28,7 +28,8 @@ fn arb_consistent_report() -> impl Strategy<Value = ReapReport> {
         })
 }
 
-/// Generate an arbitrary ReapReport (possibly inconsistent).
+/// Generate an arbitrary ReapReport (possibly inconsistent — killed_pids.len() may
+/// differ from killed, and killed may exceed scanned).
 fn arb_arbitrary_report() -> impl Strategy<Value = ReapReport> {
     (
         0usize..200,
@@ -200,6 +201,27 @@ proptest! {
             "JSON: killed ({}) should be <= scanned ({})", killed, scanned);
         prop_assert_eq!(pids_len, killed,
             "JSON: killed_pids.len() ({}) should equal killed ({})", pids_len, killed);
+    }
+}
+
+// ── ReapReport: arbitrary (inconsistent) reports ────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Even inconsistent reports serialize to valid JSON without panics.
+    #[test]
+    fn arbitrary_report_serialize_no_panic(r in arb_arbitrary_report()) {
+        let json = serde_json::to_string(&r).unwrap();
+        let _: serde_json::Value = serde_json::from_str(&json).unwrap();
+    }
+
+    /// Even inconsistent reports can be cloned without panic.
+    #[test]
+    fn arbitrary_report_clone(r in arb_arbitrary_report()) {
+        let cloned: ReapReport = r.clone();
+        prop_assert_eq!(cloned.scanned, r.scanned);
+        prop_assert_eq!(cloned.killed, r.killed);
     }
 }
 

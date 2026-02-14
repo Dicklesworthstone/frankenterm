@@ -313,7 +313,7 @@ proptest! {
         let tables = value.get("tables").unwrap().as_array().unwrap();
         for table_val in tables {
             let retention = table_val.get("retention_days").unwrap().as_u64().unwrap();
-            prop_assert!(retention <= u32::MAX as u64,
+            prop_assert!(u32::try_from(retention).is_ok(),
                 "retention_days should fit in u32");
         }
     }
