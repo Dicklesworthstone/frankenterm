@@ -435,3 +435,226 @@ proptest! {
             "watchdog_warnings count should match unhealthy_shards count");
     }
 }
+
+// =========================================================================
+// ShardId: Clone, Debug, Display, Ord
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// ShardId Clone produces identical value.
+    #[test]
+    fn prop_shard_id_clone(id in 0usize..10000) {
+        let s = ShardId(id);
+        let cloned = s;
+        prop_assert_eq!(s, cloned);
+    }
+
+    /// ShardId Debug is non-empty.
+    #[test]
+    fn prop_shard_id_debug(id in 0usize..10000) {
+        let s = ShardId(id);
+        let debug = format!("{:?}", s);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ShardId Display contains the inner value.
+    #[test]
+    fn prop_shard_id_display(id in 0usize..10000) {
+        let s = ShardId(id);
+        let display = s.to_string();
+        prop_assert!(display.contains(&id.to_string()));
+    }
+
+    /// ShardId ordering is consistent with inner usize.
+    #[test]
+    fn prop_shard_id_ordering(a in 0usize..10000, b in 0usize..10000) {
+        let sa = ShardId(a);
+        let sb = ShardId(b);
+        prop_assert_eq!(sa.cmp(&sb), a.cmp(&b));
+    }
+
+    /// ShardId serde roundtrip preserves value.
+    #[test]
+    fn prop_shard_id_serde(id in 0usize..10000) {
+        let s = ShardId(id);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: ShardId = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(s, back);
+    }
+}
+
+// =========================================================================
+// Encode/decode additional properties
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// encode_sharded_pane_id always returns a value.
+    #[test]
+    fn prop_encode_always_produces(shard in 0usize..=65535, local in any::<u64>()) {
+        let encoded = encode_sharded_pane_id(ShardId(shard), local);
+        // Decoding should always succeed
+        let (dec_shard, _dec_local) = decode_sharded_pane_id(encoded);
+        prop_assert_eq!(dec_shard, ShardId(shard));
+    }
+
+    /// Local bits are masked to 48 bits.
+    #[test]
+    fn prop_local_bits_masked(shard in 0usize..=65535, local in any::<u64>()) {
+        let encoded = encode_sharded_pane_id(ShardId(shard), local);
+        let (_dec_shard, dec_local) = decode_sharded_pane_id(encoded);
+        prop_assert!(dec_local < (1u64 << 48),
+            "decoded local {} should be < 2^48", dec_local);
+    }
+}
+
+// =========================================================================
+// AssignmentStrategy: Default and Clone
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Default strategy is RoundRobin.
+    #[test]
+    fn prop_default_strategy_is_round_robin(_dummy in 0..1u8) {
+        let strategy = AssignmentStrategy::default();
+        prop_assert_eq!(strategy, AssignmentStrategy::RoundRobin);
+    }
+
+    /// RoundRobin serde roundtrip.
+    #[test]
+    fn prop_round_robin_serde(_dummy in 0..1u8) {
+        let strategy = AssignmentStrategy::RoundRobin;
+        let json = serde_json::to_string(&strategy).unwrap();
+        let back: AssignmentStrategy = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(strategy, back);
+    }
+
+    /// ConsistentHash serde roundtrip.
+    #[test]
+    fn prop_consistent_hash_serde(vnodes in 1u32..1000) {
+        let strategy = AssignmentStrategy::ConsistentHash { virtual_nodes: vnodes };
+        let json = serde_json::to_string(&strategy).unwrap();
+        let back: AssignmentStrategy = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(strategy, back);
+    }
+}
+
+// =========================================================================
+// Assignment: RoundRobin distributes across shards
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// RoundRobin with multiple panes touches multiple shards.
+    #[test]
+    fn prop_round_robin_distribution(
+        shard_count in 2usize..8,
+        pane_ids in prop::collection::vec(any::<u64>(), 20..100),
+    ) {
+        let shards: Vec<ShardId> = (0..shard_count).map(ShardId).collect();
+        let strategy = AssignmentStrategy::RoundRobin;
+        let mut seen = std::collections::HashSet::new();
+        for pid in &pane_ids {
+            let s = assign_pane_with_strategy(&strategy, &shards, *pid, None, None);
+            seen.insert(s);
+        }
+        // With enough panes, should see more than 1 shard
+        prop_assert!(seen.len() > 1 || shard_count == 1,
+            "expected multiple shards used, got {} out of {}", seen.len(), shard_count);
+    }
+
+    /// ConsistentHash assigns to valid shards.
+    #[test]
+    fn prop_consistent_hash_valid(
+        shard_count in 2usize..10,
+        pane_id in any::<u64>(),
+        vnodes in 16u32..256,
+    ) {
+        let shards: Vec<ShardId> = (0..shard_count).map(ShardId).collect();
+        let strategy = AssignmentStrategy::ConsistentHash { virtual_nodes: vnodes };
+        let s = assign_pane_with_strategy(&strategy, &shards, pane_id, None, None);
+        prop_assert!(shards.contains(&s));
+    }
+}
+
+// =========================================================================
+// Health report: Clone, Debug, empty report
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Health report Clone preserves all fields.
+    #[test]
+    fn prop_health_report_clone(report in arb_shard_health_report()) {
+        let cloned = report.clone();
+        prop_assert_eq!(cloned.timestamp_ms, report.timestamp_ms);
+        prop_assert_eq!(cloned.overall, report.overall);
+        prop_assert_eq!(cloned.shards.len(), report.shards.len());
+    }
+
+    /// Health report Debug is non-empty.
+    #[test]
+    fn prop_health_report_debug(report in arb_shard_health_report()) {
+        let debug = format!("{:?}", report);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// Empty shards report has zero unhealthy and zero warnings.
+    #[test]
+    fn prop_empty_report_no_unhealthy(_dummy in 0..1u8) {
+        let report = ShardHealthReport {
+            timestamp_ms: 0,
+            overall: HealthStatus::Healthy,
+            shards: vec![],
+        };
+        prop_assert_eq!(report.unhealthy_shards().len(), 0);
+        prop_assert_eq!(report.watchdog_warnings().len(), 0);
+    }
+
+    /// All-healthy report has zero unhealthy shards.
+    #[test]
+    fn prop_all_healthy_no_warnings(
+        count in 1usize..8,
+    ) {
+        let shards: Vec<ShardHealthEntry> = (0..count).map(|i| ShardHealthEntry {
+            shard_id: ShardId(i),
+            label: format!("shard-{}", i),
+            status: HealthStatus::Healthy,
+            pane_count: Some(10),
+            circuit: CircuitBreakerStatus {
+                state: frankenterm_core::circuit_breaker::CircuitStateKind::Closed,
+                consecutive_failures: 0,
+                failure_threshold: 5,
+                success_threshold: 3,
+                open_cooldown_ms: 30000,
+                open_for_ms: None,
+                cooldown_remaining_ms: None,
+                half_open_successes: None,
+            },
+            error: None,
+        }).collect();
+        let report = ShardHealthReport {
+            timestamp_ms: 100,
+            overall: HealthStatus::Healthy,
+            shards,
+        };
+        prop_assert_eq!(report.unhealthy_shards().len(), 0);
+        prop_assert_eq!(report.watchdog_warnings().len(), 0);
+    }
+
+    /// watchdog_warnings returns non-empty strings.
+    #[test]
+    fn prop_watchdog_warnings_non_empty_strings(report in arb_shard_health_report()) {
+        let warnings = report.watchdog_warnings();
+        for w in &warnings {
+            prop_assert!(!w.is_empty(), "warning string should be non-empty");
+        }
+    }
+}
