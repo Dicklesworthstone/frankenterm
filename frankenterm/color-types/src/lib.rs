@@ -1141,6 +1141,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn from_css() {
         assert_eq!(
@@ -1180,6 +1181,7 @@ mod tests {
         assert_eq!(grey.to_rgb_string(), "#f0f0f0");
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn linear_rgb_contrast_ratio() {
         let a = LinearRgba::with_srgba(255, 0, 0, 1);
@@ -1192,6 +1194,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn srgba_contrast_ratio() {
         let a = SrgbaTuple::from_str("hsl:0   100  50").unwrap();
@@ -1455,6 +1458,7 @@ mod tests {
 
     // ── SrgbaTuple HSL operations ─────────────────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn lighten_increases_lightness() {
         let dark = SrgbaTuple::from_str("hsl:0 100 25").unwrap();
@@ -1464,6 +1468,7 @@ mod tests {
         assert!(l_light > l_dark);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn complement_shifts_hue_180() {
         let red = SrgbaTuple::from_str("hsl:0 100 50").unwrap();
@@ -1472,6 +1477,7 @@ mod tests {
         assert!((h - 180.0).abs() < 1.0);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn triad_returns_two_colors() {
         let c = SrgbaTuple::from_str("hsl:0 100 50").unwrap();
@@ -1482,6 +1488,7 @@ mod tests {
         assert!((h2 - 240.0).abs() < 1.0);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn square_returns_three_colors() {
         let c = SrgbaTuple::from_str("hsl:0 100 50").unwrap();
@@ -1543,6 +1550,7 @@ mod tests {
         assert_eq!(arr, [0.1, 0.2, 0.3, 0.4]);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn linear_rgba_srgba_pixel_roundtrip() {
         let orig = LinearRgba::with_srgba(200, 100, 50, 255);
@@ -1553,6 +1561,7 @@ mod tests {
         assert!((b as i32 - 50).abs() <= 1);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn linear_rgba_relative_luminance_white() {
         let white = LinearRgba(1.0, 1.0, 1.0, 1.0);
@@ -1560,6 +1569,7 @@ mod tests {
         assert!((lum - 1.0).abs() < 0.01);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn linear_rgba_relative_luminance_black() {
         let black = LinearRgba(0.0, 0.0, 0.0, 1.0);
@@ -1567,6 +1577,7 @@ mod tests {
         assert!(lum < 0.01);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn linear_rgba_contrast_ratio_black_white() {
         let black = LinearRgba(0.0, 0.0, 0.0, 1.0);
@@ -1583,6 +1594,7 @@ mod tests {
 
     // ── SrgbaTuple Hash/Eq ────────────────────────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn srgba_tuple_hash_consistent() {
         use std::collections::hash_map::DefaultHasher;
@@ -1626,6 +1638,7 @@ mod tests {
 
     // ── delta_e ───────────────────────────────────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn delta_e_identical_colors_is_zero() {
         let c = SrgbaTuple(0.5, 0.5, 0.5, 1.0);
@@ -1633,6 +1646,7 @@ mod tests {
         assert!(de < 0.01);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn delta_e_different_colors_positive() {
         let a = SrgbaTuple(1.0, 0.0, 0.0, 1.0);
@@ -1661,6 +1675,7 @@ mod tests {
 
     // ── SrgbaTuple HSL color operations ──────────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn to_hsla_red() {
         let red = SrgbaTuple(1.0, 0.0, 0.0, 1.0);
@@ -1671,6 +1686,7 @@ mod tests {
         assert!((a - 1.0).abs() < 0.01);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn to_hsla_green() {
         let green = SrgbaTuple(0.0, 1.0, 0.0, 1.0);
@@ -1678,6 +1694,7 @@ mod tests {
         assert!((h - 120.0).abs() < 1.0);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn to_hsla_blue() {
         let blue = SrgbaTuple(0.0, 0.0, 1.0, 1.0);
@@ -1685,6 +1702,7 @@ mod tests {
         assert!((h - 240.0).abs() < 1.0);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn from_hsla_roundtrip() {
         let original = SrgbaTuple(0.8, 0.3, 0.6, 1.0);
@@ -1695,6 +1713,7 @@ mod tests {
         assert!((reconstructed.2 - original.2).abs() < 0.02);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn to_laba_roundtrip_consistency() {
         let c = SrgbaTuple(0.5, 0.3, 0.7, 1.0);
@@ -1706,6 +1725,7 @@ mod tests {
         assert!(b.is_finite());
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn saturate_increases_saturation() {
         let muted = SrgbaTuple::from_str("hsl:0 50 50").unwrap();
@@ -1715,6 +1735,7 @@ mod tests {
         assert!(s_vivid > s_muted);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn saturate_fixed_adds_saturation() {
         let c = SrgbaTuple::from_str("hsl:120 30 50").unwrap();
@@ -1724,6 +1745,7 @@ mod tests {
         assert!(s_more > s_orig);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn lighten_fixed_adds_lightness() {
         let c = SrgbaTuple::from_str("hsl:0 100 30").unwrap();
@@ -1733,6 +1755,7 @@ mod tests {
         assert!(l_light > l_orig);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn adjust_hue_fixed_rotates() {
         let c = SrgbaTuple::from_str("hsl:0 100 50").unwrap();
@@ -1741,6 +1764,7 @@ mod tests {
         assert!((h - 90.0).abs() < 1.0);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn adjust_hue_fixed_negative() {
         let c = SrgbaTuple::from_str("hsl:90 100 50").unwrap();
@@ -1749,6 +1773,7 @@ mod tests {
         assert!(h.abs() < 1.0 || (h - 360.0).abs() < 1.0);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn complement_ryb_shifts_hue() {
         let c = SrgbaTuple::from_str("hsl:0 100 50").unwrap();
@@ -1760,6 +1785,7 @@ mod tests {
         assert!((h_ryb - h_rgb).abs() > 1.0);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn adjust_hue_fixed_ryb_basic() {
         let c = SrgbaTuple::from_str("hsl:0 100 50").unwrap();
@@ -1834,6 +1860,7 @@ mod tests {
 
     // ── LinearRgba ensure_contrast_ratio ─────────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn ensure_contrast_ratio_already_sufficient() {
         let black = LinearRgba(0.0, 0.0, 0.0, 1.0);
@@ -1843,6 +1870,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn ensure_contrast_ratio_same_color_returns_none() {
         let c = LinearRgba(0.5, 0.5, 0.5, 1.0);
@@ -1850,6 +1878,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn ensure_contrast_ratio_low_contrast_returns_some() {
         let fg = LinearRgba(0.5, 0.5, 0.5, 1.0);
@@ -1861,6 +1890,7 @@ mod tests {
 
     // ── LinearRgba oklaba roundtrip ──────────────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn oklaba_roundtrip() {
         let orig = LinearRgba(0.5, 0.3, 0.7, 1.0);
@@ -1871,6 +1901,7 @@ mod tests {
         assert!((back.2 - orig.2).abs() < 0.01);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn oklaba_black() {
         let black = LinearRgba(0.0, 0.0, 0.0, 1.0);
@@ -1878,6 +1909,7 @@ mod tests {
         assert!(l.abs() < 0.01); // L should be ~0 for black
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn oklaba_white() {
         let white = LinearRgba(1.0, 1.0, 1.0, 1.0);
@@ -1887,6 +1919,7 @@ mod tests {
 
     // ── LinearRgba Hash ─────────────────────────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn linear_rgba_hash_consistent() {
         use std::collections::hash_map::DefaultHasher;
@@ -1899,6 +1932,7 @@ mod tests {
         assert_eq!(ha.finish(), hb.finish());
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn linear_rgba_hash_differs_for_different_values() {
         use std::collections::hash_map::DefaultHasher;
@@ -2027,6 +2061,7 @@ mod tests {
         assert!(SrgbaTuple::from_str("#").is_err());
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn from_str_css_rgb_function() {
         let t = SrgbaTuple::from_str("rgb(0, 128, 255)").unwrap();
@@ -2035,6 +2070,7 @@ mod tests {
         assert!((t.2 - 1.0).abs() < 0.01);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn from_str_css_hsl_function() {
         let t = SrgbaTuple::from_str("hsl(120, 100%, 50%)").unwrap();
@@ -2094,6 +2130,7 @@ mod tests {
 
     // ── Conversion table functions ──────────────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn linear_u8_to_srgb8_boundaries() {
         assert_eq!(linear_u8_to_srgb8(0), 0);
@@ -2101,6 +2138,7 @@ mod tests {
         assert!(high > 250); // should be close to 255
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn linear_u8_to_srgb8_monotonic() {
         // sRGB conversion should be monotonically increasing
@@ -2155,6 +2193,7 @@ mod tests {
 
     // ── Contrast ratio symmetry ─────────────────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn contrast_ratio_symmetric() {
         let a = LinearRgba::with_srgba(200, 50, 50, 255);
@@ -2164,6 +2203,7 @@ mod tests {
         assert!((ratio_ab - ratio_ba).abs() < 0.001);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn contrast_ratio_same_color_is_one() {
         let c = LinearRgba::with_srgba(128, 128, 128, 255);
@@ -2173,6 +2213,7 @@ mod tests {
 
     // ── SrgbaTuple delta_e symmetry ─────────────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn delta_e_symmetric() {
         let a = SrgbaTuple(1.0, 0.0, 0.0, 1.0);
@@ -2184,6 +2225,7 @@ mod tests {
 
     // ── SrgbaTuple::contrast_ratio via srgba ────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn srgba_contrast_ratio_same_is_one() {
         let c = SrgbaTuple(0.5, 0.5, 0.5, 1.0);
@@ -2191,6 +2233,7 @@ mod tests {
         assert!((ratio - 1.0).abs() < 0.01);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn srgba_contrast_ratio_black_white() {
         let black = SrgbaTuple(0.0, 0.0, 0.0, 1.0);
@@ -2201,6 +2244,7 @@ mod tests {
 
     // ── SrgbaTuple ensure_contrast_ratio ─────────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn srgba_ensure_contrast_ratio_sufficient() {
         let black = SrgbaTuple(0.0, 0.0, 0.0, 1.0);
