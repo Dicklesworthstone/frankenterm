@@ -218,6 +218,7 @@ impl Rule {
 #[cfg(test)]
 mod test {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn parse_implicit() {

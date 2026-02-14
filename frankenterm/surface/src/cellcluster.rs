@@ -312,6 +312,7 @@ impl CellCluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
     use frankenterm_bidi::Direction;
     use frankenterm_cell::CellAttributes;
     use frankenterm_char_props::emoji::Presentation;

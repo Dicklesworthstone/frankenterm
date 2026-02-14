@@ -1,5 +1,5 @@
 use super::*;
-use frankenterm_dynamic::Value as DynValue;
+use frankenterm_dynamic::{FromDynamic, ToDynamic, Value as DynValue};
 use ordered_float::OrderedFloat;
 use std::collections::BTreeMap;
 
@@ -517,10 +517,7 @@ fn object_with_multiple_types_to_lua() {
         DynValue::String("test".to_string()),
     );
     map.insert(DynValue::String("count".to_string()), DynValue::I64(42));
-    map.insert(
-        DynValue::String("active".to_string()),
-        DynValue::Bool(true),
-    );
+    map.insert(DynValue::String("active".to_string()), DynValue::Bool(true));
     let obj: frankenterm_dynamic::Object = map.into();
     let result = dynamic_to_lua_value(&l, DynValue::Object(obj)).unwrap();
     if let LuaValue::Table(t) = result {
@@ -691,6 +688,329 @@ fn value_printer_object_table() {
     let debug = format!("{:?}", ValuePrinter(LuaValue::Table(t)));
     assert!(debug.contains("key"));
     assert!(debug.contains("value"));
+}
+
+// ── from_lua helpers and enum ctor behavior ────────────────
+
+#[derive(Clone, Debug, PartialEq, FromDynamic, ToDynamic)]
+struct DemoStruct {
+    name: String,
+}
+impl_lua_conversion_dynamic!(DemoStruct);
+
+#[derive(Clone, Debug, Default, PartialEq, FromDynamic, ToDynamic)]
+struct DemoArgs {
+    #[dynamic(default)]
+    label: String,
+    #[dynamic(default)]
+    flag: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, FromDynamic, ToDynamic)]
+enum DemoAction {
+    Quit,
+    Defaultable(DemoArgs),
+    NeedsArgs { name: String },
+}
+
+#[derive(Clone)]
+struct PlainUserData;
+impl mlua::UserData for PlainUserData {}
+
+#[derive(Clone)]
+struct ToStringUserData;
+impl mlua::UserData for ToStringUserData {
+    fn add_methods<'lua, M: mlua::UserDataMethods<'lua, Self>>(methods: &mut M) {
+        methods.add_meta_method(mlua::MetaMethod::ToString, |_lua, _this, ()| {
+            Ok("tostring-value".to_string())
+        });
+    }
+}
+
+fn install_demo_enum(l: &mlua::Lua) {
+    l.globals()
+        .set("action", crate::enumctor::Enum::<DemoAction>::new())
+        .unwrap();
+}
+
+#[test]
+fn lua_array_table_with_non_integer_key_fails() {
+    let l = lua();
+    let t = l.create_table().unwrap();
+    t.set(1, "ok").unwrap();
+    t.set("bad", "oops").unwrap();
+
+    let err = lua_value_to_dynamic(LuaValue::Table(t)).unwrap_err();
+    assert!(err.to_string().contains("Unexpected key"));
+}
+
+#[test]
+fn from_lua_struct_success() {
+    let l = lua();
+    let t = l.create_table().unwrap();
+    t.set("name", "alice").unwrap();
+
+    let parsed: DemoStruct = from_lua(LuaValue::Table(t)).unwrap();
+    assert_eq!(
+        parsed,
+        DemoStruct {
+            name: "alice".to_string()
+        }
+    );
+}
+
+#[test]
+fn from_lua_struct_failure_is_conversion_error() {
+    let err = from_lua::<DemoStruct>(LuaValue::Integer(7)).unwrap_err();
+    assert!(matches!(err, mlua::Error::FromLuaConversionError { .. }));
+}
+
+#[test]
+fn from_lua_value_dynamic_struct_success() {
+    let l = lua();
+    let t = l.create_table().unwrap();
+    t.set("name", "bob").unwrap();
+
+    let parsed: DemoStruct = from_lua_value_dynamic(LuaValue::Table(t)).unwrap();
+    assert_eq!(
+        parsed,
+        DemoStruct {
+            name: "bob".to_string()
+        }
+    );
+}
+
+#[test]
+fn from_lua_value_dynamic_struct_failure_is_conversion_error() {
+    let err = from_lua_value_dynamic::<DemoStruct>(LuaValue::Boolean(true)).unwrap_err();
+    assert!(matches!(err, mlua::Error::FromLuaConversionError { .. }));
+}
+
+#[test]
+fn impl_lua_conversion_dynamic_roundtrip_for_struct() {
+    let l = lua();
+    let original = DemoStruct {
+        name: "macro".to_string(),
+    };
+    let lua_value = original.clone().into_lua(&l).unwrap();
+    let parsed = <DemoStruct as mlua::FromLua>::from_lua(lua_value, &l).unwrap();
+    assert_eq!(parsed, original);
+}
+
+#[test]
+fn userdata_wezterm_to_dynamic_success_path() {
+    let l = lua();
+    let ud = l.create_userdata(PlainUserData).unwrap();
+    let mt = ud.get_metatable().unwrap();
+    mt.set(
+        "__wezterm_to_dynamic",
+        l.create_function(|lua, _ud: LuaValue| {
+            let t = lua.create_table()?;
+            t.set("kind", "converted")?;
+            Ok(LuaValue::Table(t))
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let value = lua_value_to_dynamic(LuaValue::UserData(ud)).unwrap();
+    if let DynValue::Object(obj) = value {
+        assert_eq!(
+            obj.get_by_str("kind"),
+            Some(&DynValue::String("converted".to_string()))
+        );
+    } else {
+        panic!("expected Object");
+    }
+}
+
+#[test]
+fn userdata_wezterm_to_dynamic_error_path() {
+    let l = lua();
+    let ud = l.create_userdata(PlainUserData).unwrap();
+    let mt = ud.get_metatable().unwrap();
+    mt.set(
+        "__wezterm_to_dynamic",
+        l.create_function(|_lua, _ud: LuaValue| -> mlua::Result<LuaValue> {
+            Err(mlua::Error::RuntimeError("boom".to_string()))
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let err = lua_value_to_dynamic(LuaValue::UserData(ud)).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("error calling __wezterm_to_dynamic"));
+}
+
+#[test]
+fn userdata_uses_tostring_fallback() {
+    let l = lua();
+    let ud = l.create_userdata(ToStringUserData).unwrap();
+    let value = lua_value_to_dynamic(LuaValue::UserData(ud)).unwrap();
+    assert_eq!(value, DynValue::String("tostring-value".to_string()));
+}
+
+#[test]
+fn userdata_without_tostring_errors() {
+    let l = lua();
+    let ud = l.create_userdata(PlainUserData).unwrap();
+    let err = lua_value_to_dynamic(LuaValue::UserData(ud)).unwrap_err();
+    assert!(err.to_string().contains("error getting tostring"));
+}
+
+#[test]
+fn value_printer_binary_string_uses_hex_escape() {
+    let l = lua();
+    let s = l.create_string(&[0x00, 0xff, b'A']).unwrap();
+    let debug = format!("{:?}", ValuePrinter(LuaValue::String(s)));
+    assert!(debug.starts_with("b\""));
+    assert!(debug.contains("\\x00"));
+    assert!(debug.contains("\\xff"));
+}
+
+#[test]
+fn value_printer_error_variant_includes_message() {
+    let debug = format!(
+        "{:?}",
+        ValuePrinter(LuaValue::Error(mlua::Error::RuntimeError(
+            "kapow".to_string()
+        )))
+    );
+    assert!(debug.contains("error"));
+    assert!(debug.contains("kapow"));
+}
+
+#[test]
+fn enum_index_unit_variant_returns_string() {
+    let l = lua();
+    install_demo_enum(&l);
+    let value: LuaValue = l.load("return action.Quit").eval().unwrap();
+    if let LuaValue::String(s) = value {
+        assert_eq!(s.to_str().unwrap(), "Quit");
+    } else {
+        panic!("expected String");
+    }
+}
+
+#[test]
+fn enum_index_defaultable_variant_returns_table_with_defaults() {
+    let l = lua();
+    install_demo_enum(&l);
+    let value: LuaValue = l.load("return action.Defaultable").eval().unwrap();
+    if let LuaValue::Table(t) = value {
+        assert!(t.get_metatable().is_some());
+        let dyn_value = lua_value_to_dynamic(LuaValue::Table(t)).unwrap();
+        if let DynValue::Object(obj) = dyn_value {
+            if let Some(DynValue::Object(payload)) = obj.get_by_str("Defaultable") {
+                assert_eq!(
+                    payload.get_by_str("label"),
+                    Some(&DynValue::String(String::new()))
+                );
+                assert_eq!(payload.get_by_str("flag"), Some(&DynValue::Bool(false)));
+            } else {
+                panic!("expected Defaultable payload");
+            }
+        } else {
+            panic!("expected Object");
+        }
+    } else {
+        panic!("expected Table");
+    }
+}
+
+#[test]
+fn enum_defaultable_constructor_call_applies_fields() {
+    let l = lua();
+    install_demo_enum(&l);
+    let value: LuaValue = l
+        .load("return action.Defaultable{label='set', flag=true}")
+        .eval()
+        .unwrap();
+    let dyn_value = lua_value_to_dynamic(value).unwrap();
+    if let DynValue::Object(obj) = dyn_value {
+        if let Some(DynValue::Object(payload)) = obj.get_by_str("Defaultable") {
+            assert_eq!(
+                payload.get_by_str("label"),
+                Some(&DynValue::String("set".to_string()))
+            );
+            assert_eq!(payload.get_by_str("flag"), Some(&DynValue::Bool(true)));
+        } else {
+            panic!("expected Defaultable payload");
+        }
+    } else {
+        panic!("expected Object");
+    }
+}
+
+#[test]
+fn enum_index_for_required_variant_returns_userdata_ctor() {
+    let l = lua();
+    install_demo_enum(&l);
+    let value: LuaValue = l.load("return action.NeedsArgs").eval().unwrap();
+    assert!(matches!(value, LuaValue::UserData(_)));
+}
+
+#[test]
+fn enum_required_variant_constructor_call_returns_value() {
+    let l = lua();
+    install_demo_enum(&l);
+    let value: LuaValue = l
+        .load("return action.NeedsArgs{name='neo'}")
+        .eval()
+        .unwrap();
+    let dyn_value = lua_value_to_dynamic(value).unwrap();
+    if let DynValue::Object(obj) = dyn_value {
+        if let Some(DynValue::Object(payload)) = obj.get_by_str("NeedsArgs") {
+            assert_eq!(
+                payload.get_by_str("name"),
+                Some(&DynValue::String("neo".to_string()))
+            );
+        } else {
+            panic!("expected NeedsArgs payload");
+        }
+    } else {
+        panic!("expected Object");
+    }
+}
+
+#[test]
+fn enum_unknown_variant_errors() {
+    let l = lua();
+    install_demo_enum(&l);
+    let err = l
+        .load("return action.NotARealVariant")
+        .eval::<LuaValue>()
+        .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("variant") || msg.contains("unknown") || msg.contains("invalid"));
+}
+
+#[test]
+fn enum_call_denies_unknown_fields() {
+    let l = lua();
+    install_demo_enum(&l);
+    let err = l
+        .load("return action{Defaultable={unknown=true}}")
+        .eval::<LuaValue>()
+        .unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("unknown"));
+}
+
+#[test]
+fn enum_required_variant_missing_fields_errors() {
+    let l = lua();
+    install_demo_enum(&l);
+    let err = l
+        .load("return action.NeedsArgs{}")
+        .eval::<LuaValue>()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("missing field")
+            || err.to_string().contains("invalid value")
+            || err.to_string().contains("error")
+    );
 }
 
 // ── to_lua / from_lua wrapper functions ─────────────────────

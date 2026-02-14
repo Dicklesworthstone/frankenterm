@@ -48,12 +48,14 @@ pub struct Screen {
 
     pub(crate) saved_cursor: Option<SavedCursor>,
     rewrap_cache: Option<LogicalLineWrapCache>,
+    cold_scrollback_worker: ColdScrollbackReflowWorker,
 }
 
 const MAX_WRAP_CACHE_ENTRIES: usize = 6;
 const MAX_REFLOW_BATCH_LOGICAL_LINES: usize = 64;
 const REFLOW_OVERSCAN_ROW_MULTIPLIER: usize = 1;
 const REFLOW_OVERSCAN_ROW_CAP: usize = 256;
+const COLD_SCROLLBACK_BACKLOG_DEPTH_CAP: usize = 1_048_576;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReflowBatchPriority {
@@ -112,7 +114,8 @@ impl ViewportReflowPlan {
         }
         let mut coverage = vec![0u8; logical_count];
         for batch in &self.batches {
-            if batch.logical_range.end > logical_count || batch.logical_range.start >= batch.logical_range.end
+            if batch.logical_range.end > logical_count
+                || batch.logical_range.start >= batch.logical_range.end
             {
                 return false;
             }
@@ -140,6 +143,92 @@ struct LogicalLineWrapCache {
     logical_lines: Vec<Line>,
     wrapped_by_key: HashMap<WrapCacheKey, Vec<Vec<Line>>>,
     wrap_key_order: VecDeque<WrapCacheKey>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ColdScrollbackReflowWorker {
+    active_intent: Option<SequenceNo>,
+    backlog_depth: usize,
+    peak_backlog_depth: usize,
+    completion_throughput_lines_per_sec: u64,
+    completed_lines_total: u64,
+    completed_batches_total: u64,
+    cancellation_count: u64,
+}
+
+impl ColdScrollbackReflowWorker {
+    fn begin_intent(&mut self, seqno: SequenceNo, backlog_depth: usize) {
+        if let Some(active_intent) = self.active_intent {
+            if active_intent != seqno && self.backlog_depth > 0 {
+                self.cancellation_count = self.cancellation_count.saturating_add(1);
+            }
+        }
+
+        self.active_intent = Some(seqno);
+        self.backlog_depth = backlog_depth.min(COLD_SCROLLBACK_BACKLOG_DEPTH_CAP);
+        self.peak_backlog_depth = self.peak_backlog_depth.max(self.backlog_depth);
+    }
+
+    fn complete_cold_batch(&mut self, seqno: SequenceNo, batch_lines: usize) {
+        if self.active_intent != Some(seqno) {
+            return;
+        }
+        self.backlog_depth = self.backlog_depth.saturating_sub(batch_lines);
+        self.completed_lines_total = self
+            .completed_lines_total
+            .saturating_add(batch_lines as u64);
+        self.completed_batches_total = self.completed_batches_total.saturating_add(1);
+    }
+
+    fn finish_intent(
+        &mut self,
+        seqno: SequenceNo,
+        elapsed: std::time::Duration,
+        completed_lines_for_intent: usize,
+    ) {
+        if self.active_intent != Some(seqno) {
+            return;
+        }
+
+        self.completion_throughput_lines_per_sec = if completed_lines_for_intent == 0 {
+            0
+        } else {
+            let elapsed_nanos = elapsed.as_nanos().max(1);
+            let rate =
+                (completed_lines_for_intent as u128).saturating_mul(1_000_000_000) / elapsed_nanos;
+            rate.min(u64::MAX as u128) as u64
+        };
+        self.active_intent = None;
+        self.backlog_depth = 0;
+    }
+
+    fn backlog_depth(&self) -> usize {
+        self.backlog_depth
+    }
+
+    fn peak_backlog_depth(&self) -> usize {
+        self.peak_backlog_depth
+    }
+
+    fn completion_throughput_lines_per_sec(&self) -> u64 {
+        self.completion_throughput_lines_per_sec
+    }
+
+    fn completed_lines_total(&self) -> u64 {
+        self.completed_lines_total
+    }
+
+    fn completed_batches_total(&self) -> u64 {
+        self.completed_batches_total
+    }
+
+    fn cancellation_count(&self) -> u64 {
+        self.cancellation_count
+    }
+
+    fn active_intent(&self) -> Option<SequenceNo> {
+        self.active_intent
+    }
 }
 
 impl LogicalLineWrapCache {
@@ -226,6 +315,7 @@ impl Screen {
             keyboard_stack: vec![],
             saved_cursor: None,
             rewrap_cache: None,
+            cold_scrollback_worker: ColdScrollbackReflowWorker::default(),
         }
     }
 
@@ -381,7 +471,11 @@ impl Screen {
 
         let visible_start = self.lines.len().saturating_sub(self.physical_rows);
         let visible_range = visible_start..self.lines.len();
-        Self::build_viewport_reflow_plan_from_ranges(&logical_ranges, visible_range, self.lines.len())
+        Self::build_viewport_reflow_plan_from_ranges(
+            &logical_ranges,
+            visible_range,
+            self.lines.len(),
+        )
     }
 
     fn logical_cursor_from_physical(
@@ -474,7 +568,7 @@ impl Screen {
                     );
                 }
 
-                let wrapped = Self::wrap_logical_lines_for_resize(
+                let wrapped = self.wrap_logical_lines_for_resize(
                     entry.logical_lines.clone(),
                     physical_cols,
                     seqno,
@@ -495,7 +589,7 @@ impl Screen {
 
         let logical_lines = self.rebuild_logical_lines_from_physical(seqno);
         let logical_count = logical_lines.len();
-        let wrapped = Self::wrap_logical_lines_for_resize(
+        let wrapped = self.wrap_logical_lines_for_resize(
             logical_lines.clone(),
             physical_cols,
             seqno,
@@ -533,6 +627,7 @@ impl Screen {
     }
 
     fn wrap_logical_lines_for_resize(
+        &mut self,
         logical_lines: Vec<Line>,
         physical_cols: usize,
         seqno: SequenceNo,
@@ -552,6 +647,22 @@ impl Screen {
                 &fallback_plan
             }
         };
+        let cold_backlog_depth = plan
+            .batches
+            .iter()
+            .filter(|batch| batch.priority == ReflowBatchPriority::ColdScrollback)
+            .map(|batch| {
+                batch
+                    .logical_range
+                    .end
+                    .saturating_sub(batch.logical_range.start)
+            })
+            .sum::<usize>();
+        self.cold_scrollback_worker
+            .begin_intent(seqno, cold_backlog_depth);
+        let cold_started = Instant::now();
+        let mut cold_lines_completed = 0usize;
+        let mut cold_batches_completed = 0usize;
 
         let worker_count = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -587,6 +698,12 @@ impl Screen {
                     };
                     wrapped_by_index[idx] = Some(wrapped);
                 }
+                if batch.priority == ReflowBatchPriority::ColdScrollback {
+                    self.cold_scrollback_worker
+                        .complete_cold_batch(seqno, batch_len);
+                    cold_lines_completed = cold_lines_completed.saturating_add(batch_len);
+                    cold_batches_completed = cold_batches_completed.saturating_add(1);
+                }
                 continue;
             }
 
@@ -621,7 +738,30 @@ impl Screen {
                     }
                 }
             });
+
+            if batch.priority == ReflowBatchPriority::ColdScrollback {
+                self.cold_scrollback_worker
+                    .complete_cold_batch(seqno, batch_len);
+                cold_lines_completed = cold_lines_completed.saturating_add(batch_len);
+                cold_batches_completed = cold_batches_completed.saturating_add(1);
+            }
         }
+
+        self.cold_scrollback_worker.finish_intent(
+            seqno,
+            cold_started.elapsed(),
+            cold_lines_completed,
+        );
+        debug!(
+            "cold_scrollback_worker intent={:?} backlog_depth={} peak_backlog_depth={} completed_batches={} completed_lines={} throughput_lines_per_sec={} cancellation_count={}",
+            seqno,
+            cold_backlog_depth,
+            self.cold_scrollback_worker.peak_backlog_depth(),
+            cold_batches_completed,
+            cold_lines_completed,
+            self.cold_scrollback_worker.completion_throughput_lines_per_sec(),
+            self.cold_scrollback_worker.cancellation_count()
+        );
 
         for (idx, slot) in wrapped_by_index.iter_mut().enumerate() {
             if slot.is_some() {
@@ -1899,7 +2039,10 @@ mod tests {
         assert_eq!(plan.batches[0].logical_range, 6..10);
         assert_eq!(plan.batches[1].priority, ReflowBatchPriority::NearViewport);
         assert_eq!(plan.batches[1].logical_range, 3..6);
-        assert_eq!(plan.batches[2].priority, ReflowBatchPriority::ColdScrollback);
+        assert_eq!(
+            plan.batches[2].priority,
+            ReflowBatchPriority::ColdScrollback
+        );
         assert_eq!(plan.batches[2].logical_range, 0..3);
     }
 
@@ -1935,23 +2078,70 @@ mod tests {
     #[test]
     fn viewport_reflow_plan_handles_huge_buffer_with_bounded_batches() {
         let logical_count = 4096usize;
-        let logical_ranges: Vec<Range<usize>> = (0..logical_count).map(|idx| idx..idx + 1).collect();
+        let logical_ranges: Vec<Range<usize>> =
+            (0..logical_count).map(|idx| idx..idx + 1).collect();
         let visible_range = (logical_count - 32)..logical_count;
-        let plan =
-            Screen::build_viewport_reflow_plan_from_ranges(&logical_ranges, visible_range, logical_count);
+        let plan = Screen::build_viewport_reflow_plan_from_ranges(
+            &logical_ranges,
+            visible_range,
+            logical_count,
+        );
 
         assert!(plan.covers_each_logical_line_once(logical_count));
-        assert!(
-            plan.batches
-                .iter()
-                .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES)
-        );
+        assert!(plan
+            .batches
+            .iter()
+            .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES));
         assert_eq!(
             plan.batches
                 .first()
                 .expect("non-empty plan for non-empty logical ranges")
                 .priority,
             ReflowBatchPriority::Viewport
+        );
+    }
+
+    #[test]
+    fn cold_scrollback_worker_cancels_stale_intent() {
+        let mut worker = ColdScrollbackReflowWorker::default();
+        worker.begin_intent(1, 42);
+        assert_eq!(worker.active_intent(), Some(1));
+        assert_eq!(worker.backlog_depth(), 42);
+        assert_eq!(worker.cancellation_count(), 0);
+
+        worker.begin_intent(2, 8);
+        assert_eq!(worker.active_intent(), Some(2));
+        assert_eq!(worker.backlog_depth(), 8);
+        assert_eq!(worker.cancellation_count(), 1);
+    }
+
+    #[test]
+    fn cold_scrollback_worker_tracks_completion_and_throughput() {
+        let mut worker = ColdScrollbackReflowWorker::default();
+        worker.begin_intent(7, 10);
+        worker.complete_cold_batch(7, 4);
+        worker.complete_cold_batch(7, 6);
+        worker.finish_intent(7, std::time::Duration::from_millis(20), 10);
+
+        assert_eq!(worker.backlog_depth(), 0);
+        assert_eq!(worker.active_intent(), None);
+        assert_eq!(worker.completed_batches_total(), 2);
+        assert_eq!(worker.completed_lines_total(), 10);
+        assert_eq!(worker.cancellation_count(), 0);
+        assert!(
+            worker.completion_throughput_lines_per_sec() >= 500,
+            "expected throughput to be non-trivially positive"
+        );
+    }
+
+    #[test]
+    fn cold_scrollback_worker_caps_backlog_depth() {
+        let mut worker = ColdScrollbackReflowWorker::default();
+        worker.begin_intent(11, COLD_SCROLLBACK_BACKLOG_DEPTH_CAP.saturating_mul(2));
+        assert_eq!(worker.backlog_depth(), COLD_SCROLLBACK_BACKLOG_DEPTH_CAP);
+        assert_eq!(
+            worker.peak_backlog_depth(),
+            COLD_SCROLLBACK_BACKLOG_DEPTH_CAP
         );
     }
 }

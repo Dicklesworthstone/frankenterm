@@ -11,6 +11,7 @@ use alloc::borrow::Cow;
 use alloc::sync::{Arc, Weak};
 #[cfg(feature = "appdata")]
 use core::any::Any;
+use core::cmp::Ordering;
 use core::hash::Hash;
 use core::ops::Range;
 use finl_unicode::grapheme_clusters::Graphemes;
@@ -212,40 +213,27 @@ impl Line {
     /// Wrap the line so that it fits within the provided width.
     /// Returns the list of resultant line(s)
     pub fn wrap(self, width: usize, seqno: SequenceNo) -> Vec<Self> {
+        self.wrap_with_cost_model(width, seqno, MonospaceKpCostModel::terminal_default())
+            .0
+    }
+
+    fn wrap_with_cost_model(
+        self,
+        width: usize,
+        seqno: SequenceNo,
+        cost_model: MonospaceKpCostModel,
+    ) -> (Vec<Self>, MonospaceWrapMode) {
         let mut cells: Vec<CellRef> = self.visible_cells().collect();
         if let Some(end_idx) = cells.iter().rposition(|c| c.str() != " ") {
             cells.truncate(end_idx + 1);
-
-            let mut lines: Vec<Self> = vec![];
-            let mut current_cells: Vec<Cell> = Vec::with_capacity(width.max(1));
-            let mut current_width = 0usize;
-
-            for cell in cells {
-                let cell_width = cell.width();
-                let need_new_line =
-                    !current_cells.is_empty() && current_width.saturating_add(cell_width) > width;
-                if need_new_line {
-                    let mut prior = Line::from_cells(core::mem::take(&mut current_cells), seqno);
-                    prior.set_last_cell_was_wrapped(true, seqno);
-                    lines.push(prior);
-                    current_width = 0;
-                }
-
-                let grapheme = cell.as_cell();
-                let fill_count = grapheme.width().saturating_sub(1);
-                current_width = current_width.saturating_add(grapheme.width());
-                let fill_attr = grapheme.attrs().clone();
-                current_cells.push(grapheme);
-
-                for _ in 0..fill_count {
-                    current_cells.push(Cell::blank_with_attrs(fill_attr.clone()));
-                }
-            }
-
-            lines.push(Line::from_cells(current_cells, seqno));
-            lines
+            let tokens: Vec<Cell> = cells.into_iter().map(|cell| cell.as_cell()).collect();
+            let plan = bounded_monospace_wrap_plan(&tokens, width, cost_model);
+            (
+                materialize_wrap_lines_from_tokens(&tokens, &plan.break_offsets, seqno),
+                plan.mode,
+            )
         } else {
-            vec![self]
+            (vec![self], MonospaceWrapMode::Fallback)
         }
     }
 
@@ -1215,6 +1203,334 @@ impl Line {
     }
 }
 
+/// Sentinel badness for overflow/invalid-width lines.
+#[allow(dead_code)] // Bound to wa-1u90p.3.12 integration follow-up.
+pub(crate) const KP_BADNESS_INF: u64 = u64::MAX / 4;
+
+/// Terminal defaults for bounded monospace Knuth-Plass scoring.
+#[allow(dead_code)] // Bound to wa-1u90p.3.12 integration follow-up.
+pub(crate) const KP_DEFAULT_LOOKAHEAD_LIMIT: usize = 64;
+#[allow(dead_code)] // Bound to wa-1u90p.3.12 integration follow-up.
+pub(crate) const KP_DEFAULT_MAX_DP_STATES: usize = 8_192;
+
+/// Scoring and complexity contract for bounded Knuth-Plass line breaking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MonospaceKpCostModel {
+    /// Cubic slack multiplier.
+    pub badness_scale: u64,
+    /// Added when the engine must force-break overflow content.
+    pub forced_break_penalty: u64,
+    /// Sliding lookahead cap used to bound DP transitions.
+    pub lookahead_limit: usize,
+    /// Maximum DP states evaluated before deterministic fallback.
+    pub max_dp_states: usize,
+}
+
+#[allow(dead_code)] // Bound to wa-1u90p.3.12 integration follow-up.
+impl Default for MonospaceKpCostModel {
+    fn default() -> Self {
+        Self::terminal_default()
+    }
+}
+
+#[allow(dead_code)] // Bound to wa-1u90p.3.12 integration follow-up.
+impl MonospaceKpCostModel {
+    /// Canonical terminal-safe defaults for resize-time wrapping.
+    pub const fn terminal_default() -> Self {
+        Self {
+            badness_scale: 10_000,
+            forced_break_penalty: 5_000,
+            lookahead_limit: KP_DEFAULT_LOOKAHEAD_LIMIT,
+            max_dp_states: KP_DEFAULT_MAX_DP_STATES,
+        }
+    }
+
+    /// Cubic slack badness used by the bounded DP scorer.
+    ///
+    /// - overflow => `KP_BADNESS_INF`
+    /// - last line => `0` (TeX convention)
+    /// - non-last lines => `(slack/target_width)^3 * badness_scale`
+    #[inline]
+    pub fn line_badness(self, slack: i64, target_width: usize, is_last_line: bool) -> u64 {
+        if slack < 0 {
+            return KP_BADNESS_INF;
+        }
+        if is_last_line {
+            return 0;
+        }
+        if target_width == 0 {
+            return KP_BADNESS_INF;
+        }
+
+        let slack_u64 = slack as u64;
+        let width_u64 = target_width as u64;
+        let slack_cubed = slack_u64
+            .saturating_mul(slack_u64)
+            .saturating_mul(slack_u64);
+        let width_cubed = width_u64
+            .saturating_mul(width_u64)
+            .saturating_mul(width_u64);
+        if width_cubed == 0 {
+            return KP_BADNESS_INF;
+        }
+        slack_cubed.saturating_mul(self.badness_scale) / width_cubed
+    }
+
+    /// Upper bound on DP transition count under this model.
+    pub const fn estimated_dp_states(self, token_count: usize) -> usize {
+        if token_count == 0 {
+            return 0;
+        }
+        let lookahead = if token_count < self.lookahead_limit {
+            token_count
+        } else {
+            self.lookahead_limit
+        };
+        token_count.saturating_mul(lookahead)
+    }
+
+    /// Whether the DP engine should fall back to deterministic greedy wrapping.
+    pub const fn should_fallback(self, token_count: usize) -> bool {
+        self.estimated_dp_states(token_count) > self.max_dp_states
+    }
+}
+
+/// Comparable summary for DP candidate ranking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MonospaceBreakCandidate {
+    pub total_cost: u64,
+    pub forced_breaks: usize,
+    pub max_line_badness: u64,
+    pub line_count: usize,
+    pub break_offsets: Vec<usize>,
+}
+
+/// Deterministic candidate ordering for equal/near-equal DP paths.
+///
+/// Lower sort order is better:
+/// 1. total_cost
+/// 2. forced_breaks
+/// 3. max_line_badness
+/// 4. line_count
+/// 5. lexical `break_offsets` (final stable tie-break)
+#[allow(dead_code)] // Bound to wa-1u90p.3.12 integration follow-up.
+#[inline]
+pub(crate) fn compare_monospace_break_candidates(
+    lhs: &MonospaceBreakCandidate,
+    rhs: &MonospaceBreakCandidate,
+) -> Ordering {
+    lhs.total_cost
+        .cmp(&rhs.total_cost)
+        .then(lhs.forced_breaks.cmp(&rhs.forced_breaks))
+        .then(lhs.max_line_badness.cmp(&rhs.max_line_badness))
+        .then(lhs.line_count.cmp(&rhs.line_count))
+        .then(lhs.break_offsets.cmp(&rhs.break_offsets))
+}
+
+#[allow(dead_code)] // Bound to wa-1u90p.3.12 integration follow-up.
+#[inline]
+pub(crate) fn choose_best_monospace_break_candidate(
+    candidates: &[MonospaceBreakCandidate],
+) -> Option<&MonospaceBreakCandidate> {
+    candidates
+        .iter()
+        .min_by(|lhs, rhs| compare_monospace_break_candidates(lhs, rhs))
+}
+
+/// Execution mode used by the bounded wrap planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MonospaceWrapMode {
+    /// DP planner remained within configured state budget.
+    Dp,
+    /// Planner exceeded budget or had no viable DP plan and used greedy fallback.
+    Fallback,
+}
+
+/// Wrap plan emitted by the bounded planner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MonospaceWrapPlan {
+    pub mode: MonospaceWrapMode,
+    pub break_offsets: Vec<usize>,
+    pub estimated_states: usize,
+    pub evaluated_states: usize,
+}
+
+#[inline]
+fn greedy_break_offsets_from_tokens(tokens: &[Cell], width: usize) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut current_width = 0usize;
+
+    for (idx, token) in tokens.iter().enumerate() {
+        let token_width = token.width();
+        let need_new_line = current_width > 0 && current_width.saturating_add(token_width) > width;
+        if need_new_line {
+            offsets.push(idx);
+            current_width = 0;
+        }
+        current_width = current_width.saturating_add(token_width);
+    }
+
+    offsets.push(tokens.len());
+    offsets
+}
+
+#[inline]
+fn fallback_wrap_plan(
+    tokens: &[Cell],
+    width: usize,
+    estimated_states: usize,
+    evaluated_states: usize,
+) -> MonospaceWrapPlan {
+    MonospaceWrapPlan {
+        mode: MonospaceWrapMode::Fallback,
+        break_offsets: greedy_break_offsets_from_tokens(tokens, width),
+        estimated_states,
+        evaluated_states,
+    }
+}
+
+/// Compute a bounded DP wrap plan and deterministically fall back to greedy wrapping
+/// when the configured state budget would be exceeded.
+pub(crate) fn bounded_monospace_wrap_plan(
+    tokens: &[Cell],
+    width: usize,
+    model: MonospaceKpCostModel,
+) -> MonospaceWrapPlan {
+    if tokens.is_empty() {
+        return MonospaceWrapPlan {
+            mode: MonospaceWrapMode::Dp,
+            break_offsets: vec![],
+            estimated_states: 0,
+            evaluated_states: 0,
+        };
+    }
+
+    let token_count = tokens.len();
+    let estimated_states = model.estimated_dp_states(token_count);
+    if width == 0 || model.should_fallback(token_count) {
+        return fallback_wrap_plan(tokens, width, estimated_states, 0);
+    }
+
+    let mut evaluated_states = 0usize;
+    let mut best: Vec<Option<MonospaceBreakCandidate>> = vec![None; token_count + 1];
+    best[0] = Some(MonospaceBreakCandidate {
+        total_cost: 0,
+        forced_breaks: 0,
+        max_line_badness: 0,
+        line_count: 0,
+        break_offsets: vec![],
+    });
+
+    for start in 0..token_count {
+        let Some(prefix) = best[start].clone() else {
+            continue;
+        };
+
+        let mut line_width = 0usize;
+        let max_end = (start + model.lookahead_limit).min(token_count);
+
+        for end in (start + 1)..=max_end {
+            line_width = line_width.saturating_add(tokens[end - 1].width());
+            evaluated_states = evaluated_states.saturating_add(1);
+            if evaluated_states > model.max_dp_states {
+                return fallback_wrap_plan(tokens, width, estimated_states, evaluated_states);
+            }
+
+            let is_last_line = end == token_count;
+            let (line_cost, forced_break_inc) = if line_width > width {
+                if end == start + 1 {
+                    // Preserve deterministic behavior for over-wide graphemes by forcing
+                    // exactly one token on this line and charging a fixed overflow penalty.
+                    let overflow_cols = line_width.saturating_sub(width) as u64;
+                    let overflow_penalty = model
+                        .forced_break_penalty
+                        .saturating_mul(overflow_cols.max(1));
+                    (overflow_penalty, 1usize)
+                } else {
+                    break;
+                }
+            } else {
+                let slack = width.saturating_sub(line_width) as i64;
+                (model.line_badness(slack, width, is_last_line), 0usize)
+            };
+
+            let mut break_offsets = prefix.break_offsets.clone();
+            break_offsets.push(end);
+            let candidate = MonospaceBreakCandidate {
+                total_cost: prefix.total_cost.saturating_add(line_cost),
+                forced_breaks: prefix.forced_breaks.saturating_add(forced_break_inc),
+                max_line_badness: prefix.max_line_badness.max(line_cost),
+                line_count: prefix.line_count + 1,
+                break_offsets,
+            };
+
+            match &best[end] {
+                Some(existing) => {
+                    if compare_monospace_break_candidates(&candidate, existing) == Ordering::Less {
+                        best[end] = Some(candidate);
+                    }
+                }
+                None => best[end] = Some(candidate),
+            }
+
+            if line_width > width {
+                break;
+            }
+        }
+    }
+
+    match best[token_count].take() {
+        Some(candidate) => MonospaceWrapPlan {
+            mode: MonospaceWrapMode::Dp,
+            break_offsets: candidate.break_offsets,
+            estimated_states,
+            evaluated_states,
+        },
+        None => fallback_wrap_plan(tokens, width, estimated_states, evaluated_states),
+    }
+}
+
+#[inline]
+fn materialize_wrap_lines_from_tokens(
+    tokens: &[Cell],
+    break_offsets: &[usize],
+    seqno: SequenceNo,
+) -> Vec<Line> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+
+    for &end in break_offsets {
+        if end < start || end > tokens.len() {
+            continue;
+        }
+
+        let mut current_cells: Vec<Cell> = Vec::new();
+        for token in &tokens[start..end] {
+            let grapheme = token.clone();
+            let fill_count = grapheme.width().saturating_sub(1);
+            let fill_attr = grapheme.attrs().clone();
+            current_cells.push(grapheme);
+
+            for _ in 0..fill_count {
+                current_cells.push(Cell::blank_with_attrs(fill_attr.clone()));
+            }
+        }
+
+        let mut line = Line::from_cells(current_cells, seqno);
+        if end < tokens.len() {
+            line.set_last_cell_was_wrapped(true, seqno);
+        }
+        lines.push(line);
+        start = end;
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from_cells(vec![], seqno));
+    }
+
+    lines
+}
+
 impl<'a> From<&'a str> for Line {
     fn from(s: &str) -> Line {
         Line::from_text(s, &CellAttributes::default(), SEQ_ZERO, None)
@@ -1594,6 +1910,218 @@ mod tests {
         assert_eq!(wrapped[0].as_str().as_ref(), "abc");
         assert!(wrapped[0].last_cell_was_wrapped());
         assert_eq!(wrapped[1].as_str().as_ref(), "def");
+    }
+
+    #[test]
+    fn kp_cost_model_badness_is_monotonic_for_non_last_lines() {
+        let model = MonospaceKpCostModel::terminal_default();
+        let width = 80usize;
+        let mut prev = 0u64;
+        for slack in 0..=width {
+            let badness = model.line_badness(slack as i64, width, false);
+            assert!(
+                badness >= prev,
+                "expected non-decreasing badness at slack={slack}: prev={prev} current={badness}"
+            );
+            prev = badness;
+        }
+
+        assert_eq!(model.line_badness(10, width, true), 0);
+        assert_eq!(model.line_badness(-1, width, false), KP_BADNESS_INF);
+    }
+
+    #[test]
+    fn kp_cost_model_enforces_bounded_state_budget() {
+        let model = MonospaceKpCostModel::terminal_default();
+        assert!(!model.should_fallback(32));
+        assert!(!model.should_fallback(64));
+        assert!(model.should_fallback(512));
+        assert!(model.estimated_dp_states(512) > model.max_dp_states);
+    }
+
+    #[test]
+    fn kp_candidate_tiebreak_is_deterministic_on_fixed_corpora() {
+        let corpus_a = vec![
+            MonospaceBreakCandidate {
+                total_cost: 120,
+                forced_breaks: 1,
+                max_line_badness: 80,
+                line_count: 3,
+                break_offsets: vec![10, 20, 29],
+            },
+            MonospaceBreakCandidate {
+                total_cost: 120,
+                forced_breaks: 1,
+                max_line_badness: 80,
+                line_count: 3,
+                break_offsets: vec![10, 21, 29],
+            },
+            MonospaceBreakCandidate {
+                total_cost: 120,
+                forced_breaks: 2,
+                max_line_badness: 60,
+                line_count: 3,
+                break_offsets: vec![11, 22, 29],
+            },
+        ];
+        let expected_a = vec![10, 20, 29];
+
+        let corpus_b = vec![
+            MonospaceBreakCandidate {
+                total_cost: 80,
+                forced_breaks: 0,
+                max_line_badness: 20,
+                line_count: 4,
+                break_offsets: vec![5, 10, 15, 20],
+            },
+            MonospaceBreakCandidate {
+                total_cost: 80,
+                forced_breaks: 0,
+                max_line_badness: 20,
+                line_count: 3,
+                break_offsets: vec![7, 14, 20],
+            },
+            MonospaceBreakCandidate {
+                total_cost: 81,
+                forced_breaks: 0,
+                max_line_badness: 10,
+                line_count: 3,
+                break_offsets: vec![8, 16, 20],
+            },
+        ];
+        let expected_b = vec![7, 14, 20];
+
+        let corpus_c = vec![
+            MonospaceBreakCandidate {
+                total_cost: 100,
+                forced_breaks: 0,
+                max_line_badness: 40,
+                line_count: 3,
+                break_offsets: vec![8, 16, 24],
+            },
+            MonospaceBreakCandidate {
+                total_cost: 100,
+                forced_breaks: 0,
+                max_line_badness: 35,
+                line_count: 3,
+                break_offsets: vec![9, 18, 24],
+            },
+            MonospaceBreakCandidate {
+                total_cost: 100,
+                forced_breaks: 0,
+                max_line_badness: 35,
+                line_count: 3,
+                break_offsets: vec![9, 19, 24],
+            },
+        ];
+        let expected_c = vec![9, 18, 24];
+
+        for rotation in 0..corpus_a.len() {
+            let mut permuted = corpus_a.clone();
+            permuted.rotate_left(rotation);
+            let best = choose_best_monospace_break_candidate(&permuted).expect("candidate");
+            assert_eq!(
+                best.break_offsets, expected_a,
+                "corpus_a rotation={rotation}"
+            );
+        }
+
+        for rotation in 0..corpus_b.len() {
+            let mut permuted = corpus_b.clone();
+            permuted.rotate_left(rotation);
+            let best = choose_best_monospace_break_candidate(&permuted).expect("candidate");
+            assert_eq!(
+                best.break_offsets, expected_b,
+                "corpus_b rotation={rotation}"
+            );
+        }
+
+        for rotation in 0..corpus_c.len() {
+            let mut permuted = corpus_c.clone();
+            permuted.rotate_left(rotation);
+            let best = choose_best_monospace_break_candidate(&permuted).expect("candidate");
+            assert_eq!(
+                best.break_offsets, expected_c,
+                "corpus_c rotation={rotation}"
+            );
+        }
+    }
+
+    fn cells_from_text(text: &str) -> Vec<Cell> {
+        let line: Line = text.into();
+        line.visible_cells().map(|cell| cell.as_cell()).collect()
+    }
+
+    #[test]
+    fn bounded_wrap_plan_uses_dp_when_budget_allows() {
+        let model = MonospaceKpCostModel::terminal_default();
+        let tokens = cells_from_text("abcdefghij");
+        let plan = bounded_monospace_wrap_plan(&tokens, 4, model);
+
+        assert_eq!(plan.mode, MonospaceWrapMode::Dp);
+        assert_eq!(plan.break_offsets.last(), Some(&tokens.len()));
+        assert!(plan.evaluated_states > 0);
+        assert!(plan.evaluated_states <= model.max_dp_states);
+    }
+
+    #[test]
+    fn bounded_wrap_plan_falls_back_when_estimated_budget_exceeds_limit() {
+        let mut model = MonospaceKpCostModel::terminal_default();
+        model.max_dp_states = 8;
+        let tokens = cells_from_text("abcdefghijklmnop");
+        let plan = bounded_monospace_wrap_plan(&tokens, 4, model);
+
+        assert_eq!(plan.mode, MonospaceWrapMode::Fallback);
+        assert_eq!(plan.evaluated_states, 0);
+        assert_eq!(
+            plan.break_offsets,
+            greedy_break_offsets_from_tokens(&tokens, 4)
+        );
+    }
+
+    #[test]
+    fn wrap_with_cost_model_fallback_matches_greedy_layout() {
+        let line: Line = "abcdefghijkl".into();
+        let tokens = cells_from_text("abcdefghijkl");
+        let mut model = MonospaceKpCostModel::terminal_default();
+        model.max_dp_states = 4;
+
+        let expected = materialize_wrap_lines_from_tokens(
+            &tokens,
+            &greedy_break_offsets_from_tokens(&tokens, 3),
+            1,
+        );
+        let (wrapped, mode) = line.wrap_with_cost_model(3, 1, model);
+
+        assert_eq!(mode, MonospaceWrapMode::Fallback);
+        assert_eq!(wrapped, expected);
+    }
+
+    #[test]
+    fn wrap_with_cost_model_reports_dp_on_small_inputs() {
+        let line: Line = "abcdef".into();
+        let (wrapped, mode) =
+            line.wrap_with_cost_model(3, 1, MonospaceKpCostModel::terminal_default());
+        assert_eq!(mode, MonospaceWrapMode::Dp);
+        assert_eq!(wrapped.len(), 2);
+    }
+
+    #[test]
+    fn bounded_wrap_plan_is_deterministic_for_identical_inputs() {
+        let model = MonospaceKpCostModel::terminal_default();
+        let tokens = cells_from_text("deterministic");
+        let a = bounded_monospace_wrap_plan(&tokens, 5, model);
+        let b = bounded_monospace_wrap_plan(&tokens, 5, model);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn materialized_wrap_marks_non_terminal_lines_as_wrapped() {
+        let tokens = cells_from_text("abcdef");
+        let lines = materialize_wrap_lines_from_tokens(&tokens, &[3, 6], 1);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].last_cell_was_wrapped());
+        assert!(!lines[1].last_cell_was_wrapped());
     }
 
     // ── Line clone / eq ────────────────────────────────────

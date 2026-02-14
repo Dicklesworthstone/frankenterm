@@ -287,6 +287,7 @@ impl ChangeSequence {
 #[cfg(test)]
 mod test {
     use super::*;
+    use alloc::format;
     use frankenterm_cell::color::AnsiColor;
 
     // === LineAttribute tests ===
