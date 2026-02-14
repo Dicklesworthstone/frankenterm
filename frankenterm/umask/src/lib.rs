@@ -157,4 +157,213 @@ mod tests {
         assert_eq!(after_outer, 0o022);
         unsafe { umask(original) };
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_umask_returns_none_before_any_saver() {
+        let _g = TEST_LOCK.lock().unwrap();
+        // Ensure no saver is active by dropping any leftovers
+        SAVED_UMASK.lock().unwrap().take();
+        assert!(UmaskSaver::saved_umask().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_umask_captures_prior_mask_value() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o012) };
+        let _saver = UmaskSaver::new();
+        // saved_umask should return 0o012 (the mask that was active before new())
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o012));
+        drop(_saver);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saver_sets_exactly_077() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+        let _saver = UmaskSaver::new();
+        // Query the current umask by setting and restoring
+        let current = unsafe { umask(0o077) };
+        unsafe { umask(current) };
+        assert_eq!(current, 0o077);
+        drop(_saver);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_restores_from_zero_initial_mask() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o000) };
+        {
+            let _saver = UmaskSaver::new();
+            // umask is now 0o077
+        }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o000);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_restores_from_maximally_restrictive_mask() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o777) };
+        {
+            let _saver = UmaskSaver::new();
+        }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o777);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sequential_create_drop_cycles_are_independent() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        for _ in 0..5 {
+            {
+                let _saver = UmaskSaver::new();
+                assert!(UmaskSaver::saved_umask().is_some());
+            }
+            let after = unsafe { umask(0o022) };
+            assert_eq!(after, 0o022);
+            assert!(UmaskSaver::saved_umask().is_none());
+        }
+
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_and_new_set_same_mask() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        let saver_new = UmaskSaver::new();
+        let mask_from_new = unsafe { umask(0o077) };
+        unsafe { umask(mask_from_new) };
+        drop(saver_new);
+
+        unsafe { umask(0o022) };
+        let saver_default = UmaskSaver::default();
+        let mask_from_default = unsafe { umask(0o077) };
+        unsafe { umask(mask_from_default) };
+        drop(saver_default);
+
+        assert_eq!(mask_from_new, mask_from_default);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_umask_updates_on_nested_creation() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        let _outer = UmaskSaver::new();
+        // outer captured 0o022
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o022));
+
+        let _inner = UmaskSaver::new();
+        // inner captured 0o077 (set by outer)
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o077));
+
+        drop(_inner);
+        // After inner drop, saved_umask is cleared (taken by inner's drop)
+        // Note: inner's drop calls take(), so saved_umask is None
+        // Then outer still holds its mask field
+        drop(_outer);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saver_with_already_restrictive_mask() {
+        let _g = TEST_LOCK.lock().unwrap();
+        // Start with 0o077 — same as what UmaskSaver sets
+        let original = unsafe { umask(0o077) };
+        {
+            let _saver = UmaskSaver::new();
+            // Should still be 0o077
+            let current = unsafe { umask(0o077) };
+            assert_eq!(current, 0o077);
+            unsafe { umask(current) };
+        }
+        // Restore to 0o077
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o077);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_umask_with_various_initial_values() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        for &mask in &[0o000, 0o022, 0o077, 0o133, 0o777] {
+            unsafe { umask(mask) };
+            let _saver = UmaskSaver::new();
+            assert_eq!(
+                UmaskSaver::saved_umask(),
+                Some(mask),
+                "saved_umask should capture initial mask 0o{:03o}",
+                mask
+            );
+            drop(_saver);
+        }
+
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_restores_odd_mask_values() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        for &mask in &[0o001, 0o010, 0o100, 0o137, 0o755] {
+            unsafe { umask(mask) };
+            {
+                let _saver = UmaskSaver::new();
+            }
+            let restored = unsafe { umask(mask) };
+            assert_eq!(
+                restored, mask,
+                "drop should restore mask 0o{:03o}",
+                mask
+            );
+        }
+
+        unsafe { umask(original) };
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_new_does_not_panic() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _saver = UmaskSaver::new();
+        // On non-unix, UmaskSaver is essentially a no-op
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_default_does_not_panic() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _saver = UmaskSaver::default();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_drop_does_not_panic() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let saver = UmaskSaver::new();
+        drop(saver);
+    }
 }
