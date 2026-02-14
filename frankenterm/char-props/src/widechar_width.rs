@@ -1901,4 +1901,98 @@ mod test {
         let c = '\u{20000}'; // CJK Extension B
         assert_eq!(table.classify(c), WcWidth::Two);
     }
+
+    // ── Additional from_char edge cases ───────────────────
+
+    #[test]
+    fn noncharacter_codepoints() {
+        // U+FFFE and U+FFFF are noncharacters
+        assert_eq!(WcWidth::from_char('\u{fffe}'), WcWidth::NonCharacter);
+        assert_eq!(WcWidth::from_char('\u{ffff}'), WcWidth::NonCharacter);
+    }
+
+    #[test]
+    fn ambiguous_width_characters() {
+        // U+00A1 INVERTED EXCLAMATION MARK is East-Asian ambiguous
+        assert_eq!(WcWidth::from_char('\u{00a1}'), WcWidth::Ambiguous);
+        // U+00A4 CURRENCY SIGN
+        assert_eq!(WcWidth::from_char('\u{00a4}'), WcWidth::Ambiguous);
+    }
+
+    #[test]
+    fn latin1_printable_is_one() {
+        // U+00A0 NO-BREAK SPACE through Latin-1 characters
+        // Note: some are ambiguous, test a clearly-one character
+        assert_eq!(WcWidth::from_char('\u{00B5}'), WcWidth::One); // MICRO SIGN
+    }
+
+    #[test]
+    fn mongolian_vowel_separator_nonprint() {
+        // U+180E MONGOLIAN VOWEL SEPARATOR
+        assert_eq!(WcWidth::from_char('\u{180e}'), WcWidth::NonPrint);
+    }
+
+    #[test]
+    fn interlinear_annotation_nonprint() {
+        // U+FFF9 INTERLINEAR ANNOTATION ANCHOR
+        assert_eq!(WcWidth::from_char('\u{fff9}'), WcWidth::NonPrint);
+        // U+FFFB INTERLINEAR ANNOTATION TERMINATOR
+        assert_eq!(WcWidth::from_char('\u{fffb}'), WcWidth::NonPrint);
+    }
+
+    #[test]
+    fn katakana_halfwidth_is_one() {
+        // U+FF65 HALFWIDTH KATAKANA MIDDLE DOT
+        assert_eq!(WcWidth::from_char('\u{ff65}'), WcWidth::One);
+    }
+
+    #[test]
+    fn cjk_compatibility_ideographs_are_double() {
+        // U+F900 CJK COMPATIBILITY IDEOGRAPH
+        assert_eq!(WcWidth::from_char('\u{f900}'), WcWidth::Two);
+    }
+
+    // ── Additional width method tests ─────────────────────
+
+    #[test]
+    fn width_u9_nonprint_is_0() {
+        assert_eq!(WcWidth::NonPrint.width_unicode_9_or_later(), 0);
+    }
+
+    #[test]
+    fn width_u9_ambiguous_is_1() {
+        assert_eq!(WcWidth::Ambiguous.width_unicode_9_or_later(), 1);
+    }
+
+    #[test]
+    fn width_u9_private_use_is_1() {
+        assert_eq!(WcWidth::PrivateUse.width_unicode_9_or_later(), 1);
+    }
+
+    // ── Additional WcLookupTable tests ────────────────────
+
+    #[test]
+    fn lookup_table_null_char() {
+        let table = WcLookupTable::new();
+        assert_eq!(table.classify('\0'), WcWidth::NonPrint);
+    }
+
+    #[test]
+    fn lookup_table_last_bmp_noncharacter() {
+        let table = WcLookupTable::new();
+        assert_eq!(table.classify('\u{ffff}'), WcWidth::NonCharacter);
+    }
+
+    #[test]
+    fn lookup_table_agrees_for_combining() {
+        let table = WcLookupTable::new();
+        for c in ['\u{0300}', '\u{0301}', '\u{0483}', '\u{0591}'] {
+            assert_eq!(
+                table.classify(c),
+                WcWidth::from_char(c),
+                "mismatch for U+{:04X}",
+                c as u32
+            );
+        }
+    }
 }

@@ -146,4 +146,76 @@ mod tests {
         let (default, _) = Presentation::for_grapheme("\u{1F468}\u{200D}\u{1F469}");
         assert_eq!(default, Presentation::Emoji);
     }
+
+    // ── Additional for_char tests ───────────────────────────
+
+    #[test]
+    fn digit_is_text() {
+        // Digits 0-9 have text default presentation
+        for c in '0'..='9' {
+            assert_eq!(Presentation::for_char(c), Presentation::Text, "digit {c}");
+        }
+    }
+
+    #[test]
+    fn various_emoji_presentation() {
+        // U+1F4A9 PILE OF POO
+        assert_eq!(Presentation::for_char('\u{1F4A9}'), Presentation::Emoji);
+        // U+1F680 ROCKET
+        assert_eq!(Presentation::for_char('\u{1F680}'), Presentation::Emoji);
+        // U+1F525 FIRE
+        assert_eq!(Presentation::for_char('\u{1F525}'), Presentation::Emoji);
+    }
+
+    #[test]
+    fn combining_mark_is_text() {
+        // U+0300 COMBINING GRAVE ACCENT - not emoji presentation
+        assert_eq!(Presentation::for_char('\u{0300}'), Presentation::Text);
+    }
+
+    #[test]
+    fn cjk_is_text() {
+        // CJK ideograph - text presentation
+        assert_eq!(Presentation::for_char('\u{4e00}'), Presentation::Text);
+    }
+
+    #[test]
+    fn regional_indicator_is_emoji() {
+        // U+1F1E6 REGIONAL INDICATOR SYMBOL LETTER A has emoji presentation
+        assert_eq!(Presentation::for_char('\u{1F1E6}'), Presentation::Emoji);
+    }
+
+    // ── Additional for_grapheme tests ───────────────────────
+
+    #[test]
+    fn grapheme_single_ascii_char() {
+        for c in ['a', 'Z', '5', '!', '#'] {
+            let s = String::from(c);
+            let (default, explicit) = Presentation::for_grapheme(&s);
+            assert_eq!(default, Presentation::Text, "char {c}");
+            assert_eq!(explicit, None, "char {c}");
+        }
+    }
+
+    #[test]
+    fn grapheme_rocket_emoji() {
+        let (default, _) = Presentation::for_grapheme("\u{1F680}");
+        assert_eq!(default, Presentation::Emoji);
+    }
+
+    #[test]
+    fn grapheme_multiple_text_chars() {
+        // Multiple text characters with no emoji
+        let (default, explicit) = Presentation::for_grapheme("abc");
+        assert_eq!(default, Presentation::Text);
+        assert_eq!(explicit, None);
+    }
+
+    #[test]
+    fn presentation_copy_trait() {
+        let a = Presentation::Text;
+        let b = a; // Copy
+        let c = a; // Still valid - Copy
+        assert_eq!(b, c);
+    }
 }
