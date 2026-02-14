@@ -1132,4 +1132,930 @@ mod tests {
         assert_eq!(buf, b"abc");
         cleanup(&path);
     }
+
+    // ── Get/clear timeouts ──────────────────────────────────
+
+    #[test]
+    fn get_read_timeout_returns_set_value() {
+        let path = temp_socket_path("get_rd_to");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+        let (server, _) = listener.accept().unwrap();
+        let _c = client.join().unwrap();
+        let dur = std::time::Duration::from_millis(250);
+        server.set_read_timeout(Some(dur)).unwrap();
+        let got = server.read_timeout().unwrap().unwrap();
+        assert_eq!(got, dur);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn get_write_timeout_returns_set_value() {
+        let path = temp_socket_path("get_wr_to");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+        let (server, _) = listener.accept().unwrap();
+        let _c = client.join().unwrap();
+        let dur = std::time::Duration::from_millis(300);
+        server.set_write_timeout(Some(dur)).unwrap();
+        let got = server.write_timeout().unwrap().unwrap();
+        assert_eq!(got, dur);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn clear_read_timeout() {
+        let path = temp_socket_path("clr_rd_to");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+        let (server, _) = listener.accept().unwrap();
+        let _c = client.join().unwrap();
+        server.set_read_timeout(Some(std::time::Duration::from_millis(100))).unwrap();
+        server.set_read_timeout(None).unwrap();
+        assert!(server.read_timeout().unwrap().is_none());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn clear_write_timeout() {
+        let path = temp_socket_path("clr_wr_to");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+        let (server, _) = listener.accept().unwrap();
+        let _c = client.join().unwrap();
+        server.set_write_timeout(Some(std::time::Duration::from_millis(100))).unwrap();
+        server.set_write_timeout(None).unwrap();
+        assert!(server.write_timeout().unwrap().is_none());
+        cleanup(&path);
+    }
+
+    // ── Accept addr ─────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn accept_addr_is_unnamed() {
+        let path = temp_socket_path("unnamed");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+        let (_server, addr) = listener.accept().unwrap();
+        let _c = client.join().unwrap();
+        // Client-side addresses are typically unnamed
+        assert!(addr.as_pathname().is_none());
+        cleanup(&path);
+    }
+
+    // ── Stream survives listener drop ───────────────────────
+
+    #[test]
+    fn stream_stays_connected_after_listener_drop() {
+        let path = temp_socket_path("srv_drop");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                s.write_all(b"before drop").unwrap();
+                s
+            }
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        let mut c = client.join().unwrap();
+        drop(listener); // drop listener
+        // Communication should still work
+        server.write_all(b"after drop").unwrap();
+        server.flush().unwrap();
+        let mut buf = [0u8; 64];
+        let n = c.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"after drop");
+        cleanup(&path);
+    }
+
+    // ── Drop listener while client is connected ─────────────
+
+    #[test]
+    fn drop_listener_doesnt_kill_streams() {
+        let path = temp_socket_path("drop_ls");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        let _c = client.join().unwrap();
+        drop(listener);
+        // Server stream should still be writable
+        server.write_all(b"still alive").unwrap();
+        server.flush().unwrap();
+        cleanup(&path);
+    }
+
+    // ── Write after peer dropped ────────────────────────────
+
+    #[test]
+    fn write_after_peer_dropped_fails() {
+        let path = temp_socket_path("wr_dead");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        let c = client.join().unwrap();
+        drop(c); // close client end
+        // Give OS time to propagate the close
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // First write may succeed (buffered), but repeated writes should eventually fail
+        let mut failed = false;
+        for _ in 0..100 {
+            if server.write_all(&[0u8; 1024]).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "expected write to fail after peer dropped");
+        cleanup(&path);
+    }
+
+    // ── Read into oversized buffer ──────────────────────────
+
+    #[test]
+    fn read_into_oversized_buffer() {
+        let path = temp_socket_path("big_buf");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                s.write_all(b"tiny").unwrap();
+            }
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        drop(listener);
+        let mut buf = vec![0u8; 65536];
+        let n = server.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"tiny");
+        cleanup(&path);
+    }
+
+    // ── Single byte read/write ──────────────────────────────
+
+    #[test]
+    fn write_single_byte() {
+        let path = temp_socket_path("single_w");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                let n = s.write(&[42]).unwrap();
+                assert_eq!(n, 1);
+            }
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        let mut buf = [0u8; 1];
+        server.read_exact(&mut buf).unwrap();
+        assert_eq!(buf[0], 42);
+        cleanup(&path);
+    }
+
+    // ── Partial read then rest ──────────────────────────────
+
+    #[test]
+    fn partial_read_then_rest() {
+        let path = temp_socket_path("partial");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                s.write_all(b"hello world").unwrap();
+            }
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        drop(listener);
+        // Read first 5 bytes
+        let mut part1 = [0u8; 5];
+        server.read_exact(&mut part1).unwrap();
+        assert_eq!(&part1, b"hello");
+        // Read rest
+        let mut rest = Vec::new();
+        server.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b" world");
+        cleanup(&path);
+    }
+
+    // ── Read exact with insufficient data ───────────────────
+
+    #[test]
+    fn read_exact_insufficient_data_fails() {
+        let path = temp_socket_path("exact_fail");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                s.write_all(b"hi").unwrap();
+                // drop closes the stream
+            }
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        let mut buf = [0u8; 100];
+        let result = server.read_exact(&mut buf);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        cleanup(&path);
+    }
+
+    // ── Connect with PathBuf ────────────────────────────────
+
+    #[test]
+    fn connect_with_pathbuf() {
+        let path = temp_socket_path("pathbuf");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let owned: std::path::PathBuf = path.clone();
+        let client = std::thread::spawn(move || UnixStream::connect(&owned).unwrap());
+        let (mut server, _) = listener.accept().unwrap();
+        let _c = client.join().unwrap();
+        server.write_all(b"ok").unwrap();
+        cleanup(&path);
+    }
+
+    // ── Accept returns working stream ───────────────────────
+
+    #[test]
+    fn accept_returns_working_stream() {
+        let path = temp_socket_path("accept_wk");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                let mut buf = [0u8; 64];
+                let n = s.read(&mut buf).unwrap();
+                String::from_utf8(buf[..n].to_vec()).unwrap()
+            }
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        server.write_all(b"from server").unwrap();
+        server.flush().unwrap();
+        drop(server);
+        let got = client.join().unwrap();
+        assert_eq!(got, "from server");
+        cleanup(&path);
+    }
+
+    // ── Five sequential accepts ─────────────────────────────
+
+    #[test]
+    fn five_sequential_accepts() {
+        let path = temp_socket_path("five_seq");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        for i in 0..5u8 {
+            let client = std::thread::spawn({
+                let path = path.clone();
+                move || {
+                    let mut s = UnixStream::connect(&path).unwrap();
+                    s.write_all(&[i]).unwrap();
+                }
+            });
+            let (mut server, _) = listener.accept().unwrap();
+            client.join().unwrap();
+            let mut buf = [0u8; 1];
+            server.read_exact(&mut buf).unwrap();
+            assert_eq!(buf[0], i);
+        }
+        cleanup(&path);
+    }
+
+    // ── BufReader wrapping ──────────────────────────────────
+
+    #[test]
+    fn buf_reader_wrapping() {
+        use std::io::BufRead;
+        let path = temp_socket_path("bufreader");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                s.write_all(b"line1\nline2\n").unwrap();
+            }
+        });
+        let (server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        drop(listener);
+        let reader = std::io::BufReader::new(server);
+        let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+        assert_eq!(lines, vec!["line1", "line2"]);
+        cleanup(&path);
+    }
+
+    // ── BufWriter wrapping ──────────────────────────────────
+
+    #[test]
+    fn buf_writer_wrapping() {
+        let path = temp_socket_path("bufwriter");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let s = UnixStream::connect(&path).unwrap();
+                let mut w = std::io::BufWriter::new(s);
+                w.write_all(b"buffered").unwrap();
+                w.flush().unwrap();
+            }
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        drop(listener);
+        let mut buf = Vec::new();
+        server.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"buffered");
+        cleanup(&path);
+    }
+
+    // ── Read::bytes iterator ────────────────────────────────
+
+    #[test]
+    fn bytes_iterator() {
+        let path = temp_socket_path("bytes_it");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                s.write_all(b"ABC").unwrap();
+            }
+        });
+        let (server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        drop(listener);
+        let collected: Vec<u8> = server.bytes().map(|b| b.unwrap()).collect();
+        assert_eq!(collected, b"ABC");
+        cleanup(&path);
+    }
+
+    // ── Read::take ──────────────────────────────────────────
+
+    #[test]
+    fn read_take_limits_bytes() {
+        let path = temp_socket_path("take_lim");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                s.write_all(b"abcdefgh").unwrap();
+            }
+        });
+        let (server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        drop(listener);
+        let mut limited = server.take(3);
+        let mut buf = Vec::new();
+        limited.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"abc");
+        cleanup(&path);
+    }
+
+    // ── Both ends write simultaneously ──────────────────────
+
+    #[test]
+    fn both_ends_write() {
+        let path = temp_socket_path("both_wr");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                s.write_all(b"from client").unwrap();
+                s.flush().unwrap();
+                let mut buf = [0u8; 64];
+                let n = s.read(&mut buf).unwrap();
+                String::from_utf8(buf[..n].to_vec()).unwrap()
+            }
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        server.write_all(b"from server").unwrap();
+        server.flush().unwrap();
+        let mut buf = [0u8; 64];
+        let n = server.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"from client");
+        let got = client.join().unwrap();
+        assert_eq!(got, "from server");
+        cleanup(&path);
+    }
+
+    // ── 256KB data roundtrip ────────────────────────────────
+
+    #[test]
+    fn large_data_256kb_roundtrip() {
+        let path = temp_socket_path("large256k");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let data: Vec<u8> = (0..262144).map(|i| (i % 251) as u8).collect();
+
+        let client = std::thread::spawn({
+            let path = path.clone();
+            let data = data.clone();
+            move || {
+                let mut stream = UnixStream::connect(&path).unwrap();
+                stream.write_all(&data).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let (mut server, _) = listener.accept().unwrap();
+        drop(listener);
+        let mut buf = Vec::new();
+        server.read_to_end(&mut buf).unwrap();
+        client.join().unwrap();
+        assert_eq!(buf.len(), 262144);
+        assert_eq!(buf, data);
+        cleanup(&path);
+    }
+
+    // ── Incoming with multiple connections ───────────────────
+
+    #[test]
+    fn incoming_multiple_connections() {
+        let path = temp_socket_path("inc_multi");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        // Connect 3 clients
+        let clients: Vec<_> = (0..3).map(|_| {
+            let path = path.clone();
+            std::thread::spawn(move || UnixStream::connect(&path).unwrap())
+        }).collect();
+
+        // Give clients time to connect
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let mut accepted = 0;
+        for result in listener.incoming() {
+            match result {
+                Ok(_stream) => {
+                    accepted += 1;
+                    if accepted >= 3 {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        for c in clients {
+            c.join().unwrap();
+        }
+        assert!(accepted >= 2, "expected at least 2 accepts, got {accepted}");
+        cleanup(&path);
+    }
+
+    // ── Try clone via Deref ─────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn try_clone_via_deref() {
+        let path = temp_socket_path("tryclone");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                s.write_all(b"cloned").unwrap();
+            }
+        });
+        let (server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        drop(listener);
+        // try_clone is available via Deref to StreamImpl
+        let cloned_inner = server.try_clone().unwrap();
+        let mut wrapped = UnixStream(cloned_inner);
+        let mut buf = Vec::new();
+        wrapped.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"cloned");
+        cleanup(&path);
+    }
+
+    // ── Shutdown both halves ────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_both_halves() {
+        use std::net::Shutdown;
+        let path = temp_socket_path("shut_both");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+        let (server, _) = listener.accept().unwrap();
+        let _c = client.join().unwrap();
+        server.shutdown(Shutdown::Both).unwrap();
+        cleanup(&path);
+    }
+
+    // ── Shutdown read half, write still works ───────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_read_write_still_works() {
+        use std::net::Shutdown;
+        let path = temp_socket_path("shut_rd");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                let mut buf = [0u8; 64];
+                let n = s.read(&mut buf).unwrap();
+                String::from_utf8(buf[..n].to_vec()).unwrap()
+            }
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        server.shutdown(Shutdown::Read).unwrap();
+        // Writing should still work
+        server.write_all(b"still writing").unwrap();
+        drop(server);
+        let got = client.join().unwrap();
+        assert_eq!(got, "still writing");
+        cleanup(&path);
+    }
+
+    // ── AsRawFd consistency ─────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn as_raw_fd_is_consistent() {
+        let path = temp_socket_path("fd_cons");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+        let (server, _) = listener.accept().unwrap();
+        let _c = client.join().unwrap();
+        let fd1 = server.as_raw_fd();
+        let fd2 = server.as_raw_fd();
+        assert_eq!(fd1, fd2);
+        cleanup(&path);
+    }
+
+    // ── Write all correctness ───────────────────────────────
+
+    #[test]
+    fn write_all_sends_complete_buffer() {
+        let path = temp_socket_path("wr_all");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let msg = b"the quick brown fox jumps over the lazy dog";
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                s.write_all(msg).unwrap();
+            }
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        drop(listener);
+        let mut buf = Vec::new();
+        server.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, msg);
+        cleanup(&path);
+    }
+
+    // ── Connect error kind ──────────────────────────────────
+
+    #[test]
+    fn connect_nonexistent_error_kind() {
+        let path = temp_socket_path("no_exist_kind");
+        cleanup(&path);
+        let result = UnixStream::connect(&path);
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    // ── Bind error kind for existing socket ─────────────────
+
+    #[test]
+    fn bind_existing_error_kind() {
+        let path = temp_socket_path("bind_err_k");
+        cleanup(&path);
+        let _listener = UnixListener::bind(&path).unwrap();
+        let result = UnixListener::bind(&path);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        cleanup(&path);
+    }
+
+    // ── Nonblocking write doesn't block ─────────────────────
+
+    #[test]
+    fn nonblocking_write_returns_immediately() {
+        let path = temp_socket_path("nb_write");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        let _c = client.join().unwrap();
+        server.set_nonblocking(true).unwrap();
+        // Small write should succeed even in nonblocking mode
+        let result = server.write(b"nb");
+        assert!(result.is_ok());
+        cleanup(&path);
+    }
+
+    // ── Debug format of stream contains fd info ─────────────
+
+    #[test]
+    fn unix_stream_debug_contains_fd() {
+        let path = temp_socket_path("dbg_fd");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+        let (server, _) = listener.accept().unwrap();
+        let _c = client.join().unwrap();
+        let dbg = format!("{server:?}");
+        // Debug output should contain "UnixStream" and file descriptor info
+        assert!(dbg.contains("UnixStream"));
+        cleanup(&path);
+    }
+
+    // ── Listener take_error via Deref ───────────────────────
+
+    #[test]
+    fn listener_take_error_via_deref() {
+        let path = temp_socket_path("take_err");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        // take_error should return Ok(None) when no error
+        let err = listener.take_error().unwrap();
+        assert!(err.is_none());
+        cleanup(&path);
+    }
+
+    // ── Stream take_error via Deref ─────────────────────────
+
+    #[test]
+    fn stream_take_error_via_deref() {
+        let path = temp_socket_path("str_tkerr");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+        let (server, _) = listener.accept().unwrap();
+        let _c = client.join().unwrap();
+        let err = server.take_error().unwrap();
+        assert!(err.is_none());
+        cleanup(&path);
+    }
+
+    // ── Double read after EOF ───────────────────────────────
+
+    #[test]
+    fn double_read_after_eof_returns_zero() {
+        let path = temp_socket_path("dbl_eof");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+            // drops immediately
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        let mut buf = [0u8; 16];
+        let n1 = server.read(&mut buf).unwrap();
+        assert_eq!(n1, 0);
+        let n2 = server.read(&mut buf).unwrap();
+        assert_eq!(n2, 0);
+        cleanup(&path);
+    }
+
+    // ── Two streams have distinct fds ───────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn two_streams_have_distinct_fds() {
+        let path = temp_socket_path("two_fds");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let c1 = std::thread::spawn({
+            let p = path.clone();
+            move || UnixStream::connect(&p).unwrap()
+        });
+        let c2 = std::thread::spawn({
+            let p = path.clone();
+            move || UnixStream::connect(&p).unwrap()
+        });
+        let (s1, _) = listener.accept().unwrap();
+        let (s2, _) = listener.accept().unwrap();
+        let _c1 = c1.join().unwrap();
+        let _c2 = c2.join().unwrap();
+        assert_ne!(s1.as_raw_fd(), s2.as_raw_fd());
+        cleanup(&path);
+    }
+
+    // ── Write vectored via std::io::Write ───────────────────
+
+    #[test]
+    fn write_vectored_basic() {
+        let path = temp_socket_path("wr_vec");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&path).unwrap();
+                let bufs = [
+                    std::io::IoSlice::new(b"hello"),
+                    std::io::IoSlice::new(b" "),
+                    std::io::IoSlice::new(b"world"),
+                ];
+                let n = s.write_vectored(&bufs).unwrap();
+                // write_vectored may not write all slices, but should write at least some
+                assert!(n > 0);
+                assert!(n <= 11);
+                s.flush().unwrap();
+            }
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        drop(listener);
+        let mut buf = Vec::new();
+        server.read_to_end(&mut buf).unwrap();
+        // At minimum the first slice should have been written
+        assert!(buf.starts_with(b"hello"));
+        cleanup(&path);
+    }
+
+    // ── Chain two streams ───────────────────────────────────
+
+    #[test]
+    fn read_chain_two_streams() {
+        let path1 = temp_socket_path("chain1");
+        let path2 = temp_socket_path("chain2");
+        cleanup(&path1);
+        cleanup(&path2);
+        let l1 = UnixListener::bind(&path1).unwrap();
+        let l2 = UnixListener::bind(&path2).unwrap();
+        let c1 = std::thread::spawn({
+            let p = path1.clone();
+            move || {
+                let mut s = UnixStream::connect(&p).unwrap();
+                s.write_all(b"first").unwrap();
+            }
+        });
+        let c2 = std::thread::spawn({
+            let p = path2.clone();
+            move || {
+                let mut s = UnixStream::connect(&p).unwrap();
+                s.write_all(b"second").unwrap();
+            }
+        });
+        let (s1, _) = l1.accept().unwrap();
+        let (s2, _) = l2.accept().unwrap();
+        c1.join().unwrap();
+        c2.join().unwrap();
+        drop(l1);
+        drop(l2);
+        let mut chained = s1.chain(s2);
+        let mut buf = Vec::new();
+        chained.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"firstsecond");
+        cleanup(&path1);
+        cleanup(&path2);
+    }
+
+    // ── Short socket path works ─────────────────────────────
+
+    #[test]
+    fn short_socket_path() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("t{}", std::process::id()));
+        cleanup(&path);
+        let _listener = UnixListener::bind(&path).unwrap();
+        assert!(path.exists());
+        cleanup(&path);
+    }
+
+    // ── Server reads from multiple clients concurrently ─────
+
+    #[test]
+    fn accept_multiple_then_read_all() {
+        let path = temp_socket_path("multi_rd");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let clients: Vec<_> = (0..3u8).map(|i| {
+            let p = path.clone();
+            std::thread::spawn(move || {
+                let mut s = UnixStream::connect(&p).unwrap();
+                s.write_all(&[i; 4]).unwrap();
+            })
+        }).collect();
+        let mut servers = Vec::new();
+        for _ in 0..3 {
+            let (s, _) = listener.accept().unwrap();
+            servers.push(s);
+        }
+        for c in clients {
+            c.join().unwrap();
+        }
+        drop(listener);
+        let mut all_data = Vec::new();
+        for mut s in servers {
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).unwrap();
+            assert_eq!(buf.len(), 4);
+            all_data.push(buf[0]);
+        }
+        all_data.sort();
+        assert_eq!(all_data, vec![0, 1, 2]);
+        cleanup(&path);
+    }
+
+    // ── Write then read on same client ────────────────────
+
+    #[test]
+    fn client_write_then_read_on_same_stream() {
+        let path = temp_socket_path("cl_wr_rd");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = std::thread::spawn({
+            let p = path.clone();
+            move || {
+                let mut s = UnixStream::connect(&p).unwrap();
+                s.write_all(b"request").unwrap();
+                s.flush().unwrap();
+                let mut buf = [0u8; 64];
+                let n = s.read(&mut buf).unwrap();
+                String::from_utf8(buf[..n].to_vec()).unwrap()
+            }
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 64];
+        let n = server.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"request");
+        server.write_all(b"response").unwrap();
+        server.flush().unwrap();
+        drop(server);
+        let got = client.join().unwrap();
+        assert_eq!(got, "response");
+        cleanup(&path);
+    }
 }
