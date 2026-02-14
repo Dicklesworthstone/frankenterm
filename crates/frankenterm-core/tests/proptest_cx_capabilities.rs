@@ -350,4 +350,173 @@ proptest! {
         let result = runtime.block_on(jh);
         prop_assert_eq!(result, val);
     }
+
+    // =========================================================================
+    // NEW: for_testing produces valid Cx
+    // =========================================================================
+
+    #[test]
+    fn for_testing_produces_valid_cx(_dummy in 0..10u8) {
+        let cx = for_testing();
+        let result = cx.checkpoint();
+        prop_assert!(result.is_ok(), "for_testing Cx should support checkpoint");
+    }
+
+    // =========================================================================
+    // NEW: Cx checkpoint succeeds multiple times
+    // =========================================================================
+
+    #[test]
+    fn cx_checkpoint_succeeds_multiple_times(n in 1u8..20) {
+        let cx = for_testing();
+        for i in 0..n {
+            let result = cx.checkpoint();
+            prop_assert!(result.is_ok(),
+                "checkpoint {} should succeed", i);
+        }
+    }
+
+    // =========================================================================
+    // NEW: RuntimeTuning inequality for different fields
+    // =========================================================================
+
+    #[test]
+    fn runtime_tuning_ne_for_different_workers(
+        w1 in 1usize..=4,
+        w2 in 5usize..=8,
+    ) {
+        let t1 = RuntimeTuning {
+            worker_threads: w1,
+            poll_budget: 64,
+            blocking_min_threads: 0,
+            blocking_max_threads: 2,
+        };
+        let t2 = RuntimeTuning {
+            worker_threads: w2,
+            poll_budget: 64,
+            blocking_min_threads: 0,
+            blocking_max_threads: 2,
+        };
+        prop_assert_ne!(t1, t2);
+    }
+
+    // =========================================================================
+    // NEW: with_cx_async returns correct value
+    // =========================================================================
+
+    #[test]
+    fn with_cx_async_returns_value(val in any::<u64>()) {
+        let runtime = CxRuntimeBuilder::current_thread()
+            .with_tuning(RuntimeTuning {
+                worker_threads: 1,
+                poll_budget: 64,
+                blocking_min_threads: 0,
+                blocking_max_threads: 0,
+            })
+            .build()
+            .expect("build");
+
+        let cx = for_testing();
+        let result = runtime.block_on(with_cx_async(&cx, |_inner| async move { val }));
+        prop_assert_eq!(result, val);
+    }
+
+    // =========================================================================
+    // NEW: Multiple sequential spawns all return correct values
+    // =========================================================================
+
+    #[test]
+    fn multiple_spawns_correct(
+        a in any::<u32>(),
+        b in any::<u32>(),
+    ) {
+        let runtime = CxRuntimeBuilder::current_thread()
+            .with_tuning(RuntimeTuning {
+                worker_threads: 1,
+                poll_budget: 64,
+                blocking_min_threads: 0,
+                blocking_max_threads: 0,
+            })
+            .build()
+            .expect("build");
+
+        let cx = for_testing();
+        let handle = runtime.handle();
+
+        let jh1 = spawn_with_cx(&handle, &cx, move |_| async move { a });
+        let jh2 = spawn_with_cx(&handle, &cx, move |_| async move { b });
+
+        let r1 = runtime.block_on(jh1);
+        let r2 = runtime.block_on(jh2);
+        prop_assert_eq!(r1, a);
+        prop_assert_eq!(r2, b);
+    }
+
+    // =========================================================================
+    // NEW: with_cx nested returns correct accumulated depth
+    // =========================================================================
+
+    #[test]
+    fn with_cx_nested_depth_correct(depth in 0u8..10) {
+        let cx = for_testing();
+        let result = depth_checkpoint(&cx, depth);
+        prop_assert_eq!(result, depth);
+    }
+
+    // =========================================================================
+    // NEW: RuntimeTuning default roundtrip through Clone
+    // =========================================================================
+
+    #[test]
+    fn runtime_tuning_default_clone_roundtrip(_dummy in 0..1u8) {
+        let t = RuntimeTuning::default();
+        let cloned = t;
+        prop_assert_eq!(t, cloned);
+    }
+
+    // =========================================================================
+    // NEW: Builder multi_thread builds successfully
+    // =========================================================================
+
+    #[test]
+    fn multi_thread_builder_builds(_dummy in 0..1u8) {
+        let runtime = CxRuntimeBuilder::multi_thread()
+            .with_tuning(RuntimeTuning {
+                worker_threads: 2,
+                poll_budget: 64,
+                blocking_min_threads: 0,
+                blocking_max_threads: 2,
+            })
+            .build();
+        prop_assert!(runtime.is_ok(), "multi_thread builder should succeed");
+    }
+
+    // =========================================================================
+    // NEW: RuntimePreset values are distinct
+    // =========================================================================
+
+    #[test]
+    fn runtime_presets_are_distinct(_dummy in 0..1u8) {
+        prop_assert_ne!(RuntimePreset::CurrentThread, RuntimePreset::MultiThread);
+    }
+
+    // =========================================================================
+    // NEW: Builder with varying poll budgets
+    // =========================================================================
+
+    #[test]
+    fn builder_varying_poll_budget(pb in 1u32..=1024) {
+        let runtime = CxRuntimeBuilder::current_thread()
+            .with_tuning(RuntimeTuning {
+                worker_threads: 1,
+                poll_budget: pb,
+                blocking_min_threads: 0,
+                blocking_max_threads: 0,
+            })
+            .build()
+            .expect("build");
+
+        let config = runtime.config();
+        prop_assert_eq!(config.poll_budget, pb);
+    }
 }
