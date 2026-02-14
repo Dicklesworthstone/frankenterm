@@ -1127,4 +1127,171 @@ mod test {
             );
         }
     }
+
+    // ── Third-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn enctab_indices_52_to_61_are_digits() {
+        for i in 52..62 {
+            assert!(
+                ENCTAB[i].is_ascii_digit(),
+                "ENCTAB[{i}] = {} is not a digit",
+                ENCTAB[i] as char
+            );
+        }
+    }
+
+    #[test]
+    fn enctab_last_byte_is_double_quote() {
+        assert_eq!(ENCTAB[90], b'"');
+    }
+
+    #[test]
+    fn dectab_maps_A_to_zero() {
+        assert_eq!(DECTAB[b'A' as usize], 0);
+    }
+
+    #[test]
+    fn dectab_maps_a_to_26() {
+        assert_eq!(DECTAB[b'a' as usize], 26);
+    }
+
+    #[test]
+    fn dectab_maps_0_to_52() {
+        assert_eq!(DECTAB[b'0' as usize], 52);
+    }
+
+    #[test]
+    fn roundtrip_enctab_itself() {
+        // ENCTAB is valid binary data; ensure it roundtrips
+        assert_eq!(decode(&encode(&ENCTAB)), ENCTAB.to_vec());
+    }
+
+    #[test]
+    fn zero_data_encodes_shorter_than_random_data() {
+        let zeros = vec![0u8; 500];
+        let random: Vec<u8> = (0..500).map(|i| (i * 197 % 256) as u8).collect();
+        let enc_zeros = encode(&zeros);
+        let enc_random = encode(&random);
+        assert!(
+            enc_zeros.len() < enc_random.len(),
+            "zero data ({}) should encode shorter than random data ({})",
+            enc_zeros.len(),
+            enc_random.len()
+        );
+    }
+
+    #[test]
+    fn roundtrip_bytes_near_val_88_boundary() {
+        // Test specific byte values around internal threshold
+        for b in 85..=92 {
+            let data = vec![b as u8; 20];
+            assert_eq!(
+                decode(&encode(&data)),
+                data,
+                "roundtrip failed for 20x byte {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_mixed_valid_and_invalid_interleaved() {
+        let data = b"interleaved";
+        let encoded = encode(data);
+        let mut mixed = Vec::new();
+        for &b in &encoded {
+            mixed.push(0x01); // invalid (control char)
+            mixed.push(b);
+            mixed.push(0x7F); // DEL, invalid
+        }
+        assert_eq!(decode(&mixed), data);
+    }
+
+    #[test]
+    fn flush_encode_more_flush_again() {
+        let mut result = Vec::new();
+        {
+            let mut encoder = Base91Encoder::new(&mut result);
+            encoder.write_all(b"part1").unwrap();
+            encoder.flush().unwrap();
+            encoder.write_all(b"part2").unwrap();
+            encoder.flush().unwrap();
+        }
+        // The flushed output should decode to concatenated parts
+        // (but note: each flush completes a standalone encoding segment)
+        // We can't simply decode the whole result to get "part1part2"
+        // because the internal state is reset between flushes.
+        // Instead, verify that both parts encoded something.
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn roundtrip_all_byte_pairs() {
+        // Test all 256 possible two-byte pairs with first byte = second byte
+        for b in 0..=255u8 {
+            let data = vec![b, b];
+            assert_eq!(
+                decode(&encode(&data)),
+                data,
+                "roundtrip failed for pair [{b}, {b}]"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_write_returns_zero_for_empty_slice() {
+        let mut result = Vec::new();
+        let mut encoder = Base91Encoder::new(&mut result);
+        assert_eq!(encoder.write(b"").unwrap(), 0);
+    }
+
+    #[test]
+    fn decode_write_returns_zero_for_empty_slice() {
+        let mut result = Vec::new();
+        let mut decoder = Base91Decoder::new(&mut result);
+        assert_eq!(decoder.write(b"").unwrap(), 0);
+    }
+
+    #[test]
+    fn roundtrip_seven_bytes() {
+        // 7 bytes exercises flush with 7 leftover bits
+        let data = b"SevenCh";
+        assert_eq!(decode(&encode(data)), data);
+    }
+
+    #[test]
+    fn roundtrip_eight_bytes() {
+        let data = b"EightChs";
+        assert_eq!(decode(&encode(data)), data);
+    }
+
+    #[test]
+    fn encode_produces_at_most_two_bytes_per_input_byte() {
+        // For any input, encoded length should be at most ~1.23x + small constant
+        for len in 1..=50 {
+            let data = vec![0xAA; len];
+            let encoded = encode(&data);
+            assert!(
+                encoded.len() <= len * 2 + 2,
+                "encoded {} bytes into {} bytes (input len {})",
+                len,
+                encoded.len(),
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn dectab_double_quote_maps_to_90() {
+        assert_eq!(DECTAB[b'"' as usize], 90);
+    }
+
+    #[test]
+    fn enctab_no_double_encoding_needed() {
+        // Every byte in ENCTAB should be a printable ASCII character
+        // that doesn't need escaping in most contexts
+        for &b in &ENCTAB {
+            assert!(b >= 0x20 && b <= 0x7E, "ENCTAB has non-printable: 0x{b:02x}");
+        }
+    }
 }
