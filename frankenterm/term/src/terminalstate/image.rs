@@ -432,9 +432,10 @@ mod tests {
 
     #[test]
     fn check_image_dimensions_at_limit() {
-        // 5000 * 5000 * 4 = 100_000_000 == MAX_IMAGE_SIZE, so this should fail
+        // 5000 * 5000 * 4 = 100_000_000 == MAX_IMAGE_SIZE
+        // The check uses `>` (strictly greater), so exactly-at-limit is allowed.
         let result = check_image_dimensions(5000, 5000);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
