@@ -42,4 +42,4 @@ pub use renderers::{
     RuleDetailRenderer, RuleListItem, RuleTestMatch, RulesListRenderer, RulesTestRenderer,
     SearchResultRenderer, SearchSuggestRenderer, TimelineRenderer, WorkflowResultRenderer,
 };
-pub use table::{Alignment, Column, Table};
+pub use table::{Alignment, Column, Table, strip_ansi};
