@@ -9,9 +9,7 @@
 use frankenterm_core::recorder_lexical_ingest::{
     LexicalIndexer, LexicalIndexerConfig, LexicalIngestError, read_stored_fingerprint,
 };
-use frankenterm_core::recorder_lexical_schema::{
-    build_lexical_schema_v1, fields_to_document, register_tokenizers,
-};
+use frankenterm_core::recorder_lexical_schema::build_lexical_schema_v1;
 use frankenterm_core::tantivy_ingest::{IndexDocumentFields, IndexWriter, LEXICAL_SCHEMA_VERSION};
 use proptest::prelude::*;
 use tempfile::tempdir;
@@ -19,55 +17,6 @@ use tempfile::tempdir;
 // ---------------------------------------------------------------------------
 // Strategies
 // ---------------------------------------------------------------------------
-
-fn arb_event_id() -> impl Strategy<Value = String> {
-    prop_oneof![
-        "[a-z0-9\\-]{5,40}",
-        Just("ev-test-1".to_string()),
-    ]
-}
-
-fn arb_text() -> impl Strategy<Value = String> {
-    prop_oneof![
-        Just(String::new()),
-        "[a-zA-Z0-9 _./:\\-]{0,100}",
-        Just("echo hello world".to_string()),
-        Just("cargo test --release".to_string()),
-    ]
-}
-
-fn arb_document_fields() -> impl Strategy<Value = IndexDocumentFields> {
-    (arb_event_id(), any::<u64>(), arb_text(), arb_text(), any::<bool>())
-        .prop_map(|(event_id, pane_id, text, text_symbols, is_gap)| {
-            IndexDocumentFields {
-                schema_version: "ft.recorder.v1".to_string(),
-                lexical_schema_version: LEXICAL_SCHEMA_VERSION.to_string(),
-                event_id,
-                pane_id,
-                session_id: None,
-                workflow_id: None,
-                correlation_id: None,
-                source: "test".to_string(),
-                event_type: "ingress_text".to_string(),
-                parent_event_id: None,
-                trigger_event_id: None,
-                root_event_id: None,
-                ingress_kind: Some("send_text".to_string()),
-                segment_kind: None,
-                control_marker_type: None,
-                lifecycle_phase: None,
-                is_gap,
-                redaction: None,
-                occurred_at_ms: 1_700_000_000_000,
-                recorded_at_ms: 1_700_000_000_001,
-                sequence: 0,
-                log_offset: 0,
-                text,
-                text_symbols,
-                details_json: "{}".to_string(),
-            }
-        })
-}
 
 fn arb_writer_memory() -> impl Strategy<Value = usize> {
     prop_oneof![

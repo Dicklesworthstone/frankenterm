@@ -7,8 +7,8 @@
 //! and document conversion properties.
 
 use frankenterm_core::recorder_lexical_schema::{
-    LexicalFieldHandles, TOKENIZER_TERMINAL_SYMBOLS, TOKENIZER_TERMINAL_TEXT,
-    build_lexical_schema_v1, fields_to_document, register_tokenizers, schema_fingerprint,
+    TOKENIZER_TERMINAL_SYMBOLS, TOKENIZER_TERMINAL_TEXT, build_lexical_schema_v1,
+    fields_to_document, register_tokenizers, schema_fingerprint,
 };
 use frankenterm_core::tantivy_ingest::{IndexDocumentFields, LEXICAL_SCHEMA_VERSION};
 use proptest::prelude::*;
