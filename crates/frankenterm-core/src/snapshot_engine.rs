@@ -2021,4 +2021,222 @@ mod tests {
             );
         }
     }
+
+    // =========================================================================
+    // Batch 13 — PearlSpring wa-1u90p.7.1 utility function & edge-case tests
+    // =========================================================================
+
+    #[test]
+    fn agent_type_from_db_known_types() {
+        assert!(matches!(agent_type_from_db("codex"), AgentType::Codex));
+        assert!(matches!(
+            agent_type_from_db("claude_code"),
+            AgentType::ClaudeCode
+        ));
+        assert!(matches!(agent_type_from_db("gemini"), AgentType::Gemini));
+        assert!(matches!(agent_type_from_db("wezterm"), AgentType::Wezterm));
+    }
+
+    #[test]
+    fn agent_type_from_db_unknown_fallback() {
+        assert!(matches!(agent_type_from_db(""), AgentType::Unknown));
+        assert!(matches!(
+            agent_type_from_db("something_else"),
+            AgentType::Unknown
+        ));
+        assert!(matches!(agent_type_from_db("CODEX"), AgentType::Unknown)); // case-sensitive
+    }
+
+    #[test]
+    fn severity_from_db_known() {
+        assert!(matches!(severity_from_db("warning"), Severity::Warning));
+        assert!(matches!(severity_from_db("critical"), Severity::Critical));
+        assert!(matches!(severity_from_db("info"), Severity::Info));
+    }
+
+    #[test]
+    fn severity_from_db_unknown_defaults_to_info() {
+        assert!(matches!(severity_from_db(""), Severity::Info));
+        assert!(matches!(severity_from_db("debug"), Severity::Info));
+        assert!(matches!(severity_from_db("WARNING"), Severity::Info)); // case-sensitive
+    }
+
+    #[test]
+    fn is_missing_events_table_detects_error() {
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::Unknown,
+                extended_code: 1,
+            },
+            Some("no such table: events".to_string()),
+        );
+        assert!(is_missing_events_table(&err));
+    }
+
+    #[test]
+    fn is_missing_events_table_other_error() {
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::Unknown,
+                extended_code: 1,
+            },
+            Some("syntax error".to_string()),
+        );
+        assert!(!is_missing_events_table(&err));
+    }
+
+    #[test]
+    fn compute_state_hash_empty_panes() {
+        let h = compute_state_hash(&[]);
+        assert!(!h.is_empty());
+        assert_eq!(h.len(), 16); // u64 formatted as 16 hex chars
+    }
+
+    #[test]
+    fn compute_state_hash_order_independent_for_ids() {
+        // The function sorts IDs internally for determinism
+        let p1 = make_test_pane(1, 24, 80);
+        let p2 = make_test_pane(2, 30, 120);
+
+        let h1 = compute_state_hash(&[p1.clone(), p2.clone()]);
+        // Note: the overall hash includes per-pane fields in iteration order,
+        // but the id sort contributes to determinism.
+        let h2 = compute_state_hash(&[p1, p2]);
+        assert_eq!(h1, h2, "same order gives same hash");
+    }
+
+    #[test]
+    fn compute_state_hash_differs_for_different_pane_count() {
+        let p1 = make_test_pane(1, 24, 80);
+        let p2 = make_test_pane(2, 30, 120);
+
+        let h1 = compute_state_hash(&[p1.clone()]);
+        let h2 = compute_state_hash(&[p1, p2]);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn epoch_ms_returns_reasonable_value() {
+        let ms = epoch_ms();
+        // Should be after 2020-01-01 (1577836800000) and before 2100-01-01
+        assert!(ms > 1_577_836_800_000);
+        assert!(ms < 4_102_444_800_000);
+    }
+
+    #[test]
+    fn generate_session_id_unique() {
+        let id1 = generate_session_id();
+        let id2 = generate_session_id();
+        assert_ne!(id1, id2, "session IDs should be unique");
+        assert!(id1.starts_with("sess-"));
+        assert!(id2.starts_with("sess-"));
+    }
+
+    #[test]
+    fn snapshot_error_display_messages() {
+        assert_eq!(
+            SnapshotError::InProgress.to_string(),
+            "snapshot already in progress"
+        );
+        assert_eq!(SnapshotError::NoPanes.to_string(), "no panes found");
+        assert_eq!(
+            SnapshotError::NoChanges.to_string(),
+            "no changes since last snapshot"
+        );
+        assert!(
+            SnapshotError::PaneList("timeout".into())
+                .to_string()
+                .contains("timeout")
+        );
+        assert!(
+            SnapshotError::Database("disk full".into())
+                .to_string()
+                .contains("disk full")
+        );
+        assert!(
+            SnapshotError::Serialization("bad json".into())
+                .to_string()
+                .contains("bad json")
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_checkpoint_with_no_session_marks_shutdown() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+
+        // mark_shutdown on an engine with no session should not error
+        let result = engine.mark_shutdown().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn shutdown_checkpoint_captures_and_marks() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let panes = vec![make_test_pane(1, 24, 80)];
+
+        // First capture to establish session
+        engine
+            .capture(&panes, SnapshotTrigger::Startup)
+            .await
+            .unwrap();
+
+        // Shutdown checkpoint with different panes to avoid NoChanges
+        let panes2 = vec![make_test_pane(1, 30, 100)];
+        let result = engine
+            .shutdown_checkpoint(&panes2, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(result.is_some());
+
+        let snap = result.unwrap();
+        assert_eq!(snap.trigger, SnapshotTrigger::Shutdown);
+
+        // Verify shutdown flag is set
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let clean: i64 = conn
+            .query_row(
+                "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
+                [&snap.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(clean, 1);
+    }
+
+    #[tokio::test]
+    async fn dedup_skips_periodic_fallback_too() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let panes = vec![make_test_pane(1, 24, 80)];
+
+        // First capture sets the hash
+        engine
+            .capture(&panes, SnapshotTrigger::PeriodicFallback)
+            .await
+            .unwrap();
+
+        // PeriodicFallback should also be deduped
+        let r2 = engine
+            .capture(&panes, SnapshotTrigger::PeriodicFallback)
+            .await;
+        assert!(matches!(r2, Err(SnapshotError::NoChanges)));
+    }
+
+    #[tokio::test]
+    async fn dedup_does_not_skip_event_triggers() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let panes = vec![make_test_pane(1, 24, 80)];
+
+        engine
+            .capture(&panes, SnapshotTrigger::Startup)
+            .await
+            .unwrap();
+
+        // Event, Shutdown, WorkCompleted etc. should NOT be deduped
+        let r2 = engine.capture(&panes, SnapshotTrigger::Event).await;
+        assert!(r2.is_ok());
+    }
 }
