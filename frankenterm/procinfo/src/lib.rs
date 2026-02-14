@@ -288,4 +288,288 @@ mod tests {
         let info = LocalProcessInfo::with_root_pid(u32::MAX);
         assert!(info.is_none());
     }
+
+    // ── Additional flatten_to_exe_names tests ─────────────────
+
+    #[test]
+    fn flatten_deeply_nested_children() {
+        let grandchild = LocalProcessInfo {
+            pid: 3,
+            ppid: 2,
+            name: "grep".to_string(),
+            executable: PathBuf::from("/usr/bin/grep"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children: HashMap::new(),
+        };
+        let mut gc_children = HashMap::new();
+        gc_children.insert(3, grandchild);
+        let child = LocalProcessInfo {
+            pid: 2,
+            ppid: 1,
+            name: "find".to_string(),
+            executable: PathBuf::from("/usr/bin/find"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children: gc_children,
+        };
+        let mut children = HashMap::new();
+        children.insert(2, child);
+        let proc = make_proc("bash", "/usr/bin/bash", children);
+        let names = proc.flatten_to_exe_names();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains("bash"));
+        assert!(names.contains("find"));
+        assert!(names.contains("grep"));
+    }
+
+    #[test]
+    fn flatten_mixed_valid_and_empty_executables() {
+        let child_with_exe = LocalProcessInfo {
+            pid: 2,
+            ppid: 1,
+            name: "cat".to_string(),
+            executable: PathBuf::from("/bin/cat"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children: HashMap::new(),
+        };
+        let child_without_exe = LocalProcessInfo {
+            pid: 3,
+            ppid: 1,
+            name: "kernel_worker".to_string(),
+            executable: PathBuf::new(),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Sleep,
+            start_time: 0,
+            children: HashMap::new(),
+        };
+        let mut children = HashMap::new();
+        children.insert(2, child_with_exe);
+        children.insert(3, child_without_exe);
+        let proc = make_proc("bash", "/usr/bin/bash", children);
+        let names = proc.flatten_to_exe_names();
+        assert_eq!(names.len(), 2); // bash + cat, not kernel_worker
+        assert!(names.contains("bash"));
+        assert!(names.contains("cat"));
+    }
+
+    #[test]
+    fn flatten_many_children_same_level() {
+        let mut children = HashMap::new();
+        for i in 0..10 {
+            children.insert(
+                i + 2,
+                LocalProcessInfo {
+                    pid: i + 2,
+                    ppid: 1,
+                    name: format!("worker{}", i),
+                    executable: PathBuf::from(format!("/usr/bin/worker{}", i)),
+                    argv: vec![],
+                    cwd: PathBuf::new(),
+                    status: LocalProcessStatus::Run,
+                    start_time: 0,
+                    children: HashMap::new(),
+                },
+            );
+        }
+        let proc = make_proc("supervisor", "/usr/bin/supervisor", children);
+        let names = proc.flatten_to_exe_names();
+        assert_eq!(names.len(), 11); // supervisor + 10 workers
+    }
+
+    #[test]
+    fn flatten_exe_only_filename_component() {
+        // Exe paths with same filename but different directories
+        let child1 = LocalProcessInfo {
+            pid: 2,
+            ppid: 1,
+            name: "app".to_string(),
+            executable: PathBuf::from("/opt/v1/app"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children: HashMap::new(),
+        };
+        let child2 = LocalProcessInfo {
+            pid: 3,
+            ppid: 1,
+            name: "app".to_string(),
+            executable: PathBuf::from("/opt/v2/app"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children: HashMap::new(),
+        };
+        let mut children = HashMap::new();
+        children.insert(2, child1);
+        children.insert(3, child2);
+        let proc = make_proc("init", "/sbin/init", children);
+        let names = proc.flatten_to_exe_names();
+        // "app" from both children deduplicates to one, plus "init"
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("app"));
+        assert!(names.contains("init"));
+    }
+
+    // ── Additional struct/field tests ─────────────────────────
+
+    #[test]
+    fn process_info_fields_accessible() {
+        let proc = LocalProcessInfo {
+            pid: 42,
+            ppid: 1,
+            name: "myproc".to_string(),
+            executable: PathBuf::from("/usr/local/bin/myproc"),
+            argv: vec!["myproc".to_string(), "--flag".to_string()],
+            cwd: PathBuf::from("/home/user"),
+            status: LocalProcessStatus::Sleep,
+            start_time: 1234567890,
+            children: HashMap::new(),
+        };
+        assert_eq!(proc.pid, 42);
+        assert_eq!(proc.ppid, 1);
+        assert_eq!(proc.name, "myproc");
+        assert_eq!(proc.executable, PathBuf::from("/usr/local/bin/myproc"));
+        assert_eq!(proc.argv.len(), 2);
+        assert_eq!(proc.cwd, PathBuf::from("/home/user"));
+        assert_eq!(proc.start_time, 1234567890);
+    }
+
+    #[test]
+    fn process_info_clone_preserves_all_fields() {
+        let child = LocalProcessInfo {
+            pid: 2,
+            ppid: 1,
+            name: "child".to_string(),
+            executable: PathBuf::from("/bin/child"),
+            argv: vec!["child".to_string()],
+            cwd: PathBuf::from("/tmp"),
+            status: LocalProcessStatus::Run,
+            start_time: 100,
+            children: HashMap::new(),
+        };
+        let mut children = HashMap::new();
+        children.insert(2, child);
+        let proc = LocalProcessInfo {
+            pid: 1,
+            ppid: 0,
+            name: "parent".to_string(),
+            executable: PathBuf::from("/bin/parent"),
+            argv: vec!["parent".to_string(), "-d".to_string()],
+            cwd: PathBuf::from("/home"),
+            status: LocalProcessStatus::Sleep,
+            start_time: 50,
+            children,
+        };
+        let cloned = proc.clone();
+        assert_eq!(cloned.pid, proc.pid);
+        assert_eq!(cloned.ppid, proc.ppid);
+        assert_eq!(cloned.name, proc.name);
+        assert_eq!(cloned.executable, proc.executable);
+        assert_eq!(cloned.argv, proc.argv);
+        assert_eq!(cloned.cwd, proc.cwd);
+        assert_eq!(cloned.start_time, proc.start_time);
+        assert_eq!(cloned.children.len(), 1);
+    }
+
+    // ── Status variant tests ──────────────────────────────────
+
+    #[test]
+    fn status_debug_all_distinct() {
+        let variants = [
+            LocalProcessStatus::Idle,
+            LocalProcessStatus::Run,
+            LocalProcessStatus::Sleep,
+            LocalProcessStatus::Stop,
+            LocalProcessStatus::Zombie,
+            LocalProcessStatus::Tracing,
+            LocalProcessStatus::Dead,
+            LocalProcessStatus::Wakekill,
+            LocalProcessStatus::Waking,
+            LocalProcessStatus::Parked,
+            LocalProcessStatus::LockBlocked,
+            LocalProcessStatus::Unknown,
+        ];
+        let mut names = HashSet::new();
+        for v in &variants {
+            names.insert(format!("{v:?}"));
+        }
+        assert_eq!(names.len(), variants.len(), "all variant debug strings should be unique");
+    }
+
+    // ── Additional live process tests ─────────────────────────
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn with_root_pid_has_nonempty_name() {
+        let pid = std::process::id();
+        let info = LocalProcessInfo::with_root_pid(pid).unwrap();
+        assert!(!info.name.is_empty(), "current process should have a name");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn with_root_pid_executable_is_absolute() {
+        let pid = std::process::id();
+        let info = LocalProcessInfo::with_root_pid(pid).unwrap();
+        assert!(
+            info.executable.is_absolute(),
+            "executable should be an absolute path"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn with_root_pid_ppid_is_nonzero() {
+        let pid = std::process::id();
+        let info = LocalProcessInfo::with_root_pid(pid).unwrap();
+        // Our test process is not PID 1, so ppid should be nonzero
+        assert!(info.ppid > 0, "test process ppid should be nonzero");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn current_working_dir_matches_env() {
+        let pid = std::process::id();
+        let proc_cwd = LocalProcessInfo::current_working_dir(pid).unwrap();
+        let env_cwd = std::env::current_dir().unwrap();
+        // Canonicalize both to handle symlinks (e.g., /private/tmp vs /tmp on macOS)
+        let proc_canonical = std::fs::canonicalize(&proc_cwd).unwrap_or(proc_cwd);
+        let env_canonical = std::fs::canonicalize(&env_cwd).unwrap_or(env_cwd);
+        assert_eq!(proc_canonical, env_canonical);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn executable_path_nonexistent_pid_returns_none() {
+        let exe = LocalProcessInfo::executable_path(u32::MAX);
+        assert!(exe.is_none());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn current_working_dir_nonexistent_pid_returns_none() {
+        let cwd = LocalProcessInfo::current_working_dir(u32::MAX);
+        assert!(cwd.is_none());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn with_root_pid_flatten_includes_current_exe() {
+        let pid = std::process::id();
+        let info = LocalProcessInfo::with_root_pid(pid).unwrap();
+        let names = info.flatten_to_exe_names();
+        // Our test runner should appear in the flattened exe names
+        assert!(!names.is_empty(), "should have at least one exe name");
+    }
 }

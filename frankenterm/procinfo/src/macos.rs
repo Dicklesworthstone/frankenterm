@@ -320,4 +320,130 @@ mod tests {
 
         assert!(parse_exe_and_argv_sysctl(buf).is_none());
     }
+
+    #[test]
+    fn test_single_arg() {
+        // argc=1, exe="/bin/ls", argv=["ls"]
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_ne_bytes()); // argc = 1
+        buf.extend_from_slice(b"/bin/ls\0");         // exe path
+        buf.extend_from_slice(b"ls\0");              // argv[0]
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path, Path::new("/bin/ls").to_path_buf());
+        assert_eq!(argv, vec!["ls".to_string()]);
+    }
+
+    #[test]
+    fn test_zero_argc() {
+        // argc=0, exe="/bin/daemon"
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i32.to_ne_bytes()); // argc = 0
+        buf.extend_from_slice(b"/bin/daemon\0");     // exe path
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path, Path::new("/bin/daemon").to_path_buf());
+        assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn test_many_args() {
+        // argc=4, exe="/usr/bin/gcc", argv=["gcc", "-o", "out", "main.c"]
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&4i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/bin/gcc\0");
+        buf.extend_from_slice(b"gcc\0");
+        buf.extend_from_slice(b"-o\0");
+        buf.extend_from_slice(b"out\0");
+        buf.extend_from_slice(b"main.c\0");
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path, Path::new("/usr/bin/gcc").to_path_buf());
+        assert_eq!(
+            argv,
+            vec![
+                "gcc".to_string(),
+                "-o".to_string(),
+                "out".to_string(),
+                "main.c".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_too_small_buffer_for_exe() {
+        // Only argc, no exe path bytes at all (no NUL terminator)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_ne_bytes());
+        // No exe path follows — consume_cstr should fail since there's no NUL
+        assert!(parse_exe_and_argv_sysctl(buf).is_none());
+    }
+
+    #[test]
+    fn test_argc_mismatch_fewer_args_than_claimed() {
+        // argc=3 but only 1 argv entry provided
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3i32.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/test\0");
+        buf.extend_from_slice(b"test\0");
+        // Only 1 arg, but argc says 3 — should fail when trying to read 2nd arg
+        assert!(parse_exe_and_argv_sysctl(buf).is_none());
+    }
+
+    #[test]
+    fn test_padding_between_exe_and_argv() {
+        // Lots of NUL padding between exe and first arg
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/echo\0");
+        buf.extend_from_slice(&[0; 20]); // padding NULs
+        buf.extend_from_slice(b"echo\0");
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path, Path::new("/bin/echo").to_path_buf());
+        assert_eq!(argv, vec!["echo".to_string()]);
+    }
+
+    #[test]
+    fn test_arg_with_spaces() {
+        // argv can contain spaces
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/bin/grep\0");
+        buf.extend_from_slice(b"grep\0");
+        buf.extend_from_slice(b"hello world\0");
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path, Path::new("/usr/bin/grep").to_path_buf());
+        assert_eq!(
+            argv,
+            vec!["grep".to_string(), "hello world".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_arg_with_equals() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/bin/env\0");
+        buf.extend_from_slice(b"env\0");
+        buf.extend_from_slice(b"FOO=bar\0");
+
+        let (_, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(argv, vec!["env".to_string(), "FOO=bar".to_string()]);
+    }
+
+    #[test]
+    fn test_non_utf8_in_exe_path() {
+        // Non-UTF8 bytes should be handled via from_utf8_lossy
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/\xff\xfe\0"); // non-UTF8 exe path
+        buf.extend_from_slice(b"arg0\0");
+
+        let result = parse_exe_and_argv_sysctl(buf);
+        assert!(result.is_some());
+        let (_, argv) = result.unwrap();
+        assert_eq!(argv.len(), 1);
+    }
 }
