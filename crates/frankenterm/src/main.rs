@@ -245,6 +245,14 @@ SEE ALSO:
         #[arg(long, short = 's')]
         since: Option<i64>,
 
+        /// Only return results until this timestamp (epoch ms or ISO8601)
+        #[arg(long, short = 'u')]
+        until: Option<i64>,
+
+        /// Search mode: lexical, semantic, or hybrid
+        #[arg(long, value_enum, default_value = "lexical")]
+        mode: SearchModeArg,
+
         /// Return query completion suggestions instead of running the search
         #[arg(long)]
         suggest: bool,
@@ -2175,9 +2183,17 @@ enum RobotCommands {
         #[arg(long)]
         since: Option<i64>,
 
-        /// Include snippets with highlighted terms
+        /// Only return results until this timestamp (epoch ms)
         #[arg(long)]
-        snippets: bool,
+        until: Option<i64>,
+
+        /// Include snippets with highlighted terms
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        snippets: Option<bool>,
+
+        /// Search mode: lexical, semantic, or hybrid
+        #[arg(long, value_enum, default_value = "lexical")]
+        mode: SearchModeArg,
     },
 
     /// Explain why search results may be missing or incomplete
@@ -3555,6 +3571,23 @@ enum RobotOutputFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SearchModeArg {
+    Lexical,
+    Semantic,
+    Hybrid,
+}
+
+impl From<SearchModeArg> for frankenterm_core::query_contract::UnifiedSearchMode {
+    fn from(value: SearchModeArg) -> Self {
+        match value {
+            SearchModeArg::Lexical => Self::Lexical,
+            SearchModeArg::Semantic => Self::Semantic,
+            SearchModeArg::Hybrid => Self::Hybrid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum NotifyChannel {
     Webhook,
     Desktop,
@@ -4116,6 +4149,9 @@ struct RobotSearchData {
     pane_filter: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     since_filter: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    until_filter: Option<i64>,
+    mode: String,
 }
 
 /// Individual search hit for robot mode
@@ -4769,22 +4805,6 @@ fn format_saved_searches_plain(
         }
     }
     output
-}
-
-fn format_search_lint_hint(lints: &[frankenterm_core::storage::SearchLint]) -> Option<String> {
-    let mut hint_lines = Vec::new();
-    for lint in lints.iter().take(3) {
-        let mut line = lint.message.clone();
-        if let Some(suggestion) = &lint.suggestion {
-            line.push_str(&format!(" (suggestion: {suggestion})"));
-        }
-        hint_lines.push(line);
-    }
-    if hint_lines.is_empty() {
-        None
-    } else {
-        Some(hint_lines.join(" | "))
-    }
 }
 
 async fn evaluate_robot_approve(
@@ -11123,8 +11143,60 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             limit,
                             pane,
                             since,
+                            until,
                             snippets,
+                            mode,
                         } => {
+                            let parsed =
+                                match frankenterm_core::query_contract::parse_unified_search_query(
+                                    frankenterm_core::query_contract::SearchQueryInput {
+                                        query,
+                                        limit: Some(limit),
+                                        pane,
+                                        since,
+                                        until,
+                                        snippets,
+                                        mode: Some(mode.into()),
+                                    },
+                                    frankenterm_core::query_contract::SearchQueryDefaults::default(
+                                    ),
+                                ) {
+                                    Ok(parsed) => parsed,
+                                    Err(err) => {
+                                        let code = if err.is_query_lint_error() {
+                                            ROBOT_ERR_FTS_QUERY
+                                        } else {
+                                            ROBOT_ERR_INVALID_ARGS
+                                        };
+                                        let response =
+                                            RobotResponse::<RobotSearchData>::error_with_code(
+                                                code,
+                                                err.message(),
+                                                err.hint(),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
+                            let canonical = parsed.query;
+
+                            if let Err(err) =
+                                frankenterm_core::query_contract::ensure_mode_supported(
+                                    canonical.mode,
+                                    &[frankenterm_core::query_contract::UnifiedSearchMode::Lexical],
+                                )
+                            {
+                                let response = RobotResponse::<RobotSearchData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    err.message(),
+                                    err.hint(),
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+
                             // Get workspace layout for db path
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
                                 Ok(l) => l,
@@ -11140,18 +11212,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     return Ok(());
                                 }
                             };
-
-                            let lints = frankenterm_core::storage::lint_fts_query(&query);
-                            if search_lints_have_errors(&lints) {
-                                let response = RobotResponse::<RobotSearchData>::error_with_code(
-                                    ROBOT_ERR_FTS_QUERY,
-                                    "Invalid search query.".to_string(),
-                                    format_search_lint_hint(&lints),
-                                    elapsed_ms(start),
-                                );
-                                print_robot_response(&response, format, stats)?;
-                                return Ok(());
-                            }
 
                             // Open storage handle
                             let db_path = layout.db_path.to_string_lossy();
@@ -11174,19 +11234,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             };
 
                             // Build search options
-                            let options = frankenterm_core::storage::SearchOptions {
-                                limit: Some(limit),
-                                pane_id: pane,
-                                since,
-                                until: None,
-                                include_snippets: Some(snippets),
-                                snippet_max_tokens: Some(30), // Reasonable default for terminal output
-                                highlight_prefix: Some(">>".to_string()),
-                                highlight_suffix: Some("<<".to_string()),
-                            };
+                            let options =
+                                frankenterm_core::query_contract::to_storage_search_options(
+                                    &canonical,
+                                );
+                            let query_for_storage = canonical.query.clone();
 
                             // Perform search
-                            match storage.search_with_results(&query, options).await {
+                            match storage
+                                .search_with_results(&query_for_storage, options)
+                                .await
+                            {
                                 Ok(results) => {
                                     let total_hits = results.len();
                                     let hits: Vec<RobotSearchHit> = results
@@ -11198,7 +11256,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             captured_at: r.segment.captured_at,
                                             score: r.score,
                                             snippet: r.snippet,
-                                            content: if snippets {
+                                            content: if canonical.snippets {
                                                 None // Don't include full content when snippets are requested
                                             } else {
                                                 Some(r.segment.content)
@@ -11207,12 +11265,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         .collect();
 
                                     let data = RobotSearchData {
-                                        query,
+                                        query: canonical.query,
                                         results: hits,
                                         total_hits,
-                                        limit,
-                                        pane_filter: pane,
-                                        since_filter: since,
+                                        limit: canonical.limit,
+                                        pane_filter: canonical.pane,
+                                        since_filter: canonical.since,
+                                        until_filter: canonical.until,
+                                        mode: canonical.mode.as_str().to_string(),
                                     };
                                     let response = RobotResponse::success(data, elapsed_ms(start));
                                     print_robot_response(&response, format, stats)?;
@@ -13893,6 +13953,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             bookmark,
             bookmark_tag,
             since,
+            until,
+            mode,
             suggest,
         }) => {
             use frankenterm_core::output::{
@@ -14825,35 +14887,91 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                     let redacted_query = redact_for_output(&query);
                     tracing::info!(
-                        "Searching for '{}' (limit={}, pane={:?}, bookmark={:?}, bookmark_tag={:?})",
+                        "Searching for '{}' (mode={:?}, limit={}, pane={:?}, since={:?}, until={:?}, bookmark={:?}, bookmark_tag={:?})",
                         redacted_query,
+                        mode,
                         limit,
                         pane,
+                        since,
+                        until,
                         bookmark,
                         bookmark_tag
                     );
 
-                    let lints = frankenterm_core::storage::lint_fts_query(&query);
-                    if search_lints_have_errors(&lints) {
+                    let parsed = match frankenterm_core::query_contract::parse_unified_search_query(
+                        frankenterm_core::query_contract::SearchQueryInput {
+                            query: query.clone(),
+                            limit: Some(limit),
+                            pane: None,
+                            since,
+                            until,
+                            snippets: Some(true),
+                            mode: Some(mode.into()),
+                        },
+                        frankenterm_core::query_contract::SearchQueryDefaults::default(),
+                    ) {
+                        Ok(parsed) => parsed,
+                        Err(err) => {
+                            if output_format.is_json() {
+                                let mut payload = serde_json::json!({
+                                    "ok": false,
+                                    "error": err.message(),
+                                    "error_code": err.code(),
+                                    "version": frankenterm_core::VERSION,
+                                });
+                                if let Some(hint) = err.hint() {
+                                    payload["hint"] = serde_json::json!(hint);
+                                }
+                                if let Some(lints) = err.lints() {
+                                    payload["lint"] = serde_json::to_value(lints)
+                                        .unwrap_or(serde_json::Value::Null);
+                                }
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                );
+                            } else {
+                                eprintln!("Error: {}", err.message());
+                                if let Some(lints) = err.lints() {
+                                    eprint!("{}", format_search_lints_plain(lints));
+                                }
+                                if let Some(hint) = err.hint() {
+                                    eprintln!("Hint: {hint}");
+                                }
+                            }
+                            std::process::exit(1);
+                        }
+                    };
+                    if !parsed.lints.is_empty() && !output_format.is_json() {
+                        eprint!("{}", format_search_lints_plain(&parsed.lints));
+                    }
+                    let canonical = parsed.query;
+
+                    if let Err(err) = frankenterm_core::query_contract::ensure_mode_supported(
+                        canonical.mode,
+                        &[frankenterm_core::query_contract::UnifiedSearchMode::Lexical],
+                    ) {
                         if output_format.is_json() {
-                            let payload = serde_json::json!({
+                            let mut payload = serde_json::json!({
                                 "ok": false,
-                                "error": "Invalid search query.",
-                                "lint": lints,
+                                "error": err.message(),
+                                "error_code": err.code(),
                                 "version": frankenterm_core::VERSION,
                             });
+                            if let Some(hint) = err.hint() {
+                                payload["hint"] = serde_json::json!(hint);
+                            }
                             println!(
                                 "{}",
                                 serde_json::to_string_pretty(&payload).unwrap_or_default()
                             );
                         } else {
-                            eprintln!("Error: Invalid search query.");
-                            eprint!("{}", format_search_lints_plain(&lints));
+                            eprintln!("Error: {}", err.message());
+                            if let Some(hint) = err.hint() {
+                                eprintln!("Hint: {hint}");
+                            }
                         }
                         std::process::exit(1);
-                    }
-                    if !lints.is_empty() && !output_format.is_json() {
-                        eprint!("{}", format_search_lints_plain(&lints));
                     }
 
                     let mut pane_candidates = bookmark_pane_ids.map(|pane_ids| {
@@ -14868,16 +14986,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
 
                     // Build base search options
-                    let base_options = frankenterm_core::storage::SearchOptions {
-                        limit: Some(limit),
-                        pane_id: None,
-                        since,
-                        until: None,
-                        include_snippets: Some(true),
-                        snippet_max_tokens: Some(30),
-                        highlight_prefix: Some(">>".to_string()),
-                        highlight_suffix: Some("<<".to_string()),
-                    };
+                    let mut base_options =
+                        frankenterm_core::query_contract::to_storage_search_options(&canonical);
+                    base_options.pane_id = None;
+                    let query_for_storage = canonical.query.clone();
 
                     let search_results = if let Some(candidate_panes) = pane_candidates {
                         if candidate_panes.is_empty() {
@@ -14885,14 +14997,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         } else if candidate_panes.len() == 1 {
                             let mut options = base_options.clone();
                             options.pane_id = Some(candidate_panes[0]);
-                            storage.search_with_results(&query, options).await
+                            storage
+                                .search_with_results(&query_for_storage, options)
+                                .await
                         } else {
                             let mut combined = Vec::new();
                             for candidate_pane in candidate_panes {
                                 let mut options = base_options.clone();
                                 options.pane_id = Some(candidate_pane);
                                 let mut pane_results = match storage
-                                    .search_with_results(&query, options)
+                                    .search_with_results(&query_for_storage, options)
                                     .await
                                 {
                                     Ok(results) => results,
@@ -14919,19 +15033,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     })
                                     .then_with(|| left.segment.id.cmp(&right.segment.id))
                             });
-                            combined.truncate(limit);
+                            combined.truncate(canonical.limit);
                             Ok(combined)
                         }
                     } else {
-                        storage.search_with_results(&query, base_options).await
+                        storage
+                            .search_with_results(&query_for_storage, base_options)
+                            .await
                     };
 
                     match search_results {
                         Ok(results) => {
                             let ctx = RenderContext::new(output_format)
                                 .verbose(cli.verbose)
-                                .limit(limit);
-                            let output = SearchResultRenderer::render(&results, &query, &ctx);
+                                .limit(canonical.limit);
+                            let output =
+                                SearchResultRenderer::render(&results, &canonical.query, &ctx);
                             print!("{output}");
                         }
                         Err(e) => {
@@ -22118,7 +22235,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 if resize_timeline_json && !json {
                     return Err(frankenterm_core::Error::Runtime(
                         "--resize-timeline-json requires --json".to_string(),
-                    ));
+                    )
+                    .into());
                 }
 
                 if json && !resize_timeline_json {
@@ -33017,6 +33135,66 @@ log_level = "debug"
                 assert_eq!(bookmark_tag.as_deref(), Some("prod"));
             }
             _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn cli_search_parses_time_window_and_mode() {
+        let cli = Cli::try_parse_from([
+            "ft", "search", "error", "--since", "100", "--until", "200", "--mode", "hybrid",
+        ])
+        .expect("search time window + mode should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Search {
+                query,
+                since,
+                until,
+                mode,
+                ..
+            }) => {
+                assert_eq!(query.as_deref(), Some("error"));
+                assert_eq!(since, Some(100));
+                assert_eq!(until, Some(200));
+                assert_eq!(mode, SearchModeArg::Hybrid);
+            }
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_search_parses_until_snippets_and_mode() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "search",
+            "error",
+            "--until",
+            "200",
+            "--snippets",
+            "false",
+            "--mode",
+            "semantic",
+        ])
+        .expect("robot search flags should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Search {
+                    query,
+                    until,
+                    snippets,
+                    mode,
+                    ..
+                }) => {
+                    assert_eq!(query, "error");
+                    assert_eq!(until, Some(200));
+                    assert_eq!(snippets, Some(false));
+                    assert_eq!(mode, SearchModeArg::Semantic);
+                }
+                _ => panic!("expected RobotCommands::Search"),
+            },
+            _ => panic!("expected Robot command"),
         }
     }
 
