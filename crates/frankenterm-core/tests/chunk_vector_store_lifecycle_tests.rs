@@ -1,6 +1,6 @@
 use frankenterm_core::search::{
-    ChunkDirection, ChunkEmbeddingUpsert, ChunkVectorStore, RECORDER_CHUNKING_POLICY_V1,
-    SemanticChunk,
+    ChunkDirection, ChunkEmbeddingUpsert, ChunkVectorStore, SemanticChunk,
+    RECORDER_CHUNKING_POLICY_V1,
 };
 use frankenterm_core::search::{ChunkSourceOffset, SemanticGenerationStatus};
 use sha2::{Digest, Sha256};
@@ -129,7 +129,9 @@ fn lifecycle_register_activate_upsert_and_search() {
             profile_id: "profile-a".to_string(),
             generation_id: "gen-1".to_string(),
             chunk: chunk_error,
-            embedding: normalized(&[0.0, 1.0, 0.0]),
+            // Move this chunk away from the query axis so the ranking delta is
+            // strict (no cosine tie) and deterministic across runs.
+            embedding: normalized(&[-1.0, 0.0, 0.0]),
         })
         .unwrap();
     assert!(out3.was_update);

@@ -272,7 +272,8 @@ proptest! {
         let mut graph = DataflowGraph::new();
         let s = graph.add_source(&label, Value::None);
         let result = graph.add_edge(s, s);
-        prop_assert!(matches!(result, Err(DataflowError::CycleDetected { .. })));
+        let cycle_detected = matches!(result, Err(DataflowError::CycleDetected { .. }));
+        prop_assert!(cycle_detected);
     }
 
     /// Snapshot roundtrips through JSON.
@@ -292,10 +293,10 @@ proptest! {
     #[test]
     fn edge_count_consistent(ops in arb_graph_ops(40)) {
         let (graph, _) = build_graph_from_ops(&ops);
-        // edge_count counts inputs across all nodes.
-        let expected: usize = graph.node_ids().iter().map(|_| 0).sum::<usize>();
-        // Just verify it doesn't panic.
-        let _count = graph.edge_count();
+        // edge_count should match serialized edge count from the snapshot.
+        let expected = graph.snapshot().edges.len();
+        let count = graph.edge_count();
+        prop_assert_eq!(count, expected);
     }
 
     /// Propagation stats total_nodes matches node_count.

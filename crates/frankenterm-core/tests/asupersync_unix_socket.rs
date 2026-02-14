@@ -3,6 +3,7 @@
 use frankenterm_core::runtime_compat::{self, unix};
 use std::io;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn socket_path(test_name: &str) -> std::path::PathBuf {
     let ts = std::time::SystemTime::now()
