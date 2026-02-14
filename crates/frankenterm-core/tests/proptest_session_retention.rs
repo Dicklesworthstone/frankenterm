@@ -661,12 +661,18 @@ proptest! {
         let conn = make_test_db();
         let now = epoch_ms() as i64;
 
+        // Add 1-hour buffer to avoid boundary races: cleanup uses epoch_ms()
+        // which advances slightly between the test's `now` and the call to
+        // delete_sessions_by_age, so sessions exactly at the cutoff may
+        // survive the first run and be caught on the second.
+        let buffer_ms = 3_600_000_i64; // 1 hour
+
         for i in 0..num_closed {
-            let created = now - (i as i64 + 1) * 5 * 86_400_000; // spread across days
+            let created = now - (i as i64 + 1) * 5 * 86_400_000 - buffer_ms;
             insert_session(&conn, &format!("closed-{}", i), created, true);
         }
         for i in 0..num_active {
-            let created = now - (i as i64 + 1) * 5 * 86_400_000;
+            let created = now - (i as i64 + 1) * 5 * 86_400_000 - buffer_ms;
             insert_session(&conn, &format!("active-{}", i), created, false);
         }
 

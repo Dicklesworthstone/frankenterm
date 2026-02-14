@@ -26,25 +26,27 @@ use frankenterm_core::causal_dag::{
 
 fn arb_causal_dag_config() -> impl Strategy<Value = CausalDagConfig> {
     (
-        10_usize..500,       // window_size
-        1_usize..4,          // k
-        1_usize..4,          // l
-        5_usize..200,        // n_permutations
-        0.001_f64..0.1,      // significance_level
-        3_usize..16,         // n_bins
-        0.001_f64..0.1,      // min_te_bits
+        10_usize..500,  // window_size
+        1_usize..4,     // k
+        1_usize..4,     // l
+        5_usize..200,   // n_permutations
+        0.001_f64..0.1, // significance_level
+        3_usize..16,    // n_bins
+        0.001_f64..0.1, // min_te_bits
     )
-        .prop_map(|(window_size, k, l, n_permutations, significance_level, n_bins, min_te_bits)| {
-            CausalDagConfig {
-                window_size,
-                k,
-                l,
-                n_permutations,
-                significance_level,
-                n_bins,
-                min_te_bits,
-            }
-        })
+        .prop_map(
+            |(window_size, k, l, n_permutations, significance_level, n_bins, min_te_bits)| {
+                CausalDagConfig {
+                    window_size,
+                    k,
+                    l,
+                    n_permutations,
+                    significance_level,
+                    n_bins,
+                    min_te_bits,
+                }
+            },
+        )
 }
 
 fn arb_causal_edge() -> impl Strategy<Value = CausalEdge> {
@@ -55,13 +57,15 @@ fn arb_causal_edge() -> impl Strategy<Value = CausalEdge> {
         0.0_f64..1.0,
         0_usize..10,
     )
-        .prop_map(|(source, target, transfer_entropy, p_value, lag_samples)| CausalEdge {
-            source,
-            target,
-            transfer_entropy,
-            p_value,
-            lag_samples,
-        })
+        .prop_map(
+            |(source, target, transfer_entropy, p_value, lag_samples)| CausalEdge {
+                source,
+                target,
+                transfer_entropy,
+                p_value,
+                lag_samples,
+            },
+        )
 }
 
 fn arb_causal_dag_snapshot() -> impl Strategy<Value = CausalDagSnapshot> {
@@ -71,13 +75,15 @@ fn arb_causal_dag_snapshot() -> impl Strategy<Value = CausalDagSnapshot> {
         0_u64..1000,
         prop::collection::vec(0_u64..10000, 0..20),
     )
-        .prop_map(|(pane_count, edges, update_count, pane_ids)| CausalDagSnapshot {
-            pane_count,
-            edge_count: edges.len() as u64,
-            edges,
-            update_count,
-            pane_ids,
-        })
+        .prop_map(
+            |(pane_count, edges, update_count, pane_ids)| CausalDagSnapshot {
+                pane_count,
+                edge_count: edges.len() as u64,
+                edges,
+                update_count,
+                pane_ids,
+            },
+        )
 }
 
 // =============================================================================
@@ -107,7 +113,7 @@ proptest! {
         n_bins in 3_usize..8,
     ) {
         let te = transfer_entropy(&x, &y, 1, 1, n_bins);
-        prop_assert_eq!(te, 0.0, "short input should return 0.0");
+        prop_assert!((te - 0.0_f64).abs() < f64::EPSILON, "short input should return 0.0");
     }
 
     /// TE returns 0.0 when n_bins is 0.
@@ -117,7 +123,7 @@ proptest! {
         y in prop::collection::vec(-10.0_f64..10.0, 10..50),
     ) {
         let te = transfer_entropy(&x, &y, 1, 1, 0);
-        prop_assert_eq!(te, 0.0, "zero bins should return 0.0");
+        prop_assert!((te - 0.0_f64).abs() < f64::EPSILON, "zero bins should return 0.0");
     }
 
     /// TE is approximately deterministic — same inputs produce similar output
@@ -229,7 +235,7 @@ proptest! {
         observed_te in 0.0_f64..5.0,
     ) {
         let p = permutation_test(&x, &y, 1, 1, 8, 0, observed_te);
-        prop_assert_eq!(p, 1.0, "0 permutations should return p=1.0");
+        prop_assert!((p - 1.0_f64).abs() < f64::EPSILON, "0 permutations should return p=1.0");
     }
 
     /// More permutations yield a more precise (lower variance) p-value,
@@ -305,7 +311,7 @@ proptest! {
         for i in 0..n_pushes {
             ts.push(i as f64);
             prop_assert!(!ts.is_empty(), "should not be empty after {} pushes", i + 1);
-            prop_assert!(ts.len() > 0);
+            prop_assert!(!ts.is_empty());
         }
     }
 
@@ -526,7 +532,7 @@ proptest! {
         }
         for i in 0..n_obs {
             dag.observe(0, i as f64);
-            dag.observe(1, (i as f64) * 0.5 + 1.0);
+            dag.observe(1, (i as f64).mul_add(0.5, 1.0));
             dag.observe(2, (i as f64) * 0.3);
         }
         dag.update_dag();

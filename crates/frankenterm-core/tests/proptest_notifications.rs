@@ -57,38 +57,38 @@ fn arb_notification_payload() -> impl Strategy<Value = NotificationPayload> {
 
 fn arb_delivery_record() -> impl Strategy<Value = NotificationDeliveryRecord> {
     (
-        "[a-z_-]{3,20}",         // target
-        proptest::bool::ANY,     // accepted
-        0_u16..600,              // status_code
+        "[a-z_-]{3,20}",                      // target
+        proptest::bool::ANY,                  // accepted
+        0_u16..600,                           // status_code
         proptest::option::of("[a-z ]{3,30}"), // error
     )
-        .prop_map(|(target, accepted, status_code, error)| {
-            NotificationDeliveryRecord {
+        .prop_map(
+            |(target, accepted, status_code, error)| NotificationDeliveryRecord {
                 target,
                 accepted,
                 status_code,
                 error,
-            }
-        })
+            },
+        )
 }
 
 fn arb_delivery() -> impl Strategy<Value = NotificationDelivery> {
     (
-        "[a-z_]{3,15}",          // sender
-        proptest::bool::ANY,     // success
-        proptest::bool::ANY,     // rate_limited
-        proptest::option::of("[a-z ]{3,30}"), // error
+        "[a-z_]{3,15}",                                         // sender
+        proptest::bool::ANY,                                    // success
+        proptest::bool::ANY,                                    // rate_limited
+        proptest::option::of("[a-z ]{3,30}"),                   // error
         proptest::collection::vec(arb_delivery_record(), 0..5), // records
     )
-        .prop_map(|(sender, success, rate_limited, error, records)| {
-            NotificationDelivery {
+        .prop_map(
+            |(sender, success, rate_limited, error, records)| NotificationDelivery {
                 sender,
                 success,
                 rate_limited,
                 error,
                 records,
-            }
-        })
+            },
+        )
 }
 
 // =========================================================================

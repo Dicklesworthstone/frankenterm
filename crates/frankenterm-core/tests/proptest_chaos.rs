@@ -124,9 +124,7 @@ fn fault_point_display_is_snake_case() {
     for point in &ALL_FAULT_POINTS {
         let display = point.to_string();
         assert!(
-            display
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c == '_'),
+            display.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
             "display for {point:?} should be snake_case, got: {display}"
         );
     }

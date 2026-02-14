@@ -13,8 +13,8 @@ use proptest::prelude::*;
 
 use frankenterm_core::test_artifacts::{
     ArtifactCorrelation, ArtifactEntry, ArtifactFormat, ArtifactKind, ArtifactRunOutcome,
-    StageTimingMetrics, TestArtifactManifest, TestArtifactSchemaError,
-    TEST_ARTIFACT_SCHEMA_VERSION,
+    StageTimingMetrics, TEST_ARTIFACT_SCHEMA_VERSION, TestArtifactManifest,
+    TestArtifactSchemaError,
 };
 
 // =============================================================================
@@ -83,7 +83,15 @@ fn arb_correlation_with_identity() -> impl Strategy<Value = ArtifactCorrelation>
             },
         )
         .prop_map(
-            |(test_case_id, resize_transaction_id, pane_id, tab_id, sequence_no, scheduler_decision, frame_id)| {
+            |(
+                test_case_id,
+                resize_transaction_id,
+                pane_id,
+                tab_id,
+                sequence_no,
+                scheduler_decision,
+                frame_id,
+            )| {
                 ArtifactCorrelation {
                     test_case_id,
                     resize_transaction_id,
@@ -116,22 +124,24 @@ fn arb_non_negative_timing() -> impl Strategy<Value = StageTimingMetrics> {
                     Just((None, None, None)),
                     // All present and monotonic
                     (0.0_f64..100.0, 0.0_f64..100.0, 0.0_f64..100.0).prop_map(|(a, b, c)| {
-                        let mut vals = [a, b, c];
+                        let mut vals: [f64; 3] = (a, b, c).into();
                         vals.sort_by(|x, y| x.partial_cmp(y).unwrap());
                         (Some(vals[0]), Some(vals[1]), Some(vals[2]))
                     }),
                 ],
             )
         })
-        .prop_map(|(queue, reflow, render, present, (p50, p95, p99))| StageTimingMetrics {
-            queue_wait_ms: queue,
-            reflow_ms: reflow,
-            render_ms: render,
-            present_ms: present,
-            p50_ms: p50,
-            p95_ms: p95,
-            p99_ms: p99,
-        })
+        .prop_map(
+            |(queue, reflow, render, present, (p50, p95, p99))| StageTimingMetrics {
+                queue_wait_ms: queue,
+                reflow_ms: reflow,
+                render_ms: render,
+                present_ms: present,
+                p50_ms: p50,
+                p95_ms: p95,
+                p99_ms: p99,
+            },
+        )
 }
 
 fn arb_valid_artifact_entry() -> impl Strategy<Value = ArtifactEntry> {
@@ -143,14 +153,16 @@ fn arb_valid_artifact_entry() -> impl Strategy<Value = ArtifactEntry> {
         proptest::option::of(arb_valid_sha256()),
         any::<bool>(),
     )
-        .prop_map(|(kind, format, path, bytes, sha256, redacted)| ArtifactEntry {
-            kind,
-            format,
-            path,
-            bytes,
-            sha256,
-            redacted,
-        })
+        .prop_map(
+            |(kind, format, path, bytes, sha256, redacted)| ArtifactEntry {
+                kind,
+                format,
+                path,
+                bytes,
+                sha256,
+                redacted,
+            },
+        )
 }
 
 /// Build a valid manifest for the given outcome.
@@ -162,38 +174,40 @@ fn arb_valid_manifest(outcome: ArtifactRunOutcome) -> impl Strategy<Value = Test
         arb_non_negative_timing(),
         prop::collection::vec(arb_valid_artifact_entry(), 1..5),
     )
-        .prop_map(move |( run_id, generated_at_ms, correlation, timing, mut artifacts)| {
-            // For non-Passed outcomes, ensure required failure artifact kinds
-            if outcome != ArtifactRunOutcome::Passed {
-                let kinds: std::collections::HashSet<_> =
-                    artifacts.iter().map(|a| a.kind).collect();
-                for required_kind in [
-                    ArtifactKind::TraceBundle,
-                    ArtifactKind::FrameHistogram,
-                    ArtifactKind::FailureSignature,
-                ] {
-                    if !kinds.contains(&required_kind) {
-                        artifacts.push(ArtifactEntry {
-                            kind: required_kind,
-                            format: ArtifactFormat::Json,
-                            path: format!("required/{:?}.json", required_kind),
-                            bytes: None,
-                            sha256: None,
-                            redacted: false,
-                        });
+        .prop_map(
+            move |(run_id, generated_at_ms, correlation, timing, mut artifacts)| {
+                // For non-Passed outcomes, ensure required failure artifact kinds
+                if outcome != ArtifactRunOutcome::Passed {
+                    let kinds: std::collections::HashSet<_> =
+                        artifacts.iter().map(|a| a.kind).collect();
+                    for required_kind in [
+                        ArtifactKind::TraceBundle,
+                        ArtifactKind::FrameHistogram,
+                        ArtifactKind::FailureSignature,
+                    ] {
+                        if !kinds.contains(&required_kind) {
+                            artifacts.push(ArtifactEntry {
+                                kind: required_kind,
+                                format: ArtifactFormat::Json,
+                                path: format!("required/{:?}.json", required_kind),
+                                bytes: None,
+                                sha256: None,
+                                redacted: false,
+                            });
+                        }
                     }
                 }
-            }
-            TestArtifactManifest {
-                schema_version: TEST_ARTIFACT_SCHEMA_VERSION.to_string(),
-                run_id,
-                generated_at_ms,
-                outcome,
-                correlation,
-                timing,
-                artifacts,
-            }
-        })
+                TestArtifactManifest {
+                    schema_version: TEST_ARTIFACT_SCHEMA_VERSION.to_string(),
+                    run_id,
+                    generated_at_ms,
+                    outcome,
+                    correlation,
+                    timing,
+                    artifacts,
+                }
+            },
+        )
 }
 
 // =============================================================================
