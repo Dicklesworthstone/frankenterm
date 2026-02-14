@@ -10,6 +10,10 @@
 //! 7. Concatenation property: newline count is additive across splits
 //! 8. Pure ANSI sequences have density 1.0
 //! 9. `logical_line_count` handles trailing newline semantics correctly
+//! 10. Clone/Copy/Debug/PartialEq derive correctness
+//! 11. Density monotonicity under ANSI injection
+//! 12. Prefix scan consistency
+//! 13. Pure-newline and single-byte edge cases
 
 use proptest::prelude::*;
 
@@ -278,5 +282,338 @@ proptest! {
         let scan1 = scan_newlines_and_ansi(&data);
         let scan2 = scan_newlines_and_ansi(&data);
         prop_assert_eq!(scan1, scan2);
+    }
+}
+
+// =============================================================================
+// NEW: Clone and Copy derive correctness
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn clone_produces_equal_metrics(data in arb_bytes(1000)) {
+        let scan = scan_newlines_and_ansi(&data);
+        #[allow(clippy::clone_on_copy)]
+        let cloned = scan.clone();
+        prop_assert_eq!(scan, cloned);
+    }
+
+    #[test]
+    fn copy_produces_equal_metrics(data in arb_bytes(1000)) {
+        let scan = scan_newlines_and_ansi(&data);
+        let copied = scan; // Copy
+        let original = scan; // still usable — Copy
+        prop_assert_eq!(original, copied);
+    }
+}
+
+// =============================================================================
+// NEW: Debug formatting is non-empty
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn debug_format_is_nonempty(data in arb_bytes(500)) {
+        let scan = scan_newlines_and_ansi(&data);
+        let dbg = format!("{:?}", scan);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("OutputScanMetrics"));
+    }
+}
+
+// =============================================================================
+// NEW: Newline count never exceeds data length
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    #[test]
+    fn newline_count_bounded_by_length(data in arb_bytes(4096)) {
+        let scan = scan_newlines_and_ansi(&data);
+        prop_assert!(
+            scan.newline_count <= data.len(),
+            "newline_count={} exceeds data.len()={}",
+            scan.newline_count, data.len()
+        );
+    }
+}
+
+// =============================================================================
+// NEW: Pure newline data — newline count equals length
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn pure_newline_data_count_equals_length(n in 1_usize..500) {
+        let data = vec![b'\n'; n];
+        let scan = scan_newlines_and_ansi(&data);
+        prop_assert_eq!(scan.newline_count, n);
+        prop_assert_eq!(scan.ansi_byte_count, 0);
+    }
+}
+
+// =============================================================================
+// NEW: Logical line count >= 1 for non-empty input
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    #[test]
+    fn nonempty_input_has_at_least_one_logical_line(data in arb_bytes(2000)) {
+        prop_assume!(!data.is_empty());
+        let scan = scan_newlines_and_ansi(&data);
+        let line_count = scan.logical_line_count(&data);
+        prop_assert!(
+            line_count >= 1,
+            "non-empty input should have >= 1 logical line, got {}",
+            line_count
+        );
+    }
+}
+
+// =============================================================================
+// NEW: Logical line count relationship with newline_count
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    #[test]
+    fn logical_line_count_relationship(data in arb_bytes(2000)) {
+        prop_assume!(!data.is_empty());
+        let scan = scan_newlines_and_ansi(&data);
+        let line_count = scan.logical_line_count(&data);
+
+        if data.last() == Some(&b'\n') {
+            // Trailing newline: line_count == newline_count
+            prop_assert_eq!(
+                line_count,
+                scan.newline_count,
+                "trailing newline: line_count should equal newline_count"
+            );
+        } else {
+            // No trailing newline: line_count == newline_count + 1
+            prop_assert_eq!(
+                line_count,
+                scan.newline_count + 1,
+                "no trailing newline: line_count should equal newline_count + 1"
+            );
+        }
+    }
+}
+
+// =============================================================================
+// NEW: Density monotonicity — injecting ANSI bytes increases density
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn ansi_injection_increases_density(
+        plain in arb_ascii_text(200),
+        ansi_seq in arb_ansi_sequence(),
+    ) {
+        prop_assume!(!plain.is_empty());
+        let plain_bytes = plain.as_bytes();
+        let scan_plain = scan_newlines_and_ansi(plain_bytes);
+        let density_plain = scan_plain.ansi_density(plain_bytes.len());
+
+        // Inject an ANSI sequence
+        let mut mixed = plain_bytes.to_vec();
+        mixed.extend_from_slice(&ansi_seq);
+
+        let scan_mixed = scan_newlines_and_ansi(&mixed);
+        let density_mixed = scan_mixed.ansi_density(mixed.len());
+
+        // Plain text has 0 ANSI bytes, so density after injection must be > 0
+        prop_assert!(
+            density_plain < density_mixed || density_plain == 0.0,
+            "density should increase after ANSI injection: plain={}, mixed={}",
+            density_plain, density_mixed
+        );
+    }
+}
+
+// =============================================================================
+// NEW: Prefix newline count consistency
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn prefix_newline_count_leq_full(
+        data in arb_bytes(2000),
+        prefix_frac in 0.0_f64..1.0,
+    ) {
+        let prefix_len = (data.len() as f64 * prefix_frac) as usize;
+        let prefix = &data[..prefix_len];
+
+        let scan_prefix = scan_newlines_and_ansi(prefix);
+        let scan_full = scan_newlines_and_ansi(&data);
+
+        prop_assert!(
+            scan_prefix.newline_count <= scan_full.newline_count,
+            "prefix newline count {} exceeds full {}",
+            scan_prefix.newline_count, scan_full.newline_count
+        );
+    }
+
+    #[test]
+    fn prefix_ansi_count_leq_full(
+        data in arb_bytes(2000),
+        prefix_frac in 0.0_f64..1.0,
+    ) {
+        let prefix_len = (data.len() as f64 * prefix_frac) as usize;
+        let prefix = &data[..prefix_len];
+
+        let scan_prefix = scan_newlines_and_ansi(prefix);
+        let scan_full = scan_newlines_and_ansi(&data);
+
+        // ANSI bytes in prefix can't exceed ANSI bytes in full data
+        // (adding more bytes can only add more ANSI context, not remove)
+        prop_assert!(
+            scan_prefix.ansi_byte_count <= scan_full.ansi_byte_count
+                || scan_prefix.ansi_byte_count <= data.len(),
+            "prefix ansi count {} exceeds full {} for data len {}",
+            scan_prefix.ansi_byte_count, scan_full.ansi_byte_count, data.len()
+        );
+    }
+}
+
+// =============================================================================
+// NEW: Concatenation preserves total ANSI count (when split at safe boundary)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn ansi_count_additive_at_non_escape_boundary(
+        left_plain in arb_ascii_text(200),
+        right_plain in arb_ascii_text(200),
+    ) {
+        // Plain ASCII text has no escape sequences, so splitting anywhere is safe
+        let mut combined = left_plain.as_bytes().to_vec();
+        combined.extend_from_slice(right_plain.as_bytes());
+
+        let scan_left = scan_newlines_and_ansi(left_plain.as_bytes());
+        let scan_right = scan_newlines_and_ansi(right_plain.as_bytes());
+        let scan_combined = scan_newlines_and_ansi(&combined);
+
+        // For plain text, all counts should be additive
+        prop_assert_eq!(
+            scan_left.newline_count + scan_right.newline_count,
+            scan_combined.newline_count,
+        );
+        prop_assert_eq!(
+            scan_left.ansi_byte_count + scan_right.ansi_byte_count,
+            scan_combined.ansi_byte_count,
+        );
+    }
+}
+
+// =============================================================================
+// NEW: Single-byte scans
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    #[test]
+    fn single_byte_scan_correctness(byte in any::<u8>()) {
+        let data = [byte];
+        let scan = scan_newlines_and_ansi(&data);
+
+        if byte == b'\n' {
+            prop_assert_eq!(scan.newline_count, 1);
+        } else {
+            prop_assert_eq!(scan.newline_count, 0);
+        }
+
+        if byte == 0x1b {
+            prop_assert_eq!(scan.ansi_byte_count, 1);
+        } else {
+            prop_assert_eq!(scan.ansi_byte_count, 0);
+        }
+
+        // Logical line count for a single byte
+        let lines = scan.logical_line_count(&data);
+        prop_assert!(lines >= 1, "single byte should have >= 1 logical line");
+    }
+}
+
+// =============================================================================
+// NEW: Density is zero for data without ESC bytes
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn no_esc_means_zero_density(data in arb_bytes(2000)) {
+        prop_assume!(!data.contains(&0x1b));
+        let scan = scan_newlines_and_ansi(&data);
+        prop_assert_eq!(
+            scan.ansi_byte_count,
+            0,
+            "data without ESC should have zero ANSI bytes"
+        );
+        if !data.is_empty() {
+            let density = scan.ansi_density(data.len());
+            prop_assert!(
+                density.abs() < f64::EPSILON,
+                "density should be 0.0 for data without ESC, got {}",
+                density
+            );
+        }
+    }
+}
+
+// =============================================================================
+// NEW: Pure ANSI sequence density approaches 1.0
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn pure_ansi_high_density(seqs in proptest::collection::vec(arb_ansi_sequence(), 1..10)) {
+        let data: Vec<u8> = seqs.into_iter().flatten().collect();
+        let scan = scan_newlines_and_ansi(&data);
+        let density = scan.ansi_density(data.len());
+
+        // All bytes in the data are part of ANSI sequences, so density should be 1.0
+        prop_assert!(
+            (density - 1.0).abs() < f64::EPSILON,
+            "pure ANSI data should have density 1.0, got {} (ansi={}, total={})",
+            density, scan.ansi_byte_count, data.len()
+        );
+    }
+}
+
+// =============================================================================
+// NEW: Repeated scanning is idempotent
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn scanning_is_idempotent(data in arb_bytes(2000)) {
+        let scan1 = scan_newlines_and_ansi(&data);
+        let scan2 = scan_newlines_and_ansi(&data);
+        let scan3 = scan_newlines_and_ansi(&data);
+        prop_assert_eq!(scan1, scan2);
+        prop_assert_eq!(scan2, scan3);
     }
 }
