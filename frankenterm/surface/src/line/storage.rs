@@ -34,7 +34,7 @@ mod test {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn memory_usage() {
-        assert_eq!(std::mem::size_of::<CellStorage>(), 64);
-        assert_eq!(std::mem::size_of::<VecStorage>(), 24);
+        assert_eq!(core::mem::size_of::<CellStorage>(), 64);
+        assert_eq!(core::mem::size_of::<VecStorage>(), 24);
     }
 }

@@ -5,7 +5,7 @@ use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_cell::color::ColorAttribute;
 #[cfg(feature = "use_image")]
 pub use frankenterm_cell::image::{ImageData, TextureCoordinate};
-use frankenterm_cell::{AttributeChange, CellAttributes, unicode_column_width};
+use frankenterm_cell::{unicode_column_width, AttributeChange, CellAttributes};
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
 

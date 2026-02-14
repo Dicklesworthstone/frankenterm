@@ -2107,7 +2107,14 @@ mod tests {
         let mut prev = linear_u8_to_srgb8(0);
         for i in 1..=255u8 {
             let curr = linear_u8_to_srgb8(i);
-            assert!(curr >= prev, "srgb8({}) = {} < srgb8({}) = {}", i, curr, i - 1, prev);
+            assert!(
+                curr >= prev,
+                "srgb8({}) = {} < srgb8({}) = {}",
+                i,
+                curr,
+                i - 1,
+                prev
+            );
             prev = curr;
         }
     }
