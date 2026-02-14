@@ -755,4 +755,292 @@ mod tests {
         let sd = a.as_socket_descriptor();
         assert!(sd >= 0);
     }
+
+    // ── Additional Error variant tests ───────────────────────
+
+    #[test]
+    fn error_socket_display() {
+        let err = Error::Socket(std::io::Error::from_raw_os_error(0));
+        assert!(err.to_string().contains("socket"));
+    }
+
+    #[test]
+    fn error_bind_display() {
+        let err = Error::Bind(std::io::Error::from_raw_os_error(0));
+        assert!(err.to_string().contains("bind"));
+    }
+
+    #[test]
+    fn error_getsockname_display() {
+        let err = Error::Getsockname(std::io::Error::from_raw_os_error(0));
+        assert!(err.to_string().contains("socket name"));
+    }
+
+    #[test]
+    fn error_listen_display() {
+        let err = Error::Listen(std::io::Error::from_raw_os_error(0));
+        assert!(err.to_string().contains("listen"));
+    }
+
+    #[test]
+    fn error_connect_display() {
+        let err = Error::Connect(std::io::Error::from_raw_os_error(0));
+        assert!(err.to_string().contains("connect"));
+    }
+
+    #[test]
+    fn error_accept_display() {
+        let err = Error::Accept(std::io::Error::from_raw_os_error(0));
+        assert!(err.to_string().contains("accept"));
+    }
+
+    #[test]
+    fn error_fcntl_display() {
+        let err = Error::Fcntl(std::io::Error::from_raw_os_error(0));
+        assert!(err.to_string().contains("fcntl"));
+    }
+
+    #[test]
+    fn error_cloexec_display() {
+        let err = Error::Cloexec(std::io::Error::from_raw_os_error(0));
+        assert!(err.to_string().contains("cloexec"));
+    }
+
+    #[test]
+    fn error_fionbio_display() {
+        let err = Error::FionBio(std::io::Error::from_raw_os_error(0));
+        assert!(err.to_string().contains("non-blocking"));
+    }
+
+    #[test]
+    fn error_poll_display() {
+        let err = Error::Poll(std::io::Error::from_raw_os_error(0));
+        assert!(err.to_string().contains("poll"));
+    }
+
+    #[test]
+    fn error_fd_outside_fdset_display() {
+        let err = Error::FdValueOutsideFdSetSize(99999);
+        let s = err.to_string();
+        assert!(s.contains("99999"));
+    }
+
+    #[test]
+    fn error_set_std_handle_display() {
+        let err = Error::SetStdHandle(std::io::Error::from_raw_os_error(0));
+        assert!(err.to_string().contains("SetStdHandle"));
+    }
+
+    #[test]
+    fn error_from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let err: Error = io_err.into();
+        assert!(err.to_string().contains("IoError"));
+    }
+
+    // ── Additional Pipe tests ────────────────────────────────
+
+    #[test]
+    fn pipe_multiple_writes() {
+        let mut pipe = Pipe::new().unwrap();
+        pipe.write.write_all(b"hello ").unwrap();
+        pipe.write.write_all(b"world").unwrap();
+        drop(pipe.write);
+
+        let mut buf = String::new();
+        pipe.read.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "hello world");
+    }
+
+    #[test]
+    fn pipe_binary_data() {
+        let mut pipe = Pipe::new().unwrap();
+        let data: Vec<u8> = (0..=255).collect();
+        pipe.write.write_all(&data).unwrap();
+        drop(pipe.write);
+
+        let mut buf = Vec::new();
+        pipe.read.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn pipe_read_returns_eof_after_writer_closed() {
+        let pipe = Pipe::new().unwrap();
+        drop(pipe.write);
+        let mut buf = [0u8; 16];
+        let mut reader = pipe.read;
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn pipe_read_fd_differs_from_write_fd() {
+        let pipe = Pipe::new().unwrap();
+        assert_ne!(
+            pipe.read.as_raw_file_descriptor(),
+            pipe.write.as_raw_file_descriptor()
+        );
+    }
+
+    // ── Additional Socketpair tests ──────────────────────────
+
+    #[test]
+    fn socketpair_large_transfer() {
+        let (mut a, mut b) = socketpair().unwrap();
+        let data = vec![0x42u8; 8192];
+        a.write_all(&data).unwrap();
+        drop(a);
+
+        let mut buf = Vec::new();
+        b.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf.len(), 8192);
+        assert!(buf.iter().all(|&b| b == 0x42));
+    }
+
+    #[test]
+    fn socketpair_multiple_messages() {
+        let (mut a, mut b) = socketpair().unwrap();
+        for i in 0..10u8 {
+            a.write_all(&[i]).unwrap();
+        }
+        for i in 0..10u8 {
+            let mut buf = [0u8; 1];
+            b.read_exact(&mut buf).unwrap();
+            assert_eq!(buf[0], i);
+        }
+    }
+
+    #[test]
+    fn socketpair_fds_are_distinct() {
+        let (a, b) = socketpair().unwrap();
+        assert_ne!(
+            a.as_raw_file_descriptor(),
+            b.as_raw_file_descriptor()
+        );
+    }
+
+    // ── Additional FileDescriptor tests ──────────────────────
+
+    #[test]
+    fn file_descriptor_dup_stderr() {
+        let stderr = std::io::stderr();
+        let handle = stderr.lock();
+        let fd = FileDescriptor::dup(&handle).unwrap();
+        assert!(fd.as_raw_file_descriptor() >= 0);
+    }
+
+    #[test]
+    fn file_descriptor_multiple_try_clones() {
+        let pipe = Pipe::new().unwrap();
+        let clone1 = pipe.read.try_clone().unwrap();
+        let clone2 = pipe.read.try_clone().unwrap();
+        let clone3 = clone1.try_clone().unwrap();
+        // All should have distinct fds
+        let arr = [
+            pipe.read.as_raw_file_descriptor(),
+            clone1.as_raw_file_descriptor(),
+            clone2.as_raw_file_descriptor(),
+            clone3.as_raw_file_descriptor(),
+        ];
+        let fds: std::collections::HashSet<_> = arr.iter().collect();
+        assert_eq!(fds.len(), 4);
+    }
+
+    #[test]
+    fn file_descriptor_write_debug() {
+        let pipe = Pipe::new().unwrap();
+        let debug = format!("{:?}", pipe.write);
+        assert!(debug.contains("FileDescriptor"));
+    }
+
+    // ── Poll edge cases ──────────────────────────────────────
+
+    #[test]
+    fn poll_detects_hangup() {
+        let (a, b) = socketpair().unwrap();
+        drop(b);
+        let mut pfd = [pollfd {
+            fd: a.as_socket_descriptor(),
+            events: POLLIN,
+            revents: 0,
+        }];
+        let n = poll(&mut pfd, Some(Duration::from_millis(50))).unwrap();
+        assert!(n >= 1);
+        // On hangup, POLLIN or POLLHUP should be set
+        assert!(pfd[0].revents & (POLLIN | POLLHUP) != 0);
+    }
+
+    #[test]
+    fn poll_zero_timeout_returns_immediately() {
+        let (a, _b) = socketpair().unwrap();
+        let mut pfd = [pollfd {
+            fd: a.as_socket_descriptor(),
+            events: POLLIN,
+            revents: 0,
+        }];
+        let start = std::time::Instant::now();
+        let n = poll(&mut pfd, Some(Duration::from_millis(0))).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(n, 0);
+        // Should return almost immediately
+        assert!(elapsed < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn poll_both_read_and_write_events() {
+        let (a, mut b) = socketpair().unwrap();
+        b.write_all(b"data").unwrap();
+
+        let mut pfd = [pollfd {
+            fd: a.as_socket_descriptor(),
+            events: POLLIN | POLLOUT,
+            revents: 0,
+        }];
+        let n = poll(&mut pfd, Some(Duration::from_millis(100))).unwrap();
+        assert!(n >= 1);
+        // Should be both readable and writable
+        assert!(pfd[0].revents & POLLIN != 0);
+        assert!(pfd[0].revents & POLLOUT != 0);
+    }
+
+    // ── StdioDescriptor additional tests ─────────────────────
+
+    #[test]
+    fn stdio_descriptor_all_variants_distinct() {
+        assert_ne!(StdioDescriptor::Stdin, StdioDescriptor::Stdout);
+        assert_ne!(StdioDescriptor::Stdout, StdioDescriptor::Stderr);
+        assert_ne!(StdioDescriptor::Stdin, StdioDescriptor::Stderr);
+    }
+
+    #[test]
+    fn stdio_descriptor_copy() {
+        let a = StdioDescriptor::Stdout;
+        let b = a;
+        let c = a; // Copy
+        assert_eq!(b, c);
+    }
+
+    // ── OwnedHandle additional tests ─────────────────────────
+
+    #[test]
+    fn owned_handle_dup_from_pipe() {
+        let pipe = Pipe::new().unwrap();
+        let handle = OwnedHandle::dup(&pipe.read).unwrap();
+        assert!(handle.as_raw_file_descriptor() >= 0);
+        assert_ne!(
+            handle.as_raw_file_descriptor(),
+            pipe.read.as_raw_file_descriptor()
+        );
+    }
+
+    // ── Flush behavior ───────────────────────────────────────
+
+    #[test]
+    fn file_descriptor_flush_succeeds() {
+        let mut pipe = Pipe::new().unwrap();
+        pipe.write.write_all(b"data").unwrap();
+        // flush is a no-op on unix but should succeed
+        pipe.write.flush().unwrap();
+    }
 }
