@@ -1,6 +1,6 @@
 use frankenterm_core::search::{
-    ChunkDirection, ChunkEmbeddingUpsert, ChunkVectorStore, SemanticChunk,
-    RECORDER_CHUNKING_POLICY_V1,
+    ChunkDirection, ChunkEmbeddingUpsert, ChunkVectorStore, RECORDER_CHUNKING_POLICY_V1,
+    SemanticChunk,
 };
 use frankenterm_core::search::{ChunkSourceOffset, SemanticGenerationStatus};
 use sha2::{Digest, Sha256};

@@ -23,7 +23,8 @@ use frankenterm_core::recording::{
 use frankenterm_core::sequence_model::SequenceAssigner;
 use frankenterm_core::tantivy_ingest::{
     AppendLogReader, IncrementalIndexer, IndexCommitStats, IndexDocumentFields, IndexWriteError,
-    IndexWriter, IndexerConfig, LEXICAL_SCHEMA_VERSION, compute_indexer_lag, map_event_to_document,
+    IndexWriter, IndexerConfig, IndexerError, LEXICAL_SCHEMA_VERSION, compute_indexer_lag,
+    map_event_to_document,
 };
 
 // ===========================================================================
@@ -183,6 +184,7 @@ struct TrackingWriter {
     deleted_ids: Vec<String>,
     commits: u64,
     reject_ids: Vec<String>,
+    transient_ids: Vec<String>,
     fail_commit: bool,
     /// Track add/delete ordering for dedup verification
     operations: Vec<WriteOp>,
@@ -202,6 +204,7 @@ impl TrackingWriter {
             deleted_ids: Vec::new(),
             commits: 0,
             reject_ids: Vec::new(),
+            transient_ids: Vec::new(),
             fail_commit: false,
             operations: Vec::new(),
         }
@@ -218,10 +221,21 @@ impl TrackingWriter {
         w.fail_commit = true;
         w
     }
+
+    fn with_transient_failures(ids: Vec<String>) -> Self {
+        let mut w = Self::new();
+        w.transient_ids = ids;
+        w
+    }
 }
 
 impl IndexWriter for TrackingWriter {
     fn add_document(&mut self, doc: &IndexDocumentFields) -> Result<(), IndexWriteError> {
+        if self.transient_ids.contains(&doc.event_id) {
+            return Err(IndexWriteError::Transient {
+                reason: "simulated io stall".to_string(),
+            });
+        }
         if self.reject_ids.contains(&doc.event_id) {
             return Err(IndexWriteError::Rejected {
                 reason: "test rejection".to_string(),
@@ -251,6 +265,35 @@ impl IndexWriter for TrackingWriter {
         self.operations.push(WriteOp::Delete(event_id.to_string()));
         self.deleted_ids.push(event_id.to_string());
         Ok(())
+    }
+}
+
+fn emit_chaos_artifact(label: &str, value: serde_json::Value) {
+    eprintln!("[ARTIFACT][recorder-chaos] {label}={value}");
+}
+
+#[derive(Debug, Clone)]
+struct ChaosScenarioReport {
+    name: &'static str,
+    fault: &'static str,
+    detected: bool,
+    recovered_events: u64,
+    skipped_events: u64,
+    final_ordinal: Option<u64>,
+    recovery_batches: u64,
+}
+
+impl ChaosScenarioReport {
+    fn as_artifact(&self) -> serde_json::Value {
+        serde_json::json!({
+            "scenario": self.name,
+            "fault": self.fault,
+            "detected": self.detected,
+            "recovered_events": self.recovered_events,
+            "skipped_events": self.skipped_events,
+            "final_ordinal": self.final_ordinal,
+            "recovery_batches": self.recovery_batches,
+        })
     }
 }
 
@@ -881,6 +924,325 @@ async fn torn_tail_recovery_reader_matches_storage() {
     let health2 = storage2.health().await;
     // After torn-tail truncation on reopen, storage should have same head
     assert!(health2.latest_offset.is_some());
+}
+
+async fn run_process_kill_resume_scenario() -> ChaosScenarioReport {
+    let dir = tempdir().unwrap();
+    let scfg = storage_config(dir.path());
+    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+    let total_events = 12u64;
+    append_events(
+        &storage,
+        "chaos-process-kill-batch",
+        (0..total_events)
+            .map(|i| make_ingress(&format!("pk-{i}"), 1, i, &format!("payload-{i}")))
+            .collect(),
+    )
+    .await;
+
+    let consumer = "chaos-process-kill";
+    let first_cfg = IndexerConfig {
+        batch_size: 4,
+        max_batches: 1,
+        ..indexer_config(dir.path(), consumer)
+    };
+    let mut first = IncrementalIndexer::new(first_cfg, TrackingWriter::new());
+    let first_result = first.run(&storage).await.unwrap();
+    assert_eq!(first_result.events_indexed, 4);
+    assert_eq!(first_result.final_ordinal, Some(3));
+    assert!(!first_result.caught_up);
+
+    drop(first);
+
+    let resume_cfg = IndexerConfig {
+        batch_size: 4,
+        ..indexer_config(dir.path(), consumer)
+    };
+    let mut resumed = IncrementalIndexer::new(resume_cfg, TrackingWriter::new());
+    let resumed_result = resumed.run(&storage).await.unwrap();
+    assert_eq!(
+        resumed_result.events_indexed,
+        total_events - first_result.events_indexed
+    );
+    assert_eq!(resumed_result.final_ordinal, Some(total_events - 1));
+    assert!(resumed_result.caught_up);
+
+    let lag = compute_indexer_lag(&storage, consumer).await.unwrap();
+    assert_eq!(lag.records_behind, 0);
+
+    let detected = first_result.final_ordinal != resumed_result.final_ordinal;
+    assert!(detected, "restart recovery should advance checkpoint");
+
+    ChaosScenarioReport {
+        name: "process_kill_resume",
+        fault: "indexer_interrupted_between_batches",
+        detected,
+        recovered_events: resumed_result.events_indexed,
+        skipped_events: 0,
+        final_ordinal: resumed_result.final_ordinal,
+        recovery_batches: resumed_result.batches_committed,
+    }
+}
+
+async fn run_commit_failure_recovery_scenario() -> ChaosScenarioReport {
+    let dir = tempdir().unwrap();
+    let scfg = storage_config(dir.path());
+    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+    append_events(
+        &storage,
+        "chaos-commit-batch",
+        vec![
+            make_ingress("cf-0", 1, 0, "a"),
+            make_ingress("cf-1", 1, 1, "b"),
+            make_ingress("cf-2", 1, 2, "c"),
+        ],
+    )
+    .await;
+
+    let consumer = "chaos-commit-failure";
+    let cfg = indexer_config(dir.path(), consumer);
+    let mut failing = IncrementalIndexer::new(cfg.clone(), TrackingWriter::with_fail_commit());
+    let err = failing.run(&storage).await.unwrap_err();
+    assert!(matches!(
+        err,
+        IndexerError::IndexWrite(IndexWriteError::CommitFailed { .. })
+    ));
+
+    let cp_after_failure = storage
+        .read_checkpoint(&CheckpointConsumerId(consumer.to_string()))
+        .await
+        .unwrap();
+    assert!(
+        cp_after_failure.is_none(),
+        "checkpoint must not advance on commit failure"
+    );
+
+    let mut recovered = IncrementalIndexer::new(cfg, TrackingWriter::new());
+    let recovered_result = recovered.run(&storage).await.unwrap();
+    assert_eq!(recovered_result.events_indexed, 3);
+    assert!(recovered_result.caught_up);
+
+    let lag = compute_indexer_lag(&storage, consumer).await.unwrap();
+    assert_eq!(lag.records_behind, 0);
+
+    ChaosScenarioReport {
+        name: "commit_failure_recovery",
+        fault: "index_commit_failed",
+        detected: true,
+        recovered_events: recovered_result.events_indexed,
+        skipped_events: 0,
+        final_ordinal: recovered_result.final_ordinal,
+        recovery_batches: recovered_result.batches_committed,
+    }
+}
+
+async fn run_transient_io_recovery_scenario() -> ChaosScenarioReport {
+    let dir = tempdir().unwrap();
+    let scfg = storage_config(dir.path());
+    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+    append_events(
+        &storage,
+        "chaos-transient-batch",
+        vec![
+            make_ingress("io-0", 1, 0, "alpha"),
+            make_ingress("io-1", 1, 1, "beta"),
+            make_ingress("io-2", 1, 2, "gamma"),
+        ],
+    )
+    .await;
+
+    let consumer = "chaos-transient-io";
+    let cfg = indexer_config(dir.path(), consumer);
+    let mut failing = IncrementalIndexer::new(
+        cfg.clone(),
+        TrackingWriter::with_transient_failures(vec!["io-1".to_string()]),
+    );
+    let err = failing.run(&storage).await.unwrap_err();
+    assert!(matches!(
+        err,
+        IndexerError::IndexWrite(IndexWriteError::Transient { .. })
+    ));
+
+    let cp_after_failure = storage
+        .read_checkpoint(&CheckpointConsumerId(consumer.to_string()))
+        .await
+        .unwrap();
+    assert!(
+        cp_after_failure.is_none(),
+        "checkpoint must not advance on transient write failure"
+    );
+
+    let mut recovered = IncrementalIndexer::new(cfg, TrackingWriter::new());
+    let recovered_result = recovered.run(&storage).await.unwrap();
+    assert_eq!(recovered_result.events_indexed, 3);
+    assert!(recovered_result.caught_up);
+
+    let lag = compute_indexer_lag(&storage, consumer).await.unwrap();
+    assert_eq!(lag.records_behind, 0);
+
+    ChaosScenarioReport {
+        name: "transient_io_recovery",
+        fault: "simulated_io_stall",
+        detected: true,
+        recovered_events: recovered_result.events_indexed,
+        skipped_events: 0,
+        final_ordinal: recovered_result.final_ordinal,
+        recovery_batches: recovered_result.batches_committed,
+    }
+}
+
+async fn run_writer_rejection_scenario() -> ChaosScenarioReport {
+    let dir = tempdir().unwrap();
+    let scfg = storage_config(dir.path());
+    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+    append_events(
+        &storage,
+        "chaos-reject-batch",
+        vec![
+            make_ingress("rej-0", 1, 0, "good-0"),
+            make_ingress("rej-1", 1, 1, "reject"),
+            make_ingress("rej-2", 1, 2, "good-2"),
+            make_ingress("rej-3", 1, 3, "good-3"),
+        ],
+    )
+    .await;
+
+    let consumer = "chaos-rejection";
+    let cfg = indexer_config(dir.path(), consumer);
+    let mut indexer = IncrementalIndexer::new(
+        cfg.clone(),
+        TrackingWriter::with_rejections(vec!["rej-1".to_string()]),
+    );
+    let first = indexer.run(&storage).await.unwrap();
+    assert_eq!(first.events_indexed, 3);
+    assert_eq!(first.events_skipped, 1);
+    assert_eq!(first.final_ordinal, Some(3));
+
+    let mut rerun = IncrementalIndexer::new(cfg, TrackingWriter::new());
+    let second = rerun.run(&storage).await.unwrap();
+    assert_eq!(
+        second.events_indexed, 0,
+        "replay must not silently duplicate"
+    );
+    assert!(second.caught_up);
+
+    let lag = compute_indexer_lag(&storage, consumer).await.unwrap();
+    assert_eq!(lag.records_behind, 0);
+
+    ChaosScenarioReport {
+        name: "writer_rejection_checkpointed",
+        fault: "document_rejected",
+        detected: first.events_skipped > 0,
+        recovered_events: first.events_indexed,
+        skipped_events: first.events_skipped,
+        final_ordinal: first.final_ordinal,
+        recovery_batches: first.batches_committed + second.batches_committed,
+    }
+}
+
+async fn run_torn_tail_corruption_scenario() -> ChaosScenarioReport {
+    let dir = tempdir().unwrap();
+    let scfg = storage_config(dir.path());
+    let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+    append_events(
+        &storage,
+        "chaos-torn-tail-batch",
+        (0..5)
+            .map(|i| make_ingress(&format!("tt-{i}"), 1, i, &format!("value-{i}")))
+            .collect(),
+    )
+    .await;
+
+    let log_path = dir.path().join("events.log");
+    let healthy_len = std::fs::metadata(&log_path).unwrap().len();
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        f.write_all(&(4096u32).to_le_bytes()).unwrap();
+        f.write_all(b"bad").unwrap();
+    }
+    let corrupted_len = std::fs::metadata(&log_path).unwrap().len();
+    assert!(corrupted_len > healthy_len);
+
+    drop(storage);
+
+    let mut reader = AppendLogReader::open(&log_path).unwrap();
+    let records = reader.read_batch(100).unwrap();
+    assert_eq!(records.len(), 5, "reader must ignore torn tail");
+
+    let reopened = AppendLogRecorderStorage::open(scfg).unwrap();
+    let recovered_len = std::fs::metadata(&log_path).unwrap().len();
+    assert_eq!(recovered_len, healthy_len);
+
+    let consumer = "chaos-torn-tail";
+    let mut indexer =
+        IncrementalIndexer::new(indexer_config(dir.path(), consumer), TrackingWriter::new());
+    let result = indexer.run(&reopened).await.unwrap();
+    assert_eq!(result.events_indexed, 5);
+    assert!(result.caught_up);
+
+    let lag = compute_indexer_lag(&reopened, consumer).await.unwrap();
+    assert_eq!(lag.records_behind, 0);
+
+    ChaosScenarioReport {
+        name: "torn_tail_recovery",
+        fault: "truncated_suffix_corruption",
+        detected: corrupted_len > recovered_len,
+        recovered_events: result.events_indexed,
+        skipped_events: 0,
+        final_ordinal: result.final_ordinal,
+        recovery_batches: result.batches_committed,
+    }
+}
+
+// ===========================================================================
+// Test: Chaos/failure matrix for recorder storage + indexing recovery
+// ===========================================================================
+
+#[tokio::test]
+async fn chaos_failure_matrix_detects_faults_and_recovers_without_silent_loss() {
+    let reports = vec![
+        run_process_kill_resume_scenario().await,
+        run_commit_failure_recovery_scenario().await,
+        run_transient_io_recovery_scenario().await,
+        run_writer_rejection_scenario().await,
+        run_torn_tail_corruption_scenario().await,
+    ];
+
+    assert_eq!(reports.len(), 5);
+    assert!(
+        reports.iter().all(|r| r.detected),
+        "all injected faults must be detectable"
+    );
+    assert!(
+        reports.iter().all(|r| r.recovery_batches <= 3),
+        "recovery should remain bounded in matrix scenarios: {reports:?}"
+    );
+
+    for report in &reports {
+        emit_chaos_artifact(report.name, report.as_artifact());
+    }
+
+    let recovered_events_total: u64 = reports.iter().map(|r| r.recovered_events).sum();
+    let skipped_events_total: u64 = reports.iter().map(|r| r.skipped_events).sum();
+    emit_chaos_artifact(
+        "matrix_summary",
+        serde_json::json!({
+            "scenario_count": reports.len(),
+            "detected_count": reports.iter().filter(|r| r.detected).count(),
+            "recovered_events_total": recovered_events_total,
+            "skipped_events_total": skipped_events_total,
+            "reports": reports.iter().map(|r| r.as_artifact()).collect::<Vec<_>>(),
+        }),
+    );
 }
 
 // ===========================================================================
