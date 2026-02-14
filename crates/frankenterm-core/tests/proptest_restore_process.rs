@@ -357,3 +357,227 @@ fn report_empty_roundtrip() {
     assert_eq!(back.shells_launched, 0);
     assert!(back.results.is_empty());
 }
+
+// =========================================================================
+// NEW: LaunchConfig Clone preserves all fields
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn launch_config_clone_preserves(config in arb_launch_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.launch_shells, config.launch_shells);
+        prop_assert_eq!(cloned.launch_agents, config.launch_agents);
+        prop_assert_eq!(cloned.launch_delay_ms, config.launch_delay_ms);
+        prop_assert_eq!(cloned.agent_commands.len(), config.agent_commands.len());
+    }
+}
+
+// =========================================================================
+// NEW: LaunchConfig Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn launch_config_debug_nonempty(config in arb_launch_config()) {
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("LaunchConfig"));
+    }
+}
+
+// =========================================================================
+// NEW: LaunchAction Clone preserves
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn launch_action_clone_preserves(action in arb_launch_action()) {
+        let cloned = action.clone();
+        prop_assert_eq!(cloned, action);
+    }
+}
+
+// =========================================================================
+// NEW: LaunchAction Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn launch_action_debug_nonempty(action in arb_launch_action()) {
+        let dbg = format!("{:?}", action);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// =========================================================================
+// NEW: LaunchAction PartialEq reflexive
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn launch_action_eq_reflexive(action in arb_launch_action()) {
+        prop_assert_eq!(&action, &action);
+    }
+}
+
+// =========================================================================
+// NEW: ProcessPlan Clone preserves
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn process_plan_clone_preserves(plan in arb_process_plan()) {
+        let cloned = plan.clone();
+        prop_assert_eq!(cloned.old_pane_id, plan.old_pane_id);
+        prop_assert_eq!(cloned.new_pane_id, plan.new_pane_id);
+        prop_assert_eq!(cloned.action, plan.action);
+        prop_assert_eq!(&cloned.state_warning, &plan.state_warning);
+    }
+}
+
+// =========================================================================
+// NEW: ProcessPlan Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn process_plan_debug_nonempty(plan in arb_process_plan()) {
+        let dbg = format!("{:?}", plan);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("ProcessPlan"));
+    }
+}
+
+// =========================================================================
+// NEW: LaunchResult Clone preserves
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn launch_result_clone_preserves(result in arb_launch_result()) {
+        let cloned = result.clone();
+        prop_assert_eq!(cloned.old_pane_id, result.old_pane_id);
+        prop_assert_eq!(cloned.new_pane_id, result.new_pane_id);
+        prop_assert_eq!(cloned.action, result.action);
+        prop_assert_eq!(cloned.success, result.success);
+        prop_assert_eq!(&cloned.error, &result.error);
+    }
+}
+
+// =========================================================================
+// NEW: LaunchResult Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn launch_result_debug_nonempty(result in arb_launch_result()) {
+        let dbg = format!("{:?}", result);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("LaunchResult"));
+    }
+}
+
+// =========================================================================
+// NEW: LaunchReport Clone preserves counts
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn launch_report_clone_preserves(
+        shells in 0_usize..10,
+        agents in 0_usize..10,
+        skipped in 0_usize..10,
+    ) {
+        let report = LaunchReport {
+            results: vec![],
+            shells_launched: shells,
+            agents_launched: agents,
+            skipped,
+            ..Default::default()
+        };
+        let cloned = report.clone();
+        prop_assert_eq!(cloned.shells_launched, shells);
+        prop_assert_eq!(cloned.agents_launched, agents);
+        prop_assert_eq!(cloned.skipped, skipped);
+        prop_assert_eq!(cloned.results.len(), 0);
+    }
+}
+
+// =========================================================================
+// NEW: LaunchReport Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn launch_report_debug_nonempty(
+        shells in 0_usize..10,
+        agents in 0_usize..10,
+    ) {
+        let report = LaunchReport {
+            results: vec![],
+            shells_launched: shells,
+            agents_launched: agents,
+            ..Default::default()
+        };
+        let dbg = format!("{:?}", report);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("LaunchReport"));
+    }
+}
+
+// =========================================================================
+// NEW: ProcessPlan serde deterministic
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn process_plan_serde_deterministic(plan in arb_process_plan()) {
+        let j1 = serde_json::to_string(&plan).unwrap();
+        let j2 = serde_json::to_string(&plan).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}
+
+// =========================================================================
+// NEW: LaunchResult serde deterministic
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn launch_result_serde_deterministic(result in arb_launch_result()) {
+        let j1 = serde_json::to_string(&result).unwrap();
+        let j2 = serde_json::to_string(&result).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}
+
+// =========================================================================
+// NEW: LaunchReport with multiple results roundtrips
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    #[test]
+    fn launch_report_multi_results_serde(
+        r1 in arb_launch_result(),
+        r2 in arb_launch_result(),
+    ) {
+        let report = LaunchReport {
+            results: vec![r1.clone(), r2.clone()],
+            shells_launched: 2,
+            agents_launched: 0,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: LaunchReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.results.len(), 2);
+        prop_assert_eq!(back.results[0].old_pane_id, r1.old_pane_id);
+        prop_assert_eq!(back.results[1].old_pane_id, r2.old_pane_id);
+    }
+}

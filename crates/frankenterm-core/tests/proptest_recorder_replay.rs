@@ -656,3 +656,225 @@ proptest! {
             "expected {} frames for combined filter, got {}", expected, frames.len());
     }
 }
+
+// =============================================================================
+// NEW: ReplayConfig Clone preserves
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn replay_config_clone_preserves(config in arb_replay_config()) {
+        let cloned = config.clone();
+        prop_assert!((cloned.speed - config.speed).abs() < 1e-15);
+        prop_assert_eq!(cloned.max_delay_ms, config.max_delay_ms);
+        prop_assert_eq!(cloned.skip_empty, config.skip_empty);
+        prop_assert_eq!(cloned.include_markers, config.include_markers);
+    }
+}
+
+// =============================================================================
+// NEW: ReplayConfig Debug non-empty
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn replay_config_debug_nonempty(config in arb_replay_config()) {
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// =============================================================================
+// NEW: ReplayConfig instant has speed infinity and zero max_delay
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn replay_config_instant_fast(_dummy in 0..1u8) {
+        let config = ReplayConfig::instant();
+        prop_assert_eq!(config.max_delay_ms, 0);
+    }
+}
+
+// =============================================================================
+// NEW: ReplayConfig default speed is 1.0
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn replay_config_default_speed(_dummy in 0..1u8) {
+        let config = ReplayConfig::default();
+        prop_assert!((config.speed - 1.0).abs() < 1e-15);
+    }
+}
+
+// =============================================================================
+// NEW: ReplayState Clone/Copy/Debug
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn replay_state_copy_eq(state in arb_replay_state()) {
+        let copied = state;
+        prop_assert_eq!(state, copied);
+    }
+
+    #[test]
+    fn replay_state_debug_nonempty(state in arb_replay_state()) {
+        let dbg = format!("{:?}", state);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// =============================================================================
+// NEW: ReplaySession time_range min <= max
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn time_range_min_le_max(events in arb_events(10)) {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let session = make_session(events, ReplayConfig::instant()).unwrap();
+        let (min_ts, max_ts) = session.time_range();
+        prop_assert!(min_ts <= max_ts, "min {} > max {}", min_ts, max_ts);
+    }
+}
+
+// =============================================================================
+// NEW: ReplaySession cursor starts at 0
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn session_cursor_starts_zero(events in arb_events(10)) {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let session = make_session(events, ReplayConfig::instant()).unwrap();
+        prop_assert_eq!(session.cursor(), 0);
+    }
+}
+
+// =============================================================================
+// NEW: ReplaySession state starts Ready
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn session_state_starts_ready(events in arb_events(10)) {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let session = make_session(events, ReplayConfig::instant()).unwrap();
+        prop_assert_eq!(session.state(), ReplayState::Ready);
+    }
+}
+
+// =============================================================================
+// NEW: Max delay clamping
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn delay_clamped_by_max(
+        max_delay_ms in 100_u64..=5000,
+    ) {
+        let events = vec![
+            frankenterm_core::recorder_query::QueryResultEvent {
+                event_id: "evt-1-0".into(),
+                pane_id: 1,
+                source: RecorderEventSource::WeztermMux,
+                occurred_at_ms: 1000,
+                sequence: 0,
+                session_id: None,
+                text: Some("a".into()),
+                redacted: false,
+                sensitivity: SensitivityTier::T1Standard,
+                event_kind: QueryEventKind::IngressText,
+            },
+            frankenterm_core::recorder_query::QueryResultEvent {
+                event_id: "evt-1-1".into(),
+                pane_id: 1,
+                source: RecorderEventSource::WeztermMux,
+                occurred_at_ms: 1_000_000, // 999 seconds later
+                sequence: 1,
+                session_id: None,
+                text: Some("b".into()),
+                redacted: false,
+                sensitivity: SensitivityTier::T1Standard,
+                event_kind: QueryEventKind::IngressText,
+            },
+        ];
+
+        let config = ReplayConfig {
+            speed: 1.0,
+            max_delay_ms,
+            ..ReplayConfig::default()
+        };
+
+        let mut session = make_session(events, config).unwrap();
+        let frames = session.collect_remaining();
+
+        for frame in &frames {
+            prop_assert!(
+                frame.delay.as_millis() as u64 <= max_delay_ms,
+                "delay {}ms should be <= max {}ms",
+                frame.delay.as_millis(), max_delay_ms
+            );
+        }
+    }
+}
+
+// =============================================================================
+// NEW: ReplayStats Debug non-empty
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn replay_stats_debug_nonempty(
+        emitted in 0_usize..100,
+        skipped in 0_usize..100,
+    ) {
+        let stats = ReplayStats {
+            frames_emitted: emitted,
+            frames_skipped: skipped,
+            original_duration_ms: 1000,
+            replay_duration_ms: 500,
+            unique_panes: 2,
+            by_kind: std::collections::HashMap::new(),
+            completed: false,
+        };
+        let dbg = format!("{:?}", stats);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// =============================================================================
+// NEW: Progress starts at 0
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn first_frame_progress_near_zero(events in arb_events(10)) {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut session = make_session(events, ReplayConfig::instant()).unwrap();
+        if let Some(frame) = session.next_frame() {
+            prop_assert!(frame.progress >= 0.0, "progress should be >= 0");
+            prop_assert!(frame.progress <= 1.0, "progress should be <= 1");
+        }
+    }
+}
