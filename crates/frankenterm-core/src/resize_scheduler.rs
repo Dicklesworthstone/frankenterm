@@ -881,11 +881,30 @@ impl ResizeScheduler {
     ///
     /// Returns true when the supplied sequence matched the current active sequence.
     pub fn complete_active(&mut self, pane_id: u64, intent_seq: u64) -> bool {
-        let Some(active_seq) = self.panes.get(&pane_id).and_then(|state| state.active_seq) else {
+        let Some(state) = self.panes.get(&pane_id) else {
             return false;
         };
+        let Some(active_seq) = state.active_seq else {
+            return false;
+        };
+        let latest_seq = state.latest_seq;
 
         if active_seq != intent_seq {
+            self.metrics.completion_rejected = self.metrics.completion_rejected.saturating_add(1);
+            self.push_lifecycle_event(
+                pane_id,
+                intent_seq,
+                None,
+                ResizeLifecycleStage::Failed,
+                ResizeLifecycleDetail::ActiveCompletionRejected {
+                    active_seq: Some(active_seq),
+                },
+            );
+            self.publish_debug_snapshot();
+            return false;
+        }
+
+        if latest_seq.is_some_and(|latest| latest > active_seq) {
             self.metrics.completion_rejected = self.metrics.completion_rejected.saturating_add(1);
             self.push_lifecycle_event(
                 pane_id,
@@ -1291,7 +1310,7 @@ impl ResizeScheduler {
                 check_scheduler_invariants(
                     &mut report,
                     event.pane_id,
-                    event.active_seq,
+                    Some(event.intent_seq),
                     event.latest_seq,
                     usize::from(event.pending_seq.is_some()),
                     true,
@@ -1647,7 +1666,10 @@ mod tests {
             "pane should remain single-flight"
         );
 
-        assert!(scheduler.complete_active(7, 1));
+        // Active seq 1 is now superseded by pending seq 2 — cancel it rather
+        // than complete, since complete_active rejects when latest_seq > active_seq.
+        assert!(scheduler.active_is_superseded(7));
+        assert!(scheduler.cancel_active_if_superseded(7));
         let frame3 = scheduler.schedule_frame();
         assert_eq!(frame3.scheduled.len(), 1);
         assert_eq!(frame3.scheduled[0].intent_seq, 2);
@@ -1726,6 +1748,30 @@ mod tests {
         let frame2 = scheduler.schedule_frame();
         assert_eq!(frame2.scheduled.len(), 1);
         assert_eq!(frame2.scheduled[0].intent_seq, 2);
+    }
+
+    #[test]
+    fn stale_active_completion_is_rejected_when_newer_intent_exists() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+
+        let _ = scheduler.submit_intent(intent(81, 1, ResizeWorkClass::Interactive, 1, 100));
+        let frame = scheduler.schedule_frame();
+        assert_eq!(frame.scheduled.len(), 1);
+        assert_eq!(frame.scheduled[0].intent_seq, 1);
+
+        let _ = scheduler.submit_intent(intent(81, 2, ResizeWorkClass::Interactive, 1, 101));
+        assert!(scheduler.active_is_superseded(81));
+        assert!(
+            !scheduler.complete_active(81, 1),
+            "stale completion should be rejected when latest_seq is newer"
+        );
+        assert_eq!(scheduler.metrics().completion_rejected, 1);
+
+        assert!(scheduler.cancel_active_if_superseded(81));
+        let frame2 = scheduler.schedule_frame();
+        assert_eq!(frame2.scheduled.len(), 1);
+        assert_eq!(frame2.scheduled[0].intent_seq, 2);
+        assert!(scheduler.complete_active(81, 2));
     }
 
     #[test]

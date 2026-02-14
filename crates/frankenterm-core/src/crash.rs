@@ -185,6 +185,9 @@ pub struct CrashManifest {
     pub files: Vec<String>,
     /// Whether health snapshot was available
     pub has_health_snapshot: bool,
+    /// Whether resize/reflow crash forensics were available
+    #[serde(default)]
+    pub has_resize_forensics: bool,
     /// Total bundle size in bytes
     pub bundle_size_bytes: u64,
 }
@@ -266,8 +269,9 @@ pub fn install_panic_hook(config: &CrashConfig) {
             };
 
             let health = HealthSnapshot::get_global();
+            let resize_ctx = crate::resize_crash_forensics::ResizeCrashContext::get_global();
 
-            match write_crash_bundle(dir, &report, health.as_ref()) {
+            match write_crash_bundle(dir, &report, health.as_ref(), resize_ctx.as_ref()) {
                 Ok(path) => {
                     if stderr_ok {
                         eprintln!("wa: crash bundle written to {}", path.display());
@@ -296,6 +300,7 @@ pub fn write_crash_bundle(
     crash_dir: &Path,
     report: &CrashReport,
     health: Option<&HealthSnapshot>,
+    resize_forensics: Option<&crate::resize_crash_forensics::ResizeCrashContext>,
 ) -> std::io::Result<PathBuf> {
     let redactor = Redactor::new();
 
@@ -353,6 +358,22 @@ pub fn write_crash_bundle(
         false
     };
 
+    // 2b. Write resize_forensics.json (if available)
+    let has_resize_forensics = if let Some(ctx) = resize_forensics {
+        let json = serde_json::to_string_pretty(ctx).map_err(std::io::Error::other)?;
+        let bytes = json.as_bytes();
+        total_size += bytes.len() as u64;
+        if total_size <= MAX_BUNDLE_SIZE as u64 {
+            write_file_sync(&tmp_dir.join("resize_forensics.json"), bytes)?;
+            files.push("resize_forensics.json".to_string());
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     // 3. Write manifest.json
     {
         let manifest = CrashManifest {
@@ -360,6 +381,7 @@ pub fn write_crash_bundle(
             created_at: format_iso8601(report.timestamp),
             files: files.clone(),
             has_health_snapshot: has_health,
+            has_resize_forensics,
             bundle_size_bytes: total_size,
         };
         let json = serde_json::to_string_pretty(&manifest).map_err(std::io::Error::other)?;
@@ -1745,6 +1767,7 @@ mod tests {
             created_at: "2026-01-28T12:00:00Z".to_string(),
             files: vec!["crash_report.json".to_string()],
             has_health_snapshot: false,
+            has_resize_forensics: false,
             bundle_size_bytes: 1024,
         };
 
@@ -1773,7 +1796,7 @@ mod tests {
         };
 
         let health = test_snapshot();
-        let bundle_path = write_crash_bundle(&crash_dir, &report, Some(&health)).unwrap();
+        let bundle_path = write_crash_bundle(&crash_dir, &report, Some(&health), None).unwrap();
 
         assert!(bundle_path.exists());
         assert!(bundle_path.join("manifest.json").exists());
@@ -1795,7 +1818,7 @@ mod tests {
             thread_name: None,
         };
 
-        let bundle_path = write_crash_bundle(&crash_dir, &report, None).unwrap();
+        let bundle_path = write_crash_bundle(&crash_dir, &report, None, None).unwrap();
 
         assert!(bundle_path.join("manifest.json").exists());
         assert!(bundle_path.join("crash_report.json").exists());
@@ -1822,7 +1845,7 @@ mod tests {
             thread_name: None,
         };
 
-        let bundle_path = write_crash_bundle(&crash_dir, &report, None).unwrap();
+        let bundle_path = write_crash_bundle(&crash_dir, &report, None, None).unwrap();
 
         let manifest_json = fs::read_to_string(bundle_path.join("manifest.json")).unwrap();
         let manifest: CrashManifest = serde_json::from_str(&manifest_json).unwrap();
@@ -1853,7 +1876,7 @@ mod tests {
             thread_name: None,
         };
 
-        let bundle_path = write_crash_bundle(&crash_dir, &report, None).unwrap();
+        let bundle_path = write_crash_bundle(&crash_dir, &report, None, None).unwrap();
 
         let report_json = fs::read_to_string(bundle_path.join("crash_report.json")).unwrap();
         let parsed: CrashReport = serde_json::from_str(&report_json).unwrap();
@@ -1886,14 +1909,14 @@ mod tests {
             thread_name: None,
         };
 
-        let path1 = write_crash_bundle(&crash_dir, &report, None).unwrap();
+        let path1 = write_crash_bundle(&crash_dir, &report, None, None).unwrap();
 
         let report2 = CrashReport {
             message: "second".to_string(),
             ..report.clone()
         };
 
-        let path2 = write_crash_bundle(&crash_dir, &report2, None).unwrap();
+        let path2 = write_crash_bundle(&crash_dir, &report2, None, None).unwrap();
 
         assert_ne!(path1, path2);
         assert!(path1.exists());
@@ -1915,7 +1938,7 @@ mod tests {
             thread_name: None,
         };
 
-        let bundle_path = write_crash_bundle(&crash_dir, &report, None).unwrap();
+        let bundle_path = write_crash_bundle(&crash_dir, &report, None, None).unwrap();
         let dir_name = bundle_path.file_name().unwrap().to_str().unwrap();
 
         assert!(
@@ -1940,7 +1963,7 @@ mod tests {
             thread_name: None,
         };
 
-        let bundle_path = write_crash_bundle(&crash_dir, &report, None).unwrap();
+        let bundle_path = write_crash_bundle(&crash_dir, &report, None, None).unwrap();
 
         #[cfg(unix)]
         {
@@ -2026,7 +2049,7 @@ mod tests {
             thread_name: None,
         };
 
-        let bundle_path = write_crash_bundle(&crash_dir, &report, Some(&health)).unwrap();
+        let bundle_path = write_crash_bundle(&crash_dir, &report, Some(&health), None).unwrap();
 
         let health_json = fs::read_to_string(bundle_path.join("health_snapshot.json")).unwrap();
         let parsed: HealthSnapshot = serde_json::from_str(&health_json).unwrap();
@@ -2054,7 +2077,7 @@ mod tests {
             thread_name: None,
         };
 
-        let bundle_path = write_crash_bundle(&crash_dir, &report, None).unwrap();
+        let bundle_path = write_crash_bundle(&crash_dir, &report, None, None).unwrap();
 
         // Manifest should always exist regardless of budget
         assert!(bundle_path.join("manifest.json").exists());
@@ -2087,7 +2110,7 @@ mod tests {
         };
 
         let health = test_snapshot();
-        let bundle_path = write_crash_bundle(&crash_dir, &report, Some(&health)).unwrap();
+        let bundle_path = write_crash_bundle(&crash_dir, &report, Some(&health), None).unwrap();
 
         let manifest_json = fs::read_to_string(bundle_path.join("manifest.json")).unwrap();
         let manifest: CrashManifest = serde_json::from_str(&manifest_json).unwrap();
@@ -2118,8 +2141,8 @@ mod tests {
 
         let health = test_snapshot();
 
-        let path1 = write_crash_bundle(&crash_dir1, &report, Some(&health)).unwrap();
-        let path2 = write_crash_bundle(&crash_dir2, &report, Some(&health)).unwrap();
+        let path1 = write_crash_bundle(&crash_dir1, &report, Some(&health), None).unwrap();
+        let path2 = write_crash_bundle(&crash_dir2, &report, Some(&health), None).unwrap();
 
         // Manifests should have the same structural content
         let m1: CrashManifest =
@@ -2189,7 +2212,7 @@ mod tests {
         let crash_dir = tmp.path();
 
         let report = test_report();
-        write_crash_bundle(crash_dir, &report, None).unwrap();
+        write_crash_bundle(crash_dir, &report, None, None).unwrap();
 
         let bundles = list_crash_bundles(crash_dir, 10);
         assert_eq!(bundles.len(), 1);
@@ -2205,12 +2228,12 @@ mod tests {
         let mut r1 = test_report();
         r1.timestamp = 1000;
         r1.message = "first".to_string();
-        write_crash_bundle(crash_dir, &r1, None).unwrap();
+        write_crash_bundle(crash_dir, &r1, None, None).unwrap();
 
         let mut r2 = test_report();
         r2.timestamp = 2000;
         r2.message = "second".to_string();
-        write_crash_bundle(crash_dir, &r2, None).unwrap();
+        write_crash_bundle(crash_dir, &r2, None, None).unwrap();
 
         let bundles = list_crash_bundles(crash_dir, 10);
         assert_eq!(bundles.len(), 2);
@@ -2226,7 +2249,7 @@ mod tests {
         for i in 0..5 {
             let mut r = test_report();
             r.timestamp = 1000 + i;
-            write_crash_bundle(crash_dir, &r, None).unwrap();
+            write_crash_bundle(crash_dir, &r, None, None).unwrap();
         }
 
         let bundles = list_crash_bundles(crash_dir, 3);
@@ -2242,7 +2265,7 @@ mod tests {
         fs::create_dir(crash_dir.join("some_other_dir")).unwrap();
         // Create a crash bundle
         let report = test_report();
-        write_crash_bundle(crash_dir, &report, None).unwrap();
+        write_crash_bundle(crash_dir, &report, None, None).unwrap();
 
         let bundles = list_crash_bundles(crash_dir, 10);
         assert_eq!(bundles.len(), 1);
@@ -2257,7 +2280,7 @@ mod tests {
         fs::create_dir(crash_dir.join("ft_crash_empty")).unwrap();
         // Create a valid crash bundle
         let report = test_report();
-        write_crash_bundle(crash_dir, &report, None).unwrap();
+        write_crash_bundle(crash_dir, &report, None, None).unwrap();
 
         let bundles = list_crash_bundles(crash_dir, 10);
         assert_eq!(bundles.len(), 1);
@@ -2271,12 +2294,12 @@ mod tests {
         let mut r1 = test_report();
         r1.timestamp = 1000;
         r1.message = "older".to_string();
-        write_crash_bundle(crash_dir, &r1, None).unwrap();
+        write_crash_bundle(crash_dir, &r1, None, None).unwrap();
 
         let mut r2 = test_report();
         r2.timestamp = 2000;
         r2.message = "newer".to_string();
-        write_crash_bundle(crash_dir, &r2, None).unwrap();
+        write_crash_bundle(crash_dir, &r2, None, None).unwrap();
 
         let latest = latest_crash_bundle(crash_dir).unwrap();
         assert_eq!(latest.report.as_ref().unwrap().message, "newer");
@@ -2293,7 +2316,7 @@ mod tests {
         let out_dir = tmp.path().join("out");
 
         let report = test_report();
-        write_crash_bundle(&crash_dir, &report, Some(&test_snapshot())).unwrap();
+        write_crash_bundle(&crash_dir, &report, Some(&test_snapshot()), None).unwrap();
 
         let result =
             export_incident_bundle(&crash_dir, None, &out_dir, IncidentKind::Crash).unwrap();
