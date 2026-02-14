@@ -102,7 +102,7 @@ fn bench_activity_profile_update(c: &mut Criterion) {
 fn bench_hazard_urgency_computation(c: &mut Criterion) {
     let mut group = c.benchmark_group("restart_scheduling/hazard_urgency");
     let scheduler = RestartScheduler::new(scheduler_config());
-    let hazards: Vec<f64> = (0..100).map(|i| 0.2 + f64::from(i) * 0.015).collect();
+    let hazards: Vec<f64> = (0..100).map(|i| f64::from(i).mul_add(0.015, 0.2)).collect();
     let elapsed = Some(Duration::from_secs(24 * 3600));
 
     group.throughput(Throughput::Elements(hazards.len() as u64));

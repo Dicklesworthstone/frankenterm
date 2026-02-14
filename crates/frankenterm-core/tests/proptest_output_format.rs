@@ -206,7 +206,7 @@ proptest! {
     #[test]
     fn format_plain_effective_is_plain(_i in 0..1u8) {
         let eff = OutputFormat::Plain.effective();
-        prop_assert_eq!(eff, frankenterm_core::output::detect_format().effective().clone());
+        prop_assert_eq!(eff, frankenterm_core::output::detect_format().effective());
         // Actually, just check the deterministic ones:
         let eff = OutputFormat::Plain.effective();
         let debug = format!("{:?}", eff);
