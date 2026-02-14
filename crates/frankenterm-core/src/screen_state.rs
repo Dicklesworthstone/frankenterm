@@ -389,4 +389,208 @@ mod tests {
         tracker.process_output(2, b"\x1b[?1049");
         assert!(!tracker.is_alt_screen(2));
     }
+
+    // -----------------------------------------------------------------------
+    // Rapid enter/leave cycling (resize storm simulation)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rapid_alt_screen_cycling_settles_correctly() {
+        let mut tracker = ScreenStateTracker::new();
+
+        // 100 enter/leave cycles - simulates rapid vim open/close during resize storm.
+        for _ in 0..100 {
+            tracker.process_output(1, b"\x1b[?1049h");
+            assert!(tracker.is_alt_screen(1));
+            tracker.process_output(1, b"\x1b[?1049l");
+            assert!(!tracker.is_alt_screen(1));
+        }
+    }
+
+    #[test]
+    fn many_enters_without_leave_stays_active() {
+        let mut tracker = ScreenStateTracker::new();
+
+        // Multiple redundant enters (some apps send smcup repeatedly).
+        for _ in 0..50 {
+            tracker.process_output(1, b"\x1b[?1049h");
+        }
+        assert!(tracker.is_alt_screen(1));
+
+        // Single leave should deactivate.
+        tracker.process_output(1, b"\x1b[?1049l");
+        assert!(!tracker.is_alt_screen(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-pane stress
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hundred_panes_independent_state() {
+        let mut tracker = ScreenStateTracker::new();
+
+        // Even panes enter alt-screen, odd panes stay normal.
+        for pane_id in 0..100u64 {
+            if pane_id % 2 == 0 {
+                tracker.process_output(pane_id, b"\x1b[?1049h");
+            } else {
+                tracker.process_output(pane_id, b"normal output");
+            }
+        }
+
+        for pane_id in 0..100u64 {
+            if pane_id % 2 == 0 {
+                assert!(
+                    tracker.is_alt_screen(pane_id),
+                    "pane {pane_id} should be alt"
+                );
+            } else {
+                assert!(
+                    !tracker.is_alt_screen(pane_id),
+                    "pane {pane_id} should not be alt"
+                );
+            }
+        }
+
+        assert_eq!(tracker.tracked_panes().len(), 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sequence boundary splitting edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn split_at_every_byte_boundary_of_1049h() {
+        // ESC [ ? 1 0 4 9 h  = 8 bytes
+        let full = b"\x1b[?1049h";
+        for split_at in 1..full.len() {
+            let mut tracker = ScreenStateTracker::new();
+            tracker.process_output(1, &full[..split_at]);
+            tracker.process_output(1, &full[split_at..]);
+            assert!(
+                tracker.is_alt_screen(1),
+                "split at byte {split_at} should still detect alt-screen"
+            );
+        }
+    }
+
+    #[test]
+    fn split_at_every_byte_boundary_of_1049l() {
+        let full = b"\x1b[?1049l";
+        for split_at in 1..full.len() {
+            let mut tracker = ScreenStateTracker::new();
+            // First enter alt-screen.
+            tracker.process_output(1, b"\x1b[?1049h");
+            assert!(tracker.is_alt_screen(1));
+            // Then leave via split sequence.
+            tracker.process_output(1, &full[..split_at]);
+            tracker.process_output(1, &full[split_at..]);
+            assert!(
+                !tracker.is_alt_screen(1),
+                "split at byte {split_at} should detect leave"
+            );
+        }
+    }
+
+    #[test]
+    fn split_at_every_byte_boundary_of_47h() {
+        let full = b"\x1b[?47h";
+        for split_at in 1..full.len() {
+            let mut tracker = ScreenStateTracker::new();
+            tracker.process_output(1, &full[..split_at]);
+            tracker.process_output(1, &full[split_at..]);
+            assert!(
+                tracker.is_alt_screen(1),
+                "47h split at byte {split_at} should detect alt-screen"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Large output with embedded sequences
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn large_output_with_embedded_enter() {
+        let mut tracker = ScreenStateTracker::new();
+        let mut data = vec![b'A'; 65536];
+        // Place enter sequence at offset 32768.
+        let seq = b"\x1b[?1049h";
+        data[32768..32768 + seq.len()].copy_from_slice(seq);
+        tracker.process_output(1, &data);
+        assert!(tracker.is_alt_screen(1));
+    }
+
+    #[test]
+    fn large_output_with_enter_and_leave() {
+        let mut tracker = ScreenStateTracker::new();
+        let mut data = vec![b'X'; 65536];
+        // Enter near the start.
+        let enter = b"\x1b[?1049h";
+        data[100..100 + enter.len()].copy_from_slice(enter);
+        // Leave near the end.
+        let leave = b"\x1b[?1049l";
+        data[65000..65000 + leave.len()].copy_from_slice(leave);
+        tracker.process_output(1, &data);
+        // Last sequence is leave, so should not be alt-screen.
+        assert!(!tracker.is_alt_screen(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Clear and re-track
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clear_pane_removes_from_tracked_list() {
+        let mut tracker = ScreenStateTracker::new();
+        tracker.process_output(1, b"data");
+        tracker.process_output(2, b"data");
+        assert_eq!(tracker.tracked_panes().len(), 2);
+
+        tracker.clear_pane(1);
+        assert_eq!(tracker.tracked_panes().len(), 1);
+        assert!(!tracker.tracked_panes().contains(&1));
+        assert!(tracker.tracked_panes().contains(&2));
+    }
+
+    #[test]
+    fn clear_nonexistent_pane_is_safe() {
+        let mut tracker = ScreenStateTracker::new();
+        // Clearing a pane that was never tracked should not panic.
+        tracker.clear_pane(999);
+        assert!(tracker.tracked_panes().is_empty());
+    }
+
+    #[test]
+    fn reset_context_preserves_alt_screen_state() {
+        let mut tracker = ScreenStateTracker::new();
+        tracker.process_output(1, b"\x1b[?1049h");
+        assert!(tracker.is_alt_screen(1));
+
+        // Reset context should clear tail buffer but NOT change alt-screen state.
+        tracker.reset_context(1);
+        assert!(tracker.is_alt_screen(1));
+    }
+
+    #[test]
+    fn reset_context_on_nonexistent_pane_is_safe() {
+        let mut tracker = ScreenStateTracker::new();
+        // Should not panic.
+        tracker.reset_context(42);
+    }
+
+    // -----------------------------------------------------------------------
+    // set_alt_screen creates pane entry if needed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_alt_screen_creates_pane_entry() {
+        let mut tracker = ScreenStateTracker::new();
+        assert!(tracker.tracked_panes().is_empty());
+
+        tracker.set_alt_screen(5, true);
+        assert!(tracker.tracked_panes().contains(&5));
+        assert!(tracker.is_alt_screen(5));
+    }
 }
