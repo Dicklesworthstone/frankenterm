@@ -413,3 +413,174 @@ proptest! {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Property: RecorderEvent serde roundtrip preserves all fields
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn recorder_event_serde_roundtrip(
+        pane_id in arb_pane_id(),
+        seq in 0u64..1000,
+        ts in arb_timestamp(),
+        source in arb_event_source(),
+        payload in arb_payload(),
+    ) {
+        let event = make_event_for_prop(pane_id, seq, ts, source, payload);
+        let json = serde_json::to_string(&event).unwrap();
+        let back: RecorderEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.event_id, &event.event_id);
+        prop_assert_eq!(back.pane_id, event.pane_id);
+        prop_assert_eq!(back.sequence, event.sequence);
+        prop_assert_eq!(back.occurred_at_ms, event.occurred_at_ms);
+        prop_assert_eq!(back.recorded_at_ms, event.recorded_at_ms);
+        prop_assert_eq!(&back.schema_version, &event.schema_version);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property: SequenceAssigner global sequence is strictly monotonic
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn sequence_assigner_global_monotonic(
+        pane_schedule in prop::collection::vec(arb_pane_id(), 2..100),
+    ) {
+        let assigner = SequenceAssigner::new();
+        let mut prev_global: Option<u64> = None;
+
+        for &pane_id in &pane_schedule {
+            let (_pane_seq, global_seq) = assigner.assign(pane_id);
+            if let Some(prev) = prev_global {
+                prop_assert!(global_seq > prev,
+                    "global sequence not strictly increasing: {} -> {}", prev, global_seq);
+            }
+            prev_global = Some(global_seq);
+        }
+    }
+
+    /// Per-pane sequences are strictly monotonic within each pane.
+    #[test]
+    fn sequence_assigner_per_pane_monotonic(
+        pane_schedule in prop::collection::vec(arb_pane_id(), 2..100),
+    ) {
+        let assigner = SequenceAssigner::new();
+        let mut per_pane_last: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+
+        for &pane_id in &pane_schedule {
+            let (pane_seq, _global_seq) = assigner.assign(pane_id);
+            if let Some(&prev) = per_pane_last.get(&pane_id) {
+                prop_assert!(pane_seq > prev,
+                    "per-pane sequence not strictly increasing for pane {}: {} -> {}",
+                    pane_id, prev, pane_seq);
+            }
+            per_pane_last.insert(pane_id, pane_seq);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property: merge key reflexivity — a key equals itself
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn merge_key_reflexive(
+        pane_id in arb_pane_id(),
+        seq in 0u64..1000,
+        ts in arb_timestamp(),
+    ) {
+        let event = make_event_for_prop(
+            pane_id, seq, ts,
+            RecorderEventSource::RobotMode,
+            RecorderEventPayload::IngressText {
+                text: "reflexive".into(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                ingress_kind: RecorderIngressKind::SendText,
+            },
+        );
+        let key = RecorderMergeKey::from_event(&event);
+        prop_assert_eq!(&key, &key, "merge key should equal itself");
+        prop_assert!(key <= key, "merge key should be <= itself");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property: empty event list passes all invariant checks
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
+    #[test]
+    fn empty_events_pass_invariants(_dummy in 0..1_u8) {
+        let config = InvariantCheckerConfig {
+            check_merge_order: true,
+            check_causality: true,
+            expected_schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        let report = checker.check(&[]);
+        prop_assert!(report.passed, "empty event list should pass");
+        prop_assert_eq!(report.violations.len(), 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property: different event sources produce structurally valid IDs
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn different_sources_valid_ids(
+        pane_id in arb_pane_id(),
+        seq in 0u64..100,
+        ts in arb_timestamp(),
+        source in arb_event_source(),
+    ) {
+        let event = make_event_for_prop(
+            pane_id, seq, ts, source,
+            RecorderEventPayload::IngressText {
+                text: "source-test".into(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                ingress_kind: RecorderIngressKind::SendText,
+            },
+        );
+        prop_assert!(!event.event_id.is_empty(), "event_id should not be empty");
+        // ID should be a hex string (generate_event_id_v1 produces hex)
+        prop_assert!(event.event_id.chars().all(|c| c.is_ascii_hexdigit()),
+            "event_id should be hex: {}", event.event_id);
+    }
+
+    /// RecorderEvent schema_version is always preserved through construction.
+    #[test]
+    fn event_schema_version_preserved(
+        pane_id in arb_pane_id(),
+        ts in arb_timestamp(),
+    ) {
+        let event = make_event_for_prop(
+            pane_id, 0, ts,
+            RecorderEventSource::RobotMode,
+            RecorderEventPayload::IngressText {
+                text: "version".into(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                ingress_kind: RecorderIngressKind::SendText,
+            },
+        );
+        prop_assert_eq!(&event.schema_version, RECORDER_EVENT_SCHEMA_VERSION_V1);
+    }
+}
