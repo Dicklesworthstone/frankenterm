@@ -14,6 +14,13 @@
 //! 11. SearchExplainResult is always JSON-serializable
 //! 12. render_explain_plain always produces non-empty output
 //! 13. Healthy contexts produce no reasons
+//! 14. FTS_INDEX_INCONSISTENT when fts_consistent=false with segments > 0
+//! 15. STALE_PANES when observed panes have old last_seen_at
+//! 16. NARROW_TIME_RANGE when data spans < 1 minute
+//! 17. Reason suggestions are always non-empty
+//! 18. Reason evidence keys are always non-empty
+//! 19. JSON output contains required top-level fields
+//! 20. Render output grows with more reasons
 
 use proptest::prelude::*;
 
@@ -302,6 +309,51 @@ proptest! {
 }
 
 // =============================================================================
+// Property: PANE_EXCLUDED when filtering for excluded pane
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn pane_excluded_when_filter_matches_excluded(
+        query in "[a-zA-Z]{1,20}",
+        pane_id in 0_u64..1000,
+        ignore_reason in prop_oneof![
+            Just("title_match".to_string()),
+            Just("cwd_match".to_string()),
+            Just("manual".to_string()),
+        ],
+    ) {
+        let now_ms = 1_700_000_000_000_i64;
+        let ctx = SearchExplainContext {
+            query,
+            pane_filter: Some(pane_id),
+            panes: vec![PaneExplainInfo {
+                pane_id,
+                observed: false, // excluded
+                ignore_reason: Some(ignore_reason),
+                domain: "local".to_string(),
+                last_seen_at: now_ms,
+            }],
+            indexing_stats: vec![],
+            gaps: vec![],
+            retention_cleanup_count: 0,
+            earliest_segment_at: None,
+            latest_segment_at: None,
+            now_ms,
+        };
+        let result = explain_search(&ctx);
+        prop_assert!(
+            result.reasons.iter().any(|r| r.code == "PANE_EXCLUDED"),
+            "expected PANE_EXCLUDED for excluded pane_id={}, got: {:?}",
+            pane_id,
+            result.reasons.iter().map(|r| r.code).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// =============================================================================
 // Property: CAPTURE_GAPS when gaps exist with segments
 // =============================================================================
 
@@ -445,6 +497,279 @@ proptest! {
         let result = explain_search(&ctx);
         prop_assert_eq!(&result.query, &ctx.query);
         prop_assert_eq!(result.pane_filter, ctx.pane_filter);
+    }
+}
+
+// =============================================================================
+// 14. FTS_INDEX_INCONSISTENT when fts_consistent=false with segments > 0
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn fts_inconsistency_detected(
+        query in "[a-zA-Z]{1,20}",
+        pane_id in 0_u64..1000,
+        segment_count in 1_u64..500,
+    ) {
+        let now_ms = 1_700_000_000_000_i64;
+        let ctx = SearchExplainContext {
+            query,
+            pane_filter: None,
+            panes: vec![PaneExplainInfo {
+                pane_id,
+                observed: true,
+                ignore_reason: None,
+                domain: "local".to_string(),
+                last_seen_at: now_ms,
+            }],
+            indexing_stats: vec![PaneIndexingInfo {
+                pane_id,
+                segment_count,
+                total_bytes: segment_count * 50,
+                last_segment_at: Some(now_ms),
+                fts_row_count: segment_count / 2, // mismatched
+                fts_consistent: false,
+            }],
+            gaps: vec![],
+            retention_cleanup_count: 0,
+            earliest_segment_at: Some(now_ms - 3_600_000),
+            latest_segment_at: Some(now_ms),
+            now_ms,
+        };
+        let result = explain_search(&ctx);
+        prop_assert!(
+            result.reasons.iter().any(|r| r.code == "FTS_INDEX_INCONSISTENT"),
+            "expected FTS_INDEX_INCONSISTENT for inconsistent pane, got: {:?}",
+            result.reasons.iter().map(|r| r.code).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// =============================================================================
+// 15. STALE_PANES when observed panes have old last_seen_at
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn stale_panes_when_old_last_seen(
+        query in "[a-zA-Z]{1,20}",
+        pane_id in 0_u64..1000,
+        stale_minutes in 6_i64..60, // > 5 minute threshold
+    ) {
+        let now_ms = 1_700_000_000_000_i64;
+        let stale_time = now_ms - (stale_minutes * 60 * 1000);
+        let ctx = SearchExplainContext {
+            query,
+            pane_filter: None,
+            panes: vec![PaneExplainInfo {
+                pane_id,
+                observed: true,
+                ignore_reason: None,
+                domain: "local".to_string(),
+                last_seen_at: stale_time,
+            }],
+            indexing_stats: vec![PaneIndexingInfo {
+                pane_id,
+                segment_count: 50,
+                total_bytes: 2500,
+                last_segment_at: Some(stale_time),
+                fts_row_count: 50,
+                fts_consistent: true,
+            }],
+            gaps: vec![],
+            retention_cleanup_count: 0,
+            earliest_segment_at: Some(stale_time - 3_600_000),
+            latest_segment_at: Some(stale_time),
+            now_ms,
+        };
+        let result = explain_search(&ctx);
+        prop_assert!(
+            result.reasons.iter().any(|r| r.code == "STALE_PANES"),
+            "expected STALE_PANES for pane unseen for {} minutes, got: {:?}",
+            stale_minutes,
+            result.reasons.iter().map(|r| r.code).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// =============================================================================
+// 16. NARROW_TIME_RANGE when data spans < 1 minute
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn narrow_time_range_under_one_minute(
+        query in "[a-zA-Z]{1,20}",
+        range_ms in 1_i64..59_999, // < 60_000 ms
+    ) {
+        let now_ms = 1_700_000_000_000_i64;
+        let ctx = SearchExplainContext {
+            query,
+            pane_filter: None,
+            panes: vec![PaneExplainInfo {
+                pane_id: 1,
+                observed: true,
+                ignore_reason: None,
+                domain: "local".to_string(),
+                last_seen_at: now_ms,
+            }],
+            indexing_stats: vec![PaneIndexingInfo {
+                pane_id: 1,
+                segment_count: 5,
+                total_bytes: 200,
+                last_segment_at: Some(now_ms),
+                fts_row_count: 5,
+                fts_consistent: true,
+            }],
+            gaps: vec![],
+            retention_cleanup_count: 0,
+            earliest_segment_at: Some(now_ms - range_ms),
+            latest_segment_at: Some(now_ms),
+            now_ms,
+        };
+        let result = explain_search(&ctx);
+        prop_assert!(
+            result.reasons.iter().any(|r| r.code == "NARROW_TIME_RANGE"),
+            "expected NARROW_TIME_RANGE for range={}ms, got: {:?}",
+            range_ms,
+            result.reasons.iter().map(|r| r.code).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// =============================================================================
+// 17. All reasons have non-empty suggestions
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    #[test]
+    fn all_reasons_have_suggestions(ctx in arb_search_context()) {
+        let result = explain_search(&ctx);
+        for reason in &result.reasons {
+            prop_assert!(
+                !reason.suggestions.is_empty(),
+                "reason '{}' has no suggestions", reason.code
+            );
+        }
+    }
+}
+
+// =============================================================================
+// 18. All evidence entries have non-empty keys
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    #[test]
+    fn all_evidence_keys_non_empty(ctx in arb_search_context()) {
+        let result = explain_search(&ctx);
+        for reason in &result.reasons {
+            for ev in &reason.evidence {
+                prop_assert!(!ev.key.is_empty(), "evidence key is empty for reason '{}'", reason.code);
+                prop_assert!(!ev.value.is_empty(), "evidence value is empty for key '{}' in reason '{}'", ev.key, reason.code);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// 19. JSON output contains required top-level fields
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn json_has_required_fields(ctx in arb_search_context()) {
+        let result = explain_search(&ctx);
+        let json = serde_json::to_string(&result).unwrap();
+        prop_assert!(json.contains("\"query\""), "missing query field");
+        prop_assert!(json.contains("\"total_panes\""), "missing total_panes field");
+        prop_assert!(json.contains("\"observed_panes\""), "missing observed_panes field");
+        prop_assert!(json.contains("\"ignored_panes\""), "missing ignored_panes field");
+        prop_assert!(json.contains("\"total_segments\""), "missing total_segments field");
+        prop_assert!(json.contains("\"reasons\""), "missing reasons field");
+    }
+}
+
+// =============================================================================
+// 20. Render output grows with more reasons
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn render_output_length_monotonic_with_reasons(
+        query in "[a-zA-Z]{1,20}",
+    ) {
+        let now_ms = 1_700_000_000_000_i64;
+
+        // Healthy context = no reasons
+        let healthy_ctx = SearchExplainContext {
+            query: query.clone(),
+            pane_filter: None,
+            panes: vec![PaneExplainInfo {
+                pane_id: 1,
+                observed: true,
+                ignore_reason: None,
+                domain: "local".to_string(),
+                last_seen_at: now_ms,
+            }],
+            indexing_stats: vec![PaneIndexingInfo {
+                pane_id: 1,
+                segment_count: 1000,
+                total_bytes: 50000,
+                last_segment_at: Some(now_ms),
+                fts_row_count: 1000,
+                fts_consistent: true,
+            }],
+            gaps: vec![],
+            retention_cleanup_count: 0,
+            earliest_segment_at: Some(now_ms - 3_600_000),
+            latest_segment_at: Some(now_ms),
+            now_ms,
+        };
+        let healthy_result = explain_search(&healthy_ctx);
+        let healthy_rendered = render_explain_plain(&healthy_result);
+
+        // Unhealthy context = multiple reasons
+        let unhealthy_ctx = SearchExplainContext {
+            query,
+            pane_filter: None,
+            panes: vec![],
+            indexing_stats: vec![],
+            gaps: vec![GapInfo {
+                pane_id: 1,
+                seq_before: 1,
+                seq_after: 10,
+                reason: "restart".to_string(),
+                detected_at: now_ms,
+            }],
+            retention_cleanup_count: 5,
+            earliest_segment_at: None,
+            latest_segment_at: None,
+            now_ms,
+        };
+        let unhealthy_result = explain_search(&unhealthy_ctx);
+        let unhealthy_rendered = render_explain_plain(&unhealthy_result);
+
+        // Unhealthy should produce more output
+        prop_assert!(
+            unhealthy_rendered.len() >= healthy_rendered.len(),
+            "unhealthy ({} chars) should be >= healthy ({} chars)",
+            unhealthy_rendered.len(),
+            healthy_rendered.len(),
+        );
     }
 }
 
