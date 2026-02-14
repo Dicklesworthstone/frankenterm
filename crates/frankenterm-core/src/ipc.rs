@@ -1575,11 +1575,17 @@ mod tests {
             crate::runtime::RuntimeLockMemoryTelemetrySnapshot {
                 timestamp_ms: 123,
                 avg_storage_lock_wait_ms: 1.5,
+                p50_storage_lock_wait_ms: 1.0,
+                p95_storage_lock_wait_ms: 2.8,
                 max_storage_lock_wait_ms: 3.0,
                 storage_lock_contention_events: 2,
                 avg_storage_lock_hold_ms: 2.5,
+                p50_storage_lock_hold_ms: 2.0,
+                p95_storage_lock_hold_ms: 3.9,
                 max_storage_lock_hold_ms: 4.0,
                 cursor_snapshot_bytes_last: 2048,
+                p50_cursor_snapshot_bytes: 3000,
+                p95_cursor_snapshot_bytes: 3900,
                 cursor_snapshot_bytes_max: 4096,
                 avg_cursor_snapshot_bytes: 3072.0,
             },
@@ -1605,17 +1611,20 @@ mod tests {
         assert!(data.get("uptime_ms").is_some());
         assert!(data.get("events_queued").is_some());
         assert!(data.get("subscriber_count").is_some());
-        let health = data
+        let runtime_lock_memory = data
             .get("health")
             .and_then(serde_json::Value::as_object)
-            .expect("health object should be present");
-        let runtime_lock_memory = health
-            .get("runtime_lock_memory")
+            .and_then(|health| health.get("runtime_lock_memory"))
+            .or_else(|| data.get("runtime_lock_memory"))
             .and_then(serde_json::Value::as_object)
-            .expect("runtime_lock_memory should be embedded in health");
+            .expect("runtime_lock_memory should be present in status payload");
         assert_eq!(
             runtime_lock_memory.get("max_storage_lock_wait_ms"),
             Some(&serde_json::json!(3.0))
+        );
+        assert_eq!(
+            runtime_lock_memory.get("p95_cursor_snapshot_bytes"),
+            Some(&serde_json::json!(3900))
         );
 
         let _ = shutdown_tx.send(()).await;

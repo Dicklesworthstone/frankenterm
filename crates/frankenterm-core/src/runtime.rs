@@ -18,15 +18,14 @@
 //! The runtime explicitly enforces that the observation loop never calls any
 //! send/act APIs - it is purely passive.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax};
 
-use tokio::sync::RwLock;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, instrument, warn};
 
@@ -43,7 +42,7 @@ use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
 use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
-use crate::runtime_compat::{mpsc, sleep, timeout, watch};
+use crate::runtime_compat::{RwLock, mpsc, sleep, timeout, watch};
 use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
 #[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
@@ -279,6 +278,8 @@ impl Default for RuntimeConfig {
 static GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY: OnceLock<
     StdRwLock<Option<RuntimeLockMemoryTelemetrySnapshot>>,
 > = OnceLock::new();
+/// Number of recent samples retained for lock/memory percentile telemetry.
+const TELEMETRY_PERCENTILE_WINDOW_CAPACITY: usize = 1024;
 
 /// Machine-readable lock contention and cursor-memory telemetry snapshot.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -287,16 +288,28 @@ pub struct RuntimeLockMemoryTelemetrySnapshot {
     pub timestamp_ms: u64,
     /// Average storage lock wait in milliseconds.
     pub avg_storage_lock_wait_ms: f64,
+    /// p50 storage lock wait in milliseconds (rolling window).
+    pub p50_storage_lock_wait_ms: f64,
+    /// p95 storage lock wait in milliseconds (rolling window).
+    pub p95_storage_lock_wait_ms: f64,
     /// Maximum storage lock wait in milliseconds.
     pub max_storage_lock_wait_ms: f64,
     /// Count of lock acquisitions that crossed contention threshold.
     pub storage_lock_contention_events: u64,
     /// Average storage lock hold time in milliseconds.
     pub avg_storage_lock_hold_ms: f64,
+    /// p50 storage lock hold time in milliseconds (rolling window).
+    pub p50_storage_lock_hold_ms: f64,
+    /// p95 storage lock hold time in milliseconds (rolling window).
+    pub p95_storage_lock_hold_ms: f64,
     /// Maximum storage lock hold time in milliseconds.
     pub max_storage_lock_hold_ms: f64,
     /// Last cursor snapshot memory sample in bytes.
     pub cursor_snapshot_bytes_last: u64,
+    /// p50 cursor snapshot memory in bytes (rolling window).
+    pub p50_cursor_snapshot_bytes: u64,
+    /// p95 cursor snapshot memory in bytes (rolling window).
+    pub p95_cursor_snapshot_bytes: u64,
     /// Peak cursor snapshot memory sample in bytes.
     pub cursor_snapshot_bytes_max: u64,
     /// Average cursor snapshot memory in bytes.
@@ -342,6 +355,8 @@ pub struct RuntimeMetrics {
     storage_lock_wait_samples: ShardedCounter,
     /// Maximum storage mutex wait time observed (microseconds).
     storage_lock_wait_us_max: ShardedMax,
+    /// Recent storage mutex wait samples for percentile telemetry.
+    storage_lock_wait_recent_us: StdMutex<VecDeque<u64>>,
     /// Number of storage lock acquisitions with meaningful wait (contention).
     storage_lock_contention_events: ShardedCounter,
     /// Sum of storage mutex hold time samples (microseconds).
@@ -350,6 +365,8 @@ pub struct RuntimeMetrics {
     storage_lock_hold_samples: ShardedCounter,
     /// Maximum storage mutex hold time observed (microseconds).
     storage_lock_hold_us_max: ShardedMax,
+    /// Recent storage mutex hold samples for percentile telemetry.
+    storage_lock_hold_recent_us: StdMutex<VecDeque<u64>>,
     /// Number of cursor snapshot memory samples.
     cursor_snapshot_samples: ShardedCounter,
     /// Sum of cursor snapshot bytes across samples.
@@ -358,6 +375,8 @@ pub struct RuntimeMetrics {
     cursor_snapshot_bytes_max: ShardedMax,
     /// Last cursor snapshot bytes sample.
     cursor_snapshot_bytes_last: ShardedGauge,
+    /// Recent cursor snapshot bytes for percentile telemetry.
+    cursor_snapshot_recent_bytes: StdMutex<VecDeque<u64>>,
     /// Total native pane output events received (pre-coalesce).
     native_output_input_events: ShardedCounter,
     /// Total native pane output batches emitted (post-coalesce).
@@ -385,14 +404,23 @@ impl Default for RuntimeMetrics {
             storage_lock_wait_us_sum: ShardedCounter::new(),
             storage_lock_wait_samples: ShardedCounter::new(),
             storage_lock_wait_us_max: ShardedMax::new(),
+            storage_lock_wait_recent_us: StdMutex::new(VecDeque::with_capacity(
+                TELEMETRY_PERCENTILE_WINDOW_CAPACITY,
+            )),
             storage_lock_contention_events: ShardedCounter::new(),
             storage_lock_hold_us_sum: ShardedCounter::new(),
             storage_lock_hold_samples: ShardedCounter::new(),
             storage_lock_hold_us_max: ShardedMax::new(),
+            storage_lock_hold_recent_us: StdMutex::new(VecDeque::with_capacity(
+                TELEMETRY_PERCENTILE_WINDOW_CAPACITY,
+            )),
             cursor_snapshot_samples: ShardedCounter::new(),
             cursor_snapshot_bytes_sum: ShardedCounter::new(),
             cursor_snapshot_bytes_max: ShardedMax::new(),
             cursor_snapshot_bytes_last: ShardedGauge::new(),
+            cursor_snapshot_recent_bytes: StdMutex::new(VecDeque::with_capacity(
+                TELEMETRY_PERCENTILE_WINDOW_CAPACITY,
+            )),
             native_output_input_events: ShardedCounter::new(),
             native_output_batches_emitted: ShardedCounter::new(),
             native_output_input_bytes: ShardedCounter::new(),
@@ -422,6 +450,7 @@ impl RuntimeMetrics {
         self.storage_lock_wait_us_sum.add(waited_us);
         self.storage_lock_wait_samples.increment();
         self.storage_lock_wait_us_max.observe(waited_us);
+        record_bounded_sample(&self.storage_lock_wait_recent_us, waited_us);
         if waited_us >= STORAGE_LOCK_CONTENTION_MIN_US {
             self.storage_lock_contention_events.increment();
         }
@@ -433,6 +462,7 @@ impl RuntimeMetrics {
         self.storage_lock_hold_us_sum.add(held_us);
         self.storage_lock_hold_samples.increment();
         self.storage_lock_hold_us_max.observe(held_us);
+        record_bounded_sample(&self.storage_lock_hold_recent_us, held_us);
     }
 
     /// Record a cursor snapshot memory sample.
@@ -441,6 +471,7 @@ impl RuntimeMetrics {
         self.cursor_snapshot_bytes_sum.add(total_bytes);
         self.cursor_snapshot_bytes_max.observe(total_bytes);
         self.cursor_snapshot_bytes_last.set(total_bytes);
+        record_bounded_sample(&self.cursor_snapshot_recent_bytes, total_bytes);
     }
 
     pub fn record_native_output_input(&self, bytes: usize) {
@@ -501,6 +532,18 @@ impl RuntimeMetrics {
         self.storage_lock_wait_us_max.get() as f64 / 1000.0
     }
 
+    /// p50 storage mutex wait time in milliseconds.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn p50_storage_lock_wait_ms(&self) -> f64 {
+        percentile_from_samples(&self.storage_lock_wait_recent_us, 50) as f64 / 1000.0
+    }
+
+    /// p95 storage mutex wait time in milliseconds.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn p95_storage_lock_wait_ms(&self) -> f64 {
+        percentile_from_samples(&self.storage_lock_wait_recent_us, 95) as f64 / 1000.0
+    }
+
     /// Total number of storage lock contention events (wait >= threshold).
     pub fn storage_lock_contention_events(&self) -> u64 {
         self.storage_lock_contention_events.get()
@@ -524,6 +567,18 @@ impl RuntimeMetrics {
         self.storage_lock_hold_us_max.get() as f64 / 1000.0
     }
 
+    /// p50 storage mutex hold time in milliseconds.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn p50_storage_lock_hold_ms(&self) -> f64 {
+        percentile_from_samples(&self.storage_lock_hold_recent_us, 50) as f64 / 1000.0
+    }
+
+    /// p95 storage mutex hold time in milliseconds.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn p95_storage_lock_hold_ms(&self) -> f64 {
+        percentile_from_samples(&self.storage_lock_hold_recent_us, 95) as f64 / 1000.0
+    }
+
     /// Last sampled cursor snapshot bytes.
     pub fn cursor_snapshot_bytes_last(&self) -> u64 {
         self.cursor_snapshot_bytes_last.get_max()
@@ -532,6 +587,16 @@ impl RuntimeMetrics {
     /// Maximum sampled cursor snapshot bytes.
     pub fn cursor_snapshot_bytes_max(&self) -> u64 {
         self.cursor_snapshot_bytes_max.get()
+    }
+
+    /// p50 cursor snapshot memory in bytes.
+    pub fn p50_cursor_snapshot_bytes(&self) -> u64 {
+        percentile_from_samples(&self.cursor_snapshot_recent_bytes, 50)
+    }
+
+    /// p95 cursor snapshot memory in bytes.
+    pub fn p95_cursor_snapshot_bytes(&self) -> u64 {
+        percentile_from_samples(&self.cursor_snapshot_recent_bytes, 95)
     }
 
     /// Average sampled cursor snapshot bytes.
@@ -552,11 +617,17 @@ impl RuntimeMetrics {
         RuntimeLockMemoryTelemetrySnapshot {
             timestamp_ms: epoch_ms_u64(),
             avg_storage_lock_wait_ms: self.avg_storage_lock_wait_ms(),
+            p50_storage_lock_wait_ms: self.p50_storage_lock_wait_ms(),
+            p95_storage_lock_wait_ms: self.p95_storage_lock_wait_ms(),
             max_storage_lock_wait_ms: self.max_storage_lock_wait_ms(),
             storage_lock_contention_events: self.storage_lock_contention_events(),
             avg_storage_lock_hold_ms: self.avg_storage_lock_hold_ms(),
+            p50_storage_lock_hold_ms: self.p50_storage_lock_hold_ms(),
+            p95_storage_lock_hold_ms: self.p95_storage_lock_hold_ms(),
             max_storage_lock_hold_ms: self.max_storage_lock_hold_ms(),
             cursor_snapshot_bytes_last: self.cursor_snapshot_bytes_last(),
+            p50_cursor_snapshot_bytes: self.p50_cursor_snapshot_bytes(),
+            p95_cursor_snapshot_bytes: self.p95_cursor_snapshot_bytes(),
             cursor_snapshot_bytes_max: self.cursor_snapshot_bytes_max(),
             avg_cursor_snapshot_bytes: self.avg_cursor_snapshot_bytes(),
         }
@@ -910,8 +981,13 @@ impl ObservationRuntime {
                 let mut tick_only = true;
 
                 if let Some(sub) = subscriber.as_mut() {
-                    tokio::select! {
-                        recv = sub.recv() => {
+                    match timeout(
+                        Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
+                        sub.recv(),
+                    )
+                    .await
+                    {
+                        Ok(recv) => {
                             tick_only = false;
                             match recv {
                                 Ok(event) => {
@@ -940,7 +1016,7 @@ impl ObservationRuntime {
                                 }
                             }
                         }
-                        () = sleep(Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS)) => {}
+                        Err(_elapsed) => {}
                     }
                 } else {
                     sleep(Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS)).await;
@@ -1300,7 +1376,7 @@ impl ObservationRuntime {
                     match wezterm_handle.watchdog_warnings().await {
                         Ok(wezterm_warnings) => warnings.extend(wezterm_warnings),
                         Err(err) => {
-                            warnings.push(format!("WezTerm health warning probe failed: {err}"))
+                            warnings.push(format!("WezTerm health warning probe failed: {err}"));
                         }
                     }
 
@@ -1730,40 +1806,55 @@ impl ObservationRuntime {
             let mut next_flush = Instant::now() + flush_interval;
 
             loop {
-                let flush_wait = next_flush.saturating_duration_since(Instant::now());
-                tokio::select! {
-                    () = sleep(flush_wait) => {
-                        next_flush = Instant::now() + flush_interval;
-                        let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        for item in coalescer.drain_due(now_ms) {
-                            metrics.record_native_output_batch(item.input_events, item.bytes.len());
-                            emit_native_output_delta(
-                                item.pane_id,
-                                item.bytes,
-                                item.timestamp_ms,
-                                &capture_tx,
-                                &cursors,
-                            )
-                            .await;
-                        }
-
-                        if shutdown_flag.load(Ordering::SeqCst) {
-                            break;
-                        }
+                let now = Instant::now();
+                if now >= next_flush {
+                    next_flush = now + flush_interval;
+                    let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    for item in coalescer.drain_due(now_ms) {
+                        metrics.record_native_output_batch(item.input_events, item.bytes.len());
+                        emit_native_output_delta(
+                            item.pane_id,
+                            item.bytes,
+                            item.timestamp_ms,
+                            &capture_tx,
+                            &cursors,
+                        )
+                        .await;
                     }
-                    maybe_event = event_rx.recv() => {
-                        let Some(event) = maybe_event else { break; };
+
+                    if shutdown_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    continue;
+                }
+
+                let flush_wait = next_flush.saturating_duration_since(now);
+                match timeout(flush_wait, event_rx.recv()).await {
+                    Ok(maybe_event) => {
+                        let Some(event) = maybe_event else {
+                            break;
+                        };
 
                         if shutdown_flag.load(Ordering::SeqCst) {
                             break;
                         }
 
                         match event {
-                            NativeEvent::PaneOutput { pane_id, data, timestamp_ms } => {
+                            NativeEvent::PaneOutput {
+                                pane_id,
+                                data,
+                                timestamp_ms,
+                            } => {
                                 metrics.record_native_output_input(data.len());
-                                let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                                if let Some(item) = coalescer.push(pane_id, data, timestamp_ms, now_ms) {
-                                    metrics.record_native_output_batch(item.input_events, item.bytes.len());
+                                let now_ms =
+                                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                                if let Some(item) =
+                                    coalescer.push(pane_id, data, timestamp_ms, now_ms)
+                                {
+                                    metrics.record_native_output_batch(
+                                        item.input_events,
+                                        item.bytes.len(),
+                                    );
                                     emit_native_output_delta(
                                         item.pane_id,
                                         item.bytes,
@@ -1774,9 +1865,13 @@ impl ObservationRuntime {
                                     .await;
                                 }
                             }
-                            NativeEvent::StateChange { pane_id, .. } | NativeEvent::PaneDestroyed { pane_id, .. } => {
+                            NativeEvent::StateChange { pane_id, .. }
+                            | NativeEvent::PaneDestroyed { pane_id, .. } => {
                                 if let Some(item) = coalescer.flush_pane(pane_id) {
-                                    metrics.record_native_output_batch(item.input_events, item.bytes.len());
+                                    metrics.record_native_output_batch(
+                                        item.input_events,
+                                        item.bytes.len(),
+                                    );
                                     emit_native_output_delta(
                                         item.pane_id,
                                         item.bytes,
@@ -1812,6 +1907,9 @@ impl ObservationRuntime {
                             }
                         }
                     }
+                    Err(_elapsed) => {
+                        // Timer elapsed; next loop iteration drains due batches.
+                    }
                 }
             }
 
@@ -1844,23 +1942,23 @@ impl ObservationRuntime {
 
         tokio::spawn(async move {
             loop {
-                tokio::select! {
-                    maybe_event = capture_ingress_rx.recv() => {
-                        match maybe_event {
-                            Some(event) => {
-                                if shutdown_flag.load(Ordering::SeqCst) {
-                                    debug!("Capture relay: shutdown signal received, draining remaining events");
-                                }
-
-                                if capture_ring_tx.send(event).await.is_err() {
-                                    debug!("Capture relay: persistence ring closed");
-                                    return;
-                                }
+                match timeout(Duration::from_millis(25), capture_ingress_rx.recv()).await {
+                    Ok(maybe_event) => match maybe_event {
+                        Some(event) => {
+                            if shutdown_flag.load(Ordering::SeqCst) {
+                                debug!(
+                                    "Capture relay: shutdown signal received, draining remaining events"
+                                );
                             }
-                            None => break,
+
+                            if capture_ring_tx.send(event).await.is_err() {
+                                debug!("Capture relay: persistence ring closed");
+                                return;
+                            }
                         }
-                    }
-                    () = sleep(Duration::from_millis(25)) => {
+                        None => break,
+                    },
+                    Err(_elapsed) => {
                         if shutdown_flag.load(Ordering::SeqCst) && capture_ingress_rx.is_empty() {
                             break;
                         }
@@ -2681,6 +2779,35 @@ fn bytes_to_mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+fn record_bounded_sample(samples: &StdMutex<VecDeque<u64>>, value: u64) {
+    let mut guard = samples
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.len() == TELEMETRY_PERCENTILE_WINDOW_CAPACITY {
+        let _ = guard.pop_front();
+    }
+    guard.push_back(value);
+}
+
+fn percentile_from_samples(samples: &StdMutex<VecDeque<u64>>, percentile: usize) -> u64 {
+    debug_assert!((1..=100).contains(&percentile));
+    let mut values: Vec<u64> = {
+        let guard = samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.iter().copied().collect()
+    };
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let idx = (values.len() - 1)
+        .saturating_mul(percentile)
+        .saturating_add(99)
+        / 100;
+    values[idx]
+}
+
 /// Get current time as epoch milliseconds.
 fn epoch_ms() -> i64 {
     SystemTime::now()
@@ -3071,9 +3198,13 @@ mod tests {
 
         assert!(metrics.avg_storage_lock_wait_ms() > 0.0);
         assert!(metrics.max_storage_lock_wait_ms() >= 2.0);
+        assert!(metrics.p50_storage_lock_wait_ms() >= 0.5);
+        assert!(metrics.p95_storage_lock_wait_ms() >= metrics.p50_storage_lock_wait_ms());
         assert_eq!(metrics.storage_lock_contention_events(), 1);
         assert!(metrics.avg_storage_lock_hold_ms() >= 2.0);
         assert!(metrics.max_storage_lock_hold_ms() >= 10.0);
+        assert!(metrics.p50_storage_lock_hold_ms() >= 2.0);
+        assert!(metrics.p95_storage_lock_hold_ms() >= metrics.p50_storage_lock_hold_ms());
     }
 
     #[test]
@@ -3090,6 +3221,8 @@ mod tests {
         assert_eq!(metrics.cursor_snapshot_bytes_last(), 4096);
         assert_eq!(metrics.cursor_snapshot_bytes_max(), 4096);
         assert!((metrics.avg_cursor_snapshot_bytes() - 2560.0).abs() < f64::EPSILON);
+        assert_eq!(metrics.p50_cursor_snapshot_bytes(), 4096);
+        assert_eq!(metrics.p95_cursor_snapshot_bytes(), 4096);
     }
 
     #[test]
@@ -3105,11 +3238,17 @@ mod tests {
         let snapshot = metrics.lock_memory_snapshot();
         assert!(snapshot.timestamp_ms > 0);
         assert!(snapshot.avg_storage_lock_wait_ms > 0.0);
+        assert!(snapshot.p50_storage_lock_wait_ms >= 0.75);
+        assert!(snapshot.p95_storage_lock_wait_ms >= snapshot.p50_storage_lock_wait_ms);
         assert!(snapshot.max_storage_lock_wait_ms >= 2.0);
         assert_eq!(snapshot.storage_lock_contention_events, 1);
         assert!(snapshot.avg_storage_lock_hold_ms >= 4.0);
+        assert!(snapshot.p50_storage_lock_hold_ms >= 4.0);
+        assert!(snapshot.p95_storage_lock_hold_ms >= snapshot.p50_storage_lock_hold_ms);
         assert!(snapshot.max_storage_lock_hold_ms >= 12.0);
         assert_eq!(snapshot.cursor_snapshot_bytes_last, 8192);
+        assert_eq!(snapshot.p50_cursor_snapshot_bytes, 8192);
+        assert_eq!(snapshot.p95_cursor_snapshot_bytes, 8192);
         assert_eq!(snapshot.cursor_snapshot_bytes_max, 8192);
         assert!((snapshot.avg_cursor_snapshot_bytes - 4608.0).abs() < f64::EPSILON);
     }
@@ -3119,11 +3258,17 @@ mod tests {
         let snapshot = RuntimeLockMemoryTelemetrySnapshot {
             timestamp_ms: 42,
             avg_storage_lock_wait_ms: 1.25,
+            p50_storage_lock_wait_ms: 1.0,
+            p95_storage_lock_wait_ms: 4.5,
             max_storage_lock_wait_ms: 5.0,
             storage_lock_contention_events: 7,
             avg_storage_lock_hold_ms: 2.5,
+            p50_storage_lock_hold_ms: 2.0,
+            p95_storage_lock_hold_ms: 7.0,
             max_storage_lock_hold_ms: 8.0,
             cursor_snapshot_bytes_last: 128,
+            p50_cursor_snapshot_bytes: 256,
+            p95_cursor_snapshot_bytes: 480,
             cursor_snapshot_bytes_max: 512,
             avg_cursor_snapshot_bytes: 320.0,
         };
