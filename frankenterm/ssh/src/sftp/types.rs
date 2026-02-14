@@ -697,4 +697,108 @@ mod tests {
         let cloned = meta;
         assert_eq!(meta, cloned);
     }
+
+    #[test]
+    fn file_type_debug_format() {
+        assert_eq!(format!("{:?}", FileType::Dir), "Dir");
+        assert_eq!(format!("{:?}", FileType::File), "File");
+        assert_eq!(format!("{:?}", FileType::Symlink), "Symlink");
+        assert_eq!(format!("{:?}", FileType::Other), "Other");
+    }
+
+    #[test]
+    fn file_permissions_debug_format() {
+        let perms = FilePermissions::from_unix_mode(0o644);
+        let dbg = format!("{:?}", perms);
+        assert!(dbg.contains("FilePermissions"));
+        assert!(dbg.contains("owner_read: true"));
+        assert!(dbg.contains("owner_write: true"));
+        assert!(dbg.contains("owner_exec: false"));
+    }
+
+    #[test]
+    fn metadata_is_symlink() {
+        let meta = Metadata {
+            ty: FileType::Symlink,
+            permissions: None,
+            size: None,
+            uid: None,
+            gid: None,
+            accessed: None,
+            modified: None,
+        };
+        assert!(meta.is_symlink());
+        assert!(!meta.is_file());
+        assert!(!meta.is_dir());
+    }
+
+    #[test]
+    fn metadata_all_none_fields() {
+        let meta = Metadata {
+            ty: FileType::Other,
+            permissions: None,
+            size: None,
+            uid: None,
+            gid: None,
+            accessed: None,
+            modified: None,
+        };
+        assert!(!meta.is_dir());
+        assert!(!meta.is_file());
+        assert!(!meta.is_symlink());
+        assert_eq!(meta.size, None);
+        assert_eq!(meta.uid, None);
+        assert_eq!(meta.gid, None);
+    }
+
+    #[test]
+    fn open_options_read_only() {
+        let opts = OpenOptions {
+            read: true,
+            write: None,
+            mode: 0o644,
+            ty: OpenFileType::File,
+        };
+        assert!(opts.read);
+        assert!(opts.write.is_none());
+    }
+
+    #[test]
+    fn open_options_write_append() {
+        let opts = OpenOptions {
+            read: false,
+            write: Some(WriteMode::Append),
+            mode: 0o644,
+            ty: OpenFileType::File,
+        };
+        assert!(!opts.read);
+        assert_eq!(opts.write, Some(WriteMode::Append));
+    }
+
+    #[test]
+    fn rename_options_custom_no_atomic() {
+        let opts = RenameOptions {
+            overwrite: true,
+            atomic: false,
+            native: false,
+        };
+        assert!(opts.overwrite);
+        assert!(!opts.atomic);
+        assert!(!opts.native);
+    }
+
+    #[test]
+    fn file_permissions_owner_exec_only() {
+        let perms = FilePermissions::from_unix_mode(0o100);
+        assert!(!perms.owner_read);
+        assert!(!perms.owner_write);
+        assert!(perms.owner_exec);
+        assert!(!perms.group_read);
+        assert!(!perms.group_write);
+        assert!(!perms.group_exec);
+        assert!(!perms.other_read);
+        assert!(!perms.other_write);
+        assert!(!perms.other_exec);
+        assert!(perms.is_readonly());
+    }
 }

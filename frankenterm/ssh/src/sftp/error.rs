@@ -429,4 +429,21 @@ mod tests {
         let result: SftpResult<i32> = Err(SftpError::Failure);
         assert_eq!(result.unwrap_err(), SftpError::Failure);
     }
+
+    #[test]
+    fn sftp_error_is_std_error() {
+        let err = SftpError::PermissionDenied;
+        let error: &dyn std::error::Error = &err;
+        assert_eq!(error.to_string(), "Permission denied");
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn sftp_error_ne_different_variants() {
+        assert_ne!(SftpError::Eof, SftpError::NoSuchFile);
+        assert_ne!(SftpError::Failure, SftpError::BadMessage);
+        assert_ne!(SftpError::NoConnection, SftpError::ConnectionLost);
+        assert_ne!(SftpError::InvalidHandle, SftpError::NoSuchPath);
+        assert_ne!(SftpError::FileAlreadyExists, SftpError::WriteProtect);
+    }
 }
