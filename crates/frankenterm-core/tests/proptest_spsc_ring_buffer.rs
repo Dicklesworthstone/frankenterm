@@ -1,8 +1,10 @@
 //! Property-based tests for the SPSC ring buffer channel.
 //!
 //! These tests validate bounded FIFO behavior, close semantics, depth
-//! accounting, capacity invariants, and idempotency against a simple
-//! `VecDeque` reference model.
+//! accounting, capacity invariants, idempotency against a simple
+//! VecDeque reference model, count conservation, wrap-around correctness,
+//! producer-drop semantics, capacity-1 edge cases, depth precision,
+//! and long-sequence stress invariants.
 
 use std::collections::VecDeque;
 
@@ -371,5 +373,499 @@ proptest! {
         let (tx, rx) = channel::<u8>(capacity);
         prop_assert_eq!(tx.depth(), 0);
         prop_assert_eq!(rx.depth(), 0);
+    }
+}
+
+// =========================================================================
+// Count conservation
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// sent - received == depth at every step.
+    #[test]
+    fn spsc_count_conservation(
+        capacity in 1usize..=32,
+        ops in arb_ops(200),
+    ) {
+        let (tx, rx) = channel(capacity);
+        let mut total_sent: usize = 0;
+        let mut total_received: usize = 0;
+
+        for op in &ops {
+            match *op {
+                Op::Send(v) => {
+                    if tx.try_send(v).is_ok() {
+                        total_sent += 1;
+                    }
+                }
+                Op::Recv => {
+                    if rx.try_recv().is_some() {
+                        total_received += 1;
+                    }
+                }
+                Op::Close => {
+                    tx.close();
+                }
+            }
+            let expected_depth = total_sent - total_received;
+            prop_assert_eq!(
+                tx.depth(), expected_depth,
+                "depth {} != sent {} - recv {}",
+                tx.depth(), total_sent, total_received
+            );
+        }
+    }
+
+    /// Total received never exceeds total sent.
+    #[test]
+    fn spsc_recv_never_exceeds_sent(
+        capacity in 1usize..=32,
+        ops in arb_ops(200),
+    ) {
+        let (tx, rx) = channel(capacity);
+        let mut total_sent: usize = 0;
+        let mut total_received: usize = 0;
+
+        for op in &ops {
+            match *op {
+                Op::Send(v) => {
+                    if tx.try_send(v).is_ok() {
+                        total_sent += 1;
+                    }
+                }
+                Op::Recv => {
+                    if rx.try_recv().is_some() {
+                        total_received += 1;
+                    }
+                }
+                Op::Close => { tx.close(); }
+            }
+            prop_assert!(
+                total_received <= total_sent,
+                "received {} > sent {}",
+                total_received, total_sent
+            );
+        }
+    }
+}
+
+// =========================================================================
+// Multiple fill-drain cycles (wrap-around)
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Multiple fill-drain cycles produce correct FIFO output.
+    #[test]
+    fn spsc_multi_cycle_fifo(
+        capacity in 1usize..=16,
+        cycles in 2usize..=10,
+    ) {
+        let (tx, rx) = channel::<u32>(capacity);
+
+        for cycle in 0..cycles as u32 {
+            let base = cycle * capacity as u32;
+            for i in 0..capacity as u32 {
+                prop_assert!(tx.try_send(base + i).is_ok(),
+                    "fill failed at cycle {} item {}", cycle, i);
+            }
+            prop_assert_eq!(tx.depth(), capacity);
+
+            for i in 0..capacity as u32 {
+                let got = rx.try_recv();
+                prop_assert_eq!(got, Some(base + i),
+                    "FIFO mismatch at cycle {} item {}: got {:?}", cycle, i, got);
+            }
+            prop_assert_eq!(tx.depth(), 0);
+        }
+    }
+
+    /// Partial fill-drain cycles maintain correct depth.
+    #[test]
+    fn spsc_partial_cycles(
+        capacity in 2usize..=16,
+        fill_amount in 1usize..=16,
+        drain_amount in 1usize..=16,
+        cycles in 2usize..=8,
+    ) {
+        let (tx, rx) = channel::<u32>(capacity);
+        let mut expected_depth: usize = 0;
+        let mut next_val: u32 = 0;
+
+        for _cycle in 0..cycles {
+            // Fill phase
+            let actual_fill = fill_amount.min(capacity - expected_depth);
+            for _ in 0..actual_fill {
+                if tx.try_send(next_val).is_ok() {
+                    expected_depth += 1;
+                    next_val += 1;
+                }
+            }
+            prop_assert_eq!(tx.depth(), expected_depth,
+                "depth after fill: {} != {}", tx.depth(), expected_depth);
+
+            // Drain phase
+            let actual_drain = drain_amount.min(expected_depth);
+            for _ in 0..actual_drain {
+                if rx.try_recv().is_some() {
+                    expected_depth -= 1;
+                }
+            }
+            prop_assert_eq!(tx.depth(), expected_depth,
+                "depth after drain: {} != {}", tx.depth(), expected_depth);
+        }
+    }
+}
+
+// =========================================================================
+// Producer drop semantics
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Dropping producer closes the channel.
+    #[test]
+    fn spsc_drop_producer_closes(capacity in 1usize..=64) {
+        let (tx, rx) = channel::<u8>(capacity);
+        prop_assert!(!rx.is_closed());
+        drop(tx);
+        prop_assert!(rx.is_closed());
+    }
+
+    /// Items sent before producer drop are still receivable.
+    #[test]
+    fn spsc_items_survive_producer_drop(
+        values in prop::collection::vec(any::<u32>(), 1..50),
+    ) {
+        let cap = values.len();
+        let (tx, rx) = channel(cap);
+        for &v in &values {
+            tx.try_send(v).unwrap();
+        }
+        drop(tx);
+
+        let mut received = Vec::new();
+        while let Some(v) = rx.try_recv() {
+            received.push(v);
+        }
+        prop_assert_eq!(&received, &values,
+            "items should be receivable after producer drop");
+    }
+
+    /// After producer drop and full drain, try_recv returns None.
+    #[test]
+    fn spsc_fully_drained_after_drop(
+        values in prop::collection::vec(any::<u8>(), 0..30),
+    ) {
+        let cap = values.len().max(1);
+        let (tx, rx) = channel(cap);
+        for &v in &values {
+            tx.try_send(v).unwrap();
+        }
+        drop(tx);
+
+        for _ in 0..values.len() {
+            let _ = rx.try_recv();
+        }
+        prop_assert_eq!(rx.try_recv(), None,
+            "should get None after full drain post-drop");
+        prop_assert_eq!(rx.depth(), 0);
+    }
+}
+
+// =========================================================================
+// Failed send returns original value
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Failed try_send returns the exact value that was passed in.
+    #[test]
+    fn spsc_failed_send_returns_value(
+        capacity in 1usize..=8,
+        fill_values in prop::collection::vec(any::<i32>(), 1..=8),
+        extra_value in any::<i32>(),
+    ) {
+        let cap = capacity.min(fill_values.len());
+        let (tx, _rx) = channel::<i32>(cap);
+
+        // Fill to capacity
+        for &v in &fill_values[..cap] {
+            let _ = tx.try_send(v);
+        }
+
+        // Next send should fail and return the value
+        let result = tx.try_send(extra_value);
+        prop_assert_eq!(result, Err(extra_value),
+            "failed send should return the exact value");
+    }
+
+    /// Closed channel try_send returns the exact value.
+    #[test]
+    fn spsc_closed_send_returns_value(value in any::<i64>()) {
+        let (tx, _rx) = channel::<i64>(4);
+        tx.close();
+        let result = tx.try_send(value);
+        prop_assert_eq!(result, Err(value),
+            "closed channel send should return exact value");
+    }
+}
+
+// =========================================================================
+// Capacity-1 edge cases (minimal buffer)
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// Capacity-1 channel: each send must be followed by recv before next send.
+    #[test]
+    fn spsc_capacity_one_alternating(values in prop::collection::vec(any::<i16>(), 1..100)) {
+        let (tx, rx) = channel::<i16>(1);
+
+        for &v in &values {
+            prop_assert!(tx.try_send(v).is_ok());
+            prop_assert_eq!(tx.depth(), 1);
+            // Second send must fail
+            prop_assert!(tx.try_send(v).is_err());
+
+            let got = rx.try_recv();
+            prop_assert_eq!(got, Some(v));
+            prop_assert_eq!(tx.depth(), 0);
+        }
+    }
+
+    /// Capacity-1 channel preserves full FIFO across alternating pattern.
+    #[test]
+    fn spsc_capacity_one_fifo(values in prop::collection::vec(any::<u32>(), 1..50)) {
+        let (tx, rx) = channel::<u32>(1);
+        let mut received = Vec::new();
+
+        for &v in &values {
+            tx.try_send(v).unwrap();
+            received.push(rx.try_recv().unwrap());
+        }
+
+        prop_assert_eq!(&received, &values, "capacity-1 FIFO broken");
+    }
+}
+
+// =========================================================================
+// Depth precision (increment/decrement by exactly 1)
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Depth increments by exactly 1 on successful send.
+    #[test]
+    fn spsc_depth_increments_on_send(
+        capacity in 2usize..=32,
+        count in 1usize..=32,
+    ) {
+        let count = count.min(capacity);
+        let (tx, _rx) = channel::<u32>(capacity);
+
+        for i in 0..count {
+            let depth_before = tx.depth();
+            tx.try_send(i as u32).unwrap();
+            prop_assert_eq!(
+                tx.depth(),
+                depth_before + 1,
+                "depth should increment by 1 after send"
+            );
+        }
+    }
+
+    /// Depth decrements by exactly 1 on successful recv.
+    #[test]
+    fn spsc_depth_decrements_on_recv(
+        capacity in 2usize..=32,
+        count in 1usize..=32,
+    ) {
+        let count = count.min(capacity);
+        let (tx, rx) = channel::<u32>(capacity);
+
+        for i in 0..count {
+            tx.try_send(i as u32).unwrap();
+        }
+
+        for _ in 0..count {
+            let depth_before = rx.depth();
+            rx.try_recv().unwrap();
+            prop_assert_eq!(
+                rx.depth(),
+                depth_before - 1,
+                "depth should decrement by 1 after recv"
+            );
+        }
+    }
+
+    /// Failed send does not change depth.
+    #[test]
+    fn spsc_failed_send_no_depth_change(capacity in 1usize..=16) {
+        let (tx, _rx) = channel::<u32>(capacity);
+
+        // Fill to capacity
+        for i in 0..capacity as u32 {
+            tx.try_send(i).unwrap();
+        }
+        let full_depth = tx.depth();
+        prop_assert_eq!(full_depth, capacity);
+
+        // Failed sends should not change depth
+        for _ in 0..5 {
+            let _ = tx.try_send(999);
+            prop_assert_eq!(tx.depth(), full_depth, "depth changed after failed send");
+        }
+    }
+
+    /// Failed recv (empty) does not change depth.
+    #[test]
+    fn spsc_failed_recv_no_depth_change(capacity in 1usize..=64) {
+        let (_tx, rx) = channel::<u32>(capacity);
+        prop_assert_eq!(rx.depth(), 0);
+
+        for _ in 0..5 {
+            let _ = rx.try_recv();
+            prop_assert_eq!(rx.depth(), 0, "depth changed after failed recv");
+        }
+    }
+}
+
+// =========================================================================
+// Partial drain then refill across wrap boundary
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(150))]
+
+    /// Partial drain then refill preserves FIFO across internal wrap boundary.
+    #[test]
+    fn spsc_partial_drain_refill_fifo(
+        capacity in 2usize..=16,
+        drain_fraction_pct in 25_u32..75,
+    ) {
+        let (tx, rx) = channel::<u32>(capacity);
+
+        // Fill to capacity
+        for i in 0..capacity as u32 {
+            tx.try_send(i).unwrap();
+        }
+
+        // Drain a fraction
+        let drain_count = ((capacity as u32 * drain_fraction_pct) / 100).max(1) as usize;
+        let drain_count = drain_count.min(capacity);
+        let mut received = Vec::new();
+        for _ in 0..drain_count {
+            if let Some(v) = rx.try_recv() {
+                received.push(v);
+            }
+        }
+        prop_assert_eq!(received.len(), drain_count);
+
+        // Refill the drained slots
+        let refill_start = capacity as u32;
+        for i in 0..drain_count as u32 {
+            prop_assert!(tx.try_send(refill_start + i).is_ok());
+        }
+
+        // Drain everything and verify FIFO
+        let mut all_remaining = Vec::new();
+        while let Some(v) = rx.try_recv() {
+            all_remaining.push(v);
+        }
+
+        // Expected: items [drain_count..capacity], then [capacity..capacity+drain_count]
+        let expected: Vec<u32> = (drain_count as u32..capacity as u32)
+            .chain(refill_start..refill_start + drain_count as u32)
+            .collect();
+        prop_assert_eq!(all_remaining, expected, "FIFO broken across wrap boundary");
+    }
+}
+
+// =========================================================================
+// Drop producer: depth preserved and buffer drainable
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(150))]
+
+    /// Dropping producer preserves depth and all buffered items are drainable.
+    #[test]
+    fn spsc_drop_producer_preserves_depth_and_drain(
+        capacity in 1usize..=32,
+        values in prop::collection::vec(any::<u32>(), 0..32),
+    ) {
+        let fill_count = values.len().min(capacity);
+        let (tx, rx) = channel::<u32>(capacity);
+
+        for &v in values.iter().take(fill_count) {
+            let _ = tx.try_send(v);
+        }
+
+        let depth_before_drop = rx.depth();
+        drop(tx);
+
+        prop_assert!(rx.is_closed(), "consumer should see closed after producer drop");
+        prop_assert_eq!(rx.depth(), depth_before_drop, "depth should not change on drop");
+
+        // All buffered items should still be drainable
+        let mut drained = 0;
+        while rx.try_recv().is_some() {
+            drained += 1;
+        }
+        prop_assert_eq!(drained, depth_before_drop, "should drain all buffered items");
+    }
+}
+
+// =========================================================================
+// Long-sequence stress invariants
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Long random operation sequences preserve all invariants.
+    #[test]
+    fn spsc_long_sequence_invariants(
+        capacity in 1usize..=16,
+        ops in arb_ops(1000),
+    ) {
+        let (tx, rx) = channel(capacity);
+        let mut total_sent: u64 = 0;
+        let mut total_recv: u64 = 0;
+
+        for op in &ops {
+            match *op {
+                Op::Send(v) => {
+                    if tx.try_send(v).is_ok() {
+                        total_sent += 1;
+                    }
+                }
+                Op::Recv => {
+                    if rx.try_recv().is_some() {
+                        total_recv += 1;
+                    }
+                }
+                Op::Close => {
+                    tx.close();
+                }
+            }
+
+            // Invariant: depth = sent - received (for items still in buffer)
+            let expected_depth = (total_sent - total_recv) as usize;
+            prop_assert_eq!(
+                tx.depth(), expected_depth,
+                "depth invariant violated: sent={}, recv={}, depth={}",
+                total_sent, total_recv, tx.depth()
+            );
+            prop_assert!(tx.depth() <= capacity, "depth exceeds capacity");
+        }
     }
 }
