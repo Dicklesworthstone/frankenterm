@@ -1,5 +1,5 @@
 use frankenterm_core::resize_scheduler::{
-    ResizeIntent, ResizeScheduler, ResizeSchedulerConfig, ResizeWorkClass,
+    ResizeDomain, ResizeIntent, ResizeScheduler, ResizeSchedulerConfig, ResizeWorkClass,
 };
 
 fn intent(
@@ -15,6 +15,8 @@ fn intent(
         scheduler_class,
         work_units,
         submitted_at_ms,
+        domain: ResizeDomain::default(),
+        tab_id: None,
     }
 }
 

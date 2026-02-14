@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::resize_scheduler::{ResizeIntent, ResizeWorkClass};
+use crate::resize_scheduler::{ResizeDomain, ResizeIntent, ResizeWorkClass};
 
 /// Priority lane for a planned reflow range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +127,8 @@ impl ReflowSchedulingHook {
             scheduler_class: self.scheduler_class,
             work_units: self.work_units,
             submitted_at_ms,
+            domain: ResizeDomain::default(),
+            tab_id: None,
         }
     }
 }

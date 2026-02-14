@@ -8,12 +8,18 @@
 //! - frame-budget-aware scheduling
 //! - starvation protection for background work via deferral aging
 //! - input-first guardrails that reserve budget under interaction backlog
+//! - cross-pane resize storm detection and deduplication (`wa-1u90p.5.3`)
+//! - domain-aware throttling with per-domain budget caps (`wa-1u90p.5.3`)
 //! - observability via scheduler metrics and snapshots
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
+use crate::resize_invariants::{
+    ResizeInvariantReport, ResizeInvariantTelemetry, ResizePhase, check_phase_transition,
+    check_scheduler_invariants, check_scheduler_snapshot_row_invariants,
+};
 
 /// Global scheduling class for a resize intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -34,6 +40,52 @@ impl ResizeWorkClass {
     }
 }
 
+/// Domain classification for resize intents.
+///
+/// Each pane belongs to a domain representing its connection context.
+/// Domains enable per-domain throttling and fair budget partitioning
+/// so that remote-domain resize storms don't starve local panes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResizeDomain {
+    /// Local panes on the same host.
+    Local,
+    /// Remote panes connected via SSH.
+    Ssh { host: String },
+    /// Remote panes connected via mux protocol.
+    Mux { endpoint: String },
+}
+
+impl ResizeDomain {
+    /// Return a domain key for grouping/throttling purposes.
+    #[must_use]
+    pub fn key(&self) -> String {
+        match self {
+            Self::Local => "local".to_string(),
+            Self::Ssh { host } => format!("ssh:{host}"),
+            Self::Mux { endpoint } => format!("mux:{endpoint}"),
+        }
+    }
+
+    /// Default budget share weight for this domain type.
+    ///
+    /// Local panes get higher default weight since they are more latency-sensitive.
+    #[allow(dead_code)]
+    const fn default_weight(&self) -> u32 {
+        match self {
+            Self::Local => 4,
+            Self::Ssh { .. } => 2,
+            Self::Mux { .. } => 1,
+        }
+    }
+}
+
+impl Default for ResizeDomain {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
 /// A resize intent admitted into the scheduler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResizeIntent {
@@ -48,6 +100,13 @@ pub struct ResizeIntent {
     pub work_units: u32,
     /// Submission timestamp (epoch ms).
     pub submitted_at_ms: u64,
+    /// Domain that owns this pane, used for fair budget partitioning.
+    #[serde(default)]
+    pub domain: ResizeDomain,
+    /// Optional tab grouping ID for storm dedup.
+    /// Intents from the same tab within a storm window are collapsed.
+    #[serde(default)]
+    pub tab_id: Option<u64>,
 }
 
 impl ResizeIntent {
@@ -92,6 +151,15 @@ pub struct ResizeSchedulerConfig {
     pub max_deferrals_before_drop: u32,
     /// Maximum number of lifecycle events retained for debug introspection.
     pub max_lifecycle_events: usize,
+    /// Duration in milliseconds of the storm detection sliding window.
+    /// Set to `0` to disable storm detection.
+    pub storm_window_ms: u64,
+    /// Number of intents from the same tab within the storm window to trigger storm mode.
+    pub storm_threshold_intents: u32,
+    /// Maximum picks allowed per tab per frame during storm conditions.
+    pub max_storm_picks_per_tab: u32,
+    /// Enable per-domain budget partitioning for fair cross-domain scheduling.
+    pub domain_budget_enabled: bool,
 }
 
 impl Default for ResizeSchedulerConfig {
@@ -111,6 +179,10 @@ impl Default for ResizeSchedulerConfig {
             max_pending_panes: 128,
             max_deferrals_before_drop: 12,
             max_lifecycle_events: 256,
+            storm_window_ms: 50,
+            storm_threshold_intents: 4,
+            max_storm_picks_per_tab: 2,
+            domain_budget_enabled: false,
         }
     }
 }
@@ -222,6 +294,12 @@ pub struct ResizeSchedulerMetrics {
     pub completed_active: u64,
     /// Count of completion attempts rejected due to sequence mismatch.
     pub completion_rejected: u64,
+    /// Count of storm conditions detected (tab exceeded storm threshold).
+    pub storm_events_detected: u64,
+    /// Count of candidate picks throttled by per-tab storm limit.
+    pub storm_picks_throttled: u64,
+    /// Count of candidate picks throttled by domain budget cap.
+    pub domain_budget_throttled: u64,
 }
 
 /// Overload drop reason for pending/intent admission controls.
@@ -435,6 +513,12 @@ pub struct ResizeSchedulerDebugSnapshot {
     pub scheduler: ResizeSchedulerSnapshot,
     /// Recent lifecycle events (oldest first).
     pub lifecycle_events: Vec<ResizeTransactionLifecycleEvent>,
+    /// Invariant report computed from scheduler + lifecycle state.
+    #[serde(default)]
+    pub invariants: ResizeInvariantReport,
+    /// Aggregate invariant counters for quick health checks.
+    #[serde(default)]
+    pub invariant_telemetry: ResizeInvariantTelemetry,
 }
 
 /// Stalled active transaction summary derived from scheduler debug state.
@@ -511,7 +595,7 @@ struct PaneState {
     aging_credit: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Candidate {
     pane_id: u64,
     score: u32,
@@ -519,6 +603,9 @@ struct Candidate {
     intent_seq: u64,
     submitted_at_ms: u64,
     work_units: u32,
+    domain_key: String,
+    domain_weight: u32,
+    tab_id: Option<u64>,
 }
 
 /// Global resize scheduler.
@@ -529,6 +616,8 @@ pub struct ResizeScheduler {
     metrics: ResizeSchedulerMetrics,
     lifecycle_events: VecDeque<ResizeTransactionLifecycleEvent>,
     next_lifecycle_event_seq: u64,
+    /// Per-tab submission timestamps for storm detection.
+    tab_submit_history: HashMap<u64, VecDeque<u64>>,
 }
 
 impl ResizeScheduler {
@@ -541,6 +630,7 @@ impl ResizeScheduler {
             metrics: ResizeSchedulerMetrics::default(),
             lifecycle_events: VecDeque::new(),
             next_lifecycle_event_seq: 0,
+            tab_submit_history: HashMap::new(),
         };
         scheduler.publish_debug_snapshot();
         scheduler
@@ -613,6 +703,8 @@ impl ResizeScheduler {
         let pane_id = intent.pane_id;
         let intent_seq = intent.intent_seq;
         let observed_at_ms = Some(intent.submitted_at_ms);
+        let tab_id = intent.tab_id;
+        let submitted_at_ms = intent.submitted_at_ms;
         if !self.control_plane_active() {
             self.metrics.suppressed_by_gate = self.metrics.suppressed_by_gate.saturating_add(1);
             self.push_lifecycle_event(
@@ -712,6 +804,23 @@ impl ResizeScheduler {
                 replaced_pending_seq,
             },
         );
+
+        // Storm detection: track per-tab submission rate.
+        if let Some(tab) = tab_id {
+            if self.config.storm_window_ms > 0 && self.config.storm_threshold_intents > 0 {
+                let history = self.tab_submit_history.entry(tab).or_default();
+                let cutoff = submitted_at_ms.saturating_sub(self.config.storm_window_ms);
+                while history.front().is_some_and(|&ts| ts < cutoff) {
+                    history.pop_front();
+                }
+                history.push_back(submitted_at_ms);
+                if history.len() as u32 >= self.config.storm_threshold_intents {
+                    self.metrics.storm_events_detected =
+                        self.metrics.storm_events_detected.saturating_add(1);
+                }
+            }
+        }
+
         self.publish_debug_snapshot();
 
         SubmitOutcome::Accepted {
@@ -914,7 +1023,63 @@ impl ResizeScheduler {
         }
         let mut forced_over_budget_served = false;
 
+        // Domain budget partitioning: compute per-domain budget allocations.
+        let domain_budgets: HashMap<String, u32> = if self.config.domain_budget_enabled {
+            let mut domain_weights: HashMap<String, u32> = HashMap::new();
+            for c in &candidates {
+                domain_weights
+                    .entry(c.domain_key.clone())
+                    .or_insert(c.domain_weight);
+            }
+            let total_weight: u32 = domain_weights.values().sum();
+            if total_weight > 0 {
+                domain_weights
+                    .into_iter()
+                    .map(|(key, weight)| {
+                        let share = (u64::from(effective_budget_units) * u64::from(weight)
+                            / u64::from(total_weight)) as u32;
+                        (key, share.max(1))
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            }
+        } else {
+            HashMap::new()
+        };
+        let mut domain_spent: HashMap<String, u32> = HashMap::new();
+        let mut tab_picks: HashMap<u64, u32> = HashMap::new();
+
         for candidate in candidates {
+            // Storm per-tab throttle: limit picks from tabs in storm state.
+            if let Some(tab) = candidate.tab_id {
+                if self.is_tab_in_storm(tab) {
+                    let picks = tab_picks.get(&tab).copied().unwrap_or(0);
+                    if picks >= self.config.max_storm_picks_per_tab {
+                        self.metrics.storm_picks_throttled =
+                            self.metrics.storm_picks_throttled.saturating_add(1);
+                        deferred_panes.push(candidate.pane_id);
+                        continue;
+                    }
+                }
+            }
+
+            // Domain budget throttle: enforce per-domain budget caps.
+            if self.config.domain_budget_enabled && !candidate.forced_by_starvation {
+                if let Some(&budget) = domain_budgets.get(&candidate.domain_key) {
+                    let spent = domain_spent
+                        .get(&candidate.domain_key)
+                        .copied()
+                        .unwrap_or(0);
+                    if spent.saturating_add(candidate.work_units) > budget {
+                        self.metrics.domain_budget_throttled =
+                            self.metrics.domain_budget_throttled.saturating_add(1);
+                        deferred_panes.push(candidate.pane_id);
+                        continue;
+                    }
+                }
+            }
+
             let remaining_units = effective_budget_units.saturating_sub(spent_units);
             let remaining_total_units = budget_units.saturating_sub(spent_units);
             let fits_budget = candidate.work_units <= remaining_units;
@@ -992,6 +1157,14 @@ impl ResizeScheduler {
                     phase: ResizeExecutionPhase::Preparing,
                 },
             );
+
+            // Track domain and tab usage for throttling within this frame.
+            if self.config.domain_budget_enabled {
+                *domain_spent.entry(candidate.domain_key).or_insert(0) += candidate.work_units;
+            }
+            if let Some(tab) = candidate.tab_id {
+                *tab_picks.entry(tab).or_insert(0) += 1;
+            }
         }
 
         self.apply_deferral_aging(&deferred_panes);
@@ -1061,11 +1234,88 @@ impl ResizeScheduler {
     /// Produce debug snapshot bundle with scheduler state and lifecycle events.
     #[must_use]
     pub fn debug_snapshot(&self, lifecycle_event_limit: usize) -> ResizeSchedulerDebugSnapshot {
+        let scheduler = self.snapshot();
+        let lifecycle_events = self.lifecycle_events(lifecycle_event_limit);
+        let (invariants, invariant_telemetry) =
+            self.evaluate_invariants(&scheduler, &lifecycle_events);
         ResizeSchedulerDebugSnapshot {
             gate: self.gate_state(),
-            scheduler: self.snapshot(),
-            lifecycle_events: self.lifecycle_events(lifecycle_event_limit),
+            scheduler,
+            lifecycle_events,
+            invariants,
+            invariant_telemetry,
         }
+    }
+
+    fn lifecycle_stage_to_invariant_phase(stage: ResizeLifecycleStage) -> Option<ResizePhase> {
+        match stage {
+            ResizeLifecycleStage::Queued => Some(ResizePhase::Queued),
+            ResizeLifecycleStage::Preparing => Some(ResizePhase::Preparing),
+            ResizeLifecycleStage::Reflowing => Some(ResizePhase::Reflowing),
+            ResizeLifecycleStage::Presenting => Some(ResizePhase::Presenting),
+            ResizeLifecycleStage::Committed => Some(ResizePhase::Committed),
+            ResizeLifecycleStage::Cancelled => Some(ResizePhase::Cancelled),
+            ResizeLifecycleStage::Scheduled | ResizeLifecycleStage::Failed => None,
+        }
+    }
+
+    fn evaluate_invariants(
+        &self,
+        snapshot: &ResizeSchedulerSnapshot,
+        lifecycle_events: &[ResizeTransactionLifecycleEvent],
+    ) -> (ResizeInvariantReport, ResizeInvariantTelemetry) {
+        let mut report = ResizeInvariantReport::new();
+
+        for pane in &snapshot.panes {
+            let queue_depth = usize::from(pane.pending_seq.is_some());
+            check_scheduler_invariants(
+                &mut report,
+                pane.pane_id,
+                pane.active_seq,
+                pane.latest_seq,
+                queue_depth,
+                false,
+            );
+            check_scheduler_snapshot_row_invariants(
+                &mut report,
+                pane.pane_id,
+                pane.latest_seq,
+                pane.pending_seq,
+                pane.active_seq,
+                pane.active_phase.is_some(),
+            );
+        }
+
+        let mut last_phase_by_tx: HashMap<(u64, u64), ResizePhase> = HashMap::new();
+        for event in lifecycle_events {
+            if let Some(next_phase) = Self::lifecycle_stage_to_invariant_phase(event.stage) {
+                let key = (event.pane_id, event.intent_seq);
+                let prev_phase = last_phase_by_tx.get(&key).copied().unwrap_or(ResizePhase::Idle);
+                check_phase_transition(
+                    &mut report,
+                    Some(event.pane_id),
+                    Some(event.intent_seq),
+                    prev_phase,
+                    next_phase,
+                );
+                last_phase_by_tx.insert(key, next_phase);
+            }
+
+            if matches!(event.stage, ResizeLifecycleStage::Committed) {
+                check_scheduler_invariants(
+                    &mut report,
+                    event.pane_id,
+                    event.active_seq,
+                    event.latest_seq,
+                    usize::from(event.pending_seq.is_some()),
+                    true,
+                );
+            }
+        }
+
+        let mut telemetry = ResizeInvariantTelemetry::default();
+        telemetry.absorb(&report);
+        (report, telemetry)
     }
 
     fn collect_candidates(&self) -> Vec<Candidate> {
@@ -1094,6 +1344,9 @@ impl ResizeScheduler {
                 intent_seq: intent.intent_seq,
                 submitted_at_ms: intent.submitted_at_ms,
                 work_units: intent.normalized_work_units(),
+                domain_key: intent.domain.key(),
+                domain_weight: intent.domain.default_weight(),
+                tab_id: intent.tab_id,
             });
         }
         candidates
@@ -1203,6 +1456,15 @@ impl ResizeScheduler {
         }
     }
 
+    fn is_tab_in_storm(&self, tab_id: u64) -> bool {
+        self.config.storm_window_ms > 0
+            && self.config.storm_threshold_intents > 0
+            && self
+                .tab_submit_history
+                .get(&tab_id)
+                .is_some_and(|h| h.len() as u32 >= self.config.storm_threshold_intents)
+    }
+
     fn push_lifecycle_event(
         &mut self,
         pane_id: u64,
@@ -1242,10 +1504,11 @@ impl ResizeScheduler {
 #[cfg(test)]
 mod tests {
     use super::{
-        ResizeExecutionPhase, ResizeIntent, ResizeLifecycleDetail, ResizeLifecycleStage,
-        ResizeScheduler, ResizeSchedulerConfig, ResizeSchedulerDebugSnapshot, ResizeWorkClass,
-        SubmitOutcome,
+        ResizeDomain, ResizeExecutionPhase, ResizeIntent, ResizeLifecycleDetail,
+        ResizeLifecycleStage, ResizeScheduler, ResizeSchedulerConfig, ResizeSchedulerDebugSnapshot,
+        ResizeWorkClass, SubmitOutcome,
     };
+    use crate::resize_invariants::ResizeViolationKind;
 
     fn intent(
         pane_id: u64,
@@ -1260,6 +1523,46 @@ mod tests {
             scheduler_class,
             work_units,
             submitted_at_ms,
+            domain: ResizeDomain::default(),
+            tab_id: None,
+        }
+    }
+
+    fn intent_with_tab(
+        pane_id: u64,
+        intent_seq: u64,
+        scheduler_class: ResizeWorkClass,
+        work_units: u32,
+        submitted_at_ms: u64,
+        tab_id: Option<u64>,
+    ) -> ResizeIntent {
+        ResizeIntent {
+            pane_id,
+            intent_seq,
+            scheduler_class,
+            work_units,
+            submitted_at_ms,
+            domain: ResizeDomain::default(),
+            tab_id,
+        }
+    }
+
+    fn intent_with_domain(
+        pane_id: u64,
+        intent_seq: u64,
+        scheduler_class: ResizeWorkClass,
+        work_units: u32,
+        submitted_at_ms: u64,
+        domain: ResizeDomain,
+    ) -> ResizeIntent {
+        ResizeIntent {
+            pane_id,
+            intent_seq,
+            scheduler_class,
+            work_units,
+            submitted_at_ms,
+            domain,
+            tab_id: None,
         }
     }
 
@@ -1521,6 +1824,56 @@ mod tests {
     }
 
     #[test]
+    fn debug_snapshot_invariants_clean_for_nominal_transaction() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        let _ = scheduler.submit_intent(intent(42, 1, ResizeWorkClass::Interactive, 1, 1_000));
+        let frame = scheduler.schedule_frame();
+        assert_eq!(frame.scheduled.len(), 1);
+        assert!(scheduler.mark_active_phase(42, 1, ResizeExecutionPhase::Preparing, 1_005));
+        assert!(scheduler.mark_active_phase(42, 1, ResizeExecutionPhase::Reflowing, 1_010));
+        assert!(scheduler.mark_active_phase(42, 1, ResizeExecutionPhase::Presenting, 1_015));
+        assert!(scheduler.complete_active(42, 1));
+
+        let snap = scheduler.debug_snapshot(64);
+        assert!(
+            snap.invariants.is_clean(),
+            "expected no invariant violations, got {:?}",
+            snap.invariants.violations
+        );
+        assert_eq!(snap.invariant_telemetry.critical_count, 0);
+        assert_eq!(snap.invariant_telemetry.error_count, 0);
+    }
+
+    #[test]
+    fn debug_snapshot_invariants_detect_pending_active_sequence_inversion() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        let _ = scheduler.submit_intent(intent(9, 5, ResizeWorkClass::Interactive, 1, 100));
+
+        let state = scheduler
+            .panes
+            .get_mut(&9)
+            .expect("pane state should exist after submit");
+        state.latest_seq = Some(5);
+        state.active_seq = Some(5);
+        state.active_phase = Some(ResizeExecutionPhase::Preparing);
+        state.pending = Some(intent(9, 4, ResizeWorkClass::Background, 1, 101));
+
+        let snap = scheduler.debug_snapshot(16);
+        assert!(
+            !snap.invariants.is_clean(),
+            "expected invariant violations for inverted pending/active seq"
+        );
+        assert!(snap.invariants.violations.iter().any(|violation| {
+            matches!(
+                violation.kind,
+                ResizeViolationKind::ConcurrentPaneTransaction
+                    | ResizeViolationKind::IntentSequenceRegression
+            )
+        }));
+        assert!(snap.invariant_telemetry.total_failures > 0);
+    }
+
+    #[test]
     fn active_phase_transitions_are_recorded_with_explicit_labels() {
         let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
         let _ = scheduler.submit_intent(intent(5, 1, ResizeWorkClass::Interactive, 1, 1_000));
@@ -1773,5 +2126,371 @@ mod tests {
         assert_eq!(frame.effective_resize_budget_units, 1);
         assert_eq!(frame.input_reserved_units, 1);
         assert_eq!(scheduler.metrics().input_guardrail_deferrals, 1);
+    }
+
+    #[test]
+    fn storm_detection_throttles_per_tab_picks() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 20,
+            storm_window_ms: 100,
+            storm_threshold_intents: 3,
+            max_storm_picks_per_tab: 1,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        // 4 panes in tab 1, all submit within storm window -> triggers storm.
+        let _ = scheduler.submit_intent(intent_with_tab(
+            1,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            100,
+            Some(1),
+        ));
+        let _ = scheduler.submit_intent(intent_with_tab(
+            2,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            110,
+            Some(1),
+        ));
+        let _ = scheduler.submit_intent(intent_with_tab(
+            3,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            120,
+            Some(1),
+        ));
+        let _ = scheduler.submit_intent(intent_with_tab(
+            4,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            130,
+            Some(1),
+        ));
+        // 1 pane in tab 2 (no storm).
+        let _ = scheduler.submit_intent(intent_with_tab(
+            5,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            140,
+            Some(2),
+        ));
+
+        let frame = scheduler.schedule_frame();
+        let tab1_picks = frame.scheduled.iter().filter(|s| s.pane_id <= 4).count();
+        let tab2_picks = frame.scheduled.iter().filter(|s| s.pane_id == 5).count();
+        assert_eq!(tab1_picks, 1, "storm should throttle tab 1 to 1 pick");
+        assert_eq!(tab2_picks, 1, "tab 2 should not be throttled");
+        assert!(scheduler.metrics().storm_events_detected > 0);
+        assert!(scheduler.metrics().storm_picks_throttled > 0);
+    }
+
+    #[test]
+    fn storm_detection_inactive_below_threshold() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 20,
+            storm_window_ms: 100,
+            storm_threshold_intents: 5,
+            max_storm_picks_per_tab: 1,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        // Only 3 panes in tab 1 (threshold is 5), so no storm.
+        let _ = scheduler.submit_intent(intent_with_tab(
+            1,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            100,
+            Some(1),
+        ));
+        let _ = scheduler.submit_intent(intent_with_tab(
+            2,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            110,
+            Some(1),
+        ));
+        let _ = scheduler.submit_intent(intent_with_tab(
+            3,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            120,
+            Some(1),
+        ));
+
+        let frame = scheduler.schedule_frame();
+        assert_eq!(
+            frame.scheduled.len(),
+            3,
+            "all picks should be served without storm"
+        );
+        assert_eq!(scheduler.metrics().storm_events_detected, 0);
+        assert_eq!(scheduler.metrics().storm_picks_throttled, 0);
+    }
+
+    #[test]
+    fn storm_detection_disabled_when_window_is_zero() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 20,
+            storm_window_ms: 0,
+            storm_threshold_intents: 1,
+            max_storm_picks_per_tab: 1,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        // Many panes in same tab, but storm disabled via window=0.
+        for pane in 1..=5 {
+            let _ = scheduler.submit_intent(intent_with_tab(
+                pane,
+                1,
+                ResizeWorkClass::Interactive,
+                1,
+                100,
+                Some(1),
+            ));
+        }
+
+        let frame = scheduler.schedule_frame();
+        assert_eq!(
+            frame.scheduled.len(),
+            5,
+            "storm disabled, all should schedule"
+        );
+        assert_eq!(scheduler.metrics().storm_events_detected, 0);
+        assert_eq!(scheduler.metrics().storm_picks_throttled, 0);
+    }
+
+    #[test]
+    fn domain_budget_partitions_fairly() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 6,
+            domain_budget_enabled: true,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        // 3 local panes (weight 4), 3 ssh panes (weight 2).
+        // Total weight = 4 + 2 = 6.
+        // Local budget share: 6 * 4/6 = 4 units.
+        // SSH budget share: 6 * 2/6 = 2 units.
+        let _ = scheduler.submit_intent(intent_with_domain(
+            1,
+            1,
+            ResizeWorkClass::Interactive,
+            2,
+            100,
+            ResizeDomain::Local,
+        ));
+        let _ = scheduler.submit_intent(intent_with_domain(
+            2,
+            1,
+            ResizeWorkClass::Interactive,
+            2,
+            101,
+            ResizeDomain::Local,
+        ));
+        let _ = scheduler.submit_intent(intent_with_domain(
+            3,
+            1,
+            ResizeWorkClass::Interactive,
+            2,
+            102,
+            ResizeDomain::Local,
+        ));
+        let _ = scheduler.submit_intent(intent_with_domain(
+            4,
+            1,
+            ResizeWorkClass::Interactive,
+            2,
+            103,
+            ResizeDomain::Ssh {
+                host: "remote".into(),
+            },
+        ));
+        let _ = scheduler.submit_intent(intent_with_domain(
+            5,
+            1,
+            ResizeWorkClass::Interactive,
+            2,
+            104,
+            ResizeDomain::Ssh {
+                host: "remote".into(),
+            },
+        ));
+        let _ = scheduler.submit_intent(intent_with_domain(
+            6,
+            1,
+            ResizeWorkClass::Interactive,
+            2,
+            105,
+            ResizeDomain::Ssh {
+                host: "remote".into(),
+            },
+        ));
+
+        let frame = scheduler.schedule_frame();
+        let local_picks = frame.scheduled.iter().filter(|s| s.pane_id <= 3).count();
+        let ssh_picks = frame.scheduled.iter().filter(|s| s.pane_id > 3).count();
+        assert!(
+            local_picks <= 2,
+            "local should be capped at ~4 units (2 picks of 2): got {local_picks}"
+        );
+        assert!(
+            ssh_picks <= 1,
+            "ssh should be capped at ~2 units (1 pick of 2): got {ssh_picks}"
+        );
+        assert!(scheduler.metrics().domain_budget_throttled > 0);
+    }
+
+    #[test]
+    fn domain_budget_disabled_by_default() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 6,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        // Mixed domains, but domain_budget_enabled is false (default).
+        let _ = scheduler.submit_intent(intent_with_domain(
+            1,
+            1,
+            ResizeWorkClass::Interactive,
+            2,
+            100,
+            ResizeDomain::Local,
+        ));
+        let _ = scheduler.submit_intent(intent_with_domain(
+            2,
+            1,
+            ResizeWorkClass::Interactive,
+            2,
+            101,
+            ResizeDomain::Local,
+        ));
+        let _ = scheduler.submit_intent(intent_with_domain(
+            3,
+            1,
+            ResizeWorkClass::Interactive,
+            2,
+            102,
+            ResizeDomain::Local,
+        ));
+
+        let frame = scheduler.schedule_frame();
+        assert_eq!(
+            frame.scheduled.len(),
+            3,
+            "no domain budget: all local panes scheduled"
+        );
+        assert_eq!(scheduler.metrics().domain_budget_throttled, 0);
+    }
+
+    #[test]
+    fn forced_starvation_bypasses_domain_throttle() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 4,
+            domain_budget_enabled: true,
+            max_deferrals_before_force: 0,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        // Local interactive pane (weight 4) and SSH background pane (weight 2).
+        // With budget=4: local share = 4*4/6 = 2, ssh share = 4*2/6 = 1.
+        // SSH pane needs 2 units but SSH budget is only 1.
+        // However, starvation forcing should bypass domain budget check.
+        let _ = scheduler.submit_intent(intent_with_domain(
+            1,
+            1,
+            ResizeWorkClass::Interactive,
+            2,
+            100,
+            ResizeDomain::Local,
+        ));
+        let _ = scheduler.submit_intent(intent_with_domain(
+            2,
+            1,
+            ResizeWorkClass::Background,
+            2,
+            101,
+            ResizeDomain::Ssh {
+                host: "slow".into(),
+            },
+        ));
+
+        let frame = scheduler.schedule_frame();
+        let bg_pick = frame.scheduled.iter().find(|s| s.pane_id == 2);
+        assert!(
+            bg_pick.is_some(),
+            "starvation-forced background should be scheduled"
+        );
+        assert!(bg_pick.unwrap().forced_by_starvation);
+    }
+
+    #[test]
+    fn storm_window_prunes_old_submissions() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 20,
+            storm_window_ms: 50,
+            storm_threshold_intents: 3,
+            max_storm_picks_per_tab: 1,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        // Submit 2 intents early, then 2 late (outside storm window from the first).
+        let _ = scheduler.submit_intent(intent_with_tab(
+            1,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            100,
+            Some(1),
+        ));
+        let _ = scheduler.submit_intent(intent_with_tab(
+            2,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            110,
+            Some(1),
+        ));
+        // These arrive 60ms later; the first two should be pruned from the window.
+        let _ = scheduler.submit_intent(intent_with_tab(
+            3,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            160,
+            Some(1),
+        ));
+        let _ = scheduler.submit_intent(intent_with_tab(
+            4,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            170,
+            Some(1),
+        ));
+
+        let frame = scheduler.schedule_frame();
+        // Only 2 entries remain in the 50ms window (160, 170), below threshold of 3.
+        assert_eq!(
+            frame.scheduled.len(),
+            4,
+            "no storm: old submissions pruned from window"
+        );
+        assert_eq!(scheduler.metrics().storm_picks_throttled, 0);
     }
 }
