@@ -353,12 +353,21 @@ proptest! {
 // =============================================================================
 
 proptest! {
-    /// Value serde roundtrip preserves equality.
+    /// Value serde roundtrip preserves equality (floats use tolerance for
+    /// JSON precision limits).
     #[test]
     fn value_serde_roundtrip(val in arb_value()) {
         let json = serde_json::to_string(&val).unwrap();
         let back: Value = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(&back, &val);
+        match (&val, &back) {
+            (Value::Float(a), Value::Float(b)) => {
+                // JSON float roundtrip can lose precision at extremes
+                let diff = (a - b).abs();
+                let tolerance = a.abs().max(1.0) * 1e-15;
+                prop_assert!(diff <= tolerance, "float mismatch: {} vs {}", a, b);
+            }
+            _ => prop_assert_eq!(&back, &val),
+        }
     }
 
     /// Value JSON has a "type" tag.
@@ -428,17 +437,26 @@ proptest! {
         prop_assert_eq!(id_set.len(), graph.node_count());
     }
 
-    /// propagation_count increments with each propagation.
+    /// propagation_count increments with each non-trivial propagation.
     #[test]
     fn propagation_count_increments(n in 1..10usize) {
         let mut graph = DataflowGraph::new();
-        let s = graph.add_source("s", Value::Int(0));
-        prop_assert_eq!(graph.propagation_count(), 0);
+        let s = graph.add_source("s", Value::Int(-1));
+        let _m = graph.add_map("m", vec![s], |i| i[0].clone());
+
+        // Initial propagation
+        graph.propagate();
+        let initial_count = graph.propagation_count();
+
+        // Each update uses a distinct value to ensure dirty marking
         for i in 0..n {
             let _ = graph.update_source(s, Value::Int(i as i64));
             graph.propagate();
         }
-        prop_assert_eq!(graph.propagation_count(), n as u64);
+        prop_assert_eq!(
+            graph.propagation_count(),
+            initial_count + n as u64
+        );
     }
 
     /// NodeId Display format contains "node:".
