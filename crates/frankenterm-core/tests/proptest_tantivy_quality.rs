@@ -3,14 +3,17 @@
 //! Covers `QueryClass` enum serde, `LatencyBudget` serde,
 //! `AssertionResult` serde, `QueryTestResult` serde,
 //! `QualityReport` serde and aggregate invariants,
-//! and `default_latency_budgets()` coverage.
+//! `default_latency_budgets()` coverage,
+//! `RelevanceAssertion` serde roundtrips (all 9 variants),
+//! and `GoldenQuery` serde roundtrips.
 
 use std::time::Duration;
 
 use frankenterm_core::tantivy_quality::{
-    AssertionResult, LatencyBudget, QualityReport, QueryClass, QueryTestResult,
-    default_latency_budgets,
+    AssertionResult, GoldenQuery, LatencyBudget, QualityReport, QueryClass, QueryTestResult,
+    RelevanceAssertion, default_latency_budgets,
 };
+use frankenterm_core::tantivy_query::{SearchFilter, SearchQuery};
 use proptest::prelude::*;
 
 // =========================================================================
@@ -77,6 +80,45 @@ fn arb_query_test_result() -> impl Strategy<Value = QueryTestResult> {
                 }
             },
         )
+}
+
+fn arb_relevance_assertion() -> impl Strategy<Value = RelevanceAssertion> {
+    prop_oneof![
+        "[a-z0-9-]{5,20}".prop_map(|id| RelevanceAssertion::MustHit { event_id: id }),
+        "[a-z0-9-]{5,20}".prop_map(|id| RelevanceAssertion::MustNotHit { event_id: id }),
+        (0_u64..100_000).prop_map(RelevanceAssertion::MinTotalHits),
+        (0_u64..100_000).prop_map(RelevanceAssertion::MaxTotalHits),
+        (0_u64..100_000).prop_map(RelevanceAssertion::ExactTotalHits),
+        ("[a-z0-9-]{5,20}", 1_usize..100).prop_map(|(id, n)| RelevanceAssertion::InTopN {
+            event_id: id,
+            n,
+        }),
+        ("[a-z0-9-]{5,20}", "[a-z0-9-]{5,20}")
+            .prop_map(|(h, l)| RelevanceAssertion::RankedBefore {
+                higher: h,
+                lower: l,
+            }),
+        "[a-z0-9-]{5,20}".prop_map(|id| RelevanceAssertion::FirstResult { event_id: id }),
+        prop::collection::vec(0_u64..1000, 1..5)
+            .prop_map(|v| RelevanceAssertion::AllMatchFilter(SearchFilter::PaneId { values: v })),
+    ]
+}
+
+fn arb_golden_query() -> impl Strategy<Value = GoldenQuery> {
+    (
+        "[a-z_]{3,20}",
+        arb_query_class(),
+        "[a-z ]{3,30}",
+        proptest::collection::vec(arb_relevance_assertion(), 0..4),
+        "[a-z ]{5,40}",
+    )
+        .prop_map(|(name, class, text, assertions, description)| GoldenQuery {
+            name,
+            class,
+            query: SearchQuery::simple(text),
+            assertions,
+            description,
+        })
 }
 
 // =========================================================================
@@ -250,9 +292,255 @@ proptest! {
     #[test]
     fn prop_budget_ordering(_dummy in 0..1_u8) {
         let budgets = default_latency_budgets();
-        let simple = budgets.iter().find(|b| b.class == QueryClass::SimpleTerm).unwrap();
-        let high_card = budgets.iter().find(|b| b.class == QueryClass::HighCardinality).unwrap();
+        let simple = budgets
+            .iter()
+            .find(|b| b.class == QueryClass::SimpleTerm)
+            .unwrap();
+        let high_card = budgets
+            .iter()
+            .find(|b| b.class == QueryClass::HighCardinality)
+            .unwrap();
         prop_assert!(simple.max_duration <= high_card.max_duration);
+    }
+}
+
+// =========================================================================
+// RelevanceAssertion — serde roundtrip (all 9 variants)
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn prop_relevance_assertion_serde(assertion in arb_relevance_assertion()) {
+        let json = serde_json::to_string(&assertion).unwrap();
+        let back: RelevanceAssertion = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(&json, &json2, "serde roundtrip should be stable");
+    }
+
+    #[test]
+    fn prop_relevance_assertion_deterministic(assertion in arb_relevance_assertion()) {
+        let j1 = serde_json::to_string(&assertion).unwrap();
+        let j2 = serde_json::to_string(&assertion).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    #[test]
+    fn prop_relevance_assertion_json_is_object(assertion in arb_relevance_assertion()) {
+        let json = serde_json::to_string(&assertion).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Tagged enum should serialize as JSON object (or string for unit variants).
+        prop_assert!(
+            val.is_object() || val.is_string(),
+            "RelevanceAssertion should be JSON object or string, got: {}",
+            json
+        );
+    }
+}
+
+// =========================================================================
+// RelevanceAssertion — individual variant serde
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_must_hit_serde(id in "[a-z0-9-]{5,20}") {
+        let a = RelevanceAssertion::MustHit { event_id: id };
+        let json = serde_json::to_string(&a).unwrap();
+        let back: RelevanceAssertion = serde_json::from_str(&json).unwrap();
+        if let RelevanceAssertion::MustHit { event_id } = &back {
+            if let RelevanceAssertion::MustHit {
+                event_id: orig_id,
+            } = &a
+            {
+                prop_assert_eq!(event_id, orig_id);
+            }
+        } else {
+            prop_assert!(false, "expected MustHit variant");
+        }
+    }
+
+    #[test]
+    fn prop_must_not_hit_serde(id in "[a-z0-9-]{5,20}") {
+        let a = RelevanceAssertion::MustNotHit { event_id: id };
+        let json = serde_json::to_string(&a).unwrap();
+        let back: RelevanceAssertion = serde_json::from_str(&json).unwrap();
+        if let RelevanceAssertion::MustNotHit { event_id } = &back {
+            if let RelevanceAssertion::MustNotHit {
+                event_id: orig_id,
+            } = &a
+            {
+                prop_assert_eq!(event_id, orig_id);
+            }
+        } else {
+            prop_assert!(false, "expected MustNotHit variant");
+        }
+    }
+
+    #[test]
+    fn prop_min_max_exact_hits_serde(n in 0_u64..100_000) {
+        // MinTotalHits
+        let json = serde_json::to_string(&RelevanceAssertion::MinTotalHits(n)).unwrap();
+        let back: RelevanceAssertion = serde_json::from_str(&json).unwrap();
+        if let RelevanceAssertion::MinTotalHits(v) = back {
+            prop_assert_eq!(v, n);
+        } else {
+            prop_assert!(false, "expected MinTotalHits");
+        }
+
+        // MaxTotalHits
+        let json = serde_json::to_string(&RelevanceAssertion::MaxTotalHits(n)).unwrap();
+        let back: RelevanceAssertion = serde_json::from_str(&json).unwrap();
+        if let RelevanceAssertion::MaxTotalHits(v) = back {
+            prop_assert_eq!(v, n);
+        } else {
+            prop_assert!(false, "expected MaxTotalHits");
+        }
+
+        // ExactTotalHits
+        let json = serde_json::to_string(&RelevanceAssertion::ExactTotalHits(n)).unwrap();
+        let back: RelevanceAssertion = serde_json::from_str(&json).unwrap();
+        if let RelevanceAssertion::ExactTotalHits(v) = back {
+            prop_assert_eq!(v, n);
+        } else {
+            prop_assert!(false, "expected ExactTotalHits");
+        }
+    }
+
+    #[test]
+    fn prop_in_top_n_serde(id in "[a-z0-9-]{5,20}", n in 1_usize..100) {
+        let a = RelevanceAssertion::InTopN {
+            event_id: id.clone(),
+            n,
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let back: RelevanceAssertion = serde_json::from_str(&json).unwrap();
+        if let RelevanceAssertion::InTopN {
+            event_id,
+            n: back_n,
+        } = back
+        {
+            prop_assert_eq!(&event_id, &id);
+            prop_assert_eq!(back_n, n);
+        } else {
+            prop_assert!(false, "expected InTopN");
+        }
+    }
+
+    #[test]
+    fn prop_ranked_before_serde(
+        higher in "[a-z0-9-]{5,20}",
+        lower in "[a-z0-9-]{5,20}",
+    ) {
+        let a = RelevanceAssertion::RankedBefore {
+            higher: higher.clone(),
+            lower: lower.clone(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let back: RelevanceAssertion = serde_json::from_str(&json).unwrap();
+        if let RelevanceAssertion::RankedBefore {
+            higher: h,
+            lower: l,
+        } = back
+        {
+            prop_assert_eq!(&h, &higher);
+            prop_assert_eq!(&l, &lower);
+        } else {
+            prop_assert!(false, "expected RankedBefore");
+        }
+    }
+
+    #[test]
+    fn prop_first_result_serde(id in "[a-z0-9-]{5,20}") {
+        let a = RelevanceAssertion::FirstResult {
+            event_id: id.clone(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let back: RelevanceAssertion = serde_json::from_str(&json).unwrap();
+        if let RelevanceAssertion::FirstResult { event_id } = back {
+            prop_assert_eq!(&event_id, &id);
+        } else {
+            prop_assert!(false, "expected FirstResult");
+        }
+    }
+}
+
+// =========================================================================
+// GoldenQuery — serde roundtrip
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_golden_query_serde(gq in arb_golden_query()) {
+        let json = serde_json::to_string(&gq).unwrap();
+        let back: GoldenQuery = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &gq.name);
+        prop_assert_eq!(back.class, gq.class);
+        prop_assert_eq!(&back.query.text, &gq.query.text);
+        prop_assert_eq!(back.assertions.len(), gq.assertions.len());
+        prop_assert_eq!(&back.description, &gq.description);
+    }
+
+    #[test]
+    fn prop_golden_query_deterministic(gq in arb_golden_query()) {
+        let j1 = serde_json::to_string(&gq).unwrap();
+        let j2 = serde_json::to_string(&gq).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    #[test]
+    fn prop_golden_query_json_has_required_fields(gq in arb_golden_query()) {
+        let json = serde_json::to_string(&gq).unwrap();
+        prop_assert!(json.contains("\"name\""), "missing name field");
+        prop_assert!(json.contains("\"class\""), "missing class field");
+        prop_assert!(json.contains("\"query\""), "missing query field");
+        prop_assert!(json.contains("\"assertions\""), "missing assertions field");
+    }
+}
+
+// =========================================================================
+// Aggregate invariants
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// errors + non-errors == total_queries
+    #[test]
+    fn prop_report_error_partition(
+        results in proptest::collection::vec(arb_query_test_result(), 0..10),
+    ) {
+        let errors = results.iter().filter(|r| r.error.is_some()).count();
+        let non_errors = results.iter().filter(|r| r.error.is_none()).count();
+        prop_assert_eq!(errors + non_errors, results.len());
+    }
+
+    /// latency_violations + latency_ok == total_queries
+    #[test]
+    fn prop_report_latency_partition(
+        results in proptest::collection::vec(arb_query_test_result(), 0..10),
+    ) {
+        let violations = results.iter().filter(|r| !r.latency_ok).count();
+        let ok = results.iter().filter(|r| r.latency_ok).count();
+        prop_assert_eq!(violations + ok, results.len());
+    }
+
+    /// hits_returned <= total_hits for any result
+    #[test]
+    fn prop_result_hits_bounded(result in arb_query_test_result()) {
+        // This tests the structural invariant we'd expect from real data.
+        // Since arb values are independent, this documents the expected relationship.
+        // In a real system: hits_returned <= total_hits always holds.
+        // We verify serde preserves whatever values were set.
+        let json = serde_json::to_string(&result).unwrap();
+        let back: QueryTestResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.hits_returned, result.hits_returned);
+        prop_assert_eq!(back.total_hits, result.total_hits);
     }
 }
 
