@@ -22,6 +22,13 @@ pub struct FusedResult {
     pub semantic_rank: Option<usize>,
 }
 
+fn rrf_component_score(rank: usize, k: u32, weight: f32) -> f32 {
+    if weight <= 0.0 {
+        return 0.0;
+    }
+    weight / (k as f32 + rank as f32 + 1.0)
+}
+
 /// Metrics from two-tier blending.
 #[derive(Debug, Clone, Default)]
 pub struct TwoTierMetrics {
@@ -36,17 +43,30 @@ pub struct TwoTierMetrics {
 /// Given multiple ranked lists of (id, score), produce a single fused ranking.
 /// RRF score = sum(1 / (k + rank_i)) for each list where the item appears.
 pub fn rrf_fuse(lexical: &[(u64, f32)], semantic: &[(u64, f32)], k: u32) -> Vec<FusedResult> {
+    rrf_fuse_weighted(lexical, semantic, k, 1.0, 1.0)
+}
+
+/// Weighted Reciprocal Rank Fusion.
+///
+/// `lexical_weight` and `semantic_weight` scale the contribution of each lane.
+pub fn rrf_fuse_weighted(
+    lexical: &[(u64, f32)],
+    semantic: &[(u64, f32)],
+    k: u32,
+    lexical_weight: f32,
+    semantic_weight: f32,
+) -> Vec<FusedResult> {
     let mut scores: HashMap<u64, (f32, Option<usize>, Option<usize>)> = HashMap::new();
 
     for (rank, &(id, _score)) in lexical.iter().enumerate() {
         let entry = scores.entry(id).or_insert((0.0, None, None));
-        entry.0 += 1.0 / (k as f32 + rank as f32 + 1.0);
+        entry.0 += rrf_component_score(rank, k, lexical_weight);
         entry.1 = Some(rank);
     }
 
     for (rank, &(id, _score)) in semantic.iter().enumerate() {
         let entry = scores.entry(id).or_insert((0.0, None, None));
-        entry.0 += 1.0 / (k as f32 + rank as f32 + 1.0);
+        entry.0 += rrf_component_score(rank, k, semantic_weight);
         entry.2 = Some(rank);
     }
 
@@ -64,6 +84,7 @@ pub fn rrf_fuse(lexical: &[(u64, f32)], semantic: &[(u64, f32)], k: u32) -> Vec<
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
     });
     results
 }
@@ -193,6 +214,8 @@ pub struct HybridSearchService {
     rrf_k: u32,
     alpha: f32,
     mode: SearchMode,
+    lexical_weight: f32,
+    semantic_weight: f32,
 }
 
 impl HybridSearchService {
@@ -201,6 +224,8 @@ impl HybridSearchService {
             rrf_k: 60,
             alpha: 0.7,
             mode: SearchMode::Hybrid,
+            lexical_weight: 1.0,
+            semantic_weight: 1.0,
         }
     }
 
@@ -222,6 +247,13 @@ impl HybridSearchService {
         self
     }
 
+    #[must_use]
+    pub fn with_rrf_weights(mut self, lexical_weight: f32, semantic_weight: f32) -> Self {
+        self.lexical_weight = lexical_weight.max(0.0);
+        self.semantic_weight = semantic_weight.max(0.0);
+        self
+    }
+
     pub fn mode(&self) -> SearchMode {
         self.mode
     }
@@ -232,6 +264,14 @@ impl HybridSearchService {
 
     pub fn alpha(&self) -> f32 {
         self.alpha
+    }
+
+    pub fn lexical_weight(&self) -> f32 {
+        self.lexical_weight
+    }
+
+    pub fn semantic_weight(&self) -> f32 {
+        self.semantic_weight
     }
 
     /// Fuse lexical and semantic results according to the configured mode.
@@ -265,7 +305,13 @@ impl HybridSearchService {
                 })
                 .collect(),
             SearchMode::Hybrid => {
-                let fused = rrf_fuse(lexical, semantic, self.rrf_k);
+                let fused = rrf_fuse_weighted(
+                    lexical,
+                    semantic,
+                    self.rrf_k,
+                    self.lexical_weight,
+                    self.semantic_weight,
+                );
                 fused.into_iter().take(top_k).collect()
             }
         }
@@ -446,6 +492,8 @@ mod tests {
         assert_eq!(svc.rrf_k(), 60);
         assert!((svc.alpha() - 0.7).abs() < f32::EPSILON);
         assert_eq!(svc.mode(), SearchMode::Hybrid);
+        assert!((svc.lexical_weight() - 1.0).abs() < f32::EPSILON);
+        assert!((svc.semantic_weight() - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -485,5 +533,25 @@ mod tests {
         let fused = rrf_fuse(&lexical, &[], 60);
         assert!(fused[0].score > fused[1].score);
         assert!(fused[1].score > fused[2].score);
+    }
+
+    #[test]
+    fn rrf_tie_breaks_by_id_for_determinism() {
+        let lexical = vec![(2, 1.0)];
+        let semantic = vec![(1, 1.0)];
+        let fused = rrf_fuse(&lexical, &semantic, 60);
+        assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].id, 1);
+        assert_eq!(fused[1].id, 2);
+    }
+
+    #[test]
+    fn weighted_rrf_can_bias_lexical_lane() {
+        let lexical = vec![(1, 1.0)];
+        let semantic = vec![(2, 1.0)];
+        let fused = HybridSearchService::new()
+            .with_rrf_weights(2.0, 0.5)
+            .fuse(&lexical, &semantic, 10);
+        assert_eq!(fused[0].id, 1);
     }
 }
