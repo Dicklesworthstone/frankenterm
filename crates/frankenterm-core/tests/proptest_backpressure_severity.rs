@@ -312,3 +312,144 @@ fn config_default_serde_roundtrip() {
     let back: SeverityConfig = serde_json::from_str(&json).unwrap();
     assert!((back.center_threshold - 0.60).abs() < f64::EPSILON);
 }
+
+// =========================================================================
+// NEW: SeverityConfig — Clone/Debug
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// SeverityConfig Clone preserves all fields.
+    #[test]
+    fn prop_config_clone(config in arb_severity_config()) {
+        let cloned = config.clone();
+        prop_assert!((cloned.center_threshold - config.center_threshold).abs() < f64::EPSILON);
+        prop_assert!((cloned.steepness - config.steepness).abs() < f64::EPSILON);
+        prop_assert_eq!(cloned.smoothing_window, config.smoothing_window);
+    }
+
+    /// SeverityConfig Debug is non-empty.
+    #[test]
+    fn prop_config_debug_nonempty(config in arb_severity_config()) {
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// SeverityConfig pretty JSON roundtrip.
+    #[test]
+    fn prop_config_pretty_serde(config in arb_severity_config()) {
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let back: SeverityConfig = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.center_threshold - config.center_threshold).abs() < 1e-10);
+        prop_assert!((back.steepness - config.steepness).abs() < 1e-10);
+        prop_assert_eq!(back.smoothing_window, config.smoothing_window);
+    }
+}
+
+// =========================================================================
+// NEW: ThrottleActions — Debug/Clone
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// ThrottleActions Debug is non-empty.
+    #[test]
+    fn prop_throttle_debug_nonempty(s in 0.0_f64..1.0) {
+        let actions = ThrottleActions::from_severity(s);
+        let dbg = format!("{:?}", actions);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// ThrottleActions Clone preserves all fields.
+    #[test]
+    fn prop_throttle_clone(s in 0.0_f64..1.0) {
+        let actions = ThrottleActions::from_severity(s);
+        let cloned = actions.clone();
+        prop_assert!((cloned.severity - actions.severity).abs() < f64::EPSILON);
+        prop_assert!((cloned.poll_backoff_multiplier - actions.poll_backoff_multiplier).abs() < f64::EPSILON);
+        prop_assert!((cloned.pane_skip_fraction - actions.pane_skip_fraction).abs() < f64::EPSILON);
+    }
+
+    /// ThrottleActions from_severity is deterministic.
+    #[test]
+    fn prop_throttle_deterministic(s in 0.0_f64..1.0) {
+        let a1 = ThrottleActions::from_severity(s);
+        let a2 = ThrottleActions::from_severity(s);
+        prop_assert!((a1.severity - a2.severity).abs() < f64::EPSILON);
+        prop_assert!((a1.poll_backoff_multiplier - a2.poll_backoff_multiplier).abs() < f64::EPSILON);
+    }
+}
+
+// =========================================================================
+// NEW: ThrottleActions — detection_skip monotonicity
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    /// detection_skip_fraction increases with severity.
+    #[test]
+    fn prop_detection_skip_monotonic(a in 0.0_f64..1.0, b in 0.0_f64..1.0) {
+        if a <= b {
+            let ta = ThrottleActions::from_severity(a);
+            let tb = ThrottleActions::from_severity(b);
+            prop_assert!(
+                tb.detection_skip_fraction >= ta.detection_skip_fraction - f64::EPSILON,
+                "detection_skip not monotonic: s={} gives {}, s={} gives {}",
+                a, ta.detection_skip_fraction, b, tb.detection_skip_fraction
+            );
+        }
+    }
+}
+
+// =========================================================================
+// NEW: ContinuousBackpressure — high load convergence
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// Repeated high-ratio observations drive severity up.
+    #[test]
+    fn prop_high_load_drives_severity_up(config in arb_severity_config()) {
+        let mut bp = ContinuousBackpressure::new(config);
+        let initial_severity = bp.severity();
+        for _ in 0..200 {
+            bp.observe_ratio(1.0);
+        }
+        prop_assert!(
+            bp.severity() >= initial_severity,
+            "severity should increase from {} to {} after high load",
+            initial_severity, bp.severity()
+        );
+    }
+
+    /// ContinuousBackpressure severity after observe returns bounded throttle actions.
+    #[test]
+    fn prop_bp_severity_after_observe(config in arb_severity_config()) {
+        let mut bp = ContinuousBackpressure::new(config);
+        bp.observe_ratio(0.5);
+        let s = bp.severity();
+        let actions = ThrottleActions::from_severity(s);
+        prop_assert!(actions.severity >= 0.0 && actions.severity <= 1.0);
+        prop_assert!(actions.poll_backoff_multiplier >= 1.0 && actions.poll_backoff_multiplier <= 4.0);
+        prop_assert!(actions.pane_skip_fraction >= 0.0 && actions.pane_skip_fraction <= 0.5);
+    }
+
+    /// smoothed_ratio stays in [0, 1] after arbitrary observations.
+    #[test]
+    fn prop_smoothed_ratio_bounded(
+        config in arb_severity_config(),
+        ratios in proptest::collection::vec(-0.5_f64..1.5, 1..50),
+    ) {
+        let mut bp = ContinuousBackpressure::new(config);
+        for r in &ratios {
+            bp.observe_ratio(*r);
+        }
+        let sr = bp.smoothed_ratio();
+        prop_assert!(sr >= 0.0, "smoothed_ratio {} < 0", sr);
+        prop_assert!(sr <= 1.0, "smoothed_ratio {} > 1", sr);
+    }
+}

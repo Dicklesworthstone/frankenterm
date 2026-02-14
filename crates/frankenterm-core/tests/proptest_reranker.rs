@@ -321,3 +321,146 @@ proptest! {
         prop_assert_eq!(result[0].score.to_bits(), score.to_bits(), "score bits mismatch for empty-text doc");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Group 6: ScoredDoc additional properties
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    // 21. ScoredDoc Clone is deep (modifying clone doesn't affect original)
+    #[test]
+    fn scored_doc_clone_is_deep(doc in arb_scored_doc()) {
+        let mut cloned = doc.clone();
+        cloned.id = cloned.id.wrapping_add(1);
+        cloned.text.push_str("_modified");
+        prop_assert_ne!(cloned.id, doc.id, "clone should be independent");
+        prop_assert_ne!(&cloned.text, &doc.text, "clone text should be independent");
+    }
+
+    // 22. ScoredDoc Debug contains "ScoredDoc"
+    #[test]
+    fn scored_doc_debug_contains_struct_name(doc in arb_scored_doc()) {
+        let dbg = format!("{:?}", doc);
+        prop_assert!(dbg.contains("ScoredDoc"),
+            "Debug should contain 'ScoredDoc', got '{}'", dbg);
+    }
+
+    // 23. ScoredDoc with max u64 id works
+    #[test]
+    fn scored_doc_max_id(text in "[a-z]{0,20}", score in -100.0f32..100.0f32) {
+        let doc = ScoredDoc { id: u64::MAX, text, score };
+        let cloned = doc.clone();
+        prop_assert_eq!(cloned.id, u64::MAX);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group 7: ScoredDoc edge cases
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    // 24. ScoredDoc with zero score
+    #[test]
+    fn scored_doc_zero_score(id in 0u64..1000, text in "[a-z]{0,20}") {
+        let doc = ScoredDoc { id, text: text.clone(), score: 0.0 };
+        let cloned = doc.clone();
+        prop_assert_eq!(cloned.score.to_bits(), 0.0f32.to_bits());
+        prop_assert_eq!(cloned.id, id);
+        prop_assert_eq!(&cloned.text, &text);
+    }
+
+    // 25. ScoredDoc with negative score preserves sign through clone
+    #[test]
+    fn scored_doc_negative_score(id in 0u64..1000, score in -100.0f32..-0.001) {
+        let doc = ScoredDoc { id, text: "test".to_string(), score };
+        prop_assert!(doc.score < 0.0, "score should be negative");
+        let cloned = doc.clone();
+        prop_assert!(cloned.score < 0.0, "cloned score should be negative");
+        prop_assert_eq!(cloned.score.to_bits(), score.to_bits());
+    }
+
+    // 26. ScoredDoc Debug contains field info
+    #[test]
+    fn scored_doc_debug_contains_id(doc in arb_scored_doc()) {
+        let dbg = format!("{:?}", doc);
+        prop_assert!(dbg.contains("ScoredDoc") || dbg.contains(&doc.id.to_string()),
+            "Debug should contain struct name or id");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group 8: RerankError serde
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    // 27. RerankError Debug for EmptyInput contains "EmptyInput"
+    #[test]
+    fn rerank_error_empty_debug_variant(_i in 0..1u8) {
+        let err = RerankError::EmptyInput;
+        let dbg = format!("{:?}", err);
+        prop_assert!(dbg.contains("EmptyInput"),
+            "Debug '{}' should contain 'EmptyInput'", dbg);
+    }
+
+    // 28. RerankError Debug for ModelError contains "ModelError"
+    #[test]
+    fn rerank_error_model_debug_variant(msg in "[a-z]{1,30}") {
+        let err = RerankError::ModelError(msg);
+        let dbg = format!("{:?}", err);
+        prop_assert!(dbg.contains("ModelError"),
+            "Debug '{}' should contain 'ModelError'", dbg);
+    }
+
+    // 29. RerankError Display length is positive
+    #[test]
+    fn rerank_error_display_nonempty(msg in "[a-z]{1,30}") {
+        let err = RerankError::ModelError(msg);
+        let display = format!("{}", err);
+        prop_assert!(!display.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group 9: PassthroughReranker additional properties
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    // 30. Two identical doc lists produce identical results
+    #[test]
+    fn passthrough_identical_input_identical_output(
+        query in arb_query(),
+        docs in proptest::collection::vec(arb_scored_doc(), 2..10),
+    ) {
+        let reranker = PassthroughReranker;
+        let d1 = docs.clone();
+        let d2 = docs;
+        let r1 = reranker.rerank(&query, d1).unwrap();
+        let r2 = reranker.rerank(&query, d2).unwrap();
+        for (i, (a, b)) in r1.iter().zip(r2.iter()).enumerate() {
+            prop_assert_eq!(a.id, b.id, "id diff at {}", i);
+        }
+    }
+
+    // 31. PassthroughReranker with docs containing special chars
+    #[test]
+    fn passthrough_special_chars_in_text(
+        query in arb_query(),
+        text in "[!@#$%^&*()]{1,30}",
+        id in 0u64..1000,
+        score in -50.0f32..50.0,
+    ) {
+        let doc = ScoredDoc { id, text: text.clone(), score };
+        let reranker = PassthroughReranker;
+        let result = reranker.rerank(&query, vec![doc]).unwrap();
+        prop_assert_eq!(result.len(), 1);
+        prop_assert_eq!(&result[0].text, &text);
+    }
+}
