@@ -17,7 +17,12 @@
 //!
 //! Bead: wa-1u90p.6.1
 
+use crate::resize_scheduler::{
+    ResizeExecutionPhase, ResizeLifecycleDetail, ResizeLifecycleStage, ResizeSchedulerSnapshot,
+    ResizeTransactionLifecycleEvent,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -51,6 +56,16 @@ pub enum ResizeViolationKind {
     StaleCommit,
     /// Transaction phase transition violated (e.g. Idle -> Reflowing).
     IllegalPhaseTransition,
+    /// Aggregate pending count in snapshot does not match pane rows.
+    SnapshotPendingCountMismatch,
+    /// Aggregate active count in snapshot does not match pane rows.
+    SnapshotActiveCountMismatch,
+    /// Duplicate pane row found in scheduler snapshot.
+    DuplicatePaneSnapshotRow,
+    /// Lifecycle event stream regressed in ordering metadata.
+    LifecycleEventSequenceRegression,
+    /// Lifecycle detail payload is inconsistent with lifecycle stage.
+    LifecycleDetailStageMismatch,
 
     // -- Screen invariants --
     /// `physical_rows` does not match actual content bounds.
@@ -311,6 +326,194 @@ pub fn check_scheduler_snapshot_row_invariants(
     }
 }
 
+/// Validates aggregate scheduler snapshot invariants.
+///
+/// This bridges per-row and aggregate invariants so status/debug surfaces can be
+/// checked as a single contract object.
+pub fn check_scheduler_snapshot_invariants(
+    report: &mut ResizeInvariantReport,
+    snapshot: &ResizeSchedulerSnapshot,
+) {
+    let pending_rows = snapshot
+        .panes
+        .iter()
+        .filter(|row| row.pending_seq.is_some())
+        .count();
+    report.check(
+        pending_rows == snapshot.pending_total,
+        ResizeViolationSeverity::Error,
+        ResizeViolationKind::SnapshotPendingCountMismatch,
+        None,
+        None,
+        format!(
+            "pending_total={} but pane rows report {} pending entries",
+            snapshot.pending_total, pending_rows
+        ),
+    );
+
+    let active_rows = snapshot
+        .panes
+        .iter()
+        .filter(|row| row.active_seq.is_some())
+        .count();
+    report.check(
+        active_rows == snapshot.active_total,
+        ResizeViolationSeverity::Error,
+        ResizeViolationKind::SnapshotActiveCountMismatch,
+        None,
+        None,
+        format!(
+            "active_total={} but pane rows report {} active entries",
+            snapshot.active_total, active_rows
+        ),
+    );
+
+    let mut seen_panes = HashSet::new();
+    for row in &snapshot.panes {
+        report.check(
+            seen_panes.insert(row.pane_id),
+            ResizeViolationSeverity::Error,
+            ResizeViolationKind::DuplicatePaneSnapshotRow,
+            Some(row.pane_id),
+            row.latest_seq,
+            format!("duplicate pane row for pane_id={}", row.pane_id),
+        );
+
+        check_scheduler_snapshot_row_invariants(
+            report,
+            row.pane_id,
+            row.latest_seq,
+            row.pending_seq,
+            row.active_seq,
+            row.active_phase.is_some(),
+        );
+
+        check_scheduler_invariants(
+            report,
+            row.pane_id,
+            row.active_seq,
+            row.latest_seq,
+            usize::from(row.pending_seq.is_some()),
+            false,
+        );
+    }
+}
+
+/// Validates lifecycle event stream invariants.
+///
+/// Checks:
+/// - event ordering (`event_seq` strictly increasing, `frame_seq` nondecreasing)
+/// - lifecycle detail payload consistency with stage
+pub fn check_lifecycle_event_invariants(
+    report: &mut ResizeInvariantReport,
+    events: &[ResizeTransactionLifecycleEvent],
+) {
+    let mut prev_event_seq = None;
+    let mut prev_frame_seq = None;
+
+    for event in events {
+        if let Some(prev) = prev_event_seq {
+            report.check(
+                event.event_seq > prev,
+                ResizeViolationSeverity::Error,
+                ResizeViolationKind::LifecycleEventSequenceRegression,
+                Some(event.pane_id),
+                Some(event.intent_seq),
+                format!(
+                    "event_seq regression/non-increase: prev={} current={}",
+                    prev, event.event_seq
+                ),
+            );
+        }
+        prev_event_seq = Some(event.event_seq);
+
+        if let Some(prev) = prev_frame_seq {
+            report.check(
+                event.frame_seq >= prev,
+                ResizeViolationSeverity::Error,
+                ResizeViolationKind::LifecycleEventSequenceRegression,
+                Some(event.pane_id),
+                Some(event.intent_seq),
+                format!(
+                    "frame_seq regression: prev={} current={}",
+                    prev, event.frame_seq
+                ),
+            );
+        }
+        prev_frame_seq = Some(event.frame_seq);
+
+        match &event.detail {
+            ResizeLifecycleDetail::IntentSubmitted { .. } => report.check(
+                event.stage == ResizeLifecycleStage::Queued,
+                ResizeViolationSeverity::Error,
+                ResizeViolationKind::LifecycleDetailStageMismatch,
+                Some(event.pane_id),
+                Some(event.intent_seq),
+                "IntentSubmitted detail must use Queued stage".to_string(),
+            ),
+            ResizeLifecycleDetail::IntentRejectedNonMonotonic { .. }
+            | ResizeLifecycleDetail::IntentRejectedOverload { .. }
+            | ResizeLifecycleDetail::IntentSuppressedByGate { .. }
+            | ResizeLifecycleDetail::ActiveCompletionRejected { .. }
+            | ResizeLifecycleDetail::ActivePhaseTransitionRejected { .. } => report.check(
+                event.stage == ResizeLifecycleStage::Failed,
+                ResizeViolationSeverity::Error,
+                ResizeViolationKind::LifecycleDetailStageMismatch,
+                Some(event.pane_id),
+                Some(event.intent_seq),
+                format!("{:?} detail must use Failed stage", event.detail),
+            ),
+            ResizeLifecycleDetail::PendingDroppedOverload { .. }
+            | ResizeLifecycleDetail::ActiveCancelledSuperseded { .. } => report.check(
+                event.stage == ResizeLifecycleStage::Cancelled,
+                ResizeViolationSeverity::Error,
+                ResizeViolationKind::LifecycleDetailStageMismatch,
+                Some(event.pane_id),
+                Some(event.intent_seq),
+                format!("{:?} detail must use Cancelled stage", event.detail),
+            ),
+            ResizeLifecycleDetail::IntentScheduled { .. } => report.check(
+                event.stage == ResizeLifecycleStage::Scheduled,
+                ResizeViolationSeverity::Error,
+                ResizeViolationKind::LifecycleDetailStageMismatch,
+                Some(event.pane_id),
+                Some(event.intent_seq),
+                "IntentScheduled detail must use Scheduled stage".to_string(),
+            ),
+            ResizeLifecycleDetail::ActiveCompleted => report.check(
+                event.stage == ResizeLifecycleStage::Committed,
+                ResizeViolationSeverity::Error,
+                ResizeViolationKind::LifecycleDetailStageMismatch,
+                Some(event.pane_id),
+                Some(event.intent_seq),
+                "ActiveCompleted detail must use Committed stage".to_string(),
+            ),
+            ResizeLifecycleDetail::ActivePhaseTransition { phase } => {
+                let expected_stage = phase_to_stage(*phase);
+                report.check(
+                    event.stage == expected_stage,
+                    ResizeViolationSeverity::Error,
+                    ResizeViolationKind::LifecycleDetailStageMismatch,
+                    Some(event.pane_id),
+                    Some(event.intent_seq),
+                    format!(
+                        "ActivePhaseTransition({:?}) detail must use {:?} stage (got {:?})",
+                        phase, expected_stage, event.stage
+                    ),
+                );
+            }
+        }
+    }
+}
+
+const fn phase_to_stage(phase: ResizeExecutionPhase) -> ResizeLifecycleStage {
+    match phase {
+        ResizeExecutionPhase::Preparing => ResizeLifecycleStage::Preparing,
+        ResizeExecutionPhase::Reflowing => ResizeLifecycleStage::Reflowing,
+        ResizeExecutionPhase::Presenting => ResizeLifecycleStage::Presenting,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Screen invariant checks
 // ---------------------------------------------------------------------------
@@ -563,10 +766,12 @@ mod tests {
         let mut report = ResizeInvariantReport::new();
         check_scheduler_invariants(&mut report, 1, Some(1), Some(2), 3, false);
         assert!(report.has_errors());
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.kind == ResizeViolationKind::QueueDepthOverflow));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.kind == ResizeViolationKind::QueueDepthOverflow)
+        );
     }
 
     #[test]
@@ -574,10 +779,12 @@ mod tests {
         let mut report = ResizeInvariantReport::new();
         check_scheduler_invariants(&mut report, 1, Some(5), Some(7), 0, true);
         assert!(report.has_critical());
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.kind == ResizeViolationKind::StaleCommit));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.kind == ResizeViolationKind::StaleCommit)
+        );
     }
 
     #[test]
@@ -592,45 +799,38 @@ mod tests {
         let mut report = ResizeInvariantReport::new();
         check_scheduler_invariants(&mut report, 1, Some(10), Some(5), 0, false);
         assert!(report.has_errors());
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.kind == ResizeViolationKind::IntentSequenceRegression));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.kind == ResizeViolationKind::IntentSequenceRegression)
+        );
     }
 
     #[test]
     fn scheduler_snapshot_row_detects_pending_ahead_of_latest() {
         let mut report = ResizeInvariantReport::new();
-        check_scheduler_snapshot_row_invariants(
-            &mut report,
-            7,
-            Some(5),
-            Some(6),
-            Some(4),
-            true,
-        );
+        check_scheduler_snapshot_row_invariants(&mut report, 7, Some(5), Some(6), Some(4), true);
         assert!(report.has_errors());
-        assert!(report.violations.iter().any(|v| {
-            matches!(v.kind, ResizeViolationKind::IntentSequenceRegression)
-        }));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| { matches!(v.kind, ResizeViolationKind::IntentSequenceRegression) })
+        );
     }
 
     #[test]
     fn scheduler_snapshot_row_detects_phase_without_active_seq() {
         let mut report = ResizeInvariantReport::new();
-        check_scheduler_snapshot_row_invariants(
-            &mut report,
-            9,
-            Some(3),
-            None,
-            None,
-            true,
-        );
+        check_scheduler_snapshot_row_invariants(&mut report, 9, Some(3), None, None, true);
         assert!(report.has_critical());
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| matches!(v.kind, ResizeViolationKind::IllegalPhaseTransition)));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| matches!(v.kind, ResizeViolationKind::IllegalPhaseTransition))
+        );
     }
 
     // -- Screen invariant tests --
@@ -665,10 +865,12 @@ mod tests {
         };
         check_screen_invariants(&mut report, Some(1), &snapshot);
         assert!(report.has_errors());
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.kind == ResizeViolationKind::InsufficientLines));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.kind == ResizeViolationKind::InsufficientLines)
+        );
     }
 
     #[test]
@@ -685,10 +887,12 @@ mod tests {
         };
         check_screen_invariants(&mut report, Some(1), &snapshot);
         assert!(report.has_errors());
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.kind == ResizeViolationKind::CursorOutOfBounds));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.kind == ResizeViolationKind::CursorOutOfBounds)
+        );
     }
 
     #[test]
@@ -737,10 +941,12 @@ mod tests {
         };
         check_presentation_invariants(&mut report, Some(1), Some(1), &dims);
         assert!(report.has_errors());
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.kind == ResizeViolationKind::PtyTerminalDimensionMismatch));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.kind == ResizeViolationKind::PtyTerminalDimensionMismatch)
+        );
     }
 
     // -- Phase transition tests --
@@ -794,10 +1000,12 @@ mod tests {
             ResizePhase::Reflowing,
         );
         assert!(report.has_critical());
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.kind == ResizeViolationKind::IllegalPhaseTransition));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.kind == ResizeViolationKind::IllegalPhaseTransition)
+        );
     }
 
     #[test]

@@ -15,11 +15,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{OnceLock, RwLock};
 
-use serde::{Deserialize, Serialize};
 use crate::resize_invariants::{
     ResizeInvariantReport, ResizeInvariantTelemetry, ResizePhase, check_phase_transition,
     check_scheduler_invariants, check_scheduler_snapshot_row_invariants,
 };
+use serde::{Deserialize, Serialize};
 
 /// Global scheduling class for a resize intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1290,7 +1290,10 @@ impl ResizeScheduler {
         for event in lifecycle_events {
             if let Some(next_phase) = Self::lifecycle_stage_to_invariant_phase(event.stage) {
                 let key = (event.pane_id, event.intent_seq);
-                let prev_phase = last_phase_by_tx.get(&key).copied().unwrap_or(ResizePhase::Idle);
+                let prev_phase = last_phase_by_tx
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(ResizePhase::Idle);
                 check_phase_transition(
                     &mut report,
                     Some(event.pane_id),
