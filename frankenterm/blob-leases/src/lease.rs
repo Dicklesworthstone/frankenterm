@@ -265,6 +265,52 @@ mod tests {
         clear_storage();
         assert!(lease.get_reader().is_err());
     }
+
+    #[test]
+    fn blob_lease_reader_partial_read() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(b"partial read test").unwrap();
+        let mut reader = lease.get_reader().unwrap();
+        let mut buf = [0u8; 7];
+        std::io::Read::read_exact(&mut reader, &mut buf).unwrap();
+        assert_eq!(&buf, b"partial");
+        clear_storage();
+    }
+
+    #[test]
+    fn blob_lease_clone_can_get_data_independently() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(b"clone data").unwrap();
+        let cloned = lease.clone();
+        assert_eq!(cloned.get_data().unwrap(), b"clone data");
+        assert_eq!(lease.get_data().unwrap(), b"clone data");
+        clear_storage();
+    }
+
+    #[test]
+    fn blob_lease_different_data_not_equal() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let l1 = BlobManager::store(b"alpha").unwrap();
+        let l2 = BlobManager::store(b"beta").unwrap();
+        assert_ne!(l1.content_id(), l2.content_id());
+        assert_ne!(l1, l2);
+        clear_storage();
+    }
+
+    #[test]
+    fn blob_lease_empty_data_roundtrip() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(b"").unwrap();
+        let mut reader = lease.get_reader().unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut buf).unwrap();
+        assert!(buf.is_empty());
+        clear_storage();
+    }
 }
 
 impl Drop for LeaseInner {

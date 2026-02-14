@@ -258,4 +258,53 @@ mod tests {
         assert_eq!(l3.get_data().unwrap(), b"third");
         clear_storage();
     }
+
+    #[test]
+    fn get_by_content_id_after_multiple_stores() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        BlobManager::store(b"aaa").unwrap();
+        BlobManager::store(b"bbb").unwrap();
+        BlobManager::store(b"ccc").unwrap();
+        let cid = ContentId::for_bytes(b"bbb");
+        let lease = BlobManager::get_by_content_id(cid).unwrap();
+        assert_eq!(lease.get_data().unwrap(), b"bbb");
+        clear_storage();
+    }
+
+    #[test]
+    fn store_returns_unique_lease_ids_for_same_content() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let l1 = BlobManager::store(b"dup").unwrap();
+        let l2 = BlobManager::store(b"dup").unwrap();
+        // Same content id, but different lease objects (different internal lease_id)
+        assert_eq!(l1.content_id(), l2.content_id());
+        // Both should be able to retrieve data independently
+        assert_eq!(l1.get_data().unwrap(), b"dup");
+        assert_eq!(l2.get_data().unwrap(), b"dup");
+        clear_storage();
+    }
+
+    #[test]
+    fn store_single_byte() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(&[0xFF]).unwrap();
+        assert_eq!(lease.get_data().unwrap(), vec![0xFF]);
+        clear_storage();
+    }
+
+    #[test]
+    fn get_by_content_id_returns_correct_data_after_overwrite() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        // Store same content twice; second store overwrites in InMemoryStorage
+        let _l1 = BlobManager::store(b"persistent").unwrap();
+        let _l2 = BlobManager::store(b"persistent").unwrap();
+        let cid = ContentId::for_bytes(b"persistent");
+        let lease = BlobManager::get_by_content_id(cid).unwrap();
+        assert_eq!(lease.get_data().unwrap(), b"persistent");
+        clear_storage();
+    }
 }

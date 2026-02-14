@@ -159,4 +159,50 @@ mod tests {
         let b = ContentId::for_bytes(b"y").as_hash_bytes();
         assert_ne!(a, b);
     }
+
+    #[test]
+    fn prefix_and_extension_produce_different_ids() {
+        let a = ContentId::for_bytes(b"hello");
+        let b = ContentId::for_bytes(b"hello world");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn null_bytes_produce_valid_id() {
+        let id = ContentId::for_bytes(&[0u8; 100]);
+        assert_ne!(id.as_hash_bytes(), [0u8; 32]);
+    }
+
+    #[test]
+    fn single_byte_has_valid_display() {
+        let id = ContentId::for_bytes(&[42]);
+        let display = format!("{id}");
+        assert!(display.starts_with("sha256-"));
+        assert!(display.len() > 7);
+    }
+
+    #[test]
+    fn eq_is_reflexive() {
+        let id = ContentId::for_bytes(b"reflexive");
+        assert_eq!(id, id);
+    }
+
+    #[test]
+    fn eq_is_symmetric() {
+        let a = ContentId::for_bytes(b"sym");
+        let b = ContentId::for_bytes(b"sym");
+        assert_eq!(a, b);
+        assert_eq!(b, a);
+    }
+
+    #[test]
+    fn hash_key_deduplication() {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        let id = ContentId::for_bytes(b"key");
+        map.insert(id, "first");
+        map.insert(id, "second"); // should overwrite
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&id], "second");
+    }
 }

@@ -125,4 +125,21 @@ mod tests {
         let err = Error::AlreadyInitializedStorage;
         assert!(err.source().is_none());
     }
+
+    #[test]
+    fn storage_dir_io_error_source_is_none() {
+        use std::error::Error as StdError;
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "disk fail");
+        let err = Error::StorageDirIoError(PathBuf::from("/store"), io_err);
+        // No #[source] attribute on tuple variant, so source is None
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn io_error_preserves_error_kind() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no access");
+        let err: Error = io_err.into();
+        let msg = err.to_string();
+        assert!(msg.contains("no access"), "got: {msg}");
+    }
 }

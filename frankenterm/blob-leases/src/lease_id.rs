@@ -126,4 +126,19 @@ mod tests {
         let id = LeaseId::new();
         assert_eq!(id, id);
     }
+
+    #[test]
+    fn display_is_consistent_across_calls() {
+        let id = LeaseId::new();
+        assert_eq!(format!("{id}"), format!("{id}"));
+    }
+
+    #[test]
+    fn all_ids_share_same_pid() {
+        let a = LeaseId::new();
+        let b = LeaseId::new();
+        let c = LeaseId::new();
+        assert_eq!(a.pid(), b.pid());
+        assert_eq!(b.pid(), c.pid());
+    }
 }
