@@ -35,7 +35,7 @@ pub use hybrid_search::{
     FusedResult, HybridSearchService, SearchMode, TwoTierMetrics, blend_two_tier, kendall_tau,
     rrf_fuse,
 };
-pub use reranker::{RerankError, Reranker};
+pub use reranker::{PassthroughReranker, RerankError, Reranker, ScoredDoc};
 pub use vector_index::{FtviIndex, FtviRecord, FtviWriter, write_ftvi_vec};
 
 #[cfg(feature = "semantic-search")]

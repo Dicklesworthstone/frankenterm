@@ -1478,6 +1478,44 @@ pub fn truncate(s: &str, max_len: usize) -> String {
 // =============================================================================
 
 use crate::crash::HealthSnapshot;
+use crate::degradation::{ResizeDegradationAssessment, ResizeDegradationTier};
+use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
+use crate::runtime::{
+    ResizeWatchdogAssessment, ResizeWatchdogSeverity, RuntimeLockMemoryTelemetrySnapshot,
+};
+use serde::de::DeserializeOwned;
+
+/// Structured resize control-plane dashboard payload extracted from watcher status.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ResizeDashboardSnapshot {
+    /// Runtime lock/cursor-memory telemetry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_lock_memory: Option<RuntimeLockMemoryTelemetrySnapshot>,
+    /// Resize control-plane debug snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_plane: Option<ResizeSchedulerDebugSnapshot>,
+    /// Active stalled transactions (warning threshold sampled by watcher IPC).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stalled_transactions: Vec<ResizeStalledTransaction>,
+    /// Resize watchdog assessment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watchdog: Option<ResizeWatchdogAssessment>,
+    /// Ordered degradation ladder state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degradation_ladder: Option<ResizeDegradationAssessment>,
+}
+
+impl ResizeDashboardSnapshot {
+    /// Whether the dashboard has no populated telemetry fields.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.runtime_lock_memory.is_none()
+            && self.control_plane.is_none()
+            && self.stalled_transactions.is_empty()
+            && self.watchdog.is_none()
+            && self.degradation_ladder.is_none()
+    }
+}
 
 /// Renderer for runtime health snapshot (queue depths, ingest lag, warnings).
 ///
@@ -1813,6 +1851,277 @@ impl HealthSnapshotRenderer {
         checks
     }
 
+    /// Extract resize dashboard data from watcher status payload.
+    ///
+    /// Accepts the watcher `status` payload schema produced by IPC status,
+    /// including both:
+    /// - top-level resize fields (`resize_control_plane_*`)
+    /// - nested `health.runtime_lock_memory` lock telemetry
+    #[must_use]
+    pub fn resize_dashboard_from_status_payload(
+        status_payload: &serde_json::Value,
+    ) -> Option<ResizeDashboardSnapshot> {
+        let runtime_lock_memory = Self::decode_section::<RuntimeLockMemoryTelemetrySnapshot>(
+            status_payload
+                .get("health")
+                .and_then(|health| health.get("runtime_lock_memory"))
+                .or_else(|| status_payload.get("runtime_lock_memory")),
+        );
+        let control_plane = Self::decode_section::<ResizeSchedulerDebugSnapshot>(
+            status_payload.get("resize_control_plane"),
+        );
+        let stalled_transactions = Self::decode_section::<Vec<ResizeStalledTransaction>>(
+            status_payload.get("resize_control_plane_stalled"),
+        )
+        .unwrap_or_default();
+        let watchdog = Self::decode_section::<ResizeWatchdogAssessment>(
+            status_payload.get("resize_control_plane_watchdog"),
+        );
+        let degradation_ladder = Self::decode_section::<ResizeDegradationAssessment>(
+            status_payload.get("resize_degradation_ladder"),
+        );
+
+        let dashboard = ResizeDashboardSnapshot {
+            runtime_lock_memory,
+            control_plane,
+            stalled_transactions,
+            watchdog,
+            degradation_ladder,
+        };
+
+        if dashboard.is_empty() {
+            None
+        } else {
+            Some(dashboard)
+        }
+    }
+
+    /// Compute risk-oriented diagnostics for resize latency/hitch/crash surfaces.
+    #[must_use]
+    pub fn resize_dashboard_diagnostic_checks(
+        dashboard: &ResizeDashboardSnapshot,
+    ) -> Vec<HealthDiagnostic> {
+        const LATENCY_WARN_MS: f64 = 20.0;
+        const LATENCY_ERR_MS: f64 = 100.0;
+        const STALL_WARN_MS: u64 = 2_000;
+        const STALL_ERR_MS: u64 = 8_000;
+        const CURSOR_WARN_BYTES: u64 = 8 * 1024 * 1024;
+        const CURSOR_ERR_BYTES: u64 = 32 * 1024 * 1024;
+
+        let max_stall_age_ms = dashboard
+            .stalled_transactions
+            .iter()
+            .map(|tx| tx.age_ms)
+            .max()
+            .unwrap_or(0);
+        let stall_count = dashboard.stalled_transactions.len();
+
+        let lock_wait_p95_ms = dashboard
+            .runtime_lock_memory
+            .as_ref()
+            .map_or(0.0, |lock| lock.p95_storage_lock_wait_ms);
+
+        let latency_status =
+            if lock_wait_p95_ms >= LATENCY_ERR_MS || max_stall_age_ms >= STALL_ERR_MS {
+                HealthDiagnosticStatus::Error
+            } else if lock_wait_p95_ms >= LATENCY_WARN_MS || max_stall_age_ms >= STALL_WARN_MS {
+                HealthDiagnosticStatus::Warning
+            } else if lock_wait_p95_ms > 0.0 || max_stall_age_ms > 0 {
+                HealthDiagnosticStatus::Info
+            } else {
+                HealthDiagnosticStatus::Ok
+            };
+
+        let mut checks = vec![HealthDiagnostic {
+            name: "resize latency risk",
+            status: latency_status,
+            detail: format!(
+                "lock_wait_p95={lock_wait_p95_ms:.1}ms, stalled={} (max_age={}ms)",
+                stall_count, max_stall_age_ms
+            ),
+        }];
+
+        if let Some(control_plane) = dashboard.control_plane.as_ref() {
+            let pending_total = control_plane.scheduler.pending_total;
+            let pending_cap = control_plane.scheduler.config.max_pending_panes.max(1);
+            let pending_ratio = pending_total as f64 / pending_cap as f64;
+            let hitch_status = if pending_ratio >= 0.9 || max_stall_age_ms >= STALL_ERR_MS {
+                HealthDiagnosticStatus::Error
+            } else if pending_ratio >= 0.5 || stall_count > 0 {
+                HealthDiagnosticStatus::Warning
+            } else if pending_total > 0 {
+                HealthDiagnosticStatus::Info
+            } else {
+                HealthDiagnosticStatus::Ok
+            };
+            checks.push(HealthDiagnostic {
+                name: "resize hitch risk",
+                status: hitch_status,
+                detail: format!(
+                    "pending={}/{} (active={}), guardrail_frames={}",
+                    pending_total,
+                    pending_cap,
+                    control_plane.scheduler.active_total,
+                    control_plane.scheduler.metrics.input_guardrail_frames
+                ),
+            });
+        }
+
+        let crash_status = if dashboard.watchdog.as_ref().is_some_and(|w| {
+            matches!(
+                w.severity,
+                ResizeWatchdogSeverity::Critical | ResizeWatchdogSeverity::SafeModeActive
+            )
+        }) || dashboard.degradation_ladder.as_ref().is_some_and(|ladder| {
+            matches!(
+                ladder.tier,
+                ResizeDegradationTier::CorrectnessGuarded
+                    | ResizeDegradationTier::EmergencyCompatibility
+            )
+        }) {
+            HealthDiagnosticStatus::Error
+        } else if dashboard.watchdog.as_ref().is_some_and(|w| {
+            matches!(w.severity, ResizeWatchdogSeverity::Warning) || w.safe_mode_recommended
+        }) || dashboard
+            .degradation_ladder
+            .as_ref()
+            .is_some_and(|ladder| matches!(ladder.tier, ResizeDegradationTier::QualityReduced))
+        {
+            HealthDiagnosticStatus::Warning
+        } else if dashboard.watchdog.is_some() || dashboard.degradation_ladder.is_some() {
+            HealthDiagnosticStatus::Info
+        } else {
+            HealthDiagnosticStatus::Ok
+        };
+        let watchdog_detail = dashboard.watchdog.as_ref().map_or_else(
+            || "watchdog=absent".to_string(),
+            |watchdog| {
+                format!(
+                    "watchdog={:?}, stalled={}/{}, action={}",
+                    watchdog.severity,
+                    watchdog.stalled_total,
+                    watchdog.stalled_critical,
+                    watchdog.recommended_action
+                )
+            },
+        );
+        let ladder_detail = dashboard.degradation_ladder.as_ref().map_or_else(
+            || "ladder=absent".to_string(),
+            |ladder| {
+                format!(
+                    "ladder={}, trigger={}",
+                    ladder.tier, ladder.trigger_condition
+                )
+            },
+        );
+        checks.push(HealthDiagnostic {
+            name: "resize crash risk",
+            status: crash_status,
+            detail: format!("{watchdog_detail}; {ladder_detail}"),
+        });
+
+        if let Some(lock) = dashboard.runtime_lock_memory.as_ref() {
+            let cursor_status = if lock.p95_cursor_snapshot_bytes >= CURSOR_ERR_BYTES {
+                HealthDiagnosticStatus::Error
+            } else if lock.p95_cursor_snapshot_bytes >= CURSOR_WARN_BYTES {
+                HealthDiagnosticStatus::Warning
+            } else if lock.p95_cursor_snapshot_bytes > 0 {
+                HealthDiagnosticStatus::Info
+            } else {
+                HealthDiagnosticStatus::Ok
+            };
+            checks.push(HealthDiagnostic {
+                name: "resize cursor memory",
+                status: cursor_status,
+                detail: format!(
+                    "p95={} bytes, max={} bytes",
+                    lock.p95_cursor_snapshot_bytes, lock.cursor_snapshot_bytes_max
+                ),
+            });
+        }
+
+        checks
+    }
+
+    /// Render compact resize dashboard block for status output.
+    #[must_use]
+    pub fn render_resize_dashboard_compact(
+        dashboard: &ResizeDashboardSnapshot,
+        ctx: &RenderContext,
+    ) -> String {
+        if ctx.format.is_json() {
+            return String::new();
+        }
+
+        let style = Style::from_format(ctx.format);
+        let mut output = String::new();
+        output.push_str("  Resize dashboard:\n");
+
+        if let Some(control_plane) = dashboard.control_plane.as_ref() {
+            output.push_str(&format!(
+                "    control-plane: active={}, pending={}, active_tx={}\n",
+                control_plane.gate.active,
+                control_plane.scheduler.pending_total,
+                control_plane.scheduler.active_total
+            ));
+        }
+
+        if let Some(watchdog) = dashboard.watchdog.as_ref() {
+            output.push_str(&format!(
+                "    watchdog: {:?}, stalled={} (critical={}), action={}\n",
+                watchdog.severity,
+                watchdog.stalled_total,
+                watchdog.stalled_critical,
+                watchdog.recommended_action
+            ));
+        }
+
+        if let Some(ladder) = dashboard.degradation_ladder.as_ref() {
+            output.push_str(&format!(
+                "    degradation: {} (trigger: {})\n",
+                ladder.tier, ladder.trigger_condition
+            ));
+        }
+
+        if let Some(lock) = dashboard.runtime_lock_memory.as_ref() {
+            output.push_str(&format!(
+                "    lock telemetry: wait p95 {:.1}ms, hold p95 {:.1}ms, cursor p95 {} bytes\n",
+                lock.p95_storage_lock_wait_ms,
+                lock.p95_storage_lock_hold_ms,
+                lock.p95_cursor_snapshot_bytes
+            ));
+        }
+
+        if !dashboard.stalled_transactions.is_empty() {
+            let max_age = dashboard
+                .stalled_transactions
+                .iter()
+                .map(|tx| tx.age_ms)
+                .max()
+                .unwrap_or(0);
+            output.push_str(&format!(
+                "    stalled: {} transaction(s), max_age={}ms\n",
+                dashboard.stalled_transactions.len(),
+                max_age
+            ));
+        }
+
+        for check in Self::resize_dashboard_diagnostic_checks(dashboard)
+            .into_iter()
+            .filter(|check| check.status != HealthDiagnosticStatus::Ok)
+        {
+            let label = match check.status {
+                HealthDiagnosticStatus::Info => style.dim("INFO"),
+                HealthDiagnosticStatus::Warning => style.yellow("WARN"),
+                HealthDiagnosticStatus::Error => style.red("ERROR"),
+                HealthDiagnosticStatus::Ok => style.green("OK"),
+            };
+            output.push_str(&format!("    {label} {}: {}\n", check.name, check.detail));
+        }
+
+        output
+    }
+
     /// Label suffix for queue status (empty when queue is idle).
     fn queue_status_label(depth: usize, style: &Style) -> String {
         if depth == 0 {
@@ -1821,10 +2130,20 @@ impl HealthSnapshotRenderer {
             String::new()
         }
     }
+
+    fn decode_section<T>(value: Option<&serde_json::Value>) -> Option<T>
+    where
+        T: DeserializeOwned,
+    {
+        value
+            .filter(|value| !value.is_null())
+            .and_then(|value| serde_json::from_value::<T>(value.clone()).ok())
+    }
 }
 
 /// Diagnostic status levels for health checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HealthDiagnosticStatus {
     /// No issues
     Ok,
@@ -1834,6 +2153,19 @@ pub enum HealthDiagnosticStatus {
     Warning,
     /// Definite issue
     Error,
+}
+
+impl HealthDiagnosticStatus {
+    /// Stable lowercase label for machine-readable JSON payloads.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
 }
 
 /// A single diagnostic result from health snapshot analysis.
@@ -4034,6 +4366,238 @@ mod tests {
         let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
         let activity = checks.iter().find(|c| c.name == "pane activity").unwrap();
         assert_eq!(activity.status, HealthDiagnosticStatus::Ok);
+    }
+
+    #[test]
+    fn resize_dashboard_extracts_from_status_payload() {
+        let lock = RuntimeLockMemoryTelemetrySnapshot {
+            timestamp_ms: 1_700_000_000_000,
+            avg_storage_lock_wait_ms: 1.2,
+            p50_storage_lock_wait_ms: 0.8,
+            p95_storage_lock_wait_ms: 12.5,
+            max_storage_lock_wait_ms: 30.0,
+            storage_lock_contention_events: 4,
+            avg_storage_lock_hold_ms: 2.1,
+            p50_storage_lock_hold_ms: 1.9,
+            p95_storage_lock_hold_ms: 4.2,
+            max_storage_lock_hold_ms: 9.5,
+            cursor_snapshot_bytes_last: 2048,
+            p50_cursor_snapshot_bytes: 4096,
+            p95_cursor_snapshot_bytes: 8192,
+            cursor_snapshot_bytes_max: 16384,
+            avg_cursor_snapshot_bytes: 6144.0,
+        };
+
+        let scheduler = crate::resize_scheduler::ResizeSchedulerDebugSnapshot {
+            gate: crate::resize_scheduler::ResizeControlPlaneGateState {
+                control_plane_enabled: true,
+                emergency_disable: false,
+                legacy_fallback_enabled: true,
+                active: true,
+            },
+            scheduler: crate::resize_scheduler::ResizeSchedulerSnapshot {
+                config: crate::resize_scheduler::ResizeSchedulerConfig::default(),
+                metrics: crate::resize_scheduler::ResizeSchedulerMetrics {
+                    input_guardrail_frames: 2,
+                    ..Default::default()
+                },
+                pending_total: 3,
+                active_total: 1,
+                panes: vec![],
+            },
+            lifecycle_events: vec![],
+            invariants: crate::resize_invariants::ResizeInvariantReport::default(),
+            invariant_telemetry: crate::resize_invariants::ResizeInvariantTelemetry::default(),
+        };
+        let stalled = vec![crate::resize_scheduler::ResizeStalledTransaction {
+            pane_id: 42,
+            intent_seq: 7,
+            active_phase: None,
+            age_ms: 3200,
+            latest_seq: Some(8),
+        }];
+        let watchdog = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Warning,
+            stalled_total: 1,
+            stalled_critical: 0,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 8000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+            recommended_action: "monitor_stalled_transactions".to_string(),
+            sample_stalled: stalled.clone(),
+        };
+        let ladder = crate::degradation::evaluate_resize_degradation_ladder(
+            crate::degradation::ResizeDegradationSignals {
+                stalled_total: 1,
+                stalled_critical: 0,
+                warning_threshold_ms: 2000,
+                critical_threshold_ms: 8000,
+                critical_stalled_limit: 2,
+                safe_mode_recommended: false,
+                safe_mode_active: false,
+                legacy_fallback_enabled: true,
+            },
+        );
+
+        let payload = serde_json::json!({
+            "health": { "runtime_lock_memory": lock },
+            "resize_control_plane": scheduler,
+            "resize_control_plane_stalled": stalled,
+            "resize_control_plane_watchdog": watchdog,
+            "resize_degradation_ladder": ladder,
+        });
+
+        let dashboard = HealthSnapshotRenderer::resize_dashboard_from_status_payload(&payload)
+            .expect("dashboard should parse from status payload");
+
+        assert!(dashboard.runtime_lock_memory.is_some());
+        assert!(dashboard.control_plane.is_some());
+        assert_eq!(dashboard.stalled_transactions.len(), 1);
+        assert!(dashboard.watchdog.is_some());
+        assert!(dashboard.degradation_ladder.is_some());
+    }
+
+    #[test]
+    fn resize_dashboard_diagnostics_detect_error_risk() {
+        let dashboard = ResizeDashboardSnapshot {
+            runtime_lock_memory: Some(RuntimeLockMemoryTelemetrySnapshot {
+                timestamp_ms: 1_700_000_000_000,
+                avg_storage_lock_wait_ms: 90.0,
+                p50_storage_lock_wait_ms: 70.0,
+                p95_storage_lock_wait_ms: 150.0,
+                max_storage_lock_wait_ms: 220.0,
+                storage_lock_contention_events: 20,
+                avg_storage_lock_hold_ms: 40.0,
+                p50_storage_lock_hold_ms: 30.0,
+                p95_storage_lock_hold_ms: 110.0,
+                max_storage_lock_hold_ms: 180.0,
+                cursor_snapshot_bytes_last: 8 * 1024 * 1024,
+                p50_cursor_snapshot_bytes: 12 * 1024 * 1024,
+                p95_cursor_snapshot_bytes: 40 * 1024 * 1024,
+                cursor_snapshot_bytes_max: 48 * 1024 * 1024,
+                avg_cursor_snapshot_bytes: 24.0 * 1024.0 * 1024.0,
+            }),
+            control_plane: Some(crate::resize_scheduler::ResizeSchedulerDebugSnapshot {
+                gate: crate::resize_scheduler::ResizeControlPlaneGateState {
+                    control_plane_enabled: true,
+                    emergency_disable: true,
+                    legacy_fallback_enabled: true,
+                    active: false,
+                },
+                scheduler: crate::resize_scheduler::ResizeSchedulerSnapshot {
+                    config: crate::resize_scheduler::ResizeSchedulerConfig {
+                        max_pending_panes: 8,
+                        ..Default::default()
+                    },
+                    metrics: crate::resize_scheduler::ResizeSchedulerMetrics {
+                        input_guardrail_frames: 5,
+                        ..Default::default()
+                    },
+                    pending_total: 8,
+                    active_total: 3,
+                    panes: vec![],
+                },
+                lifecycle_events: vec![],
+                invariants: crate::resize_invariants::ResizeInvariantReport::default(),
+                invariant_telemetry: crate::resize_invariants::ResizeInvariantTelemetry::default(),
+            }),
+            stalled_transactions: vec![crate::resize_scheduler::ResizeStalledTransaction {
+                pane_id: 7,
+                intent_seq: 9,
+                active_phase: None,
+                age_ms: 10_500,
+                latest_seq: Some(10),
+            }],
+            watchdog: Some(ResizeWatchdogAssessment {
+                severity: ResizeWatchdogSeverity::Critical,
+                stalled_total: 3,
+                stalled_critical: 2,
+                warning_threshold_ms: 2000,
+                critical_threshold_ms: 8000,
+                critical_stalled_limit: 2,
+                safe_mode_recommended: true,
+                safe_mode_active: false,
+                legacy_fallback_enabled: true,
+                recommended_action: "enable_safe_mode_fallback".to_string(),
+                sample_stalled: vec![],
+            }),
+            degradation_ladder: Some(crate::degradation::evaluate_resize_degradation_ladder(
+                crate::degradation::ResizeDegradationSignals {
+                    stalled_total: 3,
+                    stalled_critical: 2,
+                    warning_threshold_ms: 2000,
+                    critical_threshold_ms: 8000,
+                    critical_stalled_limit: 2,
+                    safe_mode_recommended: true,
+                    safe_mode_active: true,
+                    legacy_fallback_enabled: true,
+                },
+            )),
+        };
+
+        let checks = HealthSnapshotRenderer::resize_dashboard_diagnostic_checks(&dashboard);
+        let latency = checks
+            .iter()
+            .find(|check| check.name == "resize latency risk")
+            .unwrap();
+        let hitch = checks
+            .iter()
+            .find(|check| check.name == "resize hitch risk")
+            .unwrap();
+        let crash = checks
+            .iter()
+            .find(|check| check.name == "resize crash risk")
+            .unwrap();
+        let cursor = checks
+            .iter()
+            .find(|check| check.name == "resize cursor memory")
+            .unwrap();
+
+        assert_eq!(latency.status, HealthDiagnosticStatus::Error);
+        assert_eq!(hitch.status, HealthDiagnosticStatus::Error);
+        assert_eq!(crash.status, HealthDiagnosticStatus::Error);
+        assert_eq!(cursor.status, HealthDiagnosticStatus::Error);
+    }
+
+    #[test]
+    fn resize_dashboard_compact_render_contains_risk_lines() {
+        let dashboard = ResizeDashboardSnapshot {
+            runtime_lock_memory: None,
+            control_plane: None,
+            stalled_transactions: vec![],
+            watchdog: Some(ResizeWatchdogAssessment {
+                severity: ResizeWatchdogSeverity::Warning,
+                stalled_total: 1,
+                stalled_critical: 0,
+                warning_threshold_ms: 2000,
+                critical_threshold_ms: 8000,
+                critical_stalled_limit: 2,
+                safe_mode_recommended: false,
+                safe_mode_active: false,
+                legacy_fallback_enabled: true,
+                recommended_action: "monitor_stalled_transactions".to_string(),
+                sample_stalled: vec![],
+            }),
+            degradation_ladder: None,
+        };
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render_resize_dashboard_compact(&dashboard, &ctx);
+
+        assert!(output.contains("Resize dashboard:"));
+        assert!(output.contains("watchdog:"));
+        assert!(output.contains("resize crash risk"));
+    }
+
+    #[test]
+    fn health_diagnostic_status_as_str_is_stable() {
+        assert_eq!(HealthDiagnosticStatus::Ok.as_str(), "ok");
+        assert_eq!(HealthDiagnosticStatus::Info.as_str(), "info");
+        assert_eq!(HealthDiagnosticStatus::Warning.as_str(), "warning");
+        assert_eq!(HealthDiagnosticStatus::Error.as_str(), "error");
     }
 
     // =========================================================================

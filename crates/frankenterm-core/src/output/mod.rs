@@ -38,8 +38,8 @@ pub use renderers::{
     AccountListRenderer, ActionHistoryRenderer, AnalyticsAgentRenderer, AnalyticsDailyRenderer,
     AnalyticsExportRenderer, AnalyticsSummaryData, AnalyticsSummaryRenderer, AuditListRenderer,
     EventListRenderer, HealthDiagnostic, HealthDiagnosticStatus, HealthSnapshotRenderer,
-    PaneTableRenderer, Render, RenderContext, RuleDetail, RuleDetailRenderer, RuleListItem,
-    RuleTestMatch, RulesListRenderer, RulesTestRenderer, SearchResultRenderer,
-    SearchSuggestRenderer, TimelineRenderer, WorkflowResultRenderer,
+    PaneTableRenderer, Render, RenderContext, ResizeDashboardSnapshot, RuleDetail,
+    RuleDetailRenderer, RuleListItem, RuleTestMatch, RulesListRenderer, RulesTestRenderer,
+    SearchResultRenderer, SearchSuggestRenderer, TimelineRenderer, WorkflowResultRenderer,
 };
 pub use table::{Alignment, Column, Table};
