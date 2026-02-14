@@ -533,7 +533,15 @@ impl IpcServer {
         ctx: Arc<IpcHandlerContext>,
         shutdown_rx: &mut mpsc::Receiver<()>,
     ) {
+        #[cfg(feature = "asupersync-runtime")]
+        let shutdown_cx = crate::cx::for_testing();
+
         loop {
+            #[cfg(feature = "asupersync-runtime")]
+            let shutdown_fut = shutdown_rx.recv(&shutdown_cx);
+            #[cfg(not(feature = "asupersync-runtime"))]
+            let shutdown_fut = shutdown_rx.recv();
+
             tokio::select! {
                 result = self.listener.accept() => {
                     match result {
@@ -550,7 +558,7 @@ impl IpcServer {
                         }
                     }
                 }
-                _ = shutdown_rx.recv() => {
+                _ = shutdown_fut => {
                     tracing::info!("IPC server shutting down");
                     break;
                 }

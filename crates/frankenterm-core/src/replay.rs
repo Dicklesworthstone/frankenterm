@@ -492,7 +492,15 @@ impl Player {
             }
             PlayerControl::Pause => {
                 self.state = PlayerState::Paused;
+                #[cfg(feature = "asupersync-runtime")]
+                let watch_cx = crate::cx::for_testing();
                 loop {
+                    #[cfg(feature = "asupersync-runtime")]
+                    control_rx
+                        .changed(&watch_cx)
+                        .await
+                        .map_err(|_| crate::Error::Runtime("control channel closed".into()))?;
+                    #[cfg(not(feature = "asupersync-runtime"))]
                     control_rx
                         .changed()
                         .await
@@ -583,11 +591,23 @@ impl Player {
 
 /// Poll the control channel for the latest signal (non-blocking).
 fn check_control(rx: &mut watch::Receiver<PlayerControl>) -> Option<PlayerControl> {
-    // has_changed() returns Err if sender is dropped; treat as no change.
-    if rx.has_changed().unwrap_or(false) {
-        Some(*rx.borrow_and_update())
-    } else {
-        None
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        if rx.has_changed() {
+            Some(rx.borrow_and_clone())
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        // has_changed() returns Err if sender is dropped; treat as no change.
+        if rx.has_changed().unwrap_or(false) {
+            Some(*rx.borrow_and_update())
+        } else {
+            None
+        }
     }
 }
 

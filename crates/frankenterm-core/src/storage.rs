@@ -4884,9 +4884,48 @@ fn ensure_db_permissions(_path: &Path, _is_new: bool) -> Result<()> {
 /// a dedicated writer thread to avoid blocking the async runtime. Reads use
 /// spawn_blocking with WAL mode for concurrent access.
 #[derive(Clone)]
+struct WriteCommandSender {
+    inner: mpsc::Sender<WriteCommand>,
+}
+
+impl WriteCommandSender {
+    fn new(inner: mpsc::Sender<WriteCommand>) -> Self {
+        Self { inner }
+    }
+
+    async fn send(
+        &self,
+        command: WriteCommand,
+    ) -> std::result::Result<(), mpsc::SendError<WriteCommand>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_testing();
+            self.inner.send(&cx, command).await
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            self.inner.send(command).await
+        }
+    }
+
+    fn max_capacity(&self) -> usize {
+        self.inner.max_capacity()
+    }
+
+    fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+}
+
+#[derive(Clone)]
 pub struct StorageHandle {
     /// Sender for write commands
-    write_tx: mpsc::Sender<WriteCommand>,
+    write_tx: WriteCommandSender,
     /// Database path for read connections
     db_path: Arc<String>,
     /// Writer thread join handle (for shutdown) - shared to allow Clone
@@ -4976,7 +5015,7 @@ impl StorageHandle {
         });
 
         Ok(Self {
-            write_tx,
+            write_tx: WriteCommandSender::new(write_tx),
             db_path: Arc::new(db_path.to_string()),
             writer_handle: Arc::new(Mutex::new(Some(writer_handle))),
             semantic_budget_state: Arc::new(Mutex::new(SemanticBudgetState::new(
@@ -8349,7 +8388,24 @@ fn is_control_command(cmd: &WriteCommand) -> bool {
 /// overhead.  Control commands (Shutdown, Vacuum, Checkpoint) commit any open
 /// transaction first, then execute outside a transaction.
 fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
-    while let Some(first_cmd) = rx.blocking_recv() {
+    #[cfg(feature = "asupersync-runtime")]
+    let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        .build()
+        .expect("failed to build writer runtime");
+    #[cfg(feature = "asupersync-runtime")]
+    let recv_cx = crate::cx::for_testing();
+
+    loop {
+        #[cfg(feature = "asupersync-runtime")]
+        let first_cmd =
+            crate::runtime_compat::CompatRuntime::block_on(&runtime, rx.recv(&recv_cx)).ok();
+        #[cfg(not(feature = "asupersync-runtime"))]
+        let first_cmd = rx.blocking_recv();
+
+        let Some(first_cmd) = first_cmd else {
+            break;
+        };
+
         // Drain any additional pending commands for batching
         let mut batch = Vec::with_capacity(8);
         batch.push(first_cmd);

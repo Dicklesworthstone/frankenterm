@@ -869,7 +869,7 @@ pub struct ObservationRuntime {
     /// Runtime metrics for health/shutdown
     metrics: Arc<RuntimeMetrics>,
     /// Hot-reloadable config sender (for broadcasting updates to tasks)
-    config_tx: watch::Sender<HotReloadableConfig>,
+    config_tx: Arc<watch::Sender<HotReloadableConfig>>,
     /// Hot-reloadable config receiver (for tasks to receive updates)
     config_rx: watch::Receiver<HotReloadableConfig>,
     /// Optional event bus for publishing detection events to workflow runners
@@ -928,7 +928,7 @@ impl ObservationRuntime {
             detection_contexts: Arc::new(RwLock::new(HashMap::new())),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             metrics,
-            config_tx,
+            config_tx: Arc::new(config_tx),
             config_rx,
             event_bus: None,
             recording: None,
@@ -1108,7 +1108,7 @@ impl ObservationRuntime {
             registry: Arc::clone(&self.registry),
             cursors: Arc::clone(&self.cursors),
             start_time: Instant::now(),
-            config_tx: self.config_tx.clone(),
+            config_tx: Arc::clone(&self.config_tx),
             event_bus: self.event_bus.clone(),
             heartbeats: Arc::clone(&self.heartbeats),
             capture_tx: capture_tx_probe,
@@ -2571,7 +2571,7 @@ pub struct RuntimeHandle {
     /// Runtime start time
     pub start_time: Instant,
     /// Hot-reload config sender for broadcasting updates
-    config_tx: watch::Sender<HotReloadableConfig>,
+    config_tx: Arc<watch::Sender<HotReloadableConfig>>,
     /// Optional event bus for workflow integration
     pub event_bus: Option<Arc<EventBus>>,
     /// Heartbeat registry for watchdog monitoring

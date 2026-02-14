@@ -390,12 +390,19 @@ impl SnapshotEngine {
                 let interval_secs = self.config.interval_seconds.max(30);
                 let interval = Duration::from_secs(interval_secs);
                 let mut is_first = true;
+                #[cfg(feature = "asupersync-runtime")]
+                let shutdown_cx = crate::cx::for_testing();
 
                 loop {
                     if !is_first {
+                        #[cfg(feature = "asupersync-runtime")]
+                        let shutdown_fut = shutdown.changed(&shutdown_cx);
+                        #[cfg(not(feature = "asupersync-runtime"))]
+                        let shutdown_fut = shutdown.changed();
+
                         tokio::select! {
                             () = sleep(interval) => {}
-                            _ = shutdown.changed() => {
+                            _ = shutdown_fut => {
                                 tracing::info!("snapshot engine shutting down");
                                 break;
                             }
@@ -442,11 +449,24 @@ impl SnapshotEngine {
 
                 let mut accumulated_value = 0.0_f64;
                 let snapshot_threshold = self.config.scheduling.snapshot_threshold.max(0.0);
+                #[cfg(feature = "asupersync-runtime")]
+                let scheduler_cx = crate::cx::for_testing();
 
                 loop {
                     let fallback_wait = next_fallback_at.saturating_duration_since(Instant::now());
+
+                    #[cfg(feature = "asupersync-runtime")]
+                    let maybe_trigger_fut = async { trigger_rx.recv(&scheduler_cx).await.ok() };
+                    #[cfg(not(feature = "asupersync-runtime"))]
+                    let maybe_trigger_fut = async { trigger_rx.recv().await };
+
+                    #[cfg(feature = "asupersync-runtime")]
+                    let shutdown_fut = shutdown.changed(&scheduler_cx);
+                    #[cfg(not(feature = "asupersync-runtime"))]
+                    let shutdown_fut = shutdown.changed();
+
                     tokio::select! {
-                        maybe_trigger = trigger_rx.recv() => {
+                        maybe_trigger = maybe_trigger_fut => {
                             let Some(trigger) = maybe_trigger else {
                                 tracing::info!("trigger channel closed; intelligent scheduler stopping");
                                 break;
@@ -483,7 +503,7 @@ impl SnapshotEngine {
                             }
                             next_fallback_at = Instant::now() + fallback_interval;
                         }
-                        _ = shutdown.changed() => {
+                        _ = shutdown_fut => {
                             tracing::info!("snapshot engine shutting down");
                             break;
                         }
