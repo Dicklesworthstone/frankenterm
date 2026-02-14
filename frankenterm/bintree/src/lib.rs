@@ -1395,4 +1395,332 @@ mod tests {
         let debug = format!("{:?}", PathBranch::IsRight);
         assert!(debug.contains("IsRight"));
     }
+
+    // ── String leaf type ─────────────────────────────────────
+
+    #[test]
+    fn tree_with_string_leaves() {
+        let t = Tree::<String>::new()
+            .cursor()
+            .assign_top("hello".to_string())
+            .unwrap()
+            .split_leaf_and_insert_right("world".to_string())
+            .unwrap()
+            .tree();
+        assert_eq!(t.num_leaves(), 2);
+    }
+
+    // ── postorder_next additional tests ───────────────────────
+
+    #[test]
+    fn postorder_next_on_single_leaf_fails() {
+        let c = Tree::<i32>::Leaf(1).cursor();
+        assert!(c.postorder_next().is_err());
+    }
+
+    #[test]
+    fn postorder_full_traversal_three_leaves() {
+        // Build tree: Node(Node(Leaf(1), Leaf(2)), Leaf(3))
+        let t = Tree::<i32, ()>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(3)
+            .unwrap()
+            .go_left()
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .tree();
+
+        // Start postorder from the rightmost leaf
+        let mut cursor = t.cursor().go_right().unwrap();
+        let mut leaves = vec![*cursor.leaf_mut().unwrap()];
+
+        loop {
+            match cursor.postorder_next() {
+                Ok(c) => {
+                    cursor = c;
+                    if cursor.is_leaf() {
+                        leaves.push(*cursor.leaf_mut().unwrap());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // Postorder visits right subtree leaves in reverse
+        assert_eq!(leaves, vec![3, 2, 1]);
+    }
+
+    // ── Cursor from empty tree ───────────────────────────────
+
+    #[test]
+    fn cursor_from_empty_tree_is_empty() {
+        let t: Tree<i32> = Tree::new();
+        let c = t.cursor();
+        assert!(c.is_top());
+        assert!(!c.is_leaf());
+        assert_eq!(*c.subtree(), Tree::Empty);
+    }
+
+    // ── assign_top not at top ────────────────────────────────
+
+    #[test]
+    fn assign_top_not_at_top_fails() {
+        let c = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .go_left()
+            .unwrap();
+        // Not at top, so assign_top should fail
+        assert!(c.assign_top(99).is_err());
+    }
+
+    // ── leaf_mut / node_mut on empty tree ─────────────────────
+
+    #[test]
+    fn leaf_mut_on_empty_tree_returns_none() {
+        let mut c: Cursor<i32, ()> = Cursor::new();
+        assert!(c.leaf_mut().is_none());
+    }
+
+    #[test]
+    fn node_mut_on_empty_tree_returns_err() {
+        let mut c: Cursor<i32, ()> = Cursor::new();
+        assert!(c.node_mut().is_err());
+    }
+
+    // ── go_to_nth_leaf with many leaves ──────────────────────
+
+    #[test]
+    fn go_to_nth_leaf_four_leaves() {
+        // Build tree with 4 leaves: 1, 2, 3, 4
+        // Must .tree() between splits to reset cursor to root
+        fn build_four_leaf_tree() -> Tree<i32, ()> {
+            let t = Tree::<i32, ()>::new()
+                .cursor()
+                .assign_top(1)
+                .unwrap()
+                .split_leaf_and_insert_right(2)
+                .unwrap()
+                .tree();
+            let t = t
+                .cursor()
+                .go_to_nth_leaf(1)
+                .unwrap()
+                .split_leaf_and_insert_right(3)
+                .unwrap()
+                .tree();
+            t.cursor()
+                .go_to_nth_leaf(2)
+                .unwrap()
+                .split_leaf_and_insert_right(4)
+                .unwrap()
+                .tree()
+        }
+
+        assert_eq!(build_four_leaf_tree().num_leaves(), 4);
+
+        for (i, expected) in [1, 2, 3, 4].iter().enumerate() {
+            let mut c = build_four_leaf_tree().cursor().go_to_nth_leaf(i).unwrap();
+            assert_eq!(*c.leaf_mut().unwrap(), *expected);
+        }
+    }
+
+    // ── tree() from rightmost position ───────────────────────
+
+    #[test]
+    fn tree_from_rightmost_position() {
+        let t = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .go_right()
+            .unwrap()
+            .tree();
+        assert_eq!(t.num_leaves(), 2);
+    }
+
+    // ── Large tree ───────────────────────────────────────────
+
+    #[test]
+    fn build_ten_leaf_tree() {
+        let mut t = Tree::<i32, ()>::new()
+            .cursor()
+            .assign_top(0)
+            .unwrap()
+            .tree();
+        for i in 1..10 {
+            t = t
+                .cursor()
+                .go_to_nth_leaf(i - 1)
+                .unwrap()
+                .split_leaf_and_insert_right(i as i32)
+                .unwrap()
+                .tree();
+        }
+        assert_eq!(t.num_leaves(), 10);
+    }
+
+    // ── PartialEq nested trees ───────────────────────────────
+
+    #[test]
+    fn nested_trees_equal() {
+        let t1 = Tree::<i32, i32>::Node {
+            left: Box::new(Tree::Node {
+                left: Box::new(Tree::Leaf(1)),
+                right: Box::new(Tree::Leaf(2)),
+                data: Some(10),
+            }),
+            right: Box::new(Tree::Leaf(3)),
+            data: Some(20),
+        };
+        let t2 = Tree::<i32, i32>::Node {
+            left: Box::new(Tree::Node {
+                left: Box::new(Tree::Leaf(1)),
+                right: Box::new(Tree::Leaf(2)),
+                data: Some(10),
+            }),
+            right: Box::new(Tree::Leaf(3)),
+            data: Some(20),
+        };
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn nested_trees_different_leaf_not_equal() {
+        let t1 = Tree::<i32, i32>::Node {
+            left: Box::new(Tree::Node {
+                left: Box::new(Tree::Leaf(1)),
+                right: Box::new(Tree::Leaf(2)),
+                data: None,
+            }),
+            right: Box::new(Tree::Leaf(3)),
+            data: None,
+        };
+        let t2 = Tree::<i32, i32>::Node {
+            left: Box::new(Tree::Node {
+                left: Box::new(Tree::Leaf(1)),
+                right: Box::new(Tree::Leaf(999)),
+                data: None,
+            }),
+            right: Box::new(Tree::Leaf(3)),
+            data: None,
+        };
+        assert_ne!(t1, t2);
+    }
+
+    // ── Round-trip cursor split and unsplit ───────────────────
+
+    #[test]
+    fn preorder_full_traversal_three_leaves() {
+        let t = Tree::<i32, ()>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(3)
+            .unwrap()
+            .go_left()
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .tree();
+
+        // preorder_next from leftmost leaf should visit all leaves
+        let mut cursor = t.cursor().go_to_nth_leaf(0).unwrap();
+        let mut leaves = vec![*cursor.leaf_mut().unwrap()];
+        loop {
+            match cursor.preorder_next() {
+                Ok(c) => {
+                    cursor = c;
+                    if cursor.is_leaf() {
+                        leaves.push(*cursor.leaf_mut().unwrap());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(leaves, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn build_ten_leaf_tree_verify_values() {
+        let mut t = Tree::<i32, ()>::new()
+            .cursor()
+            .assign_top(0)
+            .unwrap()
+            .tree();
+        for i in 1..10 {
+            t = t
+                .cursor()
+                .go_to_nth_leaf(i - 1)
+                .unwrap()
+                .split_leaf_and_insert_right(i as i32)
+                .unwrap()
+                .tree();
+        }
+        // Verify each leaf value
+        for i in 0..10 {
+            let mut c = t.cursor().go_to_nth_leaf(i).unwrap();
+            assert_eq!(*c.leaf_mut().unwrap(), i as i32);
+            t = c.tree();
+        }
+    }
+
+    #[test]
+    fn go_left_then_go_right_sibling_via_up() {
+        let t = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .tree();
+
+        // Navigate: root → left → up → right
+        let mut c = t
+            .cursor()
+            .go_left()
+            .unwrap()
+            .go_up()
+            .unwrap()
+            .go_right()
+            .unwrap();
+        assert!(c.is_right());
+        assert_eq!(*c.leaf_mut().unwrap(), 2);
+    }
+
+    #[test]
+    fn assign_node_then_read_back() {
+        let mut c = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .assign_node(Some(42))
+            .unwrap();
+        assert_eq!(*c.node_mut().unwrap(), Some(42));
+    }
+
+    #[test]
+    fn split_then_unsplit_restores_leaf() {
+        let c = Tree::<i32, i32>::Leaf(42)
+            .cursor()
+            .split_leaf_and_insert_right(99)
+            .unwrap()
+            .go_right()
+            .unwrap();
+
+        let (c, removed, _data) = c.unsplit_leaf().unwrap();
+        assert_eq!(removed, 99);
+        // Should now have a single leaf with value 42
+        assert!(c.is_leaf());
+        assert_eq!(*c.subtree(), Tree::Leaf(42));
+    }
 }
