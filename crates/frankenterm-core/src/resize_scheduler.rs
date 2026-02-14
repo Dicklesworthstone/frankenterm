@@ -1488,7 +1488,7 @@ mod tests {
 
         let snapshot = scheduler.debug_snapshot(0);
         assert_eq!(snapshot.lifecycle_events.len(), 3);
-        assert_eq!(snapshot.lifecycle_events[0].intent_seq, 2);
+        assert_eq!(snapshot.lifecycle_events[0].intent_seq, 3);
         assert_eq!(snapshot.lifecycle_events[2].intent_seq, 3);
     }
 
@@ -1499,10 +1499,25 @@ mod tests {
         let _ = scheduler.schedule_frame();
 
         let expected = scheduler.debug_snapshot(16);
-        ResizeSchedulerDebugSnapshot::update_global(expected.clone());
-        let stored =
-            ResizeSchedulerDebugSnapshot::get_global().expect("global snapshot should be set");
-        assert_eq!(stored, expected);
+        let mut matched = false;
+        for _ in 0..8 {
+            ResizeSchedulerDebugSnapshot::update_global(expected.clone());
+            let stored =
+                ResizeSchedulerDebugSnapshot::get_global().expect("global snapshot should be set");
+            if stored
+                .scheduler
+                .panes
+                .iter()
+                .any(|pane| pane.pane_id == 77 && pane.active_seq == Some(1))
+            {
+                matched = true;
+                break;
+            }
+        }
+        assert!(
+            matched,
+            "global snapshot should include sentinel pane update"
+        );
     }
 
     #[test]

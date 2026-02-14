@@ -51,6 +51,82 @@ pub struct Screen {
 }
 
 const MAX_WRAP_CACHE_ENTRIES: usize = 6;
+const MAX_REFLOW_BATCH_LOGICAL_LINES: usize = 64;
+const REFLOW_OVERSCAN_ROW_MULTIPLIER: usize = 1;
+const REFLOW_OVERSCAN_ROW_CAP: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReflowBatchPriority {
+    Viewport,
+    NearViewport,
+    ColdScrollback,
+}
+
+impl ReflowBatchPriority {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewport => "viewport",
+            Self::NearViewport => "near_viewport",
+            Self::ColdScrollback => "cold_scrollback",
+        }
+    }
+
+    fn rationale(self) -> &'static str {
+        match self {
+            Self::Viewport => "intersects visible viewport",
+            Self::NearViewport => "inside overscan window",
+            Self::ColdScrollback => "outside overscan window",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReflowBatchPlan {
+    logical_range: Range<usize>,
+    priority: ReflowBatchPriority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ViewportReflowPlan {
+    batches: Vec<ReflowBatchPlan>,
+}
+
+impl ViewportReflowPlan {
+    fn full_scan(logical_count: usize) -> Self {
+        let mut batches = Vec::new();
+        let mut start = 0usize;
+        while start < logical_count {
+            let end = (start + MAX_REFLOW_BATCH_LOGICAL_LINES).min(logical_count);
+            batches.push(ReflowBatchPlan {
+                logical_range: start..end,
+                priority: ReflowBatchPriority::ColdScrollback,
+            });
+            start = end;
+        }
+        Self { batches }
+    }
+
+    fn covers_each_logical_line_once(&self, logical_count: usize) -> bool {
+        if logical_count == 0 {
+            return self.batches.is_empty();
+        }
+        let mut coverage = vec![0u8; logical_count];
+        for batch in &self.batches {
+            if batch.logical_range.end > logical_count || batch.logical_range.start >= batch.logical_range.end
+            {
+                return false;
+            }
+            for idx in batch.logical_range.clone() {
+                coverage[idx] = coverage[idx].saturating_add(1);
+            }
+        }
+        coverage.into_iter().all(|count| count == 1)
+    }
+}
+
+fn ranges_intersect(lhs: &Range<usize>, rhs: &Range<usize>) -> bool {
+    lhs.start < rhs.end && rhs.start < lhs.end
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct WrapCacheKey {
@@ -188,6 +264,126 @@ impl Screen {
         Self::compute_layout_signature_for_lines(self.lines.iter())
     }
 
+    fn logical_line_physical_ranges(lines: &VecDeque<Line>) -> Vec<Range<usize>> {
+        if lines.is_empty() {
+            return Vec::new();
+        }
+
+        let mut ranges = Vec::new();
+        let mut start = 0usize;
+        for (idx, line) in lines.iter().enumerate() {
+            if !line.last_cell_was_wrapped() {
+                ranges.push(start..idx + 1);
+                start = idx + 1;
+            }
+        }
+
+        if start < lines.len() {
+            ranges.push(start..lines.len());
+        }
+
+        ranges
+    }
+
+    fn append_batches_for_indices(
+        indices: &[usize],
+        priority: ReflowBatchPriority,
+        batches: &mut Vec<ReflowBatchPlan>,
+    ) {
+        if indices.is_empty() {
+            return;
+        }
+
+        let mut run_start = indices[0];
+        let mut run_end = run_start + 1;
+        for &idx in indices.iter().skip(1) {
+            if idx == run_end {
+                run_end += 1;
+                continue;
+            }
+
+            let mut chunk_start = run_start;
+            while chunk_start < run_end {
+                let chunk_end = (chunk_start + MAX_REFLOW_BATCH_LOGICAL_LINES).min(run_end);
+                batches.push(ReflowBatchPlan {
+                    logical_range: chunk_start..chunk_end,
+                    priority,
+                });
+                chunk_start = chunk_end;
+            }
+
+            run_start = idx;
+            run_end = idx + 1;
+        }
+
+        let mut chunk_start = run_start;
+        while chunk_start < run_end {
+            let chunk_end = (chunk_start + MAX_REFLOW_BATCH_LOGICAL_LINES).min(run_end);
+            batches.push(ReflowBatchPlan {
+                logical_range: chunk_start..chunk_end,
+                priority,
+            });
+            chunk_start = chunk_end;
+        }
+    }
+
+    fn build_viewport_reflow_plan_from_ranges(
+        logical_ranges: &[Range<usize>],
+        visible_phys_range: Range<usize>,
+        total_phys_rows: usize,
+    ) -> ViewportReflowPlan {
+        if logical_ranges.is_empty() {
+            return ViewportReflowPlan::default();
+        }
+
+        let overscan_rows = visible_phys_range
+            .len()
+            .saturating_mul(REFLOW_OVERSCAN_ROW_MULTIPLIER)
+            .min(REFLOW_OVERSCAN_ROW_CAP)
+            .max(1);
+        let overscan_start = visible_phys_range.start.saturating_sub(overscan_rows);
+        let overscan_end = (visible_phys_range.end + overscan_rows).min(total_phys_rows);
+        let overscan_range = overscan_start..overscan_end;
+
+        let mut viewport = Vec::new();
+        let mut near = Vec::new();
+        let mut cold = Vec::new();
+
+        for (logical_idx, phys_range) in logical_ranges.iter().enumerate() {
+            if ranges_intersect(phys_range, &visible_phys_range) {
+                viewport.push(logical_idx);
+            } else if ranges_intersect(phys_range, &overscan_range) {
+                near.push(logical_idx);
+            } else {
+                cold.push(logical_idx);
+            }
+        }
+
+        let mut batches = Vec::new();
+        Self::append_batches_for_indices(&viewport, ReflowBatchPriority::Viewport, &mut batches);
+        Self::append_batches_for_indices(&near, ReflowBatchPriority::NearViewport, &mut batches);
+        Self::append_batches_for_indices(&cold, ReflowBatchPriority::ColdScrollback, &mut batches);
+        ViewportReflowPlan { batches }
+    }
+
+    fn build_viewport_reflow_plan_for_current_snapshot(
+        &self,
+        logical_count: usize,
+    ) -> ViewportReflowPlan {
+        if logical_count == 0 {
+            return ViewportReflowPlan::default();
+        }
+
+        let logical_ranges = Self::logical_line_physical_ranges(&self.lines);
+        if logical_ranges.len() != logical_count {
+            return ViewportReflowPlan::full_scan(logical_count);
+        }
+
+        let visible_start = self.lines.len().saturating_sub(self.physical_rows);
+        let visible_range = visible_start..self.lines.len();
+        Self::build_viewport_reflow_plan_from_ranges(&logical_ranges, visible_range, self.lines.len())
+    }
+
     fn logical_cursor_from_physical(
         &self,
         cursor_x: usize,
@@ -282,6 +478,7 @@ impl Screen {
                     entry.logical_lines.clone(),
                     physical_cols,
                     seqno,
+                    Some(&self.build_viewport_reflow_plan_for_current_snapshot(logical_count)),
                 );
                 entry.insert_wrapped(wrap_key, wrapped.clone());
                 let cache_entries = entry.wrapped_by_key.len();
@@ -298,8 +495,12 @@ impl Screen {
 
         let logical_lines = self.rebuild_logical_lines_from_physical(seqno);
         let logical_count = logical_lines.len();
-        let wrapped =
-            Self::wrap_logical_lines_for_resize(logical_lines.clone(), physical_cols, seqno);
+        let wrapped = Self::wrap_logical_lines_for_resize(
+            logical_lines.clone(),
+            physical_cols,
+            seqno,
+            Some(&self.build_viewport_reflow_plan_for_current_snapshot(logical_count)),
+        );
         let mut new_cache = LogicalLineWrapCache::new(source_signature, logical_lines);
         new_cache.insert_wrapped(wrap_key, wrapped.clone());
         let cache_entries = new_cache.wrapped_by_key.len();
@@ -335,64 +536,108 @@ impl Screen {
         logical_lines: Vec<Line>,
         physical_cols: usize,
         seqno: SequenceNo,
+        reflow_plan: Option<&ViewportReflowPlan>,
     ) -> Vec<Vec<Line>> {
         let logical_count = logical_lines.len();
         if logical_count == 0 {
             return vec![];
         }
 
+        let mut wrapped_by_index: Vec<Option<Vec<Line>>> = vec![None; logical_count];
+        let fallback_plan;
+        let plan = match reflow_plan {
+            Some(plan) if plan.covers_each_logical_line_once(logical_count) => plan,
+            _ => {
+                fallback_plan = ViewportReflowPlan::full_scan(logical_count);
+                &fallback_plan
+            }
+        };
+
         let worker_count = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
             .min(logical_count);
 
-        // For small histories, avoid thread management overhead.
-        if worker_count <= 1 || logical_count < worker_count.saturating_mul(8) {
-            return logical_lines
-                .into_iter()
-                .map(|line| {
-                    if line.len() <= physical_cols {
+        for (batch_idx, batch) in plan.batches.iter().enumerate() {
+            let batch_len = batch
+                .logical_range
+                .end
+                .saturating_sub(batch.logical_range.start);
+            if batch_len == 0 {
+                continue;
+            }
+
+            debug!(
+                "reflow planner batch={} logical={}..{} priority={} rationale={}",
+                batch_idx,
+                batch.logical_range.start,
+                batch.logical_range.end,
+                batch.priority.as_str(),
+                batch.priority.rationale()
+            );
+
+            let batch_workers = worker_count.min(batch_len);
+            if batch_workers <= 1 || batch_len < batch_workers.saturating_mul(8) {
+                for idx in batch.logical_range.clone() {
+                    let line = logical_lines[idx].clone();
+                    let wrapped = if line.len() <= physical_cols {
                         vec![line]
                     } else {
                         line.wrap(physical_cols, seqno)
-                    }
-                })
-                .collect();
-        }
-
-        let mut buckets: Vec<Vec<(usize, Line)>> = (0..worker_count).map(|_| Vec::new()).collect();
-        for (idx, line) in logical_lines.into_iter().enumerate() {
-            buckets[idx % worker_count].push((idx, line));
-        }
-
-        let mut wrapped_by_index: Vec<Option<Vec<Line>>> = vec![None; logical_count];
-        let _ = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(worker_count);
-            for bucket in buckets {
-                handles.push(scope.spawn(move |_| {
-                    let mut wrapped = Vec::with_capacity(bucket.len());
-                    for (idx, line) in bucket {
-                        let lines = if line.len() <= physical_cols {
-                            vec![line]
-                        } else {
-                            line.wrap(physical_cols, seqno)
-                        };
-                        wrapped.push((idx, lines));
-                    }
-                    wrapped
-                }));
-            }
-
-            for handle in handles {
-                for (idx, lines) in handle.join().unwrap() {
-                    wrapped_by_index[idx] = Some(lines);
+                    };
+                    wrapped_by_index[idx] = Some(wrapped);
                 }
+                continue;
             }
-        });
+
+            let chunk_size = batch_len.div_ceil(batch_workers).max(1);
+            let _ = thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(batch_workers);
+                for worker_idx in 0..batch_workers {
+                    let start = batch.logical_range.start + worker_idx * chunk_size;
+                    if start >= batch.logical_range.end {
+                        break;
+                    }
+                    let end = (start + chunk_size).min(batch.logical_range.end);
+                    handles.push(scope.spawn(move |_| {
+                        let mut wrapped = Vec::with_capacity(end - start);
+                        for (offset, line) in logical_lines[start..end].iter().enumerate() {
+                            let idx = start + offset;
+                            let wrapped_lines = if line.len() <= physical_cols {
+                                vec![line.clone()]
+                            } else {
+                                line.clone().wrap(physical_cols, seqno)
+                            };
+                            wrapped.push((idx, wrapped_lines));
+                        }
+                        wrapped
+                    }));
+                }
+
+                for handle in handles {
+                    for (idx, lines) in handle.join().unwrap() {
+                        wrapped_by_index[idx] = Some(lines);
+                    }
+                }
+            });
+        }
+
+        for (idx, slot) in wrapped_by_index.iter_mut().enumerate() {
+            if slot.is_some() {
+                continue;
+            }
+            let line = logical_lines[idx].clone();
+            let wrapped = if line.len() <= physical_cols {
+                vec![line]
+            } else {
+                line.wrap(physical_cols, seqno)
+            };
+            *slot = Some(wrapped);
+        }
 
         wrapped_by_index
             .into_iter()
-            .map(|lines| lines.expect("missing wrapped line result"))
+            .map(|lines| lines.expect("missing wrapped line result after planner"))
             .collect()
     }
 
