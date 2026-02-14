@@ -449,9 +449,7 @@ mod tests {
         let t1 = spawn_into_main_thread(async { 1 });
         let t2 = spawn_into_main_thread(async { 2 });
         let t3 = spawn_into_main_thread(async { 3 });
-        let result = block_on(exec.run(async {
-            t1.await + t2.await + t3.await
-        }));
+        let result = block_on(exec.run(async { t1.await + t2.await + t3.await }));
         assert_eq!(result, 6);
         drop(exec);
     }

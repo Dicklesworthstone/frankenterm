@@ -13,6 +13,12 @@ impl std::fmt::Display for LeaseId {
     }
 }
 
+impl Default for LeaseId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LeaseId {
     pub fn new() -> Self {
         let uuid = Uuid::new_v4();

@@ -110,6 +110,8 @@ impl<'a> Iterator for VecStorageIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
+    use alloc::vec;
     use frankenterm_cell::{Cell, CellAttributes};
 
     fn make_cells(s: &str) -> Vec<Cell> {

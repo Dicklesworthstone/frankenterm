@@ -1,4 +1,12 @@
 #![macro_use]
+// Vendored from WezTerm — suppress cosmetic clippy lints
+#![allow(clippy::mutable_key_type)]
+#![allow(clippy::needless_borrow)]
+#![allow(clippy::needless_question_mark)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::non_canonical_partial_ord_impl)]
+#![allow(clippy::redundant_pattern_matching)]
 
 #[cfg(test)]
 mod tests;

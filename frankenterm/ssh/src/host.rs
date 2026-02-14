@@ -147,7 +147,9 @@ mod tests {
         let err = HostVerificationFailed {
             remote_address: "server.example.com:22".to_string(),
             key: "SHA256:abcdef1234567890".to_string(),
-            file: Some(std::path::PathBuf::from("/very/long/path/to/.ssh/known_hosts")),
+            file: Some(std::path::PathBuf::from(
+                "/very/long/path/to/.ssh/known_hosts",
+            )),
         };
         let msg = err.to_string();
         assert!(msg.contains("server.example.com:22"));

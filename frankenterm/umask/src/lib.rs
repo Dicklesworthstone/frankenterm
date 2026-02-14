@@ -334,11 +334,7 @@ mod tests {
                 let _saver = UmaskSaver::new();
             }
             let restored = unsafe { umask(mask) };
-            assert_eq!(
-                restored, mask,
-                "drop should restore mask 0o{:03o}",
-                mask
-            );
+            assert_eq!(restored, mask, "drop should restore mask 0o{:03o}", mask);
         }
 
         unsafe { umask(original) };
@@ -633,7 +629,9 @@ mod tests {
     fn common_pattern_022_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o022) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let restored = unsafe { umask(original) };
         assert_eq!(restored, 0o022);
         unsafe { umask(original) };
@@ -644,7 +642,9 @@ mod tests {
     fn common_pattern_027_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o027) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let restored = unsafe { umask(original) };
         assert_eq!(restored, 0o027);
         unsafe { umask(original) };
@@ -655,7 +655,9 @@ mod tests {
     fn common_pattern_002_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o002) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let restored = unsafe { umask(original) };
         assert_eq!(restored, 0o002);
         unsafe { umask(original) };
@@ -666,7 +668,9 @@ mod tests {
     fn common_pattern_077_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o077) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let restored = unsafe { umask(original) };
         assert_eq!(restored, 0o077);
         unsafe { umask(original) };
@@ -677,7 +681,9 @@ mod tests {
     fn common_pattern_007_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o007) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let restored = unsafe { umask(original) };
         assert_eq!(restored, 0o007);
         unsafe { umask(original) };
@@ -688,7 +694,9 @@ mod tests {
     fn common_pattern_037_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o037) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let restored = unsafe { umask(original) };
         assert_eq!(restored, 0o037);
         unsafe { umask(original) };
@@ -699,7 +707,9 @@ mod tests {
     fn common_pattern_066_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o066) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let restored = unsafe { umask(original) };
         assert_eq!(restored, 0o066);
         unsafe { umask(original) };
@@ -774,7 +784,9 @@ mod tests {
     fn restore_mask_0o111() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o111) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o111);
         unsafe { umask(original) };
@@ -785,7 +797,9 @@ mod tests {
     fn restore_mask_0o222() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o222) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o222);
         unsafe { umask(original) };
@@ -796,7 +810,9 @@ mod tests {
     fn restore_mask_0o333() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o333) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o333);
         unsafe { umask(original) };
@@ -807,7 +823,9 @@ mod tests {
     fn restore_mask_0o444() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o444) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o444);
         unsafe { umask(original) };
@@ -818,7 +836,9 @@ mod tests {
     fn restore_mask_0o555() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o555) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o555);
         unsafe { umask(original) };
@@ -829,7 +849,9 @@ mod tests {
     fn restore_mask_0o666() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o666) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o666);
         unsafe { umask(original) };
@@ -840,7 +862,9 @@ mod tests {
     fn restore_mask_0o234() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o234) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o234);
         unsafe { umask(original) };
@@ -851,7 +875,9 @@ mod tests {
     fn restore_mask_0o567() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o567) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o567);
         unsafe { umask(original) };
@@ -862,7 +888,9 @@ mod tests {
     fn restore_mask_0o012() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o012) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o012);
         unsafe { umask(original) };
@@ -873,7 +901,9 @@ mod tests {
     fn restore_mask_0o345() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o345) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o345);
         unsafe { umask(original) };
@@ -884,7 +914,9 @@ mod tests {
     fn restore_mask_0o076() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o076) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o076);
         unsafe { umask(original) };
@@ -895,7 +927,9 @@ mod tests {
     fn restore_mask_0o543() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o543) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o543);
         unsafe { umask(original) };
@@ -953,7 +987,9 @@ mod tests {
         for i in 0..10u32 {
             let mask = (i * 37) as mode_t & 0o777;
             unsafe { umask(mask) };
-            { let _s = UmaskSaver::new(); }
+            {
+                let _s = UmaskSaver::new();
+            }
             let restored = unsafe { umask(mask) };
             assert_eq!(restored, mask, "cycle {i} mask 0o{mask:03o}");
         }
@@ -987,7 +1023,9 @@ mod tests {
     fn pair_owner_rw() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o600) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o600);
         unsafe { umask(original) };
@@ -998,7 +1036,9 @@ mod tests {
     fn pair_group_rw() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o060) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o060);
         unsafe { umask(original) };
@@ -1009,7 +1049,9 @@ mod tests {
     fn pair_other_rw() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o006) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o006);
         unsafe { umask(original) };
@@ -1020,7 +1062,9 @@ mod tests {
     fn pair_owner_rx() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o500) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o500);
         unsafe { umask(original) };
@@ -1031,7 +1075,9 @@ mod tests {
     fn pair_group_rx() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o050) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o050);
         unsafe { umask(original) };
@@ -1042,7 +1088,9 @@ mod tests {
     fn pair_other_rx() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o005) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o005);
         unsafe { umask(original) };
@@ -1053,7 +1101,9 @@ mod tests {
     fn pair_owner_wx() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o300) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o300);
         unsafe { umask(original) };
@@ -1064,7 +1114,9 @@ mod tests {
     fn pair_group_wx() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o030) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o030);
         unsafe { umask(original) };
@@ -1075,7 +1127,9 @@ mod tests {
     fn pair_other_wx() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o003) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o003);
         unsafe { umask(original) };
@@ -1088,7 +1142,9 @@ mod tests {
     fn cross_owner_r_group_w_other_x() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o421) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o421);
         unsafe { umask(original) };
@@ -1099,7 +1155,9 @@ mod tests {
     fn cross_owner_x_group_r_other_w() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o142) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o142);
         unsafe { umask(original) };
@@ -1110,7 +1168,9 @@ mod tests {
     fn cross_owner_w_group_x_other_r() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o214) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o214);
         unsafe { umask(original) };
@@ -1121,7 +1181,9 @@ mod tests {
     fn cross_owner_rw_group_rx() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o650) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o650);
         unsafe { umask(original) };
@@ -1132,7 +1194,9 @@ mod tests {
     fn cross_group_rw_other_rx() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o065) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o065);
         unsafe { umask(original) };
@@ -1216,7 +1280,9 @@ mod tests {
     fn default_restores_on_drop() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o044) };
-        { let _s = UmaskSaver::default(); }
+        {
+            let _s = UmaskSaver::default();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o044);
         unsafe { umask(original) };
@@ -1281,7 +1347,9 @@ mod tests {
     fn single_bit_001_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o001) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o001);
         unsafe { umask(original) };
@@ -1292,7 +1360,9 @@ mod tests {
     fn single_bit_002_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o002) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o002);
         unsafe { umask(original) };
@@ -1303,7 +1373,9 @@ mod tests {
     fn single_bit_004_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o004) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o004);
         unsafe { umask(original) };
@@ -1359,7 +1431,9 @@ mod tests {
     fn restore_mask_0o015() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o015) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o015);
         unsafe { umask(original) };
@@ -1370,7 +1444,9 @@ mod tests {
     fn restore_mask_0o246() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o246) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o246);
         unsafe { umask(original) };
@@ -1381,7 +1457,9 @@ mod tests {
     fn restore_mask_0o351() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o351) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o351);
         unsafe { umask(original) };
@@ -1392,7 +1470,9 @@ mod tests {
     fn restore_mask_0o472() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o472) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o472);
         unsafe { umask(original) };
@@ -1403,7 +1483,9 @@ mod tests {
     fn restore_mask_0o613() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o613) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o613);
         unsafe { umask(original) };
@@ -1414,7 +1496,9 @@ mod tests {
     fn restore_mask_0o724() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o724) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o724);
         unsafe { umask(original) };
@@ -1427,7 +1511,9 @@ mod tests {
     fn single_bit_010_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o010) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o010);
         unsafe { umask(original) };
@@ -1438,7 +1524,9 @@ mod tests {
     fn single_bit_020_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o020) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o020);
         unsafe { umask(original) };
@@ -1449,7 +1537,9 @@ mod tests {
     fn single_bit_040_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o040) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o040);
         unsafe { umask(original) };
@@ -1460,7 +1550,9 @@ mod tests {
     fn single_bit_100_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o100) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o100);
         unsafe { umask(original) };
@@ -1471,7 +1563,9 @@ mod tests {
     fn single_bit_200_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o200) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o200);
         unsafe { umask(original) };
@@ -1482,7 +1576,9 @@ mod tests {
     fn single_bit_400_roundtrips() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o400) };
-        { let _s = UmaskSaver::new(); }
+        {
+            let _s = UmaskSaver::new();
+        }
         let r = unsafe { umask(original) };
         assert_eq!(r, 0o400);
         unsafe { umask(original) };

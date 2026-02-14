@@ -40,7 +40,6 @@
 use anyhow::Error;
 use downcast_rs::{impl_downcast, Downcast};
 #[cfg(unix)]
-use libc;
 #[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
 use std::io::Result as IoResult;
@@ -270,10 +269,7 @@ impl_downcast!(PtySystem);
 
 impl Child for std::process::Child {
     fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
-        std::process::Child::try_wait(self).map(|s| match s {
-            Some(s) => Some(s.into()),
-            None => None,
-        })
+        std::process::Child::try_wait(self).map(|s| s.map(|s| s.into()))
     }
 
     fn wait(&mut self) -> IoResult<ExitStatus> {
@@ -793,21 +789,46 @@ mod tests {
 
     #[test]
     fn pty_size_rows_differ_ne() {
-        let a = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
-        let b = PtySize { rows: 25, cols: 80, pixel_width: 0, pixel_height: 0 };
+        let a = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let b = PtySize {
+            rows: 25,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
         assert_ne!(a, b);
     }
 
     #[test]
     fn pty_size_cols_differ_ne() {
-        let a = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
-        let b = PtySize { rows: 24, cols: 120, pixel_width: 0, pixel_height: 0 };
+        let a = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let b = PtySize {
+            rows: 24,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
         assert_ne!(a, b);
     }
 
     #[test]
     fn pty_size_copy_both_survive() {
-        let a = PtySize { rows: 10, cols: 20, pixel_width: 5, pixel_height: 5 };
+        let a = PtySize {
+            rows: 10,
+            cols: 20,
+            pixel_width: 5,
+            pixel_height: 5,
+        };
         let b = a; // Copy
         let c = a; // Still valid
         assert_eq!(b, c);
@@ -815,7 +836,12 @@ mod tests {
 
     #[test]
     fn pty_size_debug_shows_row_col_fields() {
-        let s = PtySize { rows: 1, cols: 2, pixel_width: 3, pixel_height: 4 };
+        let s = PtySize {
+            rows: 1,
+            cols: 2,
+            pixel_width: 3,
+            pixel_height: 4,
+        };
         let dbg = format!("{s:?}");
         assert!(dbg.contains("rows: 1"));
         assert!(dbg.contains("cols: 2"));

@@ -63,7 +63,7 @@ pub fn get_storage() -> Result<Arc<dyn BlobStorage + Send + Sync + 'static>, Err
         .unwrap()
         .as_ref()
         .map(|s| s.clone())
-        .ok_or_else(|| Error::StorageNotInit)
+        .ok_or(Error::StorageNotInit)
 }
 
 pub fn clear_storage() {

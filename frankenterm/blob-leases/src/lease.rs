@@ -49,7 +49,9 @@ impl BlobLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{clear_storage, register_storage, BlobStorage, BoxedReader, BufSeekRead, TEST_LOCK};
+    use crate::storage::{
+        clear_storage, register_storage, BlobStorage, BoxedReader, BufSeekRead, TEST_LOCK,
+    };
     use crate::{BlobManager, LeaseId};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};

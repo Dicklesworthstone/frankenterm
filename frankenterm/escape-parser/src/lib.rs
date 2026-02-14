@@ -2,6 +2,42 @@
 // using derive(FromPrimitive)
 #![allow(clippy::useless_attribute)]
 #![allow(clippy::upper_case_acronyms)]
+#![allow(
+    clippy::bind_instead_of_map,
+    clippy::byte_char_slices,
+    clippy::clone_on_copy,
+    clippy::collapsible_if,
+    clippy::comparison_to_empty,
+    clippy::derivable_impls,
+    clippy::from_over_into,
+    clippy::get_first,
+    clippy::io_other_error,
+    clippy::legacy_numeric_constants,
+    clippy::manual_clamp,
+    clippy::manual_map,
+    clippy::manual_range_contains,
+    clippy::manual_split_once,
+    clippy::manual_strip,
+    clippy::needless_borrow,
+    clippy::needless_borrows_for_generic_args,
+    clippy::new_without_default,
+    clippy::op_ref,
+    clippy::question_mark,
+    clippy::redundant_guards,
+    clippy::result_unit_err,
+    clippy::suspicious_to_owned,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::unnecessary_min_or_max,
+    clippy::unnecessary_to_owned,
+    clippy::unwrap_or_default,
+    clippy::useless_format,
+    clippy::while_let_on_iterator,
+    clippy::wrong_self_convention,
+    clippy::manual_range_patterns,
+    clippy::match_like_matches_macro,
+    clippy::needless_return,
+    clippy::map_clone
+)]
 #![cfg_attr(not(feature = "std"), no_std)]
 //! This module provides the ability to parse escape sequences and attach
 //! semantic meaning to them.  It can also encode the semantic values as

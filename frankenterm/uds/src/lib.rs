@@ -551,10 +551,7 @@ mod tests {
         let mut buf = [0u8; 16];
         let result = server_stream.read(&mut buf);
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
         cleanup(&path);
     }
 
@@ -809,10 +806,7 @@ mod tests {
         // No client connecting, so accept should return WouldBlock
         let result = listener.accept();
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
         cleanup(&path);
     }
 
@@ -1182,7 +1176,9 @@ mod tests {
         });
         let (server, _) = listener.accept().unwrap();
         let _c = client.join().unwrap();
-        server.set_read_timeout(Some(std::time::Duration::from_millis(100))).unwrap();
+        server
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
         server.set_read_timeout(None).unwrap();
         assert!(server.read_timeout().unwrap().is_none());
         cleanup(&path);
@@ -1199,7 +1195,9 @@ mod tests {
         });
         let (server, _) = listener.accept().unwrap();
         let _c = client.join().unwrap();
-        server.set_write_timeout(Some(std::time::Duration::from_millis(100))).unwrap();
+        server
+            .set_write_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
         server.set_write_timeout(None).unwrap();
         assert!(server.write_timeout().unwrap().is_none());
         cleanup(&path);
@@ -1242,7 +1240,7 @@ mod tests {
         let (mut server, _) = listener.accept().unwrap();
         let mut c = client.join().unwrap();
         drop(listener); // drop listener
-        // Communication should still work
+                        // Communication should still work
         server.write_all(b"after drop").unwrap();
         server.flush().unwrap();
         let mut buf = [0u8; 64];
@@ -1285,7 +1283,7 @@ mod tests {
         let (mut server, _) = listener.accept().unwrap();
         let c = client.join().unwrap();
         drop(c); // close client end
-        // Give OS time to propagate the close
+                 // Give OS time to propagate the close
         std::thread::sleep(std::time::Duration::from_millis(50));
         // First write may succeed (buffered), but repeated writes should eventually fail
         let mut failed = false;
@@ -1393,7 +1391,10 @@ mod tests {
         let mut buf = [0u8; 100];
         let result = server.read_exact(&mut buf);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
         cleanup(&path);
     }
 
@@ -1624,10 +1625,12 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
 
         // Connect 3 clients
-        let clients: Vec<_> = (0..3).map(|_| {
-            let path = path.clone();
-            std::thread::spawn(move || UnixStream::connect(&path).unwrap())
-        }).collect();
+        let clients: Vec<_> = (0..3)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || UnixStream::connect(&path).unwrap())
+            })
+            .collect();
 
         // Give clients time to connect
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2001,13 +2004,15 @@ mod tests {
         let path = temp_socket_path("multi_rd");
         cleanup(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        let clients: Vec<_> = (0..3u8).map(|i| {
-            let p = path.clone();
-            std::thread::spawn(move || {
-                let mut s = UnixStream::connect(&p).unwrap();
-                s.write_all(&[i; 4]).unwrap();
+        let clients: Vec<_> = (0..3u8)
+            .map(|i| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    let mut s = UnixStream::connect(&p).unwrap();
+                    s.write_all(&[i; 4]).unwrap();
+                })
             })
-        }).collect();
+            .collect();
         let mut servers = Vec::new();
         for _ in 0..3 {
             let (s, _) = listener.accept().unwrap();
@@ -2203,9 +2208,7 @@ mod tests {
         cleanup(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let path_str = path.to_str().unwrap().to_owned();
-        let client = std::thread::spawn(move || {
-            UnixStream::connect(path_str.as_str()).unwrap()
-        });
+        let client = std::thread::spawn(move || UnixStream::connect(path_str.as_str()).unwrap());
         let (_server, _) = listener.accept().unwrap();
         let _c = client.join().unwrap();
         cleanup(&path);

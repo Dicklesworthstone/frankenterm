@@ -326,8 +326,8 @@ mod tests {
         // argc=1, exe="/bin/ls", argv=["ls"]
         let mut buf = Vec::new();
         buf.extend_from_slice(&1i32.to_ne_bytes()); // argc = 1
-        buf.extend_from_slice(b"/bin/ls\0");         // exe path
-        buf.extend_from_slice(b"ls\0");              // argv[0]
+        buf.extend_from_slice(b"/bin/ls\0"); // exe path
+        buf.extend_from_slice(b"ls\0"); // argv[0]
 
         let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
         assert_eq!(exe_path, Path::new("/bin/ls").to_path_buf());
@@ -339,7 +339,7 @@ mod tests {
         // argc=0, exe="/bin/daemon"
         let mut buf = Vec::new();
         buf.extend_from_slice(&0i32.to_ne_bytes()); // argc = 0
-        buf.extend_from_slice(b"/bin/daemon\0");     // exe path
+        buf.extend_from_slice(b"/bin/daemon\0"); // exe path
 
         let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
         assert_eq!(exe_path, Path::new("/bin/daemon").to_path_buf());
@@ -415,10 +415,7 @@ mod tests {
 
         let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
         assert_eq!(exe_path, Path::new("/usr/bin/grep").to_path_buf());
-        assert_eq!(
-            argv,
-            vec!["grep".to_string(), "hello world".to_string()]
-        );
+        assert_eq!(argv, vec!["grep".to_string(), "hello world".to_string()]);
     }
 
     #[test]
@@ -574,7 +571,10 @@ mod tests {
         buf.extend_from_slice(b"binary\0");
 
         let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
-        assert_eq!(exe_path, Path::new("/a/b/c/d/e/f/g/h/i/j/k/binary").to_path_buf());
+        assert_eq!(
+            exe_path,
+            Path::new("/a/b/c/d/e/f/g/h/i/j/k/binary").to_path_buf()
+        );
         assert_eq!(argv, vec!["binary".to_string()]);
     }
 
@@ -592,7 +592,14 @@ mod tests {
 
         let (exe, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
         assert_eq!(exe, Path::new("/bin/cmd").to_path_buf());
-        assert_eq!(argv, vec!["cmd".to_string(), "--verbose".to_string(), "file.txt".to_string()]);
+        assert_eq!(
+            argv,
+            vec![
+                "cmd".to_string(),
+                "--verbose".to_string(),
+                "file.txt".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -619,6 +626,13 @@ mod tests {
 
         let (exe, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
         assert_eq!(exe, Path::new("/usr/bin/rsync").to_path_buf());
-        assert_eq!(argv, vec!["rsync".to_string(), "--archive".to_string(), "/src/dir/".to_string()]);
+        assert_eq!(
+            argv,
+            vec![
+                "rsync".to_string(),
+                "--archive".to_string(),
+                "/src/dir/".to_string()
+            ]
+        );
     }
 }

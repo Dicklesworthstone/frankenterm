@@ -1,4 +1,29 @@
 #![allow(clippy::unused_io_amount)]
+#![allow(
+    clippy::boxed_local,
+    clippy::drop_non_drop,
+    clippy::enum_variant_names,
+    clippy::get_first,
+    clippy::len_zero,
+    clippy::manual_clamp,
+    clippy::manual_find,
+    clippy::manual_map,
+    clippy::manual_unwrap_or_default,
+    clippy::match_like_matches_macro,
+    clippy::match_ref_pats,
+    clippy::needless_borrow,
+    clippy::needless_borrows_for_generic_args,
+    clippy::needless_range_loop,
+    clippy::result_large_err,
+    clippy::single_match,
+    clippy::unneeded_struct_pattern,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_min_or_max,
+    clippy::unwrap_or_default,
+    clippy::upper_case_acronyms,
+    clippy::useless_conversion,
+    clippy::manual_unwrap_or
+)]
 //! This crate provides the core of the virtual terminal emulator implementation
 //! used by [wezterm](https://wezterm.org/).  The home for this
 //! crate is in the wezterm repo and development is tracked at

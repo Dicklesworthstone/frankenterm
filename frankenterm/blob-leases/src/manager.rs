@@ -30,7 +30,9 @@ impl BlobManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{clear_storage, register_storage, BlobStorage, BoxedReader, BufSeekRead, TEST_LOCK};
+    use crate::storage::{
+        clear_storage, register_storage, BlobStorage, BoxedReader, BufSeekRead, TEST_LOCK,
+    };
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 
@@ -128,7 +130,10 @@ mod tests {
         clear_storage();
         let result = BlobManager::store(b"data");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not been initialized"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not been initialized"));
     }
 
     #[test]

@@ -1812,11 +1812,7 @@ mod tests {
             .tree();
         assert_eq!(t.num_leaves(), 2);
 
-        let t = t
-            .cursor()
-            .split_node_and_insert_left(0)
-            .unwrap()
-            .tree();
+        let t = t.cursor().split_node_and_insert_left(0).unwrap().tree();
         assert_eq!(t.num_leaves(), 3);
     }
 
@@ -1830,11 +1826,7 @@ mod tests {
             .unwrap()
             .tree();
 
-        let t = t
-            .cursor()
-            .split_node_and_insert_right(3)
-            .unwrap()
-            .tree();
+        let t = t.cursor().split_node_and_insert_right(3).unwrap().tree();
         assert_eq!(t.num_leaves(), 3);
     }
 
@@ -1981,11 +1973,7 @@ mod tests {
 
     #[test]
     fn assign_top_on_empty_then_tree() {
-        let t = Tree::<i32>::new()
-            .cursor()
-            .assign_top(77)
-            .unwrap()
-            .tree();
+        let t = Tree::<i32>::new().cursor().assign_top(77).unwrap().tree();
         assert_eq!(t, Tree::Leaf(77));
         assert_eq!(t.num_leaves(), 1);
     }

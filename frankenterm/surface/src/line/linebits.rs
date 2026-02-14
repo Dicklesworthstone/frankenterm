@@ -55,6 +55,7 @@ bitflags! {
 #[cfg(test)]
 mod test {
     use super::*;
+    use alloc::format;
 
     #[test]
     fn none_is_empty() {

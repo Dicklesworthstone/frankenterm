@@ -1,3 +1,12 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::manual_map,
+    clippy::redundant_guards,
+    clippy::suspicious_to_owned,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::unwrap_or_default
+)]
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -504,7 +513,11 @@ mod tests {
         for v in &variants {
             names.insert(format!("{v:?}"));
         }
-        assert_eq!(names.len(), variants.len(), "all variant debug strings should be unique");
+        assert_eq!(
+            names.len(),
+            variants.len(),
+            "all variant debug strings should be unique"
+        );
     }
 
     // ── Additional live process tests ─────────────────────────
@@ -823,17 +836,20 @@ mod tests {
     fn flatten_three_distinct_children() {
         let mut children = HashMap::new();
         for (id, name) in [(2u32, "cat"), (3, "grep"), (4, "sed")] {
-            children.insert(id, LocalProcessInfo {
-                pid: id,
-                ppid: 1,
-                name: name.to_string(),
-                executable: PathBuf::from(format!("/usr/bin/{}", name)),
-                argv: vec![],
-                cwd: PathBuf::new(),
-                status: LocalProcessStatus::Run,
-                start_time: 0,
-                children: HashMap::new(),
-            });
+            children.insert(
+                id,
+                LocalProcessInfo {
+                    pid: id,
+                    ppid: 1,
+                    name: name.to_string(),
+                    executable: PathBuf::from(format!("/usr/bin/{}", name)),
+                    argv: vec![],
+                    cwd: PathBuf::new(),
+                    status: LocalProcessStatus::Run,
+                    start_time: 0,
+                    children: HashMap::new(),
+                },
+            );
         }
         let proc = make_proc("pipe", "/usr/bin/pipe", children);
         let names = proc.flatten_to_exe_names();
@@ -1150,18 +1166,21 @@ mod tests {
         // Verify flatten returns a HashSet that deduplicates properly
         let mut children = HashMap::new();
         for i in 2..12u32 {
-            children.insert(i, LocalProcessInfo {
-                pid: i,
-                ppid: 1,
-                name: format!("worker{i}"),
-                // All have the same exe filename
-                executable: PathBuf::from(format!("/path{i}/same_name")),
-                argv: vec![],
-                cwd: PathBuf::new(),
-                status: LocalProcessStatus::Run,
-                start_time: 0,
-                children: HashMap::new(),
-            });
+            children.insert(
+                i,
+                LocalProcessInfo {
+                    pid: i,
+                    ppid: 1,
+                    name: format!("worker{i}"),
+                    // All have the same exe filename
+                    executable: PathBuf::from(format!("/path{i}/same_name")),
+                    argv: vec![],
+                    cwd: PathBuf::new(),
+                    status: LocalProcessStatus::Run,
+                    start_time: 0,
+                    children: HashMap::new(),
+                },
+            );
         }
         let proc = make_proc("same_name", "/bin/same_name", children);
         let names = proc.flatten_to_exe_names();

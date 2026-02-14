@@ -1,4 +1,20 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+#![allow(
+    clippy::cast_abs_to_unsigned,
+    clippy::derivable_impls,
+    clippy::from_over_into,
+    clippy::len_without_is_empty,
+    clippy::manual_flatten,
+    clippy::module_inception,
+    clippy::needless_borrow,
+    clippy::needless_borrowed_reference,
+    clippy::needless_lifetimes,
+    clippy::needless_return,
+    clippy::redundant_closure,
+    clippy::result_large_err,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_sort_by
+)]
 use crate::line::CellRef;
 use alloc::borrow::Cow;
 use core::cmp::min;
@@ -917,6 +933,7 @@ fn compute_position_change(current: usize, pos: &Position, limit: usize) -> usiz
 #[cfg(test)]
 mod test {
     use super::*;
+    use alloc::format;
     #[cfg(feature = "use_image")]
     use alloc::sync::Arc;
     use frankenterm_cell::color::AnsiColor;

@@ -40,6 +40,23 @@
 //! * `widgets` - enables the widget layout and related traits
 //! * `use_serde` - makes a number of structs serde serializable
 
+#![allow(
+    clippy::byte_char_slices,
+    clippy::collapsible_match,
+    clippy::derivable_impls,
+    clippy::io_other_error,
+    clippy::match_like_matches_macro,
+    clippy::needless_borrow,
+    clippy::needless_borrows_for_generic_args,
+    clippy::neg_multiply,
+    clippy::question_mark,
+    clippy::redundant_allocation,
+    clippy::redundant_field_names,
+    clippy::result_large_err,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_lazy_evaluations
+)]
+
 pub mod caps;
 pub use frankenterm_cell as cell;
 pub use frankenterm_cell::color;

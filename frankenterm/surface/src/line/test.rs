@@ -4,7 +4,9 @@ use super::*;
 use crate::hyperlink::{Hyperlink, Rule};
 use crate::line::clusterline::ClusteredLine;
 use crate::SEQ_ZERO;
+use alloc::format;
 use alloc::sync::Arc;
+use alloc::vec;
 use frankenterm_cell::{Cell, CellAttributes};
 use k9::assert_equal as assert_eq;
 
@@ -291,11 +293,6 @@ Line {
     bits: LineBits(
         0x0,
     ),
-    appdata: Mutex {
-        data: None,
-        poisoned: false,
-        ..
-    },
 }
 "#
     );
@@ -603,11 +600,6 @@ Line {
     bits: LineBits(
         0x0,
     ),
-    appdata: Mutex {
-        data: None,
-        poisoned: false,
-        ..
-    },
 }
 "#
     );

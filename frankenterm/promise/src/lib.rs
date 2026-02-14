@@ -603,7 +603,7 @@ mod tests {
         let mut p: Promise<i32> = Promise::new();
         let fut = p.get_future().unwrap();
         drop(fut); // drop future before resolving
-        // Promise can still be resolved without panic
+                   // Promise can still be resolved without panic
         assert!(p.ok(42));
     }
 

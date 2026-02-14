@@ -711,10 +711,7 @@ mod test {
     #[test]
     fn dectab_control_chars_all_invalid() {
         for i in 0..0x20usize {
-            assert_eq!(
-                DECTAB[i], INV,
-                "DECTAB[{i}] should be INV for control char"
-            );
+            assert_eq!(DECTAB[i], INV, "DECTAB[{i}] should be INV for control char");
         }
         assert_eq!(DECTAB[0x7F], INV, "DECTAB[DEL] should be INV");
     }
@@ -753,10 +750,7 @@ mod test {
         let encoded = encode(&data);
         let valid: std::collections::HashSet<u8> = ENCTAB.iter().copied().collect();
         for &b in &encoded {
-            assert!(
-                valid.contains(&b),
-                "encoded byte 0x{b:02x} not in ENCTAB"
-            );
+            assert!(valid.contains(&b), "encoded byte 0x{b:02x} not in ENCTAB");
         }
     }
 
@@ -988,7 +982,9 @@ mod test {
 
     #[test]
     fn roundtrip_alternating_ff_00() {
-        let data: Vec<u8> = (0..128).map(|i| if i % 2 == 0 { 0xFF } else { 0x00 }).collect();
+        let data: Vec<u8> = (0..128)
+            .map(|i| if i % 2 == 0 { 0xFF } else { 0x00 })
+            .collect();
         assert_eq!(decode(&encode(&data)), data);
     }
 
@@ -1291,7 +1287,10 @@ mod test {
         // Every byte in ENCTAB should be a printable ASCII character
         // that doesn't need escaping in most contexts
         for &b in &ENCTAB {
-            assert!(b >= 0x20 && b <= 0x7E, "ENCTAB has non-printable: 0x{b:02x}");
+            assert!(
+                b >= 0x20 && b <= 0x7E,
+                "ENCTAB has non-printable: 0x{b:02x}"
+            );
         }
     }
 }

@@ -1,4 +1,9 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+// Vendored from WezTerm — suppress cosmetic clippy lints
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::excessive_precision)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::wrong_self_convention)]
 
 use core::hash::{Hash, Hasher};
 use core::str::FromStr;
@@ -321,7 +326,7 @@ impl SrgbaTuple {
 
 impl ToDynamic for SrgbaTuple {
     fn to_dynamic(&self) -> Value {
-        self.to_string().to_dynamic()
+        self.to_color_string().to_dynamic()
     }
 }
 
@@ -487,7 +492,8 @@ impl SrgbaTuple {
         )
     }
 
-    pub fn to_string(self) -> String {
+    /// Format as a color string: `#RRGGBB` if opaque, `rgba(...)` if transparent.
+    pub fn to_color_string(self) -> String {
         if self.3 == 1.0 {
             self.to_rgb_string()
         } else {
@@ -495,6 +501,15 @@ impl SrgbaTuple {
         }
     }
 
+}
+
+impl core::fmt::Display for SrgbaTuple {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.to_color_string())
+    }
+}
+
+impl SrgbaTuple {
     /// Returns a string of the form `#RRGGBB`
     pub fn to_rgb_string(self) -> String {
         format!(
@@ -739,7 +754,7 @@ fn x_parse_color_component(value: &str) -> Result<f32, ()> {
 
     for c in value.chars() {
         num_digits += 1;
-        component = component << 4;
+        component <<= 4;
 
         let nybble = match c.to_digit(16) {
             Some(v) => v as u16,
@@ -767,7 +782,7 @@ impl FromStr for SrgbaTuple {
         if !s.is_ascii() {
             return Err(());
         }
-        if s.len() > 0 && s.as_bytes()[0] == b'#' {
+        if !s.is_empty() && s.as_bytes()[0] == b'#' {
             // Probably `#RGB`
 
             let digits = (s.len() - 1) / 3;
@@ -787,7 +802,7 @@ impl FromStr for SrgbaTuple {
                     let mut component = 0u16;
 
                     for _ in 0..digits {
-                        component = component << 4;
+                        component <<= 4;
 
                         let nybble = match chars.next().unwrap().to_digit(16) {
                             Some(v) => v as u16,
@@ -838,7 +853,7 @@ impl FromStr for SrgbaTuple {
                         Ok(v / 100.)
                     } else {
                         let v: f32 = s.parse().map_err(|_| ())?;
-                        if v > 255.0 || v < 0. {
+                        if !(0. ..=255.0).contains(&v) {
                             Err(())
                         } else {
                             Ok(v / 255.)
@@ -854,8 +869,8 @@ impl FromStr for SrgbaTuple {
             } else {
                 Err(())
             }
-        } else if s.starts_with("hsl:") {
-            let fields: Vec<_> = s[4..].split_ascii_whitespace().collect();
+        } else if let Some(rest) = s.strip_prefix("hsl:") {
+            let fields: Vec<_> = rest.split_ascii_whitespace().collect();
             if fields.len() == 3 {
                 // Expected to be degrees in range 0-360, but we allow for negative and wrapping
                 let h: i32 = fields[0].parse().map_err(|_| ())?;
@@ -872,7 +887,7 @@ impl FromStr for SrgbaTuple {
                     let a = sat * light.min(1. - light);
                     let f = |n: f32| -> f32 {
                         let k = (n + hue / 30.) % 12.;
-                        light - a * (k - 3.).min(9. - k).min(1.).max(-1.)
+                        light - a * (k - 3.).min(9. - k).clamp(-1., 1.)
                     };
                     (f(0.), f(8.), f(4.))
                 }
@@ -1115,6 +1130,7 @@ impl LinearRgba {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
     #[test]
     fn named_rgb() {
         let dark_green = SrgbaTuple::from_named("DarkGreen").unwrap();
@@ -2297,6 +2313,7 @@ mod tests {
     fn srgba_tuple_copy_clone() {
         let a = SrgbaTuple(0.1, 0.2, 0.3, 0.4);
         let b = a; // Copy
+        #[allow(clippy::clone_on_copy)]
         let c = a.clone();
         assert_eq!(a, b);
         assert_eq!(a, c);

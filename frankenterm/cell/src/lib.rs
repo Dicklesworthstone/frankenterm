@@ -1,4 +1,17 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+#![allow(
+    clippy::bind_instead_of_map,
+    clippy::collapsible_if,
+    clippy::derivable_impls,
+    clippy::doc_lazy_continuation,
+    clippy::from_over_into,
+    clippy::len_without_is_empty,
+    clippy::needless_option_as_deref,
+    clippy::single_match,
+    clippy::too_many_arguments,
+    clippy::unnecessary_cast,
+    clippy::vec_box
+)]
 //! Model a cell in the terminal display
 use crate::color::{ColorAttribute, PaletteIndex};
 #[cfg(feature = "use_image")]
@@ -1000,8 +1013,8 @@ pub enum AttributeChange {
 #[cfg(test)]
 mod test {
     use super::*;
-    use alloc::{format, vec};
     use crate::color::SrgbaTuple;
+    use alloc::{format, vec};
 
     #[test]
     fn teeny_string() {

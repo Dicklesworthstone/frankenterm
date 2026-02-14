@@ -1171,7 +1171,7 @@ impl ITermDimension {
 }
 
 impl ITermProprietary {
-    #[allow(clippy::cyclomatic_complexity, clippy::cognitive_complexity)]
+    #[allow(clippy::cognitive_complexity)]
     fn parse(osc: &[&[u8]]) -> Result<Self> {
         // iTerm has a number of different styles of OSC parameter
         // encodings, which makes this section of code a bit gnarly.

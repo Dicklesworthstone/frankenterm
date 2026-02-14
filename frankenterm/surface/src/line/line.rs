@@ -5,7 +5,7 @@ use crate::line::clusterline::ClusteredLine;
 use crate::line::linebits::LineBits;
 use crate::line::storage::{CellStorage, VisibleCellIter};
 use crate::line::vecstorage::{VecStorage, VecStorageIter};
-use crate::{Change, SEQ_ZERO, SequenceNo};
+use crate::{Change, SequenceNo, SEQ_ZERO};
 use alloc::borrow::Cow;
 #[cfg(feature = "appdata")]
 use alloc::sync::{Arc, Weak};
@@ -1704,8 +1704,9 @@ impl<'a> From<&'a str> for Line {
 mod tests {
     use super::*;
     use crate::SEQ_ZERO;
+    use alloc::collections::BTreeSet;
+    use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
-    use std::collections::BTreeSet;
 
     // ── ZoneRange ──────────────────────────────────────────
 
@@ -1814,7 +1815,7 @@ mod tests {
         let line = Line::from_text("abc", &attrs, 1, None);
         assert_eq!(line.len(), 3);
         assert_eq!(line.as_str().as_ref(), "abc");
-        assert_eq!(line.current_seqno(), 0);
+        assert_eq!(line.current_seqno(), 1);
     }
 
     // ── Line seqno ─────────────────────────────────────────

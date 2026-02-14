@@ -1,4 +1,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+// Vendored from WezTerm — suppress cosmetic clippy lints
+#![allow(clippy::match_like_matches_macro)]
+#![allow(clippy::to_string_trait_impl)]
+#![allow(clippy::wrong_self_convention)]
 
 #[cfg(feature = "serde")]
 use ::serde::*;
@@ -530,7 +534,7 @@ impl TryFrom<String> for Modifiers {
                 mods |= Modifiers::SUPER;
             } else if ele == "LEADER" {
                 mods |= Modifiers::LEADER;
-            } else if ele == "NONE" || ele == "" {
+            } else if ele == "NONE" || ele.is_empty() {
                 mods |= Modifiers::NONE;
             } else {
                 return Err(format!("invalid modifier name {} in {}", ele, s));
@@ -1174,7 +1178,7 @@ impl PhysKeyCode {
     fn name_to_code(name: &str) -> Option<Self> {
         #[cfg(feature = "std")]
         {
-            return PHYSKEYCODE_MAP.get(name).copied();
+            PHYSKEYCODE_MAP.get(name).copied()
         }
         #[cfg(not(feature = "std"))]
         {
@@ -1194,7 +1198,7 @@ impl PhysKeyCode {
     fn to_name(&self) -> Option<String> {
         #[cfg(feature = "std")]
         {
-            return INV_PHYSKEYCODE_MAP.get(self).cloned();
+            INV_PHYSKEYCODE_MAP.get(self).cloned()
         }
         #[cfg(not(feature = "std"))]
         {
@@ -1282,6 +1286,12 @@ pub struct MouseEvent {
 
 #[derive(Debug, Clone)]
 pub struct Handled(Arc<AtomicBool>);
+
+impl Default for Handled {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Handled {
     pub fn new() -> Self {
@@ -2054,26 +2064,26 @@ bitflags! {
     }
 }
 
-impl Into<String> for &WindowDecorations {
-    fn into(self) -> String {
+impl From<&WindowDecorations> for String {
+    fn from(val: &WindowDecorations) -> Self {
         let mut s = vec![];
-        if self.contains(WindowDecorations::TITLE) {
+        if val.contains(WindowDecorations::TITLE) {
             s.push("TITLE");
         }
-        if self.contains(WindowDecorations::RESIZE) {
+        if val.contains(WindowDecorations::RESIZE) {
             s.push("RESIZE");
         }
-        if self.contains(WindowDecorations::INTEGRATED_BUTTONS) {
+        if val.contains(WindowDecorations::INTEGRATED_BUTTONS) {
             s.push("INTEGRATED_BUTTONS");
         }
-        if self.contains(WindowDecorations::MACOS_USE_BACKGROUND_COLOR_AS_TITLEBAR_COLOR) {
+        if val.contains(WindowDecorations::MACOS_USE_BACKGROUND_COLOR_AS_TITLEBAR_COLOR) {
             s.push("MACOS_USE_BACKGROUND_COLOR_AS_TITLEBAR_COLOR")
         }
-        if self.contains(WindowDecorations::MACOS_FORCE_ENABLE_SHADOW) {
+        if val.contains(WindowDecorations::MACOS_FORCE_ENABLE_SHADOW) {
             s.push("MACOS_FORCE_ENABLE_SHADOW");
-        } else if self.contains(WindowDecorations::MACOS_FORCE_DISABLE_SHADOW) {
+        } else if val.contains(WindowDecorations::MACOS_FORCE_DISABLE_SHADOW) {
             s.push("MACOS_FORCE_DISABLE_SHADOW");
-        } else if self.contains(WindowDecorations::MACOS_FORCE_SQUARE_CORNERS) {
+        } else if val.contains(WindowDecorations::MACOS_FORCE_SQUARE_CORNERS) {
             s.push("MACOS_FORCE_SQUARE_CORNERS");
         }
         if s.is_empty() {
@@ -3608,7 +3618,8 @@ mod test {
 
     #[test]
     fn modifiers_remove_positional_mods() {
-        let mods = Modifiers::CTRL | Modifiers::LEFT_CTRL | Modifiers::SHIFT | Modifiers::LEFT_SHIFT;
+        let mods =
+            Modifiers::CTRL | Modifiers::LEFT_CTRL | Modifiers::SHIFT | Modifiers::LEFT_SHIFT;
         let cleaned = mods.remove_positional_mods();
         assert!(cleaned.contains(Modifiers::CTRL));
         assert!(cleaned.contains(Modifiers::SHIFT));

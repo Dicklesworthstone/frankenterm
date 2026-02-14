@@ -1,4 +1,12 @@
 #![no_std]
+// Vendored from WezTerm — suppress cosmetic clippy lints
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::legacy_numeric_constants)]
+#![allow(clippy::match_like_matches_macro)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::ptr_arg)]
+#![allow(clippy::upper_case_acronyms)]
+
 use alloc::borrow::Cow;
 use core::ops::Range;
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
@@ -26,7 +34,9 @@ pub use level::Level;
 const DELETED: usize = usize::max_value();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+#[derive(Default)]
 pub enum ParagraphDirectionHint {
+    #[default]
     LeftToRight,
     RightToLeft,
     /// Attempt to auto-detect but fall back to LTR
@@ -35,11 +45,6 @@ pub enum ParagraphDirectionHint {
     AutoRightToLeft,
 }
 
-impl Default for ParagraphDirectionHint {
-    fn default() -> Self {
-        Self::LeftToRight
-    }
-}
 
 impl ParagraphDirectionHint {
     /// Returns just the direction portion of the hint, independent
@@ -110,7 +115,7 @@ impl BidiRun {
             type Item = usize;
             fn next(&mut self) -> Option<usize> {
                 for idx in self.range.by_ref() {
-                    if self.removed_by_x9.iter().any(|&i| i == idx) {
+                    if self.removed_by_x9.contains(&idx) {
                         // Skip it
                         continue;
                     }
@@ -849,7 +854,7 @@ impl BidiContext {
                 // of the substring in this isolating run sequence
                 // enclosed by those brackets (inclusive
                 // of the brackets). Resolve that individual pair.
-                self.resolve_one_pair(pair, &iso_run);
+                self.resolve_one_pair(pair, iso_run);
             }
         }
     }
@@ -1003,7 +1008,6 @@ impl BidiContext {
                     &self.orig_char_types,
                     &self.levels,
                 );
-                return;
             } else {
                 // No strong type matching the oppositedirection was found either
                 // before or after these brackets in this text chain. Resolve the
@@ -1016,7 +1020,6 @@ impl BidiContext {
                     &self.orig_char_types,
                     &self.levels,
                 );
-                return;
             }
         } else {
             // No strong type was found between the brackets. Leave
@@ -1464,12 +1467,9 @@ impl BidiContext {
                         // Do nothing
                     } else if overflow_embedding > 0 {
                         overflow_embedding -= 1;
-                    } else {
-                        if !stack.isolate_status() {
-                            if stack.depth() >= 2 {
-                                stack.pop();
-                            }
-                        }
+                    } else if !stack.isolate_status()
+                    && stack.depth() >= 2 {
+                        stack.pop();
                     }
                 }
                 BidiClass::BoundaryNeutral => {}

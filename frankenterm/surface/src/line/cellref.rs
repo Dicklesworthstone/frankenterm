@@ -76,8 +76,8 @@ impl<'a> CellRef<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use core::hash::BuildHasher;
-    use std::collections::hash_map::RandomState;
+    use alloc::format;
+    use siphasher::sip::SipHasher;
 
     fn make_cell(text: &str) -> Cell {
         Cell::new_grapheme(text, CellAttributes::default(), None)
@@ -245,9 +245,8 @@ mod test {
             cell_index: 0,
             cell: &cell,
         };
-        let s = RandomState::new();
-        let mut h1 = s.build_hasher();
-        let mut h2 = s.build_hasher();
+        let mut h1 = SipHasher::new();
+        let mut h2 = SipHasher::new();
         cr.compute_shape_hash(&mut h1);
         cr.compute_shape_hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());

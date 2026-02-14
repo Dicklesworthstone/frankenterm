@@ -2,12 +2,12 @@
 use super::*;
 use crate::config::BidiMode;
 use crossbeam::thread;
-use frankenterm_surface::SequenceNo;
 use frankenterm_surface::line::{
     LineWrapScorecard as MonospaceLineWrapScorecard, MonospaceKpCostModel, MonospaceWrapMode,
 };
+use frankenterm_surface::SequenceNo;
 use log::{debug, warn};
-use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
+use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
@@ -830,7 +830,8 @@ impl Screen {
 
     fn prepare_rewrap_scratch_slots(&mut self, logical_count: usize) {
         if self.rewrap_scratch_slots.len() < logical_count {
-            self.rewrap_scratch_slots.resize_with(logical_count, || None);
+            self.rewrap_scratch_slots
+                .resize_with(logical_count, || None);
         }
         for slot in self.rewrap_scratch_slots.iter_mut().take(logical_count) {
             *slot = None;
@@ -840,7 +841,10 @@ impl Screen {
     fn take_wrapped_from_scratch(&mut self, logical_count: usize) -> Vec<Vec<Line>> {
         let mut wrapped = Vec::with_capacity(logical_count);
         for slot in self.rewrap_scratch_slots.iter_mut().take(logical_count) {
-            wrapped.push(slot.take().expect("missing wrapped line result after planner"));
+            wrapped.push(
+                slot.take()
+                    .expect("missing wrapped line result after planner"),
+            );
         }
         wrapped
     }
@@ -1240,7 +1244,7 @@ impl Screen {
             .unwrap_or(0);
 
         debug!(
-            "rewrap_lines cols={}→{} physical_lines={} logical_lines={} rewrapped_lines={} cache.logical={} cache.wrap={} cache.entries={} pruned_rows={} elapsed_ms={}",
+            "rewrap_lines cols={}→{} physical_lines={} logical_lines={} rewrapped_lines={} cache.logical={} cache.wrap={} cache.entries={} scratch.slot_capacity={} scratch.prefix_capacity={} pruned_rows={} elapsed_ms={}",
             old_cols,
             physical_cols,
             original_len,
@@ -1249,6 +1253,8 @@ impl Screen {
             logical_cache_hit,
             wrap_cache_hit,
             final_cache_entries.max(cache_entries),
+            self.rewrap_scratch_slots.capacity(),
+            self.rewrap_row_prefix_scratch.capacity(),
             pruned_rows,
             started.elapsed().as_millis()
         );
@@ -2228,7 +2234,11 @@ impl Screen {
 fn phys_intersection(r1: &Range<PhysRowIndex>, r2: &Range<PhysRowIndex>) -> Range<PhysRowIndex> {
     let start = r1.start.max(r2.start);
     let end = r1.end.min(r2.end);
-    if end > start { start..end } else { 0..0 }
+    if end > start {
+        start..end
+    } else {
+        0..0
+    }
 }
 
 #[cfg(test)]
@@ -2586,11 +2596,10 @@ mod tests {
         );
 
         assert!(plan.covers_each_logical_line_once(logical_count));
-        assert!(
-            plan.batches
-                .iter()
-                .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES)
-        );
+        assert!(plan
+            .batches
+            .iter()
+            .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES));
         assert_eq!(
             plan.batches
                 .first()

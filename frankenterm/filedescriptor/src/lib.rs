@@ -914,10 +914,7 @@ mod tests {
     #[test]
     fn socketpair_fds_are_distinct() {
         let (a, b) = socketpair().unwrap();
-        assert_ne!(
-            a.as_raw_file_descriptor(),
-            b.as_raw_file_descriptor()
-        );
+        assert_ne!(a.as_raw_file_descriptor(), b.as_raw_file_descriptor());
     }
 
     // ── Additional FileDescriptor tests ──────────────────────
@@ -1115,9 +1112,7 @@ mod tests {
     fn file_descriptor_new_from_raw() {
         let pipe = Pipe::new().unwrap();
         let raw = pipe.write.into_raw_file_descriptor();
-        let fd = FileDescriptor::new(unsafe {
-            FileDescriptor::from_raw_file_descriptor(raw)
-        });
+        let fd = FileDescriptor::new(unsafe { FileDescriptor::from_raw_file_descriptor(raw) });
         assert!(fd.as_raw_file_descriptor() >= 0);
     }
 
@@ -1162,8 +1157,14 @@ mod tests {
 
         // Both should return WouldBlock when no data
         let mut buf = [0u8; 16];
-        assert_eq!(a.read(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
-        assert_eq!(b.read(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            a.read(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            b.read(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     // ── Poll with multiple ready fds ─────────────────────────
