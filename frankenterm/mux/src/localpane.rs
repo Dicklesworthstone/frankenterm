@@ -2041,4 +2041,259 @@ mod tests {
             Some((100, 35))
         );
     }
+
+    // =========================================================================
+    // Additional resize queue and replay edge cases
+    // =========================================================================
+
+    #[test]
+    fn queue_empty_dequeue_returns_none_and_marks_idle() {
+        let mut queue = ResizeQueueState::default();
+        // Never enqueued — dequeue should return None
+        assert!(queue.dequeue_for_worker().is_none());
+        assert!(!queue.worker_running);
+    }
+
+    #[test]
+    fn queue_seq_monotonically_increases() {
+        let mut queue = ResizeQueueState::default();
+        let now = Instant::now();
+        let mut prev_seq = 0u64;
+        for i in 1..=50 {
+            let outcome = queue.enqueue(
+                term_size(80 + i, 24 + (i % 5)),
+                pty_size((80 + i) as u16, (24 + (i % 5)) as u16),
+                now,
+            );
+            assert!(
+                outcome.seq > prev_seq,
+                "seq should increase: {} > {}",
+                outcome.seq,
+                prev_seq
+            );
+            prev_seq = outcome.seq;
+        }
+    }
+
+    #[test]
+    fn queue_replaced_seq_chains_correctly() {
+        let mut queue = ResizeQueueState::default();
+        let now = Instant::now();
+
+        // First enqueue — no replacement
+        let o1 = queue.enqueue(term_size(80, 24), pty_size(80, 24), now);
+        assert_eq!(o1.replaced_seq, None);
+
+        // Take first as in-flight
+        queue.dequeue_for_worker();
+
+        // Second enqueue while first is running — no replacement (nothing pending)
+        let o2 = queue.enqueue(term_size(90, 24), pty_size(90, 24), now);
+        assert_eq!(o2.replaced_seq, None);
+
+        // Third replaces second
+        let o3 = queue.enqueue(term_size(100, 24), pty_size(100, 24), now);
+        assert_eq!(o3.replaced_seq, Some(o2.seq));
+
+        // Fourth replaces third
+        let o4 = queue.enqueue(term_size(110, 24), pty_size(110, 24), now);
+        assert_eq!(o4.replaced_seq, Some(o3.seq));
+    }
+
+    #[test]
+    fn queue_worker_restart_after_idle() {
+        let mut queue = ResizeQueueState::default();
+        let now = Instant::now();
+
+        // First cycle
+        let o1 = queue.enqueue(term_size(80, 24), pty_size(80, 24), now);
+        assert!(o1.spawn_worker);
+        queue.dequeue_for_worker(); // process first
+        queue.dequeue_for_worker(); // goes idle
+        assert!(!queue.worker_running);
+
+        // Second cycle — worker should spawn again
+        let o2 = queue.enqueue(term_size(100, 30), pty_size(100, 30), now);
+        assert!(o2.spawn_worker, "worker should respawn after going idle");
+        assert_eq!(o2.queue_depth_hint, 1);
+    }
+
+    #[test]
+    fn cancellation_token_for_latest_seq_is_not_superseded() {
+        let mut queue = ResizeQueueState::default();
+        let now = Instant::now();
+
+        queue.enqueue(term_size(80, 24), pty_size(80, 24), now);
+        queue.enqueue(term_size(90, 30), pty_size(90, 30), now);
+        queue.enqueue(term_size(100, 40), pty_size(100, 40), now);
+
+        // Token for the latest seq should NOT be superseded
+        let latest_token = ResizeCancellationToken::new(3);
+        assert_eq!(queue.superseded_by(latest_token), None);
+
+        // Token for older seq should be superseded
+        let old_token = ResizeCancellationToken::new(1);
+        assert_eq!(queue.superseded_by(old_token), Some(3));
+    }
+
+    #[test]
+    fn replay_single_intent_completes_cleanly() {
+        let mut replay = ResizeReplayHarness::default();
+
+        let o = replay.enqueue(80, 24);
+        assert!(o.spawn_worker);
+
+        replay.start_next().expect("intent should start");
+        assert_eq!(
+            replay.commit_current_with_present_barrier(),
+            Some(true),
+            "single intent commits successfully"
+        );
+        assert_eq!(replay.presented_seq, Some(1));
+        assert_eq!(
+            replay.presented_size.map(|s| (s.cols, s.rows)),
+            Some((80, 24))
+        );
+        assert!(replay.cancelled.is_empty());
+        assert!(replay.rejected_frames.is_empty());
+    }
+
+    #[test]
+    fn replay_sequential_intents_without_overlap() {
+        let mut replay = ResizeReplayHarness::default();
+
+        // First intent — enqueue, start, commit
+        replay.enqueue(80, 24);
+        replay.start_next().unwrap();
+        replay.commit_current_with_present_barrier();
+        // Worker tries to dequeue again — nothing pending → goes idle
+        assert!(
+            replay.start_next().is_none(),
+            "no more work after first commit"
+        );
+
+        // Second intent — worker went idle, new intent respawns
+        let o2 = replay.enqueue(100, 30);
+        assert!(
+            o2.spawn_worker,
+            "worker should respawn for second intent after idle"
+        );
+        replay.start_next().unwrap();
+        assert_eq!(
+            replay.commit_current_with_present_barrier(),
+            Some(true),
+            "second intent commits cleanly"
+        );
+        assert_eq!(replay.presented_seq, Some(2));
+        assert!(replay.cancelled.is_empty());
+    }
+
+    #[test]
+    fn replay_start_next_when_nothing_queued() {
+        let mut replay = ResizeReplayHarness::default();
+        assert!(
+            replay.start_next().is_none(),
+            "start_next on empty queue returns None"
+        );
+    }
+
+    #[test]
+    fn replay_commit_with_no_in_flight_returns_none() {
+        let mut replay = ResizeReplayHarness::default();
+        assert_eq!(
+            replay.commit_current_with_present_barrier(),
+            None,
+            "commit with no in-flight should return None"
+        );
+    }
+
+    #[test]
+    fn replay_cancel_with_no_in_flight_returns_false() {
+        let mut replay = ResizeReplayHarness::default();
+        assert!(
+            !replay.boundary_cancel_current_if_superseded(),
+            "cancel with no in-flight should return false"
+        );
+    }
+
+    #[test]
+    fn replay_cancel_not_superseded_returns_false() {
+        let mut replay = ResizeReplayHarness::default();
+        replay.enqueue(80, 24);
+        replay.start_next().unwrap();
+        // No newer intent — cancel should not trigger
+        assert!(
+            !replay.boundary_cancel_current_if_superseded(),
+            "cancel when not superseded should return false"
+        );
+    }
+
+    #[test]
+    fn replay_multi_cancel_cascade() {
+        let mut replay = ResizeReplayHarness::default();
+
+        // First intent starts
+        replay.enqueue(80, 24);
+        replay.start_next().unwrap();
+
+        // Multiple rapid intents supersede it
+        replay.enqueue(90, 25);
+        replay.enqueue(100, 30);
+        replay.enqueue(110, 35);
+
+        // Cancel first — superseded by seq 4
+        assert!(replay.boundary_cancel_current_if_superseded());
+        assert_eq!(replay.cancelled, vec![1]);
+
+        // Start and commit the latest coalesced
+        let latest = replay.start_next().unwrap();
+        assert_eq!(latest.seq, 4);
+        assert_eq!(replay.commit_current_with_present_barrier(), Some(true));
+        assert_eq!(replay.presented_seq, Some(4));
+        assert_eq!(
+            replay.presented_size.map(|s| (s.cols, s.rows)),
+            Some((110, 35))
+        );
+    }
+
+    #[test]
+    fn replay_causality_log_covers_full_lifecycle() {
+        let mut replay = ResizeReplayHarness::default();
+
+        replay.enqueue(80, 24);
+        replay.start_next().unwrap();
+        replay.enqueue(120, 40);
+        replay.commit_current_with_present_barrier(); // rejected
+        replay.start_next().unwrap();
+        replay.commit_current_with_present_barrier(); // committed
+
+        // Verify causality log has all phases
+        assert!(replay.causality_contains("intent seq=1"));
+        assert!(replay.causality_contains("start seq=1"));
+        assert!(replay.causality_contains("reject_frame commit_id=1"));
+        assert!(replay.causality_contains("intent seq=2"));
+        assert!(replay.causality_contains("start seq=2"));
+        assert!(replay.causality_contains("commit_frame commit_id=2"));
+    }
+
+    #[test]
+    fn queue_depth_hint_reflects_worker_state() {
+        let mut queue = ResizeQueueState::default();
+        let now = Instant::now();
+
+        // Idle worker — depth is 1
+        let o1 = queue.enqueue(term_size(80, 24), pty_size(80, 24), now);
+        assert_eq!(o1.queue_depth_hint, 1);
+
+        // Take in-flight, now worker is running
+        queue.dequeue_for_worker();
+
+        // With worker running — depth is 2 (1 in-flight + 1 pending)
+        let o2 = queue.enqueue(term_size(90, 24), pty_size(90, 24), now);
+        assert_eq!(o2.queue_depth_hint, 2);
+
+        // Coalescing doesn't change depth hint
+        let o3 = queue.enqueue(term_size(100, 24), pty_size(100, 24), now);
+        assert_eq!(o3.queue_depth_hint, 2);
+    }
 }
