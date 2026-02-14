@@ -527,4 +527,211 @@ mod tests {
         let dbg = format!("{s:?}");
         assert!(dbg.contains("SIGINT"));
     }
+
+    // ── Second-pass expansion ────────────────────────────────────
+
+    // ── PtySize additional ────────────────────────────────────
+
+    #[test]
+    fn pty_size_all_fields_custom() {
+        let s = PtySize {
+            rows: 100,
+            cols: 200,
+            pixel_width: 1600,
+            pixel_height: 1200,
+        };
+        assert_eq!(s.rows, 100);
+        assert_eq!(s.cols, 200);
+        assert_eq!(s.pixel_width, 1600);
+        assert_eq!(s.pixel_height, 1200);
+    }
+
+    #[test]
+    fn pty_size_zero_dimensions() {
+        let s = PtySize {
+            rows: 0,
+            cols: 0,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        assert_eq!(s.rows, 0);
+        assert_eq!(s.cols, 0);
+    }
+
+    #[test]
+    fn pty_size_max_u16() {
+        let s = PtySize {
+            rows: u16::MAX,
+            cols: u16::MAX,
+            pixel_width: u16::MAX,
+            pixel_height: u16::MAX,
+        };
+        assert_eq!(s.rows, u16::MAX);
+    }
+
+    #[test]
+    fn pty_size_copy_is_independent() {
+        let a = PtySize {
+            rows: 10,
+            cols: 20,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn pty_size_ne_cols() {
+        let a = PtySize::default();
+        let b = PtySize { cols: 132, ..a };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn pty_size_ne_pixel_width() {
+        let a = PtySize::default();
+        let b = PtySize {
+            pixel_width: 100,
+            ..a
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn pty_size_ne_pixel_height() {
+        let a = PtySize::default();
+        let b = PtySize {
+            pixel_height: 100,
+            ..a
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn pty_size_debug_contains_all_fields() {
+        let s = PtySize {
+            rows: 50,
+            cols: 132,
+            pixel_width: 800,
+            pixel_height: 600,
+        };
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("50"));
+        assert!(dbg.contains("132"));
+        assert!(dbg.contains("800"));
+        assert!(dbg.contains("600"));
+    }
+
+    // ── ExitStatus additional ─────────────────────────────────
+
+    #[test]
+    fn exit_status_code_255() {
+        let s = ExitStatus::with_exit_code(255);
+        assert!(!s.success());
+        assert_eq!(s.exit_code(), 255);
+    }
+
+    #[test]
+    fn exit_status_code_max_u32() {
+        let s = ExitStatus::with_exit_code(u32::MAX);
+        assert!(!s.success());
+        assert_eq!(s.exit_code(), u32::MAX);
+    }
+
+    #[test]
+    fn exit_status_signal_empty_string() {
+        let s = ExitStatus::with_signal("");
+        assert!(!s.success());
+        assert_eq!(s.signal(), Some(""));
+    }
+
+    #[test]
+    fn exit_status_display_empty_signal() {
+        let s = ExitStatus::with_signal("");
+        assert_eq!(format!("{s}"), "Terminated by ");
+    }
+
+    #[test]
+    fn exit_status_signal_has_code_1() {
+        let s = ExitStatus::with_signal("SIGTERM");
+        assert_eq!(s.exit_code(), 1);
+    }
+
+    #[test]
+    fn exit_status_clone_with_signal() {
+        let a = ExitStatus::with_signal("SIGKILL");
+        let b = a.clone();
+        assert_eq!(a.exit_code(), b.exit_code());
+        assert_eq!(a.signal(), b.signal());
+    }
+
+    #[test]
+    fn exit_status_debug_success() {
+        let s = ExitStatus::with_exit_code(0);
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("0"));
+    }
+
+    #[test]
+    fn exit_status_display_code_1() {
+        let s = ExitStatus::with_exit_code(1);
+        assert_eq!(format!("{s}"), "Exited with code 1");
+    }
+
+    #[test]
+    fn exit_status_no_signal_by_default() {
+        let s = ExitStatus::with_exit_code(0);
+        assert!(s.signal().is_none());
+    }
+
+    #[test]
+    fn exit_status_success_is_only_zero() {
+        for code in 1..=10u32 {
+            assert!(!ExitStatus::with_exit_code(code).success());
+        }
+    }
+
+    #[test]
+    fn exit_status_display_various_codes() {
+        assert_eq!(
+            format!("{}", ExitStatus::with_exit_code(127)),
+            "Exited with code 127"
+        );
+        assert_eq!(
+            format!("{}", ExitStatus::with_exit_code(130)),
+            "Exited with code 130"
+        );
+    }
+
+    #[test]
+    fn exit_status_display_various_signals() {
+        assert_eq!(
+            format!("{}", ExitStatus::with_signal("SIGSEGV")),
+            "Terminated by SIGSEGV"
+        );
+        assert_eq!(
+            format!("{}", ExitStatus::with_signal("SIGPIPE")),
+            "Terminated by SIGPIPE"
+        );
+    }
+
+    #[test]
+    fn exit_status_clone_preserves_signal_none() {
+        let a = ExitStatus::with_exit_code(42);
+        let b = a.clone();
+        assert!(b.signal().is_none());
+        assert_eq!(b.exit_code(), 42);
+    }
+
+    #[test]
+    fn pty_size_eq_reflexive() {
+        let s = PtySize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 10,
+            pixel_height: 20,
+        };
+        assert_eq!(s, s);
+    }
 }

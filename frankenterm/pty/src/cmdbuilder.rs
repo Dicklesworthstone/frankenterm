@@ -1046,4 +1046,165 @@ mod tests {
         // Should be an absolute path on unix
         assert!(shell.starts_with('/'));
     }
+
+    // ── Second-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn env_set_and_get() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.env("MY_KEY", "my_value");
+        assert_eq!(cmd.get_env("MY_KEY"), Some(OsStr::new("my_value")));
+    }
+
+    #[test]
+    fn env_override_value() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.env("KEY", "first");
+        cmd.env("KEY", "second");
+        assert_eq!(cmd.get_env("KEY"), Some(OsStr::new("second")));
+    }
+
+    #[test]
+    fn env_remove_nonexistent_is_noop() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.env_remove("DOES_NOT_EXIST_XYZ_UNIQUE");
+        // Should not panic
+    }
+
+    #[test]
+    fn env_clear_removes_all() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.env("A", "1");
+        cmd.env("B", "2");
+        cmd.env_clear();
+        assert!(cmd.get_env("A").is_none());
+        assert!(cmd.get_env("B").is_none());
+    }
+
+    #[test]
+    fn env_clear_then_set() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.env_clear();
+        cmd.env("FRESH", "value");
+        assert_eq!(cmd.get_env("FRESH"), Some(OsStr::new("value")));
+    }
+
+    #[test]
+    fn get_env_nonexistent_returns_none() {
+        let cmd = CommandBuilder::new("test");
+        assert!(cmd.get_env("ABSOLUTELY_NONEXISTENT_VAR_XYZ").is_none());
+    }
+
+    #[test]
+    fn iter_extra_env_empty_when_no_extras() {
+        let cmd = CommandBuilder::new("test");
+        let extras: Vec<_> = cmd.iter_extra_env_as_str().collect();
+        assert!(extras.is_empty());
+    }
+
+    #[test]
+    fn iter_extra_env_shows_only_extras() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.env("EXTRA_ONE", "val1");
+        let extras: Vec<_> = cmd.iter_extra_env_as_str().collect();
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0], ("EXTRA_ONE", "val1"));
+    }
+
+    #[test]
+    fn from_argv_empty_is_default_prog() {
+        let cmd = CommandBuilder::from_argv(vec![]);
+        assert!(cmd.is_default_prog());
+    }
+
+    #[test]
+    fn from_argv_single_element() {
+        let cmd = CommandBuilder::from_argv(vec![OsString::from("zsh")]);
+        assert!(!cmd.is_default_prog());
+        assert_eq!(cmd.get_argv()[0], OsStr::new("zsh"));
+    }
+
+    #[test]
+    fn as_unix_command_line_default_prog() {
+        let cmd = CommandBuilder::new_default_prog();
+        let cl = cmd.as_unix_command_line().unwrap();
+        assert_eq!(cl, "");
+    }
+
+    #[test]
+    fn as_unix_command_line_with_special_chars() {
+        let mut cmd = CommandBuilder::new("echo");
+        cmd.arg("hello;world");
+        let cl = cmd.as_unix_command_line().unwrap();
+        // shell_words should quote this
+        assert!(cl.contains("hello;world"));
+    }
+
+    #[test]
+    fn command_builder_ne_different_args() {
+        let mut a = CommandBuilder::new("foo");
+        let mut b = CommandBuilder::new("foo");
+        b.arg("extra");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn command_builder_ne_different_program() {
+        let a = CommandBuilder::new("foo");
+        let b = CommandBuilder::new("bar");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cwd_set_multiple_times_last_wins() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.cwd("/first");
+        cmd.cwd("/second");
+        assert_eq!(cmd.get_cwd(), Some(&OsString::from("/second")));
+    }
+
+    #[test]
+    fn controlling_tty_toggle() {
+        let mut cmd = CommandBuilder::new("test");
+        assert!(cmd.get_controlling_tty());
+        cmd.set_controlling_tty(false);
+        assert!(!cmd.get_controlling_tty());
+        cmd.set_controlling_tty(true);
+        assert!(cmd.get_controlling_tty());
+    }
+
+    #[test]
+    fn get_argv_mut_clear() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.arg("--flag");
+        cmd.get_argv_mut().clear();
+        assert!(cmd.is_default_prog());
+    }
+
+    #[test]
+    fn clone_is_independent() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.env("KEY", "value");
+        let mut cloned = cmd.clone();
+        cloned.env("KEY", "different");
+        assert_eq!(cmd.get_env("KEY"), Some(OsStr::new("value")));
+        assert_eq!(cloned.get_env("KEY"), Some(OsStr::new("different")));
+    }
+
+    #[test]
+    fn env_with_empty_value() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.env("EMPTY", "");
+        assert_eq!(cmd.get_env("EMPTY"), Some(OsStr::new("")));
+    }
+
+    #[test]
+    fn env_with_special_chars_in_value() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.env("SPECIAL", "foo=bar;baz&qux");
+        assert_eq!(
+            cmd.get_env("SPECIAL"),
+            Some(OsStr::new("foo=bar;baz&qux"))
+        );
+    }
 }
