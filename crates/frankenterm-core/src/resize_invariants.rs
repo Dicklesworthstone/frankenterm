@@ -750,6 +750,7 @@ impl ResizeInvariantTelemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resize_scheduler::ResizeWorkClass;
 
     // -- Scheduler invariant tests --
 
@@ -1055,5 +1056,535 @@ mod tests {
         assert!(s.contains("42"));
         assert!(s.contains("7"));
         assert!(s.contains("queue_depth=3"));
+    }
+
+    #[test]
+    fn violation_display_with_no_pane_or_seq() {
+        let v = ResizeViolation {
+            severity: ResizeViolationSeverity::Warning,
+            kind: ResizeViolationKind::ExcessiveLines,
+            pane_id: None,
+            intent_seq: None,
+            message: "too many lines".to_string(),
+        };
+        let s = format!("{}", v);
+        assert!(s.contains("Warning"));
+        assert!(s.contains("n/a"));
+        assert!(s.contains("too many lines"));
+    }
+
+    // -- Lifecycle event invariant tests --
+
+    fn make_event(
+        event_seq: u64,
+        frame_seq: u64,
+        pane_id: u64,
+        intent_seq: u64,
+        stage: ResizeLifecycleStage,
+        detail: ResizeLifecycleDetail,
+    ) -> ResizeTransactionLifecycleEvent {
+        ResizeTransactionLifecycleEvent {
+            event_seq,
+            frame_seq,
+            pane_id,
+            intent_seq,
+            observed_at_ms: Some(event_seq * 10),
+            latest_seq: Some(intent_seq),
+            pending_seq: None,
+            active_seq: Some(intent_seq),
+            stage,
+            detail,
+        }
+    }
+
+    #[test]
+    fn lifecycle_events_empty_stream_is_clean() {
+        let mut report = ResizeInvariantReport::new();
+        check_lifecycle_event_invariants(&mut report, &[]);
+        assert!(report.is_clean());
+        assert_eq!(report.total_checks(), 0);
+    }
+
+    #[test]
+    fn lifecycle_events_valid_submitted_then_scheduled_then_completed() {
+        let mut report = ResizeInvariantReport::new();
+        let events = vec![
+            make_event(
+                1,
+                1,
+                10,
+                1,
+                ResizeLifecycleStage::Queued,
+                ResizeLifecycleDetail::IntentSubmitted {
+                    replaced_pending_seq: None,
+                },
+            ),
+            make_event(
+                2,
+                1,
+                10,
+                1,
+                ResizeLifecycleStage::Scheduled,
+                ResizeLifecycleDetail::IntentScheduled {
+                    scheduler_class: ResizeWorkClass::Interactive,
+                    work_units: 4,
+                    over_budget: false,
+                    forced_by_starvation: false,
+                },
+            ),
+            make_event(
+                3,
+                2,
+                10,
+                1,
+                ResizeLifecycleStage::Committed,
+                ResizeLifecycleDetail::ActiveCompleted,
+            ),
+        ];
+        check_lifecycle_event_invariants(&mut report, &events);
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn lifecycle_events_detect_event_seq_regression() {
+        let mut report = ResizeInvariantReport::new();
+        let events = vec![
+            make_event(
+                5,
+                1,
+                10,
+                1,
+                ResizeLifecycleStage::Queued,
+                ResizeLifecycleDetail::IntentSubmitted {
+                    replaced_pending_seq: None,
+                },
+            ),
+            make_event(
+                3, // regression: 3 < 5
+                2,
+                10,
+                1,
+                ResizeLifecycleStage::Committed,
+                ResizeLifecycleDetail::ActiveCompleted,
+            ),
+        ];
+        check_lifecycle_event_invariants(&mut report, &events);
+        assert!(report.has_errors());
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.kind == ResizeViolationKind::LifecycleEventSequenceRegression)
+        );
+    }
+
+    #[test]
+    fn lifecycle_events_detect_frame_seq_regression() {
+        let mut report = ResizeInvariantReport::new();
+        let events = vec![
+            make_event(
+                1,
+                5,
+                10,
+                1,
+                ResizeLifecycleStage::Queued,
+                ResizeLifecycleDetail::IntentSubmitted {
+                    replaced_pending_seq: None,
+                },
+            ),
+            make_event(
+                2,
+                3, // regression: 3 < 5
+                10,
+                1,
+                ResizeLifecycleStage::Committed,
+                ResizeLifecycleDetail::ActiveCompleted,
+            ),
+        ];
+        check_lifecycle_event_invariants(&mut report, &events);
+        assert!(report.has_errors());
+    }
+
+    #[test]
+    fn lifecycle_events_detect_detail_stage_mismatch() {
+        let mut report = ResizeInvariantReport::new();
+        let events = vec![make_event(
+            1,
+            1,
+            10,
+            1,
+            ResizeLifecycleStage::Committed, // wrong: should be Queued
+            ResizeLifecycleDetail::IntentSubmitted {
+                replaced_pending_seq: None,
+            },
+        )];
+        check_lifecycle_event_invariants(&mut report, &events);
+        assert!(report.has_errors());
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.kind == ResizeViolationKind::LifecycleDetailStageMismatch)
+        );
+    }
+
+    #[test]
+    fn lifecycle_events_cancelled_detail_requires_cancelled_stage() {
+        let mut report = ResizeInvariantReport::new();
+        let events = vec![make_event(
+            1,
+            1,
+            10,
+            1,
+            ResizeLifecycleStage::Cancelled,
+            ResizeLifecycleDetail::ActiveCancelledSuperseded {
+                superseded_by_seq: 2,
+            },
+        )];
+        check_lifecycle_event_invariants(&mut report, &events);
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn lifecycle_events_phase_transition_stage_must_match_phase() {
+        let mut report = ResizeInvariantReport::new();
+        let events_ok = vec![make_event(
+            1,
+            1,
+            10,
+            1,
+            ResizeLifecycleStage::Preparing,
+            ResizeLifecycleDetail::ActivePhaseTransition {
+                phase: ResizeExecutionPhase::Preparing,
+            },
+        )];
+        check_lifecycle_event_invariants(&mut report, &events_ok);
+        assert!(report.is_clean());
+
+        let mut report2 = ResizeInvariantReport::new();
+        let events_bad = vec![make_event(
+            1,
+            1,
+            10,
+            1,
+            ResizeLifecycleStage::Presenting, // mismatch with Reflowing
+            ResizeLifecycleDetail::ActivePhaseTransition {
+                phase: ResizeExecutionPhase::Reflowing,
+            },
+        )];
+        check_lifecycle_event_invariants(&mut report2, &events_bad);
+        assert!(report2.has_errors());
+    }
+
+    // -- Screen invariant edge cases --
+
+    #[test]
+    fn screen_warns_excessive_lines() {
+        let mut report = ResizeInvariantReport::new();
+        let snapshot = ScreenSnapshot {
+            physical_rows: 24,
+            physical_cols: 80,
+            lines_len: 2000,
+            scrollback_size: 100, // capacity = 24 + 100 = 124 < 2000
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_phys_row: 0,
+        };
+        check_screen_invariants(&mut report, Some(1), &snapshot);
+        assert!(!report.is_clean());
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.kind == ResizeViolationKind::ExcessiveLines)
+        );
+    }
+
+    #[test]
+    fn screen_cursor_x_at_cols_is_valid_wrap_next() {
+        let mut report = ResizeInvariantReport::new();
+        let snapshot = ScreenSnapshot {
+            physical_rows: 24,
+            physical_cols: 80,
+            lines_len: 1024,
+            scrollback_size: 1000,
+            cursor_x: 80, // at physical_cols: valid wrap_next state
+            cursor_y: 5,
+            cursor_phys_row: 1005,
+        };
+        check_screen_invariants(&mut report, Some(1), &snapshot);
+        // Should NOT have cursor out-of-bounds for x at cols.
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.message.contains("cursor past right margin"))
+        );
+    }
+
+    #[test]
+    fn screen_cursor_x_past_cols_warns() {
+        let mut report = ResizeInvariantReport::new();
+        let snapshot = ScreenSnapshot {
+            physical_rows: 24,
+            physical_cols: 80,
+            lines_len: 1024,
+            scrollback_size: 1000,
+            cursor_x: 81, // past physical_cols
+            cursor_y: 5,
+            cursor_phys_row: 1005,
+        };
+        check_screen_invariants(&mut report, Some(1), &snapshot);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.message.contains("cursor past right margin"))
+        );
+    }
+
+    #[test]
+    fn screen_zero_rows_detects_all_relevant_violations() {
+        let mut report = ResizeInvariantReport::new();
+        let snapshot = ScreenSnapshot {
+            physical_rows: 0,
+            physical_cols: 80,
+            lines_len: 0,
+            scrollback_size: 0,
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_phys_row: 0,
+        };
+        check_screen_invariants(&mut report, Some(1), &snapshot);
+        // cursor_phys_row (0) >= lines_len (0) => CursorOutOfBounds.
+        assert!(report.has_errors());
+    }
+
+    // -- Phase transition exhaustive edge cases --
+
+    #[test]
+    fn failed_to_idle_is_valid() {
+        let mut report = ResizeInvariantReport::new();
+        check_phase_transition(
+            &mut report,
+            Some(1),
+            Some(1),
+            ResizePhase::Failed,
+            ResizePhase::Idle,
+        );
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn cancelled_to_idle_is_valid() {
+        let mut report = ResizeInvariantReport::new();
+        check_phase_transition(
+            &mut report,
+            Some(1),
+            Some(1),
+            ResizePhase::Cancelled,
+            ResizePhase::Idle,
+        );
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn failed_cannot_go_to_queued() {
+        let mut report = ResizeInvariantReport::new();
+        check_phase_transition(
+            &mut report,
+            Some(1),
+            Some(1),
+            ResizePhase::Failed,
+            ResizePhase::Queued,
+        );
+        assert!(report.has_critical());
+    }
+
+    #[test]
+    fn committed_cannot_go_to_queued() {
+        let mut report = ResizeInvariantReport::new();
+        check_phase_transition(
+            &mut report,
+            Some(1),
+            Some(1),
+            ResizePhase::Committed,
+            ResizePhase::Queued,
+        );
+        assert!(report.has_critical());
+    }
+
+    #[test]
+    fn all_phases_have_at_least_one_valid_transition() {
+        let all_phases = [
+            ResizePhase::Idle,
+            ResizePhase::Queued,
+            ResizePhase::Preparing,
+            ResizePhase::Reflowing,
+            ResizePhase::Presenting,
+            ResizePhase::Committed,
+            ResizePhase::Cancelled,
+            ResizePhase::Failed,
+        ];
+        for phase in all_phases {
+            assert!(
+                !phase.valid_transitions().is_empty(),
+                "{:?} should have at least one valid transition",
+                phase
+            );
+        }
+    }
+
+    #[test]
+    fn self_transition_is_always_illegal() {
+        let all_phases = [
+            ResizePhase::Idle,
+            ResizePhase::Queued,
+            ResizePhase::Preparing,
+            ResizePhase::Reflowing,
+            ResizePhase::Presenting,
+            ResizePhase::Committed,
+            ResizePhase::Cancelled,
+            ResizePhase::Failed,
+        ];
+        for phase in all_phases {
+            let mut report = ResizeInvariantReport::new();
+            check_phase_transition(&mut report, None, None, phase, phase);
+            assert!(
+                report.has_critical(),
+                "{:?} -> {:?} should be illegal",
+                phase,
+                phase
+            );
+        }
+    }
+
+    // -- Telemetry accumulation edge cases --
+
+    #[test]
+    fn telemetry_absorb_multiple_reports() {
+        let mut telemetry = ResizeInvariantTelemetry::default();
+
+        // Report 1: one clean check.
+        let mut report1 = ResizeInvariantReport::new();
+        check_scheduler_invariants(&mut report1, 1, Some(1), Some(1), 0, false);
+        assert!(report1.is_clean());
+        telemetry.absorb(&report1);
+
+        // Report 2: one check with error and one with critical.
+        let mut report2 = ResizeInvariantReport::new();
+        check_scheduler_invariants(&mut report2, 2, Some(1), Some(2), 3, true);
+        telemetry.absorb(&report2);
+
+        assert!(telemetry.total_checks > 0);
+        assert!(telemetry.total_passes > 0);
+        assert!(telemetry.total_failures > 0);
+        assert!(telemetry.critical_count > 0);
+        assert!(telemetry.error_count > 0);
+    }
+
+    #[test]
+    fn telemetry_absorb_clean_report_only() {
+        let mut telemetry = ResizeInvariantTelemetry::default();
+        let mut report = ResizeInvariantReport::new();
+        check_scheduler_invariants(&mut report, 1, Some(1), Some(1), 0, false);
+        telemetry.absorb(&report);
+
+        assert!(telemetry.total_passes > 0);
+        assert_eq!(telemetry.total_failures, 0);
+        assert_eq!(telemetry.critical_count, 0);
+        assert_eq!(telemetry.error_count, 0);
+        assert_eq!(telemetry.warning_count, 0);
+    }
+
+    // -- Report utility tests --
+
+    #[test]
+    fn report_total_checks_matches_pass_plus_fail() {
+        let mut report = ResizeInvariantReport::new();
+        check_scheduler_invariants(&mut report, 1, Some(1), Some(1), 0, false);
+        check_scheduler_invariants(&mut report, 2, Some(5), Some(7), 3, true);
+        assert_eq!(
+            report.total_checks(),
+            report.checks_passed + report.checks_failed
+        );
+    }
+
+    #[test]
+    fn report_new_is_clean() {
+        let report = ResizeInvariantReport::new();
+        assert!(report.is_clean());
+        assert!(!report.has_critical());
+        assert!(!report.has_errors());
+        assert_eq!(report.total_checks(), 0);
+    }
+
+    // -- Presentation invariant edge cases --
+
+    #[test]
+    fn presentation_detects_screen_terminal_mismatch() {
+        let mut report = ResizeInvariantReport::new();
+        let dims = DimensionTriple {
+            pty_rows: 24,
+            pty_cols: 80,
+            terminal_rows: 24,
+            terminal_cols: 80,
+            screen_rows: 30,  // different
+            screen_cols: 120, // different
+        };
+        check_presentation_invariants(&mut report, Some(1), Some(1), &dims);
+        assert!(report.has_errors());
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.kind == ResizeViolationKind::RenderDimensionStale)
+        );
+    }
+
+    #[test]
+    fn presentation_with_none_ids_still_works() {
+        let mut report = ResizeInvariantReport::new();
+        let dims = DimensionTriple {
+            pty_rows: 24,
+            pty_cols: 80,
+            terminal_rows: 24,
+            terminal_cols: 80,
+            screen_rows: 24,
+            screen_cols: 80,
+        };
+        check_presentation_invariants(&mut report, None, None, &dims);
+        assert!(report.is_clean());
+    }
+
+    // -- Scheduler snapshot row invariant edge cases --
+
+    #[test]
+    fn snapshot_row_all_none_is_clean_when_no_phase() {
+        let mut report = ResizeInvariantReport::new();
+        check_scheduler_snapshot_row_invariants(&mut report, 1, None, None, None, false);
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn snapshot_row_pending_without_latest_is_clean() {
+        let mut report = ResizeInvariantReport::new();
+        // pending_seq exists but latest_seq is None: no check fires.
+        check_scheduler_snapshot_row_invariants(&mut report, 1, None, Some(3), None, false);
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn snapshot_row_active_without_pending_and_with_phase_is_clean() {
+        let mut report = ResizeInvariantReport::new();
+        check_scheduler_snapshot_row_invariants(
+            &mut report,
+            1,
+            Some(5), // latest
+            None,    // no pending
+            Some(5), // active matches latest
+            true,    // phase present
+        );
+        assert!(report.is_clean());
     }
 }
