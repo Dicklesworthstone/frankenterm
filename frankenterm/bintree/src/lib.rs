@@ -1169,4 +1169,230 @@ mod tests {
         let debug = format!("{:?}", PathBranch::IsLeft);
         assert!(debug.contains("IsLeft"));
     }
+
+    // ── Additional Tree tests ─────────────────────────────────
+
+    #[test]
+    fn node_is_not_empty() {
+        let t = Tree::<i32>::Node {
+            left: Box::new(Tree::Leaf(1)),
+            right: Box::new(Tree::Leaf(2)),
+            data: None,
+        };
+        assert!(!t.is_empty());
+    }
+
+    #[test]
+    fn num_leaves_deep_tree() {
+        let t = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .go_left()
+            .unwrap()
+            .split_leaf_and_insert_right(3)
+            .unwrap()
+            .tree();
+        assert_eq!(t.num_leaves(), 3);
+    }
+
+    #[test]
+    fn tree_node_debug_shows_fields() {
+        let t = Tree::<i32>::Node {
+            left: Box::new(Tree::Leaf(1)),
+            right: Box::new(Tree::Leaf(2)),
+            data: None,
+        };
+        let debug = format!("{t:?}");
+        assert!(debug.contains("Node"));
+        assert!(debug.contains("left"));
+        assert!(debug.contains("right"));
+    }
+
+    #[test]
+    fn same_structure_same_data_equal() {
+        let t1 = Tree::<i32, i32>::Node {
+            left: Box::new(Tree::Leaf(1)),
+            right: Box::new(Tree::Leaf(2)),
+            data: Some(10),
+        };
+        let t2 = Tree::<i32, i32>::Node {
+            left: Box::new(Tree::Leaf(1)),
+            right: Box::new(Tree::Leaf(2)),
+            data: Some(10),
+        };
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn same_structure_different_node_data_not_equal() {
+        let t1 = Tree::<i32, i32>::Node {
+            left: Box::new(Tree::Leaf(1)),
+            right: Box::new(Tree::Leaf(2)),
+            data: Some(10),
+        };
+        let t2 = Tree::<i32, i32>::Node {
+            left: Box::new(Tree::Leaf(1)),
+            right: Box::new(Tree::Leaf(2)),
+            data: Some(20),
+        };
+        assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn node_vs_leaf_not_equal() {
+        let t1 = Tree::<i32>::Node {
+            left: Box::new(Tree::Leaf(1)),
+            right: Box::new(Tree::Leaf(2)),
+            data: None,
+        };
+        let t2 = Tree::<i32>::Leaf(1);
+        assert_ne!(t1, t2);
+    }
+
+    // ── Additional Cursor mutation tests ──────────────────────
+
+    #[test]
+    fn assign_node_on_leaf_fails() {
+        let c = Tree::<i32, i32>::Leaf(1).cursor();
+        assert!(c.assign_node(Some(5)).is_err());
+    }
+
+    #[test]
+    fn node_mut_can_mutate() {
+        let mut c = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .assign_node(Some(10))
+            .unwrap();
+        *c.node_mut().unwrap() = Some(99);
+        assert_eq!(*c.node_mut().unwrap(), Some(99));
+    }
+
+    #[test]
+    fn split_leaf_and_insert_left_works() {
+        let c = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_left(0)
+            .unwrap();
+        let t = c.tree();
+        assert_eq!(t.num_leaves(), 2);
+        // Left should be the inserted value
+        let mut cursor = t.cursor().go_left().unwrap();
+        assert_eq!(*cursor.leaf_mut().unwrap(), 0);
+    }
+
+    #[test]
+    fn split_leaf_and_insert_right_on_node_fails() {
+        let c = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap();
+        // Now at a node, not leaf
+        assert!(c.split_leaf_and_insert_right(3).is_err());
+    }
+
+    #[test]
+    fn split_leaf_and_insert_left_on_node_fails() {
+        let c = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap();
+        assert!(c.split_leaf_and_insert_left(3).is_err());
+    }
+
+    // ── Additional path_to_root tests ─────────────────────────
+
+    #[test]
+    fn path_to_root_from_right_child() {
+        let c = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .assign_node(Some(20))
+            .unwrap()
+            .go_right()
+            .unwrap();
+
+        let path: Vec<_> = c.path_to_root().collect();
+        assert_eq!(path.len(), 1);
+        assert_eq!(path[0].0, PathBranch::IsRight);
+        assert_eq!(*path[0].1, Some(20));
+    }
+
+    #[test]
+    fn path_to_root_deep_nesting() {
+        let c = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .assign_node(Some(10))
+            .unwrap()
+            .go_left()
+            .unwrap()
+            .split_leaf_and_insert_right(3)
+            .unwrap()
+            .assign_node(Some(20))
+            .unwrap()
+            .go_left()
+            .unwrap();
+
+        let path: Vec<_> = c.path_to_root().collect();
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].0, PathBranch::IsLeft);
+        assert_eq!(*path[0].1, Some(20));
+        assert_eq!(path[1].0, PathBranch::IsLeft);
+        assert_eq!(*path[1].1, Some(10));
+    }
+
+    // ── Additional traversal tests ────────────────────────────
+
+    #[test]
+    fn preorder_next_on_single_leaf_fails() {
+        let c = Tree::<i32>::Leaf(1).cursor();
+        assert!(c.preorder_next().is_err());
+    }
+
+    #[test]
+    fn go_to_nth_leaf_single_leaf() {
+        let mut c = Tree::<i32>::Leaf(42).cursor().go_to_nth_leaf(0).unwrap();
+        assert_eq!(*c.leaf_mut().unwrap(), 42);
+    }
+
+    #[test]
+    fn go_to_nth_leaf_on_empty_tree_fails() {
+        let c: Cursor<i32, ()> = Cursor::new();
+        assert!(c.go_to_nth_leaf(0).is_err());
+    }
+
+    // ── PathBranch derive traits ──────────────────────────────
+
+    #[test]
+    fn path_branch_clone_copy() {
+        let a = PathBranch::IsLeft;
+        let b = a; // Copy
+        let c = a.clone();
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn path_branch_is_right_debug() {
+        let debug = format!("{:?}", PathBranch::IsRight);
+        assert!(debug.contains("IsRight"));
+    }
 }
