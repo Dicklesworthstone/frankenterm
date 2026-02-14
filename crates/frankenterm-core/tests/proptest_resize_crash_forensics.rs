@@ -373,33 +373,35 @@ proptest! {
 // Global singleton properties
 // ---------------------------------------------------------------------------
 
+// Note: global singleton tests are combined into a single test to avoid
+// race conditions between parallel test threads sharing the OnceLock.
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
     #[test]
-    fn global_update_get_clear_cycle(
+    fn global_update_get_clear_and_builder_cycle(
         ts in 0_u64..100000,
         gate in arb_gate()
     ) {
+        // Phase 1: update → get → clear cycle
         let ctx = ResizeCrashContextBuilder::new(ts).gate(gate).build();
         ResizeCrashContext::update_global(ctx.clone());
 
         let got = ResizeCrashContext::get_global();
-        // Due to shared global state across tests, we can only check it's Some
         prop_assert!(got.is_some(), "global should be Some after update");
 
         ResizeCrashContext::clear_global();
         let cleared = ResizeCrashContext::get_global();
         prop_assert!(cleared.is_none(), "global should be None after clear");
-    }
 
-    #[test]
-    fn build_and_update_global_sets_global(ts in 0_u64..100000) {
-        ResizeCrashContextBuilder::new(ts)
+        // Phase 2: build_and_update_global
+        ResizeCrashContextBuilder::new(ts + 1)
+            .gate(gate)
             .build_and_update_global();
 
-        let got = ResizeCrashContext::get_global();
-        prop_assert!(got.is_some(), "global should be set after build_and_update_global");
+        let got2 = ResizeCrashContext::get_global();
+        prop_assert!(got2.is_some(), "global should be set after build_and_update_global");
 
         ResizeCrashContext::clear_global();
     }
