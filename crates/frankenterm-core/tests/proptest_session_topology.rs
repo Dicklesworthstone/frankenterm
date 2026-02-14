@@ -506,3 +506,407 @@ proptest! {
         prop_assert_eq!(back.workspace_id, ws);
     }
 }
+
+// =============================================================================
+// Helpers: PaneInfo construction for from_panes / match_panes tests
+// =============================================================================
+
+use frankenterm_core::session_topology::match_panes;
+use frankenterm_core::wezterm::{PaneInfo, PaneSize};
+use std::collections::HashMap;
+
+fn make_pane_info(
+    pane_id: u64,
+    tab_id: u64,
+    window_id: u64,
+    rows: u32,
+    cols: u32,
+    cwd: Option<&str>,
+    title: Option<&str>,
+    is_active: bool,
+) -> PaneInfo {
+    PaneInfo {
+        pane_id,
+        tab_id,
+        window_id,
+        domain_id: None,
+        domain_name: None,
+        workspace: None,
+        size: Some(PaneSize {
+            rows,
+            cols,
+            pixel_width: None,
+            pixel_height: None,
+            dpi: None,
+        }),
+        rows: None,
+        cols: None,
+        title: title.map(String::from),
+        cwd: cwd.map(String::from),
+        tty_name: None,
+        cursor_x: None,
+        cursor_y: None,
+        cursor_visibility: None,
+        left_col: None,
+        top_row: None,
+        is_active,
+        is_zoomed: false,
+        extra: HashMap::new(),
+    }
+}
+
+// =============================================================================
+// Property 19: from_panes — pane_count == input length
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn from_panes_pane_count_equals_input(
+        count in 0_usize..8,
+    ) {
+        let panes: Vec<PaneInfo> = (0..count)
+            .map(|i| make_pane_info(i as u64, 0, 0, 24, 80, None, None, i == 0))
+            .collect();
+        let (snapshot, report) = TopologySnapshot::from_panes(&panes, 1000);
+        prop_assert_eq!(snapshot.pane_count(), count,
+            "snapshot.pane_count() should equal input count");
+        prop_assert_eq!(report.pane_count, count,
+            "report.pane_count should equal input count");
+    }
+}
+
+// =============================================================================
+// Property 20: from_panes — report window_count == distinct window_ids
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn from_panes_window_count_matches(
+        n_windows in 1_usize..4,
+        n_panes_per in 1_usize..3,
+    ) {
+        let mut panes = Vec::new();
+        let mut pane_id = 0u64;
+        for w in 0..n_windows {
+            for _ in 0..n_panes_per {
+                panes.push(make_pane_info(pane_id, 0, w as u64, 24, 80, None, None, pane_id == 0));
+                pane_id += 1;
+            }
+        }
+        let (_, report) = TopologySnapshot::from_panes(&panes, 1000);
+        prop_assert_eq!(report.window_count, n_windows,
+            "report.window_count should equal distinct window IDs");
+    }
+}
+
+// =============================================================================
+// Property 21: from_panes — report tab_count == distinct (window_id, tab_id)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn from_panes_tab_count_matches(
+        n_tabs in 1_usize..5,
+    ) {
+        let panes: Vec<PaneInfo> = (0..n_tabs)
+            .map(|t| make_pane_info(t as u64, t as u64, 0, 24, 80, None, None, t == 0))
+            .collect();
+        let (_, report) = TopologySnapshot::from_panes(&panes, 1000);
+        prop_assert_eq!(report.tab_count, n_tabs,
+            "report.tab_count should equal distinct tab IDs");
+    }
+}
+
+// =============================================================================
+// Property 22: from_panes — pane_ids contains all input pane IDs
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn from_panes_pane_ids_complete(
+        count in 1_usize..8,
+    ) {
+        let panes: Vec<PaneInfo> = (0..count)
+            .map(|i| make_pane_info(i as u64, 0, 0, 24, 80, None, None, i == 0))
+            .collect();
+        let (snapshot, _) = TopologySnapshot::from_panes(&panes, 1000);
+        let mut ids = snapshot.pane_ids();
+        ids.sort_unstable();
+        let expected: Vec<u64> = (0..count as u64).collect();
+        prop_assert_eq!(ids, expected,
+            "pane_ids should contain all input pane IDs");
+    }
+}
+
+// =============================================================================
+// Property 23: from_panes — captured_at is preserved
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn from_panes_captured_at_preserved(
+        ts in 0_u64..u64::MAX / 2,
+    ) {
+        let panes = vec![make_pane_info(0, 0, 0, 24, 80, None, None, true)];
+        let (snapshot, _) = TopologySnapshot::from_panes(&panes, ts);
+        prop_assert_eq!(snapshot.captured_at, ts);
+    }
+}
+
+// =============================================================================
+// Property 24: from_panes roundtrips through JSON
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn from_panes_json_roundtrip(
+        count in 1_usize..5,
+    ) {
+        let panes: Vec<PaneInfo> = (0..count)
+            .map(|i| make_pane_info(i as u64, 0, 0, 24, 80, None, None, i == 0))
+            .collect();
+        let (snapshot, _) = TopologySnapshot::from_panes(&panes, 1000);
+        let json = snapshot.to_json().unwrap();
+        let back = TopologySnapshot::from_json(&json).unwrap();
+        prop_assert_eq!(back.pane_count(), snapshot.pane_count());
+        prop_assert_eq!(back.pane_ids(), snapshot.pane_ids());
+    }
+}
+
+// =============================================================================
+// Property 25: match_panes — mappings + unmatched covers all old pane IDs
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn match_panes_old_coverage(
+        n_old in 1_usize..5,
+        n_new in 1_usize..5,
+    ) {
+        let old_panes: Vec<PaneInfo> = (0..n_old)
+            .map(|i| make_pane_info(i as u64, 0, 0, 24, 80,
+                Some(&format!("/dir{}", i)), Some(&format!("title{}", i)), i == 0))
+            .collect();
+        let (old_snapshot, _) = TopologySnapshot::from_panes(&old_panes, 1000);
+
+        let new_panes: Vec<PaneInfo> = (0..n_new)
+            .map(|i| make_pane_info(100 + i as u64, 0, 0, 24, 80,
+                Some(&format!("/dir{}", i)), Some(&format!("title{}", i)), i == 0))
+            .collect();
+
+        let mapping = match_panes(&old_snapshot, &new_panes);
+
+        // Every old pane ID is either mapped or unmatched
+        let mapped_old: Vec<u64> = mapping.mappings.keys().copied().collect();
+        let total = mapped_old.len() + mapping.unmatched_old.len();
+        prop_assert_eq!(total, n_old,
+            "mapped({}) + unmatched_old({}) should equal n_old({})",
+            mapped_old.len(), mapping.unmatched_old.len(), n_old);
+    }
+}
+
+// =============================================================================
+// Property 26: match_panes — mappings + unmatched covers all new pane IDs
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn match_panes_new_coverage(
+        n_old in 1_usize..5,
+        n_new in 1_usize..5,
+    ) {
+        let old_panes: Vec<PaneInfo> = (0..n_old)
+            .map(|i| make_pane_info(i as u64, 0, 0, 24, 80,
+                Some(&format!("/dir{}", i)), Some(&format!("title{}", i)), i == 0))
+            .collect();
+        let (old_snapshot, _) = TopologySnapshot::from_panes(&old_panes, 1000);
+
+        let new_panes: Vec<PaneInfo> = (0..n_new)
+            .map(|i| make_pane_info(100 + i as u64, 0, 0, 24, 80,
+                Some(&format!("/dir{}", i)), Some(&format!("title{}", i)), i == 0))
+            .collect();
+
+        let mapping = match_panes(&old_snapshot, &new_panes);
+
+        // Every new pane ID is either in mappings values or unmatched_new
+        let mapped_new_count = mapping.mappings.values().count();
+        let total = mapped_new_count + mapping.unmatched_new.len();
+        prop_assert_eq!(total, n_new,
+            "mapped_new({}) + unmatched_new({}) should equal n_new({})",
+            mapped_new_count, mapping.unmatched_new.len(), n_new);
+    }
+}
+
+// =============================================================================
+// Property 27: match_panes — mappings are injective (no two old map to same new)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn match_panes_injective(
+        n in 1_usize..6,
+    ) {
+        let old_panes: Vec<PaneInfo> = (0..n)
+            .map(|i| make_pane_info(i as u64, 0, 0, 24, 80,
+                Some(&format!("/dir{}", i)), None, i == 0))
+            .collect();
+        let (old_snapshot, _) = TopologySnapshot::from_panes(&old_panes, 1000);
+
+        let new_panes: Vec<PaneInfo> = (0..n)
+            .map(|i| make_pane_info(100 + i as u64, 0, 0, 24, 80,
+                Some(&format!("/dir{}", i)), None, i == 0))
+            .collect();
+
+        let mapping = match_panes(&old_snapshot, &new_panes);
+
+        // No duplicate values in mappings
+        let mut seen_new: Vec<u64> = mapping.mappings.values().copied().collect();
+        seen_new.sort_unstable();
+        seen_new.dedup();
+        prop_assert_eq!(seen_new.len(), mapping.mappings.len(),
+            "mappings should be injective (no duplicate new pane IDs)");
+    }
+}
+
+// =============================================================================
+// Property 28: match_panes — empty old → all new unmatched
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn match_panes_empty_old(
+        n_new in 1_usize..5,
+    ) {
+        let (old_snapshot, _) = TopologySnapshot::from_panes(&[], 1000);
+        let new_panes: Vec<PaneInfo> = (0..n_new)
+            .map(|i| make_pane_info(i as u64, 0, 0, 24, 80, None, None, i == 0))
+            .collect();
+
+        let mapping = match_panes(&old_snapshot, &new_panes);
+        prop_assert!(mapping.mappings.is_empty(),
+            "empty old snapshot should have no mappings");
+        prop_assert!(mapping.unmatched_old.is_empty());
+        prop_assert_eq!(mapping.unmatched_new.len(), n_new);
+    }
+}
+
+// =============================================================================
+// Property 29: match_panes — empty new → all old unmatched
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn match_panes_empty_new(
+        n_old in 1_usize..5,
+    ) {
+        let old_panes: Vec<PaneInfo> = (0..n_old)
+            .map(|i| make_pane_info(i as u64, 0, 0, 24, 80,
+                Some(&format!("/d{}", i)), None, i == 0))
+            .collect();
+        let (old_snapshot, _) = TopologySnapshot::from_panes(&old_panes, 1000);
+
+        let mapping = match_panes(&old_snapshot, &[]);
+        prop_assert!(mapping.mappings.is_empty(),
+            "empty new panes should have no mappings");
+        prop_assert_eq!(mapping.unmatched_old.len(), n_old);
+        prop_assert!(mapping.unmatched_new.is_empty());
+    }
+}
+
+// =============================================================================
+// Property 30: CaptureReport — inference_quality has entry for each tab
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn capture_report_inference_per_tab(
+        n_tabs in 1_usize..5,
+    ) {
+        let panes: Vec<PaneInfo> = (0..n_tabs)
+            .map(|t| make_pane_info(t as u64, t as u64, 0, 24, 80, None, None, t == 0))
+            .collect();
+        let (_, report) = TopologySnapshot::from_panes(&panes, 1000);
+        prop_assert_eq!(report.inference_quality.len(), n_tabs,
+            "inference_quality should have entry for each tab");
+    }
+}
+
+// =============================================================================
+// Property 31: TopologySnapshot serde is deterministic
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn topology_serde_deterministic(
+        snapshot in arb_topology_snapshot(),
+    ) {
+        let j1 = serde_json::to_string(&snapshot).unwrap();
+        let j2 = serde_json::to_string(&snapshot).unwrap();
+        prop_assert_eq!(j1.as_str(), j2.as_str(), "serde should be deterministic");
+    }
+}
+
+// =============================================================================
+// Property 32: PaneNode JSON always contains "type" tag
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn pane_node_json_has_type_tag(
+        node in arb_pane_node(),
+    ) {
+        let json = serde_json::to_string(&node).unwrap();
+        prop_assert!(json.contains("\"type\""),
+            "PaneNode JSON should contain type tag, got: {}", json);
+    }
+}
+
+// =============================================================================
+// Property 33: PaneNode type tag matches variant
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn pane_node_type_tag_correct(
+        node in arb_pane_node(),
+    ) {
+        let json = serde_json::to_string(&node).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let type_tag = value.get("type").unwrap().as_str().unwrap();
+        match &node {
+            PaneNode::Leaf { .. } => prop_assert_eq!(type_tag, "Leaf"),
+            PaneNode::HSplit { .. } => prop_assert_eq!(type_tag, "HSplit"),
+            PaneNode::VSplit { .. } => prop_assert_eq!(type_tag, "VSplit"),
+        }
+    }
+}
