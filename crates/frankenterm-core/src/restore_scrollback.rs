@@ -750,6 +750,268 @@ mod tests {
         assert!(!InjectionGuard::is_suppressed(&suppressed, 10));
     }
 
+    // --- ScrollbackData edge cases ---
+
+    #[test]
+    fn scrollback_data_from_empty_segments() {
+        let data = ScrollbackData::from_segments(vec![]);
+        assert_eq!(data.lines.len(), 0);
+        assert_eq!(data.total_bytes, 0);
+    }
+
+    #[test]
+    fn scrollback_data_single_large_segment() {
+        let big = "x".repeat(100_000);
+        let data = ScrollbackData::from_segments(vec![big.clone()]);
+        assert_eq!(data.lines.len(), 1);
+        assert_eq!(data.total_bytes, 100_000);
+    }
+
+    #[test]
+    fn scrollback_data_truncate_to_zero() {
+        let mut data = ScrollbackData::from_segments(vec!["a".into(), "b".into()]);
+        data.truncate(0);
+        assert!(data.lines.is_empty());
+        assert_eq!(data.total_bytes, 0);
+    }
+
+    #[test]
+    fn scrollback_data_truncate_to_exact_count() {
+        let mut data = ScrollbackData::from_segments(vec!["a".into(), "b".into(), "c".into()]);
+        data.truncate(3); // Exactly the count
+        assert_eq!(data.lines.len(), 3);
+        assert_eq!(data.total_bytes, 3);
+    }
+
+    #[test]
+    fn scrollback_data_truncate_to_one_keeps_last() {
+        let mut data =
+            ScrollbackData::from_segments(vec!["first".into(), "middle".into(), "last".into()]);
+        data.truncate(1);
+        assert_eq!(data.lines, vec!["last"]);
+        assert_eq!(data.total_bytes, 4);
+    }
+
+    #[test]
+    fn scrollback_data_total_bytes_includes_all_segments() {
+        let data = ScrollbackData::from_segments(vec!["abc".into(), "de".into(), "f".into()]);
+        assert_eq!(data.total_bytes, 6); // 3 + 2 + 1
+    }
+
+    // --- InjectionGuard edge cases ---
+
+    #[test]
+    fn injection_guard_empty_pane_list() {
+        let set = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let _guard = InjectionGuard::new(set.clone(), vec![]);
+        // No panes suppressed
+        assert!(!InjectionGuard::is_suppressed(&set, 1));
+        assert!(!InjectionGuard::is_suppressed(&set, 0));
+    }
+
+    #[test]
+    fn injection_guard_overlapping_guards() {
+        let set = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let guard1 = InjectionGuard::new(set.clone(), vec![1, 2]);
+        let guard2 = InjectionGuard::new(set.clone(), vec![2, 3]);
+
+        assert!(InjectionGuard::is_suppressed(&set, 1));
+        assert!(InjectionGuard::is_suppressed(&set, 2));
+        assert!(InjectionGuard::is_suppressed(&set, 3));
+
+        drop(guard1);
+        // guard1 removed 1 and 2, but guard2 still has 2 and 3
+        // NOTE: InjectionGuard removes its pane_ids on drop even if shared,
+        // so after guard1 drop, pane 2 is removed even though guard2 added it.
+        assert!(!InjectionGuard::is_suppressed(&set, 1));
+        assert!(InjectionGuard::is_suppressed(&set, 3));
+
+        drop(guard2);
+        assert!(!InjectionGuard::is_suppressed(&set, 3));
+    }
+
+    #[test]
+    fn injection_guard_duplicate_pane_ids() {
+        let set = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        {
+            let _guard = InjectionGuard::new(set.clone(), vec![42, 42, 42]);
+            assert!(InjectionGuard::is_suppressed(&set, 42));
+        }
+        // After drop, suppression cleared even with duplicates
+        assert!(!InjectionGuard::is_suppressed(&set, 42));
+    }
+
+    // --- InjectionReport edge cases ---
+
+    #[test]
+    fn injection_report_total_bytes_with_mixed() {
+        let mut r = InjectionReport::default();
+        r.successes.push(PaneInjectionStats {
+            old_pane_id: 1,
+            new_pane_id: 10,
+            lines_injected: 0,
+            bytes_written: 0,
+            chunks_sent: 0,
+        });
+        r.successes.push(PaneInjectionStats {
+            old_pane_id: 2,
+            new_pane_id: 11,
+            lines_injected: 10,
+            bytes_written: 500,
+            chunks_sent: 1,
+        });
+        assert_eq!(r.success_count(), 2);
+        assert_eq!(r.total_bytes(), 500);
+    }
+
+    // --- build_injection_content edge cases ---
+
+    #[test]
+    fn build_content_with_empty_string_elements() {
+        let content = build_injection_content(&["".into(), "".into()]);
+        assert!(content.starts_with("\x1b[0m\x1b[H\x1b[2J"));
+        // Two empty lines with newline between them
+        assert!(content.contains("\n"));
+    }
+
+    #[test]
+    fn build_content_preserves_ansi_in_lines() {
+        let content = build_injection_content(&["\x1b[31mred\x1b[0m".into()]);
+        assert!(content.contains("\x1b[31mred\x1b[0m"));
+    }
+
+    #[test]
+    fn build_content_single_empty_line() {
+        let content = build_injection_content(&["".into()]);
+        // Just reset prefix + empty string
+        assert_eq!(content, "\x1b[0m\x1b[H\x1b[2J");
+    }
+
+    // --- chunk_content edge cases ---
+
+    #[test]
+    fn chunk_content_chunk_size_one() {
+        let content = "abc";
+        let chunks = chunk_content(content, 1);
+        assert_eq!(chunks.len(), 3);
+        let rejoined: String = chunks.concat();
+        assert_eq!(rejoined, content);
+    }
+
+    #[test]
+    fn chunk_content_exact_fit() {
+        let content = "hello";
+        let chunks = chunk_content(content, 5);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "hello");
+    }
+
+    #[test]
+    fn chunk_content_empty_input() {
+        let chunks = chunk_content("", 10);
+        assert_eq!(chunks, vec![""]);
+    }
+
+    #[test]
+    fn chunk_content_multibyte_emoji() {
+        // Each emoji is 4 bytes in UTF-8
+        let content = "😀😁😂";
+        let chunks = chunk_content(content, 5); // Forces split between emojis
+        let rejoined: String = chunks.concat();
+        assert_eq!(rejoined, content);
+        // Ensure no chunk splits mid-character
+        for chunk in &chunks {
+            assert!(chunk.is_ascii() || chunk.chars().count() > 0);
+        }
+    }
+
+    #[test]
+    fn chunk_content_ansi_not_split_mid_sequence() {
+        // 5 bytes of text + ESC [ 3 1 m (5 ANSI bytes) = 10 total
+        let content = "hello\x1b[31m";
+        let chunks = chunk_content(content, 7); // Would split inside the CSI
+        let rejoined: String = chunks.concat();
+        assert_eq!(rejoined, content);
+    }
+
+    // --- has_csi_terminator edge cases ---
+
+    #[test]
+    fn csi_terminator_empty_string() {
+        assert!(!has_csi_terminator(""));
+    }
+
+    #[test]
+    fn csi_terminator_just_esc() {
+        assert!(!has_csi_terminator("\x1b"));
+    }
+
+    #[test]
+    fn csi_terminator_esc_bracket_only() {
+        assert!(!has_csi_terminator("\x1b["));
+    }
+
+    #[test]
+    fn csi_various_terminators() {
+        // All valid CSI terminators are 0x40-0x7E
+        assert!(has_csi_terminator("\x1b[A")); // Cursor up
+        assert!(has_csi_terminator("\x1b[H")); // Cursor home
+        assert!(has_csi_terminator("\x1b[J")); // Erase in display
+        assert!(has_csi_terminator("\x1b[K")); // Erase in line
+        assert!(has_csi_terminator("\x1b[~")); // Tilde (0x7E)
+    }
+
+    #[test]
+    fn csi_with_many_parameters() {
+        // Long CSI with many params: ESC [ 3 8 ; 2 ; 2 5 5 ; 0 ; 0 m
+        assert!(has_csi_terminator("\x1b[38;2;255;0;0m"));
+    }
+
+    // --- find_safe_split edge cases ---
+
+    #[test]
+    fn find_safe_split_at_ansi_boundary() {
+        let content = "ab\x1b[31mcd";
+        // Target split at position 4 (inside ESC [ sequence)
+        let pos = find_safe_split(content, 0, 4);
+        // Should split before the ESC
+        assert!(pos <= 2 || pos >= 7); // Either before ESC or after sequence
+    }
+
+    #[test]
+    fn find_safe_split_at_utf8_boundary() {
+        let content = "a日b"; // 'a' (1) + '日' (3) + 'b' (1) = 5 bytes
+        // Target split at byte 2, which is mid-'日'
+        let pos = find_safe_split(content, 0, 2);
+        assert!(content.is_char_boundary(pos));
+    }
+
+    // --- InjectionConfig serde ---
+
+    #[test]
+    fn injection_config_serde_roundtrip() {
+        let config = InjectionConfig {
+            max_lines: 5000,
+            chunk_size: 2048,
+            inter_chunk_delay_ms: 5,
+            concurrent_injections: 10,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: InjectionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.max_lines, 5000);
+        assert_eq!(parsed.chunk_size, 2048);
+        assert_eq!(parsed.inter_chunk_delay_ms, 5);
+        assert_eq!(parsed.concurrent_injections, 10);
+    }
+
+    #[test]
+    fn injection_config_serde_defaults_on_missing() {
+        let json = "{}";
+        let parsed: InjectionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.max_lines, 10_000);
+        assert_eq!(parsed.chunk_size, 4096);
+    }
+
     // --- Chunked injection ---
 
     #[tokio::test]

@@ -487,4 +487,287 @@ mod tests {
         let n = detect_ncpu();
         assert!(n >= 1, "should detect at least 1 CPU");
     }
+
+    // -----------------------------------------------------------------------
+    // Boundary classification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_at_exact_thresholds() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        // Exact threshold values should classify at the tier
+        assert_eq!(monitor.classify(15.0), CpuPressureTier::Yellow);
+        assert_eq!(monitor.classify(30.0), CpuPressureTier::Orange);
+        assert_eq!(monitor.classify(50.0), CpuPressureTier::Red);
+    }
+
+    #[test]
+    fn classify_just_below_thresholds() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        // Just below each threshold stays in the lower tier
+        assert_eq!(monitor.classify(14.999), CpuPressureTier::Green);
+        assert_eq!(monitor.classify(29.999), CpuPressureTier::Yellow);
+        assert_eq!(monitor.classify(49.999), CpuPressureTier::Orange);
+    }
+
+    #[test]
+    fn classify_negative_pressure_is_green() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        assert_eq!(monitor.classify(-1.0), CpuPressureTier::Green);
+        assert_eq!(monitor.classify(-100.0), CpuPressureTier::Green);
+        assert_eq!(monitor.classify(f64::NEG_INFINITY), CpuPressureTier::Green);
+    }
+
+    #[test]
+    fn classify_very_high_pressure() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        assert_eq!(monitor.classify(1000.0), CpuPressureTier::Red);
+        assert_eq!(monitor.classify(f64::MAX), CpuPressureTier::Red);
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom configuration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn custom_tight_thresholds_all_equal() {
+        let config = CpuPressureConfig {
+            yellow_threshold: 10.0,
+            orange_threshold: 10.0,
+            red_threshold: 10.0,
+            ..test_config()
+        };
+        let monitor = CpuPressureMonitor::new(config);
+        // At 10.0, all thresholds match → Red wins (checked first)
+        assert_eq!(monitor.classify(10.0), CpuPressureTier::Red);
+        assert_eq!(monitor.classify(9.999), CpuPressureTier::Green);
+    }
+
+    #[test]
+    fn custom_very_high_thresholds() {
+        let config = CpuPressureConfig {
+            yellow_threshold: 999.0,
+            orange_threshold: 999.0,
+            red_threshold: 999.0,
+            ..test_config()
+        };
+        let monitor = CpuPressureMonitor::new(config);
+        // Everything below 999 is Green
+        assert_eq!(monitor.classify(100.0), CpuPressureTier::Green);
+        assert_eq!(monitor.classify(500.0), CpuPressureTier::Green);
+    }
+
+    #[test]
+    fn custom_zero_thresholds_everything_red() {
+        let config = CpuPressureConfig {
+            yellow_threshold: 0.0,
+            orange_threshold: 0.0,
+            red_threshold: 0.0,
+            ..test_config()
+        };
+        let monitor = CpuPressureMonitor::new(config);
+        assert_eq!(monitor.classify(0.0), CpuPressureTier::Red);
+        assert_eq!(monitor.classify(1.0), CpuPressureTier::Red);
+    }
+
+    // -----------------------------------------------------------------------
+    // Monitor state management
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multiple_samples_update_tier_atomically() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        // First sample sets tier based on real system load
+        let s1 = monitor.sample();
+        assert_eq!(s1.tier, monitor.current_tier());
+
+        // Second sample also updates
+        let s2 = monitor.sample();
+        assert_eq!(s2.tier, monitor.current_tier());
+    }
+
+    #[test]
+    fn tier_handle_reflects_manual_updates() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        let handle = monitor.tier_handle();
+
+        // Set each tier via handle and verify monitor sees it
+        for (val, expected) in [
+            (0, CpuPressureTier::Green),
+            (1, CpuPressureTier::Yellow),
+            (2, CpuPressureTier::Orange),
+            (3, CpuPressureTier::Red),
+        ] {
+            handle.store(val, Ordering::Relaxed);
+            assert_eq!(monitor.current_tier(), expected);
+        }
+    }
+
+    #[test]
+    fn tier_handle_unknown_value_falls_back_to_green() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        let handle = monitor.tier_handle();
+
+        // Values outside 0-3 should fall back to Green (via _ arm)
+        handle.store(99, Ordering::Relaxed);
+        assert_eq!(monitor.current_tier(), CpuPressureTier::Green);
+
+        handle.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(monitor.current_tier(), CpuPressureTier::Green);
+    }
+
+    // -----------------------------------------------------------------------
+    // Capture interval multiplier monotonicity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capture_multiplier_increases_monotonically() {
+        let tiers = [
+            CpuPressureTier::Green,
+            CpuPressureTier::Yellow,
+            CpuPressureTier::Orange,
+            CpuPressureTier::Red,
+        ];
+        for w in tiers.windows(2) {
+            assert!(
+                w[0].capture_interval_multiplier() < w[1].capture_interval_multiplier(),
+                "multiplier should increase: {:?}={} < {:?}={}",
+                w[0],
+                w[0].capture_interval_multiplier(),
+                w[1],
+                w[1].capture_interval_multiplier(),
+            );
+        }
+    }
+
+    #[test]
+    fn capture_multiplier_doubles_each_tier() {
+        // Green=1, Yellow=2, Orange=4, Red=8 — each doubles
+        assert_eq!(
+            CpuPressureTier::Yellow.capture_interval_multiplier(),
+            CpuPressureTier::Green.capture_interval_multiplier() * 2
+        );
+        assert_eq!(
+            CpuPressureTier::Orange.capture_interval_multiplier(),
+            CpuPressureTier::Yellow.capture_interval_multiplier() * 2
+        );
+        assert_eq!(
+            CpuPressureTier::Red.capture_interval_multiplier(),
+            CpuPressureTier::Orange.capture_interval_multiplier() * 2
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier numeric and display completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn all_tiers_have_distinct_as_u8() {
+        let values: Vec<u8> = [
+            CpuPressureTier::Green,
+            CpuPressureTier::Yellow,
+            CpuPressureTier::Orange,
+            CpuPressureTier::Red,
+        ]
+        .iter()
+        .map(|t| t.as_u8())
+        .collect();
+        let mut unique = values.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            values.len(),
+            unique.len(),
+            "all tier values must be distinct"
+        );
+    }
+
+    #[test]
+    fn all_tiers_display_uppercase() {
+        assert_eq!(format!("{}", CpuPressureTier::Yellow), "YELLOW");
+        assert_eq!(format!("{}", CpuPressureTier::Orange), "ORANGE");
+    }
+
+    #[test]
+    fn tier_serde_all_variants() {
+        for tier in [
+            CpuPressureTier::Green,
+            CpuPressureTier::Yellow,
+            CpuPressureTier::Orange,
+            CpuPressureTier::Red,
+        ] {
+            let json = serde_json::to_string(&tier).unwrap();
+            let parsed: CpuPressureTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, tier);
+        }
+    }
+
+    #[test]
+    fn tier_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&CpuPressureTier::Green).unwrap(),
+            "\"green\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CpuPressureTier::Yellow).unwrap(),
+            "\"yellow\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CpuPressureTier::Orange).unwrap(),
+            "\"orange\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CpuPressureTier::Red).unwrap(),
+            "\"red\""
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Config serde partial
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_serde_partial_fields_uses_defaults() {
+        let json = r#"{"enabled": false}"#;
+        let parsed: CpuPressureConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.enabled);
+        // Other fields should use defaults
+        assert_eq!(parsed.sample_interval_ms, 5000);
+        assert!((parsed.yellow_threshold - 15.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn config_with_custom_interval() {
+        let config = CpuPressureConfig {
+            sample_interval_ms: 100,
+            ..Default::default()
+        };
+        assert_eq!(config.sample_interval_ms, 100);
+        // Other values remain default
+        assert!(config.enabled);
+    }
+
+    // -----------------------------------------------------------------------
+    // as_u8 ordering matches tier ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn as_u8_matches_ord_ordering() {
+        let tiers = [
+            CpuPressureTier::Green,
+            CpuPressureTier::Yellow,
+            CpuPressureTier::Orange,
+            CpuPressureTier::Red,
+        ];
+        for w in tiers.windows(2) {
+            assert!(
+                w[0].as_u8() < w[1].as_u8(),
+                "as_u8 should match Ord: {:?}={} < {:?}={}",
+                w[0],
+                w[0].as_u8(),
+                w[1],
+                w[1].as_u8(),
+            );
+        }
+    }
 }
