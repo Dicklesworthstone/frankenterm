@@ -1089,4 +1089,267 @@ mod tests {
         nonempty.add_range(1..10);
         assert!(empty.difference(&nonempty).is_empty());
     }
+
+    // ── Free function edge cases ────────────────────────────
+
+    #[test]
+    fn intersects_identical_ranges() {
+        assert!(intersects_range(&(1..5), &(1..5)));
+    }
+
+    #[test]
+    fn intersects_empty_ranges() {
+        assert!(!intersects_range(&(3..3), &(3..3)));
+    }
+
+    #[test]
+    fn intersects_one_inside_other() {
+        assert!(intersects_range(&(3..5), &(1..10)));
+    }
+
+    #[test]
+    fn range_intersection_identical() {
+        assert_eq!(range_intersection(&(1..5), &(1..5)), Some(1..5));
+    }
+
+    #[test]
+    fn range_intersection_adjacent_returns_none() {
+        assert_eq!(range_intersection(&(1..5), &(5..10)), None);
+    }
+
+    #[test]
+    fn range_subtract_from_itself() {
+        assert_eq!(range_subtract(&(1..5), &(1..5)), (None, None));
+    }
+
+    #[test]
+    fn range_subtract_with_no_intersection_left_side() {
+        assert_eq!(range_subtract(&(5..10), &(1..3)), (Some(5..10), None));
+    }
+
+    #[test]
+    fn range_union_identical() {
+        assert_eq!(range_union(1..5, 1..5), 1..5);
+    }
+
+    #[test]
+    fn range_union_disjoint() {
+        // Union of disjoint ranges spans the gap
+        assert_eq!(range_union(1..3, 7..10), 1..10);
+    }
+
+    #[test]
+    fn range_union_both_empty() {
+        // Both empty at same point — second is returned
+        assert_eq!(range_union(5..5, 5..5), 5..5);
+    }
+
+    #[test]
+    fn range_is_empty_zero_zero() {
+        assert!(range_is_empty(&(0..0)));
+    }
+
+    // ── Negative number support ─────────────────────────────
+
+    #[test]
+    fn negative_range_add_and_contains() {
+        let mut set: RangeSet<i32> = RangeSet::new();
+        set.add_range(-10..-5);
+        assert!(set.contains(-7));
+        assert!(!set.contains(-4));
+        assert!(!set.contains(-11));
+    }
+
+    #[test]
+    fn negative_and_positive_ranges() {
+        let mut set: RangeSet<i32> = RangeSet::new();
+        set.add_range(-5..5);
+        assert!(set.contains(-5));
+        assert!(set.contains(0));
+        assert!(set.contains(4));
+        assert!(!set.contains(5));
+        assert_eq!(set.len(), 10);
+    }
+
+    #[test]
+    fn negative_range_remove() {
+        let mut set: RangeSet<i32> = RangeSet::new();
+        set.add_range(-10..10);
+        set.remove_range(-3..3);
+        assert_eq!(collect(&set), vec![-10..-3, 3..10]);
+    }
+
+    // ── Large ranges ────────────────────────────────────────
+
+    #[test]
+    fn large_range_len() {
+        let mut set: RangeSet<i64> = RangeSet::new();
+        set.add_range(0..1_000_000);
+        assert_eq!(set.len(), 1_000_000);
+    }
+
+    #[test]
+    fn large_range_contains_boundaries() {
+        let mut set: RangeSet<i64> = RangeSet::new();
+        set.add_range(0..1_000_000);
+        assert!(set.contains(0));
+        assert!(set.contains(999_999));
+        assert!(!set.contains(1_000_000));
+    }
+
+    // ── Bridging ranges ─────────────────────────────────────
+
+    #[test]
+    fn add_range_fills_gap_between_existing() {
+        let mut set = RangeSet::new();
+        set.add_range(1..5);
+        set.add_range(10..15);
+        // Fill the gap — merges with first, result may stay as two adjacent ranges
+        set.add_range(5..10);
+        // All values should be contained even if internal representation varies
+        for v in 1..15 {
+            assert!(set.contains(v), "should contain {v}");
+        }
+        assert!(!set.contains(0));
+        assert!(!set.contains(15));
+        assert_eq!(set.len(), 14);
+    }
+
+    #[test]
+    fn add_range_supersetting_existing() {
+        let mut set = RangeSet::new();
+        set.add_range(1..3);
+        set.add_range(5..7);
+        set.add_range(9..11);
+        // Superset covers all
+        set.add_range(1..11);
+        for v in 1..11 {
+            assert!(set.contains(v), "should contain {v}");
+        }
+        assert_eq!(set.len(), 10);
+    }
+
+    // ── Equality of differently-constructed sets ────────────
+
+    #[test]
+    fn equal_sets_from_different_construction() {
+        let mut a = RangeSet::new();
+        a.add_range(1..10);
+
+        let mut b = RangeSet::new();
+        b.add_range(1..5);
+        b.add_range(5..10);
+
+        assert_eq!(a, b);
+    }
+
+    // ── Clone independence ──────────────────────────────────
+
+    #[test]
+    fn clone_is_independent() {
+        let mut set = RangeSet::new();
+        set.add_range(1..10);
+        let mut cloned = set.clone();
+        cloned.remove(5);
+        // Original should be unchanged
+        assert!(set.contains(5));
+        assert!(!cloned.contains(5));
+    }
+
+    // ── iter with no ranges vs one range ────────────────────
+
+    #[test]
+    fn iter_single_range() {
+        let mut set = RangeSet::new();
+        set.add_range(5..10);
+        let ranges: Vec<_> = set.iter().collect();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], &(5..10));
+    }
+
+    // ── Into Vec round-trip ─────────────────────────────────
+
+    #[test]
+    fn into_vec_empty_set() {
+        let set: RangeSet<i32> = RangeSet::new();
+        let v: Vec<Range<i32>> = set.into();
+        assert!(v.is_empty());
+    }
+
+    // ── add_set with overlapping and adjacent ranges ────────
+
+    #[test]
+    fn add_set_with_overlapping_ranges() {
+        let mut a = RangeSet::new();
+        a.add_range(1..10);
+
+        let mut b = RangeSet::new();
+        b.add_range(5..15);
+        b.add_range(20..25);
+
+        a.add_set(&b);
+        assert_eq!(collect(&a), vec![1..15, 20..25]);
+    }
+
+    // ── remove_set with disjoint ────────────────────────────
+
+    #[test]
+    fn remove_set_disjoint_is_noop() {
+        let mut set = RangeSet::new();
+        set.add_range(1..5);
+
+        let mut to_remove = RangeSet::new();
+        to_remove.add_range(10..15);
+
+        set.remove_set(&to_remove);
+        assert_eq!(collect(&set), vec![1..5]);
+    }
+
+    // ── sort_if_needed idempotent ───────────────────────────
+
+    #[test]
+    fn sort_if_needed_when_already_sorted() {
+        let mut set = RangeSet::new();
+        set.add_range(1..5);
+        set.add_range(10..15);
+        // Already sorted, should be a no-op
+        set.sort_if_needed();
+        assert_eq!(collect(&set), vec![1..5, 10..15]);
+    }
+
+    // ── iter_values preserves order ─────────────────────────
+
+    #[test]
+    fn iter_values_in_order() {
+        let mut set = RangeSet::new();
+        set.add_range(10..13);
+        set.add_range(1..4);
+        // add_range maintains sorted order
+        let values: Vec<i32> = set.iter_values().collect();
+        assert_eq!(values, vec![1, 2, 3, 10, 11, 12]);
+    }
+
+    // ── Intersection self ───────────────────────────────────
+
+    #[test]
+    fn self_intersection_equals_self() {
+        let mut set = RangeSet::new();
+        set.add_range(1..10);
+        set.add_range(20..30);
+        let inter = set.intersection(&set);
+        assert_eq!(set, inter);
+    }
+
+    // ── Mixed add and remove sequence ───────────────────────
+
+    #[test]
+    fn mixed_add_remove_sequence() {
+        let mut set = RangeSet::new();
+        set.add_range(1..20);
+        set.remove_range(5..8);
+        set.add_range(6..7);
+        set.remove(10);
+        assert_eq!(collect(&set), vec![1..5, 6..7, 8..10, 11..20]);
+        assert_eq!(set.len(), 16);
+    }
 }
