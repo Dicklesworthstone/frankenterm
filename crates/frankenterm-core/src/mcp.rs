@@ -28,7 +28,11 @@ use crate::policy::{
     ActionKind, ActorKind, InjectionResult, PaneCapabilities, PolicyDecision, PolicyEngine,
     PolicyGatedInjector, PolicyInput,
 };
-use crate::storage::{EventQuery, PaneReservation, SearchOptions, StorageHandle};
+use crate::query_contract::{
+    SearchQueryDefaults, SearchQueryInput, UnifiedSearchMode, ensure_mode_supported,
+    parse_unified_search_query, to_storage_search_options,
+};
+use crate::storage::{EventQuery, PaneReservation, StorageHandle};
 use crate::wezterm::{
     PaneInfo, PaneWaiter, WaitMatcher, WaitOptions, WaitResult, WeztermHandleSource,
     default_wezterm_handle,
@@ -180,20 +184,12 @@ struct TruncationInfo {
 #[derive(Debug, Default, Deserialize)]
 struct SearchParams {
     query: String,
-    #[serde(default = "default_search_limit")]
-    limit: usize,
+    limit: Option<usize>,
     pane: Option<u64>,
     since: Option<i64>,
-    #[serde(default = "default_snippets")]
-    snippets: bool,
-}
-
-fn default_search_limit() -> usize {
-    20
-}
-
-fn default_snippets() -> bool {
-    true
+    until: Option<i64>,
+    snippets: Option<bool>,
+    mode: Option<UnifiedSearchMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -254,6 +250,9 @@ struct McpSearchData {
     pane_filter: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     since_filter: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    until_filter: Option<i64>,
+    mode: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1971,7 +1970,8 @@ impl ToolHandler for WaSearchTool {
         Tool {
             name: "wa.search".to_string(),
             description: Some(
-                "Full-text search across captured pane output (robot parity)".to_string(),
+                "Unified lexical search across captured pane output (CLI/robot/MCP contract)"
+                    .to_string(),
             ),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -1979,8 +1979,11 @@ impl ToolHandler for WaSearchTool {
                     "query": { "type": "string", "description": "FTS5 search query" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 20, "description": "Maximum results" },
                     "pane": { "type": "integer", "minimum": 0, "description": "Filter by pane ID" },
-                    "since": { "type": "integer", "description": "Filter by time (epoch ms)" },
+                    "since": { "type": "integer", "description": "Filter by lower bound time (epoch ms, inclusive)" },
+                    "until": { "type": "integer", "description": "Filter by upper bound time (epoch ms, inclusive)" },
                     "snippets": { "type": "boolean", "default": true, "description": "Include snippets in results" }
+                    ,
+                    "mode": { "type": "string", "enum": ["lexical", "semantic", "hybrid"], "default": "lexical", "description": "Search mode (semantic/hybrid reserved for future wa.search support)" }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -2003,8 +2006,7 @@ impl ToolHandler for WaSearchTool {
                     MCP_ERR_INVALID_ARGS,
                     format!("Invalid params: {err}"),
                     Some(
-                        "Expected object with query (required), limit, pane, since, snippets"
-                            .to_string(),
+                        "Expected object with query (required), limit, pane, since, until, snippets, mode".to_string(),
                     ),
                     elapsed_ms(start),
                 );
@@ -2012,27 +2014,56 @@ impl ToolHandler for WaSearchTool {
             }
         };
 
+        let parsed = match parse_unified_search_query(
+            SearchQueryInput {
+                query: params.query,
+                limit: params.limit,
+                pane: params.pane,
+                since: params.since,
+                until: params.until,
+                snippets: params.snippets,
+                mode: params.mode,
+            },
+            SearchQueryDefaults::default(),
+        ) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                let code = if err.is_query_lint_error() {
+                    MCP_ERR_FTS_QUERY
+                } else {
+                    MCP_ERR_INVALID_ARGS
+                };
+                let envelope =
+                    McpEnvelope::<()>::error(code, err.message(), err.hint(), elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+        let canonical = parsed.query;
+
+        if let Err(err) = ensure_mode_supported(canonical.mode, &[UnifiedSearchMode::Lexical]) {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_NOT_IMPLEMENTED,
+                err.message(),
+                err.hint(),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
         let db_path = Arc::clone(&self.db_path);
+        let query_for_storage = canonical.query.clone();
+        let search_options = to_storage_search_options(&canonical);
+        let snippets_enabled = canonical.snippets;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
-        let result = runtime.block_on(async {
+        let result = runtime.block_on(async move {
             let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
-
-            let options = SearchOptions {
-                limit: Some(params.limit),
-                pane_id: params.pane,
-                since: params.since,
-                until: None,
-                include_snippets: Some(params.snippets),
-                snippet_max_tokens: Some(30),
-                highlight_prefix: Some(">>".to_string()),
-                highlight_suffix: Some("<<".to_string()),
-            };
-
-            storage.search_with_results(&params.query, options).await
+            storage
+                .search_with_results(&query_for_storage, search_options)
+                .await
         });
 
         match result {
@@ -2047,7 +2078,7 @@ impl ToolHandler for WaSearchTool {
                         captured_at: r.segment.captured_at,
                         score: r.score,
                         snippet: r.snippet,
-                        content: if params.snippets {
+                        content: if snippets_enabled {
                             None
                         } else {
                             Some(r.segment.content)
@@ -2056,12 +2087,14 @@ impl ToolHandler for WaSearchTool {
                     .collect();
 
                 let data = McpSearchData {
-                    query: params.query,
+                    query: canonical.query,
                     results: hits,
                     total_hits,
-                    limit: params.limit,
-                    pane_filter: params.pane,
-                    since_filter: params.since,
+                    limit: canonical.limit,
+                    pane_filter: canonical.pane,
+                    since_filter: canonical.since,
+                    until_filter: canonical.until,
+                    mode: canonical.mode.as_str().to_string(),
                 };
                 let envelope = McpEnvelope::success(data, elapsed_ms(start));
                 envelope_to_content(envelope)
@@ -4807,7 +4840,11 @@ mod tests {
         fn proptest_toon_roundtrip_preserves_json_semantics(value in json_value_strategy()) {
             let toon = toon_rust::encode(value.clone(), None);
             let decoded = toon_rust::try_decode(&toon, None).expect("decode should succeed");
-            prop_assert_eq!(decoded, value);
+            let decoded_json = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0)
+                .join("\n");
+            let decoded_value: serde_json::Value =
+                serde_json::from_str(&decoded_json).expect("decoded TOON should parse as JSON");
+            prop_assert_eq!(decoded_value, value);
         }
 
         #[test]
@@ -4820,7 +4857,14 @@ mod tests {
 
             let decoded_from_lines =
                 toon_rust::try_decode_from_lines(lines, None).expect("line decode should succeed");
-            prop_assert_eq!(decoded_from_lines, value);
+            let decoded_json = toon_rust::cli::json_stringify::json_stringify_lines(
+                &decoded_from_lines,
+                0,
+            )
+            .join("\n");
+            let decoded_value: serde_json::Value =
+                serde_json::from_str(&decoded_json).expect("decoded TOON should parse as JSON");
+            prop_assert_eq!(decoded_value, value);
         }
 
         #[test]
@@ -5117,6 +5161,26 @@ mod tests {
                 "Storage tool '{name}' should not be registered without DB"
             );
         }
+    }
+
+    #[test]
+    fn wa_search_schema_includes_unified_contract_fields() {
+        let tool = WaSearchTool::new(Arc::new(PathBuf::from("wa-test.db"))).definition();
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("wa.search properties object");
+
+        assert!(properties.contains_key("query"));
+        assert!(properties.contains_key("limit"));
+        assert!(properties.contains_key("pane"));
+        assert!(properties.contains_key("since"));
+        assert!(properties.contains_key("until"));
+        assert!(properties.contains_key("snippets"));
+        assert!(properties.contains_key("mode"));
+        assert_eq!(properties["snippets"]["default"], true);
+        assert_eq!(properties["mode"]["default"], "lexical");
     }
 
     #[test]
