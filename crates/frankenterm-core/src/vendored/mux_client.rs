@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::config as wa_config;
 use crate::runtime_compat::unix::{self as compat_unix, AsyncReadExt, AsyncWriteExt, UnixStream};
-use crate::runtime_compat::{sleep, timeout};
+use crate::runtime_compat::{mpsc, sleep, timeout, watch};
 use codec::{
     CODEC_VERSION, CompressionMode, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
     GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, ListPanes,
@@ -645,8 +645,8 @@ impl Default for SubscriptionConfig {
 ///
 /// Dropping this handle cancels the subscription.
 pub struct PaneOutputSubscription {
-    receiver: tokio::sync::mpsc::Receiver<PaneDelta>,
-    cancel: tokio::sync::watch::Sender<bool>,
+    receiver: mpsc::Receiver<PaneDelta>,
+    cancel: watch::Sender<bool>,
 }
 
 impl PaneOutputSubscription {
@@ -680,8 +680,8 @@ pub fn subscribe_pane_output(
     pane_id: u64,
     config: SubscriptionConfig,
 ) -> PaneOutputSubscription {
-    let (tx, rx) = tokio::sync::mpsc::channel(config.channel_capacity);
-    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    let (tx, rx) = mpsc::channel(config.channel_capacity);
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
 
     tokio::spawn(async move {
         let mut last_seqno: Option<u64> = None;

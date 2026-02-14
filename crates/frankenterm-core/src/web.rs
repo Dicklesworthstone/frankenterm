@@ -541,11 +541,11 @@ async fn send_rate_limited_sse(
             *consecutive_drops = 0;
             true
         }
-        Err(mpsc::error::TrySendError::Full(_)) => {
+        Err(mpsc::TrySendError::Full(_)) => {
             *consecutive_drops += 1;
             *consecutive_drops < STREAM_MAX_CONSECUTIVE_DROPS
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::TrySendError::Closed(_)) => false,
     }
 }
 

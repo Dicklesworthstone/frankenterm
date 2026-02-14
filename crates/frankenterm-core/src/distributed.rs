@@ -678,6 +678,16 @@ impl ClientCertVerifier for AllowlistedClientVerifier {
 }
 
 #[cfg(feature = "distributed")]
+fn ensure_rustls_provider_installed() {
+    use std::sync::Once;
+    static INSTALL: Once = Once::new();
+
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+#[cfg(feature = "distributed")]
 fn build_server_config(
     tls: &DistributedTlsConfig,
     auth_mode: DistributedAuthMode,
@@ -686,6 +696,7 @@ fn build_server_config(
     if !tls.enabled {
         return Err(DistributedTlsError::TlsDisabled);
     }
+    ensure_rustls_provider_installed();
 
     let cert_path = tls
         .cert_path
@@ -742,6 +753,7 @@ fn build_client_config(
     if !tls.enabled {
         return Err(DistributedTlsError::TlsDisabled);
     }
+    ensure_rustls_provider_installed();
 
     let versions = resolve_tls_versions(&tls.min_tls_version)?;
     let mut roots = RootCertStore::empty();
@@ -1107,15 +1119,15 @@ mod tests {
     }
 
     #[cfg(feature = "distributed")]
+    use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(feature = "distributed")]
+    use asupersync::net::{TcpListener, TcpStream};
+    #[cfg(feature = "distributed")]
+    use asupersync::tls::{TlsAcceptor, TlsConnector};
+    #[cfg(feature = "distributed")]
     use proptest::prelude::*;
     #[cfg(feature = "distributed")]
     use std::time::Duration;
-    #[cfg(feature = "distributed")]
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    #[cfg(feature = "distributed")]
-    use tokio::net::TcpListener;
-    #[cfg(feature = "distributed")]
-    use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     #[cfg(feature = "distributed")]
     const CA_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIDGzCCAgOgAwIBAgIUR8JHXom3tZxZAwXcBF09FctZBXUwDQYJKoZIhvcNAQEL\nBQAwFTETMBEGA1UEAwwKd2EtdGVzdC1jYTAeFw0yNjAxMzExOTUwNDFaFw0yNjAz\nMDIxOTUwNDFaMBUxEzARBgNVBAMMCndhLXRlc3QtY2EwggEiMA0GCSqGSIb3DQEB\nAQUAA4IBDwAwggEKAoIBAQCLsfmpPVqsXx4W3mJhOSonFeARj9j9jZ2z7HKq5DwF\nt40XW9aBTJ3tAyEf+96so/196v2dwNL/GF2c/NLFDYblpVKWKEBpbIxsFeimquz/\nBP+biMAXHK18/r2Sotad5FNb3jLGmeZ5q9jjC2T+Mvw7KFc0ptz/m7yivBgECQgS\n3qfaKfeYwdPVtRT9BHLXtVi0y1r7E+7bvfnWBkIJ5Jz/LIDOQBoEd/ofwuvWx/as\n3Pnz4jbN8Rz5/x8GmgVni5ryaoJv0nmNavoZScIGgVOua3Cro8Nf47lW67HQ7QTl\ngWbTURQzjRznD2KWQKclNt8LMfhaTPWCwWv5m99wibDDAgMBAAGjYzBhMB0GA1Ud\nDgQWBBRuIqT4PRnABam0DRoUTFnTmT0rozAfBgNVHSMEGDAWgBRuIqT4PRnABam0\nDRoUTFnTmT0rozAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjANBgkq\nhkiG9w0BAQsFAAOCAQEAIrtQ1+ykRNoqpYuvcuMa5s3inzpCkmtXfrhXAIclroAW\nhxkZ8YobU381HSjq9CoOmcEwvj/SESqCD21u3qH4iqAPXEMSdi7sfXznc41Xmm+Z\nK5gXwmeqmO+VX7t2XtSvAeBEhOTpgtFcOCt2UoSVD38Qq8yJGcE7zS5d2B2rncTz\nhtHaFr21HeGSpn+Jz91CgPBCdhHuVrruZOr61lhfHfaNH8E7pPS63GXbo58yrOfX\nw/w5gkbPZVMkxLFn1OQt2Ah4uud4VbJ76JOylfyKwWJH3VrYw8ZE98M3CWRh6mGq\nhLXdOswkuXOAIL5kTVIpJzkXRxW+owwW5pHvCs0DiA==\n-----END CERTIFICATE-----\n";
@@ -1166,7 +1178,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
 
-        let acceptor = TlsAcceptor::from(server_config);
+        let acceptor = TlsAcceptor::new((*server_config).clone());
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let mut tls_stream = acceptor.accept(stream).await.expect("accept tls");
@@ -1175,12 +1187,11 @@ mod tests {
             buf
         });
 
-        let connector = TlsConnector::from(client_config);
-        let server_name = ServerName::try_from("localhost").expect("server name");
+        let connector = TlsConnector::new((*client_config).clone());
         let mut stream = connector
             .connect(
-                server_name,
-                tokio::net::TcpStream::connect(addr).await.expect("connect"),
+                "localhost",
+                TcpStream::connect(addr).await.expect("connect"),
             )
             .await
             .expect("tls connect");
@@ -1231,7 +1242,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
 
-        let acceptor = TlsAcceptor::from(server_tls);
+        let acceptor = TlsAcceptor::new((*server_tls).clone());
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let mut tls_stream = acceptor.accept(stream).await.expect("accept tls");
@@ -1240,12 +1251,11 @@ mod tests {
             buf
         });
 
-        let connector = TlsConnector::from(client_tls);
-        let server_name = ServerName::try_from("localhost").expect("server name");
+        let connector = TlsConnector::new((*client_tls).clone());
         let mut stream = connector
             .connect(
-                server_name,
-                tokio::net::TcpStream::connect(addr).await.expect("connect"),
+                "localhost",
+                TcpStream::connect(addr).await.expect("connect"),
             )
             .await
             .expect("tls connect");
@@ -1284,18 +1294,17 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
 
-        let acceptor = TlsAcceptor::from(server_config);
+        let acceptor = TlsAcceptor::new((*server_config).clone());
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             acceptor.accept(stream).await
         });
 
-        let connector = TlsConnector::from(client_config);
-        let server_name = ServerName::try_from("localhost").expect("server name");
+        let connector = TlsConnector::new((*client_config).clone());
         let client_result = connector
             .connect(
-                server_name,
-                tokio::net::TcpStream::connect(addr).await.expect("connect"),
+                "localhost",
+                TcpStream::connect(addr).await.expect("connect"),
             )
             .await;
 
@@ -1349,18 +1358,17 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
 
-        let acceptor = TlsAcceptor::from(server_tls);
+        let acceptor = TlsAcceptor::new((*server_tls).clone());
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             acceptor.accept(stream).await
         });
 
-        let connector = TlsConnector::from(client_tls);
-        let server_name = ServerName::try_from("localhost").expect("server name");
+        let connector = TlsConnector::new((*client_tls).clone());
         let client_result = connector
             .connect(
-                server_name,
-                tokio::net::TcpStream::connect(addr).await.expect("connect"),
+                "localhost",
+                TcpStream::connect(addr).await.expect("connect"),
             )
             .await;
 
@@ -1419,18 +1427,17 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
 
-        let acceptor = TlsAcceptor::from(server_tls);
+        let acceptor = TlsAcceptor::new((*server_tls).clone());
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             acceptor.accept(stream).await
         });
 
-        let connector = TlsConnector::from(client_tls);
-        let server_name = ServerName::try_from("localhost").expect("server name");
+        let connector = TlsConnector::new((*client_tls).clone());
         let client_result = connector
             .connect(
-                server_name,
-                tokio::net::TcpStream::connect(addr).await.expect("connect"),
+                "localhost",
+                TcpStream::connect(addr).await.expect("connect"),
             )
             .await;
 
@@ -1469,15 +1476,15 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
 
-        let acceptor = TlsAcceptor::from(server_config);
+        let acceptor = TlsAcceptor::new((*server_config).clone());
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             acceptor.accept(stream).await
         });
 
-        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut client = TcpStream::connect(addr).await.expect("connect");
         client.write_all(b"not tls").await.expect("write");
-        let _ = client.shutdown().await;
+        let _ = client.shutdown(std::net::Shutdown::Both);
 
         let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
             .await

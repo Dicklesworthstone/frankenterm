@@ -22,8 +22,7 @@ use crate::runtime_compat::{sleep, timeout};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Boxed future for WezTerm interface operations.
 pub type WeztermFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;

@@ -71,10 +71,9 @@ toon_rust = { workspace = true, optional = true }
 fastapi = { workspace = true, optional = true }
 fastapi-core = { workspace = true, optional = true }
 # Sync (optional, behind feature)
-asupersync = { workspace = true, optional = true }
+asupersync = { workspace = true, optional = true, features = ["tls"] }
 # Distributed mode (optional, behind feature)
 rustls = { workspace = true, optional = true }
-tokio-rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 x509-parser = { workspace = true, optional = true }
 # Lexical search (optional, behind feature)
@@ -265,8 +264,8 @@ rollout = ["tui", "ftui"]
 metrics = []
 native-wezterm = []
 distributed = [
+    "dep:asupersync",
     "dep:rustls",
-    "dep:tokio-rustls",
     "dep:rustls-pemfile",
     "dep:x509-parser",
 ]

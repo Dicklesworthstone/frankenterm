@@ -40,12 +40,13 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, params, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::error::{Result, StorageError};
 use crate::events::event_identity_key;
 use crate::lru_cache::LruCache;
 use crate::policy::Redactor;
+use crate::runtime_compat::mpsc;
 use crate::search::{HybridSearchService, SearchMode};
 
 // =============================================================================
@@ -20772,8 +20773,8 @@ mod queue_depth_tests {
 #[cfg(test)]
 mod backpressure_integration_tests {
     use super::*;
+    use crate::runtime_compat::mpsc;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use tokio::sync::mpsc;
 
     static BP_COUNTER: AtomicU64 = AtomicU64::new(0);
 

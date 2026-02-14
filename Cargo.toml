@@ -205,7 +205,6 @@ thiserror = "2.0.18"
 anyhow = "1.0.100"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
-reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # CLI
 clap = { version = "4.5.54", features = ["derive", "env"] }
@@ -391,7 +390,6 @@ console = "0.15"
 getrandom = "0.3"
 trybuild = { version = "1", default-features = false }
 rustls = "0.23"
-tokio-rustls = "0.26"
 rustls-pemfile = "2"
 fastmcp = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", package = "fastmcp-rust" }
 fastmcp-core = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
