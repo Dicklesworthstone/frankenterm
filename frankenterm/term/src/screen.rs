@@ -3121,4 +3121,176 @@ mod tests {
         assert_eq!(screen.cursor_consistency_telemetry.checks_failed, 1);
         assert_eq!(screen.cursor_consistency_telemetry.total_checks(), 1);
     }
+
+    // =========================================================================
+    // Core Screen::resize() behavior
+    // =========================================================================
+
+    #[test]
+    fn resize_changes_physical_dimensions() {
+        let mut screen = test_screen(3, 4, 96);
+        assert_eq!(screen.physical_rows, 3);
+        assert_eq!(screen.physical_cols, 4);
+
+        let cursor = test_cursor(0, 0, 1);
+        let _ = screen.resize(test_size(5, 8, 96), cursor, 1, false);
+        assert_eq!(screen.physical_rows, 5);
+        assert_eq!(screen.physical_cols, 8);
+    }
+
+    #[test]
+    fn resize_shrink_updates_dimensions() {
+        let mut screen = test_screen(8, 10, 96);
+        let cursor = test_cursor(0, 0, 1);
+        let _ = screen.resize(test_size(3, 4, 96), cursor, 1, false);
+        assert_eq!(screen.physical_rows, 3);
+        assert_eq!(screen.physical_cols, 4);
+    }
+
+    #[test]
+    fn resize_updates_dpi() {
+        let mut screen = test_screen(3, 4, 96);
+        assert_eq!(screen.dpi, 96);
+
+        let cursor = test_cursor(0, 0, 1);
+        let _ = screen.resize(test_size(3, 4, 144), cursor, 1, false);
+        assert_eq!(screen.dpi, 144);
+    }
+
+    #[test]
+    fn resize_returns_cursor_position() {
+        let mut screen = test_screen(4, 6, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("aaa", &attrs, 0, None),
+            Line::from_text("bbb", &attrs, 0, None),
+            Line::from_text("ccc", &attrs, 0, None),
+            Line::from_text("ddd", &attrs, 0, None),
+        ]);
+
+        let cursor = test_cursor(2, 1, 1);
+        let new_cursor = screen.resize(test_size(4, 8, 96), cursor, 1, false);
+        // Cursor should be valid within new dimensions
+        assert!(
+            (new_cursor.x as usize) < screen.physical_cols,
+            "cursor x {} should be < cols {}",
+            new_cursor.x,
+            screen.physical_cols
+        );
+    }
+
+    #[test]
+    fn resize_same_dimensions_preserves_content() {
+        let mut screen = test_screen(2, 4, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("abcd", &attrs, 0, None),
+            Line::from_text("efgh", &attrs, 0, None),
+        ]);
+
+        let before: Vec<String> = screen
+            .visible_lines()
+            .into_iter()
+            .map(|l| l.as_str().to_string())
+            .collect();
+
+        let cursor = test_cursor(0, 0, 1);
+        let _ = screen.resize(test_size(2, 4, 96), cursor, 1, false);
+
+        let after: Vec<String> = screen
+            .visible_lines()
+            .into_iter()
+            .map(|l| l.as_str().to_string())
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn resize_grow_adds_visible_lines() {
+        let mut screen = test_screen(2, 4, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("abcd", &attrs, 0, None),
+            Line::from_text("efgh", &attrs, 0, None),
+        ]);
+
+        let cursor = test_cursor(0, 0, 1);
+        let _ = screen.resize(test_size(4, 4, 96), cursor, 1, false);
+
+        let visible = screen.visible_lines();
+        assert_eq!(visible.len(), 4);
+    }
+
+    #[test]
+    fn cold_scrollback_worker_zero_backlog() {
+        let mut worker = ColdScrollbackReflowWorker::default();
+        worker.begin_intent(1, 0);
+        assert_eq!(worker.backlog_depth(), 0);
+        worker.finish_intent(1, std::time::Duration::from_millis(0), 0);
+        assert_eq!(worker.active_intent(), None);
+        assert_eq!(worker.completed_batches_total(), 0);
+    }
+
+    #[test]
+    fn cold_scrollback_worker_peak_backlog_tracks_maximum() {
+        let mut worker = ColdScrollbackReflowWorker::default();
+
+        // First intent with backlog 50
+        worker.begin_intent(1, 50);
+        assert_eq!(worker.peak_backlog_depth(), 50);
+        worker.finish_intent(1, std::time::Duration::from_millis(5), 50);
+
+        // Second intent with smaller backlog
+        worker.begin_intent(2, 20);
+        assert_eq!(worker.peak_backlog_depth(), 50, "peak should persist");
+        worker.finish_intent(2, std::time::Duration::from_millis(2), 20);
+    }
+
+    #[test]
+    fn multiple_resizes_preserve_rewrap_cache_integrity() {
+        let mut screen = test_screen(3, 6, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text_with_wrapped_last_col("abcdef", &attrs, 0),
+            Line::from_text("ghij", &attrs, 0, None),
+            Line::from_text("klmn", &attrs, 0, None),
+        ]);
+
+        let cursor = test_cursor(0, 0, 1);
+        // Resize through multiple widths
+        let cursor = screen.resize(test_size(3, 4, 96), cursor, 1, false);
+        let cursor = screen.resize(test_size(3, 8, 96), cursor, 2, false);
+        let _ = screen.resize(test_size(3, 3, 96), cursor, 3, false);
+
+        // Cache should exist and contain entries
+        let cache = screen.rewrap_cache.as_ref().expect("cache should exist");
+        assert!(
+            !cache.wrapped_by_key.is_empty(),
+            "cache should have at least one entry after multiple resizes"
+        );
+    }
+
+    #[test]
+    fn last_good_frame_lifecycle_capture_count_increases_per_resize() {
+        let mut screen = test_screen(2, 4, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("abcd", &attrs, 0, None),
+            Line::from_text("efgh", &attrs, 0, None),
+        ]);
+
+        let cursor = test_cursor(0, 0, 1);
+        let cursor = screen.resize(test_size(2, 3, 96), cursor, 1, false);
+        let count_after_first = screen.last_good_frame_lifecycle.capture_count;
+
+        let _ = screen.resize(test_size(2, 5, 96), cursor, 2, false);
+        let count_after_second = screen.last_good_frame_lifecycle.capture_count;
+
+        assert!(
+            count_after_second > count_after_first,
+            "capture count should increase: {} > {}",
+            count_after_second,
+            count_after_first
+        );
+    }
 }
