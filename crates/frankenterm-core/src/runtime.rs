@@ -42,6 +42,7 @@ use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
 use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
+use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
 use crate::runtime_compat::{RwLock, mpsc, sleep, timeout, watch};
 use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
 #[cfg(feature = "native-wezterm")]
@@ -280,6 +281,14 @@ static GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY: OnceLock<
 > = OnceLock::new();
 /// Number of recent samples retained for lock/memory percentile telemetry.
 const TELEMETRY_PERCENTILE_WINDOW_CAPACITY: usize = 1024;
+/// Warning threshold for stalled resize transactions.
+const RESIZE_WATCHDOG_WARNING_THRESHOLD_MS: u64 = 2_000;
+/// Critical threshold for stalled resize transactions.
+const RESIZE_WATCHDOG_CRITICAL_THRESHOLD_MS: u64 = 8_000;
+/// Number of critical stalls that triggers safe-mode recommendation.
+const RESIZE_WATCHDOG_CRITICAL_STALLED_LIMIT: usize = 2;
+/// Maximum stalled-transaction samples retained in watchdog payloads.
+const RESIZE_WATCHDOG_SAMPLE_LIMIT: usize = 8;
 
 /// Machine-readable lock contention and cursor-memory telemetry snapshot.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -331,6 +340,131 @@ impl RuntimeLockMemoryTelemetrySnapshot {
         let lock = GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY.get_or_init(|| StdRwLock::new(None));
         lock.read().ok().and_then(|guard| guard.clone())
     }
+}
+
+/// Resize watchdog health severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResizeWatchdogSeverity {
+    /// No stalled resize transactions above warning threshold.
+    Healthy,
+    /// One or more stalled transactions above warning threshold.
+    Warning,
+    /// Pathological stalls detected; safe-mode fallback should be enabled.
+    Critical,
+    /// Safe-mode is currently active via resize control-plane kill-switch.
+    SafeModeActive,
+}
+
+/// Machine-readable resize watchdog assessment.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResizeWatchdogAssessment {
+    /// Current severity classification.
+    pub severity: ResizeWatchdogSeverity,
+    /// Number of stalled transactions above warning threshold.
+    pub stalled_total: usize,
+    /// Number of stalled transactions above critical threshold.
+    pub stalled_critical: usize,
+    /// Warning threshold used for detection.
+    pub warning_threshold_ms: u64,
+    /// Critical threshold used for detection.
+    pub critical_threshold_ms: u64,
+    /// Critical stall count needed before safe-mode recommendation.
+    pub critical_stalled_limit: usize,
+    /// Whether safe-mode fallback should be enabled by operators/runtime policy.
+    pub safe_mode_recommended: bool,
+    /// Whether safe-mode is already active.
+    pub safe_mode_active: bool,
+    /// Whether legacy fallback path is available when safe-mode is active.
+    pub legacy_fallback_enabled: bool,
+    /// Suggested operator/runtime action.
+    pub recommended_action: String,
+    /// Sample stalled transactions for diagnostics.
+    pub sample_stalled: Vec<ResizeStalledTransaction>,
+}
+
+impl ResizeWatchdogAssessment {
+    /// Render an operator-facing warning line for health snapshots.
+    #[must_use]
+    pub fn warning_line(&self) -> Option<String> {
+        match self.severity {
+            ResizeWatchdogSeverity::Healthy => None,
+            ResizeWatchdogSeverity::Warning => Some(format!(
+                "Resize watchdog warning: {} stalled transaction(s) >= {}ms",
+                self.stalled_total, self.warning_threshold_ms
+            )),
+            ResizeWatchdogSeverity::Critical => Some(format!(
+                "Resize watchdog CRITICAL: {} stalled transaction(s) >= {}ms; recommend safe-mode fallback{}",
+                self.stalled_critical,
+                self.critical_threshold_ms,
+                if self.legacy_fallback_enabled {
+                    " with legacy path enabled"
+                } else {
+                    ""
+                }
+            )),
+            ResizeWatchdogSeverity::SafeModeActive => Some(format!(
+                "Resize watchdog: safe-mode active ({} stalled >= {}ms)",
+                self.stalled_total, self.warning_threshold_ms
+            )),
+        }
+    }
+}
+
+/// Evaluate resize control-plane stall health from the latest global debug snapshot.
+#[must_use]
+pub fn evaluate_resize_watchdog(now_ms: u64) -> Option<ResizeWatchdogAssessment> {
+    let snapshot = ResizeSchedulerDebugSnapshot::get_global()?;
+    let stalled_warning =
+        snapshot.stalled_transactions(now_ms, RESIZE_WATCHDOG_WARNING_THRESHOLD_MS);
+    let stalled_critical =
+        snapshot.stalled_transactions(now_ms, RESIZE_WATCHDOG_CRITICAL_THRESHOLD_MS);
+    let safe_mode_active = snapshot.gate.emergency_disable;
+    let safe_mode_recommended =
+        !safe_mode_active && stalled_critical.len() >= RESIZE_WATCHDOG_CRITICAL_STALLED_LIMIT;
+
+    let severity = if safe_mode_active {
+        ResizeWatchdogSeverity::SafeModeActive
+    } else if safe_mode_recommended {
+        ResizeWatchdogSeverity::Critical
+    } else if !stalled_warning.is_empty() {
+        ResizeWatchdogSeverity::Warning
+    } else {
+        ResizeWatchdogSeverity::Healthy
+    };
+
+    let recommended_action = match severity {
+        ResizeWatchdogSeverity::Healthy => "none",
+        ResizeWatchdogSeverity::Warning => "monitor_stalled_transactions",
+        ResizeWatchdogSeverity::Critical => "enable_safe_mode_fallback",
+        ResizeWatchdogSeverity::SafeModeActive => "safe_mode_active_monitor_and_recover",
+    }
+    .to_string();
+
+    let sample_source = if !stalled_critical.is_empty() {
+        &stalled_critical
+    } else {
+        &stalled_warning
+    };
+    let sample_stalled = sample_source
+        .iter()
+        .take(RESIZE_WATCHDOG_SAMPLE_LIMIT)
+        .cloned()
+        .collect();
+
+    Some(ResizeWatchdogAssessment {
+        severity,
+        stalled_total: stalled_warning.len(),
+        stalled_critical: stalled_critical.len(),
+        warning_threshold_ms: RESIZE_WATCHDOG_WARNING_THRESHOLD_MS,
+        critical_threshold_ms: RESIZE_WATCHDOG_CRITICAL_THRESHOLD_MS,
+        critical_stalled_limit: RESIZE_WATCHDOG_CRITICAL_STALLED_LIMIT,
+        safe_mode_recommended,
+        safe_mode_active,
+        legacy_fallback_enabled: snapshot.gate.legacy_fallback_enabled,
+        recommended_action,
+        sample_stalled,
+    })
 }
 
 #[derive(Debug)]
@@ -2688,6 +2822,11 @@ impl RuntimeHandle {
             Ok(wezterm_warnings) => warnings.extend(wezterm_warnings),
             Err(err) => warnings.push(format!("WezTerm health warning probe failed: {err}")),
         }
+        if let Some(resize_watchdog) = evaluate_resize_watchdog(epoch_ms_u64()) {
+            if let Some(line) = resize_watchdog.warning_line() {
+                warnings.push(line);
+            }
+        }
 
         let snapshot = HealthSnapshot {
             timestamp: epoch_ms_u64(),
@@ -3606,6 +3745,264 @@ mod tests {
         assert_eq!(sched.max_captures_per_sec, 10);
         assert_eq!(sched.tracked_panes, 2);
         assert!(deser.backpressure_tier.is_none());
+    }
+
+    // =========================================================================
+    // Resize Watchdog Tests (wa-1u90p.7.1)
+    // =========================================================================
+
+    #[test]
+    fn watchdog_severity_serde_roundtrip() {
+        for severity in [
+            ResizeWatchdogSeverity::Healthy,
+            ResizeWatchdogSeverity::Warning,
+            ResizeWatchdogSeverity::Critical,
+            ResizeWatchdogSeverity::SafeModeActive,
+        ] {
+            let json = serde_json::to_string(&severity).unwrap();
+            let parsed: ResizeWatchdogSeverity = serde_json::from_str(&json).unwrap();
+            assert_eq!(severity, parsed);
+        }
+    }
+
+    #[test]
+    fn watchdog_severity_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ResizeWatchdogSeverity::Healthy).unwrap(),
+            "\"healthy\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ResizeWatchdogSeverity::SafeModeActive).unwrap(),
+            "\"safe_mode_active\""
+        );
+    }
+
+    #[test]
+    fn watchdog_warning_line_healthy_returns_none() {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Healthy,
+            stalled_total: 0,
+            stalled_critical: 0,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 5000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+            recommended_action: "none".into(),
+            sample_stalled: vec![],
+        };
+        assert!(assessment.warning_line().is_none());
+    }
+
+    #[test]
+    fn watchdog_warning_line_warning_contains_stalled_count() {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Warning,
+            stalled_total: 2,
+            stalled_critical: 0,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 5000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+            recommended_action: "monitor_stalled_transactions".into(),
+            sample_stalled: vec![],
+        };
+        let line = assessment.warning_line().unwrap();
+        assert!(line.contains("warning"));
+        assert!(line.contains("2 stalled"));
+        assert!(line.contains("2000ms"));
+    }
+
+    #[test]
+    fn watchdog_warning_line_critical_recommends_safe_mode() {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Critical,
+            stalled_total: 5,
+            stalled_critical: 4,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 5000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: true,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+            recommended_action: "enable_safe_mode_fallback".into(),
+            sample_stalled: vec![],
+        };
+        let line = assessment.warning_line().unwrap();
+        assert!(line.contains("CRITICAL"));
+        assert!(line.contains("4 stalled"));
+        assert!(line.contains("5000ms"));
+        assert!(line.contains("safe-mode fallback"));
+        assert!(line.contains("legacy path enabled"));
+    }
+
+    #[test]
+    fn watchdog_warning_line_critical_without_legacy() {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Critical,
+            stalled_total: 3,
+            stalled_critical: 3,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 5000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: true,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+            recommended_action: "enable_safe_mode_fallback".into(),
+            sample_stalled: vec![],
+        };
+        let line = assessment.warning_line().unwrap();
+        assert!(line.contains("CRITICAL"));
+        assert!(!line.contains("legacy path enabled"));
+    }
+
+    #[test]
+    fn watchdog_warning_line_safe_mode_active() {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::SafeModeActive,
+            stalled_total: 1,
+            stalled_critical: 0,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 5000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: false,
+            safe_mode_active: true,
+            legacy_fallback_enabled: true,
+            recommended_action: "safe_mode_active_monitor_and_recover".into(),
+            sample_stalled: vec![],
+        };
+        let line = assessment.warning_line().unwrap();
+        assert!(line.contains("safe-mode active"));
+        assert!(line.contains("1 stalled"));
+    }
+
+    #[test]
+    fn watchdog_assessment_serde_roundtrip() {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Warning,
+            stalled_total: 2,
+            stalled_critical: 0,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 5000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+            recommended_action: "monitor_stalled_transactions".into(),
+            sample_stalled: vec![],
+        };
+        let json = serde_json::to_string(&assessment).unwrap();
+        let parsed: ResizeWatchdogAssessment = serde_json::from_str(&json).unwrap();
+        assert_eq!(assessment, parsed);
+    }
+
+    // =========================================================================
+    // RuntimeMetrics edge cases
+    // =========================================================================
+
+    #[test]
+    fn runtime_metrics_default_zero_values() {
+        let metrics = RuntimeMetrics::default();
+        assert!((metrics.avg_ingest_lag_ms() - 0.0).abs() < f64::EPSILON);
+        assert_eq!(metrics.max_ingest_lag_ms(), 0);
+        assert!(metrics.last_db_write().is_none());
+        assert!((metrics.avg_storage_lock_wait_ms() - 0.0).abs() < f64::EPSILON);
+        assert!((metrics.max_storage_lock_wait_ms() - 0.0).abs() < f64::EPSILON);
+        assert_eq!(metrics.storage_lock_contention_events(), 0);
+        assert!((metrics.avg_storage_lock_hold_ms() - 0.0).abs() < f64::EPSILON);
+        assert!((metrics.max_storage_lock_hold_ms() - 0.0).abs() < f64::EPSILON);
+        assert_eq!(metrics.cursor_snapshot_bytes_last(), 0);
+        assert_eq!(metrics.cursor_snapshot_bytes_max(), 0);
+        assert!((metrics.avg_cursor_snapshot_bytes() - 0.0).abs() < f64::EPSILON);
+        assert_eq!(metrics.p50_cursor_snapshot_bytes(), 0);
+        assert_eq!(metrics.p95_cursor_snapshot_bytes(), 0);
+    }
+
+    #[test]
+    fn runtime_metrics_single_ingest_lag_sample() {
+        let metrics = RuntimeMetrics::default();
+        metrics.record_ingest_lag(42);
+        assert!((metrics.avg_ingest_lag_ms() - 42.0).abs() < f64::EPSILON);
+        assert_eq!(metrics.max_ingest_lag_ms(), 42);
+    }
+
+    #[test]
+    fn runtime_metrics_single_lock_wait_sample() {
+        let metrics = RuntimeMetrics::default();
+        metrics.record_storage_lock_wait(Duration::from_millis(5));
+        assert!(metrics.avg_storage_lock_wait_ms() >= 5.0);
+        assert!(metrics.max_storage_lock_wait_ms() >= 5.0);
+        // Single sample: p50 and p95 should both equal the sample
+        assert!(metrics.p50_storage_lock_wait_ms() >= 5.0);
+        assert!(metrics.p95_storage_lock_wait_ms() >= 5.0);
+    }
+
+    #[test]
+    fn runtime_metrics_single_cursor_snapshot_sample() {
+        let metrics = RuntimeMetrics::default();
+        metrics.record_cursor_snapshot_memory(2048);
+        assert_eq!(metrics.cursor_snapshot_bytes_last(), 2048);
+        assert_eq!(metrics.cursor_snapshot_bytes_max(), 2048);
+        assert!((metrics.avg_cursor_snapshot_bytes() - 2048.0).abs() < f64::EPSILON);
+        assert_eq!(metrics.p50_cursor_snapshot_bytes(), 2048);
+        assert_eq!(metrics.p95_cursor_snapshot_bytes(), 2048);
+    }
+
+    #[test]
+    fn runtime_metrics_many_ingest_lag_samples() {
+        let metrics = RuntimeMetrics::default();
+        for i in 1..=100 {
+            metrics.record_ingest_lag(i);
+        }
+        // Average should be 50.5
+        assert!((metrics.avg_ingest_lag_ms() - 50.5).abs() < f64::EPSILON);
+        assert_eq!(metrics.max_ingest_lag_ms(), 100);
+    }
+
+    #[test]
+    fn runtime_metrics_lock_contention_counts_above_threshold() {
+        let metrics = RuntimeMetrics::default();
+        // Sub-threshold: 500us is below the 1ms contention threshold
+        metrics.record_storage_lock_wait(Duration::from_micros(500));
+        assert_eq!(metrics.storage_lock_contention_events(), 0);
+
+        // Above threshold: 2ms
+        metrics.record_storage_lock_wait(Duration::from_millis(2));
+        assert_eq!(metrics.storage_lock_contention_events(), 1);
+
+        // Another above threshold
+        metrics.record_storage_lock_wait(Duration::from_millis(5));
+        assert_eq!(metrics.storage_lock_contention_events(), 2);
+    }
+
+    #[test]
+    fn lock_memory_snapshot_zeroed_round_trips() {
+        let snap = RuntimeLockMemoryTelemetrySnapshot {
+            timestamp_ms: 0,
+            avg_storage_lock_wait_ms: 0.0,
+            p50_storage_lock_wait_ms: 0.0,
+            p95_storage_lock_wait_ms: 0.0,
+            max_storage_lock_wait_ms: 0.0,
+            storage_lock_contention_events: 0,
+            avg_storage_lock_hold_ms: 0.0,
+            p50_storage_lock_hold_ms: 0.0,
+            p95_storage_lock_hold_ms: 0.0,
+            max_storage_lock_hold_ms: 0.0,
+            cursor_snapshot_bytes_last: 0,
+            p50_cursor_snapshot_bytes: 0,
+            p95_cursor_snapshot_bytes: 0,
+            cursor_snapshot_bytes_max: 0,
+            avg_cursor_snapshot_bytes: 0.0,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: RuntimeLockMemoryTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+        assert_eq!(back.timestamp_ms, 0);
+        assert_eq!(back.storage_lock_contention_events, 0);
+        assert_eq!(back.cursor_snapshot_bytes_last, 0);
     }
 
     #[test]
