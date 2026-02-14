@@ -285,6 +285,33 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # Recorder validation gates: wire load/invariant/quality/recovery harnesses
+  # into CI with explicit thresholds and artifact retention.
+  # Implements: wa-oegrb.7.5
+  recorder-validation-gates:
+    name: Recorder Validation Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: recorder-validation-gates
+
+      - name: Run recorder validation gates (CI mode)
+        run: scripts/check_recorder_validation_gates.sh
+
+      - name: Upload recorder validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recorder-validation-gates
+          path: |
+            target/recorder-validation-gates/
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Security audit for dependency vulnerabilities
   security:
     name: Security Audit

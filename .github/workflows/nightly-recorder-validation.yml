@@ -1,0 +1,44 @@
+name: Nightly Recorder Validation
+
+on:
+  schedule:
+    - cron: "20 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-recorder-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  recorder-validation-nightly:
+    name: Recorder Validation (nightly full)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-recorder-validation
+
+      - name: Run recorder validation gates (nightly mode)
+        env:
+          FT_RECORDER_GATE_RUN_LOAD_BENCH: "1"
+        run: scripts/check_recorder_validation_gates.sh
+
+      - name: Upload nightly recorder validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-recorder-validation
+          path: |
+            target/recorder-validation-gates/
+          if-no-files-found: ignore
+          retention-days: 30
