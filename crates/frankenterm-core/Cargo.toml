@@ -228,6 +228,10 @@ name = "spsc_ring_buffer"
 harness = false
 
 [[bench]]
+name = "fork_hardening_benchmarks"
+harness = false
+
+[[bench]]
 name = "subscription_streaming"
 harness = false
 required-features = ["streaming"]
@@ -248,6 +252,10 @@ harness = false
 name = "native_events_latency"
 harness = false
 required-features = ["native-wezterm"]
+
+[[bench]]
+name = "fork_hardening"
+harness = false
 
 [features]
 default = []

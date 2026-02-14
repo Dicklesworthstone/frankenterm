@@ -67,6 +67,11 @@ declare -A BUDGETS=(
     # Sizing benchmarks (DB-bound, large data)
     ["sizing_insert"]=2000000000              # ceiling 2s
     ["sizing_query"]=1000000000               # ceiling 1s
+
+    # Fork hardening benchmark slices
+    ["fork_hardening/spsc_capture_path"]=150000000      # lock-free roundtrip path, ceiling 150ms
+    ["fork_hardening/snapshot_capture_path"]=250000000  # full clone + diff capture paths, ceiling 250ms
+    ["fork_hardening/telemetry_overhead"]=20000000      # scope timer overhead, ceiling 20ms
 )
 
 # --- Step 1: Run benchmarks (unless --check) ---------------------------------

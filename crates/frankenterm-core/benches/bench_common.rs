@@ -161,6 +161,24 @@ pub const CI_BUDGETS: &[CiBudgetEntry] = &[
         max_median_ns: 1_000_000_000,
         note: "sizing query at scale: DB-bound, ceiling 1s",
     },
+    // Fork hardening SPSC capture path: lock-free queue roundtrip benchmark.
+    CiBudgetEntry {
+        group_prefix: "fork_hardening/spsc_capture_path",
+        max_median_ns: 150_000_000,
+        note: "fork hardening spsc path: ceiling 150ms",
+    },
+    // Fork hardening snapshot path (full clone + diff capture): ceiling 250ms.
+    CiBudgetEntry {
+        group_prefix: "fork_hardening/snapshot_capture_path",
+        max_median_ns: 250_000_000,
+        note: "fork hardening snapshot path: ceiling 250ms",
+    },
+    // Fork hardening telemetry overhead: tiny hot path with scope timer.
+    CiBudgetEntry {
+        group_prefix: "fork_hardening/telemetry_overhead",
+        max_median_ns: 20_000_000,
+        note: "fork hardening telemetry overhead: ceiling 20ms",
+    },
 ];
 
 #[derive(Serialize)]
