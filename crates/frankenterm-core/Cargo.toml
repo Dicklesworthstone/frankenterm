@@ -154,6 +154,10 @@ name = "snapshot_engine"
 harness = false
 
 [[bench]]
+name = "restart_scheduling"
+harness = false
+
+[[bench]]
 name = "pool_benchmark"
 harness = false
 
