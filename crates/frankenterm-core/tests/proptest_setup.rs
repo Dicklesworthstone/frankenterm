@@ -379,3 +379,99 @@ proptest! {
         prop_assert_eq!(&redacted[0], &format!("~/{}", filename));
     }
 }
+
+// =========================================================================
+// Additional property tests for coverage
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// ShellType Debug output is non-empty.
+    #[test]
+    fn prop_shell_debug_nonempty(shell in arb_shell_type()) {
+        let dbg = format!("{:?}", shell);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// ShellType Clone preserves variant.
+    #[test]
+    fn prop_shell_clone(shell in arb_shell_type()) {
+        let cloned = shell.clone();
+        prop_assert_eq!(shell.name(), cloned.name());
+    }
+
+    /// SshHost Clone preserves all fields.
+    #[test]
+    fn prop_ssh_host_clone(host in arb_ssh_host()) {
+        let cloned = host.clone();
+        prop_assert_eq!(cloned.alias.as_str(), host.alias.as_str());
+        prop_assert_eq!(&cloned.hostname, &host.hostname);
+        prop_assert_eq!(&cloned.user, &host.user);
+        prop_assert_eq!(cloned.port, host.port);
+        prop_assert_eq!(&cloned.identity_files, &host.identity_files);
+    }
+
+    /// SshHost Debug output is non-empty.
+    #[test]
+    fn prop_ssh_host_debug_nonempty(host in arb_ssh_host()) {
+        let dbg = format!("{:?}", host);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// parse_ssh_config is deterministic.
+    #[test]
+    fn prop_ssh_config_deterministic(
+        alias in "[a-z][a-z0-9]{2,8}",
+        hostname in "[a-z0-9.-]{3,15}",
+    ) {
+        let config = format!("Host {}\n  HostName {}\n", alias, hostname);
+        let h1 = parse_ssh_config(&config);
+        let h2 = parse_ssh_config(&config);
+        prop_assert_eq!(h1.len(), h2.len());
+        for (a, b) in h1.iter().zip(h2.iter()) {
+            prop_assert_eq!(a.alias.as_str(), b.alias.as_str());
+            prop_assert_eq!(&a.hostname, &b.hostname);
+        }
+    }
+
+    /// generate_ssh_domains_lua always returns non-empty output.
+    #[test]
+    fn prop_generated_lua_nonempty(
+        hosts in proptest::collection::vec(arb_ssh_host(), 0..3),
+        scrollback in 1000u64..50_000,
+    ) {
+        let lua = generate_ssh_domains_lua(&hosts, scrollback);
+        prop_assert!(!lua.is_empty());
+    }
+
+    /// has_ft_block is deterministic.
+    #[test]
+    fn prop_has_ft_block_deterministic(
+        hosts in proptest::collection::vec(arb_ssh_host(), 0..3),
+        scrollback in 1000u64..50_000,
+    ) {
+        let block = generate_ssh_domains_lua(&hosts, scrollback);
+        let r1 = has_ft_block(&block);
+        let r2 = has_ft_block(&block);
+        prop_assert_eq!(r1, r2);
+    }
+
+    /// ShellType osc133_snippet is deterministic.
+    #[test]
+    fn prop_osc133_snippet_deterministic(shell in arb_shell_type()) {
+        let s1 = shell.osc133_snippet();
+        let s2 = shell.osc133_snippet();
+        prop_assert_eq!(s1, s2);
+    }
+
+    /// ShellType::from_name accepts both lowercase and uppercase variants.
+    #[test]
+    fn prop_shell_from_name_case_insensitive(shell in arb_shell_type()) {
+        let upper = shell.name().to_uppercase();
+        let parsed = ShellType::from_name(&upper);
+        // from_name is case-insensitive, so uppercase should also resolve
+        prop_assert_eq!(parsed, Some(shell),
+            "'{}' (uppercase) should parse to {:?}", upper, shell);
+    }
+}

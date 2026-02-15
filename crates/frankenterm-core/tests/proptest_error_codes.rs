@@ -403,4 +403,54 @@ proptest! {
         prop_assert!(!entries.is_empty(),
                     "Category {:?} has no catalog entries", cat);
     }
+
+    /// Property 29: format_plain is deterministic for all catalog entries
+    #[test]
+    fn prop_format_plain_deterministic(_dummy in Just(())) {
+        for def in ERROR_CATALOG.values() {
+            let f1 = def.format_plain();
+            let f2 = def.format_plain();
+            prop_assert_eq!(f1, f2,
+                "format_plain should be deterministic for {}", def.code);
+        }
+    }
+
+    /// Property 30: format_plain is non-empty for all catalog entries
+    #[test]
+    fn prop_format_plain_nonempty(_dummy in Just(())) {
+        for def in ERROR_CATALOG.values() {
+            let formatted = def.format_plain();
+            prop_assert!(!formatted.is_empty(),
+                "format_plain should be non-empty for {}", def.code);
+        }
+    }
+
+    /// Property 31: list_codes_by_category returns only entries from that category
+    #[test]
+    fn prop_list_by_category_all_match(cat in arb_error_category()) {
+        let codes = list_codes_by_category(cat);
+        for def in &codes {
+            prop_assert_eq!(def.category, cat,
+                "Code {} should be in category {:?}, got {:?}", def.code, cat, def.category);
+        }
+    }
+
+    /// Property 32: list_error_codes is deterministic
+    #[test]
+    fn prop_list_error_codes_deterministic(_dummy in Just(())) {
+        let c1 = list_error_codes();
+        let c2 = list_error_codes();
+        prop_assert_eq!(c1.len(), c2.len());
+        for (a, b) in c1.iter().zip(c2.iter()) {
+            prop_assert_eq!(a, b);
+        }
+    }
+
+    /// Property 33: from_code is deterministic
+    #[test]
+    fn prop_from_code_deterministic(s in arb_code_string()) {
+        let r1 = ErrorCategory::from_code(&s);
+        let r2 = ErrorCategory::from_code(&s);
+        prop_assert_eq!(r1, r2, "from_code should be deterministic for '{}'", s);
+    }
 }

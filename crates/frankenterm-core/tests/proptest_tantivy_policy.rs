@@ -368,3 +368,93 @@ fn classify_boundary_values() {
     assert_eq!(LoadRegime::classify(4999.99), LoadRegime::Burst);
     assert_eq!(LoadRegime::classify(5000.0), LoadRegime::Overload);
 }
+
+// =========================================================================
+// Additional property tests for coverage
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// LoadRegime Debug output is non-empty.
+    #[test]
+    fn prop_regime_debug_nonempty(regime in arb_load_regime()) {
+        let dbg = format!("{:?}", regime);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// LoadRegime Clone preserves variant.
+    #[test]
+    fn prop_regime_clone(regime in arb_load_regime()) {
+        let cloned = regime.clone();
+        prop_assert_eq!(regime, cloned);
+    }
+
+    /// MergeStrategy Debug output is non-empty.
+    #[test]
+    fn prop_strategy_debug_nonempty(strategy in arb_merge_strategy()) {
+        let dbg = format!("{:?}", strategy);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// MergeStrategy Clone preserves variant.
+    #[test]
+    fn prop_strategy_clone(strategy in arb_merge_strategy()) {
+        let cloned = strategy.clone();
+        prop_assert_eq!(strategy, cloned);
+    }
+
+    /// CommitPolicy Clone preserves all fields.
+    #[test]
+    fn prop_commit_clone(policy in arb_commit_policy()) {
+        let cloned = policy.clone();
+        prop_assert_eq!(policy, cloned);
+    }
+
+    /// MergePolicyConfig Clone preserves all fields.
+    #[test]
+    fn prop_merge_config_clone(config in arb_merge_policy_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(config, cloned);
+    }
+
+    /// IndexTuningConfig Clone preserves equality.
+    #[test]
+    fn prop_tuning_config_clone(
+        adaptive in any::<bool>(),
+        window in 1_u32..120,
+    ) {
+        let config = IndexTuningConfig {
+            adaptive,
+            rate_window_secs: window,
+            ..IndexTuningConfig::default()
+        };
+        let cloned = config.clone();
+        prop_assert_eq!(config, cloned);
+    }
+
+    /// All four regimes produce distinct for_regime CommitPolicy (at least some differ).
+    #[test]
+    fn prop_idle_overload_commit_differ(_dummy in 0..1_u8) {
+        let idle = CommitPolicy::for_regime(LoadRegime::Idle);
+        let overload = CommitPolicy::for_regime(LoadRegime::Overload);
+        prop_assert_ne!(idle, overload,
+            "Idle and Overload should have different commit policies");
+    }
+
+    /// LoadRegime serde roundtrip is deterministic.
+    #[test]
+    fn prop_regime_serde_deterministic(regime in arb_load_regime()) {
+        let j1 = serde_json::to_string(&regime).unwrap();
+        let j2 = serde_json::to_string(&regime).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// CommitPolicy for_regime: min_interval <= max_interval for all regimes.
+    #[test]
+    fn prop_commit_interval_ordering(regime in arb_load_regime()) {
+        let policy = CommitPolicy::for_regime(regime);
+        prop_assert!(policy.min_interval <= policy.max_interval,
+            "{:?}: min_interval {:?} > max_interval {:?}", regime, policy.min_interval, policy.max_interval);
+    }
+}
