@@ -4993,6 +4993,17 @@ impl StorageHandle {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
+        Self::spawn_blocking_storage_with_join_error("Task join error", work).await
+    }
+
+    async fn spawn_blocking_storage_with_join_error<T, F>(
+        join_error_prefix: &'static str,
+        work: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
         #[cfg(feature = "asupersync-runtime")]
         {
             asupersync::runtime::spawn_blocking(work).await
@@ -5001,7 +5012,7 @@ impl StorageHandle {
         {
             tokio::task::spawn_blocking(work)
                 .await
-                .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+                .map_err(|e| StorageError::Database(format!("{join_error_prefix}: {e}")))?
         }
     }
 
@@ -5685,40 +5696,37 @@ impl StorageHandle {
     /// Query usage metrics with filters (read-only, uses read connection).
     pub async fn query_usage_metrics(&self, query: MetricQuery) -> Result<Vec<UsageMetricRecord>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             query_usage_metrics_sync(&conn, &query)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
     }
 
     /// Get daily aggregated metric summaries since a given timestamp.
     pub async fn aggregate_daily_metrics(&self, since_ts: i64) -> Result<Vec<DailyMetricSummary>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             aggregate_daily_sync(&conn, since_ts)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
     }
 
     /// Get per-agent metric breakdown since a given timestamp.
     pub async fn aggregate_by_agent(&self, since_ts: i64) -> Result<Vec<AgentMetricBreakdown>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             aggregate_by_agent_sync(&conn, since_ts)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
     }
 
     // ---- Notification History ----
@@ -5816,27 +5824,25 @@ impl StorageHandle {
     /// Count output_segments older than a cutoff (read-path).
     pub async fn count_segments_before(&self, before_ts: i64) -> Result<usize> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             count_segments_before_sync(&conn, before_ts)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
     }
 
     /// Count events older than a cutoff (flat, no tier filters; read-path).
     pub async fn count_events_before(&self, before_ts: i64) -> Result<usize> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             count_events_before_sync(&conn, before_ts)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
     }
 
     /// Count events matching tier criteria older than a cutoff (read-path).
@@ -5850,53 +5856,49 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let severities = severities.to_vec();
         let event_types = event_types.to_vec();
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             count_events_by_tier_sync(&conn, before_ts, &severities, &event_types, handled)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
     }
 
     /// Count audit_actions older than a cutoff (read-path).
     pub async fn count_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             count_audit_actions_before_sync(&conn, before_ts)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
     }
 
     /// Count usage_metrics older than a cutoff (read-path).
     pub async fn count_usage_metrics_before(&self, before_ts: i64) -> Result<usize> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             count_usage_metrics_before_sync(&conn, before_ts)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
     }
 
     /// Count notification_history older than a cutoff (read-path).
     pub async fn count_notification_history_before(&self, before_ts: i64) -> Result<usize> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             count_notification_history_before_sync(&conn, before_ts)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
     }
 
     /// Delete events older than a cutoff (flat, no tier; write-path).
@@ -5947,27 +5949,25 @@ impl StorageHandle {
         query: NotificationHistoryQuery,
     ) -> Result<Vec<NotificationHistoryRecord>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             query_notification_history_sync(&conn, &query)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
     }
 
     /// Get a single notification by ID.
     pub async fn get_notification(&self, id: i64) -> Result<NotificationHistoryRecord> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             get_notification_sync(&conn, id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
     }
 
     /// Current write queue depth (pending commands waiting for the writer thread).
@@ -6396,14 +6396,13 @@ impl StorageHandle {
     /// Get the state_hash of the latest checkpoint for a session.
     pub async fn get_latest_checkpoint_hash(&self, session_id: String) -> Result<Option<String>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             get_latest_checkpoint_hash(&conn, &session_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     pub async fn upsert_agent_session(&self, session: AgentSessionRecord) -> Result<i64> {
@@ -6424,7 +6423,7 @@ impl StorageHandle {
     pub async fn get_agent_session(&self, session_id: i64) -> Result<Option<AgentSessionRecord>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6432,14 +6431,13 @@ impl StorageHandle {
             query_agent_session(&conn, session_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get active agent sessions (those without an ended_at timestamp)
     pub async fn get_active_sessions(&self) -> Result<Vec<AgentSessionRecord>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6447,14 +6445,13 @@ impl StorageHandle {
             query_active_sessions(&conn)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get agent sessions for a specific pane
     pub async fn get_sessions_for_pane(&self, pane_id: u64) -> Result<Vec<AgentSessionRecord>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6462,7 +6459,6 @@ impl StorageHandle {
             query_sessions_for_pane(&conn, pane_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Search segments using FTS5
@@ -6510,7 +6506,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let query = query.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6518,7 +6514,6 @@ impl StorageHandle {
             search_fts_with_snippets(&conn, &query, &options)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     // =========================================================================
@@ -6537,7 +6532,7 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
         let vector = vector.to_vec();
 
-        tokio::task::spawn_blocking(move || -> std::result::Result<(), StorageError> {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open connection: {e}"))
             })?;
@@ -6551,8 +6546,7 @@ impl StorageHandle {
 
             Ok(())
         })
-        .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))??;
+        .await?;
 
         self.invalidate_semantic_cache();
         Ok(())
@@ -6567,7 +6561,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let embedder_id = embedder_id.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str())
                 .map_err(|e| StorageError::Database(format!("Failed to open connection: {e}")))?;
 
@@ -6592,7 +6586,6 @@ impl StorageHandle {
             Ok(ids)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get the embedding for a specific segment.
@@ -6604,7 +6597,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let embedder_id = embedder_id.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open connection: {e}"))
             })?;
@@ -6621,14 +6614,13 @@ impl StorageHandle {
             Ok(result)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get embedding statistics per embedder.
     pub async fn embedding_stats(&self) -> Result<Vec<EmbeddingStats>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str())
                 .map_err(|e| StorageError::Database(format!("Failed to open connection: {e}")))?;
 
@@ -6658,7 +6650,6 @@ impl StorageHandle {
             Ok(stats)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Store an f32 embedding vector (little-endian packed) for a segment.
@@ -6694,14 +6685,13 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
         let query_vector = query_vector.to_vec();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             search_semantic_sync(&conn, &embedder_id, &query_vector, &options)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Hybrid lexical+semantic retrieval using deterministic fusion.
@@ -6723,7 +6713,7 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
         let query_vector = query_vector.to_vec();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6739,14 +6729,13 @@ impl StorageHandle {
             )
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get unhandled events
     pub async fn get_unhandled_events(&self, limit: usize) -> Result<Vec<StoredEvent>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6754,14 +6743,13 @@ impl StorageHandle {
             query_unhandled_events(&conn, limit)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Query events with filters
     pub async fn get_events(&self, query: EventQuery) -> Result<Vec<StoredEvent>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6769,7 +6757,6 @@ impl StorageHandle {
             query_events(&conn, &query)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get a unified timeline of events across panes.
@@ -6779,7 +6766,7 @@ impl StorageHandle {
     pub async fn get_timeline(&self, query: TimelineQuery) -> Result<Timeline> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6787,7 +6774,6 @@ impl StorageHandle {
             query_timeline(&conn, &query)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Count unhandled events grouped by pane ID
@@ -6798,7 +6784,7 @@ impl StorageHandle {
     ) -> Result<std::collections::HashMap<u64, u32>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6806,7 +6792,6 @@ impl StorageHandle {
             query_unhandled_event_counts(&conn)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get the most recent activity timestamp for each pane
@@ -6815,7 +6800,7 @@ impl StorageHandle {
     pub async fn get_last_activity_by_pane(&self) -> Result<std::collections::HashMap<u64, i64>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6823,14 +6808,13 @@ impl StorageHandle {
             query_last_activity_by_pane(&conn)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Query audit actions with filters
     pub async fn get_audit_actions(&self, query: AuditQuery) -> Result<Vec<AuditActionRecord>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6838,7 +6822,6 @@ impl StorageHandle {
             crate::storage::query_audit_actions(&conn, &query)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Stream audit actions using a cursor and stable ordering.
@@ -6850,7 +6833,7 @@ impl StorageHandle {
     ) -> Result<AuditStreamPage> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6858,7 +6841,6 @@ impl StorageHandle {
             crate::storage::query_audit_actions_stream(&conn, &query)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Query action history view with filters
@@ -6868,7 +6850,7 @@ impl StorageHandle {
     ) -> Result<Vec<ActionHistoryRecord>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6876,7 +6858,6 @@ impl StorageHandle {
             crate::storage::query_action_history(&conn, &query)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Count active (unused + unexpired) approval tokens for a workspace
@@ -6884,7 +6865,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let workspace_id = workspace_id.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6892,7 +6873,6 @@ impl StorageHandle {
             query_active_approvals_count(&conn, &workspace_id, now_ms)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Look up an approval token by code hash (without consuming it)
@@ -6903,7 +6883,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let code_hash = code_hash.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6911,14 +6891,13 @@ impl StorageHandle {
             query_approval_token_by_hash(&conn, &code_hash)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get the maximum sequence number for a pane (to resume capture).
     pub async fn get_max_seq(&self, pane_id: u64) -> Result<Option<u64>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6926,14 +6905,13 @@ impl StorageHandle {
             query_max_seq(&conn, pane_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get all panes
     pub async fn get_panes(&self) -> Result<Vec<PaneRecord>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6941,14 +6919,13 @@ impl StorageHandle {
             query_panes(&conn)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get a specific pane
     pub async fn get_pane(&self, pane_id: u64) -> Result<Option<PaneRecord>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6956,14 +6933,13 @@ impl StorageHandle {
             query_pane(&conn, pane_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get recent segments for a pane
     pub async fn get_segments(&self, pane_id: u64, limit: usize) -> Result<Vec<Segment>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6971,14 +6947,13 @@ impl StorageHandle {
             query_segments(&conn, pane_id, limit)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Scan segments in ascending id order with incremental paging.
     pub async fn scan_segments(&self, query: SegmentScanQuery) -> Result<Vec<Segment>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6986,7 +6961,6 @@ impl StorageHandle {
             query_scan_segments(&conn, &query)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Fetch the most recent secret scan report for a scope hash.
@@ -6997,7 +6971,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let scope_hash = scope_hash.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -7005,7 +6979,6 @@ impl StorageHandle {
             query_latest_secret_scan_report(&conn, &scope_hash)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get workflow by ID
@@ -7013,7 +6986,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let workflow_id = workflow_id.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -7021,7 +6994,6 @@ impl StorageHandle {
             query_workflow(&conn, &workflow_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get step logs for a workflow
@@ -7031,7 +7003,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let workflow_id = workflow_id.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -7039,7 +7011,6 @@ impl StorageHandle {
             query_step_logs(&conn, &workflow_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get the latest step log for a workflow (highest step_index).
@@ -7050,7 +7021,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let workflow_id = workflow_id.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -7058,7 +7029,6 @@ impl StorageHandle {
             query_latest_step_log(&conn, &workflow_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get the persisted action plan for a workflow execution, if available
@@ -7069,7 +7039,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let workflow_id = workflow_id.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -7077,7 +7047,6 @@ impl StorageHandle {
             query_action_plan(&conn, &workflow_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get a prepared plan preview by plan_id
@@ -7085,7 +7054,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let plan_id = plan_id.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -7093,7 +7062,6 @@ impl StorageHandle {
             query_prepared_plan(&conn, &plan_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Find incomplete workflows for resume on restart
@@ -7103,7 +7071,7 @@ impl StorageHandle {
     pub async fn find_incomplete_workflows(&self) -> Result<Vec<WorkflowRecord>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -7111,7 +7079,6 @@ impl StorageHandle {
             query_incomplete_workflows(&conn)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Check if the storage is writable (writer thread is alive and responsive).
@@ -7196,13 +7163,12 @@ impl StorageHandle {
     ) -> Result<Vec<crate::accounts::AccountRecord>> {
         let db_path = self.db_path.clone();
         let service = service.to_string();
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str())
                 .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
             get_accounts_by_service_sync(&conn, &service)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get a single account by service and account_id
@@ -7214,13 +7180,12 @@ impl StorageHandle {
         let db_path = self.db_path.clone();
         let service = service.to_string();
         let account_id = account_id.to_string();
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str())
                 .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
             get_account_sync(&conn, &service, &account_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Select the best account for a service according to selection policy
@@ -7289,25 +7254,23 @@ impl StorageHandle {
     /// Get the active reservation for a pane (read-only).
     pub async fn get_active_reservation(&self, pane_id: u64) -> Result<Option<PaneReservation>> {
         let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str())
                 .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
             get_active_reservation_sync(&conn, pane_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// List all active (unexpired) pane reservations (read-only).
     pub async fn list_active_reservations(&self) -> Result<Vec<PaneReservation>> {
         let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str())
                 .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
             list_active_reservations_sync(&conn)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     // =========================================================================
@@ -7317,65 +7280,65 @@ impl StorageHandle {
     /// Export segments with optional pane/time/limit filters
     pub async fn export_segments(&self, query: ExportQuery) -> Result<Vec<Segment>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             query_export_segments(&conn, &query)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Export output gaps with optional pane/time/limit filters
     pub async fn export_gaps(&self, query: ExportQuery) -> Result<Vec<Gap>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             query_export_gaps(&conn, &query)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get all output gaps (for search explain diagnostics)
     pub async fn get_gaps(&self) -> Result<Vec<Gap>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || -> Result<Vec<Gap>> {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, pane_id, seq_before, seq_after, reason, detected_at \
+        Self::spawn_blocking_storage_with_join_error(
+            "Task join error",
+            move || -> Result<Vec<Gap>> {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, pane_id, seq_before, seq_after, reason, detected_at \
                      FROM output_gaps ORDER BY detected_at DESC",
-                )
-                .map_err(|e| StorageError::Database(format!("Prepare gaps query: {e}")))?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(Gap {
-                        id: row.get(0)?,
-                        pane_id: row.get::<_, i64>(1)? as u64,
-                        seq_before: row.get::<_, i64>(2)? as u64,
-                        seq_after: row.get::<_, i64>(3)? as u64,
-                        reason: row.get(4)?,
-                        detected_at: row.get(5)?,
+                    )
+                    .map_err(|e| StorageError::Database(format!("Prepare gaps query: {e}")))?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok(Gap {
+                            id: row.get(0)?,
+                            pane_id: row.get::<_, i64>(1)? as u64,
+                            seq_before: row.get::<_, i64>(2)? as u64,
+                            seq_after: row.get::<_, i64>(3)? as u64,
+                            reason: row.get(4)?,
+                            detected_at: row.get(5)?,
+                        })
                     })
-                })
-                .map_err(|e| StorageError::Database(format!("Query gaps: {e}")))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| StorageError::Database(format!("Collect gaps: {e}")).into())
-        })
+                    .map_err(|e| StorageError::Database(format!("Query gaps: {e}")))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| StorageError::Database(format!("Collect gaps: {e}")).into())
+            },
+        )
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Count retention cleanup events (for search explain diagnostics)
     pub async fn get_retention_cleanup_count(&self) -> Result<u64> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || -> Result<u64> {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || -> Result<u64> {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -7389,66 +7352,66 @@ impl StorageHandle {
             Ok(count as u64)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get the min/max captured_at timestamps across all segments (for search explain diagnostics)
     pub async fn get_segment_time_range(&self) -> Result<(Option<i64>, Option<i64>)> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || -> Result<(Option<i64>, Option<i64>)> {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            let (earliest, latest): (Option<i64>, Option<i64>) = conn
-                .query_row(
-                    "SELECT MIN(captured_at), MAX(captured_at) FROM output_segments",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(|e| StorageError::Database(format!("Query segment time range: {e}")))?;
-            Ok((earliest, latest))
-        })
+        Self::spawn_blocking_storage_with_join_error(
+            "Task join error",
+            move || -> Result<(Option<i64>, Option<i64>)> {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                let (earliest, latest): (Option<i64>, Option<i64>) = conn
+                    .query_row(
+                        "SELECT MIN(captured_at), MAX(captured_at) FROM output_segments",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|e| {
+                        StorageError::Database(format!("Query segment time range: {e}"))
+                    })?;
+                Ok((earliest, latest))
+            },
+        )
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Export workflow executions with optional pane/time/limit filters
     pub async fn export_workflows(&self, query: ExportQuery) -> Result<Vec<WorkflowRecord>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             query_export_workflows(&conn, &query)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Export agent sessions with optional pane/time/limit filters
     pub async fn export_sessions(&self, query: ExportQuery) -> Result<Vec<AgentSessionRecord>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             query_export_sessions(&conn, &query)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Export pane reservations (active + historical) with optional pane/time/limit filters
     pub async fn export_reservations(&self, query: ExportQuery) -> Result<Vec<PaneReservation>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             query_export_reservations(&conn, &query)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Expire all stale reservations (past their TTL).
