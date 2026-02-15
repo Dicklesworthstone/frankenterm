@@ -1959,4 +1959,880 @@ mod tests {
     fn lexical_schema_version_is_v1() {
         assert_eq!(LEXICAL_SCHEMA_VERSION, "ft.recorder.lexical.v1");
     }
+
+    // =========================================================================
+    // NEW: format helper coverage (all enum variants)
+    // =========================================================================
+
+    #[test]
+    fn format_source_all_variants() {
+        use crate::recording::RecorderEventSource;
+        assert_eq!(format_source(RecorderEventSource::WeztermMux), "wezterm_mux");
+        assert_eq!(format_source(RecorderEventSource::RobotMode), "robot_mode");
+        assert_eq!(
+            format_source(RecorderEventSource::WorkflowEngine),
+            "workflow_engine"
+        );
+        assert_eq!(
+            format_source(RecorderEventSource::OperatorAction),
+            "operator_action"
+        );
+        assert_eq!(
+            format_source(RecorderEventSource::RecoveryFlow),
+            "recovery_flow"
+        );
+    }
+
+    #[test]
+    fn format_ingress_kind_all_variants() {
+        assert_eq!(
+            format_ingress_kind(RecorderIngressKind::SendText),
+            "send_text"
+        );
+        assert_eq!(format_ingress_kind(RecorderIngressKind::Paste), "paste");
+        assert_eq!(
+            format_ingress_kind(RecorderIngressKind::WorkflowAction),
+            "workflow_action"
+        );
+    }
+
+    #[test]
+    fn format_segment_kind_all_variants() {
+        assert_eq!(format_segment_kind(RecorderSegmentKind::Delta), "delta");
+        assert_eq!(format_segment_kind(RecorderSegmentKind::Gap), "gap");
+        assert_eq!(
+            format_segment_kind(RecorderSegmentKind::Snapshot),
+            "snapshot"
+        );
+    }
+
+    #[test]
+    fn format_control_marker_all_variants() {
+        assert_eq!(
+            format_control_marker(RecorderControlMarkerType::PromptBoundary),
+            "prompt_boundary"
+        );
+        assert_eq!(
+            format_control_marker(RecorderControlMarkerType::Resize),
+            "resize"
+        );
+        assert_eq!(
+            format_control_marker(RecorderControlMarkerType::PolicyDecision),
+            "policy_decision"
+        );
+        assert_eq!(
+            format_control_marker(RecorderControlMarkerType::ApprovalCheckpoint),
+            "approval_checkpoint"
+        );
+    }
+
+    #[test]
+    fn format_lifecycle_phase_all_variants() {
+        assert_eq!(
+            format_lifecycle_phase(RecorderLifecyclePhase::CaptureStarted),
+            "capture_started"
+        );
+        assert_eq!(
+            format_lifecycle_phase(RecorderLifecyclePhase::CaptureStopped),
+            "capture_stopped"
+        );
+        assert_eq!(
+            format_lifecycle_phase(RecorderLifecyclePhase::PaneOpened),
+            "pane_opened"
+        );
+        assert_eq!(
+            format_lifecycle_phase(RecorderLifecyclePhase::PaneClosed),
+            "pane_closed"
+        );
+        assert_eq!(
+            format_lifecycle_phase(RecorderLifecyclePhase::ReplayStarted),
+            "replay_started"
+        );
+        assert_eq!(
+            format_lifecycle_phase(RecorderLifecyclePhase::ReplayFinished),
+            "replay_finished"
+        );
+    }
+
+    #[test]
+    fn format_redaction_all_variants() {
+        assert_eq!(format_redaction(RecorderRedactionLevel::None), "none");
+        assert_eq!(format_redaction(RecorderRedactionLevel::Partial), "partial");
+        assert_eq!(format_redaction(RecorderRedactionLevel::Full), "full");
+    }
+
+    #[test]
+    fn redacted_text_none_preserves_content() {
+        assert_eq!(
+            redacted_text("secret data", RecorderRedactionLevel::None),
+            "secret data"
+        );
+    }
+
+    #[test]
+    fn redacted_text_partial_replaces() {
+        assert_eq!(
+            redacted_text("secret data", RecorderRedactionLevel::Partial),
+            "[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn redacted_text_full_empties() {
+        assert_eq!(
+            redacted_text("secret data", RecorderRedactionLevel::Full),
+            ""
+        );
+    }
+
+    #[test]
+    fn redacted_text_empty_input_none() {
+        assert_eq!(redacted_text("", RecorderRedactionLevel::None), "");
+    }
+
+    #[test]
+    fn redacted_text_empty_input_partial() {
+        assert_eq!(
+            redacted_text("", RecorderRedactionLevel::Partial),
+            "[REDACTED]"
+        );
+    }
+
+    // =========================================================================
+    // NEW: Document mapper edge cases
+    // =========================================================================
+
+    #[test]
+    fn map_ingress_paste_variant() {
+        let mut event = sample_event("ev-paste", 1, 0, "pasted text");
+        if let RecorderEventPayload::IngressText {
+            ref mut ingress_kind,
+            ..
+        } = event.payload
+        {
+            *ingress_kind = RecorderIngressKind::Paste;
+        }
+        let doc = map_event_to_document(&event, 0);
+        assert_eq!(doc.ingress_kind, Some("paste".to_string()));
+    }
+
+    #[test]
+    fn map_egress_snapshot_variant() {
+        let mut event = egress_event("ev-snap", 1, 0, "snapshot text");
+        if let RecorderEventPayload::EgressOutput {
+            ref mut segment_kind,
+            ..
+        } = event.payload
+        {
+            *segment_kind = RecorderSegmentKind::Snapshot;
+        }
+        let doc = map_event_to_document(&event, 0);
+        assert_eq!(doc.segment_kind, Some("snapshot".to_string()));
+    }
+
+    #[test]
+    fn map_control_resize_variant() {
+        let event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            event_id: "ctrl-resize".to_string(),
+            pane_id: 1,
+            session_id: None,
+            workflow_id: None,
+            correlation_id: None,
+            source: RecorderEventSource::WeztermMux,
+            occurred_at_ms: 1000,
+            recorded_at_ms: 1001,
+            sequence: 0,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload: RecorderEventPayload::ControlMarker {
+                control_marker_type: RecorderControlMarkerType::Resize,
+                details: serde_json::json!({"cols": 120, "rows": 40}),
+            },
+        };
+        let doc = map_event_to_document(&event, 0);
+        assert_eq!(doc.control_marker_type, Some("resize".to_string()));
+        assert!(doc.details_json.contains("120"));
+        assert!(doc.details_json.contains("40"));
+        assert_eq!(doc.text, "");
+        assert_eq!(doc.ingress_kind, None);
+        assert_eq!(doc.segment_kind, None);
+        assert_eq!(doc.lifecycle_phase, None);
+        assert_eq!(doc.redaction, None);
+    }
+
+    #[test]
+    fn map_lifecycle_no_reason() {
+        let event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            event_id: "lc-noreason".to_string(),
+            pane_id: 1,
+            session_id: None,
+            workflow_id: None,
+            correlation_id: None,
+            source: RecorderEventSource::WeztermMux,
+            occurred_at_ms: 1000,
+            recorded_at_ms: 1001,
+            sequence: 0,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload: RecorderEventPayload::LifecycleMarker {
+                lifecycle_phase: RecorderLifecyclePhase::CaptureStopped,
+                reason: None,
+                details: serde_json::json!({}),
+            },
+        };
+        let doc = map_event_to_document(&event, 0);
+        assert_eq!(doc.lifecycle_phase, Some("capture_stopped".to_string()));
+        assert_eq!(doc.text, "");
+    }
+
+    #[test]
+    fn map_event_text_symbols_matches_text() {
+        let event = sample_event("ev-sym", 1, 0, "ls -la /tmp");
+        let doc = map_event_to_document(&event, 0);
+        assert_eq!(doc.text, doc.text_symbols);
+    }
+
+    #[test]
+    fn map_event_none_optional_fields() {
+        let event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            event_id: "ev-none".to_string(),
+            pane_id: 0,
+            session_id: None,
+            workflow_id: None,
+            correlation_id: None,
+            source: RecorderEventSource::OperatorAction,
+            occurred_at_ms: 0,
+            recorded_at_ms: 0,
+            sequence: 0,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload: RecorderEventPayload::IngressText {
+                text: "x".to_string(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                ingress_kind: RecorderIngressKind::SendText,
+            },
+        };
+        let doc = map_event_to_document(&event, 0);
+        assert_eq!(doc.session_id, None);
+        assert_eq!(doc.workflow_id, None);
+        assert_eq!(doc.correlation_id, None);
+        assert_eq!(doc.parent_event_id, None);
+        assert_eq!(doc.trigger_event_id, None);
+        assert_eq!(doc.root_event_id, None);
+        assert_eq!(doc.pane_id, 0);
+        assert_eq!(doc.source, "operator_action");
+    }
+
+    #[test]
+    fn map_event_large_pane_id() {
+        let event = sample_event("ev-big", u64::MAX, 0, "big pane");
+        let doc = map_event_to_document(&event, u64::MAX);
+        assert_eq!(doc.pane_id, u64::MAX);
+        assert_eq!(doc.log_offset, u64::MAX);
+    }
+
+    #[test]
+    fn map_egress_redacted_partial() {
+        let mut event = egress_event("ev-egrp", 1, 0, "secret output");
+        if let RecorderEventPayload::EgressOutput {
+            ref mut redaction, ..
+        } = event.payload
+        {
+            *redaction = RecorderRedactionLevel::Partial;
+        }
+        let doc = map_event_to_document(&event, 0);
+        assert_eq!(doc.text, "[REDACTED]");
+        assert_eq!(doc.redaction, Some("partial".to_string()));
+    }
+
+    #[test]
+    fn map_egress_redacted_full() {
+        let mut event = egress_event("ev-egrf", 1, 0, "secret output");
+        if let RecorderEventPayload::EgressOutput {
+            ref mut redaction, ..
+        } = event.payload
+        {
+            *redaction = RecorderRedactionLevel::Full;
+        }
+        let doc = map_event_to_document(&event, 0);
+        assert_eq!(doc.text, "");
+        assert_eq!(doc.text_symbols, "");
+        assert_eq!(doc.redaction, Some("full".to_string()));
+    }
+
+    // =========================================================================
+    // NEW: Serde roundtrip edge cases
+    // =========================================================================
+
+    #[test]
+    fn document_fields_serde_roundtrip_egress() {
+        let event = egress_event("ev-eg-rt", 99, 42, "output data");
+        let doc = map_event_to_document(&event, 77);
+        let json = serde_json::to_string(&doc).unwrap();
+        let deser: IndexDocumentFields = serde_json::from_str(&json).unwrap();
+        assert_eq!(doc, deser);
+    }
+
+    #[test]
+    fn document_fields_serde_roundtrip_control() {
+        let event = control_event("ev-ct-rt", 5, 10);
+        let doc = map_event_to_document(&event, 200);
+        let json = serde_json::to_string(&doc).unwrap();
+        let deser: IndexDocumentFields = serde_json::from_str(&json).unwrap();
+        assert_eq!(doc, deser);
+    }
+
+    #[test]
+    fn document_fields_serde_roundtrip_lifecycle() {
+        let event = lifecycle_event("ev-lc-rt", 8, 20);
+        let doc = map_event_to_document(&event, 300);
+        let json = serde_json::to_string(&doc).unwrap();
+        let deser: IndexDocumentFields = serde_json::from_str(&json).unwrap();
+        assert_eq!(doc, deser);
+    }
+
+    #[test]
+    fn document_fields_serde_all_none_optionals() {
+        let doc = IndexDocumentFields {
+            schema_version: "v1".to_string(),
+            lexical_schema_version: "lv1".to_string(),
+            event_id: "eid".to_string(),
+            pane_id: 0,
+            session_id: None,
+            workflow_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            trigger_event_id: None,
+            root_event_id: None,
+            source: "test".to_string(),
+            event_type: "test".to_string(),
+            ingress_kind: None,
+            segment_kind: None,
+            control_marker_type: None,
+            lifecycle_phase: None,
+            is_gap: false,
+            redaction: None,
+            occurred_at_ms: 0,
+            recorded_at_ms: 0,
+            sequence: 0,
+            log_offset: 0,
+            text: String::new(),
+            text_symbols: String::new(),
+            details_json: "{}".to_string(),
+        };
+        let json = serde_json::to_string(&doc).unwrap();
+        let deser: IndexDocumentFields = serde_json::from_str(&json).unwrap();
+        assert_eq!(doc, deser);
+        assert!(json.contains("\"session_id\":null"));
+    }
+
+    // =========================================================================
+    // NEW: Display/Debug impls
+    // =========================================================================
+
+    #[test]
+    fn log_read_error_io_display() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+        let err = LogReadError::Io(io_err);
+        let msg = err.to_string();
+        assert!(msg.contains("log read I/O error"));
+        assert!(msg.contains("file missing"));
+    }
+
+    #[test]
+    fn log_read_error_corrupt_display() {
+        let err = LogReadError::Corrupt {
+            byte_offset: 1024,
+            reason: "bad header".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("corrupt record at byte 1024"));
+        assert!(msg.contains("bad header"));
+    }
+
+    #[test]
+    fn log_read_error_deserialize_display() {
+        let json_err = serde_json::from_str::<serde_json::Value>("{{bad}}").unwrap_err();
+        let err = LogReadError::Deserialize {
+            byte_offset: 256,
+            source: json_err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("JSON error at byte 256"));
+    }
+
+    #[test]
+    fn log_read_error_is_std_error() {
+        let err = LogReadError::Corrupt {
+            byte_offset: 0,
+            reason: "test".to_string(),
+        };
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn log_read_error_from_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let err: LogReadError = io_err.into();
+        assert!(matches!(err, LogReadError::Io(_)));
+        assert!(err.to_string().contains("denied"));
+    }
+
+    #[test]
+    fn index_write_error_transient_display() {
+        let err = IndexWriteError::Transient {
+            reason: "resource busy".to_string(),
+        };
+        assert!(err.to_string().contains("transient index error"));
+        assert!(err.to_string().contains("resource busy"));
+    }
+
+    #[test]
+    fn index_write_error_is_std_error() {
+        let err = IndexWriteError::Rejected {
+            reason: "x".to_string(),
+        };
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn indexer_error_from_log_read() {
+        let lre = LogReadError::Corrupt {
+            byte_offset: 10,
+            reason: "bad".to_string(),
+        };
+        let err: IndexerError = lre.into();
+        assert!(matches!(err, IndexerError::LogRead(_)));
+        assert!(err.to_string().contains("log read"));
+    }
+
+    #[test]
+    fn indexer_error_from_index_write() {
+        let iwe = IndexWriteError::CommitFailed {
+            reason: "disk full".to_string(),
+        };
+        let err: IndexerError = iwe.into();
+        assert!(matches!(err, IndexerError::IndexWrite(_)));
+        assert!(err.to_string().contains("index write"));
+        assert!(err.to_string().contains("disk full"));
+    }
+
+    #[test]
+    fn indexer_error_config_display() {
+        let err = IndexerError::Config("batch_size must be >= 1".to_string());
+        assert_eq!(err.to_string(), "config: batch_size must be >= 1");
+    }
+
+    #[test]
+    fn indexer_error_is_std_error() {
+        let err = IndexerError::Config("test".to_string());
+        let _: &dyn std::error::Error = &err;
+    }
+
+    // =========================================================================
+    // NEW: IndexerConfig Debug and Clone
+    // =========================================================================
+
+    #[test]
+    fn indexer_config_debug_impl() {
+        let cfg = IndexerConfig::default();
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("IndexerConfig"));
+        assert!(dbg.contains("batch_size"));
+    }
+
+    #[test]
+    fn indexer_config_clone() {
+        let cfg = IndexerConfig {
+            data_path: PathBuf::from("/tmp/test.log"),
+            consumer_id: "clone-test".to_string(),
+            batch_size: 99,
+            dedup_on_replay: false,
+            max_batches: 5,
+            expected_event_schema: "v99".to_string(),
+        };
+        let cloned = cfg.clone();
+        assert_eq!(cloned.data_path, cfg.data_path);
+        assert_eq!(cloned.consumer_id, cfg.consumer_id);
+        assert_eq!(cloned.batch_size, cfg.batch_size);
+        assert_eq!(cloned.dedup_on_replay, cfg.dedup_on_replay);
+        assert_eq!(cloned.max_batches, cfg.max_batches);
+        assert_eq!(cloned.expected_event_schema, cfg.expected_event_schema);
+    }
+
+    #[test]
+    fn default_config_data_path() {
+        let cfg = IndexerConfig::default();
+        assert_eq!(
+            cfg.data_path,
+            PathBuf::from(".ft/recorder-log/events.log")
+        );
+    }
+
+    // =========================================================================
+    // NEW: IndexCommitStats
+    // =========================================================================
+
+    #[test]
+    fn index_commit_stats_clone_eq() {
+        let stats = IndexCommitStats {
+            docs_added: 10,
+            docs_deleted: 2,
+            segment_count: 3,
+        };
+        let cloned = stats.clone();
+        assert_eq!(stats, cloned);
+    }
+
+    #[test]
+    fn index_commit_stats_debug() {
+        let stats = IndexCommitStats {
+            docs_added: 0,
+            docs_deleted: 0,
+            segment_count: 1,
+        };
+        let dbg = format!("{:?}", stats);
+        assert!(dbg.contains("IndexCommitStats"));
+    }
+
+    // =========================================================================
+    // NEW: IndexerRunResult
+    // =========================================================================
+
+    #[test]
+    fn indexer_run_result_clone_eq() {
+        let r1 = IndexerRunResult {
+            events_read: 100,
+            events_indexed: 95,
+            events_skipped: 5,
+            batches_committed: 10,
+            final_ordinal: Some(99),
+            caught_up: true,
+        };
+        let r2 = r1.clone();
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn indexer_run_result_debug() {
+        let result = IndexerRunResult {
+            events_read: 0,
+            events_indexed: 0,
+            events_skipped: 0,
+            batches_committed: 0,
+            final_ordinal: None,
+            caught_up: false,
+        };
+        let dbg = format!("{:?}", result);
+        assert!(dbg.contains("IndexerRunResult"));
+        assert!(dbg.contains("caught_up"));
+    }
+
+    // =========================================================================
+    // NEW: IndexerLagSnapshot
+    // =========================================================================
+
+    #[test]
+    fn lag_snapshot_clone_eq() {
+        let s = IndexerLagSnapshot {
+            log_head_ordinal: Some(100),
+            indexer_ordinal: Some(50),
+            records_behind: 50,
+            caught_up: false,
+        };
+        assert_eq!(s, s.clone());
+    }
+
+    #[test]
+    fn lag_snapshot_debug() {
+        let s = IndexerLagSnapshot {
+            log_head_ordinal: None,
+            indexer_ordinal: None,
+            records_behind: 0,
+            caught_up: true,
+        };
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("IndexerLagSnapshot"));
+    }
+
+    // =========================================================================
+    // NEW: LogRecord Debug/Clone
+    // =========================================================================
+
+    #[test]
+    fn log_record_debug_clone() {
+        let event = sample_event("lr-1", 1, 0, "test");
+        let record = LogRecord {
+            event,
+            offset: RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 0,
+            },
+        };
+        let cloned = record.clone();
+        assert_eq!(cloned.event.event_id, "lr-1");
+        assert_eq!(cloned.offset.ordinal, 0);
+        let dbg = format!("{:?}", record);
+        assert!(dbg.contains("LogRecord"));
+    }
+
+    // =========================================================================
+    // NEW: Append-log reader edge cases
+    // =========================================================================
+
+    #[test]
+    fn reader_nonexistent_file() {
+        let result = AppendLogReader::open(Path::new("/nonexistent/path/file.log"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reader_corrupt_json_payload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt_json.log");
+
+        let payload = b"this is not json";
+        let mut data = Vec::new();
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(payload);
+        std::fs::write(&path, &data).unwrap();
+
+        let mut reader = AppendLogReader::open(&path).unwrap();
+        let err = reader.next_record().unwrap_err();
+        assert!(matches!(err, LogReadError::Deserialize { .. }));
+        match err {
+            LogReadError::Deserialize { byte_offset, .. } => assert_eq!(byte_offset, 0),
+            _ => panic!("expected Deserialize"),
+        }
+    }
+
+    #[test]
+    fn reader_only_length_header_no_payload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("header_only.log");
+
+        // Write a length header claiming 100 bytes but provide 0 bytes of payload
+        let mut data = Vec::new();
+        data.extend_from_slice(&(100u32).to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+
+        let mut reader = AppendLogReader::open(&path).unwrap();
+        // Torn tail: length header says 100 bytes but file only has 4 bytes total
+        let record = reader.next_record().unwrap();
+        assert!(record.is_none());
+    }
+
+    #[test]
+    fn reader_partial_length_header() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("partial_header.log");
+
+        // Only 2 bytes — not enough for a 4-byte length header
+        std::fs::write(&path, &[0u8, 1u8]).unwrap();
+
+        let mut reader = AppendLogReader::open(&path).unwrap();
+        let record = reader.next_record().unwrap();
+        assert!(record.is_none());
+    }
+
+    #[test]
+    fn reader_batch_zero_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("zero_batch.log");
+
+        let event = sample_event("e1", 1, 0, "hello");
+        let payload = serde_json::to_vec(&event).unwrap();
+        let mut data = Vec::new();
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&payload);
+        std::fs::write(&path, &data).unwrap();
+
+        let mut reader = AppendLogReader::open(&path).unwrap();
+        let batch = reader.read_batch(0).unwrap();
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn reader_byte_offset_and_ordinal_accessors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("accessors.log");
+
+        let event = sample_event("e1", 1, 0, "hello");
+        let payload = serde_json::to_vec(&event).unwrap();
+        let mut data = Vec::new();
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&payload);
+        std::fs::write(&path, &data).unwrap();
+
+        let mut reader = AppendLogReader::open(&path).unwrap();
+        assert_eq!(reader.byte_offset(), 0);
+        assert_eq!(reader.next_ordinal(), 0);
+
+        let _ = reader.next_record().unwrap();
+        assert_eq!(reader.byte_offset(), 4 + payload.len() as u64);
+        assert_eq!(reader.next_ordinal(), 1);
+    }
+
+    #[tokio::test]
+    async fn reader_skip_to_ordinal_beyond_eof() {
+        let dir = tempdir().unwrap();
+        let cfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(cfg.clone()).unwrap();
+        populate_log(&storage, vec![sample_event("e1", 1, 0, "only")]).await;
+        drop(storage);
+
+        let result = AppendLogReader::open_at_ordinal(&cfg.data_path, 5);
+        assert!(result.is_err());
+        if let Err(LogReadError::Corrupt { reason, .. }) = result {
+            assert!(reason.contains("EOF before reaching ordinal"));
+        } else {
+            panic!("expected Corrupt error");
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_multiple_next_record_past_eof() {
+        let dir = tempdir().unwrap();
+        let cfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(cfg.clone()).unwrap();
+        populate_log(&storage, vec![sample_event("e1", 1, 0, "only")]).await;
+        drop(storage);
+
+        let mut reader = AppendLogReader::open(&cfg.data_path).unwrap();
+        let _ = reader.next_record().unwrap().unwrap();
+        // Multiple calls past EOF should all return None safely
+        assert!(reader.next_record().unwrap().is_none());
+        assert!(reader.next_record().unwrap().is_none());
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    // =========================================================================
+    // NEW: IncrementalIndexer into_writer / writer accessors
+    // =========================================================================
+
+    #[test]
+    fn indexer_writer_accessor() {
+        let cfg = test_indexer_config(Path::new("/tmp"));
+        let writer = MockIndexWriter::new();
+        let indexer = IncrementalIndexer::new(cfg, writer);
+        assert_eq!(indexer.writer().docs.len(), 0);
+        assert_eq!(indexer.writer().commits, 0);
+    }
+
+    #[test]
+    fn indexer_into_writer() {
+        let cfg = test_indexer_config(Path::new("/tmp"));
+        let mut writer = MockIndexWriter::new();
+        writer.reject_event_ids = vec!["x".to_string()];
+        let indexer = IncrementalIndexer::new(cfg, writer);
+        let recovered = indexer.into_writer();
+        assert_eq!(recovered.reject_event_ids, vec!["x".to_string()]);
+    }
+
+    // =========================================================================
+    // NEW: Indexer transient error propagation
+    // =========================================================================
+
+    #[tokio::test]
+    async fn indexer_transient_write_error_propagates() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+        populate_log(&storage, vec![sample_event("e1", 1, 0, "text")]).await;
+
+        let icfg = test_indexer_config(dir.path());
+
+        // Build a writer that returns Transient errors
+        struct TransientFailWriter;
+        impl IndexWriter for TransientFailWriter {
+            fn add_document(&mut self, _doc: &IndexDocumentFields) -> Result<(), IndexWriteError> {
+                Err(IndexWriteError::Transient {
+                    reason: "overloaded".to_string(),
+                })
+            }
+            fn commit(&mut self) -> Result<IndexCommitStats, IndexWriteError> {
+                Ok(IndexCommitStats {
+                    docs_added: 0,
+                    docs_deleted: 0,
+                    segment_count: 0,
+                })
+            }
+            fn delete_by_event_id(&mut self, _: &str) -> Result<(), IndexWriteError> {
+                Ok(())
+            }
+        }
+
+        let mut indexer = IncrementalIndexer::new(icfg, TransientFailWriter);
+        let err = indexer.run(&storage).await.unwrap_err();
+        assert!(matches!(err, IndexerError::IndexWrite(_)));
+        assert!(err.to_string().contains("overloaded"));
+    }
+
+    // =========================================================================
+    // NEW: All-skipped batch still advances checkpoint
+    // =========================================================================
+
+    #[tokio::test]
+    async fn indexer_all_events_wrong_schema_still_commits_checkpoint() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let mut ev1 = sample_event("bad-1", 1, 0, "a");
+        ev1.schema_version = "ft.recorder.event.v99".to_string();
+        let mut ev2 = sample_event("bad-2", 1, 1, "b");
+        ev2.schema_version = "ft.recorder.event.v99".to_string();
+
+        populate_log(&storage, vec![ev1, ev2]).await;
+
+        let icfg = IndexerConfig {
+            consumer_id: "all-skip-test".to_string(),
+            ..test_indexer_config(dir.path())
+        };
+        let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
+        let result = indexer.run(&storage).await.unwrap();
+
+        assert_eq!(result.events_read, 2);
+        assert_eq!(result.events_indexed, 0);
+        assert_eq!(result.events_skipped, 2);
+        assert_eq!(result.batches_committed, 1);
+        assert!(result.caught_up);
+        // Checkpoint should still advance
+        assert!(result.final_ordinal.is_some());
+    }
+
+    // =========================================================================
+    // NEW: LEXICAL_INDEXER_CONSUMER constant
+    // =========================================================================
+
+    #[test]
+    fn lexical_indexer_consumer_constant() {
+        assert_eq!(LEXICAL_INDEXER_CONSUMER, "tantivy-lexical-v1");
+    }
+
+    // =========================================================================
+    // NEW: epoch_ms_now sanity
+    // =========================================================================
+
+    #[test]
+    fn epoch_ms_now_returns_reasonable_value() {
+        let ms = epoch_ms_now();
+        // Should be after 2024-01-01 (1_704_067_200_000) and before 2030-01-01
+        assert!(ms > 1_704_067_200_000);
+        assert!(ms < 1_893_456_000_000);
+    }
 }

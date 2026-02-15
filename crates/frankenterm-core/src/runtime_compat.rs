@@ -997,4 +997,661 @@ mod tests {
         rt.block_on(async {});
         rt.spawn_detached(async {});
     }
+
+    // ========================================================================
+    // NEW TESTS: RuntimeBuilder edge cases
+    // ========================================================================
+
+    #[test]
+    fn runtime_builder_worker_threads_one() {
+        // Minimum meaningful worker thread count
+        let rt = RuntimeBuilder::multi_thread().worker_threads(1).build();
+        assert!(rt.is_ok());
+    }
+
+    #[test]
+    fn runtime_builder_multi_thread_without_worker_threads_uses_default() {
+        // multi_thread without explicit worker_threads should use system default
+        let rt = RuntimeBuilder::multi_thread().build();
+        assert!(rt.is_ok());
+    }
+
+    #[test]
+    fn runtime_builder_current_thread_ignores_worker_threads_one() {
+        // current_thread silently ignores worker_threads(1)
+        let rt = RuntimeBuilder::current_thread().worker_threads(1).build();
+        assert!(rt.is_ok());
+    }
+
+    #[test]
+    fn runtime_builder_current_thread_worker_threads_large() {
+        // current_thread should silently ignore even large worker_threads values
+        let rt = RuntimeBuilder::current_thread().worker_threads(128).build();
+        assert!(rt.is_ok());
+    }
+
+    #[test]
+    fn runtime_builder_build_returns_result() {
+        // Verify the build() return type is Result<Runtime, String>
+        let result: Result<Runtime, String> = RuntimeBuilder::current_thread().build();
+        assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // NEW TESTS: CompatRuntime block_on edge cases
+    // ========================================================================
+
+    #[test]
+    fn block_on_returns_unit() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let result: () = rt.block_on(async {});
+        assert_eq!(result, ());
+    }
+
+    #[test]
+    fn block_on_returns_result_ok() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let result: Result<i32, String> = rt.block_on(async { Ok(42) });
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn block_on_returns_result_err() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let result: Result<i32, String> = rt.block_on(async { Err("oops".to_string()) });
+        assert_eq!(result.unwrap_err(), "oops");
+    }
+
+    #[test]
+    fn block_on_returns_option_some() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let result: Option<u64> = rt.block_on(async { Some(100) });
+        assert_eq!(result, Some(100));
+    }
+
+    #[test]
+    fn block_on_returns_option_none() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let result: Option<u64> = rt.block_on(async { None });
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn block_on_with_string_type() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let result = rt.block_on(async { String::from("async string") });
+        assert_eq!(result, "async string");
+    }
+
+    #[test]
+    fn block_on_with_nested_async_computation() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let result = rt.block_on(async {
+            let a = async { 10 }.await;
+            let b = async { 20 }.await;
+            a + b
+        });
+        assert_eq!(result, 30);
+    }
+
+    #[test]
+    fn multi_thread_block_on_returns_tuple() {
+        let rt = RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let (a, b) = rt.block_on(async { (1, "two") });
+        assert_eq!(a, 1);
+        assert_eq!(b, "two");
+    }
+
+    #[test]
+    fn spawn_detached_from_multi_thread_runtime() {
+        let rt = RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        // Should not panic even from multi-threaded runtime
+        rt.spawn_detached(async {});
+    }
+
+    // ========================================================================
+    // NEW TESTS: Mutex edge cases
+    // ========================================================================
+
+    #[tokio::test]
+    async fn mutex_with_string_type() {
+        let m = Mutex::new(String::from("initial"));
+        {
+            let mut guard = m.lock().await;
+            guard.push_str(" modified");
+        }
+        let guard = m.lock().await;
+        assert_eq!(&*guard, "initial modified");
+    }
+
+    #[tokio::test]
+    async fn mutex_with_hashmap() {
+        use std::collections::HashMap;
+        let m = Mutex::new(HashMap::new());
+        {
+            let mut guard = m.lock().await;
+            guard.insert("key", 42);
+        }
+        let guard = m.lock().await;
+        assert_eq!(guard.get("key"), Some(&42));
+    }
+
+    #[tokio::test]
+    async fn mutex_with_option_type() {
+        let m = Mutex::new(None::<u32>);
+        {
+            let mut guard = m.lock().await;
+            *guard = Some(7);
+        }
+        let guard = m.lock().await;
+        assert_eq!(*guard, Some(7));
+    }
+
+    #[tokio::test]
+    async fn mutex_multiple_lock_unlock_cycles() {
+        let m = Mutex::new(0u64);
+        for i in 0..10 {
+            let mut guard = m.lock().await;
+            *guard = i;
+        }
+        let guard = m.lock().await;
+        assert_eq!(*guard, 9);
+    }
+
+    #[tokio::test]
+    async fn mutex_deref_read_access() {
+        let m = Mutex::new(vec![10, 20, 30]);
+        let guard = m.lock().await;
+        // Test Deref: can call Vec methods via guard
+        assert_eq!(guard.len(), 3);
+        assert!(guard.contains(&20));
+    }
+
+    // ========================================================================
+    // NEW TESTS: RwLock edge cases
+    // ========================================================================
+
+    #[tokio::test]
+    async fn rwlock_write_then_write() {
+        let rw = RwLock::new(0);
+        {
+            let mut guard = rw.write().await;
+            *guard = 10;
+        }
+        {
+            let mut guard = rw.write().await;
+            *guard += 5;
+        }
+        let guard = rw.read().await;
+        assert_eq!(*guard, 15);
+    }
+
+    #[tokio::test]
+    async fn rwlock_with_string_type() {
+        let rw = RwLock::new(String::new());
+        {
+            let mut guard = rw.write().await;
+            guard.push_str("hello");
+        }
+        let guard = rw.read().await;
+        assert_eq!(&*guard, "hello");
+    }
+
+    #[tokio::test]
+    async fn rwlock_with_vec_type() {
+        let rw = RwLock::new(Vec::<i32>::new());
+        {
+            let mut guard = rw.write().await;
+            guard.extend_from_slice(&[1, 2, 3]);
+        }
+        let guard = rw.read().await;
+        assert_eq!(guard.len(), 3);
+        assert_eq!(&*guard, &[1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn rwlock_read_does_not_mutate() {
+        let rw = RwLock::new(42);
+        {
+            let guard = rw.read().await;
+            assert_eq!(*guard, 42);
+        }
+        // Value unchanged
+        let guard = rw.read().await;
+        assert_eq!(*guard, 42);
+    }
+
+    #[tokio::test]
+    async fn rwlock_multiple_write_cycles() {
+        let rw = RwLock::new(0i64);
+        for i in 0..5 {
+            let mut guard = rw.write().await;
+            *guard += i;
+        }
+        // Sum of 0..5 = 0+1+2+3+4 = 10
+        let guard = rw.read().await;
+        assert_eq!(*guard, 10);
+    }
+
+    // ========================================================================
+    // NEW TESTS: Semaphore edge cases
+    // ========================================================================
+
+    #[tokio::test]
+    async fn semaphore_zero_permits() {
+        let sem = Semaphore::new(0);
+        assert_eq!(sem.available_permits(), 0);
+        // try_acquire should fail immediately with zero permits
+        let result = sem.try_acquire();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn semaphore_close_then_try_acquire() {
+        let sem = Semaphore::new(5);
+        sem.close();
+        let result = sem.try_acquire();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn semaphore_close_then_try_acquire_owned() {
+        let sem = std::sync::Arc::new(Semaphore::new(5));
+        sem.close();
+        let result = sem.clone().try_acquire_owned();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn semaphore_acquire_all_permits_then_release() {
+        let sem = Semaphore::new(3);
+        let p1 = sem.acquire().await.expect("acquire 1");
+        let p2 = sem.acquire().await.expect("acquire 2");
+        let p3 = sem.acquire().await.expect("acquire 3");
+        assert_eq!(sem.available_permits(), 0);
+
+        drop(p1);
+        assert_eq!(sem.available_permits(), 1);
+        drop(p2);
+        assert_eq!(sem.available_permits(), 2);
+        drop(p3);
+        assert_eq!(sem.available_permits(), 3);
+    }
+
+    #[tokio::test]
+    async fn semaphore_large_permit_count() {
+        let sem = Semaphore::new(10000);
+        assert_eq!(sem.available_permits(), 10000);
+        let _p = sem.try_acquire().expect("should acquire from large pool");
+        assert_eq!(sem.available_permits(), 9999);
+    }
+
+    #[tokio::test]
+    async fn semaphore_owned_acquire_and_release() {
+        let sem = std::sync::Arc::new(Semaphore::new(2));
+        let p1 = sem.clone().acquire_owned().await.expect("acquire 1");
+        assert_eq!(sem.available_permits(), 1);
+        let p2 = sem.clone().acquire_owned().await.expect("acquire 2");
+        assert_eq!(sem.available_permits(), 0);
+        drop(p1);
+        assert_eq!(sem.available_permits(), 1);
+        drop(p2);
+        assert_eq!(sem.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn semaphore_try_acquire_returns_permit_on_success() {
+        let sem = Semaphore::new(1);
+        let permit = sem.try_acquire();
+        assert!(permit.is_ok());
+        assert_eq!(sem.available_permits(), 0);
+        drop(permit);
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn semaphore_close_preserves_held_permits() {
+        let sem = Semaphore::new(2);
+        let _p = sem.acquire().await.expect("acquire");
+        assert_eq!(sem.available_permits(), 1);
+        sem.close();
+        // After close, available permits may still be reported
+        // but new acquires should fail
+        let result = sem.try_acquire();
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // NEW TESTS: MPSC channel edge cases
+    // ========================================================================
+
+    #[tokio::test]
+    async fn mpsc_send_helper_to_closed_receiver_returns_error() {
+        let (tx, rx) = mpsc::channel::<i32>(1);
+        drop(rx);
+        let result = mpsc_send(&tx, 42).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn mpsc_send_recv_string_type() {
+        let (tx, mut rx) = mpsc::channel(4);
+        mpsc_send(&tx, String::from("hello")).await.expect("send");
+        let got = mpsc_recv_option(&mut rx).await;
+        assert_eq!(got, Some(String::from("hello")));
+    }
+
+    #[tokio::test]
+    async fn mpsc_multiple_messages_via_helpers() {
+        let (tx, mut rx) = mpsc::channel(8);
+        for i in 0..5u32 {
+            mpsc_send(&tx, i).await.expect("send");
+        }
+        for i in 0..5u32 {
+            let got = mpsc_recv_option(&mut rx).await;
+            assert_eq!(got, Some(i));
+        }
+    }
+
+    #[tokio::test]
+    async fn mpsc_channel_capacity_one() {
+        let (tx, mut rx) = mpsc::channel(1);
+        mpsc_send(&tx, 99u8).await.expect("send");
+        let got = mpsc_recv_option(&mut rx).await;
+        assert_eq!(got, Some(99u8));
+    }
+
+    #[tokio::test]
+    async fn mpsc_send_error_contains_value() {
+        let (tx, rx) = mpsc::channel::<String>(1);
+        drop(rx);
+        let err = mpsc_send(&tx, String::from("lost")).await;
+        assert!(err.is_err());
+        // The SendError should contain the value that could not be sent
+        let send_err = err.unwrap_err();
+        assert_eq!(send_err.0, "lost");
+    }
+
+    #[tokio::test]
+    async fn mpsc_recv_option_multiple_then_close() {
+        let (tx, mut rx) = mpsc::channel(4);
+        mpsc_send(&tx, 1).await.expect("send 1");
+        mpsc_send(&tx, 2).await.expect("send 2");
+        drop(tx);
+        assert_eq!(mpsc_recv_option(&mut rx).await, Some(1));
+        assert_eq!(mpsc_recv_option(&mut rx).await, Some(2));
+        assert_eq!(mpsc_recv_option(&mut rx).await, None);
+    }
+
+    // ========================================================================
+    // NEW TESTS: Watch channel edge cases
+    // ========================================================================
+
+    #[tokio::test]
+    async fn watch_multiple_sends_receiver_sees_latest() {
+        let (tx, rx) = watch::channel(0);
+        tx.send(1).expect("send 1");
+        tx.send(2).expect("send 2");
+        tx.send(3).expect("send 3");
+        // Watch channels only retain the latest value
+        assert_eq!(*rx.borrow(), 3);
+    }
+
+    #[tokio::test]
+    async fn watch_send_after_drop_receiver_fails() {
+        let (tx, rx) = watch::channel(0);
+        drop(rx);
+        // With no receivers, send should fail
+        let result = tx.send(42);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn watch_initial_value_string() {
+        let (_, rx) = watch::channel(String::from("init"));
+        assert_eq!(&*rx.borrow(), "init");
+    }
+
+    #[tokio::test]
+    async fn watch_borrow_returns_ref_to_current_value() {
+        let (tx, rx) = watch::channel(vec![1, 2, 3]);
+        assert_eq!(*rx.borrow(), vec![1, 2, 3]);
+        tx.send(vec![4, 5]).expect("send");
+        assert_eq!(*rx.borrow(), vec![4, 5]);
+    }
+
+    #[tokio::test]
+    async fn watch_multiple_receivers_see_same_value() {
+        let (tx, rx1) = watch::channel(0);
+        let rx2 = rx1.clone();
+        tx.send(42).expect("send");
+        assert_eq!(*rx1.borrow(), 42);
+        assert_eq!(*rx2.borrow(), 42);
+    }
+
+    // ========================================================================
+    // NEW TESTS: Broadcast channel edge cases
+    // ========================================================================
+
+    #[tokio::test]
+    async fn broadcast_multiple_messages_fifo() {
+        let (tx, mut rx) = broadcast::channel(16);
+        tx.send(1).expect("send 1");
+        tx.send(2).expect("send 2");
+        tx.send(3).expect("send 3");
+        assert_eq!(rx.recv().await.expect("recv 1"), 1);
+        assert_eq!(rx.recv().await.expect("recv 2"), 2);
+        assert_eq!(rx.recv().await.expect("recv 3"), 3);
+    }
+
+    #[tokio::test]
+    async fn broadcast_receiver_lagged_returns_error() {
+        // Create a tiny capacity channel
+        let (tx, mut rx) = broadcast::channel(2);
+        // Send more messages than the channel can hold
+        tx.send(1).expect("send 1");
+        tx.send(2).expect("send 2");
+        tx.send(3).expect("send 3");
+        // First recv should return Lagged error
+        let result = rx.recv().await;
+        match result {
+            Err(broadcast::RecvError::Lagged(_)) => {} // expected
+            other => panic!("expected Lagged error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_send_with_no_receivers_returns_error() {
+        let (tx, rx) = broadcast::channel::<i32>(16);
+        drop(rx);
+        // send should return error when there are no receivers
+        let result = tx.send(42);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn broadcast_subscribe_after_send_misses_prior_messages() {
+        let (tx, _rx) = broadcast::channel(16);
+        tx.send(1).expect("send");
+        let mut rx2 = tx.subscribe();
+        tx.send(2).expect("send 2");
+        // rx2 subscribed after message 1, should only see message 2
+        let val = rx2.recv().await.expect("recv");
+        assert_eq!(val, 2);
+    }
+
+    #[tokio::test]
+    async fn broadcast_try_recv_empty_channel() {
+        let (_tx, mut rx) = broadcast::channel::<i32>(16);
+        let result = rx.try_recv();
+        assert!(result.is_err());
+        match result {
+            Err(broadcast::TryRecvError::Empty) => {} // expected
+            other => panic!("expected Empty, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // NEW TESTS: Timeout edge cases
+    // ========================================================================
+
+    #[tokio::test]
+    async fn timeout_zero_duration_with_immediate_future_succeeds() {
+        // Zero timeout but future completes immediately: should succeed
+        let result = timeout(Duration::ZERO, async { 42 }).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_complex_type() {
+        let result = timeout(Duration::from_secs(1), async { vec![1, 2, 3] }).await;
+        assert_eq!(result.unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_result_type() {
+        let result = timeout(Duration::from_secs(1), async { Ok::<_, String>(42) }).await;
+        let inner = result.expect("should not timeout");
+        assert_eq!(inner.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn timeout_preserves_string_value() {
+        let result = timeout(Duration::from_secs(1), async { String::from("survived") }).await;
+        assert_eq!(result.unwrap(), "survived");
+    }
+
+    // ========================================================================
+    // NEW TESTS: Sleep edge cases
+    // ========================================================================
+
+    #[tokio::test]
+    async fn sleep_very_short_duration() {
+        let start = std::time::Instant::now();
+        sleep(Duration::from_nanos(1)).await;
+        // Should complete quickly (nanos might round up to ~1ms)
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn sleep_one_millisecond() {
+        let start = std::time::Instant::now();
+        sleep(Duration::from_millis(1)).await;
+        // Should complete in reasonable time
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    // ========================================================================
+    // NEW TESTS: CompatRuntime with spawn_detached edge cases
+    // ========================================================================
+
+    #[test]
+    fn spawn_detached_multiple_tasks() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        // Spawning multiple detached tasks should not panic
+        for _ in 0..10 {
+            rt.spawn_detached(async {});
+        }
+    }
+
+    #[test]
+    fn block_on_with_tokio_sync_inside() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let result = rt.block_on(async {
+            let (tx, rx) = watch::channel(0);
+            tx.send(42).expect("send");
+            *rx.borrow()
+        });
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn block_on_with_mutex_inside() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let result = rt.block_on(async {
+            let m = Mutex::new(99);
+            let guard = m.lock().await;
+            *guard
+        });
+        assert_eq!(result, 99);
+    }
+
+    #[test]
+    fn block_on_with_rwlock_inside() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let result = rt.block_on(async {
+            let rw = RwLock::new(77);
+            let guard = rw.read().await;
+            *guard
+        });
+        assert_eq!(result, 77);
+    }
+
+    #[test]
+    fn block_on_with_mpsc_inside() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let result = rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel(1);
+            mpsc_send(&tx, 123).await.expect("send");
+            mpsc_recv_option(&mut rx).await
+        });
+        assert_eq!(result, Some(123));
+    }
+
+    // ========================================================================
+    // NEW TESTS: Type assertions and trait bounds
+    // ========================================================================
+
+    #[test]
+    fn runtime_builder_build_error_type_is_string() {
+        // The build() method returns Result<Runtime, String>
+        let result = RuntimeBuilder::current_thread().build();
+        let _rt: Runtime = result.expect("build should succeed");
+    }
+
+    #[tokio::test]
+    async fn semaphore_is_send_sync() {
+        // Verify Semaphore can be shared across tasks
+        let sem = std::sync::Arc::new(Semaphore::new(1));
+        let sem2 = sem.clone();
+        let handle = tokio::spawn(async move {
+            let _p = sem2.acquire().await.expect("acquire in spawned task");
+        });
+        handle.await.expect("spawned task should complete");
+    }
+
+    #[tokio::test]
+    async fn mutex_is_send_sync() {
+        // Verify Mutex can be shared across tasks
+        let m = std::sync::Arc::new(Mutex::new(0));
+        let m2 = m.clone();
+        let handle = tokio::spawn(async move {
+            let mut guard = m2.lock().await;
+            *guard = 42;
+        });
+        handle.await.expect("spawned task should complete");
+        let guard = m.lock().await;
+        assert_eq!(*guard, 42);
+    }
+
+    #[tokio::test]
+    async fn rwlock_is_send_sync() {
+        // Verify RwLock can be shared across tasks
+        let rw = std::sync::Arc::new(RwLock::new(0));
+        let rw2 = rw.clone();
+        let handle = tokio::spawn(async move {
+            let mut guard = rw2.write().await;
+            *guard = 99;
+        });
+        handle.await.expect("spawned task should complete");
+        let guard = rw.read().await;
+        assert_eq!(*guard, 99);
+    }
 }
