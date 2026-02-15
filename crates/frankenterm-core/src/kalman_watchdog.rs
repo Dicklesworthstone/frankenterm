@@ -1101,4 +1101,241 @@ mod tests {
 
         assert!(wd.classify_component(Component::Capture, 1000).is_none());
     }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──────────────────────
+
+    // ── KalmanFilter additional coverage ────────────────────
+
+    #[test]
+    fn kalman_debug_clone() {
+        let kf = KalmanFilter::new(100.0, 2500.0);
+        let dbg = format!("{:?}", kf);
+        assert!(dbg.contains("KalmanFilter"));
+        let kf2 = kf.clone();
+        assert!(!kf2.is_initialized());
+    }
+
+    #[test]
+    fn kalman_std_dev_positive() {
+        let mut kf = KalmanFilter::new(100.0, 2500.0);
+        kf.update(500.0);
+        kf.update(510.0);
+        assert!(kf.std_dev() > 0.0);
+        assert!((kf.std_dev() - kf.variance().sqrt()).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn kalman_is_initialized_tracking() {
+        let mut kf = KalmanFilter::new(100.0, 2500.0);
+        assert!(!kf.is_initialized());
+        kf.update(100.0);
+        assert!(kf.is_initialized());
+        kf.reset();
+        assert!(!kf.is_initialized());
+    }
+
+    #[test]
+    fn kalman_z_score_none_when_uninitialized() {
+        let kf = KalmanFilter::new(100.0, 2500.0);
+        assert!(kf.z_score(100.0).is_none());
+    }
+
+    #[test]
+    fn kalman_z_score_near_zero_for_estimate() {
+        let mut kf = KalmanFilter::new(100.0, 2500.0);
+        for _ in 0..20 {
+            kf.update(500.0);
+        }
+        let z = kf.z_score(500.0).unwrap();
+        assert!(
+            z.abs() < 0.5,
+            "z-score at estimate should be near zero, got {}",
+            z
+        );
+    }
+
+    #[test]
+    fn kalman_process_noise_clamped() {
+        let kf = KalmanFilter::new(0.0, 0.0);
+        // Should not panic — noise clamped to minimum
+        assert!(kf.variance() > 0.0);
+    }
+
+    // ── AdaptiveWatchdogConfig additional coverage ──────────
+
+    #[test]
+    fn config_debug_clone() {
+        let c = AdaptiveWatchdogConfig::default();
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("AdaptiveWatchdogConfig"));
+        let c2 = c.clone();
+        assert!((c2.sensitivity_k - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn config_default_z_thresholds() {
+        let c = AdaptiveWatchdogConfig::default();
+        assert!(c.degraded_z < c.critical_z);
+        assert!(c.critical_z < c.hung_z);
+        assert!((c.degraded_z - 2.0).abs() < f64::EPSILON);
+        assert!((c.critical_z - 3.0).abs() < f64::EPSILON);
+        assert!((c.hung_z - 5.0).abs() < f64::EPSILON);
+    }
+
+    // ── HealthClassification additional coverage ────────────
+
+    #[test]
+    fn health_classification_debug_clone() {
+        let c = HealthClassification {
+            status: HealthStatus::Healthy,
+            z_score: None,
+            adaptive_threshold_ms: None,
+            estimated_interval_ms: None,
+            estimated_std_dev_ms: None,
+            observations: 0,
+            adaptive_mode: false,
+        };
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("HealthClassification"));
+        let c2 = c.clone();
+        assert_eq!(c2.observations, 0);
+        assert!(!c2.adaptive_mode);
+    }
+
+    #[test]
+    fn health_classification_serde_all_none() {
+        let c = HealthClassification {
+            status: HealthStatus::Healthy,
+            z_score: None,
+            adaptive_threshold_ms: None,
+            estimated_interval_ms: None,
+            estimated_std_dev_ms: None,
+            observations: 0,
+            adaptive_mode: false,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let back: HealthClassification = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, HealthStatus::Healthy);
+        assert!(back.z_score.is_none());
+    }
+
+    // ── ComponentTracker additional coverage ────────────────
+
+    #[test]
+    fn tracker_debug_clone() {
+        let config = AdaptiveWatchdogConfig::default();
+        let t = ComponentTracker::new(&config, 5000);
+        let dbg = format!("{:?}", t);
+        assert!(dbg.contains("ComponentTracker"));
+        let t2 = t.clone();
+        assert_eq!(t2.observation_count(), 0);
+    }
+
+    #[test]
+    fn tracker_observation_count_increments() {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut t = ComponentTracker::new(&config, 5000);
+        assert_eq!(t.observation_count(), 0);
+        t.observe(1000);
+        assert_eq!(t.observation_count(), 0); // First observe sets baseline, no interval
+        t.observe(2000);
+        assert_eq!(t.observation_count(), 1);
+        t.observe(3000);
+        assert_eq!(t.observation_count(), 2);
+    }
+
+    #[test]
+    fn tracker_estimated_interval_none_initially() {
+        let config = AdaptiveWatchdogConfig::default();
+        let t = ComponentTracker::new(&config, 5000);
+        assert!(t.estimated_interval().is_none());
+    }
+
+    #[test]
+    fn tracker_adaptive_threshold_none_before_init() {
+        let config = AdaptiveWatchdogConfig::default();
+        let t = ComponentTracker::new(&config, 5000);
+        assert!(t.adaptive_threshold(3.0).is_none());
+    }
+
+    #[test]
+    fn tracker_adaptive_threshold_positive_after_observations() {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut t = ComponentTracker::new(&config, 5000);
+        for i in 0..10u64 {
+            t.observe(i * 1000);
+        }
+        let threshold = t.adaptive_threshold(3.0);
+        assert!(threshold.is_some());
+        assert!(threshold.unwrap() > 0.0);
+    }
+
+    // ── AdaptiveWatchdog additional coverage ────────────────
+
+    #[test]
+    fn watchdog_debug_clone() {
+        let config = AdaptiveWatchdogConfig::default();
+        let wd = AdaptiveWatchdog::new(config);
+        let dbg = format!("{:?}", wd);
+        assert!(dbg.contains("AdaptiveWatchdog"));
+        let wd2 = wd.clone();
+        let _ = wd2.check_health(1000); // Should work on clone
+    }
+
+    #[test]
+    fn watchdog_config_accessor() {
+        let config = AdaptiveWatchdogConfig {
+            sensitivity_k: 4.0,
+            ..Default::default()
+        };
+        let wd = AdaptiveWatchdog::new(config);
+        assert!((wd.config().sensitivity_k - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn watchdog_tracker_accessor() {
+        let mut wd = AdaptiveWatchdog::new(AdaptiveWatchdogConfig::default());
+        wd.observe(Component::Capture, 1000);
+        assert!(wd.tracker(Component::Capture).is_some());
+        assert!(wd.tracker(Component::Discovery).is_none());
+    }
+
+    // ── AdaptiveHealthReport additional coverage ────────────
+
+    #[test]
+    fn health_report_debug_clone_serde() {
+        let mut wd = AdaptiveWatchdog::new(AdaptiveWatchdogConfig::default());
+        wd.observe(Component::Capture, 1000);
+        wd.observe(Component::Capture, 2000);
+        let report = wd.check_health(2500);
+        let dbg = format!("{:?}", report);
+        assert!(dbg.contains("AdaptiveHealthReport"));
+        let r2 = report.clone();
+        assert_eq!(r2.overall_status, report.overall_status);
+        let json = serde_json::to_string(&report).unwrap();
+        let back: AdaptiveHealthReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.overall_status, report.overall_status);
+    }
+
+    // ── ComponentClassification additional coverage ─────────
+
+    #[test]
+    fn component_classification_debug_clone() {
+        let cc = ComponentClassification {
+            component: Component::Capture,
+            classification: HealthClassification {
+                status: HealthStatus::Healthy,
+                z_score: Some(0.5),
+                adaptive_threshold_ms: Some(1500.0),
+                estimated_interval_ms: Some(1000.0),
+                estimated_std_dev_ms: Some(50.0),
+                observations: 10,
+                adaptive_mode: true,
+            },
+        };
+        let dbg = format!("{:?}", cc);
+        assert!(dbg.contains("ComponentClassification"));
+        let cc2 = cc.clone();
+        assert_eq!(cc2.component, Component::Capture);
+    }
 }
