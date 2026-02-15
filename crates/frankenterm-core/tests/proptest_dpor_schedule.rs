@@ -12,6 +12,7 @@ mod common;
 use asupersync::lab::explorer::{ExplorerConfig, ScheduleExplorer};
 use asupersync::{Budget, LabRuntime};
 use proptest::prelude::*;
+use proptest::strategy::ValueTree;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1023,6 +1024,66 @@ proptest! {
                 "violations with {} workers at seed {}",
                 workers, seed
             );
+        }
+    }
+
+    // =========================================================================
+    // TaskSpec / TaskGraph: additional structural invariants
+    // =========================================================================
+
+    #[test]
+    fn task_spec_debug_nonempty(graph in arb_task_graph(1, 6)) {
+        for task in &graph.tasks {
+            let debug = format!("{:?}", task);
+            prop_assert!(!debug.is_empty());
+            prop_assert!(debug.contains("TaskSpec"));
+        }
+    }
+
+    #[test]
+    fn task_graph_debug_nonempty(graph in arb_task_graph(1, 6)) {
+        let debug = format!("{:?}", graph);
+        prop_assert!(!debug.is_empty());
+        prop_assert!(debug.contains("TaskGraph"));
+    }
+
+    #[test]
+    fn task_graph_no_self_deps(graph in arb_task_graph(1, 8)) {
+        for task in &graph.tasks {
+            prop_assert!(
+                !task.deps.contains(&task.id),
+                "task {} should not depend on itself", task.id
+            );
+        }
+    }
+
+    #[test]
+    fn task_graph_deps_no_duplicates(graph in arb_task_graph(1, 8)) {
+        for task in &graph.tasks {
+            let mut seen = std::collections::HashSet::new();
+            for &dep in &task.deps {
+                prop_assert!(
+                    seen.insert(dep),
+                    "task {} has duplicate dep {}", task.id, dep
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn task_graph_min_size_respected(
+        min in 1_usize..=4,
+        max in 4_usize..=8,
+    ) {
+        // Just verify arb_task_graph produces graphs within [min, max]
+        let strategy = arb_task_graph(min, max);
+        let mut runner = proptest::test_runner::TestRunner::default();
+        for _ in 0..20 {
+            let graph = strategy.new_tree(&mut runner).unwrap().current();
+            prop_assert!(graph.task_count() >= min,
+                "graph has {} tasks, expected >= {}", graph.task_count(), min);
+            prop_assert!(graph.task_count() <= max,
+                "graph has {} tasks, expected <= {}", graph.task_count(), max);
         }
     }
 }

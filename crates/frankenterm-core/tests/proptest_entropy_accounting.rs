@@ -600,3 +600,77 @@ proptest! {
             cost_high, cost_low, score_high, score_low);
     }
 }
+
+// =============================================================================
+// Additional structural / invariant tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn estimator_total_bytes_increases(
+        chunks in proptest::collection::vec(arb_bytes(500), 1..5),
+    ) {
+        let mut est = EntropyEstimator::new(100_000);
+        let mut prev_total = 0_u64;
+        for chunk in &chunks {
+            est.update_block(chunk);
+            let total = est.total_bytes();
+            prop_assert!(total >= prev_total,
+                "total_bytes should not decrease: {} -> {}", prev_total, total);
+            prev_total = total;
+        }
+    }
+
+    #[test]
+    fn budget_new_starts_empty(
+        limit in 1.0_f64..1_000_000.0,
+    ) {
+        let budget = InformationBudget::new(limit);
+        prop_assert_eq!(budget.pane_count, 0);
+        prop_assert!((budget.current_cost - 0.0).abs() < 0.001,
+            "new budget should have zero cost, got {}", budget.current_cost);
+        prop_assert!(!budget.is_exceeded());
+    }
+
+    #[test]
+    fn estimator_fill_ratio_after_exact_window(
+        window in 500_usize..5000,
+    ) {
+        let mut est = EntropyEstimator::new(window);
+        let data: Vec<u8> = (0..window).map(|i| (i % 256) as u8).collect();
+        est.update_block(&data);
+        let ratio = est.fill_ratio();
+        // After feeding exactly window bytes, ratio should be ~1.0
+        prop_assert!((ratio - 1.0).abs() < 0.1,
+            "fill ratio after exact window should be ~1.0, got {}", ratio);
+    }
+
+    #[test]
+    fn eviction_order_preserves_all_ids(
+        raw_scores in proptest::collection::vec(0.0_f64..100_000.0, 1..20),
+    ) {
+        let scores: Vec<(u64, f64)> = raw_scores.iter()
+            .enumerate()
+            .map(|(i, &s)| (i as u64, s))
+            .collect();
+        let order = eviction_order(&scores);
+        prop_assert_eq!(order.len(), scores.len(),
+            "eviction order length should match input length");
+        let mut sorted_ids: Vec<u64> = order.clone();
+        sorted_ids.sort();
+        let expected_ids: Vec<u64> = (0..scores.len() as u64).collect();
+        prop_assert_eq!(sorted_ids, expected_ids,
+            "eviction order should contain all input IDs");
+    }
+
+    #[test]
+    fn budget_utilization_zero_when_empty(
+        limit in 1.0_f64..1_000_000.0,
+    ) {
+        let budget = InformationBudget::new(limit);
+        prop_assert!((budget.utilization() - 0.0).abs() < 0.001,
+            "empty budget utilization should be 0, got {}", budget.utilization());
+    }
+}

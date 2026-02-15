@@ -610,3 +610,63 @@ proptest! {
         prop_assert_eq!(config.include_error_codes, parsed.include_error_codes);
     }
 }
+
+// =========================================================================
+// Structural / Clone / Debug tests
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_endpoint_meta_clone(ep in arb_endpoint_meta()) {
+        let cloned = ep.clone();
+        prop_assert_eq!(cloned.id, ep.id);
+        prop_assert_eq!(cloned.title, ep.title);
+        prop_assert_eq!(cloned.description, ep.description);
+        prop_assert_eq!(cloned.stable, ep.stable);
+        prop_assert_eq!(cloned.since, ep.since);
+    }
+
+    #[test]
+    fn prop_endpoint_meta_debug_nonempty(ep in arb_endpoint_meta()) {
+        let debug = format!("{:?}", ep);
+        prop_assert!(!debug.is_empty());
+    }
+
+    #[test]
+    fn prop_endpoint_category_clone(cat in arb_endpoint_category()) {
+        let cloned = cat.clone();
+        prop_assert_eq!(cloned, cat);
+    }
+
+    #[test]
+    fn prop_doc_gen_config_clone(
+        envelope in any::<bool>(),
+        experimental in any::<bool>(),
+        error_codes in any::<bool>(),
+    ) {
+        let config = DocGenConfig {
+            include_envelope: envelope,
+            include_experimental: experimental,
+            include_error_codes: error_codes,
+        };
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.include_envelope, config.include_envelope);
+        prop_assert_eq!(cloned.include_experimental, config.include_experimental);
+        prop_assert_eq!(cloned.include_error_codes, config.include_error_codes);
+    }
+
+    #[test]
+    fn prop_doc_gen_config_debug_nonempty(
+        envelope in any::<bool>(),
+    ) {
+        let config = DocGenConfig {
+            include_envelope: envelope,
+            include_experimental: false,
+            include_error_codes: true,
+        };
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+    }
+}
