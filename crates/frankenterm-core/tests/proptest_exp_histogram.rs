@@ -621,3 +621,110 @@ proptest! {
         );
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// HistogramStats trait tests and structural properties
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// HistogramStats Debug output is nonempty.
+    #[test]
+    fn prop_stats_debug_nonempty(
+        values in arb_positive_values(20),
+    ) {
+        let mut h = ExpHistogram::power_of_two(20);
+        for &v in &values {
+            h.record(v);
+        }
+        let stats = h.stats();
+        let debug = format!("{:?}", stats);
+        prop_assert!(!debug.is_empty(), "HistogramStats Debug should not be empty");
+    }
+
+    /// HistogramStats serde deterministic — serialize twice yields same JSON.
+    #[test]
+    fn prop_stats_serde_deterministic(
+        values in arb_positive_values(20),
+    ) {
+        let mut h = ExpHistogram::power_of_two(20);
+        for &v in &values {
+            h.record(v);
+        }
+        let stats = h.stats();
+        let json1 = serde_json::to_string(&stats).unwrap();
+        let json2 = serde_json::to_string(&stats).unwrap();
+        prop_assert_eq!(&json1, &json2, "HistogramStats serialization not deterministic");
+    }
+
+    /// power_of_two(n) creates exactly n buckets.
+    #[test]
+    fn prop_power_of_two_num_buckets(n in 2i32..30) {
+        let h = ExpHistogram::power_of_two(n);
+        prop_assert_eq!(
+            h.num_buckets(), n as usize,
+            "power_of_two({}) should create {} buckets, got {}", n, n, h.num_buckets()
+        );
+    }
+
+    /// Recording a single value: min == max == value.
+    #[test]
+    fn prop_single_value_min_eq_max(value in arb_positive_value()) {
+        let mut h = ExpHistogram::power_of_two(20);
+        h.record(value);
+        prop_assert_eq!(h.min(), Some(value), "min should equal the single recorded value");
+        prop_assert_eq!(h.max(), Some(value), "max should equal the single recorded value");
+        prop_assert_eq!(h.count(), 1);
+    }
+
+    /// stats().count matches count().
+    #[test]
+    fn prop_stats_count_matches(
+        values in arb_any_values(30),
+    ) {
+        let mut h = ExpHistogram::power_of_two(20);
+        for &v in &values {
+            h.record(v);
+        }
+        let stats = h.stats();
+        prop_assert_eq!(stats.count, h.count(), "stats.count != count()");
+    }
+
+    /// stats().min and stats().max match min() and max().
+    #[test]
+    fn prop_stats_min_max_matches(
+        values in arb_any_values(30),
+    ) {
+        let mut h = ExpHistogram::power_of_two(20);
+        for &v in &values {
+            h.record(v);
+        }
+        let stats = h.stats();
+        prop_assert_eq!(stats.min, h.min(), "stats.min != min()");
+        prop_assert_eq!(stats.max, h.max(), "stats.max != max()");
+    }
+
+    /// bucket_details length is consistent — after recording values, details are populated.
+    #[test]
+    fn prop_bucket_details_populated_after_recording(
+        values in arb_positive_values(20),
+    ) {
+        let mut h = ExpHistogram::power_of_two(20);
+        for &v in &values {
+            h.record(v);
+        }
+        let details = h.bucket_details();
+        // After recording, details should be populated
+        prop_assert!(
+            !details.is_empty(),
+            "bucket_details should not be empty after recording {} values", values.len()
+        );
+        // Sum of detail counts should equal total count
+        let detail_count: u64 = details.iter().map(|d| d.count).sum();
+        prop_assert_eq!(
+            detail_count, h.count(),
+            "bucket_details sum {} != count {}", detail_count, h.count()
+        );
+    }
+}

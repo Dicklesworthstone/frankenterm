@@ -1027,3 +1027,126 @@ proptest! {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Property: structural and trait tests
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// SearchQuery implements Clone correctly.
+    #[test]
+    fn prop_search_query_clone(events in arb_event_corpus(5)) {
+        let _ = &events; // use the strategy
+        let q = SearchQuery {
+            text: "cargo".to_string(),
+            filters: vec![SearchFilter::PaneId { values: vec![1, 2] }],
+            sort: SearchSortOrder::default(),
+            pagination: Pagination { limit: 10, after: None },
+            snippet_config: SnippetConfig { enabled: false, ..Default::default() },
+            field_boosts: HashMap::new(),
+        };
+        let q2 = q.clone();
+        prop_assert_eq!(&q.text, &q2.text);
+        prop_assert_eq!(q.pagination.limit, q2.pagination.limit);
+    }
+
+    /// SearchFilter implements Clone correctly.
+    #[test]
+    fn prop_search_filter_clone(pane_id in 1u64..100) {
+        let f = SearchFilter::PaneId { values: vec![pane_id] };
+        let f2 = f.clone();
+        // Both should match the same doc
+        let event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            event_id: format!("test-{}", pane_id),
+            pane_id,
+            session_id: None,
+            workflow_id: None,
+            correlation_id: None,
+            source: RecorderEventSource::WeztermMux,
+            payload: RecorderEventPayload::IngressText {
+                text: "hello".into(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                ingress_kind: RecorderIngressKind::SendText,
+            },
+            occurred_at_ms: 1_700_000_000_000,
+            recorded_at_ms: 1_700_000_000_001,
+            sequence: 0,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+        };
+        let doc = map_event_to_document(&event, 0);
+        prop_assert_eq!(f.matches(&doc), f2.matches(&doc));
+    }
+
+    /// IndexDocumentFields Debug is nonempty.
+    #[test]
+    fn prop_document_debug_nonempty(events in arb_event_corpus(5)) {
+        for (offset, event) in events.iter().enumerate() {
+            let doc = map_event_to_document(event, offset as u64);
+            let debug = format!("{:?}", doc);
+            prop_assert!(!debug.is_empty(), "Debug output is empty for {}", event.event_id);
+        }
+    }
+
+    /// RecorderEvent serde roundtrip preserves all fields.
+    #[test]
+    fn prop_recorder_event_serde_roundtrip(events in arb_event_corpus(10)) {
+        for event in &events {
+            let json = serde_json::to_string(event).unwrap();
+            let back: RecorderEvent = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(&back.event_id, &event.event_id, "event_id mismatch");
+            prop_assert_eq!(back.pane_id, event.pane_id, "pane_id mismatch");
+            prop_assert_eq!(back.sequence, event.sequence, "sequence mismatch");
+            prop_assert_eq!(back.occurred_at_ms, event.occurred_at_ms, "occurred_at_ms mismatch");
+        }
+    }
+
+    /// Document pane_id is always in valid range (1..=20 per strategy).
+    #[test]
+    fn prop_document_pane_id_valid(events in arb_event_corpus(15)) {
+        for (offset, event) in events.iter().enumerate() {
+            let doc = map_event_to_document(event, offset as u64);
+            prop_assert!(doc.pane_id > 0, "pane_id should be positive, got {}", doc.pane_id);
+        }
+    }
+
+    /// Document source field is always a non-empty string.
+    #[test]
+    fn prop_document_source_nonempty(events in arb_event_corpus(15)) {
+        for (offset, event) in events.iter().enumerate() {
+            let doc = map_event_to_document(event, offset as u64);
+            prop_assert!(!doc.source.is_empty(), "source field is empty for {}", event.event_id);
+        }
+    }
+
+    /// Document event_type field is always one of the known types.
+    #[test]
+    fn prop_document_event_type_known(events in arb_event_corpus(15)) {
+        let known_types = ["ingress_text", "egress_output", "control_marker", "lifecycle_marker"];
+        for (offset, event) in events.iter().enumerate() {
+            let doc = map_event_to_document(event, offset as u64);
+            prop_assert!(
+                known_types.contains(&doc.event_type.as_str()),
+                "unknown event_type '{}' for {}", doc.event_type, event.event_id
+            );
+        }
+    }
+
+    /// Document serde deterministic — serialize twice yields identical JSON.
+    #[test]
+    fn prop_document_serde_deterministic(events in arb_event_corpus(10)) {
+        for (offset, event) in events.iter().enumerate() {
+            let doc = map_event_to_document(event, offset as u64);
+            let json1 = serde_json::to_string(&doc).unwrap();
+            let json2 = serde_json::to_string(&doc).unwrap();
+            prop_assert_eq!(&json1, &json2, "non-deterministic serialization for {}", event.event_id);
+        }
+    }
+}

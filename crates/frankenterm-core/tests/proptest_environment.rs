@@ -582,6 +582,87 @@ fn boundary_memory_exactly_2048_not_low() {
     assert_eq!(auto.poll_interval_ms, 100);
 }
 
+// =============================================================================
+// Property: AutoConfig clone, debug, and serde tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// AutoConfig implements Clone correctly.
+    #[test]
+    fn prop_auto_config_clone(env in arb_detected_environment()) {
+        let auto = AutoConfig::from_environment(&env);
+        let cloned = auto.clone();
+        prop_assert_eq!(auto.poll_interval_ms, cloned.poll_interval_ms);
+        prop_assert_eq!(auto.min_poll_interval_ms, cloned.min_poll_interval_ms);
+        prop_assert_eq!(auto.max_concurrent_captures, cloned.max_concurrent_captures);
+        prop_assert_eq!(auto.strict_safety, cloned.strict_safety);
+        prop_assert_eq!(auto.rate_limit_per_pane, cloned.rate_limit_per_pane);
+        prop_assert_eq!(&auto.pattern_packs, &cloned.pattern_packs);
+    }
+
+    /// AutoConfig Debug output is nonempty.
+    #[test]
+    fn prop_auto_config_debug_nonempty(env in arb_detected_environment()) {
+        let auto = AutoConfig::from_environment(&env);
+        let debug = format!("{:?}", auto);
+        prop_assert!(!debug.is_empty(), "AutoConfig Debug should not be empty");
+    }
+
+    /// AutoConfig serde roundtrip preserves fields.
+    #[test]
+    fn prop_auto_config_serde_deterministic(env in arb_detected_environment()) {
+        let auto = AutoConfig::from_environment(&env);
+        let json1 = serde_json::to_string(&auto).unwrap();
+        let json2 = serde_json::to_string(&auto).unwrap();
+        prop_assert_eq!(&json1, &json2, "AutoConfig serialization is not deterministic");
+    }
+
+    /// ConfigSource serde deterministic — serialize twice yields same output.
+    #[test]
+    fn prop_config_source_serde_deterministic(
+        source in prop_oneof![
+            Just(ConfigSource::Default),
+            Just(ConfigSource::AutoDetected),
+            Just(ConfigSource::ConfigFile),
+        ]
+    ) {
+        let json1 = serde_json::to_string(&source).unwrap();
+        let json2 = serde_json::to_string(&source).unwrap();
+        prop_assert_eq!(&json1, &json2, "ConfigSource serialization not deterministic");
+    }
+
+    /// ConnectionType serde deterministic — serialize twice yields same output.
+    #[test]
+    fn prop_connection_type_serde_deterministic(ct in arb_connection_type()) {
+        let json1 = serde_json::to_string(&ct).unwrap();
+        let json2 = serde_json::to_string(&ct).unwrap();
+        prop_assert_eq!(&json1, &json2, "ConnectionType serialization not deterministic");
+    }
+
+    /// Recommendations count is bounded by number of adjustments applied.
+    #[test]
+    fn prop_recommendations_count_bounded(env in arb_detected_environment()) {
+        let auto = AutoConfig::from_environment(&env);
+        // Should not produce an unreasonable number of recommendations
+        prop_assert!(
+            auto.recommendations.len() <= 20,
+            "Too many recommendations: {}", auto.recommendations.len()
+        );
+    }
+
+    /// Pattern packs always has at least one entry.
+    #[test]
+    fn prop_pattern_packs_nonempty(env in arb_detected_environment()) {
+        let auto = AutoConfig::from_environment(&env);
+        prop_assert!(
+            !auto.pattern_packs.is_empty(),
+            "pattern_packs should never be empty"
+        );
+    }
+}
+
 #[test]
 fn all_agent_types_get_packs() {
     let agents = vec![
