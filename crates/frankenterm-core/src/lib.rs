@@ -104,6 +104,7 @@ pub mod extensions;
 #[cfg(unix)]
 pub mod fd_budget;
 pub mod gc;
+pub mod hyperloglog;
 pub mod incident_bundle;
 pub mod ingest;
 #[cfg(unix)]
