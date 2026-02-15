@@ -50,7 +50,7 @@ async fn ipc_status_includes_resize_watchdog_assessment() {
 
     use frankenterm_core::events::EventBus;
     use frankenterm_core::ipc::{IpcClient, IpcServer};
-    use frankenterm_core::runtime_compat::{mpsc, sleep};
+    use frankenterm_core::runtime_compat::{mpsc, mpsc_send, sleep};
     use tempfile::TempDir;
 
     // Create stale active transactions so watchdog emits a critical assessment.
@@ -111,14 +111,6 @@ async fn ipc_status_includes_resize_watchdog_assessment() {
         ))
     );
 
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        let cx = asupersync::Cx::for_testing();
-        let _ = shutdown_tx.send(&cx, ()).await;
-    }
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        let _ = shutdown_tx.send(()).await;
-    }
+    let _ = mpsc_send(&shutdown_tx, ()).await;
     let _ = server_handle.await;
 }
