@@ -1305,6 +1305,842 @@ mod tests {
         let _ = fs::remove_dir_all(layout.root);
     }
 
+    // ---------------------------------------------------------------
+    // Pure function tests: dir_size
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn dir_size_empty_directory() {
+        let tmp = std::env::temp_dir().join(format!("wa_test_diag_dirsize_empty_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(dir_size(&tmp), 0);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dir_size_with_files() {
+        let tmp = std::env::temp_dir().join(format!("wa_test_diag_dirsize_files_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("a.txt"), "hello").unwrap();
+        fs::write(tmp.join("b.txt"), "world!").unwrap();
+        let size = dir_size(&tmp);
+        assert_eq!(size, 11); // 5 + 6 bytes
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dir_size_nonexistent_returns_zero() {
+        let fake = std::env::temp_dir().join("wa_test_diag_dirsize_nonexistent_xyzzy");
+        assert_eq!(dir_size(&fake), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: DiagnosticOptions
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn diagnostic_options_default_values() {
+        let opts = DiagnosticOptions::default();
+        assert_eq!(opts.event_limit, 100);
+        assert_eq!(opts.audit_limit, 50);
+        assert_eq!(opts.workflow_limit, 50);
+        assert!(opts.output.is_none());
+    }
+
+    #[test]
+    fn diagnostic_options_custom_values() {
+        let opts = DiagnosticOptions {
+            event_limit: 10,
+            audit_limit: 5,
+            workflow_limit: 3,
+            output: Some(PathBuf::from("/tmp/custom")),
+        };
+        assert_eq!(opts.event_limit, 10);
+        assert_eq!(opts.output.as_ref().unwrap().to_str().unwrap(), "/tmp/custom");
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: DiagnosticResult serialization
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn diagnostic_result_serializes() {
+        let result = DiagnosticResult {
+            output_path: "/tmp/diag_123".to_string(),
+            file_count: 9,
+            total_size_bytes: 4096,
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        assert!(json.contains("\"output_path\":\"/tmp/diag_123\""));
+        assert!(json.contains("\"file_count\":9"));
+        assert!(json.contains("\"total_size_bytes\":4096"));
+    }
+
+    #[test]
+    fn diagnostic_result_zero_values() {
+        let result = DiagnosticResult {
+            output_path: String::new(),
+            file_count: 0,
+            total_size_bytes: 0,
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        assert!(json.contains("\"file_count\":0"));
+        assert!(json.contains("\"total_size_bytes\":0"));
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: EnvironmentInfo serialization
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn environment_info_serializes() {
+        let env = gather_environment();
+        let json = serde_json::to_string_pretty(&env).expect("serialize");
+        assert!(json.contains("\"wa_version\""));
+        assert!(json.contains("\"schema_version\""));
+        assert!(json.contains("\"os\""));
+        assert!(json.contains("\"arch\""));
+    }
+
+    #[test]
+    fn environment_info_has_cwd() {
+        let env = gather_environment();
+        assert!(env.cwd.is_some(), "cwd should be available in test env");
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: ConfigSummary
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn config_summary_custom_values() {
+        let mut config = Config::default();
+        config.general.log_level = "debug".to_string();
+        config.ingest.poll_interval_ms = 500;
+        config.ingest.gap_detection = false;
+        config.storage.retention_days = 90;
+        config.workflows.max_concurrent = 10;
+        config.safety.rate_limit_per_pane = 5;
+
+        let summary = summarize_config(&config);
+        assert_eq!(summary.general_log_level, "debug");
+        assert_eq!(summary.ingest_poll_interval_ms, 500);
+        assert!(!summary.ingest_gap_detection);
+        assert_eq!(summary.storage_retention_days, 90);
+        assert_eq!(summary.workflows_max_concurrent, 10);
+        assert_eq!(summary.safety_rate_limit, 5);
+    }
+
+    #[test]
+    fn config_summary_serializes() {
+        let config = Config::default();
+        let summary = summarize_config(&config);
+        let json = serde_json::to_string_pretty(&summary).expect("serialize");
+        assert!(json.contains("\"general_log_level\""));
+        assert!(json.contains("\"ingest_poll_interval_ms\""));
+        assert!(json.contains("\"patterns_packs\""));
+        assert!(json.contains("\"metrics_enabled\""));
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: redact_reservation
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn redact_reservation_preserves_structure() {
+        let redactor = Redactor::new();
+        let res = crate::storage::PaneReservation {
+            id: 42,
+            pane_id: 3,
+            owner_kind: "workflow".to_string(),
+            owner_id: "wf-test-abc".to_string(),
+            reason: Some("testing cleanup".to_string()),
+            created_at: 1000,
+            expires_at: 2000,
+            released_at: None,
+            status: "active".to_string(),
+        };
+
+        let redacted = redact_reservation(res, &redactor);
+        assert_eq!(redacted.id, 42);
+        assert_eq!(redacted.pane_id, 3);
+        assert_eq!(redacted.owner_kind, "workflow");
+        assert_eq!(redacted.status, "active");
+        assert_eq!(redacted.created_at, 1000);
+        assert_eq!(redacted.expires_at, 2000);
+        assert!(redacted.released_at.is_none());
+    }
+
+    #[test]
+    fn redact_reservation_redacts_secrets_in_owner_id() {
+        let redactor = Redactor::new();
+        let res = crate::storage::PaneReservation {
+            id: 1,
+            pane_id: 1,
+            owner_kind: "agent".to_string(),
+            owner_id: "sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string(),
+            reason: Some("API key sk-abc123def456ghi789jkl012mno345pqr678stu901v used".to_string()),
+            created_at: 1000,
+            expires_at: 2000,
+            released_at: None,
+            status: "active".to_string(),
+        };
+
+        let redacted = redact_reservation(res, &redactor);
+        assert!(redacted.owner_id.contains("[REDACTED]"));
+        assert!(!redacted.owner_id.contains("sk-abc123"));
+        let reason = redacted.reason.unwrap();
+        assert!(reason.contains("[REDACTED]"));
+        assert!(!reason.contains("sk-abc123"));
+    }
+
+    #[test]
+    fn redact_reservation_released_preserves_released_at() {
+        let redactor = Redactor::new();
+        let res = crate::storage::PaneReservation {
+            id: 1,
+            pane_id: 1,
+            owner_kind: "manual".to_string(),
+            owner_id: "user".to_string(),
+            reason: None,
+            created_at: 1000,
+            expires_at: 2000,
+            released_at: Some(1500),
+            status: "released".to_string(),
+        };
+
+        let redacted = redact_reservation(res, &redactor);
+        assert_eq!(redacted.released_at, Some(1500));
+        assert_eq!(redacted.status, "released");
+        assert!(redacted.reason.is_none());
+    }
+
+    #[test]
+    fn redact_reservation_serializes() {
+        let redactor = Redactor::new();
+        let res = crate::storage::PaneReservation {
+            id: 1,
+            pane_id: 1,
+            owner_kind: "workflow".to_string(),
+            owner_id: "wf-1".to_string(),
+            reason: None,
+            created_at: 1000,
+            expires_at: 2000,
+            released_at: None,
+            status: "active".to_string(),
+        };
+        let redacted = redact_reservation(res, &redactor);
+        let json = serde_json::to_string(&redacted).expect("serialize");
+        assert!(json.contains("\"pane_id\":1"));
+        assert!(json.contains("\"status\":\"active\""));
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: redact_step
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn redact_step_preserves_structure() {
+        let redactor = Redactor::new();
+        let step = crate::storage::WorkflowStepLogRecord {
+            id: 10,
+            workflow_id: "wf-123".to_string(),
+            audit_action_id: Some(5),
+            step_index: 2,
+            step_name: "send_text".to_string(),
+            step_id: Some("step-a".to_string()),
+            step_kind: Some("action".to_string()),
+            result_type: "continue".to_string(),
+            result_data: None,
+            policy_summary: Some("allow: rate limit ok".to_string()),
+            verification_refs: None,
+            error_code: None,
+            started_at: 1000,
+            completed_at: 2000,
+            duration_ms: 1000,
+        };
+
+        let redacted = redact_step(step, &redactor);
+        assert_eq!(redacted.step_index, 2);
+        assert_eq!(redacted.step_name, "send_text");
+        assert_eq!(redacted.result_type, "continue");
+        assert_eq!(redacted.started_at, 1000);
+        assert_eq!(redacted.completed_at, 2000);
+    }
+
+    #[test]
+    fn redact_step_redacts_secrets_in_policy_summary() {
+        let redactor = Redactor::new();
+        let step = crate::storage::WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "wf-1".to_string(),
+            audit_action_id: None,
+            step_index: 0,
+            step_name: "auth_check".to_string(),
+            step_id: None,
+            step_kind: None,
+            result_type: "done".to_string(),
+            result_data: None,
+            policy_summary: Some("key sk-abc123def456ghi789jkl012mno345pqr678stu901v valid".to_string()),
+            verification_refs: None,
+            error_code: None,
+            started_at: 1000,
+            completed_at: 1500,
+            duration_ms: 500,
+        };
+
+        let redacted = redact_step(step, &redactor);
+        let summary = redacted.policy_summary.unwrap();
+        assert!(summary.contains("[REDACTED]"));
+        assert!(!summary.contains("sk-abc123"));
+    }
+
+    #[test]
+    fn redact_step_none_policy_preserved() {
+        let redactor = Redactor::new();
+        let step = crate::storage::WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "wf-1".to_string(),
+            audit_action_id: None,
+            step_index: 0,
+            step_name: "noop".to_string(),
+            step_id: None,
+            step_kind: None,
+            result_type: "continue".to_string(),
+            result_data: None,
+            policy_summary: None,
+            verification_refs: None,
+            error_code: None,
+            started_at: 1000,
+            completed_at: 1001,
+            duration_ms: 1,
+        };
+
+        let redacted = redact_step(step, &redactor);
+        assert!(redacted.policy_summary.is_none());
+    }
+
+    #[test]
+    fn redact_step_serializes() {
+        let redactor = Redactor::new();
+        let step = crate::storage::WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "wf-1".to_string(),
+            audit_action_id: None,
+            step_index: 3,
+            step_name: "wait_for".to_string(),
+            step_id: None,
+            step_kind: None,
+            result_type: "wait_for".to_string(),
+            result_data: None,
+            policy_summary: None,
+            verification_refs: None,
+            error_code: None,
+            started_at: 1000,
+            completed_at: 5000,
+            duration_ms: 4000,
+        };
+        let redacted = redact_step(step, &redactor);
+        let json = serde_json::to_string(&redacted).expect("serialize");
+        assert!(json.contains("\"step_index\":3"));
+        assert!(json.contains("\"result_type\":\"wait_for\""));
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: generate_rule_traces edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn generate_rule_traces_empty_events() {
+        let redactor = Redactor::new();
+        let traces = generate_rule_traces(&[], &redactor);
+        assert!(traces.is_empty());
+    }
+
+    #[test]
+    fn generate_rule_traces_non_object_extracted_data() {
+        let redactor = Redactor::new();
+        let events = vec![crate::storage::StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test.rule".to_string(),
+            agent_type: "test".to_string(),
+            event_type: "test".to_string(),
+            severity: "info".to_string(),
+            confidence: 1.0,
+            extracted: Some(serde_json::json!("just a string")),
+            matched_text: None,
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }];
+
+        let traces = generate_rule_traces(&events, &redactor);
+        assert_eq!(traces.len(), 1);
+        assert!(traces[0].extracted_fields.is_empty(), "non-object extracted should yield empty fields");
+    }
+
+    #[test]
+    fn generate_rule_traces_array_extracted_data() {
+        let redactor = Redactor::new();
+        let events = vec![crate::storage::StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test.rule".to_string(),
+            agent_type: "test".to_string(),
+            event_type: "test".to_string(),
+            severity: "info".to_string(),
+            confidence: 1.0,
+            extracted: Some(serde_json::json!([1, 2, 3])),
+            matched_text: Some("match".to_string()),
+            segment_id: None,
+            detected_at: 2000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }];
+
+        let traces = generate_rule_traces(&events, &redactor);
+        assert_eq!(traces.len(), 1);
+        assert!(traces[0].extracted_fields.is_empty());
+        assert_eq!(traces[0].matched_text.as_deref(), Some("match"));
+    }
+
+    #[test]
+    fn generate_rule_traces_null_extracted() {
+        let redactor = Redactor::new();
+        let events = vec![crate::storage::StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test.rule".to_string(),
+            agent_type: "test".to_string(),
+            event_type: "test".to_string(),
+            severity: "info".to_string(),
+            confidence: 0.5,
+            extracted: None,
+            matched_text: None,
+            segment_id: None,
+            detected_at: 3000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }];
+
+        let traces = generate_rule_traces(&events, &redactor);
+        assert_eq!(traces.len(), 1);
+        assert!(traces[0].extracted_fields.is_empty());
+        assert!(traces[0].matched_text.is_none());
+        assert!(!traces[0].handled);
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: gather_db_health edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn gather_db_health_missing_wal_file() {
+        let tmp = std::env::temp_dir().join(format!("wa_test_diag_nowal_{}.db", std::process::id()));
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE panes (id INTEGER PRIMARY KEY);
+                 CREATE TABLE output_segments (id INTEGER PRIMARY KEY);
+                 CREATE TABLE events (id INTEGER PRIMARY KEY);
+                 CREATE TABLE audit_actions (id INTEGER PRIMARY KEY);
+                 CREATE TABLE workflow_executions (id INTEGER PRIMARY KEY);
+                 CREATE TABLE workflow_step_logs (id INTEGER PRIMARY KEY);
+                 CREATE TABLE pane_reservations (id INTEGER PRIMARY KEY);
+                 CREATE TABLE approval_tokens (id INTEGER PRIMARY KEY);",
+            ).unwrap();
+        }
+        // Ensure no WAL file exists
+        let wal_path = tmp.with_extension("db-wal");
+        let _ = fs::remove_file(&wal_path);
+
+        let health = gather_db_health(&tmp).unwrap();
+        assert_eq!(health.wal_file_size_bytes, 0);
+        assert_eq!(health.table_counts.panes, 0);
+
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn gather_db_health_invalid_path() {
+        let fake = PathBuf::from("/nonexistent/path/to/db.db");
+        // Should still succeed (rusqlite creates a new DB at the path if possible,
+        // but /nonexistent won't work, so it should error)
+        let result = gather_db_health(&fake);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gather_db_health_missing_table_returns_negative_one() {
+        let tmp = std::env::temp_dir().join(format!("wa_test_diag_missing_table_{}.db", std::process::id()));
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            // Only create some tables, not all
+            conn.execute_batch(
+                "CREATE TABLE panes (id INTEGER PRIMARY KEY);
+                 CREATE TABLE events (id INTEGER PRIMARY KEY);
+                 INSERT INTO panes VALUES (1);",
+            ).unwrap();
+        }
+
+        let health = gather_db_health(&tmp).unwrap();
+        assert_eq!(health.table_counts.panes, 1);
+        assert_eq!(health.table_counts.events, 0);
+        // Missing tables should return -1
+        assert_eq!(health.table_counts.output_segments, -1);
+        assert_eq!(health.table_counts.audit_actions, -1);
+        assert_eq!(health.table_counts.workflow_executions, -1);
+
+        let _ = fs::remove_file(&tmp);
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: write_json_file edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn write_json_file_nested_data() {
+        let tmp = std::env::temp_dir().join(format!("wa_test_diag_nested_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+
+        let data = serde_json::json!({
+            "outer": {
+                "inner": [1, 2, 3],
+                "nested": {"deep": true}
+            }
+        });
+        write_json_file(&tmp, "nested.json", &data).unwrap();
+
+        let content = fs::read_to_string(tmp.join("nested.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["outer"]["inner"][0], 1);
+        assert!(parsed["outer"]["nested"]["deep"].as_bool().unwrap());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_json_file_empty_object() {
+        let tmp = std::env::temp_dir().join(format!("wa_test_diag_empty_obj_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+
+        let data = serde_json::json!({});
+        write_json_file(&tmp, "empty.json", &data).unwrap();
+
+        let content = fs::read_to_string(tmp.join("empty.json")).unwrap();
+        assert_eq!(content.trim(), "{}");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_json_file_invalid_directory() {
+        let bad_dir = PathBuf::from("/nonexistent/path/for/test");
+        let data = serde_json::json!({"test": true});
+        let result = write_json_file(&bad_dir, "test.json", &data);
+        assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: redact_audit edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn redact_audit_none_fields_preserved() {
+        let redactor = Redactor::new();
+        let action = crate::storage::AuditActionRecord {
+            id: 1,
+            ts: 1000,
+            actor_kind: "robot".to_string(),
+            actor_id: None,
+            correlation_id: None,
+            pane_id: None,
+            domain: None,
+            action_kind: "query".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: None,
+            verification_summary: None,
+            decision_context: None,
+            result: "ok".to_string(),
+        };
+
+        let redacted = redact_audit(action, &redactor);
+        assert_eq!(redacted.id, 1);
+        assert_eq!(redacted.actor_kind, "robot");
+        assert!(redacted.pane_id.is_none());
+        assert!(redacted.input_summary.is_none());
+        assert!(redacted.decision_reason.is_none());
+    }
+
+    #[test]
+    fn redact_audit_input_summary_redacted() {
+        let redactor = Redactor::new();
+        let action = crate::storage::AuditActionRecord {
+            id: 1,
+            ts: 1000,
+            actor_kind: "workflow".to_string(),
+            actor_id: None,
+            correlation_id: None,
+            pane_id: Some(5),
+            domain: None,
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some("approved".to_string()),
+            rule_id: None,
+            input_summary: Some("export KEY=sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string()),
+            verification_summary: None,
+            decision_context: None,
+            result: "ok".to_string(),
+        };
+
+        let redacted = redact_audit(action, &redactor);
+        let summary = redacted.input_summary.unwrap();
+        assert!(summary.contains("[REDACTED]"));
+        assert!(!summary.contains("sk-abc123"));
+        assert_eq!(redacted.pane_id, Some(5));
+    }
+
+    #[test]
+    fn redact_audit_serializes() {
+        let redactor = Redactor::new();
+        let action = crate::storage::AuditActionRecord {
+            id: 7,
+            ts: 5000,
+            actor_kind: "robot".to_string(),
+            actor_id: None,
+            correlation_id: None,
+            pane_id: Some(2),
+            domain: None,
+            action_kind: "send_text".to_string(),
+            policy_decision: "deny".to_string(),
+            decision_reason: Some("rate limited".to_string()),
+            rule_id: None,
+            input_summary: None,
+            verification_summary: None,
+            decision_context: None,
+            result: "blocked".to_string(),
+        };
+        let redacted = redact_audit(action, &redactor);
+        let json = serde_json::to_string(&redacted).expect("serialize");
+        assert!(json.contains("\"policy_decision\":\"deny\""));
+        assert!(json.contains("\"result\":\"blocked\""));
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: redact_events edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn redact_events_empty_list() {
+        let redactor = Redactor::new();
+        let redacted = redact_events(vec![], &redactor);
+        assert!(redacted.is_empty());
+    }
+
+    #[test]
+    fn redact_events_no_matched_text() {
+        let redactor = Redactor::new();
+        let events = vec![crate::storage::StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test".to_string(),
+            agent_type: "test".to_string(),
+            event_type: "test".to_string(),
+            severity: "info".to_string(),
+            confidence: 1.0,
+            extracted: None,
+            matched_text: None,
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }];
+
+        let redacted = redact_events(events, &redactor);
+        assert_eq!(redacted.len(), 1);
+        assert!(redacted[0].matched_text.is_none());
+        assert_eq!(redacted[0].rule_id, "test");
+    }
+
+    #[test]
+    fn redact_events_preserves_handled_status() {
+        let redactor = Redactor::new();
+        let events = vec![crate::storage::StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test".to_string(),
+            agent_type: "test".to_string(),
+            event_type: "test".to_string(),
+            severity: "warning".to_string(),
+            confidence: 0.8,
+            extracted: None,
+            matched_text: Some("clean text".to_string()),
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at: Some(2000),
+            handled_by_workflow_id: Some("wf-1".to_string()),
+            handled_status: Some("completed".to_string()),
+        }];
+
+        let redacted = redact_events(events, &redactor);
+        assert_eq!(redacted[0].handled_status.as_deref(), Some("completed"));
+        assert_eq!(redacted[0].severity, "warning");
+        assert!((redacted[0].confidence - 0.8).abs() < f64::EPSILON);
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: BundleManifest serialization
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn bundle_manifest_serializes() {
+        let manifest = BundleManifest {
+            wa_version: "0.1.0".to_string(),
+            generated_at_ms: 1_700_000_000_000,
+            file_count: 9,
+            files: vec![
+                "environment.json".to_string(),
+                "config_summary.json".to_string(),
+            ],
+            redacted: true,
+        };
+        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
+        assert!(json.contains("\"wa_version\": \"0.1.0\""));
+        assert!(json.contains("\"file_count\": 9"));
+        assert!(json.contains("\"redacted\": true"));
+        assert!(json.contains("environment.json"));
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: TraceEvidence skip_serializing_if
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn trace_evidence_skips_none_fields() {
+        let evidence = TraceEvidence {
+            kind: "anchor_match".to_string(),
+            label: None,
+            value: None,
+        };
+        let json = serde_json::to_string(&evidence).expect("serialize");
+        assert!(!json.contains("label"));
+        assert!(!json.contains("value"));
+        assert!(json.contains("\"kind\":\"anchor_match\""));
+    }
+
+    #[test]
+    fn trace_evidence_includes_present_fields() {
+        let evidence = TraceEvidence {
+            kind: "extracted_field".to_string(),
+            label: Some("percentage".to_string()),
+            value: Some("25%".to_string()),
+        };
+        let json = serde_json::to_string(&evidence).expect("serialize");
+        assert!(json.contains("\"label\":\"percentage\""));
+        assert!(json.contains("\"value\":\"25%\""));
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: EventRuleTrace skip_serializing_if
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn event_rule_trace_skips_empty_extracted() {
+        let trace = EventRuleTrace {
+            event_id: 1,
+            rule_id: "test".to_string(),
+            agent_type: "test".to_string(),
+            confidence: 1.0,
+            severity: "info".to_string(),
+            matched_text: None,
+            extracted_fields: vec![],
+            handled: false,
+            detected_at: 1000,
+        };
+        let json = serde_json::to_string(&trace).expect("serialize");
+        assert!(!json.contains("extracted_fields"));
+        assert!(!json.contains("matched_text"));
+    }
+
+    #[test]
+    fn event_rule_trace_includes_nonempty_extracted() {
+        let trace = EventRuleTrace {
+            event_id: 1,
+            rule_id: "test.rule".to_string(),
+            agent_type: "codex".to_string(),
+            confidence: 0.95,
+            severity: "warning".to_string(),
+            matched_text: Some("matched text here".to_string()),
+            extracted_fields: vec![TraceEvidence {
+                kind: "extracted_field".to_string(),
+                label: Some("key".to_string()),
+                value: Some("val".to_string()),
+            }],
+            handled: true,
+            detected_at: 2000,
+        };
+        let json = serde_json::to_string(&trace).expect("serialize");
+        assert!(json.contains("extracted_fields"));
+        assert!(json.contains("matched_text"));
+        assert!(json.contains("\"handled\":true"));
+    }
+
+    // ---------------------------------------------------------------
+    // Pure function tests: RedactedWorkflow serialization
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn redacted_workflow_serializes() {
+        let wf = RedactedWorkflow {
+            id: "wf-abc".to_string(),
+            workflow_name: "handle_usage_limit".to_string(),
+            pane_id: 3,
+            status: "completed".to_string(),
+            started_at: 1000,
+            completed_at: Some(2000),
+            step_count: 2,
+            steps: vec![
+                RedactedStep {
+                    step_index: 0,
+                    step_name: "detect".to_string(),
+                    result_type: "continue".to_string(),
+                    policy_summary: None,
+                    started_at: 1000,
+                    completed_at: 1500,
+                },
+                RedactedStep {
+                    step_index: 1,
+                    step_name: "send_text".to_string(),
+                    result_type: "done".to_string(),
+                    policy_summary: Some("allow".to_string()),
+                    started_at: 1500,
+                    completed_at: 2000,
+                },
+            ],
+        };
+        let json = serde_json::to_string_pretty(&wf).expect("serialize");
+        assert!(json.contains("\"workflow_name\": \"handle_usage_limit\""));
+        assert!(json.contains("\"step_count\": 2"));
+        assert!(json.contains("\"pane_id\": 3"));
+    }
+
+    // ---------------------------------------------------------------
+    // Integration tests (with real StorageHandle)
+    // ---------------------------------------------------------------
+
     #[tokio::test]
     async fn bundle_output_dir_reuse_generates_fresh_bundle() {
         let tmp =
