@@ -4521,10 +4521,17 @@ description = "Project lint warning"
             span: (10, 20),
         };
         let json = serde_json::to_string(&d).unwrap();
-        assert!(!json.contains("span"), "span should be skipped in serialization");
+        assert!(
+            !json.contains("span"),
+            "span should be skipped in serialization"
+        );
         let back: Detection = serde_json::from_str(&json).unwrap();
         assert_eq!(back.rule_id, "codex.test");
-        assert_eq!(back.span, (0, 0), "deserialized span should default to (0,0)");
+        assert_eq!(
+            back.span,
+            (0, 0),
+            "deserialized span should default to (0,0)"
+        );
     }
 
     // --- TraceSpan serde ---
@@ -4552,7 +4559,10 @@ description = "Project lint warning"
         assert!(!json.contains("label"), "None label should be omitted");
         assert!(!json.contains("span"), "None span should be omitted");
         assert!(!json.contains("excerpt"), "None excerpt should be omitted");
-        assert!(!json.contains("truncated"), "false truncated should be omitted");
+        assert!(
+            !json.contains("truncated"),
+            "false truncated should be omitted"
+        );
     }
 
     #[test]
@@ -4716,11 +4726,20 @@ description = "Project lint warning"
     #[test]
     fn parse_severity_override_all_valid() {
         assert_eq!(parse_severity_override("info").unwrap(), Severity::Info);
-        assert_eq!(parse_severity_override("warning").unwrap(), Severity::Warning);
-        assert_eq!(parse_severity_override("critical").unwrap(), Severity::Critical);
+        assert_eq!(
+            parse_severity_override("warning").unwrap(),
+            Severity::Warning
+        );
+        assert_eq!(
+            parse_severity_override("critical").unwrap(),
+            Severity::Critical
+        );
         // Case-insensitive
         assert_eq!(parse_severity_override("INFO").unwrap(), Severity::Info);
-        assert_eq!(parse_severity_override("  Warning  ").unwrap(), Severity::Warning);
+        assert_eq!(
+            parse_severity_override("  Warning  ").unwrap(),
+            Severity::Warning
+        );
     }
 
     #[test]
@@ -4765,7 +4784,10 @@ description = "Project lint warning"
 
     #[test]
     fn slice_bytes_valid_range() {
-        assert_eq!(PatternEngine::slice_bytes("hello world", 6, 11), Some("world"));
+        assert_eq!(
+            PatternEngine::slice_bytes("hello world", 6, 11),
+            Some("world")
+        );
     }
 
     #[test]
@@ -4844,11 +4866,7 @@ description = "Project lint warning"
 
     #[test]
     fn cross_segment_tail_buffer_catches_split_pattern() {
-        let engine = engine_with_rules(vec![rule_with_anchor(
-            "codex.split",
-            "SPLIT_MATCH",
-            None,
-        )]);
+        let engine = engine_with_rules(vec![rule_with_anchor("codex.split", "SPLIT_MATCH", None)]);
 
         let mut ctx = DetectionContext::new();
 
@@ -5028,7 +5046,8 @@ description = "Project lint warning"
     #[test]
     fn merge_pack_overrides_severity_overlay_wins() {
         let mut base = PackOverride::default();
-        base.severity_overrides.insert("rule_a".into(), "info".into());
+        base.severity_overrides
+            .insert("rule_a".into(), "info".into());
         let mut overlay = PackOverride::default();
         overlay
             .severity_overrides
@@ -5243,11 +5262,7 @@ rules:
 
     #[test]
     fn pattern_pack_serde_round_trip() {
-        let pack = PatternPack::new(
-            "test-pack",
-            "2.0.0",
-            vec![sample_rule("codex.serde")],
-        );
+        let pack = PatternPack::new("test-pack", "2.0.0", vec![sample_rule("codex.serde")]);
         let json = serde_json::to_string(&pack).unwrap();
         let back: PatternPack = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, "test-pack");
@@ -5284,10 +5299,15 @@ rules:
         let engine = PatternEngine::new();
         let text = "Using tool: Bash to run tests";
         let detections = engine.detect(text);
-        let d = detections.iter().find(|d| d.rule_id == "claude_code.tool_use");
+        let d = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.tool_use");
         assert!(d.is_some(), "Should match claude_code.tool_use");
         assert_eq!(
-            d.unwrap().extracted.get("tool_name").and_then(|v| v.as_str()),
+            d.unwrap()
+                .extracted
+                .get("tool_name")
+                .and_then(|v| v.as_str()),
             Some("Bash")
         );
     }

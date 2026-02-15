@@ -732,9 +732,8 @@ mod tests {
         // Random bytes containing ESC (0x1b) but not forming valid
         // alt-screen sequences.
         let noise: Vec<u8> = vec![
-            0x1b, 0x00, 0x1b, 0x5b, 0x1b, 0xff, 0x1b, b'[', b'?', b'9',
-            b'9', b'h', 0x1b, b'O', b'A', 0x1b, b'[', b'?', b'4', b'8',
-            b'h', 0x1b, b'[', b'1', b'0', b'4', b'9',
+            0x1b, 0x00, 0x1b, 0x5b, 0x1b, 0xff, 0x1b, b'[', b'?', b'9', b'9', b'h', 0x1b, b'O',
+            b'A', 0x1b, b'[', b'?', b'4', b'8', b'h', 0x1b, b'[', b'1', b'0', b'4', b'9',
         ];
         tracker.process_output(1, &noise);
         assert!(

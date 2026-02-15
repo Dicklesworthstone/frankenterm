@@ -633,7 +633,10 @@ mod tests {
     fn generate_allow_once_code_length_one() {
         let code = generate_allow_once_code(1);
         assert_eq!(code.len(), 1);
-        assert!(code.chars().next().unwrap().is_ascii_uppercase() || code.chars().next().unwrap().is_ascii_digit());
+        assert!(
+            code.chars().next().unwrap().is_ascii_uppercase()
+                || code.chars().next().unwrap().is_ascii_digit()
+        );
     }
 
     #[test]
@@ -763,10 +766,7 @@ mod tests {
             decision_context: Some("{\"key\":\"value\"}".to_string()),
         };
         assert_eq!(ctx.correlation_id.as_deref(), Some("corr-123"));
-        assert_eq!(
-            ctx.decision_context.as_deref(),
-            Some("{\"key\":\"value\"}")
-        );
+        assert_eq!(ctx.decision_context.as_deref(), Some("{\"key\":\"value\"}"));
     }
 
     #[test]
@@ -860,8 +860,14 @@ mod tests {
         let input2 = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(2);
         let input_none = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
 
-        assert_ne!(fingerprint_for_input(&input1), fingerprint_for_input(&input2));
-        assert_ne!(fingerprint_for_input(&input1), fingerprint_for_input(&input_none));
+        assert_ne!(
+            fingerprint_for_input(&input1),
+            fingerprint_for_input(&input2)
+        );
+        assert_ne!(
+            fingerprint_for_input(&input1),
+            fingerprint_for_input(&input_none)
+        );
     }
 
     #[test]
@@ -969,10 +975,7 @@ mod tests {
         let pane_pos = s.find("pane 5").unwrap();
         let domain_pos = s.find("(staging)").unwrap();
         let text_pos = s.find("deploy").unwrap();
-        assert!(
-            pane_pos < domain_pos,
-            "pane should appear before domain"
-        );
+        assert!(pane_pos < domain_pos, "pane should appear before domain");
         assert!(
             domain_pos < text_pos,
             "domain should appear before text_summary"
@@ -1576,7 +1579,10 @@ mod tests {
 
         // Try a completely wrong code
         let consumed = store.consume("ZZZZZZZZ", &input).await.unwrap();
-        assert!(consumed.is_none(), "Wrong code should not consume any token");
+        assert!(
+            consumed.is_none(),
+            "Wrong code should not consume any token"
+        );
 
         cleanup_storage(storage, &db_path).await;
     }
@@ -1590,7 +1596,10 @@ mod tests {
         let _request = store.issue(&input, None).await.unwrap();
 
         let consumed = store.consume("", &input).await.unwrap();
-        assert!(consumed.is_none(), "Empty code should not consume any token");
+        assert!(
+            consumed.is_none(),
+            "Empty code should not consume any token"
+        );
 
         cleanup_storage(storage, &db_path).await;
     }
@@ -1602,7 +1611,10 @@ mod tests {
         let input = base_input();
 
         let request = store.issue(&input, None).await.unwrap();
-        let consumed = store.consume(&request.allow_once_code, &input).await.unwrap();
+        let consumed = store
+            .consume(&request.allow_once_code, &input)
+            .await
+            .unwrap();
         assert!(consumed.is_some());
 
         // Audit should exist but without correlation_id
@@ -1897,7 +1909,10 @@ mod tests {
         let input = base_input();
 
         let request = store.issue(&input, None).await.unwrap();
-        store.consume(&request.allow_once_code, &input).await.unwrap();
+        store
+            .consume(&request.allow_once_code, &input)
+            .await
+            .unwrap();
 
         let query = AuditQuery {
             action_kind: Some("approve_allow_once".to_string()),
@@ -1911,11 +1926,41 @@ mod tests {
         assert_eq!(audit.action_kind, "approve_allow_once");
         assert_eq!(audit.policy_decision, "allow");
         assert_eq!(audit.result, "success");
-        assert!(audit.decision_reason.as_deref().unwrap().contains("allow_once"));
-        assert!(audit.input_summary.as_deref().unwrap().contains("send_text"));
-        assert!(audit.verification_summary.as_deref().unwrap().contains("workspace=ws"));
-        assert!(audit.verification_summary.as_deref().unwrap().contains("fingerprint=sha256:"));
-        assert!(audit.verification_summary.as_deref().unwrap().contains("hash=sha256:"));
+        assert!(
+            audit
+                .decision_reason
+                .as_deref()
+                .unwrap()
+                .contains("allow_once")
+        );
+        assert!(
+            audit
+                .input_summary
+                .as_deref()
+                .unwrap()
+                .contains("send_text")
+        );
+        assert!(
+            audit
+                .verification_summary
+                .as_deref()
+                .unwrap()
+                .contains("workspace=ws")
+        );
+        assert!(
+            audit
+                .verification_summary
+                .as_deref()
+                .unwrap()
+                .contains("fingerprint=sha256:")
+        );
+        assert!(
+            audit
+                .verification_summary
+                .as_deref()
+                .unwrap()
+                .contains("hash=sha256:")
+        );
         assert_eq!(audit.pane_id, Some(1));
         assert_eq!(audit.domain.as_deref(), Some("local"));
 

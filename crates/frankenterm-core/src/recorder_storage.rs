@@ -1535,7 +1535,10 @@ mod tests {
 
     #[test]
     fn backend_kind_serde_roundtrip_both_variants() {
-        for kind in [RecorderBackendKind::AppendLog, RecorderBackendKind::FrankenSqlite] {
+        for kind in [
+            RecorderBackendKind::AppendLog,
+            RecorderBackendKind::FrankenSqlite,
+        ] {
             let json = serde_json::to_string(&kind).unwrap();
             let back: RecorderBackendKind = serde_json::from_str(&json).unwrap();
             assert_eq!(back, kind);
@@ -1549,15 +1552,31 @@ mod tests {
 
     #[test]
     fn durability_level_serde_roundtrip_all_variants() {
-        for level in [DurabilityLevel::Enqueued, DurabilityLevel::Appended, DurabilityLevel::Fsync] {
+        for level in [
+            DurabilityLevel::Enqueued,
+            DurabilityLevel::Appended,
+            DurabilityLevel::Fsync,
+        ] {
             let json = serde_json::to_string(&level).unwrap();
             let back: DurabilityLevel = serde_json::from_str(&json).unwrap();
             assert_eq!(back, level);
         }
         // Verify snake_case rename
-        assert!(serde_json::to_string(&DurabilityLevel::Enqueued).unwrap().contains("enqueued"));
-        assert!(serde_json::to_string(&DurabilityLevel::Appended).unwrap().contains("appended"));
-        assert!(serde_json::to_string(&DurabilityLevel::Fsync).unwrap().contains("fsync"));
+        assert!(
+            serde_json::to_string(&DurabilityLevel::Enqueued)
+                .unwrap()
+                .contains("enqueued")
+        );
+        assert!(
+            serde_json::to_string(&DurabilityLevel::Appended)
+                .unwrap()
+                .contains("appended")
+        );
+        assert!(
+            serde_json::to_string(&DurabilityLevel::Fsync)
+                .unwrap()
+                .contains("fsync")
+        );
     }
 
     #[test]
@@ -1567,8 +1586,16 @@ mod tests {
             let back: FlushMode = serde_json::from_str(&json).unwrap();
             assert_eq!(back, mode);
         }
-        assert!(serde_json::to_string(&FlushMode::Buffered).unwrap().contains("buffered"));
-        assert!(serde_json::to_string(&FlushMode::Durable).unwrap().contains("durable"));
+        assert!(
+            serde_json::to_string(&FlushMode::Buffered)
+                .unwrap()
+                .contains("buffered")
+        );
+        assert!(
+            serde_json::to_string(&FlushMode::Durable)
+                .unwrap()
+                .contains("durable")
+        );
     }
 
     #[test]
@@ -1658,7 +1685,11 @@ mod tests {
             message: "bad batch".to_string(),
         };
         let msg = format!("{}", err);
-        assert!(msg.contains("bad batch"), "expected detail in message: {}", msg);
+        assert!(
+            msg.contains("bad batch"),
+            "expected detail in message: {}",
+            msg
+        );
 
         let err = RecorderStorageError::CheckpointRegression {
             consumer: "idx".to_string(),
@@ -1667,8 +1698,16 @@ mod tests {
         };
         let msg = format!("{}", err);
         assert!(msg.contains("idx"), "expected consumer in message: {}", msg);
-        assert!(msg.contains("10"), "expected current ordinal in message: {}", msg);
-        assert!(msg.contains("5"), "expected attempted ordinal in message: {}", msg);
+        assert!(
+            msg.contains("10"),
+            "expected current ordinal in message: {}",
+            msg
+        );
+        assert!(
+            msg.contains("5"),
+            "expected attempted ordinal in message: {}",
+            msg
+        );
 
         let err = RecorderStorageError::CorruptRecord {
             offset: 42,
@@ -1676,7 +1715,11 @@ mod tests {
         };
         let msg = format!("{}", err);
         assert!(msg.contains("42"), "expected offset in message: {}", msg);
-        assert!(msg.contains("truncated"), "expected reason in message: {}", msg);
+        assert!(
+            msg.contains("truncated"),
+            "expected reason in message: {}",
+            msg
+        );
     }
 
     #[test]
@@ -1688,7 +1731,8 @@ mod tests {
 
     #[test]
     fn json_error_class_is_terminal_data() {
-        let json_err: serde_json::Error = serde_json::from_str::<RecorderOffset>("bad json").unwrap_err();
+        let json_err: serde_json::Error =
+            serde_json::from_str::<RecorderOffset>("bad json").unwrap_err();
         let err = RecorderStorageError::Json(json_err);
         assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
     }
@@ -1967,7 +2011,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(resp.committed_at_ms > 0, "committed_at_ms should be a valid epoch timestamp");
+        assert!(
+            resp.committed_at_ms > 0,
+            "committed_at_ms should be a valid epoch timestamp"
+        );
     }
 
     #[test]
@@ -2116,10 +2163,15 @@ mod tests {
             .unwrap();
 
         let stats = storage.flush(FlushMode::Buffered).await.unwrap();
-        assert!(stats.flushed_at_ms > 0, "flushed_at_ms should be a valid epoch timestamp");
+        assert!(
+            stats.flushed_at_ms > 0,
+            "flushed_at_ms should be a valid epoch timestamp"
+        );
 
         let stats2 = storage.flush(FlushMode::Durable).await.unwrap();
-        assert!(stats2.flushed_at_ms >= stats.flushed_at_ms,
-            "subsequent flush timestamp should be >= previous");
+        assert!(
+            stats2.flushed_at_ms >= stats.flushed_at_ms,
+            "subsequent flush timestamp should be >= previous"
+        );
     }
 }

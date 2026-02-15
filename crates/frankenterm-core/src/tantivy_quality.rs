@@ -1388,10 +1388,7 @@ mod tests {
         let parsed: AssertionResult = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.description, "must hit event-1");
         assert!(!parsed.passed);
-        assert_eq!(
-            parsed.message.as_deref(),
-            Some("event-1 not in results")
-        );
+        assert_eq!(parsed.message.as_deref(), Some("event-1 not in results"));
     }
 
     #[test]
@@ -1486,7 +1483,11 @@ mod tests {
     fn forensic_corpus_timestamps_are_positive() {
         let corpus = build_forensic_corpus();
         for doc in &corpus {
-            assert!(doc.occurred_at_ms > 0, "doc {} has non-positive ts", doc.event_id);
+            assert!(
+                doc.occurred_at_ms > 0,
+                "doc {} has non-positive ts",
+                doc.event_id
+            );
         }
     }
 

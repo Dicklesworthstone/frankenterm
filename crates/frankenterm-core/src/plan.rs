@@ -2389,10 +2389,7 @@ mod tests {
             metadata: None,
         };
         let err = plan.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            PlanValidationError::UnknownStepReference(_)
-        ));
+        assert!(matches!(err, PlanValidationError::UnknownStepReference(_)));
     }
 
     #[test]
@@ -2411,12 +2408,8 @@ mod tests {
 
     #[test]
     fn plan_hash_ignores_created_at() {
-        let plan1 = ActionPlan::builder("Same", "ws")
-            .created_at(1000)
-            .build();
-        let plan2 = ActionPlan::builder("Same", "ws")
-            .created_at(2000)
-            .build();
+        let plan1 = ActionPlan::builder("Same", "ws").created_at(1000).build();
+        let plan2 = ActionPlan::builder("Same", "ws").created_at(2000).build();
         assert_eq!(plan1.compute_hash(), plan2.compute_hash());
     }
 
@@ -2530,9 +2523,7 @@ mod tests {
                 pane_id: Some(2),
                 stable_for_ms: 1000,
             },
-            WaitCondition::External {
-                key: "sig".into(),
-            },
+            WaitCondition::External { key: "sig".into() },
         ];
         for cond in &conditions {
             let json = serde_json::to_string(cond).unwrap();

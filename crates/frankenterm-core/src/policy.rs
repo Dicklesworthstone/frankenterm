@@ -5971,7 +5971,10 @@ mod tests {
     fn risk_factor_new_clamps_base_weight_to_100() {
         // RiskFactor::new should cap base_weight at 100
         let factor = RiskFactor::new("test.factor", RiskCategory::Content, 200, "over limit");
-        assert_eq!(factor.base_weight, 100, "base_weight above 100 must be clamped");
+        assert_eq!(
+            factor.base_weight, 100,
+            "base_weight above 100 must be clamped"
+        );
         assert_eq!(factor.id, "test.factor");
         assert_eq!(factor.category, RiskCategory::Content);
 
@@ -6067,7 +6070,12 @@ mod tests {
         assert!(ctx.risk.is_none());
 
         // Record a rule
-        ctx.record_rule("test.rule.1", true, Some("deny"), Some("matched pattern".to_string()));
+        ctx.record_rule(
+            "test.rule.1",
+            true,
+            Some("deny"),
+            Some("matched pattern".to_string()),
+        );
         ctx.record_rule("test.rule.2", false, None, None);
         assert_eq!(ctx.rules_evaluated.len(), 2);
         assert!(ctx.rules_evaluated[0].matched);

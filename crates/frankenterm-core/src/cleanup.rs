@@ -1963,7 +1963,8 @@ mod tests {
 
     #[test]
     fn cleanup_table_summary_deserialize_from_json_object() {
-        let json = r#"{"table":"usage_metrics","eligible_rows":77,"deleted_rows":33,"retention_days":14}"#;
+        let json =
+            r#"{"table":"usage_metrics","eligible_rows":77,"deleted_rows":33,"retention_days":14}"#;
         let s: CleanupTableSummary = serde_json::from_str(json).unwrap();
         assert_eq!(s.table, "usage_metrics");
         assert_eq!(s.eligible_rows, 77);

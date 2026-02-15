@@ -1860,7 +1860,9 @@ mod tests {
 
     #[test]
     fn undo_request_clone_produces_equal_fields() {
-        let req = UndoRequest::new(7).with_actor("admin").with_reason("rollback");
+        let req = UndoRequest::new(7)
+            .with_actor("admin")
+            .with_reason("rollback");
         let cloned = req.clone();
         assert_eq!(cloned.action_id, 7);
         assert_eq!(cloned.actor, "admin");
@@ -1901,7 +1903,9 @@ mod tests {
 
     #[test]
     fn undo_request_with_reason_last_wins() {
-        let req = UndoRequest::new(1).with_reason("first").with_reason("second");
+        let req = UndoRequest::new(1)
+            .with_reason("first")
+            .with_reason("second");
         assert_eq!(req.reason.as_deref(), Some("second"));
     }
 
@@ -2394,8 +2398,7 @@ mod tests {
 
         let pane_id = 77_u64;
         seed_pane(storage.as_ref(), pane_id).await;
-        let action_id =
-            seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
+        let action_id = seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
 
         storage
             .upsert_action_undo(ActionUndoRecord {
@@ -2452,9 +2455,7 @@ mod tests {
                 undoable: true,
                 undo_strategy: "workflow_abort".to_string(),
                 undo_hint: None,
-                undo_payload: Some(
-                    serde_json::json!({ "execution_id": execution_id }).to_string(),
-                ),
+                undo_payload: Some(serde_json::json!({ "execution_id": execution_id }).to_string()),
                 undone_at: None,
                 undone_by: None,
             })
@@ -2561,11 +2562,7 @@ mod tests {
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert_eq!(result.strategy, "none");
-        assert!(result
-            .guidance
-            .as_deref()
-            .unwrap()
-            .contains("ft history"));
+        assert!(result.guidance.as_deref().unwrap().contains("ft history"));
 
         storage.shutdown().await.expect("shutdown");
     }
@@ -2654,10 +2651,7 @@ mod tests {
 
         assert_eq!(result.outcome, UndoOutcome::Failed);
         assert_eq!(result.strategy, "quantum_revert");
-        assert_eq!(
-            result.guidance.as_deref(),
-            Some("Contact quantum support")
-        );
+        assert_eq!(result.guidance.as_deref(), Some("Contact quantum support"));
 
         storage.shutdown().await.expect("shutdown");
     }
@@ -2670,8 +2664,7 @@ mod tests {
         let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
         let pane_id = 123_u64;
         seed_pane(storage.as_ref(), pane_id).await;
-        let action_id =
-            seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
+        let action_id = seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
 
         storage
             .upsert_action_undo(ActionUndoRecord {
@@ -2726,9 +2719,7 @@ mod tests {
                 undoable: true,
                 undo_strategy: "workflow_abort".to_string(),
                 undo_hint: None,
-                undo_payload: Some(
-                    serde_json::json!({ "execution_id": execution_id }).to_string(),
-                ),
+                undo_payload: Some(serde_json::json!({ "execution_id": execution_id }).to_string()),
                 undone_at: None,
                 undone_by: None,
             })
@@ -2774,9 +2765,7 @@ mod tests {
                 undoable: true,
                 undo_strategy: "workflow_abort".to_string(),
                 undo_hint: None,
-                undo_payload: Some(
-                    serde_json::json!({ "execution_id": execution_id }).to_string(),
-                ),
+                undo_payload: Some(serde_json::json!({ "execution_id": execution_id }).to_string()),
                 undone_at: None,
                 undone_by: None,
             })

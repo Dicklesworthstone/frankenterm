@@ -1950,7 +1950,11 @@ mod tests {
     fn subsystem_clone_produces_equal_copy() {
         for sub in &ALL_SUBSYSTEMS {
             let cloned = *sub;
-            assert_eq!(*sub, cloned, "Clone/Copy should produce equal value for {:?}", sub);
+            assert_eq!(
+                *sub, cloned,
+                "Clone/Copy should produce equal value for {:?}",
+                sub
+            );
         }
     }
 
@@ -1989,12 +1993,30 @@ mod tests {
     #[test]
     fn subsystem_serde_json_string_format() {
         // snake_case rename: DbWrite -> "db_write" etc.
-        assert_eq!(serde_json::to_string(&Subsystem::DbWrite).unwrap(), "\"db_write\"");
-        assert_eq!(serde_json::to_string(&Subsystem::PatternEngine).unwrap(), "\"pattern_engine\"");
-        assert_eq!(serde_json::to_string(&Subsystem::WorkflowEngine).unwrap(), "\"workflow_engine\"");
-        assert_eq!(serde_json::to_string(&Subsystem::WeztermCli).unwrap(), "\"wezterm_cli\"");
-        assert_eq!(serde_json::to_string(&Subsystem::MuxConnection).unwrap(), "\"mux_connection\"");
-        assert_eq!(serde_json::to_string(&Subsystem::Capture).unwrap(), "\"capture\"");
+        assert_eq!(
+            serde_json::to_string(&Subsystem::DbWrite).unwrap(),
+            "\"db_write\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Subsystem::PatternEngine).unwrap(),
+            "\"pattern_engine\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Subsystem::WorkflowEngine).unwrap(),
+            "\"workflow_engine\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Subsystem::WeztermCli).unwrap(),
+            "\"wezterm_cli\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Subsystem::MuxConnection).unwrap(),
+            "\"mux_connection\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Subsystem::Capture).unwrap(),
+            "\"capture\""
+        );
     }
 
     // -- DegradationLevel derive coverage --
@@ -2002,7 +2024,11 @@ mod tests {
     #[test]
     fn degradation_level_debug_normal() {
         let dbg = format!("{:?}", DegradationLevel::Normal);
-        assert!(dbg.contains("Normal"), "Debug for Normal should contain 'Normal', got {}", dbg);
+        assert!(
+            dbg.contains("Normal"),
+            "Debug for Normal should contain 'Normal', got {}",
+            dbg
+        );
     }
 
     #[test]
@@ -2072,7 +2098,10 @@ mod tests {
             since_epoch_ms: 99999,
             recovery_attempts: 100,
         };
-        assert_eq!(u1, u2, "two Unavailable values should be equal regardless of inner fields");
+        assert_eq!(
+            u1, u2,
+            "two Unavailable values should be equal regardless of inner fields"
+        );
     }
 
     #[test]
@@ -2110,9 +2139,18 @@ mod tests {
 
     #[test]
     fn overall_status_serde_json_string_format() {
-        assert_eq!(serde_json::to_string(&OverallStatus::Healthy).unwrap(), "\"healthy\"");
-        assert_eq!(serde_json::to_string(&OverallStatus::Degraded).unwrap(), "\"degraded\"");
-        assert_eq!(serde_json::to_string(&OverallStatus::Critical).unwrap(), "\"critical\"");
+        assert_eq!(
+            serde_json::to_string(&OverallStatus::Healthy).unwrap(),
+            "\"healthy\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OverallStatus::Degraded).unwrap(),
+            "\"degraded\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OverallStatus::Critical).unwrap(),
+            "\"critical\""
+        );
     }
 
     // -- DegradationSnapshot --
@@ -2130,9 +2168,18 @@ mod tests {
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         // None fields should be omitted due to skip_serializing_if
-        assert!(!json.contains("reason"), "None reason should be omitted from JSON");
-        assert!(!json.contains("since_epoch_ms"), "None since_epoch_ms should be omitted");
-        assert!(!json.contains("duration_ms"), "None duration_ms should be omitted");
+        assert!(
+            !json.contains("reason"),
+            "None reason should be omitted from JSON"
+        );
+        assert!(
+            !json.contains("since_epoch_ms"),
+            "None since_epoch_ms should be omitted"
+        );
+        assert!(
+            !json.contains("duration_ms"),
+            "None duration_ms should be omitted"
+        );
     }
 
     #[test]
@@ -2173,7 +2220,10 @@ mod tests {
         assert_eq!(cloned.recovery_attempts, snapshot.recovery_attempts);
 
         let dbg = format!("{:?}", snapshot);
-        assert!(dbg.contains("DegradationSnapshot"), "Debug should contain type name");
+        assert!(
+            dbg.contains("DegradationSnapshot"),
+            "Debug should contain type name"
+        );
     }
 
     // -- QueuedWrite --
@@ -2271,7 +2321,12 @@ mod tests {
             ResizeDegradationTier::EmergencyCompatibility,
         ];
         for tier in &all_tiers {
-            assert_eq!(tier.rank(), tier.rank(), "rank should be deterministic for {:?}", tier);
+            assert_eq!(
+                tier.rank(),
+                tier.rank(),
+                "rank should be deterministic for {:?}",
+                tier
+            );
         }
         // Ranks must be strictly increasing
         for i in 1..all_tiers.len() {
@@ -2392,7 +2447,10 @@ mod tests {
             safe_mode_active: true,
             legacy_fallback_enabled: false,
         });
-        assert_eq!(assessment.tier, ResizeDegradationTier::EmergencyCompatibility);
+        assert_eq!(
+            assessment.tier,
+            ResizeDegradationTier::EmergencyCompatibility
+        );
     }
 
     #[test]
@@ -2408,7 +2466,11 @@ mod tests {
             legacy_fallback_enabled: false,
         });
         assert_eq!(assessment.tier, ResizeDegradationTier::CorrectnessGuarded);
-        assert!(assessment.trigger_condition.contains("critical_stalls_detected"));
+        assert!(
+            assessment
+                .trigger_condition
+                .contains("critical_stalls_detected")
+        );
     }
 
     #[test]
@@ -2425,7 +2487,10 @@ mod tests {
         });
         let line = assessment.warning_line().unwrap();
         assert!(line.contains("emergency compatibility"));
-        assert!(!line.contains("legacy fallback"), "should not mention legacy fallback when disabled");
+        assert!(
+            !line.contains("legacy fallback"),
+            "should not mention legacy fallback when disabled"
+        );
     }
 
     #[test]
@@ -2483,9 +2548,21 @@ mod tests {
         let test_cases: Vec<(usize, usize, bool, bool, ResizeDegradationTier)> = vec![
             (0, 0, false, false, ResizeDegradationTier::FullQuality),
             (1, 0, false, false, ResizeDegradationTier::QualityReduced),
-            (1, 1, false, false, ResizeDegradationTier::CorrectnessGuarded),
+            (
+                1,
+                1,
+                false,
+                false,
+                ResizeDegradationTier::CorrectnessGuarded,
+            ),
             (0, 0, true, false, ResizeDegradationTier::CorrectnessGuarded),
-            (0, 0, false, true, ResizeDegradationTier::EmergencyCompatibility),
+            (
+                0,
+                0,
+                false,
+                true,
+                ResizeDegradationTier::EmergencyCompatibility,
+            ),
         ];
         for (st, sc, smr, sma, expected_tier) in test_cases {
             let assessment = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
@@ -2553,7 +2630,10 @@ mod tests {
             legacy_fallback_enabled: true,
         };
         let assessment = evaluate_resize_degradation_ladder(signals.clone());
-        assert_eq!(assessment.signals, signals, "assessment should preserve original signals");
+        assert_eq!(
+            assessment.signals, signals,
+            "assessment should preserve original signals"
+        );
     }
 
     // -- DegradationManager state transitions --
@@ -2800,9 +2880,17 @@ mod tests {
     fn epoch_ms_returns_reasonable_value() {
         let ms = epoch_ms();
         // Should be after 2024-01-01 00:00:00 UTC (1704067200000)
-        assert!(ms > 1_704_067_200_000, "epoch_ms should be after 2024-01-01, got {}", ms);
+        assert!(
+            ms > 1_704_067_200_000,
+            "epoch_ms should be after 2024-01-01, got {}",
+            ms
+        );
         // Should be before 2100-01-01 00:00:00 UTC (4102444800000)
-        assert!(ms < 4_102_444_800_000, "epoch_ms should be before 2100-01-01, got {}", ms);
+        assert!(
+            ms < 4_102_444_800_000,
+            "epoch_ms should be before 2100-01-01, got {}",
+            ms
+        );
     }
 
     // -- Report comprehensive --

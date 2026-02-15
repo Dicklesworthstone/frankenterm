@@ -1657,7 +1657,10 @@ mod tests {
         }
         let json = serde_json::to_string(&monitor).unwrap();
         let parsed: PreferenceMonitor = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.irl.observation_count(), monitor.irl.observation_count());
+        assert_eq!(
+            parsed.irl.observation_count(),
+            monitor.irl.observation_count()
+        );
     }
 
     #[test]

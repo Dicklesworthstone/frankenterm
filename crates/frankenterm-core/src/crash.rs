@@ -3327,7 +3327,12 @@ mod tests {
         // Empty directory — no manifest.json or incident_manifest.json
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
         assert_eq!(result.status, "fail");
-        assert!(result.checks.iter().any(|c| c.name == "manifest_valid" && !c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "manifest_valid" && !c.passed)
+        );
     }
 
     #[test]
@@ -3337,7 +3342,12 @@ mod tests {
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
         assert_eq!(result.status, "fail");
-        assert!(result.checks.iter().any(|c| c.name == "manifest_valid" && !c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "manifest_valid" && !c.passed)
+        );
     }
 
     #[test]
@@ -3356,11 +3366,26 @@ mod tests {
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
         // Manifest is valid
-        assert!(result.checks.iter().any(|c| c.name == "manifest_valid" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "manifest_valid" && c.passed)
+        );
         // No redaction report → warning
-        assert!(result.warnings.iter().any(|w| w.contains("redaction_report")));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("redaction_report"))
+        );
         // No secrets found → passes
-        assert!(result.checks.iter().any(|c| c.name == "no_secrets_leaked" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "no_secrets_leaked" && c.passed)
+        );
     }
 
     #[test]
@@ -3393,10 +3418,12 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "redaction_report_valid" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "redaction_report_valid" && c.passed)
+        );
     }
 
     #[test]
@@ -3418,10 +3445,12 @@ mod tests {
         fs::write(tmp.path().join("redaction_report.json"), "{ bad json }").unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "redaction_report_valid" && !c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "redaction_report_valid" && !c.passed)
+        );
     }
 
     #[test]
@@ -3448,10 +3477,12 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "crash_report_valid" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "crash_report_valid" && c.passed)
+        );
     }
 
     #[test]
@@ -3473,10 +3504,12 @@ mod tests {
         fs::write(tmp.path().join("crash_report.json"), "not valid crash json").unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "crash_report_valid" && !c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "crash_report_valid" && !c.passed)
+        );
     }
 
     #[test]
@@ -3509,10 +3542,12 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "db_metadata_valid" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "db_metadata_valid" && c.passed)
+        );
     }
 
     #[test]
@@ -3552,14 +3587,18 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "events_structure_valid" && c.passed));
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "events_text_bounded" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "events_structure_valid" && c.passed)
+        );
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "events_text_bounded" && c.passed)
+        );
     }
 
     #[test]
@@ -3614,10 +3653,12 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "events_text_bounded" && !c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "events_text_bounded" && !c.passed)
+        );
     }
 
     #[test]
@@ -3648,10 +3689,12 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "files_complete" && !c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "files_complete" && !c.passed)
+        );
     }
 
     #[test]
@@ -3673,10 +3716,12 @@ mod tests {
         fs::write(tmp.path().join("data.json"), "{}").unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "files_complete" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "files_complete" && c.passed)
+        );
     }
 
     // -- write_redacted_file tests --

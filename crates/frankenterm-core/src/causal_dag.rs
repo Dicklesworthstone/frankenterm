@@ -887,7 +887,11 @@ mod tests {
     fn time_series_debug_format() {
         let ts = PaneTimeSeries::new(3);
         let dbg = format!("{:?}", ts);
-        assert!(dbg.contains("PaneTimeSeries"), "Debug should name the struct: {}", dbg);
+        assert!(
+            dbg.contains("PaneTimeSeries"),
+            "Debug should name the struct: {}",
+            dbg
+        );
     }
 
     // ── bin_series edge cases ─────────────────────────────────────────────
@@ -934,7 +938,11 @@ mod tests {
         let x: Vec<f64> = (0..100).map(|i| i as f64).collect();
         let y: Vec<f64> = (0..50).map(|i| (i + 1) as f64).collect();
         let te = transfer_entropy(&x, &y, 1, 1, 4);
-        assert!(te.is_finite(), "TE with unequal lengths should be finite: {}", te);
+        assert!(
+            te.is_finite(),
+            "TE with unequal lengths should be finite: {}",
+            te
+        );
         assert!(te >= 0.0, "TE should be non-negative: {}", te);
     }
 
@@ -943,7 +951,11 @@ mod tests {
         let x: Vec<f64> = vec![];
         let y: Vec<f64> = (0..50).map(|i| i as f64).collect();
         let te = transfer_entropy(&x, &y, 1, 1, 4);
-        assert!(te.abs() < f64::EPSILON, "empty source should give TE=0, got {}", te);
+        assert!(
+            te.abs() < f64::EPSILON,
+            "empty source should give TE=0, got {}",
+            te
+        );
     }
 
     #[test]
@@ -952,7 +964,11 @@ mod tests {
         let x: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let y: Vec<f64> = vec![5.0, 4.0, 3.0, 2.0, 1.0];
         let te = transfer_entropy(&x, &y, 10, 10, 4);
-        assert!(te.abs() < f64::EPSILON, "oversized history should give TE=0, got {}", te);
+        assert!(
+            te.abs() < f64::EPSILON,
+            "oversized history should give TE=0, got {}",
+            te
+        );
     }
 
     // ── permutation_test edge cases ───────────────────────────────────────
@@ -963,7 +979,11 @@ mod tests {
         let y: Vec<f64> = (0..80).map(|i| (i as f64 * 0.4).cos()).collect();
         let te = transfer_entropy(&x, &y, 1, 1, 4);
         let p = permutation_test(&x, &y, 1, 1, 4, 30, te);
-        assert!((0.0..=1.0).contains(&p), "p-value must be in [0,1], got {}", p);
+        assert!(
+            (0.0..=1.0).contains(&p),
+            "p-value must be in [0,1], got {}",
+            p
+        );
     }
 
     #[test]
@@ -973,7 +993,11 @@ mod tests {
         let te = transfer_entropy(&x, &y, 1, 1, 4);
         let p = permutation_test(&x, &y, 1, 1, 4, 1, te);
         // With n_permutations=1: p = (count_ge + 1) / (1 + 1) = {1/2 or 2/2}
-        assert!((0.5..=1.0).contains(&p), "single-perm p-value should be 0.5 or 1.0, got {}", p);
+        assert!(
+            (0.5..=1.0).contains(&p),
+            "single-perm p-value should be 0.5 or 1.0, got {}",
+            p
+        );
     }
 
     // ── Fisher-Yates edge cases ───────────────────────────────────────────
@@ -999,7 +1023,10 @@ mod tests {
         fisher_yates_deterministic(&mut data, 123);
         data.sort_by(|a, b| a.partial_cmp(b).unwrap());
         expected.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        assert_eq!(data, expected, "shuffle must be a permutation of original elements");
+        assert_eq!(
+            data, expected,
+            "shuffle must be a permutation of original elements"
+        );
     }
 
     // ── CausalDag operations ──────────────────────────────────────────────
@@ -1121,7 +1148,10 @@ mod tests {
         dag.observe(1, 1.0);
         dag.observe(2, 2.0);
         dag.update_dag();
-        assert!(dag.edges().is_empty(), "insufficient data should yield no edges");
+        assert!(
+            dag.edges().is_empty(),
+            "insufficient data should yield no edges"
+        );
     }
 
     #[test]
@@ -1151,10 +1181,26 @@ mod tests {
         dag.register_pane(1);
         dag.register_pane(2);
         let dbg = format!("{:?}", dag);
-        assert!(dbg.contains("CausalDag"), "Debug should name the struct: {}", dbg);
-        assert!(dbg.contains("pane_count"), "Debug should show pane_count: {}", dbg);
-        assert!(dbg.contains("edge_count"), "Debug should show edge_count: {}", dbg);
-        assert!(dbg.contains("update_count"), "Debug should show update_count: {}", dbg);
+        assert!(
+            dbg.contains("CausalDag"),
+            "Debug should name the struct: {}",
+            dbg
+        );
+        assert!(
+            dbg.contains("pane_count"),
+            "Debug should show pane_count: {}",
+            dbg
+        );
+        assert!(
+            dbg.contains("edge_count"),
+            "Debug should show edge_count: {}",
+            dbg
+        );
+        assert!(
+            dbg.contains("update_count"),
+            "Debug should show update_count: {}",
+            dbg
+        );
     }
 
     // ── Serde roundtrips ──────────────────────────────────────────────────

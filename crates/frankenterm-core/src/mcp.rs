@@ -6240,8 +6240,7 @@ mod tests {
 
     #[test]
     fn map_mcp_error_wezterm_generic() {
-        let err =
-            crate::Error::Wezterm(WeztermError::CommandFailed("unknown error".to_string()));
+        let err = crate::Error::Wezterm(WeztermError::CommandFailed("unknown error".to_string()));
         let (code, hint) = map_mcp_error(&err);
         assert_eq!(code, MCP_ERR_WEZTERM);
         assert!(hint.is_none());

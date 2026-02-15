@@ -1431,8 +1431,7 @@ mod tests {
 
     #[test]
     fn replay_error_is_std_error() {
-        let err: Box<dyn std::error::Error> =
-            Box::new(ReplayError::InvalidConfig("test".into()));
+        let err: Box<dyn std::error::Error> = Box::new(ReplayError::InvalidConfig("test".into()));
         // Verify Display works through the trait object.
         assert!(err.to_string().contains("test"));
     }
@@ -1669,10 +1668,7 @@ mod tests {
 
         let frames = session.collect_remaining();
         assert_eq!(frames.len(), 1);
-        assert_eq!(
-            frames[0].event.event_kind,
-            QueryEventKind::LifecycleMarker
-        );
+        assert_eq!(frames[0].event.event_kind, QueryEventKind::LifecycleMarker);
     }
 
     #[test]

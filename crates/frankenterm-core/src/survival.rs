@@ -1916,7 +1916,11 @@ mod tests {
             timestamp_secs: 0,
         };
         let ll = params.log_likelihood_single(&obs);
-        assert!(ll.is_infinite() && ll < 0.0, "expected NEG_INFINITY, got {}", ll);
+        assert!(
+            ll.is_infinite() && ll < 0.0,
+            "expected NEG_INFINITY, got {}",
+            ll
+        );
     }
 
     #[test]
@@ -2144,7 +2148,11 @@ mod tests {
     fn sigmoid_properties() {
         // sigmoid(0) = 0.5
         let s0 = sigmoid(0.0);
-        assert!((s0 - 0.5).abs() < 1e-10, "sigmoid(0) should be 0.5, got {}", s0);
+        assert!(
+            (s0 - 0.5).abs() < 1e-10,
+            "sigmoid(0) should be 0.5, got {}",
+            s0
+        );
 
         // sigmoid is monotonically increasing
         let s_neg = sigmoid(-5.0);

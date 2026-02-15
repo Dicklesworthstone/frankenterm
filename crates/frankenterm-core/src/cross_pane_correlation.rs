@@ -963,7 +963,10 @@ mod tests {
     #[test]
     fn erfc_at_zero() {
         let val = erfc(0.0);
-        assert!((val - 1.0).abs() < 0.01, "erfc(0) should be ~1.0, got {val}");
+        assert!(
+            (val - 1.0).abs() < 0.01,
+            "erfc(0) should be ~1.0, got {val}"
+        );
     }
 
     #[test]
@@ -975,7 +978,10 @@ mod tests {
     #[test]
     fn chi_squared_survival_at_zero() {
         let val = chi_squared_survival(0.0, 1.0);
-        assert!((val - 1.0).abs() < 0.01, "survival(0, 1) should be ~1.0, got {val}");
+        assert!(
+            (val - 1.0).abs() < 0.01,
+            "survival(0, 1) should be ~1.0, got {val}"
+        );
     }
 
     #[test]

@@ -5583,13 +5583,13 @@ retention_tiers = []
         // Multiple criteria accumulate
         let multi = PolicyRuleMatch {
             actions: vec!["send_text".to_string()],   // +1
-            actors: vec!["robot".to_string()],         // +1
-            pane_ids: vec![1],                         // +2
-            pane_titles: vec!["bash".to_string()],     // +1
-            pane_cwds: vec!["/tmp".to_string()],       // +1
-            pane_domains: vec!["local".to_string()],   // +1
-            command_patterns: vec!["ls".to_string()],  // +2
-            agent_types: vec!["codex".to_string()],    // +1
+            actors: vec!["robot".to_string()],        // +1
+            pane_ids: vec![1],                        // +2
+            pane_titles: vec!["bash".to_string()],    // +1
+            pane_cwds: vec!["/tmp".to_string()],      // +1
+            pane_domains: vec!["local".to_string()],  // +1
+            command_patterns: vec!["ls".to_string()], // +2
+            agent_types: vec!["codex".to_string()],   // +1
         };
         assert_eq!(multi.specificity(), 10);
         assert!(!multi.is_catch_all());
@@ -5603,13 +5603,20 @@ retention_tiers = []
         assert_eq!(PolicyRuleDecision::Allow.priority(), 2);
 
         // Deny beats RequireApproval beats Allow
-        assert!(PolicyRuleDecision::Deny.priority() < PolicyRuleDecision::RequireApproval.priority());
-        assert!(PolicyRuleDecision::RequireApproval.priority() < PolicyRuleDecision::Allow.priority());
+        assert!(
+            PolicyRuleDecision::Deny.priority() < PolicyRuleDecision::RequireApproval.priority()
+        );
+        assert!(
+            PolicyRuleDecision::RequireApproval.priority() < PolicyRuleDecision::Allow.priority()
+        );
 
         // as_str returns serde-compatible names
         assert_eq!(PolicyRuleDecision::Allow.as_str(), "allow");
         assert_eq!(PolicyRuleDecision::Deny.as_str(), "deny");
-        assert_eq!(PolicyRuleDecision::RequireApproval.as_str(), "require_approval");
+        assert_eq!(
+            PolicyRuleDecision::RequireApproval.as_str(),
+            "require_approval"
+        );
     }
 
     #[test]
@@ -5647,7 +5654,10 @@ retention_tiers = []
         };
 
         // First matching rule wins
-        assert_eq!(config.priority_for_pane("local", "codex agent", "/home"), 10);
+        assert_eq!(
+            config.priority_for_pane("local", "codex agent", "/home"),
+            10
+        );
         assert_eq!(config.priority_for_pane("SSH:remote", "bash", "/home"), 50);
 
         // No match -> default
@@ -5673,7 +5683,10 @@ retention_tiers = []
     #[test]
     fn snapshot_scheduling_mode_defaults_and_serde() {
         // Default is Intelligent
-        assert_eq!(SnapshotSchedulingMode::default(), SnapshotSchedulingMode::Intelligent);
+        assert_eq!(
+            SnapshotSchedulingMode::default(),
+            SnapshotSchedulingMode::Intelligent
+        );
 
         // TOML roundtrip
         let toml_str = r#"
@@ -5681,7 +5694,10 @@ retention_tiers = []
 mode = "periodic"
 "#;
         let config = Config::from_toml(toml_str).expect("parse");
-        assert_eq!(config.snapshots.scheduling.mode, SnapshotSchedulingMode::Periodic);
+        assert_eq!(
+            config.snapshots.scheduling.mode,
+            SnapshotSchedulingMode::Periodic
+        );
 
         // Default scheduling values
         let sched = SnapshotSchedulingConfig::default();
@@ -5693,7 +5709,10 @@ mode = "periodic"
     #[test]
     fn vendored_compression_mode_default_and_serde() {
         // Default is Auto
-        assert_eq!(VendoredCompressionMode::default(), VendoredCompressionMode::Auto);
+        assert_eq!(
+            VendoredCompressionMode::default(),
+            VendoredCompressionMode::Auto
+        );
 
         // JSON roundtrip for all variants
         for mode in [

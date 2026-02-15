@@ -1336,7 +1336,7 @@ mod tests {
         let ctx = SearchExplainContext {
             gaps: vec![GapInfo {
                 pane_id: 1,
-                seq_before: 20,  // before > after (shouldn't happen, but be robust)
+                seq_before: 20, // before > after (shouldn't happen, but be robust)
                 seq_after: 10,
                 reason: "weird".to_string(),
                 detected_at: now,
@@ -1729,7 +1729,10 @@ mod tests {
             ..empty_context()
         };
         let result = explain_search(&ctx);
-        assert_eq!(result.query, r#"error "disk full" OR (code=500 AND path=/api/*)"#);
+        assert_eq!(
+            result.query,
+            r#"error "disk full" OR (code=500 AND path=/api/*)"#
+        );
     }
 
     #[test]

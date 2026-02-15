@@ -2553,7 +2553,10 @@ mod tests {
         let redactor = Redactor::new();
         let mut obj = serde_json::Map::new();
         for i in 0..10 {
-            obj.insert(format!("field_{}", i), serde_json::json!(format!("val_{}", i)));
+            obj.insert(
+                format!("field_{}", i),
+                serde_json::json!(format!("val_{}", i)),
+            );
         }
         let events = vec![crate::storage::StoredEvent {
             id: 1,
@@ -2630,10 +2633,8 @@ mod tests {
 
     #[test]
     fn write_json_file_large_payload() {
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_diag_large_payload_{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_diag_large_payload_{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
 
         // Build a large serializable value

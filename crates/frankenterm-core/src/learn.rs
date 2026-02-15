@@ -3085,7 +3085,10 @@ mod tests {
 
     #[test]
     fn rarity_serde_uses_snake_case() {
-        assert_eq!(serde_json::to_string(&Rarity::Common).unwrap(), "\"common\"");
+        assert_eq!(
+            serde_json::to_string(&Rarity::Common).unwrap(),
+            "\"common\""
+        );
         assert_eq!(
             serde_json::to_string(&Rarity::Uncommon).unwrap(),
             "\"uncommon\""
@@ -3112,7 +3115,11 @@ mod tests {
     #[test]
     fn builtin_achievements_non_empty_names() {
         for ach in BUILTIN_ACHIEVEMENTS {
-            assert!(!ach.name.is_empty(), "achievement {} has empty name", ach.id);
+            assert!(
+                !ach.name.is_empty(),
+                "achievement {} has empty name",
+                ach.id
+            );
             assert!(
                 !ach.description.is_empty(),
                 "achievement {} has empty description",

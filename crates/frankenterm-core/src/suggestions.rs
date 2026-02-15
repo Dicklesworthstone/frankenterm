@@ -2419,7 +2419,10 @@ mod tests {
             .with_learn_more("https://docs.example.com/search");
 
         assert!(hint.used);
-        assert_eq!(hint.learn_more.as_deref(), Some("https://docs.example.com/search"));
+        assert_eq!(
+            hint.learn_more.as_deref(),
+            Some("https://docs.example.com/search")
+        );
         assert_eq!(hint.feature, "search");
         assert_eq!(hint.command, "ft search");
     }
@@ -2514,10 +2517,7 @@ mod tests {
         store.dismiss_permanent(&SuggestionId::new("a"));
         assert_eq!(store.count(), 1);
 
-        store.dismiss_temporary(
-            &SuggestionId::new("b"),
-            std::time::Duration::from_secs(60),
-        );
+        store.dismiss_temporary(&SuggestionId::new("b"), std::time::Duration::from_secs(60));
         assert_eq!(store.count(), 2);
 
         // Permanent dismissal replaces temporary if same ID

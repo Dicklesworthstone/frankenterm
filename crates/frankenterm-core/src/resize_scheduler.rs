@@ -2931,9 +2931,7 @@ mod tests {
     #[test]
     fn domain_default_weight_local_highest() {
         let local = ResizeDomain::Local;
-        let ssh = ResizeDomain::Ssh {
-            host: "box".into(),
-        };
+        let ssh = ResizeDomain::Ssh { host: "box".into() };
         let mux = ResizeDomain::Mux {
             endpoint: "ep".into(),
         };

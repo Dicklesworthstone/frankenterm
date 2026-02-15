@@ -1967,7 +1967,10 @@ mod tests {
     #[test]
     fn format_source_all_variants() {
         use crate::recording::RecorderEventSource;
-        assert_eq!(format_source(RecorderEventSource::WeztermMux), "wezterm_mux");
+        assert_eq!(
+            format_source(RecorderEventSource::WeztermMux),
+            "wezterm_mux"
+        );
         assert_eq!(format_source(RecorderEventSource::RobotMode), "robot_mode");
         assert_eq!(
             format_source(RecorderEventSource::WorkflowEngine),
@@ -2476,10 +2479,7 @@ mod tests {
     #[test]
     fn default_config_data_path() {
         let cfg = IndexerConfig::default();
-        assert_eq!(
-            cfg.data_path,
-            PathBuf::from(".ft/recorder-log/events.log")
-        );
+        assert_eq!(cfg.data_path, PathBuf::from(".ft/recorder-log/events.log"));
     }
 
     // =========================================================================

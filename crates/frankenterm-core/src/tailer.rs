@@ -2785,7 +2785,12 @@ mod tests {
         supervisor.sync_tailers(&panes);
 
         supervisor.capturing_panes.insert(1);
-        supervisor.handle_poll_result(1, PollOutcome::CircuitOpen { retry_after_ms: 500 });
+        supervisor.handle_poll_result(
+            1,
+            PollOutcome::CircuitOpen {
+                retry_after_ms: 500,
+            },
+        );
 
         // CircuitOpen should not increment events_sent or send_timeouts
         assert_eq!(supervisor.metrics().events_sent, 0);
@@ -2810,10 +2815,7 @@ mod tests {
         supervisor.sync_tailers(&panes);
 
         supervisor.capturing_panes.insert(1);
-        supervisor.handle_poll_result(
-            1,
-            PollOutcome::Error("connection refused".to_string()),
-        );
+        supervisor.handle_poll_result(1, PollOutcome::Error("connection refused".to_string()));
 
         assert_eq!(supervisor.metrics().events_sent, 0);
         assert_eq!(supervisor.metrics().send_timeouts, 0);

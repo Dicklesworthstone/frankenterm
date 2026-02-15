@@ -1351,12 +1351,15 @@ mod tests {
                 maximum: None,
                 pattern: None,
             }],
-            definitions: vec![("sub".into(), SchemaDoc {
-                title: "Sub".into(),
-                description: "sub desc".into(),
-                properties: vec![],
-                definitions: vec![],
-            })],
+            definitions: vec![(
+                "sub".into(),
+                SchemaDoc {
+                    title: "Sub".into(),
+                    description: "sub desc".into(),
+                    properties: vec![],
+                    definitions: vec![],
+                },
+            )],
         };
         let json = serde_json::to_string(&doc).unwrap();
         let parsed: SchemaDoc = serde_json::from_str(&json).unwrap();
@@ -2090,7 +2093,10 @@ mod tests {
 
     #[test]
     fn error_code_unknown_returns_unknown() {
-        assert_eq!(error_code_description("robot.nonexistent"), "Unknown error code");
+        assert_eq!(
+            error_code_description("robot.nonexistent"),
+            "Unknown error code"
+        );
     }
 
     #[test]
@@ -2116,7 +2122,11 @@ mod tests {
         let original_len = descs.len();
         descs.sort();
         descs.dedup();
-        assert_eq!(descs.len(), original_len, "all error codes should have unique descriptions");
+        assert_eq!(
+            descs.len(),
+            original_len,
+            "all error codes should have unique descriptions"
+        );
     }
 
     // --- DocPage traits ---
@@ -2203,7 +2213,11 @@ mod tests {
             include_error_codes: false,
         };
         let pages = generate_reference(&registry, &[], &config);
-        assert!(!pages[0].content.contains("Response Envelope](#response-envelope)"));
+        assert!(
+            !pages[0]
+                .content
+                .contains("Response Envelope](#response-envelope)")
+        );
         assert!(!pages[0].content.contains("Error Codes](#error-codes)"));
     }
 
@@ -2212,7 +2226,11 @@ mod tests {
         let registry = SchemaRegistry::canonical();
         let config = DocGenConfig::default();
         let pages = generate_reference(&registry, &[], &config);
-        assert!(pages[0].content.contains("[Response Envelope](#response-envelope)"));
+        assert!(
+            pages[0]
+                .content
+                .contains("[Response Envelope](#response-envelope)")
+        );
         assert!(pages[0].content.contains("[Error Codes](#error-codes)"));
     }
 
@@ -2222,7 +2240,9 @@ mod tests {
         let config = DocGenConfig::default();
         let pages = generate_reference(&registry, &[], &config);
         assert!(
-            pages[0].content.contains(&format!("Version: {}.", registry.version)),
+            pages[0]
+                .content
+                .contains(&format!("Version: {}.", registry.version)),
             "output should contain the registry version"
         );
     }
@@ -2771,6 +2791,10 @@ mod tests {
         let mut deduped = titles.clone();
         deduped.sort();
         deduped.dedup();
-        assert_eq!(titles.len(), deduped.len(), "all category titles should be unique");
+        assert_eq!(
+            titles.len(),
+            deduped.len(),
+            "all category titles should be unique"
+        );
     }
 }

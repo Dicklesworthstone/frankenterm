@@ -198,10 +198,7 @@ mod tests {
         assert_eq!(parse_backend(Some("RATATUI")), TuiBackend::STAGE_DEFAULT);
         assert_eq!(parse_backend(Some("Ratatui")), TuiBackend::STAGE_DEFAULT);
         assert_eq!(parse_backend(Some("LEGACY")), TuiBackend::STAGE_DEFAULT);
-        assert_eq!(
-            parse_backend(Some("FRANKENTUI")),
-            TuiBackend::STAGE_DEFAULT
-        );
+        assert_eq!(parse_backend(Some("FRANKENTUI")), TuiBackend::STAGE_DEFAULT);
     }
 
     #[test]
@@ -222,10 +219,7 @@ mod tests {
     fn parse_backend_special_characters() {
         assert_eq!(parse_backend(Some("ftui\n")), TuiBackend::STAGE_DEFAULT);
         assert_eq!(parse_backend(Some("ftui\0")), TuiBackend::STAGE_DEFAULT);
-        assert_eq!(
-            parse_backend(Some("ratatui\t")),
-            TuiBackend::STAGE_DEFAULT
-        );
+        assert_eq!(parse_backend(Some("ratatui\t")), TuiBackend::STAGE_DEFAULT);
     }
 
     #[test]

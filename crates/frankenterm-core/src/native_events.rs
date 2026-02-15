@@ -1071,10 +1071,7 @@ mod tests {
             timestamp_ms: 2000,
         };
         let e2 = e.clone();
-        assert!(matches!(
-            e2,
-            NativeEvent::StateChange { pane_id: 2, .. }
-        ));
+        assert!(matches!(e2, NativeEvent::StateChange { pane_id: 2, .. }));
     }
 
     #[test]
@@ -1086,10 +1083,7 @@ mod tests {
             timestamp_ms: 3000,
         };
         let e2 = e.clone();
-        assert!(matches!(
-            e2,
-            NativeEvent::UserVarChanged { pane_id: 3, .. }
-        ));
+        assert!(matches!(e2, NativeEvent::UserVarChanged { pane_id: 3, .. }));
     }
 
     #[test]
@@ -1101,10 +1095,7 @@ mod tests {
             timestamp_ms: 4000,
         };
         let e2 = e.clone();
-        assert!(matches!(
-            e2,
-            NativeEvent::PaneCreated { pane_id: 4, .. }
-        ));
+        assert!(matches!(e2, NativeEvent::PaneCreated { pane_id: 4, .. }));
     }
 
     #[test]
@@ -1114,10 +1105,7 @@ mod tests {
             timestamp_ms: 5000,
         };
         let e2 = e.clone();
-        assert!(matches!(
-            e2,
-            NativeEvent::PaneDestroyed { pane_id: 5, .. }
-        ));
+        assert!(matches!(e2, NativeEvent::PaneDestroyed { pane_id: 5, .. }));
     }
 
     #[test]

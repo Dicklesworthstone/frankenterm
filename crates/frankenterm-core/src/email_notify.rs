@@ -598,9 +598,17 @@ mod tests {
         assert!(dbg.contains("smtp_host"), "missing 'smtp_host' in: {}", dbg);
         assert!(dbg.contains("smtp_port"), "missing 'smtp_port' in: {}", dbg);
         assert!(dbg.contains("from"), "missing 'from' in: {}", dbg);
-        assert!(dbg.contains("subject_prefix"), "missing 'subject_prefix' in: {}", dbg);
+        assert!(
+            dbg.contains("subject_prefix"),
+            "missing 'subject_prefix' in: {}",
+            dbg
+        );
         assert!(dbg.contains("tls"), "missing 'tls' in: {}", dbg);
-        assert!(dbg.contains("timeout_secs"), "missing 'timeout_secs' in: {}", dbg);
+        assert!(
+            dbg.contains("timeout_secs"),
+            "missing 'timeout_secs' in: {}",
+            dbg
+        );
     }
 
     #[test]

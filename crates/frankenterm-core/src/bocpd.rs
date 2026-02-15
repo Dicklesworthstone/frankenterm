@@ -1224,14 +1224,8 @@ mod tests {
             let prev_kappa = ss.kappa;
             let prev_alpha = ss.alpha;
             ss = ss.update(i as f64);
-            assert!(
-                ss.kappa > prev_kappa,
-                "kappa should increase monotonically"
-            );
-            assert!(
-                ss.alpha > prev_alpha,
-                "alpha should increase monotonically"
-            );
+            assert!(ss.kappa > prev_kappa, "kappa should increase monotonically");
+            assert!(ss.alpha > prev_alpha, "alpha should increase monotonically");
         }
         // After 10 updates, kappa should be prior + 10
         assert!(
@@ -1446,10 +1440,7 @@ mod tests {
         };
         let json = serde_json::to_string(&f).unwrap();
         let back: OutputFeatures = serde_json::from_str(&json).unwrap();
-        assert!(
-            (back.output_rate - 0.0).abs() < f64::EPSILON,
-            "output_rate"
-        );
+        assert!((back.output_rate - 0.0).abs() < f64::EPSILON, "output_rate");
         assert!(
             (back.unique_line_ratio - 1.0).abs() < f64::EPSILON,
             "unique_line_ratio"
@@ -1621,8 +1612,7 @@ mod tests {
         let result = log_sum_exp(&[1000.0, 1001.0, 1002.0]);
         // Should be close to log(e^1000 + e^1001 + e^1002)
         // = 1002 + log(e^-2 + e^-1 + 1)
-        let expected =
-            1002.0 + ((-2.0f64).exp() + (-1.0f64).exp()).ln_1p();
+        let expected = 1002.0 + ((-2.0f64).exp() + (-1.0f64).exp()).ln_1p();
         assert!(
             (result - expected).abs() < 1e-10,
             "result={}, expected={}",
@@ -1744,10 +1734,7 @@ mod tests {
             (feats.output_rate - 15.0).abs() < f64::EPSILON,
             "output_rate"
         );
-        assert!(
-            (feats.entropy - 5.5).abs() < f64::EPSILON,
-            "entropy"
-        );
+        assert!((feats.entropy - 5.5).abs() < f64::EPSILON, "entropy");
     }
 
     #[test]

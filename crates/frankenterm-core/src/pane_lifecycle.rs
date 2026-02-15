@@ -985,7 +985,12 @@ mod tests {
         ];
         for (v, name) in &variants {
             let debug = format!("{:?}", v);
-            assert!(debug.contains(name), "Debug for {:?} should contain {}", v, name);
+            assert!(
+                debug.contains(name),
+                "Debug for {:?} should contain {}",
+                v,
+                name
+            );
         }
     }
 
@@ -1100,7 +1105,9 @@ mod tests {
         assert_eq!(cloned.grace_period, cfg.grace_period);
         assert!((cloned.active_cpu_threshold - cfg.active_cpu_threshold).abs() < f64::EPSILON);
         assert!((cloned.stuck_cpu_threshold - cfg.stuck_cpu_threshold).abs() < f64::EPSILON);
-        assert!((cloned.pressure_renice_threshold - cfg.pressure_renice_threshold).abs() < f64::EPSILON);
+        assert!(
+            (cloned.pressure_renice_threshold - cfg.pressure_renice_threshold).abs() < f64::EPSILON
+        );
         assert_eq!(cloned.renice_value, cfg.renice_value);
         assert_eq!(cloned.protected_panes, cfg.protected_panes);
     }
@@ -1210,14 +1217,20 @@ mod tests {
         let none_debug = format!("{:?}", LifecycleAction::None);
         assert!(none_debug.contains("None"));
 
-        let warn_debug = format!("{:?}", LifecycleAction::Warn {
-            reason: "dbg".to_string(),
-        });
+        let warn_debug = format!(
+            "{:?}",
+            LifecycleAction::Warn {
+                reason: "dbg".to_string(),
+            }
+        );
         assert!(warn_debug.contains("Warn"));
 
-        let kill_debug = format!("{:?}", LifecycleAction::ForceKill {
-            reason: "dbg".to_string(),
-        });
+        let kill_debug = format!(
+            "{:?}",
+            LifecycleAction::ForceKill {
+                reason: "dbg".to_string(),
+            }
+        );
         assert!(kill_debug.contains("ForceKill"));
     }
 
@@ -1356,9 +1369,7 @@ mod tests {
     #[test]
     fn pressure_renice_working_excluded() {
         let config = LifecycleConfig::default();
-        let healths = vec![
-            (1, PaneHealth::Working, Duration::from_secs(8 * 3600)),
-        ];
+        let healths = vec![(1, PaneHealth::Working, Duration::from_secs(8 * 3600))];
         // Above threshold, Working is NOT in the renice filter.
         let candidates = pressure_renice_candidates(&healths, 0.9, &config);
         assert!(candidates.is_empty());
@@ -1382,7 +1393,11 @@ mod tests {
         // Exactly at threshold (0.8). The guard is `cpu_load_fraction < threshold`,
         // so 0.8 < 0.8 is false -- we do NOT early-return. Candidates are produced.
         let candidates = pressure_renice_candidates(&healths, 0.8, &config);
-        assert_eq!(candidates.len(), 2, "At exact threshold, < guard does not fire so candidates returned");
+        assert_eq!(
+            candidates.len(),
+            2,
+            "At exact threshold, < guard does not fire so candidates returned"
+        );
 
         // Just below threshold: early return fires.
         let below = pressure_renice_candidates(&healths, 0.79, &config);

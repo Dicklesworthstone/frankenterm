@@ -1590,11 +1590,19 @@ mod tests {
         }
         // q=0.0 should return the minimum retained sample
         let q0 = h.quantile(0.0).unwrap();
-        assert!((q0 - 1.0).abs() < f64::EPSILON, "q(0.0) = {}, expected 1.0", q0);
+        assert!(
+            (q0 - 1.0).abs() < f64::EPSILON,
+            "q(0.0) = {}, expected 1.0",
+            q0
+        );
 
         // q=1.0 should return the maximum retained sample
         let q1 = h.quantile(1.0).unwrap();
-        assert!((q1 - 10.0).abs() < f64::EPSILON, "q(1.0) = {}, expected 10.0", q1);
+        assert!(
+            (q1 - 10.0).abs() < f64::EPSILON,
+            "q(1.0) = {}, expected 10.0",
+            q1
+        );
     }
 
     #[test]
@@ -1604,11 +1612,17 @@ mod tests {
         h.record(10.0);
         // Negative quantile clamped to 0.0
         let q_neg = h.quantile(-1.0).unwrap();
-        assert!((q_neg - 5.0).abs() < f64::EPSILON, "q(-1.0) should clamp to min");
+        assert!(
+            (q_neg - 5.0).abs() < f64::EPSILON,
+            "q(-1.0) should clamp to min"
+        );
 
         // Quantile > 1.0 clamped to 1.0
         let q_big = h.quantile(2.0).unwrap();
-        assert!((q_big - 10.0).abs() < f64::EPSILON, "q(2.0) should clamp to max");
+        assert!(
+            (q_big - 10.0).abs() < f64::EPSILON,
+            "q(2.0) should clamp to max"
+        );
     }
 
     #[test]
@@ -1684,7 +1698,11 @@ mod tests {
         assert_eq!(h.min_max(), Some((0.0, 9999.0)));
         let mean = h.mean().unwrap();
         // Mean of 0..9999 = 4999.5
-        assert!((mean - 4999.5).abs() < 0.1, "mean = {}, expected ~4999.5", mean);
+        assert!(
+            (mean - 4999.5).abs() < 0.1,
+            "mean = {}, expected ~4999.5",
+            mean
+        );
     }
 
     #[test]
@@ -1696,7 +1714,11 @@ mod tests {
         h.record(5.0);
         assert_eq!(h.min_max(), Some((-10.0, 5.0)));
         let mean = h.mean().unwrap();
-        assert!((mean - (-2.5)).abs() < f64::EPSILON, "mean = {}, expected -2.5", mean);
+        assert!(
+            (mean - (-2.5)).abs() < f64::EPSILON,
+            "mean = {}, expected -2.5",
+            mean
+        );
     }
 
     #[test]
@@ -1848,7 +1870,11 @@ mod tests {
         }
         let snaps = buf.snapshots();
         for (i, snap) in snaps.iter().enumerate().take(5) {
-            assert_eq!(snap.pid, i as u32, "snapshot ordering mismatch at index {}", i);
+            assert_eq!(
+                snap.pid, i as u32,
+                "snapshot ordering mismatch at index {}",
+                i
+            );
         }
     }
 
@@ -2510,10 +2536,7 @@ mod tests {
 
     #[test]
     fn store_aggregate_no_cpu() {
-        let snapshots = vec![
-            make_snap(1, 500, 10, 1000),
-            make_snap(1, 600, 12, 1030),
-        ];
+        let snapshots = vec![make_snap(1, 500, 10, 1000), make_snap(1, 600, 12, 1030)];
         let agg = TelemetryStore::aggregate_snapshots(1000, &snapshots).unwrap();
         assert!(agg.mean_cpu_percent.is_none());
         assert_eq!(agg.mean_rss_bytes, 550);
@@ -2867,11 +2890,20 @@ mod tests {
         assert_eq!(reg.counter_value("queries"), 20);
 
         let summaries = reg.histogram_summaries();
-        let capture = summaries.iter().find(|s| s.name == "capture_latency_us").unwrap();
+        let capture = summaries
+            .iter()
+            .find(|s| s.name == "capture_latency_us")
+            .unwrap();
         assert_eq!(capture.count, 100);
-        let storage = summaries.iter().find(|s| s.name == "storage_write_us").unwrap();
+        let storage = summaries
+            .iter()
+            .find(|s| s.name == "storage_write_us")
+            .unwrap();
         assert_eq!(storage.count, 100);
-        let query = summaries.iter().find(|s| s.name == "query_latency_us").unwrap();
+        let query = summaries
+            .iter()
+            .find(|s| s.name == "query_latency_us")
+            .unwrap();
         assert_eq!(query.count, 20);
     }
 
@@ -2962,13 +2994,25 @@ mod tests {
         h.record(200.0);
 
         let q0 = h.quantile(0.0).unwrap();
-        assert!((q0 - 100.0).abs() < f64::EPSILON, "q(0.0) = {}, expected 100.0", q0);
+        assert!(
+            (q0 - 100.0).abs() < f64::EPSILON,
+            "q(0.0) = {}, expected 100.0",
+            q0
+        );
 
         let q50 = h.quantile(0.5).unwrap();
-        assert!((q50 - 100.0).abs() < f64::EPSILON, "q(0.5) = {}, expected 100.0", q50);
+        assert!(
+            (q50 - 100.0).abs() < f64::EPSILON,
+            "q(0.5) = {}, expected 100.0",
+            q50
+        );
 
         let q1 = h.quantile(1.0).unwrap();
-        assert!((q1 - 200.0).abs() < f64::EPSILON, "q(1.0) = {}, expected 200.0", q1);
+        assert!(
+            (q1 - 200.0).abs() < f64::EPSILON,
+            "q(1.0) = {}, expected 200.0",
+            q1
+        );
 
         // Mean should reflect both, including evicted tracking
         assert!((h.mean().unwrap() - 150.0).abs() < f64::EPSILON);
@@ -3033,14 +3077,26 @@ mod tests {
         // 7 days = 168 hours, 0 days = 0 hours, 365 days = 8760 hours
         let store_7 = TelemetryStore::open_in_memory(7).unwrap();
         let dbg_7 = format!("{:?}", store_7);
-        assert!(dbg_7.contains("168"), "7 days should be 168 hours, got: {}", dbg_7);
+        assert!(
+            dbg_7.contains("168"),
+            "7 days should be 168 hours, got: {}",
+            dbg_7
+        );
 
         let store_0 = TelemetryStore::open_in_memory(0).unwrap();
         let dbg_0 = format!("{:?}", store_0);
-        assert!(dbg_0.contains("0"), "0 days should be 0 hours, got: {}", dbg_0);
+        assert!(
+            dbg_0.contains("0"),
+            "0 days should be 0 hours, got: {}",
+            dbg_0
+        );
 
         let store_365 = TelemetryStore::open_in_memory(365).unwrap();
         let dbg_365 = format!("{:?}", store_365);
-        assert!(dbg_365.contains("8760"), "365 days should be 8760 hours, got: {}", dbg_365);
+        assert!(
+            dbg_365.contains("8760"),
+            "365 days should be 8760 hours, got: {}",
+            dbg_365
+        );
     }
 }

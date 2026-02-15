@@ -1332,8 +1332,7 @@ mod tests {
 
     #[test]
     fn policy_check_serde_roundtrip() {
-        let check = PolicyCheck::failed("rate_limit", "exceeded")
-            .with_details("5/5 sends in 30s");
+        let check = PolicyCheck::failed("rate_limit", "exceeded").with_details("5/5 sends in 30s");
         let json = serde_json::to_string(&check).unwrap();
         let parsed: PolicyCheck = serde_json::from_str(&json).unwrap();
         assert!(!parsed.passed);
@@ -1343,8 +1342,8 @@ mod tests {
     #[test]
     fn planned_action_builder_with_metadata() {
         let meta = serde_json::json!({"target_pane": 42, "text": "hello"});
-        let action = PlannedAction::new(1, ActionType::SendText, "send text")
-            .with_metadata(meta.clone());
+        let action =
+            PlannedAction::new(1, ActionType::SendText, "send text").with_metadata(meta.clone());
         assert_eq!(action.step, 1);
         assert_eq!(action.action_type, ActionType::SendText);
         assert_eq!(action.metadata.unwrap(), meta);

@@ -19244,8 +19244,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn extract_token_usage_full_line() {
-        let line =
-            "Token usage: total=1,000 input=400 output=500 (+ 50 cached) (reasoning 100)";
+        let line = "Token usage: total=1,000 input=400 output=500 (+ 50 cached) (reasoning 100)";
         let usage = extract_token_usage(line);
         assert_eq!(usage.total, Some(1000));
         assert_eq!(usage.input, Some(400));
@@ -19377,8 +19376,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn step_result_wait_for_with_timeout_builder() {
-        let result =
-            StepResult::wait_for_with_timeout(WaitCondition::external("key"), 3000);
+        let result = StepResult::wait_for_with_timeout(WaitCondition::external("key"), 3000);
         if let StepResult::WaitFor { timeout_ms, .. } = result {
             assert_eq!(timeout_ms, Some(3000));
         } else {
@@ -19406,11 +19404,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn step_result_send_text_and_wait_builder() {
-        let result = StepResult::send_text_and_wait(
-            "hello",
-            WaitCondition::pane_idle(1000),
-            5000,
-        );
+        let result = StepResult::send_text_and_wait("hello", WaitCondition::pane_idle(1000), 5000);
         assert!(result.is_send_text());
         if let StepResult::SendText {
             wait_for,
@@ -19551,18 +19545,12 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn step_error_code_done_returns_none() {
-        assert_eq!(
-            step_error_code_from_result(&StepResult::done_empty()),
-            None
-        );
+        assert_eq!(step_error_code_from_result(&StepResult::done_empty()), None);
     }
 
     #[test]
     fn step_error_code_retry_returns_none() {
-        assert_eq!(
-            step_error_code_from_result(&StepResult::retry(100)),
-            None
-        );
+        assert_eq!(step_error_code_from_result(&StepResult::retry(100)), None);
     }
 
     #[test]
@@ -19892,10 +19880,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn build_verification_refs_populated_for_wait_for() {
-        let result = StepResult::wait_for_with_timeout(
-            WaitCondition::external("signal"),
-            5000,
-        );
+        let result = StepResult::wait_for_with_timeout(WaitCondition::external("signal"), 5000);
         let refs = build_verification_refs(&result, None).unwrap();
         assert!(refs.contains("wait_for"));
         assert!(refs.contains("5000"));
@@ -19903,11 +19888,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn build_verification_refs_populated_for_send_text_wait() {
-        let result = StepResult::send_text_and_wait(
-            "hello",
-            WaitCondition::pane_idle(1000),
-            3000,
-        );
+        let result = StepResult::send_text_and_wait("hello", WaitCondition::pane_idle(1000), 3000);
         let refs = build_verification_refs(&result, None).unwrap();
         assert!(refs.contains("post_send_wait"));
     }
@@ -19949,8 +19930,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn parse_codex_session_summary_no_reset_time() {
-        let tail =
-            "codex resume abc12345\nToken usage: total=500 input=200 output=300";
+        let tail = "codex resume abc12345\nToken usage: total=500 input=200 output=300";
         let summary = parse_codex_session_summary(tail).unwrap();
         assert!(summary.reset_time.is_none());
     }
@@ -20292,10 +20272,11 @@ You've hit your usage limit. Try again at 5:00 PM.";
         );
         assert_eq!(plan.version, FallbackNextStepPlan::CURRENT_VERSION);
         assert_eq!(plan.pane_id, 42);
-        assert!(plan
-            .operator_steps
-            .iter()
-            .any(|s| s.contains("openai-team")));
+        assert!(
+            plan.operator_steps
+                .iter()
+                .any(|s| s.contains("openai-team"))
+        );
         assert_eq!(plan.retry_after_ms, Some(9999));
         assert_eq!(plan.resume_session_id.as_deref(), Some("sess-123"));
     }
@@ -20382,8 +20363,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn wait_condition_pane_id_text_match_on_pane() {
-        let cond =
-            WaitCondition::text_match_on_pane(99, TextMatch::substring("x"));
+        let cond = WaitCondition::text_match_on_pane(99, TextMatch::substring("x"));
         assert_eq!(cond.pane_id(), Some(99));
     }
 
