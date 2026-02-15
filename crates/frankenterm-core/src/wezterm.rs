@@ -3004,6 +3004,313 @@ mod tests {
         let result = fut.await.unwrap();
         assert!(matches!(result, WaitResult::TimedOut { .. }));
     }
+
+    // Batch: DarkBadger wa-1u90p.7.1
+
+    #[test]
+    fn pane_size_debug_clone() {
+        let s = PaneSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: Some(640),
+            pixel_height: None,
+            dpi: None,
+        };
+        let c = s.clone();
+        assert_eq!(c.rows, 24);
+        assert_eq!(c.cols, 80);
+        assert_eq!(c.pixel_width, Some(640));
+        let _ = format!("{:?}", s);
+    }
+
+    #[test]
+    fn cursor_visibility_copy_eq_ne() {
+        let a = CursorVisibility::Visible;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(CursorVisibility::Visible, CursorVisibility::Hidden);
+    }
+
+    #[test]
+    fn cursor_visibility_serde_pascal_case() {
+        let json = serde_json::to_string(&CursorVisibility::Visible).unwrap();
+        assert_eq!(json, "\"Visible\"");
+        let json = serde_json::to_string(&CursorVisibility::Hidden).unwrap();
+        assert_eq!(json, "\"Hidden\"");
+    }
+
+    #[test]
+    fn cwd_info_default_empty() {
+        let c = CwdInfo::default();
+        assert_eq!(c.raw_uri, "");
+        assert_eq!(c.path, "");
+        assert_eq!(c.host, "");
+        assert!(!c.is_remote);
+    }
+
+    #[test]
+    fn cwd_info_parse_local() {
+        let c = CwdInfo::parse("file:///home/user");
+        assert_eq!(c.path, "/home/user");
+        assert_eq!(c.host, "");
+        assert!(!c.is_remote);
+    }
+
+    #[test]
+    fn cwd_info_parse_remote() {
+        let c = CwdInfo::parse("file://myhost/var/log");
+        assert_eq!(c.path, "/var/log");
+        assert_eq!(c.host, "myhost");
+        assert!(c.is_remote);
+    }
+
+    #[test]
+    fn cwd_info_parse_empty() {
+        let c = CwdInfo::parse("");
+        assert_eq!(c.path, "");
+        assert!(!c.is_remote);
+    }
+
+    #[test]
+    fn cwd_info_parse_plain_path() {
+        let c = CwdInfo::parse("/tmp/foo");
+        assert_eq!(c.path, "/tmp/foo");
+        assert!(!c.is_remote);
+    }
+
+    #[test]
+    fn cwd_info_parse_host_only() {
+        let c = CwdInfo::parse("file://remotehost");
+        assert_eq!(c.host, "remotehost");
+        assert!(c.is_remote);
+        assert_eq!(c.path, "");
+    }
+
+    #[test]
+    fn cwd_info_debug_clone_serde() {
+        let c = CwdInfo::parse("file:///home/user");
+        let c2 = c.clone();
+        assert_eq!(c.path, c2.path);
+        let _ = format!("{:?}", c);
+        let json = serde_json::to_string(&c).unwrap();
+        let back: CwdInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.path, "/home/user");
+    }
+
+    #[test]
+    fn pane_info_effective_rows_fallback_flat() {
+        let json = r#"{"pane_id": 0, "tab_id": 0, "window_id": 0, "rows": 30}"#;
+        let p: PaneInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(p.effective_rows(), 30);
+    }
+
+    #[test]
+    fn pane_info_effective_cols_fallback_flat() {
+        let json = r#"{"pane_id": 0, "tab_id": 0, "window_id": 0, "cols": 120}"#;
+        let p: PaneInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(p.effective_cols(), 120);
+    }
+
+    #[test]
+    fn pane_info_inferred_domain_from_cwd() {
+        let json = r#"{
+            "pane_id": 0, "tab_id": 0, "window_id": 0,
+            "cwd": "file://remotehost/var/log"
+        }"#;
+        let p: PaneInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(p.inferred_domain(), "ssh:remotehost");
+    }
+
+    #[test]
+    fn pane_info_extra_fields_ignored() {
+        let json = r#"{
+            "pane_id": 1, "tab_id": 2, "window_id": 3,
+            "future_field": "should be captured"
+        }"#;
+        let p: PaneInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(p.pane_id, 1);
+        assert!(p.extra.contains_key("future_field"));
+    }
+
+    #[test]
+    fn split_direction_all_four_variants() {
+        let variants = [
+            SplitDirection::Left,
+            SplitDirection::Right,
+            SplitDirection::Top,
+            SplitDirection::Bottom,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn move_direction_all_four_variants() {
+        let variants = [
+            MoveDirection::Left,
+            MoveDirection::Right,
+            MoveDirection::Up,
+            MoveDirection::Down,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wait_matcher_substring_matches() {
+        let m = WaitMatcher::substring("hello");
+        assert!(m.matches("say hello world").unwrap());
+        assert!(!m.matches("goodbye").unwrap());
+    }
+
+    #[test]
+    fn wait_matcher_regex_matches() {
+        let re = fancy_regex::Regex::new(r"\d+\.\d+").unwrap();
+        let m = WaitMatcher::regex(re);
+        assert!(m.matches("version 1.2").unwrap());
+        assert!(!m.matches("no numbers").unwrap());
+    }
+
+    #[test]
+    fn wait_matcher_description_substring() {
+        let m = WaitMatcher::substring("test");
+        let desc = m.description();
+        assert!(desc.starts_with("substring("));
+        assert!(desc.contains("len=4"));
+    }
+
+    #[test]
+    fn wait_matcher_description_regex() {
+        let re = fancy_regex::Regex::new(r"abc").unwrap();
+        let m = WaitMatcher::regex(re);
+        let desc = m.description();
+        assert!(desc.starts_with("regex("));
+        assert!(desc.contains("len=3"));
+    }
+
+    #[test]
+    fn wait_options_default_values() {
+        let opts = WaitOptions::default();
+        assert_eq!(opts.tail_lines, 200);
+        assert!(!opts.escapes);
+        assert_eq!(opts.poll_initial, Duration::from_millis(50));
+        assert_eq!(opts.poll_max, Duration::from_secs(1));
+        assert_eq!(opts.max_polls, 10_000);
+        let _ = format!("{:?}", opts);
+    }
+
+    #[test]
+    fn wait_options_clone() {
+        let opts = WaitOptions {
+            tail_lines: 50,
+            escapes: true,
+            poll_initial: Duration::from_millis(100),
+            poll_max: Duration::from_secs(5),
+            max_polls: 100,
+        };
+        let c = opts.clone();
+        assert_eq!(c.tail_lines, 50);
+        assert!(c.escapes);
+        assert_eq!(c.max_polls, 100);
+    }
+
+    #[test]
+    fn wait_result_matched_eq() {
+        let a = WaitResult::Matched {
+            elapsed_ms: 50,
+            polls: 3,
+        };
+        let b = WaitResult::Matched {
+            elapsed_ms: 50,
+            polls: 3,
+        };
+        assert_eq!(a, b);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn wait_result_timed_out_eq() {
+        let a = WaitResult::TimedOut {
+            elapsed_ms: 1000,
+            polls: 10,
+            last_tail_hash: Some(42),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn wait_result_matched_ne_timed_out() {
+        let m = WaitResult::Matched {
+            elapsed_ms: 50,
+            polls: 3,
+        };
+        let t = WaitResult::TimedOut {
+            elapsed_ms: 50,
+            polls: 3,
+            last_tail_hash: None,
+        };
+        assert_ne!(m, t);
+    }
+
+    #[test]
+    fn codex_summary_markers_complete() {
+        let m = CodexSummaryMarkers {
+            token_usage: true,
+            resume_hint: true,
+        };
+        assert!(m.complete());
+    }
+
+    #[test]
+    fn codex_summary_markers_debug_clone() {
+        let m = CodexSummaryMarkers {
+            token_usage: false,
+            resume_hint: true,
+        };
+        let c = m; // Copy
+        assert_eq!(m, c);
+        let _ = format!("{:?}", m);
+    }
+
+    #[test]
+    fn codex_summary_wait_result_clone_eq() {
+        let r = CodexSummaryWaitResult {
+            matched: false,
+            elapsed_ms: 200,
+            polls: 5,
+            last_tail_hash: None,
+            last_markers: CodexSummaryMarkers {
+                token_usage: false,
+                resume_hint: false,
+            },
+        };
+        let c = r.clone();
+        assert_eq!(r, c);
+        let _ = format!("{:?}", r);
+    }
+
+    #[test]
+    fn wezterm_handle_source_clone() {
+        let mock = MockWezterm::new();
+        let handle: WeztermHandle = Arc::new(mock);
+        let src = WeztermHandleSource::new(handle);
+        let _c = src.clone();
+    }
 }
 
 // ---------------------------------------------------------------------------

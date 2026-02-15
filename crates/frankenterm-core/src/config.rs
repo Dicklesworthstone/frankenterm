@@ -5733,4 +5733,333 @@ mode = "periodic"
         let never_json = serde_json::to_string(&VendoredCompressionMode::Never).unwrap();
         assert_eq!(never_json, "\"never\"");
     }
+
+    // Batch: DarkBadger wa-1u90p.7.1
+
+    #[test]
+    fn log_format_debug_clone_copy_eq() {
+        let a = LogFormat::Pretty;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+        assert_ne!(LogFormat::Pretty, LogFormat::Json);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn log_format_default_is_pretty() {
+        assert_eq!(LogFormat::default(), LogFormat::Pretty);
+    }
+
+    #[test]
+    fn log_format_display_all() {
+        assert_eq!(format!("{}", LogFormat::Pretty), "pretty");
+        assert_eq!(format!("{}", LogFormat::Json), "json");
+    }
+
+    #[test]
+    fn log_format_from_str_roundtrip() {
+        for variant in [LogFormat::Pretty, LogFormat::Json] {
+            let s = format!("{}", variant);
+            let parsed: LogFormat = s.parse().unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn log_format_from_str_case_insensitive() {
+        let p: LogFormat = "PRETTY".parse().unwrap();
+        assert_eq!(p, LogFormat::Pretty);
+        let j: LogFormat = "Json".parse().unwrap();
+        assert_eq!(j, LogFormat::Json);
+    }
+
+    #[test]
+    fn log_format_from_str_invalid() {
+        let err = "xml".parse::<LogFormat>();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn log_format_serde_rename_lowercase() {
+        let json = serde_json::to_string(&LogFormat::Pretty).unwrap();
+        assert_eq!(json, "\"pretty\"");
+        let json = serde_json::to_string(&LogFormat::Json).unwrap();
+        assert_eq!(json, "\"json\"");
+    }
+
+    #[test]
+    fn sync_direction_debug_clone_copy_eq() {
+        let a = SyncDirection::Push;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+        assert_ne!(SyncDirection::Push, SyncDirection::Pull);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn sync_direction_default_is_push() {
+        assert_eq!(SyncDirection::default(), SyncDirection::Push);
+    }
+
+    #[test]
+    fn sync_direction_serde_roundtrip() {
+        for dir in [SyncDirection::Push, SyncDirection::Pull] {
+            let json = serde_json::to_string(&dir).unwrap();
+            let back: SyncDirection = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, dir);
+        }
+        assert_eq!(
+            serde_json::to_string(&SyncDirection::Push).unwrap(),
+            "\"push\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SyncDirection::Pull).unwrap(),
+            "\"pull\""
+        );
+    }
+
+    #[test]
+    fn distributed_auth_mode_debug_clone_copy_eq() {
+        let a = DistributedAuthMode::Token;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn distributed_auth_mode_default_is_token() {
+        assert_eq!(DistributedAuthMode::default(), DistributedAuthMode::Token);
+    }
+
+    #[test]
+    fn distributed_auth_mode_requires_token() {
+        assert!(DistributedAuthMode::Token.requires_token());
+        assert!(!DistributedAuthMode::Mtls.requires_token());
+        assert!(DistributedAuthMode::TokenAndMtls.requires_token());
+    }
+
+    #[test]
+    fn distributed_auth_mode_requires_mtls() {
+        assert!(!DistributedAuthMode::Token.requires_mtls());
+        assert!(DistributedAuthMode::Mtls.requires_mtls());
+        assert!(DistributedAuthMode::TokenAndMtls.requires_mtls());
+    }
+
+    #[test]
+    fn distributed_auth_mode_serde_roundtrip() {
+        let json = serde_json::to_string(&DistributedAuthMode::Token).unwrap();
+        assert_eq!(json, "\"token\"");
+        let json = serde_json::to_string(&DistributedAuthMode::Mtls).unwrap();
+        assert_eq!(json, "\"mtls\"");
+        let json = serde_json::to_string(&DistributedAuthMode::TokenAndMtls).unwrap();
+        assert_eq!(json, "\"token+mtls\"");
+        for mode in [
+            DistributedAuthMode::Token,
+            DistributedAuthMode::Mtls,
+            DistributedAuthMode::TokenAndMtls,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: DistributedAuthMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, mode);
+        }
+    }
+
+    #[test]
+    fn dcg_mode_debug_clone_copy_eq() {
+        let a = DcgMode::Native;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn dcg_mode_serde_all_variants() {
+        let expected = [
+            (DcgMode::Disabled, "\"disabled\""),
+            (DcgMode::Native, "\"native\""),
+            (DcgMode::Opportunistic, "\"opportunistic\""),
+            (DcgMode::Required, "\"required\""),
+        ];
+        for (variant, json_str) in expected {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, json_str);
+            let back: DcgMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn dcg_deny_policy_debug_clone_copy_eq() {
+        let a = DcgDenyPolicy::Deny;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(DcgDenyPolicy::Deny, DcgDenyPolicy::RequireApproval);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn dcg_deny_policy_serde_roundtrip() {
+        let expected = [
+            (DcgDenyPolicy::Deny, "\"deny\""),
+            (DcgDenyPolicy::RequireApproval, "\"require_approval\""),
+        ];
+        for (variant, json_str) in expected {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, json_str);
+            let back: DcgDenyPolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn general_config_default_values() {
+        let gc = GeneralConfig::default();
+        assert_eq!(gc.log_level, "info");
+        assert_eq!(gc.log_format, LogFormat::Pretty);
+        assert!(gc.log_file.is_none());
+        assert!(gc.workspace.is_none());
+        let _ = format!("{:?}", gc);
+    }
+
+    #[test]
+    fn ingest_config_default_values() {
+        let ic = IngestConfig::default();
+        assert_eq!(ic.poll_interval_ms, 200);
+        assert_eq!(ic.min_poll_interval_ms, 50);
+        assert_eq!(ic.max_concurrent_captures, 10);
+        assert_eq!(ic.backpressure_threshold, 1000);
+        assert!(ic.gap_detection);
+        assert_eq!(ic.gap_detection_threshold_percent, 50);
+        assert_eq!(ic.max_segment_bytes, 65536);
+    }
+
+    #[test]
+    fn sync_config_default_values() {
+        let sc = SyncConfig::default();
+        assert!(!sc.enabled);
+        assert!(sc.require_confirmation);
+        assert!(!sc.allow_overwrite);
+        assert!(!sc.allow_binary);
+        assert!(sc.allow_config);
+        assert!(sc.allow_snapshots);
+        assert!(sc.allow_paths.is_empty());
+        assert!(sc.deny_paths.is_empty());
+        assert!(sc.targets.is_empty());
+    }
+
+    #[test]
+    fn distributed_config_default_values() {
+        let dc = DistributedConfig::default();
+        assert!(!dc.enabled);
+        assert_eq!(dc.bind_addr, "127.0.0.1:4141");
+        assert!(!dc.allow_insecure);
+        assert!(dc.require_tls_for_non_loopback);
+        assert_eq!(dc.auth_mode, DistributedAuthMode::Token);
+        assert!(dc.token.is_none());
+        assert!(dc.allow_agent_ids.is_empty());
+    }
+
+    #[test]
+    fn distributed_tls_config_default_values() {
+        let tc = DistributedTlsConfig::default();
+        assert!(!tc.enabled);
+        assert!(tc.cert_path.is_none());
+        assert!(tc.key_path.is_none());
+        assert!(tc.client_ca_path.is_none());
+        assert_eq!(tc.min_tls_version, "1.2");
+    }
+
+    #[test]
+    fn command_gate_config_default_values() {
+        let cg = CommandGateConfig::default();
+        assert!(cg.enabled);
+        assert_eq!(cg.dcg_mode, DcgMode::Native);
+        assert_eq!(cg.dcg_deny_policy, DcgDenyPolicy::RequireApproval);
+    }
+
+    #[test]
+    fn compaction_prompt_config_default_has_agents() {
+        let cpc = CompactionPromptConfig::default();
+        assert!(cpc.by_agent.contains_key("claude_code"));
+        assert!(cpc.by_agent.contains_key("codex"));
+        assert!(cpc.by_agent.contains_key("gemini"));
+        assert!(cpc.by_agent.contains_key("unknown"));
+        assert_eq!(cpc.max_prompt_len, 2000);
+        assert_eq!(cpc.max_snippet_len, 400);
+        assert!(!cpc.default.is_empty());
+    }
+
+    #[test]
+    fn is_valid_agent_key_accepts_known_keys() {
+        assert!(is_valid_agent_key("codex"));
+        assert!(is_valid_agent_key("claude_code"));
+        assert!(is_valid_agent_key("gemini"));
+        assert!(is_valid_agent_key("unknown"));
+        assert!(!is_valid_agent_key("gpt4"));
+        assert!(!is_valid_agent_key(""));
+    }
+
+    #[test]
+    fn extract_prompt_placeholders_empty() {
+        let r = extract_prompt_placeholders("no placeholders here").unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn extract_prompt_placeholders_valid() {
+        let r = extract_prompt_placeholders("Hello {{agent_type}} on {{pane_id}}").unwrap();
+        assert_eq!(r, vec!["agent_type", "pane_id"]);
+    }
+
+    #[test]
+    fn extract_prompt_placeholders_unterminated() {
+        let r = extract_prompt_placeholders("broken {{open");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn patterns_config_default_values() {
+        let pc = PatternsConfig::default();
+        assert_eq!(pc.packs.len(), 5);
+        assert!(pc.packs.contains(&"builtin:core".to_string()));
+        assert!(pc.quick_reject_enabled);
+        assert!(pc.user_packs_enabled);
+        assert!(pc.user_packs_dir.is_none());
+    }
+
+    #[test]
+    fn pack_override_default_empty() {
+        let po = PackOverride::default();
+        assert!(po.disabled_rules.is_empty());
+        assert!(po.severity_overrides.is_empty());
+        assert!(po.extra.is_empty());
+        let _ = format!("{:?}", po);
+    }
+
+    #[test]
+    fn search_config_default_values() {
+        let sc = SearchConfig::default();
+        assert!(!sc.enabled);
+        assert_eq!(sc.mode, "fts5");
+        assert_eq!(sc.rrf_k, 60);
+        assert!((sc.quality_weight - 0.7).abs() < 0.001);
+        assert!(!sc.reranker_enabled);
+    }
+
+    #[test]
+    fn search_daemon_config_default_values() {
+        let sdc = SearchDaemonConfig::default();
+        assert!(!sdc.enabled);
+        assert!(sdc.auto_spawn);
+        assert_eq!(sdc.worker_scan_interval_secs, 30);
+        assert_eq!(sdc.worker_batch_size, 64);
+    }
 }
