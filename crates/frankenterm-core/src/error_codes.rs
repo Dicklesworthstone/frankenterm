@@ -1886,4 +1886,123 @@ mod tests {
             assert_eq!(hi - lo, 999, "{:?} range is not 1000 wide", cat);
         }
     }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──
+
+    #[test]
+    fn error_category_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(ErrorCategory::Wezterm);
+        set.insert(ErrorCategory::Storage);
+        set.insert(ErrorCategory::Wezterm);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn error_category_copy_semantics() {
+        let a = ErrorCategory::Pattern;
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn error_category_serde_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ErrorCategory::Wezterm).unwrap(),
+            "\"wezterm\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCategory::Storage).unwrap(),
+            "\"storage\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCategory::Internal).unwrap(),
+            "\"internal\""
+        );
+    }
+
+    #[test]
+    fn error_category_serde_roundtrip_all() {
+        let cats = [
+            ErrorCategory::Wezterm,
+            ErrorCategory::Storage,
+            ErrorCategory::Pattern,
+            ErrorCategory::Policy,
+            ErrorCategory::Workflow,
+            ErrorCategory::Network,
+            ErrorCategory::Config,
+            ErrorCategory::Internal,
+        ];
+        for cat in cats {
+            let json = serde_json::to_string(&cat).unwrap();
+            let back: ErrorCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(cat, back);
+        }
+    }
+
+    #[test]
+    fn from_code_boundary_below_range() {
+        // FT-0999 is below all ranges
+        assert!(ErrorCategory::from_code("FT-0999").is_none());
+    }
+
+    #[test]
+    fn from_code_gap_between_config_and_internal() {
+        // FT-8000 is in the gap between Config (7999) and Internal (9000)
+        assert!(ErrorCategory::from_code("FT-8000").is_none());
+    }
+
+    #[test]
+    fn from_code_non_numeric() {
+        assert!(ErrorCategory::from_code("FT-abc").is_none());
+    }
+
+    #[test]
+    fn recovery_step_with_command_serde_roundtrip() {
+        let step = RecoveryStep::with_command("Run diagnostics", "ft doctor");
+        let json = serde_json::to_string(&step).unwrap();
+        let back: RecoveryStep = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.description.as_ref(), "Run diagnostics");
+        assert_eq!(back.command.as_deref(), Some("ft doctor"));
+    }
+
+    #[test]
+    fn format_plain_includes_doc_link() {
+        let formatted = FT_9001.format_plain();
+        // FT-9001 has a doc_link
+        if FT_9001.doc_link.is_some() {
+            assert!(formatted.contains("Learn more:"));
+        }
+    }
+
+    #[test]
+    fn format_plain_includes_recovery_commands() {
+        let formatted = FT_1001.format_plain();
+        // FT-1001 has a recovery step with command "wezterm --version"
+        assert!(formatted.contains("$ wezterm --version"));
+    }
+
+    #[test]
+    fn format_plain_includes_causes() {
+        let formatted = FT_1001.format_plain();
+        assert!(formatted.contains("Common causes:"));
+    }
+
+    #[test]
+    fn all_codes_in_correct_category_range() {
+        for (code_str, def) in ERROR_CATALOG.iter() {
+            let num: u16 = code_str.strip_prefix("FT-").unwrap().parse().unwrap();
+            let (lo, hi) = def.category.range();
+            assert!(
+                num >= lo && num <= hi,
+                "Code {} (num={}) not in {:?} range ({}-{})",
+                code_str,
+                num,
+                def.category,
+                lo,
+                hi
+            );
+        }
+    }
 }

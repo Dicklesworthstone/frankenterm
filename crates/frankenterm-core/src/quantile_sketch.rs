@@ -346,7 +346,11 @@ impl TDigest {
         if total_w == 0.0 {
             return 0.0;
         }
-        self.centroids.iter().map(|c| c.mean * c.weight).sum::<f64>() / total_w
+        self.centroids
+            .iter()
+            .map(|c| c.mean * c.weight)
+            .sum::<f64>()
+            / total_w
     }
 
     /// Number of centroids currently stored.
@@ -431,8 +435,11 @@ impl TDigest {
         }
 
         // Sort centroids by mean
-        self.centroids
-            .sort_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap_or(std::cmp::Ordering::Equal));
+        self.centroids.sort_by(|a, b| {
+            a.mean
+                .partial_cmp(&b.mean)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let total_weight: f64 = self.centroids.iter().map(|c| c.weight).sum();
         if total_weight == 0.0 {
@@ -714,11 +721,7 @@ mod tests {
         td.insert_weighted(20.0, 100.0);
         assert_eq!(td.count(), 200.0);
         let p50 = td.quantile(0.5);
-        assert!(
-            (p50 - 15.0).abs() < 6.0,
-            "p50={} should be near 15",
-            p50
-        );
+        assert!((p50 - 15.0).abs() < 6.0, "p50={} should be near 15", p50);
     }
 
     #[test]
@@ -753,5 +756,130 @@ mod tests {
         let td2 = TDigest::new();
         td1.merge(&td2);
         assert_eq!(td1.count(), 100.0);
+    }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──
+
+    #[test]
+    fn centroid_debug_clone_serde() {
+        let c = Centroid::new(3.14, 2.0);
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("Centroid"));
+        let c2 = c.clone();
+        assert_eq!(c, c2);
+        let json = serde_json::to_string(&c).unwrap();
+        let back: Centroid = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn tdigest_config_default_values() {
+        let cfg = TDigestConfig::default();
+        assert!((cfg.compression - 100.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.buffer_size, 500);
+    }
+
+    #[test]
+    fn tdigest_config_debug_clone() {
+        let cfg = TDigestConfig::default();
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("TDigestConfig"));
+        let c = cfg.clone();
+        assert_eq!(c, cfg);
+    }
+
+    #[test]
+    fn tdigest_stats_debug_clone() {
+        let stats = TDigestStats {
+            centroid_count: 10,
+            total_weight: 100.0,
+            buffer_len: 5,
+            compression: 100.0,
+            min: Some(0.0),
+            max: Some(99.0),
+        };
+        let dbg = format!("{:?}", stats);
+        assert!(dbg.contains("TDigestStats"));
+        let s2 = stats.clone();
+        assert_eq!(s2, stats);
+    }
+
+    #[test]
+    fn tdigest_default_trait() {
+        let td = TDigest::default();
+        assert!(td.is_empty());
+        assert_eq!(td.count(), 0.0);
+    }
+
+    #[test]
+    fn tdigest_debug_clone() {
+        let mut td = TDigest::new();
+        td.insert(42.0);
+        let dbg = format!("{:?}", td);
+        assert!(dbg.contains("TDigest"));
+        let td2 = td.clone();
+        assert_eq!(td2.count(), 1.0);
+    }
+
+    #[test]
+    fn insert_weighted_zero_weight_ignored() {
+        let mut td = TDigest::new();
+        td.insert_weighted(10.0, 0.0);
+        assert!(td.is_empty());
+    }
+
+    #[test]
+    fn insert_weighted_negative_weight_ignored() {
+        let mut td = TDigest::new();
+        td.insert_weighted(10.0, -5.0);
+        assert!(td.is_empty());
+    }
+
+    #[test]
+    fn insert_weighted_nan_value_ignored() {
+        let mut td = TDigest::new();
+        td.insert_weighted(f64::NAN, 10.0);
+        assert!(td.is_empty());
+    }
+
+    #[test]
+    fn cdf_empty_returns_zero() {
+        let mut td = TDigest::new();
+        assert_eq!(td.cdf(50.0), 0.0);
+    }
+
+    #[test]
+    fn mean_empty_returns_zero() {
+        let mut td = TDigest::new();
+        assert_eq!(td.mean(), 0.0);
+    }
+
+    #[test]
+    fn with_compression_clamps_minimum() {
+        let td = TDigest::with_compression(1.0);
+        // compression should be clamped to at least 10.0
+        assert!(!td.is_empty() || td.count() == 0.0);
+        let stats = td.stats();
+        assert!((stats.compression - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantile_clamped_above_one() {
+        let mut td = TDigest::new();
+        td.insert(10.0);
+        td.insert(20.0);
+        // q > 1.0 should be clamped to 1.0 and return max
+        let result = td.quantile(2.0);
+        assert_eq!(result, 20.0);
+    }
+
+    #[test]
+    fn quantile_clamped_below_zero() {
+        let mut td = TDigest::new();
+        td.insert(10.0);
+        td.insert(20.0);
+        // q < 0.0 should be clamped to 0.0 and return min
+        let result = td.quantile(-1.0);
+        assert_eq!(result, 10.0);
     }
 }

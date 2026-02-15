@@ -1370,4 +1370,179 @@ mod tests {
         // Root subtree should equal total_rss_kb
         assert_eq!(tree.root.subtree_rss_kb(), tree.total_rss_kb);
     }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──
+
+    #[test]
+    fn process_tree_serde_roundtrip() {
+        let tree = sample_tree();
+        let json = serde_json::to_string(&tree).unwrap();
+        let back: ProcessTree = serde_json::from_str(&json).unwrap();
+        assert_eq!(tree, back);
+    }
+
+    #[test]
+    fn process_node_empty_children_skipped_in_json() {
+        let node = ProcessNode {
+            pid: 1,
+            ppid: 0,
+            name: "bash".into(),
+            argv: vec![],
+            state: ProcessState::Running,
+            rss_kb: 100,
+            children: vec![],
+        };
+        let json = serde_json::to_string(&node).unwrap();
+        // skip_serializing_if = "Vec::is_empty" means no "children" key
+        assert!(!json.contains("\"children\""));
+        assert!(!json.contains("\"argv\""));
+    }
+
+    #[test]
+    fn process_node_with_children_includes_children_in_json() {
+        let node = ProcessNode {
+            pid: 1,
+            ppid: 0,
+            name: "bash".into(),
+            argv: vec!["bash".into()],
+            state: ProcessState::Running,
+            rss_kb: 100,
+            children: vec![ProcessNode {
+                pid: 2,
+                ppid: 1,
+                name: "ls".into(),
+                argv: vec![],
+                state: ProcessState::Running,
+                rss_kb: 50,
+                children: vec![],
+            }],
+        };
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains("\"children\""));
+        assert!(json.contains("\"argv\""));
+    }
+
+    #[test]
+    fn infer_unknown_binary_is_active() {
+        let tree = ProcessTree {
+            root: ProcessNode {
+                pid: 1,
+                ppid: 0,
+                name: "bash".into(),
+                argv: vec![],
+                state: ProcessState::Sleeping,
+                rss_kb: 5000,
+                children: vec![ProcessNode {
+                    pid: 2,
+                    ppid: 1,
+                    name: "some-random-binary".into(),
+                    argv: vec![],
+                    state: ProcessState::Running,
+                    rss_kb: 1000,
+                    children: vec![],
+                }],
+            },
+            total_processes: 2,
+            total_rss_kb: 6000,
+        };
+        assert_eq!(infer_activity(&tree), PaneActivity::Active);
+    }
+
+    #[test]
+    fn process_state_serde_snake_case_all_variants() {
+        assert_eq!(
+            serde_json::to_string(&ProcessState::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProcessState::DiskSleep).unwrap(),
+            "\"disk_sleep\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProcessState::Unknown).unwrap(),
+            "\"unknown\""
+        );
+    }
+
+    #[test]
+    fn pane_activity_serde_snake_case_all_variants() {
+        assert_eq!(
+            serde_json::to_string(&PaneActivity::Idle).unwrap(),
+            "\"idle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PaneActivity::AgentRunning).unwrap(),
+            "\"agent_running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PaneActivity::VersionControl).unwrap(),
+            "\"version_control\""
+        );
+    }
+
+    #[test]
+    fn process_tree_config_serde_roundtrip() {
+        let cfg = ProcessTreeConfig {
+            enabled: false,
+            capture_interval_secs: 120,
+            max_depth: 3,
+            include_threads: true,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: ProcessTreeConfig = serde_json::from_str(&json).unwrap();
+        assert!(!back.enabled);
+        assert_eq!(back.capture_interval_secs, 120);
+        assert_eq!(back.max_depth, 3);
+        assert!(back.include_threads);
+    }
+
+    #[test]
+    fn exe_names_empty_tree() {
+        let tree = ProcessTree {
+            root: ProcessNode {
+                pid: 1,
+                ppid: 0,
+                name: "zsh".into(),
+                argv: vec![],
+                state: ProcessState::Sleeping,
+                rss_kb: 3000,
+                children: vec![],
+            },
+            total_processes: 1,
+            total_rss_kb: 3000,
+        };
+        let names = tree.exe_names();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0], "zsh");
+    }
+
+    #[test]
+    fn process_node_subtree_rss_deep() {
+        let node = ProcessNode {
+            pid: 1,
+            ppid: 0,
+            name: "bash".into(),
+            argv: vec![],
+            state: ProcessState::Running,
+            rss_kb: 1000,
+            children: vec![ProcessNode {
+                pid: 2,
+                ppid: 1,
+                name: "sh".into(),
+                argv: vec![],
+                state: ProcessState::Sleeping,
+                rss_kb: 500,
+                children: vec![ProcessNode {
+                    pid: 3,
+                    ppid: 2,
+                    name: "tool".into(),
+                    argv: vec![],
+                    state: ProcessState::Running,
+                    rss_kb: 2000,
+                    children: vec![],
+                }],
+            }],
+        };
+        assert_eq!(node.subtree_rss_kb(), 3500);
+    }
 }
