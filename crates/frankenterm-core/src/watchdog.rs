@@ -1232,4 +1232,197 @@ mod tests {
         assert!(parsed.latest_sample.is_some());
         assert_eq!(parsed.latest_sample.unwrap().status, HealthStatus::Degraded);
     }
+
+    // -------------------------------------------------------------------
+    // Batch: DarkBadger wa-1u90p.7.1
+    // -------------------------------------------------------------------
+
+    // -- WatchdogConfig --
+
+    #[test]
+    fn watchdog_config_debug_clone() {
+        let config = WatchdogConfig::default();
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("WatchdogConfig"), "got: {}", dbg);
+        let cloned = config.clone();
+        assert_eq!(cloned.grace_period_ms, config.grace_period_ms);
+    }
+
+    // -- Component --
+
+    #[test]
+    fn component_debug_clone_copy() {
+        let c = Component::Capture;
+        let cloned = c.clone();
+        let copied = c;
+        assert_eq!(cloned, copied);
+    }
+
+    #[test]
+    fn component_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        for c in Component::ALL {
+            set.insert(c);
+        }
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn component_eq_ne() {
+        assert_eq!(Component::Discovery, Component::Discovery);
+        assert_ne!(Component::Discovery, Component::Capture);
+        assert_ne!(Component::Persistence, Component::Maintenance);
+    }
+
+    // -- HealthStatus --
+
+    #[test]
+    fn health_status_debug_clone_copy() {
+        let s = HealthStatus::Degraded;
+        let cloned = s.clone();
+        let copied = s;
+        assert_eq!(cloned, copied);
+    }
+
+    #[test]
+    fn health_status_display_all() {
+        assert_eq!(HealthStatus::Healthy.to_string(), "healthy");
+        assert_eq!(HealthStatus::Degraded.to_string(), "degraded");
+        assert_eq!(HealthStatus::Critical.to_string(), "critical");
+        assert_eq!(HealthStatus::Hung.to_string(), "hung");
+    }
+
+    #[test]
+    fn health_status_ordering_complete() {
+        assert!(HealthStatus::Healthy < HealthStatus::Degraded);
+        assert!(HealthStatus::Degraded < HealthStatus::Critical);
+        assert!(HealthStatus::Critical < HealthStatus::Hung);
+    }
+
+    #[test]
+    fn health_status_eq_ne() {
+        assert_eq!(HealthStatus::Healthy, HealthStatus::Healthy);
+        assert_ne!(HealthStatus::Healthy, HealthStatus::Hung);
+    }
+
+    // -- ComponentHealth --
+
+    #[test]
+    fn component_health_debug_clone() {
+        let ch = ComponentHealth {
+            component: Component::Discovery,
+            last_heartbeat_ms: Some(1000),
+            age_ms: Some(500),
+            threshold_ms: 30_000,
+            status: HealthStatus::Healthy,
+        };
+        let dbg = format!("{:?}", ch);
+        assert!(dbg.contains("ComponentHealth"), "got: {}", dbg);
+        let cloned = ch.clone();
+        assert_eq!(cloned.status, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn component_health_serde_roundtrip() {
+        let ch = ComponentHealth {
+            component: Component::Capture,
+            last_heartbeat_ms: None,
+            age_ms: None,
+            threshold_ms: 15_000,
+            status: HealthStatus::Degraded,
+        };
+        let json = serde_json::to_string(&ch).unwrap();
+        let back: ComponentHealth = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.component, Component::Capture);
+        assert_eq!(back.status, HealthStatus::Degraded);
+    }
+
+    // -- HealthReport --
+
+    #[test]
+    fn health_report_debug_clone() {
+        let report = HealthReport {
+            timestamp_ms: 1000,
+            overall: HealthStatus::Healthy,
+            components: vec![],
+        };
+        let dbg = format!("{:?}", report);
+        assert!(dbg.contains("HealthReport"), "got: {}", dbg);
+        let cloned = report.clone();
+        assert_eq!(cloned.overall, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn health_report_unhealthy_with_mixed() {
+        let report = HealthReport {
+            timestamp_ms: 1000,
+            overall: HealthStatus::Critical,
+            components: vec![
+                ComponentHealth {
+                    component: Component::Discovery,
+                    last_heartbeat_ms: Some(900),
+                    age_ms: Some(100),
+                    threshold_ms: 30_000,
+                    status: HealthStatus::Healthy,
+                },
+                ComponentHealth {
+                    component: Component::Capture,
+                    last_heartbeat_ms: None,
+                    age_ms: None,
+                    threshold_ms: 15_000,
+                    status: HealthStatus::Critical,
+                },
+            ],
+        };
+        let unhealthy = report.unhealthy_components();
+        assert_eq!(unhealthy.len(), 1);
+        assert_eq!(unhealthy[0].component, Component::Capture);
+    }
+
+    // -- MuxWatchdogConfig --
+
+    #[test]
+    fn mux_watchdog_config_debug_clone() {
+        let config = MuxWatchdogConfig::default();
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("MuxWatchdogConfig"), "got: {}", dbg);
+        let cloned = config.clone();
+        assert_eq!(cloned.failure_threshold, config.failure_threshold);
+    }
+
+    // -- MuxHealthSample --
+
+    #[test]
+    fn mux_health_sample_debug_clone() {
+        let sample = MuxHealthSample {
+            timestamp_ms: 1000,
+            ping_ok: true,
+            ping_latency_ms: Some(5),
+            rss_bytes: Some(1024),
+            status: HealthStatus::Healthy,
+        };
+        let dbg = format!("{:?}", sample);
+        assert!(dbg.contains("MuxHealthSample"), "got: {}", dbg);
+        let cloned = sample.clone();
+        assert_eq!(cloned.ping_ok, true);
+    }
+
+    // -- MuxHealthReport --
+
+    #[test]
+    fn mux_health_report_debug_clone() {
+        let report = MuxHealthReport {
+            timestamp_ms: 1000,
+            status: HealthStatus::Healthy,
+            consecutive_failures: 0,
+            latest_sample: None,
+            total_checks: 0,
+            total_failures: 0,
+        };
+        let dbg = format!("{:?}", report);
+        assert!(dbg.contains("MuxHealthReport"), "got: {}", dbg);
+        let cloned = report.clone();
+        assert_eq!(cloned.consecutive_failures, 0);
+    }
 }

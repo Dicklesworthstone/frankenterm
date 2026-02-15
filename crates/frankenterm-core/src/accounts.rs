@@ -1150,4 +1150,375 @@ mod tests {
         assert_eq!(parsed.earliest_reset_ms, info.earliest_reset_ms);
         assert_eq!(parsed.earliest_reset_account, info.earliest_reset_account);
     }
+
+    // =========================================================================
+    // Batch: DarkBadger wa-1u90p.7.1 — trait impls and edge cases
+    // =========================================================================
+
+    // -- AccountRecord trait coverage --
+
+    #[test]
+    fn account_record_debug() {
+        let acct = make_account("dbg", 50.0, None);
+        let dbg = format!("{:?}", acct);
+        assert!(dbg.contains("AccountRecord"));
+        assert!(dbg.contains("dbg"));
+    }
+
+    #[test]
+    fn account_record_clone_independence() {
+        let acct = make_account("orig", 75.0, Some(2000));
+        let mut cloned = acct.clone();
+        cloned.percent_remaining = 10.0;
+        cloned.account_id = "cloned".to_string();
+        assert!((acct.percent_remaining - 75.0).abs() < 0.001);
+        assert_eq!(acct.account_id, "orig");
+    }
+
+    #[test]
+    fn account_record_serde_roundtrip() {
+        let acct = make_account("serde-test", 42.5, Some(9999));
+        let json = serde_json::to_string(&acct).unwrap();
+        let parsed: AccountRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.account_id, "serde-test");
+        assert!((parsed.percent_remaining - 42.5).abs() < 0.001);
+        assert_eq!(parsed.last_used_at, Some(9999));
+    }
+
+    #[test]
+    fn account_record_is_above_threshold_zero() {
+        let acct = make_account("zero", 0.0, None);
+        assert!(acct.is_above_threshold(0.0));
+        assert!(!acct.is_above_threshold(0.001));
+    }
+
+    #[test]
+    fn account_record_is_above_threshold_hundred() {
+        let acct = make_account("full", 100.0, None);
+        assert!(acct.is_above_threshold(100.0));
+        assert!(acct.is_above_threshold(99.9));
+    }
+
+    // -- AccountSelectionConfig --
+
+    #[test]
+    fn account_selection_config_debug_clone() {
+        let cfg = AccountSelectionConfig::default();
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("AccountSelectionConfig"));
+        let cloned = cfg.clone();
+        assert!((cloned.threshold_percent - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn account_selection_config_serde_roundtrip() {
+        let cfg = AccountSelectionConfig {
+            threshold_percent: 15.0,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: AccountSelectionConfig = serde_json::from_str(&json).unwrap();
+        assert!((parsed.threshold_percent - 15.0).abs() < 0.001);
+    }
+
+    // -- AccountSelectionResult --
+
+    #[test]
+    fn account_selection_result_debug_clone() {
+        let result = AccountSelectionResult {
+            selected: None,
+            explanation: SelectionExplanation {
+                total_considered: 0,
+                filtered_out: vec![],
+                candidates: vec![],
+                selection_reason: "None".to_string(),
+            },
+        };
+        let dbg = format!("{:?}", result);
+        assert!(dbg.contains("AccountSelectionResult"));
+        let cloned = result.clone();
+        assert!(cloned.selected.is_none());
+    }
+
+    #[test]
+    fn account_selection_result_serde_roundtrip() {
+        let result = AccountSelectionResult {
+            selected: Some(make_account("winner", 80.0, None)),
+            explanation: SelectionExplanation {
+                total_considered: 3,
+                filtered_out: vec![],
+                candidates: vec![],
+                selection_reason: "Highest".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: AccountSelectionResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.selected.unwrap().account_id, "winner");
+        assert_eq!(parsed.explanation.total_considered, 3);
+    }
+
+    // -- QuotaAvailability --
+
+    #[test]
+    fn quota_availability_debug_clone_copy() {
+        let qa = QuotaAvailability::Available;
+        let dbg = format!("{:?}", qa);
+        assert!(dbg.contains("Available"));
+        let cloned = qa.clone();
+        let copied = qa;
+        assert_eq!(cloned, copied);
+    }
+
+    #[test]
+    fn quota_availability_eq_all_variants() {
+        assert_eq!(QuotaAvailability::Available, QuotaAvailability::Available);
+        assert_eq!(QuotaAvailability::Low, QuotaAvailability::Low);
+        assert_eq!(QuotaAvailability::Exhausted, QuotaAvailability::Exhausted);
+        assert_ne!(QuotaAvailability::Available, QuotaAvailability::Low);
+        assert_ne!(QuotaAvailability::Low, QuotaAvailability::Exhausted);
+    }
+
+    #[test]
+    fn quota_availability_serde_snake_case() {
+        let json_available = serde_json::to_string(&QuotaAvailability::Available).unwrap();
+        assert_eq!(json_available, "\"available\"");
+        let json_low = serde_json::to_string(&QuotaAvailability::Low).unwrap();
+        assert_eq!(json_low, "\"low\"");
+        let json_exhausted = serde_json::to_string(&QuotaAvailability::Exhausted).unwrap();
+        assert_eq!(json_exhausted, "\"exhausted\"");
+        // Roundtrip
+        let parsed: QuotaAvailability = serde_json::from_str("\"low\"").unwrap();
+        assert_eq!(parsed, QuotaAvailability::Low);
+    }
+
+    // -- AccountQuotaAdvisory --
+
+    #[test]
+    fn account_quota_advisory_debug_clone() {
+        let adv = AccountQuotaAdvisory {
+            availability: QuotaAvailability::Available,
+            low_quota_threshold_percent: 10.0,
+            selected_percent_remaining: Some(50.0),
+            warning: None,
+        };
+        let dbg = format!("{:?}", adv);
+        assert!(dbg.contains("AccountQuotaAdvisory"));
+        let cloned = adv.clone();
+        assert_eq!(cloned.availability, QuotaAvailability::Available);
+    }
+
+    #[test]
+    fn account_quota_advisory_serde_roundtrip() {
+        let adv = AccountQuotaAdvisory {
+            availability: QuotaAvailability::Low,
+            low_quota_threshold_percent: 10.0,
+            selected_percent_remaining: Some(7.5),
+            warning: Some("Low quota".to_string()),
+        };
+        let json = serde_json::to_string(&adv).unwrap();
+        let parsed: AccountQuotaAdvisory = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.availability, QuotaAvailability::Low);
+        assert_eq!(parsed.warning.as_deref(), Some("Low quota"));
+    }
+
+    #[test]
+    fn account_quota_advisory_is_blocking_all_variants() {
+        let exhausted = AccountQuotaAdvisory {
+            availability: QuotaAvailability::Exhausted,
+            low_quota_threshold_percent: 10.0,
+            selected_percent_remaining: None,
+            warning: None,
+        };
+        assert!(exhausted.is_blocking());
+
+        let low = AccountQuotaAdvisory {
+            availability: QuotaAvailability::Low,
+            low_quota_threshold_percent: 10.0,
+            selected_percent_remaining: Some(5.0),
+            warning: None,
+        };
+        assert!(!low.is_blocking());
+
+        let available = AccountQuotaAdvisory {
+            availability: QuotaAvailability::Available,
+            low_quota_threshold_percent: 10.0,
+            selected_percent_remaining: Some(50.0),
+            warning: None,
+        };
+        assert!(!available.is_blocking());
+    }
+
+    // -- SelectionExplanation --
+
+    #[test]
+    fn selection_explanation_debug_clone() {
+        let exp = SelectionExplanation {
+            total_considered: 5,
+            filtered_out: vec![],
+            candidates: vec![],
+            selection_reason: "test".to_string(),
+        };
+        let dbg = format!("{:?}", exp);
+        assert!(dbg.contains("SelectionExplanation"));
+        let cloned = exp.clone();
+        assert_eq!(cloned.total_considered, 5);
+    }
+
+    #[test]
+    fn selection_explanation_serde_roundtrip() {
+        let exp = SelectionExplanation {
+            total_considered: 2,
+            filtered_out: vec![FilteredAccount {
+                account_id: "f1".to_string(),
+                name: None,
+                percent_remaining: 1.0,
+                reason: "below".to_string(),
+            }],
+            candidates: vec![CandidateAccount {
+                account_id: "c1".to_string(),
+                name: Some("C1".to_string()),
+                percent_remaining: 80.0,
+                last_used_at: Some(5000),
+            }],
+            selection_reason: "Highest".to_string(),
+        };
+        let json = serde_json::to_string(&exp).unwrap();
+        let parsed: SelectionExplanation = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.filtered_out.len(), 1);
+        assert_eq!(parsed.candidates.len(), 1);
+        assert_eq!(parsed.candidates[0].account_id, "c1");
+    }
+
+    // -- FilteredAccount --
+
+    #[test]
+    fn filtered_account_debug_clone_serde() {
+        let fa = FilteredAccount {
+            account_id: "fa-1".to_string(),
+            name: Some("FA".to_string()),
+            percent_remaining: 2.5,
+            reason: "Below threshold".to_string(),
+        };
+        let dbg = format!("{:?}", fa);
+        assert!(dbg.contains("FilteredAccount"));
+        let cloned = fa.clone();
+        assert_eq!(cloned.account_id, "fa-1");
+        let json = serde_json::to_string(&fa).unwrap();
+        let parsed: FilteredAccount = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name.as_deref(), Some("FA"));
+    }
+
+    // -- CandidateAccount --
+
+    #[test]
+    fn candidate_account_debug_clone_serde() {
+        let ca = CandidateAccount {
+            account_id: "ca-1".to_string(),
+            name: None,
+            percent_remaining: 90.0,
+            last_used_at: None,
+        };
+        let dbg = format!("{:?}", ca);
+        assert!(dbg.contains("CandidateAccount"));
+        let cloned = ca.clone();
+        assert!(cloned.name.is_none());
+        let json = serde_json::to_string(&ca).unwrap();
+        let parsed: CandidateAccount = serde_json::from_str(&json).unwrap();
+        assert!(parsed.last_used_at.is_none());
+    }
+
+    // -- AccountExhaustionInfo --
+
+    #[test]
+    fn account_exhaustion_info_debug_clone() {
+        let info = AccountExhaustionInfo {
+            accounts_checked: 3,
+            earliest_reset_ms: Some(999),
+            earliest_reset_account: Some("a".to_string()),
+            explanation: SelectionExplanation {
+                total_considered: 3,
+                filtered_out: vec![],
+                candidates: vec![],
+                selection_reason: "test".to_string(),
+            },
+        };
+        let dbg = format!("{:?}", info);
+        assert!(dbg.contains("AccountExhaustionInfo"));
+        let cloned = info.clone();
+        assert_eq!(cloned.accounts_checked, 3);
+    }
+
+    // -- build_quota_advisory edge cases --
+
+    #[test]
+    fn build_quota_advisory_at_exact_threshold() {
+        // Account at exactly 10.0% with threshold 10.0 → Available (not Low), because >= check
+        let selection = AccountSelectionResult {
+            selected: Some(make_account("edge", 10.0, None)),
+            explanation: SelectionExplanation {
+                total_considered: 1,
+                filtered_out: vec![],
+                candidates: vec![],
+                selection_reason: "Only".to_string(),
+            },
+        };
+        let advisory = build_quota_advisory(&selection, 10.0);
+        // 10.0 < 10.0 is false, so should be Available
+        assert_eq!(advisory.availability, QuotaAvailability::Available);
+    }
+
+    #[test]
+    fn build_quota_advisory_just_below_threshold() {
+        let selection = AccountSelectionResult {
+            selected: Some(make_account("edge", 9.999, None)),
+            explanation: SelectionExplanation {
+                total_considered: 1,
+                filtered_out: vec![],
+                candidates: vec![],
+                selection_reason: "Only".to_string(),
+            },
+        };
+        let advisory = build_quota_advisory(&selection, 10.0);
+        assert_eq!(advisory.availability, QuotaAvailability::Low);
+        assert!(advisory.warning.is_some());
+    }
+
+    // -- parse_reset_at_ms edge cases --
+
+    #[test]
+    fn parse_reset_at_ms_iso8601_with_plus_offset() {
+        let ms = parse_reset_at_ms("2026-01-29T12:00:00+0000");
+        assert!(ms.is_some());
+    }
+
+    #[test]
+    fn parse_reset_at_ms_leading_trailing_whitespace() {
+        assert_eq!(
+            parse_reset_at_ms("  1700000000000  "),
+            Some(1_700_000_000_000)
+        );
+    }
+
+    #[test]
+    fn parse_reset_at_ms_zero_epoch() {
+        assert_eq!(parse_reset_at_ms("0"), Some(0));
+    }
+
+    // -- DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT --
+
+    #[test]
+    fn default_low_quota_threshold_value() {
+        assert!((DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT - 10.0).abs() < 0.001);
+    }
+
+    // -- now_ms --
+
+    #[test]
+    fn now_ms_returns_positive() {
+        let ts = now_ms();
+        assert!(
+            ts > 0,
+            "now_ms should return a positive epoch ms, got {}",
+            ts
+        );
+    }
 }
