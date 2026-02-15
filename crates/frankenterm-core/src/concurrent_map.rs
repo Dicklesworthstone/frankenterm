@@ -961,4 +961,308 @@ mod tests {
         assert_eq!(back.shard_count, 64);
         assert_eq!(back.total_entries, 200);
     }
+
+    // -------------------------------------------------------------------
+    // Batch: DarkBadger wa-1u90p.7.1
+    // -------------------------------------------------------------------
+
+    // -- ShardedMap trait coverage --
+
+    #[test]
+    fn sharded_map_debug_format() {
+        let map: ShardedMap<String, i32> = ShardedMap::with_shards(4);
+        map.insert("hello".to_string(), 1);
+        let dbg = format!("{:?}", map);
+        assert!(dbg.contains("ShardedMap"), "got: {}", dbg);
+        assert!(dbg.contains("shard_count: 4"), "got: {}", dbg);
+    }
+
+    #[test]
+    fn sharded_map_default() {
+        let map: ShardedMap<u32, u32> = ShardedMap::default();
+        assert_eq!(map.shard_count(), DEFAULT_SHARDS);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn sharded_map_with_shards_clamp_zero() {
+        let map: ShardedMap<u32, u32> = ShardedMap::with_shards(0);
+        assert_eq!(map.shard_count(), 1);
+    }
+
+    #[test]
+    fn sharded_map_with_shards_clamp_high() {
+        let map: ShardedMap<u32, u32> = ShardedMap::with_shards(1000);
+        assert_eq!(map.shard_count(), 256);
+    }
+
+    #[test]
+    fn sharded_map_get_nonexistent() {
+        let map: ShardedMap<String, i32> = ShardedMap::with_shards(4);
+        assert_eq!(map.get(&"missing".to_string()), None);
+    }
+
+    #[test]
+    fn sharded_map_remove_nonexistent() {
+        let map: ShardedMap<String, i32> = ShardedMap::with_shards(4);
+        assert_eq!(map.remove(&"missing".to_string()), None);
+    }
+
+    #[test]
+    fn sharded_map_read_with_nonexistent() {
+        let map: ShardedMap<String, i32> = ShardedMap::with_shards(4);
+        let result = map.read_with(&"nope".to_string(), |v| *v * 2);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn sharded_map_write_with_nonexistent() {
+        let map: ShardedMap<String, Vec<i32>> = ShardedMap::with_shards(4);
+        let result = map.write_with(&"nope".to_string(), |v| v.len());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn sharded_map_shard_sizes() {
+        let map: ShardedMap<u32, u32> = ShardedMap::with_shards(4);
+        for i in 0..20 {
+            map.insert(i, i);
+        }
+        let sizes = map.shard_sizes();
+        assert_eq!(sizes.len(), 4);
+        let total: usize = sizes.iter().sum();
+        assert_eq!(total, 20);
+    }
+
+    #[test]
+    fn sharded_map_shard_count_accessor() {
+        let map: ShardedMap<u32, u32> = ShardedMap::with_shards(16);
+        assert_eq!(map.shard_count(), 16);
+    }
+
+    #[test]
+    fn sharded_map_empty_keys_values_entries() {
+        let map: ShardedMap<String, i32> = ShardedMap::with_shards(4);
+        assert!(map.keys().is_empty());
+        assert!(map.values().is_empty());
+        assert!(map.entries().is_empty());
+    }
+
+    #[test]
+    fn sharded_map_retain_all() {
+        let map: ShardedMap<u32, i32> = ShardedMap::with_shards(4);
+        for i in 0..10 {
+            map.insert(i, i as i32);
+        }
+        map.retain(|_, _| true);
+        assert_eq!(map.len(), 10);
+    }
+
+    #[test]
+    fn sharded_map_retain_none() {
+        let map: ShardedMap<u32, i32> = ShardedMap::with_shards(4);
+        for i in 0..10 {
+            map.insert(i, i as i32);
+        }
+        map.retain(|_, _| false);
+        assert!(map.is_empty());
+    }
+
+    // -- PaneMap trait coverage --
+
+    #[test]
+    fn pane_map_debug_format() {
+        let map = PaneMap::<i32>::with_shards(8);
+        map.insert(1, 42);
+        let dbg = format!("{:?}", map);
+        assert!(dbg.contains("PaneMap"), "got: {}", dbg);
+        assert!(dbg.contains("shard_count: 8"), "got: {}", dbg);
+    }
+
+    #[test]
+    fn pane_map_default() {
+        let map: PaneMap<i32> = PaneMap::default();
+        assert_eq!(map.shard_count, DEFAULT_SHARDS);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn pane_map_with_shards_clamp_zero() {
+        let map = PaneMap::<i32>::with_shards(0);
+        assert_eq!(map.shard_count, 1);
+    }
+
+    #[test]
+    fn pane_map_with_shards_clamp_high() {
+        let map = PaneMap::<i32>::with_shards(999);
+        assert_eq!(map.shard_count, 256);
+    }
+
+    #[test]
+    fn pane_map_get_nonexistent() {
+        let map = PaneMap::<i32>::new();
+        assert_eq!(map.get(999), None);
+    }
+
+    #[test]
+    fn pane_map_contains_nonexistent() {
+        let map = PaneMap::<i32>::new();
+        assert!(!map.contains(42));
+    }
+
+    #[test]
+    fn pane_map_remove_nonexistent() {
+        let map = PaneMap::<i32>::new();
+        assert_eq!(map.remove(42), None);
+    }
+
+    #[test]
+    fn pane_map_for_each_mut() {
+        let map = PaneMap::<i32>::with_shards(4);
+        map.insert(1, 10);
+        map.insert(2, 20);
+        map.insert(3, 30);
+        map.for_each_mut(|_id, val| {
+            *val += 1;
+        });
+        assert_eq!(map.get(1), Some(11));
+        assert_eq!(map.get(2), Some(21));
+        assert_eq!(map.get(3), Some(31));
+    }
+
+    #[test]
+    fn pane_map_for_each_mut_empty() {
+        let map = PaneMap::<i32>::with_shards(4);
+        let mut count = 0;
+        map.for_each_mut(|_, _| count += 1);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn pane_map_map_all_mut() {
+        let map = PaneMap::<i32>::with_shards(4);
+        map.insert(10, 100);
+        map.insert(20, 200);
+        let results = map.map_all_mut(|id, val| {
+            *val *= 2;
+            id + *val as u64
+        });
+        assert_eq!(results.len(), 2);
+        // Values were doubled
+        assert_eq!(map.get(10), Some(200));
+        assert_eq!(map.get(20), Some(400));
+    }
+
+    #[test]
+    fn pane_map_map_all_mut_empty() {
+        let map = PaneMap::<i32>::with_shards(4);
+        let results = map.map_all_mut(|_, v| *v);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn pane_map_insert_if_absent() {
+        let map = PaneMap::<String>::with_shards(4);
+        assert!(map.insert_if_absent(1, "first".to_string()));
+        assert!(!map.insert_if_absent(1, "second".to_string()));
+        assert_eq!(map.get(1), Some("first".to_string()));
+    }
+
+    #[test]
+    fn pane_map_values_snapshot() {
+        let map = PaneMap::<i32>::with_shards(4);
+        map.insert(1, 10);
+        map.insert(2, 20);
+        map.insert(3, 30);
+        let mut vals = map.values();
+        vals.sort();
+        assert_eq!(vals, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn pane_map_entries_snapshot() {
+        let map = PaneMap::<i32>::with_shards(4);
+        map.insert(1, 10);
+        map.insert(2, 20);
+        let mut entries = map.entries();
+        entries.sort_by_key(|(k, _)| *k);
+        assert_eq!(entries, vec![(1, 10), (2, 20)]);
+    }
+
+    #[test]
+    fn pane_map_clear() {
+        let map = PaneMap::<i32>::with_shards(4);
+        map.insert(1, 10);
+        map.insert(2, 20);
+        assert_eq!(map.len(), 2);
+        map.clear();
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn pane_map_shard_sizes() {
+        let map = PaneMap::<()>::with_shards(8);
+        for i in 0..40 {
+            map.insert(i, ());
+        }
+        let sizes = map.shard_sizes();
+        assert_eq!(sizes.len(), 8);
+        assert_eq!(sizes.iter().sum::<usize>(), 40);
+    }
+
+    #[test]
+    fn pane_map_read_with_nonexistent() {
+        let map = PaneMap::<i32>::new();
+        assert_eq!(map.read_with(999, |v| *v), None);
+    }
+
+    #[test]
+    fn pane_map_write_with_nonexistent() {
+        let map = PaneMap::<i32>::new();
+        assert_eq!(map.write_with(999, |v| *v), None);
+    }
+
+    // -- DistributionStats edge cases --
+
+    #[test]
+    fn distribution_stats_debug_clone() {
+        let stats = DistributionStats::from_shard_sizes(&[3, 3, 4]);
+        let dbg = format!("{:?}", stats);
+        assert!(dbg.contains("DistributionStats"), "got: {}", dbg);
+        let cloned = stats.clone();
+        assert_eq!(cloned.shard_count, stats.shard_count);
+        assert_eq!(cloned.total_entries, stats.total_entries);
+    }
+
+    #[test]
+    fn distribution_stats_single_shard() {
+        let stats = DistributionStats::from_shard_sizes(&[42]);
+        assert_eq!(stats.shard_count, 1);
+        assert_eq!(stats.total_entries, 42);
+        assert_eq!(stats.min_shard_size, 42);
+        assert_eq!(stats.max_shard_size, 42);
+        assert!((stats.mean_shard_size - 42.0).abs() < f64::EPSILON);
+        assert!(stats.stddev_shard_size.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn distribution_stats_uniform() {
+        let sizes = vec![10; 8];
+        let stats = DistributionStats::from_shard_sizes(&sizes);
+        assert_eq!(stats.total_entries, 80);
+        assert_eq!(stats.min_shard_size, 10);
+        assert_eq!(stats.max_shard_size, 10);
+        assert!(stats.stddev_shard_size.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn distribution_stats_skewed() {
+        let stats = DistributionStats::from_shard_sizes(&[0, 0, 0, 100]);
+        assert_eq!(stats.shard_count, 4);
+        assert_eq!(stats.total_entries, 100);
+        assert_eq!(stats.min_shard_size, 0);
+        assert_eq!(stats.max_shard_size, 100);
+        assert!(stats.stddev_shard_size > 40.0);
+    }
 }

@@ -91,9 +91,7 @@ pub struct ReconcileConfig {
 
 impl Default for ReconcileConfig {
     fn default() -> Self {
-        Self {
-            max_probe_depth: 6,
-        }
+        Self { max_probe_depth: 6 }
     }
 }
 
@@ -447,11 +445,7 @@ mod tests {
     use super::*;
 
     fn make_tree(entries: &[(&[u8], &[u8])]) -> MerkleTree {
-        MerkleTree::from_entries(
-            entries
-                .iter()
-                .map(|(k, v)| (k.to_vec(), v.to_vec())),
-        )
+        MerkleTree::from_entries(entries.iter().map(|(k, v)| (k.to_vec(), v.to_vec())))
     }
 
     #[test]
@@ -521,7 +515,10 @@ mod tests {
         session.start();
         let wrong_hash = MerkleHash::from_bytes([0xFF; 32]);
         let result = session.receive(&ReconcileMessage::RootHash(wrong_hash));
-        assert!(matches!(result, RoundResult::SendMessage(ReconcileMessage::LevelHashes { .. })));
+        assert!(matches!(
+            result,
+            RoundResult::SendMessage(ReconcileMessage::LevelHashes { .. })
+        ));
         assert_eq!(session.phase(), Phase::Narrowing { depth: 1 });
     }
 
@@ -640,5 +637,294 @@ mod tests {
             let back: Phase = serde_json::from_str(&json).unwrap();
             assert_eq!(*phase, back);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Batch: DarkBadger wa-1u90p.7.1
+    // -------------------------------------------------------------------
+
+    // -- ReconcileMessage trait coverage --
+
+    #[test]
+    fn reconcile_message_debug() {
+        let msg = ReconcileMessage::Converged;
+        let dbg = format!("{:?}", msg);
+        assert!(dbg.contains("Converged"), "got: {}", dbg);
+    }
+
+    #[test]
+    fn reconcile_message_clone() {
+        let msg = ReconcileMessage::Patch(vec![(b"k".to_vec(), b"v".to_vec())]);
+        let cloned = msg.clone();
+        assert_eq!(msg, cloned);
+    }
+
+    #[test]
+    fn reconcile_message_serde_all_variants() {
+        let msgs = vec![
+            ReconcileMessage::RootHash(MerkleHash::from_bytes([0x11; 32])),
+            ReconcileMessage::LevelHashes {
+                depth: 2,
+                hashes: vec![MerkleHash::from_bytes([0x22; 32])],
+            },
+            ReconcileMessage::Diff(MerkleTree::new().diff(&MerkleTree::new())),
+            ReconcileMessage::Patch(vec![(b"key".to_vec(), b"val".to_vec())]),
+            ReconcileMessage::Converged,
+        ];
+        for msg in &msgs {
+            let json = serde_json::to_string(msg).unwrap();
+            let back: ReconcileMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(*msg, back);
+        }
+    }
+
+    // -- RoundResult trait coverage --
+
+    #[test]
+    fn round_result_debug() {
+        let results = [
+            RoundResult::AlreadyConverged,
+            RoundResult::Done,
+            RoundResult::ApplyPatch(vec![]),
+            RoundResult::RemoveKeys(vec![]),
+        ];
+        for r in &results {
+            let dbg = format!("{:?}", r);
+            assert!(!dbg.is_empty());
+        }
+    }
+
+    #[test]
+    fn round_result_clone() {
+        let r = RoundResult::ApplyPatch(vec![(b"k".to_vec(), b"v".to_vec())]);
+        let cloned = r.clone();
+        assert_eq!(r, cloned);
+    }
+
+    #[test]
+    fn round_result_eq() {
+        assert_eq!(RoundResult::AlreadyConverged, RoundResult::AlreadyConverged);
+        assert_eq!(RoundResult::Done, RoundResult::Done);
+        assert_ne!(RoundResult::AlreadyConverged, RoundResult::Done);
+    }
+
+    // -- Phase trait coverage --
+
+    #[test]
+    fn phase_debug() {
+        let phase = Phase::Narrowing { depth: 5 };
+        let dbg = format!("{:?}", phase);
+        assert!(dbg.contains("Narrowing"), "got: {}", dbg);
+        assert!(dbg.contains("5"), "got: {}", dbg);
+    }
+
+    #[test]
+    fn phase_clone_copy() {
+        let phase = Phase::Init;
+        let cloned = phase.clone();
+        let copied = phase;
+        assert_eq!(cloned, copied);
+    }
+
+    #[test]
+    fn phase_eq_variants() {
+        assert_eq!(Phase::Init, Phase::Init);
+        assert_eq!(Phase::Converged, Phase::Converged);
+        assert_ne!(Phase::Init, Phase::Converged);
+        assert_ne!(Phase::Narrowing { depth: 1 }, Phase::Narrowing { depth: 2 });
+    }
+
+    // -- ReconcileConfig --
+
+    #[test]
+    fn reconcile_config_debug_clone() {
+        let config = ReconcileConfig::default();
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("ReconcileConfig"), "got: {}", dbg);
+        let cloned = config.clone();
+        assert_eq!(cloned.max_probe_depth, config.max_probe_depth);
+    }
+
+    #[test]
+    fn reconcile_config_default_values() {
+        let config = ReconcileConfig::default();
+        assert_eq!(config.max_probe_depth, 6);
+    }
+
+    // -- ReconcileSession --
+
+    #[test]
+    fn session_rounds_initially_zero() {
+        let tree = make_tree(&[(b"a", b"1")]);
+        let session = ReconcileSession::new(tree, true, ReconcileConfig::default());
+        assert_eq!(session.rounds(), 0);
+    }
+
+    #[test]
+    fn session_is_converged_initially_false() {
+        let tree = make_tree(&[(b"a", b"1")]);
+        let session = ReconcileSession::new(tree, true, ReconcileConfig::default());
+        assert!(!session.is_converged());
+    }
+
+    #[test]
+    fn session_local_tree_accessor() {
+        let tree = make_tree(&[(b"x", b"y")]);
+        let session = ReconcileSession::new(tree, false, ReconcileConfig::default());
+        assert_eq!(session.local_tree().get(b"x"), Some(b"y".as_slice()));
+    }
+
+    #[test]
+    fn session_receive_converged_message() {
+        let tree = make_tree(&[(b"a", b"1")]);
+        let mut session = ReconcileSession::new(tree, false, ReconcileConfig::default());
+        session.start();
+        let result = session.receive(&ReconcileMessage::Converged);
+        assert_eq!(result, RoundResult::Done);
+        assert!(session.is_converged());
+    }
+
+    #[test]
+    fn session_rounds_increment_on_receive() {
+        let tree = make_tree(&[(b"a", b"1")]);
+        let mut session = ReconcileSession::new(tree.clone(), true, ReconcileConfig::default());
+        session.start();
+        assert_eq!(session.rounds(), 0);
+        session.receive(&ReconcileMessage::RootHash(tree.root_hash()));
+        assert_eq!(session.rounds(), 1);
+    }
+
+    #[test]
+    fn session_non_authority_narrows_on_mismatch() {
+        let tree = make_tree(&[(b"a", b"1")]);
+        let mut session = ReconcileSession::new(tree, false, ReconcileConfig::default());
+        session.start();
+        let wrong_hash = MerkleHash::from_bytes([0x00; 32]);
+        let result = session.receive(&ReconcileMessage::RootHash(wrong_hash));
+        assert!(matches!(
+            result,
+            RoundResult::SendMessage(ReconcileMessage::LevelHashes { .. })
+        ));
+        assert_eq!(session.phase(), Phase::Narrowing { depth: 1 });
+    }
+
+    #[test]
+    fn session_handle_level_hashes_all_match() {
+        let tree = make_tree(&[(b"a", b"1")]);
+        let hashes = tree.level_hashes(1);
+        let mut session = ReconcileSession::new(tree, true, ReconcileConfig::default());
+        session.start();
+        let result = session.receive(&ReconcileMessage::LevelHashes {
+            depth: 1,
+            hashes: hashes.clone(),
+        });
+        assert_eq!(result, RoundResult::AlreadyConverged);
+        assert!(session.is_converged());
+    }
+
+    #[test]
+    fn session_handle_patch_non_authority() {
+        let tree = make_tree(&[(b"a", b"old")]);
+        let mut session = ReconcileSession::new(tree, false, ReconcileConfig::default());
+        session.start();
+        let patches = vec![(b"a".to_vec(), b"new".to_vec())];
+        let result = session.receive(&ReconcileMessage::Patch(patches.clone()));
+        assert!(matches!(result, RoundResult::ApplyPatch(_)));
+        // Local tree should be updated
+        assert_eq!(session.local_tree().get(b"a"), Some(b"new".as_slice()));
+        assert!(session.is_converged());
+    }
+
+    // -- ReconcileStats --
+
+    #[test]
+    fn reconcile_stats_debug_clone() {
+        let stats = ReconcileStats {
+            rounds: 1,
+            added: 2,
+            removed: 3,
+            changed: 4,
+            converged: true,
+        };
+        let dbg = format!("{:?}", stats);
+        assert!(dbg.contains("ReconcileStats"), "got: {}", dbg);
+        let cloned = stats.clone();
+        assert_eq!(stats, cloned);
+    }
+
+    #[test]
+    fn reconcile_stats_all_zeros() {
+        let authority = make_tree(&[(b"a", b"1")]);
+        let config = ReconcileConfig::default();
+        let (_, stats) = reconcile_with_stats(&authority, &authority.clone(), &config);
+        assert!(stats.converged);
+        assert_eq!(stats.added, 0);
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.changed, 0);
+        assert_eq!(stats.rounds, 0);
+    }
+
+    // -- StateFingerprint --
+
+    #[test]
+    fn fingerprint_debug_clone() {
+        let tree = make_tree(&[(b"k", b"v")]);
+        let fp = StateFingerprint::from_tree(&tree, 10);
+        let dbg = format!("{:?}", fp);
+        assert!(dbg.contains("StateFingerprint"), "got: {}", dbg);
+        let cloned = fp.clone();
+        assert_eq!(fp, cloned);
+    }
+
+    #[test]
+    fn fingerprint_entry_count() {
+        let tree = make_tree(&[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]);
+        let fp = StateFingerprint::from_tree(&tree, 1);
+        assert_eq!(fp.entry_count, 3);
+    }
+
+    #[test]
+    fn fingerprint_version_accessor() {
+        let tree = make_tree(&[(b"a", b"1")]);
+        let fp = StateFingerprint::from_tree(&tree, 42);
+        assert_eq!(fp.version, 42);
+    }
+
+    #[test]
+    fn fingerprint_from_empty_tree() {
+        let fp = StateFingerprint::from_tree(&MerkleTree::new(), 0);
+        assert_eq!(fp.entry_count, 0);
+        assert_eq!(fp.version, 0);
+    }
+
+    #[test]
+    fn fingerprint_same_version_not_newer() {
+        let tree = make_tree(&[(b"x", b"y")]);
+        let fp1 = StateFingerprint::from_tree(&tree, 5);
+        let fp2 = StateFingerprint::from_tree(&tree, 5);
+        assert!(!fp1.is_newer_than(&fp2));
+        assert!(!fp2.is_newer_than(&fp1));
+    }
+
+    // -- reconcile_trees edge cases --
+
+    #[test]
+    fn reconcile_both_empty() {
+        let authority = MerkleTree::new();
+        let replica = MerkleTree::new();
+        let config = ReconcileConfig::default();
+        let (result, rounds) = reconcile_trees(&authority, &replica, &config);
+        assert!(result.is_empty());
+        assert_eq!(rounds, 0);
+    }
+
+    #[test]
+    fn reconcile_with_stats_convergence() {
+        let authority = make_tree(&[(b"a", b"1"), (b"b", b"2")]);
+        let replica = make_tree(&[(b"a", b"1"), (b"b", b"2")]);
+        let config = ReconcileConfig::default();
+        let (result, stats) = reconcile_with_stats(&authority, &replica, &config);
+        assert!(stats.converged);
+        assert_eq!(result.root_hash(), authority.root_hash());
     }
 }
