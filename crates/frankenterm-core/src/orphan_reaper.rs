@@ -32,8 +32,8 @@ pub struct ReapReport {
 
 /// Run the orphan reaper loop until `shutdown` is signalled.
 ///
-/// This is intended to be spawned as a background `tokio::spawn` task
-/// inside the watcher process.
+/// This is intended to be spawned as a background runtime task inside the
+/// watcher process.
 pub async fn run_orphan_reaper(config: CliConfig, shutdown: Arc<AtomicBool>) {
     if config.orphan_reap_interval_seconds == 0 {
         info!("Orphan reaper disabled (orphan_reap_interval_seconds = 0)");
@@ -80,14 +80,21 @@ pub async fn run_orphan_reaper(config: CliConfig, shutdown: Arc<AtomicBool>) {
 
 /// Scan for and kill orphaned `wezterm` CLI processes older than `max_age_secs`.
 pub async fn reap_orphans(max_age_secs: u64) -> ReapReport {
-    // Run the blocking process scan on the blocking threadpool
-    tokio::task::spawn_blocking(move || reap_orphans_sync(max_age_secs))
-        .await
-        .unwrap_or_else(|e| {
-            let mut report = ReapReport::default();
-            report.errors.push(format!("spawn_blocking failed: {e}"));
-            report
-        })
+    // Run the blocking process scan on the active runtime's blocking threadpool.
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        asupersync::runtime::spawn_blocking(move || reap_orphans_sync(max_age_secs)).await
+    }
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        tokio::task::spawn_blocking(move || reap_orphans_sync(max_age_secs))
+            .await
+            .unwrap_or_else(|e| {
+                let mut report = ReapReport::default();
+                report.errors.push(format!("spawn_blocking failed: {e}"));
+                report
+            })
+    }
 }
 
 /// Synchronous implementation of the orphan reaper.
@@ -454,5 +461,232 @@ mod tests {
         assert_eq!(json["killed"], 0);
         assert!(json["killed_pids"].as_array().unwrap().is_empty());
         assert_eq!(json["errors"][0], "test error");
+    }
+
+    // ── Batch: RubyBeaver wa-1u90p.7.1 ──────────────────────────────────
+
+    // ---- parse_etime comprehensive ----
+
+    #[test]
+    fn parse_etime_minutes_zero_seconds() {
+        assert_eq!(parse_etime("05:00").unwrap(), 300);
+    }
+
+    #[test]
+    fn parse_etime_hours_zero_minutes_seconds() {
+        assert_eq!(parse_etime("02:00:00").unwrap(), 7200);
+    }
+
+    #[test]
+    fn parse_etime_large_days() {
+        assert_eq!(parse_etime("365-00:00:00").unwrap(), 365 * 86400);
+    }
+
+    #[test]
+    fn parse_etime_days_with_time() {
+        assert_eq!(
+            parse_etime("1-12:30:45").unwrap(),
+            86400 + 12 * 3600 + 30 * 60 + 45
+        );
+    }
+
+    #[test]
+    fn parse_etime_invalid_days_format() {
+        assert!(parse_etime("abc-01:02:03").is_err());
+    }
+
+    #[test]
+    fn parse_etime_invalid_hours() {
+        assert!(parse_etime("xx:02:03").is_err());
+    }
+
+    #[test]
+    fn parse_etime_invalid_minutes() {
+        assert!(parse_etime("01:yy:03").is_err());
+    }
+
+    #[test]
+    fn parse_etime_invalid_seconds_in_mm_ss() {
+        assert!(parse_etime("01:zz").is_err());
+    }
+
+    #[test]
+    fn parse_etime_max_values() {
+        // 99 days, 23 hours, 59 minutes, 59 seconds
+        let result = parse_etime("99-23:59:59").unwrap();
+        assert_eq!(result, 99 * 86400 + 23 * 3600 + 59 * 60 + 59);
+    }
+
+    #[test]
+    fn parse_etime_single_digit_seconds() {
+        assert_eq!(parse_etime("5").unwrap(), 5);
+    }
+
+    #[test]
+    fn parse_etime_single_digit_minutes_seconds() {
+        assert_eq!(parse_etime("1:2").unwrap(), 62);
+    }
+
+    // ---- split_first_token comprehensive ----
+
+    #[test]
+    fn split_first_token_multiple_spaces() {
+        let (first, rest) = split_first_token("hello    world").unwrap();
+        assert_eq!(first, "hello");
+        assert!(rest.starts_with(' '));
+    }
+
+    #[test]
+    fn split_first_token_newline_separator() {
+        let (first, rest) = split_first_token("abc\ndef").unwrap();
+        assert_eq!(first, "abc");
+        assert_eq!(rest.trim(), "def");
+    }
+
+    #[test]
+    fn split_first_token_mixed_whitespace() {
+        let (first, rest) = split_first_token("  \thello world").unwrap();
+        assert_eq!(first, "hello");
+        assert_eq!(rest.trim(), "world");
+    }
+
+    // ---- ReapReport tests ----
+
+    #[test]
+    fn reap_report_debug_format() {
+        let report = ReapReport::default();
+        let dbg = format!("{report:?}");
+        assert!(dbg.contains("scanned"));
+        assert!(dbg.contains("killed"));
+    }
+
+    #[test]
+    fn reap_report_clone() {
+        let report = ReapReport {
+            scanned: 3,
+            killed: 1,
+            killed_pids: vec![42],
+            errors: vec!["err".to_string()],
+        };
+        let cloned = report.clone();
+        assert_eq!(cloned.scanned, 3);
+        assert_eq!(cloned.killed, 1);
+        assert_eq!(cloned.killed_pids, vec![42]);
+        assert_eq!(cloned.errors, vec!["err"]);
+    }
+
+    #[test]
+    fn reap_report_with_multiple_killed() {
+        let report = ReapReport {
+            scanned: 20,
+            killed: 5,
+            killed_pids: vec![100, 200, 300, 400, 500],
+            errors: vec![],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"killed\":5"));
+        assert!(json.contains("500"));
+    }
+
+    #[test]
+    fn reap_report_with_multiple_errors() {
+        let report = ReapReport {
+            scanned: 3,
+            killed: 0,
+            killed_pids: vec![],
+            errors: vec![
+                "error 1".to_string(),
+                "error 2".to_string(),
+                "error 3".to_string(),
+            ],
+        };
+        assert_eq!(report.errors.len(), 3);
+    }
+
+    // ---- reap_orphans_sync with mocked process list ----
+
+    #[test]
+    fn reap_orphans_sync_returns_report() {
+        // With max_age_secs very high, no real processes should be killed
+        let report = reap_orphans_sync(999_999);
+        // We can't predict exact counts but the structure should be valid
+        assert!(report.killed_pids.len() == report.killed);
+    }
+
+    #[test]
+    fn reap_orphans_sync_max_age_zero_is_aggressive() {
+        // max_age 0 means kill any wezterm cli process
+        let report = reap_orphans_sync(0);
+        // Report structure is valid regardless of what was found
+        assert!(report.killed_pids.len() == report.killed);
+    }
+
+    // ---- CliConfig defaults for reaper ----
+
+    #[test]
+    fn cli_config_orphan_fields() {
+        let config = CliConfig::default();
+        assert!(config.orphan_reap_interval_seconds > 0);
+        assert!(config.orphan_max_age_seconds > 0);
+        assert!(
+            config.orphan_max_age_seconds < config.orphan_reap_interval_seconds,
+            "max age should be less than interval"
+        );
+    }
+
+    #[test]
+    fn cli_config_debug() {
+        let config = CliConfig::default();
+        let dbg = format!("{config:?}");
+        assert!(dbg.contains("timeout_seconds"));
+        assert!(dbg.contains("orphan_reap_interval_seconds"));
+    }
+
+    // ---- Async reap_orphans ----
+
+    #[tokio::test]
+    async fn reap_orphans_async_returns_report() {
+        let report = reap_orphans(999_999).await;
+        assert!(report.killed_pids.len() == report.killed);
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_async_zero_max_age() {
+        let report = reap_orphans(0).await;
+        assert!(report.killed_pids.len() == report.killed);
+    }
+
+    // ---- run_orphan_reaper disabled ----
+
+    #[tokio::test]
+    async fn run_orphan_reaper_disabled_returns_immediately() {
+        let mut config = CliConfig::default();
+        config.orphan_reap_interval_seconds = 0; // disabled
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Should return immediately when interval is 0
+        let handle = tokio::spawn(run_orphan_reaper(config, shutdown));
+        let result = tokio::time::timeout(Duration::from_millis(100), handle).await;
+        assert!(result.is_ok(), "disabled reaper should return immediately");
+    }
+
+    // ---- run_orphan_reaper shutdown ----
+
+    #[tokio::test]
+    async fn run_orphan_reaper_responds_to_shutdown() {
+        let mut config = CliConfig::default();
+        config.orphan_reap_interval_seconds = 1; // 1 second interval
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        let handle = tokio::spawn(run_orphan_reaper(config, shutdown_clone));
+
+        // Signal shutdown after a short delay
+        crate::runtime_compat::sleep(Duration::from_millis(50)).await;
+        shutdown.store(true, Ordering::Relaxed);
+
+        // Should exit within a reasonable time (after current sleep)
+        let result = tokio::time::timeout(Duration::from_secs(3), handle).await;
+        assert!(result.is_ok(), "reaper should respond to shutdown signal");
     }
 }

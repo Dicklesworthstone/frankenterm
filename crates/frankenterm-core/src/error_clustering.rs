@@ -405,6 +405,9 @@ impl ErrorClusterer {
 
     /// Get info for a specific cluster by root ID.
     pub fn cluster_info(&mut self, error_id: usize) -> Option<ClusterInfo> {
+        if error_id >= self.union_find.parent.len() {
+            return None;
+        }
         let root = self.union_find.find(error_id);
         self.cluster_meta.get(&root).map(|meta| ClusterInfo {
             cluster_id: root,
