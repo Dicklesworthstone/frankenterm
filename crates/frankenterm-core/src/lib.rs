@@ -202,6 +202,7 @@ pub mod undo;
 pub mod user_preferences;
 pub mod viewport_reflow_planner;
 pub mod voi;
+pub mod wal_engine;
 pub mod wait;
 pub mod watchdog;
 pub mod watcher_client;

@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn wal_entry_clone_eq() {
-        let entry = WalEntry {
+        let entry = WalEntry::<String> {
             seq: 5,
             timestamp_ms: 500,
             kind: EntryKind::Checkpoint,
