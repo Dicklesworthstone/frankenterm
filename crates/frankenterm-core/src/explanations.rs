@@ -767,4 +767,474 @@ mod tests {
             }
         }
     }
+
+    // ================================================================
+    // Individual template access tests
+    // ================================================================
+
+    #[test]
+    fn get_explanation_all_deny_templates() {
+        let deny_ids = [
+            "deny.alt_screen",
+            "deny.command_running",
+            "deny.recent_gap",
+            "deny.rate_limited",
+            "deny.unknown_pane",
+            "deny.permission",
+        ];
+        for id in deny_ids {
+            let tmpl = get_explanation(id);
+            assert!(tmpl.is_some(), "Should find template for '{id}'");
+            assert_eq!(tmpl.unwrap().id, id);
+        }
+    }
+
+    #[test]
+    fn get_explanation_all_workflow_templates() {
+        let workflow_ids = [
+            "workflow.usage_limit",
+            "workflow.compaction",
+            "workflow.error_detected",
+            "workflow.approval_needed",
+        ];
+        for id in workflow_ids {
+            let tmpl = get_explanation(id);
+            assert!(tmpl.is_some(), "Should find template for '{id}'");
+            assert_eq!(tmpl.unwrap().id, id);
+        }
+    }
+
+    #[test]
+    fn get_explanation_all_event_templates() {
+        let event_ids = ["event.pattern_detected", "event.gap_detected"];
+        for id in event_ids {
+            let tmpl = get_explanation(id);
+            assert!(tmpl.is_some(), "Should find template for '{id}'");
+            assert_eq!(tmpl.unwrap().id, id);
+        }
+    }
+
+    #[test]
+    fn get_explanation_all_risk_templates() {
+        let risk_ids = [
+            "risk.elevated",
+            "risk.high",
+            "risk.factor.alt_screen",
+            "risk.factor.destructive_tokens",
+            "risk.factor.sudo_elevation",
+        ];
+        for id in risk_ids {
+            let tmpl = get_explanation(id);
+            assert!(tmpl.is_some(), "Should find template for '{id}'");
+            assert_eq!(tmpl.unwrap().id, id);
+        }
+    }
+
+    // ================================================================
+    // Template registry count and uniqueness
+    // ================================================================
+
+    #[test]
+    fn template_registry_has_expected_count() {
+        // 6 deny + 4 workflow + 2 event + 5 risk = 17
+        assert_eq!(
+            EXPLANATION_TEMPLATES.len(),
+            17,
+            "Registry should have exactly 17 templates"
+        );
+    }
+
+    #[test]
+    fn template_ids_are_unique() {
+        let ids = list_template_ids();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(ids.len(), unique.len(), "All template IDs should be unique");
+    }
+
+    #[test]
+    fn list_template_ids_is_sorted() {
+        let ids = list_template_ids();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "list_template_ids should return sorted IDs");
+    }
+
+    // ================================================================
+    // Category listing tests
+    // ================================================================
+
+    #[test]
+    fn list_templates_by_category_events() {
+        let events = list_templates_by_category("event");
+        assert_eq!(events.len(), 2, "Should have 2 event templates");
+        for tmpl in events {
+            assert!(tmpl.id.starts_with("event."));
+        }
+    }
+
+    #[test]
+    fn list_templates_by_category_risk() {
+        let risks = list_templates_by_category("risk");
+        assert_eq!(risks.len(), 5, "Should have 5 risk templates");
+        for tmpl in risks {
+            assert!(tmpl.id.starts_with("risk."));
+        }
+    }
+
+    #[test]
+    fn list_templates_by_category_unknown_returns_empty() {
+        let unknown = list_templates_by_category("nonexistent");
+        assert!(unknown.is_empty(), "Unknown category should return empty vec");
+    }
+
+    #[test]
+    fn list_templates_by_category_empty_prefix_returns_all() {
+        let all = list_templates_by_category("");
+        assert_eq!(all.len(), EXPLANATION_TEMPLATES.len());
+    }
+
+    // ================================================================
+    // Render and format tests
+    // ================================================================
+
+    #[test]
+    fn render_explanation_substitutes_multiple_placeholders() {
+        // Create a template-like scenario: manually test replace logic
+        let template = ExplanationTemplate {
+            id: "test.multi",
+            scenario: "Test",
+            brief: "Test",
+            detailed: "Pane {pane_id} in workspace {workspace} had error {error}",
+            suggestions: &[],
+            see_also: &[],
+        };
+        let mut ctx = HashMap::new();
+        ctx.insert("pane_id".to_string(), "42".to_string());
+        ctx.insert("workspace".to_string(), "default".to_string());
+        ctx.insert("error".to_string(), "timeout".to_string());
+
+        let rendered = render_explanation(&template, &ctx);
+        assert_eq!(rendered, "Pane 42 in workspace default had error timeout");
+    }
+
+    #[test]
+    fn render_explanation_leaves_unmatched_placeholders() {
+        let template = ExplanationTemplate {
+            id: "test.unmatched",
+            scenario: "Test",
+            brief: "Test",
+            detailed: "Pane {pane_id} status {status}",
+            suggestions: &[],
+            see_also: &[],
+        };
+        let mut ctx = HashMap::new();
+        ctx.insert("pane_id".to_string(), "7".to_string());
+        // {status} not provided
+
+        let rendered = render_explanation(&template, &ctx);
+        assert_eq!(rendered, "Pane 7 status {status}");
+    }
+
+    #[test]
+    fn render_explanation_with_empty_value() {
+        let template = ExplanationTemplate {
+            id: "test.empty_val",
+            scenario: "Test",
+            brief: "Test",
+            detailed: "Error: {msg}",
+            suggestions: &[],
+            see_also: &[],
+        };
+        let mut ctx = HashMap::new();
+        ctx.insert("msg".to_string(), String::new());
+
+        let rendered = render_explanation(&template, &ctx);
+        assert_eq!(rendered, "Error: ");
+    }
+
+    #[test]
+    fn format_explanation_with_context_interpolation() {
+        let template = ExplanationTemplate {
+            id: "test.fmt_ctx",
+            scenario: "Test scenario",
+            brief: "Test brief",
+            detailed: "Pane {id} failed",
+            suggestions: &["Check pane"],
+            see_also: &["ft status"],
+        };
+        let mut ctx = HashMap::new();
+        ctx.insert("id".to_string(), "99".to_string());
+
+        let formatted = format_explanation(&template, Some(&ctx));
+        assert!(formatted.contains("Pane 99 failed"));
+        assert!(formatted.contains("## Test scenario"));
+        assert!(formatted.contains("**Test brief**"));
+        assert!(formatted.contains("Check pane"));
+        assert!(formatted.contains("ft status"));
+    }
+
+    #[test]
+    fn format_explanation_without_suggestions() {
+        let template = ExplanationTemplate {
+            id: "test.no_sugg",
+            scenario: "No suggestions",
+            brief: "Brief",
+            detailed: "Details here",
+            suggestions: &[],
+            see_also: &["ft help"],
+        };
+        let formatted = format_explanation(&template, None);
+        assert!(!formatted.contains("### Suggestions"));
+        assert!(formatted.contains("ft help"));
+    }
+
+    #[test]
+    fn format_explanation_without_see_also() {
+        let template = ExplanationTemplate {
+            id: "test.no_see",
+            scenario: "No see also",
+            brief: "Brief",
+            detailed: "Details here",
+            suggestions: &["Do something"],
+            see_also: &[],
+        };
+        let formatted = format_explanation(&template, None);
+        assert!(formatted.contains("### Suggestions"));
+        assert!(!formatted.contains("See also"));
+    }
+
+    #[test]
+    fn format_explanation_empty_suggestions_and_see_also() {
+        let template = ExplanationTemplate {
+            id: "test.bare",
+            scenario: "Bare template",
+            brief: "Minimal",
+            detailed: "Just details",
+            suggestions: &[],
+            see_also: &[],
+        };
+        let formatted = format_explanation(&template, None);
+        assert!(formatted.contains("## Bare template"));
+        assert!(formatted.contains("**Minimal**"));
+        assert!(formatted.contains("Just details"));
+        assert!(!formatted.contains("Suggestions"));
+        assert!(!formatted.contains("See also"));
+    }
+
+    // ================================================================
+    // Serialization tests
+    // ================================================================
+
+    #[test]
+    fn template_serializes_to_json() {
+        let json = serde_json::to_value(&DENY_ALT_SCREEN).unwrap();
+        assert_eq!(json["id"], "deny.alt_screen");
+        assert_eq!(
+            json["scenario"],
+            "Send denied because alt-screen is active"
+        );
+        assert!(json["brief"].as_str().unwrap().contains("full-screen"));
+        assert!(json["suggestions"].is_array());
+        assert!(json["see_also"].is_array());
+    }
+
+    #[test]
+    fn template_serializes_suggestions_as_array() {
+        let json = serde_json::to_value(&DENY_RATE_LIMITED).unwrap();
+        let sugg = json["suggestions"].as_array().unwrap();
+        assert_eq!(sugg.len(), 3);
+        assert!(sugg[0].as_str().unwrap().starts_with("Wait"));
+    }
+
+    #[test]
+    fn template_serializes_see_also_as_array() {
+        let json = serde_json::to_value(&WORKFLOW_USAGE_LIMIT).unwrap();
+        let refs = json["see_also"].as_array().unwrap();
+        assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn all_templates_serialize_roundtrip_to_json() {
+        for (_id, template) in EXPLANATION_TEMPLATES.iter() {
+            let json = serde_json::to_string(template);
+            assert!(
+                json.is_ok(),
+                "Template '{}' should serialize to JSON",
+                template.id
+            );
+            let json_str = json.unwrap();
+            assert!(json_str.contains(template.id));
+        }
+    }
+
+    // ================================================================
+    // Static template field content tests
+    // ================================================================
+
+    #[test]
+    fn deny_alt_screen_has_correct_fields() {
+        assert_eq!(DENY_ALT_SCREEN.id, "deny.alt_screen");
+        assert!(DENY_ALT_SCREEN.detailed.contains("alternate screen buffer"));
+        assert_eq!(DENY_ALT_SCREEN.suggestions.len(), 3);
+        assert_eq!(DENY_ALT_SCREEN.see_also.len(), 2);
+    }
+
+    #[test]
+    fn deny_command_running_has_correct_fields() {
+        assert_eq!(DENY_COMMAND_RUNNING.id, "deny.command_running");
+        assert!(DENY_COMMAND_RUNNING.detailed.contains("OSC 133"));
+        assert_eq!(DENY_COMMAND_RUNNING.suggestions.len(), 3);
+    }
+
+    #[test]
+    fn risk_elevated_has_correct_fields() {
+        assert_eq!(RISK_ELEVATED.id, "risk.elevated");
+        assert!(RISK_ELEVATED.detailed.contains("51-70"));
+        assert_eq!(RISK_ELEVATED.suggestions.len(), 4);
+    }
+
+    #[test]
+    fn risk_high_has_correct_fields() {
+        assert_eq!(RISK_HIGH.id, "risk.high");
+        assert!(RISK_HIGH.detailed.contains("71-100"));
+        assert_eq!(RISK_HIGH.suggestions.len(), 4);
+    }
+
+    #[test]
+    fn risk_factor_templates_have_weight_info() {
+        // Each risk factor template should mention its default weight
+        assert!(
+            RISK_FACTOR_ALT_SCREEN.detailed.contains("60"),
+            "Alt-screen factor should mention weight 60"
+        );
+        assert!(
+            RISK_FACTOR_DESTRUCTIVE.detailed.contains("40"),
+            "Destructive factor should mention weight 40"
+        );
+        assert!(
+            RISK_FACTOR_SUDO.detailed.contains("30"),
+            "Sudo factor should mention weight 30"
+        );
+    }
+
+    #[test]
+    fn workflow_templates_have_numbered_steps() {
+        // Workflow templates should describe steps with numbers
+        assert!(WORKFLOW_USAGE_LIMIT.detailed.contains("1."));
+        assert!(WORKFLOW_USAGE_LIMIT.detailed.contains("5."));
+        assert!(WORKFLOW_COMPACTION.detailed.contains("1."));
+        assert!(WORKFLOW_ERROR_DETECTED.detailed.contains("1."));
+    }
+
+    #[test]
+    fn event_templates_describe_detection() {
+        assert!(EVENT_PATTERN_DETECTED.detailed.contains("pattern"));
+        assert!(EVENT_GAP_DETECTED.detailed.contains("gap"));
+        assert!(EVENT_GAP_DETECTED.brief.contains("Discontinuity"));
+    }
+
+    // ================================================================
+    // Edge case tests
+    // ================================================================
+
+    #[test]
+    fn get_explanation_partial_id_returns_none() {
+        assert!(get_explanation("deny").is_none());
+        assert!(get_explanation("deny.").is_none());
+        assert!(get_explanation("alt_screen").is_none());
+    }
+
+    #[test]
+    fn get_explanation_case_sensitive() {
+        assert!(get_explanation("Deny.Alt_Screen").is_none());
+        assert!(get_explanation("DENY.ALT_SCREEN").is_none());
+    }
+
+    #[test]
+    fn render_explanation_with_special_chars_in_value() {
+        let template = ExplanationTemplate {
+            id: "test.special",
+            scenario: "Test",
+            brief: "Test",
+            detailed: "Error: {msg}",
+            suggestions: &[],
+            see_also: &[],
+        };
+        let mut ctx = HashMap::new();
+        ctx.insert("msg".to_string(), "can't parse <xml> & \"json\"".to_string());
+
+        let rendered = render_explanation(&template, &ctx);
+        assert_eq!(rendered, "Error: can't parse <xml> & \"json\"");
+    }
+
+    #[test]
+    fn render_explanation_with_braces_in_value() {
+        let template = ExplanationTemplate {
+            id: "test.braces",
+            scenario: "Test",
+            brief: "Test",
+            detailed: "Got {val}",
+            suggestions: &[],
+            see_also: &[],
+        };
+        let mut ctx = HashMap::new();
+        ctx.insert("val".to_string(), "{nested}".to_string());
+
+        let rendered = render_explanation(&template, &ctx);
+        assert_eq!(rendered, "Got {nested}");
+    }
+
+    #[test]
+    fn list_templates_by_category_deny_count() {
+        let denials = list_templates_by_category("deny");
+        assert_eq!(denials.len(), 6, "Should have exactly 6 deny templates");
+    }
+
+    #[test]
+    fn list_templates_by_category_workflow_count() {
+        let workflows = list_templates_by_category("workflow");
+        assert_eq!(
+            workflows.len(),
+            4,
+            "Should have exactly 4 workflow templates"
+        );
+    }
+
+    #[test]
+    fn format_explanation_multiple_suggestions_ordered() {
+        let template = &DENY_ALT_SCREEN;
+        let formatted = format_explanation(template, None);
+        let exit_pos = formatted.find("Exit the full-screen").unwrap();
+        let use_pos = formatted.find("Use --force").unwrap();
+        let configure_pos = formatted.find("Configure policy").unwrap();
+        assert!(
+            exit_pos < use_pos && use_pos < configure_pos,
+            "Suggestions should appear in order"
+        );
+    }
+
+    #[test]
+    fn format_explanation_see_also_comma_separated() {
+        let template = &DENY_ALT_SCREEN;
+        let formatted = format_explanation(template, None);
+        assert!(formatted.contains("ft policy, ft status --pane <id>"));
+    }
+
+    #[test]
+    fn detailed_text_has_reasonable_length() {
+        for (_id, template) in EXPLANATION_TEMPLATES.iter() {
+            assert!(
+                template.detailed.len() >= 50,
+                "Template '{}' detailed text too short ({} chars)",
+                template.id,
+                template.detailed.len()
+            );
+            assert!(
+                template.detailed.len() <= 2000,
+                "Template '{}' detailed text too long ({} chars)",
+                template.id,
+                template.detailed.len()
+            );
+        }
+    }
 }
