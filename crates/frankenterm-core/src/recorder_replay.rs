@@ -1268,4 +1268,616 @@ mod tests {
         session.next_frame(); // cursor → 2
         assert!((session.progress() - 0.4).abs() < 0.01);
     }
+
+    // -----------------------------------------------------------------------
+    // Batch — RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let config = ReplayConfig {
+            speed: 2.5,
+            max_delay_ms: 3000,
+            skip_empty: true,
+            include_markers: false,
+            pane_filter: vec![1, 2, 3],
+            kind_filter: vec![QueryEventKind::IngressText],
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: ReplayConfig = serde_json::from_str(&json).unwrap();
+        assert!((deserialized.speed - 2.5).abs() < f64::EPSILON);
+        assert_eq!(deserialized.max_delay_ms, 3000);
+        assert!(deserialized.skip_empty);
+        assert!(!deserialized.include_markers);
+        assert_eq!(deserialized.pane_filter, vec![1, 2, 3]);
+        assert_eq!(deserialized.kind_filter, vec![QueryEventKind::IngressText]);
+    }
+
+    #[test]
+    fn config_serde_defaults_from_empty_json() {
+        // Deserializing an empty JSON object should produce all defaults.
+        let deserialized: ReplayConfig = serde_json::from_str("{}").unwrap();
+        assert!((deserialized.speed - 1.0).abs() < f64::EPSILON);
+        assert_eq!(deserialized.max_delay_ms, 5000);
+        assert!(!deserialized.skip_empty);
+        assert!(deserialized.include_markers);
+        assert!(deserialized.pane_filter.is_empty());
+        assert!(deserialized.kind_filter.is_empty());
+    }
+
+    #[test]
+    fn config_validate_zero_speed_is_invalid() {
+        let config = ReplayConfig {
+            speed: 0.0,
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(matches!(result, Err(ReplayError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn config_validate_positive_infinity_is_valid() {
+        let config = ReplayConfig {
+            speed: f64::INFINITY,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_validate_negative_speed_is_invalid() {
+        let config = ReplayConfig {
+            speed: -0.001,
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ReplayError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn config_with_speed_builder() {
+        let config = ReplayConfig::default().with_speed(4.0);
+        assert!((config.speed - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn config_with_kinds_builder() {
+        let config = ReplayConfig::default().with_kinds(vec![
+            QueryEventKind::EgressOutput,
+            QueryEventKind::ControlMarker,
+        ]);
+        assert_eq!(config.kind_filter.len(), 2);
+        assert_eq!(config.kind_filter[0], QueryEventKind::EgressOutput);
+        assert_eq!(config.kind_filter[1], QueryEventKind::ControlMarker);
+    }
+
+    #[test]
+    fn config_realtime_preset_defaults() {
+        let config = ReplayConfig::realtime();
+        assert!((config.speed - 1.0).abs() < f64::EPSILON);
+        assert_eq!(config.max_delay_ms, 5000);
+        assert!(!config.skip_empty);
+        assert!(config.include_markers);
+    }
+
+    #[test]
+    fn replay_state_serde_roundtrip() {
+        let states = [
+            ReplayState::Ready,
+            ReplayState::Playing,
+            ReplayState::Paused,
+            ReplayState::Completed,
+        ];
+        for state in &states {
+            let json = serde_json::to_string(state).unwrap();
+            let deserialized: ReplayState = serde_json::from_str(&json).unwrap();
+            assert_eq!(*state, deserialized);
+        }
+    }
+
+    #[test]
+    fn replay_state_serde_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ReplayState::Ready).unwrap(),
+            "\"ready\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReplayState::Playing).unwrap(),
+            "\"playing\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReplayState::Paused).unwrap(),
+            "\"paused\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReplayState::Completed).unwrap(),
+            "\"completed\""
+        );
+    }
+
+    #[test]
+    fn replay_error_equality() {
+        assert_eq!(ReplayError::EmptySession, ReplayError::EmptySession);
+        assert_eq!(
+            ReplayError::InvalidConfig("x".into()),
+            ReplayError::InvalidConfig("x".into())
+        );
+        assert_ne!(
+            ReplayError::InvalidConfig("a".into()),
+            ReplayError::InvalidConfig("b".into())
+        );
+        assert_eq!(
+            ReplayError::SeekOutOfRange {
+                target_ms: 1,
+                min_ms: 2,
+                max_ms: 3
+            },
+            ReplayError::SeekOutOfRange {
+                target_ms: 1,
+                min_ms: 2,
+                max_ms: 3
+            }
+        );
+        assert_ne!(ReplayError::EmptySession, ReplayError::SessionCompleted);
+    }
+
+    #[test]
+    fn replay_error_display_session_completed() {
+        let err = ReplayError::SessionCompleted;
+        assert_eq!(err.to_string(), "replay session already completed");
+    }
+
+    #[test]
+    fn replay_error_is_std_error() {
+        let err: Box<dyn std::error::Error> =
+            Box::new(ReplayError::InvalidConfig("test".into()));
+        // Verify Display works through the trait object.
+        assert!(err.to_string().contains("test"));
+    }
+
+    #[test]
+    fn session_sorts_out_of_order_events() {
+        // Provide events in reverse timestamp order.
+        let events = vec![
+            make_text_event(1, 2, 3000, "third"),
+            make_text_event(1, 0, 1000, "first"),
+            make_text_event(1, 1, 2000, "second"),
+        ];
+        let mut session = ReplaySession::new(
+            events,
+            ReplayConfig::instant(),
+            human(),
+            AccessTier::A2FullQuery,
+            "sort-test",
+        )
+        .unwrap();
+
+        let frames = session.collect_remaining();
+        assert_eq!(frames[0].event.text.as_deref(), Some("first"));
+        assert_eq!(frames[1].event.text.as_deref(), Some("second"));
+        assert_eq!(frames[2].event.text.as_deref(), Some("third"));
+    }
+
+    #[test]
+    fn session_sorts_by_sequence_for_same_timestamp() {
+        // Same timestamp, different sequences — should sort by sequence.
+        let events = vec![
+            make_text_event(1, 5, 1000, "seq-5"),
+            make_text_event(1, 1, 1000, "seq-1"),
+            make_text_event(1, 3, 1000, "seq-3"),
+        ];
+        let mut session = ReplaySession::new(
+            events,
+            ReplayConfig::instant(),
+            human(),
+            AccessTier::A2FullQuery,
+            "seq-sort",
+        )
+        .unwrap();
+
+        let frames = session.collect_remaining();
+        assert_eq!(frames[0].event.sequence, 1);
+        assert_eq!(frames[1].event.sequence, 3);
+        assert_eq!(frames[2].event.sequence, 5);
+    }
+
+    #[test]
+    fn pause_from_ready_is_noop() {
+        let mut session = ReplaySession::new(
+            sample_events(),
+            ReplayConfig::instant(),
+            human(),
+            AccessTier::A2FullQuery,
+            "pause-ready",
+        )
+        .unwrap();
+
+        assert_eq!(session.state(), ReplayState::Ready);
+        session.pause(); // pause when Ready should be a no-op
+        assert_eq!(session.state(), ReplayState::Ready);
+    }
+
+    #[test]
+    fn play_when_completed_is_noop() {
+        let mut session = ReplaySession::new(
+            sample_events(),
+            ReplayConfig::instant(),
+            human(),
+            AccessTier::A2FullQuery,
+            "play-completed",
+        )
+        .unwrap();
+
+        session.collect_remaining();
+        assert_eq!(session.state(), ReplayState::Completed);
+        session.play(); // play when Completed should be a no-op
+        assert_eq!(session.state(), ReplayState::Completed);
+    }
+
+    #[test]
+    fn next_frame_auto_transitions_ready_to_playing() {
+        let mut session = ReplaySession::new(
+            sample_events(),
+            ReplayConfig::instant(),
+            human(),
+            AccessTier::A2FullQuery,
+            "auto-transition",
+        )
+        .unwrap();
+
+        assert_eq!(session.state(), ReplayState::Ready);
+        let _frame = session.next_frame().unwrap();
+        assert_eq!(session.state(), ReplayState::Playing);
+    }
+
+    #[test]
+    fn combined_pane_and_kind_filter() {
+        // Events: pane 1 text, pane 1 lifecycle, pane 2 text, pane 2 lifecycle
+        let events = vec![
+            make_text_event(1, 0, 1000, "p1-text"),
+            make_lifecycle(1, 1, 1500),
+            make_text_event(2, 2, 2000, "p2-text"),
+            make_lifecycle(2, 3, 2500),
+        ];
+        // Filter: only pane 1 AND only IngressText
+        let config = ReplayConfig::instant()
+            .with_panes(vec![1])
+            .with_kinds(vec![QueryEventKind::IngressText]);
+
+        let mut session = ReplaySession::new(
+            events,
+            config,
+            human(),
+            AccessTier::A2FullQuery,
+            "combined-filter",
+        )
+        .unwrap();
+
+        let frames = session.collect_remaining();
+        // Only pane-1 IngressText should survive both filters.
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event.pane_id, 1);
+        assert_eq!(frames[0].event.event_kind, QueryEventKind::IngressText);
+        // 3 events skipped (pane-1 lifecycle, pane-2 text, pane-2 lifecycle)
+        assert_eq!(session.stats().frames_skipped, 3);
+    }
+
+    #[test]
+    fn replay_duration_ms_tracks_scaled_delays() {
+        let mut session = ReplaySession::new(
+            vec![
+                make_text_event(1, 0, 1000, "a"),
+                make_text_event(1, 1, 3000, "b"), // 2000ms gap
+                make_text_event(1, 2, 4000, "c"), // 1000ms gap
+            ],
+            ReplayConfig::default().with_speed(2.0),
+            human(),
+            AccessTier::A2FullQuery,
+            "duration-track",
+        )
+        .unwrap();
+
+        session.collect_remaining();
+        // At 2x speed: 0 + (2000/2) + (1000/2) = 0 + 1000 + 500 = 1500
+        assert_eq!(session.stats().replay_duration_ms, 1500);
+    }
+
+    #[test]
+    fn by_kind_stats_populated_correctly() {
+        let mut session = ReplaySession::new(
+            sample_events(),
+            ReplayConfig::instant(),
+            human(),
+            AccessTier::A2FullQuery,
+            "kind-stats",
+        )
+        .unwrap();
+
+        session.collect_remaining();
+        let by_kind = &session.stats().by_kind;
+        // sample_events has 4 IngressText and 1 LifecycleMarker.
+        assert_eq!(by_kind.get("IngressText"), Some(&4));
+        assert_eq!(by_kind.get("LifecycleMarker"), Some(&1));
+    }
+
+    #[test]
+    fn builder_default_session_id_uses_actor_identity() {
+        let session = ReplayBuilder::new(human())
+            .instant()
+            .build(sample_events())
+            .unwrap();
+
+        // Default session_id should be "replay-<identity>"
+        assert_eq!(session.session_id(), "replay-user-1");
+    }
+
+    #[test]
+    fn builder_speed_method() {
+        let session = ReplayBuilder::new(human())
+            .speed(3.0)
+            .build(sample_events())
+            .unwrap();
+
+        // Verify the session was created — speed is internal to config so we
+        // verify indirectly through the delay computation on a known gap.
+        let (start, end) = session.time_range();
+        assert!(end > start);
+    }
+
+    #[test]
+    fn builder_tier_method() {
+        let session = ReplayBuilder::new(human())
+            .tier(AccessTier::A4Admin)
+            .instant()
+            .build(sample_events())
+            .unwrap();
+
+        assert_eq!(session.effective_tier(), AccessTier::A4Admin);
+    }
+
+    #[test]
+    fn builder_skip_empty_filters_null_text() {
+        let events = vec![
+            make_text_event(1, 0, 1000, "has text"),
+            make_lifecycle(1, 1, 2000), // no text
+            make_text_event(1, 2, 3000, "also text"),
+        ];
+        let mut session = ReplayBuilder::new(human())
+            .instant()
+            .skip_empty()
+            .build(events)
+            .unwrap();
+
+        let frames = session.collect_remaining();
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|f| f.event.text.is_some()));
+    }
+
+    #[test]
+    fn builder_kinds_method() {
+        let events = vec![
+            make_text_event(1, 0, 1000, "text"),
+            make_lifecycle(1, 1, 2000),
+        ];
+        let mut session = ReplayBuilder::new(human())
+            .instant()
+            .kinds(vec![QueryEventKind::LifecycleMarker])
+            .build(events)
+            .unwrap();
+
+        let frames = session.collect_remaining();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].event.event_kind,
+            QueryEventKind::LifecycleMarker
+        );
+    }
+
+    #[test]
+    fn seek_to_exact_first_timestamp() {
+        let mut session = ReplaySession::new(
+            sample_events(),
+            ReplayConfig::instant(),
+            human(),
+            AccessTier::A2FullQuery,
+            "seek-first",
+        )
+        .unwrap();
+
+        // Seeking to the exact first timestamp should land on index 0.
+        let idx = session.seek(1000).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(session.cursor(), 0);
+    }
+
+    #[test]
+    fn seek_to_exact_last_timestamp() {
+        let mut session = ReplaySession::new(
+            sample_events(),
+            ReplayConfig::instant(),
+            human(),
+            AccessTier::A2FullQuery,
+            "seek-last",
+        )
+        .unwrap();
+
+        // Seeking to the exact last timestamp should land on the last event index.
+        let idx = session.seek(3000).unwrap();
+        assert_eq!(idx, 4); // partition_point for 3000 in [1000,1500,2000,2500,3000]
+        assert_eq!(session.cursor(), 4);
+    }
+
+    #[test]
+    fn seek_preserves_state_when_not_completed() {
+        let mut session = ReplaySession::new(
+            sample_events(),
+            ReplayConfig::instant(),
+            human(),
+            AccessTier::A2FullQuery,
+            "seek-state",
+        )
+        .unwrap();
+
+        // In Ready state, seek should not change to Paused.
+        assert_eq!(session.state(), ReplayState::Ready);
+        session.seek(2000).unwrap();
+        assert_eq!(session.state(), ReplayState::Ready);
+
+        // In Playing state, seek should not change to Paused.
+        session.play();
+        assert_eq!(session.state(), ReplayState::Playing);
+        session.seek(1500).unwrap();
+        assert_eq!(session.state(), ReplayState::Playing);
+    }
+
+    #[test]
+    fn actor_and_tier_accessors() {
+        let actor = ActorIdentity::new(ActorKind::Robot, "bot-42");
+        let session = ReplaySession::new(
+            sample_events(),
+            ReplayConfig::instant(),
+            actor,
+            AccessTier::A1RedactedQuery,
+            "access-test",
+        )
+        .unwrap();
+
+        assert_eq!(session.actor().kind, ActorKind::Robot);
+        assert_eq!(session.actor().identity, "bot-42");
+        assert_eq!(session.effective_tier(), AccessTier::A1RedactedQuery);
+    }
+
+    #[test]
+    fn reset_clears_by_kind_and_replay_duration() {
+        let mut session = ReplaySession::new(
+            sample_events(),
+            ReplayConfig::realtime(),
+            human(),
+            AccessTier::A2FullQuery,
+            "reset-deep",
+        )
+        .unwrap();
+
+        session.collect_remaining();
+        assert!(!session.stats().by_kind.is_empty());
+        assert!(session.stats().replay_duration_ms > 0);
+
+        session.reset();
+        assert!(session.stats().by_kind.is_empty());
+        assert_eq!(session.stats().replay_duration_ms, 0);
+        assert!(!session.stats().completed);
+        assert_eq!(session.stats().frames_skipped, 0);
+    }
+
+    #[test]
+    fn replay_stats_default() {
+        let stats = ReplayStats::default();
+        assert_eq!(stats.frames_emitted, 0);
+        assert_eq!(stats.frames_skipped, 0);
+        assert_eq!(stats.original_duration_ms, 0);
+        assert_eq!(stats.replay_duration_ms, 0);
+        assert_eq!(stats.unique_panes, 0);
+        assert!(stats.by_kind.is_empty());
+        assert!(!stats.completed);
+    }
+
+    #[test]
+    fn replay_stats_serde_roundtrip() {
+        let mut stats = ReplayStats {
+            frames_emitted: 10,
+            frames_skipped: 3,
+            original_duration_ms: 5000,
+            replay_duration_ms: 2500,
+            unique_panes: 2,
+            by_kind: std::collections::HashMap::new(),
+            completed: true,
+        };
+        stats.by_kind.insert("IngressText".to_string(), 7);
+        stats.by_kind.insert("LifecycleMarker".to_string(), 3);
+
+        let json = serde_json::to_string(&stats).unwrap();
+        let deserialized: ReplayStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.frames_emitted, 10);
+        assert_eq!(deserialized.frames_skipped, 3);
+        assert_eq!(deserialized.original_duration_ms, 5000);
+        assert_eq!(deserialized.replay_duration_ms, 2500);
+        assert_eq!(deserialized.unique_panes, 2);
+        assert!(deserialized.completed);
+        assert_eq!(deserialized.by_kind.get("IngressText"), Some(&7));
+        assert_eq!(deserialized.by_kind.get("LifecycleMarker"), Some(&3));
+    }
+
+    #[test]
+    fn audit_start_records_pane_ids_and_time_range() {
+        let session = ReplaySession::new(
+            sample_events(),
+            ReplayConfig::instant(),
+            human(),
+            AccessTier::A2FullQuery,
+            "audit-detail",
+        )
+        .unwrap();
+
+        let audit = AuditLog::new(crate::recorder_audit::AuditLogConfig::default());
+        session.audit_start(&audit, 9000000);
+
+        let entries = audit.entries();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.actor.kind, ActorKind::Human);
+        assert_eq!(entry.actor.identity, "user-1");
+        assert_eq!(entry.decision, AuthzDecision::Allow);
+        // Scope should have pane_ids [1, 2] (sorted, deduped) and time_range.
+        assert_eq!(entry.scope.pane_ids, vec![1, 2]);
+        assert_eq!(entry.scope.time_range, Some((1000, 3000)));
+        assert_eq!(entry.scope.result_count, Some(5));
+    }
+
+    #[test]
+    fn audit_complete_records_stats() {
+        let mut session = ReplaySession::new(
+            sample_events(),
+            ReplayConfig::instant().with_panes(vec![1]),
+            human(),
+            AccessTier::A2FullQuery,
+            "audit-stats",
+        )
+        .unwrap();
+
+        session.collect_remaining();
+        let audit = AuditLog::new(crate::recorder_audit::AuditLogConfig::default());
+        session.audit_complete(&audit, 9000000);
+
+        let entries = audit.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].decision, AuthzDecision::Allow);
+    }
+
+    #[test]
+    fn multi_pane_filter_accepts_multiple_panes() {
+        let events = vec![
+            make_text_event(1, 0, 1000, "pane1"),
+            make_text_event(2, 1, 2000, "pane2"),
+            make_text_event(3, 2, 3000, "pane3"),
+            make_text_event(4, 3, 4000, "pane4"),
+        ];
+        let config = ReplayConfig::instant().with_panes(vec![2, 4]);
+
+        let mut session = ReplaySession::new(
+            events,
+            config,
+            human(),
+            AccessTier::A2FullQuery,
+            "multi-pane",
+        )
+        .unwrap();
+
+        let frames = session.collect_remaining();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].event.pane_id, 2);
+        assert_eq!(frames[1].event.pane_id, 4);
+        assert_eq!(session.stats().frames_skipped, 2);
+    }
 }

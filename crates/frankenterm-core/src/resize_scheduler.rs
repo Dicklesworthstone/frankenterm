@@ -3372,10 +3372,12 @@ mod tests {
         let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
         let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
         let _ = scheduler.schedule_frame();
+        assert!(scheduler.mark_active_phase(1, 1, ResizeExecutionPhase::Reflowing, 110));
+        assert!(scheduler.mark_active_phase(1, 1, ResizeExecutionPhase::Presenting, 120));
         assert!(scheduler.complete_active(1, 1));
 
         let snap = scheduler.debug_snapshot(64);
-        // Clean transaction should have zero failures
+        // Clean transaction with proper phase transitions should have zero failures
         assert_eq!(snap.invariant_telemetry.critical_count, 0);
         assert_eq!(snap.invariant_telemetry.error_count, 0);
         assert!(snap.invariants.is_clean());

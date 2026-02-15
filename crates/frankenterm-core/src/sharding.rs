@@ -341,6 +341,7 @@ struct PaneRoute {
 }
 
 /// Shard-aware wrapper implementing the WezTerm interface.
+#[derive(Debug)]
 pub struct ShardedWeztermClient {
     backends: Vec<ShardBackend>,
     backend_index: HashMap<ShardId, usize>,
@@ -1392,5 +1393,667 @@ mod tests {
         let trait_warnings = client.watchdog_warnings().await.unwrap();
         assert_eq!(trait_warnings.len(), 1);
         assert!(trait_warnings[0].contains("Shard 1 (failing)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // AssignmentStrategy serde variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assignment_strategy_by_domain_serde() {
+        let s = AssignmentStrategy::ByDomain {
+            domain_to_shard: HashMap::from([("local".to_string(), ShardId(0))]),
+            default_shard: Some(ShardId(1)),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: AssignmentStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn assignment_strategy_by_agent_type_serde() {
+        let s = AssignmentStrategy::ByAgentType {
+            agent_to_shard: HashMap::from([(AgentType::Codex, ShardId(2))]),
+            default_shard: None,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: AssignmentStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn assignment_strategy_manual_serde() {
+        let s = AssignmentStrategy::Manual {
+            pane_to_shard: HashMap::from([(42, ShardId(1))]),
+            default_shard: Some(ShardId(0)),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: AssignmentStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_shards
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_shards_rejects_unknown_shard_in_by_domain() {
+        let valid: HashSet<ShardId> = [ShardId(0)].into();
+        let strategy = AssignmentStrategy::ByDomain {
+            domain_to_shard: HashMap::from([("x".to_string(), ShardId(99))]),
+            default_shard: None,
+        };
+        let err = strategy.validate_shards(&valid).unwrap_err();
+        assert!(err.to_string().contains("unknown shard id 99"));
+    }
+
+    #[test]
+    fn validate_shards_rejects_unknown_in_by_agent_type() {
+        let valid: HashSet<ShardId> = [ShardId(0)].into();
+        let strategy = AssignmentStrategy::ByAgentType {
+            agent_to_shard: HashMap::from([(AgentType::Codex, ShardId(5))]),
+            default_shard: None,
+        };
+        assert!(strategy.validate_shards(&valid).is_err());
+    }
+
+    #[test]
+    fn validate_shards_rejects_unknown_in_manual() {
+        let valid: HashSet<ShardId> = [ShardId(0)].into();
+        let strategy = AssignmentStrategy::Manual {
+            pane_to_shard: HashMap::from([(1, ShardId(7))]),
+            default_shard: None,
+        };
+        assert!(strategy.validate_shards(&valid).is_err());
+    }
+
+    #[test]
+    fn validate_shards_rejects_zero_virtual_nodes() {
+        let valid: HashSet<ShardId> = [ShardId(0)].into();
+        let strategy = AssignmentStrategy::ConsistentHash { virtual_nodes: 0 };
+        let err = strategy.validate_shards(&valid).unwrap_err();
+        assert!(err.to_string().contains("virtual_nodes must be >= 1"));
+    }
+
+    #[test]
+    fn validate_shards_round_robin_always_ok() {
+        let valid: HashSet<ShardId> = [ShardId(0)].into();
+        assert!(AssignmentStrategy::RoundRobin.validate_shards(&valid).is_ok());
+    }
+
+    #[test]
+    fn validate_shards_rejects_unknown_default_shard() {
+        let valid: HashSet<ShardId> = [ShardId(0)].into();
+        let strategy = AssignmentStrategy::ByDomain {
+            domain_to_shard: HashMap::new(),
+            default_shard: Some(ShardId(99)),
+        };
+        assert!(strategy.validate_shards(&valid).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // preferred_for_spawn
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn preferred_for_spawn_round_robin_returns_none() {
+        let s = AssignmentStrategy::RoundRobin;
+        assert_eq!(s.preferred_for_spawn(None, None), None);
+    }
+
+    #[test]
+    fn preferred_for_spawn_by_domain_with_hint() {
+        let s = AssignmentStrategy::ByDomain {
+            domain_to_shard: HashMap::from([("local".to_string(), ShardId(1))]),
+            default_shard: Some(ShardId(0)),
+        };
+        assert_eq!(s.preferred_for_spawn(Some("local"), None), Some(ShardId(1)));
+    }
+
+    #[test]
+    fn preferred_for_spawn_by_domain_no_hint_uses_default() {
+        let s = AssignmentStrategy::ByDomain {
+            domain_to_shard: HashMap::from([("local".to_string(), ShardId(1))]),
+            default_shard: Some(ShardId(0)),
+        };
+        assert_eq!(s.preferred_for_spawn(None, None), Some(ShardId(0)));
+    }
+
+    #[test]
+    fn preferred_for_spawn_by_agent_type_with_match() {
+        let s = AssignmentStrategy::ByAgentType {
+            agent_to_shard: HashMap::from([(AgentType::Gemini, ShardId(2))]),
+            default_shard: None,
+        };
+        assert_eq!(
+            s.preferred_for_spawn(None, Some(AgentType::Gemini)),
+            Some(ShardId(2))
+        );
+    }
+
+    #[test]
+    fn preferred_for_spawn_by_agent_type_no_match_uses_default() {
+        let s = AssignmentStrategy::ByAgentType {
+            agent_to_shard: HashMap::from([(AgentType::Gemini, ShardId(2))]),
+            default_shard: Some(ShardId(0)),
+        };
+        assert_eq!(
+            s.preferred_for_spawn(None, Some(AgentType::Codex)),
+            Some(ShardId(0))
+        );
+    }
+
+    #[test]
+    fn preferred_for_spawn_manual_returns_default_only() {
+        let s = AssignmentStrategy::Manual {
+            pane_to_shard: HashMap::from([(42, ShardId(1))]),
+            default_shard: Some(ShardId(0)),
+        };
+        assert_eq!(s.preferred_for_spawn(None, None), Some(ShardId(0)));
+    }
+
+    #[test]
+    fn preferred_for_spawn_consistent_hash_returns_none() {
+        let s = AssignmentStrategy::ConsistentHash { virtual_nodes: 64 };
+        assert_eq!(s.preferred_for_spawn(Some("x"), Some(AgentType::Codex)), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // ShardBackend
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shard_backend_debug_omits_handle() {
+        let mock = Arc::new(MockWezterm::new()) as WeztermHandle;
+        let backend = ShardBackend::new(ShardId(3), "test-shard", mock);
+        let debug = format!("{:?}", backend);
+        assert!(debug.contains("id: ShardId(3)"));
+        assert!(debug.contains("test-shard"));
+        // handle should be omitted via finish_non_exhaustive
+        assert!(debug.contains(".."));
+    }
+
+    // -----------------------------------------------------------------------
+    // ShardedWeztermClient constructor errors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn client_new_rejects_empty_backends() {
+        let result = ShardedWeztermClient::new(vec![], AssignmentStrategy::RoundRobin);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("at least one backend"));
+    }
+
+    #[test]
+    fn client_new_rejects_duplicate_shard_ids() {
+        let mock1 = Arc::new(MockWezterm::new()) as WeztermHandle;
+        let mock2 = Arc::new(MockWezterm::new()) as WeztermHandle;
+        let result = ShardedWeztermClient::new(
+            vec![
+                ShardBackend::new(ShardId(0), "a", mock1),
+                ShardBackend::new(ShardId(0), "b", mock2),
+            ],
+            AssignmentStrategy::RoundRobin,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("duplicate shard id"));
+    }
+
+    // -----------------------------------------------------------------------
+    // from_handles
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_handles_assigns_sequential_ids() {
+        let mock0 = Arc::new(MockWezterm::new()) as WeztermHandle;
+        let mock1 = Arc::new(MockWezterm::new()) as WeztermHandle;
+        let client = ShardedWeztermClient::from_handles(
+            AssignmentStrategy::RoundRobin,
+            vec![mock0, mock1],
+        )
+        .unwrap();
+        assert_eq!(client.shard_ids(), vec![ShardId(0), ShardId(1)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // shard_ids
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shard_ids_returns_sorted() {
+        let mock0 = Arc::new(MockWezterm::new()) as WeztermHandle;
+        let mock1 = Arc::new(MockWezterm::new()) as WeztermHandle;
+        // Provide out-of-order backends
+        let client = ShardedWeztermClient::new(
+            vec![
+                ShardBackend::new(ShardId(5), "five", mock0),
+                ShardBackend::new(ShardId(2), "two", mock1),
+            ],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+        assert_eq!(client.shard_ids(), vec![ShardId(2), ShardId(5)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // assign_pane_with_strategy: ByAgentType
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assign_by_agent_type_known_agent() {
+        let shards = vec![ShardId(0), ShardId(1)];
+        let strategy = AssignmentStrategy::ByAgentType {
+            agent_to_shard: HashMap::from([(AgentType::ClaudeCode, ShardId(1))]),
+            default_shard: Some(ShardId(0)),
+        };
+        let result = assign_pane_with_strategy(
+            &strategy,
+            &shards,
+            1,
+            None,
+            Some(AgentType::ClaudeCode),
+        );
+        assert_eq!(result, ShardId(1));
+    }
+
+    #[test]
+    fn assign_by_agent_type_unknown_agent_uses_default() {
+        let shards = vec![ShardId(0), ShardId(1)];
+        let strategy = AssignmentStrategy::ByAgentType {
+            agent_to_shard: HashMap::from([(AgentType::Codex, ShardId(1))]),
+            default_shard: Some(ShardId(0)),
+        };
+        let result = assign_pane_with_strategy(
+            &strategy,
+            &shards,
+            1,
+            None,
+            Some(AgentType::Gemini),
+        );
+        assert_eq!(result, ShardId(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // assign_pane_with_strategy: Manual with explicit pane mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assign_manual_explicit_pane_id() {
+        let shards = vec![ShardId(0), ShardId(1)];
+        let strategy = AssignmentStrategy::Manual {
+            pane_to_shard: HashMap::from([(100, ShardId(1))]),
+            default_shard: Some(ShardId(0)),
+        };
+        assert_eq!(
+            assign_pane_with_strategy(&strategy, &shards, 100, None, None),
+            ShardId(1)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // assign_pane_with_strategy: strategy_choice references invalid shard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assign_strategy_invalid_shard_falls_back() {
+        // The strategy maps to ShardId(99) but shard_ids only has [0,1]
+        let shards = vec![ShardId(0), ShardId(1)];
+        let strategy = AssignmentStrategy::Manual {
+            pane_to_shard: HashMap::from([(42, ShardId(99))]),
+            default_shard: None,
+        };
+        // Should fall through to deterministic_fallback_shard
+        let result = assign_pane_with_strategy(&strategy, &shards, 42, None, None);
+        assert!(shards.contains(&result));
+    }
+
+    // -----------------------------------------------------------------------
+    // deterministic_fallback_shard consistency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deterministic_fallback_is_repeatable() {
+        let shards = vec![ShardId(0), ShardId(1), ShardId(2)];
+        let a = deterministic_fallback_shard(&shards, 42);
+        let b = deterministic_fallback_shard(&shards, 42);
+        assert_eq!(a, b);
+        assert!(shards.contains(&a));
+    }
+
+    #[test]
+    fn deterministic_fallback_spreads_across_shards() {
+        let shards = vec![ShardId(0), ShardId(1), ShardId(2)];
+        let mut seen = HashSet::new();
+        for seed in 0..100 {
+            seen.insert(deterministic_fallback_shard(&shards, seed));
+        }
+        // With 100 seeds and 3 shards, we should hit all 3
+        assert_eq!(seen.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // ShardHealthEntry serde
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shard_health_entry_serde_roundtrip() {
+        let entry = ShardHealthEntry {
+            shard_id: ShardId(2),
+            label: "test".to_string(),
+            status: HealthStatus::Degraded,
+            pane_count: Some(5),
+            circuit: CircuitBreakerStatus::default(),
+            error: Some("timeout".to_string()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: ShardHealthEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.shard_id, ShardId(2));
+        assert_eq!(back.label, "test");
+        assert_eq!(back.status, HealthStatus::Degraded);
+        assert_eq!(back.pane_count, Some(5));
+        assert_eq!(back.error.as_deref(), Some("timeout"));
+    }
+
+    // -----------------------------------------------------------------------
+    // now_epoch_ms
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn now_epoch_ms_is_reasonable() {
+        let ms = now_epoch_ms();
+        // Should be after 2020-01-01 (1577836800000ms)
+        assert!(ms > 1_577_836_800_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // infer_agent_type edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn infer_agent_type_wezterm_title() {
+        fn pane_with_title(title: &str) -> PaneInfo {
+            serde_json::from_value(serde_json::json!({
+                "pane_id": 0,
+                "tab_id": 0,
+                "window_id": 0,
+                "title": title,
+            }))
+            .unwrap()
+        }
+        assert_eq!(
+            infer_agent_type(&pane_with_title("WezTerm config")),
+            AgentType::Wezterm
+        );
+    }
+
+    #[test]
+    fn infer_agent_type_mixed_case() {
+        fn pane_with_title(title: &str) -> PaneInfo {
+            serde_json::from_value(serde_json::json!({
+                "pane_id": 0,
+                "tab_id": 0,
+                "window_id": 0,
+                "title": title,
+            }))
+            .unwrap()
+        }
+        // Case-insensitive matching
+        assert_eq!(
+            infer_agent_type(&pane_with_title("CODEX-dev")),
+            AgentType::Codex
+        );
+        assert_eq!(
+            infer_agent_type(&pane_with_title("CLAUDE-code")),
+            AgentType::ClaudeCode
+        );
+        assert_eq!(
+            infer_agent_type(&pane_with_title("GEMINI session")),
+            AgentType::Gemini
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Async trait operations: get_pane, send_text, split_pane, kill_pane, etc.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_pane_routes_to_correct_shard() {
+        let shard0 = Arc::new(MockWezterm::new());
+        shard0.add_default_pane(10).await;
+
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(ShardId(0), "s0", shard0.clone() as WeztermHandle)],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+
+        // List first to populate routes
+        let panes = client.list_panes().await.unwrap();
+        assert_eq!(panes.len(), 1);
+
+        let global_id = panes[0].pane_id;
+        let pane = client.get_pane(global_id).await.unwrap();
+        assert_eq!(pane.pane_id, global_id);
+        assert_eq!(
+            pane.extra.get("shard_id"),
+            Some(&Value::from(0_u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn send_text_routes_to_correct_shard() {
+        let shard0 = Arc::new(MockWezterm::new());
+        shard0.add_default_pane(5).await;
+        let shard1 = Arc::new(MockWezterm::new());
+        shard1.add_default_pane(5).await;
+
+        let client = ShardedWeztermClient::new(
+            vec![
+                ShardBackend::new(ShardId(0), "s0", shard0.clone() as WeztermHandle),
+                ShardBackend::new(ShardId(1), "s1", shard1.clone() as WeztermHandle),
+            ],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+
+        let panes = client.list_panes().await.unwrap();
+        let shard1_pane = panes
+            .iter()
+            .find(|p| p.extra.get("shard_id") == Some(&Value::from(1_u64)))
+            .unwrap();
+
+        client
+            .send_text(shard1_pane.pane_id, "hello")
+            .await
+            .unwrap();
+        // Verify shard1 got the text
+        let text = shard1.get_text(5, false).await.unwrap();
+        assert!(text.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn split_pane_encodes_global_id() {
+        let shard0 = Arc::new(MockWezterm::new());
+        shard0.add_default_pane(1).await;
+
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+
+        let panes = client.list_panes().await.unwrap();
+        let global_id = panes[0].pane_id;
+
+        let new_pane = client
+            .split_pane(global_id, SplitDirection::Right, None, None)
+            .await
+            .unwrap();
+        let (shard, _local) = decode_sharded_pane_id(new_pane);
+        assert_eq!(shard, ShardId(0));
+    }
+
+    #[tokio::test]
+    async fn kill_pane_removes_from_routes() {
+        let shard0 = Arc::new(MockWezterm::new());
+        shard0.add_default_pane(1).await;
+
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+
+        let panes = client.list_panes().await.unwrap();
+        assert_eq!(panes.len(), 1);
+        let global_id = panes[0].pane_id;
+
+        client.kill_pane(global_id).await.unwrap();
+
+        // Route should be removed
+        let routes = client.pane_routes.read().await;
+        assert!(!routes.contains_key(&global_id));
+    }
+
+    #[tokio::test]
+    async fn circuit_status_aggregates_worst_state() {
+        let healthy = Arc::new(MockWezterm::new());
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(ShardId(0), "s0", healthy as WeztermHandle)],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+
+        let status = client.circuit_status();
+        assert_eq!(status.state, CircuitStateKind::Closed);
+    }
+
+    #[tokio::test]
+    async fn activate_pane_routes_correctly() {
+        let shard0 = Arc::new(MockWezterm::new());
+        shard0.add_default_pane(3).await;
+
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+
+        let panes = client.list_panes().await.unwrap();
+        // Should not error
+        client.activate_pane(panes[0].pane_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn zoom_pane_routes_correctly() {
+        let shard0 = Arc::new(MockWezterm::new());
+        shard0.add_default_pane(3).await;
+
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+
+        let panes = client.list_panes().await.unwrap();
+        client.zoom_pane(panes[0].pane_id, true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_for_unknown_pane_single_backend_uses_raw_id() {
+        let shard0 = Arc::new(MockWezterm::new());
+        shard0.add_default_pane(42).await;
+
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+
+        // Don't list_panes first, so routes are empty.
+        // With single backend, route_for_global_pane_id should fall back to
+        // using the raw pane_id on the only backend. The collect_panes call
+        // will find pane 42, so 42 should be routable.
+        let text = client.get_text(42, false).await.unwrap();
+        assert!(text.is_empty() || text.len() >= 0); // Just verify no error
+    }
+
+    #[tokio::test]
+    async fn send_ctrl_c_routes_correctly() {
+        let shard0 = Arc::new(MockWezterm::new());
+        shard0.add_default_pane(1).await;
+
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+
+        let panes = client.list_panes().await.unwrap();
+        client.send_ctrl_c(panes[0].pane_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_ctrl_d_routes_correctly() {
+        let shard0 = Arc::new(MockWezterm::new());
+        shard0.add_default_pane(1).await;
+
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+
+        let panes = client.list_panes().await.unwrap();
+        client.send_ctrl_d(panes[0].pane_id).await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // assign_pane_with_strategy: ByDomain with case normalization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assign_by_domain_normalizes_case() {
+        let shards = vec![ShardId(0), ShardId(1)];
+        let strategy = AssignmentStrategy::ByDomain {
+            domain_to_shard: HashMap::from([("local".to_string(), ShardId(1))]),
+            default_shard: Some(ShardId(0)),
+        };
+        // Pass "LOCAL" which should normalize to "local"
+        let result = assign_pane_with_strategy(&strategy, &shards, 1, Some("LOCAL"), None);
+        assert_eq!(result, ShardId(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // watchdog_warnings formatting
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn watchdog_warnings_includes_no_error_detail() {
+        let report = ShardHealthReport {
+            timestamp_ms: 1000,
+            overall: HealthStatus::Critical,
+            shards: vec![ShardHealthEntry {
+                shard_id: ShardId(0),
+                label: "s0".to_string(),
+                status: HealthStatus::Critical,
+                pane_count: None,
+                circuit: CircuitBreakerStatus::default(),
+                error: None,
+            }],
+        };
+        let warnings = report.watchdog_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("no error details"));
+    }
+
+    // -----------------------------------------------------------------------
+    // SHARD_ID_BITS / LOCAL_PANE_ID_MASK constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shard_id_bits_and_mask_are_consistent() {
+        assert_eq!(SHARD_ID_BITS, 16);
+        assert_eq!(LOCAL_PANE_ID_MASK, (1u64 << 48) - 1);
     }
 }
