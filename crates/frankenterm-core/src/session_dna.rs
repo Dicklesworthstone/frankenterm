@@ -1332,4 +1332,254 @@ mod tests {
             }
         }
     }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──────────────────────
+
+    // ── SessionDna additional coverage ──────────────────────
+
+    #[test]
+    fn dna_debug_clone() {
+        let dna = SessionDna::default();
+        let dbg = format!("{:?}", dna);
+        assert!(dbg.contains("SessionDna"));
+        let cloned = dna.clone();
+        assert!((cloned.active_fraction - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dna_raw_features_time_to_first_error_some() {
+        let mut dna = SessionDna::default();
+        dna.duration_hours = 10.0;
+        dna.time_to_first_error = Some(2.5);
+        let features = dna.to_raw_features();
+        // Feature[15] = time_to_first_error (2.5), not duration_hours (10.0)
+        assert!((features[15] - 2.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn dna_raw_features_time_to_first_error_none() {
+        let mut dna = SessionDna::default();
+        dna.duration_hours = 5.0;
+        dna.time_to_first_error = None;
+        let features = dna.to_raw_features();
+        // Feature[15] = duration_hours (5.0) when no error
+        assert!((features[15] - 5.0).abs() < 0.01);
+    }
+
+    // ── SessionDnaConfig additional coverage ────────────────
+
+    #[test]
+    fn config_debug_clone() {
+        let c = SessionDnaConfig::default();
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("SessionDnaConfig"));
+        let c2 = c.clone();
+        assert_eq!(c2.embedding_dim, c.embedding_dim);
+    }
+
+    // ── SessionDnaBuilder additional coverage ───────────────
+
+    #[test]
+    fn builder_debug_clone() {
+        let b = SessionDnaBuilder::new();
+        let dbg = format!("{:?}", b);
+        assert!(dbg.contains("SessionDnaBuilder"));
+        let b2 = b.clone();
+        assert_eq!(b2.current().burst_count, 0);
+    }
+
+    #[test]
+    fn builder_current_accessor() {
+        let mut b = SessionDnaBuilder::new();
+        b.set_tokens_per_hour(42.0);
+        assert!((b.current().tokens_per_hour - 42.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn builder_default_is_new() {
+        let b1 = SessionDnaBuilder::new();
+        let b2 = SessionDnaBuilder::default();
+        assert_eq!(b1.current().burst_count, b2.current().burst_count);
+        assert!((b1.current().active_fraction - b2.current().active_fraction).abs() < f32::EPSILON);
+    }
+
+    // ── DetectionType additional coverage ───────────────────
+
+    #[test]
+    fn detection_type_debug_clone_copy() {
+        let dt = DetectionType::ToolCall;
+        let dbg = format!("{:?}", dt);
+        assert!(dbg.contains("ToolCall"));
+        let copied = dt; // Copy
+        let cloned = dt.clone(); // Clone
+        assert_eq!(copied, cloned);
+    }
+
+    #[test]
+    fn detection_type_serde_roundtrip_all() {
+        let types = [
+            DetectionType::ToolCall,
+            DetectionType::Error,
+            DetectionType::RateLimit,
+            DetectionType::Compaction,
+        ];
+        for dt in &types {
+            let json = serde_json::to_string(dt).unwrap();
+            let back: DetectionType = serde_json::from_str(&json).unwrap();
+            assert_eq!(*dt, back);
+        }
+    }
+
+    #[test]
+    fn detection_type_all_variants_distinct() {
+        let variants = [
+            DetectionType::ToolCall,
+            DetectionType::Error,
+            DetectionType::RateLimit,
+            DetectionType::Compaction,
+        ];
+        for i in 0..variants.len() {
+            for j in (i + 1)..variants.len() {
+                assert_ne!(variants[i], variants[j]);
+            }
+        }
+    }
+
+    // ── FeatureNormalizer additional coverage ───────────────
+
+    #[test]
+    fn normalizer_debug_clone() {
+        let n = FeatureNormalizer::new(3);
+        let dbg = format!("{:?}", n);
+        assert!(dbg.contains("FeatureNormalizer"));
+        let n2 = n.clone();
+        assert_eq!(n2.count(), 0);
+    }
+
+    #[test]
+    fn normalizer_count_accessor() {
+        let mut n = FeatureNormalizer::new(2);
+        assert_eq!(n.count(), 0);
+        n.update(&[1.0, 2.0]);
+        assert_eq!(n.count(), 1);
+        n.update(&[3.0, 4.0]);
+        assert_eq!(n.count(), 2);
+    }
+
+    #[test]
+    fn normalizer_insufficient_samples_passthrough() {
+        let mut n = FeatureNormalizer::new(2);
+        n.update(&[5.0, 10.0]); // Only 1 sample, need >= 2 for z-score
+        let result = n.normalize(&[5.0, 10.0]);
+        // With < 2 samples, should pass through raw values
+        assert!((result[0] - 5.0).abs() < f64::EPSILON);
+        assert!((result[1] - 10.0).abs() < f64::EPSILON);
+    }
+
+    // ── KnnPrediction additional coverage ───────────────────
+
+    #[test]
+    fn knn_prediction_debug_clone() {
+        let pred = KnnPrediction {
+            predicted_duration_hours: 2.5,
+            duration_iqr_hours: 0.5,
+            k: 5,
+            neighbor_similarities: vec![0.9, 0.85, 0.8],
+        };
+        let dbg = format!("{:?}", pred);
+        assert!(dbg.contains("KnnPrediction"));
+        let p2 = pred.clone();
+        assert_eq!(p2.k, 5);
+    }
+
+    // ── StoredSession additional coverage ───────────────────
+
+    #[test]
+    fn stored_session_debug_clone_serde() {
+        let session = StoredSession {
+            session_id: "sess-001".to_string(),
+            dna: SessionDna::default(),
+            embedding: vec![0.1, 0.2, 0.3],
+            duration_hours: 1.5,
+            successful: true,
+        };
+        let dbg = format!("{:?}", session);
+        assert!(dbg.contains("StoredSession"));
+        let s2 = session.clone();
+        assert_eq!(s2.session_id, "sess-001");
+        let json = serde_json::to_string(&session).unwrap();
+        let back: StoredSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_id, "sess-001");
+        assert!(back.successful);
+    }
+
+    // ── SessionStore additional coverage ────────────────────
+
+    #[test]
+    fn store_debug_clone() {
+        let store = SessionStore::new(SessionDnaConfig::default());
+        let dbg = format!("{:?}", store);
+        assert!(dbg.contains("SessionStore"));
+        let s2 = store.clone();
+        assert!(s2.is_empty());
+    }
+
+    #[test]
+    fn store_is_empty_and_len() {
+        let mut store = SessionStore::new(SessionDnaConfig::default());
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+        store.add_session("s1", SessionDna::default(), true);
+        assert!(!store.is_empty());
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn store_predict_no_sessions() {
+        let store = SessionStore::new(SessionDnaConfig::default());
+        let result = store.predict(&SessionDna::default());
+        assert!(result.is_none());
+    }
+
+    // ── PcaModel additional coverage ────────────────────────
+
+    #[test]
+    fn pca_debug_clone() {
+        let data = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![4.0, 5.0, 6.0],
+            vec![7.0, 8.0, 9.0],
+        ];
+        if let Some(model) = PcaModel::fit(&data, 2) {
+            let dbg = format!("{:?}", model);
+            assert!(dbg.contains("PcaModel"));
+            let m2 = model.clone();
+            assert_eq!(m2.embedding_dim(), 2);
+        }
+    }
+
+    #[test]
+    fn pca_embedding_dim_accessor() {
+        let data = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![1.0, 1.0, 0.0],
+        ];
+        if let Some(model) = PcaModel::fit(&data, 2) {
+            assert_eq!(model.embedding_dim(), 2);
+            let projected = model.project(&[1.0, 0.5, 0.5]);
+            assert_eq!(projected.len(), 2);
+        }
+    }
+
+    // ── RAW_FEATURE_DIM constant ───────────────────────────
+
+    #[test]
+    fn raw_feature_dim_is_17() {
+        assert_eq!(RAW_FEATURE_DIM, 17);
+        // SessionDna::to_raw_features should return exactly this many features
+        let dna = SessionDna::default();
+        assert_eq!(dna.to_raw_features().len(), RAW_FEATURE_DIM);
+    }
 }
