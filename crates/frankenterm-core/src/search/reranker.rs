@@ -152,4 +152,134 @@ mod tests {
         // Verify it implements std::error::Error
         let _: &dyn std::error::Error = &e;
     }
+
+    // =====================================================================
+    // RerankError tests
+    // =====================================================================
+
+    #[test]
+    fn rerank_error_model_error_display() {
+        let e = RerankError::ModelError("out of memory".into());
+        let msg = e.to_string();
+        assert!(msg.contains("rerank model error"));
+        assert!(msg.contains("out of memory"));
+    }
+
+    #[test]
+    fn rerank_error_empty_input_display() {
+        let e = RerankError::EmptyInput;
+        assert_eq!(e.to_string(), "empty input to reranker");
+    }
+
+    #[test]
+    fn rerank_error_debug() {
+        let e = RerankError::ModelError("fail".into());
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("ModelError"));
+        assert!(dbg.contains("fail"));
+
+        let e = RerankError::EmptyInput;
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("EmptyInput"));
+    }
+
+    // =====================================================================
+    // ScoredDoc tests
+    // =====================================================================
+
+    #[test]
+    fn scored_doc_debug() {
+        let doc = ScoredDoc {
+            id: 1,
+            text: "hello".into(),
+            score: 0.9,
+        };
+        let dbg = format!("{doc:?}");
+        assert!(dbg.contains("ScoredDoc"));
+        assert!(dbg.contains("hello"));
+    }
+
+    #[test]
+    fn scored_doc_clone_preserves_all_fields() {
+        let doc = ScoredDoc {
+            id: 999,
+            text: "long text content here".into(),
+            score: 0.12345,
+        };
+        let doc2 = doc.clone();
+        assert_eq!(doc2.id, 999);
+        assert_eq!(doc2.text, "long text content here");
+        assert!((doc2.score - 0.12345).abs() < f32::EPSILON);
+    }
+
+    // =====================================================================
+    // PassthroughReranker additional tests
+    // =====================================================================
+
+    #[test]
+    fn passthrough_single_doc() {
+        let reranker = PassthroughReranker;
+        let docs = vec![ScoredDoc {
+            id: 1,
+            text: "only".into(),
+            score: 1.0,
+        }];
+        let result = reranker.rerank("q", docs).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, 1);
+    }
+
+    #[test]
+    fn passthrough_preserves_order() {
+        let reranker = PassthroughReranker;
+        let docs = vec![
+            ScoredDoc {
+                id: 3,
+                text: "third".into(),
+                score: 0.3,
+            },
+            ScoredDoc {
+                id: 1,
+                text: "first".into(),
+                score: 0.1,
+            },
+            ScoredDoc {
+                id: 2,
+                text: "second".into(),
+                score: 0.2,
+            },
+        ];
+        let result = reranker.rerank("query", docs).unwrap();
+        assert_eq!(result[0].id, 3);
+        assert_eq!(result[1].id, 1);
+        assert_eq!(result[2].id, 2);
+    }
+
+    #[test]
+    fn passthrough_large_batch() {
+        let reranker = PassthroughReranker;
+        let docs: Vec<ScoredDoc> = (0..100)
+            .map(|i| ScoredDoc {
+                id: i,
+                text: format!("doc-{i}"),
+                score: i as f32 / 100.0,
+            })
+            .collect();
+        let result = reranker.rerank("q", docs).unwrap();
+        assert_eq!(result.len(), 100);
+        assert_eq!(result[0].id, 0);
+        assert_eq!(result[99].id, 99);
+    }
+
+    #[test]
+    fn passthrough_preserves_text_content() {
+        let reranker = PassthroughReranker;
+        let docs = vec![ScoredDoc {
+            id: 1,
+            text: "special chars: !@#$%^&*()".into(),
+            score: 0.5,
+        }];
+        let result = reranker.rerank("q", docs).unwrap();
+        assert_eq!(result[0].text, "special chars: !@#$%^&*()");
+    }
 }

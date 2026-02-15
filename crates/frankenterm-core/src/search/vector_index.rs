@@ -415,4 +415,237 @@ mod tests {
         w.push(2, &[0.0, 1.0]).unwrap();
         assert_eq!(w.count(), 2);
     }
+
+    // =====================================================================
+    // f16 conversion additional tests
+    // =====================================================================
+
+    #[test]
+    fn f16_negative_values() {
+        let val = -1.5f32;
+        let rt = f16_to_f32(f32_to_f16(val));
+        assert!((val - rt).abs() < 0.01, "expected ~{val}, got {rt}");
+    }
+
+    #[test]
+    fn f16_one_roundtrip() {
+        assert!((f16_to_f32(f32_to_f16(1.0)) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn f16_negative_infinity() {
+        let h = f32_to_f16(f32::NEG_INFINITY);
+        let back = f16_to_f32(h);
+        assert!(back.is_infinite() && back.is_sign_negative());
+    }
+
+    #[test]
+    fn f16_small_denorm() {
+        // Smallest positive f16 subnormal: ~5.96e-8
+        let h: u16 = 1; // smallest f16 subnormal
+        let val = f16_to_f32(h);
+        assert!(val > 0.0 && val < 1e-4);
+    }
+
+    #[test]
+    fn f16_max_normal() {
+        // f16 max normal value is 65504.0
+        let h: u16 = 0x7BFF; // max finite f16
+        let val = f16_to_f32(h);
+        assert!((val - 65504.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn f16_various_values() {
+        let test_values = [0.5, 0.25, 2.0, 10.0, 100.0, 0.001, -0.5, -42.0];
+        for &v in &test_values {
+            let rt = f16_to_f32(f32_to_f16(v));
+            let tol = v.abs() * 0.01 + 0.001;
+            assert!(
+                (v - rt).abs() < tol,
+                "f16 roundtrip for {v}: got {rt}, tol={tol}"
+            );
+        }
+    }
+
+    // =====================================================================
+    // dot_product additional tests
+    // =====================================================================
+
+    #[test]
+    fn dot_product_zero_vectors() {
+        let a = vec![0.0; 8];
+        let b = vec![1.0; 8];
+        assert!(dot_product(&a, &b).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dot_product_single_element() {
+        let a = vec![3.0];
+        let b = vec![7.0];
+        assert!((dot_product(&a, &b) - 21.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dot_product_identity_like() {
+        // [1,0,0...] · [1,0,0...] = 1
+        let mut a = vec![0.0; 16];
+        let mut b = vec![0.0; 16];
+        a[0] = 1.0;
+        b[0] = 1.0;
+        assert!((dot_product(&a, &b) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dot_product_negative_values() {
+        let a = vec![-1.0, 2.0, -3.0];
+        let b = vec![4.0, -5.0, 6.0];
+        // (-1*4) + (2*-5) + (-3*6) = -4 - 10 - 18 = -32
+        assert!((dot_product(&a, &b) - (-32.0)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dot_product_exact_8_elements() {
+        // Tests the 8-lane path with no tail
+        let a: Vec<f32> = (1..=8).map(|i| i as f32).collect();
+        let b: Vec<f32> = vec![1.0; 8];
+        let expected: f32 = (1..=8).map(|i| i as f32).sum();
+        assert!((dot_product(&a, &b) - expected).abs() < f32::EPSILON);
+    }
+
+    // =====================================================================
+    // Writer tests
+    // =====================================================================
+
+    #[test]
+    fn writer_dimension_mismatch_error() {
+        let mut buf = Vec::new();
+        let mut w = FtviWriter::new(&mut buf, 3).unwrap();
+        let err = w.push(1, &[1.0, 2.0]); // 2 elements, expected 3
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("dimension"));
+    }
+
+    #[test]
+    fn writer_finish_returns_writer() {
+        let mut buf = Vec::new();
+        let w = FtviWriter::new(&mut buf, 2).unwrap();
+        let _inner = w.finish().unwrap();
+        // Should not panic
+    }
+
+    // =====================================================================
+    // write_ftvi_vec tests
+    // =====================================================================
+
+    #[test]
+    fn write_ftvi_vec_dimension_mismatch() {
+        let err = write_ftvi_vec(3, &[(1, &[1.0, 2.0])]);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("dimension"));
+    }
+
+    #[test]
+    fn write_ftvi_vec_empty() {
+        let data = write_ftvi_vec(4, &[]).unwrap();
+        let idx = FtviIndex::from_bytes(&data).unwrap();
+        assert!(idx.is_empty());
+        assert_eq!(idx.dimension(), 4);
+    }
+
+    #[test]
+    fn write_ftvi_vec_single_record() {
+        let data = write_ftvi_vec(2, &[(42, &[1.0, 0.5])]).unwrap();
+        let idx = FtviIndex::from_bytes(&data).unwrap();
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.ids[0], 42);
+    }
+
+    // =====================================================================
+    // FtviIndex additional tests
+    // =====================================================================
+
+    #[test]
+    fn bad_version() {
+        let mut data = write_ftvi_vec(2, &[(1, &[1.0, 0.0])]).unwrap();
+        // Version is at bytes 4-5, change to 99
+        data[4] = 99;
+        data[5] = 0;
+        let err = FtviIndex::from_bytes(&data).unwrap_err();
+        assert!(err.to_string().contains("version"));
+    }
+
+    #[test]
+    fn truncated_data() {
+        let data = write_ftvi_vec(2, &[(1, &[1.0, 0.0])]).unwrap();
+        let truncated = &data[..data.len() - 2];
+        assert!(FtviIndex::from_bytes(truncated).is_err());
+    }
+
+    #[test]
+    fn search_k_zero_returns_empty() {
+        let vecs = vec![(1u64, vec![1.0, 0.0])];
+        let idx = make_index(&vecs);
+        let results = idx.search(&[1.0, 0.0], 0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_k_exceeds_count() {
+        let vecs = vec![
+            (1u64, vec![1.0, 0.0]),
+            (2, vec![0.0, 1.0]),
+        ];
+        let idx = make_index(&vecs);
+        let results = idx.search(&[1.0, 0.0], 100);
+        assert_eq!(results.len(), 2); // returns all, not 100
+    }
+
+    #[test]
+    fn search_ordering_by_similarity() {
+        let vecs = vec![
+            (1u64, vec![1.0, 0.0, 0.0, 0.0]),
+            (2, vec![0.9, 0.1, 0.0, 0.0]),
+            (3, vec![0.0, 0.0, 0.0, 1.0]),
+        ];
+        let idx = make_index(&vecs);
+        let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 3);
+        assert_eq!(results.len(), 3);
+        // Most similar first
+        assert_eq!(results[0].0, 1);
+        assert!(results[0].1 > results[1].1);
+        assert!(results[1].1 > results[2].1);
+    }
+
+    #[test]
+    fn ftvi_record_clone_debug() {
+        let r = FtviRecord {
+            id: 5,
+            vector: vec![0.1, 0.2, 0.3],
+        };
+        let r2 = r.clone();
+        assert_eq!(r2.id, 5);
+        assert_eq!(r2.vector.len(), 3);
+        let dbg = format!("{r:?}");
+        assert!(dbg.contains("FtviRecord"));
+    }
+
+    #[test]
+    fn ftvi_index_debug() {
+        let vecs = vec![(1u64, vec![1.0, 0.0])];
+        let idx = make_index(&vecs);
+        let dbg = format!("{idx:?}");
+        assert!(dbg.contains("FtviIndex"));
+    }
+
+    #[test]
+    fn ftvi_index_len_and_is_empty() {
+        let empty_idx = make_index(&[]);
+        assert!(empty_idx.is_empty());
+        assert_eq!(empty_idx.len(), 0);
+
+        let idx = make_index(&[(1, vec![1.0, 0.0])]);
+        assert!(!idx.is_empty());
+        assert_eq!(idx.len(), 1);
+    }
 }
