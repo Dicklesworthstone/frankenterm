@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::patterns::AgentType;
 use crate::setup::{ShellType, has_shell_ft_block, locate_shell_rc};
@@ -76,7 +76,7 @@ pub struct RemoteHost {
 }
 
 /// Connection type inferred from pane metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionType {
     Ssh,
@@ -392,7 +392,7 @@ fn detect_load_average() -> Option<f64> {
 // ---------------------------------------------------------------------------
 
 /// Source of a configuration value in the resolution chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigSource {
     /// Hard-coded default.
@@ -404,7 +404,7 @@ pub enum ConfigSource {
 }
 
 /// A single configuration recommendation produced by the auto-config engine.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigRecommendation {
     /// Config key path (e.g. `ingest.poll_interval_ms`).
     pub key: String,
@@ -417,7 +417,7 @@ pub struct ConfigRecommendation {
 }
 
 /// Aggregated auto-configuration output from environment detection.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoConfig {
     /// Recommended poll interval in milliseconds.
     pub poll_interval_ms: u64,
