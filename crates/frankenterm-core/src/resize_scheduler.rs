@@ -2923,4 +2923,475 @@ mod tests {
         );
         assert_eq!(scheduler.metrics().storm_picks_throttled, 0);
     }
+
+    // -----------------------------------------------------------------------
+    // Batch — RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn domain_default_weight_local_highest() {
+        let local = ResizeDomain::Local;
+        let ssh = ResizeDomain::Ssh {
+            host: "box".into(),
+        };
+        let mux = ResizeDomain::Mux {
+            endpoint: "ep".into(),
+        };
+        assert_eq!(local.default_weight(), 4);
+        assert_eq!(ssh.default_weight(), 2);
+        assert_eq!(mux.default_weight(), 1);
+        assert!(local.default_weight() > ssh.default_weight());
+        assert!(ssh.default_weight() > mux.default_weight());
+    }
+
+    #[test]
+    fn intent_serde_roundtrip() {
+        let i = ResizeIntent {
+            pane_id: 42,
+            intent_seq: 7,
+            scheduler_class: ResizeWorkClass::Background,
+            work_units: 3,
+            submitted_at_ms: 12345,
+            domain: ResizeDomain::Ssh {
+                host: "remote".into(),
+            },
+            tab_id: Some(99),
+        };
+        let json = serde_json::to_string(&i).unwrap();
+        let parsed: ResizeIntent = serde_json::from_str(&json).unwrap();
+        assert_eq!(i, parsed);
+    }
+
+    #[test]
+    fn submit_outcome_serde_roundtrip_all_variants() {
+        let variants: Vec<SubmitOutcome> = vec![
+            SubmitOutcome::Accepted {
+                replaced_pending_seq: Some(5),
+            },
+            SubmitOutcome::Accepted {
+                replaced_pending_seq: None,
+            },
+            SubmitOutcome::RejectedNonMonotonic { latest_seq: 10 },
+            SubmitOutcome::DroppedOverload {
+                pending_total: 128,
+                evicted_pending: Some((1, 2)),
+            },
+            SubmitOutcome::DroppedOverload {
+                pending_total: 1,
+                evicted_pending: None,
+            },
+            SubmitOutcome::SuppressedByKillSwitch {
+                legacy_fallback: true,
+            },
+            SubmitOutcome::SuppressedByKillSwitch {
+                legacy_fallback: false,
+            },
+        ];
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let parsed: SubmitOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(variant, parsed);
+        }
+    }
+
+    #[test]
+    fn overload_reason_serde_roundtrip() {
+        use super::ResizeOverloadReason;
+        for reason in [
+            ResizeOverloadReason::QueueCapacity,
+            ResizeOverloadReason::DeferralTimeout,
+        ] {
+            let json = serde_json::to_string(&reason).unwrap();
+            let parsed: ResizeOverloadReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(reason, parsed);
+        }
+    }
+
+    #[test]
+    fn execution_phase_serde_roundtrip() {
+        for phase in [
+            ResizeExecutionPhase::Preparing,
+            ResizeExecutionPhase::Reflowing,
+            ResizeExecutionPhase::Presenting,
+        ] {
+            let json = serde_json::to_string(&phase).unwrap();
+            let parsed: ResizeExecutionPhase = serde_json::from_str(&json).unwrap();
+            assert_eq!(phase, parsed);
+        }
+    }
+
+    #[test]
+    fn scheduled_resize_work_serde_roundtrip() {
+        use super::ScheduledResizeWork;
+        let work = ScheduledResizeWork {
+            pane_id: 5,
+            intent_seq: 3,
+            scheduler_class: ResizeWorkClass::Interactive,
+            work_units: 2,
+            over_budget: true,
+            forced_by_starvation: false,
+        };
+        let json = serde_json::to_string(&work).unwrap();
+        let parsed: ScheduledResizeWork = serde_json::from_str(&json).unwrap();
+        assert_eq!(work, parsed);
+    }
+
+    #[test]
+    fn control_plane_gate_state_serde_roundtrip() {
+        use super::ResizeControlPlaneGateState;
+        let gate = ResizeControlPlaneGateState {
+            control_plane_enabled: true,
+            emergency_disable: false,
+            legacy_fallback_enabled: true,
+            active: true,
+        };
+        let json = serde_json::to_string(&gate).unwrap();
+        let parsed: ResizeControlPlaneGateState = serde_json::from_str(&json).unwrap();
+        assert_eq!(gate, parsed);
+    }
+
+    #[test]
+    fn stalled_transaction_serde_roundtrip() {
+        use super::ResizeStalledTransaction;
+        let stalled = ResizeStalledTransaction {
+            pane_id: 11,
+            intent_seq: 3,
+            active_phase: Some(ResizeExecutionPhase::Reflowing),
+            age_ms: 5000,
+            latest_seq: Some(3),
+        };
+        let json = serde_json::to_string(&stalled).unwrap();
+        let parsed: ResizeStalledTransaction = serde_json::from_str(&json).unwrap();
+        assert_eq!(stalled, parsed);
+    }
+
+    #[test]
+    fn interactive_aging_credit_is_half_background() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 1,
+            aging_credit_per_frame: 20,
+            max_aging_credit: 200,
+            allow_single_oversubscription: false,
+            max_deferrals_before_force: 100,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        // Both panes get deferred because work_units > budget
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 5, 100));
+        let _ = scheduler.submit_intent(intent(2, 1, ResizeWorkClass::Background, 5, 101));
+        let _ = scheduler.schedule_frame();
+
+        let snap = scheduler.snapshot();
+        let interactive_credit = snap
+            .panes
+            .iter()
+            .find(|r| r.pane_id == 1)
+            .unwrap()
+            .aging_credit;
+        let background_credit = snap
+            .panes
+            .iter()
+            .find(|r| r.pane_id == 2)
+            .unwrap()
+            .aging_credit;
+        // Interactive gets aging_credit_per_frame/2 = 10, Background gets full 20
+        assert_eq!(interactive_credit, 10);
+        assert_eq!(background_credit, 20);
+    }
+
+    #[test]
+    fn complete_active_pane_exists_but_no_active_seq() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        // Submit and then leave as pending (don't schedule)
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+        // Pane exists but has no active_seq
+        assert!(!scheduler.complete_active(1, 1));
+    }
+
+    #[test]
+    fn lifecycle_events_empty_returns_empty_vec() {
+        let scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        let events = scheduler.lifecycle_events(0);
+        assert!(events.is_empty());
+        let events_limited = scheduler.lifecycle_events(10);
+        assert!(events_limited.is_empty());
+    }
+
+    #[test]
+    fn schedule_frame_with_budget_uses_custom_budget() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 100, // large default
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 3, 100));
+        // Use custom budget of 2, which is smaller than work_units=3
+        let frame = scheduler.schedule_frame_with_budget(2);
+        assert!(
+            frame.scheduled.is_empty(),
+            "work_units=3 exceeds custom budget=2"
+        );
+        assert_eq!(frame.frame_budget_units, 2);
+        assert_eq!(frame.pending_after, 1);
+    }
+
+    #[test]
+    fn suppressed_frame_records_correct_pending_after() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        // Submit some work, then disable control plane
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+        let _ = scheduler.submit_intent(intent(2, 1, ResizeWorkClass::Background, 1, 101));
+        scheduler.set_emergency_disable(true);
+
+        let frame = scheduler.schedule_frame();
+        assert!(frame.scheduled.is_empty());
+        assert_eq!(frame.pending_after, 2);
+        assert_eq!(scheduler.metrics().suppressed_frames, 1);
+    }
+
+    #[test]
+    fn metrics_accumulate_across_multiple_frames() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 2,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+        let _ = scheduler.schedule_frame();
+        assert!(scheduler.complete_active(1, 1));
+
+        let _ = scheduler.submit_intent(intent(1, 2, ResizeWorkClass::Interactive, 1, 200));
+        let _ = scheduler.schedule_frame();
+        assert!(scheduler.complete_active(1, 2));
+
+        let _ = scheduler.submit_intent(intent(1, 3, ResizeWorkClass::Interactive, 1, 300));
+        let _ = scheduler.schedule_frame();
+
+        assert_eq!(scheduler.metrics().frames, 3);
+        assert_eq!(scheduler.metrics().completed_active, 2);
+        assert_eq!(scheduler.metrics().superseded_intents, 0);
+        assert_eq!(scheduler.metrics().last_frame_scheduled, 1);
+    }
+
+    #[test]
+    fn stalled_transactions_no_phase_started_at_returns_empty() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+        let _ = scheduler.schedule_frame();
+        // Manually clear active_phase_started_at_ms to simulate missing timestamp
+        scheduler
+            .panes
+            .get_mut(&1)
+            .unwrap()
+            .active_phase_started_at_ms = None;
+
+        let debug = scheduler.debug_snapshot(64);
+        let stalled = debug.stalled_transactions(10_000, 100);
+        assert!(
+            stalled.is_empty(),
+            "no started_at_ms means stalled check should skip"
+        );
+    }
+
+    #[test]
+    fn overload_evicts_oldest_background_among_multiple() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            max_pending_panes: 2,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        // Fill with two background panes at different times
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Background, 1, 100));
+        let _ = scheduler.submit_intent(intent(2, 1, ResizeWorkClass::Background, 1, 200));
+        assert_eq!(scheduler.pending_total(), 2);
+
+        // Interactive should evict oldest background (pane 1, submitted at 100)
+        let result = scheduler.submit_intent(intent(3, 1, ResizeWorkClass::Interactive, 1, 300));
+        assert!(matches!(
+            result,
+            SubmitOutcome::Accepted {
+                replaced_pending_seq: None
+            }
+        ));
+        assert_eq!(scheduler.metrics().overload_evicted, 1);
+
+        // Pane 1 should have been evicted, pane 2 and 3 should remain
+        let snap = scheduler.snapshot();
+        let pane1 = snap.panes.iter().find(|r| r.pane_id == 1).unwrap();
+        let pane2 = snap.panes.iter().find(|r| r.pane_id == 2).unwrap();
+        let pane3 = snap.panes.iter().find(|r| r.pane_id == 3).unwrap();
+        assert_eq!(pane1.pending_seq, None, "oldest bg should be evicted");
+        assert_eq!(pane2.pending_seq, Some(1), "newer bg survives");
+        assert_eq!(pane3.pending_seq, Some(1), "interactive admitted");
+    }
+
+    #[test]
+    fn storm_detection_tracks_tabs_independently() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 20,
+            storm_window_ms: 100,
+            storm_threshold_intents: 3,
+            max_storm_picks_per_tab: 1,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        // Tab 1: 4 panes -> storm
+        for pane in 1..=4 {
+            let _ = scheduler.submit_intent(intent_with_tab(
+                pane,
+                1,
+                ResizeWorkClass::Interactive,
+                1,
+                100 + pane,
+                Some(1),
+            ));
+        }
+        // Tab 2: 2 panes -> no storm
+        for pane in 5..=6 {
+            let _ = scheduler.submit_intent(intent_with_tab(
+                pane,
+                1,
+                ResizeWorkClass::Interactive,
+                1,
+                100 + pane,
+                Some(2),
+            ));
+        }
+
+        let frame = scheduler.schedule_frame();
+        let tab1_picks = frame.scheduled.iter().filter(|s| s.pane_id <= 4).count();
+        let tab2_picks = frame
+            .scheduled
+            .iter()
+            .filter(|s| s.pane_id >= 5 && s.pane_id <= 6)
+            .count();
+        assert_eq!(
+            tab1_picks, 1,
+            "tab 1 in storm: capped at max_storm_picks_per_tab"
+        );
+        assert_eq!(tab2_picks, 2, "tab 2 not in storm: all served");
+    }
+
+    #[test]
+    fn mux_domain_key_format() {
+        let mux = ResizeDomain::Mux {
+            endpoint: "wss://example.com:8080".into(),
+        };
+        assert_eq!(mux.key(), "mux:wss://example.com:8080");
+    }
+
+    #[test]
+    fn phase_transition_rejected_records_lifecycle_event() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+        let _ = scheduler.schedule_frame();
+
+        // Try marking phase with wrong seq
+        assert!(!scheduler.mark_active_phase(1, 999, ResizeExecutionPhase::Reflowing, 200));
+
+        let events = scheduler.lifecycle_events(0);
+        let rejected = events.iter().find(|e| {
+            matches!(
+                e.detail,
+                ResizeLifecycleDetail::ActivePhaseTransitionRejected { .. }
+            )
+        });
+        assert!(
+            rejected.is_some(),
+            "should record phase transition rejection event"
+        );
+        if let ResizeLifecycleDetail::ActivePhaseTransitionRejected {
+            active_seq,
+            requested_phase,
+        } = &rejected.unwrap().detail
+        {
+            assert_eq!(*active_seq, Some(1));
+            assert_eq!(*requested_phase, ResizeExecutionPhase::Reflowing);
+        }
+    }
+
+    #[test]
+    fn completion_rejected_records_lifecycle_event() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+        let _ = scheduler.schedule_frame();
+
+        // Try completing with wrong seq
+        assert!(!scheduler.complete_active(1, 999));
+
+        let events = scheduler.lifecycle_events(0);
+        let rejected = events.iter().find(|e| {
+            matches!(
+                e.detail,
+                ResizeLifecycleDetail::ActiveCompletionRejected { .. }
+            )
+        });
+        assert!(
+            rejected.is_some(),
+            "should record completion rejection event"
+        );
+        if let ResizeLifecycleDetail::ActiveCompletionRejected { active_seq } =
+            &rejected.unwrap().detail
+        {
+            assert_eq!(*active_seq, Some(1));
+        }
+    }
+
+    #[test]
+    fn schedule_frame_budget_minimum_is_one() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+
+        // Pass budget 0, should be normalized to 1
+        let frame = scheduler.schedule_frame_with_budget(0);
+        assert_eq!(frame.frame_budget_units, 1);
+        assert_eq!(frame.scheduled.len(), 1);
+    }
+
+    #[test]
+    fn input_guardrail_disabled_ignores_backlog() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 4,
+            input_guardrail_enabled: false,
+            input_reserve_units: 2,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 4, 100));
+        let frame = scheduler.schedule_frame_with_input_backlog(4, 100);
+        assert_eq!(frame.scheduled.len(), 1, "guardrail disabled: full budget");
+        assert_eq!(frame.effective_resize_budget_units, 4);
+        assert_eq!(frame.input_reserved_units, 0);
+        assert_eq!(scheduler.metrics().input_guardrail_frames, 0);
+    }
+
+    #[test]
+    fn debug_snapshot_includes_invariant_telemetry() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+        let _ = scheduler.schedule_frame();
+        assert!(scheduler.complete_active(1, 1));
+
+        let snap = scheduler.debug_snapshot(64);
+        // Clean transaction should have zero failures
+        assert_eq!(snap.invariant_telemetry.critical_count, 0);
+        assert_eq!(snap.invariant_telemetry.error_count, 0);
+        assert!(snap.invariants.is_clean());
+    }
+
+    #[test]
+    fn stalled_transactions_no_active_seq_returns_empty() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        // Submit but do not schedule (no active_seq)
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+
+        let debug = scheduler.debug_snapshot(64);
+        let stalled = debug.stalled_transactions(10_000, 100);
+        assert!(
+            stalled.is_empty(),
+            "no active_seq means no stalled transaction"
+        );
+    }
 }

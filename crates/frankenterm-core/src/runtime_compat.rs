@@ -898,6 +898,22 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn mpsc_send_and_recv_option_helpers_roundtrip() {
+        let (tx, mut rx) = mpsc::channel(4);
+        mpsc_send(&tx, 7).await.expect("send helper");
+        let got = mpsc_recv_option(&mut rx).await;
+        assert_eq!(got, Some(7));
+    }
+
+    #[tokio::test]
+    async fn mpsc_recv_option_helper_returns_none_when_closed() {
+        let (tx, mut rx) = mpsc::channel::<u8>(1);
+        drop(tx);
+        let got = mpsc_recv_option(&mut rx).await;
+        assert_eq!(got, None);
+    }
+
     // ========================================================================
     // Watch channel tests
     // ========================================================================

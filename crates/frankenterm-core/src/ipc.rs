@@ -582,23 +582,14 @@ impl IpcServer {
 
 #[cfg(unix)]
 async fn shutdown_signal_pending(shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
-    #[cfg(feature = "asupersync-runtime")]
+    match crate::runtime_compat::timeout(
+        IPC_SHUTDOWN_POLL_INTERVAL,
+        crate::runtime_compat::mpsc_recv_option(shutdown_rx),
+    )
+    .await
     {
-        let cx = crate::cx::for_testing();
-        match crate::runtime_compat::timeout(IPC_SHUTDOWN_POLL_INTERVAL, shutdown_rx.recv(&cx))
-            .await
-        {
-            Ok(Ok(())) | Ok(Err(_)) => true,
-            Err(_elapsed) => false,
-        }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        match crate::runtime_compat::timeout(IPC_SHUTDOWN_POLL_INTERVAL, shutdown_rx.recv()).await {
-            Ok(Some(()) | None) => true,
-            Err(_elapsed) => false,
-        }
+        Ok(Some(()) | None) => true,
+        Err(_elapsed) => false,
     }
 }
 
@@ -631,15 +622,7 @@ impl IpcServer {
     }
 
     async fn recv_shutdown(shutdown_rx: &mut mpsc::Receiver<()>) {
-        #[cfg(feature = "asupersync-runtime")]
-        {
-            let cx = crate::cx::for_testing();
-            let _ = shutdown_rx.recv(&cx).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let _ = shutdown_rx.recv().await;
-        }
+        let _ = crate::runtime_compat::mpsc_recv_option(shutdown_rx).await;
     }
 
     /// Run the IPC server (no-op on non-unix platforms).
@@ -1307,15 +1290,7 @@ mod tests {
     }
 
     async fn send_shutdown(shutdown_tx: &mpsc::Sender<()>) {
-        #[cfg(feature = "asupersync-runtime")]
-        {
-            let cx = crate::cx::for_testing();
-            let _ = shutdown_tx.send(&cx, ()).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let _ = shutdown_tx.send(()).await;
-        }
+        let _ = crate::runtime_compat::mpsc_send(shutdown_tx, ()).await;
     }
 
     #[tokio::test]

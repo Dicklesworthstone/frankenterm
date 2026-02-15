@@ -952,4 +952,440 @@ mod tests {
         assert_eq!(PaneHealth::Abandoned.to_string(), "abandoned");
         assert_eq!(PaneHealth::PossiblyStuck.to_string(), "possibly_stuck");
     }
+
+    // ========================================================================
+    // Extended PaneHealth Tests
+    // ========================================================================
+
+    #[test]
+    fn pane_health_clone() {
+        let variants = [
+            PaneHealth::Active,
+            PaneHealth::Thinking,
+            PaneHealth::Working,
+            PaneHealth::PossiblyStuck,
+            PaneHealth::LikelyStuck,
+            PaneHealth::Abandoned,
+        ];
+        for v in &variants {
+            let cloned = *v;
+            assert_eq!(*v, cloned);
+        }
+    }
+
+    #[test]
+    fn pane_health_debug_all() {
+        let variants = [
+            (PaneHealth::Active, "Active"),
+            (PaneHealth::Thinking, "Thinking"),
+            (PaneHealth::Working, "Working"),
+            (PaneHealth::PossiblyStuck, "PossiblyStuck"),
+            (PaneHealth::LikelyStuck, "LikelyStuck"),
+            (PaneHealth::Abandoned, "Abandoned"),
+        ];
+        for (v, name) in &variants {
+            let debug = format!("{:?}", v);
+            assert!(debug.contains(name), "Debug for {:?} should contain {}", v, name);
+        }
+    }
+
+    #[test]
+    fn pane_health_serde_roundtrip_all() {
+        let variants = [
+            PaneHealth::Active,
+            PaneHealth::Thinking,
+            PaneHealth::Working,
+            PaneHealth::PossiblyStuck,
+            PaneHealth::LikelyStuck,
+            PaneHealth::Abandoned,
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: PaneHealth = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back, "Serde roundtrip failed for {:?}", v);
+        }
+    }
+
+    #[test]
+    fn pane_health_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(PaneHealth::Active);
+        set.insert(PaneHealth::Thinking);
+        set.insert(PaneHealth::Working);
+        set.insert(PaneHealth::PossiblyStuck);
+        set.insert(PaneHealth::LikelyStuck);
+        set.insert(PaneHealth::Abandoned);
+        assert_eq!(set.len(), 6);
+    }
+
+    #[test]
+    fn pane_health_ord_ordering() {
+        assert!(PaneHealth::Active < PaneHealth::Thinking);
+        assert!(PaneHealth::Thinking < PaneHealth::Working);
+        assert!(PaneHealth::Working < PaneHealth::PossiblyStuck);
+        assert!(PaneHealth::PossiblyStuck < PaneHealth::LikelyStuck);
+        assert!(PaneHealth::LikelyStuck < PaneHealth::Abandoned);
+    }
+
+    #[test]
+    fn pane_health_display_all_variants() {
+        assert_eq!(PaneHealth::Active.to_string(), "active");
+        assert_eq!(PaneHealth::Thinking.to_string(), "thinking");
+        assert_eq!(PaneHealth::Working.to_string(), "working");
+        assert_eq!(PaneHealth::PossiblyStuck.to_string(), "possibly_stuck");
+        assert_eq!(PaneHealth::LikelyStuck.to_string(), "likely_stuck");
+        assert_eq!(PaneHealth::Abandoned.to_string(), "abandoned");
+    }
+
+    #[test]
+    fn pane_health_is_protected_all() {
+        assert!(PaneHealth::Active.is_protected());
+        assert!(PaneHealth::Thinking.is_protected());
+        assert!(!PaneHealth::Working.is_protected());
+        assert!(!PaneHealth::PossiblyStuck.is_protected());
+        assert!(!PaneHealth::LikelyStuck.is_protected());
+        assert!(!PaneHealth::Abandoned.is_protected());
+    }
+
+    #[test]
+    fn pane_health_needs_review_all() {
+        assert!(!PaneHealth::Active.needs_review());
+        assert!(!PaneHealth::Thinking.needs_review());
+        assert!(PaneHealth::Working.needs_review());
+        assert!(PaneHealth::PossiblyStuck.needs_review());
+        assert!(!PaneHealth::LikelyStuck.needs_review());
+        assert!(!PaneHealth::Abandoned.needs_review());
+    }
+
+    #[test]
+    fn pane_health_is_reapable_all() {
+        assert!(!PaneHealth::Active.is_reapable());
+        assert!(!PaneHealth::Thinking.is_reapable());
+        assert!(!PaneHealth::Working.is_reapable());
+        assert!(!PaneHealth::PossiblyStuck.is_reapable());
+        assert!(PaneHealth::LikelyStuck.is_reapable());
+        assert!(PaneHealth::Abandoned.is_reapable());
+    }
+
+    // ========================================================================
+    // LifecycleConfig Tests
+    // ========================================================================
+
+    #[test]
+    fn lifecycle_config_default_values() {
+        let cfg = LifecycleConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.sample_interval, Duration::from_secs(30));
+        assert_eq!(cfg.trend_window, 60);
+        assert!((cfg.warn_age_hours - 16.0).abs() < f64::EPSILON);
+        assert!((cfg.kill_age_hours - 24.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.grace_period, Duration::from_secs(30));
+        assert!((cfg.active_cpu_threshold - 10.0).abs() < f64::EPSILON);
+        assert!((cfg.stuck_cpu_threshold - 2.0).abs() < f64::EPSILON);
+        assert!((cfg.pressure_renice_threshold - 0.8).abs() < f64::EPSILON);
+        assert_eq!(cfg.renice_value, 19);
+        assert!(cfg.protected_panes.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_config_clone() {
+        let cfg = LifecycleConfig::default();
+        let cloned = cfg.clone();
+        assert_eq!(cloned.enabled, cfg.enabled);
+        assert_eq!(cloned.sample_interval, cfg.sample_interval);
+        assert_eq!(cloned.trend_window, cfg.trend_window);
+        assert!((cloned.warn_age_hours - cfg.warn_age_hours).abs() < f64::EPSILON);
+        assert!((cloned.kill_age_hours - cfg.kill_age_hours).abs() < f64::EPSILON);
+        assert_eq!(cloned.grace_period, cfg.grace_period);
+        assert!((cloned.active_cpu_threshold - cfg.active_cpu_threshold).abs() < f64::EPSILON);
+        assert!((cloned.stuck_cpu_threshold - cfg.stuck_cpu_threshold).abs() < f64::EPSILON);
+        assert!((cloned.pressure_renice_threshold - cfg.pressure_renice_threshold).abs() < f64::EPSILON);
+        assert_eq!(cloned.renice_value, cfg.renice_value);
+        assert_eq!(cloned.protected_panes, cfg.protected_panes);
+    }
+
+    #[test]
+    fn lifecycle_config_debug() {
+        let cfg = LifecycleConfig::default();
+        let debug = format!("{:?}", cfg);
+        assert!(debug.contains("LifecycleConfig"));
+    }
+
+    #[test]
+    fn lifecycle_config_serde_roundtrip() {
+        let cfg = LifecycleConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: LifecycleConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.enabled, cfg.enabled);
+        assert_eq!(back.trend_window, cfg.trend_window);
+        assert!((back.warn_age_hours - cfg.warn_age_hours).abs() < f64::EPSILON);
+        assert!((back.kill_age_hours - cfg.kill_age_hours).abs() < f64::EPSILON);
+        assert_eq!(back.renice_value, cfg.renice_value);
+    }
+
+    #[test]
+    fn lifecycle_config_serde_missing_fields() {
+        let json = r#"{"enabled": false}"#;
+        let cfg: LifecycleConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.enabled);
+        // All other fields should get defaults.
+        assert_eq!(cfg.sample_interval, Duration::from_secs(30));
+        assert_eq!(cfg.trend_window, 60);
+        assert!((cfg.warn_age_hours - 16.0).abs() < f64::EPSILON);
+        assert!((cfg.kill_age_hours - 24.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.grace_period, Duration::from_secs(30));
+        assert!((cfg.active_cpu_threshold - 10.0).abs() < f64::EPSILON);
+        assert!((cfg.stuck_cpu_threshold - 2.0).abs() < f64::EPSILON);
+        assert!((cfg.pressure_renice_threshold - 0.8).abs() < f64::EPSILON);
+        assert_eq!(cfg.renice_value, 19);
+        assert!(cfg.protected_panes.is_empty());
+    }
+
+    // ========================================================================
+    // LifecycleAction Tests
+    // ========================================================================
+
+    #[test]
+    fn lifecycle_action_serde_roundtrip_none() {
+        let action = LifecycleAction::None;
+        let json = serde_json::to_string(&action).unwrap();
+        let back: LifecycleAction = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, LifecycleAction::None));
+    }
+
+    #[test]
+    fn lifecycle_action_serde_roundtrip_warn() {
+        let action = LifecycleAction::Warn {
+            reason: "test warning".to_string(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let back: LifecycleAction = serde_json::from_str(&json).unwrap();
+        match back {
+            LifecycleAction::Warn { reason } => assert_eq!(reason, "test warning"),
+            other => panic!("Expected Warn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lifecycle_action_serde_roundtrip_force_kill() {
+        let action = LifecycleAction::ForceKill {
+            reason: "abandoned pane".to_string(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let back: LifecycleAction = serde_json::from_str(&json).unwrap();
+        match back {
+            LifecycleAction::ForceKill { reason } => assert_eq!(reason, "abandoned pane"),
+            other => panic!("Expected ForceKill, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lifecycle_action_clone() {
+        let none = LifecycleAction::None;
+        let cloned_none = none.clone();
+        assert!(matches!(cloned_none, LifecycleAction::None));
+
+        let warn = LifecycleAction::Warn {
+            reason: "clone test".to_string(),
+        };
+        let cloned_warn = warn.clone();
+        match cloned_warn {
+            LifecycleAction::Warn { reason } => assert_eq!(reason, "clone test"),
+            other => panic!("Expected Warn, got {:?}", other),
+        }
+
+        let kill = LifecycleAction::ForceKill {
+            reason: "kill clone".to_string(),
+        };
+        let cloned_kill = kill.clone();
+        match cloned_kill {
+            LifecycleAction::ForceKill { reason } => assert_eq!(reason, "kill clone"),
+            other => panic!("Expected ForceKill, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lifecycle_action_debug() {
+        let none_debug = format!("{:?}", LifecycleAction::None);
+        assert!(none_debug.contains("None"));
+
+        let warn_debug = format!("{:?}", LifecycleAction::Warn {
+            reason: "dbg".to_string(),
+        });
+        assert!(warn_debug.contains("Warn"));
+
+        let kill_debug = format!("{:?}", LifecycleAction::ForceKill {
+            reason: "dbg".to_string(),
+        });
+        assert!(kill_debug.contains("ForceKill"));
+    }
+
+    // ========================================================================
+    // PaneHealthSample Tests
+    // ========================================================================
+
+    #[test]
+    fn pane_health_sample_clone() {
+        use crate::process_tree::PaneActivity;
+        let sample = PaneHealthSample {
+            pane_id: 42,
+            health: PaneHealth::Active,
+            activity: PaneActivity::Idle,
+            cpu_percent: 55.0,
+            rss_kb: 2048,
+            child_count: 3,
+            age: Duration::from_secs(7200),
+            root_pid: 9999,
+        };
+        let cloned = sample.clone();
+        assert_eq!(cloned.pane_id, 42);
+        assert_eq!(cloned.health, PaneHealth::Active);
+        assert!((cloned.cpu_percent - 55.0).abs() < f64::EPSILON);
+        assert_eq!(cloned.rss_kb, 2048);
+        assert_eq!(cloned.child_count, 3);
+        assert_eq!(cloned.age, Duration::from_secs(7200));
+        assert_eq!(cloned.root_pid, 9999);
+    }
+
+    #[test]
+    fn pane_health_sample_debug() {
+        use crate::process_tree::PaneActivity;
+        let sample = PaneHealthSample {
+            pane_id: 1,
+            health: PaneHealth::Thinking,
+            activity: PaneActivity::Idle,
+            cpu_percent: 0.5,
+            rss_kb: 512,
+            child_count: 0,
+            age: Duration::from_secs(60),
+            root_pid: 100,
+        };
+        let debug = format!("{:?}", sample);
+        assert!(debug.contains("PaneHealthSample"));
+    }
+
+    // ========================================================================
+    // Engine Accessor Tests
+    // ========================================================================
+
+    #[test]
+    fn engine_config_accessor() {
+        let engine = PaneLifecycleEngine::with_defaults();
+        let cfg = engine.config();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.trend_window, 60);
+    }
+
+    // ========================================================================
+    // Boundary Classification Tests
+    // ========================================================================
+
+    #[test]
+    fn classify_health_exactly_4h_boundary() {
+        let engine = PaneLifecycleEngine::with_defaults();
+        // Exactly 4h with high CPU -- still young (<= 4h boundary uses >4.0 check).
+        // 4h = 14400s. The check is `hours > 4.0`, so exactly 4.0 stays in the young branch.
+        let health_high_cpu = engine.classify_health(Duration::from_secs(14400), 50.0);
+        assert_eq!(health_high_cpu, PaneHealth::Active);
+
+        let health_low_cpu = engine.classify_health(Duration::from_secs(14400), 0.5);
+        assert_eq!(health_low_cpu, PaneHealth::Thinking);
+
+        // One second past 4h enters mid-age branch.
+        let health_past = engine.classify_health(Duration::from_secs(14401), 50.0);
+        assert_eq!(health_past, PaneHealth::Working);
+    }
+
+    #[test]
+    fn classify_health_exactly_warn_boundary() {
+        let engine = PaneLifecycleEngine::with_defaults();
+        // Exactly 16h = 57600s. The check is `hours > 16.0`, so exactly 16.0 stays in mid-age.
+        let health_at = engine.classify_health(Duration::from_secs(57600), 50.0);
+        assert_eq!(health_at, PaneHealth::Working);
+
+        // One second past 16h enters LikelyStuck.
+        let health_past = engine.classify_health(Duration::from_secs(57601), 50.0);
+        assert_eq!(health_past, PaneHealth::LikelyStuck);
+    }
+
+    #[test]
+    fn classify_health_exactly_kill_boundary() {
+        let engine = PaneLifecycleEngine::with_defaults();
+        // Exactly 24h = 86400s. The check is `hours > 24.0`, so exactly 24.0 stays LikelyStuck.
+        let health_at = engine.classify_health(Duration::from_secs(86400), 0.0);
+        assert_eq!(health_at, PaneHealth::LikelyStuck);
+
+        // One second past 24h enters Abandoned.
+        let health_past = engine.classify_health(Duration::from_secs(86401), 0.0);
+        assert_eq!(health_past, PaneHealth::Abandoned);
+    }
+
+    #[test]
+    fn classify_health_cpu_at_active_threshold() {
+        let engine = PaneLifecycleEngine::with_defaults();
+        // active_cpu_threshold is 10.0. Check is `cpu_percent > 10.0`.
+        // Exactly 10.0 should NOT be Active (falls to Thinking since 10.0 is not > 10.0).
+        let health_at = engine.classify_health(Duration::from_secs(3600), 10.0);
+        assert_eq!(health_at, PaneHealth::Thinking);
+
+        // Just above threshold is Active.
+        let health_above = engine.classify_health(Duration::from_secs(3600), 10.1);
+        assert_eq!(health_above, PaneHealth::Active);
+    }
+
+    // ========================================================================
+    // Engine State Access Tests
+    // ========================================================================
+
+    #[test]
+    fn pane_root_pid_accessor() {
+        let mut engine = PaneLifecycleEngine::with_defaults();
+        // Before health_check, no pane state exists.
+        assert_eq!(engine.pane_root_pid(42), None);
+
+        // After health_check, pane_root_pid returns the pid used.
+        let _ = engine.health_check(42, 5678, Duration::from_secs(3600), 50.0, None);
+        assert_eq!(engine.pane_root_pid(42), Some(5678));
+    }
+
+    // ========================================================================
+    // Pressure Renice Edge Cases
+    // ========================================================================
+
+    #[test]
+    fn pressure_renice_working_excluded() {
+        let config = LifecycleConfig::default();
+        let healths = vec![
+            (1, PaneHealth::Working, Duration::from_secs(8 * 3600)),
+        ];
+        // Above threshold, Working is NOT in the renice filter.
+        let candidates = pressure_renice_candidates(&healths, 0.9, &config);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn pressure_renice_empty_healths() {
+        let config = LifecycleConfig::default();
+        let healths: Vec<(u64, PaneHealth, Duration)> = vec![];
+        let candidates = pressure_renice_candidates(&healths, 0.9, &config);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn pressure_renice_at_exact_threshold() {
+        let config = LifecycleConfig::default();
+        let healths = vec![
+            (1, PaneHealth::Thinking, Duration::from_secs(3600)),
+            (2, PaneHealth::PossiblyStuck, Duration::from_secs(8 * 3600)),
+        ];
+        // Exactly at threshold (0.8). The guard is `cpu_load_fraction < threshold`,
+        // so 0.8 < 0.8 is false -- we do NOT early-return. Candidates are produced.
+        let candidates = pressure_renice_candidates(&healths, 0.8, &config);
+        assert_eq!(candidates.len(), 2, "At exact threshold, < guard does not fire so candidates returned");
+
+        // Just below threshold: early return fires.
+        let below = pressure_renice_candidates(&healths, 0.79, &config);
+        assert!(below.is_empty(), "Below threshold should return empty");
+    }
 }

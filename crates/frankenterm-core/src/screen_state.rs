@@ -593,4 +593,173 @@ mod tests {
         assert!(tracker.tracked_panes().contains(&5));
         assert!(tracker.is_alt_screen(5));
     }
+
+    // -----------------------------------------------------------------------
+    // Extended tests: debug, default, edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tracker_debug_format() {
+        let tracker = ScreenStateTracker::new();
+        let debug_str = format!("{:?}", tracker);
+        assert!(
+            debug_str.contains("ScreenStateTracker"),
+            "Debug format should contain 'ScreenStateTracker', got: {}",
+            debug_str
+        );
+    }
+
+    #[test]
+    fn tracker_default_trait() {
+        let from_new = ScreenStateTracker::new();
+        let from_default: ScreenStateTracker = Default::default();
+        // Both should start with no tracked panes and identical behavior.
+        assert_eq!(from_new.tracked_panes(), from_default.tracked_panes());
+        assert!(!from_new.is_alt_screen(1));
+        assert!(!from_default.is_alt_screen(1));
+    }
+
+    #[test]
+    fn process_output_only_esc_no_sequence() {
+        let mut tracker = ScreenStateTracker::new();
+        // A lone ESC byte without any following CSI sequence should not
+        // change alt-screen state.
+        tracker.process_output(1, &[0x1b]);
+        assert!(!tracker.is_alt_screen(1));
+    }
+
+    #[test]
+    fn process_output_unicode_with_embedded_sequence() {
+        let mut tracker = ScreenStateTracker::new();
+        // Unicode content (Chinese characters) followed by alt-screen enter.
+        let mut data: Vec<u8> = "Hello \u{4f60}\u{597d} world ".as_bytes().to_vec();
+        data.extend_from_slice(b"\x1b[?1049h");
+        data.extend_from_slice("more \u{1f600} text".as_bytes());
+        tracker.process_output(1, &data);
+        assert!(tracker.is_alt_screen(1));
+    }
+
+    #[test]
+    fn enter_47_leave_1049() {
+        // Enter with ?47h, leave with ?1049l (cross-variant).
+        let mut tracker = ScreenStateTracker::new();
+        tracker.process_output(1, b"\x1b[?47h");
+        assert!(tracker.is_alt_screen(1));
+
+        tracker.process_output(1, b"\x1b[?1049l");
+        assert!(!tracker.is_alt_screen(1));
+    }
+
+    #[test]
+    fn split_at_every_byte_boundary_of_47l() {
+        let full = b"\x1b[?47l";
+        for split_at in 1..full.len() {
+            let mut tracker = ScreenStateTracker::new();
+            // First enter alt-screen via ?47h.
+            tracker.process_output(1, b"\x1b[?47h");
+            assert!(tracker.is_alt_screen(1));
+            // Then leave via split sequence.
+            tracker.process_output(1, &full[..split_at]);
+            tracker.process_output(1, &full[split_at..]);
+            assert!(
+                !tracker.is_alt_screen(1),
+                "47l split at byte {} should detect leave",
+                split_at
+            );
+        }
+    }
+
+    #[test]
+    fn set_alt_screen_overwrite_existing() {
+        let mut tracker = ScreenStateTracker::new();
+        tracker.set_alt_screen(1, true);
+        assert!(tracker.is_alt_screen(1));
+
+        tracker.set_alt_screen(1, false);
+        assert!(!tracker.is_alt_screen(1));
+
+        // Pane should still be tracked even after setting to false.
+        assert!(tracker.tracked_panes().contains(&1));
+    }
+
+    #[test]
+    fn tracked_panes_after_clearing_all() {
+        let mut tracker = ScreenStateTracker::new();
+        tracker.process_output(1, b"hello");
+        tracker.process_output(2, b"world");
+        tracker.process_output(3, b"\x1b[?1049h");
+        assert_eq!(tracker.tracked_panes().len(), 3);
+
+        tracker.clear_pane(1);
+        tracker.clear_pane(2);
+        tracker.clear_pane(3);
+        assert!(
+            tracker.tracked_panes().is_empty(),
+            "After clearing all panes, tracked_panes should be empty"
+        );
+    }
+
+    #[test]
+    fn process_output_back_to_back_enters() {
+        let mut tracker = ScreenStateTracker::new();
+        // Two enters in the same output buffer.
+        tracker.process_output(1, b"\x1b[?1049h\x1b[?47h");
+        assert!(tracker.is_alt_screen(1));
+    }
+
+    #[test]
+    fn process_output_back_to_back_leaves() {
+        let mut tracker = ScreenStateTracker::new();
+        // Two leaves in the same output; should remain not-alt-screen.
+        tracker.process_output(1, b"\x1b[?1049l\x1b[?47l");
+        assert!(!tracker.is_alt_screen(1));
+    }
+
+    #[test]
+    fn interleaved_47_and_1049_in_single_output() {
+        let mut tracker = ScreenStateTracker::new();
+        // Enter with ?47h then leave with ?1049l in one call.
+        tracker.process_output(1, b"\x1b[?47h\x1b[?1049l");
+        assert!(
+            !tracker.is_alt_screen(1),
+            "Final state should be non-alt after enter then leave"
+        );
+    }
+
+    #[test]
+    fn process_output_binary_noise_no_false_positive() {
+        let mut tracker = ScreenStateTracker::new();
+        // Random bytes containing ESC (0x1b) but not forming valid
+        // alt-screen sequences.
+        let noise: Vec<u8> = vec![
+            0x1b, 0x00, 0x1b, 0x5b, 0x1b, 0xff, 0x1b, b'[', b'?', b'9',
+            b'9', b'h', 0x1b, b'O', b'A', 0x1b, b'[', b'?', b'4', b'8',
+            b'h', 0x1b, b'[', b'1', b'0', b'4', b'9',
+        ];
+        tracker.process_output(1, &noise);
+        assert!(
+            !tracker.is_alt_screen(1),
+            "Binary noise should not trigger false alt-screen detection"
+        );
+    }
+
+    #[test]
+    fn clear_pane_then_retrack() {
+        let mut tracker = ScreenStateTracker::new();
+        tracker.process_output(7, b"\x1b[?1049h");
+        assert!(tracker.is_alt_screen(7));
+
+        tracker.clear_pane(7);
+        assert!(!tracker.is_alt_screen(7));
+        assert!(!tracker.tracked_panes().contains(&7));
+
+        // Re-track the same pane ID; should start fresh (not alt-screen).
+        tracker.process_output(7, b"new output");
+        assert!(tracker.tracked_panes().contains(&7));
+        assert!(!tracker.is_alt_screen(7));
+
+        // And entering alt-screen should work again.
+        tracker.process_output(7, b"\x1b[?47h");
+        assert!(tracker.is_alt_screen(7));
+    }
 }

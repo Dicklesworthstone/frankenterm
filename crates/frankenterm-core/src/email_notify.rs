@@ -532,4 +532,173 @@ mod tests {
             "\"tls\""
         );
     }
+
+    #[test]
+    fn email_tls_mode_copy_semantics() {
+        let a = EmailTlsMode::StartTls;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        // a is still usable after copy
+        assert_eq!(a, EmailTlsMode::StartTls);
+    }
+
+    #[test]
+    fn email_tls_mode_debug_format() {
+        let dbg_none = format!("{:?}", EmailTlsMode::None);
+        let dbg_start = format!("{:?}", EmailTlsMode::StartTls);
+        let dbg_tls = format!("{:?}", EmailTlsMode::Tls);
+        assert!(dbg_none.contains("None"), "Debug for None: {}", dbg_none);
+        assert!(
+            dbg_start.contains("StartTls"),
+            "Debug for StartTls: {}",
+            dbg_start
+        );
+        assert!(dbg_tls.contains("Tls"), "Debug for Tls: {}", dbg_tls);
+    }
+
+    #[test]
+    fn email_config_clone_independence() {
+        let original = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            from: "sender@example.com".to_string(),
+            to: vec!["a@example.com".to_string()],
+            ..EmailNotifyConfig::default()
+        };
+        let mut cloned = original.clone();
+        cloned.smtp_host = "other.host.com".to_string();
+        cloned.smtp_port = 465;
+        cloned.to.push("b@example.com".to_string());
+
+        // Original is unchanged
+        assert_eq!(original.smtp_host, "smtp.example.com");
+        assert_eq!(original.smtp_port, 587);
+        assert_eq!(original.to.len(), 1);
+
+        // Clone reflects mutations
+        assert_eq!(cloned.smtp_host, "other.host.com");
+        assert_eq!(cloned.smtp_port, 465);
+        assert_eq!(cloned.to.len(), 2);
+    }
+
+    #[test]
+    fn email_config_debug_contains_fields() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.test.com".to_string(),
+            smtp_port: 465,
+            from: "me@test.com".to_string(),
+            to: vec!["you@test.com".to_string()],
+            subject_prefix: "[alert]".to_string(),
+            ..EmailNotifyConfig::default()
+        };
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("enabled"), "missing 'enabled' in: {}", dbg);
+        assert!(dbg.contains("smtp_host"), "missing 'smtp_host' in: {}", dbg);
+        assert!(dbg.contains("smtp_port"), "missing 'smtp_port' in: {}", dbg);
+        assert!(dbg.contains("from"), "missing 'from' in: {}", dbg);
+        assert!(dbg.contains("subject_prefix"), "missing 'subject_prefix' in: {}", dbg);
+        assert!(dbg.contains("tls"), "missing 'tls' in: {}", dbg);
+        assert!(dbg.contains("timeout_secs"), "missing 'timeout_secs' in: {}", dbg);
+    }
+
+    #[test]
+    fn looks_like_email_numeric_local() {
+        assert!(looks_like_email("123@example.com"));
+    }
+
+    #[test]
+    fn looks_like_email_dots_in_local() {
+        assert!(looks_like_email("user.name@example.com"));
+    }
+
+    #[test]
+    fn looks_like_email_hyphen_in_domain() {
+        assert!(looks_like_email("user@my-server.com"));
+    }
+
+    #[test]
+    fn looks_like_email_just_at_and_dot() {
+        assert!(looks_like_email("a@b.c"));
+    }
+
+    #[test]
+    fn looks_like_email_unicode_local() {
+        // The function only checks structure (@ and .), not charset
+        assert!(looks_like_email("\u{00FC}ser@example.com"));
+    }
+
+    #[test]
+    fn email_config_serde_missing_fields_get_defaults() {
+        let json = r#"{"enabled": true}"#;
+        let config: EmailNotifyConfig = serde_json::from_str(json).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.smtp_host, "");
+        assert_eq!(config.smtp_port, 587);
+        assert!(config.username.is_none());
+        assert!(config.password.is_none());
+        assert_eq!(config.from, "");
+        assert!(config.to.is_empty());
+        assert_eq!(config.subject_prefix, "[wa]");
+        assert_eq!(config.tls, EmailTlsMode::StartTls);
+        assert_eq!(config.timeout_secs, 10);
+    }
+
+    #[test]
+    fn email_config_validate_max_port() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: u16::MAX,
+            from: "wa@example.com".to_string(),
+            to: vec!["ops@example.com".to_string()],
+            ..EmailNotifyConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn email_config_validate_multiple_valid_recipients() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            from: "wa@example.com".to_string(),
+            to: vec![
+                "a@example.com".to_string(),
+                "b@example.com".to_string(),
+                "c@example.com".to_string(),
+                "d@example.com".to_string(),
+                "e@example.com".to_string(),
+            ],
+            ..EmailNotifyConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn email_config_validate_from_with_whitespace_passes() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            from: "  user@example.com  ".to_string(),
+            to: vec!["ops@example.com".to_string()],
+            ..EmailNotifyConfig::default()
+        };
+        // looks_like_email trims, so this should pass validation
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn email_tls_mode_all_variants_distinct() {
+        assert_ne!(EmailTlsMode::None, EmailTlsMode::StartTls);
+        assert_ne!(EmailTlsMode::StartTls, EmailTlsMode::Tls);
+        assert_ne!(EmailTlsMode::None, EmailTlsMode::Tls);
+    }
+
+    #[test]
+    fn email_config_default_not_enabled() {
+        let config = EmailNotifyConfig::default();
+        assert!(!config.enabled);
+    }
 }
