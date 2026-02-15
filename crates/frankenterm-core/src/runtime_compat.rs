@@ -328,6 +328,22 @@ pub mod broadcast {
     };
 }
 
+/// Task primitives used during runtime migration.
+///
+/// Note: this remains tokio-backed while call sites are normalized through
+/// `runtime_compat`.
+pub mod task {
+    pub use tokio::task::{JoinError, JoinHandle, JoinSet};
+
+    pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        tokio::spawn(future)
+    }
+}
+
 /// Unix socket aliases/helpers for the active runtime.
 #[cfg(feature = "asupersync-runtime")]
 pub mod unix {

@@ -537,7 +537,7 @@ impl IpcServer {
         ctx: Arc<IpcHandlerContext>,
         shutdown_rx: &mut mpsc::Receiver<()>,
     ) {
-        let mut connection_tasks = tokio::task::JoinSet::new();
+        let mut connection_tasks = crate::runtime_compat::task::JoinSet::new();
 
         loop {
             if shutdown_signal_pending(shutdown_rx).await {
@@ -1184,7 +1184,7 @@ impl IpcClient {
 #[allow(clippy::items_after_statements, clippy::significant_drop_tightening)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::RwLock;
+    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder, RwLock};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -1275,11 +1275,14 @@ mod tests {
     async fn start_auth_server(
         socket_path: &Path,
         auth: IpcAuth,
-    ) -> (mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        mpsc::Sender<()>,
+        crate::runtime_compat::task::JoinHandle<()>,
+    ) {
         let server = IpcServer::bind(socket_path).await.unwrap();
         let event_bus = Arc::new(EventBus::new(100));
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             server
                 .run_with_auth(event_bus, Some(auth), shutdown_rx)
                 .await;
@@ -1293,162 +1296,184 @@ mod tests {
         let _ = crate::runtime_compat::mpsc_send(shutdown_tx, ()).await;
     }
 
-    #[tokio::test]
-    async fn ipc_auth_rejects_missing_token() {
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
-
-        let auth = build_auth("secret", vec![IpcScope::Read], None);
-        let (shutdown_tx, server_handle) = start_auth_server(&socket_path, auth).await;
-
-        let mut client = IpcClient::new(&socket_path);
-        client.set_token(None);
-        let response = client.ping().await.unwrap();
-        assert!(!response.ok);
-        assert!(
-            response
-                .error
-                .unwrap_or_default()
-                .contains("missing auth token")
-        );
-
-        send_shutdown(&shutdown_tx).await;
-        let _ = server_handle.await;
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("failed to build runtime for ipc tests");
+        runtime.block_on(future);
     }
 
-    #[tokio::test]
-    async fn ipc_auth_rejects_invalid_token() {
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
+    #[test]
+    fn ipc_auth_rejects_missing_token() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
 
-        let auth = build_auth("secret", vec![IpcScope::Read], None);
-        let (shutdown_tx, server_handle) = start_auth_server(&socket_path, auth).await;
+            let auth = build_auth("secret", vec![IpcScope::Read], None);
+            let (shutdown_tx, server_handle) = start_auth_server(&socket_path, auth).await;
 
-        let client = IpcClient::with_token(&socket_path, "bad-token");
-        let response = client.ping().await.unwrap();
-        assert!(!response.ok);
-        assert!(
-            response
-                .error
-                .unwrap_or_default()
-                .contains("invalid auth token")
-        );
+            let mut client = IpcClient::new(&socket_path);
+            client.set_token(None);
+            let response = client.ping().await.unwrap();
+            assert!(!response.ok);
+            assert!(
+                response
+                    .error
+                    .unwrap_or_default()
+                    .contains("missing auth token")
+            );
 
-        send_shutdown(&shutdown_tx).await;
-        let _ = server_handle.await;
-    }
-
-    #[tokio::test]
-    async fn ipc_auth_rejects_expired_token() {
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
-
-        let expired_at = now_ms().saturating_sub(1);
-        let auth = build_auth("secret", vec![IpcScope::Read], Some(expired_at));
-        let (shutdown_tx, server_handle) = start_auth_server(&socket_path, auth).await;
-
-        let client = IpcClient::with_token(&socket_path, "secret");
-        let response = client.ping().await.unwrap();
-        assert!(!response.ok);
-        assert!(
-            response
-                .error
-                .unwrap_or_default()
-                .contains("auth token expired")
-        );
-
-        send_shutdown(&shutdown_tx).await;
-        let _ = server_handle.await;
-    }
-
-    #[tokio::test]
-    async fn ipc_auth_enforces_scopes() {
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
-
-        let auth = build_auth("reader", vec![IpcScope::Read], None);
-        let (shutdown_tx, server_handle) = start_auth_server(&socket_path, auth).await;
-
-        let client = IpcClient::with_token(&socket_path, "reader");
-        let response = client
-            .send_user_var(
-                1,
-                "FT_EVENT".to_string(),
-                "eyJraW5kIjoidGVzdCJ9".to_string(),
-            )
-            .await
-            .unwrap();
-        assert!(!response.ok);
-        assert!(
-            response
-                .error
-                .unwrap_or_default()
-                .contains("insufficient scope")
-        );
-
-        send_shutdown(&shutdown_tx).await;
-        let _ = server_handle.await;
-    }
-
-    #[tokio::test]
-    async fn ipc_roundtrip() {
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
-
-        // Start server
-        let server = IpcServer::bind(&socket_path).await.unwrap();
-        let event_bus = Arc::new(EventBus::new(100));
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-
-        let server_bus = event_bus.clone();
-        let server_handle = tokio::spawn(async move {
-            server.run(server_bus, shutdown_rx).await;
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
         });
-
-        // Give server time to start
-        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
-
-        // Create client and send ping
-        let client = IpcClient::new(&socket_path);
-        let response = client.ping().await.unwrap();
-        assert!(response.ok);
-        assert!(response.data.is_some());
-
-        // Send user-var event
-        let response = client
-            .send_user_var(
-                1,
-                "FT_EVENT".to_string(),
-                "eyJraW5kIjoidGVzdCJ9".to_string(), // {"kind":"test"}
-            )
-            .await
-            .unwrap();
-        assert!(response.ok);
-
-        // Shutdown
-        send_shutdown(&shutdown_tx).await;
-        let _ = server_handle.await;
     }
 
-    #[tokio::test]
-    async fn ipc_server_removes_socket_on_shutdown() {
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
+    #[test]
+    fn ipc_auth_rejects_invalid_token() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
 
-        let server = IpcServer::bind(&socket_path).await.unwrap();
-        let event_bus = Arc::new(EventBus::new(100));
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            let auth = build_auth("secret", vec![IpcScope::Read], None);
+            let (shutdown_tx, server_handle) = start_auth_server(&socket_path, auth).await;
 
-        let server_handle = tokio::spawn(async move {
-            server.run(event_bus, shutdown_rx).await;
+            let client = IpcClient::with_token(&socket_path, "bad-token");
+            let response = client.ping().await.unwrap();
+            assert!(!response.ok);
+            assert!(
+                response
+                    .error
+                    .unwrap_or_default()
+                    .contains("invalid auth token")
+            );
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
         });
+    }
 
-        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
-        assert!(socket_path.exists());
+    #[test]
+    fn ipc_auth_rejects_expired_token() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
 
-        send_shutdown(&shutdown_tx).await;
-        let _ = server_handle.await;
-        assert!(!socket_path.exists());
+            let expired_at = now_ms().saturating_sub(1);
+            let auth = build_auth("secret", vec![IpcScope::Read], Some(expired_at));
+            let (shutdown_tx, server_handle) = start_auth_server(&socket_path, auth).await;
+
+            let client = IpcClient::with_token(&socket_path, "secret");
+            let response = client.ping().await.unwrap();
+            assert!(!response.ok);
+            assert!(
+                response
+                    .error
+                    .unwrap_or_default()
+                    .contains("auth token expired")
+            );
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
+        });
+    }
+
+    #[test]
+    fn ipc_auth_enforces_scopes() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
+
+            let auth = build_auth("reader", vec![IpcScope::Read], None);
+            let (shutdown_tx, server_handle) = start_auth_server(&socket_path, auth).await;
+
+            let client = IpcClient::with_token(&socket_path, "reader");
+            let response = client
+                .send_user_var(
+                    1,
+                    "FT_EVENT".to_string(),
+                    "eyJraW5kIjoidGVzdCJ9".to_string(),
+                )
+                .await
+                .unwrap();
+            assert!(!response.ok);
+            assert!(
+                response
+                    .error
+                    .unwrap_or_default()
+                    .contains("insufficient scope")
+            );
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
+        });
+    }
+
+    #[test]
+    fn ipc_roundtrip() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
+
+            // Start server
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+            let server_bus = event_bus.clone();
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server.run(server_bus, shutdown_rx).await;
+            });
+
+            // Give server time to start
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+
+            // Create client and send ping
+            let client = IpcClient::new(&socket_path);
+            let response = client.ping().await.unwrap();
+            assert!(response.ok);
+            assert!(response.data.is_some());
+
+            // Send user-var event
+            let response = client
+                .send_user_var(
+                    1,
+                    "FT_EVENT".to_string(),
+                    "eyJraW5kIjoidGVzdCJ9".to_string(), // {"kind":"test"}
+                )
+                .await
+                .unwrap();
+            assert!(response.ok);
+
+            // Shutdown
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
+        });
+    }
+
+    #[test]
+    fn ipc_server_removes_socket_on_shutdown() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
+
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server.run(event_bus, shutdown_rx).await;
+            });
+
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            assert!(socket_path.exists());
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
+            assert!(!socket_path.exists());
+        });
     }
 
     fn make_pane_info(pane_id: u64) -> crate::wezterm::PaneInfo {
@@ -1476,344 +1501,358 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn ipc_pane_state_roundtrip() {
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
+    #[test]
+    fn ipc_pane_state_roundtrip() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
 
-        let server = IpcServer::bind(&socket_path).await.unwrap();
-        let event_bus = Arc::new(EventBus::new(100));
-        let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let registry = Arc::new(RwLock::new(PaneRegistry::new()));
 
-        {
-            let mut registry = registry.write().await;
-            registry.discovery_tick(vec![make_pane_info(7)]);
-            if let Some(entry) = registry.get_entry_mut(7) {
-                // Note: These fields are deprecated and manually set here only for testing
-                // field serialization. In production, is_alt_screen is always false and
-                // last_status_at is always None since Lua status updates were removed in v0.2.0.
-                entry.is_alt_screen = true;
-                entry.last_status_at = Some(123);
+            {
+                let mut registry = registry.write().await;
+                registry.discovery_tick(vec![make_pane_info(7)]);
+                if let Some(entry) = registry.get_entry_mut(7) {
+                    // Note: These fields are deprecated and manually set here only for testing
+                    // field serialization. In production, is_alt_screen is always false and
+                    // last_status_at is always None since Lua status updates were removed in v0.2.0.
+                    entry.is_alt_screen = true;
+                    entry.last_status_at = Some(123);
+                }
+                if let Some(cursor) = registry.get_cursor_mut(7) {
+                    cursor.in_gap = true;
+                    cursor.in_alt_screen = true;
+                }
             }
-            if let Some(cursor) = registry.get_cursor_mut(7) {
-                cursor.in_gap = true;
-                cursor.in_alt_screen = true;
-            }
-        }
 
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-        let server_handle = tokio::spawn(async move {
-            server
-                .run_with_registry(event_bus, registry, shutdown_rx)
-                .await;
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server
+                    .run_with_registry(event_bus, registry, shutdown_rx)
+                    .await;
+            });
+
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+
+            let client = IpcClient::new(&socket_path);
+            let response = client.pane_state(7).await.unwrap();
+            assert!(response.ok);
+            let data = response.data.unwrap();
+            assert_eq!(
+                data.get("pane_id").and_then(serde_json::Value::as_u64),
+                Some(7)
+            );
+            assert_eq!(
+                data.get("known").and_then(serde_json::Value::as_bool),
+                Some(true)
+            );
+            assert_eq!(
+                data.get("observed").and_then(serde_json::Value::as_bool),
+                Some(true)
+            );
+            assert_eq!(
+                data.get("alt_screen").and_then(serde_json::Value::as_bool),
+                Some(true)
+            );
+            assert_eq!(
+                data.get("cursor_alt_screen")
+                    .and_then(serde_json::Value::as_bool),
+                Some(true)
+            );
+            assert_eq!(
+                data.get("in_gap").and_then(serde_json::Value::as_bool),
+                Some(true)
+            );
+            assert!(data.get("last_status_at").is_some());
+
+            let response = client.pane_state(999).await.unwrap();
+            assert!(response.ok);
+            let data = response.data.unwrap();
+            assert_eq!(
+                data.get("known").and_then(serde_json::Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                data.get("reason").and_then(|v| v.as_str()),
+                Some("unknown_pane")
+            );
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
         });
-
-        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
-
-        let client = IpcClient::new(&socket_path);
-        let response = client.pane_state(7).await.unwrap();
-        assert!(response.ok);
-        let data = response.data.unwrap();
-        assert_eq!(
-            data.get("pane_id").and_then(serde_json::Value::as_u64),
-            Some(7)
-        );
-        assert_eq!(
-            data.get("known").and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            data.get("observed").and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            data.get("alt_screen").and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            data.get("cursor_alt_screen")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            data.get("in_gap").and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert!(data.get("last_status_at").is_some());
-
-        let response = client.pane_state(999).await.unwrap();
-        assert!(response.ok);
-        let data = response.data.unwrap();
-        assert_eq!(
-            data.get("known").and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            data.get("reason").and_then(|v| v.as_str()),
-            Some("unknown_pane")
-        );
-
-        send_shutdown(&shutdown_tx).await;
-        let _ = server_handle.await;
     }
 
     // ========================================================================
     // User-var lane IPC integration tests (wa-4vx.4.10)
     // ========================================================================
 
-    #[tokio::test]
-    async fn user_var_event_reaches_event_bus() {
-        use base64::Engine;
+    #[test]
+    fn user_var_event_reaches_event_bus() {
+        run_async_test(async {
+            use base64::Engine;
 
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
 
-        // Start server
-        let server = IpcServer::bind(&socket_path).await.unwrap();
-        let event_bus = Arc::new(EventBus::new(100));
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            // Start server
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-        // Subscribe to signal events BEFORE starting server
-        let mut subscriber = event_bus.subscribe_signals();
+            // Subscribe to signal events BEFORE starting server
+            let mut subscriber = event_bus.subscribe_signals();
 
-        let server_bus = event_bus.clone();
-        let server_handle = tokio::spawn(async move {
-            server.run(server_bus, shutdown_rx).await;
+            let server_bus = event_bus.clone();
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server.run(server_bus, shutdown_rx).await;
+            });
+
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+
+            // Send a user-var event
+            let client = IpcClient::new(&socket_path);
+            let json = r#"{"type":"command_start","cmd":"ls"}"#;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(json);
+
+            let response = client
+                .send_user_var(42, "FT_EVENT".to_string(), encoded)
+                .await
+                .unwrap();
+            assert!(response.ok);
+
+            // Verify event reached the bus
+            let event = subscriber.try_recv();
+            assert!(event.is_some());
+            let event = event.unwrap().unwrap();
+
+            if let Event::UserVarReceived {
+                pane_id,
+                name,
+                payload,
+            } = event
+            {
+                assert_eq!(pane_id, 42);
+                assert_eq!(name, "FT_EVENT");
+                assert_eq!(payload.event_type, Some("command_start".to_string()));
+            } else {
+                panic!("Expected UserVarReceived event, got {:?}", event);
+            }
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
         });
-
-        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
-
-        // Send a user-var event
-        let client = IpcClient::new(&socket_path);
-        let json = r#"{"type":"command_start","cmd":"ls"}"#;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(json);
-
-        let response = client
-            .send_user_var(42, "FT_EVENT".to_string(), encoded)
-            .await
-            .unwrap();
-        assert!(response.ok);
-
-        // Verify event reached the bus
-        let event = subscriber.try_recv();
-        assert!(event.is_some());
-        let event = event.unwrap().unwrap();
-
-        if let Event::UserVarReceived {
-            pane_id,
-            name,
-            payload,
-        } = event
-        {
-            assert_eq!(pane_id, 42);
-            assert_eq!(name, "FT_EVENT");
-            assert_eq!(payload.event_type, Some("command_start".to_string()));
-        } else {
-            panic!("Expected UserVarReceived event, got {:?}", event);
-        }
-
-        send_shutdown(&shutdown_tx).await;
-        let _ = server_handle.await;
     }
 
-    #[tokio::test]
-    async fn ipc_status_returns_event_bus_stats() {
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
-        crate::runtime::RuntimeLockMemoryTelemetrySnapshot::update_global(
-            crate::runtime::RuntimeLockMemoryTelemetrySnapshot {
-                timestamp_ms: 123,
-                avg_storage_lock_wait_ms: 1.5,
-                p50_storage_lock_wait_ms: 1.0,
-                p95_storage_lock_wait_ms: 2.8,
-                max_storage_lock_wait_ms: 3.0,
-                storage_lock_contention_events: 2,
-                avg_storage_lock_hold_ms: 2.5,
-                p50_storage_lock_hold_ms: 2.0,
-                p95_storage_lock_hold_ms: 3.9,
-                max_storage_lock_hold_ms: 4.0,
-                cursor_snapshot_bytes_last: 2048,
-                p50_cursor_snapshot_bytes: 3000,
-                p95_cursor_snapshot_bytes: 3900,
-                cursor_snapshot_bytes_max: 4096,
-                avg_cursor_snapshot_bytes: 3072.0,
-            },
-        );
+    #[test]
+    fn ipc_status_returns_event_bus_stats() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
+            crate::runtime::RuntimeLockMemoryTelemetrySnapshot::update_global(
+                crate::runtime::RuntimeLockMemoryTelemetrySnapshot {
+                    timestamp_ms: 123,
+                    avg_storage_lock_wait_ms: 1.5,
+                    p50_storage_lock_wait_ms: 1.0,
+                    p95_storage_lock_wait_ms: 2.8,
+                    max_storage_lock_wait_ms: 3.0,
+                    storage_lock_contention_events: 2,
+                    avg_storage_lock_hold_ms: 2.5,
+                    p50_storage_lock_hold_ms: 2.0,
+                    p95_storage_lock_hold_ms: 3.9,
+                    max_storage_lock_hold_ms: 4.0,
+                    cursor_snapshot_bytes_last: 2048,
+                    p50_cursor_snapshot_bytes: 3000,
+                    p95_cursor_snapshot_bytes: 3900,
+                    cursor_snapshot_bytes_max: 4096,
+                    avg_cursor_snapshot_bytes: 3072.0,
+                },
+            );
 
-        let server = IpcServer::bind(&socket_path).await.unwrap();
-        let event_bus = Arc::new(EventBus::new(100));
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-        let server_bus = event_bus.clone();
-        let server_handle = tokio::spawn(async move {
-            server.run(server_bus, shutdown_rx).await;
+            let server_bus = event_bus.clone();
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server.run(server_bus, shutdown_rx).await;
+            });
+
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+
+            let client = IpcClient::new(&socket_path);
+            let response = client.status().await.unwrap();
+
+            assert!(response.ok);
+            assert!(response.data.is_some());
+            let data = response.data.unwrap();
+            assert!(data.get("uptime_ms").is_some());
+            assert!(data.get("events_queued").is_some());
+            assert!(data.get("subscriber_count").is_some());
+            let runtime_lock_memory = data
+                .get("health")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|health| health.get("runtime_lock_memory"))
+                .or_else(|| data.get("runtime_lock_memory"))
+                .and_then(serde_json::Value::as_object)
+                .expect("runtime_lock_memory should be present in status payload");
+            assert_eq!(
+                runtime_lock_memory.get("max_storage_lock_wait_ms"),
+                Some(&serde_json::json!(3.0))
+            );
+            assert_eq!(
+                runtime_lock_memory.get("p95_cursor_snapshot_bytes"),
+                Some(&serde_json::json!(3900))
+            );
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
         });
-
-        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
-
-        let client = IpcClient::new(&socket_path);
-        let response = client.status().await.unwrap();
-
-        assert!(response.ok);
-        assert!(response.data.is_some());
-        let data = response.data.unwrap();
-        assert!(data.get("uptime_ms").is_some());
-        assert!(data.get("events_queued").is_some());
-        assert!(data.get("subscriber_count").is_some());
-        let runtime_lock_memory = data
-            .get("health")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|health| health.get("runtime_lock_memory"))
-            .or_else(|| data.get("runtime_lock_memory"))
-            .and_then(serde_json::Value::as_object)
-            .expect("runtime_lock_memory should be present in status payload");
-        assert_eq!(
-            runtime_lock_memory.get("max_storage_lock_wait_ms"),
-            Some(&serde_json::json!(3.0))
-        );
-        assert_eq!(
-            runtime_lock_memory.get("p95_cursor_snapshot_bytes"),
-            Some(&serde_json::json!(3900))
-        );
-
-        send_shutdown(&shutdown_tx).await;
-        let _ = server_handle.await;
     }
 
-    #[tokio::test]
-    async fn ipc_client_error_on_missing_socket() {
-        let client = IpcClient::new("/nonexistent/path/ipc.sock");
-        let result = client.ping().await;
+    #[test]
+    fn ipc_client_error_on_missing_socket() {
+        run_async_test(async {
+            let client = IpcClient::new("/nonexistent/path/ipc.sock");
+            let result = client.ping().await;
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, UserVarError::WatcherNotRunning { .. }));
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(matches!(err, UserVarError::WatcherNotRunning { .. }));
+        });
     }
 
-    #[tokio::test]
-    async fn ipc_handles_invalid_json_request() {
-        use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
+    #[test]
+    fn ipc_handles_invalid_json_request() {
+        run_async_test(async {
+            use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
 
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
 
-        let server = IpcServer::bind(&socket_path).await.unwrap();
-        let event_bus = Arc::new(EventBus::new(100));
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-        let server_bus = event_bus.clone();
-        let server_handle = tokio::spawn(async move {
-            server.run(server_bus, shutdown_rx).await;
+            let server_bus = event_bus.clone();
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server.run(server_bus, shutdown_rx).await;
+            });
+
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+
+            // Send invalid JSON directly via raw socket
+            let mut stream = compat_unix::connect(&socket_path).await.unwrap();
+            stream.write_all(b"not valid json\n").await.unwrap();
+            stream.flush().await.unwrap();
+
+            // Read response
+            let (reader, _) = stream.into_split();
+            let mut lines = compat_unix::lines(compat_unix::buffered(reader));
+            let line = compat_unix::next_line(&mut lines)
+                .await
+                .unwrap()
+                .expect("expected response line");
+
+            let response: IpcResponse = serde_json::from_str(&line).unwrap();
+            assert!(!response.ok);
+            assert!(response.error.is_some());
+            assert!(response.error.unwrap().contains("invalid request"));
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
         });
-
-        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
-
-        // Send invalid JSON directly via raw socket
-        let mut stream = compat_unix::connect(&socket_path).await.unwrap();
-        stream.write_all(b"not valid json\n").await.unwrap();
-        stream.flush().await.unwrap();
-
-        // Read response
-        let (reader, _) = stream.into_split();
-        let mut lines = compat_unix::lines(compat_unix::buffered(reader));
-        let line = compat_unix::next_line(&mut lines)
-            .await
-            .unwrap()
-            .expect("expected response line");
-
-        let response: IpcResponse = serde_json::from_str(&line).unwrap();
-        assert!(!response.ok);
-        assert!(response.error.is_some());
-        assert!(response.error.unwrap().contains("invalid request"));
-
-        send_shutdown(&shutdown_tx).await;
-        let _ = server_handle.await;
     }
 
-    #[tokio::test]
-    async fn ipc_rejects_oversized_messages() {
-        use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
+    #[test]
+    fn ipc_rejects_oversized_messages() {
+        run_async_test(async {
+            use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
 
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
 
-        let server = IpcServer::bind(&socket_path).await.unwrap();
-        let event_bus = Arc::new(EventBus::new(100));
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-        let server_bus = event_bus.clone();
-        let server_handle = tokio::spawn(async move {
-            server.run(server_bus, shutdown_rx).await;
+            let server_bus = event_bus.clone();
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server.run(server_bus, shutdown_rx).await;
+            });
+
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+
+            // Create an oversized message (> MAX_MESSAGE_SIZE)
+            let oversized_value = "x".repeat(MAX_MESSAGE_SIZE + 1000);
+            let request = IpcRequest::UserVar {
+                pane_id: 1,
+                name: "TEST".to_string(),
+                value: oversized_value,
+            };
+            let request_json = serde_json::to_string(&request).unwrap();
+
+            // Send directly
+            let mut stream = compat_unix::connect(&socket_path).await.unwrap();
+            stream.write_all(request_json.as_bytes()).await.unwrap();
+            stream.write_all(b"\n").await.unwrap();
+            stream.flush().await.unwrap();
+
+            let (reader, _) = stream.into_split();
+            let mut lines = compat_unix::lines(compat_unix::buffered(reader));
+            let line = compat_unix::next_line(&mut lines)
+                .await
+                .unwrap()
+                .expect("expected response line");
+
+            let response: IpcResponse = serde_json::from_str(&line).unwrap();
+            assert!(!response.ok);
+            assert!(response.error.is_some());
+            assert!(response.error.unwrap().contains("too large"));
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
         });
-
-        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
-
-        // Create an oversized message (> MAX_MESSAGE_SIZE)
-        let oversized_value = "x".repeat(MAX_MESSAGE_SIZE + 1000);
-        let request = IpcRequest::UserVar {
-            pane_id: 1,
-            name: "TEST".to_string(),
-            value: oversized_value,
-        };
-        let request_json = serde_json::to_string(&request).unwrap();
-
-        // Send directly
-        let mut stream = compat_unix::connect(&socket_path).await.unwrap();
-        stream.write_all(request_json.as_bytes()).await.unwrap();
-        stream.write_all(b"\n").await.unwrap();
-        stream.flush().await.unwrap();
-
-        let (reader, _) = stream.into_split();
-        let mut lines = compat_unix::lines(compat_unix::buffered(reader));
-        let line = compat_unix::next_line(&mut lines)
-            .await
-            .unwrap()
-            .expect("expected response line");
-
-        let response: IpcResponse = serde_json::from_str(&line).unwrap();
-        assert!(!response.ok);
-        assert!(response.error.is_some());
-        assert!(response.error.unwrap().contains("too large"));
-
-        send_shutdown(&shutdown_tx).await;
-        let _ = server_handle.await;
     }
 
-    #[tokio::test]
-    async fn multiple_clients_can_connect_concurrently() {
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
+    #[test]
+    fn multiple_clients_can_connect_concurrently() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
 
-        let server = IpcServer::bind(&socket_path).await.unwrap();
-        let event_bus = Arc::new(EventBus::new(100));
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-        let server_bus = event_bus.clone();
-        let server_handle = tokio::spawn(async move {
-            server.run(server_bus, shutdown_rx).await;
-        });
+            let server_bus = event_bus.clone();
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server.run(server_bus, shutdown_rx).await;
+            });
 
-        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
 
-        // Spawn multiple concurrent clients
-        let socket_path_clone = socket_path.clone();
-        let handles: Vec<_> = (0..5)
-            .map(|i| {
-                let path = socket_path_clone.clone();
-                tokio::spawn(async move {
-                    let client = IpcClient::new(&path);
-                    let response = client.ping().await.unwrap();
-                    assert!(response.ok, "Client {} failed", i);
+            // Spawn multiple concurrent clients
+            let socket_path_clone = socket_path.clone();
+            let handles: Vec<_> = (0..5)
+                .map(|i| {
+                    let path = socket_path_clone.clone();
+                    crate::runtime_compat::task::spawn(async move {
+                        let client = IpcClient::new(&path);
+                        let response = client.ping().await.unwrap();
+                        assert!(response.ok, "Client {} failed", i);
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        for handle in handles {
-            handle.await.unwrap();
-        }
+            for handle in handles {
+                handle.await.unwrap();
+            }
 
-        send_shutdown(&shutdown_tx).await;
-        let _ = server_handle.await;
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
+        });
     }
 
     // ========================================================================

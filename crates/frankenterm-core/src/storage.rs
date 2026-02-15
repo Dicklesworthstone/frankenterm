@@ -4988,6 +4988,23 @@ impl StorageHandle {
         }
     }
 
+    async fn spawn_blocking_storage<T, F>(work: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            asupersync::runtime::spawn_blocking(work).await
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            tokio::task::spawn_blocking(work)
+                .await
+                .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+        }
+    }
+
     /// Create a storage handle with custom configuration
     pub async fn with_config(db_path: &str, config: StorageConfig) -> Result<Self> {
         // Ensure parent directory exists
@@ -4996,7 +5013,7 @@ impl StorageHandle {
         // Open connection, recover WAL if needed, and initialize schema (blocking)
         let db_path_owned = db_path.to_string();
         let db_existed = Path::new(&db_path_owned).exists();
-        let init_result = tokio::task::spawn_blocking(move || -> Result<Connection> {
+        let init_result = Self::spawn_blocking_storage(move || -> Result<Connection> {
             let conn = Connection::open(&db_path_owned)
                 .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
 
@@ -5010,8 +5027,7 @@ impl StorageHandle {
             }
             Ok(conn)
         })
-        .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))??;
+        .await?;
 
         // Create bounded channel for write commands
         let (write_tx, mut write_rx) = mpsc::channel::<WriteCommand>(config.write_queue_size);
@@ -5205,14 +5221,13 @@ impl StorageHandle {
     /// Fetch triage state, note, and labels for an event.
     pub async fn get_event_annotations(&self, event_id: i64) -> Result<Option<EventAnnotations>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             query_event_annotations_sync(&conn, event_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Add or update a persistent event mute by identity key.
@@ -5250,7 +5265,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let identity_key = identity_key.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -5258,14 +5273,13 @@ impl StorageHandle {
             query_event_mute(&conn, &identity_key, now_ms)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// List all active (non-expired) mutes.
     pub async fn list_active_mutes(&self, now_ms: i64) -> Result<Vec<EventMuteRecord>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -5273,14 +5287,13 @@ impl StorageHandle {
             list_active_mutes_sync(&conn, now_ms)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Fetch an event's dedupe/identity key by ID.
     pub async fn get_event_identity_key(&self, event_id: i64) -> Result<Option<String>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -5288,7 +5301,6 @@ impl StorageHandle {
             query_event_identity_key(&conn, event_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Record an audit action
@@ -5339,7 +5351,7 @@ impl StorageHandle {
     pub async fn get_action_undo(&self, audit_action_id: i64) -> Result<Option<ActionUndoRecord>> {
         let db_path = Arc::clone(&self.db_path);
 
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -5347,7 +5359,6 @@ impl StorageHandle {
             query_action_undo_sync(&conn, audit_action_id)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Mark an undo record as executed.
@@ -5495,27 +5506,25 @@ impl StorageHandle {
     pub async fn get_saved_search_by_name(&self, name: &str) -> Result<Option<SavedSearchRecord>> {
         let db_path = Arc::clone(&self.db_path);
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             query_saved_search_by_name(&conn, &name)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// List saved searches in deterministic order.
     pub async fn list_saved_searches(&self) -> Result<Vec<SavedSearchRecord>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             list_saved_searches_sync(&conn)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Insert a pane bookmark. Returns the row ID.
@@ -5555,41 +5564,38 @@ impl StorageHandle {
     ) -> Result<Option<PaneBookmarkRecord>> {
         let db_path = Arc::clone(&self.db_path);
         let alias = alias.to_string();
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             query_pane_bookmark_by_alias(&conn, &alias)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// List all pane bookmarks in alias order.
     pub async fn list_pane_bookmarks(&self) -> Result<Vec<PaneBookmarkRecord>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             list_pane_bookmarks_sync(&conn)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// List pane bookmarks filtered by tag.
     pub async fn list_pane_bookmarks_by_tag(&self, tag: &str) -> Result<Vec<PaneBookmarkRecord>> {
         let db_path = Arc::clone(&self.db_path);
         let tag = tag.to_string();
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             list_pane_bookmarks_by_tag_sync(&conn, &tag)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Prune output segments older than a cutoff timestamp
@@ -6007,33 +6013,31 @@ impl StorageHandle {
     /// Read SQLite page statistics used to decide whether VACUUM is worthwhile.
     pub async fn database_page_stats(&self) -> Result<DatabasePageStats> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             database_page_stats_sync(&conn)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get per-pane indexing statistics (read-only, uses read connection).
     pub async fn get_pane_indexing_stats(&self) -> Result<Vec<PaneIndexingStats>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             get_pane_indexing_stats_sync(&conn)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get a full indexing health report (per-pane stats + FTS integrity).
     pub async fn get_indexing_health(&self) -> Result<IndexingHealthReport> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -6042,7 +6046,6 @@ impl StorageHandle {
             Ok(build_indexing_health_report(stats, fts_ok))
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Perform incremental FTS sync on startup.
@@ -6055,14 +6058,13 @@ impl StorageHandle {
     /// Returns a result describing what was synced.
     pub async fn sync_fts(&self, config: FtsSyncConfig) -> Result<FtsSyncResult> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             sync_fts_on_startup(&conn, &config)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Perform a full FTS rebuild regardless of current state.
@@ -6071,27 +6073,25 @@ impl StorageHandle {
     /// Use this for recovery or when a clean rebuild is needed.
     pub async fn rebuild_fts(&self, config: FtsSyncConfig) -> Result<FtsSyncResult> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             full_fts_rebuild_sync(&conn, &config)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Get the current FTS index state (version, last rebuild time).
     pub async fn get_fts_index_state(&self) -> Result<Option<FtsIndexState>> {
         let db_path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || {
+        Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             get_fts_index_state_sync(&conn)
         })
         .await
-        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Insert an approval token
