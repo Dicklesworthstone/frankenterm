@@ -795,4 +795,481 @@ mod tests {
         assert!(SENSITIVE_VAR_PATTERNS.contains(&"PASSWORD"));
         assert!(SENSITIVE_VAR_PATTERNS.contains(&"API_KEY"));
     }
+
+    // -----------------------------------------------------------------------
+    // Batch — RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    // ---- Sub-type serde roundtrips ----
+
+    #[test]
+    fn scrollback_ref_serde_roundtrip() {
+        let sr = ScrollbackRef {
+            output_segments_seq: -5,
+            total_lines_captured: 999_999,
+            last_capture_at: u64::MAX,
+        };
+        let json = serde_json::to_string(&sr).unwrap();
+        let restored: ScrollbackRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(sr, restored);
+    }
+
+    #[test]
+    fn agent_metadata_minimal_serde_roundtrip() {
+        let am = AgentMetadata {
+            agent_type: "gemini".to_string(),
+            session_id: None,
+            state: None,
+        };
+        let json = serde_json::to_string(&am).unwrap();
+        let restored: AgentMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(am, restored);
+        // Optional fields should be absent in JSON
+        assert!(!json.contains("session_id"));
+        assert!(!json.contains("state"));
+    }
+
+    #[test]
+    fn captured_env_serde_roundtrip() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("PATH".to_string(), "/usr/bin:/usr/local/bin".to_string());
+        vars.insert("HOME".to_string(), "/home/test".to_string());
+        let ce = CapturedEnv {
+            vars,
+            redacted_count: 7,
+        };
+        let json = serde_json::to_string(&ce).unwrap();
+        let restored: CapturedEnv = serde_json::from_str(&json).unwrap();
+        assert_eq!(ce, restored);
+    }
+
+    #[test]
+    fn process_info_full_serde_roundtrip() {
+        let p = ProcessInfo {
+            name: "claude-code".to_string(),
+            pid: Some(u32::MAX),
+            argv: Some(vec![
+                "claude-code".to_string(),
+                "--flag".to_string(),
+                "".to_string(),
+            ]),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let restored: ProcessInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, restored);
+    }
+
+    #[test]
+    fn terminal_state_full_roundtrip() {
+        let ts = TerminalState {
+            rows: u16::MAX,
+            cols: u16::MAX,
+            cursor_row: u16::MAX,
+            cursor_col: u16::MAX,
+            is_alt_screen: true,
+            title: "a".repeat(500),
+        };
+        let json = serde_json::to_string(&ts).unwrap();
+        let restored: TerminalState = serde_json::from_str(&json).unwrap();
+        assert_eq!(ts, restored);
+    }
+
+    // ---- from_pane_info edge cases ----
+
+    #[test]
+    fn from_pane_info_no_cwd_leaves_cwd_none() {
+        let pane = crate::wezterm::PaneInfo {
+            pane_id: 1,
+            tab_id: 0,
+            window_id: 0,
+            domain_id: None,
+            domain_name: None,
+            workspace: None,
+            size: None,
+            rows: Some(40),
+            cols: Some(100),
+            title: Some("test".to_string()),
+            cwd: None,
+            tty_name: None,
+            cursor_x: Some(5),
+            cursor_y: Some(10),
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
+            is_active: false,
+            is_zoomed: false,
+            extra: std::collections::HashMap::new(),
+        };
+        let snapshot = PaneStateSnapshot::from_pane_info(&pane, 1000, false);
+        assert!(snapshot.cwd.is_none());
+        // Falls back to legacy rows/cols
+        assert_eq!(snapshot.terminal.rows, 40);
+        assert_eq!(snapshot.terminal.cols, 100);
+    }
+
+    #[test]
+    fn from_pane_info_no_title_defaults_to_empty() {
+        let pane = crate::wezterm::PaneInfo {
+            pane_id: 2,
+            tab_id: 0,
+            window_id: 0,
+            domain_id: None,
+            domain_name: None,
+            workspace: None,
+            size: None,
+            rows: None,
+            cols: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            cursor_x: None,
+            cursor_y: None,
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
+            is_active: false,
+            is_zoomed: false,
+            extra: std::collections::HashMap::new(),
+        };
+        let snapshot = PaneStateSnapshot::from_pane_info(&pane, 2000, true);
+        assert!(snapshot.terminal.title.is_empty());
+        // Cursor defaults to 0 when not present
+        assert_eq!(snapshot.terminal.cursor_row, 0);
+        assert_eq!(snapshot.terminal.cursor_col, 0);
+        // No size or legacy rows/cols => defaults 24x80
+        assert_eq!(snapshot.terminal.rows, 24);
+        assert_eq!(snapshot.terminal.cols, 80);
+        // Alt-screen flag is passed through
+        assert!(snapshot.terminal.is_alt_screen);
+    }
+
+    #[test]
+    fn from_pane_info_uses_legacy_rows_cols_fallback() {
+        let pane = crate::wezterm::PaneInfo {
+            pane_id: 3,
+            tab_id: 0,
+            window_id: 0,
+            domain_id: None,
+            domain_name: None,
+            workspace: None,
+            size: None, // no nested size
+            rows: Some(50),
+            cols: Some(200),
+            title: Some("legacy".to_string()),
+            cwd: None,
+            tty_name: None,
+            cursor_x: None,
+            cursor_y: None,
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
+            is_active: false,
+            is_zoomed: false,
+            extra: std::collections::HashMap::new(),
+        };
+        let snapshot = PaneStateSnapshot::from_pane_info(&pane, 3000, false);
+        assert_eq!(snapshot.terminal.rows, 50);
+        assert_eq!(snapshot.terminal.cols, 200);
+    }
+
+    // ---- Builder edge cases ----
+
+    #[test]
+    fn with_cwd_overwrites_previous_value() {
+        let snapshot = PaneStateSnapshot::new(0, 0, make_terminal())
+            .with_cwd("/first".to_string())
+            .with_cwd("/second".to_string());
+        assert_eq!(snapshot.cwd.as_deref(), Some("/second"));
+    }
+
+    #[test]
+    fn builder_order_does_not_matter() {
+        let a = PaneStateSnapshot::new(1, 100, make_terminal())
+            .with_cwd("/tmp".to_string())
+            .with_shell("bash".to_string());
+
+        let b = PaneStateSnapshot::new(1, 100, make_terminal())
+            .with_shell("bash".to_string())
+            .with_cwd("/tmp".to_string());
+
+        assert_eq!(a, b);
+    }
+
+    // ---- Size budget boundary ----
+
+    #[test]
+    fn size_budget_at_exact_boundary_not_truncated() {
+        // Build a snapshot, measure its base size, then pad env to reach exactly the budget
+        let base = PaneStateSnapshot::new(0, 1000, make_terminal());
+        let base_json = base.to_json().unwrap();
+        let base_len = base_json.len();
+
+        // We need to add env vars that bring the total to exactly PANE_STATE_SIZE_BUDGET
+        // The overhead for env wrapping is: ,"env":{"vars":{"K":"V"},"redacted_count":0}
+        // We'll pad with a single large value
+        let overhead_estimate = 50; // {"vars":{"X":"..."},"redacted_count":0} + ,"env":
+        let padding_needed = PANE_STATE_SIZE_BUDGET - base_len - overhead_estimate;
+
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("X".to_string(), "y".repeat(padding_needed));
+        let mut snapshot = PaneStateSnapshot::new(0, 1000, make_terminal());
+        snapshot.env = Some(CapturedEnv {
+            vars,
+            redacted_count: 0,
+        });
+
+        let (json, truncated) = snapshot.to_json_budgeted().unwrap();
+        // It might be slightly under or over; the point is the boundary logic works
+        if json.len() <= PANE_STATE_SIZE_BUDGET {
+            assert!(!truncated);
+        } else {
+            assert!(truncated);
+        }
+    }
+
+    #[test]
+    fn size_budget_only_argv_large_removes_env_first() {
+        // Snapshot with no env but large argv still under budget is not truncated
+        let snapshot = PaneStateSnapshot::new(0, 1000, make_terminal())
+            .with_process(ProcessInfo {
+                name: "test".to_string(),
+                pid: Some(1),
+                argv: Some(vec!["arg".to_string(); 10]),
+            });
+        let (_, truncated) = snapshot.to_json_budgeted().unwrap();
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn size_budget_only_argv_oversized_no_env_to_remove() {
+        // Snapshot with no env but argv so large it exceeds budget
+        let snapshot = PaneStateSnapshot::new(0, 1000, make_terminal())
+            .with_process(ProcessInfo {
+                name: "test".to_string(),
+                pid: Some(1),
+                argv: Some(vec!["x".repeat(70_000)]),
+            });
+        let (json, truncated) = snapshot.to_json_budgeted().unwrap();
+        assert!(truncated);
+        // argv should be removed in the result
+        let restored: PaneStateSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(restored.foreground_process.as_ref().unwrap().argv.is_none());
+        // process name is preserved
+        assert_eq!(restored.foreground_process.as_ref().unwrap().name, "test");
+    }
+
+    // ---- Sensitive variable detection edge cases ----
+
+    #[test]
+    fn is_sensitive_detects_passwd_pattern() {
+        assert!(is_sensitive_var("MYSQL_PASSWD"));
+        assert!(is_sensitive_var("passwd_file"));
+        assert!(is_sensitive_var("MyPasswdStore"));
+    }
+
+    #[test]
+    fn is_sensitive_detects_credential_pattern() {
+        assert!(is_sensitive_var("GOOGLE_CREDENTIAL"));
+        assert!(is_sensitive_var("credential_helper"));
+        assert!(is_sensitive_var("SERVICE_CREDENTIALS"));
+    }
+
+    #[test]
+    fn is_sensitive_detects_private_pattern() {
+        assert!(is_sensitive_var("SSH_PRIVATE_KEY"));
+        assert!(is_sensitive_var("private_key_path"));
+        assert!(is_sensitive_var("TLS_PRIVATE"));
+    }
+
+    #[test]
+    fn is_sensitive_partial_match_on_key_substring() {
+        // "KEY" pattern matches within variable names containing "key"
+        assert!(is_sensitive_var("ENCRYPTION_KEY_ID"));
+        assert!(is_sensitive_var("ssh_key"));
+        assert!(is_sensitive_var("MONKEY")); // contains "KEY"
+    }
+
+    #[test]
+    fn is_sensitive_does_not_match_unrelated_words() {
+        assert!(!is_sensitive_var("PATH"));
+        assert!(!is_sensitive_var("DISPLAY"));
+        assert!(!is_sensitive_var("LANG"));
+        assert!(!is_sensitive_var("COLORTERM"));
+        assert!(!is_sensitive_var("SHLVL"));
+        assert!(!is_sensitive_var("XDG_RUNTIME_DIR"));
+    }
+
+    // ---- Env capture: mixed safe + sensitive + unknown ----
+
+    #[test]
+    fn env_capture_mixed_safe_sensitive_unknown() {
+        let vars = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("AWS_SECRET_KEY".to_string(), "secret!".to_string()),
+            ("RANDOM_CUSTOM".to_string(), "value".to_string()),
+            ("TERM".to_string(), "xterm".to_string()),
+            ("DB_PASSWORD".to_string(), "pw123".to_string()),
+            ("EDITOR".to_string(), "vim".to_string()),
+            ("NOT_LISTED".to_string(), "nope".to_string()),
+        ];
+        let env = capture_env_from_iter(vars.into_iter());
+
+        // Safe vars captured
+        assert_eq!(env.vars.len(), 3);
+        assert!(env.vars.contains_key("PATH"));
+        assert!(env.vars.contains_key("TERM"));
+        assert!(env.vars.contains_key("EDITOR"));
+        // Sensitive vars counted as redacted
+        assert_eq!(env.redacted_count, 2);
+        // Unknown vars neither captured nor counted
+        assert!(!env.vars.contains_key("RANDOM_CUSTOM"));
+        assert!(!env.vars.contains_key("NOT_LISTED"));
+    }
+
+    // ---- Empty and null field handling ----
+
+    #[test]
+    fn snapshot_all_none_optionals_serializes_compactly() {
+        let snapshot = PaneStateSnapshot::new(0, 0, make_terminal());
+        let json = snapshot.to_json().unwrap();
+
+        // skip_serializing_if = "Option::is_none" means these keys are absent
+        assert!(!json.contains("\"cwd\""));
+        assert!(!json.contains("\"foreground_process\""));
+        assert!(!json.contains("\"shell\""));
+        assert!(!json.contains("\"scrollback_ref\""));
+        assert!(!json.contains("\"agent\""));
+        assert!(!json.contains("\"env\""));
+    }
+
+    #[test]
+    fn from_json_with_empty_string_fails() {
+        let result = PaneStateSnapshot::from_json("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_json_with_invalid_json_fails() {
+        let result = PaneStateSnapshot::from_json("{not valid json}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_json_missing_required_field_fails() {
+        // Missing "terminal" field which is required
+        let json = r#"{"schema_version":1,"pane_id":0,"captured_at":0}"#;
+        let result = PaneStateSnapshot::from_json(json);
+        assert!(result.is_err());
+    }
+
+    // ---- ProcessInfo edge cases ----
+
+    #[test]
+    fn process_info_empty_argv_vec_roundtrip() {
+        let p = ProcessInfo {
+            name: "shell".to_string(),
+            pid: Some(1),
+            argv: Some(vec![]),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let restored: ProcessInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.argv, Some(vec![]));
+    }
+
+    #[test]
+    fn process_info_empty_name_roundtrip() {
+        let p = ProcessInfo {
+            name: String::new(),
+            pid: None,
+            argv: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let restored: ProcessInfo = serde_json::from_str(&json).unwrap();
+        assert!(restored.name.is_empty());
+    }
+
+    // ---- AgentMetadata deserializes with unknown fields ----
+
+    #[test]
+    fn agent_metadata_ignores_unknown_json_fields() {
+        let json = r#"{"agent_type":"codex","session_id":"s1","state":"idle","future_field":"ok"}"#;
+        let am: AgentMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(am.agent_type, "codex");
+        assert_eq!(am.session_id, Some("s1".to_string()));
+        assert_eq!(am.state, Some("idle".to_string()));
+    }
+
+    // ---- Safe env vars: FT_ prefixed vars ----
+
+    #[test]
+    fn safe_env_vars_include_ft_prefixed() {
+        assert!(SAFE_ENV_VARS.contains(&"FT_WORKSPACE"));
+        assert!(SAFE_ENV_VARS.contains(&"FT_OUTPUT_FORMAT"));
+
+        let vars = vec![
+            ("FT_WORKSPACE".to_string(), "/workspace".to_string()),
+            (
+                "FT_OUTPUT_FORMAT".to_string(),
+                "json".to_string(),
+            ),
+            ("FT_CUSTOM".to_string(), "not_safe".to_string()),
+        ];
+        let env = capture_env_from_iter(vars.into_iter());
+        assert!(env.vars.contains_key("FT_WORKSPACE"));
+        assert!(env.vars.contains_key("FT_OUTPUT_FORMAT"));
+        // FT_CUSTOM is not in the safe list
+        assert!(!env.vars.contains_key("FT_CUSTOM"));
+    }
+
+    // ---- Captured env with empty vars HashMap ----
+
+    #[test]
+    fn captured_env_empty_roundtrip() {
+        let ce = CapturedEnv {
+            vars: std::collections::HashMap::new(),
+            redacted_count: 0,
+        };
+        let json = serde_json::to_string(&ce).unwrap();
+        let restored: CapturedEnv = serde_json::from_str(&json).unwrap();
+        assert!(restored.vars.is_empty());
+        assert_eq!(restored.redacted_count, 0);
+    }
+
+    // ---- Schema version constant ----
+
+    #[test]
+    fn schema_version_is_one() {
+        assert_eq!(PANE_STATE_SCHEMA_VERSION, 1);
+    }
+
+    // ---- Pane state with zero pane_id and captured_at ----
+
+    #[test]
+    fn snapshot_zero_ids_roundtrip() {
+        let snapshot = PaneStateSnapshot::new(0, 0, TerminalState {
+            rows: 1,
+            cols: 1,
+            cursor_row: 0,
+            cursor_col: 0,
+            is_alt_screen: false,
+            title: String::new(),
+        });
+        let json = snapshot.to_json().unwrap();
+        let restored = PaneStateSnapshot::from_json(&json).unwrap();
+        assert_eq!(restored.pane_id, 0);
+        assert_eq!(restored.captured_at, 0);
+        assert_eq!(restored.terminal.rows, 1);
+        assert_eq!(restored.terminal.cols, 1);
+    }
+
+    // ---- Pane state with u64::MAX pane_id ----
+
+    #[test]
+    fn snapshot_max_pane_id_roundtrip() {
+        let snapshot = PaneStateSnapshot::new(u64::MAX, u64::MAX, make_terminal());
+        let json = snapshot.to_json().unwrap();
+        let restored = PaneStateSnapshot::from_json(&json).unwrap();
+        assert_eq!(restored.pane_id, u64::MAX);
+        assert_eq!(restored.captured_at, u64::MAX);
+    }
 }

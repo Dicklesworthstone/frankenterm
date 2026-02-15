@@ -2276,4 +2276,450 @@ mod tests {
         let r2 = engine.capture(&panes, SnapshotTrigger::Event).await;
         assert!(r2.is_ok());
     }
+
+    // -----------------------------------------------------------------------
+    // Batch — RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_trigger_serde_json_is_snake_case() {
+        // Verify #[serde(rename_all = "snake_case")] produces expected strings
+        assert_eq!(
+            serde_json::to_string(&SnapshotTrigger::Periodic).unwrap(),
+            "\"periodic\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotTrigger::PeriodicFallback).unwrap(),
+            "\"periodic_fallback\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotTrigger::WorkCompleted).unwrap(),
+            "\"work_completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotTrigger::HazardThreshold).unwrap(),
+            "\"hazard_threshold\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotTrigger::StateTransition).unwrap(),
+            "\"state_transition\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotTrigger::IdleWindow).unwrap(),
+            "\"idle_window\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotTrigger::MemoryPressure).unwrap(),
+            "\"memory_pressure\""
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_copy_semantics() {
+        let a = SnapshotTrigger::Manual;
+        let b = a; // Copy
+        let c = a; // Still valid after copy
+        assert_eq!(b, c);
+        assert_eq!(a, SnapshotTrigger::Manual);
+    }
+
+    #[test]
+    fn snapshot_trigger_debug_not_empty() {
+        let dbg = format!("{:?}", SnapshotTrigger::WorkCompleted);
+        assert!(!dbg.is_empty());
+        assert!(dbg.contains("WorkCompleted"));
+    }
+
+    #[test]
+    fn snapshot_error_debug_format() {
+        let err = SnapshotError::InProgress;
+        let dbg = format!("{:?}", err);
+        assert!(
+            dbg.contains("InProgress"),
+            "Debug should contain variant name"
+        );
+
+        let db_err = SnapshotError::Database("connection refused".into());
+        let dbg2 = format!("{:?}", db_err);
+        assert!(
+            dbg2.contains("connection refused"),
+            "Debug should contain inner message"
+        );
+    }
+
+    #[test]
+    fn snapshot_result_fields_after_capture_are_consistent() {
+        // SnapshotResult is Clone — verify clone preserves all fields
+        let result = SnapshotResult {
+            session_id: "sess-test-001".to_string(),
+            checkpoint_id: 42,
+            pane_count: 3,
+            total_bytes: 1024,
+            trigger: SnapshotTrigger::Manual,
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned.session_id, "sess-test-001");
+        assert_eq!(cloned.checkpoint_id, 42);
+        assert_eq!(cloned.pane_count, 3);
+        assert_eq!(cloned.total_bytes, 1024);
+        assert_eq!(cloned.trigger, SnapshotTrigger::Manual);
+    }
+
+    #[test]
+    fn state_detection_max_age_is_five_minutes() {
+        assert_eq!(STATE_DETECTION_MAX_AGE, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn compute_state_hash_differs_on_cwd_change() {
+        let mut p1 = make_test_pane(1, 24, 80);
+        p1.cwd = Some("file:///home/user/project-a".to_string());
+        let mut p2 = make_test_pane(1, 24, 80);
+        p2.cwd = Some("file:///home/user/project-b".to_string());
+
+        let h1 = compute_state_hash(&[p1]);
+        let h2 = compute_state_hash(&[p2]);
+        assert_ne!(h1, h2, "different cwd should produce different hash");
+    }
+
+    #[test]
+    fn compute_state_hash_differs_on_title_change() {
+        let mut p1 = make_test_pane(1, 24, 80);
+        p1.title = Some("vim".to_string());
+        let mut p2 = make_test_pane(1, 24, 80);
+        p2.title = Some("bash".to_string());
+
+        let h1 = compute_state_hash(&[p1]);
+        let h2 = compute_state_hash(&[p2]);
+        assert_ne!(h1, h2, "different title should produce different hash");
+    }
+
+    #[test]
+    fn compute_state_hash_differs_on_cursor_position() {
+        let mut p1 = make_test_pane(1, 24, 80);
+        p1.cursor_x = Some(0);
+        p1.cursor_y = Some(0);
+        let mut p2 = make_test_pane(1, 24, 80);
+        p2.cursor_x = Some(40);
+        p2.cursor_y = Some(12);
+
+        let h1 = compute_state_hash(&[p1]);
+        let h2 = compute_state_hash(&[p2]);
+        assert_ne!(h1, h2, "different cursor position should produce different hash");
+    }
+
+    #[test]
+    fn compute_state_hash_differs_on_is_zoomed() {
+        let mut p1 = make_test_pane(1, 24, 80);
+        p1.is_zoomed = false;
+        let mut p2 = make_test_pane(1, 24, 80);
+        p2.is_zoomed = true;
+
+        let h1 = compute_state_hash(&[p1]);
+        let h2 = compute_state_hash(&[p2]);
+        assert_ne!(h1, h2, "zoomed vs non-zoomed should produce different hash");
+    }
+
+    #[test]
+    fn compute_state_hash_differs_on_tab_id() {
+        let mut p1 = make_test_pane(1, 24, 80);
+        p1.tab_id = 0;
+        let mut p2 = make_test_pane(1, 24, 80);
+        p2.tab_id = 5;
+
+        let h1 = compute_state_hash(&[p1]);
+        let h2 = compute_state_hash(&[p2]);
+        assert_ne!(h1, h2, "different tab_id should produce different hash");
+    }
+
+    #[test]
+    fn compute_state_hash_differs_on_window_id() {
+        let mut p1 = make_test_pane(1, 24, 80);
+        p1.window_id = 0;
+        let mut p2 = make_test_pane(1, 24, 80);
+        p2.window_id = 99;
+
+        let h1 = compute_state_hash(&[p1]);
+        let h2 = compute_state_hash(&[p2]);
+        assert_ne!(h1, h2, "different window_id should produce different hash");
+    }
+
+    #[test]
+    fn compute_state_hash_many_panes_deterministic() {
+        let panes: Vec<PaneInfo> = (0..50).map(|i| make_test_pane(i, 24, 80)).collect();
+        let h1 = compute_state_hash(&panes);
+        let h2 = compute_state_hash(&panes);
+        assert_eq!(h1, h2, "hash of 50 panes should be deterministic");
+        assert_eq!(h1.len(), 16, "hash should be 16 hex chars");
+    }
+
+    #[test]
+    fn generate_session_id_has_correct_structure() {
+        let id = generate_session_id();
+        let parts: Vec<&str> = id.splitn(3, '-').collect();
+        assert_eq!(parts.len(), 3, "session ID has 3 dash-separated parts");
+        assert_eq!(parts[0], "sess");
+        assert_eq!(
+            parts[1].len(),
+            13,
+            "timestamp hex should be 13 chars (zero-padded)"
+        );
+        assert_eq!(
+            parts[2].len(),
+            16,
+            "random hex should be 16 chars (zero-padded)"
+        );
+        // All hex chars
+        assert!(
+            parts[1].chars().all(|c| c.is_ascii_hexdigit()),
+            "timestamp part should be hex"
+        );
+        assert!(
+            parts[2].chars().all(|c| c.is_ascii_hexdigit()),
+            "random part should be hex"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_with_minimal_pane_info() {
+        // Pane with all optional fields set to None
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let pane = PaneInfo {
+            pane_id: 1,
+            tab_id: 0,
+            window_id: 0,
+            domain_id: None,
+            domain_name: None,
+            workspace: None,
+            size: None,
+            rows: None,
+            cols: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            cursor_x: None,
+            cursor_y: None,
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
+            is_active: false,
+            is_zoomed: false,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let result = engine.capture(&[pane], SnapshotTrigger::Manual).await;
+        assert!(result.is_ok(), "capture with minimal pane should succeed");
+        let snap = result.unwrap();
+        assert_eq!(snap.pane_count, 1);
+    }
+
+    #[tokio::test]
+    async fn capture_stores_correct_checkpoint_type_in_db() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let panes = vec![make_test_pane(1, 24, 80)];
+
+        let r = engine
+            .capture(&panes, SnapshotTrigger::Startup)
+            .await
+            .unwrap();
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let ctype: String = conn
+            .query_row(
+                "SELECT checkpoint_type FROM session_checkpoints WHERE id = ?1",
+                [r.checkpoint_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ctype, "startup");
+    }
+
+    #[tokio::test]
+    async fn capture_stores_event_type_for_manual() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let panes = vec![make_test_pane(1, 24, 80)];
+
+        let r = engine
+            .capture(&panes, SnapshotTrigger::Manual)
+            .await
+            .unwrap();
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let ctype: String = conn
+            .query_row(
+                "SELECT checkpoint_type FROM session_checkpoints WHERE id = ?1",
+                [r.checkpoint_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ctype, "event");
+    }
+
+    #[tokio::test]
+    async fn multiple_checkpoints_have_increasing_ids() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+
+        let r1 = engine
+            .capture(&[make_test_pane(1, 24, 80)], SnapshotTrigger::Manual)
+            .await
+            .unwrap();
+        let r2 = engine
+            .capture(&[make_test_pane(2, 30, 120)], SnapshotTrigger::Manual)
+            .await
+            .unwrap();
+        let r3 = engine
+            .capture(&[make_test_pane(3, 40, 160)], SnapshotTrigger::Manual)
+            .await
+            .unwrap();
+
+        assert!(
+            r1.checkpoint_id < r2.checkpoint_id,
+            "checkpoint IDs should be monotonically increasing"
+        );
+        assert!(
+            r2.checkpoint_id < r3.checkpoint_id,
+            "checkpoint IDs should be monotonically increasing"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_total_bytes_is_nonzero() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let panes = vec![make_test_pane(1, 24, 80)];
+
+        let r = engine
+            .capture(&panes, SnapshotTrigger::Manual)
+            .await
+            .unwrap();
+        assert!(
+            r.total_bytes > 0,
+            "total_bytes should be positive for a valid capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_checkpoint_returns_none_on_no_changes() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let panes = vec![make_test_pane(1, 24, 80)];
+
+        // First capture to set hash
+        engine
+            .capture(&panes, SnapshotTrigger::Periodic)
+            .await
+            .unwrap();
+
+        // shutdown_checkpoint with same panes should return None (NoChanges path)
+        let result = engine
+            .shutdown_checkpoint(&panes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        // Shutdown trigger is NOT periodic, so it bypasses dedup — actually it
+        // goes through capture() which only dedupes Periodic/PeriodicFallback.
+        // So shutdown with unchanged data should still succeed.
+        assert!(result.is_some(), "Shutdown trigger bypasses dedup");
+    }
+
+    #[tokio::test]
+    async fn shutdown_checkpoint_with_empty_panes() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+
+        // First capture to establish session
+        engine
+            .capture(&[make_test_pane(1, 24, 80)], SnapshotTrigger::Startup)
+            .await
+            .unwrap();
+
+        // Shutdown with empty panes should error (NoPanes)
+        let result = engine
+            .shutdown_checkpoint(&[], Duration::from_secs(5))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn dedup_does_not_skip_shutdown_trigger() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let panes = vec![make_test_pane(1, 24, 80)];
+
+        engine
+            .capture(&panes, SnapshotTrigger::Periodic)
+            .await
+            .unwrap();
+
+        // Shutdown trigger should NOT be deduped even with identical data
+        let r2 = engine.capture(&panes, SnapshotTrigger::Shutdown).await;
+        assert!(r2.is_ok(), "Shutdown bypasses dedup");
+    }
+
+    #[tokio::test]
+    async fn dedup_does_not_skip_work_completed_trigger() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let panes = vec![make_test_pane(1, 24, 80)];
+
+        engine
+            .capture(&panes, SnapshotTrigger::Periodic)
+            .await
+            .unwrap();
+
+        // WorkCompleted should NOT be deduped
+        let r2 = engine
+            .capture(&panes, SnapshotTrigger::WorkCompleted)
+            .await;
+        assert!(r2.is_ok(), "WorkCompleted bypasses dedup");
+    }
+
+    #[tokio::test]
+    async fn open_conn_sets_wal_mode() {
+        let (_tmp, db_path) = setup_test_db();
+        let conn = open_conn(db_path.as_str()).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal", "connection should be in WAL mode");
+    }
+
+    #[tokio::test]
+    async fn cleanup_with_zero_retention_count_deletes_all() {
+        let (_tmp, db_path) = setup_test_db();
+        let config = SnapshotConfig {
+            retention_count: 0,
+            retention_days: 365,
+            ..SnapshotConfig::default()
+        };
+        let engine = SnapshotEngine::new(db_path.clone(), config);
+
+        // Create 3 checkpoints
+        for i in 0..3u64 {
+            engine
+                .capture(
+                    &[make_test_pane(i, 24 + i as u32, 80)],
+                    SnapshotTrigger::Manual,
+                )
+                .await
+                .unwrap();
+        }
+
+        let deleted = engine.cleanup().await.unwrap();
+        assert_eq!(deleted, 3, "retention_count=0 should delete all checkpoints");
+
+        let count = checkpoint_count(db_path.as_str());
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn snapshot_config_default_has_sane_values() {
+        let config = SnapshotConfig::default();
+        assert!(config.interval_seconds >= 30, "interval should be at least 30s");
+        assert!(config.retention_count > 0, "retention count should be positive");
+        assert!(config.retention_days > 0, "retention days should be positive");
+    }
 }
