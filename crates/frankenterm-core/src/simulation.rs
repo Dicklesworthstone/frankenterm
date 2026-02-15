@@ -243,6 +243,14 @@ pub struct ResizeTimelineEvent {
     pub frame_id: u64,
     /// Scenario-level test case identifier.
     pub test_case_id: String,
+    /// Queue wait stage duration in milliseconds.
+    pub queue_wait_ms: u64,
+    /// Logical reflow stage duration in milliseconds.
+    pub reflow_ms: u64,
+    /// Render prep stage duration in milliseconds.
+    pub render_ms: u64,
+    /// Presentation stage duration in milliseconds.
+    pub present_ms: u64,
     /// Scheduled scenario timestamp offset (nanoseconds).
     pub scheduled_at_ns: u64,
     /// Actual dispatch offset relative to scenario execution start (nanoseconds).
@@ -633,14 +641,14 @@ impl Scenario {
             // Stage 1: input intent
             let stage_started = Instant::now();
             let _ = scheduled_at_ns;
-            let duration_ns = duration_ns_u64(stage_started.elapsed());
+            let input_intent_duration_ns = duration_ns_u64(stage_started.elapsed());
             stages.push(ResizeTimelineStageSample {
                 stage: ResizeTimelineStage::InputIntent,
                 start_offset_ns: offset_ns,
-                duration_ns,
+                duration_ns: input_intent_duration_ns,
                 queue_metrics: None,
             });
-            offset_ns = offset_ns.saturating_add(duration_ns);
+            offset_ns = offset_ns.saturating_add(input_intent_duration_ns);
 
             // Stage 2: scheduler queueing
             let depth_before =
@@ -648,30 +656,30 @@ impl Scenario {
             let depth_after = depth_before.saturating_sub(1);
             let stage_started = Instant::now();
             let queue_delay_ns = dispatch_offset_ns.saturating_sub(scheduled_at_ns);
-            let duration_ns =
+            let scheduler_queue_duration_ns =
                 duration_ns_u64(stage_started.elapsed()).saturating_add(queue_delay_ns);
             stages.push(ResizeTimelineStageSample {
                 stage: ResizeTimelineStage::SchedulerQueueing,
                 start_offset_ns: offset_ns,
-                duration_ns,
+                duration_ns: scheduler_queue_duration_ns,
                 queue_metrics: Some(ResizeQueueMetrics {
                     depth_before,
                     depth_after,
                 }),
             });
-            offset_ns = offset_ns.saturating_add(duration_ns);
+            offset_ns = offset_ns.saturating_add(scheduler_queue_duration_ns);
 
             // Stage 3: logical reflow
             let stage_started = Instant::now();
             let mock_event = Self::to_mock_event(event)?;
-            let duration_ns = duration_ns_u64(stage_started.elapsed());
+            let logical_reflow_duration_ns = duration_ns_u64(stage_started.elapsed());
             stages.push(ResizeTimelineStageSample {
                 stage: ResizeTimelineStage::LogicalReflow,
                 start_offset_ns: offset_ns,
-                duration_ns,
+                duration_ns: logical_reflow_duration_ns,
                 queue_metrics: None,
             });
-            offset_ns = offset_ns.saturating_add(duration_ns);
+            offset_ns = offset_ns.saturating_add(logical_reflow_duration_ns);
 
             // Stage 4: render prep
             let stage_started = Instant::now();
@@ -681,23 +689,23 @@ impl Scenario {
                 MockEvent::Resize(cols, rows) => (*cols as usize) + (*rows as usize),
                 MockEvent::ClearScreen => 0,
             };
-            let duration_ns = duration_ns_u64(stage_started.elapsed());
+            let render_prep_duration_ns = duration_ns_u64(stage_started.elapsed());
             stages.push(ResizeTimelineStageSample {
                 stage: ResizeTimelineStage::RenderPrep,
                 start_offset_ns: offset_ns,
-                duration_ns,
+                duration_ns: render_prep_duration_ns,
                 queue_metrics: None,
             });
-            offset_ns = offset_ns.saturating_add(duration_ns);
+            offset_ns = offset_ns.saturating_add(render_prep_duration_ns);
 
             // Stage 5: presentation
             let stage_started = Instant::now();
             mock.inject(event.pane, mock_event).await?;
-            let duration_ns = duration_ns_u64(stage_started.elapsed());
+            let presentation_duration_ns = duration_ns_u64(stage_started.elapsed());
             stages.push(ResizeTimelineStageSample {
                 stage: ResizeTimelineStage::Presentation,
                 start_offset_ns: offset_ns,
-                duration_ns,
+                duration_ns: presentation_duration_ns,
                 queue_metrics: None,
             });
 
@@ -724,6 +732,10 @@ impl Scenario {
                 scheduler_decision,
                 frame_id: sequence_no,
                 test_case_id: self.name.clone(),
+                queue_wait_ms: ns_to_ms_u64(scheduler_queue_duration_ns),
+                reflow_ms: ns_to_ms_u64(logical_reflow_duration_ns),
+                render_ms: ns_to_ms_u64(render_prep_duration_ns),
+                present_ms: ns_to_ms_u64(presentation_duration_ns),
                 scheduled_at_ns,
                 dispatch_offset_ns,
                 total_duration_ns,
@@ -1137,6 +1149,10 @@ fn duration_ns_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
+fn ns_to_ms_u64(duration_ns: u64) -> u64 {
+    duration_ns / 1_000_000
+}
+
 fn epoch_ms_u64() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1494,6 +1510,13 @@ events:
             for (sample, expected) in event.stages.iter().zip(ResizeTimelineStage::ALL.iter()) {
                 assert_eq!(sample.stage, *expected);
             }
+            assert_eq!(
+                event.queue_wait_ms,
+                ns_to_ms_u64(event.stages[1].duration_ns)
+            );
+            assert_eq!(event.reflow_ms, ns_to_ms_u64(event.stages[2].duration_ns));
+            assert_eq!(event.render_ms, ns_to_ms_u64(event.stages[3].duration_ns));
+            assert_eq!(event.present_ms, ns_to_ms_u64(event.stages[4].duration_ns));
             let queue = event.stages[1].queue_metrics.as_ref().unwrap();
             assert!(
                 queue.depth_before >= queue.depth_after,
@@ -2393,7 +2416,10 @@ events: []
         assert_eq!(EventAction::SetTitle.as_str(), "set_title");
         assert_eq!(EventAction::Resize.as_str(), "resize");
         assert_eq!(EventAction::SetFontSize.as_str(), "set_font_size");
-        assert_eq!(EventAction::GenerateScrollback.as_str(), "generate_scrollback");
+        assert_eq!(
+            EventAction::GenerateScrollback.as_str(),
+            "generate_scrollback"
+        );
         assert_eq!(EventAction::Marker.as_str(), "marker");
     }
 
@@ -2434,8 +2460,14 @@ events: []
     #[test]
     fn resize_timeline_stage_as_str_all_variants() {
         assert_eq!(ResizeTimelineStage::InputIntent.as_str(), "input_intent");
-        assert_eq!(ResizeTimelineStage::SchedulerQueueing.as_str(), "scheduler_queueing");
-        assert_eq!(ResizeTimelineStage::LogicalReflow.as_str(), "logical_reflow");
+        assert_eq!(
+            ResizeTimelineStage::SchedulerQueueing.as_str(),
+            "scheduler_queueing"
+        );
+        assert_eq!(
+            ResizeTimelineStage::LogicalReflow.as_str(),
+            "logical_reflow"
+        );
         assert_eq!(ResizeTimelineStage::RenderPrep.as_str(), "render_prep");
         assert_eq!(ResizeTimelineStage::Presentation.as_str(), "presentation");
     }
@@ -2818,6 +2850,10 @@ events: []
                 scheduler_decision: "dequeue_latest_intent".to_string(),
                 frame_id: 0,
                 test_case_id: "one".to_string(),
+                queue_wait_ms: 0,
+                reflow_ms: 0,
+                render_ms: 0,
+                present_ms: 0,
                 scheduled_at_ns: 0,
                 dispatch_offset_ns: 0,
                 total_duration_ns: 1000,
@@ -2867,7 +2903,10 @@ events: []
             assert!((entry.avg_duration_ns - entry.total_duration_ns as f64).abs() < f64::EPSILON);
         }
         // Verify a specific stage
-        let input_intent_summary = summary.iter().find(|s| s.stage == ResizeTimelineStage::InputIntent).unwrap();
+        let input_intent_summary = summary
+            .iter()
+            .find(|s| s.stage == ResizeTimelineStage::InputIntent)
+            .unwrap();
         assert_eq!(input_intent_summary.total_duration_ns, 100);
     }
 
@@ -2888,6 +2927,10 @@ events: []
                 scheduler_decision: "dequeue_latest_intent".to_string(),
                 frame_id: 0,
                 test_case_id: "test".to_string(),
+                queue_wait_ms: 0,
+                reflow_ms: 0,
+                render_ms: 0,
+                present_ms: 0,
                 scheduled_at_ns: 0,
                 dispatch_offset_ns: 0,
                 total_duration_ns: 100,
@@ -2937,6 +2980,10 @@ events: []
             scheduler_decision: "dequeue_latest_intent".to_string(),
             frame_id: 3,
             test_case_id: "roundtrip".to_string(),
+            queue_wait_ms: 0,
+            reflow_ms: 0,
+            render_ms: 0,
+            present_ms: 0,
             scheduled_at_ns: 1_000_000_000,
             dispatch_offset_ns: 1_000_100_000,
             total_duration_ns: 5000,
@@ -3536,10 +3583,7 @@ events: []
         drop(f);
 
         let scenario = Scenario::load(&path).unwrap();
-        assert_eq!(
-            scenario.reproducibility_key(),
-            "file_suite:v2:file_meta:99"
-        );
+        assert_eq!(scenario.reproducibility_key(), "file_suite:v2:file_meta:99");
     }
 
     // -----------------------------------------------------------------------
