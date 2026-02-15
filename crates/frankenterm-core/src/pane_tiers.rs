@@ -885,4 +885,142 @@ mod tests {
         // Should not have panicked and all panes still tracked
         assert_eq!(clf.pane_count(), 50);
     }
+
+    // -- Batch: DarkBadger wa-1u90p.7.1 ----------------------------------------
+
+    #[test]
+    fn pane_tier_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        for t in PaneTier::all() {
+            assert!(set.insert(*t));
+        }
+        assert_eq!(set.len(), 5);
+        // Re-inserting should not grow the set
+        for t in PaneTier::all() {
+            assert!(!set.insert(*t));
+        }
+    }
+
+    #[test]
+    fn pane_tier_copy_semantics() {
+        let a = PaneTier::Thinking;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn pane_tier_all_returns_five() {
+        assert_eq!(PaneTier::all().len(), 5);
+    }
+
+    #[test]
+    fn pane_tier_serde_snake_case_strings() {
+        assert_eq!(
+            serde_json::to_string(&PaneTier::Active).unwrap(),
+            "\"active\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PaneTier::Thinking).unwrap(),
+            "\"thinking\""
+        );
+        assert_eq!(serde_json::to_string(&PaneTier::Idle).unwrap(), "\"idle\"");
+        assert_eq!(
+            serde_json::to_string(&PaneTier::Background).unwrap(),
+            "\"background\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PaneTier::Dormant).unwrap(),
+            "\"dormant\""
+        );
+    }
+
+    #[test]
+    fn pane_tier_display_matches_serde() {
+        for tier in PaneTier::all() {
+            let display = tier.to_string();
+            let serde_str = serde_json::to_string(tier).unwrap();
+            assert_eq!(format!("\"{}\"", display), serde_str);
+        }
+    }
+
+    #[test]
+    fn pane_tier_as_u8_all_five() {
+        let indices: Vec<u8> = PaneTier::all().iter().map(|t| t.as_u8()).collect();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn pane_tier_debug_format() {
+        let dbg = format!("{:?}", PaneTier::Active);
+        assert_eq!(dbg, "Active");
+        let dbg = format!("{:?}", PaneTier::Dormant);
+        assert_eq!(dbg, "Dormant");
+    }
+
+    #[test]
+    fn tier_config_debug_clone() {
+        let config = TierConfig::default();
+        let cloned = config.clone();
+        assert_eq!(cloned.active_ms, 200);
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("TierConfig"));
+    }
+
+    #[test]
+    fn tier_config_interval_for_all_tiers() {
+        let config = TierConfig::default();
+        assert_eq!(
+            config.interval_for(PaneTier::Thinking),
+            Duration::from_millis(2000)
+        );
+        assert_eq!(
+            config.interval_for(PaneTier::Idle),
+            Duration::from_millis(5000)
+        );
+        assert_eq!(
+            config.interval_for(PaneTier::Background),
+            Duration::from_millis(10000)
+        );
+    }
+
+    #[test]
+    fn tier_metrics_debug_clone_serde() {
+        let m = TierMetrics {
+            tier_counts: HashMap::from([("active".to_string(), 5)]),
+            total_transitions: 10,
+            total_panes: 5,
+            estimated_rps: 25.0,
+        };
+        let cloned = m.clone();
+        assert_eq!(cloned.total_panes, 5);
+        let dbg = format!("{:?}", m);
+        assert!(dbg.contains("TierMetrics"));
+
+        let json = serde_json::to_string(&m).unwrap();
+        let parsed: TierMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_transitions, 10);
+        assert!((parsed.estimated_rps - 25.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn effective_interval_green_equals_default() {
+        for tier in PaneTier::all() {
+            assert_eq!(
+                tier.effective_interval(BackpressureTier::Green),
+                tier.default_interval()
+            );
+        }
+    }
+
+    #[test]
+    fn backpressure_multiplier_green_is_one() {
+        for tier in PaneTier::all() {
+            assert!(
+                (tier.backpressure_multiplier(BackpressureTier::Green) - 1.0).abs() < f64::EPSILON
+            );
+        }
+    }
 }

@@ -983,6 +983,139 @@ mod tests {
         assert_eq!(mgr.worst_level(), BudgetLevel::Throttled);
     }
 
+    // ---- Batch: DarkBadger wa-1u90p.7.1 ----
+
+    #[test]
+    fn budget_level_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        assert!(set.insert(BudgetLevel::Normal));
+        assert!(set.insert(BudgetLevel::Throttled));
+        assert!(set.insert(BudgetLevel::OverBudget));
+        assert_eq!(set.len(), 3);
+        // Re-insert should be no-op
+        assert!(!set.insert(BudgetLevel::Normal));
+    }
+
+    #[test]
+    fn budget_level_copy_semantics() {
+        let a = BudgetLevel::Throttled;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn budget_level_serde_snake_case_strings() {
+        assert_eq!(
+            serde_json::to_string(&BudgetLevel::Normal).unwrap(),
+            "\"normal\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BudgetLevel::Throttled).unwrap(),
+            "\"throttled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BudgetLevel::OverBudget).unwrap(),
+            "\"over_budget\""
+        );
+    }
+
+    #[test]
+    fn budget_level_debug_format() {
+        assert_eq!(format!("{:?}", BudgetLevel::Normal), "Normal");
+        assert_eq!(format!("{:?}", BudgetLevel::OverBudget), "OverBudget");
+    }
+
+    #[test]
+    fn budget_level_all_three_distinct() {
+        let levels = [
+            BudgetLevel::Normal,
+            BudgetLevel::Throttled,
+            BudgetLevel::OverBudget,
+        ];
+        for i in 0..levels.len() {
+            for j in (i + 1)..levels.len() {
+                assert_ne!(levels[i], levels[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn memory_budget_config_debug_clone() {
+        let cfg = MemoryBudgetConfig::default();
+        let cloned = cfg.clone();
+        assert_eq!(cloned.default_budget_bytes, cfg.default_budget_bytes);
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("MemoryBudgetConfig"));
+    }
+
+    #[test]
+    fn pane_budget_debug_clone() {
+        let mut b = PaneBudget::new(7, 2000, 0.75);
+        b.current_bytes = 100;
+        b.pid = Some(42);
+        let cloned = b.clone();
+        assert_eq!(cloned.pane_id, 7);
+        assert_eq!(cloned.high_bytes, 1500);
+        assert_eq!(cloned.pid, Some(42));
+        let dbg = format!("{:?}", b);
+        assert!(dbg.contains("PaneBudget"));
+    }
+
+    #[test]
+    fn pane_budget_high_ratio_boundary() {
+        // ratio 1.0 means high == budget
+        let b = PaneBudget::new(1, 1000, 1.0);
+        assert_eq!(b.high_bytes, 1000);
+        // ratio 0.0 means high == 0
+        let b2 = PaneBudget::new(2, 1000, 0.0);
+        assert_eq!(b2.high_bytes, 0);
+    }
+
+    #[test]
+    fn budget_summary_debug_clone() {
+        let summary = BudgetSummary {
+            pane_count: 2,
+            total_budget_bytes: 2000,
+            total_current_bytes: 500,
+            normal_count: 1,
+            throttled_count: 1,
+            over_budget_count: 0,
+            worst_pane_id: Some(1),
+            worst_usage_ratio: 0.5,
+        };
+        let cloned = summary.clone();
+        assert_eq!(cloned.pane_count, 2);
+        assert_eq!(cloned.worst_pane_id, Some(1));
+        let dbg = format!("{:?}", summary);
+        assert!(dbg.contains("BudgetSummary"));
+    }
+
+    #[test]
+    fn pane_budget_update_level_boundary_just_below_high() {
+        let mut b = PaneBudget::new(1, 1000, 0.8);
+        b.current_bytes = 799;
+        b.update_level();
+        assert_eq!(b.level, BudgetLevel::Normal);
+    }
+
+    #[test]
+    fn pane_budget_update_level_boundary_exactly_at_budget() {
+        let mut b = PaneBudget::new(1, 1000, 0.8);
+        b.current_bytes = 1000;
+        b.update_level();
+        assert_eq!(b.level, BudgetLevel::OverBudget);
+    }
+
+    #[test]
+    fn pane_budget_usage_ratio_over_one() {
+        let mut b = PaneBudget::new(1, 1000, 0.8);
+        b.current_bytes = 1500;
+        assert!((b.usage_ratio() - 1.5).abs() < f64::EPSILON);
+    }
+
     // ---- Linux cgroup filesystem tests (with temp dir) ----
 
     #[cfg(target_os = "linux")]

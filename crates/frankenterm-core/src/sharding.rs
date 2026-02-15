@@ -2069,4 +2069,141 @@ mod tests {
         assert_eq!(SHARD_ID_BITS, 16);
         assert_eq!(LOCAL_PANE_ID_MASK, (1u64 << 48) - 1);
     }
+
+    // -- Batch: DarkBadger wa-1u90p.7.1 ----------------------------------------
+
+    #[test]
+    fn shard_id_display() {
+        assert_eq!(ShardId(0).to_string(), "0");
+        assert_eq!(ShardId(42).to_string(), "42");
+        assert_eq!(ShardId(65535).to_string(), "65535");
+    }
+
+    #[test]
+    fn shard_id_debug_clone_copy_eq() {
+        let a = ShardId(5);
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+        let dbg = format!("{:?}", a);
+        assert!(dbg.contains("ShardId"));
+    }
+
+    #[test]
+    fn shard_id_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        assert!(set.insert(ShardId(0)));
+        assert!(set.insert(ShardId(1)));
+        assert!(set.insert(ShardId(2)));
+        assert_eq!(set.len(), 3);
+        assert!(!set.insert(ShardId(1)));
+    }
+
+    #[test]
+    fn shard_id_ord() {
+        assert!(ShardId(0) < ShardId(1));
+        assert!(ShardId(1) < ShardId(100));
+        let mut ids = vec![ShardId(3), ShardId(1), ShardId(2)];
+        ids.sort();
+        assert_eq!(ids, vec![ShardId(1), ShardId(2), ShardId(3)]);
+    }
+
+    #[test]
+    fn shard_id_serde_roundtrip() {
+        let id = ShardId(42);
+        let json = serde_json::to_string(&id).unwrap();
+        let parsed: ShardId = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn encode_decode_shard_zero() {
+        let encoded = encode_sharded_pane_id(ShardId(0), 123);
+        let (shard, local) = decode_sharded_pane_id(encoded);
+        assert_eq!(shard, ShardId(0));
+        assert_eq!(local, 123);
+    }
+
+    #[test]
+    fn is_sharded_pane_id_shard_zero() {
+        let encoded = encode_sharded_pane_id(ShardId(0), 42);
+        assert!(!is_sharded_pane_id(encoded));
+    }
+
+    #[test]
+    fn is_sharded_pane_id_shard_nonzero() {
+        let encoded = encode_sharded_pane_id(ShardId(1), 42);
+        assert!(is_sharded_pane_id(encoded));
+    }
+
+    #[test]
+    fn assignment_strategy_default_is_round_robin() {
+        assert_eq!(
+            AssignmentStrategy::default(),
+            AssignmentStrategy::RoundRobin
+        );
+    }
+
+    #[test]
+    fn assignment_strategy_serde_round_robin() {
+        let s = AssignmentStrategy::RoundRobin;
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: AssignmentStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, s);
+    }
+
+    #[test]
+    fn assignment_strategy_serde_consistent_hash() {
+        let s = AssignmentStrategy::ConsistentHash { virtual_nodes: 64 };
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: AssignmentStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, s);
+    }
+
+    #[test]
+    fn assignment_strategy_serde_manual() {
+        let s = AssignmentStrategy::Manual {
+            pane_to_shard: HashMap::from([(1, ShardId(0)), (2, ShardId(1))]),
+            default_shard: Some(ShardId(0)),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: AssignmentStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, s);
+    }
+
+    #[test]
+    fn assignment_strategy_debug_clone() {
+        let s = AssignmentStrategy::RoundRobin;
+        let cloned = s.clone();
+        assert_eq!(s, cloned);
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("RoundRobin"));
+    }
+
+    #[test]
+    fn assign_pane_empty_shards_returns_zero() {
+        let result =
+            assign_pane_with_strategy(&AssignmentStrategy::RoundRobin, &[], 42, None, None);
+        assert_eq!(result, ShardId(0));
+    }
+
+    #[test]
+    fn encode_max_local_pane_id() {
+        let max_local = LOCAL_PANE_ID_MASK;
+        let encoded = encode_sharded_pane_id(ShardId(1), max_local);
+        let (shard, local) = decode_sharded_pane_id(encoded);
+        assert_eq!(shard, ShardId(1));
+        assert_eq!(local, max_local);
+    }
+
+    #[test]
+    fn encode_local_id_overflow_is_masked() {
+        // local_pane_id larger than LOCAL_PANE_ID_MASK gets masked
+        let big_local = LOCAL_PANE_ID_MASK + 1;
+        let encoded = encode_sharded_pane_id(ShardId(0), big_local);
+        let (_, local) = decode_sharded_pane_id(encoded);
+        assert_eq!(local, 0); // overflow bit masked off
+    }
 }
