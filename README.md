@@ -203,6 +203,9 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 ```bash
 # Guided setup (generates config snippets and shell hooks)
 ft setup
+
+# Bundled Pragmasevka Nerd Font auto-installs on normal ft usage
+# and generated wezterm config defaults to it automatically.
 ```
 
 ### 2. Verify Terminal Backend Connectivity

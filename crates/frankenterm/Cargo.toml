@@ -34,6 +34,9 @@ toml_edit.workspace = true
 toon_rust.workspace = true
 rusqlite.workspace = true
 dirs = "6.0.0"
+sha2.workspace = true
+zip.workspace = true
+zstd.workspace = true
 fastmcp = { workspace = true, optional = true }
 asupersync = { workspace = true, features = ["tls"] }
 

@@ -56,6 +56,13 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
   end
 end)";
 
+const DEFAULT_WEZTERM_FONT_FAMILIES: &[&str] = &[
+    "Pragmasevka NF",
+    "Pragmasevka Nerd Font",
+    "JetBrainsMono Nerd Font",
+    "Symbols Nerd Font Mono",
+];
+
 // NOTE: STATUS_UPDATE_LUA was removed in v0.2.0 to eliminate Lua performance bottleneck.
 // The update-status event fires at ~60Hz, causing significant WezTerm slowdown.
 // Alt-screen detection is now handled via escape sequence parsing (see screen_state.rs).
@@ -635,6 +642,14 @@ pub fn generate_ssh_domains_lua(hosts: &[SshHost], scrollback_lines: u64) -> Str
     output.push_str("-- wa: generated ssh_domains config\n");
     output.push_str("config = config or {}\n");
     output.push_str(&format!("config.scrollback_lines = {scrollback_lines}\n\n"));
+    output.push_str("local wa_wezterm = wezterm or require 'wezterm'\n");
+    output.push_str("if config.font == nil then\n");
+    output.push_str("  config.font = wa_wezterm.font_with_fallback({\n");
+    for family in DEFAULT_WEZTERM_FONT_FAMILIES {
+        output.push_str(&format!("    '{}',\n", lua_escape(family)));
+    }
+    output.push_str("  })\n");
+    output.push_str("end\n\n");
     // Preserve any existing ssh_domains defined outside the WA block
     output.push_str("config.ssh_domains = config.ssh_domains or {}\n");
     if hosts.is_empty() {
@@ -1563,6 +1578,9 @@ return config
         assert!(block.contains(FT_BEGIN_MARKER));
         assert!(block.contains("config = config or {}"));
         assert!(block.contains("config.scrollback_lines = 50000"));
+        assert!(block.contains("local wa_wezterm = wezterm or require 'wezterm'"));
+        assert!(block.contains("config.font = wa_wezterm.font_with_fallback"));
+        assert!(block.contains("Pragmasevka NF"));
         assert!(block.contains("config.ssh_domains = config.ssh_domains or {}"));
         assert!(block.contains("local wa_ssh_domains = {"));
         assert!(block.contains("name = 'box'"));
@@ -2697,6 +2715,7 @@ alias ll='ls -la'
         let block = generate_ssh_domains_lua(&[], 50_000);
         assert!(block.contains(FT_BEGIN_MARKER));
         assert!(block.contains(FT_END_MARKER));
+        assert!(block.contains("config.font = wa_wezterm.font_with_fallback"));
         assert!(block.contains("No SSH hosts found"));
         assert!(!block.contains("wa_ssh_domains"));
     }

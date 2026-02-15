@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::{Cursor, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -915,9 +915,9 @@ SEE ALSO:
     /// Setup helpers
     #[command(after_help = r#"EXAMPLES:
     ft setup --list-hosts             List SSH hosts from ~/.ssh/config
-    ft setup shell-hooks              Install shell integration hooks
-    ft setup shell-hooks --apply      Apply hook changes
-    ft setup lua-domain               Generate WezTerm SSH domain Lua
+    ft setup config --apply           Patch wezterm.lua with generated ft block
+    ft setup shell --apply            Install OSC 133 shell markers
+    ft setup font --apply             Install bundled Pragmasevka Nerd Font
     ft setup --dry-run                Preview all setup changes
 
 SEE ALSO:
@@ -2940,6 +2940,17 @@ enum SetupCommands {
         /// Custom path to rc file (auto-detected if not specified)
         #[arg(long)]
         rc_path: Option<PathBuf>,
+    },
+
+    /// Install bundled Pragmasevka Nerd Font files
+    Font {
+        /// Reinstall even if the bundled font files already exist
+        #[arg(long)]
+        force: bool,
+
+        /// Custom font directory (auto-detected per platform if omitted)
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -8882,6 +8893,14 @@ async fn distributed_agent_sleep_with_shutdown(
 }
 
 #[cfg(feature = "distributed")]
+fn distributed_agent_next_reconnect_backoff_ms(
+    streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
+) -> u64 {
+    // Preserve reconnect attempt state so repeated failures ramp up backoff.
+    streamer.mark_reconnecting()
+}
+
+#[cfg(feature = "distributed")]
 async fn distributed_agent_stream_forever(
     connect_addr: String,
     distributed_config: frankenterm_core::config::DistributedConfig,
@@ -8937,8 +8956,7 @@ async fn distributed_agent_stream_forever(
         if shutdown_flag.load(Ordering::SeqCst) {
             break;
         }
-        streamer.mark_disconnected();
-        let backoff_ms = streamer.mark_reconnecting();
+        let backoff_ms = distributed_agent_next_reconnect_backoff_ms(&mut streamer);
         if distributed_agent_sleep_with_shutdown(&shutdown_flag, Duration::from_millis(backoff_ms))
             .await
         {
@@ -10701,6 +10719,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
     init_logging_from_config(&config, Some(&workspace_root))?;
     layout.ensure_directories()?;
+    ensure_default_bundled_font(verbose, command.as_ref());
     let permission_warnings = frankenterm_core::config::collect_permission_warnings(
         &layout,
         resolved_config_path.as_deref(),
@@ -21186,6 +21205,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    SetupCommands::Font { force, dir } => {
+                        run_setup_font_command(apply, dry_run, force, dir, cli.verbose)?;
+                    }
                 }
             } else {
                 run_guided_setup(apply, dry_run, cli.verbose).await?;
@@ -28324,6 +28346,315 @@ fn set_toml_value(
 
 /// Recommended minimum scrollback lines for wa to function reliably
 const RECOMMENDED_SCROLLBACK_LINES: u64 = 50_000;
+const PRAGMASEVKA_BUNDLED_VERSION: &str = "1.7.0";
+const PRAGMASEVKA_BUNDLED_SOURCE_URL: &str =
+    "https://github.com/shytikov/pragmasevka/releases/download/v1.7.0/Pragmasevka_NF.zip";
+const PRAGMASEVKA_BUNDLED_ZIP_SHA256: &str =
+    "eeab758eff562d1caed761244488e56545be25e81a6b40cd84b31b032a37615c";
+const PRAGMASEVKA_BUNDLED_ZST_SHA256: &str =
+    "60379b739067c70e13a670c2b231b930050c69d6eb9a67265b992135f9bd780d";
+const PRAGMASEVKA_BUNDLED_PAYLOAD_ZST: &[u8] = include_bytes!("../assets/Pragmasevka_NF.zip.zst");
+const PRAGMASEVKA_FONT_FILES: &[&str] = &[
+    "pragmasevka-nf-bold.ttf",
+    "pragmasevka-nf-bolditalic.ttf",
+    "pragmasevka-nf-italic.ttf",
+    "pragmasevka-nf-regular.ttf",
+];
+const PRAGMASEVKA_MARKER_FILE: &str = ".ft-pragmasevka-nf-v1.7.0.sha256";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}")
+}
+
+fn decode_bundled_pragmasevka_zip() -> anyhow::Result<Vec<u8>> {
+    let compressed_hash = sha256_hex(PRAGMASEVKA_BUNDLED_PAYLOAD_ZST);
+    if compressed_hash != PRAGMASEVKA_BUNDLED_ZST_SHA256 {
+        anyhow::bail!(
+            "Bundled font payload hash mismatch (zst): expected {}, got {}",
+            PRAGMASEVKA_BUNDLED_ZST_SHA256,
+            compressed_hash
+        );
+    }
+
+    let zip_bytes = zstd::stream::decode_all(Cursor::new(PRAGMASEVKA_BUNDLED_PAYLOAD_ZST))
+        .map_err(|e| anyhow::anyhow!("Failed to decompress bundled Pragmasevka payload: {e}"))?;
+
+    let zip_hash = sha256_hex(&zip_bytes);
+    if zip_hash != PRAGMASEVKA_BUNDLED_ZIP_SHA256 {
+        anyhow::bail!(
+            "Bundled font payload hash mismatch (zip): expected {}, got {}",
+            PRAGMASEVKA_BUNDLED_ZIP_SHA256,
+            zip_hash
+        );
+    }
+
+    Ok(zip_bytes)
+}
+
+fn default_font_install_dir() -> anyhow::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        return dirs::home_dir()
+            .map(|home| home.join("Library/Fonts"))
+            .ok_or_else(|| anyhow::anyhow!("Could not resolve home directory for font install"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return dirs::home_dir()
+            .map(|home| home.join(".local/share/fonts"))
+            .ok_or_else(|| anyhow::anyhow!("Could not resolve home directory for font install"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return dirs::data_local_dir()
+            .map(|dir| dir.join("Microsoft/Windows/Fonts"))
+            .ok_or_else(|| anyhow::anyhow!("Could not resolve local data directory for fonts"));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        anyhow::bail!("Bundled font install is not supported on this platform");
+    }
+}
+
+fn bundled_pragmasevka_installed(font_dir: &Path) -> bool {
+    PRAGMASEVKA_FONT_FILES
+        .iter()
+        .all(|file| font_dir.join(file).exists())
+}
+
+fn install_bundled_pragmasevka(font_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    fs::create_dir_all(font_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create font directory {}: {}",
+            font_dir.display(),
+            e
+        )
+    })?;
+
+    let zip_bytes = decode_bundled_pragmasevka_zip()?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
+        .map_err(|e| anyhow::anyhow!("Failed to open bundled font archive: {e}"))?;
+
+    let mut written_files = Vec::new();
+    let mut seen_files = HashSet::new();
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|e| anyhow::anyhow!("Failed to read zip entry #{index}: {e}"))?;
+
+        if entry.is_dir() {
+            continue;
+        }
+
+        let enclosed = entry.enclosed_name().ok_or_else(|| {
+            anyhow::anyhow!("Refusing to extract unsafe zip path: {}", entry.name())
+        })?;
+
+        let file_name = enclosed
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 filename in bundled zip"))?;
+
+        if !file_name.ends_with(".ttf") {
+            continue;
+        }
+
+        let output_path = font_dir.join(file_name);
+        let mut output_file = fs::File::create(&output_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create font file {}: {}",
+                output_path.display(),
+                e
+            )
+        })?;
+        std::io::copy(&mut entry, &mut output_file).map_err(|e| {
+            anyhow::anyhow!("Failed to write font file {}: {}", output_path.display(), e)
+        })?;
+        written_files.push(output_path);
+        seen_files.insert(file_name.to_string());
+    }
+
+    for expected in PRAGMASEVKA_FONT_FILES {
+        if !seen_files.contains(*expected) {
+            anyhow::bail!("Bundled font archive missing expected file: {expected}");
+        }
+    }
+
+    let marker_path = font_dir.join(PRAGMASEVKA_MARKER_FILE);
+    let marker = format!(
+        "font=Pragmasevka NF\nversion={}\nsource={}\nzip_sha256={}\nzst_sha256={}\ninstalled_at_utc={}\n",
+        PRAGMASEVKA_BUNDLED_VERSION,
+        PRAGMASEVKA_BUNDLED_SOURCE_URL,
+        PRAGMASEVKA_BUNDLED_ZIP_SHA256,
+        PRAGMASEVKA_BUNDLED_ZST_SHA256,
+        chrono::Utc::now().to_rfc3339(),
+    );
+    fs::write(&marker_path, marker).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to write font install marker {}: {}",
+            marker_path.display(),
+            e
+        )
+    })?;
+
+    Ok(written_files)
+}
+
+#[cfg(target_os = "linux")]
+fn refresh_linux_font_cache(font_dir: &Path, verbose: u8) -> Option<String> {
+    let output = std::process::Command::new("fc-cache")
+        .arg("-f")
+        .arg(font_dir)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => Some(format!(
+            "✓ Refreshed font cache: fc-cache -f {}",
+            font_dir.display()
+        )),
+        Ok(output) => {
+            if verbose > 0 {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Some(format!(
+                    "⚠ fc-cache returned {} ({}). You may need to refresh fonts manually.",
+                    output.status, stderr
+                ));
+            }
+            Some(
+                "⚠ Could not refresh fc-cache automatically. Run `fc-cache -f` manually if needed."
+                    .to_string(),
+            )
+        }
+        Err(err) => Some(format!(
+            "⚠ Could not run fc-cache ({}). Run `fc-cache -f` manually if needed.",
+            err
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn refresh_linux_font_cache(_font_dir: &Path, _verbose: u8) -> Option<String> {
+    None
+}
+
+fn should_auto_install_bundled_font(command: Option<&Commands>) -> bool {
+    match command {
+        Some(Commands::Version { .. }) => false,
+        Some(Commands::Setup { dry_run: true, .. }) => false,
+        Some(Commands::Setup {
+            command: Some(SetupCommands::Font { .. }),
+            ..
+        }) => false,
+        _ => true,
+    }
+}
+
+fn ensure_default_bundled_font(verbose: u8, command: Option<&Commands>) {
+    if !should_auto_install_bundled_font(command) {
+        return;
+    }
+
+    let font_dir = match default_font_install_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::debug!("Skipping bundled font install (unsupported platform): {err}");
+            return;
+        }
+    };
+
+    if bundled_pragmasevka_installed(&font_dir) {
+        return;
+    }
+
+    match install_bundled_pragmasevka(&font_dir) {
+        Ok(installed_files) => {
+            tracing::info!(
+                "Installed bundled Pragmasevka Nerd Font ({} files) at {}",
+                installed_files.len(),
+                font_dir.display()
+            );
+            if let Some(cache_message) = refresh_linux_font_cache(&font_dir, verbose) {
+                tracing::info!("{cache_message}");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Failed to install bundled Pragmasevka Nerd Font automatically: {err}"
+            );
+        }
+    }
+}
+
+fn run_setup_font_command(
+    apply: bool,
+    dry_run: bool,
+    force: bool,
+    dir: Option<PathBuf>,
+    verbose: u8,
+) -> anyhow::Result<()> {
+    println!("ft setup font - Bundled Pragmasevka Nerd Font\n");
+
+    let font_dir = dir.map_or_else(default_font_install_dir, Ok)?;
+    let already_installed = bundled_pragmasevka_installed(&font_dir);
+
+    println!("Version: {}", PRAGMASEVKA_BUNDLED_VERSION);
+    println!("Source:  {}", PRAGMASEVKA_BUNDLED_SOURCE_URL);
+    println!("Target:  {}\n", font_dir.display());
+
+    if dry_run {
+        if already_installed && !force {
+            println!("✓ Bundled Pragmasevka font files already present.");
+        } else if already_installed {
+            println!("• Would reinstall bundled font files due to --force.");
+        } else {
+            println!(
+                "• Would install {} bundled font file(s).",
+                PRAGMASEVKA_FONT_FILES.len()
+            );
+        }
+        return Ok(());
+    }
+
+    if !apply {
+        if already_installed && !force {
+            println!("✓ Bundled Pragmasevka font files already present.");
+        } else {
+            println!("Bundled font payload is embedded in this ft binary.");
+            println!("Run `ft setup font --apply` to install it.");
+        }
+        return Ok(());
+    }
+
+    if already_installed && !force {
+        println!("✓ Bundled Pragmasevka font files already present.");
+        println!("Use `--force` to reinstall.");
+        return Ok(());
+    }
+
+    let installed_files = install_bundled_pragmasevka(&font_dir)?;
+    println!(
+        "✓ Installed {} Pragmasevka Nerd Font file(s).",
+        installed_files.len()
+    );
+    println!("  Location: {}", font_dir.display());
+
+    if verbose > 0 {
+        for file in &installed_files {
+            println!("  - {}", file.display());
+        }
+    }
+
+    if let Some(cache_message) = refresh_linux_font_cache(&font_dir, verbose) {
+        println!("{cache_message}");
+    }
+
+    println!("Restart terminal applications to use the new font files.");
+    Ok(())
+}
 
 /// Check WezTerm scrollback configuration
 ///
@@ -28542,7 +28873,43 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
         }
     }
 
-    // ---- Phase 5: SSH hosts (optional) ----
+    // ---- Phase 5: Bundled font install (automatic by default) ----
+    match default_font_install_dir() {
+        Ok(font_dir) => {
+            if bundled_pragmasevka_installed(&font_dir) {
+                println!(
+                    "✓ Bundled Pragmasevka Nerd Font already installed ({})",
+                    font_dir.display()
+                );
+            } else if dry_run {
+                println!("• Bundled Pragmasevka Nerd Font will auto-install on normal ft usage.");
+            } else {
+                match install_bundled_pragmasevka(&font_dir) {
+                    Ok(installed) => {
+                        println!(
+                            "✓ Installed bundled Pragmasevka Nerd Font ({} files)",
+                            installed.len()
+                        );
+                        println!("  Location: {}", font_dir.display());
+                        if let Some(cache_message) = refresh_linux_font_cache(&font_dir, verbose) {
+                            println!("{cache_message}");
+                        }
+                    }
+                    Err(err) => {
+                        println!("⚠ Failed to install bundled Pragmasevka Nerd Font: {err}");
+                        println!("  ft will retry automatically on normal startup.");
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            if verbose > 0 {
+                println!("⚠ Skipping bundled font install: {err}");
+            }
+        }
+    }
+
+    // ---- Phase 6: SSH hosts (optional) ----
     match setup::locate_ssh_config() {
         Ok(path) => match setup::load_ssh_hosts(&path) {
             Ok(hosts) => {
@@ -28561,7 +28928,7 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
         }
     }
 
-    // ---- Phase 6: Save config ----
+    // ---- Phase 7: Save config ----
     if apply_changes {
         let choice = WizardChoice::Accept;
         let save_path = default_config_save_path();
@@ -33596,6 +33963,31 @@ log_level = "debug"
         }
     }
 
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_agent_reconnect_backoff_escalates_until_connect() {
+        let mut streamer = frankenterm_core::wire_protocol::AgentStreamer::new("agent-test");
+
+        assert_eq!(
+            distributed_agent_next_reconnect_backoff_ms(&mut streamer),
+            500
+        );
+        assert_eq!(
+            distributed_agent_next_reconnect_backoff_ms(&mut streamer),
+            1000
+        );
+        assert_eq!(
+            distributed_agent_next_reconnect_backoff_ms(&mut streamer),
+            2000
+        );
+
+        streamer.mark_connected();
+        assert_eq!(
+            distributed_agent_next_reconnect_backoff_ms(&mut streamer),
+            500
+        );
+    }
+
     // ========================================================================
     // CLI Parsing Tests — cass subcommands (wa-2l9kn)
     // ========================================================================
@@ -35627,5 +36019,135 @@ log_level = "debug"
         );
 
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn setup_font_command_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "setup",
+            "--apply",
+            "font",
+            "--force",
+            "--dir",
+            "/tmp/fonts",
+        ])
+        .expect("setup font command should parse");
+
+        match cli.command.map(|c| *c) {
+            Some(Commands::Setup {
+                apply,
+                dry_run,
+                list_hosts,
+                command: Some(SetupCommands::Font { force, dir }),
+            }) => {
+                assert!(apply);
+                assert!(!dry_run);
+                assert!(!list_hosts);
+                assert!(force);
+                assert_eq!(dir, Some(PathBuf::from("/tmp/fonts")));
+            }
+            _ => panic!("unexpected command parse result"),
+        }
+    }
+
+    #[test]
+    fn auto_font_install_respects_version_dry_run_and_setup_font() {
+        assert!(!should_auto_install_bundled_font(Some(&Commands::Version {
+            full: false,
+        })));
+        assert!(!should_auto_install_bundled_font(Some(&Commands::Setup {
+            list_hosts: false,
+            apply: false,
+            dry_run: true,
+            command: None,
+        })));
+        assert!(!should_auto_install_bundled_font(Some(&Commands::Setup {
+            list_hosts: false,
+            apply: false,
+            dry_run: false,
+            command: Some(SetupCommands::Font {
+                force: false,
+                dir: None,
+            }),
+        })));
+        assert!(should_auto_install_bundled_font(Some(&Commands::Setup {
+            list_hosts: false,
+            apply: false,
+            dry_run: false,
+            command: Some(SetupCommands::Config),
+        })));
+        assert!(should_auto_install_bundled_font(Some(&Commands::Status {
+            health: false,
+            format: "auto".to_string(),
+            domain: None,
+            agent: None,
+            pane_id: None,
+            bookmark: None,
+            bookmark_tag: None,
+        })));
+    }
+
+    #[test]
+    fn bundled_pragmasevka_payload_hashes_match_manifest() {
+        assert_eq!(
+            sha256_hex(PRAGMASEVKA_BUNDLED_PAYLOAD_ZST),
+            PRAGMASEVKA_BUNDLED_ZST_SHA256
+        );
+
+        let zip_bytes = decode_bundled_pragmasevka_zip()
+            .expect("bundled Pragmasevka payload should decode correctly");
+        assert_eq!(sha256_hex(&zip_bytes), PRAGMASEVKA_BUNDLED_ZIP_SHA256);
+    }
+
+    #[test]
+    fn bundled_pragmasevka_archive_contains_expected_font_files() {
+        let zip_bytes = decode_bundled_pragmasevka_zip()
+            .expect("bundled Pragmasevka payload should decode correctly");
+        let mut archive =
+            zip::ZipArchive::new(Cursor::new(zip_bytes)).expect("zip payload should be readable");
+
+        let mut names = std::collections::HashSet::new();
+        for index in 0..archive.len() {
+            let entry = archive.by_index(index).expect("zip entry should read");
+            if !entry.is_dir() {
+                names.insert(entry.name().to_string());
+            }
+        }
+
+        for expected in PRAGMASEVKA_FONT_FILES {
+            assert!(
+                names.contains(*expected),
+                "expected bundled font file missing: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_pragmasevka_installed_requires_all_expected_files() {
+        let temp_dir = unique_temp_dir("font_install_detection");
+
+        assert!(
+            !bundled_pragmasevka_installed(&temp_dir),
+            "empty directory should not count as installed"
+        );
+
+        for file in PRAGMASEVKA_FONT_FILES.iter().take(2) {
+            std::fs::write(temp_dir.join(file), b"placeholder").unwrap();
+        }
+        assert!(
+            !bundled_pragmasevka_installed(&temp_dir),
+            "partial file set should not count as installed"
+        );
+
+        for file in PRAGMASEVKA_FONT_FILES {
+            std::fs::write(temp_dir.join(file), b"placeholder").unwrap();
+        }
+        assert!(
+            bundled_pragmasevka_installed(&temp_dir),
+            "all expected files should count as installed"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
