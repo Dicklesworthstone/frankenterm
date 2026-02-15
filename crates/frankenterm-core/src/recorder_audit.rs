@@ -1674,4 +1674,329 @@ mod tests {
         let parsed: AuditEventType = serde_json::from_str(&et).unwrap();
         assert_eq!(parsed, AuditEventType::RecorderQueryPrivileged);
     }
+
+    // Batch: DarkBadger wa-1u90p.7.1
+
+    #[test]
+    fn access_tier_level_all_five() {
+        assert_eq!(AccessTier::A0PublicMetadata.level(), 0);
+        assert_eq!(AccessTier::A1RedactedQuery.level(), 1);
+        assert_eq!(AccessTier::A2FullQuery.level(), 2);
+        assert_eq!(AccessTier::A3PrivilegedRaw.level(), 3);
+        assert_eq!(AccessTier::A4Admin.level(), 4);
+    }
+
+    #[test]
+    fn access_tier_satisfies_same_tier() {
+        for tier in [
+            AccessTier::A0PublicMetadata,
+            AccessTier::A1RedactedQuery,
+            AccessTier::A2FullQuery,
+            AccessTier::A3PrivilegedRaw,
+            AccessTier::A4Admin,
+        ] {
+            assert!(tier.satisfies(tier));
+        }
+    }
+
+    #[test]
+    fn access_tier_satisfies_higher_ok() {
+        assert!(AccessTier::A4Admin.satisfies(AccessTier::A0PublicMetadata));
+        assert!(AccessTier::A3PrivilegedRaw.satisfies(AccessTier::A2FullQuery));
+    }
+
+    #[test]
+    fn access_tier_satisfies_lower_denied() {
+        assert!(!AccessTier::A0PublicMetadata.satisfies(AccessTier::A1RedactedQuery));
+        assert!(!AccessTier::A1RedactedQuery.satisfies(AccessTier::A4Admin));
+    }
+
+    #[test]
+    fn access_tier_display_all() {
+        assert_eq!(
+            format!("{}", AccessTier::A0PublicMetadata),
+            "A0 (public metadata)"
+        );
+        assert_eq!(
+            format!("{}", AccessTier::A1RedactedQuery),
+            "A1 (redacted query)"
+        );
+        assert_eq!(format!("{}", AccessTier::A2FullQuery), "A2 (full query)");
+        assert_eq!(
+            format!("{}", AccessTier::A3PrivilegedRaw),
+            "A3 (privileged raw)"
+        );
+        assert_eq!(format!("{}", AccessTier::A4Admin), "A4 (admin)");
+    }
+
+    #[test]
+    fn access_tier_ord_ordering() {
+        assert!(AccessTier::A0PublicMetadata < AccessTier::A1RedactedQuery);
+        assert!(AccessTier::A1RedactedQuery < AccessTier::A2FullQuery);
+        assert!(AccessTier::A2FullQuery < AccessTier::A3PrivilegedRaw);
+        assert!(AccessTier::A3PrivilegedRaw < AccessTier::A4Admin);
+    }
+
+    #[test]
+    fn access_tier_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(AccessTier::A0PublicMetadata);
+        set.insert(AccessTier::A4Admin);
+        set.insert(AccessTier::A0PublicMetadata); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn access_tier_serde_all_five() {
+        let expected = [
+            (AccessTier::A0PublicMetadata, "\"a0_public_metadata\""),
+            (AccessTier::A1RedactedQuery, "\"a1_redacted_query\""),
+            (AccessTier::A2FullQuery, "\"a2_full_query\""),
+            (AccessTier::A3PrivilegedRaw, "\"a3_privileged_raw\""),
+            (AccessTier::A4Admin, "\"a4_admin\""),
+        ];
+        for (tier, json_str) in expected {
+            let json = serde_json::to_string(&tier).unwrap();
+            assert_eq!(json, json_str);
+            let back: AccessTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, tier);
+        }
+    }
+
+    #[test]
+    fn access_tier_default_for_actor_all() {
+        assert_eq!(
+            AccessTier::default_for_actor(ActorKind::Human),
+            AccessTier::A2FullQuery
+        );
+        assert_eq!(
+            AccessTier::default_for_actor(ActorKind::Robot),
+            AccessTier::A1RedactedQuery
+        );
+        assert_eq!(
+            AccessTier::default_for_actor(ActorKind::Mcp),
+            AccessTier::A1RedactedQuery
+        );
+        assert_eq!(
+            AccessTier::default_for_actor(ActorKind::Workflow),
+            AccessTier::A2FullQuery
+        );
+    }
+
+    #[test]
+    fn authz_decision_debug_clone_eq() {
+        let a = AuthzDecision::Allow;
+        let b = a.clone();
+        assert_eq!(a, b);
+        assert_ne!(AuthzDecision::Allow, AuthzDecision::Deny);
+        assert_ne!(AuthzDecision::Deny, AuthzDecision::Elevate);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn authz_decision_serde_roundtrip_all() {
+        for d in [
+            AuthzDecision::Allow,
+            AuthzDecision::Deny,
+            AuthzDecision::Elevate,
+        ] {
+            let json = serde_json::to_string(&d).unwrap();
+            let back: AuthzDecision = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, d);
+        }
+    }
+
+    #[test]
+    fn actor_identity_debug_clone_eq() {
+        let a = ActorIdentity::new(ActorKind::Human, "session-1");
+        let b = a.clone();
+        assert_eq!(a, b);
+        let c = ActorIdentity::new(ActorKind::Robot, "session-1");
+        assert_ne!(a, c); // different kind
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn actor_identity_serde_roundtrip() {
+        let a = ActorIdentity::new(ActorKind::Mcp, "tool-42");
+        let json = serde_json::to_string(&a).unwrap();
+        let back: ActorIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn audit_event_type_serde_all_15() {
+        let all = [
+            (AuditEventType::RecorderQuery, "\"recorder_query\""),
+            (
+                AuditEventType::RecorderQueryPrivileged,
+                "\"recorder_query_privileged\"",
+            ),
+            (AuditEventType::RecorderReplay, "\"recorder_replay\""),
+            (AuditEventType::RecorderExport, "\"recorder_export\""),
+            (
+                AuditEventType::AdminRetentionOverride,
+                "\"admin_retention_override\"",
+            ),
+            (AuditEventType::AdminPurge, "\"admin_purge\""),
+            (AuditEventType::AdminPolicyChange, "\"admin_policy_change\""),
+            (
+                AuditEventType::AccessApprovalGranted,
+                "\"access_approval_granted\"",
+            ),
+            (
+                AuditEventType::AccessApprovalExpired,
+                "\"access_approval_expired\"",
+            ),
+            (
+                AuditEventType::AccessIncidentMode,
+                "\"access_incident_mode\"",
+            ),
+            (AuditEventType::AccessDebugMode, "\"access_debug_mode\""),
+            (
+                AuditEventType::RetentionSegmentSealed,
+                "\"retention_segment_sealed\"",
+            ),
+            (
+                AuditEventType::RetentionSegmentArchived,
+                "\"retention_segment_archived\"",
+            ),
+            (
+                AuditEventType::RetentionSegmentPurged,
+                "\"retention_segment_purged\"",
+            ),
+            (
+                AuditEventType::RetentionAcceleratedPurge,
+                "\"retention_accelerated_purge\"",
+            ),
+        ];
+        for (variant, json_str) in all {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, json_str, "variant {:?}", variant);
+            let back: AuditEventType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn audit_event_type_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(AuditEventType::RecorderQuery);
+        set.insert(AuditEventType::AdminPurge);
+        set.insert(AuditEventType::RecorderQuery); // dup
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn audit_scope_default_empty() {
+        let s = AuditScope::default();
+        assert!(s.pane_ids.is_empty());
+        assert!(s.time_range.is_none());
+        assert!(s.query.is_none());
+        assert!(s.segment_ids.is_empty());
+        assert!(s.result_count.is_none());
+        let _ = format!("{:?}", s);
+    }
+
+    #[test]
+    fn audit_scope_serde_roundtrip() {
+        let s = AuditScope {
+            pane_ids: vec![1, 2],
+            time_range: Some((100, 200)),
+            query: Some("test".into()),
+            segment_ids: vec!["seg-1".into()],
+            result_count: Some(42),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: AuditScope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pane_ids, vec![1, 2]);
+        assert_eq!(back.time_range, Some((100, 200)));
+        assert_eq!(back.result_count, Some(42));
+    }
+
+    #[test]
+    fn audit_scope_serde_skip_empty() {
+        let s = AuditScope::default();
+        let json = serde_json::to_string(&s).unwrap();
+        // skip_serializing_if should omit empty fields
+        assert!(!json.contains("pane_ids"));
+        assert!(!json.contains("time_range"));
+        assert!(!json.contains("query"));
+    }
+
+    #[test]
+    fn audit_log_config_default_values() {
+        let c = AuditLogConfig::default();
+        assert_eq!(c.retention_days, 90);
+        assert!(c.hash_chain_enabled);
+        assert_eq!(c.max_memory_entries, 10_000);
+        assert_eq!(c.policy_version, "governance.v1");
+        let _ = format!("{:?}", c);
+    }
+
+    #[test]
+    fn audit_log_config_serde_roundtrip() {
+        let c = AuditLogConfig::default();
+        let json = serde_json::to_string(&c).unwrap();
+        let back: AuditLogConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.retention_days, c.retention_days);
+        assert_eq!(back.policy_version, c.policy_version);
+    }
+
+    #[test]
+    fn chain_verification_debug_clone_eq() {
+        let v = ChainVerification {
+            total_entries: 10,
+            chain_intact: true,
+            first_break_at: None,
+            missing_ordinals: vec![],
+            ordinal_range: Some((0, 9)),
+        };
+        let c = v.clone();
+        assert_eq!(v, c);
+        let _ = format!("{:?}", v);
+    }
+
+    #[test]
+    fn constants_values() {
+        assert_eq!(AUDIT_SCHEMA_VERSION, "ft.recorder.audit.v1");
+        assert_eq!(GENESIS_HASH.len(), 64); // SHA-256 hex
+        assert_eq!(DEFAULT_AUDIT_RETENTION_DAYS, 90);
+        assert_eq!(DEFAULT_MAX_RAW_QUERY_ROWS, 100);
+        assert_eq!(DEFAULT_APPROVAL_TTL_SECONDS, 900);
+    }
+
+    #[test]
+    fn audit_log_drain_idempotent() {
+        let log = AuditLog::new(AuditLogConfig::default());
+        let actor = ActorIdentity::new(ActorKind::Human, "test");
+        log.append(AuditEventBuilder::new(
+            AuditEventType::RecorderQuery,
+            actor,
+            1000,
+        ));
+        let first = log.drain();
+        assert_eq!(first.len(), 1);
+        let second = log.drain();
+        assert!(second.is_empty());
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn audit_log_resume_continues_ordinal() {
+        let log = AuditLog::resume(AuditLogConfig::default(), 100, "abc123".to_string());
+        assert_eq!(log.next_ordinal(), 100);
+        assert_eq!(log.last_hash(), "abc123");
+        let actor = ActorIdentity::new(ActorKind::Robot, "bot");
+        let entry = log.append(AuditEventBuilder::new(
+            AuditEventType::AdminPurge,
+            actor,
+            2000,
+        ));
+        assert_eq!(entry.ordinal, 100);
+        assert_eq!(entry.prev_entry_hash, "abc123");
+        assert_eq!(log.next_ordinal(), 101);
+    }
 }

@@ -1267,4 +1267,385 @@ mod tests {
         assert_eq!(stats.live_count(), 0);
         assert_eq!(stats.live_bytes(), 0);
     }
+
+    // Batch: DarkBadger wa-1u90p.7.1
+
+    fn make_test_segment(id: &str, tier: SensitivityTier, created_at_ms: u64) -> SegmentMeta {
+        make_segment(id, tier, SegmentPhase::Active, created_at_ms)
+    }
+
+    #[test]
+    fn retention_config_debug_clone() {
+        let c = RetentionConfig::default();
+        let c2 = c.clone();
+        assert_eq!(c.hot_hours, c2.hot_hours);
+        assert_eq!(c.warm_days, c2.warm_days);
+        let _ = format!("{:?}", c);
+    }
+
+    #[test]
+    fn retention_config_default_values() {
+        let c = RetentionConfig::default();
+        assert_eq!(c.hot_hours, 24);
+        assert_eq!(c.warm_days, 7);
+        assert_eq!(c.cold_days, 30);
+        assert_eq!(c.t3_max_hours, 24);
+        assert_eq!(c.t1_extended_days, 30);
+        assert_eq!(c.max_segment_bytes, 256 * 1024 * 1024);
+        assert_eq!(c.max_segment_duration_secs, 3600);
+    }
+
+    #[test]
+    fn retention_config_serde_roundtrip() {
+        let c = RetentionConfig::default();
+        let json = serde_json::to_string(&c).unwrap();
+        let back: RetentionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.hot_hours, c.hot_hours);
+        assert_eq!(back.warm_days, c.warm_days);
+        assert_eq!(back.cold_days, c.cold_days);
+    }
+
+    #[test]
+    fn retention_config_validate_zero_warm_days() {
+        let mut c = RetentionConfig::default();
+        c.warm_days = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn retention_config_validate_zero_cold_days() {
+        let mut c = RetentionConfig::default();
+        c.cold_days = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn retention_config_validate_zero_segment_bytes() {
+        let mut c = RetentionConfig::default();
+        c.max_segment_bytes = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn retention_config_validate_zero_segment_duration() {
+        let mut c = RetentionConfig::default();
+        c.max_segment_duration_secs = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn retention_config_validate_t1_extended_days_limit() {
+        let mut c = RetentionConfig::default();
+        c.t1_extended_days = 91;
+        assert!(c.validate().is_err());
+        c.t1_extended_days = 90;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn sensitivity_tier_debug_clone_copy_eq() {
+        let a = SensitivityTier::T1Standard;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+        assert_ne!(SensitivityTier::T1Standard, SensitivityTier::T2Sensitive);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn sensitivity_tier_ord_ordering() {
+        assert!(SensitivityTier::T1Standard < SensitivityTier::T2Sensitive);
+        assert!(SensitivityTier::T2Sensitive < SensitivityTier::T3Restricted);
+    }
+
+    #[test]
+    fn sensitivity_tier_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(SensitivityTier::T1Standard);
+        set.insert(SensitivityTier::T3Restricted);
+        set.insert(SensitivityTier::T1Standard); // dup
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn sensitivity_tier_serde_all_three() {
+        let expected = [
+            (SensitivityTier::T1Standard, "\"t1_standard\""),
+            (SensitivityTier::T2Sensitive, "\"t2_sensitive\""),
+            (SensitivityTier::T3Restricted, "\"t3_restricted\""),
+        ];
+        for (tier, json_str) in expected {
+            let json = serde_json::to_string(&tier).unwrap();
+            assert_eq!(json, json_str);
+            let back: SensitivityTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, tier);
+        }
+    }
+
+    #[test]
+    fn sensitivity_tier_requires_accelerated_purge() {
+        assert!(!SensitivityTier::T1Standard.requires_accelerated_purge());
+        assert!(!SensitivityTier::T2Sensitive.requires_accelerated_purge());
+        assert!(SensitivityTier::T3Restricted.requires_accelerated_purge());
+    }
+
+    #[test]
+    fn segment_phase_debug_clone_copy_eq() {
+        let a = SegmentPhase::Active;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(SegmentPhase::Active, SegmentPhase::Sealed);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn segment_phase_ord_ordering() {
+        assert!(SegmentPhase::Active < SegmentPhase::Sealed);
+        assert!(SegmentPhase::Sealed < SegmentPhase::Archived);
+        assert!(SegmentPhase::Archived < SegmentPhase::Purged);
+    }
+
+    #[test]
+    fn segment_phase_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        for p in [
+            SegmentPhase::Active,
+            SegmentPhase::Sealed,
+            SegmentPhase::Archived,
+            SegmentPhase::Purged,
+        ] {
+            set.insert(p);
+        }
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn segment_phase_serde_all_four() {
+        let expected = [
+            (SegmentPhase::Active, "\"active\""),
+            (SegmentPhase::Sealed, "\"sealed\""),
+            (SegmentPhase::Archived, "\"archived\""),
+            (SegmentPhase::Purged, "\"purged\""),
+        ];
+        for (phase, json_str) in expected {
+            let json = serde_json::to_string(&phase).unwrap();
+            assert_eq!(json, json_str);
+            let back: SegmentPhase = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, phase);
+        }
+    }
+
+    #[test]
+    fn segment_phase_is_writable() {
+        assert!(SegmentPhase::Active.is_writable());
+        assert!(!SegmentPhase::Sealed.is_writable());
+        assert!(!SegmentPhase::Archived.is_writable());
+        assert!(!SegmentPhase::Purged.is_writable());
+    }
+
+    #[test]
+    fn segment_phase_is_queryable() {
+        assert!(SegmentPhase::Active.is_queryable());
+        assert!(SegmentPhase::Sealed.is_queryable());
+        assert!(SegmentPhase::Archived.is_queryable());
+        assert!(!SegmentPhase::Purged.is_queryable());
+    }
+
+    #[test]
+    fn segment_phase_valid_transitions_all() {
+        assert_eq!(
+            SegmentPhase::Active.valid_transitions(),
+            &[SegmentPhase::Sealed]
+        );
+        assert_eq!(
+            SegmentPhase::Sealed.valid_transitions(),
+            &[SegmentPhase::Archived]
+        );
+        assert_eq!(
+            SegmentPhase::Archived.valid_transitions(),
+            &[SegmentPhase::Purged]
+        );
+        assert!(SegmentPhase::Purged.valid_transitions().is_empty());
+    }
+
+    #[test]
+    fn segment_phase_can_transition_to_invalid() {
+        assert!(!SegmentPhase::Active.can_transition_to(SegmentPhase::Archived)); // skip
+        assert!(!SegmentPhase::Sealed.can_transition_to(SegmentPhase::Active)); // backwards
+        assert!(!SegmentPhase::Purged.can_transition_to(SegmentPhase::Active)); // from terminal
+    }
+
+    #[test]
+    fn segment_meta_make_id_all_tiers() {
+        assert_eq!(
+            SegmentMeta::make_id(0, SensitivityTier::T1Standard, 1000),
+            "0_t1_1000"
+        );
+        assert_eq!(
+            SegmentMeta::make_id(5, SensitivityTier::T2Sensitive, 2000),
+            "5_t2_2000"
+        );
+        assert_eq!(
+            SegmentMeta::make_id(10, SensitivityTier::T3Restricted, 3000),
+            "10_t3_3000"
+        );
+    }
+
+    #[test]
+    fn segment_meta_debug_clone_serde() {
+        let m = make_test_segment("seg-1", SensitivityTier::T1Standard, 1000);
+        let c = m.clone();
+        assert_eq!(c.segment_id, "seg-1");
+        let _ = format!("{:?}", m);
+        let json = serde_json::to_string(&m).unwrap();
+        let back: SegmentMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.segment_id, "seg-1");
+        assert_eq!(back.sensitivity, SensitivityTier::T1Standard);
+    }
+
+    #[test]
+    fn retention_sweep_result_default_empty() {
+        let r = RetentionSweepResult::default();
+        assert!(r.sealed.is_empty());
+        assert!(r.archived.is_empty());
+        assert!(r.purge_candidates.is_empty());
+        assert!(r.purged.is_empty());
+        assert!(r.held.is_empty());
+        let _ = format!("{:?}", r);
+    }
+
+    #[test]
+    fn retention_sweep_result_serde_roundtrip() {
+        let mut r = RetentionSweepResult::default();
+        r.sealed.push("seg-1".into());
+        r.purged.push("seg-2".into());
+        let json = serde_json::to_string(&r).unwrap();
+        let back: RetentionSweepResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sealed, vec!["seg-1"]);
+        assert_eq!(back.purged, vec!["seg-2"]);
+    }
+
+    #[test]
+    fn retention_stats_debug_clone_serde() {
+        let mut s = RetentionStats::default();
+        s.active_count = 2;
+        s.active_bytes = 1024;
+        s.sealed_count = 1;
+        s.sealed_bytes = 512;
+        let c = s.clone();
+        assert_eq!(c.live_count(), 3);
+        assert_eq!(c.live_bytes(), 1536);
+        let _ = format!("{:?}", s);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: RetentionStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.active_count, 2);
+    }
+
+    #[test]
+    fn retention_audit_type_serde_all_six() {
+        let expected = [
+            (RetentionAuditType::SegmentSealed, "\"segment_sealed\""),
+            (RetentionAuditType::SegmentArchived, "\"segment_archived\""),
+            (RetentionAuditType::SegmentPurged, "\"segment_purged\""),
+            (
+                RetentionAuditType::AcceleratedPurge,
+                "\"accelerated_purge\"",
+            ),
+            (RetentionAuditType::ManualPurge, "\"manual_purge\""),
+            (RetentionAuditType::PolicyOverride, "\"policy_override\""),
+        ];
+        for (variant, json_str) in expected {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, json_str, "variant {:?}", variant);
+            let back: RetentionAuditType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn retention_audit_event_debug_clone_serde() {
+        let e = RetentionAuditEvent {
+            audit_version: "v1".into(),
+            event_type: RetentionAuditType::ManualPurge,
+            segment_id: "seg-x".into(),
+            ordinal_range: Some((0, 50)),
+            sensitivity: SensitivityTier::T3Restricted,
+            from_phase: Some(SegmentPhase::Archived),
+            to_phase: SegmentPhase::Purged,
+            timestamp_ms: 9000,
+            justification: Some("security incident".into()),
+        };
+        let c = e.clone();
+        assert_eq!(c.segment_id, "seg-x");
+        let _ = format!("{:?}", e);
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("manual_purge"));
+        assert!(json.contains("security incident"));
+    }
+
+    #[test]
+    fn retention_error_display_invalid_transition() {
+        let err = RetentionError::InvalidTransition {
+            segment_id: "s1".into(),
+            from: SegmentPhase::Active,
+            to: SegmentPhase::Purged,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("s1"));
+        assert!(msg.contains("Active"));
+        assert!(msg.contains("Purged"));
+    }
+
+    #[test]
+    fn retention_error_display_not_found() {
+        let err = RetentionError::NotFound("missing-seg".into());
+        assert!(err.to_string().contains("missing-seg"));
+    }
+
+    #[test]
+    fn retention_error_std_error() {
+        let err = RetentionError::InvalidConfig("test".into());
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn retention_manager_get_segment_mut() {
+        let mut mgr = RetentionManager::with_defaults();
+        mgr.add_segment(make_test_segment("s1", SensitivityTier::T1Standard, 1000));
+        let seg = mgr.get_segment_mut("s1").unwrap();
+        seg.size_bytes = 999;
+        assert_eq!(mgr.get_segment("s1").unwrap().size_bytes, 999);
+        assert!(mgr.get_segment_mut("nonexistent").is_none());
+    }
+
+    #[test]
+    fn retention_manager_total_events() {
+        let mut mgr = RetentionManager::with_defaults();
+        let mut seg = make_test_segment("s1", SensitivityTier::T1Standard, 1000);
+        seg.event_count = 100;
+        mgr.add_segment(seg);
+        let mut seg2 = make_test_segment("s2", SensitivityTier::T2Sensitive, 2000);
+        seg2.event_count = 50;
+        mgr.add_segment(seg2);
+        assert_eq!(mgr.total_events(), 150);
+    }
+
+    #[test]
+    fn retention_manager_config_accessor() {
+        let mgr = RetentionManager::with_defaults();
+        assert_eq!(mgr.config().hot_hours, 24);
+    }
+
+    #[test]
+    fn retention_manager_segments_needing_roll() {
+        let mut mgr = RetentionManager::with_defaults();
+        let mut seg = make_test_segment("s1", SensitivityTier::T1Standard, 1000);
+        seg.size_bytes = 256 * 1024 * 1024; // exactly at limit
+        mgr.add_segment(seg);
+        let needing = mgr.segments_needing_roll(1000);
+        assert_eq!(needing.len(), 1);
+    }
 }
