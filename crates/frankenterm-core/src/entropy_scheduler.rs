@@ -895,6 +895,98 @@ mod tests {
         assert_eq!(r2.decisions.len(), 1);
         assert!((r2.mean_density - 0.75).abs() < 1e-10);
     }
+
+    // -- Batch: DarkBadger wa-1u90p.7.1 ----------------------------------------
+
+    #[test]
+    fn config_debug_clone() {
+        let cfg = EntropySchedulerConfig::default();
+        let cloned = cfg.clone();
+        assert_eq!(cloned.base_interval_ms, cfg.base_interval_ms);
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("EntropySchedulerConfig"));
+    }
+
+    #[test]
+    fn entropy_decision_debug_clone() {
+        let d = EntropyDecision {
+            pane_id: 1,
+            entropy: 4.0,
+            density: 0.5,
+            interval_ms: 2000,
+            total_bytes: 1000,
+            in_warmup: false,
+        };
+        let cloned = d.clone();
+        assert_eq!(cloned.pane_id, 1);
+        assert!((cloned.density - 0.5).abs() < f64::EPSILON);
+        let dbg = format!("{:?}", d);
+        assert!(dbg.contains("EntropyDecision"));
+    }
+
+    #[test]
+    fn schedule_result_debug_clone() {
+        let r = EntropyScheduleResult {
+            decisions: vec![],
+            mean_density: 0.0,
+            warmup_count: 0,
+        };
+        let cloned = r.clone();
+        assert!(cloned.decisions.is_empty());
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("EntropyScheduleResult"));
+    }
+
+    #[test]
+    fn snapshot_debug_clone_serde() {
+        let snap = EntropySchedulerSnapshot {
+            pane_count: 2,
+            config: EntropySchedulerConfig::default(),
+            pane_states: vec![PaneSnapshotEntry {
+                pane_id: 1,
+                entropy: 4.0,
+                density: 0.5,
+                interval_ms: 2000,
+                total_bytes: 500,
+                in_warmup: true,
+            }],
+        };
+        let cloned = snap.clone();
+        assert_eq!(cloned.pane_count, 2);
+        let dbg = format!("{:?}", snap);
+        assert!(dbg.contains("EntropySchedulerSnapshot"));
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: EntropySchedulerSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pane_states.len(), 1);
+    }
+
+    #[test]
+    fn pane_snapshot_entry_debug_clone_serde() {
+        let e = PaneSnapshotEntry {
+            pane_id: 42,
+            entropy: 6.5,
+            density: 0.8125,
+            interval_ms: 1230,
+            total_bytes: 10_000,
+            in_warmup: false,
+        };
+        let cloned = e.clone();
+        assert_eq!(cloned.pane_id, 42);
+        let dbg = format!("{:?}", e);
+        assert!(dbg.contains("PaneSnapshotEntry"));
+
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: PaneSnapshotEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_bytes, 10_000);
+    }
+
+    #[test]
+    fn feed_bytes_to_missing_pane_is_noop() {
+        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        // Should not panic
+        sched.feed_bytes(999, &[1, 2, 3]);
+    }
 }
 
 // =============================================================================

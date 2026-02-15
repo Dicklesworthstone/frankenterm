@@ -1109,4 +1109,136 @@ mod tests {
             "merge must be deterministic regardless of input order"
         );
     }
+
+    // -- Batch: DarkBadger wa-1u90p.7.1 ----------------------------------------
+
+    #[test]
+    fn sequence_assigner_default_trait() {
+        let a = SequenceAssigner::default();
+        assert_eq!(a.current_global(), 0);
+        assert_eq!(a.pane_count(), 0);
+    }
+
+    #[test]
+    fn sequence_assigner_debug() {
+        let a = SequenceAssigner::new();
+        let dbg = format!("{:?}", a);
+        assert!(dbg.contains("SequenceAssigner"));
+    }
+
+    #[test]
+    fn replay_order_hash_in_set() {
+        use std::collections::HashSet;
+        let a = ReplayOrder::new(0, 0, 0);
+        let b = ReplayOrder::new(0, 0, 1);
+        let c = ReplayOrder::new(0, 0, 0);
+        let mut set = HashSet::new();
+        assert!(set.insert(a));
+        assert!(set.insert(b));
+        assert!(!set.insert(c));
+    }
+
+    #[test]
+    fn replay_order_copy_semantics() {
+        let a = ReplayOrder::new(1, 2, 3);
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn replay_order_debug_clone() {
+        let o = ReplayOrder::new(10, 20, 30);
+        let cloned = o.clone();
+        assert_eq!(o, cloned);
+        let dbg = format!("{:?}", o);
+        assert!(dbg.contains("ReplayOrder"));
+    }
+
+    #[test]
+    fn replay_order_serde_roundtrip() {
+        let o = ReplayOrder::new(100, 200, 300);
+        let json = serde_json::to_string(&o).unwrap();
+        let parsed: ReplayOrder = serde_json::from_str(&json).unwrap();
+        assert_eq!(o, parsed);
+    }
+
+    #[test]
+    fn correlation_context_empty_has_no_links() {
+        let ctx = CorrelationContext::empty();
+        assert!(!ctx.has_links());
+        assert!(ctx.parent_event_id.is_none());
+        assert!(ctx.batch_id.is_none());
+    }
+
+    #[test]
+    fn correlation_context_with_parent_has_links() {
+        let ctx = CorrelationContext::with_parent("evt-1".to_string());
+        assert!(ctx.has_links());
+        assert_eq!(ctx.parent_event_id.as_deref(), Some("evt-1"));
+    }
+
+    #[test]
+    fn correlation_context_as_response() {
+        let ctx =
+            CorrelationContext::as_response("trigger-1".to_string(), Some("root-1".to_string()));
+        assert!(ctx.has_links());
+        assert_eq!(ctx.trigger_event_id.as_deref(), Some("trigger-1"));
+        assert_eq!(ctx.root_event_id.as_deref(), Some("root-1"));
+    }
+
+    #[test]
+    fn correlation_context_with_batch() {
+        let ctx = CorrelationContext::empty().with_batch("batch-1".to_string());
+        assert_eq!(ctx.batch_id.as_deref(), Some("batch-1"));
+    }
+
+    #[test]
+    fn correlation_context_default_is_empty() {
+        let ctx = CorrelationContext::default();
+        assert!(!ctx.has_links());
+    }
+
+    #[test]
+    fn correlation_context_serde_roundtrip() {
+        let ctx = CorrelationContext::with_parent("p1".to_string()).with_batch("b1".to_string());
+        let json = serde_json::to_string(&ctx).unwrap();
+        let parsed: CorrelationContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(ctx, parsed);
+    }
+
+    #[test]
+    fn correlation_context_debug_clone_eq() {
+        let a = CorrelationContext::with_parent("p1".to_string());
+        let b = a.clone();
+        assert_eq!(a, b);
+        let dbg = format!("{:?}", a);
+        assert!(dbg.contains("CorrelationContext"));
+    }
+
+    #[test]
+    fn clock_skew_anomaly_debug_clone_serde() {
+        let a = ClockSkewAnomaly {
+            pane_id: 1,
+            event_ts_ms: 1000,
+            prev_ts_ms: 2000,
+            delta_ms: -1000,
+            global_sequence: 42,
+        };
+        let cloned = a.clone();
+        assert_eq!(cloned.delta_ms, -1000);
+        let dbg = format!("{:?}", a);
+        assert!(dbg.contains("ClockSkewAnomaly"));
+
+        let json = serde_json::to_string(&a).unwrap();
+        let parsed: ClockSkewAnomaly = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pane_id, 1);
+    }
+
+    #[test]
+    fn replay_order_is_concurrent_with() {
+        let a = ReplayOrder::new(5, 0, 0);
+        let b = ReplayOrder::new(5, 1, 0);
+        assert!(a.is_concurrent_with(&b));
+        assert!(!a.is_concurrent_with(&a));
+    }
 }

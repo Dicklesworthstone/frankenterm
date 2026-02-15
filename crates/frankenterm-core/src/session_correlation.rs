@@ -950,6 +950,107 @@ mod tests {
         assert_eq!(CASS_CORRELATION_VERSION, "v1");
     }
 
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──
+
+    #[test]
+    fn correlation_status_debug_format() {
+        let dbg = format!("{:?}", CorrelationStatus::Linked);
+        assert!(dbg.contains("Linked"));
+    }
+
+    #[test]
+    fn correlation_status_copy_semantics() {
+        let a = CorrelationStatus::Unlinked;
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn correlation_options_debug_clone() {
+        let opts = CassCorrelationOptions::default();
+        let dbg = format!("{:?}", opts);
+        assert!(dbg.contains("CassCorrelationOptions"));
+        let c = opts.clone();
+        assert_eq!(c.window_before_ms, opts.window_before_ms);
+    }
+
+    #[test]
+    fn session_correlation_debug_clone() {
+        let c = SessionCorrelation::linked(
+            "ext-1".to_string(),
+            0.9,
+            vec!["ok".to_string()],
+            1,
+            100,
+            200,
+            None,
+        );
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("SessionCorrelation"));
+        let c2 = c.clone();
+        assert_eq!(c2.status, c.status);
+        assert_eq!(c2.external_id, c.external_id);
+    }
+
+    #[test]
+    fn to_external_meta_unlinked_variant() {
+        let c = SessionCorrelation::unlinked(vec!["no_match".to_string()], 0, 100, 200);
+        let meta = c.to_external_meta();
+        assert!(meta.is_object());
+        assert_eq!(meta["status"], "unlinked");
+        assert!(meta["external_id"].is_null());
+    }
+
+    #[test]
+    fn to_external_meta_error_variant() {
+        let c =
+            SessionCorrelation::error("timeout".to_string(), vec!["fail".to_string()], 100, 200);
+        let meta = c.to_external_meta();
+        assert!(meta.is_object());
+        assert_eq!(meta["status"], "error");
+        assert_eq!(meta["error"], "timeout");
+    }
+
+    #[test]
+    fn session_correlation_unlinked_serde_roundtrip() {
+        let c = SessionCorrelation::unlinked(vec!["no_cass".to_string()], 5, 1000, 2000);
+        let json = serde_json::to_string(&c).unwrap();
+        let back: SessionCorrelation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, CorrelationStatus::Unlinked);
+        assert!(back.external_id.is_none());
+        assert_eq!(back.candidates_considered, 5);
+    }
+
+    #[test]
+    fn session_correlation_error_serde_roundtrip() {
+        let c =
+            SessionCorrelation::error("api_fail".to_string(), vec!["reason".to_string()], 500, 600);
+        let json = serde_json::to_string(&c).unwrap();
+        let back: SessionCorrelation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, CorrelationStatus::Error);
+        assert_eq!(back.error.as_deref(), Some("api_fail"));
+    }
+
+    #[test]
+    fn summary_refresh_options_debug_clone() {
+        let opts = CassSummaryRefreshOptions::default();
+        let dbg = format!("{:?}", opts);
+        assert!(dbg.contains("CassSummaryRefreshOptions"));
+        let c = opts.clone();
+        assert_eq!(c.min_refresh_interval_ms, opts.min_refresh_interval_ms);
+        assert_eq!(c.force, opts.force);
+    }
+
+    #[test]
+    fn session_correlation_algorithm_version_always_set() {
+        let linked = SessionCorrelation::linked("e".to_string(), 0.5, vec![], 1, 0, 0, None);
+        let unlinked = SessionCorrelation::unlinked(vec![], 0, 0, 0);
+        let error = SessionCorrelation::error("e".to_string(), vec![], 0, 0);
+        assert_eq!(linked.algorithm_version, CASS_CORRELATION_VERSION);
+        assert_eq!(unlinked.algorithm_version, CASS_CORRELATION_VERSION);
+        assert_eq!(error.algorithm_version, CASS_CORRELATION_VERSION);
+    }
+
     // ── DB-backed tests ──
 
     #[tokio::test]
