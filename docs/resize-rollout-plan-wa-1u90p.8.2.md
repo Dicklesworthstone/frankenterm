@@ -19,6 +19,7 @@ This plan depends on:
 - `docs/resize-performance-slos.md`
 - `docs/resize-baseline-scenarios.md`
 - `docs/resize-artifact-fault-model-wa-1u90p.4.1.md`
+- `docs/resize-incident-response-rollback-runbook-wa-1u90p.8.4.md`
 
 ## Rollout Control Surface
 
@@ -121,6 +122,9 @@ Rollback is mandatory when any condition is true:
 5. Watchdog signals sustained critical stall state or emergency safe-mode activation.
 
 ## Rollback Procedure (Fast Path)
+
+Detailed operator actions, severity mapping, and evidence templates are defined in:
+- `docs/resize-incident-response-rollback-runbook-wa-1u90p.8.4.md`
 
 1. Freeze rollout progression immediately.
 2. Enable `emergency_disable=true` and verify `legacy_fallback_enabled=true`.
