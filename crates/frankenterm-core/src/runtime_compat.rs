@@ -610,6 +610,28 @@ where
         .map_err(|err| err.to_string())
 }
 
+/// Runs blocking work on the active runtime's blocking executor.
+///
+/// Returns the closure output when successful, or a stringified join/runtime
+/// error when the blocking task could not complete.
+pub async fn spawn_blocking<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        asupersync::runtime::spawn_blocking(work).await
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        tokio::task::spawn_blocking(work)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
 /// Receives one message from an mpsc receiver, normalized to Option semantics.
 ///
 /// Returns:
