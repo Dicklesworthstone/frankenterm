@@ -965,4 +965,419 @@ mod tests {
             );
         }
     }
+
+    // --- ApiVersion parse edge cases ---
+
+    #[test]
+    fn parse_large_version_numbers() {
+        let v = ApiVersion::parse("999.888.777").unwrap();
+        assert_eq!(v.major, 999);
+        assert_eq!(v.minor, 888);
+        assert_eq!(v.patch, 777);
+    }
+
+    #[test]
+    fn parse_zero_version() {
+        let v = ApiVersion::parse("0.0.0").unwrap();
+        assert_eq!(v.major, 0);
+        assert_eq!(v.minor, 0);
+        assert_eq!(v.patch, 0);
+    }
+
+    #[test]
+    fn parse_extra_parts_still_works() {
+        // "1.2.3.4" — has 4 parts, but parse only needs first 3
+        let v = ApiVersion::parse("1.2.3.4").unwrap();
+        assert_eq!(v.major, 1);
+        assert_eq!(v.minor, 2);
+        assert_eq!(v.patch, 3);
+    }
+
+    #[test]
+    fn parse_negative_rejected() {
+        // Negative numbers won't parse as u32
+        assert!(ApiVersion::parse("-1.0.0").is_none());
+    }
+
+    #[test]
+    fn parse_non_numeric_rejected() {
+        assert!(ApiVersion::parse("a.b.c").is_none());
+    }
+
+    #[test]
+    fn version_display_roundtrip() {
+        let v = ApiVersion {
+            major: 5,
+            minor: 10,
+            patch: 15,
+        };
+        let s = v.to_string();
+        let reparsed = ApiVersion::parse(&s).unwrap();
+        assert_eq!(v, reparsed);
+    }
+
+    #[test]
+    fn version_clone() {
+        let v = ApiVersion {
+            major: 1,
+            minor: 2,
+            patch: 3,
+        };
+        let v2 = v.clone();
+        assert_eq!(v, v2);
+    }
+
+    #[test]
+    fn version_debug() {
+        let v = ApiVersion {
+            major: 0,
+            minor: 1,
+            patch: 0,
+        };
+        let dbg = format!("{:?}", v);
+        assert!(dbg.contains("ApiVersion"));
+    }
+
+    // --- VersionCompatibility ---
+
+    #[test]
+    fn version_compatibility_debug() {
+        let vc = VersionCompatibility::Exact;
+        let dbg = format!("{:?}", vc);
+        assert!(dbg.contains("Exact"));
+    }
+
+    #[test]
+    fn version_compatibility_copy() {
+        let vc = VersionCompatibility::NewerMinor;
+        let vc2 = vc;
+        assert_eq!(vc, vc2);
+    }
+
+    #[test]
+    fn version_compatibility_all_variants_distinct() {
+        let variants = [
+            VersionCompatibility::Exact,
+            VersionCompatibility::Compatible,
+            VersionCompatibility::NewerMinor,
+            VersionCompatibility::Incompatible,
+        ];
+        for i in 0..variants.len() {
+            for j in (i + 1)..variants.len() {
+                assert_ne!(variants[i], variants[j]);
+            }
+        }
+    }
+
+    // --- Pre/Post-1.0 symmetry ---
+
+    #[test]
+    fn pre1_compatibility_is_symmetric_for_exact() {
+        let a = ApiVersion {
+            major: 0,
+            minor: 3,
+            patch: 5,
+        };
+        assert_eq!(a.compatibility(&a), VersionCompatibility::Exact);
+    }
+
+    #[test]
+    fn post1_same_patch_different_direction() {
+        let reader = ApiVersion {
+            major: 2,
+            minor: 5,
+            patch: 0,
+        };
+        let wire_older = ApiVersion {
+            major: 2,
+            minor: 3,
+            patch: 0,
+        };
+        let wire_newer = ApiVersion {
+            major: 2,
+            minor: 7,
+            patch: 0,
+        };
+        assert_eq!(
+            reader.compatibility(&wire_older),
+            VersionCompatibility::Compatible
+        );
+        assert_eq!(
+            reader.compatibility(&wire_newer),
+            VersionCompatibility::NewerMinor
+        );
+    }
+
+    // --- EndpointMeta ---
+
+    #[test]
+    fn endpoint_meta_serde_roundtrip() {
+        let ep = EndpointMeta {
+            id: "test".into(),
+            title: "Test".into(),
+            description: "A test endpoint".into(),
+            robot_command: Some("robot test".into()),
+            mcp_tool: None,
+            schema_file: "wa-robot-test.json".into(),
+            stable: false,
+            since: "0.2.0".into(),
+        };
+        let json = serde_json::to_string(&ep).unwrap();
+        let parsed: EndpointMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "test");
+        assert!(!parsed.stable);
+        assert!(parsed.mcp_tool.is_none());
+    }
+
+    #[test]
+    fn endpoint_meta_clone() {
+        let ep = EndpointMeta {
+            id: "foo".into(),
+            title: "Foo".into(),
+            description: "bar".into(),
+            robot_command: None,
+            mcp_tool: Some("wa.foo".into()),
+            schema_file: "wa-robot-foo.json".into(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        let ep2 = ep.clone();
+        assert_eq!(ep2.id, ep.id);
+        assert_eq!(ep2.mcp_tool, ep.mcp_tool);
+    }
+
+    #[test]
+    fn endpoint_meta_debug() {
+        let ep = EndpointMeta {
+            id: "dbg".into(),
+            title: "Debug".into(),
+            description: "d".into(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: "wa-robot-dbg.json".into(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        let dbg = format!("{:?}", ep);
+        assert!(dbg.contains("EndpointMeta"));
+    }
+
+    // --- SchemaRegistry ---
+
+    #[test]
+    fn schema_registry_default() {
+        let reg = SchemaRegistry::default();
+        assert!(reg.endpoints.is_empty());
+        assert!(reg.version.is_empty());
+    }
+
+    #[test]
+    fn schema_registry_clone() {
+        let reg = SchemaRegistry::canonical();
+        let reg2 = reg.clone();
+        assert_eq!(reg2.endpoints.len(), reg.endpoints.len());
+    }
+
+    #[test]
+    fn canonical_all_have_schema_file() {
+        let reg = SchemaRegistry::canonical();
+        for ep in &reg.endpoints {
+            assert!(
+                !ep.schema_file.is_empty(),
+                "endpoint {} has empty schema_file",
+                ep.id
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_all_since_valid_semver() {
+        let reg = SchemaRegistry::canonical();
+        for ep in &reg.endpoints {
+            assert!(
+                ApiVersion::parse(&ep.since).is_some(),
+                "endpoint {} has invalid since: {}",
+                ep.id,
+                ep.since
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_dual_and_robot_only_partition() {
+        let reg = SchemaRegistry::canonical();
+        let dual_count = reg.dual_surface().count();
+        let robot_only_count = reg.robot_only().count();
+        // Every endpoint with a robot_command is either dual or robot-only
+        let with_robot = reg
+            .endpoints
+            .iter()
+            .filter(|e| e.robot_command.is_some())
+            .count();
+        assert_eq!(dual_count + robot_only_count, with_robot);
+    }
+
+    #[test]
+    fn schema_files_are_sorted_and_deduped() {
+        let reg = SchemaRegistry::canonical();
+        let files = reg.schema_files();
+        let mut sorted = files.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(files, sorted);
+    }
+
+    // --- ChangeKind ---
+
+    #[test]
+    fn change_kind_serde_roundtrip_all_variants() {
+        let variants = [
+            ChangeKind::Added,
+            ChangeKind::Removed,
+            ChangeKind::RequiredFieldAdded,
+            ChangeKind::OptionalFieldAdded,
+            ChangeKind::FieldRemoved,
+            ChangeKind::TypeChanged,
+            ChangeKind::Cosmetic,
+        ];
+        for kind in &variants {
+            let json = serde_json::to_string(kind).unwrap();
+            let parsed: ChangeKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(&parsed, kind);
+        }
+    }
+
+    #[test]
+    fn change_kind_copy() {
+        let k = ChangeKind::Removed;
+        let k2 = k;
+        assert_eq!(k, k2);
+    }
+
+    #[test]
+    fn change_kind_debug() {
+        let k = ChangeKind::TypeChanged;
+        let dbg = format!("{:?}", k);
+        assert!(dbg.contains("TypeChanged"));
+    }
+
+    // --- SchemaChange ---
+
+    #[test]
+    fn schema_change_clone() {
+        let sc = SchemaChange {
+            schema_file: "test.json".into(),
+            kind: ChangeKind::Added,
+            description: "new".into(),
+        };
+        let sc2 = sc.clone();
+        assert_eq!(sc, sc2);
+    }
+
+    #[test]
+    fn schema_change_serde_roundtrip() {
+        let sc = SchemaChange {
+            schema_file: "wa-robot-state.json".into(),
+            kind: ChangeKind::FieldRemoved,
+            description: "removed field X".into(),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let parsed: SchemaChange = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, sc);
+    }
+
+    // --- SchemaDiffResult ---
+
+    #[test]
+    fn schema_diff_default() {
+        let d = SchemaDiffResult::default();
+        assert!(d.from_version.is_empty());
+        assert!(d.to_version.is_empty());
+        assert!(d.changes.is_empty());
+        assert!(!d.has_breaking_changes());
+    }
+
+    #[test]
+    fn schema_diff_clone() {
+        let d = SchemaDiffResult {
+            from_version: "0.1.0".into(),
+            to_version: "0.2.0".into(),
+            changes: vec![SchemaChange {
+                schema_file: "test.json".into(),
+                kind: ChangeKind::Cosmetic,
+                description: "desc update".into(),
+            }],
+        };
+        let d2 = d.clone();
+        assert_eq!(d2.changes.len(), 1);
+    }
+
+    #[test]
+    fn schema_diff_breaking_changes_iterator() {
+        let d = SchemaDiffResult {
+            from_version: "1.0.0".into(),
+            to_version: "2.0.0".into(),
+            changes: vec![
+                SchemaChange {
+                    schema_file: "a.json".into(),
+                    kind: ChangeKind::Added,
+                    description: "added".into(),
+                },
+                SchemaChange {
+                    schema_file: "b.json".into(),
+                    kind: ChangeKind::Removed,
+                    description: "removed".into(),
+                },
+                SchemaChange {
+                    schema_file: "c.json".into(),
+                    kind: ChangeKind::Cosmetic,
+                    description: "cosmetic".into(),
+                },
+                SchemaChange {
+                    schema_file: "d.json".into(),
+                    kind: ChangeKind::TypeChanged,
+                    description: "type changed".into(),
+                },
+            ],
+        };
+        assert!(d.has_breaking_changes());
+        let breaking: Vec<_> = d.breaking_changes().collect();
+        assert_eq!(breaking.len(), 2);
+        assert_eq!(breaking[0].kind, ChangeKind::Removed);
+        assert_eq!(breaking[1].kind, ChangeKind::TypeChanged);
+    }
+
+    #[test]
+    fn schema_diff_no_breaking_all_compatible() {
+        let d = SchemaDiffResult {
+            from_version: "0.1.0".into(),
+            to_version: "0.1.1".into(),
+            changes: vec![
+                SchemaChange {
+                    schema_file: "a.json".into(),
+                    kind: ChangeKind::Added,
+                    description: "added".into(),
+                },
+                SchemaChange {
+                    schema_file: "b.json".into(),
+                    kind: ChangeKind::OptionalFieldAdded,
+                    description: "optional".into(),
+                },
+                SchemaChange {
+                    schema_file: "c.json".into(),
+                    kind: ChangeKind::Cosmetic,
+                    description: "cosmetic".into(),
+                },
+            ],
+        };
+        assert!(!d.has_breaking_changes());
+        assert_eq!(d.breaking_changes().count(), 0);
+    }
+
+    #[test]
+    fn uncovered_schemas_empty_disk() {
+        let reg = SchemaRegistry::canonical();
+        let uncovered = reg.uncovered_schemas(&[]);
+        assert!(uncovered.is_empty());
+    }
 }

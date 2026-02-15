@@ -808,4 +808,295 @@ mod tests {
         assert!((deserialized.p_value - 0.001).abs() < f64::EPSILON);
         assert_eq!(deserialized.participating_panes.len(), 3);
     }
+
+    // --- Default & Clone ---
+
+    #[test]
+    fn correlation_config_default_values() {
+        let cfg = CorrelationConfig::default();
+        assert_eq!(cfg.window_ms, 30_000);
+        assert_eq!(cfg.min_observations, 5);
+        assert!((cfg.p_value_threshold - 0.01).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_event_types, 50);
+        assert_eq!(cfg.retention_ms, 300_000);
+        assert_eq!(cfg.max_panes, 250);
+    }
+
+    #[test]
+    fn correlation_config_clone() {
+        let cfg = CorrelationConfig::default();
+        let cfg2 = cfg.clone();
+        assert_eq!(cfg2.window_ms, cfg.window_ms);
+        assert_eq!(cfg2.max_panes, cfg.max_panes);
+    }
+
+    #[test]
+    fn event_record_clone() {
+        let r = EventRecord {
+            pane_id: 1,
+            event_type: "test".to_string(),
+            timestamp_ms: 5000,
+        };
+        let r2 = r.clone();
+        assert_eq!(r2.pane_id, 1);
+        assert_eq!(r2.event_type, "test");
+    }
+
+    #[test]
+    fn chi_squared_result_clone() {
+        let r = ChiSquaredResult {
+            event_a: "a".to_string(),
+            event_b: "b".to_string(),
+            chi_squared: 10.0,
+            p_value: 0.005,
+            observed: 20,
+            expected: 10.0,
+            positive_association: true,
+        };
+        let r2 = r.clone();
+        assert_eq!(r2.event_a, "a");
+        assert!((r2.chi_squared - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn correlation_clone() {
+        let c = Correlation {
+            event_a: "x".to_string(),
+            event_b: "y".to_string(),
+            chi_squared: 5.0,
+            p_value: 0.05,
+            co_occurrence_count: 10,
+            expected_count: 3.0,
+            positive: false,
+            participating_panes: vec![1, 2],
+        };
+        let c2 = c.clone();
+        assert_eq!(c2.participating_panes.len(), 2);
+        assert!(!c2.positive);
+    }
+
+    // --- Debug ---
+
+    #[test]
+    fn correlation_config_debug() {
+        let cfg = CorrelationConfig::default();
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("CorrelationConfig"));
+    }
+
+    #[test]
+    fn event_record_debug() {
+        let r = EventRecord {
+            pane_id: 42,
+            event_type: "test".to_string(),
+            timestamp_ms: 1000,
+        };
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("EventRecord"));
+    }
+
+    #[test]
+    fn chi_squared_result_debug() {
+        let r = ChiSquaredResult {
+            event_a: "a".to_string(),
+            event_b: "b".to_string(),
+            chi_squared: 1.0,
+            p_value: 0.5,
+            observed: 5,
+            expected: 5.0,
+            positive_association: false,
+        };
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("ChiSquaredResult"));
+    }
+
+    #[test]
+    fn co_occurrence_matrix_debug() {
+        let m = CoOccurrenceMatrix::new();
+        let dbg = format!("{:?}", m);
+        assert!(dbg.contains("CoOccurrenceMatrix"));
+    }
+
+    // --- CoOccurrenceMatrix edge cases ---
+
+    #[test]
+    fn marginal_unknown_event_returns_zero() {
+        let m = CoOccurrenceMatrix::new();
+        assert_eq!(m.marginal("nonexistent"), 0);
+    }
+
+    #[test]
+    fn pair_count_unknown_events_returns_zero() {
+        let m = CoOccurrenceMatrix::new();
+        assert_eq!(m.pair_count("a", "b"), 0);
+    }
+
+    #[test]
+    fn pair_count_nonzero_empty() {
+        let m = CoOccurrenceMatrix::new();
+        assert_eq!(m.pair_count_nonzero(), 0);
+    }
+
+    #[test]
+    fn event_type_count_empty() {
+        let m = CoOccurrenceMatrix::new();
+        assert_eq!(m.event_type_count(), 0);
+    }
+
+    #[test]
+    fn pairs_iterator_empty_matrix() {
+        let m = CoOccurrenceMatrix::new();
+        assert_eq!(m.pairs().count(), 0);
+    }
+
+    #[test]
+    fn single_event_no_pairs() {
+        let mut m = CoOccurrenceMatrix::new();
+        m.record_window(&["error".to_string()]);
+        assert_eq!(m.pair_count_nonzero(), 0);
+        assert_eq!(m.marginal("error"), 1);
+        assert_eq!(m.event_type_count(), 1);
+    }
+
+    // --- erfc math edge cases ---
+
+    #[test]
+    fn erfc_at_zero() {
+        let val = erfc(0.0);
+        assert!((val - 1.0).abs() < 0.01, "erfc(0) should be ~1.0, got {val}");
+    }
+
+    #[test]
+    fn erfc_large_positive() {
+        let val = erfc(5.0);
+        assert!(val < 1e-6, "erfc(5) should be very small, got {val}");
+    }
+
+    #[test]
+    fn chi_squared_survival_at_zero() {
+        let val = chi_squared_survival(0.0, 1.0);
+        assert!((val - 1.0).abs() < 0.01, "survival(0, 1) should be ~1.0, got {val}");
+    }
+
+    #[test]
+    fn chi_squared_survival_large_x() {
+        let val = chi_squared_survival(50.0, 1.0);
+        assert!(val < 1e-10, "survival(50,1) should be near zero, got {val}");
+    }
+
+    // --- CorrelationEngine extras ---
+
+    #[test]
+    fn engine_config_accessor() {
+        let cfg = CorrelationConfig {
+            window_ms: 5000,
+            ..CorrelationConfig::default()
+        };
+        let engine = CorrelationEngine::new(cfg);
+        assert_eq!(engine.config().window_ms, 5000);
+    }
+
+    #[test]
+    fn engine_last_scan_ms_initial() {
+        let engine = CorrelationEngine::new(CorrelationConfig::default());
+        assert_eq!(engine.last_scan_ms(), 0);
+    }
+
+    #[test]
+    fn engine_last_scan_ms_updates() {
+        let mut engine = CorrelationEngine::new(CorrelationConfig::default());
+        let _ = engine.scan(42000);
+        assert_eq!(engine.last_scan_ms(), 42000);
+    }
+
+    #[test]
+    fn engine_event_count_empty() {
+        let engine = CorrelationEngine::new(CorrelationConfig::default());
+        assert_eq!(engine.event_count(), 0);
+    }
+
+    #[test]
+    fn engine_event_count_after_ingest() {
+        let mut engine = CorrelationEngine::new(CorrelationConfig::default());
+        engine.ingest(EventRecord {
+            pane_id: 1,
+            event_type: "test".to_string(),
+            timestamp_ms: 1000,
+        });
+        assert_eq!(engine.event_count(), 1);
+    }
+
+    #[test]
+    fn engine_ingest_batch_empty() {
+        let mut engine = CorrelationEngine::new(CorrelationConfig::default());
+        engine.ingest_batch(std::iter::empty());
+        assert_eq!(engine.event_count(), 0);
+    }
+
+    #[test]
+    fn engine_prune_future_clears_all() {
+        let mut engine = CorrelationEngine::new(CorrelationConfig {
+            retention_ms: 1000,
+            ..CorrelationConfig::default()
+        });
+        engine.ingest(EventRecord {
+            pane_id: 1,
+            event_type: "a".to_string(),
+            timestamp_ms: 100,
+        });
+        engine.prune(1_000_000);
+        assert_eq!(engine.event_count(), 0);
+    }
+
+    #[test]
+    fn engine_prune_keeps_recent() {
+        let mut engine = CorrelationEngine::new(CorrelationConfig {
+            retention_ms: 10_000,
+            ..CorrelationConfig::default()
+        });
+        engine.ingest(EventRecord {
+            pane_id: 1,
+            event_type: "a".to_string(),
+            timestamp_ms: 5000,
+        });
+        engine.prune(6000);
+        assert_eq!(engine.event_count(), 1);
+    }
+
+    #[test]
+    fn engine_matrix_empty_before_scan() {
+        let engine = CorrelationEngine::new(CorrelationConfig::default());
+        assert_eq!(engine.matrix().total_windows(), 0);
+    }
+
+    // --- Correlation serde edge cases ---
+
+    #[test]
+    fn correlation_empty_panes_serde() {
+        let c = Correlation {
+            event_a: "a".to_string(),
+            event_b: "b".to_string(),
+            chi_squared: 1.0,
+            p_value: 0.5,
+            co_occurrence_count: 1,
+            expected_count: 1.0,
+            positive: true,
+            participating_panes: vec![],
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let parsed: Correlation = serde_json::from_str(&json).unwrap();
+        assert!(parsed.participating_panes.is_empty());
+    }
+
+    #[test]
+    fn event_record_large_pane_id() {
+        let r = EventRecord {
+            pane_id: u64::MAX,
+            event_type: "test".to_string(),
+            timestamp_ms: 0,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let parsed: EventRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pane_id, u64::MAX);
+    }
 }

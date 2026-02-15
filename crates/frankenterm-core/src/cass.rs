@@ -1044,4 +1044,248 @@ mod tests {
         assert_eq!(summary.output_tokens, None);
         assert_eq!(summary.message_count, 2);
     }
+
+    // ----------------------------------------------------------------
+    // Expanded pure unit tests (wa-1u90p.7.1)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn cass_agent_as_str_all_variants() {
+        assert_eq!(CassAgent::Codex.as_str(), "codex");
+        assert_eq!(CassAgent::ClaudeCode.as_str(), "claude_code");
+        assert_eq!(CassAgent::Gemini.as_str(), "gemini");
+        assert_eq!(CassAgent::Cursor.as_str(), "cursor");
+        assert_eq!(CassAgent::Aider.as_str(), "aider");
+        assert_eq!(CassAgent::ChatGpt.as_str(), "chatgpt");
+    }
+
+    #[test]
+    fn cass_agent_display_matches_as_str() {
+        let variants = [
+            CassAgent::Codex,
+            CassAgent::ClaudeCode,
+            CassAgent::Gemini,
+            CassAgent::Cursor,
+            CassAgent::Aider,
+            CassAgent::ChatGpt,
+        ];
+        for v in variants {
+            assert_eq!(v.to_string(), v.as_str());
+        }
+    }
+
+    #[test]
+    fn cass_agent_clone_and_eq() {
+        let a = CassAgent::Codex;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(CassAgent::Codex, CassAgent::Gemini);
+    }
+
+    #[test]
+    fn cass_agent_debug() {
+        let dbg = format!("{:?}", CassAgent::ClaudeCode);
+        assert!(dbg.contains("ClaudeCode"));
+    }
+
+    #[test]
+    fn cass_search_result_default() {
+        let r = CassSearchResult::default();
+        assert!(r.query.is_none());
+        assert!(r.hits.is_empty());
+        assert!(r.total_matches.is_none());
+        assert!(r.extra.is_empty());
+    }
+
+    #[test]
+    fn cass_search_result_serde_roundtrip() {
+        let r = CassSearchResult {
+            query: Some("error".to_string()),
+            limit: Some(10),
+            count: Some(2),
+            total_matches: Some(5),
+            hits: vec![CassSearchHit {
+                agent: Some("s1".to_string()),
+                score: Some(0.95),
+                ..CassSearchHit::default()
+            }],
+            ..CassSearchResult::default()
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let parsed: CassSearchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.query.as_deref(), Some("error"));
+        assert_eq!(parsed.hits.len(), 1);
+    }
+
+    #[test]
+    fn cass_search_hit_default() {
+        let h = CassSearchHit::default();
+        assert!(h.source_path.is_none());
+        assert!(h.score.is_none());
+    }
+
+    #[test]
+    fn cass_session_default() {
+        let s = CassSession::default();
+        assert!(s.session_id.is_none());
+        assert!(s.messages.is_empty());
+        assert!(s.extra.is_empty());
+    }
+
+    #[test]
+    fn cass_message_default() {
+        let m = CassMessage::default();
+        assert!(m.role.is_none());
+        assert!(m.content.is_none());
+        assert!(m.token_count.is_none());
+    }
+
+    #[test]
+    fn cass_view_result_default() {
+        let v = CassViewResult::default();
+        assert!(v.source_path.is_none());
+        assert!(v.line_number.is_none());
+        assert!(v.context_before.is_none());
+    }
+
+    #[test]
+    fn cass_context_line_default() {
+        let c = CassContextLine::default();
+        assert!(c.line_number.is_none());
+        assert!(c.content.is_none());
+        assert!(c.role.is_none());
+    }
+
+    #[test]
+    fn cass_status_default() {
+        let s = CassStatus::default();
+        assert!(s.healthy.is_none());
+        assert!(s.total_sessions.is_none());
+        assert!(s.stale.is_none());
+    }
+
+    #[test]
+    fn cass_error_display_not_installed() {
+        let err = CassError::NotInstalled;
+        assert!(err.to_string().contains("not installed"));
+    }
+
+    #[test]
+    fn cass_error_display_timeout() {
+        let err = CassError::Timeout { timeout_secs: 30 };
+        assert!(err.to_string().contains("30s"));
+    }
+
+    #[test]
+    fn cass_error_display_non_zero_exit() {
+        let err = CassError::NonZeroExit {
+            status: 1,
+            stderr: "error".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("exit code 1"));
+        assert!(msg.contains("error"));
+    }
+
+    #[test]
+    fn cass_error_display_output_too_large() {
+        let err = CassError::OutputTooLarge {
+            bytes: 2_000_000,
+            max_bytes: 1_000_000,
+        };
+        assert!(err.to_string().contains("1000000"));
+    }
+
+    #[test]
+    fn cass_error_display_invalid_json() {
+        let err = CassError::InvalidJson {
+            message: "bad".to_string(),
+            preview: "...".to_string(),
+        };
+        assert!(err.to_string().contains("invalid JSON"));
+    }
+
+    #[test]
+    fn cass_error_display_no_results() {
+        let err = CassError::NoResults {
+            query: "test".to_string(),
+        };
+        assert!(err.to_string().contains("no results"));
+    }
+
+    #[test]
+    fn cass_error_display_io() {
+        let err = CassError::Io {
+            message: "broken pipe".to_string(),
+        };
+        assert!(err.to_string().contains("broken pipe"));
+    }
+
+    #[test]
+    fn parse_cass_timestamp_ms_epoch_seconds() {
+        // Smaller than 10 billion → treated as seconds
+        let ms = parse_cass_timestamp_ms("1700000000").unwrap();
+        assert_eq!(ms, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn parse_cass_timestamp_ms_epoch_millis() {
+        // Larger than 10 billion → treated as milliseconds
+        let ms = parse_cass_timestamp_ms("1700000000000").unwrap();
+        assert_eq!(ms, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn parse_cass_timestamp_ms_rfc3339() {
+        let ms = parse_cass_timestamp_ms("2026-01-15T12:00:00Z").unwrap();
+        assert!(ms > 0);
+    }
+
+    #[test]
+    fn parse_cass_timestamp_ms_empty() {
+        assert!(parse_cass_timestamp_ms("").is_none());
+    }
+
+    #[test]
+    fn parse_cass_timestamp_ms_whitespace() {
+        assert!(parse_cass_timestamp_ms("   ").is_none());
+    }
+
+    #[test]
+    fn parse_cass_timestamp_ms_garbage() {
+        assert!(parse_cass_timestamp_ms("not-a-timestamp").is_none());
+    }
+
+    #[test]
+    fn classify_role_input_variants() {
+        assert_eq!(classify_role("user"), RoleClass::Input);
+        assert_eq!(classify_role("human"), RoleClass::Input);
+        assert_eq!(classify_role("system"), RoleClass::Input);
+        assert_eq!(classify_role("USER"), RoleClass::Input);
+    }
+
+    #[test]
+    fn classify_role_output_variants() {
+        assert_eq!(classify_role("assistant"), RoleClass::Output);
+        assert_eq!(classify_role("model"), RoleClass::Output);
+        assert_eq!(classify_role("ai"), RoleClass::Output);
+        assert_eq!(classify_role("ASSISTANT"), RoleClass::Output);
+    }
+
+    #[test]
+    fn classify_role_unknown() {
+        assert_eq!(classify_role("tool"), RoleClass::Unknown);
+        assert_eq!(classify_role(""), RoleClass::Unknown);
+        assert_eq!(classify_role("moderator"), RoleClass::Unknown);
+    }
+
+    #[test]
+    fn summarize_session_empty_messages() {
+        let session = CassSession::default();
+        let summary = CassSessionSummary::from_session(&session);
+        assert_eq!(summary.message_count, 0);
+        assert_eq!(summary.total_tokens, None);
+        assert!(summary.first_message_at_ms.is_none());
+        assert!(summary.last_message_at_ms.is_none());
+    }
 }

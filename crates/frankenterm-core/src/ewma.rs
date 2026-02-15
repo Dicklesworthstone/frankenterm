@@ -565,4 +565,203 @@ mod tests {
     fn negative_half_life_panics() {
         let _ = Ewma::with_half_life_ms(-1.0);
     }
+
+    // --- Ewma extras ---
+
+    #[test]
+    fn ewma_clone() {
+        let mut ewma = Ewma::with_half_life_ms(1000.0);
+        ewma.observe(42.0, 0);
+        let ewma2 = ewma.clone();
+        assert!((ewma2.value() - 42.0).abs() < f64::EPSILON);
+        assert_eq!(ewma2.count(), 1);
+    }
+
+    #[test]
+    fn ewma_debug() {
+        let ewma = Ewma::with_half_life_ms(1000.0);
+        let dbg = format!("{:?}", ewma);
+        assert!(dbg.contains("Ewma"));
+    }
+
+    #[test]
+    fn ewma_same_timestamp_observations() {
+        let mut ewma = Ewma::with_half_life_ms(1000.0);
+        ewma.observe(100.0, 0);
+        ewma.observe(200.0, 0); // dt=0 → alpha=0.5
+        // EWMA = 0.5*200 + 0.5*100 = 150
+        assert!((ewma.value() - 150.0).abs() < 0.1, "value={}", ewma.value());
+    }
+
+    #[test]
+    fn ewma_multiple_observations_converge() {
+        let mut ewma = Ewma::with_half_life_ms(100.0);
+        ewma.observe(0.0, 0);
+        // Feed constant value of 50 for many half-lives
+        for i in 1..=100 {
+            ewma.observe(50.0, i * 100);
+        }
+        assert!((ewma.value() - 50.0).abs() < 0.1, "value={}", ewma.value());
+    }
+
+    #[test]
+    fn ewma_half_life_accessor() {
+        let ewma = Ewma::with_half_life_ms(2500.0);
+        assert!((ewma.half_life_ms() - 2500.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ewma_count_increments() {
+        let mut ewma = Ewma::with_half_life_ms(1000.0);
+        assert_eq!(ewma.count(), 0);
+        ewma.observe(1.0, 0);
+        assert_eq!(ewma.count(), 1);
+        ewma.observe(2.0, 100);
+        assert_eq!(ewma.count(), 2);
+        ewma.observe(3.0, 200);
+        assert_eq!(ewma.count(), 3);
+    }
+
+    #[test]
+    fn ewma_very_large_half_life() {
+        let mut ewma = Ewma::with_half_life_ms(1_000_000.0);
+        ewma.observe(0.0, 0);
+        ewma.observe(100.0, 1000);
+        // With such a large half-life, value should barely change from 0
+        assert!(ewma.value() < 5.0, "value={}", ewma.value());
+    }
+
+    // --- EwmaWithVariance extras ---
+
+    #[test]
+    fn variance_clone() {
+        let mut t = EwmaWithVariance::with_half_life_ms(1000.0);
+        t.observe(10.0, 0);
+        t.observe(20.0, 500);
+        let t2 = t.clone();
+        assert!((t2.mean() - t.mean()).abs() < f64::EPSILON);
+        assert!((t2.variance() - t.variance()).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn variance_debug() {
+        let t = EwmaWithVariance::with_half_life_ms(1000.0);
+        let dbg = format!("{:?}", t);
+        assert!(dbg.contains("EwmaWithVariance"));
+    }
+
+    #[test]
+    fn variance_stddev_is_sqrt_of_variance() {
+        let mut t = EwmaWithVariance::with_half_life_ms(1000.0);
+        t.observe(10.0, 0);
+        t.observe(20.0, 500);
+        let expected_stddev = t.variance().sqrt();
+        assert!((t.stddev() - expected_stddev).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn variance_count_matches_observations() {
+        let mut t = EwmaWithVariance::with_half_life_ms(1000.0);
+        assert_eq!(t.count(), 0);
+        t.observe(10.0, 0);
+        assert_eq!(t.count(), 1);
+        t.observe(20.0, 500);
+        assert_eq!(t.count(), 2);
+    }
+
+    #[test]
+    fn z_score_negative_anomaly() {
+        let mut t = EwmaWithVariance::with_half_life_ms(1000.0);
+        for i in 0..20 {
+            t.observe(100.0 + (i % 3) as f64, i * 100);
+        }
+        // Value far below mean
+        let z = t.z_score(-200.0);
+        assert!(z < -3.0, "z={z}, expected < -3.0");
+        assert!(t.is_anomaly(-200.0, 3.0));
+    }
+
+    #[test]
+    fn variance_stabilizes_with_constant_input() {
+        let mut t = EwmaWithVariance::with_half_life_ms(100.0);
+        for i in 0..100 {
+            t.observe(50.0, i * 100);
+        }
+        // Constant input → variance should approach zero
+        assert!(t.variance() < 1.0, "variance={}", t.variance());
+    }
+
+    // --- RateEstimator extras ---
+
+    #[test]
+    fn rate_clone() {
+        let mut r = RateEstimator::with_half_life_ms(1000.0);
+        r.tick(0);
+        r.tick(100);
+        let r2 = r.clone();
+        assert_eq!(r2.total_events(), 2);
+    }
+
+    #[test]
+    fn rate_debug() {
+        let r = RateEstimator::with_half_life_ms(1000.0);
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("RateEstimator"));
+    }
+
+    #[test]
+    fn rate_total_events_counts() {
+        let mut r = RateEstimator::with_half_life_ms(1000.0);
+        for i in 0..5 {
+            r.tick(i * 100);
+        }
+        assert_eq!(r.total_events(), 5);
+    }
+
+    #[test]
+    fn rate_after_reset_zero_events() {
+        let mut r = RateEstimator::with_half_life_ms(1000.0);
+        r.tick(0);
+        r.tick(100);
+        r.tick(200);
+        r.reset();
+        assert_eq!(r.total_events(), 0);
+        assert!(r.rate_per_sec().abs() < f64::EPSILON);
+    }
+
+    // --- EwmaStats extras ---
+
+    #[test]
+    fn ewma_stats_clone() {
+        let mut ewma = Ewma::with_half_life_ms(500.0);
+        ewma.observe(10.0, 0);
+        let s = ewma.stats();
+        let s2 = s.clone();
+        assert!((s.value - s2.value).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ewma_stats_debug() {
+        let s = EwmaStats {
+            value: 1.0,
+            count: 1,
+            half_life_ms: 1000.0,
+        };
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("EwmaStats"));
+    }
+
+    #[test]
+    fn ewma_stats_serde_roundtrip() {
+        let s = EwmaStats {
+            value: 42.5,
+            count: 10,
+            half_life_ms: 2000.0,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: EwmaStats = serde_json::from_str(&json).unwrap();
+        assert!((parsed.value - 42.5).abs() < f64::EPSILON);
+        assert_eq!(parsed.count, 10);
+        assert!((parsed.half_life_ms - 2000.0).abs() < f64::EPSILON);
+    }
 }

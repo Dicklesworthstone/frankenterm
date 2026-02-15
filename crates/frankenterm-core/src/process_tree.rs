@@ -935,4 +935,439 @@ mod tests {
             assert_eq!(parsed, activity);
         }
     }
+
+    // --- ProcessTreeConfig extras ---
+
+    #[test]
+    fn config_clone() {
+        let cfg = ProcessTreeConfig::default();
+        let cfg2 = cfg.clone();
+        assert_eq!(cfg2.max_depth, cfg.max_depth);
+        assert_eq!(cfg2.enabled, cfg.enabled);
+    }
+
+    #[test]
+    fn config_debug() {
+        let cfg = ProcessTreeConfig::default();
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("ProcessTreeConfig"));
+    }
+
+    #[test]
+    fn config_serde_missing_fields_default() {
+        let json = "{}";
+        let cfg: ProcessTreeConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.capture_interval_secs, 30);
+        assert_eq!(cfg.max_depth, 5);
+        assert!(!cfg.include_threads);
+    }
+
+    #[test]
+    fn config_custom_values() {
+        let cfg = ProcessTreeConfig {
+            enabled: false,
+            capture_interval_secs: 60,
+            max_depth: 10,
+            include_threads: true,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: ProcessTreeConfig = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.capture_interval_secs, 60);
+        assert_eq!(parsed.max_depth, 10);
+        assert!(parsed.include_threads);
+    }
+
+    // --- ProcessNode ---
+
+    #[test]
+    fn process_node_leaf_subtree_rss() {
+        let node = ProcessNode {
+            pid: 1,
+            ppid: 0,
+            name: "bash".into(),
+            argv: vec![],
+            state: ProcessState::Running,
+            rss_kb: 5000,
+            children: vec![],
+        };
+        assert_eq!(node.subtree_rss_kb(), 5000);
+    }
+
+    #[test]
+    fn process_node_clone_eq() {
+        let node = ProcessNode {
+            pid: 42,
+            ppid: 1,
+            name: "test".into(),
+            argv: vec!["test".into(), "--flag".into()],
+            state: ProcessState::Sleeping,
+            rss_kb: 1024,
+            children: vec![],
+        };
+        let node2 = node.clone();
+        assert_eq!(node, node2);
+    }
+
+    #[test]
+    fn process_node_debug() {
+        let node = ProcessNode {
+            pid: 1,
+            ppid: 0,
+            name: "bash".into(),
+            argv: vec![],
+            state: ProcessState::Running,
+            rss_kb: 100,
+            children: vec![],
+        };
+        let dbg = format!("{:?}", node);
+        assert!(dbg.contains("ProcessNode"));
+        assert!(dbg.contains("bash"));
+    }
+
+    // --- ProcessTree ---
+
+    #[test]
+    fn tree_clone_eq() {
+        let tree = sample_tree();
+        let tree2 = tree.clone();
+        assert_eq!(tree, tree2);
+    }
+
+    #[test]
+    fn tree_debug() {
+        let tree = sample_tree();
+        let dbg = format!("{:?}", tree);
+        assert!(dbg.contains("ProcessTree"));
+    }
+
+    #[test]
+    fn tree_single_process() {
+        let tree = ProcessTree {
+            root: ProcessNode {
+                pid: 1,
+                ppid: 0,
+                name: "zsh".into(),
+                argv: vec!["-zsh".into()],
+                state: ProcessState::Sleeping,
+                rss_kb: 3000,
+                children: vec![],
+            },
+            total_processes: 1,
+            total_rss_kb: 3000,
+        };
+        assert_eq!(tree.exe_names(), vec!["zsh"]);
+        assert!(tree.contains_process("zsh"));
+        assert!(!tree.contains_process("bash"));
+    }
+
+    #[test]
+    fn exe_names_deduplicated() {
+        let tree = ProcessTree {
+            root: ProcessNode {
+                pid: 1,
+                ppid: 0,
+                name: "bash".into(),
+                argv: vec![],
+                state: ProcessState::Sleeping,
+                rss_kb: 1000,
+                children: vec![
+                    ProcessNode {
+                        pid: 2,
+                        ppid: 1,
+                        name: "cargo".into(),
+                        argv: vec![],
+                        state: ProcessState::Running,
+                        rss_kb: 1000,
+                        children: vec![],
+                    },
+                    ProcessNode {
+                        pid: 3,
+                        ppid: 1,
+                        name: "cargo".into(),
+                        argv: vec![],
+                        state: ProcessState::Running,
+                        rss_kb: 1000,
+                        children: vec![],
+                    },
+                ],
+            },
+            total_processes: 3,
+            total_rss_kb: 3000,
+        };
+        let names = tree.exe_names();
+        assert_eq!(names, vec!["bash", "cargo"]);
+    }
+
+    #[test]
+    fn contains_process_deep_recursive() {
+        let tree = ProcessTree {
+            root: ProcessNode {
+                pid: 1,
+                ppid: 0,
+                name: "bash".into(),
+                argv: vec![],
+                state: ProcessState::Sleeping,
+                rss_kb: 1000,
+                children: vec![ProcessNode {
+                    pid: 2,
+                    ppid: 1,
+                    name: "sh".into(),
+                    argv: vec![],
+                    state: ProcessState::Sleeping,
+                    rss_kb: 500,
+                    children: vec![ProcessNode {
+                        pid: 3,
+                        ppid: 2,
+                        name: "deep-tool".into(),
+                        argv: vec![],
+                        state: ProcessState::Running,
+                        rss_kb: 2000,
+                        children: vec![],
+                    }],
+                }],
+            },
+            total_processes: 3,
+            total_rss_kb: 3500,
+        };
+        assert!(tree.contains_process("deep-tool"));
+        assert!(!tree.contains_process("missing"));
+    }
+
+    // --- ProcessState extras ---
+
+    #[test]
+    fn process_state_display_all_variants() {
+        assert_eq!(format!("{}", ProcessState::Running), "running");
+        assert_eq!(format!("{}", ProcessState::Sleeping), "sleeping");
+        assert_eq!(format!("{}", ProcessState::DiskSleep), "disk_sleep");
+        assert_eq!(format!("{}", ProcessState::Stopped), "stopped");
+        assert_eq!(format!("{}", ProcessState::Zombie), "zombie");
+        assert_eq!(format!("{}", ProcessState::Unknown), "unknown");
+    }
+
+    #[test]
+    fn process_state_copy() {
+        let s = ProcessState::Running;
+        let s2 = s;
+        assert_eq!(s, s2);
+    }
+
+    #[test]
+    fn process_state_debug() {
+        let dbg = format!("{:?}", ProcessState::DiskSleep);
+        assert!(dbg.contains("DiskSleep"));
+    }
+
+    // --- PaneActivity extras ---
+
+    #[test]
+    fn pane_activity_display_all_variants() {
+        assert_eq!(format!("{}", PaneActivity::Idle), "idle");
+        assert_eq!(format!("{}", PaneActivity::Compiling), "compiling");
+        assert_eq!(format!("{}", PaneActivity::Testing), "testing");
+        assert_eq!(format!("{}", PaneActivity::VersionControl), "vcs");
+        assert_eq!(format!("{}", PaneActivity::AgentRunning), "agent");
+        assert_eq!(format!("{}", PaneActivity::Editing), "editing");
+        assert_eq!(format!("{}", PaneActivity::Active), "active");
+    }
+
+    #[test]
+    fn pane_activity_copy() {
+        let a = PaneActivity::Compiling;
+        let a2 = a;
+        assert_eq!(a, a2);
+    }
+
+    #[test]
+    fn pane_activity_debug() {
+        let dbg = format!("{:?}", PaneActivity::AgentRunning);
+        assert!(dbg.contains("AgentRunning"));
+    }
+
+    // --- infer_activity edge cases ---
+
+    #[test]
+    fn infer_codex_is_agent() {
+        let tree = ProcessTree {
+            root: ProcessNode {
+                pid: 1,
+                ppid: 0,
+                name: "bash".into(),
+                argv: vec![],
+                state: ProcessState::Sleeping,
+                rss_kb: 5000,
+                children: vec![ProcessNode {
+                    pid: 2,
+                    ppid: 1,
+                    name: "codex".into(),
+                    argv: vec![],
+                    state: ProcessState::Running,
+                    rss_kb: 50000,
+                    children: vec![],
+                }],
+            },
+            total_processes: 2,
+            total_rss_kb: 55000,
+        };
+        assert_eq!(infer_activity(&tree), PaneActivity::AgentRunning);
+    }
+
+    #[test]
+    fn infer_aider_is_agent() {
+        let tree = ProcessTree {
+            root: ProcessNode {
+                pid: 1,
+                ppid: 0,
+                name: "bash".into(),
+                argv: vec![],
+                state: ProcessState::Sleeping,
+                rss_kb: 5000,
+                children: vec![ProcessNode {
+                    pid: 2,
+                    ppid: 1,
+                    name: "aider".into(),
+                    argv: vec![],
+                    state: ProcessState::Running,
+                    rss_kb: 30000,
+                    children: vec![],
+                }],
+            },
+            total_processes: 2,
+            total_rss_kb: 35000,
+        };
+        assert_eq!(infer_activity(&tree), PaneActivity::AgentRunning);
+    }
+
+    #[test]
+    fn infer_vitest_is_testing() {
+        let tree = ProcessTree {
+            root: ProcessNode {
+                pid: 1,
+                ppid: 0,
+                name: "bash".into(),
+                argv: vec![],
+                state: ProcessState::Sleeping,
+                rss_kb: 5000,
+                children: vec![ProcessNode {
+                    pid: 2,
+                    ppid: 1,
+                    name: "vitest".into(),
+                    argv: vec![],
+                    state: ProcessState::Running,
+                    rss_kb: 20000,
+                    children: vec![],
+                }],
+            },
+            total_processes: 2,
+            total_rss_kb: 25000,
+        };
+        assert_eq!(infer_activity(&tree), PaneActivity::Testing);
+    }
+
+    #[test]
+    fn infer_make_is_compiling() {
+        let tree = ProcessTree {
+            root: ProcessNode {
+                pid: 1,
+                ppid: 0,
+                name: "bash".into(),
+                argv: vec![],
+                state: ProcessState::Sleeping,
+                rss_kb: 5000,
+                children: vec![ProcessNode {
+                    pid: 2,
+                    ppid: 1,
+                    name: "make".into(),
+                    argv: vec![],
+                    state: ProcessState::Running,
+                    rss_kb: 10000,
+                    children: vec![],
+                }],
+            },
+            total_processes: 2,
+            total_rss_kb: 15000,
+        };
+        assert_eq!(infer_activity(&tree), PaneActivity::Compiling);
+    }
+
+    #[test]
+    fn infer_helix_is_editing() {
+        let tree = ProcessTree {
+            root: ProcessNode {
+                pid: 1,
+                ppid: 0,
+                name: "bash".into(),
+                argv: vec![],
+                state: ProcessState::Sleeping,
+                rss_kb: 5000,
+                children: vec![ProcessNode {
+                    pid: 2,
+                    ppid: 1,
+                    name: "hx".into(),
+                    argv: vec![],
+                    state: ProcessState::Running,
+                    rss_kb: 20000,
+                    children: vec![],
+                }],
+            },
+            total_processes: 2,
+            total_rss_kb: 25000,
+        };
+        assert_eq!(infer_activity(&tree), PaneActivity::Editing);
+    }
+
+    #[test]
+    fn infer_hg_is_vcs() {
+        let tree = ProcessTree {
+            root: ProcessNode {
+                pid: 1,
+                ppid: 0,
+                name: "bash".into(),
+                argv: vec![],
+                state: ProcessState::Sleeping,
+                rss_kb: 5000,
+                children: vec![ProcessNode {
+                    pid: 2,
+                    ppid: 1,
+                    name: "hg".into(),
+                    argv: vec!["hg".into(), "commit".into()],
+                    state: ProcessState::Running,
+                    rss_kb: 8000,
+                    children: vec![],
+                }],
+            },
+            total_processes: 2,
+            total_rss_kb: 13000,
+        };
+        assert_eq!(infer_activity(&tree), PaneActivity::VersionControl);
+    }
+
+    // --- count_tree edge cases ---
+
+    #[test]
+    fn count_tree_leaf_only() {
+        let node = ProcessNode {
+            pid: 1,
+            ppid: 0,
+            name: "bash".into(),
+            argv: vec![],
+            state: ProcessState::Sleeping,
+            rss_kb: 7000,
+            children: vec![],
+        };
+        let mut count = 0;
+        let mut rss = 0;
+        count_tree(&node, &mut count, &mut rss);
+        assert_eq!(count, 1);
+        assert_eq!(rss, 7000);
+    }
+
+    #[test]
+    fn subtree_rss_with_children() {
+        let tree = sample_tree();
+        // Root subtree should equal total_rss_kb
+        assert_eq!(tree.root.subtree_rss_kb(), tree.total_rss_kb);
+    }
 }

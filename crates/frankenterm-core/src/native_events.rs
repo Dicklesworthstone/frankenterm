@@ -995,4 +995,361 @@ mod tests {
 
         assert_eq!(outcome, EventDispatchOutcome::Backpressure);
     }
+
+    // --- NativePaneState ---
+
+    #[test]
+    fn native_pane_state_clone() {
+        let s = NativePaneState {
+            title: "test pane".to_string(),
+            rows: 24,
+            cols: 80,
+            is_alt_screen: true,
+            cursor_row: 5,
+            cursor_col: 10,
+        };
+        let s2 = s.clone();
+        assert_eq!(s2.title, "test pane");
+        assert_eq!(s2.rows, 24);
+        assert_eq!(s2.cols, 80);
+        assert!(s2.is_alt_screen);
+    }
+
+    #[test]
+    fn native_pane_state_debug() {
+        let s = NativePaneState {
+            title: "t".to_string(),
+            rows: 1,
+            cols: 1,
+            is_alt_screen: false,
+            cursor_row: 0,
+            cursor_col: 0,
+        };
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("NativePaneState"));
+    }
+
+    #[test]
+    fn native_pane_state_max_values() {
+        let s = NativePaneState {
+            title: "x".repeat(1000),
+            rows: u16::MAX,
+            cols: u16::MAX,
+            is_alt_screen: true,
+            cursor_row: u32::MAX,
+            cursor_col: u32::MAX,
+        };
+        assert_eq!(s.rows, u16::MAX);
+        assert_eq!(s.cursor_row, u32::MAX);
+    }
+
+    // --- NativeEvent variant tests ---
+
+    #[test]
+    fn native_event_clone_pane_output() {
+        let e = NativeEvent::PaneOutput {
+            pane_id: 1,
+            data: vec![65, 66, 67],
+            timestamp_ms: 1000,
+        };
+        let e2 = e.clone();
+        assert!(matches!(e2, NativeEvent::PaneOutput { pane_id: 1, .. }));
+    }
+
+    #[test]
+    fn native_event_clone_state_change() {
+        let e = NativeEvent::StateChange {
+            pane_id: 2,
+            state: NativePaneState {
+                title: "t".to_string(),
+                rows: 24,
+                cols: 80,
+                is_alt_screen: false,
+                cursor_row: 0,
+                cursor_col: 0,
+            },
+            timestamp_ms: 2000,
+        };
+        let e2 = e.clone();
+        assert!(matches!(
+            e2,
+            NativeEvent::StateChange { pane_id: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn native_event_clone_user_var() {
+        let e = NativeEvent::UserVarChanged {
+            pane_id: 3,
+            name: "TERM".to_string(),
+            value: "xterm".to_string(),
+            timestamp_ms: 3000,
+        };
+        let e2 = e.clone();
+        assert!(matches!(
+            e2,
+            NativeEvent::UserVarChanged { pane_id: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn native_event_clone_pane_created() {
+        let e = NativeEvent::PaneCreated {
+            pane_id: 4,
+            domain: "local".to_string(),
+            cwd: Some("/tmp".to_string()),
+            timestamp_ms: 4000,
+        };
+        let e2 = e.clone();
+        assert!(matches!(
+            e2,
+            NativeEvent::PaneCreated { pane_id: 4, .. }
+        ));
+    }
+
+    #[test]
+    fn native_event_clone_pane_destroyed() {
+        let e = NativeEvent::PaneDestroyed {
+            pane_id: 5,
+            timestamp_ms: 5000,
+        };
+        let e2 = e.clone();
+        assert!(matches!(
+            e2,
+            NativeEvent::PaneDestroyed { pane_id: 5, .. }
+        ));
+    }
+
+    #[test]
+    fn native_event_debug_variants() {
+        let events: Vec<NativeEvent> = vec![
+            NativeEvent::PaneOutput {
+                pane_id: 1,
+                data: vec![],
+                timestamp_ms: 0,
+            },
+            NativeEvent::StateChange {
+                pane_id: 2,
+                state: NativePaneState {
+                    title: String::new(),
+                    rows: 0,
+                    cols: 0,
+                    is_alt_screen: false,
+                    cursor_row: 0,
+                    cursor_col: 0,
+                },
+                timestamp_ms: 0,
+            },
+            NativeEvent::UserVarChanged {
+                pane_id: 3,
+                name: String::new(),
+                value: String::new(),
+                timestamp_ms: 0,
+            },
+            NativeEvent::PaneCreated {
+                pane_id: 4,
+                domain: String::new(),
+                cwd: None,
+                timestamp_ms: 0,
+            },
+            NativeEvent::PaneDestroyed {
+                pane_id: 5,
+                timestamp_ms: 0,
+            },
+        ];
+        for e in &events {
+            let dbg = format!("{:?}", e);
+            assert!(!dbg.is_empty());
+        }
+    }
+
+    // --- event_metadata ---
+
+    #[test]
+    fn event_metadata_pane_output() {
+        let e = NativeEvent::PaneOutput {
+            pane_id: 42,
+            data: vec![],
+            timestamp_ms: 0,
+        };
+        let (kind, id) = event_metadata(&e);
+        assert_eq!(kind, "pane_output");
+        assert_eq!(id, 42);
+    }
+
+    #[test]
+    fn event_metadata_state_change() {
+        let e = NativeEvent::StateChange {
+            pane_id: 10,
+            state: NativePaneState {
+                title: String::new(),
+                rows: 0,
+                cols: 0,
+                is_alt_screen: false,
+                cursor_row: 0,
+                cursor_col: 0,
+            },
+            timestamp_ms: 0,
+        };
+        let (kind, id) = event_metadata(&e);
+        assert_eq!(kind, "state_change");
+        assert_eq!(id, 10);
+    }
+
+    #[test]
+    fn event_metadata_user_var_changed() {
+        let e = NativeEvent::UserVarChanged {
+            pane_id: 7,
+            name: "k".to_string(),
+            value: "v".to_string(),
+            timestamp_ms: 0,
+        };
+        let (kind, id) = event_metadata(&e);
+        assert_eq!(kind, "user_var");
+        assert_eq!(id, 7);
+    }
+
+    #[test]
+    fn event_metadata_pane_created() {
+        let e = NativeEvent::PaneCreated {
+            pane_id: 99,
+            domain: "d".to_string(),
+            cwd: None,
+            timestamp_ms: 0,
+        };
+        let (kind, id) = event_metadata(&e);
+        assert_eq!(kind, "pane_created");
+        assert_eq!(id, 99);
+    }
+
+    #[test]
+    fn event_metadata_pane_destroyed() {
+        let e = NativeEvent::PaneDestroyed {
+            pane_id: 55,
+            timestamp_ms: 0,
+        };
+        let (kind, id) = event_metadata(&e);
+        assert_eq!(kind, "pane_destroyed");
+        assert_eq!(id, 55);
+    }
+
+    // --- NativeEventError extras ---
+
+    #[test]
+    fn error_empty_socket_path_exact_message() {
+        let e = NativeEventError::EmptySocketPath;
+        assert_eq!(format!("{e}"), "socket path is empty");
+    }
+
+    #[test]
+    fn error_socket_already_exists_contains_path() {
+        let e = NativeEventError::SocketAlreadyExists("/tmp/test.sock".to_string());
+        let msg = format!("{e}");
+        assert!(msg.contains("/tmp/test.sock"));
+    }
+
+    #[test]
+    fn error_io_permission_denied() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let e = NativeEventError::Io(io_err);
+        let msg = format!("{e}");
+        assert!(msg.contains("denied"));
+    }
+
+    #[test]
+    fn error_debug_all_variants() {
+        let errors: Vec<NativeEventError> = vec![
+            NativeEventError::EmptySocketPath,
+            NativeEventError::SocketAlreadyExists("x".into()),
+            NativeEventError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test")),
+        ];
+        for e in &errors {
+            let dbg = format!("{:?}", e);
+            assert!(!dbg.is_empty());
+        }
+    }
+
+    // --- EventDispatchOutcome ---
+
+    #[test]
+    fn dispatch_outcome_equality() {
+        assert_eq!(EventDispatchOutcome::Sent, EventDispatchOutcome::Sent);
+        assert_ne!(
+            EventDispatchOutcome::Sent,
+            EventDispatchOutcome::Backpressure
+        );
+        assert_ne!(
+            EventDispatchOutcome::Backpressure,
+            EventDispatchOutcome::Closed
+        );
+    }
+
+    #[test]
+    fn dispatch_outcome_copy() {
+        let o = EventDispatchOutcome::Sent;
+        let o2 = o;
+        assert_eq!(o, o2);
+    }
+
+    #[test]
+    fn dispatch_outcome_debug() {
+        let dbg = format!("{:?}", EventDispatchOutcome::Backpressure);
+        assert!(dbg.contains("Backpressure"));
+    }
+
+    // --- decode_wire_event edge cases ---
+
+    #[test]
+    fn decode_user_var_empty_name_value() {
+        let json = r#"{"type":"user_var","pane_id":1,"name":"","value":"","ts":100}"#;
+        let result = decode_wire_event(json).unwrap();
+        assert!(result.is_some());
+        if let Some(NativeEvent::UserVarChanged { name, value, .. }) = result {
+            assert!(name.is_empty());
+            assert!(value.is_empty());
+        }
+    }
+
+    #[test]
+    fn decode_pane_created_empty_domain() {
+        let json = r#"{"type":"pane_created","pane_id":1,"domain":"","ts":100}"#;
+        let result = decode_wire_event(json).unwrap();
+        assert!(result.is_some());
+        if let Some(NativeEvent::PaneCreated { domain, cwd, .. }) = result {
+            assert!(domain.is_empty());
+            assert!(cwd.is_none());
+        }
+    }
+
+    #[test]
+    fn decode_timestamp_zero() {
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"hi");
+        let json = format!(
+            r#"{{"type":"pane_output","pane_id":1,"data_b64":"{}","ts":0}}"#,
+            b64
+        );
+        let result = decode_wire_event(&json).unwrap();
+        assert!(result.is_some());
+        if let Some(NativeEvent::PaneOutput { timestamp_ms, .. }) = result {
+            assert_eq!(timestamp_ms, 0);
+        }
+    }
+
+    // --- Constants validation ---
+
+    #[test]
+    fn constants_are_positive() {
+        assert!(MAX_EVENT_LINE_BYTES > 0);
+        assert!(MAX_OUTPUT_BYTES > 0);
+        assert!(!ACCEPT_POLL_INTERVAL.is_zero());
+        assert!(!EVENT_SEND_TIMEOUT.is_zero());
+    }
+
+    #[test]
+    fn output_bytes_less_than_line_bytes() {
+        assert!(
+            MAX_OUTPUT_BYTES < MAX_EVENT_LINE_BYTES,
+            "MAX_OUTPUT_BYTES should be less than MAX_EVENT_LINE_BYTES"
+        );
+    }
 }
