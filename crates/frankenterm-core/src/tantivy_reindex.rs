@@ -1937,6 +1937,274 @@ mod tests {
         assert_eq!(report.index_matches, 8);
     }
 
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──────────────────────────────────
+
+    #[tokio::test]
+    async fn reindex_dedup_calls_delete_before_add() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        populate_log(
+            &storage,
+            vec![
+                sample_event("e0", 1, 0, "hello"),
+                sample_event("e1", 1, 1, "world"),
+            ],
+        )
+        .await;
+
+        let config = ReindexConfig {
+            data_path: dir.path().join("events.log"),
+            consumer_id: "dedup-test".to_string(),
+            batch_size: 10,
+            dedup_on_replay: true,
+            clear_before_start: true,
+            max_batches: 0,
+            expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+        };
+
+        let mut pipeline = ReindexPipeline::new(MockReindexWriter::new());
+        let progress = pipeline.full_reindex(&storage, &config).await.unwrap();
+        assert_eq!(progress.events_indexed, 2);
+
+        // With dedup_on_replay=true, delete_by_event_id should be called for each doc
+        let deleted = &pipeline.writer().deleted_ids;
+        assert_eq!(deleted.len(), 2);
+        assert!(deleted.contains(&"e0".to_string()));
+        assert!(deleted.contains(&"e1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reindex_no_dedup_skips_delete() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        populate_log(
+            &storage,
+            vec![
+                sample_event("e0", 1, 0, "hello"),
+                sample_event("e1", 1, 1, "world"),
+            ],
+        )
+        .await;
+
+        let config = ReindexConfig {
+            data_path: dir.path().join("events.log"),
+            consumer_id: "nodedup-test".to_string(),
+            batch_size: 10,
+            dedup_on_replay: false,
+            clear_before_start: false,
+            max_batches: 0,
+            expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+        };
+
+        let mut pipeline = ReindexPipeline::new(MockReindexWriter::new());
+        let progress = pipeline.full_reindex(&storage, &config).await.unwrap();
+        assert_eq!(progress.events_indexed, 2);
+
+        // With dedup_on_replay=false, no deletes should be issued
+        assert!(pipeline.writer().deleted_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reindex_commit_failure_propagates() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        populate_log(&storage, vec![sample_event("e0", 1, 0, "text")]).await;
+
+        let config = ReindexConfig {
+            data_path: dir.path().join("events.log"),
+            consumer_id: "fail-commit".to_string(),
+            batch_size: 10,
+            dedup_on_replay: false,
+            clear_before_start: false,
+            max_batches: 0,
+            expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+        };
+
+        let mut writer = MockReindexWriter::new();
+        writer.fail_commit = true;
+        let mut pipeline = ReindexPipeline::new(writer);
+        let err = pipeline.full_reindex(&storage, &config).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn backfill_commit_failure_propagates() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        populate_log(&storage, vec![sample_event("e0", 1, 0, "text")]).await;
+
+        let config = BackfillConfig {
+            data_path: dir.path().join("events.log"),
+            consumer_id: "fail-commit-bf".to_string(),
+            batch_size: 10,
+            range: BackfillRange::All,
+            dedup_on_replay: false,
+            expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            max_batches: 0,
+        };
+
+        let mut writer = MockReindexWriter::new();
+        writer.fail_commit = true;
+        let mut pipeline = ReindexPipeline::new_for_backfill(writer);
+        let err = pipeline.backfill(&storage, &config).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn pipeline_writer_accessor() {
+        let writer = MockReindexWriter::new();
+        let pipeline = ReindexPipeline::new(writer);
+        // writer() returns a reference to the inner writer
+        assert!(!pipeline.writer().cleared);
+        assert_eq!(pipeline.writer().docs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn pipeline_into_writer_consumes() {
+        let writer = MockReindexWriter::new();
+        let pipeline = ReindexPipeline::new(writer);
+        let recovered = pipeline.into_writer();
+        assert_eq!(recovered.commits, 0);
+        assert!(!recovered.cleared);
+    }
+
+    #[tokio::test]
+    async fn pipeline_backfill_writer_accessor() {
+        let writer = MockReindexWriter::new();
+        let pipeline = ReindexPipeline::new_for_backfill(writer);
+        assert_eq!(pipeline.backfill_writer().docs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn reindex_multi_batch_progress_accumulates() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events: Vec<_> = (0..10)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("text-{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        // batch_size=3 means 4 batches (3+3+3+1)
+        let config = ReindexConfig {
+            data_path: dir.path().join("events.log"),
+            consumer_id: "multi-batch".to_string(),
+            batch_size: 3,
+            dedup_on_replay: false,
+            clear_before_start: true,
+            max_batches: 0,
+            expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+        };
+
+        let mut pipeline = ReindexPipeline::new(MockReindexWriter::new());
+        let progress = pipeline.full_reindex(&storage, &config).await.unwrap();
+
+        assert_eq!(progress.events_read, 10);
+        assert_eq!(progress.events_indexed, 10);
+        assert_eq!(progress.batches_committed, 4);
+        assert!(progress.caught_up);
+        assert_eq!(progress.current_ordinal, Some(9));
+    }
+
+    #[tokio::test]
+    async fn integrity_report_with_mixed_issues() {
+        // Test a report that has BOTH missing and mismatched entries
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events: Vec<_> = (0..5)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        // Index: e0 correct, e1 wrong offset, e2 missing, e3 correct, e4 missing
+        let mut lookup = MockIndexLookup::new();
+        lookup.docs.insert("e0".to_string(), 0);
+        lookup.docs.insert("e1".to_string(), 777); // wrong offset
+        // e2 missing
+        lookup.docs.insert("e3".to_string(), 3);
+        // e4 missing
+        lookup.total = 3;
+
+        let config = IntegrityCheckConfig {
+            data_path: dir.path().join("events.log"),
+            ordinal_range: None,
+            max_events: 0,
+            expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+        };
+
+        let report = IntegrityChecker::check(&lookup, &config).unwrap();
+        assert!(!report.is_consistent);
+        assert_eq!(report.index_matches, 3); // e0, e1, e3 found
+        assert_eq!(report.missing_from_index.len(), 2); // e2, e4
+        assert_eq!(report.offset_mismatches.len(), 1); // e1
+        assert_eq!(report.offset_mismatches[0].event_id, "e1");
+        assert_eq!(report.offset_mismatches[0].actual_offset, 777);
+    }
+
+    #[test]
+    fn reindex_progress_equality() {
+        let a = ReindexProgress {
+            events_read: 10,
+            events_indexed: 8,
+            events_skipped: 1,
+            events_filtered: 1,
+            batches_committed: 2,
+            current_ordinal: Some(9),
+            caught_up: true,
+            docs_cleared: 0,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+
+        let c = ReindexProgress::new();
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn integrity_report_serde_with_mismatches() {
+        let report = IntegrityReport {
+            log_events_scanned: 50,
+            index_matches: 48,
+            missing_from_index: vec!["e10".to_string()],
+            offset_mismatches: vec![
+                OffsetMismatch {
+                    event_id: "e5".to_string(),
+                    expected_offset: 5,
+                    actual_offset: 500,
+                },
+                OffsetMismatch {
+                    event_id: "e20".to_string(),
+                    expected_offset: 20,
+                    actual_offset: 2000,
+                },
+            ],
+            is_consistent: false,
+            total_index_docs: Some(48),
+            checked_range: CheckedRange {
+                start_ordinal: 0,
+                end_ordinal: 49,
+                events_checked: 50,
+            },
+        };
+
+        let json = serde_json::to_string(&report).unwrap();
+        let back: IntegrityReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report, back);
+        assert_eq!(back.offset_mismatches.len(), 2);
+        assert_eq!(back.missing_from_index.len(), 1);
+    }
+
     #[tokio::test]
     async fn backfill_then_integrity_check_partial() {
         let dir = tempdir().unwrap();
