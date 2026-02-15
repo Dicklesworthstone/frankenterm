@@ -108,6 +108,7 @@ pub mod ingest;
 #[cfg(unix)]
 pub mod ipc;
 pub mod kalman_watchdog;
+pub mod latency_model;
 pub mod learn;
 pub mod lock;
 pub mod logging;
