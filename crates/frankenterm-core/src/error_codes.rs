@@ -1396,4 +1396,414 @@ mod tests {
         let codes = list_error_codes();
         assert_eq!(codes.len(), ERROR_CATALOG.len());
     }
+
+    // =========================================================================
+    // ErrorCategory — trait coverage
+    // =========================================================================
+
+    #[test]
+    fn error_category_copy_and_clone() {
+        let cat = ErrorCategory::Wezterm;
+        let cloned = cat.clone();
+        let copied = cat; // Copy
+        assert_eq!(cat, cloned);
+        assert_eq!(cat, copied);
+    }
+
+    #[test]
+    fn error_category_debug() {
+        let dbg = format!("{:?}", ErrorCategory::Storage);
+        assert_eq!(dbg, "Storage");
+    }
+
+    #[test]
+    fn error_category_hash_distinct() {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+
+        let categories = [
+            ErrorCategory::Wezterm,
+            ErrorCategory::Storage,
+            ErrorCategory::Pattern,
+            ErrorCategory::Policy,
+            ErrorCategory::Workflow,
+            ErrorCategory::Network,
+            ErrorCategory::Config,
+            ErrorCategory::Internal,
+        ];
+        let mut hashes = std::collections::HashSet::new();
+        for cat in &categories {
+            let mut hasher = DefaultHasher::new();
+            cat.hash(&mut hasher);
+            hashes.insert(hasher.finish());
+        }
+        // All categories should have distinct hashes (with very high probability)
+        assert_eq!(hashes.len(), categories.len());
+    }
+
+    #[test]
+    fn error_category_eq_and_ne() {
+        assert_eq!(ErrorCategory::Wezterm, ErrorCategory::Wezterm);
+        assert_ne!(ErrorCategory::Wezterm, ErrorCategory::Storage);
+        assert_ne!(ErrorCategory::Config, ErrorCategory::Internal);
+    }
+
+    // =========================================================================
+    // ErrorCategory::from_code — gap coverage
+    // =========================================================================
+
+    #[test]
+    fn from_code_in_gap_between_config_and_internal() {
+        // 8000-8999 is between Config (7xxx) and Internal (9xxx)
+        assert_eq!(ErrorCategory::from_code("FT-8000"), None);
+        assert_eq!(ErrorCategory::from_code("FT-8500"), None);
+        assert_eq!(ErrorCategory::from_code("FT-8999"), None);
+    }
+
+    #[test]
+    fn from_code_all_categories_at_start() {
+        assert_eq!(ErrorCategory::from_code("FT-1000"), Some(ErrorCategory::Wezterm));
+        assert_eq!(ErrorCategory::from_code("FT-2000"), Some(ErrorCategory::Storage));
+        assert_eq!(ErrorCategory::from_code("FT-3000"), Some(ErrorCategory::Pattern));
+        assert_eq!(ErrorCategory::from_code("FT-4000"), Some(ErrorCategory::Policy));
+        assert_eq!(ErrorCategory::from_code("FT-5000"), Some(ErrorCategory::Workflow));
+        assert_eq!(ErrorCategory::from_code("FT-6000"), Some(ErrorCategory::Network));
+        assert_eq!(ErrorCategory::from_code("FT-7000"), Some(ErrorCategory::Config));
+        assert_eq!(ErrorCategory::from_code("FT-9000"), Some(ErrorCategory::Internal));
+    }
+
+    #[test]
+    fn from_code_all_categories_at_end() {
+        assert_eq!(ErrorCategory::from_code("FT-1999"), Some(ErrorCategory::Wezterm));
+        assert_eq!(ErrorCategory::from_code("FT-2999"), Some(ErrorCategory::Storage));
+        assert_eq!(ErrorCategory::from_code("FT-3999"), Some(ErrorCategory::Pattern));
+        assert_eq!(ErrorCategory::from_code("FT-4999"), Some(ErrorCategory::Policy));
+        assert_eq!(ErrorCategory::from_code("FT-5999"), Some(ErrorCategory::Workflow));
+        assert_eq!(ErrorCategory::from_code("FT-6999"), Some(ErrorCategory::Network));
+        assert_eq!(ErrorCategory::from_code("FT-7999"), Some(ErrorCategory::Config));
+        assert_eq!(ErrorCategory::from_code("FT-9999"), Some(ErrorCategory::Internal));
+    }
+
+    // =========================================================================
+    // ErrorCategory — serde edge cases
+    // =========================================================================
+
+    #[test]
+    fn error_category_serde_all_variants_snake_case() {
+        let expected = [
+            (ErrorCategory::Wezterm, "\"wezterm\""),
+            (ErrorCategory::Storage, "\"storage\""),
+            (ErrorCategory::Pattern, "\"pattern\""),
+            (ErrorCategory::Policy, "\"policy\""),
+            (ErrorCategory::Workflow, "\"workflow\""),
+            (ErrorCategory::Network, "\"network\""),
+            (ErrorCategory::Config, "\"config\""),
+            (ErrorCategory::Internal, "\"internal\""),
+        ];
+        for (cat, json_str) in &expected {
+            assert_eq!(
+                serde_json::to_string(cat).unwrap(),
+                *json_str,
+                "serde mismatch for {:?}",
+                cat
+            );
+        }
+    }
+
+    #[test]
+    fn error_category_deserialize_from_string() {
+        let cat: ErrorCategory = serde_json::from_str("\"storage\"").unwrap();
+        assert_eq!(cat, ErrorCategory::Storage);
+    }
+
+    #[test]
+    fn error_category_deserialize_unknown_fails() {
+        let result = serde_json::from_str::<ErrorCategory>("\"nonexistent\"");
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // RecoveryStep — trait and serde coverage
+    // =========================================================================
+
+    #[test]
+    fn recovery_step_clone() {
+        let step = RecoveryStep::with_command("desc", "cmd");
+        let cloned = step.clone();
+        assert_eq!(cloned.description.as_ref(), "desc");
+        assert_eq!(cloned.command.as_deref(), Some("cmd"));
+    }
+
+    #[test]
+    fn recovery_step_debug() {
+        let step = RecoveryStep::text("some step");
+        let dbg = format!("{step:?}");
+        assert!(dbg.contains("RecoveryStep"));
+        assert!(dbg.contains("some step"));
+    }
+
+    #[test]
+    fn recovery_step_text_serde_roundtrip() {
+        let step = RecoveryStep::text("Check permissions");
+        let json = serde_json::to_string(&step).unwrap();
+        assert!(json.contains("\"command\":null") || !json.contains("\"command\""));
+        let back: RecoveryStep = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.description.as_ref(), "Check permissions");
+        assert!(back.command.is_none());
+    }
+
+    // =========================================================================
+    // ErrorCodeDef — clone and format_plain details
+    // =========================================================================
+
+    #[test]
+    fn error_code_def_clone() {
+        let def = FT_1001.clone();
+        assert_eq!(def.code, "FT-1001");
+        assert_eq!(def.category, ErrorCategory::Wezterm);
+        assert_eq!(def.title, FT_1001.title);
+    }
+
+    #[test]
+    fn error_code_def_debug() {
+        let dbg = format!("{:?}", FT_1001);
+        assert!(dbg.contains("ErrorCodeDef"));
+        assert!(dbg.contains("FT-1001"));
+    }
+
+    #[test]
+    fn format_plain_with_doc_link() {
+        let def = get_error_code("FT-1001").unwrap();
+        assert!(def.doc_link.is_some());
+        let formatted = def.format_plain();
+        assert!(formatted.contains("Learn more:"));
+        assert!(formatted.contains(def.doc_link.unwrap()));
+    }
+
+    #[test]
+    fn format_plain_without_doc_link() {
+        let def = get_error_code("FT-1002").unwrap();
+        assert!(def.doc_link.is_none());
+        let formatted = def.format_plain();
+        assert!(!formatted.contains("Learn more:"));
+    }
+
+    #[test]
+    fn format_plain_recovery_steps_numbered() {
+        let def = get_error_code("FT-1001").unwrap();
+        let formatted = def.format_plain();
+        // Steps should be numbered 1, 2, 3...
+        for (i, _step) in def.recovery_steps.iter().enumerate() {
+            let prefix = format!("  {}. ", i + 1);
+            assert!(
+                formatted.contains(&prefix),
+                "Missing numbered step prefix '{}'",
+                prefix
+            );
+        }
+    }
+
+    #[test]
+    fn format_plain_commands_prefixed_with_dollar() {
+        let def = get_error_code("FT-1001").unwrap();
+        let formatted = def.format_plain();
+        for step in def.recovery_steps {
+            if let Some(cmd) = &step.command {
+                let expected = format!("$ {}", cmd);
+                assert!(
+                    formatted.contains(&expected),
+                    "Missing '$ {}' in output",
+                    cmd
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // Catalog integrity — additional checks
+    // =========================================================================
+
+    #[test]
+    fn all_codes_start_with_ft_prefix() {
+        for code in list_error_codes() {
+            assert!(
+                code.starts_with("FT-"),
+                "Code {} does not start with FT-",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_has_expected_minimum_size() {
+        // We know there are 30+ defined error codes
+        assert!(ERROR_CATALOG.len() >= 30, "Catalog unexpectedly small: {}", ERROR_CATALOG.len());
+    }
+
+    #[test]
+    fn category_count_wezterm() {
+        let codes = list_codes_by_category(ErrorCategory::Wezterm);
+        assert!(codes.len() >= 5, "Expected at least 5 Wezterm codes, got {}", codes.len());
+    }
+
+    #[test]
+    fn category_count_storage() {
+        let codes = list_codes_by_category(ErrorCategory::Storage);
+        assert!(codes.len() >= 5, "Expected at least 5 Storage codes, got {}", codes.len());
+    }
+
+    #[test]
+    fn category_count_policy() {
+        let codes = list_codes_by_category(ErrorCategory::Policy);
+        assert!(codes.len() >= 4, "Expected at least 4 Policy codes, got {}", codes.len());
+    }
+
+    #[test]
+    fn category_count_workflow() {
+        let codes = list_codes_by_category(ErrorCategory::Workflow);
+        assert!(codes.len() >= 4, "Expected at least 4 Workflow codes, got {}", codes.len());
+    }
+
+    #[test]
+    fn category_count_internal() {
+        let codes = list_codes_by_category(ErrorCategory::Internal);
+        assert!(codes.len() >= 3, "Expected at least 3 Internal codes, got {}", codes.len());
+    }
+
+    // =========================================================================
+    // Specific error code spot-checks
+    // =========================================================================
+
+    #[test]
+    fn ft_1001_definition() {
+        let def = get_error_code("FT-1001").unwrap();
+        assert_eq!(def.category, ErrorCategory::Wezterm);
+        assert!(def.title.contains("not found"));
+        assert!(def.description.contains("PATH"));
+        assert!(def.causes.len() >= 2);
+        assert!(def.recovery_steps.len() >= 2);
+    }
+
+    #[test]
+    fn ft_2001_definition() {
+        let def = get_error_code("FT-2001").unwrap();
+        assert_eq!(def.category, ErrorCategory::Storage);
+        assert!(def.title.contains("Database"));
+        assert!(def.causes.iter().any(|c| c.contains("permission") || c.contains("disk")));
+    }
+
+    #[test]
+    fn ft_4001_definition() {
+        let def = get_error_code("FT-4001").unwrap();
+        assert_eq!(def.category, ErrorCategory::Policy);
+        assert!(def.title.contains("alternate screen"));
+        assert!(def.causes.iter().any(|c| c.contains("vim") || c.contains("editor")));
+    }
+
+    #[test]
+    fn ft_9001_definition() {
+        let def = get_error_code("FT-9001").unwrap();
+        assert_eq!(def.category, ErrorCategory::Internal);
+        assert!(def.title.contains("Internal"));
+        assert!(def.doc_link.is_some());
+    }
+
+    // =========================================================================
+    // get_error_code edge cases
+    // =========================================================================
+
+    #[test]
+    fn get_error_code_empty_string() {
+        assert!(get_error_code("").is_none());
+    }
+
+    #[test]
+    fn get_error_code_wrong_prefix() {
+        assert!(get_error_code("WA-1001").is_none());
+        assert!(get_error_code("XX-1001").is_none());
+    }
+
+    #[test]
+    fn get_error_code_valid_format_not_registered() {
+        // FT-1500 is valid format but not registered
+        assert!(get_error_code("FT-1500").is_none());
+    }
+
+    // =========================================================================
+    // list_codes_by_category — empty category edge case
+    // =========================================================================
+
+    #[test]
+    fn list_codes_by_category_all_results_match_category() {
+        let all_categories = [
+            ErrorCategory::Wezterm,
+            ErrorCategory::Storage,
+            ErrorCategory::Pattern,
+            ErrorCategory::Policy,
+            ErrorCategory::Workflow,
+            ErrorCategory::Network,
+            ErrorCategory::Config,
+            ErrorCategory::Internal,
+        ];
+        for cat in all_categories {
+            let codes = list_codes_by_category(cat);
+            for def in &codes {
+                assert_eq!(
+                    def.category, cat,
+                    "Code {} has wrong category",
+                    def.code
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn list_codes_by_category_sum_equals_total() {
+        let all_categories = [
+            ErrorCategory::Wezterm,
+            ErrorCategory::Storage,
+            ErrorCategory::Pattern,
+            ErrorCategory::Policy,
+            ErrorCategory::Workflow,
+            ErrorCategory::Network,
+            ErrorCategory::Config,
+            ErrorCategory::Internal,
+        ];
+        let total: usize = all_categories
+            .iter()
+            .map(|cat| list_codes_by_category(*cat).len())
+            .sum();
+        assert_eq!(total, ERROR_CATALOG.len(), "Category sums should equal total catalog size");
+    }
+
+    // =========================================================================
+    // Range coverage — all 8 category ranges
+    // =========================================================================
+
+    #[test]
+    fn category_range_all_values() {
+        assert_eq!(ErrorCategory::Pattern.range(), (3000, 3999));
+        assert_eq!(ErrorCategory::Policy.range(), (4000, 4999));
+        assert_eq!(ErrorCategory::Workflow.range(), (5000, 5999));
+        assert_eq!(ErrorCategory::Network.range(), (6000, 6999));
+        assert_eq!(ErrorCategory::Config.range(), (7000, 7999));
+    }
+
+    #[test]
+    fn each_range_spans_1000() {
+        let categories = [
+            ErrorCategory::Wezterm,
+            ErrorCategory::Storage,
+            ErrorCategory::Pattern,
+            ErrorCategory::Policy,
+            ErrorCategory::Workflow,
+            ErrorCategory::Network,
+            ErrorCategory::Config,
+            ErrorCategory::Internal,
+        ];
+        for cat in &categories {
+            let (lo, hi) = cat.range();
+            assert_eq!(hi - lo, 999, "{:?} range is not 1000 wide", cat);
+        }
+    }
 }
