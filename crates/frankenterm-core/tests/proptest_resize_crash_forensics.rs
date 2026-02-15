@@ -540,3 +540,83 @@ proptest! {
         prop_assert_eq!(s.total_storm_throttled, 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Additional property tests for coverage
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// InFlightTransaction Clone preserves all fields.
+    #[test]
+    fn prop_in_flight_clone(txn in arb_in_flight()) {
+        let cloned = txn.clone();
+        prop_assert_eq!(txn, cloned);
+    }
+
+    /// PolicyDecision Clone preserves all fields.
+    #[test]
+    fn prop_policy_decision_clone(d in arb_policy_decision()) {
+        let cloned = d.clone();
+        prop_assert_eq!(d, cloned);
+    }
+
+    /// ResizeQueueDepths Clone preserves all fields.
+    #[test]
+    fn prop_queue_depths_clone(d in arb_queue_depths()) {
+        let cloned = d.clone();
+        prop_assert_eq!(d, cloned);
+    }
+
+    /// StormState Clone preserves all fields.
+    #[test]
+    fn prop_storm_state_clone(s in arb_storm_state()) {
+        let cloned = s.clone();
+        prop_assert_eq!(s, cloned);
+    }
+
+    /// DomainBudgetEntry Clone preserves all fields.
+    #[test]
+    fn prop_domain_budget_clone(e in arb_domain_budget_entry()) {
+        let cloned = e.clone();
+        prop_assert_eq!(e, cloned);
+    }
+
+    /// InFlightTransaction Debug output is non-empty.
+    #[test]
+    fn prop_in_flight_debug_nonempty(txn in arb_in_flight()) {
+        let dbg = format!("{:?}", txn);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// PolicyDecision Debug output is non-empty.
+    #[test]
+    fn prop_policy_decision_debug_nonempty(d in arb_policy_decision()) {
+        let dbg = format!("{:?}", d);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// InFlightTransaction serde is deterministic.
+    #[test]
+    fn prop_in_flight_serde_deterministic(txn in arb_in_flight()) {
+        let j1 = serde_json::to_string(&txn).unwrap();
+        let j2 = serde_json::to_string(&txn).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// ResizeCrashContext Debug output is non-empty.
+    #[test]
+    fn prop_context_debug_nonempty(ts in 0_u64..100000, gate in arb_gate()) {
+        let ctx = ResizeCrashContextBuilder::new(ts).gate(gate).build();
+        let dbg = format!("{:?}", ctx);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// PolicyDecisionKind Debug output is non-empty.
+    #[test]
+    fn prop_policy_kind_debug_nonempty(kind in arb_policy_kind()) {
+        let dbg = format!("{:?}", kind);
+        prop_assert!(!dbg.is_empty());
+    }
+}

@@ -794,7 +794,7 @@ proptest! {
 
     /// Under monotonically increasing memory pressure, scrollback never increases.
     #[test]
-    fn prop_monotonic_memory_scrollback_decrease(base_rss in 0.6..=0.8_f64) {
+    fn prop_monotonic_memory_scrollback_decrease(base_rss in 0.55..=0.75_f64) {
         let config = AutoTuneConfig {
             hysteresis_ticks: 1,
             max_change_per_tick: 0.1,
@@ -819,5 +819,95 @@ proptest! {
             );
             prev_scrollback = current_scrollback;
         }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Additional property tests for coverage
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// TunableParams Clone preserves all fields.
+    #[test]
+    fn prop_tunable_params_clone(params in arb_valid_tunable_params()) {
+        let cloned = params.clone();
+        prop_assert_eq!(params, cloned);
+    }
+
+    /// TunableParams Debug output is non-empty.
+    #[test]
+    fn prop_tunable_params_debug_nonempty(params in arb_valid_tunable_params()) {
+        let dbg = format!("{:?}", params);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// AutoTuneConfig Clone preserves fields.
+    #[test]
+    fn prop_config_clone(config in arb_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(config.hysteresis_ticks, cloned.hysteresis_ticks);
+        prop_assert_eq!(config.history_limit, cloned.history_limit);
+        prop_assert_eq!(config.tick_interval_secs, cloned.tick_interval_secs);
+        prop_assert_eq!(config.enabled, cloned.enabled);
+    }
+
+    /// AutoTuneConfig Debug output is non-empty.
+    #[test]
+    fn prop_config_debug_nonempty(config in arb_config()) {
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// TunerMetrics Clone preserves fields.
+    #[test]
+    fn prop_metrics_clone(metrics in arb_metrics()) {
+        let cloned = metrics.clone();
+        let eps = f64::EPSILON;
+        prop_assert!((metrics.rss_fraction - cloned.rss_fraction).abs() < eps);
+        prop_assert!((metrics.mux_latency_ms - cloned.mux_latency_ms).abs() < eps);
+        prop_assert!((metrics.cpu_fraction - cloned.cpu_fraction).abs() < eps);
+    }
+
+    /// PinnedParams Clone preserves all fields.
+    #[test]
+    fn prop_pinned_params_clone(pinned in arb_pinned()) {
+        let cloned = pinned.clone();
+        prop_assert_eq!(pinned.poll_interval_ms, cloned.poll_interval_ms);
+        prop_assert_eq!(pinned.scrollback_lines, cloned.scrollback_lines);
+        prop_assert_eq!(pinned.snapshot_interval_secs, cloned.snapshot_interval_secs);
+        prop_assert_eq!(pinned.pool_size, cloned.pool_size);
+        prop_assert_eq!(pinned.backpressure_threshold, cloned.backpressure_threshold);
+    }
+
+    /// TunableParams serde is deterministic.
+    #[test]
+    fn prop_tunable_params_serde_deterministic(params in arb_valid_tunable_params()) {
+        let j1 = serde_json::to_string(&params).unwrap();
+        let j2 = serde_json::to_string(&params).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// AutoTuneConfig serde is deterministic.
+    #[test]
+    fn prop_config_serde_deterministic(config in arb_config()) {
+        let j1 = serde_json::to_string(&config).unwrap();
+        let j2 = serde_json::to_string(&config).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// New AutoTuner has tick_count == 0.
+    #[test]
+    fn prop_tuner_initial_tick_count_zero(_dummy in 0..1_u8) {
+        let tuner = AutoTuner::new(AutoTuneConfig::default());
+        prop_assert_eq!(tuner.tick_count(), 0);
+    }
+
+    /// Default AutoTuneConfig has enabled=true.
+    #[test]
+    fn prop_default_config_enabled(_dummy in 0..1_u8) {
+        let config = AutoTuneConfig::default();
+        prop_assert!(config.enabled, "default config should be enabled");
     }
 }

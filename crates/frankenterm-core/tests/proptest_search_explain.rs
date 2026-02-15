@@ -777,6 +777,105 @@ proptest! {
 // Unit: healthy context produces no reasons
 // =============================================================================
 
+// =============================================================================
+// Additional property tests for coverage
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// SearchExplainResult serde is deterministic.
+    #[test]
+    fn prop_result_serde_deterministic(ctx in arb_search_context()) {
+        let result = explain_search(&ctx);
+        let j1 = serde_json::to_string(&result).unwrap();
+        let j2 = serde_json::to_string(&result).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// SearchExplainResult Debug output is non-empty.
+    #[test]
+    fn prop_result_debug_nonempty(ctx in arb_search_context()) {
+        let result = explain_search(&ctx);
+        let dbg = format!("{:?}", result);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// SearchExplainResult JSON is a valid object.
+    #[test]
+    fn prop_result_json_valid_object(ctx in arb_search_context()) {
+        let result = explain_search(&ctx);
+        let json = serde_json::to_string(&result).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+    }
+
+    /// All reason codes are uppercase with underscores.
+    #[test]
+    fn prop_reason_codes_uppercase(ctx in arb_search_context()) {
+        let result = explain_search(&ctx);
+        for reason in &result.reasons {
+            prop_assert!(
+                reason.code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "reason code '{}' should be uppercase with underscores", reason.code
+            );
+        }
+    }
+
+    /// PaneExplainInfo Clone preserves all fields.
+    #[test]
+    fn prop_pane_explain_clone(item in arb_pane_explain_info(1_700_000_000_000)) {
+        let cloned = item.clone();
+        prop_assert_eq!(cloned.pane_id, item.pane_id);
+        prop_assert_eq!(cloned.observed, item.observed);
+        prop_assert_eq!(cloned.ignore_reason, item.ignore_reason);
+        prop_assert_eq!(cloned.domain, item.domain);
+    }
+
+    /// GapInfo Clone preserves all fields.
+    #[test]
+    fn prop_gap_info_clone(gap in arb_gap_info(1_700_000_000_000)) {
+        let cloned = gap.clone();
+        prop_assert_eq!(cloned.pane_id, gap.pane_id);
+        prop_assert_eq!(cloned.seq_before, gap.seq_before);
+        prop_assert_eq!(cloned.seq_after, gap.seq_after);
+        prop_assert_eq!(cloned.reason, gap.reason);
+    }
+
+    /// PaneIndexingInfo Clone preserves all fields.
+    #[test]
+    fn prop_pane_indexing_clone(info in arb_pane_indexing_info(1_700_000_000_000)) {
+        let cloned = info.clone();
+        prop_assert_eq!(cloned.pane_id, info.pane_id);
+        prop_assert_eq!(cloned.segment_count, info.segment_count);
+        prop_assert_eq!(cloned.total_bytes, info.total_bytes);
+        prop_assert_eq!(cloned.fts_consistent, info.fts_consistent);
+    }
+
+    /// PaneExplainInfo Debug output is non-empty.
+    #[test]
+    fn prop_pane_explain_debug_nonempty(item in arb_pane_explain_info(1_700_000_000_000)) {
+        let dbg = format!("{:?}", item);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// GapInfo Debug output is non-empty.
+    #[test]
+    fn prop_gap_info_debug_nonempty(gap in arb_gap_info(1_700_000_000_000)) {
+        let dbg = format!("{:?}", gap);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// observed_panes count matches panes with observed=true.
+    #[test]
+    fn prop_observed_count_matches_panes(ctx in arb_search_context()) {
+        let result = explain_search(&ctx);
+        let counted = ctx.panes.iter().filter(|p| p.observed).count();
+        prop_assert_eq!(result.observed_panes, counted,
+            "observed_panes {} != counted {}", result.observed_panes, counted);
+    }
+}
+
 #[test]
 fn healthy_context_no_reasons() {
     let now_ms = 1_700_000_000_000_i64;
