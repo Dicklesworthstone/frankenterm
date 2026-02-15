@@ -478,7 +478,11 @@ fn correlator_new_and_default() {
 
 #[test]
 fn detection_source_debug_nonempty() {
-    for src in [DetectionSource::PatternEngine, DetectionSource::PaneTitle, DetectionSource::ProcessName] {
+    for src in [
+        DetectionSource::PatternEngine,
+        DetectionSource::PaneTitle,
+        DetectionSource::ProcessName,
+    ] {
         let debug = format!("{:?}", src);
         assert!(!debug.is_empty());
     }
@@ -493,7 +497,11 @@ fn detection_source_clone_preserves() {
 
 #[test]
 fn detection_source_serde_roundtrip() {
-    for src in [DetectionSource::PatternEngine, DetectionSource::PaneTitle, DetectionSource::ProcessName] {
+    for src in [
+        DetectionSource::PatternEngine,
+        DetectionSource::PaneTitle,
+        DetectionSource::ProcessName,
+    ] {
         let json = serde_json::to_string(&src).unwrap();
         let back: DetectionSource = serde_json::from_str(&json).unwrap();
         assert_eq!(back, src);

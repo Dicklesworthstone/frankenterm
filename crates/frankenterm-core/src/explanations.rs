@@ -884,7 +884,10 @@ mod tests {
     #[test]
     fn list_templates_by_category_unknown_returns_empty() {
         let unknown = list_templates_by_category("nonexistent");
-        assert!(unknown.is_empty(), "Unknown category should return empty vec");
+        assert!(
+            unknown.is_empty(),
+            "Unknown category should return empty vec"
+        );
     }
 
     #[test]
@@ -1029,10 +1032,7 @@ mod tests {
     fn template_serializes_to_json() {
         let json = serde_json::to_value(&DENY_ALT_SCREEN).unwrap();
         assert_eq!(json["id"], "deny.alt_screen");
-        assert_eq!(
-            json["scenario"],
-            "Send denied because alt-screen is active"
-        );
+        assert_eq!(json["scenario"], "Send denied because alt-screen is active");
         assert!(json["brief"].as_str().unwrap().contains("full-screen"));
         assert!(json["suggestions"].is_array());
         assert!(json["see_also"].is_array());
@@ -1161,7 +1161,10 @@ mod tests {
             see_also: &[],
         };
         let mut ctx = HashMap::new();
-        ctx.insert("msg".to_string(), "can't parse <xml> & \"json\"".to_string());
+        ctx.insert(
+            "msg".to_string(),
+            "can't parse <xml> & \"json\"".to_string(),
+        );
 
         let rendered = render_explanation(&template, &ctx);
         assert_eq!(rendered, "Error: can't parse <xml> & \"json\"");

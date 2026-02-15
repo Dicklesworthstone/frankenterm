@@ -1234,12 +1234,8 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
 
-        let skip1 = LaunchAction::Skip {
-            reason: "x".into(),
-        };
-        let skip2 = LaunchAction::Skip {
-            reason: "y".into(),
-        };
+        let skip1 = LaunchAction::Skip { reason: "x".into() };
+        let skip2 = LaunchAction::Skip { reason: "y".into() };
         assert_ne!(skip1, skip2);
     }
 
@@ -1321,9 +1317,7 @@ mod tests {
             results: vec![LaunchResult {
                 old_pane_id: 1,
                 new_pane_id: 10,
-                action: LaunchAction::Skip {
-                    reason: "r".into(),
-                },
+                action: LaunchAction::Skip { reason: "r".into() },
                 success: true,
                 error: None,
             }],
@@ -1346,15 +1340,15 @@ mod tests {
 
     #[test]
     fn normalize_cwd_bare_path() {
-        assert_eq!(normalize_cwd("/usr/local/bin"), PathBuf::from("/usr/local/bin"));
+        assert_eq!(
+            normalize_cwd("/usr/local/bin"),
+            PathBuf::from("/usr/local/bin")
+        );
     }
 
     #[test]
     fn normalize_cwd_file_triple_slash() {
-        assert_eq!(
-            normalize_cwd("file:///var/log"),
-            PathBuf::from("/var/log")
-        );
+        assert_eq!(normalize_cwd("file:///var/log"), PathBuf::from("/var/log"));
     }
 
     #[test]
@@ -1406,16 +1400,16 @@ mod tests {
 
     #[test]
     fn percent_decode_multiple_sequences() {
-        assert_eq!(
-            percent_decode("a%20b%20c%20d"),
-            "a b c d"
-        );
+        assert_eq!(percent_decode("a%20b%20c%20d"), "a b c d");
     }
 
     #[test]
     fn percent_decode_special_chars() {
         // %23 = '#', %26 = '&', %3D = '='
-        assert_eq!(percent_decode("key%3Dvalue%26other%23tag"), "key=value&other#tag");
+        assert_eq!(
+            percent_decode("key%3Dvalue%26other%23tag"),
+            "key=value&other#tag"
+        );
     }
 
     #[test]
@@ -1511,7 +1505,11 @@ mod tests {
             "bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "nu", "nushell",
         ];
         for shell in &shells {
-            assert!(is_shell(shell), "expected {} to be detected as shell", shell);
+            assert!(
+                is_shell(shell),
+                "expected {} to be detected as shell",
+                shell
+            );
         }
     }
 
@@ -1541,9 +1539,9 @@ mod tests {
     #[test]
     fn is_interactive_all_recognized_programs() {
         let programs = [
-            "vim", "nvim", "vi", "nano", "emacs", "helix", "hx", "htop", "btop", "top",
-            "less", "more", "man", "tmux", "screen", "python", "python3", "ipython", "node",
-            "irb", "ghci", "psql", "mysql", "sqlite3",
+            "vim", "nvim", "vi", "nano", "emacs", "helix", "hx", "htop", "btop", "top", "less",
+            "more", "man", "tmux", "screen", "python", "python3", "ipython", "node", "irb", "ghci",
+            "psql", "mysql", "sqlite3",
         ];
         for prog in &programs {
             assert!(
@@ -1576,7 +1574,10 @@ mod tests {
 
     #[test]
     fn agent_type_all_recognized_names() {
-        assert_eq!(agent_type_from_process_name("claude"), AgentType::ClaudeCode);
+        assert_eq!(
+            agent_type_from_process_name("claude"),
+            AgentType::ClaudeCode
+        );
         assert_eq!(
             agent_type_from_process_name("claude-code"),
             AgentType::ClaudeCode

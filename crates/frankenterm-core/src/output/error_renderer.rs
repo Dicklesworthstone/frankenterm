@@ -432,9 +432,7 @@ mod tests {
             "FT-1020"
         );
         assert_eq!(
-            ErrorRenderer::error_code(&Error::Wezterm(WeztermError::ParseError(
-                "bad".to_string()
-            ))),
+            ErrorRenderer::error_code(&Error::Wezterm(WeztermError::ParseError("bad".to_string()))),
             "FT-1021"
         );
         assert_eq!(

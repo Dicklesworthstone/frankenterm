@@ -1027,52 +1027,76 @@ mod tests {
 
     #[test]
     fn pattern_error_display() {
-        assert!(PatternError::InvalidRule("bad rule".to_string())
-            .to_string()
-            .contains("bad rule"));
-        assert!(PatternError::InvalidRegex("bad regex".to_string())
-            .to_string()
-            .contains("bad regex"));
-        assert!(PatternError::PackNotFound("core".to_string())
-            .to_string()
-            .contains("core"));
+        assert!(
+            PatternError::InvalidRule("bad rule".to_string())
+                .to_string()
+                .contains("bad rule")
+        );
+        assert!(
+            PatternError::InvalidRegex("bad regex".to_string())
+                .to_string()
+                .contains("bad regex")
+        );
+        assert!(
+            PatternError::PackNotFound("core".to_string())
+                .to_string()
+                .contains("core")
+        );
         assert!(PatternError::MatchTimeout.to_string().contains("timeout"));
     }
 
     #[test]
     fn workflow_error_display() {
-        assert!(WorkflowError::NotFound("flow1".to_string())
-            .to_string()
-            .contains("flow1"));
-        assert!(WorkflowError::Aborted("reason".to_string())
-            .to_string()
-            .contains("reason"));
-        assert!(WorkflowError::GuardFailed("precondition".to_string())
-            .to_string()
-            .contains("precondition"));
+        assert!(
+            WorkflowError::NotFound("flow1".to_string())
+                .to_string()
+                .contains("flow1")
+        );
+        assert!(
+            WorkflowError::Aborted("reason".to_string())
+                .to_string()
+                .contains("reason")
+        );
+        assert!(
+            WorkflowError::GuardFailed("precondition".to_string())
+                .to_string()
+                .contains("precondition")
+        );
         assert!(WorkflowError::PaneLocked.to_string().contains("locked"));
     }
 
     #[test]
     fn config_error_display() {
-        assert!(ConfigError::FileNotFound("ft.toml".to_string())
-            .to_string()
-            .contains("ft.toml"));
-        assert!(ConfigError::ReadFailed("path".to_string(), "err".to_string())
-            .to_string()
-            .contains("path"));
-        assert!(ConfigError::ParseError("syntax".to_string())
-            .to_string()
-            .contains("syntax"));
-        assert!(ConfigError::ParseFailed("toml".to_string())
-            .to_string()
-            .contains("toml"));
-        assert!(ConfigError::SerializeFailed("err".to_string())
-            .to_string()
-            .contains("err"));
-        assert!(ConfigError::ValidationError("invalid".to_string())
-            .to_string()
-            .contains("invalid"));
+        assert!(
+            ConfigError::FileNotFound("ft.toml".to_string())
+                .to_string()
+                .contains("ft.toml")
+        );
+        assert!(
+            ConfigError::ReadFailed("path".to_string(), "err".to_string())
+                .to_string()
+                .contains("path")
+        );
+        assert!(
+            ConfigError::ParseError("syntax".to_string())
+                .to_string()
+                .contains("syntax")
+        );
+        assert!(
+            ConfigError::ParseFailed("toml".to_string())
+                .to_string()
+                .contains("toml")
+        );
+        assert!(
+            ConfigError::SerializeFailed("err".to_string())
+                .to_string()
+                .contains("err")
+        );
+        assert!(
+            ConfigError::ValidationError("invalid".to_string())
+                .to_string()
+                .contains("invalid")
+        );
     }
 
     #[test]

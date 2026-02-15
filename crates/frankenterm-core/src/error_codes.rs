@@ -1418,8 +1418,8 @@ mod tests {
 
     #[test]
     fn error_category_hash_distinct() {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let categories = [
             ErrorCategory::Wezterm,
@@ -1462,26 +1462,74 @@ mod tests {
 
     #[test]
     fn from_code_all_categories_at_start() {
-        assert_eq!(ErrorCategory::from_code("FT-1000"), Some(ErrorCategory::Wezterm));
-        assert_eq!(ErrorCategory::from_code("FT-2000"), Some(ErrorCategory::Storage));
-        assert_eq!(ErrorCategory::from_code("FT-3000"), Some(ErrorCategory::Pattern));
-        assert_eq!(ErrorCategory::from_code("FT-4000"), Some(ErrorCategory::Policy));
-        assert_eq!(ErrorCategory::from_code("FT-5000"), Some(ErrorCategory::Workflow));
-        assert_eq!(ErrorCategory::from_code("FT-6000"), Some(ErrorCategory::Network));
-        assert_eq!(ErrorCategory::from_code("FT-7000"), Some(ErrorCategory::Config));
-        assert_eq!(ErrorCategory::from_code("FT-9000"), Some(ErrorCategory::Internal));
+        assert_eq!(
+            ErrorCategory::from_code("FT-1000"),
+            Some(ErrorCategory::Wezterm)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-2000"),
+            Some(ErrorCategory::Storage)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-3000"),
+            Some(ErrorCategory::Pattern)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-4000"),
+            Some(ErrorCategory::Policy)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-5000"),
+            Some(ErrorCategory::Workflow)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-6000"),
+            Some(ErrorCategory::Network)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-7000"),
+            Some(ErrorCategory::Config)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-9000"),
+            Some(ErrorCategory::Internal)
+        );
     }
 
     #[test]
     fn from_code_all_categories_at_end() {
-        assert_eq!(ErrorCategory::from_code("FT-1999"), Some(ErrorCategory::Wezterm));
-        assert_eq!(ErrorCategory::from_code("FT-2999"), Some(ErrorCategory::Storage));
-        assert_eq!(ErrorCategory::from_code("FT-3999"), Some(ErrorCategory::Pattern));
-        assert_eq!(ErrorCategory::from_code("FT-4999"), Some(ErrorCategory::Policy));
-        assert_eq!(ErrorCategory::from_code("FT-5999"), Some(ErrorCategory::Workflow));
-        assert_eq!(ErrorCategory::from_code("FT-6999"), Some(ErrorCategory::Network));
-        assert_eq!(ErrorCategory::from_code("FT-7999"), Some(ErrorCategory::Config));
-        assert_eq!(ErrorCategory::from_code("FT-9999"), Some(ErrorCategory::Internal));
+        assert_eq!(
+            ErrorCategory::from_code("FT-1999"),
+            Some(ErrorCategory::Wezterm)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-2999"),
+            Some(ErrorCategory::Storage)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-3999"),
+            Some(ErrorCategory::Pattern)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-4999"),
+            Some(ErrorCategory::Policy)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-5999"),
+            Some(ErrorCategory::Workflow)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-6999"),
+            Some(ErrorCategory::Network)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-7999"),
+            Some(ErrorCategory::Config)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-9999"),
+            Some(ErrorCategory::Internal)
+        );
     }
 
     // =========================================================================
@@ -1637,37 +1685,61 @@ mod tests {
     #[test]
     fn catalog_has_expected_minimum_size() {
         // We know there are 30+ defined error codes
-        assert!(ERROR_CATALOG.len() >= 30, "Catalog unexpectedly small: {}", ERROR_CATALOG.len());
+        assert!(
+            ERROR_CATALOG.len() >= 30,
+            "Catalog unexpectedly small: {}",
+            ERROR_CATALOG.len()
+        );
     }
 
     #[test]
     fn category_count_wezterm() {
         let codes = list_codes_by_category(ErrorCategory::Wezterm);
-        assert!(codes.len() >= 5, "Expected at least 5 Wezterm codes, got {}", codes.len());
+        assert!(
+            codes.len() >= 5,
+            "Expected at least 5 Wezterm codes, got {}",
+            codes.len()
+        );
     }
 
     #[test]
     fn category_count_storage() {
         let codes = list_codes_by_category(ErrorCategory::Storage);
-        assert!(codes.len() >= 5, "Expected at least 5 Storage codes, got {}", codes.len());
+        assert!(
+            codes.len() >= 5,
+            "Expected at least 5 Storage codes, got {}",
+            codes.len()
+        );
     }
 
     #[test]
     fn category_count_policy() {
         let codes = list_codes_by_category(ErrorCategory::Policy);
-        assert!(codes.len() >= 4, "Expected at least 4 Policy codes, got {}", codes.len());
+        assert!(
+            codes.len() >= 4,
+            "Expected at least 4 Policy codes, got {}",
+            codes.len()
+        );
     }
 
     #[test]
     fn category_count_workflow() {
         let codes = list_codes_by_category(ErrorCategory::Workflow);
-        assert!(codes.len() >= 4, "Expected at least 4 Workflow codes, got {}", codes.len());
+        assert!(
+            codes.len() >= 4,
+            "Expected at least 4 Workflow codes, got {}",
+            codes.len()
+        );
     }
 
     #[test]
     fn category_count_internal() {
         let codes = list_codes_by_category(ErrorCategory::Internal);
-        assert!(codes.len() >= 3, "Expected at least 3 Internal codes, got {}", codes.len());
+        assert!(
+            codes.len() >= 3,
+            "Expected at least 3 Internal codes, got {}",
+            codes.len()
+        );
     }
 
     // =========================================================================
@@ -1689,7 +1761,11 @@ mod tests {
         let def = get_error_code("FT-2001").unwrap();
         assert_eq!(def.category, ErrorCategory::Storage);
         assert!(def.title.contains("Database"));
-        assert!(def.causes.iter().any(|c| c.contains("permission") || c.contains("disk")));
+        assert!(
+            def.causes
+                .iter()
+                .any(|c| c.contains("permission") || c.contains("disk"))
+        );
     }
 
     #[test]
@@ -1697,7 +1773,11 @@ mod tests {
         let def = get_error_code("FT-4001").unwrap();
         assert_eq!(def.category, ErrorCategory::Policy);
         assert!(def.title.contains("alternate screen"));
-        assert!(def.causes.iter().any(|c| c.contains("vim") || c.contains("editor")));
+        assert!(
+            def.causes
+                .iter()
+                .any(|c| c.contains("vim") || c.contains("editor"))
+        );
     }
 
     #[test]
@@ -1748,11 +1828,7 @@ mod tests {
         for cat in all_categories {
             let codes = list_codes_by_category(cat);
             for def in &codes {
-                assert_eq!(
-                    def.category, cat,
-                    "Code {} has wrong category",
-                    def.code
-                );
+                assert_eq!(def.category, cat, "Code {} has wrong category", def.code);
             }
         }
     }
@@ -1773,7 +1849,11 @@ mod tests {
             .iter()
             .map(|cat| list_codes_by_category(*cat).len())
             .sum();
-        assert_eq!(total, ERROR_CATALOG.len(), "Category sums should equal total catalog size");
+        assert_eq!(
+            total,
+            ERROR_CATALOG.len(),
+            "Category sums should equal total catalog size"
+        );
     }
 
     // =========================================================================

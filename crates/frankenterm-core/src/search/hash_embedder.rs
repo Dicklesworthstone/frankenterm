@@ -340,10 +340,7 @@ mod tests {
         let emb = HashEmbedder::new(64).with_ngram_range(2, 5);
         let emb2 = emb.clone();
         // Both should produce the same embedding
-        assert_eq!(
-            emb.embed("test").unwrap(),
-            emb2.embed("test").unwrap()
-        );
+        assert_eq!(emb.embed("test").unwrap(), emb2.embed("test").unwrap());
     }
 
     #[test]

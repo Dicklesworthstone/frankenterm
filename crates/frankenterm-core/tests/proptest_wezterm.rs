@@ -564,7 +564,13 @@ fn cwd_parse_host_only() {
 
 #[test]
 fn pane_size_debug_nonempty() {
-    let size = PaneSize { rows: 24, cols: 80, pixel_width: None, pixel_height: None, dpi: None };
+    let size = PaneSize {
+        rows: 24,
+        cols: 80,
+        pixel_width: None,
+        pixel_height: None,
+        dpi: None,
+    };
     let debug = format!("{:?}", size);
     assert!(!debug.is_empty());
 }

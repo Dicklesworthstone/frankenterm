@@ -5304,8 +5304,7 @@ retention_tiers = []
 
     #[test]
     fn validate_compaction_prompt_all_tokens() {
-        let template =
-            "{{agent_type}} {{pane_id}} {{pane_domain}} {{pane_title}} {{pane_cwd}}";
+        let template = "{{agent_type}} {{pane_id}} {{pane_domain}} {{pane_title}} {{pane_cwd}}";
         assert!(validate_compaction_prompt_template(template).is_ok());
     }
 
@@ -5338,8 +5337,7 @@ retention_tiers = []
 
     #[test]
     fn extract_prompt_placeholders_multiple() {
-        let result =
-            extract_prompt_placeholders("{{agent_type}} and {{pane_id}}").unwrap();
+        let result = extract_prompt_placeholders("{{agent_type}} and {{pane_id}}").unwrap();
         assert_eq!(result, vec!["agent_type", "pane_id"]);
     }
 
@@ -5463,28 +5461,22 @@ retention_tiers = []
 
     #[test]
     fn resolve_workspace_root_with_explicit_path() {
-        let result = resolve_workspace_root_with_env(
-            Some(Path::new("/tmp/test-workspace")),
-            None,
-        )
-        .unwrap();
+        let result =
+            resolve_workspace_root_with_env(Some(Path::new("/tmp/test-workspace")), None).unwrap();
         assert_eq!(result, PathBuf::from("/tmp/test-workspace"));
     }
 
     #[test]
     fn resolve_workspace_root_with_env_path() {
-        let result =
-            resolve_workspace_root_with_env(None, Some("/tmp/env-workspace")).unwrap();
+        let result = resolve_workspace_root_with_env(None, Some("/tmp/env-workspace")).unwrap();
         assert_eq!(result, PathBuf::from("/tmp/env-workspace"));
     }
 
     #[test]
     fn resolve_workspace_root_explicit_overrides_env() {
-        let result = resolve_workspace_root_with_env(
-            Some(Path::new("/tmp/explicit")),
-            Some("/tmp/env"),
-        )
-        .unwrap();
+        let result =
+            resolve_workspace_root_with_env(Some(Path::new("/tmp/explicit")), Some("/tmp/env"))
+                .unwrap();
         assert_eq!(result, PathBuf::from("/tmp/explicit"));
     }
 

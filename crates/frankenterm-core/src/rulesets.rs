@@ -680,7 +680,10 @@ mod tests {
         assert_eq!(back.version, RULESET_MANIFEST_VERSION);
         assert_eq!(back.rulesets.len(), 1);
         assert_eq!(back.rulesets[0].name, "ci-ops");
-        assert_eq!(back.rulesets[0].description.as_deref(), Some("CI operations profile"));
+        assert_eq!(
+            back.rulesets[0].description.as_deref(),
+            Some("CI operations profile")
+        );
     }
 
     #[test]
@@ -830,7 +833,10 @@ mod tests {
 
         touch_last_applied(&mut manifest, "ops", "ops.toml", 300);
 
-        assert_eq!(manifest.rulesets[0].description.as_deref(), Some("Operations profile"));
+        assert_eq!(
+            manifest.rulesets[0].description.as_deref(),
+            Some("Operations profile")
+        );
     }
 
     // =========================================================================
@@ -946,7 +952,11 @@ mod tests {
         let result = patch.apply_to(&base);
         let pack_a = result.pack_overrides.get("pack-a").unwrap();
         // rule-2 should not be duplicated
-        let rule2_count = pack_a.disabled_rules.iter().filter(|r| *r == "rule-2").count();
+        let rule2_count = pack_a
+            .disabled_rules
+            .iter()
+            .filter(|r| *r == "rule-2")
+            .count();
         assert_eq!(rule2_count, 1);
         assert!(pack_a.disabled_rules.contains(&"rule-1".to_string()));
         assert!(pack_a.disabled_rules.contains(&"rule-3".to_string()));
@@ -1060,7 +1070,10 @@ mod tests {
     fn resolve_rulesets_dir_with_config_path() {
         let config_path = std::path::Path::new("/home/user/.config/ft/ft.toml");
         let dir = resolve_rulesets_dir(Some(config_path));
-        assert_eq!(dir, std::path::PathBuf::from("/home/user/.config/ft/rulesets"));
+        assert_eq!(
+            dir,
+            std::path::PathBuf::from("/home/user/.config/ft/rulesets")
+        );
     }
 
     #[test]

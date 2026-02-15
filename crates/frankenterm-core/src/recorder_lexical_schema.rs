@@ -729,7 +729,10 @@ mod tests {
     #[test]
     fn terminal_token_pattern_is_valid_regex() {
         let regex = regex::Regex::new(TERMINAL_TOKEN_PATTERN);
-        assert!(regex.is_ok(), "TERMINAL_TOKEN_PATTERN should be valid regex");
+        assert!(
+            regex.is_ok(),
+            "TERMINAL_TOKEN_PATTERN should be valid regex"
+        );
     }
 
     #[test]
@@ -798,11 +801,7 @@ mod tests {
             h.details_json,
         ];
         let unique: std::collections::HashSet<_> = all_fields.iter().collect();
-        assert_eq!(
-            unique.len(),
-            25,
-            "All 25 field handles should be distinct"
-        );
+        assert_eq!(unique.len(), 25, "All 25 field handles should be distinct");
     }
 
     // =========================================================================
@@ -812,16 +811,28 @@ mod tests {
     #[test]
     fn all_handles_match_schema_fields() {
         let (schema, h) = build_lexical_schema_v1();
-        assert_eq!(h.schema_version, schema.get_field("schema_version").unwrap());
+        assert_eq!(
+            h.schema_version,
+            schema.get_field("schema_version").unwrap()
+        );
         assert_eq!(
             h.lexical_schema_version,
             schema.get_field("lexical_schema_version").unwrap()
         );
         assert_eq!(h.session_id, schema.get_field("session_id").unwrap());
         assert_eq!(h.workflow_id, schema.get_field("workflow_id").unwrap());
-        assert_eq!(h.correlation_id, schema.get_field("correlation_id").unwrap());
-        assert_eq!(h.parent_event_id, schema.get_field("parent_event_id").unwrap());
-        assert_eq!(h.trigger_event_id, schema.get_field("trigger_event_id").unwrap());
+        assert_eq!(
+            h.correlation_id,
+            schema.get_field("correlation_id").unwrap()
+        );
+        assert_eq!(
+            h.parent_event_id,
+            schema.get_field("parent_event_id").unwrap()
+        );
+        assert_eq!(
+            h.trigger_event_id,
+            schema.get_field("trigger_event_id").unwrap()
+        );
         assert_eq!(h.root_event_id, schema.get_field("root_event_id").unwrap());
         assert_eq!(h.source, schema.get_field("source").unwrap());
         assert_eq!(h.event_type, schema.get_field("event_type").unwrap());
@@ -831,10 +842,19 @@ mod tests {
             h.control_marker_type,
             schema.get_field("control_marker_type").unwrap()
         );
-        assert_eq!(h.lifecycle_phase, schema.get_field("lifecycle_phase").unwrap());
+        assert_eq!(
+            h.lifecycle_phase,
+            schema.get_field("lifecycle_phase").unwrap()
+        );
         assert_eq!(h.redaction, schema.get_field("redaction").unwrap());
-        assert_eq!(h.occurred_at_ms, schema.get_field("occurred_at_ms").unwrap());
-        assert_eq!(h.recorded_at_ms, schema.get_field("recorded_at_ms").unwrap());
+        assert_eq!(
+            h.occurred_at_ms,
+            schema.get_field("occurred_at_ms").unwrap()
+        );
+        assert_eq!(
+            h.recorded_at_ms,
+            schema.get_field("recorded_at_ms").unwrap()
+        );
         assert_eq!(h.sequence, schema.get_field("sequence").unwrap());
         assert_eq!(h.log_offset, schema.get_field("log_offset").unwrap());
         assert_eq!(h.text_symbols, schema.get_field("text_symbols").unwrap());
@@ -869,7 +889,10 @@ mod tests {
     fn fingerprint_is_lowercase_hex() {
         let (schema, _) = build_lexical_schema_v1();
         let fp = schema_fingerprint(&schema);
-        assert!(fp.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(
+            fp.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        );
     }
 
     // =========================================================================
@@ -1019,10 +1042,7 @@ mod tests {
         let index = Index::create_in_ram(schema);
         register_tokenizers(&index);
 
-        let mut tokenizer = index
-            .tokenizers()
-            .get(TOKENIZER_TERMINAL_SYMBOLS)
-            .unwrap();
+        let mut tokenizer = index.tokenizers().get(TOKENIZER_TERMINAL_SYMBOLS).unwrap();
         let mut stream = tokenizer.token_stream("FooBar");
         let mut tokens = Vec::new();
         while stream.advance() {

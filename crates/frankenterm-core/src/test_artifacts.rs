@@ -475,7 +475,10 @@ mod tests {
         let err = manifest.validate().unwrap_err();
         assert!(matches!(
             err,
-            TestArtifactSchemaError::NegativeTiming { field: "reflow_ms", .. }
+            TestArtifactSchemaError::NegativeTiming {
+                field: "reflow_ms",
+                ..
+            }
         ));
     }
 
@@ -486,7 +489,10 @@ mod tests {
         let err = manifest.validate().unwrap_err();
         assert!(matches!(
             err,
-            TestArtifactSchemaError::NegativeTiming { field: "queue_wait_ms", .. }
+            TestArtifactSchemaError::NegativeTiming {
+                field: "queue_wait_ms",
+                ..
+            }
         ));
     }
 
@@ -882,8 +888,7 @@ mod tests {
 
     #[test]
     fn schema_error_is_std_error() {
-        let err: Box<dyn std::error::Error> =
-            Box::new(TestArtifactSchemaError::MissingRunId);
+        let err: Box<dyn std::error::Error> = Box::new(TestArtifactSchemaError::MissingRunId);
         assert!(err.to_string().contains("run_id"));
     }
 

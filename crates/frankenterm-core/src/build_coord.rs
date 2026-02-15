@@ -825,10 +825,7 @@ mod tests {
             Some(PathBuf::from("/custom/target"))
         );
         assert_eq!(back.auto_sccache, false);
-        assert_eq!(
-            back.lock_dir_override,
-            Some(PathBuf::from("/custom/locks"))
-        );
+        assert_eq!(back.lock_dir_override, Some(PathBuf::from("/custom/locks")));
     }
 
     #[test]

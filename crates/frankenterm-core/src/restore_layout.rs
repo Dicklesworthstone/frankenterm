@@ -985,7 +985,10 @@ mod tests {
 
     #[test]
     fn normalize_cwd_file_uri_with_spaces() {
-        assert_eq!(normalize_cwd("file:///home/my user/project"), "/home/my user/project");
+        assert_eq!(
+            normalize_cwd("file:///home/my user/project"),
+            "/home/my user/project"
+        );
     }
 
     #[test]
@@ -1026,10 +1029,7 @@ mod tests {
 
     #[test]
     fn shell_escape_multiple_single_quotes() {
-        assert_eq!(
-            shell_escape("it's a 'test'"),
-            "'it'\\''s a '\\''test'\\'''",
-        );
+        assert_eq!(shell_escape("it's a 'test'"), "'it'\\''s a '\\''test'\\'''",);
     }
 
     #[test]
@@ -1065,10 +1065,7 @@ mod tests {
             1.0,
             vsplit(vec![(
                 1.0,
-                hsplit(vec![(
-                    1.0,
-                    vsplit(vec![(1.0, leaf(99, None))]),
-                )]),
+                hsplit(vec![(1.0, vsplit(vec![(1.0, leaf(99, None))]))]),
             )]),
         )]);
         assert_eq!(collect_leaf_ids(&tree), vec![99]);
@@ -1079,7 +1076,10 @@ mod tests {
         // Left-to-right, depth-first traversal order
         let tree = vsplit(vec![
             (0.33, leaf(5, None)),
-            (0.33, hsplit(vec![(0.5, leaf(3, None)), (0.5, leaf(7, None))])),
+            (
+                0.33,
+                hsplit(vec![(0.5, leaf(3, None)), (0.5, leaf(7, None))]),
+            ),
             (0.34, leaf(1, None)),
         ]);
         assert_eq!(collect_leaf_ids(&tree), vec![5, 3, 7, 1]);
@@ -1152,7 +1152,10 @@ mod tests {
             1.0,
             hsplit(vec![
                 (0.5, leaf(1, None)),
-                (0.5, vsplit(vec![(0.5, leaf(2, None)), (0.5, leaf(3, None))])),
+                (
+                    0.5,
+                    vsplit(vec![(0.5, leaf(2, None)), (0.5, leaf(3, None))]),
+                ),
             ]),
         )]);
         assert_eq!(count_leaves(&tree), 3);
@@ -1205,10 +1208,7 @@ mod tests {
                     tabs: vec![TabSnapshot {
                         tab_id: 2,
                         title: None,
-                        pane_tree: hsplit(vec![
-                            (0.5, leaf(4, None)),
-                            (0.5, leaf(5, None)),
-                        ]),
+                        pane_tree: hsplit(vec![(0.5, leaf(4, None)), (0.5, leaf(5, None))]),
                         active_pane_id: None,
                     }],
                     active_tab_index: None,

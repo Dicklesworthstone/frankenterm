@@ -2292,10 +2292,7 @@ alias ll='ls -la'
 
     #[test]
     fn strip_inline_comment_hash_after_quoted_value() {
-        assert_eq!(
-            strip_inline_comment(r#""value" # comment"#),
-            r#""value" "#
-        );
+        assert_eq!(strip_inline_comment(r#""value" # comment"#), r#""value" "#);
     }
 
     #[test]
@@ -2406,10 +2403,7 @@ alias ll='ls -la'
 
     #[test]
     fn redact_identity_path_absolute() {
-        assert_eq!(
-            redact_identity_path("/home/user/.ssh/id_rsa"),
-            ".../id_rsa"
-        );
+        assert_eq!(redact_identity_path("/home/user/.ssh/id_rsa"), ".../id_rsa");
     }
 
     #[test]
@@ -2628,10 +2622,7 @@ alias ll='ls -la'
         let input = "Host myhost\n  HostName=server.example.com\n  User=deploy\n";
         let hosts = parse_ssh_config(input);
         assert_eq!(hosts.len(), 1);
-        assert_eq!(
-            hosts[0].hostname.as_deref(),
-            Some("server.example.com")
-        );
+        assert_eq!(hosts[0].hostname.as_deref(), Some("server.example.com"));
         assert_eq!(hosts[0].user.as_deref(), Some("deploy"));
     }
 
@@ -2640,10 +2631,7 @@ alias ll='ls -la'
         let input = "Host myhost\n  HostName \"server.example.com\"\n  User 'deploy'\n";
         let hosts = parse_ssh_config(input);
         assert_eq!(hosts.len(), 1);
-        assert_eq!(
-            hosts[0].hostname.as_deref(),
-            Some("server.example.com")
-        );
+        assert_eq!(hosts[0].hostname.as_deref(), Some("server.example.com"));
         assert_eq!(hosts[0].user.as_deref(), Some("deploy"));
     }
 
@@ -2668,10 +2656,7 @@ alias ll='ls -la'
         let input = "Host myhost\n  HOSTNAME server.example.com\n  USER admin\n  PORT 2222\n";
         let hosts = parse_ssh_config(input);
         assert_eq!(hosts.len(), 1);
-        assert_eq!(
-            hosts[0].hostname.as_deref(),
-            Some("server.example.com")
-        );
+        assert_eq!(hosts[0].hostname.as_deref(), Some("server.example.com"));
         assert_eq!(hosts[0].user.as_deref(), Some("admin"));
         assert_eq!(hosts[0].port, Some(2222));
     }
@@ -2691,14 +2676,8 @@ alias ll='ls -la'
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[0].alias, "alpha");
         assert_eq!(hosts[1].alias, "beta");
-        assert_eq!(
-            hosts[0].hostname.as_deref(),
-            Some("shared.example.com")
-        );
-        assert_eq!(
-            hosts[1].hostname.as_deref(),
-            Some("shared.example.com")
-        );
+        assert_eq!(hosts[0].hostname.as_deref(), Some("shared.example.com"));
+        assert_eq!(hosts[1].hostname.as_deref(), Some("shared.example.com"));
     }
 
     #[test]

@@ -1476,11 +1476,9 @@ mod tests {
         let mut g = DataflowGraph::new();
         let a = g.add_source("src_a", Value::Int(10));
         let b = g.add_source("src_b", Value::Int(20));
-        let _c = g.add_combine("sum", vec![a, b], |inputs| {
-            match (&inputs[0], &inputs[1]) {
-                (Value::Int(x), Value::Int(y)) => Value::Int(x + y),
-                _ => Value::None,
-            }
+        let _c = g.add_combine("sum", vec![a, b], |inputs| match (&inputs[0], &inputs[1]) {
+            (Value::Int(x), Value::Int(y)) => Value::Int(x + y),
+            _ => Value::None,
         });
         g.propagate();
 
@@ -1878,11 +1876,9 @@ mod tests {
             Value::Int(v) => Value::Int(v * 3),
             _ => Value::None,
         });
-        let c = g.add_combine("c", vec![a, b], |inputs| {
-            match (&inputs[0], &inputs[1]) {
-                (Value::Int(x), Value::Int(y)) => Value::Int(x + y),
-                _ => Value::None,
-            }
+        let c = g.add_combine("c", vec![a, b], |inputs| match (&inputs[0], &inputs[1]) {
+            (Value::Int(x), Value::Int(y)) => Value::Int(x + y),
+            _ => Value::None,
         });
         let d = g.add_map("d", vec![c], |i| match &i[0] {
             Value::Int(v) => Value::Int(v * 10),

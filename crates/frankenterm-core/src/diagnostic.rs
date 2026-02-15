@@ -1311,7 +1311,8 @@ mod tests {
 
     #[test]
     fn dir_size_empty_directory() {
-        let tmp = std::env::temp_dir().join(format!("wa_test_diag_dirsize_empty_{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_diag_dirsize_empty_{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
         assert_eq!(dir_size(&tmp), 0);
         let _ = fs::remove_dir_all(&tmp);
@@ -1319,7 +1320,8 @@ mod tests {
 
     #[test]
     fn dir_size_with_files() {
-        let tmp = std::env::temp_dir().join(format!("wa_test_diag_dirsize_files_{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_diag_dirsize_files_{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
         fs::write(tmp.join("a.txt"), "hello").unwrap();
         fs::write(tmp.join("b.txt"), "world!").unwrap();
@@ -1356,7 +1358,10 @@ mod tests {
             output: Some(PathBuf::from("/tmp/custom")),
         };
         assert_eq!(opts.event_limit, 10);
-        assert_eq!(opts.output.as_ref().unwrap().to_str().unwrap(), "/tmp/custom");
+        assert_eq!(
+            opts.output.as_ref().unwrap().to_str().unwrap(),
+            "/tmp/custom"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1581,7 +1586,9 @@ mod tests {
             step_kind: None,
             result_type: "done".to_string(),
             result_data: None,
-            policy_summary: Some("key sk-abc123def456ghi789jkl012mno345pqr678stu901v valid".to_string()),
+            policy_summary: Some(
+                "key sk-abc123def456ghi789jkl012mno345pqr678stu901v valid".to_string(),
+            ),
             verification_refs: None,
             error_code: None,
             started_at: 1000,
@@ -1680,7 +1687,10 @@ mod tests {
 
         let traces = generate_rule_traces(&events, &redactor);
         assert_eq!(traces.len(), 1);
-        assert!(traces[0].extracted_fields.is_empty(), "non-object extracted should yield empty fields");
+        assert!(
+            traces[0].extracted_fields.is_empty(),
+            "non-object extracted should yield empty fields"
+        );
     }
 
     #[test]
@@ -1744,7 +1754,8 @@ mod tests {
 
     #[test]
     fn gather_db_health_missing_wal_file() {
-        let tmp = std::env::temp_dir().join(format!("wa_test_diag_nowal_{}.db", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_diag_nowal_{}.db", std::process::id()));
         {
             let conn = Connection::open(&tmp).unwrap();
             conn.execute_batch(
@@ -1756,7 +1767,8 @@ mod tests {
                  CREATE TABLE workflow_step_logs (id INTEGER PRIMARY KEY);
                  CREATE TABLE pane_reservations (id INTEGER PRIMARY KEY);
                  CREATE TABLE approval_tokens (id INTEGER PRIMARY KEY);",
-            ).unwrap();
+            )
+            .unwrap();
         }
         // Ensure no WAL file exists
         let wal_path = tmp.with_extension("db-wal");
@@ -1780,7 +1792,10 @@ mod tests {
 
     #[test]
     fn gather_db_health_missing_table_returns_negative_one() {
-        let tmp = std::env::temp_dir().join(format!("wa_test_diag_missing_table_{}.db", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "wa_test_diag_missing_table_{}.db",
+            std::process::id()
+        ));
         {
             let conn = Connection::open(&tmp).unwrap();
             // Only create some tables, not all
@@ -1788,7 +1803,8 @@ mod tests {
                 "CREATE TABLE panes (id INTEGER PRIMARY KEY);
                  CREATE TABLE events (id INTEGER PRIMARY KEY);
                  INSERT INTO panes VALUES (1);",
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         let health = gather_db_health(&tmp).unwrap();
@@ -1829,7 +1845,8 @@ mod tests {
 
     #[test]
     fn write_json_file_empty_object() {
-        let tmp = std::env::temp_dir().join(format!("wa_test_diag_empty_obj_{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_diag_empty_obj_{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
 
         let data = serde_json::json!({});
@@ -1897,7 +1914,9 @@ mod tests {
             policy_decision: "allow".to_string(),
             decision_reason: Some("approved".to_string()),
             rule_id: None,
-            input_summary: Some("export KEY=sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string()),
+            input_summary: Some(
+                "export KEY=sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string(),
+            ),
             verification_summary: None,
             decision_context: None,
             result: "ok".to_string(),

@@ -592,10 +592,7 @@ mod tests {
 
     #[test]
     fn search_k_exceeds_count() {
-        let vecs = vec![
-            (1u64, vec![1.0, 0.0]),
-            (2, vec![0.0, 1.0]),
-        ];
+        let vecs = vec![(1u64, vec![1.0, 0.0]), (2, vec![0.0, 1.0])];
         let idx = make_index(&vecs);
         let results = idx.search(&[1.0, 0.0], 100);
         assert_eq!(results.len(), 2); // returns all, not 100

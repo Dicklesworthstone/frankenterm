@@ -689,10 +689,7 @@ mod tests {
 
     #[test]
     fn detect_title_case_insensitive_gemini() {
-        assert_eq!(
-            detect_agent_from_title("GEMINI"),
-            Some(AgentType::Gemini)
-        );
+        assert_eq!(detect_agent_from_title("GEMINI"), Some(AgentType::Gemini));
         assert_eq!(
             detect_agent_from_title("Gemini Pro"),
             Some(AgentType::Gemini)
@@ -743,10 +740,7 @@ mod tests {
             detect_agent_from_process("Claude-Code"),
             Some(AgentType::ClaudeCode)
         );
-        assert_eq!(
-            detect_agent_from_process("CODEX"),
-            Some(AgentType::Codex)
-        );
+        assert_eq!(detect_agent_from_process("CODEX"), Some(AgentType::Codex));
         assert_eq!(
             detect_agent_from_process("GEMINI-CLI"),
             Some(AgentType::Gemini)
@@ -782,10 +776,7 @@ mod tests {
 
     #[test]
     fn infer_state_compaction() {
-        assert_eq!(
-            infer_state_from_rule("core.codex:compaction"),
-            "working"
-        );
+        assert_eq!(infer_state_from_rule("core.codex:compaction"), "working");
     }
 
     #[test]
@@ -818,10 +809,7 @@ mod tests {
 
     #[test]
     fn infer_state_idle_variants() {
-        assert_eq!(
-            infer_state_from_rule("core.codex:session.end"),
-            "idle"
-        );
+        assert_eq!(infer_state_from_rule("core.codex:session.end"), "idle");
         assert_eq!(
             infer_state_from_rule("core.claude_code:token_usage"),
             "idle"
@@ -861,10 +849,7 @@ mod tests {
     #[test]
     fn infer_state_multiple_colons_uses_last() {
         // rsplit(':').next() gets the part after the last colon
-        assert_eq!(
-            infer_state_from_rule("a:b:c:banner"),
-            "starting"
-        );
+        assert_eq!(infer_state_from_rule("a:b:c:banner"), "starting");
     }
 
     // ====================================================================
@@ -994,7 +979,10 @@ mod tests {
         let mut c = AgentCorrelator::new();
         c.ingest_detections(
             1,
-            &[make_detection("core.claude_code:banner", AgentType::ClaudeCode)],
+            &[make_detection(
+                "core.claude_code:banner",
+                AgentType::ClaudeCode,
+            )],
         );
         c.ingest_detections(
             2,
@@ -1002,12 +990,18 @@ mod tests {
         );
         c.ingest_detections(
             3,
-            &[make_detection("core.gemini:rate_limited", AgentType::Gemini)],
+            &[make_detection(
+                "core.gemini:rate_limited",
+                AgentType::Gemini,
+            )],
         );
 
         assert_eq!(c.tracked_pane_count(), 3);
         assert_eq!(c.get_metadata(1).unwrap().agent_type, "claude_code");
-        assert_eq!(c.get_metadata(1).unwrap().state.as_deref(), Some("starting"));
+        assert_eq!(
+            c.get_metadata(1).unwrap().state.as_deref(),
+            Some("starting")
+        );
         assert_eq!(c.get_metadata(2).unwrap().agent_type, "codex");
         assert_eq!(c.get_metadata(2).unwrap().state.as_deref(), Some("working"));
         assert_eq!(c.get_metadata(3).unwrap().agent_type, "gemini");
@@ -1090,10 +1084,7 @@ mod tests {
     #[test]
     fn agent_type_updated_on_new_detection() {
         let mut c = AgentCorrelator::new();
-        c.ingest_detections(
-            1,
-            &[make_detection("core.codex:banner", AgentType::Codex)],
-        );
+        c.ingest_detections(1, &[make_detection("core.codex:banner", AgentType::Codex)]);
         assert_eq!(c.get_metadata(1).unwrap().agent_type, "codex");
 
         // Different agent type on same pane
@@ -1110,10 +1101,7 @@ mod tests {
     #[test]
     fn remove_pane_then_redetect() {
         let mut c = AgentCorrelator::new();
-        c.ingest_detections(
-            1,
-            &[make_detection("core.codex:banner", AgentType::Codex)],
-        );
+        c.ingest_detections(1, &[make_detection("core.codex:banner", AgentType::Codex)]);
         c.remove_pane(1);
         assert!(c.get_metadata(1).is_none());
 

@@ -2450,7 +2450,10 @@ mod tests {
 
     #[test]
     fn is_not_retryable_circuit_open() {
-        let err: crate::Error = WeztermError::CircuitOpen { retry_after_ms: 100 }.into();
+        let err: crate::Error = WeztermError::CircuitOpen {
+            retry_after_ms: 100,
+        }
+        .into();
         assert!(!is_retryable_error(&err));
     }
 

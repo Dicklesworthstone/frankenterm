@@ -796,9 +796,10 @@ mod tests {
 
     #[test]
     fn error_is_error_trait() {
-        let e: Box<dyn std::error::Error> = Box::new(LexicalIngestError::Io(
-            std::io::Error::new(std::io::ErrorKind::Other, "test"),
-        ));
+        let e: Box<dyn std::error::Error> = Box::new(LexicalIngestError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "test",
+        )));
         assert!(e.to_string().contains("I/O error"));
     }
 
@@ -849,9 +850,7 @@ mod tests {
 
         // Add a document, then delete it
         let ev = sample_event("ev-1", "hello");
-        writer
-            .add_document(&map_event_to_document(&ev, 0))
-            .unwrap();
+        writer.add_document(&map_event_to_document(&ev, 0)).unwrap();
         writer.delete_by_event_id("ev-1").unwrap();
 
         let stats = writer.commit().unwrap();
@@ -870,9 +869,7 @@ mod tests {
         // Add 3, delete 1
         for i in 0..3 {
             let ev = sample_event(&format!("ev-{i}"), &format!("text-{i}"));
-            writer
-                .add_document(&map_event_to_document(&ev, i))
-                .unwrap();
+            writer.add_document(&map_event_to_document(&ev, i)).unwrap();
         }
         writer.delete_by_event_id("ev-0").unwrap();
 
@@ -980,9 +977,7 @@ mod tests {
         let mut writer = indexer.create_writer().unwrap();
         // Verify it works by adding a doc
         let ev = sample_event("ev-default", "test");
-        writer
-            .add_document(&map_event_to_document(&ev, 0))
-            .unwrap();
+        writer.add_document(&map_event_to_document(&ev, 0)).unwrap();
         let stats = writer.commit().unwrap();
         assert_eq!(stats.docs_added, 1);
     }
@@ -997,9 +992,7 @@ mod tests {
         let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
         for i in 0..3 {
             let ev = sample_event(&format!("ev-{i}"), &format!("text-{i}"));
-            writer
-                .add_document(&map_event_to_document(&ev, i))
-                .unwrap();
+            writer.add_document(&map_event_to_document(&ev, i)).unwrap();
         }
         writer.commit().unwrap();
 
@@ -1037,10 +1030,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let fp_path = dir.path().join(FINGERPRINT_FILENAME);
         std::fs::write(&fp_path, "").unwrap();
-        assert_eq!(
-            read_stored_fingerprint(dir.path()),
-            Some("".to_string())
-        );
+        assert_eq!(read_stored_fingerprint(dir.path()), Some("".to_string()));
     }
 
     #[test]
@@ -1124,9 +1114,7 @@ mod tests {
         let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
 
         let ev = sample_event("ev-dup", "text");
-        writer
-            .add_document(&map_event_to_document(&ev, 0))
-            .unwrap();
+        writer.add_document(&map_event_to_document(&ev, 0)).unwrap();
         writer.commit().unwrap();
         assert_eq!(indexer.doc_count().unwrap(), 1);
 
@@ -1153,9 +1141,7 @@ mod tests {
         let count = 100;
         for i in 0..count {
             let ev = sample_event(&format!("ev-{i}"), &format!("command number {i}"));
-            writer
-                .add_document(&map_event_to_document(&ev, i))
-                .unwrap();
+            writer.add_document(&map_event_to_document(&ev, i)).unwrap();
         }
         let stats = writer.commit().unwrap();
         assert_eq!(stats.docs_added, count as u64);
@@ -1176,9 +1162,7 @@ mod tests {
 
         for i in 0..3 {
             let ev = egress_event(&format!("eg-{i}"), &format!("output line {i}"));
-            writer
-                .add_document(&map_event_to_document(&ev, i))
-                .unwrap();
+            writer.add_document(&map_event_to_document(&ev, i)).unwrap();
         }
         let stats = writer.commit().unwrap();
         assert_eq!(stats.docs_added, 3);
@@ -1198,9 +1182,7 @@ mod tests {
         let indexer = LexicalIndexer::open(config.clone()).unwrap();
         let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
         let ev = sample_event("ev-persist", "persisted data");
-        writer
-            .add_document(&map_event_to_document(&ev, 0))
-            .unwrap();
+        writer.add_document(&map_event_to_document(&ev, 0)).unwrap();
         writer.commit().unwrap();
         assert_eq!(indexer.doc_count().unwrap(), 1);
         drop(writer);
