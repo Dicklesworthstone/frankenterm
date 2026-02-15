@@ -1251,7 +1251,7 @@ mod tests {
         let preview = cleanup_preview(&storage, &config).await.expect("preview");
         assert!(preview.dry_run);
 
-        // critical tier: 100d old is beyond 90d → 1 eligible; 50d is within → 0
+        // critical tier: 100d old is beyond 90d -> 1 eligible; 50d is within -> 0
         let crit_tier = preview
             .tables
             .iter()
@@ -1259,7 +1259,7 @@ mod tests {
             .unwrap();
         assert_eq!(crit_tier.eligible_rows, 1, "1 old critical eligible");
 
-        // warning tier: 20d and 10d both within 30d → 0 eligible
+        // warning tier: 20d and 10d both within 30d -> 0 eligible
         let warn_tier = preview
             .tables
             .iter()
@@ -1267,7 +1267,7 @@ mod tests {
             .unwrap();
         assert_eq!(warn_tier.eligible_rows, 0, "warnings within retention");
 
-        // info tier: 15d old beyond 7d → 1 eligible; 5d and 2d within → 0
+        // info tier: 15d old beyond 7d -> 1 eligible; 5d and 2d within -> 0
         let info_tier = preview
             .tables
             .iter()
@@ -1779,7 +1779,7 @@ mod tests {
     #[test]
     fn retention_cutoff_ms_max_days() {
         let now = 1_700_000_000_000i64;
-        // u32::MAX days is ~11.7 million years — cutoff should be far in the past
+        // u32::MAX days is ~11.7 million years -- cutoff should be far in the past
         let cutoff = retention_cutoff_ms(now, u32::MAX);
         assert!(cutoff < 0, "max retention days produces negative cutoff");
     }
@@ -1826,7 +1826,7 @@ mod tests {
 
     #[test]
     fn cleanup_plan_dry_run_field_independent() {
-        // dry_run is just a flag — doesn't affect other fields
+        // dry_run is just a flag -- doesn't affect other fields
         let mut p = CleanupPlan::default();
         p.dry_run = true;
         p.total_deleted = 42;
@@ -1857,7 +1857,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // RubyBeaver wa-1u90p.7.1 — additional pure unit tests
+    // RubyBeaver wa-1u90p.7.1 -- additional pure unit tests
     // ---------------------------------------------------------------
 
     #[test]
@@ -1955,5 +1955,908 @@ mod tests {
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"retention_days\":0"));
+    }
+
+    // ---------------------------------------------------------------
+    // RubyBeaver wa-1u90p.7.1 -- NEW expanded tests (batch 2)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cleanup_table_summary_deserialize_from_json_object() {
+        let json = r#"{"table":"usage_metrics","eligible_rows":77,"deleted_rows":33,"retention_days":14}"#;
+        let s: CleanupTableSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(s.table, "usage_metrics");
+        assert_eq!(s.eligible_rows, 77);
+        assert_eq!(s.deleted_rows, 33);
+        assert_eq!(s.retention_days, 14);
+    }
+
+    #[test]
+    fn cleanup_plan_deserialize_from_json_object() {
+        let json = r#"{
+            "tables": [],
+            "total_eligible": 0,
+            "total_deleted": 0,
+            "dry_run": false
+        }"#;
+        let p: CleanupPlan = serde_json::from_str(json).unwrap();
+        assert!(p.tables.is_empty());
+        assert!(!p.dry_run);
+    }
+
+    #[test]
+    fn cleanup_table_summary_large_row_counts() {
+        let s = CleanupTableSummary {
+            table: "events".to_string(),
+            eligible_rows: usize::MAX,
+            deleted_rows: usize::MAX - 1,
+            retention_days: u32::MAX,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: CleanupTableSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.eligible_rows, usize::MAX);
+        assert_eq!(back.deleted_rows, usize::MAX - 1);
+        assert_eq!(back.retention_days, u32::MAX);
+    }
+
+    #[test]
+    fn cleanup_plan_with_many_tables_roundtrip() {
+        let tables: Vec<CleanupTableSummary> = (0..20)
+            .map(|i| CleanupTableSummary {
+                table: format!("table_{}", i),
+                eligible_rows: i * 10,
+                deleted_rows: i * 5,
+                retention_days: (i as u32) + 1,
+            })
+            .collect();
+        let total_eligible: usize = tables.iter().map(|t| t.eligible_rows).sum();
+        let total_deleted: usize = tables.iter().map(|t| t.deleted_rows).sum();
+        let p = CleanupPlan {
+            tables,
+            total_eligible,
+            total_deleted,
+            dry_run: true,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: CleanupPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tables.len(), 20);
+        assert_eq!(back.total_eligible, total_eligible);
+        assert_eq!(back.total_deleted, total_deleted);
+    }
+
+    #[test]
+    fn cleanup_table_summary_empty_table_name() {
+        let s = CleanupTableSummary {
+            table: String::new(),
+            eligible_rows: 1,
+            deleted_rows: 0,
+            retention_days: 7,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: CleanupTableSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.table, "");
+        assert_eq!(back.eligible_rows, 1);
+    }
+
+    #[test]
+    fn cleanup_table_summary_unicode_table_name() {
+        let s = CleanupTableSummary {
+            table: "events (tier: critico)".to_string(),
+            eligible_rows: 5,
+            deleted_rows: 3,
+            retention_days: 30,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: CleanupTableSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.table, "events (tier: critico)");
+    }
+
+    #[test]
+    fn cleanup_plan_serde_preserves_table_order() {
+        let p = CleanupPlan {
+            tables: vec![
+                CleanupTableSummary {
+                    table: "z_last".to_string(),
+                    eligible_rows: 1,
+                    deleted_rows: 0,
+                    retention_days: 7,
+                },
+                CleanupTableSummary {
+                    table: "a_first".to_string(),
+                    eligible_rows: 2,
+                    deleted_rows: 1,
+                    retention_days: 30,
+                },
+                CleanupTableSummary {
+                    table: "m_middle".to_string(),
+                    eligible_rows: 3,
+                    deleted_rows: 2,
+                    retention_days: 90,
+                },
+            ],
+            total_eligible: 6,
+            total_deleted: 3,
+            dry_run: false,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: CleanupPlan = serde_json::from_str(&json).unwrap();
+        // Order must be preserved (not alphabetically sorted)
+        assert_eq!(back.tables[0].table, "z_last");
+        assert_eq!(back.tables[1].table, "a_first");
+        assert_eq!(back.tables[2].table, "m_middle");
+    }
+
+    #[test]
+    fn retention_cutoff_ms_negative_now() {
+        // Hypothetical: negative now_ms (before epoch)
+        let now = -1_000_000i64;
+        let cutoff = retention_cutoff_ms(now, 1);
+        assert_eq!(cutoff, now - 86_400_000);
+        assert!(cutoff < now);
+    }
+
+    #[test]
+    fn retention_cutoff_ms_zero_now() {
+        let cutoff = retention_cutoff_ms(0, 7);
+        assert_eq!(cutoff, -(7 * 86_400_000));
+    }
+
+    #[test]
+    fn retention_cutoff_ms_linearity() {
+        // cutoff(now, a) - cutoff(now, b) = (b - a) * ms_per_day
+        let now = 1_700_000_000_000i64;
+        let ca = retention_cutoff_ms(now, 10);
+        let cb = retention_cutoff_ms(now, 20);
+        let ms_per_day: i64 = 86_400_000;
+        assert_eq!(ca - cb, 10 * ms_per_day);
+    }
+
+    #[test]
+    fn retention_cutoff_ms_same_day_different_now() {
+        let c1 = retention_cutoff_ms(1_000_000_000_000, 30);
+        let c2 = retention_cutoff_ms(2_000_000_000_000, 30);
+        // The difference in cutoffs should equal the difference in now values
+        assert_eq!(c2 - c1, 1_000_000_000_000);
+    }
+
+    #[test]
+    fn cleanup_plan_clone_independence() {
+        // Cloned plan should be independent of the original
+        let mut original = CleanupPlan {
+            tables: vec![CleanupTableSummary {
+                table: "events".to_string(),
+                eligible_rows: 10,
+                deleted_rows: 5,
+                retention_days: 30,
+            }],
+            total_eligible: 10,
+            total_deleted: 5,
+            dry_run: true,
+        };
+        let cloned = original.clone();
+        original.total_deleted = 999;
+        original.tables[0].deleted_rows = 999;
+        // Clone should be unaffected
+        assert_eq!(cloned.total_deleted, 5);
+        assert_eq!(cloned.tables[0].deleted_rows, 5);
+    }
+
+    #[test]
+    fn cleanup_table_summary_clone_independence() {
+        let mut original = CleanupTableSummary {
+            table: "events".to_string(),
+            eligible_rows: 50,
+            deleted_rows: 25,
+            retention_days: 14,
+        };
+        let cloned = original.clone();
+        original.eligible_rows = 0;
+        original.table = "modified".to_string();
+        assert_eq!(cloned.eligible_rows, 50);
+        assert_eq!(cloned.table, "events");
+    }
+
+    #[test]
+    fn cleanup_plan_debug_contains_all_key_fields() {
+        let p = CleanupPlan {
+            tables: vec![CleanupTableSummary {
+                table: "notification_history".to_string(),
+                eligible_rows: 7,
+                deleted_rows: 3,
+                retention_days: 30,
+            }],
+            total_eligible: 7,
+            total_deleted: 3,
+            dry_run: false,
+        };
+        let dbg = format!("{:?}", p);
+        assert!(dbg.contains("total_eligible"));
+        assert!(dbg.contains("total_deleted"));
+        assert!(dbg.contains("tables"));
+        assert!(dbg.contains("notification_history"));
+    }
+
+    #[test]
+    fn cleanup_table_summary_debug_contains_retention() {
+        let s = CleanupTableSummary {
+            table: "output_segments".to_string(),
+            eligible_rows: 0,
+            deleted_rows: 0,
+            retention_days: 365,
+        };
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("retention_days"));
+        assert!(dbg.contains("365"));
+    }
+
+    #[test]
+    fn cleanup_plan_serde_roundtrip_with_dry_run_false() {
+        let p = CleanupPlan {
+            tables: vec![],
+            total_eligible: 0,
+            total_deleted: 0,
+            dry_run: false,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: CleanupPlan = serde_json::from_str(&json).unwrap();
+        assert!(!back.dry_run);
+    }
+
+    #[test]
+    fn cleanup_table_summary_serde_roundtrip_max_retention() {
+        let s = CleanupTableSummary {
+            table: "events".to_string(),
+            eligible_rows: 0,
+            deleted_rows: 0,
+            retention_days: u32::MAX,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: CleanupTableSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.retention_days, u32::MAX);
+    }
+
+    #[test]
+    fn cleanup_plan_tables_push_increments_len() {
+        let mut p = CleanupPlan::default();
+        assert_eq!(p.tables.len(), 0);
+        p.tables.push(CleanupTableSummary::default());
+        assert_eq!(p.tables.len(), 1);
+        p.tables.push(CleanupTableSummary::default());
+        assert_eq!(p.tables.len(), 2);
+    }
+
+    #[test]
+    fn cleanup_plan_default_matches_struct_literal() {
+        let from_default = CleanupPlan::default();
+        let from_literal = CleanupPlan {
+            tables: vec![],
+            total_eligible: 0,
+            total_deleted: 0,
+            dry_run: false,
+        };
+        assert_eq!(from_default.tables.len(), from_literal.tables.len());
+        assert_eq!(from_default.total_eligible, from_literal.total_eligible);
+        assert_eq!(from_default.total_deleted, from_literal.total_deleted);
+        assert_eq!(from_default.dry_run, from_literal.dry_run);
+    }
+
+    #[test]
+    fn cleanup_table_summary_default_matches_struct_literal() {
+        let from_default = CleanupTableSummary::default();
+        let from_literal = CleanupTableSummary {
+            table: String::new(),
+            eligible_rows: 0,
+            deleted_rows: 0,
+            retention_days: 0,
+        };
+        assert_eq!(from_default.table, from_literal.table);
+        assert_eq!(from_default.eligible_rows, from_literal.eligible_rows);
+        assert_eq!(from_default.deleted_rows, from_literal.deleted_rows);
+        assert_eq!(from_default.retention_days, from_literal.retention_days);
+    }
+
+    #[test]
+    fn cleanup_plan_json_value_types() {
+        let p = CleanupPlan {
+            tables: vec![CleanupTableSummary {
+                table: "events".to_string(),
+                eligible_rows: 5,
+                deleted_rows: 2,
+                retention_days: 7,
+            }],
+            total_eligible: 5,
+            total_deleted: 2,
+            dry_run: true,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        // Verify JSON types are correct
+        assert!(v["tables"].is_array());
+        assert!(v["total_eligible"].is_number());
+        assert!(v["total_deleted"].is_number());
+        assert!(v["dry_run"].is_boolean());
+        assert!(v["tables"][0]["table"].is_string());
+        assert!(v["tables"][0]["eligible_rows"].is_number());
+    }
+
+    #[test]
+    fn retention_cutoff_ms_7_days_in_milliseconds() {
+        let now = 1_700_000_000_000i64;
+        let cutoff = retention_cutoff_ms(now, 7);
+        // 7 days = 7 * 24 * 60 * 60 * 1000 = 604_800_000 ms
+        assert_eq!(now - cutoff, 604_800_000);
+    }
+
+    #[test]
+    fn retention_cutoff_ms_30_days_in_milliseconds() {
+        let now = 1_700_000_000_000i64;
+        let cutoff = retention_cutoff_ms(now, 30);
+        // 30 days = 2_592_000_000 ms
+        assert_eq!(now - cutoff, 2_592_000_000);
+    }
+
+    #[test]
+    fn retention_cutoff_ms_90_days_in_milliseconds() {
+        let now = 1_700_000_000_000i64;
+        let cutoff = retention_cutoff_ms(now, 90);
+        // 90 days = 7_776_000_000 ms
+        assert_eq!(now - cutoff, 7_776_000_000);
+    }
+
+    #[test]
+    fn delete_batch_size_value() {
+        // Document the actual constant value for regression detection
+        assert_eq!(DELETE_BATCH_SIZE, 5000);
+    }
+
+    #[test]
+    fn cleanup_plan_deserialize_ignores_unknown_fields_if_deny_missing() {
+        // Standard serde: extra fields are silently ignored by default
+        let json = r#"{
+            "tables": [],
+            "total_eligible": 0,
+            "total_deleted": 0,
+            "dry_run": true,
+            "extra_field": "should_be_ignored"
+        }"#;
+        // This should succeed since serde default behavior ignores unknown fields
+        let p: Result<CleanupPlan, _> = serde_json::from_str(json);
+        assert!(p.is_ok());
+    }
+
+    #[test]
+    fn cleanup_table_summary_special_chars_in_table_name() {
+        let s = CleanupTableSummary {
+            table: "events (tier: info/handled)".to_string(),
+            eligible_rows: 1,
+            deleted_rows: 0,
+            retention_days: 3,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: CleanupTableSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.table, "events (tier: info/handled)");
+    }
+
+    #[test]
+    fn cleanup_plan_serde_compact_vs_pretty() {
+        let p = CleanupPlan {
+            tables: vec![CleanupTableSummary {
+                table: "events".to_string(),
+                eligible_rows: 1,
+                deleted_rows: 1,
+                retention_days: 7,
+            }],
+            total_eligible: 1,
+            total_deleted: 1,
+            dry_run: false,
+        };
+        let compact = serde_json::to_string(&p).unwrap();
+        let pretty = serde_json::to_string_pretty(&p).unwrap();
+        // Both should deserialize to the same thing
+        let from_compact: CleanupPlan = serde_json::from_str(&compact).unwrap();
+        let from_pretty: CleanupPlan = serde_json::from_str(&pretty).unwrap();
+        assert_eq!(from_compact.total_eligible, from_pretty.total_eligible);
+        assert_eq!(from_compact.total_deleted, from_pretty.total_deleted);
+        assert_eq!(from_compact.dry_run, from_pretty.dry_run);
+        assert_eq!(from_compact.tables.len(), from_pretty.tables.len());
+        // Pretty should be longer due to whitespace
+        assert!(pretty.len() > compact.len());
+    }
+
+    #[test]
+    fn cleanup_plan_with_zero_eligible_and_nonzero_deleted() {
+        // Edge case: deleted > eligible is structurally allowed
+        let p = CleanupPlan {
+            tables: vec![],
+            total_eligible: 0,
+            total_deleted: 5,
+            dry_run: false,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: CleanupPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total_eligible, 0);
+        assert_eq!(back.total_deleted, 5);
+    }
+
+    #[test]
+    fn cleanup_table_summary_all_zeros() {
+        let s = CleanupTableSummary {
+            table: "events".to_string(),
+            eligible_rows: 0,
+            deleted_rows: 0,
+            retention_days: 0,
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["eligible_rows"], 0);
+        assert_eq!(json["deleted_rows"], 0);
+        assert_eq!(json["retention_days"], 0);
+    }
+
+    #[test]
+    fn retention_cutoff_ms_commutes_with_addition() {
+        // cutoff(now + delta, days) = cutoff(now, days) + delta
+        let now = 1_700_000_000_000i64;
+        let delta = 5_000_000i64;
+        let days = 30u32;
+        assert_eq!(
+            retention_cutoff_ms(now + delta, days),
+            retention_cutoff_ms(now, days) + delta
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // RubyBeaver wa-1u90p.7.1 -- async integration edge-case tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn preview_with_only_audit_data() {
+        let (storage, db_path) = setup_storage("only_audit").await;
+        let now = now_ms();
+        let old_ts = now - 60 * 86_400_000;
+
+        // Only insert audit data, no events
+        storage
+            .record_audit_action(make_audit(old_ts))
+            .await
+            .unwrap();
+        storage
+            .record_audit_action(make_audit(old_ts - 1000))
+            .await
+            .unwrap();
+
+        let config = StorageConfig {
+            retention_days: 30,
+            retention_tiers: vec![],
+            ..Default::default()
+        };
+
+        let plan = cleanup_preview(&storage, &config).await.expect("preview");
+        let audit = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "audit_actions")
+            .unwrap();
+        assert_eq!(audit.eligible_rows, 2);
+        assert_eq!(audit.deleted_rows, 0, "preview never deletes");
+
+        // Events table should show 0 eligible
+        let events = plan.tables.iter().find(|t| t.table == "events").unwrap();
+        assert_eq!(events.eligible_rows, 0);
+
+        teardown(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn preview_with_only_usage_data() {
+        let (storage, db_path) = setup_storage("only_usage").await;
+        let now = now_ms();
+        let old_ts = now - 60 * 86_400_000;
+
+        storage
+            .record_usage_metric(make_usage(old_ts))
+            .await
+            .unwrap();
+
+        let config = StorageConfig {
+            retention_days: 30,
+            retention_tiers: vec![],
+            ..Default::default()
+        };
+
+        let plan = cleanup_preview(&storage, &config).await.expect("preview");
+        let usage = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "usage_metrics")
+            .unwrap();
+        assert_eq!(usage.eligible_rows, 1);
+
+        teardown(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn preview_with_only_notification_data() {
+        let (storage, db_path) = setup_storage("only_notif").await;
+        let now = now_ms();
+        let old_ts = now - 60 * 86_400_000;
+
+        storage
+            .record_notification(make_notification(old_ts))
+            .await
+            .unwrap();
+
+        let config = StorageConfig {
+            retention_days: 30,
+            retention_tiers: vec![],
+            ..Default::default()
+        };
+
+        let plan = cleanup_preview(&storage, &config).await.expect("preview");
+        let notif = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "notification_history")
+            .unwrap();
+        assert_eq!(notif.eligible_rows, 1);
+
+        teardown(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn apply_with_all_recent_data_deletes_nothing() {
+        let (storage, db_path) = setup_storage("all_recent").await;
+        let now = now_ms();
+        let recent_ts = now - 2 * 86_400_000; // 2 days ago
+
+        storage
+            .record_event(make_event(recent_ts, "info", "test"))
+            .await
+            .unwrap();
+        storage
+            .record_audit_action(make_audit(recent_ts))
+            .await
+            .unwrap();
+        storage
+            .record_usage_metric(make_usage(recent_ts))
+            .await
+            .unwrap();
+        storage
+            .record_notification(make_notification(recent_ts))
+            .await
+            .unwrap();
+
+        let config = StorageConfig {
+            retention_days: 30,
+            retention_tiers: vec![],
+            ..Default::default()
+        };
+
+        let plan = cleanup_apply(&storage, &config).await.expect("apply");
+        assert_eq!(plan.total_deleted, 0, "all data is recent");
+        assert_eq!(plan.total_eligible, 0);
+
+        teardown(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn preview_plan_always_has_dry_run_true() {
+        let (storage, db_path) = setup_storage("dry_run_flag").await;
+
+        let config = StorageConfig::default();
+        let plan = cleanup_preview(&storage, &config).await.expect("preview");
+        assert!(plan.dry_run, "preview must always set dry_run=true");
+
+        teardown(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn apply_plan_always_has_dry_run_false() {
+        let (storage, db_path) = setup_storage("apply_flag").await;
+
+        let config = StorageConfig::default();
+        let plan = cleanup_apply(&storage, &config).await.expect("apply");
+        assert!(!plan.dry_run, "apply must always set dry_run=false");
+
+        teardown(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn preview_total_eligible_equals_sum_of_table_eligible() {
+        let (storage, db_path) = setup_storage("eligible_sum").await;
+        let now = now_ms();
+        let old_ts = now - 60 * 86_400_000;
+
+        storage
+            .record_event(make_event(old_ts, "info", "test"))
+            .await
+            .unwrap();
+        storage
+            .record_audit_action(make_audit(old_ts))
+            .await
+            .unwrap();
+        storage
+            .record_usage_metric(make_usage(old_ts))
+            .await
+            .unwrap();
+        storage
+            .record_notification(make_notification(old_ts))
+            .await
+            .unwrap();
+
+        let config = StorageConfig {
+            retention_days: 30,
+            retention_tiers: vec![],
+            ..Default::default()
+        };
+
+        let plan = cleanup_preview(&storage, &config).await.expect("preview");
+        let table_sum: usize = plan.tables.iter().map(|t| t.eligible_rows).sum();
+        assert_eq!(
+            plan.total_eligible, table_sum,
+            "total_eligible must equal sum of per-table eligible_rows"
+        );
+
+        teardown(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn apply_total_deleted_equals_sum_of_table_deleted() {
+        let (storage, db_path) = setup_storage("deleted_sum").await;
+        let now = now_ms();
+        let old_ts = now - 60 * 86_400_000;
+
+        storage
+            .record_event(make_event(old_ts, "info", "test"))
+            .await
+            .unwrap();
+        storage
+            .record_audit_action(make_audit(old_ts))
+            .await
+            .unwrap();
+
+        let config = StorageConfig {
+            retention_days: 30,
+            retention_tiers: vec![],
+            ..Default::default()
+        };
+
+        let plan = cleanup_apply(&storage, &config).await.expect("apply");
+        let table_sum: usize = plan.tables.iter().map(|t| t.deleted_rows).sum();
+        assert_eq!(
+            plan.total_deleted, table_sum,
+            "total_deleted must equal sum of per-table deleted_rows"
+        );
+
+        teardown(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn multiple_tiers_all_zero_retention_produces_no_event_entries() {
+        let (storage, db_path) = setup_storage("all_tiers_zero").await;
+        let now = now_ms();
+        let ancient_ts = now - 365 * 86_400_000;
+
+        storage
+            .record_event(make_event(ancient_ts, "critical", "error"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(ancient_ts, "info", "detection"))
+            .await
+            .unwrap();
+
+        let config = StorageConfig {
+            retention_days: 30,
+            retention_tiers: vec![
+                RetentionTier {
+                    name: "crit-forever".to_string(),
+                    retention_days: 0,
+                    severities: vec!["critical".to_string()],
+                    event_types: vec![],
+                    handled: None,
+                },
+                RetentionTier {
+                    name: "info-forever".to_string(),
+                    retention_days: 0,
+                    severities: vec!["info".to_string()],
+                    event_types: vec![],
+                    handled: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let plan = cleanup_apply(&storage, &config).await.expect("apply");
+
+        // All tiers have retention_days=0, so they should all be skipped
+        let event_tables: Vec<_> = plan
+            .tables
+            .iter()
+            .filter(|t| t.table.starts_with("events"))
+            .collect();
+        assert!(
+            event_tables.is_empty(),
+            "all zero-retention tiers should be skipped"
+        );
+
+        // Both events should survive
+        let remaining = storage.count_events_before(now + 1000).await.unwrap();
+        assert_eq!(remaining, 2);
+
+        teardown(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn tier_with_unhandled_filter_only_deletes_unhandled() {
+        let (storage, db_path) = setup_storage("unhandled_filter").await;
+        let now = now_ms();
+        let old_ts = now - 10 * 86_400_000;
+
+        let ev1_id = storage
+            .record_event(make_event(old_ts, "info", "detection"))
+            .await
+            .unwrap();
+        let _ev2_id = storage
+            .record_event(make_event(old_ts, "info", "detection"))
+            .await
+            .unwrap();
+
+        // Mark ev1 as handled
+        storage
+            .mark_event_handled(ev1_id, None, "auto")
+            .await
+            .unwrap();
+
+        // Tier: only delete UNhandled info events older than 3 days
+        let config = StorageConfig {
+            retention_days: 30,
+            retention_tiers: vec![RetentionTier {
+                name: "info-unhandled".to_string(),
+                retention_days: 3,
+                severities: vec!["info".to_string()],
+                event_types: vec![],
+                handled: Some(false),
+            }],
+            ..Default::default()
+        };
+
+        let plan = cleanup_apply(&storage, &config).await.expect("apply");
+        let tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("info-unhandled"))
+            .unwrap();
+        assert_eq!(
+            tier.deleted_rows, 1,
+            "only the unhandled event should be deleted"
+        );
+
+        // The handled event should remain
+        let remaining = storage.count_events_before(now + 1000).await.unwrap();
+        assert_eq!(remaining, 1, "handled event should survive");
+
+        teardown(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn preview_retention_days_propagated_to_table_summaries() {
+        let (storage, db_path) = setup_storage("retention_propagate").await;
+
+        let config = StorageConfig {
+            retention_days: 45,
+            retention_tiers: vec![RetentionTier {
+                name: "special".to_string(),
+                retention_days: 120,
+                severities: vec!["critical".to_string()],
+                event_types: vec![],
+                handled: None,
+            }],
+            ..Default::default()
+        };
+
+        let plan = cleanup_preview(&storage, &config).await.expect("preview");
+
+        // The special tier should have retention_days=120
+        let special = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("special"))
+            .unwrap();
+        assert_eq!(special.retention_days, 120);
+
+        // Global tables should have retention_days=45
+        let audit = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "audit_actions")
+            .unwrap();
+        assert_eq!(audit.retention_days, 45);
+
+        let usage = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "usage_metrics")
+            .unwrap();
+        assert_eq!(usage.retention_days, 45);
+
+        let notif = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "notification_history")
+            .unwrap();
+        assert_eq!(notif.retention_days, 45);
+
+        let segments = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "output_segments")
+            .unwrap();
+        assert_eq!(segments.retention_days, 45);
+
+        teardown(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn preview_with_one_day_retention() {
+        let (storage, db_path) = setup_storage("one_day_retention").await;
+        let now = now_ms();
+        // Event from 2 days ago should be eligible with 1-day retention
+        let ts_2d = now - 2 * 86_400_000;
+        // Event from 12 hours ago should NOT be eligible
+        let ts_12h = now - 12 * 60 * 60 * 1000;
+
+        storage
+            .record_event(make_event(ts_2d, "info", "test"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(ts_12h, "info", "test"))
+            .await
+            .unwrap();
+
+        let config = StorageConfig {
+            retention_days: 1,
+            retention_tiers: vec![],
+            ..Default::default()
+        };
+
+        let plan = cleanup_preview(&storage, &config).await.expect("preview");
+        let events = plan.tables.iter().find(|t| t.table == "events").unwrap();
+        assert_eq!(events.eligible_rows, 1, "only the 2-day-old event");
+
+        teardown(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn apply_with_very_short_retention_cleans_almost_everything() {
+        let (storage, db_path) = setup_storage("short_retention").await;
+        let now = now_ms();
+
+        // Insert events at various ages
+        for days_ago in [1, 3, 7, 14, 30] {
+            let ts = now - days_ago * 86_400_000;
+            storage
+                .record_event(make_event(ts, "info", "test"))
+                .await
+                .unwrap();
+        }
+
+        // 1-day retention should clean everything except the 1-day-old one
+        // (since cutoff = now - 1 day, a 1-day-old event is right at the boundary)
+        let config = StorageConfig {
+            retention_days: 2, // 2-day retention
+            retention_tiers: vec![],
+            ..Default::default()
+        };
+
+        let plan = cleanup_apply(&storage, &config).await.expect("apply");
+        let events = plan.tables.iter().find(|t| t.table == "events").unwrap();
+        // Events at 3, 7, 14, 30 days are older than 2 days -> 4 eligible
+        // Event at 1 day is within 2-day retention -> survives
+        assert_eq!(events.deleted_rows, 4);
+
+        let remaining = storage.count_events_before(now + 1000).await.unwrap();
+        assert_eq!(remaining, 1, "only the 1-day-old event survives");
+
+        teardown(storage, &db_path).await;
     }
 }

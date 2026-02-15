@@ -1789,4 +1789,1106 @@ mod tests {
         // success constructor always sets guidance to None
         assert!(r.guidance.is_none());
     }
+
+    // ── Expanded tests (wa-1u90p.7.1) ──
+
+    #[test]
+    fn undo_outcome_clone_produces_equal_value() {
+        let original = UndoOutcome::Failed;
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn undo_outcome_eq_is_reflexive() {
+        let v = UndoOutcome::Success;
+        assert_eq!(v, v);
+    }
+
+    #[test]
+    fn undo_outcome_eq_is_symmetric() {
+        let a = UndoOutcome::NotApplicable;
+        let b = UndoOutcome::NotApplicable;
+        assert_eq!(a, b);
+        assert_eq!(b, a);
+    }
+
+    #[test]
+    fn undo_outcome_ne_across_variants() {
+        assert_ne!(UndoOutcome::Success, UndoOutcome::Failed);
+        assert_ne!(UndoOutcome::Success, UndoOutcome::NotApplicable);
+        assert_ne!(UndoOutcome::Failed, UndoOutcome::NotApplicable);
+    }
+
+    #[test]
+    fn undo_outcome_deser_rejects_integer() {
+        assert!(serde_json::from_str::<UndoOutcome>("42").is_err());
+    }
+
+    #[test]
+    fn undo_outcome_deser_rejects_null() {
+        assert!(serde_json::from_str::<UndoOutcome>("null").is_err());
+    }
+
+    #[test]
+    fn undo_outcome_deser_rejects_boolean() {
+        assert!(serde_json::from_str::<UndoOutcome>("true").is_err());
+    }
+
+    #[test]
+    fn undo_outcome_deser_rejects_object() {
+        assert!(serde_json::from_str::<UndoOutcome>(r#"{"kind":"success"}"#).is_err());
+    }
+
+    #[test]
+    fn undo_outcome_deser_rejects_camel_case() {
+        // snake_case is required, CamelCase should fail
+        assert!(serde_json::from_str::<UndoOutcome>(r#""NotApplicable""#).is_err());
+    }
+
+    #[test]
+    fn undo_outcome_debug_format_success() {
+        let dbg = format!("{:?}", UndoOutcome::Success);
+        assert_eq!(dbg, "Success");
+    }
+
+    #[test]
+    fn undo_outcome_debug_format_failed() {
+        let dbg = format!("{:?}", UndoOutcome::Failed);
+        assert_eq!(dbg, "Failed");
+    }
+
+    #[test]
+    fn undo_request_clone_produces_equal_fields() {
+        let req = UndoRequest::new(7).with_actor("admin").with_reason("rollback");
+        let cloned = req.clone();
+        assert_eq!(cloned.action_id, 7);
+        assert_eq!(cloned.actor, "admin");
+        assert_eq!(cloned.reason.as_deref(), Some("rollback"));
+    }
+
+    #[test]
+    fn undo_request_action_id_zero() {
+        let req = UndoRequest::new(0);
+        assert_eq!(req.action_id, 0);
+    }
+
+    #[test]
+    fn undo_request_action_id_max() {
+        let req = UndoRequest::new(i64::MAX);
+        assert_eq!(req.action_id, i64::MAX);
+    }
+
+    #[test]
+    fn undo_request_action_id_min() {
+        let req = UndoRequest::new(i64::MIN);
+        assert_eq!(req.action_id, i64::MIN);
+    }
+
+    #[test]
+    fn undo_request_with_actor_overrides_default() {
+        let req = UndoRequest::new(1);
+        assert_eq!(req.actor, "user");
+        let req = req.with_actor("robot");
+        assert_eq!(req.actor, "robot");
+    }
+
+    #[test]
+    fn undo_request_with_actor_last_wins() {
+        let req = UndoRequest::new(1).with_actor("first").with_actor("second");
+        assert_eq!(req.actor, "second");
+    }
+
+    #[test]
+    fn undo_request_with_reason_last_wins() {
+        let req = UndoRequest::new(1).with_reason("first").with_reason("second");
+        assert_eq!(req.reason.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn undo_request_with_unicode_actor() {
+        let req = UndoRequest::new(1).with_actor("operateur-\u{00e9}l\u{00e8}ve");
+        assert!(req.actor.contains('\u{00e9}'));
+    }
+
+    #[test]
+    fn undo_request_with_unicode_reason() {
+        let req = UndoRequest::new(1).with_reason("undo reason \u{1f4a5}");
+        assert!(req.reason.unwrap().contains('\u{1f4a5}'));
+    }
+
+    #[test]
+    fn undo_request_with_very_long_actor() {
+        let long_actor = "a".repeat(10_000);
+        let req = UndoRequest::new(1).with_actor(long_actor.clone());
+        assert_eq!(req.actor.len(), 10_000);
+    }
+
+    #[test]
+    fn undo_execution_result_clone_preserves_all_fields() {
+        let r = UndoExecutionResult {
+            action_id: 99,
+            strategy: "workflow_abort".to_string(),
+            outcome: UndoOutcome::Success,
+            message: "aborted workflow wf-1".to_string(),
+            guidance: Some("check logs".to_string()),
+            target_workflow_id: Some("wf-1".to_string()),
+            target_pane_id: Some(42),
+            undone_at: Some(1_700_000_000),
+        };
+        let c = r.clone();
+        assert_eq!(c.action_id, r.action_id);
+        assert_eq!(c.strategy, r.strategy);
+        assert_eq!(c.outcome, r.outcome);
+        assert_eq!(c.message, r.message);
+        assert_eq!(c.guidance, r.guidance);
+        assert_eq!(c.target_workflow_id, r.target_workflow_id);
+        assert_eq!(c.target_pane_id, r.target_pane_id);
+        assert_eq!(c.undone_at, r.undone_at);
+    }
+
+    #[test]
+    fn undo_execution_result_success_with_all_some() {
+        let r = UndoExecutionResult::success(
+            100,
+            "workflow_abort".to_string(),
+            "aborted".to_string(),
+            Some("wf-100".to_string()),
+            Some(200),
+            Some(999_999),
+        );
+        assert_eq!(r.outcome, UndoOutcome::Success);
+        assert_eq!(r.action_id, 100);
+        assert_eq!(r.target_workflow_id.as_deref(), Some("wf-100"));
+        assert_eq!(r.target_pane_id, Some(200));
+        assert_eq!(r.undone_at, Some(999_999));
+        // guidance is always None for success
+        assert!(r.guidance.is_none());
+    }
+
+    #[test]
+    fn undo_execution_result_not_applicable_with_guidance() {
+        let r = UndoExecutionResult::not_applicable(
+            5,
+            "pane_close".to_string(),
+            "Pane gone".to_string(),
+            Some("Manually recreate pane".to_string()),
+            Some("wf-5".to_string()),
+            Some(55),
+        );
+        assert_eq!(r.outcome, UndoOutcome::NotApplicable);
+        assert_eq!(r.guidance.as_deref(), Some("Manually recreate pane"));
+        assert_eq!(r.target_workflow_id.as_deref(), Some("wf-5"));
+        assert_eq!(r.target_pane_id, Some(55));
+        assert!(r.undone_at.is_none());
+    }
+
+    #[test]
+    fn undo_execution_result_failed_with_guidance() {
+        let r = UndoExecutionResult::failed(
+            6,
+            "pane_close".to_string(),
+            "kill_pane error".to_string(),
+            Some("Try again later".to_string()),
+            None,
+            Some(66),
+        );
+        assert_eq!(r.outcome, UndoOutcome::Failed);
+        assert_eq!(r.guidance.as_deref(), Some("Try again later"));
+        assert!(r.target_workflow_id.is_none());
+        assert_eq!(r.target_pane_id, Some(66));
+        assert!(r.undone_at.is_none());
+    }
+
+    #[test]
+    fn undo_execution_result_message_preserved_in_all_constructors() {
+        let s = UndoExecutionResult::success(
+            1,
+            "s".to_string(),
+            "success message".to_string(),
+            None,
+            None,
+            None,
+        );
+        let n = UndoExecutionResult::not_applicable(
+            1,
+            "n".to_string(),
+            "not applicable message".to_string(),
+            None,
+            None,
+            None,
+        );
+        let f = UndoExecutionResult::failed(
+            1,
+            "f".to_string(),
+            "failed message".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(s.message, "success message");
+        assert_eq!(n.message, "not applicable message");
+        assert_eq!(f.message, "failed message");
+    }
+
+    #[test]
+    fn undo_execution_result_serde_roundtrip_failed_variant() {
+        let r = UndoExecutionResult::failed(
+            77,
+            "workflow_abort".to_string(),
+            "timeout".to_string(),
+            Some("retry".to_string()),
+            Some("wf-77".to_string()),
+            Some(88),
+        );
+        let json = serde_json::to_string(&r).unwrap();
+        let back: UndoExecutionResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.action_id, 77);
+        assert_eq!(back.outcome, UndoOutcome::Failed);
+        assert_eq!(back.strategy, "workflow_abort");
+        assert_eq!(back.message, "timeout");
+        assert_eq!(back.guidance.as_deref(), Some("retry"));
+        assert_eq!(back.target_workflow_id.as_deref(), Some("wf-77"));
+        assert_eq!(back.target_pane_id, Some(88));
+        assert!(back.undone_at.is_none());
+    }
+
+    #[test]
+    fn undo_execution_result_serde_roundtrip_not_applicable_variant() {
+        let r = UndoExecutionResult::not_applicable(
+            33,
+            "manual".to_string(),
+            "no auto undo".to_string(),
+            Some("use CLI".to_string()),
+            None,
+            None,
+        );
+        let json = serde_json::to_string(&r).unwrap();
+        let back: UndoExecutionResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.action_id, 33);
+        assert_eq!(back.outcome, UndoOutcome::NotApplicable);
+        assert_eq!(back.guidance.as_deref(), Some("use CLI"));
+    }
+
+    #[test]
+    fn undo_execution_result_serde_json_contains_expected_keys() {
+        let r = UndoExecutionResult::success(
+            1,
+            "pane_close".to_string(),
+            "done".to_string(),
+            None,
+            Some(5),
+            Some(12345),
+        );
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"action_id\""));
+        assert!(json.contains("\"strategy\""));
+        assert!(json.contains("\"outcome\""));
+        assert!(json.contains("\"message\""));
+        assert!(json.contains("\"target_pane_id\""));
+        assert!(json.contains("\"undone_at\""));
+    }
+
+    #[test]
+    fn undo_execution_result_deser_from_raw_json() {
+        let raw = r#"{
+            "action_id": 10,
+            "strategy": "pane_close",
+            "outcome": "success",
+            "message": "Closed pane 5",
+            "guidance": null,
+            "target_workflow_id": null,
+            "target_pane_id": 5,
+            "undone_at": 1700000000
+        }"#;
+        let r: UndoExecutionResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(r.action_id, 10);
+        assert_eq!(r.outcome, UndoOutcome::Success);
+        assert_eq!(r.target_pane_id, Some(5));
+        assert_eq!(r.undone_at, Some(1_700_000_000));
+        assert!(r.guidance.is_none());
+    }
+
+    #[test]
+    fn undo_execution_result_debug_contains_all_field_names() {
+        let r = UndoExecutionResult {
+            action_id: 1,
+            strategy: "test".to_string(),
+            outcome: UndoOutcome::Failed,
+            message: "msg".to_string(),
+            guidance: Some("guide".to_string()),
+            target_workflow_id: Some("wf".to_string()),
+            target_pane_id: Some(9),
+            undone_at: Some(100),
+        };
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("action_id"));
+        assert!(dbg.contains("strategy"));
+        assert!(dbg.contains("outcome"));
+        assert!(dbg.contains("message"));
+        assert!(dbg.contains("guidance"));
+        assert!(dbg.contains("target_workflow_id"));
+        assert!(dbg.contains("target_pane_id"));
+        assert!(dbg.contains("undone_at"));
+    }
+
+    #[test]
+    fn parse_undo_payload_array_json() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "custom".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"[1, 2, 3]"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        let val = parse_undo_payload(&undo);
+        assert!(val.is_some());
+        assert!(val.unwrap().is_array());
+    }
+
+    #[test]
+    fn parse_undo_payload_null_json() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "custom".to_string(),
+            undo_hint: None,
+            undo_payload: Some("null".to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        let val = parse_undo_payload(&undo);
+        assert!(val.is_some());
+        assert!(val.unwrap().is_null());
+    }
+
+    #[test]
+    fn parse_undo_payload_whitespace_only() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "custom".to_string(),
+            undo_hint: None,
+            undo_payload: Some("   ".to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        assert!(parse_undo_payload(&undo).is_none());
+    }
+
+    #[test]
+    fn parse_undo_payload_boolean_json() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "custom".to_string(),
+            undo_hint: None,
+            undo_payload: Some("true".to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        let val = parse_undo_payload(&undo);
+        assert!(val.is_some());
+        assert_eq!(val.unwrap(), serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn parse_undo_payload_string_json() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "custom".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#""just a string""#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        let val = parse_undo_payload(&undo);
+        assert!(val.is_some());
+        assert_eq!(val.unwrap().as_str(), Some("just a string"));
+    }
+
+    #[test]
+    fn execution_id_from_undo_payload_null_execution_id() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "workflow_abort".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"{"execution_id": null}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        let action = make_action_history(1, "human", None, None, None);
+        // null is not a string, falls through, human actor with no workflow_id => None
+        assert!(execution_id_from_undo(&undo, &action).is_none());
+    }
+
+    #[test]
+    fn execution_id_from_undo_payload_array_execution_id() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "workflow_abort".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"{"execution_id": ["a", "b"]}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        let action = make_action_history(1, "human", None, Some("wf-fallback"), None);
+        // Array is not a string, falls through to workflow_id
+        assert_eq!(
+            execution_id_from_undo(&undo, &action).as_deref(),
+            Some("wf-fallback")
+        );
+    }
+
+    #[test]
+    fn execution_id_from_undo_workflow_actor_with_no_actor_id() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "workflow_abort".to_string(),
+            undo_hint: None,
+            undo_payload: None,
+            undone_at: None,
+            undone_by: None,
+        };
+        // actor_kind is "workflow" but actor_id is None
+        let action = make_action_history(1, "workflow", None, Some("wf-from-workflow"), None);
+        // Falls to actor_id (None), returns None, then falls to workflow_id
+        assert_eq!(
+            execution_id_from_undo(&undo, &action).as_deref(),
+            // actor_kind == "workflow" => return actor_id which is None
+            None
+        );
+    }
+
+    #[test]
+    fn execution_id_from_undo_invalid_payload_json_uses_fallback() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "workflow_abort".to_string(),
+            undo_hint: None,
+            undo_payload: Some("not valid json".to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        let action = make_action_history(1, "human", None, Some("wf-fallback-2"), None);
+        // Invalid JSON => parse_undo_payload returns None => falls to workflow_id
+        assert_eq!(
+            execution_id_from_undo(&undo, &action).as_deref(),
+            Some("wf-fallback-2")
+        );
+    }
+
+    #[test]
+    fn pane_id_from_undo_null_value() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "pane_close".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"{"pane_id": null}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        assert!(pane_id_from_undo(&undo).is_none());
+    }
+
+    #[test]
+    fn pane_id_from_undo_boolean_value() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "pane_close".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"{"pane_id": true}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        assert!(pane_id_from_undo(&undo).is_none());
+    }
+
+    #[test]
+    fn pane_id_from_undo_nested_pane_id() {
+        // pane_id is nested, not at top level — should return None
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "pane_close".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"{"data": {"pane_id": 42}}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        assert!(pane_id_from_undo(&undo).is_none());
+    }
+
+    #[test]
+    fn pane_id_from_undo_array_value() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "pane_close".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"{"pane_id": [1, 2]}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        assert!(pane_id_from_undo(&undo).is_none());
+    }
+
+    #[test]
+    fn make_action_history_helper_all_none() {
+        let h = make_action_history(0, "human", None, None, None);
+        assert_eq!(h.id, 0);
+        assert_eq!(h.actor_kind, "human");
+        assert!(h.actor_id.is_none());
+        assert!(h.workflow_id.is_none());
+        assert!(h.pane_id.is_none());
+        assert!(h.correlation_id.is_none());
+        assert!(h.undo_hint.is_none());
+    }
+
+    #[test]
+    fn make_action_history_helper_default_undo_fields() {
+        let h = make_action_history(1, "robot", None, None, None);
+        assert_eq!(h.undoable, Some(true));
+        assert_eq!(h.undo_strategy.as_deref(), Some("workflow_abort"));
+        assert!(h.undone_at.is_none());
+        assert!(h.undone_by.is_none());
+        assert!(h.step_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn undo_executor_clone() {
+        // UndoExecutor derives Clone
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("clone-test.db");
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
+        let mock = Arc::new(MockWezterm::new());
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let _cloned = executor.clone();
+        // Just verify it compiles and doesn't panic
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn pane_close_falls_back_to_action_pane_id() {
+        // When payload has no pane_id but action record does, should use action's pane_id
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-pane-close-fallback.db");
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
+
+        let pane_id = 77_u64;
+        seed_pane(storage.as_ref(), pane_id).await;
+        let action_id =
+            seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
+
+        storage
+            .upsert_action_undo(ActionUndoRecord {
+                audit_action_id: action_id,
+                undoable: true,
+                undo_strategy: "pane_close".to_string(),
+                undo_hint: None,
+                // Payload has no pane_id key
+                undo_payload: Some(r#"{"reason": "test"}"#.to_string()),
+                undone_at: None,
+                undone_by: None,
+            })
+            .await
+            .expect("undo metadata");
+
+        let mock = Arc::new(MockWezterm::new());
+        mock.add_default_pane(pane_id).await;
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock.clone());
+        let result = executor
+            .execute(UndoRequest::new(action_id).with_actor("fallback-test"))
+            .await
+            .expect("result");
+
+        // Should succeed using action's pane_id as fallback
+        assert_eq!(result.outcome, UndoOutcome::Success);
+        assert_eq!(result.target_pane_id, Some(pane_id));
+
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn workflow_abort_waiting_workflow_succeeds() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-wf-waiting.db");
+        let db_path = db_path.to_string_lossy().to_string();
+        let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+        let pane_id = 88_u64;
+        let execution_id = "wf-waiting-1";
+
+        seed_pane(storage.as_ref(), pane_id).await;
+        let action_id = seed_action(
+            storage.as_ref(),
+            pane_id,
+            "workflow",
+            Some(execution_id),
+            "workflow_start",
+        )
+        .await;
+        seed_workflow(storage.as_ref(), execution_id, pane_id, "waiting").await;
+
+        storage
+            .upsert_action_undo(ActionUndoRecord {
+                audit_action_id: action_id,
+                undoable: true,
+                undo_strategy: "workflow_abort".to_string(),
+                undo_hint: None,
+                undo_payload: Some(
+                    serde_json::json!({ "execution_id": execution_id }).to_string(),
+                ),
+                undone_at: None,
+                undone_by: None,
+            })
+            .await
+            .expect("undo metadata");
+
+        let mock = Arc::new(MockWezterm::new());
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let result = executor
+            .execute(UndoRequest::new(action_id).with_actor("test"))
+            .await
+            .expect("undo result");
+
+        assert_eq!(result.outcome, UndoOutcome::Success);
+        assert_eq!(result.strategy, "workflow_abort");
+
+        let workflow = storage
+            .get_workflow(execution_id)
+            .await
+            .expect("workflow query")
+            .expect("workflow exists");
+        assert_eq!(workflow.status, "aborted");
+
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn undoable_false_hint_falls_back_to_action_hint() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-fallback-hint.db");
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
+
+        seed_pane(storage.as_ref(), 1).await;
+        // Create action with undo_hint in the action record itself
+        let now = now_ms();
+        let action_id = storage
+            .record_audit_action(AuditActionRecord {
+                id: 0,
+                ts: now,
+                actor_kind: "human".to_string(),
+                actor_id: None,
+                correlation_id: None,
+                pane_id: Some(1),
+                domain: Some("local".to_string()),
+                action_kind: "send_text".to_string(),
+                policy_decision: "allow".to_string(),
+                decision_reason: None,
+                rule_id: None,
+                input_summary: None,
+                verification_summary: None,
+                decision_context: None,
+                result: "success".to_string(),
+            })
+            .await
+            .expect("seed action");
+
+        // Undo record with no hint (None), undoable=false
+        storage
+            .upsert_action_undo(ActionUndoRecord {
+                audit_action_id: action_id,
+                undoable: false,
+                undo_strategy: "manual".to_string(),
+                undo_hint: None,
+                undo_payload: None,
+                undone_at: None,
+                undone_by: None,
+            })
+            .await
+            .expect("undo metadata");
+
+        let mock = Arc::new(MockWezterm::new());
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
+
+        assert_eq!(result.outcome, UndoOutcome::NotApplicable);
+        assert!(result.message.contains("not currently undoable"));
+
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn action_not_found_guidance_suggests_ft_history() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-guidance-msg.db");
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
+
+        let mock = Arc::new(MockWezterm::new());
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let result = executor
+            .execute(UndoRequest::new(12345))
+            .await
+            .expect("result");
+
+        assert_eq!(result.outcome, UndoOutcome::NotApplicable);
+        assert_eq!(result.strategy, "none");
+        assert!(result
+            .guidance
+            .as_deref()
+            .unwrap()
+            .contains("ft history"));
+
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn action_not_found_message_includes_action_id() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-notfound-id.db");
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
+
+        let mock = Arc::new(MockWezterm::new());
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let result = executor
+            .execute(UndoRequest::new(54321))
+            .await
+            .expect("result");
+
+        assert!(result.message.contains("54321"));
+
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn no_undo_metadata_guidance_mentions_non_undoable() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-no-meta-guide.db");
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
+
+        seed_pane(storage.as_ref(), 1).await;
+        let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
+
+        let mock = Arc::new(MockWezterm::new());
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
+
+        assert_eq!(result.outcome, UndoOutcome::NotApplicable);
+        let guidance = result.guidance.as_deref().unwrap();
+        assert!(guidance.contains("non-undoable") || guidance.contains("predates"));
+
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn unknown_strategy_returns_hint_from_undo_record() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-unknown-hint.db");
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
+
+        seed_pane(storage.as_ref(), 1).await;
+        let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
+
+        storage
+            .upsert_action_undo(ActionUndoRecord {
+                audit_action_id: action_id,
+                undoable: true,
+                undo_strategy: "quantum_revert".to_string(),
+                undo_hint: Some("Contact quantum support".to_string()),
+                undo_payload: None,
+                undone_at: None,
+                undone_by: None,
+            })
+            .await
+            .expect("undo metadata");
+
+        let mock = Arc::new(MockWezterm::new());
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
+
+        assert_eq!(result.outcome, UndoOutcome::Failed);
+        assert_eq!(result.strategy, "quantum_revert");
+        assert_eq!(
+            result.guidance.as_deref(),
+            Some("Contact quantum support")
+        );
+
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn pane_close_success_message_contains_pane_id() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-pane-msg.db");
+        let db_path = db_path.to_string_lossy().to_string();
+        let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+        let pane_id = 123_u64;
+        seed_pane(storage.as_ref(), pane_id).await;
+        let action_id =
+            seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
+
+        storage
+            .upsert_action_undo(ActionUndoRecord {
+                audit_action_id: action_id,
+                undoable: true,
+                undo_strategy: "pane_close".to_string(),
+                undo_hint: None,
+                undo_payload: Some(serde_json::json!({ "pane_id": pane_id }).to_string()),
+                undone_at: None,
+                undone_by: None,
+            })
+            .await
+            .expect("undo metadata");
+
+        let mock = Arc::new(MockWezterm::new());
+        mock.add_default_pane(pane_id).await;
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
+
+        assert_eq!(result.outcome, UndoOutcome::Success);
+        assert!(result.message.contains("123"));
+
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn workflow_abort_success_message_contains_execution_id() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-wf-msg.db");
+        let db_path = db_path.to_string_lossy().to_string();
+        let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+        let pane_id = 50_u64;
+        let execution_id = "wf-msg-test-1";
+
+        seed_pane(storage.as_ref(), pane_id).await;
+        let action_id = seed_action(
+            storage.as_ref(),
+            pane_id,
+            "workflow",
+            Some(execution_id),
+            "workflow_start",
+        )
+        .await;
+        seed_workflow(storage.as_ref(), execution_id, pane_id, "running").await;
+
+        storage
+            .upsert_action_undo(ActionUndoRecord {
+                audit_action_id: action_id,
+                undoable: true,
+                undo_strategy: "workflow_abort".to_string(),
+                undo_hint: None,
+                undo_payload: Some(
+                    serde_json::json!({ "execution_id": execution_id }).to_string(),
+                ),
+                undone_at: None,
+                undone_by: None,
+            })
+            .await
+            .expect("undo metadata");
+
+        let mock = Arc::new(MockWezterm::new());
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
+
+        assert_eq!(result.outcome, UndoOutcome::Success);
+        assert!(result.message.contains(execution_id));
+
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn undo_request_with_reason_propagates_to_workflow_abort() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-reason-prop.db");
+        let db_path = db_path.to_string_lossy().to_string();
+        let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+        let pane_id = 60_u64;
+        let execution_id = "wf-reason-prop-1";
+
+        seed_pane(storage.as_ref(), pane_id).await;
+        let action_id = seed_action(
+            storage.as_ref(),
+            pane_id,
+            "workflow",
+            Some(execution_id),
+            "workflow_start",
+        )
+        .await;
+        seed_workflow(storage.as_ref(), execution_id, pane_id, "running").await;
+
+        storage
+            .upsert_action_undo(ActionUndoRecord {
+                audit_action_id: action_id,
+                undoable: true,
+                undo_strategy: "workflow_abort".to_string(),
+                undo_hint: None,
+                undo_payload: Some(
+                    serde_json::json!({ "execution_id": execution_id }).to_string(),
+                ),
+                undone_at: None,
+                undone_by: None,
+            })
+            .await
+            .expect("undo metadata");
+
+        let mock = Arc::new(MockWezterm::new());
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let result = executor
+            .execute(
+                UndoRequest::new(action_id)
+                    .with_actor("reason-test")
+                    .with_reason("emergency rollback"),
+            )
+            .await
+            .expect("result");
+
+        assert_eq!(result.outcome, UndoOutcome::Success);
+        // The reason was passed through; verify the workflow is aborted
+        let wf = storage
+            .get_workflow(execution_id)
+            .await
+            .expect("wf query")
+            .expect("wf exists");
+        assert_eq!(wf.status, "aborted");
+
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn already_undone_preserves_original_undone_by() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-preserve-by.db");
+        let db_path = db_path.to_string_lossy().to_string();
+        let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+        let pane_id = 30_u64;
+        seed_pane(storage.as_ref(), pane_id).await;
+        let action_id = seed_action(storage.as_ref(), pane_id, "human", None, "spawn").await;
+
+        storage
+            .upsert_action_undo(ActionUndoRecord {
+                audit_action_id: action_id,
+                undoable: true,
+                undo_strategy: "pane_close".to_string(),
+                undo_hint: None,
+                undo_payload: Some(serde_json::json!({ "pane_id": pane_id }).to_string()),
+                undone_at: Some(1_000_000),
+                undone_by: Some("original-actor".to_string()),
+            })
+            .await
+            .expect("undo metadata");
+
+        let mock = Arc::new(MockWezterm::new());
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let result = executor
+            .execute(UndoRequest::new(action_id).with_actor("new-actor"))
+            .await
+            .expect("result");
+
+        // Should be not applicable since already undone
+        assert_eq!(result.outcome, UndoOutcome::NotApplicable);
+
+        // Original undone_by should be preserved
+        let undo = storage
+            .get_action_undo(action_id)
+            .await
+            .expect("undo query")
+            .expect("undo exists");
+        assert_eq!(undo.undone_by.as_deref(), Some("original-actor"));
+
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn manual_strategy_undoable_true_still_returns_not_applicable() {
+        // Even when undoable=true, manual strategy returns not_applicable
+        // because automatic undo is not supported
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-manual-true.db");
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
+
+        seed_pane(storage.as_ref(), 1).await;
+        let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
+
+        storage
+            .upsert_action_undo(ActionUndoRecord {
+                audit_action_id: action_id,
+                undoable: true,
+                undo_strategy: "manual".to_string(),
+                undo_hint: Some("manual steps needed".to_string()),
+                undo_payload: None,
+                undone_at: None,
+                undone_by: None,
+            })
+            .await
+            .expect("undo metadata");
+
+        let mock = Arc::new(MockWezterm::new());
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
+
+        assert_eq!(result.outcome, UndoOutcome::NotApplicable);
+        assert!(result.message.contains("not supported"));
+        assert_eq!(result.guidance.as_deref(), Some("manual steps needed"));
+
+        storage.shutdown().await.expect("shutdown");
+    }
 }
