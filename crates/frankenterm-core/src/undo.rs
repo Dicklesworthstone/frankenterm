@@ -1444,4 +1444,349 @@ mod tests {
 
         storage.shutdown().await.expect("shutdown");
     }
+
+    // ── Additional pure-function and type-level tests ──
+
+    #[test]
+    fn undo_outcome_deserialize_from_string_values() {
+        let s: UndoOutcome = serde_json::from_str(r#""success""#).unwrap();
+        assert_eq!(s, UndoOutcome::Success);
+        let n: UndoOutcome = serde_json::from_str(r#""not_applicable""#).unwrap();
+        assert_eq!(n, UndoOutcome::NotApplicable);
+        let f: UndoOutcome = serde_json::from_str(r#""failed""#).unwrap();
+        assert_eq!(f, UndoOutcome::Failed);
+    }
+
+    #[test]
+    fn undo_outcome_invalid_string_fails_deser() {
+        let result = serde_json::from_str::<UndoOutcome>(r#""unknown_variant""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn undo_outcome_copy_semantics() {
+        let a = UndoOutcome::Success;
+        let b = a; // Copy
+        assert_eq!(a, b); // a still accessible after copy
+    }
+
+    #[test]
+    fn undo_outcome_debug_format() {
+        let dbg = format!("{:?}", UndoOutcome::NotApplicable);
+        assert!(dbg.contains("NotApplicable"));
+    }
+
+    #[test]
+    fn undo_request_negative_action_id() {
+        let req = UndoRequest::new(-1);
+        assert_eq!(req.action_id, -1);
+    }
+
+    #[test]
+    fn undo_request_with_actor_empty_string() {
+        let req = UndoRequest::new(1).with_actor("");
+        assert_eq!(req.actor, "");
+    }
+
+    #[test]
+    fn undo_request_builder_chaining_order_independent() {
+        let r1 = UndoRequest::new(5).with_actor("admin").with_reason("oops");
+        let r2 = UndoRequest::new(5).with_reason("oops").with_actor("admin");
+        assert_eq!(r1.action_id, r2.action_id);
+        assert_eq!(r1.actor, r2.actor);
+        assert_eq!(r1.reason, r2.reason);
+    }
+
+    #[test]
+    fn undo_request_with_reason_string_type() {
+        let req = UndoRequest::new(1).with_reason(String::from("owned"));
+        assert_eq!(req.reason.as_deref(), Some("owned"));
+    }
+
+    #[test]
+    fn undo_execution_result_serde_all_none_optionals() {
+        let r = UndoExecutionResult {
+            action_id: 1,
+            strategy: "manual".to_string(),
+            outcome: UndoOutcome::NotApplicable,
+            message: "nope".to_string(),
+            guidance: None,
+            target_workflow_id: None,
+            target_pane_id: None,
+            undone_at: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: UndoExecutionResult = serde_json::from_str(&json).unwrap();
+        assert!(back.guidance.is_none());
+        assert!(back.target_workflow_id.is_none());
+        assert!(back.target_pane_id.is_none());
+        assert!(back.undone_at.is_none());
+    }
+
+    #[test]
+    fn undo_execution_result_serde_all_some_optionals() {
+        let r = UndoExecutionResult {
+            action_id: 99,
+            strategy: "pane_close".to_string(),
+            outcome: UndoOutcome::Success,
+            message: "closed".to_string(),
+            guidance: Some("check state".to_string()),
+            target_workflow_id: Some("wf-99".to_string()),
+            target_pane_id: Some(42),
+            undone_at: Some(1_700_000_000),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: UndoExecutionResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.guidance.as_deref(), Some("check state"));
+        assert_eq!(back.target_workflow_id.as_deref(), Some("wf-99"));
+        assert_eq!(back.target_pane_id, Some(42));
+        assert_eq!(back.undone_at, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn undo_execution_result_not_applicable_has_no_undone_at() {
+        let r = UndoExecutionResult::not_applicable(
+            1,
+            "manual".to_string(),
+            "msg".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert!(r.undone_at.is_none());
+    }
+
+    #[test]
+    fn undo_execution_result_failed_has_no_undone_at() {
+        let r = UndoExecutionResult::failed(
+            1,
+            "workflow_abort".to_string(),
+            "msg".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert!(r.undone_at.is_none());
+    }
+
+    #[test]
+    fn undo_execution_result_action_id_preserved_in_all_constructors() {
+        let s =
+            UndoExecutionResult::success(42, "s".to_string(), "m".to_string(), None, None, None);
+        let n = UndoExecutionResult::not_applicable(
+            42,
+            "n".to_string(),
+            "m".to_string(),
+            None,
+            None,
+            None,
+        );
+        let f = UndoExecutionResult::failed(42, "f".to_string(), "m".to_string(), None, None, None);
+        assert_eq!(s.action_id, 42);
+        assert_eq!(n.action_id, 42);
+        assert_eq!(f.action_id, 42);
+    }
+
+    #[test]
+    fn parse_undo_payload_empty_string() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "manual".to_string(),
+            undo_hint: None,
+            undo_payload: Some("".to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        assert!(parse_undo_payload(&undo).is_none());
+    }
+
+    #[test]
+    fn parse_undo_payload_nested_json() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "custom".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"{"nested": {"deep": 42}}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        let val = parse_undo_payload(&undo).unwrap();
+        assert_eq!(val["nested"]["deep"], 42);
+    }
+
+    #[test]
+    fn execution_id_from_undo_payload_non_string_execution_id() {
+        // execution_id is numeric, not string — should not extract
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "workflow_abort".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"{"execution_id": 12345}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        let action = make_action_history(1, "human", None, None, None);
+        // Numeric execution_id won't match as_str, falls through to None
+        assert!(execution_id_from_undo(&undo, &action).is_none());
+    }
+
+    #[test]
+    fn execution_id_from_undo_payload_empty_string_execution_id() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "workflow_abort".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"{"execution_id": ""}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        let action = make_action_history(1, "human", None, Some("wf-fallback"), None);
+        // Empty string is still a valid string, so it takes priority
+        assert_eq!(execution_id_from_undo(&undo, &action).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn pane_id_from_undo_zero() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "pane_close".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"{"pane_id": 0}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        assert_eq!(pane_id_from_undo(&undo), Some(0));
+    }
+
+    #[test]
+    fn pane_id_from_undo_large_value() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "pane_close".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"{"pane_id": 18446744073709551615}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        assert_eq!(pane_id_from_undo(&undo), Some(u64::MAX));
+    }
+
+    #[test]
+    fn pane_id_from_undo_negative_number() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "pane_close".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"{"pane_id": -1}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        // Negative numbers don't parse as u64
+        assert!(pane_id_from_undo(&undo).is_none());
+    }
+
+    #[test]
+    fn pane_id_from_undo_float_number() {
+        let undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "pane_close".to_string(),
+            undo_hint: None,
+            undo_payload: Some(r#"{"pane_id": 3.14}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        // Floats don't parse as u64
+        assert!(pane_id_from_undo(&undo).is_none());
+    }
+
+    #[tokio::test]
+    async fn none_strategy_returns_not_applicable() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-none-strategy.db");
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
+
+        seed_pane(storage.as_ref(), 1).await;
+        let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
+
+        storage
+            .upsert_action_undo(ActionUndoRecord {
+                audit_action_id: action_id,
+                undoable: true,
+                undo_strategy: "none".to_string(),
+                undo_hint: Some("No undo available".to_string()),
+                undo_payload: None,
+                undone_at: None,
+                undone_by: None,
+            })
+            .await
+            .expect("undo metadata");
+
+        let mock = Arc::new(MockWezterm::new());
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
+
+        assert_eq!(result.outcome, UndoOutcome::NotApplicable);
+        assert!(result.message.contains("not supported"));
+        assert_eq!(result.guidance.as_deref(), Some("No undo available"));
+
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[test]
+    fn make_action_history_helper_fields() {
+        let h = make_action_history(10, "workflow", Some("wf-1"), Some("wfid"), Some(5));
+        assert_eq!(h.id, 10);
+        assert_eq!(h.actor_kind, "workflow");
+        assert_eq!(h.actor_id.as_deref(), Some("wf-1"));
+        assert_eq!(h.workflow_id.as_deref(), Some("wfid"));
+        assert_eq!(h.pane_id, Some(5));
+        assert_eq!(h.domain.as_deref(), Some("local"));
+        assert_eq!(h.action_kind, "send_text");
+        assert_eq!(h.result, "success");
+    }
+
+    #[test]
+    fn undo_execution_result_debug_format() {
+        let r = UndoExecutionResult::success(
+            1,
+            "pane_close".to_string(),
+            "ok".to_string(),
+            None,
+            None,
+            None,
+        );
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("UndoExecutionResult"));
+        assert!(dbg.contains("pane_close"));
+    }
+
+    #[test]
+    fn undo_request_debug_format() {
+        let req = UndoRequest::new(7).with_actor("admin");
+        let dbg = format!("{:?}", req);
+        assert!(dbg.contains("UndoRequest"));
+        assert!(dbg.contains("admin"));
+    }
+
+    #[test]
+    fn undo_execution_result_success_guidance_is_none() {
+        let r = UndoExecutionResult::success(1, "s".to_string(), "m".to_string(), None, None, None);
+        // success constructor always sets guidance to None
+        assert!(r.guidance.is_none());
+    }
 }
