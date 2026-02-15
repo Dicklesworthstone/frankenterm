@@ -2203,4 +2203,456 @@ mod tests {
         let _ = fs::remove_dir_all(&output_dir);
         let _ = fs::remove_dir_all(layout.root);
     }
+
+    // -----------------------------------------------------------------------
+    // Batch — RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn diagnostic_options_clone_is_independent() {
+        let opts = DiagnosticOptions {
+            event_limit: 10,
+            audit_limit: 5,
+            workflow_limit: 3,
+            output: Some(PathBuf::from("/tmp/a")),
+        };
+        let mut clone = opts.clone();
+        clone.event_limit = 999;
+        clone.output = Some(PathBuf::from("/tmp/b"));
+        // Original unchanged
+        assert_eq!(opts.event_limit, 10);
+        assert_eq!(opts.output.as_ref().unwrap().to_str().unwrap(), "/tmp/a");
+        assert_eq!(clone.event_limit, 999);
+    }
+
+    #[test]
+    fn diagnostic_options_debug_format() {
+        let opts = DiagnosticOptions::default();
+        let dbg = format!("{:?}", opts);
+        assert!(dbg.contains("DiagnosticOptions"));
+        assert!(dbg.contains("event_limit"));
+        assert!(dbg.contains("100"));
+    }
+
+    #[test]
+    fn diagnostic_result_clone_is_independent() {
+        let result = DiagnosticResult {
+            output_path: "/tmp/diag".to_string(),
+            file_count: 5,
+            total_size_bytes: 1024,
+        };
+        let mut clone = result.clone();
+        clone.file_count = 99;
+        assert_eq!(result.file_count, 5);
+        assert_eq!(clone.file_count, 99);
+    }
+
+    #[test]
+    fn diagnostic_result_debug_format() {
+        let result = DiagnosticResult {
+            output_path: "/x".to_string(),
+            file_count: 3,
+            total_size_bytes: 42,
+        };
+        let dbg = format!("{:?}", result);
+        assert!(dbg.contains("DiagnosticResult"));
+        assert!(dbg.contains("file_count"));
+        assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn diagnostic_result_serde_roundtrip() {
+        let result = DiagnosticResult {
+            output_path: "/tmp/diag_roundtrip".to_string(),
+            file_count: 12,
+            total_size_bytes: 8192,
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        // Deserialize back (DiagnosticResult derives Serialize but we can parse as Value)
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["output_path"], "/tmp/diag_roundtrip");
+        assert_eq!(parsed["file_count"], 12);
+        assert_eq!(parsed["total_size_bytes"], 8192);
+    }
+
+    #[test]
+    fn environment_info_schema_version_matches_constant() {
+        let env = gather_environment();
+        assert_eq!(
+            env.schema_version, SCHEMA_VERSION,
+            "schema_version should always match SCHEMA_VERSION"
+        );
+    }
+
+    #[test]
+    fn environment_info_os_and_arch_are_known_values() {
+        let env = gather_environment();
+        // OS should be one of the standard Rust targets
+        let known_os = ["linux", "macos", "windows", "freebsd", "android", "ios"];
+        assert!(
+            known_os.contains(&env.os.as_str()),
+            "unexpected os: {}",
+            env.os
+        );
+        let known_arch = ["x86_64", "aarch64", "arm", "x86", "wasm32", "riscv64"];
+        assert!(
+            known_arch.contains(&env.arch.as_str()),
+            "unexpected arch: {}",
+            env.arch
+        );
+    }
+
+    #[test]
+    fn config_summary_serializes_all_twelve_fields() {
+        let config = Config::default();
+        let summary = summarize_config(&config);
+        let json = serde_json::to_string(&summary).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        let obj = parsed.as_object().expect("should be object");
+        let expected_keys = [
+            "general_log_level",
+            "general_log_format",
+            "ingest_poll_interval_ms",
+            "ingest_max_concurrent",
+            "ingest_gap_detection",
+            "storage_retention_days",
+            "storage_retention_max_mb",
+            "storage_checkpoint_secs",
+            "patterns_quick_reject",
+            "patterns_packs",
+            "workflows_enabled",
+            "workflows_max_concurrent",
+            "safety_rate_limit",
+            "metrics_enabled",
+        ];
+        for key in &expected_keys {
+            assert!(obj.contains_key(*key), "missing field: {}", key);
+        }
+    }
+
+    #[test]
+    fn config_summary_patterns_packs_is_array() {
+        let config = Config::default();
+        let summary = summarize_config(&config);
+        let json = serde_json::to_string(&summary).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert!(parsed["patterns_packs"].is_array());
+        assert!(parsed["workflows_enabled"].is_array());
+    }
+
+    #[test]
+    fn db_health_stats_serializes_all_fields() {
+        let health = DbHealthStats {
+            schema_version: 8,
+            db_file_size_bytes: 4096,
+            wal_file_size_bytes: 0,
+            page_count: 10,
+            page_size: 4096,
+            freelist_count: 2,
+            table_counts: TableCounts {
+                panes: 5,
+                output_segments: 10,
+                events: 20,
+                audit_actions: 3,
+                workflow_executions: 2,
+                workflow_step_logs: 8,
+                pane_reservations: 1,
+                approval_tokens: 0,
+            },
+        };
+        let json = serde_json::to_string_pretty(&health).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["schema_version"], 8);
+        assert_eq!(parsed["page_size"], 4096);
+        assert_eq!(parsed["freelist_count"], 2);
+        assert_eq!(parsed["table_counts"]["panes"], 5);
+        assert_eq!(parsed["table_counts"]["approval_tokens"], 0);
+    }
+
+    #[test]
+    fn table_counts_serializes_all_eight_fields() {
+        let tc = TableCounts {
+            panes: 1,
+            output_segments: 2,
+            events: 3,
+            audit_actions: 4,
+            workflow_executions: 5,
+            workflow_step_logs: 6,
+            pane_reservations: 7,
+            approval_tokens: 8,
+        };
+        let json = serde_json::to_string(&tc).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        let obj = parsed.as_object().expect("should be object");
+        assert_eq!(obj.len(), 8, "TableCounts should have exactly 8 fields");
+        assert_eq!(parsed["panes"], 1);
+        assert_eq!(parsed["approval_tokens"], 8);
+    }
+
+    #[test]
+    fn redacted_event_serializes_all_fields() {
+        let event = RedactedEvent {
+            id: 42,
+            pane_id: 7,
+            rule_id: "test.rule".to_string(),
+            event_type: "usage".to_string(),
+            severity: "critical".to_string(),
+            confidence: 0.99,
+            detected_at: 5000,
+            handled_status: Some("completed".to_string()),
+            matched_text: Some("some match".to_string()),
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["id"], 42);
+        assert_eq!(parsed["pane_id"], 7);
+        assert_eq!(parsed["severity"], "critical");
+        assert!((parsed["confidence"].as_f64().unwrap() - 0.99).abs() < f64::EPSILON);
+        assert_eq!(parsed["handled_status"], "completed");
+    }
+
+    #[test]
+    fn redacted_event_none_fields_are_null_in_json() {
+        let event = RedactedEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "r".to_string(),
+            event_type: "e".to_string(),
+            severity: "info".to_string(),
+            confidence: 0.5,
+            detected_at: 100,
+            handled_status: None,
+            matched_text: None,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert!(parsed["handled_status"].is_null());
+        assert!(parsed["matched_text"].is_null());
+    }
+
+    #[test]
+    fn redact_events_multiple_items_preserves_count() {
+        let redactor = Redactor::new();
+        let mk_event = |id: i64| crate::storage::StoredEvent {
+            id,
+            pane_id: id as u64,
+            rule_id: format!("rule_{}", id),
+            agent_type: "test".to_string(),
+            event_type: "test".to_string(),
+            severity: "info".to_string(),
+            confidence: 1.0,
+            extracted: None,
+            matched_text: Some(format!("text_{}", id)),
+            segment_id: None,
+            detected_at: id * 1000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let events: Vec<_> = (1..=5).map(mk_event).collect();
+        let redacted = redact_events(events, &redactor);
+        assert_eq!(redacted.len(), 5);
+        for (i, r) in redacted.iter().enumerate() {
+            let expected_id = (i + 1) as i64;
+            assert_eq!(r.id, expected_id);
+            assert_eq!(r.rule_id, format!("rule_{}", expected_id));
+        }
+    }
+
+    #[test]
+    fn redact_events_safe_text_passes_through_unchanged() {
+        let redactor = Redactor::new();
+        let events = vec![crate::storage::StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test".to_string(),
+            agent_type: "test".to_string(),
+            event_type: "test".to_string(),
+            severity: "info".to_string(),
+            confidence: 1.0,
+            extracted: None,
+            matched_text: Some("this is perfectly safe text with no secrets".to_string()),
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }];
+        let redacted = redact_events(events, &redactor);
+        assert_eq!(
+            redacted[0].matched_text.as_deref(),
+            Some("this is perfectly safe text with no secrets")
+        );
+    }
+
+    #[test]
+    fn redacted_workflow_no_steps_serializes() {
+        let wf = RedactedWorkflow {
+            id: "wf-empty".to_string(),
+            workflow_name: "empty_wf".to_string(),
+            pane_id: 1,
+            status: "pending".to_string(),
+            started_at: 1000,
+            completed_at: None,
+            step_count: 0,
+            steps: vec![],
+        };
+        let json = serde_json::to_string(&wf).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["step_count"], 0);
+        assert!(parsed["steps"].as_array().unwrap().is_empty());
+        assert!(parsed["completed_at"].is_null());
+    }
+
+    #[test]
+    fn redacted_workflow_incomplete_has_null_completed() {
+        let wf = RedactedWorkflow {
+            id: "wf-running".to_string(),
+            workflow_name: "in_progress_wf".to_string(),
+            pane_id: 2,
+            status: "running".to_string(),
+            started_at: 5000,
+            completed_at: None,
+            step_count: 1,
+            steps: vec![RedactedStep {
+                step_index: 0,
+                step_name: "init".to_string(),
+                result_type: "continue".to_string(),
+                policy_summary: None,
+                started_at: 5000,
+                completed_at: 5500,
+            }],
+        };
+        let json = serde_json::to_string(&wf).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert!(parsed["completed_at"].is_null());
+        assert_eq!(parsed["status"], "running");
+        assert_eq!(parsed["steps"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bundle_manifest_empty_files_list() {
+        let manifest = BundleManifest {
+            wa_version: "0.0.1".to_string(),
+            generated_at_ms: 0,
+            file_count: 0,
+            files: vec![],
+            redacted: false,
+        };
+        let json = serde_json::to_string(&manifest).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert!(parsed["files"].as_array().unwrap().is_empty());
+        assert_eq!(parsed["file_count"], 0);
+        assert!(!parsed["redacted"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn generate_rule_traces_many_extracted_fields() {
+        let redactor = Redactor::new();
+        let mut obj = serde_json::Map::new();
+        for i in 0..10 {
+            obj.insert(format!("field_{}", i), serde_json::json!(format!("val_{}", i)));
+        }
+        let events = vec![crate::storage::StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "multi_field.rule".to_string(),
+            agent_type: "test".to_string(),
+            event_type: "test".to_string(),
+            severity: "info".to_string(),
+            confidence: 1.0,
+            extracted: Some(serde_json::Value::Object(obj)),
+            matched_text: None,
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }];
+        let traces = generate_rule_traces(&events, &redactor);
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].extracted_fields.len(), 10);
+        for field in &traces[0].extracted_fields {
+            assert_eq!(field.kind, "extracted_field");
+            assert!(field.label.is_some());
+            assert!(field.value.is_some());
+        }
+    }
+
+    #[test]
+    fn generate_rule_traces_handled_flag_logic() {
+        let redactor = Redactor::new();
+        let mk = |id, handled_at: Option<i64>| crate::storage::StoredEvent {
+            id,
+            pane_id: 1,
+            rule_id: "r".to_string(),
+            agent_type: "t".to_string(),
+            event_type: "t".to_string(),
+            severity: "info".to_string(),
+            confidence: 1.0,
+            extracted: None,
+            matched_text: None,
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let events = vec![mk(1, Some(2000)), mk(2, None), mk(3, Some(0))];
+        let traces = generate_rule_traces(&events, &redactor);
+        assert_eq!(traces.len(), 3);
+        assert!(traces[0].handled, "handled_at=Some(2000) should be handled");
+        assert!(!traces[1].handled, "handled_at=None should not be handled");
+        assert!(traces[2].handled, "handled_at=Some(0) should be handled");
+    }
+
+    #[test]
+    fn dir_size_ignores_subdirectories() {
+        let tmp = std::env::temp_dir().join(format!(
+            "wa_test_diag_dirsize_subdir_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(tmp.join("subdir")).unwrap();
+        fs::write(tmp.join("top.txt"), "hello").unwrap();
+        fs::write(tmp.join("subdir").join("nested.txt"), "world!!!!").unwrap();
+        let size = dir_size(&tmp);
+        // dir_size only counts top-level entries; subdir entry metadata != file content
+        // The top.txt is 5 bytes. The subdir entry itself has metadata size but
+        // the function calls e.metadata().map_or(0, |m| m.len()) which for dirs is
+        // implementation-defined. We just verify top.txt is included.
+        assert!(size >= 5, "should include at least top.txt (5 bytes)");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_json_file_large_payload() {
+        let tmp = std::env::temp_dir().join(format!(
+            "wa_test_diag_large_payload_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Build a large serializable value
+        let items: Vec<serde_json::Value> = (0..500)
+            .map(|i| {
+                serde_json::json!({
+                    "index": i,
+                    "data": "x".repeat(100),
+                })
+            })
+            .collect();
+        let data = serde_json::json!({ "items": items });
+        write_json_file(&tmp, "large.json", &data).unwrap();
+
+        let content = fs::read_to_string(tmp.join("large.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
+        assert_eq!(parsed["items"].as_array().unwrap().len(), 500);
+        assert!(content.len() > 50_000, "should be a substantial file");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

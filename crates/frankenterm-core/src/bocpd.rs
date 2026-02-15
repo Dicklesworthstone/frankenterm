@@ -1142,4 +1142,634 @@ mod tests {
         let back: PaneChangePoint = serde_json::from_str(&json).unwrap();
         assert_eq!(back.pane_id, 7);
     }
+
+    // -----------------------------------------------------------------------
+    // Batch — RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    // -- NormalGammaSS edge cases ---------------------------------------------
+
+    #[test]
+    fn prior_predictive_degenerate_returns_negative_100() {
+        // Manually create a degenerate NormalGammaSS with beta = 0 to trigger
+        // the scale_sq <= 0 guard in predictive_log_likelihood.
+        let ss = NormalGammaSS {
+            mu: 0.0,
+            kappa: 1.0,
+            alpha: 1.0,
+            beta: 0.0,
+        };
+        let ll = ss.predictive_log_likelihood(5.0);
+        assert!(
+            (ll - (-100.0)).abs() < f64::EPSILON,
+            "expected -100.0 for degenerate case, got {}",
+            ll
+        );
+    }
+
+    #[test]
+    fn prior_predictive_negative_alpha_returns_negative_100() {
+        // alpha = 0 => df = 0 => degenerate
+        let ss = NormalGammaSS {
+            mu: 0.0,
+            kappa: 1.0,
+            alpha: 0.0,
+            beta: 1.0,
+        };
+        let ll = ss.predictive_log_likelihood(5.0);
+        assert!(
+            (ll - (-100.0)).abs() < f64::EPSILON,
+            "expected -100.0 for zero-alpha, got {}",
+            ll
+        );
+    }
+
+    #[test]
+    fn update_with_negative_values() {
+        let prior = NormalGammaSS::prior();
+        let updated = prior.update(-100.0);
+        // mu should shift toward -100
+        assert!(
+            updated.mu < 0.0,
+            "mu should be negative after observing -100, got {}",
+            updated.mu
+        );
+        // beta should increase (deviation from prior mean adds to beta)
+        assert!(
+            updated.beta > prior.beta,
+            "beta should grow: {} > {}",
+            updated.beta,
+            prior.beta
+        );
+    }
+
+    #[test]
+    fn update_with_very_large_value() {
+        let prior = NormalGammaSS::prior();
+        let updated = prior.update(1e6);
+        assert!(updated.mu > 0.0, "mu should be positive");
+        assert!(
+            updated.beta > prior.beta,
+            "beta should increase substantially"
+        );
+        // predictive_log_likelihood should still be finite
+        let ll = updated.predictive_log_likelihood(1e6);
+        assert!(ll.is_finite(), "log-likelihood should be finite: {}", ll);
+    }
+
+    #[test]
+    fn sequential_updates_increase_kappa_and_alpha() {
+        let mut ss = NormalGammaSS::prior();
+        for i in 0..10 {
+            let prev_kappa = ss.kappa;
+            let prev_alpha = ss.alpha;
+            ss = ss.update(i as f64);
+            assert!(
+                ss.kappa > prev_kappa,
+                "kappa should increase monotonically"
+            );
+            assert!(
+                ss.alpha > prev_alpha,
+                "alpha should increase monotonically"
+            );
+        }
+        // After 10 updates, kappa should be prior + 10
+        assert!(
+            (ss.kappa - 10.01).abs() < 1e-10,
+            "kappa should be 10.01, got {}",
+            ss.kappa
+        );
+        assert!(
+            (ss.alpha - 5.01).abs() < 1e-10,
+            "alpha should be 5.01, got {}",
+            ss.alpha
+        );
+    }
+
+    // -- BocpdModel edge cases ------------------------------------------------
+
+    #[test]
+    fn model_single_observation() {
+        let mut model = BocpdModel::new(BocpdConfig {
+            min_observations: 1,
+            ..Default::default()
+        });
+        // Single observation should produce valid state
+        let _ = model.update(42.0);
+        assert_eq!(model.observation_count(), 1);
+        assert!(!model.in_warmup());
+        let sum = model.posterior_sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "posterior must sum to 1 after single obs, got {}",
+            sum
+        );
+    }
+
+    #[test]
+    fn model_change_point_probability_initially() {
+        let model = BocpdModel::new(BocpdConfig::default());
+        // Before any observations, the run length posterior is [0.0] (log(1.0)),
+        // so change_point_probability() = exp(0) = 1.0.
+        let p = model.change_point_probability();
+        assert!(
+            (p - 1.0).abs() < 1e-10,
+            "initially change_point_prob should be 1.0 (all mass on r=0), got {}",
+            p
+        );
+    }
+
+    #[test]
+    fn model_run_length_posterior_values() {
+        let mut model = BocpdModel::new(BocpdConfig::default());
+        for _ in 0..10 {
+            model.update(5.0);
+        }
+        let posterior = model.run_length_posterior();
+        // All entries should be non-negative (they are exp of log-probs)
+        for (i, &p) in posterior.iter().enumerate() {
+            assert!(p >= 0.0, "posterior[{}] = {} should be >= 0", i, p);
+            assert!(p <= 1.0, "posterior[{}] = {} should be <= 1", i, p);
+        }
+        // Sum should be ~1.0
+        let sum: f64 = posterior.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "posterior sum = {}, expected ~1.0",
+            sum
+        );
+    }
+
+    #[test]
+    fn model_truncation_at_max_run_length() {
+        let mut model = BocpdModel::new(BocpdConfig {
+            max_run_length: 10,
+            min_observations: 3,
+            ..Default::default()
+        });
+        // Feed more observations than max_run_length
+        for _ in 0..20 {
+            model.update(1.0);
+        }
+        let posterior = model.run_length_posterior();
+        assert!(
+            posterior.len() <= 11,
+            "posterior length {} exceeds max_run_length+1=11",
+            posterior.len()
+        );
+        // Posterior should still sum to ~1.0 after truncation
+        let sum: f64 = posterior.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "posterior sum after truncation = {}, expected ~1.0",
+            sum
+        );
+    }
+
+    #[test]
+    fn model_multiple_regime_changes() {
+        let mut model = BocpdModel::new(BocpdConfig {
+            hazard_rate: 0.1,
+            detection_threshold: 0.3,
+            min_observations: 5,
+            max_run_length: 50,
+        });
+
+        let mut total_detections = 0u64;
+        // Regime 1: low values
+        for _ in 0..20 {
+            if model.update(1.0).is_some() {
+                total_detections += 1;
+            }
+        }
+        // Regime 2: high values
+        for _ in 0..20 {
+            if model.update(500.0).is_some() {
+                total_detections += 1;
+            }
+        }
+        // Regime 3: back to low
+        for _ in 0..20 {
+            if model.update(1.0).is_some() {
+                total_detections += 1;
+            }
+        }
+
+        // The model's change_point_count should match detections we recorded
+        assert_eq!(
+            model.change_point_count(),
+            total_detections,
+            "change_point_count should match detected events"
+        );
+    }
+
+    #[test]
+    fn model_debug_impl() {
+        let mut model = BocpdModel::new(BocpdConfig::default());
+        model.update(1.0);
+        let debug_str = format!("{:?}", model);
+        assert!(
+            debug_str.contains("BocpdModel"),
+            "Debug should contain struct name"
+        );
+        assert!(
+            debug_str.contains("observation_count"),
+            "Debug should contain observation_count"
+        );
+        assert!(
+            debug_str.contains("change_point_count"),
+            "Debug should contain change_point_count"
+        );
+        assert!(
+            debug_str.contains("map_run_length"),
+            "Debug should contain map_run_length"
+        );
+        assert!(
+            debug_str.contains("change_point_prob"),
+            "Debug should contain change_point_prob"
+        );
+    }
+
+    // -- OutputFeatures edge cases --------------------------------------------
+
+    #[test]
+    fn features_primary_metric_is_output_rate() {
+        let f = OutputFeatures {
+            output_rate: 42.0,
+            byte_rate: 100.0,
+            entropy: 3.0,
+            unique_line_ratio: 0.5,
+            ansi_density: 0.1,
+        };
+        assert!(
+            (f.primary_metric() - 42.0).abs() < f64::EPSILON,
+            "primary_metric should be output_rate"
+        );
+    }
+
+    #[test]
+    fn features_very_short_duration_clamps() {
+        // Duration of 0 should be clamped to 0.001s internally
+        let text = "hello\n";
+        let features = OutputFeatures::compute(text, std::time::Duration::from_secs(0));
+        // byte_rate = 6 / 0.001 = 6000
+        assert!(
+            features.byte_rate > 1000.0,
+            "short duration should produce high rates, got {}",
+            features.byte_rate
+        );
+    }
+
+    #[test]
+    fn features_single_line_no_trailing_newline() {
+        let text = "hello world";
+        let features = OutputFeatures::compute(text, std::time::Duration::from_secs(1));
+        // A single line with no newline: line count depends on simd_scan impl
+        assert!(
+            features.byte_rate > 0.0,
+            "byte_rate should be positive for non-empty text"
+        );
+        assert!(
+            features.entropy > 0.0,
+            "entropy should be positive for varied text"
+        );
+    }
+
+    #[test]
+    fn features_all_fields_serde_roundtrip() {
+        let f = OutputFeatures {
+            output_rate: 0.0,
+            byte_rate: 0.0,
+            entropy: 0.0,
+            unique_line_ratio: 1.0,
+            ansi_density: 0.0,
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        let back: OutputFeatures = serde_json::from_str(&json).unwrap();
+        assert!(
+            (back.output_rate - 0.0).abs() < f64::EPSILON,
+            "output_rate"
+        );
+        assert!(
+            (back.unique_line_ratio - 1.0).abs() < f64::EPSILON,
+            "unique_line_ratio"
+        );
+        assert!(
+            (back.ansi_density - 0.0).abs() < f64::EPSILON,
+            "ansi_density"
+        );
+    }
+
+    // -- PaneBocpd edge cases -------------------------------------------------
+
+    #[test]
+    fn pane_bocpd_change_point_count_starts_zero() {
+        let pane = PaneBocpd::new(1, BocpdConfig::default());
+        assert_eq!(pane.change_point_count(), 0);
+        assert!(pane.last_features.is_none());
+        assert!(pane.change_points.is_empty());
+    }
+
+    #[test]
+    fn pane_bocpd_observe_stores_last_features() {
+        let mut pane = PaneBocpd::new(1, BocpdConfig::default());
+        let f = OutputFeatures {
+            output_rate: 7.77,
+            byte_rate: 123.0,
+            entropy: 2.5,
+            unique_line_ratio: 0.6,
+            ansi_density: 0.0,
+        };
+        let _ = pane.observe(f);
+        let last = pane.last_features.as_ref().unwrap();
+        assert!(
+            (last.output_rate - 7.77).abs() < f64::EPSILON,
+            "last_features.output_rate should match"
+        );
+    }
+
+    // -- BocpdManager edge cases ----------------------------------------------
+
+    #[test]
+    fn manager_register_pane_idempotent() {
+        let mut mgr = BocpdManager::new(BocpdConfig::default());
+        mgr.register_pane(5);
+        mgr.register_pane(5);
+        mgr.register_pane(5);
+        assert_eq!(
+            mgr.pane_count(),
+            1,
+            "registering same pane multiple times should not duplicate"
+        );
+    }
+
+    #[test]
+    fn manager_unregister_nonexistent_pane() {
+        let mut mgr = BocpdManager::new(BocpdConfig::default());
+        // Should not panic
+        mgr.unregister_pane(999);
+        assert_eq!(mgr.pane_count(), 0);
+    }
+
+    #[test]
+    fn manager_total_change_points_tracks_across_panes() {
+        let mut mgr = BocpdManager::new(BocpdConfig {
+            hazard_rate: 0.1,
+            detection_threshold: 0.3,
+            min_observations: 5,
+            max_run_length: 50,
+        });
+
+        // Feed stable data to two panes to get past warmup
+        for _ in 0..10 {
+            let f = OutputFeatures {
+                output_rate: 1.0,
+                byte_rate: 10.0,
+                entropy: 1.0,
+                unique_line_ratio: 1.0,
+                ansi_density: 0.0,
+            };
+            mgr.observe(1, f.clone());
+            mgr.observe(2, f);
+        }
+
+        let before = mgr.total_change_points();
+        // Shift both panes to trigger detection
+        for _ in 0..20 {
+            let f = OutputFeatures {
+                output_rate: 1000.0,
+                byte_rate: 50000.0,
+                entropy: 7.0,
+                unique_line_ratio: 0.1,
+                ansi_density: 0.0,
+            };
+            mgr.observe(1, f.clone());
+            mgr.observe(2, f);
+        }
+
+        assert!(
+            mgr.total_change_points() >= before,
+            "total_change_points should not decrease"
+        );
+    }
+
+    #[test]
+    fn manager_snapshot_multiple_panes() {
+        let mut mgr = BocpdManager::new(BocpdConfig {
+            min_observations: 2,
+            ..Default::default()
+        });
+        mgr.register_pane(10);
+        mgr.register_pane(20);
+        mgr.register_pane(30);
+
+        for _ in 0..5 {
+            let f = OutputFeatures {
+                output_rate: 3.0,
+                byte_rate: 100.0,
+                entropy: 2.0,
+                unique_line_ratio: 0.8,
+                ansi_density: 0.0,
+            };
+            mgr.observe(10, f.clone());
+            mgr.observe(20, f.clone());
+            mgr.observe(30, f);
+        }
+
+        let snap = mgr.snapshot();
+        assert_eq!(snap.pane_count, 3);
+        assert_eq!(snap.panes.len(), 3);
+        // Each pane should have 5 observations
+        for p in &snap.panes {
+            assert_eq!(
+                p.observation_count, 5,
+                "pane {} should have 5 observations",
+                p.pane_id
+            );
+            assert!(
+                !p.in_warmup,
+                "pane {} should be past warmup with min_observations=2",
+                p.pane_id
+            );
+        }
+    }
+
+    #[test]
+    fn manager_debug_impl() {
+        let mgr = BocpdManager::new(BocpdConfig::default());
+        let debug_str = format!("{:?}", mgr);
+        assert!(
+            debug_str.contains("BocpdManager"),
+            "Debug should contain struct name"
+        );
+        assert!(
+            debug_str.contains("pane_count"),
+            "Debug should contain pane_count"
+        );
+        assert!(
+            debug_str.contains("total_change_points"),
+            "Debug should contain total_change_points"
+        );
+    }
+
+    // -- Math helpers edge cases -----------------------------------------------
+
+    #[test]
+    fn log_sum_exp_large_values_numerical_stability() {
+        // With naive implementation, e^1000 would overflow.
+        // log_sum_exp should handle this via the max-shift trick.
+        let result = log_sum_exp(&[1000.0, 1001.0, 1002.0]);
+        // Should be close to log(e^1000 + e^1001 + e^1002)
+        // = 1002 + log(e^-2 + e^-1 + 1)
+        let expected =
+            1002.0 + ((-2.0f64).exp() + (-1.0f64).exp() + 1.0f64).ln();
+        assert!(
+            (result - expected).abs() < 1e-10,
+            "result={}, expected={}",
+            result,
+            expected
+        );
+    }
+
+    #[test]
+    fn log_sum_exp_all_neg_infinity() {
+        let result = log_sum_exp(&[f64::NEG_INFINITY, f64::NEG_INFINITY]);
+        assert!(
+            result.is_infinite() && result.is_sign_negative(),
+            "expected NEG_INFINITY, got {}",
+            result
+        );
+    }
+
+    #[test]
+    fn ln_gamma_half_equals_sqrt_pi() {
+        // Γ(0.5) = √π, so ln(Γ(0.5)) = 0.5 * ln(π) ≈ 0.5723649
+        let expected = 0.5 * std::f64::consts::PI.ln();
+        let result = ln_gamma(0.5);
+        assert!(
+            (result - expected).abs() < 1e-4,
+            "ln_gamma(0.5) = {}, expected {}",
+            result,
+            expected
+        );
+    }
+
+    #[test]
+    fn ln_gamma_non_positive_returns_zero() {
+        assert!(
+            (ln_gamma(0.0) - 0.0).abs() < f64::EPSILON,
+            "ln_gamma(0) should return 0.0"
+        );
+        assert!(
+            (ln_gamma(-1.0) - 0.0).abs() < f64::EPSILON,
+            "ln_gamma(-1) should return 0.0"
+        );
+    }
+
+    #[test]
+    fn compute_entropy_empty() {
+        let e = compute_entropy(b"");
+        assert!(
+            e.abs() < f64::EPSILON,
+            "entropy of empty data should be 0, got {}",
+            e
+        );
+    }
+
+    #[test]
+    fn compute_entropy_uniform_256() {
+        // All 256 byte values equally likely => entropy = 8 bits
+        let data: Vec<u8> = (0..=255u8).collect();
+        let e = compute_entropy(&data);
+        assert!(
+            (e - 8.0).abs() < 0.01,
+            "entropy of uniform 256 symbols should be 8.0, got {}",
+            e
+        );
+    }
+
+    // -- Serde: partial JSON with defaults ------------------------------------
+
+    #[test]
+    fn config_serde_partial_json_uses_defaults() {
+        // Only provide hazard_rate; other fields should get defaults
+        let json = r#"{"hazard_rate": 0.1}"#;
+        let config: BocpdConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            (config.hazard_rate - 0.1).abs() < f64::EPSILON,
+            "hazard_rate"
+        );
+        // These should be the defaults
+        assert!(
+            (config.detection_threshold - 0.7).abs() < 1e-10,
+            "detection_threshold should default to 0.7"
+        );
+        assert_eq!(config.min_observations, 20);
+        assert_eq!(config.max_run_length, 200);
+    }
+
+    #[test]
+    fn config_serde_empty_json_uses_all_defaults() {
+        let json = "{}";
+        let config: BocpdConfig = serde_json::from_str(json).unwrap();
+        assert!((config.hazard_rate - 0.005).abs() < 1e-10);
+        assert!((config.detection_threshold - 0.7).abs() < 1e-10);
+        assert_eq!(config.min_observations, 20);
+        assert_eq!(config.max_run_length, 200);
+    }
+
+    // -- PaneChangePoint with features serde ----------------------------------
+
+    #[test]
+    fn pane_change_point_with_features_serde() {
+        let pcp = PaneChangePoint {
+            pane_id: 3,
+            observation_index: 50,
+            posterior_probability: 0.88,
+            features_at_change: Some(OutputFeatures {
+                output_rate: 15.0,
+                byte_rate: 800.0,
+                entropy: 5.5,
+                unique_line_ratio: 0.6,
+                ansi_density: 0.02,
+            }),
+            timestamp_secs: 1700000000,
+        };
+        let json = serde_json::to_string(&pcp).unwrap();
+        let back: PaneChangePoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pane_id, 3);
+        assert_eq!(back.observation_index, 50);
+        let feats = back.features_at_change.unwrap();
+        assert!(
+            (feats.output_rate - 15.0).abs() < f64::EPSILON,
+            "output_rate"
+        );
+        assert!(
+            (feats.entropy - 5.5).abs() < f64::EPSILON,
+            "entropy"
+        );
+    }
+
+    #[test]
+    fn pane_bocpd_summary_serde_roundtrip() {
+        let summary = PaneBocpdSummary {
+            pane_id: 42,
+            observation_count: 100,
+            change_point_count: 3,
+            current_change_prob: 0.05,
+            map_run_length: 47,
+            in_warmup: false,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: PaneBocpdSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pane_id, 42);
+        assert_eq!(back.observation_count, 100);
+        assert_eq!(back.change_point_count, 3);
+        assert!(
+            (back.current_change_prob - 0.05).abs() < f64::EPSILON,
+            "current_change_prob"
+        );
+        assert_eq!(back.map_run_length, 47);
+        assert!(!back.in_warmup);
+    }
 }

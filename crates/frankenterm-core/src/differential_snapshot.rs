@@ -1250,6 +1250,473 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Batch -- RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tracker_default_is_clean() {
+        let tracker = DirtyTracker::default();
+        assert!(tracker.is_clean());
+        assert_eq!(tracker.dirty_count(), 0);
+        assert!(!tracker.is_layout_dirty());
+    }
+
+    #[test]
+    fn tracker_dirty_fields_returns_none_for_unknown_pane() {
+        let tracker = DirtyTracker::new();
+        assert!(tracker.dirty_fields(999).is_none());
+    }
+
+    #[test]
+    fn tracker_layout_dirty_alone_makes_not_clean() {
+        let mut tracker = DirtyTracker::new();
+        tracker.mark_layout_dirty();
+        assert!(!tracker.is_clean());
+        // No dirty panes, but layout is dirty
+        assert_eq!(tracker.dirty_count(), 0);
+        assert!(tracker.is_layout_dirty());
+    }
+
+    #[test]
+    fn tracker_scrollback_and_metadata_do_not_set_layout_dirty() {
+        let mut tracker = DirtyTracker::new();
+        tracker.mark_output(10);
+        tracker.mark_metadata(20);
+        assert!(!tracker.is_layout_dirty());
+        assert_eq!(tracker.dirty_count(), 2);
+    }
+
+    #[test]
+    fn tracker_clone_is_independent() {
+        let mut tracker = DirtyTracker::new();
+        tracker.mark_output(1);
+        tracker.mark_created(2);
+
+        let mut cloned = tracker.clone();
+        cloned.clear();
+
+        // Original unchanged
+        assert!(!tracker.is_clean());
+        assert_eq!(tracker.dirty_count(), 2);
+        // Clone is clean
+        assert!(cloned.is_clean());
+    }
+
+    #[test]
+    fn tracker_mark_dirty_all_four_fields_same_pane() {
+        let mut tracker = DirtyTracker::new();
+        tracker.mark_dirty(1, DirtyField::Scrollback);
+        tracker.mark_dirty(1, DirtyField::Metadata);
+        tracker.mark_dirty(1, DirtyField::Created);
+        tracker.mark_dirty(1, DirtyField::Closed);
+
+        let fields = tracker.dirty_fields(1).unwrap();
+        assert_eq!(fields.len(), 4);
+        assert!(fields.contains(&DirtyField::Scrollback));
+        assert!(fields.contains(&DirtyField::Metadata));
+        assert!(fields.contains(&DirtyField::Created));
+        assert!(fields.contains(&DirtyField::Closed));
+        assert!(tracker.is_layout_dirty());
+    }
+
+    #[test]
+    fn dirty_field_serde_roundtrip_all_variants() {
+        let variants = [
+            DirtyField::Scrollback,
+            DirtyField::Metadata,
+            DirtyField::Created,
+            DirtyField::Closed,
+        ];
+        for field in &variants {
+            let json = serde_json::to_string(field).unwrap();
+            let restored: DirtyField = serde_json::from_str(&json).unwrap();
+            assert_eq!(*field, restored);
+        }
+    }
+
+    #[test]
+    fn dirty_field_serde_uses_snake_case() {
+        let json = serde_json::to_string(&DirtyField::Scrollback).unwrap();
+        assert_eq!(json, "\"scrollback\"");
+        let json = serde_json::to_string(&DirtyField::Metadata).unwrap();
+        assert_eq!(json, "\"metadata\"");
+        let json = serde_json::to_string(&DirtyField::Created).unwrap();
+        assert_eq!(json, "\"created\"");
+        let json = serde_json::to_string(&DirtyField::Closed).unwrap();
+        assert_eq!(json, "\"closed\"");
+    }
+
+    #[test]
+    fn dirty_field_clone_copy_eq_hash() {
+        let a = DirtyField::Scrollback;
+        let b = a; // Copy
+        let c = a.clone(); // Clone
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+
+        let mut set = HashSet::new();
+        set.insert(a);
+        assert!(set.contains(&b));
+    }
+
+    #[test]
+    fn snapshot_diff_pane_id_scrollback_changed() {
+        let diff = SnapshotDiff::PaneScrollbackChanged {
+            pane_id: 77,
+            new_scrollback_ref: None,
+        };
+        assert_eq!(diff.pane_id(), Some(77));
+    }
+
+    #[test]
+    fn snapshot_diff_pane_id_metadata_changed() {
+        let diff = SnapshotDiff::PaneMetadataChanged {
+            pane_id: 88,
+            new_state: make_pane_state(88, 24, 80),
+        };
+        assert_eq!(diff.pane_id(), Some(88));
+    }
+
+    #[test]
+    fn snapshot_diff_pane_id_pane_created() {
+        let diff = SnapshotDiff::PaneCreated {
+            pane_id: 99,
+            snapshot: make_pane_state(99, 24, 80),
+        };
+        assert_eq!(diff.pane_id(), Some(99));
+    }
+
+    #[test]
+    fn snapshot_diff_serde_roundtrip_each_variant() {
+        // PaneScrollbackChanged
+        let d1 = SnapshotDiff::PaneScrollbackChanged {
+            pane_id: 1,
+            new_scrollback_ref: Some(ScrollbackRef {
+                output_segments_seq: 10,
+                total_lines_captured: 200,
+                last_capture_at: 5000,
+            }),
+        };
+        let j1 = serde_json::to_string(&d1).unwrap();
+        let r1: SnapshotDiff = serde_json::from_str(&j1).unwrap();
+        assert_eq!(d1, r1);
+
+        // PaneMetadataChanged
+        let d2 = SnapshotDiff::PaneMetadataChanged {
+            pane_id: 2,
+            new_state: make_pane_state(2, 30, 120),
+        };
+        let j2 = serde_json::to_string(&d2).unwrap();
+        let r2: SnapshotDiff = serde_json::from_str(&j2).unwrap();
+        assert_eq!(d2, r2);
+
+        // PaneCreated
+        let d3 = SnapshotDiff::PaneCreated {
+            pane_id: 3,
+            snapshot: make_pane_state(3, 24, 80),
+        };
+        let j3 = serde_json::to_string(&d3).unwrap();
+        let r3: SnapshotDiff = serde_json::from_str(&j3).unwrap();
+        assert_eq!(d3, r3);
+
+        // PaneClosed
+        let d4 = SnapshotDiff::PaneClosed { pane_id: 4 };
+        let j4 = serde_json::to_string(&d4).unwrap();
+        let r4: SnapshotDiff = serde_json::from_str(&j4).unwrap();
+        assert_eq!(d4, r4);
+
+        // LayoutChanged
+        let d5 = SnapshotDiff::LayoutChanged {
+            new_topology: make_topology(&[1, 2]),
+        };
+        let j5 = serde_json::to_string(&d5).unwrap();
+        let r5: SnapshotDiff = serde_json::from_str(&j5).unwrap();
+        assert_eq!(d5, r5);
+    }
+
+    #[test]
+    fn base_snapshot_serde_roundtrip() {
+        let base = make_base(&[1, 2, 3]);
+        let json = serde_json::to_string(&base).unwrap();
+        let restored: BaseSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(base, restored);
+    }
+
+    #[test]
+    fn base_snapshot_new_empty_panes() {
+        let base = BaseSnapshot::new(500, make_topology(&[]), vec![]);
+        assert_eq!(base.pane_states.len(), 0);
+        assert_eq!(base.captured_at, 500);
+        assert!(base.topology.windows[0].tabs.is_empty());
+    }
+
+    #[test]
+    fn apply_diff_scrollback_nonexistent_pane_is_noop() {
+        let mut base = make_base(&[1]);
+        let original = base.clone();
+
+        let diff = DiffSnapshot {
+            seq: 1,
+            captured_at: 2000,
+            diffs: vec![SnapshotDiff::PaneScrollbackChanged {
+                pane_id: 999, // does not exist
+                new_scrollback_ref: Some(ScrollbackRef {
+                    output_segments_seq: 50,
+                    total_lines_captured: 100,
+                    last_capture_at: 2000,
+                }),
+            }],
+        };
+
+        base.apply_diff(&diff);
+        // Pane map unchanged
+        assert_eq!(base.pane_states.len(), original.pane_states.len());
+        assert_eq!(
+            base.pane_states[&1].scrollback_ref,
+            original.pane_states[&1].scrollback_ref
+        );
+        // But captured_at is updated
+        assert_eq!(base.captured_at, 2000);
+    }
+
+    #[test]
+    fn apply_diff_scrollback_set_to_none() {
+        let mut base = make_base(&[1]);
+        // First set a scrollback ref
+        base.pane_states.get_mut(&1).unwrap().scrollback_ref = Some(ScrollbackRef {
+            output_segments_seq: 10,
+            total_lines_captured: 100,
+            last_capture_at: 1500,
+        });
+
+        let diff = DiffSnapshot {
+            seq: 1,
+            captured_at: 2000,
+            diffs: vec![SnapshotDiff::PaneScrollbackChanged {
+                pane_id: 1,
+                new_scrollback_ref: None,
+            }],
+        };
+
+        base.apply_diff(&diff);
+        assert!(base.pane_states[&1].scrollback_ref.is_none());
+    }
+
+    #[test]
+    fn apply_diff_multiple_records_in_single_snapshot() {
+        let mut base = make_base(&[1, 2, 3]);
+
+        let diff = DiffSnapshot {
+            seq: 1,
+            captured_at: 2000,
+            diffs: vec![
+                SnapshotDiff::PaneClosed { pane_id: 1 },
+                SnapshotDiff::PaneCreated {
+                    pane_id: 10,
+                    snapshot: make_pane_state(10, 40, 160),
+                },
+                SnapshotDiff::PaneMetadataChanged {
+                    pane_id: 2,
+                    new_state: {
+                        let mut ps = make_pane_state(2, 50, 200);
+                        ps.cwd = Some("/updated".to_string());
+                        ps
+                    },
+                },
+                SnapshotDiff::LayoutChanged {
+                    new_topology: make_topology(&[2, 3, 10]),
+                },
+            ],
+        };
+
+        base.apply_diff(&diff);
+        assert!(!base.pane_states.contains_key(&1));
+        assert!(base.pane_states.contains_key(&10));
+        assert_eq!(base.pane_states[&2].cwd, Some("/updated".to_string()));
+        assert_eq!(base.topology.windows[0].tabs.len(), 3);
+        assert_eq!(base.captured_at, 2000);
+    }
+
+    #[test]
+    fn diff_chain_serde_roundtrip() {
+        let base = make_base(&[1, 2]);
+        let mut chain = DiffChain::new(base);
+        chain.push_diff(DiffSnapshot {
+            seq: 0,
+            captured_at: 2000,
+            diffs: vec![SnapshotDiff::PaneClosed { pane_id: 1 }],
+        });
+
+        let json = serde_json::to_string(&chain).unwrap();
+        let restored: DiffChain = serde_json::from_str(&json).unwrap();
+
+        // Verify restored chain yields same state
+        let orig_state = chain.restore_latest();
+        let rest_state = restored.restore_latest();
+        assert_eq!(orig_state, rest_state);
+    }
+
+    #[test]
+    fn diff_chain_chain_len_tracks_pushes() {
+        let base = make_base(&[1]);
+        let mut chain = DiffChain::new(base);
+        assert_eq!(chain.chain_len(), 0);
+
+        chain.push_diff(DiffSnapshot {
+            seq: 0,
+            captured_at: 2000,
+            diffs: vec![],
+        });
+        assert_eq!(chain.chain_len(), 1);
+
+        chain.push_diff(DiffSnapshot {
+            seq: 0,
+            captured_at: 3000,
+            diffs: vec![],
+        });
+        assert_eq!(chain.chain_len(), 2);
+    }
+
+    #[test]
+    fn engine_chain_len_zero_when_not_initialized() {
+        let engine = DiffSnapshotEngine::new(10);
+        assert_eq!(engine.chain_len(), 0);
+    }
+
+    #[test]
+    fn engine_compact_returns_none_when_not_initialized() {
+        let mut engine = DiffSnapshotEngine::new(10);
+        assert!(engine.compact().is_none());
+    }
+
+    #[test]
+    fn engine_layout_dirty_but_no_topology_provided() {
+        let mut engine = DiffSnapshotEngine::new(10);
+        engine.initialize(make_base(&[1]));
+
+        engine.tracker_mut().mark_layout_dirty();
+
+        // Layout is dirty, but we pass None for topology
+        let diff = engine.capture_diff(&HashMap::new(), None, 2000);
+        // No diffs produced because no topology was supplied and no panes dirty
+        assert!(diff.is_none());
+        // Tracker should be cleared
+        assert!(engine.tracker().is_clean());
+    }
+
+    #[test]
+    fn engine_scrollback_only_dirty_emits_scrollback_diff() {
+        let mut engine = DiffSnapshotEngine::new(10);
+        engine.initialize(make_base(&[1, 2]));
+
+        // Mark pane 1 scrollback only (not metadata)
+        engine.tracker_mut().mark_output(1);
+
+        let mut current = HashMap::new();
+        let mut ps = make_pane_state(1, 24, 80);
+        ps.scrollback_ref = Some(ScrollbackRef {
+            output_segments_seq: 99,
+            total_lines_captured: 1000,
+            last_capture_at: 2000,
+        });
+        current.insert(1, ps);
+
+        let diff = engine.capture_diff(&current, None, 2000).unwrap();
+        assert_eq!(diff.diffs.len(), 1);
+        match &diff.diffs[0] {
+            SnapshotDiff::PaneScrollbackChanged {
+                pane_id,
+                new_scrollback_ref,
+            } => {
+                assert_eq!(*pane_id, 1);
+                let sb = new_scrollback_ref.as_ref().unwrap();
+                assert_eq!(sb.output_segments_seq, 99);
+                assert_eq!(sb.total_lines_captured, 1000);
+            }
+            other => panic!("expected PaneScrollbackChanged, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn engine_reinitialize_replaces_chain() {
+        let mut engine = DiffSnapshotEngine::new(10);
+        engine.initialize(make_base(&[1, 2, 3]));
+
+        // Make some changes
+        engine.tracker_mut().mark_metadata(1);
+        let mut current = HashMap::new();
+        current.insert(1, make_pane_state(1, 24, 80));
+        engine.capture_diff(&current, None, 2000);
+        assert_eq!(engine.chain_len(), 1);
+
+        // Re-initialize with different base
+        engine.initialize(make_base(&[10, 20]));
+        assert_eq!(engine.chain_len(), 0);
+        let restored = engine.restore_latest().unwrap();
+        assert_eq!(restored.pane_states.len(), 2);
+        assert!(restored.pane_states.contains_key(&10));
+        assert!(restored.pane_states.contains_key(&20));
+        assert!(!restored.pane_states.contains_key(&1));
+    }
+
+    #[test]
+    fn engine_dirty_pane_not_in_current_panes_is_skipped() {
+        let mut engine = DiffSnapshotEngine::new(10);
+        engine.initialize(make_base(&[1, 2]));
+
+        // Mark pane 1 as dirty but don't include it in current_panes
+        engine.tracker_mut().mark_metadata(1);
+
+        let current = HashMap::new(); // empty!
+        let diff = engine.capture_diff(&current, None, 2000);
+        // No diffs because the dirty pane is not found in current_panes
+        assert!(diff.is_none());
+        assert!(engine.tracker().is_clean());
+    }
+
+    #[test]
+    fn engine_metadata_takes_priority_over_scrollback() {
+        // When a pane has both metadata and scrollback dirty, metadata wins
+        let mut engine = DiffSnapshotEngine::new(10);
+        engine.initialize(make_base(&[1]));
+
+        engine.tracker_mut().mark_output(1);
+        engine.tracker_mut().mark_metadata(1);
+
+        let mut current = HashMap::new();
+        let mut ps = make_pane_state(1, 30, 120);
+        ps.cwd = Some("/both-dirty".to_string());
+        current.insert(1, ps);
+
+        let diff = engine.capture_diff(&current, None, 2000).unwrap();
+        // Should emit PaneMetadataChanged (not PaneScrollbackChanged)
+        assert_eq!(diff.diffs.len(), 1);
+        assert!(matches!(
+            &diff.diffs[0],
+            SnapshotDiff::PaneMetadataChanged { pane_id: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn chain_restore_at_base_preserves_original_state() {
+        let base = make_base(&[1, 2]);
+        let mut chain = DiffChain::new(base.clone());
+
+        // Add diffs that modify state
+        chain.push_diff(DiffSnapshot {
+            seq: 0,
+            captured_at: 2000,
+            diffs: vec![SnapshotDiff::PaneClosed { pane_id: 1 }],
+        });
+
+        // restore_at(0) should yield original base
+        let at_base = chain.restore_at(0).unwrap();
+        assert_eq!(at_base.pane_states.len(), 2);
+        assert_eq!(at_base.captured_at, base.captured_at);
+        assert!(at_base.pane_states.contains_key(&1));
+    }
+
     // ---- proptest ----
 
     #[cfg(test)]

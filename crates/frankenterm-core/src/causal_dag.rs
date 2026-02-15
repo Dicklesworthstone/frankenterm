@@ -828,4 +828,447 @@ mod tests {
         fisher_yates_deterministic(&mut b, 999);
         assert_ne!(a, b, "different seeds should produce different shuffles");
     }
+
+    // -----------------------------------------------------------------------
+    // Batch — RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    // ── PaneTimeSeries edge cases ─────────────────────────────────────────
+
+    #[test]
+    fn time_series_capacity_one() {
+        let mut ts = PaneTimeSeries::new(1);
+        assert!(ts.is_empty());
+        ts.push(42.0);
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts.as_slice_ordered(), vec![42.0]);
+        ts.push(99.0);
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts.as_slice_ordered(), vec![99.0]);
+    }
+
+    #[test]
+    fn time_series_exactly_at_capacity() {
+        let mut ts = PaneTimeSeries::new(4);
+        for i in 0..4 {
+            ts.push(i as f64);
+        }
+        assert_eq!(ts.len(), 4);
+        assert_eq!(ts.as_slice_ordered(), vec![0.0, 1.0, 2.0, 3.0]);
+        // write_pos wraps to 0, count == capacity — hits the else branch
+        // but data is still in order since we filled exactly once
+    }
+
+    #[test]
+    fn time_series_double_wrap() {
+        // Push 2x capacity to verify the ring works through multiple wraps
+        let mut ts = PaneTimeSeries::new(3);
+        for i in 0..9 {
+            ts.push(i as f64);
+        }
+        assert_eq!(ts.len(), 3);
+        assert_eq!(ts.as_slice_ordered(), vec![6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn time_series_clone_independence() {
+        let mut ts = PaneTimeSeries::new(5);
+        ts.push(1.0);
+        ts.push(2.0);
+        let mut ts2 = ts.clone();
+        ts2.push(100.0);
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts2.len(), 3);
+        assert_eq!(ts.as_slice_ordered(), vec![1.0, 2.0]);
+        assert_eq!(ts2.as_slice_ordered(), vec![1.0, 2.0, 100.0]);
+    }
+
+    #[test]
+    fn time_series_debug_format() {
+        let ts = PaneTimeSeries::new(3);
+        let dbg = format!("{:?}", ts);
+        assert!(dbg.contains("PaneTimeSeries"), "Debug should name the struct: {}", dbg);
+    }
+
+    // ── bin_series edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn bin_series_zero_bins_returns_empty() {
+        let series = vec![1.0, 2.0, 3.0];
+        assert!(bin_series(&series, 0).is_empty());
+    }
+
+    #[test]
+    fn bin_series_single_bin_all_zero() {
+        let series = vec![1.0, 5.0, 10.0];
+        let binned = bin_series(&series, 1);
+        // With 1 bin, everything maps to bin 0
+        assert_eq!(binned, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn bin_series_negative_values() {
+        let series = vec![-10.0, -5.0, 0.0, 5.0, 10.0];
+        let binned = bin_series(&series, 4);
+        assert_eq!(binned.len(), 5);
+        assert_eq!(binned[0], 0); // min → bin 0
+        assert_eq!(binned[4], 3); // max → bin n_bins-1 (capped)
+    }
+
+    // ── transfer_entropy edge cases ───────────────────────────────────────
+
+    #[test]
+    fn te_zero_bins_returns_zero() {
+        let x: Vec<f64> = (0..50).map(|i| i as f64).collect();
+        let y: Vec<f64> = (0..50).map(|i| (i + 1) as f64).collect();
+        let te = transfer_entropy(&x, &y, 1, 1, 0);
+        assert!(
+            te.abs() < f64::EPSILON,
+            "n_bins=0 should return 0.0, got {}",
+            te
+        );
+    }
+
+    #[test]
+    fn te_unequal_length_uses_shorter() {
+        let x: Vec<f64> = (0..100).map(|i| i as f64).collect();
+        let y: Vec<f64> = (0..50).map(|i| (i + 1) as f64).collect();
+        let te = transfer_entropy(&x, &y, 1, 1, 4);
+        assert!(te.is_finite(), "TE with unequal lengths should be finite: {}", te);
+        assert!(te >= 0.0, "TE should be non-negative: {}", te);
+    }
+
+    #[test]
+    fn te_empty_source_returns_zero() {
+        let x: Vec<f64> = vec![];
+        let y: Vec<f64> = (0..50).map(|i| i as f64).collect();
+        let te = transfer_entropy(&x, &y, 1, 1, 4);
+        assert!(te.abs() < f64::EPSILON, "empty source should give TE=0, got {}", te);
+    }
+
+    #[test]
+    fn te_large_history_vs_short_data() {
+        // target_history=10 but only 5 samples → should return 0
+        let x: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let y: Vec<f64> = vec![5.0, 4.0, 3.0, 2.0, 1.0];
+        let te = transfer_entropy(&x, &y, 10, 10, 4);
+        assert!(te.abs() < f64::EPSILON, "oversized history should give TE=0, got {}", te);
+    }
+
+    // ── permutation_test edge cases ───────────────────────────────────────
+
+    #[test]
+    fn permutation_test_pvalue_in_zero_one() {
+        let x: Vec<f64> = (0..80).map(|i| (i as f64 * 0.4).sin()).collect();
+        let y: Vec<f64> = (0..80).map(|i| (i as f64 * 0.4).cos()).collect();
+        let te = transfer_entropy(&x, &y, 1, 1, 4);
+        let p = permutation_test(&x, &y, 1, 1, 4, 30, te);
+        assert!(p >= 0.0 && p <= 1.0, "p-value must be in [0,1], got {}", p);
+    }
+
+    #[test]
+    fn permutation_test_single_permutation() {
+        let x: Vec<f64> = (0..50).map(|i| i as f64).collect();
+        let y: Vec<f64> = (0..50).map(|i| (i + 1) as f64).collect();
+        let te = transfer_entropy(&x, &y, 1, 1, 4);
+        let p = permutation_test(&x, &y, 1, 1, 4, 1, te);
+        // With n_permutations=1: p = (count_ge + 1) / (1 + 1) = {1/2 or 2/2}
+        assert!(p >= 0.5 && p <= 1.0, "single-perm p-value should be 0.5 or 1.0, got {}", p);
+    }
+
+    // ── Fisher-Yates edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn fisher_yates_empty_slice() {
+        let mut data: Vec<f64> = vec![];
+        fisher_yates_deterministic(&mut data, 42);
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn fisher_yates_single_element() {
+        let mut data = vec![7.0];
+        fisher_yates_deterministic(&mut data, 42);
+        assert_eq!(data, vec![7.0]);
+    }
+
+    #[test]
+    fn fisher_yates_preserves_elements() {
+        let mut data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let mut expected = data.clone();
+        fisher_yates_deterministic(&mut data, 123);
+        data.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        expected.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(data, expected, "shuffle must be a permutation of original elements");
+    }
+
+    // ── CausalDag operations ──────────────────────────────────────────────
+
+    #[test]
+    fn dag_double_register_is_idempotent() {
+        let mut dag = CausalDag::new(CausalDagConfig {
+            window_size: 10,
+            ..Default::default()
+        });
+        dag.register_pane(1);
+        dag.observe(1, 42.0);
+        dag.register_pane(1); // should not reset the series
+        assert_eq!(dag.pane_count(), 1);
+        assert_eq!(dag.series[&1].len(), 1, "re-register must not clear data");
+    }
+
+    #[test]
+    fn dag_observe_unregistered_pane_is_noop() {
+        let mut dag = CausalDag::new(CausalDagConfig::default());
+        // pane 99 never registered — observe should silently skip
+        dag.observe(99, 1.0);
+        assert_eq!(dag.pane_count(), 0);
+    }
+
+    #[test]
+    fn dag_unregister_removes_edges() {
+        let mut dag = CausalDag::new(CausalDagConfig::default());
+        dag.register_pane(1);
+        dag.register_pane(2);
+        dag.register_pane(3);
+        dag.edges = vec![
+            CausalEdge {
+                source: 1,
+                target: 2,
+                transfer_entropy: 0.5,
+                p_value: 0.001,
+                lag_samples: 1,
+            },
+            CausalEdge {
+                source: 2,
+                target: 3,
+                transfer_entropy: 0.3,
+                p_value: 0.002,
+                lag_samples: 1,
+            },
+            CausalEdge {
+                source: 1,
+                target: 3,
+                transfer_entropy: 0.2,
+                p_value: 0.003,
+                lag_samples: 1,
+            },
+        ];
+        dag.unregister_pane(2);
+        // Edges involving pane 2 (src=2→3, src=1→tgt=2) should be removed
+        assert_eq!(dag.edges().len(), 1);
+        assert_eq!(dag.edges()[0].source, 1);
+        assert_eq!(dag.edges()[0].target, 3);
+    }
+
+    #[test]
+    fn dag_unregister_nonexistent_pane_is_noop() {
+        let mut dag = CausalDag::new(CausalDagConfig::default());
+        dag.register_pane(1);
+        dag.unregister_pane(999); // should not panic
+        assert_eq!(dag.pane_count(), 1);
+    }
+
+    #[test]
+    fn dag_update_count_increments() {
+        let mut dag = CausalDag::new(CausalDagConfig {
+            window_size: 10,
+            n_permutations: 0,
+            ..Default::default()
+        });
+        assert_eq!(dag.update_count(), 0);
+        dag.update_dag();
+        assert_eq!(dag.update_count(), 1);
+        dag.update_dag();
+        dag.update_dag();
+        assert_eq!(dag.update_count(), 3);
+    }
+
+    #[test]
+    fn dag_update_no_panes_produces_no_edges() {
+        let mut dag = CausalDag::new(CausalDagConfig::default());
+        dag.update_dag();
+        assert!(dag.edges().is_empty());
+    }
+
+    #[test]
+    fn dag_update_single_pane_no_edges() {
+        let mut dag = CausalDag::new(CausalDagConfig {
+            window_size: 20,
+            n_permutations: 5,
+            ..Default::default()
+        });
+        dag.register_pane(1);
+        for i in 0..20 {
+            dag.observe(1, i as f64);
+        }
+        dag.update_dag();
+        // A single pane cannot form an edge with itself
+        assert!(dag.edges().is_empty());
+    }
+
+    #[test]
+    fn dag_update_insufficient_data_no_edges() {
+        let mut dag = CausalDag::new(CausalDagConfig {
+            window_size: 100,
+            n_permutations: 5,
+            min_te_bits: 0.001,
+            ..Default::default()
+        });
+        dag.register_pane(1);
+        dag.register_pane(2);
+        // Only 2 observations — not enough for TE computation
+        dag.observe(1, 1.0);
+        dag.observe(2, 2.0);
+        dag.update_dag();
+        assert!(dag.edges().is_empty(), "insufficient data should yield no edges");
+    }
+
+    #[test]
+    fn dag_upstream_no_edges() {
+        let dag = CausalDag::new(CausalDagConfig::default());
+        assert!(dag.upstream(42).is_empty());
+    }
+
+    #[test]
+    fn dag_downstream_isolated_node_in_graph() {
+        // Node 5 has no outgoing edges even though other edges exist
+        let mut dag = CausalDag::new(CausalDagConfig::default());
+        dag.edges = vec![CausalEdge {
+            source: 1,
+            target: 2,
+            transfer_entropy: 0.4,
+            p_value: 0.001,
+            lag_samples: 1,
+        }];
+        assert!(dag.downstream(5).is_empty());
+        assert!(dag.upstream(5).is_empty());
+    }
+
+    #[test]
+    fn dag_debug_format() {
+        let mut dag = CausalDag::new(CausalDagConfig::default());
+        dag.register_pane(1);
+        dag.register_pane(2);
+        let dbg = format!("{:?}", dag);
+        assert!(dbg.contains("CausalDag"), "Debug should name the struct: {}", dbg);
+        assert!(dbg.contains("pane_count"), "Debug should show pane_count: {}", dbg);
+        assert!(dbg.contains("edge_count"), "Debug should show edge_count: {}", dbg);
+        assert!(dbg.contains("update_count"), "Debug should show update_count: {}", dbg);
+    }
+
+    // ── Serde roundtrips ──────────────────────────────────────────────────
+
+    #[test]
+    fn causal_edge_serde_roundtrip() {
+        let edge = CausalEdge {
+            source: 10,
+            target: 20,
+            transfer_entropy: 1.234,
+            p_value: 0.005,
+            lag_samples: 3,
+        };
+        let json = serde_json::to_string(&edge).unwrap();
+        let parsed: CausalEdge = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source, 10);
+        assert_eq!(parsed.target, 20);
+        assert!((parsed.transfer_entropy - 1.234).abs() < f64::EPSILON);
+        assert!((parsed.p_value - 0.005).abs() < f64::EPSILON);
+        assert_eq!(parsed.lag_samples, 3);
+    }
+
+    #[test]
+    fn snapshot_with_edges_serde_roundtrip() {
+        let snapshot = CausalDagSnapshot {
+            pane_count: 3,
+            edge_count: 2,
+            edges: vec![
+                CausalEdge {
+                    source: 1,
+                    target: 2,
+                    transfer_entropy: 0.8,
+                    p_value: 0.001,
+                    lag_samples: 1,
+                },
+                CausalEdge {
+                    source: 2,
+                    target: 3,
+                    transfer_entropy: 0.4,
+                    p_value: 0.009,
+                    lag_samples: 2,
+                },
+            ],
+            update_count: 7,
+            pane_ids: vec![1, 2, 3],
+        };
+        let json = serde_json::to_string_pretty(&snapshot).unwrap();
+        let parsed: CausalDagSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pane_count, 3);
+        assert_eq!(parsed.edge_count, 2);
+        assert_eq!(parsed.edges.len(), 2);
+        assert_eq!(parsed.update_count, 7);
+        assert_eq!(parsed.pane_ids.len(), 3);
+    }
+
+    #[test]
+    fn config_custom_values_serde_roundtrip() {
+        let config = CausalDagConfig {
+            window_size: 500,
+            k: 3,
+            l: 2,
+            n_permutations: 200,
+            significance_level: 0.05,
+            n_bins: 16,
+            min_te_bits: 0.1,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: CausalDagConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.window_size, 500);
+        assert_eq!(parsed.k, 3);
+        assert_eq!(parsed.l, 2);
+        assert_eq!(parsed.n_permutations, 200);
+        assert!((parsed.significance_level - 0.05).abs() < f64::EPSILON);
+        assert_eq!(parsed.n_bins, 16);
+        assert!((parsed.min_te_bits - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn config_from_partial_json_uses_defaults() {
+        // serde(default) should fill missing fields with defaults
+        let json = r#"{"window_size": 42}"#;
+        let parsed: CausalDagConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.window_size, 42);
+        assert_eq!(parsed.k, 1); // default
+        assert_eq!(parsed.l, 1); // default
+        assert_eq!(parsed.n_permutations, 100); // default
+        assert!((parsed.significance_level - 0.01).abs() < f64::EPSILON);
+        assert_eq!(parsed.n_bins, 8); // default
+        assert!((parsed.min_te_bits - 0.01).abs() < f64::EPSILON);
+    }
+
+    // ── Snapshot from DAG with edges ──────────────────────────────────────
+
+    #[test]
+    fn dag_snapshot_captures_edges_and_pane_ids() {
+        let mut dag = CausalDag::new(CausalDagConfig::default());
+        dag.register_pane(10);
+        dag.register_pane(20);
+        dag.register_pane(30);
+        dag.edges = vec![CausalEdge {
+            source: 10,
+            target: 20,
+            transfer_entropy: 0.6,
+            p_value: 0.002,
+            lag_samples: 1,
+        }];
+
+        let snap = dag.snapshot();
+        assert_eq!(snap.pane_count, 3);
+        assert_eq!(snap.edge_count, 1);
+        assert_eq!(snap.edges[0].source, 10);
+        assert_eq!(snap.edges[0].target, 20);
+        let mut pane_ids = snap.pane_ids.clone();
+        pane_ids.sort();
+        assert_eq!(pane_ids, vec![10, 20, 30]);
+    }
 }
