@@ -73,6 +73,7 @@ pub mod consistent_hash;
 pub mod content_dedup;
 pub mod continuous_backpressure;
 pub mod cpu_pressure;
+pub mod cuckoo_filter;
 pub mod crash;
 pub mod cross_pane_correlation;
 #[cfg(feature = "asupersync-runtime")]
