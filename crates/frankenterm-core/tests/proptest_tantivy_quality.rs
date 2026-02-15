@@ -583,3 +583,27 @@ fn empty_quality_report_roundtrips() {
     assert_eq!(back.total_queries, 0);
     assert!(back.all_passed);
 }
+
+#[test]
+fn query_class_debug_nonempty() {
+    let classes = [
+        QueryClass::SimpleTerm,
+        QueryClass::MultiTerm,
+        QueryClass::Filtered,
+        QueryClass::Forensic,
+        QueryClass::HighCardinality,
+    ];
+    for c in &classes {
+        let debug = format!("{:?}", c);
+        assert!(!debug.is_empty());
+    }
+}
+
+#[test]
+fn latency_budget_debug_nonempty() {
+    let budgets = default_latency_budgets();
+    for b in &budgets {
+        let debug = format!("{:?}", b);
+        assert!(!debug.is_empty());
+    }
+}

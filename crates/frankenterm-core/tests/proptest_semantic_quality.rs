@@ -674,3 +674,22 @@ fn default_corpus_passes_default_thresholds() {
         report.violations
     );
 }
+
+#[test]
+fn regression_thresholds_debug_nonempty() {
+    let t = RegressionThresholds::default();
+    let debug = format!("{:?}", t);
+    assert!(!debug.is_empty());
+}
+
+#[test]
+fn threshold_violation_debug_nonempty() {
+    let v = ThresholdViolation {
+        query: "q1".to_string(),
+        metric: "test".to_string(),
+        actual: 0.3,
+        required: 0.5,
+    };
+    let debug = format!("{:?}", v);
+    assert!(!debug.is_empty());
+}

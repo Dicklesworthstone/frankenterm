@@ -713,4 +713,25 @@ proptest! {
         prop_assert_eq!(cloned.retained(), h.retained());
         prop_assert_eq!(cloned.name(), h.name());
     }
+
+    /// Histogram Debug is non-empty.
+    #[test]
+    fn histogram_debug_nonempty(
+        values in proptest::collection::vec(arb_value(), 1..10),
+    ) {
+        let mut h = Histogram::new("dbg_test", 50);
+        for &v in &values {
+            h.record(v);
+        }
+        let debug = format!("{:?}", h);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// Empty histogram has zero count.
+    #[test]
+    fn histogram_empty_zero_count(_dummy in 0..1u8) {
+        let h = Histogram::new("empty_metric", 50);
+        prop_assert_eq!(h.count(), 0);
+        prop_assert_eq!(h.retained(), 0);
+    }
 }

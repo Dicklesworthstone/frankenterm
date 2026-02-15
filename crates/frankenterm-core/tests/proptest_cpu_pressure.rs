@@ -415,4 +415,20 @@ proptest! {
         let s = monitor.sample();
         prop_assert!(s.pressure.is_finite(), "pressure should be finite: {}", s.pressure);
     }
+
+    /// CpuPressureConfig Debug contains struct name.
+    #[test]
+    fn prop_config_debug_contains_name(c in arb_config()) {
+        let debug = format!("{:?}", c);
+        prop_assert!(debug.contains("CpuPressureConfig"));
+    }
+
+    /// CpuPressureConfig Clone preserves all threshold fields.
+    #[test]
+    fn prop_config_clone_all_thresholds(c in arb_config()) {
+        let cloned = c.clone();
+        prop_assert!((cloned.yellow_threshold - c.yellow_threshold).abs() < 1e-12);
+        prop_assert!((cloned.orange_threshold - c.orange_threshold).abs() < 1e-12);
+        prop_assert!((cloned.red_threshold - c.red_threshold).abs() < 1e-12);
+    }
 }
