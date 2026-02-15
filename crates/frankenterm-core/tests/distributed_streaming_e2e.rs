@@ -7,7 +7,8 @@ use frankenterm_core::distributed::validate_token;
 use frankenterm_core::patterns::{AgentType, Severity};
 use frankenterm_core::storage::{EventQuery, PaneRecord, StorageHandle, StoredEvent};
 use frankenterm_core::wire_protocol::{
-    Aggregator, DetectionNotice, IngestResult, PaneDelta, PaneMeta, WireEnvelope, WirePayload,
+    Aggregator, DEFAULT_AGENT_STALE_AFTER_MS, DetectionNotice, IngestResult, PaneDelta, PaneMeta,
+    WireEnvelope, WirePayload,
 };
 
 fn now_ms() -> i64 {
@@ -45,8 +46,16 @@ impl DistributedBridge {
         db_path: &str,
         max_agents: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_capacity_and_stale(db_path, max_agents, DEFAULT_AGENT_STALE_AFTER_MS).await
+    }
+
+    async fn new_with_capacity_and_stale(
+        db_path: &str,
+        max_agents: usize,
+        stale_after_ms: i64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            aggregator: Aggregator::new(max_agents),
+            aggregator: Aggregator::with_stale_after(max_agents, stale_after_ms),
             storage: StorageHandle::new(db_path).await?,
             pane_seq_by_pane: HashMap::new(),
             diagnostics: BridgeDiagnostics::default(),
@@ -607,6 +616,92 @@ async fn distributed_streaming_e2e_enforces_agent_capacity_without_cross_sender_
         "rejected sender metadata must not persist to storage"
     );
     assert_eq!(panes[0].pane_id, 41);
+}
+
+#[tokio::test]
+async fn distributed_streaming_e2e_prunes_stale_sender_and_accepts_new_sender_at_capacity() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir
+        .path()
+        .join("distributed_streaming_stale_capacity.db");
+    let mut bridge =
+        DistributedBridge::new_with_capacity_and_stale(db_path.to_str().expect("db path"), 1, 50)
+            .await
+            .expect("bridge");
+
+    let mut first = WireEnvelope::new(1, "agent-cap-a", WirePayload::PaneMeta(pane_meta(41)));
+    first.sent_at_ms = 100;
+    bridge
+        .ingest_envelope(first)
+        .await
+        .expect("first sender should be accepted");
+
+    let mut second = WireEnvelope::new(1, "agent-cap-b", WirePayload::PaneMeta(pane_meta(42)));
+    second.sent_at_ms = 300;
+    bridge
+        .ingest_envelope(second)
+        .await
+        .expect("stale sender should be pruned before second sender is admitted");
+
+    assert_eq!(bridge.aggregator.total_accepted(), 2);
+    assert_eq!(bridge.aggregator.total_rejected(), 0);
+    assert_eq!(bridge.aggregator.agent_count(), 1);
+    assert_eq!(bridge.aggregator.agent_last_seq("agent-cap-a"), None);
+    assert_eq!(bridge.aggregator.agent_last_seq("agent-cap-b"), Some(1));
+
+    let mut panes = bridge.storage.get_panes().await.expect("panes");
+    panes.sort_by_key(|pane| pane.pane_id);
+    assert_eq!(panes.len(), 2);
+    assert_eq!(panes[0].pane_id, 41);
+    assert_eq!(panes[1].pane_id, 42);
+}
+
+#[tokio::test]
+async fn distributed_streaming_e2e_duplicate_refresh_prevents_false_stale_eviction() {
+    use frankenterm_core::wire_protocol::WireProtocolError;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir
+        .path()
+        .join("distributed_streaming_duplicate_refresh.db");
+    let mut bridge =
+        DistributedBridge::new_with_capacity_and_stale(db_path.to_str().expect("db path"), 1, 50)
+            .await
+            .expect("bridge");
+
+    let mut first = WireEnvelope::new(1, "agent-dup-a", WirePayload::PaneMeta(pane_meta(51)));
+    first.sent_at_ms = 100;
+    bridge
+        .ingest_envelope(first)
+        .await
+        .expect("first sender should be accepted");
+
+    let mut duplicate = WireEnvelope::new(1, "agent-dup-a", WirePayload::PaneMeta(pane_meta(51)));
+    duplicate.sent_at_ms = 130;
+    bridge
+        .ingest_envelope(duplicate)
+        .await
+        .expect("duplicate should refresh liveness without persisting");
+
+    let mut second = WireEnvelope::new(1, "agent-dup-b", WirePayload::PaneMeta(pane_meta(52)));
+    second.sent_at_ms = 160;
+    let err = bridge
+        .ingest_envelope(second)
+        .await
+        .expect_err("recent duplicate should keep first sender from being pruned");
+    let wire_err = err
+        .downcast_ref::<WireProtocolError>()
+        .expect("expected WireProtocolError");
+    assert!(matches!(
+        wire_err,
+        WireProtocolError::TooManyAgents { max: 1, sender: _ }
+    ));
+    assert_eq!(bridge.aggregator.total_accepted(), 1);
+    assert_eq!(bridge.aggregator.total_rejected(), 1);
+
+    let panes = bridge.storage.get_panes().await.expect("panes");
+    assert_eq!(panes.len(), 1);
+    assert_eq!(panes[0].pane_id, 51);
 }
 
 #[test]

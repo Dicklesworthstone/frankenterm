@@ -13,6 +13,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Maximum allowed message payload size in bytes (1 MiB).
 pub const MAX_MESSAGE_SIZE: usize = 1_048_576;
+/// Default idle window before a sender is considered stale.
+pub const DEFAULT_AGENT_STALE_AFTER_MS: i64 = 5 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Core wire messages
@@ -396,16 +398,23 @@ pub struct Aggregator {
     total_accepted: u64,
     total_rejected: u64,
     max_agents: usize,
+    stale_after_ms: i64,
 }
 
 impl Aggregator {
     /// Create a new aggregator with a maximum number of tracked agents.
     pub fn new(max_agents: usize) -> Self {
+        Self::with_stale_after(max_agents, DEFAULT_AGENT_STALE_AFTER_MS)
+    }
+
+    /// Create a new aggregator with a custom stale-agent threshold.
+    pub fn with_stale_after(max_agents: usize, stale_after_ms: i64) -> Self {
         Self {
             agents: HashMap::new(),
             total_accepted: 0,
             total_rejected: 0,
             max_agents,
+            stale_after_ms,
         }
     }
 
@@ -428,6 +437,9 @@ impl Aggregator {
     ) -> Result<IngestResult, WireProtocolError> {
         let is_new = !self.agents.contains_key(&envelope.sender);
         if is_new && self.agents.len() >= self.max_agents {
+            self.prune_stale_agents(envelope.sent_at_ms);
+        }
+        if is_new && self.agents.len() >= self.max_agents {
             self.total_rejected = self.total_rejected.saturating_add(1);
             return Err(WireProtocolError::TooManyAgents {
                 max: self.max_agents,
@@ -448,6 +460,7 @@ impl Aggregator {
         // Dedup: skip if we've already seen this or a later seq from this sender.
         if envelope.seq <= session.last_seq {
             session.duplicates_skipped += 1;
+            session.last_seen_ms = session.last_seen_ms.max(envelope.sent_at_ms);
             return Ok(IngestResult::Duplicate {
                 sender: envelope.sender,
                 seq: envelope.seq,
@@ -478,6 +491,20 @@ impl Aggregator {
     #[must_use]
     pub fn total_rejected(&self) -> u64 {
         self.total_rejected
+    }
+
+    /// Remove tracked senders that have not been seen within `stale_after_ms`.
+    ///
+    /// Returns the number of removed sender sessions.
+    pub fn prune_stale_agents(&mut self, now_ms: i64) -> usize {
+        if self.stale_after_ms <= 0 {
+            return 0;
+        }
+
+        let before = self.agents.len();
+        self.agents
+            .retain(|_, session| now_ms.saturating_sub(session.last_seen_ms) < self.stale_after_ms);
+        before.saturating_sub(self.agents.len())
     }
 
     /// Get the last sequence number received from a given agent.
@@ -1287,6 +1314,87 @@ mod tests {
             err,
             WireProtocolError::TooManyAgents { max: 1, sender: _ }
         ));
+        assert_eq!(agg.total_rejected(), 1);
+    }
+
+    #[test]
+    fn aggregator_prunes_stale_agents_before_capacity_reject() {
+        let mut agg = Aggregator::with_stale_after(1, 50);
+
+        let mut first = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        first.sent_at_ms = 100;
+        assert!(matches!(
+            agg.ingest_envelope(first).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+
+        let mut second = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
+        second.sent_at_ms = 200;
+        assert!(matches!(
+            agg.ingest_envelope(second).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+
+        assert_eq!(agg.agent_count(), 1);
+        assert_eq!(agg.agent_last_seq("agent-a"), None);
+        assert_eq!(agg.agent_last_seq("agent-b"), Some(1));
+        assert_eq!(agg.total_rejected(), 0);
+    }
+
+    #[test]
+    fn aggregator_retains_recent_agents_under_stale_threshold() {
+        let mut agg = Aggregator::with_stale_after(1, 200);
+
+        let mut first = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        first.sent_at_ms = 100;
+        assert!(matches!(
+            agg.ingest_envelope(first).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+
+        let mut second = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
+        second.sent_at_ms = 250;
+        let err = agg
+            .ingest_envelope(second)
+            .expect_err("recent sender should still count against capacity");
+        assert!(matches!(
+            err,
+            WireProtocolError::TooManyAgents { max: 1, sender: _ }
+        ));
+        assert_eq!(agg.agent_count(), 1);
+        assert_eq!(agg.agent_last_seq("agent-a"), Some(1));
+        assert_eq!(agg.total_rejected(), 1);
+    }
+
+    #[test]
+    fn aggregator_duplicate_refreshes_last_seen_for_stale_pruning() {
+        let mut agg = Aggregator::with_stale_after(1, 50);
+
+        let mut first = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        first.sent_at_ms = 100;
+        assert!(matches!(
+            agg.ingest_envelope(first).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+
+        let mut duplicate = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        duplicate.sent_at_ms = 130;
+        assert!(matches!(
+            agg.ingest_envelope(duplicate).unwrap(),
+            IngestResult::Duplicate { .. }
+        ));
+
+        let mut second = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
+        second.sent_at_ms = 160;
+        let err = agg
+            .ingest_envelope(second)
+            .expect_err("duplicate should refresh last_seen so sender-a is not stale yet");
+        assert!(matches!(
+            err,
+            WireProtocolError::TooManyAgents { max: 1, sender: _ }
+        ));
+        assert_eq!(agg.agent_last_seq("agent-a"), Some(1));
+        assert_eq!(agg.agent_last_seq("agent-b"), None);
         assert_eq!(agg.total_rejected(), 1);
     }
 }
