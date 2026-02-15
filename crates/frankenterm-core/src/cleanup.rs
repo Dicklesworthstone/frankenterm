@@ -2668,13 +2668,8 @@ mod tests {
         let plan = cleanup_apply(&storage, &config).await.expect("apply");
 
         // All tiers have retention_days=0, so they should all be skipped
-        let event_tables: Vec<_> = plan
-            .tables
-            .iter()
-            .filter(|t| t.table.starts_with("events"))
-            .collect();
         assert!(
-            event_tables.is_empty(),
+            !plan.tables.iter().any(|t| t.table.starts_with("events")),
             "all zero-retention tiers should be skipped"
         );
 

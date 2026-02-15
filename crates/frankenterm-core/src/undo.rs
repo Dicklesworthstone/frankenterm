@@ -1795,7 +1795,7 @@ mod tests {
     #[test]
     fn undo_outcome_clone_produces_equal_value() {
         let original = UndoOutcome::Failed;
-        let cloned = original.clone();
+        let cloned = original;
         assert_eq!(original, cloned);
     }
 
@@ -2139,7 +2139,7 @@ mod tests {
             undoable: true,
             undo_strategy: "custom".to_string(),
             undo_hint: None,
-            undo_payload: Some(r#"[1, 2, 3]"#.to_string()),
+            undo_payload: Some("[1, 2, 3]".to_string()),
             undone_at: None,
             undone_by: None,
         };

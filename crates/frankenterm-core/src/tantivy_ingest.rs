@@ -2642,7 +2642,7 @@ mod tests {
         let path = dir.path().join("partial_header.log");
 
         // Only 2 bytes — not enough for a 4-byte length header
-        std::fs::write(&path, &[0u8, 1u8]).unwrap();
+        std::fs::write(&path, [0u8, 1u8]).unwrap();
 
         let mut reader = AppendLogReader::open(&path).unwrap();
         let record = reader.next_record().unwrap();
