@@ -2262,4 +2262,721 @@ alias ll='ls -la'
         let wizard = SetupWizard::new(env);
         assert!(!wizard.recommendations().is_empty());
     }
+
+    // =========================================================================
+    // Helper Function Tests
+    // =========================================================================
+
+    #[test]
+    fn strip_inline_comment_no_comment() {
+        assert_eq!(strip_inline_comment("Host prod"), "Host prod");
+    }
+
+    #[test]
+    fn strip_inline_comment_bare_hash() {
+        assert_eq!(strip_inline_comment("Host prod # production"), "Host prod ");
+    }
+
+    #[test]
+    fn strip_inline_comment_leading_hash() {
+        assert_eq!(strip_inline_comment("# full line comment"), "");
+    }
+
+    #[test]
+    fn strip_inline_comment_hash_inside_quotes() {
+        assert_eq!(
+            strip_inline_comment(r#"HostName "server#1.example.com""#),
+            r#"HostName "server#1.example.com""#
+        );
+    }
+
+    #[test]
+    fn strip_inline_comment_hash_after_quoted_value() {
+        assert_eq!(
+            strip_inline_comment(r#""value" # comment"#),
+            r#""value" "#
+        );
+    }
+
+    #[test]
+    fn strip_inline_comment_empty_string() {
+        assert_eq!(strip_inline_comment(""), "");
+    }
+
+    #[test]
+    fn split_key_value_whitespace_separated() {
+        let (k, v) = split_key_value("Host prod");
+        assert_eq!(k, "Host");
+        assert_eq!(v, "prod");
+    }
+
+    #[test]
+    fn split_key_value_equals_separated() {
+        let (k, v) = split_key_value("Host=prod");
+        assert_eq!(k, "Host");
+        assert_eq!(v, "prod");
+    }
+
+    #[test]
+    fn split_key_value_whitespace_and_equals() {
+        let (k, v) = split_key_value("Host = prod");
+        assert_eq!(k, "Host");
+        assert_eq!(v, "prod");
+    }
+
+    #[test]
+    fn split_key_value_key_only() {
+        let (k, v) = split_key_value("Host");
+        assert_eq!(k, "Host");
+        assert_eq!(v, "");
+    }
+
+    #[test]
+    fn split_key_value_multiple_spaces_in_value() {
+        let (k, v) = split_key_value("Host   prod staging");
+        assert_eq!(k, "Host");
+        assert_eq!(v, "prod staging");
+    }
+
+    #[test]
+    fn strip_quotes_double() {
+        assert_eq!(strip_quotes(r#""hello""#), "hello");
+    }
+
+    #[test]
+    fn strip_quotes_single() {
+        assert_eq!(strip_quotes("'hello'"), "hello");
+    }
+
+    #[test]
+    fn strip_quotes_no_quotes() {
+        assert_eq!(strip_quotes("hello"), "hello");
+    }
+
+    #[test]
+    fn strip_quotes_mismatched() {
+        // Mismatched quote types should not strip
+        assert_eq!(strip_quotes(r#""hello'"#), r#""hello'"#);
+    }
+
+    #[test]
+    fn strip_quotes_empty_string() {
+        assert_eq!(strip_quotes(""), "");
+    }
+
+    #[test]
+    fn strip_quotes_single_char() {
+        assert_eq!(strip_quotes("a"), "a");
+    }
+
+    #[test]
+    fn strip_quotes_empty_quoted() {
+        assert_eq!(strip_quotes(r#""""#), "");
+    }
+
+    #[test]
+    fn lua_escape_backslash() {
+        assert_eq!(lua_escape(r"C:\Users"), r"C:\\Users");
+    }
+
+    #[test]
+    fn lua_escape_single_quote() {
+        assert_eq!(lua_escape("it's"), r"it\'s");
+    }
+
+    #[test]
+    fn lua_escape_newline() {
+        assert_eq!(lua_escape("line1\nline2"), r"line1\nline2");
+    }
+
+    #[test]
+    fn lua_escape_combined() {
+        assert_eq!(lua_escape("a\\b'c\nd"), r"a\\b\'c\nd");
+    }
+
+    #[test]
+    fn lua_escape_no_special() {
+        assert_eq!(lua_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn redact_identity_path_tilde_prefix() {
+        assert_eq!(redact_identity_path("~/.ssh/id_ed25519"), "~/id_ed25519");
+    }
+
+    #[test]
+    fn redact_identity_path_absolute() {
+        assert_eq!(
+            redact_identity_path("/home/user/.ssh/id_rsa"),
+            ".../id_rsa"
+        );
+    }
+
+    #[test]
+    fn redact_identity_path_bare_filename() {
+        assert_eq!(redact_identity_path("id_rsa"), "id_rsa");
+    }
+
+    #[test]
+    fn redact_identity_path_windows_style() {
+        // On Unix, backslashes are not path separators, so file_name() returns
+        // the full string. The function still detects backslash as a separator hint.
+        let result = redact_identity_path(r"C:\Users\alice\.ssh\id_rsa");
+        assert!(result.starts_with(".../"));
+    }
+
+    #[test]
+    fn is_wildcard_host_star() {
+        assert!(is_wildcard_host("*"));
+        assert!(is_wildcard_host("*.example.com"));
+    }
+
+    #[test]
+    fn is_wildcard_host_question_mark() {
+        assert!(is_wildcard_host("host?"));
+    }
+
+    #[test]
+    fn is_wildcard_host_no_wildcard() {
+        assert!(!is_wildcard_host("prod"));
+        assert!(!is_wildcard_host("staging.example.com"));
+    }
+
+    #[test]
+    fn find_return_line_start_simple() {
+        let content = "local config = {}\nreturn config\n";
+        let idx = find_return_line_start(content).unwrap();
+        assert_eq!(&content[idx..idx + 6], "return");
+    }
+
+    #[test]
+    fn find_return_line_start_no_return() {
+        let content = "local config = {}\n";
+        assert!(find_return_line_start(content).is_none());
+    }
+
+    #[test]
+    fn find_return_line_start_last_wins() {
+        let content = "return early\nlocal x = 1\nreturn config\n";
+        let idx = find_return_line_start(content).unwrap();
+        assert!(content[idx..].starts_with("return config"));
+    }
+
+    #[test]
+    fn find_return_line_start_indented() {
+        let content = "  return config\n";
+        let idx = find_return_line_start(content).unwrap();
+        assert!(content[idx..].contains("return config"));
+    }
+
+    #[test]
+    fn find_return_line_start_return_as_substring() {
+        // "noreturn" should not match (line doesn't start with "return")
+        let content = "local noreturn = true\n";
+        assert!(find_return_line_start(content).is_none());
+    }
+
+    #[test]
+    fn insert_ft_block_before_return() {
+        let content = "local x = 1\nreturn config\n";
+        let block = "-- FT-BEGIN (do not edit this block)\n-- code\n-- FT-END\n";
+        let result = insert_ft_block(content, block);
+        let ft_pos = result.find("-- FT-BEGIN").unwrap();
+        let ret_pos = result.find("return config").unwrap();
+        assert!(ft_pos < ret_pos);
+    }
+
+    #[test]
+    fn insert_ft_block_no_return_trailing_newline() {
+        let content = "local x = 1\n";
+        let block = "-- FT-BEGIN (do not edit this block)\n-- code\n-- FT-END\n";
+        let result = insert_ft_block(content, block);
+        assert!(result.contains("-- FT-BEGIN"));
+        assert!(result.contains("local x = 1"));
+    }
+
+    #[test]
+    fn insert_ft_block_no_return_no_trailing_newline() {
+        let content = "local x = 1";
+        let block = "-- FT-BEGIN (do not edit this block)\n-- code\n-- FT-END\n";
+        let result = insert_ft_block(content, block);
+        assert!(result.contains("-- FT-BEGIN"));
+        assert!(result.contains("local x = 1"));
+    }
+
+    #[test]
+    fn create_shell_ft_block_bash() {
+        let block = create_shell_ft_block(ShellType::Bash);
+        assert!(block.starts_with(FT_BEGIN_MARKER_SHELL));
+        assert!(block.ends_with(FT_END_MARKER_SHELL));
+        assert!(block.contains("__ft_precmd"));
+        assert!(block.contains("PROMPT_COMMAND"));
+    }
+
+    #[test]
+    fn create_shell_ft_block_zsh() {
+        let block = create_shell_ft_block(ShellType::Zsh);
+        assert!(block.starts_with(FT_BEGIN_MARKER_SHELL));
+        assert!(block.ends_with(FT_END_MARKER_SHELL));
+        assert!(block.contains("precmd_functions"));
+        assert!(block.contains("preexec_functions"));
+    }
+
+    #[test]
+    fn create_shell_ft_block_fish() {
+        let block = create_shell_ft_block(ShellType::Fish);
+        assert!(block.starts_with(FT_BEGIN_MARKER_SHELL));
+        assert!(block.ends_with(FT_END_MARKER_SHELL));
+        assert!(block.contains("--on-event fish_prompt"));
+        assert!(block.contains("--on-event fish_preexec"));
+    }
+
+    // =========================================================================
+    // SshHost Tests
+    // =========================================================================
+
+    #[test]
+    fn ssh_host_redacted_identity_files() {
+        let host = SshHost {
+            alias: "prod".into(),
+            hostname: Some("prod.example.com".into()),
+            user: None,
+            port: None,
+            identity_files: vec![
+                "~/.ssh/id_ed25519".into(),
+                "/home/user/.ssh/id_rsa".into(),
+                "my_key".into(),
+            ],
+        };
+        let redacted = host.redacted_identity_files();
+        assert_eq!(redacted[0], "~/id_ed25519");
+        assert_eq!(redacted[1], ".../id_rsa");
+        assert_eq!(redacted[2], "my_key");
+    }
+
+    #[test]
+    fn ssh_host_redacted_identity_files_empty() {
+        let host = SshHost {
+            alias: "dev".into(),
+            hostname: None,
+            user: None,
+            port: None,
+            identity_files: vec![],
+        };
+        assert!(host.redacted_identity_files().is_empty());
+    }
+
+    #[test]
+    fn ssh_host_clone_and_eq() {
+        let host = SshHost {
+            alias: "test".into(),
+            hostname: Some("test.example.com".into()),
+            user: Some("admin".into()),
+            port: Some(22),
+            identity_files: vec!["~/.ssh/id_rsa".into()],
+        };
+        let cloned = host.clone();
+        assert_eq!(host, cloned);
+    }
+
+    #[test]
+    fn ssh_host_debug() {
+        let host = SshHost {
+            alias: "x".into(),
+            hostname: None,
+            user: None,
+            port: None,
+            identity_files: vec![],
+        };
+        let dbg = format!("{:?}", host);
+        assert!(dbg.contains("SshHost"));
+        assert!(dbg.contains("alias"));
+    }
+
+    // =========================================================================
+    // SSH Config Parsing Edge Cases
+    // =========================================================================
+
+    #[test]
+    fn parse_ssh_config_empty_input() {
+        assert!(parse_ssh_config("").is_empty());
+    }
+
+    #[test]
+    fn parse_ssh_config_comments_only() {
+        let input = "# This is a comment\n# Another comment\n";
+        assert!(parse_ssh_config(input).is_empty());
+    }
+
+    #[test]
+    fn parse_ssh_config_wildcard_hosts_skipped() {
+        let input = "Host *\n  ServerAliveInterval 60\n\nHost *.example.com\n  User admin\n";
+        assert!(parse_ssh_config(input).is_empty());
+    }
+
+    #[test]
+    fn parse_ssh_config_duplicate_host_merges() {
+        let input = "Host myhost\n  User alice\n\nHost myhost\n  Port 2222\n";
+        let hosts = parse_ssh_config(input);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].user.as_deref(), Some("alice"));
+        assert_eq!(hosts[0].port, Some(2222));
+    }
+
+    #[test]
+    fn parse_ssh_config_equals_syntax() {
+        let input = "Host myhost\n  HostName=server.example.com\n  User=deploy\n";
+        let hosts = parse_ssh_config(input);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(
+            hosts[0].hostname.as_deref(),
+            Some("server.example.com")
+        );
+        assert_eq!(hosts[0].user.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn parse_ssh_config_quoted_values() {
+        let input = "Host myhost\n  HostName \"server.example.com\"\n  User 'deploy'\n";
+        let hosts = parse_ssh_config(input);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(
+            hosts[0].hostname.as_deref(),
+            Some("server.example.com")
+        );
+        assert_eq!(hosts[0].user.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn parse_ssh_config_invalid_port_ignored() {
+        let input = "Host myhost\n  Port notaport\n";
+        let hosts = parse_ssh_config(input);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].port, None);
+    }
+
+    #[test]
+    fn parse_ssh_config_multiple_identity_files() {
+        let input = "Host myhost\n  IdentityFile ~/.ssh/id_ed25519\n  IdentityFile ~/.ssh/id_rsa\n";
+        let hosts = parse_ssh_config(input);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].identity_files.len(), 2);
+    }
+
+    #[test]
+    fn parse_ssh_config_case_insensitive_keys() {
+        let input = "Host myhost\n  HOSTNAME server.example.com\n  USER admin\n  PORT 2222\n";
+        let hosts = parse_ssh_config(input);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(
+            hosts[0].hostname.as_deref(),
+            Some("server.example.com")
+        );
+        assert_eq!(hosts[0].user.as_deref(), Some("admin"));
+        assert_eq!(hosts[0].port, Some(2222));
+    }
+
+    #[test]
+    fn parse_ssh_config_unknown_directives_ignored() {
+        let input = "Host myhost\n  ProxyCommand ssh -W %h:%p bastion\n  HostName actual.host\n";
+        let hosts = parse_ssh_config(input);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].hostname.as_deref(), Some("actual.host"));
+    }
+
+    #[test]
+    fn parse_ssh_config_multi_alias_host_line() {
+        let input = "Host alpha beta\n  HostName shared.example.com\n";
+        let hosts = parse_ssh_config(input);
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0].alias, "alpha");
+        assert_eq!(hosts[1].alias, "beta");
+        assert_eq!(
+            hosts[0].hostname.as_deref(),
+            Some("shared.example.com")
+        );
+        assert_eq!(
+            hosts[1].hostname.as_deref(),
+            Some("shared.example.com")
+        );
+    }
+
+    #[test]
+    fn parse_ssh_config_directives_before_first_host_ignored() {
+        let input = "ServerAliveInterval 60\n\nHost myhost\n  HostName server.example.com\n";
+        let hosts = parse_ssh_config(input);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].alias, "myhost");
+    }
+
+    // =========================================================================
+    // generate_ssh_domains_lua Edge Cases
+    // =========================================================================
+
+    #[test]
+    fn generate_ssh_domains_lua_empty_hosts() {
+        let block = generate_ssh_domains_lua(&[], 50_000);
+        assert!(block.contains(FT_BEGIN_MARKER));
+        assert!(block.contains(FT_END_MARKER));
+        assert!(block.contains("No SSH hosts found"));
+        assert!(!block.contains("wa_ssh_domains"));
+    }
+
+    #[test]
+    fn generate_ssh_domains_lua_special_chars_escaped() {
+        let hosts = vec![SshHost {
+            alias: "it's-a-host".into(),
+            hostname: Some("host'name.example".into()),
+            user: Some("o'brien".into()),
+            port: None,
+            identity_files: vec![],
+        }];
+        let block = generate_ssh_domains_lua(&hosts, 10_000);
+        assert!(block.contains(r"it\'s-a-host"));
+        assert!(block.contains(r"host\'name.example"));
+        assert!(block.contains(r"o\'brien"));
+    }
+
+    #[test]
+    fn generate_ssh_domains_lua_no_port_no_user() {
+        let hosts = vec![SshHost {
+            alias: "simple".into(),
+            hostname: Some("simple.example.com".into()),
+            user: None,
+            port: None,
+            identity_files: vec![],
+        }];
+        let block = generate_ssh_domains_lua(&hosts, 10_000);
+        assert!(block.contains("name = 'simple'"));
+        assert!(!block.contains("username"));
+        assert!(!block.contains("port ="));
+        assert!(!block.contains("ssh_option"));
+    }
+
+    #[test]
+    fn generate_ssh_domains_lua_hostname_falls_back_to_alias() {
+        let hosts = vec![SshHost {
+            alias: "myalias".into(),
+            hostname: None,
+            user: None,
+            port: None,
+            identity_files: vec![],
+        }];
+        let block = generate_ssh_domains_lua(&hosts, 10_000);
+        assert!(block.contains("remote_address = 'myalias'"));
+    }
+
+    // =========================================================================
+    // Trait Coverage
+    // =========================================================================
+
+    #[test]
+    fn shell_type_copy_clone() {
+        let s = ShellType::Bash;
+        let s2 = s; // Copy
+        let s3 = s.clone();
+        assert_eq!(s, s2);
+        assert_eq!(s, s3);
+    }
+
+    #[test]
+    fn shell_type_debug() {
+        assert_eq!(format!("{:?}", ShellType::Bash), "Bash");
+        assert_eq!(format!("{:?}", ShellType::Zsh), "Zsh");
+        assert_eq!(format!("{:?}", ShellType::Fish), "Fish");
+    }
+
+    #[test]
+    fn shell_type_eq_ne() {
+        assert_eq!(ShellType::Bash, ShellType::Bash);
+        assert_ne!(ShellType::Bash, ShellType::Zsh);
+        assert_ne!(ShellType::Zsh, ShellType::Fish);
+    }
+
+    #[test]
+    fn shell_type_rc_file_path_differs_per_shell() {
+        if dirs::home_dir().is_some() {
+            let bash_rc = ShellType::Bash.rc_file_path().unwrap();
+            let zsh_rc = ShellType::Zsh.rc_file_path().unwrap();
+            let fish_rc = ShellType::Fish.rc_file_path().unwrap();
+            assert!(bash_rc.to_string_lossy().contains(".bashrc"));
+            assert!(zsh_rc.to_string_lossy().contains(".zshrc"));
+            assert!(fish_rc.to_string_lossy().contains("config.fish"));
+            assert_ne!(bash_rc, zsh_rc);
+            assert_ne!(zsh_rc, fish_rc);
+        }
+    }
+
+    #[test]
+    fn patch_result_debug_clone() {
+        let pr = PatchResult {
+            config_path: PathBuf::from("/tmp/test"),
+            backup_path: Some(PathBuf::from("/tmp/test.bak")),
+            modified: true,
+            message: "test".into(),
+        };
+        let cloned = pr.clone();
+        assert_eq!(pr.modified, cloned.modified);
+        assert_eq!(pr.config_path, cloned.config_path);
+        let dbg = format!("{:?}", pr);
+        assert!(dbg.contains("PatchResult"));
+    }
+
+    #[test]
+    fn detection_step_debug_clone() {
+        let step = DetectionStep {
+            label: "Test".into(),
+            ok: true,
+            detail: "all good".into(),
+        };
+        let cloned = step.clone();
+        assert_eq!(step.label, cloned.label);
+        assert_eq!(step.ok, cloned.ok);
+        let dbg = format!("{:?}", step);
+        assert!(dbg.contains("DetectionStep"));
+    }
+
+    #[test]
+    fn wizard_choice_copy_clone_eq() {
+        let a = WizardChoice::Accept;
+        let b = a; // Copy
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_ne!(WizardChoice::Accept, WizardChoice::Skip);
+    }
+
+    #[test]
+    fn wizard_choice_debug() {
+        assert_eq!(format!("{:?}", WizardChoice::Accept), "Accept");
+        assert_eq!(format!("{:?}", WizardChoice::Skip), "Skip");
+    }
+
+    #[test]
+    fn wizard_result_debug_clone() {
+        let wr = WizardResult {
+            steps: vec![],
+            recommendations: vec![],
+            config: None,
+            config_path: None,
+            patches: vec![],
+        };
+        let cloned = wr.clone();
+        assert_eq!(wr.steps.len(), cloned.steps.len());
+        let dbg = format!("{:?}", wr);
+        assert!(dbg.contains("WizardResult"));
+    }
+
+    // =========================================================================
+    // Constants Validation
+    // =========================================================================
+
+    #[test]
+    fn marker_constants_valid() {
+        assert!(FT_BEGIN_MARKER.starts_with("-- FT-BEGIN"));
+        assert_eq!(FT_END_MARKER, "-- FT-END");
+        assert!(FT_BEGIN_MARKER_SHELL.starts_with("# FT-BEGIN"));
+        assert_eq!(FT_END_MARKER_SHELL, "# FT-END");
+    }
+
+    #[test]
+    fn uservar_forwarding_lua_content() {
+        assert!(USERVAR_FORWARDING_LUA.contains("user-var-changed"));
+        assert!(USERVAR_FORWARDING_LUA.contains("ft%-"));
+        assert!(USERVAR_FORWARDING_LUA.contains("background_child_process"));
+    }
+
+    // =========================================================================
+    // extract_ft_block Edge Cases
+    // =========================================================================
+
+    #[test]
+    fn extract_ft_block_no_markers() {
+        assert!(extract_ft_block("just some content").is_none());
+    }
+
+    #[test]
+    fn extract_ft_block_reversed_markers() {
+        // END before BEGIN should return None
+        let content = "-- FT-END\nsome code\n-- FT-BEGIN (do not edit this block)\n";
+        assert!(extract_ft_block(content).is_none());
+    }
+
+    #[test]
+    fn extract_ft_block_end_without_newline() {
+        let content = "-- FT-BEGIN (do not edit this block)\n-- code\n-- FT-END";
+        let block = extract_ft_block(content).unwrap();
+        assert!(block.starts_with("-- FT-BEGIN"));
+        assert!(block.ends_with("-- FT-END"));
+    }
+
+    // =========================================================================
+    // patch_wezterm_config_block_at Validation
+    // =========================================================================
+
+    #[test]
+    fn patch_wezterm_config_block_missing_markers_error() {
+        let original = "local x = 1\n";
+        let file = create_temp_config(original);
+        let bad_block = "no markers here";
+        let result = patch_wezterm_config_block_at(file.path(), bad_block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("marker"));
+    }
+
+    // =========================================================================
+    // Wizard Accessors
+    // =========================================================================
+
+    #[test]
+    fn wizard_environment_accessor() {
+        let env = make_test_env(Some("20260101"), Some("zsh"), true, vec![], vec![]);
+        let wizard = SetupWizard::new(env);
+        assert_eq!(
+            wizard.environment().wezterm.version.as_deref(),
+            Some("20260101")
+        );
+    }
+
+    #[test]
+    fn wizard_auto_config_accessor() {
+        let env = make_test_env(Some("20260101"), Some("zsh"), true, vec![], vec![]);
+        let wizard = SetupWizard::new(env);
+        let ac = wizard.auto_config();
+        assert!(ac.poll_interval_ms > 0);
+    }
+
+    // =========================================================================
+    // Shell Snippet Content Validation
+    // =========================================================================
+
+    #[test]
+    fn bash_snippet_has_all_markers() {
+        let snippet = ShellType::Bash.osc133_snippet();
+        assert!(snippet.contains("133;A")); // prompt start
+        assert!(snippet.contains("133;C")); // command start
+        assert!(snippet.contains("133;D")); // command end
+        assert!(snippet.contains("__ft_precmd"));
+        assert!(snippet.contains("__ft_preexec"));
+    }
+
+    #[test]
+    fn zsh_snippet_uses_hook_arrays() {
+        let snippet = ShellType::Zsh.osc133_snippet();
+        assert!(snippet.contains("precmd_functions"));
+        assert!(snippet.contains("preexec_functions"));
+        // Should NOT use bash-specific PROMPT_COMMAND
+        assert!(!snippet.contains("PROMPT_COMMAND"));
+    }
+
+    #[test]
+    fn fish_snippet_uses_events() {
+        let snippet = ShellType::Fish.osc133_snippet();
+        assert!(snippet.contains("--on-event fish_prompt"));
+        assert!(snippet.contains("--on-event fish_preexec"));
+        assert!(snippet.contains("--on-event fish_postexec"));
+        // Fish uses $status not $?
+        assert!(snippet.contains("$status"));
+    }
 }
