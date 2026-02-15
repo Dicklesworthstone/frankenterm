@@ -1329,4 +1329,455 @@ mod tests {
             "high-value line should be retained"
         );
     }
+
+    // ===================================================================
+    // NEW: ImportanceScoringConfig
+    // ===================================================================
+
+    #[test]
+    fn importance_scoring_config_defaults() {
+        let c = ImportanceScoringConfig::default();
+        assert!((c.baseline - 0.3).abs() < f64::EPSILON);
+        assert!((c.critical_bonus - 0.35).abs() < f64::EPSILON);
+        assert!((c.warning_bonus - 0.2).abs() < f64::EPSILON);
+        assert!((c.tool_boundary_bonus - 0.25).abs() < f64::EPSILON);
+        assert!((c.compilation_bonus - 0.15).abs() < f64::EPSILON);
+        assert!((c.test_result_bonus - 0.25).abs() < f64::EPSILON);
+        assert!((c.blank_line_penalty - 0.2).abs() < f64::EPSILON);
+        assert!((c.progress_line_penalty - 0.25).abs() < f64::EPSILON);
+        assert!((c.ansi_only_penalty - 0.3).abs() < f64::EPSILON);
+        assert!((c.repeated_line_penalty - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn importance_scoring_config_serde_roundtrip() {
+        let c = ImportanceScoringConfig::default();
+        let json = serde_json::to_string(&c).unwrap();
+        let back: ImportanceScoringConfig = serde_json::from_str(&json).unwrap();
+        assert!((back.baseline - c.baseline).abs() < f64::EPSILON);
+        assert!((back.critical_bonus - c.critical_bonus).abs() < f64::EPSILON);
+    }
+
+    // ===================================================================
+    // NEW: ImportanceRetentionConfig
+    // ===================================================================
+
+    #[test]
+    fn importance_retention_config_defaults() {
+        let c = ImportanceRetentionConfig::default();
+        assert_eq!(c.byte_budget_per_pane, 2 * 1024 * 1024);
+        assert_eq!(c.min_lines, 500);
+        assert_eq!(c.max_lines, 10_000);
+        assert!((c.importance_threshold - 0.8).abs() < f64::EPSILON);
+        assert!((c.oldest_window_fraction - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn importance_retention_config_serde_roundtrip() {
+        let c = ImportanceRetentionConfig::default();
+        let json = serde_json::to_string(&c).unwrap();
+        let back: ImportanceRetentionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.min_lines, c.min_lines);
+        assert_eq!(back.max_lines, c.max_lines);
+    }
+
+    #[test]
+    fn validate_default_config_is_ok() {
+        assert!(ImportanceRetentionConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_min_lines_zero_fails() {
+        let mut c = ImportanceRetentionConfig::default();
+        c.min_lines = 0;
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("min_lines must be > 0"));
+    }
+
+    #[test]
+    fn validate_max_less_than_min_fails() {
+        let mut c = ImportanceRetentionConfig::default();
+        c.min_lines = 100;
+        c.max_lines = 50;
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("max_lines must be >= min_lines"));
+    }
+
+    #[test]
+    fn validate_nan_threshold_fails() {
+        let mut c = ImportanceRetentionConfig::default();
+        c.importance_threshold = f64::NAN;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_threshold_out_of_range_fails() {
+        let mut c = ImportanceRetentionConfig::default();
+        c.importance_threshold = 1.5;
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("importance_threshold must be within"));
+    }
+
+    #[test]
+    fn validate_threshold_negative_fails() {
+        let mut c = ImportanceRetentionConfig::default();
+        c.importance_threshold = -0.1;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_oldest_window_nan_fails() {
+        let mut c = ImportanceRetentionConfig::default();
+        c.oldest_window_fraction = f64::NAN;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_oldest_window_zero_fails() {
+        let mut c = ImportanceRetentionConfig::default();
+        c.oldest_window_fraction = 0.0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_oldest_window_over_one_fails() {
+        let mut c = ImportanceRetentionConfig::default();
+        c.oldest_window_fraction = 1.5;
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("oldest_window_fraction must be <= 1"));
+    }
+
+    // ===================================================================
+    // NEW: ScrollbackLine
+    // ===================================================================
+
+    #[test]
+    fn scrollback_line_clamps_importance() {
+        let line = ScrollbackLine::new("test", 1.5, 100);
+        assert!((line.importance - 1.0).abs() < f64::EPSILON);
+        let line2 = ScrollbackLine::new("test", -0.5, 100);
+        assert!((line2.importance - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn scrollback_line_bytes_matches_text() {
+        let line = ScrollbackLine::new("hello world", 0.5, 0);
+        assert_eq!(line.bytes, "hello world".len());
+    }
+
+    #[test]
+    fn scrollback_line_serde_roundtrip() {
+        let line = ScrollbackLine::new("error: fatal", 0.9, 42);
+        let json = serde_json::to_string(&line).unwrap();
+        let back: ScrollbackLine = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.text, "error: fatal");
+        assert!((back.importance - 0.9).abs() < f64::EPSILON);
+        assert_eq!(back.timestamp_ms, 42);
+        assert_eq!(back.bytes, "error: fatal".len());
+    }
+
+    // ===================================================================
+    // NEW: ImportanceBudgetReport
+    // ===================================================================
+
+    #[test]
+    fn importance_budget_report_default() {
+        let r = ImportanceBudgetReport::default();
+        assert_eq!(r.lines_removed, 0);
+        assert_eq!(r.bytes_removed, 0);
+        assert_eq!(r.remaining_lines, 0);
+        assert_eq!(r.remaining_bytes, 0);
+    }
+
+    #[test]
+    fn importance_budget_report_serde_roundtrip() {
+        let r = ImportanceBudgetReport {
+            lines_removed: 5,
+            bytes_removed: 100,
+            remaining_lines: 50,
+            remaining_bytes: 1000,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: ImportanceBudgetReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.lines_removed, 5);
+        assert_eq!(back.bytes_removed, 100);
+    }
+
+    // ===================================================================
+    // NEW: Signal detection helpers
+    // ===================================================================
+
+    #[test]
+    fn error_signal_detected() {
+        assert!(line_contains_error_signal("error: failed to build"));
+        assert!(line_contains_error_signal("panic at the disco"));
+        assert!(line_contains_error_signal("unhandled exception"));
+        assert!(line_contains_error_signal("fatal error occurred"));
+        assert!(line_contains_error_signal("test failed"));
+        assert!(line_contains_error_signal(
+            "traceback (most recent call last)"
+        ));
+        assert!(!line_contains_error_signal("all good here"));
+    }
+
+    #[test]
+    fn warning_signal_detected() {
+        assert!(line_contains_warning_signal("warning: unused variable"));
+        assert!(line_contains_warning_signal("[warn] deprecated"));
+        assert!(line_contains_warning_signal("deprecation notice"));
+        assert!(!line_contains_warning_signal("info: all good"));
+    }
+
+    #[test]
+    fn tool_boundary_signal_detected() {
+        assert!(line_contains_tool_boundary_signal("using tool: bash"));
+        assert!(line_contains_tool_boundary_signal("tool call started"));
+        assert!(line_contains_tool_boundary_signal("executing tool read"));
+        assert!(line_contains_tool_boundary_signal("tool_use block"));
+        assert!(!line_contains_tool_boundary_signal("regular text"));
+    }
+
+    #[test]
+    fn compilation_signal_detected() {
+        assert!(line_contains_compilation_signal(
+            "compiling frankenterm-core v0.1.0"
+        ));
+        assert!(line_contains_compilation_signal(
+            "build finished successfully"
+        ));
+        assert!(line_contains_compilation_signal("now linking final binary"));
+        assert!(line_contains_compilation_signal("building project"));
+        assert!(line_contains_compilation_signal("running cargo test"));
+        assert!(!line_contains_compilation_signal("regular text"));
+    }
+
+    #[test]
+    fn test_signal_detected() {
+        assert!(line_contains_test_signal("test result: ok. 5 passed"));
+        assert!(line_contains_test_signal("running 42 tests"));
+        assert!(line_contains_test_signal("assertion failed"));
+        assert!(line_contains_test_signal("12 tests passed"));
+        assert!(line_contains_test_signal("3 tests failed"));
+        assert!(!line_contains_test_signal("regular text"));
+    }
+
+    #[test]
+    fn progress_line_detected() {
+        assert!(is_progress_line("[########  ] 80% done"));
+        assert!(is_progress_line("downloading eta 2m"));
+        assert!(is_progress_line("100 it/s"));
+        assert!(is_progress_line("50 bytes/s"));
+        assert!(!is_progress_line("regular text"));
+    }
+
+    #[test]
+    fn ansi_only_line_detected() {
+        assert!(is_ansi_only_line("\u{1b}[2K\u{1b}[1A"));
+        assert!(!is_ansi_only_line("no ansi here"));
+        assert!(!is_ansi_only_line("\u{1b}[31mred text\u{1b}[0m"));
+    }
+
+    #[test]
+    fn strip_ansi_sequences_removes_csi() {
+        let input = "\u{1b}[31mhello\u{1b}[0m";
+        assert_eq!(strip_ansi_sequences(input), "hello");
+    }
+
+    #[test]
+    fn strip_ansi_sequences_removes_osc() {
+        let input = "\u{1b}]0;title\u{7}content";
+        assert_eq!(strip_ansi_sequences(input), "content");
+    }
+
+    #[test]
+    fn strip_ansi_sequences_plain_text_unchanged() {
+        assert_eq!(strip_ansi_sequences("hello world"), "hello world");
+    }
+
+    // ===================================================================
+    // NEW: EvictionTarget serde
+    // ===================================================================
+
+    #[test]
+    fn eviction_target_serde_roundtrip() {
+        let t = EvictionTarget {
+            pane_id: 42,
+            tier: PaneTier::Idle,
+            current_segments: 5000,
+            max_segments: 1000,
+            segments_to_remove: 4000,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: EvictionTarget = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pane_id, 42);
+        assert_eq!(back.segments_to_remove, 4000);
+    }
+
+    // ===================================================================
+    // NEW: EvictionPlan::is_empty
+    // ===================================================================
+
+    #[test]
+    fn eviction_plan_is_empty_when_zero_segments() {
+        let plan = EvictionPlan {
+            pressure: MemoryPressureTier::Green,
+            targets: vec![],
+            total_segments_to_remove: 0,
+            panes_affected: 0,
+        };
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn eviction_plan_is_not_empty_when_segments_pending() {
+        let plan = EvictionPlan {
+            pressure: MemoryPressureTier::Red,
+            targets: vec![],
+            total_segments_to_remove: 100,
+            panes_affected: 1,
+        };
+        assert!(!plan.is_empty());
+    }
+
+    // ===================================================================
+    // NEW: EvictionReport default
+    // ===================================================================
+
+    #[test]
+    fn eviction_report_default() {
+        let r = EvictionReport::default();
+        assert_eq!(r.panes_trimmed, 0);
+        assert_eq!(r.segments_removed, 0);
+        assert!(r.errors.is_empty());
+    }
+
+    // ===================================================================
+    // NEW: total_line_bytes
+    // ===================================================================
+
+    #[test]
+    fn total_line_bytes_empty_deque() {
+        let lines: VecDeque<ScrollbackLine> = VecDeque::new();
+        assert_eq!(total_line_bytes(&lines), 0);
+    }
+
+    #[test]
+    fn total_line_bytes_sums_correctly() {
+        let lines = VecDeque::from(vec![
+            ScrollbackLine::new("abc", 0.5, 0),
+            ScrollbackLine::new("de", 0.5, 0),
+        ]);
+        assert_eq!(total_line_bytes(&lines), 5);
+    }
+
+    // ===================================================================
+    // NEW: select_importance_eviction_index edge cases
+    // ===================================================================
+
+    #[test]
+    fn select_eviction_empty_deque_returns_none() {
+        let config = ImportanceRetentionConfig::default();
+        let lines: VecDeque<ScrollbackLine> = VecDeque::new();
+        assert!(select_importance_eviction_index(&lines, &config).is_none());
+    }
+
+    #[test]
+    fn select_eviction_at_min_lines_returns_none() {
+        let config = ImportanceRetentionConfig {
+            min_lines: 2,
+            max_lines: 100,
+            ..Default::default()
+        };
+        let lines = VecDeque::from(vec![
+            ScrollbackLine::new("a", 0.1, 0),
+            ScrollbackLine::new("b", 0.1, 0),
+        ]);
+        // len == min_lines, so no eviction
+        assert!(select_importance_eviction_index(&lines, &config).is_none());
+    }
+
+    // ===================================================================
+    // NEW: enforce_importance_budget max_lines
+    // ===================================================================
+
+    #[test]
+    fn enforce_budget_respects_max_lines() {
+        let config = ImportanceRetentionConfig {
+            byte_budget_per_pane: usize::MAX,
+            min_lines: 1,
+            max_lines: 3,
+            importance_threshold: 0.8,
+            oldest_window_fraction: 1.0,
+        };
+
+        let mut lines = VecDeque::from(vec![
+            ScrollbackLine::new("a", 0.1, 1),
+            ScrollbackLine::new("b", 0.2, 2),
+            ScrollbackLine::new("c", 0.3, 3),
+            ScrollbackLine::new("d", 0.4, 4),
+            ScrollbackLine::new("e", 0.5, 5),
+        ]);
+
+        let report = enforce_importance_budget(&mut lines, &config);
+        assert!(lines.len() <= config.max_lines);
+        assert_eq!(report.lines_removed, 2);
+    }
+
+    // ===================================================================
+    // NEW: Thinking / Background tiers
+    // ===================================================================
+
+    #[test]
+    fn thinking_tier_green_gets_thinking_limit() {
+        let c = EvictionConfig::default();
+        assert_eq!(
+            c.max_segments_for(PaneTier::Thinking, MemoryPressureTier::Green),
+            5_000
+        );
+    }
+
+    #[test]
+    fn background_tier_green_gets_background_limit() {
+        let c = EvictionConfig::default();
+        assert_eq!(
+            c.max_segments_for(PaneTier::Background, MemoryPressureTier::Green),
+            500
+        );
+    }
+
+    // ===================================================================
+    // NEW: LineImportanceScorer accessor + scoring specifics
+    // ===================================================================
+
+    #[test]
+    fn scorer_config_accessor() {
+        let scorer = LineImportanceScorer::default();
+        assert!((scorer.config().baseline - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn error_line_scores_higher_than_blank() {
+        let scorer = LineImportanceScorer::default();
+        let error_score = scorer.score_line("error: failed to compile", None);
+        let blank_score = scorer.score_line("", None);
+        assert!(error_score > blank_score);
+    }
+
+    #[test]
+    fn repeated_line_gets_penalty() {
+        let scorer = LineImportanceScorer::default();
+        let first = scorer.score_line("hello", None);
+        let repeated = scorer.score_line("hello", Some("hello"));
+        assert!(repeated < first);
+    }
+
+    // ===================================================================
+    // NEW: Evictor config accessor
+    // ===================================================================
+
+    #[test]
+    fn evictor_config_accessor() {
+        let ev = default_evictor(&[], &[]);
+        assert_eq!(ev.config().active_max_segments, 10_000);
+    }
 }
