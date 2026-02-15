@@ -3011,6 +3011,879 @@ mod tests {
         assert_eq!(det.consecutive_crashes(), 0);
         assert_eq!(det.next_delay_ms(), 0);
     }
+
+    // -----------------------------------------------------------------------
+    // Batch 2: RubyBeaver wa-1u90p.7.1 — Struct + replay + enhanced collector
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn replay_mode_serialization_round_trip() {
+        let policy_json = serde_json::to_string(&ReplayMode::Policy).unwrap();
+        assert_eq!(policy_json, "\"policy\"");
+        let parsed: ReplayMode = serde_json::from_str(&policy_json).unwrap();
+        assert_eq!(parsed, ReplayMode::Policy);
+
+        let rules_json = serde_json::to_string(&ReplayMode::Rules).unwrap();
+        assert_eq!(rules_json, "\"rules\"");
+        let parsed: ReplayMode = serde_json::from_str(&rules_json).unwrap();
+        assert_eq!(parsed, ReplayMode::Rules);
+    }
+
+    #[test]
+    fn replay_mode_display() {
+        assert_eq!(format!("{}", ReplayMode::Policy), "policy");
+        assert_eq!(format!("{}", ReplayMode::Rules), "rules");
+    }
+
+    #[test]
+    fn replay_check_serialization() {
+        let check = ReplayCheck {
+            name: "manifest_valid".to_string(),
+            passed: true,
+            detail: Some("All 3 files present".to_string()),
+        };
+        let json = serde_json::to_string(&check).unwrap();
+        let parsed: ReplayCheck = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "manifest_valid");
+        assert!(parsed.passed);
+        assert_eq!(parsed.detail.as_deref(), Some("All 3 files present"));
+    }
+
+    #[test]
+    fn replay_check_without_detail() {
+        let check = ReplayCheck {
+            name: "simple_check".to_string(),
+            passed: false,
+            detail: None,
+        };
+        let json = serde_json::to_string(&check).unwrap();
+        let parsed: ReplayCheck = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.passed);
+        assert!(parsed.detail.is_none());
+    }
+
+    #[test]
+    fn replay_result_serialization() {
+        let result = ReplayResult {
+            mode: ReplayMode::Policy,
+            status: "pass".to_string(),
+            checks: vec![ReplayCheck {
+                name: "test".to_string(),
+                passed: true,
+                detail: None,
+            }],
+            warnings: vec!["minor issue".to_string()],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: ReplayResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.mode, ReplayMode::Policy);
+        assert_eq!(parsed.status, "pass");
+        assert_eq!(parsed.checks.len(), 1);
+        assert_eq!(parsed.warnings.len(), 1);
+    }
+
+    #[test]
+    fn redaction_report_serialization() {
+        let report = RedactionReport {
+            total_redactions: 5,
+            per_file: vec![
+                FileRedactionEntry {
+                    file: "crash_report.json".to_string(),
+                    count: 3,
+                },
+                FileRedactionEntry {
+                    file: "config_summary.toml".to_string(),
+                    count: 2,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: RedactionReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_redactions, 5);
+        assert_eq!(parsed.per_file.len(), 2);
+        assert_eq!(parsed.per_file[0].file, "crash_report.json");
+        assert_eq!(parsed.per_file[0].count, 3);
+    }
+
+    #[test]
+    fn redaction_report_empty() {
+        let report = RedactionReport {
+            total_redactions: 0,
+            per_file: vec![],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: RedactionReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_redactions, 0);
+        assert!(parsed.per_file.is_empty());
+    }
+
+    #[test]
+    fn db_metadata_serialization_all_fields() {
+        let meta = DbMetadata {
+            schema_version: Some(3),
+            db_size_bytes: Some(1_048_576),
+            journal_mode: Some("wal".to_string()),
+            event_count: Some(500),
+            segment_count: Some(100),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: DbMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.schema_version, Some(3));
+        assert_eq!(parsed.db_size_bytes, Some(1_048_576));
+        assert_eq!(parsed.journal_mode.as_deref(), Some("wal"));
+        assert_eq!(parsed.event_count, Some(500));
+        assert_eq!(parsed.segment_count, Some(100));
+    }
+
+    #[test]
+    fn db_metadata_all_none_fields() {
+        let meta = DbMetadata {
+            schema_version: None,
+            db_size_bytes: None,
+            journal_mode: None,
+            event_count: None,
+            segment_count: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: DbMetadata = serde_json::from_str(&json).unwrap();
+        assert!(parsed.schema_version.is_none());
+        assert!(parsed.db_size_bytes.is_none());
+        assert!(parsed.journal_mode.is_none());
+        assert!(parsed.event_count.is_none());
+        assert!(parsed.segment_count.is_none());
+    }
+
+    #[test]
+    fn pane_priority_override_snapshot_serialization() {
+        let snap = PanePriorityOverrideSnapshot {
+            pane_id: 42,
+            priority: 1,
+            expires_at: Some(1_700_000_000),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: PanePriorityOverrideSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pane_id, 42);
+        assert_eq!(parsed.priority, 1);
+        assert_eq!(parsed.expires_at, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn pane_priority_override_without_expiry() {
+        let snap = PanePriorityOverrideSnapshot {
+            pane_id: 7,
+            priority: 5,
+            expires_at: None,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: PanePriorityOverrideSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(parsed.expires_at.is_none());
+    }
+
+    #[test]
+    fn crash_loop_diagnostics_serialization() {
+        let diag = CrashLoopDiagnostics {
+            restart_count: 5,
+            last_crash_at: Some(1_700_000_000),
+            consecutive_crashes: 3,
+            current_backoff_ms: 4_000,
+            in_crash_loop: true,
+        };
+        let json = serde_json::to_string(&diag).unwrap();
+        let parsed: CrashLoopDiagnostics = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.restart_count, 5);
+        assert_eq!(parsed.last_crash_at, Some(1_700_000_000));
+        assert_eq!(parsed.consecutive_crashes, 3);
+        assert_eq!(parsed.current_backoff_ms, 4_000);
+        assert!(parsed.in_crash_loop);
+    }
+
+    #[test]
+    fn crash_loop_diagnostics_healthy_state() {
+        let diag = CrashLoopDiagnostics {
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
+        };
+        let json = serde_json::to_string(&diag).unwrap();
+        let parsed: CrashLoopDiagnostics = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.restart_count, 0);
+        assert!(parsed.last_crash_at.is_none());
+        assert!(!parsed.in_crash_loop);
+    }
+
+    #[test]
+    fn incident_kind_serialization_round_trip() {
+        let crash_json = serde_json::to_string(&IncidentKind::Crash).unwrap();
+        assert_eq!(crash_json, "\"crash\"");
+        let manual_json = serde_json::to_string(&IncidentKind::Manual).unwrap();
+        assert_eq!(manual_json, "\"manual\"");
+
+        let parsed: IncidentKind = serde_json::from_str("\"crash\"").unwrap();
+        assert_eq!(parsed, IncidentKind::Crash);
+        let parsed: IncidentKind = serde_json::from_str("\"manual\"").unwrap();
+        assert_eq!(parsed, IncidentKind::Manual);
+    }
+
+    #[test]
+    fn incident_bundle_result_serialization() {
+        let result = IncidentBundleResult {
+            path: PathBuf::from("/tmp/test_bundle"),
+            kind: IncidentKind::Crash,
+            files: vec!["crash_report.json".to_string()],
+            total_size_bytes: 1024,
+            wa_version: "0.1.0".to_string(),
+            exported_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: IncidentBundleResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.kind, IncidentKind::Crash);
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.total_size_bytes, 1024);
+        assert_eq!(parsed.wa_version, "0.1.0");
+    }
+
+    #[test]
+    fn health_snapshot_with_all_optional_fields() {
+        let snapshot = HealthSnapshot {
+            timestamp: 1_700_000_000,
+            observed_panes: 10,
+            capture_queue_depth: 5,
+            write_queue_depth: 3,
+            last_seq_by_pane: vec![(1, 100), (2, 200), (3, 50)],
+            warnings: vec!["backpressure active".to_string()],
+            ingest_lag_avg_ms: 25.5,
+            ingest_lag_max_ms: 100,
+            db_writable: true,
+            db_last_write_at: Some(1_699_999_990),
+            pane_priority_overrides: vec![PanePriorityOverrideSnapshot {
+                pane_id: 1,
+                priority: 0,
+                expires_at: Some(1_700_001_000),
+            }],
+            scheduler: None,
+            backpressure_tier: Some("Yellow".to_string()),
+            last_activity_by_pane: vec![(1, 1_700_000_000), (2, 1_699_999_500)],
+            restart_count: 2,
+            last_crash_at: Some(1_699_990_000),
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let parsed: HealthSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.observed_panes, 10);
+        assert_eq!(parsed.pane_priority_overrides.len(), 1);
+        assert_eq!(parsed.pane_priority_overrides[0].pane_id, 1);
+        assert_eq!(parsed.backpressure_tier.as_deref(), Some("Yellow"));
+        assert_eq!(parsed.last_activity_by_pane.len(), 2);
+        assert_eq!(parsed.restart_count, 2);
+        assert_eq!(parsed.last_crash_at, Some(1_699_990_000));
+    }
+
+    #[test]
+    fn health_snapshot_default_optional_fields_deserialize() {
+        // JSON without the newer optional fields (tests serde(default))
+        let json = r#"{
+            "timestamp": 1000,
+            "observed_panes": 1,
+            "capture_queue_depth": 0,
+            "write_queue_depth": 0,
+            "last_seq_by_pane": [],
+            "warnings": [],
+            "ingest_lag_avg_ms": 0.0,
+            "ingest_lag_max_ms": 0,
+            "db_writable": true,
+            "db_last_write_at": null
+        }"#;
+        let parsed: HealthSnapshot = serde_json::from_str(json).unwrap();
+        assert!(parsed.pane_priority_overrides.is_empty());
+        assert!(parsed.scheduler.is_none());
+        assert!(parsed.backpressure_tier.is_none());
+        assert!(parsed.last_activity_by_pane.is_empty());
+        assert_eq!(parsed.restart_count, 0);
+        assert!(parsed.last_crash_at.is_none());
+        assert_eq!(parsed.consecutive_crashes, 0);
+        assert_eq!(parsed.current_backoff_ms, 0);
+        assert!(!parsed.in_crash_loop);
+    }
+
+    // -- replay_incident_bundle tests --
+
+    #[test]
+    fn replay_bundle_not_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("not_a_dir.txt");
+        fs::write(&file_path, "hello").unwrap();
+
+        let result = replay_incident_bundle(&file_path, ReplayMode::Policy);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn replay_bundle_missing_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty directory — no manifest.json or incident_manifest.json
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
+        assert_eq!(result.status, "fail");
+        assert!(result.checks.iter().any(|c| c.name == "manifest_valid" && !c.passed));
+    }
+
+    #[test]
+    fn replay_bundle_invalid_manifest_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("incident_manifest.json"), "not json!!!").unwrap();
+
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
+        assert_eq!(result.status, "fail");
+        assert!(result.checks.iter().any(|c| c.name == "manifest_valid" && !c.passed));
+    }
+
+    #[test]
+    fn replay_bundle_valid_manifest_no_other_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = IncidentBundleResult {
+            path: tmp.path().to_path_buf(),
+            kind: IncidentKind::Crash,
+            files: vec![],
+            total_size_bytes: 0,
+            wa_version: crate::VERSION.to_string(),
+            exported_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        fs::write(tmp.path().join("incident_manifest.json"), &json).unwrap();
+
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
+        // Manifest is valid
+        assert!(result.checks.iter().any(|c| c.name == "manifest_valid" && c.passed));
+        // No redaction report → warning
+        assert!(result.warnings.iter().any(|w| w.contains("redaction_report")));
+        // No secrets found → passes
+        assert!(result.checks.iter().any(|c| c.name == "no_secrets_leaked" && c.passed));
+    }
+
+    #[test]
+    fn replay_bundle_with_valid_redaction_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = IncidentBundleResult {
+            path: tmp.path().to_path_buf(),
+            kind: IncidentKind::Manual,
+            files: vec!["redaction_report.json".to_string()],
+            total_size_bytes: 100,
+            wa_version: crate::VERSION.to_string(),
+            exported_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        fs::write(
+            tmp.path().join("incident_manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let redaction = RedactionReport {
+            total_redactions: 2,
+            per_file: vec![FileRedactionEntry {
+                file: "crash_report.json".to_string(),
+                count: 2,
+            }],
+        };
+        fs::write(
+            tmp.path().join("redaction_report.json"),
+            serde_json::to_string_pretty(&redaction).unwrap(),
+        )
+        .unwrap();
+
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "redaction_report_valid" && c.passed));
+    }
+
+    #[test]
+    fn replay_bundle_with_invalid_redaction_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = IncidentBundleResult {
+            path: tmp.path().to_path_buf(),
+            kind: IncidentKind::Manual,
+            files: vec!["redaction_report.json".to_string()],
+            total_size_bytes: 100,
+            wa_version: crate::VERSION.to_string(),
+            exported_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        fs::write(
+            tmp.path().join("incident_manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(tmp.path().join("redaction_report.json"), "{ bad json }").unwrap();
+
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "redaction_report_valid" && !c.passed));
+    }
+
+    #[test]
+    fn replay_bundle_policy_mode_with_crash_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = IncidentBundleResult {
+            path: tmp.path().to_path_buf(),
+            kind: IncidentKind::Crash,
+            files: vec!["crash_report.json".to_string()],
+            total_size_bytes: 200,
+            wa_version: crate::VERSION.to_string(),
+            exported_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        fs::write(
+            tmp.path().join("incident_manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let report = test_report();
+        fs::write(
+            tmp.path().join("crash_report.json"),
+            serde_json::to_string_pretty(&report).unwrap(),
+        )
+        .unwrap();
+
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "crash_report_valid" && c.passed));
+    }
+
+    #[test]
+    fn replay_bundle_policy_mode_invalid_crash_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = IncidentBundleResult {
+            path: tmp.path().to_path_buf(),
+            kind: IncidentKind::Crash,
+            files: vec!["crash_report.json".to_string()],
+            total_size_bytes: 200,
+            wa_version: crate::VERSION.to_string(),
+            exported_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        fs::write(
+            tmp.path().join("incident_manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(tmp.path().join("crash_report.json"), "not valid crash json").unwrap();
+
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "crash_report_valid" && !c.passed));
+    }
+
+    #[test]
+    fn replay_bundle_policy_mode_with_db_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = IncidentBundleResult {
+            path: tmp.path().to_path_buf(),
+            kind: IncidentKind::Manual,
+            files: vec![],
+            total_size_bytes: 0,
+            wa_version: crate::VERSION.to_string(),
+            exported_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        fs::write(
+            tmp.path().join("incident_manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let db_meta = DbMetadata {
+            schema_version: Some(3),
+            db_size_bytes: Some(1024),
+            journal_mode: Some("wal".to_string()),
+            event_count: Some(50),
+            segment_count: Some(10),
+        };
+        fs::write(
+            tmp.path().join("db_metadata.json"),
+            serde_json::to_string_pretty(&db_meta).unwrap(),
+        )
+        .unwrap();
+
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "db_metadata_valid" && c.passed));
+    }
+
+    #[test]
+    fn replay_bundle_rules_mode_with_valid_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = IncidentBundleResult {
+            path: tmp.path().to_path_buf(),
+            kind: IncidentKind::Crash,
+            files: vec!["recent_events.json".to_string()],
+            total_size_bytes: 100,
+            wa_version: crate::VERSION.to_string(),
+            exported_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        fs::write(
+            tmp.path().join("incident_manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let events = serde_json::json!([
+            {
+                "rule_id": "r1",
+                "event_type": "pattern_match",
+                "severity": "warning",
+                "matched_text_preview": "short text"
+            },
+            {
+                "rule_id": "r2",
+                "event_type": "anomaly",
+                "severity": "critical",
+                "matched_text_preview": "another"
+            }
+        ]);
+        fs::write(
+            tmp.path().join("recent_events.json"),
+            serde_json::to_string_pretty(&events).unwrap(),
+        )
+        .unwrap();
+
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "events_structure_valid" && c.passed));
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "events_text_bounded" && c.passed));
+    }
+
+    #[test]
+    fn replay_bundle_rules_mode_missing_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = IncidentBundleResult {
+            path: tmp.path().to_path_buf(),
+            kind: IncidentKind::Manual,
+            files: vec![],
+            total_size_bytes: 0,
+            wa_version: crate::VERSION.to_string(),
+            exported_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        fs::write(
+            tmp.path().join("incident_manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
+        assert!(result.warnings.iter().any(|w| w.contains("recent_events")));
+    }
+
+    #[test]
+    fn replay_bundle_rules_mode_oversized_text_preview() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = IncidentBundleResult {
+            path: tmp.path().to_path_buf(),
+            kind: IncidentKind::Crash,
+            files: vec!["recent_events.json".to_string()],
+            total_size_bytes: 100,
+            wa_version: crate::VERSION.to_string(),
+            exported_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        fs::write(
+            tmp.path().join("incident_manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        // Event with oversized matched_text_preview (>200 chars)
+        let oversized = "x".repeat(300);
+        let events = serde_json::json!([{
+            "rule_id": "r1",
+            "event_type": "match",
+            "severity": "warning",
+            "matched_text_preview": oversized
+        }]);
+        fs::write(
+            tmp.path().join("recent_events.json"),
+            serde_json::to_string_pretty(&events).unwrap(),
+        )
+        .unwrap();
+
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "events_text_bounded" && !c.passed));
+    }
+
+    #[test]
+    fn replay_bundle_files_complete_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = IncidentBundleResult {
+            path: tmp.path().to_path_buf(),
+            kind: IncidentKind::Crash,
+            files: vec![
+                "crash_report.json".to_string(),
+                "missing_file.json".to_string(),
+            ],
+            total_size_bytes: 100,
+            wa_version: crate::VERSION.to_string(),
+            exported_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        fs::write(
+            tmp.path().join("incident_manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        // Only create one of the two listed files
+        let report = test_report();
+        fs::write(
+            tmp.path().join("crash_report.json"),
+            serde_json::to_string_pretty(&report).unwrap(),
+        )
+        .unwrap();
+
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "files_complete" && !c.passed));
+    }
+
+    #[test]
+    fn replay_bundle_all_files_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = IncidentBundleResult {
+            path: tmp.path().to_path_buf(),
+            kind: IncidentKind::Manual,
+            files: vec!["data.json".to_string()],
+            total_size_bytes: 50,
+            wa_version: crate::VERSION.to_string(),
+            exported_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        fs::write(
+            tmp.path().join("incident_manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(tmp.path().join("data.json"), "{}").unwrap();
+
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "files_complete" && c.passed));
+    }
+
+    // -- write_redacted_file tests --
+
+    #[test]
+    fn write_redacted_file_tracks_no_redactions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let redactor = Redactor::new();
+        let mut files = Vec::new();
+        let mut total_size = 0u64;
+        let mut entries = Vec::new();
+
+        write_redacted_file(
+            "test.json",
+            "clean content",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut entries,
+        )
+        .unwrap();
+
+        assert_eq!(files, vec!["test.json"]);
+        assert!(total_size > 0);
+        assert!(entries.is_empty()); // No redactions
+        assert!(tmp.path().join("test.json").exists());
+    }
+
+    // -- collect_incident_bundle tests --
+
+    #[test]
+    fn collect_incident_bundle_manual_creates_redaction_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let out_dir = tmp.path().join("out");
+
+        let opts = IncidentBundleOptions {
+            crash_dir: &crash_dir,
+            config_path: None,
+            out_dir: &out_dir,
+            kind: IncidentKind::Manual,
+            db_path: None,
+            max_events: 0,
+        };
+
+        let result = collect_incident_bundle(&opts).unwrap();
+        assert_eq!(result.kind, IncidentKind::Manual);
+        assert!(result.files.contains(&"redaction_report.json".to_string()));
+
+        // Verify redaction report exists and is valid
+        let report_path = result.path.join("redaction_report.json");
+        assert!(report_path.exists());
+        let report: RedactionReport =
+            serde_json::from_str(&fs::read_to_string(report_path).unwrap()).unwrap();
+        assert_eq!(report.total_redactions, 0);
+    }
+
+    #[test]
+    fn collect_incident_bundle_crash_with_existing_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let out_dir = tmp.path().join("out");
+
+        // Create a crash bundle first
+        let report = test_report();
+        write_crash_bundle(&crash_dir, &report, Some(&test_snapshot()), None).unwrap();
+
+        let opts = IncidentBundleOptions {
+            crash_dir: &crash_dir,
+            config_path: None,
+            out_dir: &out_dir,
+            kind: IncidentKind::Crash,
+            db_path: None,
+            max_events: 0,
+        };
+
+        let result = collect_incident_bundle(&opts).unwrap();
+        assert_eq!(result.kind, IncidentKind::Crash);
+        assert!(result.files.contains(&"crash_report.json".to_string()));
+        assert!(result.files.contains(&"redaction_report.json".to_string()));
+    }
+
+    #[test]
+    fn collect_incident_bundle_with_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let out_dir = tmp.path().join("out");
+        let config_path = tmp.path().join("config.toml");
+
+        fs::write(&config_path, "[ingest]\nbuffer_size = 2048\n").unwrap();
+
+        let opts = IncidentBundleOptions {
+            crash_dir: &crash_dir,
+            config_path: Some(&config_path),
+            out_dir: &out_dir,
+            kind: IncidentKind::Manual,
+            db_path: None,
+            max_events: 0,
+        };
+
+        let result = collect_incident_bundle(&opts).unwrap();
+        assert!(result.files.contains(&"config_summary.toml".to_string()));
+    }
+
+    // -- Additional edge case tests --
+
+    #[test]
+    fn days_to_ymd_dec31_to_jan1() {
+        // 2023-12-31
+        let (y, m, d) = days_to_ymd(19_722);
+        assert_eq!((y, m, d), (2023, 12, 31));
+        // 2024-01-01
+        let (y, m, d) = days_to_ymd(19_723);
+        assert_eq!((y, m, d), (2024, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_feb28_non_leap() {
+        // 2023-02-28
+        let (y, m, d) = days_to_ymd(19_416);
+        assert_eq!((y, m, d), (2023, 2, 28));
+        // 2023-03-01
+        let (y, m, d) = days_to_ymd(19_417);
+        assert_eq!((y, m, d), (2023, 3, 1));
+    }
+
+    #[test]
+    fn detector_total_restarts_increments() {
+        let mut det = CrashLoopDetector::new(CrashLoopConfig {
+            window_secs: 3600,
+            ..CrashLoopConfig::default()
+        });
+        assert_eq!(det.total_restarts(), 0);
+        det.record_crash(1000);
+        assert_eq!(det.total_restarts(), 1);
+        det.record_crash(1001);
+        assert_eq!(det.total_restarts(), 2);
+        det.record_success();
+        assert_eq!(det.total_restarts(), 2); // success doesn't clear timestamps
+    }
+
+    #[test]
+    fn detector_last_crash_timestamp() {
+        let mut det = CrashLoopDetector::new(CrashLoopConfig::default());
+        assert_eq!(det.last_crash_timestamp(), None);
+        det.record_crash(42);
+        assert_eq!(det.last_crash_timestamp(), Some(42));
+        det.record_crash(99);
+        assert_eq!(det.last_crash_timestamp(), Some(99));
+    }
+
+    #[test]
+    fn shutdown_summary_with_warnings() {
+        let summary = ShutdownSummary {
+            elapsed_secs: 120,
+            final_capture_queue: 5,
+            final_write_queue: 2,
+            segments_persisted: 50,
+            events_recorded: 10,
+            last_seq_by_pane: vec![(1, 50), (2, 30)],
+            clean: false,
+            warnings: vec![
+                "timeout waiting for flush".to_string(),
+                "queue not empty".to_string(),
+            ],
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let parsed: ShutdownSummary = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.clean);
+        assert_eq!(parsed.warnings.len(), 2);
+        assert_eq!(parsed.final_capture_queue, 5);
+        assert_eq!(parsed.final_write_queue, 2);
+    }
+
+    #[test]
+    fn crash_manifest_with_resize_forensics() {
+        let manifest = CrashManifest {
+            wa_version: "0.2.0".to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            files: vec![
+                "crash_report.json".to_string(),
+                "resize_forensics.json".to_string(),
+            ],
+            has_health_snapshot: true,
+            has_resize_forensics: true,
+            bundle_size_bytes: 4096,
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let parsed: CrashManifest = serde_json::from_str(&json).unwrap();
+        assert!(parsed.has_resize_forensics);
+        assert_eq!(parsed.files.len(), 2);
+    }
+
+    #[test]
+    fn crash_manifest_default_resize_forensics() {
+        // Old manifest JSON without has_resize_forensics field
+        let json = r#"{
+            "wa_version": "0.1.0",
+            "created_at": "2023-01-01T00:00:00Z",
+            "files": [],
+            "has_health_snapshot": false,
+            "bundle_size_bytes": 0
+        }"#;
+        let parsed: CrashManifest = serde_json::from_str(json).unwrap();
+        assert!(!parsed.has_resize_forensics); // defaults to false
+    }
 }
 
 // ---------------------------------------------------------------------------
