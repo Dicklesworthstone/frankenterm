@@ -2198,4 +2198,616 @@ mod tests {
         // Content should be redacted
         assert!(redacted.content.contains("[REDACTED]"));
     }
+
+    // -----------------------------------------------------------------------
+    // Batch -- RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn export_kind_singular_aliases() {
+        // Verify all singular-form aliases parse correctly
+        assert_eq!(
+            ExportKind::from_str_loose("event"),
+            Some(ExportKind::Events)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("workflow"),
+            Some(ExportKind::Workflows)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("session"),
+            Some(ExportKind::Sessions)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("reservation"),
+            Some(ExportKind::Reservations)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("reserves"),
+            Some(ExportKind::Reservations)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("audit_actions"),
+            Some(ExportKind::Audit)
+        );
+    }
+
+    #[test]
+    fn export_kind_rejects_empty_and_whitespace() {
+        assert_eq!(ExportKind::from_str_loose(""), None);
+        assert_eq!(ExportKind::from_str_loose(" "), None);
+        assert_eq!(ExportKind::from_str_loose("  segments  "), None);
+        assert_eq!(ExportKind::from_str_loose("\t"), None);
+    }
+
+    #[test]
+    fn export_kind_rejects_similar_but_invalid() {
+        assert_eq!(ExportKind::from_str_loose("segmentation"), None);
+        assert_eq!(ExportKind::from_str_loose("auditing"), None);
+        assert_eq!(ExportKind::from_str_loose("reserved"), None);
+        assert_eq!(ExportKind::from_str_loose("eventlog"), None);
+        assert_eq!(ExportKind::from_str_loose("work_flows"), None);
+    }
+
+    #[test]
+    fn export_kind_as_str_all_variants() {
+        assert_eq!(ExportKind::Segments.as_str(), "segments");
+        assert_eq!(ExportKind::Gaps.as_str(), "gaps");
+        assert_eq!(ExportKind::Events.as_str(), "events");
+        assert_eq!(ExportKind::Workflows.as_str(), "workflows");
+        assert_eq!(ExportKind::Sessions.as_str(), "sessions");
+        assert_eq!(ExportKind::Audit.as_str(), "audit");
+        assert_eq!(ExportKind::Reservations.as_str(), "reservations");
+    }
+
+    #[test]
+    fn export_kind_debug_impl() {
+        // Verify Debug is derived and produces reasonable output
+        let debug_str = format!("{:?}", ExportKind::Segments);
+        assert_eq!(debug_str, "Segments");
+        let debug_str = format!("{:?}", ExportKind::Audit);
+        assert_eq!(debug_str, "Audit");
+    }
+
+    #[test]
+    fn export_kind_clone_and_copy() {
+        let kind = ExportKind::Events;
+        let cloned = kind.clone();
+        let copied = kind; // Copy
+        assert_eq!(kind, cloned);
+        assert_eq!(kind, copied);
+        // After copy, original is still usable (Copy semantics)
+        assert_eq!(kind.as_str(), "events");
+    }
+
+    #[test]
+    fn export_kind_eq_and_ne() {
+        assert_eq!(ExportKind::Segments, ExportKind::Segments);
+        assert_ne!(ExportKind::Segments, ExportKind::Gaps);
+        assert_ne!(ExportKind::Audit, ExportKind::Events);
+        // All 7 variants are distinct
+        let all = [
+            ExportKind::Segments,
+            ExportKind::Gaps,
+            ExportKind::Events,
+            ExportKind::Workflows,
+            ExportKind::Sessions,
+            ExportKind::Audit,
+            ExportKind::Reservations,
+        ];
+        for i in 0..all.len() {
+            for j in 0..all.len() {
+                if i == j {
+                    assert_eq!(all[i], all[j]);
+                } else {
+                    assert_ne!(all[i], all[j]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn export_header_all_optional_fields_present() {
+        let header = ExportHeader {
+            export: true,
+            version: "1.2.3".to_string(),
+            kind: "audit".to_string(),
+            redacted: true,
+            exported_at_ms: 999999,
+            pane_id: Some(42),
+            since: Some(100),
+            until: Some(200),
+            limit: Some(50),
+            record_count: 10,
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        // All optional fields should now be present
+        assert!(json.contains("\"pane_id\":42"));
+        assert!(json.contains("\"since\":100"));
+        assert!(json.contains("\"until\":200"));
+        assert!(json.contains("\"limit\":50"));
+        // Required fields
+        assert!(json.contains("\"_export\":true"));
+        assert!(json.contains("\"version\":\"1.2.3\""));
+        assert!(json.contains("\"kind\":\"audit\""));
+        assert!(json.contains("\"redacted\":true"));
+        assert!(json.contains("\"exported_at_ms\":999999"));
+        assert!(json.contains("\"record_count\":10"));
+    }
+
+    #[test]
+    fn export_header_clone_and_debug() {
+        let header = ExportHeader {
+            export: true,
+            version: "0.1.0".to_string(),
+            kind: "segments".to_string(),
+            redacted: false,
+            exported_at_ms: 1000,
+            pane_id: None,
+            since: None,
+            until: None,
+            limit: None,
+            record_count: 0,
+        };
+        let cloned = header.clone();
+        assert_eq!(cloned.version, "0.1.0");
+        assert_eq!(cloned.record_count, 0);
+        let debug = format!("{:?}", cloned);
+        assert!(debug.contains("ExportHeader"));
+        assert!(debug.contains("version"));
+    }
+
+    #[test]
+    fn write_record_unicode_content() {
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: "CJK chars: \u{4e16}\u{754c}; emoji: \u{1f680}; accents: \u{00e9}\u{00e8}\u{00ea}".to_string(),
+            content_len: 30,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let mut buf = Vec::new();
+        write_record(&mut buf, &seg, false).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        // Should be valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        let content = parsed["content"].as_str().unwrap();
+        assert!(content.contains('\u{4e16}'));
+        assert!(content.contains('\u{1f680}'));
+    }
+
+    #[test]
+    fn write_record_empty_content() {
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: "".to_string(),
+            content_len: 0,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let mut buf = Vec::new();
+        write_record(&mut buf, &seg, false).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(parsed["content"], "");
+        assert_eq!(parsed["content_len"], 0);
+    }
+
+    #[test]
+    fn write_record_special_json_chars() {
+        // Content with JSON-special characters: quotes, backslash, newlines
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: "line1\nline2\ttab \"quoted\" back\\slash".to_string(),
+            content_len: 35,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let mut buf = Vec::new();
+        write_record(&mut buf, &seg, false).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        // Must parse as valid JSON despite special chars
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        let content = parsed["content"].as_str().unwrap();
+        assert!(content.contains("line1\nline2"));
+        assert!(content.contains("\"quoted\""));
+        assert!(content.contains("back\\slash"));
+    }
+
+    #[test]
+    fn write_record_compact_vs_pretty_size() {
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: "test".to_string(),
+            content_len: 4,
+            content_hash: Some("h".to_string()),
+            captured_at: 1000,
+        };
+        let mut compact_buf = Vec::new();
+        write_record(&mut compact_buf, &seg, false).unwrap();
+        let mut pretty_buf = Vec::new();
+        write_record(&mut pretty_buf, &seg, true).unwrap();
+        // Pretty should always be larger due to whitespace
+        assert!(
+            pretty_buf.len() > compact_buf.len(),
+            "Pretty output ({}) should be larger than compact ({})",
+            pretty_buf.len(),
+            compact_buf.len()
+        );
+        // Both should deserialize to the same value
+        let compact_val: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(compact_buf).unwrap().trim()).unwrap();
+        // Pretty has multiple lines; join them for parsing
+        let pretty_str = String::from_utf8(pretty_buf).unwrap();
+        let pretty_val: serde_json::Value = serde_json::from_str(pretty_str.trim()).unwrap();
+        assert_eq!(compact_val, pretty_val);
+    }
+
+    #[test]
+    fn redact_segment_empty_content() {
+        let r = Redactor::new();
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: "".to_string(),
+            content_len: 0,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let redacted = redact_segment(seg, &r);
+        assert_eq!(redacted.content, "");
+    }
+
+    #[test]
+    fn redact_event_extracted_with_nested_secret() {
+        let r = Redactor::new();
+        let event = StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "leak".to_string(),
+            severity: "high".to_string(),
+            confidence: 1.0,
+            extracted: Some(serde_json::json!({
+                "nested": {
+                    "key": "sk-abc123def456ghi789jkl012mno345pqr678stu901v"
+                }
+            })),
+            matched_text: None,
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let redacted = redact_event(event, &r);
+        // The extracted value should be redacted
+        let extracted_str = serde_json::to_string(&redacted.extracted.unwrap()).unwrap();
+        assert!(!extracted_str.contains("sk-abc123"));
+        assert!(extracted_str.contains("REDACTED"));
+    }
+
+    #[test]
+    fn redact_step_log_preserves_non_sensitive_fields() {
+        let r = Redactor::new();
+        let step = WorkflowStepLogRecord {
+            id: 99,
+            workflow_id: "wf-preserve".to_string(),
+            audit_action_id: Some(42),
+            step_index: 3,
+            step_name: "send_notification".to_string(),
+            step_id: Some("step-abc".to_string()),
+            step_kind: Some("action".to_string()),
+            result_type: "success".to_string(),
+            result_data: Some("secret sk-abc123def456ghi789jkl012mno345pqr678stu901v leaked".to_string()),
+            policy_summary: Some("clean summary no secrets".to_string()),
+            verification_refs: Some("[ref1, ref2]".to_string()),
+            error_code: Some("E001".to_string()),
+            started_at: 5000,
+            completed_at: 6000,
+            duration_ms: 1000,
+        };
+        let redacted = redact_step_log(step, &r);
+        // Non-sensitive fields must be preserved exactly
+        assert_eq!(redacted.id, 99);
+        assert_eq!(redacted.workflow_id, "wf-preserve");
+        assert_eq!(redacted.audit_action_id, Some(42));
+        assert_eq!(redacted.step_index, 3);
+        assert_eq!(redacted.step_name, "send_notification");
+        assert_eq!(redacted.step_id, Some("step-abc".to_string()));
+        assert_eq!(redacted.step_kind, Some("action".to_string()));
+        assert_eq!(redacted.result_type, "success");
+        assert_eq!(redacted.verification_refs, Some("[ref1, ref2]".to_string()));
+        assert_eq!(redacted.error_code, Some("E001".to_string()));
+        assert_eq!(redacted.started_at, 5000);
+        assert_eq!(redacted.completed_at, 6000);
+        assert_eq!(redacted.duration_ms, 1000);
+        // result_data had a secret, so it must be redacted
+        assert!(redacted.result_data.unwrap().contains("[REDACTED]"));
+        // policy_summary had no secret, so it stays the same
+        assert_eq!(
+            redacted.policy_summary,
+            Some("clean summary no secrets".to_string())
+        );
+    }
+
+    #[test]
+    fn export_kind_mixed_case_all_aliases() {
+        // MiXeD case for every alias
+        assert_eq!(
+            ExportKind::from_str_loose("OUTPUT"),
+            Some(ExportKind::Segments)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("Detections"),
+            Some(ExportKind::Events)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("AUDIT_ACTIONS"),
+            Some(ExportKind::Audit)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("AUDIT-ACTIONS"),
+            Some(ExportKind::Audit)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("Reserves"),
+            Some(ExportKind::Reservations)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("Gap"),
+            Some(ExportKind::Gaps)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("Workflow"),
+            Some(ExportKind::Workflows)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("Session"),
+            Some(ExportKind::Sessions)
+        );
+    }
+
+    #[test]
+    fn parse_jsonl_helper_single_line() {
+        // Header-only output (empty export)
+        let output = "{\"_export\":true,\"record_count\":0}\n";
+        let (header, records) = parse_jsonl(output);
+        assert_eq!(header["_export"], true);
+        assert_eq!(header["record_count"], 0);
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn parse_jsonl_helper_multiple_records() {
+        let output = "{\"_export\":true,\"record_count\":2}\n{\"id\":1}\n{\"id\":2}\n";
+        let (header, records) = parse_jsonl(output);
+        assert_eq!(header["record_count"], 2);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["id"], 1);
+        assert_eq!(records[1]["id"], 2);
+    }
+
+    #[tokio::test]
+    async fn export_multiple_segments_count() {
+        let (storage, tmp) = test_db_with_pane("multi_seg").await;
+
+        for i in 0..5 {
+            storage
+                .append_segment(1, &format!("segment content {}", i), None)
+                .await
+                .unwrap();
+        }
+
+        let opts = ExportOptions {
+            kind: ExportKind::Segments,
+            query: ExportQuery::default(),
+            audit_actor: None,
+            audit_action: None,
+            redact: false,
+            pretty: false,
+        };
+
+        let mut buf = Vec::new();
+        let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+        assert_eq!(count, 5);
+
+        let output = String::from_utf8(buf).unwrap();
+        let (header, records) = parse_jsonl(&output);
+        assert_eq!(header["record_count"], 5);
+        assert_eq!(records.len(), 5);
+        // Verify all segments are present
+        for i in 0..5 {
+            let expected = format!("segment content {}", i);
+            assert!(
+                records.iter().any(|r| r["content"] == expected),
+                "Missing segment content {}",
+                i
+            );
+        }
+
+        storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn export_header_exported_at_ms_is_recent() {
+        let (storage, tmp) = test_db_with_pane("timestamp").await;
+
+        let before_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let opts = ExportOptions {
+            kind: ExportKind::Segments,
+            query: ExportQuery::default(),
+            audit_actor: None,
+            audit_action: None,
+            redact: false,
+            pretty: false,
+        };
+
+        let mut buf = Vec::new();
+        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+        let after_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let output = String::from_utf8(buf).unwrap();
+        let (header, _) = parse_jsonl(&output);
+        let exported_at = header["exported_at_ms"].as_i64().unwrap();
+        assert!(
+            exported_at >= before_ms,
+            "exported_at_ms ({}) should be >= before ({})",
+            exported_at,
+            before_ms
+        );
+        assert!(
+            exported_at <= after_ms,
+            "exported_at_ms ({}) should be <= after ({})",
+            exported_at,
+            after_ms
+        );
+
+        storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn export_header_reflects_query_filters() {
+        let (storage, tmp) = test_db_with_pane("query_hdr").await;
+
+        let opts = ExportOptions {
+            kind: ExportKind::Segments,
+            query: ExportQuery {
+                pane_id: Some(42),
+                since: Some(1000),
+                until: Some(9000),
+                limit: Some(25),
+            },
+            audit_actor: None,
+            audit_action: None,
+            redact: false,
+            pretty: false,
+        };
+
+        let mut buf = Vec::new();
+        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+        let output = String::from_utf8(buf).unwrap();
+        let (header, _) = parse_jsonl(&output);
+        assert_eq!(header["pane_id"], 42);
+        assert_eq!(header["since"], 1000);
+        assert_eq!(header["until"], 9000);
+        assert_eq!(header["limit"], 25);
+
+        storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn export_empty_all_kinds_produce_header() {
+        let (storage, tmp) = test_db_with_pane("empty_all").await;
+
+        let kinds = [
+            ExportKind::Segments,
+            ExportKind::Gaps,
+            ExportKind::Events,
+            ExportKind::Workflows,
+            ExportKind::Sessions,
+            ExportKind::Audit,
+            ExportKind::Reservations,
+        ];
+
+        for kind in &kinds {
+            let opts = ExportOptions {
+                kind: *kind,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(
+                count, 0,
+                "Empty DB should have 0 records for kind {}",
+                kind.as_str()
+            );
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_eq!(
+                header["kind"],
+                kind.as_str(),
+                "Header kind mismatch for {}",
+                kind.as_str()
+            );
+            assert_eq!(
+                header["record_count"], 0,
+                "Header record_count should be 0 for {}",
+                kind.as_str()
+            );
+            assert!(
+                records.is_empty(),
+                "No data records expected for {}",
+                kind.as_str()
+            );
+        }
+
+        storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn export_redact_false_does_not_alter_content() {
+        let (storage, tmp) = test_db_with_pane("no_redact").await;
+
+        let secret = "sk-abc123def456ghi789jkl012mno345pqr678stu901v";
+        storage
+            .append_segment(1, &format!("has secret: {}", secret), None)
+            .await
+            .unwrap();
+
+        let opts = ExportOptions {
+            kind: ExportKind::Segments,
+            query: ExportQuery::default(),
+            audit_actor: None,
+            audit_action: None,
+            redact: false,
+            pretty: false,
+        };
+
+        let mut buf = Vec::new();
+        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+        let output = String::from_utf8(buf).unwrap();
+        let (_header, records) = parse_jsonl(&output);
+        let content = records[0]["content"].as_str().unwrap();
+        // Secret should NOT be redacted when redact=false
+        assert!(
+            content.contains(secret),
+            "Content should contain secret when redact is false"
+        );
+        assert!(!content.contains("[REDACTED]"));
+
+        storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
