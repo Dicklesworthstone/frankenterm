@@ -1804,4 +1804,522 @@ mod tests {
         model.shutdown();
         handle.await.unwrap();
     }
+
+    // -----------------------------------------------------------------------
+    // Batch — RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn covariates_names_returns_correct_labels() {
+        let names = Covariates::names();
+        assert_eq!(names.len(), Covariates::COUNT);
+        assert_eq!(names[0], "rss_gb");
+        assert_eq!(names[1], "pane_count");
+        assert_eq!(names[2], "output_rate_mbps");
+        assert_eq!(names[3], "uptime_hours");
+        assert_eq!(names[4], "conn_error_rate");
+    }
+
+    #[test]
+    fn covariates_dot_with_zero_beta() {
+        let cov = Covariates {
+            rss_gb: 99.0,
+            pane_count: 50.0,
+            output_rate_mbps: 10.0,
+            uptime_hours: 1000.0,
+            conn_error_rate: 5.0,
+        };
+        let zero_beta = [0.0; Covariates::COUNT];
+        assert!((cov.dot(&zero_beta)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn covariates_default_is_all_zeros() {
+        let cov = Covariates::default();
+        let arr = cov.to_array();
+        for val in &arr {
+            assert!(val.abs() < 1e-15, "expected 0.0 got {}", val);
+        }
+    }
+
+    #[test]
+    fn weibull_params_default_values() {
+        let params = WeibullParams::default();
+        assert!((params.shape - 1.5).abs() < 1e-10);
+        assert!((params.scale - 168.0).abs() < 1e-10);
+        for b in &params.beta {
+            assert!(b.abs() < 1e-15, "default beta should be 0, got {}", b);
+        }
+    }
+
+    #[test]
+    fn baseline_hazard_zero_for_zero_scale() {
+        let params = WeibullParams {
+            shape: 2.0,
+            scale: 0.0,
+            beta: [0.0; Covariates::COUNT],
+        };
+        assert_eq!(params.baseline_hazard(10.0), 0.0);
+    }
+
+    #[test]
+    fn baseline_hazard_zero_for_negative_shape() {
+        let params = WeibullParams {
+            shape: -1.0,
+            scale: 100.0,
+            beta: [0.0; Covariates::COUNT],
+        };
+        assert_eq!(params.baseline_hazard(10.0), 0.0);
+    }
+
+    #[test]
+    fn cumulative_hazard_zero_at_t_zero() {
+        let params = WeibullParams {
+            shape: 2.0,
+            scale: 100.0,
+            beta: [0.1, 0.2, 0.0, 0.0, 0.0],
+        };
+        let cov = Covariates {
+            rss_gb: 5.0,
+            pane_count: 10.0,
+            ..Default::default()
+        };
+        assert_eq!(params.cumulative_hazard(0.0, &cov), 0.0);
+        assert_eq!(params.cumulative_hazard(-5.0, &cov), 0.0);
+    }
+
+    #[test]
+    fn failure_probability_increases_with_time() {
+        let params = WeibullParams::default();
+        let cov = Covariates::default();
+        let f1 = params.failure_probability(1.0, &cov);
+        let f2 = params.failure_probability(50.0, &cov);
+        let f3 = params.failure_probability(200.0, &cov);
+        assert!(f1 < f2, "F(1)={} should be < F(50)={}", f1, f2);
+        assert!(f2 < f3, "F(50)={} should be < F(200)={}", f2, f3);
+        assert!((0.0..=1.0).contains(&f1));
+        assert!((0.0..=1.0).contains(&f3));
+    }
+
+    #[test]
+    fn log_likelihood_at_zero_time_event_is_neg_infinity() {
+        // t=0 → baseline_hazard=0 → hazard=0 → event branch returns NEG_INFINITY
+        let params = WeibullParams {
+            shape: 2.0,
+            scale: 100.0,
+            beta: [0.0; Covariates::COUNT],
+        };
+        let obs = Observation {
+            time: 0.0,
+            event_observed: true,
+            covariates: Covariates::default(),
+            timestamp_secs: 0,
+        };
+        let ll = params.log_likelihood_single(&obs);
+        assert!(ll.is_infinite() && ll < 0.0, "expected NEG_INFINITY, got {}", ll);
+    }
+
+    #[test]
+    fn hazard_action_display_all_variants() {
+        assert_eq!(HazardAction::None.to_string(), "none");
+        assert_eq!(
+            HazardAction::IncreaseSnapshotFrequency.to_string(),
+            "increase_snapshot_frequency"
+        );
+        assert_eq!(
+            HazardAction::ImmediateSnapshot.to_string(),
+            "immediate_snapshot"
+        );
+        assert_eq!(
+            HazardAction::AlertAndPrepareRestart.to_string(),
+            "alert_and_prepare_restart"
+        );
+    }
+
+    #[test]
+    fn hazard_action_serde_roundtrip() {
+        for action in [
+            HazardAction::None,
+            HazardAction::IncreaseSnapshotFrequency,
+            HazardAction::ImmediateSnapshot,
+            HazardAction::AlertAndPrepareRestart,
+        ] {
+            let json = serde_json::to_string(&action).unwrap();
+            let back: HazardAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, action, "roundtrip failed for {:?}", action);
+        }
+    }
+
+    #[test]
+    fn restart_mode_default_is_advisory() {
+        let mode = RestartMode::default();
+        assert_eq!(mode, RestartMode::Advisory);
+    }
+
+    #[test]
+    fn restart_scheduler_config_defaults() {
+        let cfg = RestartSchedulerConfig::default();
+        assert_eq!(cfg.mode, RestartMode::Advisory);
+        assert!((cfg.hazard_threshold - 0.8).abs() < 1e-10);
+        assert!((cfg.urgency_steepness - 8.0).abs() < 1e-10);
+        assert!((cfg.cooldown_hours - 12.0).abs() < 1e-10);
+        assert_eq!(cfg.schedule_horizon_minutes, 24 * 60);
+        assert!((cfg.activity_ewma_alpha - 0.2).abs() < 1e-10);
+        assert!((cfg.default_activity - 0.5).abs() < 1e-10);
+        assert!(cfg.pre_restart_snapshot);
+        assert_eq!(cfg.advance_warning_minutes, 30);
+    }
+
+    #[test]
+    fn activity_profile_alpha_clamping() {
+        let profile_high = ActivityProfile::new(5.0, 0.5);
+        // alpha should be clamped to 1.0
+        // With alpha=1.0: new sample completely replaces old
+        let _ = profile_high.predict_hour(0); // just ensure it doesn't panic
+
+        let profile_low = ActivityProfile::new(-2.0, 0.5);
+        // alpha should be clamped to 0.0
+        let _ = profile_low.predict_hour(0);
+
+        // default_activity clamping
+        let profile_act = ActivityProfile::new(0.5, 2.0);
+        // should be clamped to 1.0
+        assert!((profile_act.predict_hour(0) - 1.0).abs() < 1e-10);
+
+        let profile_act_neg = ActivityProfile::new(0.5, -1.0);
+        // should be clamped to 0.0
+        assert!((profile_act_neg.predict_hour(0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn activity_profile_hourly_snapshot_returns_all_24() {
+        let mut profile = ActivityProfile::new(0.3, 0.4);
+        profile.update_hour(5, 0.9);
+        profile.update_hour(23, 0.1);
+        let snap = profile.hourly_snapshot();
+        assert_eq!(snap.len(), 24);
+        // hour 5 was updated: first sample seeds to 0.9
+        assert!((snap[5] - 0.9).abs() < 1e-10);
+        // hour 23 was updated: first sample seeds to 0.1
+        assert!((snap[23] - 0.1).abs() < 1e-10);
+        // untouched hours stay at default 0.4
+        assert!((snap[0] - 0.4).abs() < 1e-10);
+    }
+
+    #[test]
+    fn activity_profile_update_via_system_time() {
+        let mut profile = ActivityProfile::new(0.5, 0.3);
+        // 7200 seconds = 2 hours from epoch → hour 2 UTC
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(7200);
+        profile.update(at, 0.8);
+        assert_eq!(profile.sample_count(2), 1);
+        assert!((profile.predict_hour(2) - 0.8).abs() < 1e-10);
+    }
+
+    #[test]
+    fn activity_profile_predict_via_system_time() {
+        let mut profile = ActivityProfile::new(0.5, 0.5);
+        profile.update_hour(14, 0.9);
+        // 14 * 3600 = 50400 seconds from epoch → hour 14 UTC
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(14 * 3600);
+        assert!((profile.predict(at) - 0.9).abs() < 1e-10);
+    }
+
+    #[test]
+    fn restart_scheduler_accessors() {
+        let cfg = RestartSchedulerConfig {
+            cooldown_hours: 8.0,
+            ..RestartSchedulerConfig::default()
+        };
+        let mut scheduler = RestartScheduler::new(cfg.clone());
+
+        // config() accessor
+        assert!((scheduler.config().cooldown_hours - 8.0).abs() < 1e-10);
+
+        // last_restart_at() starts as None
+        assert!(scheduler.last_restart_at().is_none());
+
+        // record_restart sets it
+        let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        scheduler.record_restart(ts);
+        assert_eq!(scheduler.last_restart_at(), Some(ts));
+
+        // activity_profile() / activity_profile_mut()
+        let profile = scheduler.activity_profile();
+        assert!((profile.predict_hour(0) - 0.5).abs() < 1e-10);
+
+        scheduler.activity_profile_mut().update_hour(12, 0.7);
+        assert!((scheduler.activity_profile().predict_hour(12) - 0.7).abs() < 1e-10);
+    }
+
+    #[test]
+    fn restart_scheduler_record_activity() {
+        let mut scheduler = RestartScheduler::new(RestartSchedulerConfig::default());
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(3 * 3600); // hour 3
+        scheduler.record_activity(at, 0.95);
+        assert!((scheduler.activity_profile().predict_hour(3) - 0.95).abs() < 1e-10);
+    }
+
+    #[test]
+    fn restart_scheduler_empty_forecast_returns_none() {
+        let scheduler = RestartScheduler::new(scheduler_config(RestartMode::Advisory));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
+        assert!(scheduler.recommend(now, &[]).is_none());
+    }
+
+    #[test]
+    fn restart_scheduler_beyond_horizon_skipped() {
+        let scheduler = RestartScheduler::new(RestartSchedulerConfig {
+            mode: RestartMode::Advisory,
+            schedule_horizon_minutes: 60, // only 1 hour
+            ..RestartSchedulerConfig::default()
+        });
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
+        let forecast = vec![HazardForecastPoint {
+            offset_minutes: 120, // 2 hours — beyond horizon
+            hazard_rate: 2.0,
+            predicted_activity: Some(0.0),
+        }];
+        // All candidates beyond horizon → None
+        assert!(scheduler.recommend(now, &forecast).is_none());
+    }
+
+    #[test]
+    fn score_components_no_elapsed_gives_full_recency() {
+        let scheduler = RestartScheduler::new(scheduler_config(RestartMode::Advisory));
+        let breakdown = scheduler.score_components(1.5, 0.0, None);
+        // With elapsed=None, recency_penalty should be 1.0
+        assert!(
+            (breakdown.recency_penalty - 1.0).abs() < 1e-10,
+            "expected recency=1.0, got {}",
+            breakdown.recency_penalty
+        );
+    }
+
+    #[test]
+    fn score_components_zero_elapsed_gives_zero_recency() {
+        let scheduler = RestartScheduler::new(scheduler_config(RestartMode::Advisory));
+        let breakdown = scheduler.score_components(1.5, 0.0, Some(Duration::ZERO));
+        // With elapsed=0, recency_penalty should be ~0
+        assert!(
+            breakdown.recency_penalty < 1e-6,
+            "expected recency near 0, got {}",
+            breakdown.recency_penalty
+        );
+    }
+
+    #[test]
+    fn model_with_params_uses_custom_params() {
+        let custom = WeibullParams {
+            shape: 3.0,
+            scale: 50.0,
+            beta: [0.1, 0.2, 0.3, 0.4, 0.5],
+        };
+        let model = SurvivalModel::with_params(
+            SurvivalConfig {
+                warmup_observations: 0,
+                ..Default::default()
+            },
+            custom.clone(),
+        );
+        let p = model.params();
+        assert!((p.shape - 3.0).abs() < 1e-10);
+        assert!((p.scale - 50.0).abs() < 1e-10);
+        assert_eq!(p.beta, [0.1, 0.2, 0.3, 0.4, 0.5]);
+    }
+
+    #[test]
+    fn model_debug_format() {
+        let model = SurvivalModel::new(SurvivalConfig {
+            warmup_observations: 5,
+            ..Default::default()
+        });
+        let debug_str = format!("{:?}", model);
+        assert!(debug_str.contains("SurvivalModel"));
+        assert!(debug_str.contains("observation_count"));
+        assert!(debug_str.contains("in_warmup"));
+    }
+
+    #[test]
+    fn sigmoid_properties() {
+        // sigmoid(0) = 0.5
+        let s0 = sigmoid(0.0);
+        assert!((s0 - 0.5).abs() < 1e-10, "sigmoid(0) should be 0.5, got {}", s0);
+
+        // sigmoid is monotonically increasing
+        let s_neg = sigmoid(-5.0);
+        let s_pos = sigmoid(5.0);
+        assert!(s_neg < s0, "sigmoid(-5) should be < sigmoid(0)");
+        assert!(s_pos > s0, "sigmoid(5) should be > sigmoid(0)");
+
+        // sigmoid output in (0,1)
+        assert!(s_neg > 0.0);
+        assert!(s_pos < 1.0);
+
+        // sigmoid symmetry: sigmoid(x) + sigmoid(-x) = 1
+        for x in [0.5, 1.0, 3.0, 10.0] {
+            let sum = sigmoid(x) + sigmoid(-x);
+            assert!((sum - 1.0).abs() < 1e-10, "symmetry failed at x={}", x);
+        }
+    }
+
+    #[test]
+    fn hour_of_day_utc_known_values() {
+        // UNIX_EPOCH = hour 0
+        assert_eq!(hour_of_day_utc(SystemTime::UNIX_EPOCH), 0);
+
+        // 3600s = 1 hour
+        let h1 = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
+        assert_eq!(hour_of_day_utc(h1), 1);
+
+        // 23 * 3600 = hour 23
+        let h23 = SystemTime::UNIX_EPOCH + Duration::from_secs(23 * 3600);
+        assert_eq!(hour_of_day_utc(h23), 23);
+
+        // 24 * 3600 wraps to hour 0
+        let h24 = SystemTime::UNIX_EPOCH + Duration::from_secs(24 * 3600);
+        assert_eq!(hour_of_day_utc(h24), 0);
+
+        // 25 * 3600 = hour 1 next day
+        let h25 = SystemTime::UNIX_EPOCH + Duration::from_secs(25 * 3600);
+        assert_eq!(hour_of_day_utc(h25), 1);
+    }
+
+    #[test]
+    fn epoch_secs_known_values() {
+        assert_eq!(epoch_secs(SystemTime::UNIX_EPOCH), Some(0));
+        let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(epoch_secs(ts), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn restart_recommendation_warning_and_snapshot_fields() {
+        let cfg = RestartSchedulerConfig {
+            mode: RestartMode::Automatic { min_score: 0.0 },
+            pre_restart_snapshot: true,
+            advance_warning_minutes: 15,
+            cooldown_hours: 0.0,
+            ..RestartSchedulerConfig::default()
+        };
+        let scheduler = RestartScheduler::new(cfg);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let forecast = vec![HazardForecastPoint {
+            offset_minutes: 60,
+            hazard_rate: 1.5,
+            predicted_activity: Some(0.1),
+        }];
+        let rec = scheduler.recommend(now, &forecast).expect("recommendation");
+        // snapshot_epoch_secs should equal scheduled time when pre_restart_snapshot=true
+        assert_eq!(rec.snapshot_epoch_secs, Some(rec.scheduled_for_epoch_secs));
+        // warning should be scheduled_for - 15 minutes
+        let expected_warning = rec.scheduled_for_epoch_secs - 15 * 60;
+        assert_eq!(rec.warning_epoch_secs, Some(expected_warning));
+        assert!(rec.should_execute_automatically);
+    }
+
+    #[test]
+    fn restart_recommendation_no_warning_when_zero_advance() {
+        let cfg = RestartSchedulerConfig {
+            mode: RestartMode::Advisory,
+            advance_warning_minutes: 0,
+            cooldown_hours: 0.0,
+            ..RestartSchedulerConfig::default()
+        };
+        let scheduler = RestartScheduler::new(cfg);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let forecast = vec![HazardForecastPoint {
+            offset_minutes: 30,
+            hazard_rate: 1.0,
+            predicted_activity: Some(0.2),
+        }];
+        let rec = scheduler.recommend(now, &forecast).expect("recommendation");
+        assert_eq!(rec.warning_epoch_secs, None);
+    }
+
+    #[test]
+    fn restart_recommendation_no_snapshot_when_disabled() {
+        let cfg = RestartSchedulerConfig {
+            mode: RestartMode::Advisory,
+            pre_restart_snapshot: false,
+            cooldown_hours: 0.0,
+            ..RestartSchedulerConfig::default()
+        };
+        let scheduler = RestartScheduler::new(cfg);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let forecast = vec![HazardForecastPoint {
+            offset_minutes: 30,
+            hazard_rate: 1.0,
+            predicted_activity: Some(0.2),
+        }];
+        let rec = scheduler.recommend(now, &forecast).expect("recommendation");
+        assert_eq!(rec.snapshot_epoch_secs, None);
+    }
+
+    #[test]
+    fn model_report_risk_fractions_sum_to_one_with_nonzero_beta() {
+        let model = SurvivalModel::with_params(
+            SurvivalConfig {
+                warmup_observations: 0,
+                ..Default::default()
+            },
+            WeibullParams {
+                shape: 1.5,
+                scale: 168.0,
+                beta: [0.5, 0.1, 0.2, 0.05, 0.3],
+            },
+        );
+        let cov = Covariates {
+            rss_gb: 4.0,
+            pane_count: 20.0,
+            output_rate_mbps: 2.0,
+            uptime_hours: 50.0,
+            conn_error_rate: 1.0,
+        };
+        let report = model.report(24.0, &cov);
+        let total_fraction: f64 = report.risk_factors.iter().map(|rf| rf.risk_fraction).sum();
+        assert!(
+            (total_fraction - 1.0).abs() < 1e-10,
+            "risk fractions should sum to 1.0, got {}",
+            total_fraction
+        );
+    }
+
+    #[test]
+    fn model_report_risk_fractions_zero_with_zero_beta() {
+        let model = SurvivalModel::new(SurvivalConfig {
+            warmup_observations: 0,
+            ..Default::default()
+        });
+        let cov = Covariates {
+            rss_gb: 4.0,
+            pane_count: 20.0,
+            ..Default::default()
+        };
+        let report = model.report(24.0, &cov);
+        // With zero beta, all risk fractions should be 0
+        for rf in &report.risk_factors {
+            assert!(
+                rf.risk_fraction.abs() < 1e-15,
+                "expected risk_fraction=0 with zero beta, got {} for {}",
+                rf.risk_fraction,
+                rf.name
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_hazard_decreasing_when_k_less_than_1() {
+        // k < 1 → decreasing hazard with time (infant mortality)
+        let params = WeibullParams {
+            shape: 0.5,
+            scale: 100.0,
+            beta: [0.0; Covariates::COUNT],
+        };
+        let h1 = params.baseline_hazard(1.0);
+        let h2 = params.baseline_hazard(10.0);
+        let h3 = params.baseline_hazard(100.0);
+        assert!(h1 > 0.0);
+        assert!(h1 > h2, "h(1)={} should be > h(10)={} when k<1", h1, h2);
+        assert!(h2 > h3, "h(10)={} should be > h(100)={} when k<1", h2, h3);
+    }
 }

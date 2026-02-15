@@ -2565,4 +2565,517 @@ mod tests {
         assert_eq!(health.dirty_rows_total, 0);
         assert_eq!(health.active_panes, 0);
     }
+
+    // -----------------------------------------------------------------------
+    // Batch — RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tailer_config_custom_fields() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(10),
+            max_interval: Duration::from_secs(5),
+            backoff_multiplier: 3.0,
+            max_concurrent: 20,
+            overlap_size: 512,
+            send_timeout: Duration::from_millis(200),
+        };
+        assert_eq!(config.min_interval, Duration::from_millis(10));
+        assert_eq!(config.max_interval, Duration::from_secs(5));
+        assert!((config.backoff_multiplier - 3.0).abs() < f64::EPSILON);
+        assert_eq!(config.max_concurrent, 20);
+        assert_eq!(config.overlap_size, 512);
+        assert_eq!(config.send_timeout, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn tailer_config_clone() {
+        let config = TailerConfig::default();
+        let clone = config.clone();
+        assert_eq!(config.min_interval, clone.min_interval);
+        assert_eq!(config.max_interval, clone.max_interval);
+        assert_eq!(config.max_concurrent, clone.max_concurrent);
+    }
+
+    #[test]
+    fn tailer_metrics_fields_mutate() {
+        let mut m = TailerMetrics::default();
+        m.events_sent = 10;
+        m.send_timeouts = 3;
+        m.no_change_captures = 7;
+        m.overflow_gaps_emitted = 1;
+        assert_eq!(m.events_sent, 10);
+        assert_eq!(m.send_timeouts, 3);
+        assert_eq!(m.no_change_captures, 7);
+        assert_eq!(m.overflow_gaps_emitted, 1);
+    }
+
+    #[test]
+    fn supervisor_metrics_default_and_fields() {
+        let mut sm = SupervisorMetrics::default();
+        assert_eq!(sm.tailers_started, 0);
+        assert_eq!(sm.tailers_stopped, 0);
+        assert_eq!(sm.sync_count, 0);
+        sm.tailers_started = 5;
+        sm.tailers_stopped = 2;
+        sm.sync_count = 10;
+        assert_eq!(sm.tailers_started, 5);
+        assert_eq!(sm.tailers_stopped, 2);
+        assert_eq!(sm.sync_count, 10);
+    }
+
+    #[test]
+    fn pane_tailer_should_poll_initially_false() {
+        // With a non-trivial interval, should_poll is false immediately after creation
+        let tailer = PaneTailer::new(1, Duration::from_secs(10));
+        assert!(!tailer.should_poll());
+    }
+
+    #[test]
+    fn pane_tailer_had_changes_tracks_last_poll() {
+        let config = TailerConfig::default();
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+        assert!(!tailer.had_changes);
+
+        tailer.record_poll(true, &config);
+        assert!(tailer.had_changes);
+
+        tailer.record_poll(false, &config);
+        assert!(!tailer.had_changes);
+    }
+
+    #[test]
+    fn pane_tailer_backoff_multiplier_one_keeps_interval() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(100),
+            max_interval: Duration::from_secs(1),
+            backoff_multiplier: 1.0,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+
+        tailer.record_poll(false, &config);
+        // With multiplier 1.0, interval stays the same
+        assert_eq!(tailer.current_interval, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn scheduler_snapshot_unlimited_budget() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        };
+        let sched = CaptureScheduler::new(budget);
+        let snap = sched.snapshot();
+        assert!(!snap.budget_active);
+        assert_eq!(snap.max_captures_per_sec, 0);
+        assert_eq!(snap.max_bytes_per_sec, 0);
+        assert_eq!(snap.tracked_panes, 0);
+        assert_eq!(snap.total_rate_limited, 0);
+        assert_eq!(snap.total_byte_budget_exceeded, 0);
+        assert_eq!(snap.total_throttle_events, 0);
+    }
+
+    #[test]
+    fn scheduler_snapshot_active_budget() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 10,
+            max_bytes_per_sec: 5000,
+        };
+        let sched = CaptureScheduler::new(budget);
+        let snap = sched.snapshot();
+        assert!(snap.budget_active);
+        assert_eq!(snap.max_captures_per_sec, 10);
+        assert_eq!(snap.max_bytes_per_sec, 5000);
+        assert_eq!(snap.captures_remaining, 10);
+        assert_eq!(snap.bytes_remaining, 5000);
+    }
+
+    #[test]
+    fn scheduler_snapshot_after_consumption() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 5,
+            max_bytes_per_sec: 1000,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+        sched.record_capture(1, 300);
+        let _ = sched.select_panes(&[(1, 10), (2, 20)], 5);
+
+        let snap = sched.snapshot();
+        assert_eq!(snap.tracked_panes, 1);
+        assert_eq!(snap.bytes_remaining, 700);
+        assert_eq!(snap.captures_remaining, 3);
+    }
+
+    #[test]
+    fn scheduler_snapshot_serde_roundtrip() {
+        let snap = SchedulerSnapshot {
+            budget_active: true,
+            max_captures_per_sec: 42,
+            max_bytes_per_sec: 8192,
+            captures_remaining: 10,
+            bytes_remaining: 4096,
+            total_rate_limited: 3,
+            total_byte_budget_exceeded: 1,
+            total_throttle_events: 4,
+            tracked_panes: 7,
+        };
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let deser: SchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deser.budget_active, snap.budget_active);
+        assert_eq!(deser.max_captures_per_sec, snap.max_captures_per_sec);
+        assert_eq!(deser.max_bytes_per_sec, snap.max_bytes_per_sec);
+        assert_eq!(deser.captures_remaining, snap.captures_remaining);
+        assert_eq!(deser.bytes_remaining, snap.bytes_remaining);
+        assert_eq!(deser.total_rate_limited, snap.total_rate_limited);
+        assert_eq!(
+            deser.total_byte_budget_exceeded,
+            snap.total_byte_budget_exceeded
+        );
+        assert_eq!(deser.total_throttle_events, snap.total_throttle_events);
+        assert_eq!(deser.tracked_panes, snap.tracked_panes);
+    }
+
+    #[test]
+    fn scheduler_snapshot_default_is_inactive() {
+        let snap = SchedulerSnapshot::default();
+        assert!(!snap.budget_active);
+        assert_eq!(snap.max_captures_per_sec, 0);
+        assert_eq!(snap.max_bytes_per_sec, 0);
+    }
+
+    #[test]
+    fn scheduler_check_global_budget_unlimited_always_allows() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+        // Should always return true with unlimited budget
+        for _ in 0..100 {
+            assert!(sched.check_global_budget());
+        }
+        assert_eq!(sched.metrics().global_rate_limited, 0);
+    }
+
+    #[test]
+    fn scheduler_byte_budget_unlimited_never_exhausted() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+        sched.record_capture(1, 1_000_000);
+        assert!(!sched.is_byte_budget_exhausted());
+    }
+
+    #[test]
+    fn handle_poll_result_circuit_open() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::CircuitOpen { retry_after_ms: 500 });
+
+        // CircuitOpen should not increment events_sent or send_timeouts
+        assert_eq!(supervisor.metrics().events_sent, 0);
+        assert_eq!(supervisor.metrics().send_timeouts, 0);
+        // Pane should be removed from capturing set
+        assert!(!supervisor.capturing_panes.contains(&1));
+    }
+
+    #[test]
+    fn handle_poll_result_error() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(
+            1,
+            PollOutcome::Error("connection refused".to_string()),
+        );
+
+        assert_eq!(supervisor.metrics().events_sent, 0);
+        assert_eq!(supervisor.metrics().send_timeouts, 0);
+        assert!(!supervisor.capturing_panes.contains(&1));
+    }
+
+    #[test]
+    fn handle_poll_result_channel_closed() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::ChannelClosed);
+
+        assert_eq!(supervisor.metrics().events_sent, 0);
+        assert!(!supervisor.capturing_panes.contains(&1));
+    }
+
+    #[test]
+    fn handle_poll_result_no_cursor() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::NoCursor);
+
+        assert_eq!(supervisor.metrics().events_sent, 0);
+        assert_eq!(supervisor.metrics().no_change_captures, 0);
+        assert!(!supervisor.capturing_panes.contains(&1));
+    }
+
+    #[test]
+    fn handle_poll_result_unknown_pane_is_noop() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        // No panes synced, handling result for unknown pane should not panic
+        supervisor.handle_poll_result(999, PollOutcome::Changed { bytes: 100 });
+        assert_eq!(supervisor.metrics().events_sent, 0);
+    }
+
+    #[test]
+    fn supervisor_update_config_changes_concurrency() {
+        let config = TailerConfig {
+            max_concurrent: 5,
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+        assert_eq!(supervisor.semaphore.available_permits(), 5);
+
+        supervisor.update_config(TailerConfig {
+            max_concurrent: 20,
+            ..Default::default()
+        });
+        assert_eq!(supervisor.semaphore.available_permits(), 20);
+    }
+
+    #[test]
+    fn supervisor_update_config_zero_concurrent_floors_to_one() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        supervisor.update_config(TailerConfig {
+            max_concurrent: 0,
+            ..Default::default()
+        });
+        // max_concurrent.max(1) floors to 1
+        assert_eq!(supervisor.semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn supervisor_shutdown_clears_all_state() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        panes.insert(2, make_pane(2));
+        supervisor.sync_tailers(&panes);
+        supervisor.capturing_panes.insert(1);
+        assert_eq!(supervisor.active_count(), 2);
+
+        supervisor.shutdown().await;
+        assert_eq!(supervisor.active_count(), 0);
+        assert!(supervisor.capturing_panes.is_empty());
+    }
+
+    #[test]
+    fn supervisor_sync_idempotent_for_same_panes() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        panes.insert(2, make_pane(2));
+
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.active_count(), 2);
+        let sm = supervisor.supervisor_metrics();
+        assert_eq!(sm.tailers_started, 2);
+        assert_eq!(sm.sync_count, 1);
+
+        // Syncing again with the same panes should not add duplicates
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.active_count(), 2);
+        let sm = supervisor.supervisor_metrics();
+        assert_eq!(sm.tailers_started, 2); // still 2, not 4
+        assert_eq!(sm.sync_count, 2);
+    }
+
+    #[test]
+    fn supervisor_metrics_tracks_sync_and_start_stop() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        // Add 3 panes
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        panes.insert(2, make_pane(2));
+        panes.insert(3, make_pane(3));
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.supervisor_metrics().tailers_started, 3);
+        assert_eq!(supervisor.supervisor_metrics().tailers_stopped, 0);
+
+        // Remove 2 panes
+        panes.remove(&1);
+        panes.remove(&2);
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.supervisor_metrics().tailers_started, 3);
+        assert_eq!(supervisor.supervisor_metrics().tailers_stopped, 2);
+    }
+
+    #[test]
+    fn tailer_mode_serde_roundtrip() {
+        let polling_json = serde_json::to_string(&TailerMode::Polling).unwrap();
+        let streaming_json = serde_json::to_string(&TailerMode::Streaming).unwrap();
+        assert_eq!(polling_json, "\"polling\"");
+        assert_eq!(streaming_json, "\"streaming\"");
+
+        let deser_polling: TailerMode = serde_json::from_str(&polling_json).unwrap();
+        let deser_streaming: TailerMode = serde_json::from_str(&streaming_json).unwrap();
+        assert_eq!(deser_polling, TailerMode::Polling);
+        assert_eq!(deser_streaming, TailerMode::Streaming);
+    }
+
+    #[test]
+    fn streaming_health_serde_roundtrip() {
+        let health = StreamingHealth {
+            mode: TailerMode::Streaming,
+            events_processed: 42,
+            dirty_ranges_total: 10,
+            dirty_rows_total: 80,
+            gaps_emitted: 2,
+            fallback_count: 1,
+            active_panes: 3,
+        };
+        let json = serde_json::to_string(&health).expect("serialize");
+        let deser: StreamingHealth = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deser.mode, TailerMode::Streaming);
+        assert_eq!(deser.events_processed, 42);
+        assert_eq!(deser.dirty_ranges_total, 10);
+        assert_eq!(deser.dirty_rows_total, 80);
+        assert_eq!(deser.gaps_emitted, 2);
+        assert_eq!(deser.fallback_count, 1);
+        assert_eq!(deser.active_panes, 3);
+    }
+
+    #[test]
+    fn supervisor_record_capture_bytes_debits_scheduler() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 1000,
+        };
+
+        let mut supervisor =
+            TailerSupervisor::with_budget(config, tx, cursors, registry, shutdown, source, budget);
+
+        supervisor.record_capture_bytes(1, 400);
+        supervisor.record_capture_bytes(1, 300);
+
+        let snap = supervisor.scheduler_snapshot();
+        assert_eq!(snap.bytes_remaining, 300);
+        assert_eq!(snap.tracked_panes, 1);
+    }
+
+    #[test]
+    fn supervisor_scheduler_metrics_accessor() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let sm = supervisor.scheduler_metrics();
+        assert_eq!(sm.global_rate_limited, 0);
+        assert_eq!(sm.pane_byte_budget_exceeded, 0);
+        assert_eq!(sm.throttle_events, 0);
+    }
 }
