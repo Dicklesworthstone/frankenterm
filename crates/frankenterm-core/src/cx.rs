@@ -231,3 +231,141 @@ where
 {
     crate::runtime_compat::timeout(timeout, spawn_with_cx(handle, cx, task)).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── DarkBadger wa-1u90p.7.1 ──────────────────────────────────────
+
+    #[test]
+    fn runtime_preset_equality() {
+        assert_eq!(RuntimePreset::CurrentThread, RuntimePreset::CurrentThread);
+        assert_eq!(RuntimePreset::MultiThread, RuntimePreset::MultiThread);
+        assert_ne!(RuntimePreset::CurrentThread, RuntimePreset::MultiThread);
+    }
+
+    #[test]
+    fn runtime_preset_clone_copy() {
+        let preset = RuntimePreset::CurrentThread;
+        let cloned = preset.clone();
+        let copied = preset;
+        assert_eq!(preset, cloned);
+        assert_eq!(preset, copied);
+    }
+
+    #[test]
+    fn runtime_preset_debug_format() {
+        let ct = format!("{:?}", RuntimePreset::CurrentThread);
+        let mt = format!("{:?}", RuntimePreset::MultiThread);
+        assert!(ct.contains("CurrentThread"));
+        assert!(mt.contains("MultiThread"));
+    }
+
+    #[test]
+    fn runtime_tuning_default_has_positive_values() {
+        let tuning = RuntimeTuning::default();
+        assert!(
+            tuning.worker_threads > 0,
+            "worker_threads should be positive"
+        );
+        assert!(tuning.poll_budget > 0, "poll_budget should be positive");
+        assert!(
+            tuning.blocking_max_threads >= tuning.blocking_min_threads,
+            "max_threads should be >= min_threads"
+        );
+    }
+
+    #[test]
+    fn runtime_tuning_clone_eq() {
+        let t1 = RuntimeTuning {
+            worker_threads: 4,
+            poll_budget: 128,
+            blocking_min_threads: 2,
+            blocking_max_threads: 16,
+        };
+        let t2 = t1.clone();
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn runtime_tuning_ne_when_different() {
+        let t1 = RuntimeTuning::default();
+        let t2 = RuntimeTuning {
+            worker_threads: t1.worker_threads + 1,
+            ..t1
+        };
+        assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn runtime_tuning_debug_format() {
+        let tuning = RuntimeTuning::default();
+        let dbg = format!("{:?}", tuning);
+        assert!(dbg.contains("RuntimeTuning"));
+        assert!(dbg.contains("worker_threads"));
+        assert!(dbg.contains("poll_budget"));
+    }
+
+    #[test]
+    fn cx_runtime_builder_debug_format() {
+        let builder = CxRuntimeBuilder::current_thread();
+        let dbg = format!("{:?}", builder);
+        assert!(dbg.contains("CxRuntimeBuilder"));
+    }
+
+    #[test]
+    fn cx_runtime_builder_from_preset_current_thread() {
+        let builder = CxRuntimeBuilder::from_preset(RuntimePreset::CurrentThread);
+        let dbg = format!("{:?}", builder);
+        assert!(dbg.contains("CxRuntimeBuilder"));
+    }
+
+    #[test]
+    fn cx_runtime_builder_from_preset_multi_thread() {
+        let builder = CxRuntimeBuilder::from_preset(RuntimePreset::MultiThread);
+        let dbg = format!("{:?}", builder);
+        assert!(dbg.contains("CxRuntimeBuilder"));
+    }
+
+    #[test]
+    fn cx_runtime_builder_chain_methods() {
+        // Verify builder chain methods compile and don't panic
+        let _builder = CxRuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .poll_budget(64)
+            .blocking_threads(1, 8);
+    }
+
+    #[test]
+    fn cx_runtime_builder_with_tuning() {
+        let tuning = RuntimeTuning {
+            worker_threads: 2,
+            poll_budget: 32,
+            blocking_min_threads: 1,
+            blocking_max_threads: 4,
+        };
+        let _builder = CxRuntimeBuilder::current_thread().with_tuning(tuning);
+    }
+
+    #[test]
+    fn for_testing_creates_cx() {
+        let _cx = for_testing();
+    }
+
+    #[test]
+    fn with_cx_passes_through() {
+        let cx = for_testing();
+        let result = with_cx(&cx, |_inner| 42);
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn with_cx_preserves_identity() {
+        let cx = for_testing();
+        with_cx(&cx, |inner| {
+            // inner is the same Cx reference
+            let _ = inner;
+        });
+    }
+}

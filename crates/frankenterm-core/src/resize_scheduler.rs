@@ -3394,4 +3394,274 @@ mod tests {
             "no active_seq means no stalled transaction"
         );
     }
+
+    // ── DarkBadger wa-1u90p.7.1 ──────────────────────────────────────
+
+    #[test]
+    fn zero_work_units_normalized_to_one() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 4,
+            ..ResizeSchedulerConfig::default()
+        });
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 0, 100));
+        let frame = scheduler.schedule_frame();
+        assert_eq!(frame.scheduled.len(), 1);
+        assert_eq!(
+            frame.scheduled[0].work_units, 1,
+            "zero work_units should be normalized to 1"
+        );
+        assert_eq!(frame.budget_spent_units, 1);
+    }
+
+    #[test]
+    fn input_guardrail_reserves_budget_when_backlog_present() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 8,
+            input_guardrail_enabled: true,
+            input_backlog_threshold: 1,
+            input_reserve_units: 3,
+            ..ResizeSchedulerConfig::default()
+        });
+        // Submit a background intent needing 7 work units
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Background, 7, 100));
+        // Schedule with input backlog >= threshold
+        let frame = scheduler.schedule_frame_with_input_backlog(8, 5);
+        // Effective budget = 8 - 3 = 5, so 7 units won't fit
+        assert_eq!(frame.input_reserved_units, 3);
+        assert_eq!(frame.effective_resize_budget_units, 5);
+        // The 7-unit intent is deferred since it doesn't fit in 5
+        assert_eq!(frame.scheduled.len(), 0);
+        assert_eq!(frame.pending_after, 1);
+    }
+
+    #[test]
+    fn input_guardrail_below_threshold_no_reserve() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 8,
+            input_guardrail_enabled: true,
+            input_backlog_threshold: 10,
+            input_reserve_units: 3,
+            ..ResizeSchedulerConfig::default()
+        });
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 2, 100));
+        // Backlog 5 < threshold 10 → no reservation
+        let frame = scheduler.schedule_frame_with_input_backlog(8, 5);
+        assert_eq!(frame.input_reserved_units, 0);
+        assert_eq!(frame.effective_resize_budget_units, 8);
+        assert_eq!(frame.scheduled.len(), 1);
+    }
+
+    #[test]
+    fn drop_overdeferred_pending_after_threshold() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 0, // force everything to defer
+            max_deferrals_before_drop: 3,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Background, 5, 100));
+        // Run 3 frames — each defers the pending intent
+        for _ in 0..3 {
+            scheduler.schedule_frame();
+        }
+        // After 3 deferrals (>= max_deferrals_before_drop=3), pending should be dropped
+        assert_eq!(
+            scheduler.pending_total(),
+            0,
+            "overdeferred pending should be dropped"
+        );
+        assert_eq!(scheduler.metrics().dropped_after_deferrals, 1);
+    }
+
+    #[test]
+    fn domain_budget_throttles_oversized_domain() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 10,
+            domain_budget_enabled: true,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+        // Submit 3 SSH intents (same domain) each needing 4 units
+        // Local weight=4, SSH weight=2 → SSH gets proportional share
+        for i in 0..3 {
+            let _ = scheduler.submit_intent(intent_with_domain(
+                10 + i,
+                1,
+                ResizeWorkClass::Interactive,
+                4,
+                100 + i as u64,
+                ResizeDomain::Ssh {
+                    host: "remote1".into(),
+                },
+            ));
+        }
+        // Also submit a local pane
+        let _ = scheduler.submit_intent(intent(20, 1, ResizeWorkClass::Interactive, 2, 100));
+
+        let frame = scheduler.schedule_frame();
+        // Domain budget should limit SSH panes from consuming all budget
+        let ssh_picks = frame
+            .scheduled
+            .iter()
+            .filter(|s| s.pane_id >= 10 && s.pane_id < 20)
+            .count();
+        // At least 1 SSH pick should be throttled (can't get all 3*4=12 from budget=10)
+        assert!(
+            ssh_picks < 3,
+            "domain budgeting should throttle SSH picks, got {}",
+            ssh_picks
+        );
+        assert!(scheduler.metrics().domain_budget_throttled > 0);
+    }
+
+    #[test]
+    fn complete_active_rejected_when_superseded() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        // Submit, schedule, then submit a newer sequence
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+        let _ = scheduler.schedule_frame();
+        // Now submit newer intent (seq=2), making active seq=1 superseded
+        let _ = scheduler.submit_intent(intent(1, 2, ResizeWorkClass::Interactive, 1, 200));
+        // Attempting to complete the old active seq should fail
+        let completed = scheduler.complete_active(1, 1);
+        assert!(
+            !completed,
+            "completion should be rejected when latest_seq > active_seq"
+        );
+        assert_eq!(scheduler.metrics().completion_rejected, 1);
+    }
+
+    #[test]
+    fn lifecycle_event_ring_buffer_truncates() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            max_lifecycle_events: 4,
+            ..ResizeSchedulerConfig::default()
+        });
+        // Submit 10 intents to generate many lifecycle events
+        for i in 1..=10 {
+            let _ = scheduler.submit_intent(intent(i, 1, ResizeWorkClass::Interactive, 1, 100));
+        }
+        let events = scheduler.lifecycle_events(0);
+        assert!(
+            events.len() <= 4,
+            "lifecycle events should be bounded to max_lifecycle_events, got {}",
+            events.len()
+        );
+    }
+
+    #[test]
+    fn set_control_plane_enabled_toggle() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        assert!(scheduler.control_plane_active());
+        scheduler.set_control_plane_enabled(false);
+        assert!(!scheduler.control_plane_active());
+        scheduler.set_control_plane_enabled(true);
+        assert!(scheduler.control_plane_active());
+    }
+
+    #[test]
+    fn set_emergency_disable_toggle() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        assert!(scheduler.control_plane_active());
+        scheduler.set_emergency_disable(true);
+        assert!(!scheduler.control_plane_active());
+        scheduler.set_emergency_disable(false);
+        assert!(scheduler.control_plane_active());
+    }
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let cfg = ResizeSchedulerConfig {
+            frame_budget_units: 16,
+            max_deferrals_before_force: 5,
+            storm_window_ms: 100,
+            domain_budget_enabled: true,
+            ..ResizeSchedulerConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: ResizeSchedulerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn metrics_serde_roundtrip() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+        let _ = scheduler.schedule_frame();
+        let metrics = scheduler.metrics().clone();
+        let json = serde_json::to_string(&metrics).unwrap();
+        let back: super::ResizeSchedulerMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(metrics, back);
+    }
+
+    #[test]
+    fn schedule_frame_result_serde_roundtrip() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 2, 100));
+        let frame = scheduler.schedule_frame();
+        let json = serde_json::to_string(&frame).unwrap();
+        let back: super::ScheduleFrameResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(frame, back);
+    }
+
+    #[test]
+    fn resize_domain_key_formats() {
+        assert_eq!(ResizeDomain::Local.key(), "local");
+        assert_eq!(
+            ResizeDomain::Ssh {
+                host: "box1".into()
+            }
+            .key(),
+            "ssh:box1"
+        );
+        assert_eq!(
+            ResizeDomain::Mux {
+                endpoint: "unix:///tmp/mux.sock".into()
+            }
+            .key(),
+            "mux:unix:///tmp/mux.sock"
+        );
+    }
+
+    #[test]
+    fn resize_domain_default_is_local() {
+        assert_eq!(ResizeDomain::default(), ResizeDomain::Local);
+    }
+
+    #[test]
+    fn stalled_transactions_returns_correct_age() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+        let _ = scheduler.schedule_frame();
+        // Mark phase at ts=200
+        scheduler.mark_active_phase(1, 1, ResizeExecutionPhase::Reflowing, 200);
+
+        let debug = scheduler.debug_snapshot(64);
+        let stalled = debug.stalled_transactions(1000, 500);
+        assert_eq!(stalled.len(), 1);
+        assert_eq!(stalled[0].pane_id, 1);
+        assert_eq!(stalled[0].age_ms, 800); // 1000 - 200
+        assert_eq!(
+            stalled[0].active_phase,
+            Some(ResizeExecutionPhase::Reflowing)
+        );
+    }
+
+    #[test]
+    fn work_class_base_priority_interactive_higher() {
+        assert!(
+            ResizeWorkClass::Interactive.base_priority()
+                > ResizeWorkClass::Background.base_priority()
+        );
+    }
+
+    #[test]
+    fn scheduler_snapshot_serde_roundtrip() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+        let snap = scheduler.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: super::ResizeSchedulerSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
 }
