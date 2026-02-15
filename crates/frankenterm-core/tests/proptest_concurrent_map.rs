@@ -538,6 +538,14 @@ proptest! {
         prop_assert_eq!(result, None);
     }
 
+    /// DistributionStats Debug is non-empty.
+    #[test]
+    fn prop_stats_debug_nonempty(sizes in arb_shard_sizes()) {
+        let stats = DistributionStats::from_shard_sizes(&sizes);
+        let debug = format!("{:?}", stats);
+        prop_assert!(!debug.is_empty());
+    }
+
     /// write_with mutates in place.
     #[test]
     fn prop_map_write_with(

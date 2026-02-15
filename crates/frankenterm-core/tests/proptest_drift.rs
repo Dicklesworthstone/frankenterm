@@ -671,6 +671,16 @@ proptest! {
         prop_assert_eq!(summary.rules.len(), back.rules.len());
     }
 
+    /// DriftConfig Clone preserves fields.
+    #[test]
+    fn prop_drift_config_clone(config in arb_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.enabled, config.enabled);
+        prop_assert!((cloned.confidence - config.confidence).abs() < 1e-12);
+        prop_assert_eq!(cloned.min_window_size, config.min_window_size);
+        prop_assert_eq!(cloned.max_window_size, config.max_window_size);
+    }
+
     /// DriftType survives serde roundtrip.
     #[test]
     fn prop_drift_type_serde(is_drop in any::<bool>()) {

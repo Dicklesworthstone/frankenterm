@@ -429,6 +429,13 @@ proptest! {
         prop_assert_eq!(monitor.rules().len(), n);
     }
 
+    /// TriggeredAlert Debug is non-empty.
+    #[test]
+    fn prop_triggered_debug_nonempty(a in arb_triggered_alert()) {
+        let debug = format!("{:?}", a);
+        prop_assert!(!debug.is_empty());
+    }
+
     /// add_rule increases count by 1.
     #[test]
     fn prop_monitor_add_rule_increments(n in 0usize..=10) {
