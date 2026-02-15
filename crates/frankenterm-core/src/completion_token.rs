@@ -1187,4 +1187,281 @@ mod tests {
         assert_eq!(tracker.advance(&fake, "a", StepOutcome::Ok, "?"), None);
         assert_eq!(tracker.pending_subsystems(&fake), None);
     }
+
+    // === Batch: DarkBadger wa-1u90p.7.1 ===
+
+    #[test]
+    fn token_id_debug_clone_hash() {
+        use std::collections::HashSet;
+        let id = TokenId("ct-test-001".to_string());
+        let dbg = format!("{:?}", id);
+        assert!(dbg.contains("ct-test-001"));
+        let cloned = id.clone();
+        assert_eq!(id, cloned);
+        let mut set = HashSet::new();
+        set.insert(id.clone());
+        set.insert(id.clone());
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn completion_state_debug_clone_copy() {
+        let s = CompletionState::InProgress;
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("InProgress"));
+        let copied = s; // Copy
+        let cloned = s.clone(); // Clone
+        assert_eq!(copied, cloned);
+    }
+
+    #[test]
+    fn completion_state_serde_roundtrip() {
+        for &state in &[
+            CompletionState::Pending,
+            CompletionState::InProgress,
+            CompletionState::Completed,
+            CompletionState::TimedOut,
+            CompletionState::Failed,
+            CompletionState::PartialFailure,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            let back: CompletionState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn completion_state_from_u8_defensive() {
+        // Unknown u8 values map to Failed
+        assert_eq!(CompletionState::from_u8(255), CompletionState::Failed);
+        assert_eq!(CompletionState::from_u8(6), CompletionState::Failed);
+    }
+
+    #[test]
+    fn step_outcome_debug_clone_copy_eq() {
+        let o = StepOutcome::Ok;
+        let dbg = format!("{:?}", o);
+        assert!(dbg.contains("Ok"));
+        let copied = o; // Copy
+        let cloned = o.clone(); // Clone
+        assert_eq!(copied, cloned);
+        assert_ne!(StepOutcome::Ok, StepOutcome::Error);
+        assert_ne!(StepOutcome::Skipped, StepOutcome::Cancelled);
+    }
+
+    #[test]
+    fn step_outcome_serde_roundtrip() {
+        for &outcome in &[
+            StepOutcome::Ok,
+            StepOutcome::Error,
+            StepOutcome::Skipped,
+            StepOutcome::Cancelled,
+        ] {
+            let json = serde_json::to_string(&outcome).unwrap();
+            let back: StepOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, outcome);
+        }
+    }
+
+    #[test]
+    fn cause_step_debug_clone_serde() {
+        let mut meta = HashMap::new();
+        meta.insert("key".to_string(), "value".to_string());
+        let step = CauseStep {
+            subsystem: "policy".to_string(),
+            outcome: StepOutcome::Ok,
+            message: "allowed".to_string(),
+            timestamp_ms: 12345,
+            metadata: meta,
+        };
+        let dbg = format!("{:?}", step);
+        assert!(dbg.contains("CauseStep"));
+        assert!(dbg.contains("policy"));
+        let cloned = step.clone();
+        assert_eq!(cloned.subsystem, "policy");
+        assert_eq!(cloned.metadata.get("key"), Some(&"value".to_string()));
+        let json = serde_json::to_string(&step).unwrap();
+        let back: CauseStep = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.subsystem, "policy");
+        assert_eq!(back.timestamp_ms, 12345);
+        assert!(json.contains("key"));
+    }
+
+    #[test]
+    fn cause_chain_default_is_empty() {
+        let chain = CauseChain::default();
+        assert!(chain.is_empty());
+        assert_eq!(chain.len(), 0);
+        assert!(chain.failed_subsystems().is_empty());
+    }
+
+    #[test]
+    fn cause_chain_debug_clone() {
+        let mut chain = CauseChain::new();
+        chain.record("a", StepOutcome::Ok, "ok");
+        let dbg = format!("{:?}", chain);
+        assert!(dbg.contains("CauseChain"));
+        let cloned = chain.clone();
+        assert_eq!(cloned.len(), 1);
+        assert_eq!(cloned.steps()[0].subsystem, "a");
+    }
+
+    #[test]
+    fn cause_chain_elapsed_empty() {
+        let chain = CauseChain::new();
+        assert_eq!(chain.elapsed_ms(), 0);
+    }
+
+    #[test]
+    fn completion_boundary_debug_clone_serde() {
+        let b = CompletionBoundary::new(&["policy", "audit"]);
+        let dbg = format!("{:?}", b);
+        assert!(dbg.contains("CompletionBoundary"));
+        let cloned = b.clone();
+        assert_eq!(cloned.required().len(), 2);
+        let json = serde_json::to_string(&b).unwrap();
+        let back: CompletionBoundary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.required().len(), 2);
+    }
+
+    #[test]
+    fn completion_boundary_empty() {
+        let b = CompletionBoundary::new(&[]);
+        let chain = CauseChain::new();
+        // Empty boundary is always satisfied
+        assert!(b.is_satisfied(&chain));
+        assert!(b.pending_subsystems(&chain).is_empty());
+        assert!(b.required().is_empty());
+    }
+
+    #[test]
+    fn completion_token_debug() {
+        let mut tracker = CompletionTracker::new(test_config());
+        let b = CompletionBoundary::new(&["a"]);
+        let id = tracker.begin("test_op", b).unwrap();
+        let token = tracker.token(&id).unwrap();
+        let dbg = format!("{:?}", token);
+        assert!(dbg.contains("CompletionToken"));
+        assert!(dbg.contains("test_op"));
+    }
+
+    #[test]
+    fn completion_token_is_expired_no_deadline() {
+        let mut tracker = CompletionTracker::new(test_config());
+        let b = CompletionBoundary::new(&["a"]);
+        let id = tracker.begin("test_op", b).unwrap();
+        let token = tracker.token(&id).unwrap();
+        assert!(!token.is_expired()); // No deadline set
+    }
+
+    #[test]
+    fn completion_tracker_config_default_values() {
+        let c = CompletionTrackerConfig::default();
+        assert_eq!(c.default_timeout_ms, 30_000);
+        assert_eq!(c.max_active_tokens, 10_000);
+        assert_eq!(c.retention_ms, 300_000);
+    }
+
+    #[test]
+    fn completion_tracker_config_debug_clone_serde() {
+        let c = CompletionTrackerConfig::default();
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("CompletionTrackerConfig"));
+        let cloned = c.clone();
+        assert_eq!(cloned.default_timeout_ms, c.default_timeout_ms);
+        let json = serde_json::to_string(&c).unwrap();
+        let back: CompletionTrackerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.default_timeout_ms, 30_000);
+        assert_eq!(back.max_active_tokens, 10_000);
+    }
+
+    #[test]
+    fn completion_tracker_config_serde_default_annotation() {
+        let back: CompletionTrackerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(back.default_timeout_ms, 30_000);
+        assert_eq!(back.max_active_tokens, 10_000);
+    }
+
+    #[test]
+    fn token_summary_debug_clone_serde() {
+        let summary = TokenSummary {
+            id: TokenId("ct-test-001".to_string()),
+            operation: "send_text".to_string(),
+            state: CompletionState::InProgress,
+            steps_completed: 2,
+            pending: vec!["audit".to_string()],
+            age_ms: 500,
+            pane_id: Some(7),
+        };
+        let dbg = format!("{:?}", summary);
+        assert!(dbg.contains("TokenSummary"));
+        assert!(dbg.contains("send_text"));
+        let cloned = summary.clone();
+        assert_eq!(cloned.operation, "send_text");
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: TokenSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.steps_completed, 2);
+        assert_eq!(back.pane_id, Some(7));
+    }
+
+    #[test]
+    fn boundaries_send_text_subsystems() {
+        let b = Boundaries::send_text();
+        assert_eq!(b.required(), &["policy", "injection", "audit"]);
+    }
+
+    #[test]
+    fn boundaries_capture_subsystems() {
+        let b = Boundaries::capture();
+        assert_eq!(b.required(), &["ingest", "storage"]);
+    }
+
+    #[test]
+    fn boundaries_recovery_subsystems() {
+        let b = Boundaries::recovery();
+        assert_eq!(b.required(), &["snapshot", "restore", "verify"]);
+    }
+
+    #[test]
+    fn tracker_cancel_step_leads_to_failed() {
+        let mut tracker = CompletionTracker::new(test_config());
+        let boundary = CompletionBoundary::new(&["a", "b"]);
+        let id = tracker.begin("test_op", boundary).unwrap();
+        let s = tracker.advance(&id, "a", StepOutcome::Cancelled, "user cancelled");
+        assert_eq!(s, Some(CompletionState::Failed));
+    }
+
+    #[test]
+    fn tracker_fail_nonexistent_returns_none() {
+        let mut tracker = CompletionTracker::new(test_config());
+        let fake = TokenId("ct-nonexistent-0000".to_string());
+        assert_eq!(tracker.fail(&fake, "reason"), None);
+    }
+
+    #[test]
+    fn tracker_timeout_nonexistent_returns_none() {
+        let mut tracker = CompletionTracker::new(test_config());
+        let fake = TokenId("ct-nonexistent-0000".to_string());
+        assert_eq!(tracker.timeout(&fake), None);
+    }
+
+    #[test]
+    fn tracker_total_count_includes_completed() {
+        let mut tracker = CompletionTracker::new(CompletionTrackerConfig {
+            default_timeout_ms: 0,
+            max_active_tokens: 100,
+            retention_ms: 60_000, // long retention
+        });
+        let b = CompletionBoundary::new(&["a"]);
+        let id = tracker.begin("op", b).unwrap();
+        tracker.advance(&id, "a", StepOutcome::Ok, "done");
+        assert_eq!(tracker.active_count(), 0);
+        assert_eq!(tracker.total_count(), 1); // Still retained
+    }
+
+    #[test]
+    fn now_ms_is_positive() {
+        let ms = now_ms();
+        assert!(ms > 0, "epoch ms should be positive");
+    }
 }
