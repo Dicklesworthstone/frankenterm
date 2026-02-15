@@ -53,9 +53,18 @@ impl PiecewiseLinear {
     pub fn new(mut points: Vec<CurvePoint>) -> Self {
         assert!(!points.is_empty(), "curve must have at least one point");
         points.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
-        // Deduplicate: keep last point at each t
-        points.dedup_by(|a, b| (a.t - b.t).abs() < 1e-12);
-        Self { points }
+        // Deduplicate: keep last point at each t.
+        let mut deduped: Vec<CurvePoint> = Vec::with_capacity(points.len());
+        for point in points {
+            if let Some(last) = deduped.last_mut() {
+                if (last.t - point.t).abs() < 1e-12 {
+                    *last = point;
+                    continue;
+                }
+            }
+            deduped.push(point);
+        }
+        Self { points: deduped }
     }
 
     /// Create a constant curve at value `c` for all t ≥ 0.
@@ -83,6 +92,9 @@ impl PiecewiseLinear {
 
     /// Evaluate the curve at time t.
     pub fn eval(&self, t: f64) -> f64 {
+        if self.points.is_empty() {
+            return 0.0;
+        }
         if self.points.len() == 1 {
             return self.points[0].y;
         }
@@ -125,6 +137,9 @@ impl PiecewiseLinear {
     /// The trailing slope of the curve (slope of the last segment).
     pub fn trailing_slope(&self) -> f64 {
         let n = self.points.len();
+        if n == 0 {
+            return 0.0;
+        }
         if n < 2 {
             return 0.0;
         }
@@ -142,10 +157,9 @@ impl PiecewiseLinear {
         self.points.len()
     }
 
-    /// Whether this curve has a single breakpoint.
+    /// Whether this curve has no breakpoints.
     pub fn is_empty(&self) -> bool {
-        // A PiecewiseLinear always has ≥1 point, but clippy wants this
-        false
+        self.points.is_empty()
     }
 
     /// Access the breakpoints.
@@ -443,10 +457,7 @@ pub fn min_plus_deconvolution_sampled(
 pub fn delay_bound(arrival: &ArrivalCurve, service: &ServiceCurve) -> f64 {
     // Closed-form for leaky-bucket + rate-latency
     match (arrival, service) {
-        (
-            ArrivalCurve::LeakyBucket { sigma, rho },
-            ServiceCurve::RateLatency { rate, latency },
-        ) => {
+        (ArrivalCurve::LeakyBucket { sigma, rho }, ServiceCurve::RateLatency { rate, latency }) => {
             if *rate <= *rho {
                 return f64::INFINITY; // System is unstable
             }
@@ -497,10 +508,7 @@ pub fn delay_bound(arrival: &ArrivalCurve, service: &ServiceCurve) -> f64 {
 pub fn backlog_bound(arrival: &ArrivalCurve, service: &ServiceCurve) -> f64 {
     // Closed-form for leaky-bucket + rate-latency
     match (arrival, service) {
-        (
-            ArrivalCurve::LeakyBucket { sigma, rho },
-            ServiceCurve::RateLatency { rate, latency },
-        ) => {
+        (ArrivalCurve::LeakyBucket { sigma, rho }, ServiceCurve::RateLatency { rate, latency }) => {
             if *rate <= *rho {
                 return f64::INFINITY;
             }
@@ -616,7 +624,9 @@ pub fn aggregate_arrival(curves: &[ArrivalCurve]) -> ArrivalCurve {
     }
 
     // If all are leaky buckets, aggregate analytically
-    let all_leaky = curves.iter().all(|c| matches!(c, ArrivalCurve::LeakyBucket { .. }));
+    let all_leaky = curves
+        .iter()
+        .all(|c| matches!(c, ArrivalCurve::LeakyBucket { .. }));
     if all_leaky {
         let mut total_sigma = 0.0;
         let mut total_rho = 0.0;
@@ -645,19 +655,13 @@ pub fn aggregate_arrival(curves: &[ArrivalCurve]) -> ArrivalCurve {
 ///
 /// For N identical leaky-bucket panes with rate-latency server:
 /// D_max = (N·σ) / (R - N·ρ) + T
-pub fn multiplexed_delay_bound(
-    pane_arrivals: &[ArrivalCurve],
-    service: &ServiceCurve,
-) -> f64 {
+pub fn multiplexed_delay_bound(pane_arrivals: &[ArrivalCurve], service: &ServiceCurve) -> f64 {
     let agg = aggregate_arrival(pane_arrivals);
     delay_bound(&agg, service)
 }
 
 /// Compute backlog bound for N multiplexed panes sharing a service curve.
-pub fn multiplexed_backlog_bound(
-    pane_arrivals: &[ArrivalCurve],
-    service: &ServiceCurve,
-) -> f64 {
+pub fn multiplexed_backlog_bound(pane_arrivals: &[ArrivalCurve], service: &ServiceCurve) -> f64 {
     let agg = aggregate_arrival(pane_arrivals);
     backlog_bound(&agg, service)
 }
@@ -750,7 +754,12 @@ pub fn analyze_frankenterm_pipeline(
     let stages = pipeline
         .stages
         .iter()
-        .zip(analysis.per_stage_delays.iter().zip(analysis.per_stage_backlogs.iter()))
+        .zip(
+            analysis
+                .per_stage_delays
+                .iter()
+                .zip(analysis.per_stage_backlogs.iter()),
+        )
         .map(|(stage, (delay, backlog))| StageAnalysis {
             name: stage.name.clone(),
             delay_bound_ms: delay * 1000.0,
@@ -820,6 +829,24 @@ mod tests {
             CurvePoint { t: 2.0, y: 6.0 },
         ]);
         assert!(approx_eq(pw.trailing_slope(), 3.0));
+    }
+
+    #[test]
+    fn dedup_keeps_last_at_same_t() {
+        let pw = PiecewiseLinear::new(vec![
+            CurvePoint { t: 1.0, y: 10.0 },
+            CurvePoint { t: 1.0, y: 20.0 },
+        ]);
+        assert!(approx_eq(pw.eval(1.0), 20.0));
+    }
+
+    #[test]
+    fn empty_deserialized_piecewise_is_safe() {
+        let pw: PiecewiseLinear =
+            serde_json::from_str(r#"{"points":[]}"#).expect("empty points should deserialize");
+        assert!(pw.is_empty());
+        assert!(approx_eq(pw.eval(0.0), 0.0));
+        assert!(approx_eq(pw.trailing_slope(), 0.0));
     }
 
     // ── Arrival curve tests ──

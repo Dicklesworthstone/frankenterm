@@ -62,16 +62,15 @@ fn arb_service() -> impl Strategy<Value = ServiceCurve> {
 }
 
 fn arb_stable_pair() -> impl Strategy<Value = (ArrivalCurve, ServiceCurve)> {
-    (arb_sigma(), arb_rho(), arb_latency())
-        .prop_flat_map(|(sigma, rho, latency)| {
-            // Ensure rate > rho for stability
-            let min_rate = rho * 1.1;
-            (
-                Just(ArrivalCurve::leaky_bucket(sigma, rho)),
-                (min_rate..min_rate * 100.0)
-                    .prop_map(move |rate| ServiceCurve::rate_latency(rate, latency)),
-            )
-        })
+    (arb_sigma(), arb_rho(), arb_latency()).prop_flat_map(|(sigma, rho, latency)| {
+        // Ensure rate > rho for stability
+        let min_rate = rho * 1.1;
+        (
+            Just(ArrivalCurve::leaky_bucket(sigma, rho)),
+            (min_rate..min_rate * 100.0)
+                .prop_map(move |rate| ServiceCurve::rate_latency(rate, latency)),
+        )
+    })
 }
 
 fn arb_piecewise_linear() -> impl Strategy<Value = PiecewiseLinear> {
