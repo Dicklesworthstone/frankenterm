@@ -1116,4 +1116,904 @@ mod tests {
         assert_eq!(report.failed, 0);
         assert_eq!(report.results.len(), 3);
     }
+
+    // =========================================================================
+    // LaunchConfig — defaults & serde
+    // =========================================================================
+
+    #[test]
+    fn launch_config_default_values() {
+        let cfg = LaunchConfig::default();
+        assert!(cfg.launch_shells);
+        assert!(!cfg.launch_agents);
+        assert_eq!(cfg.launch_delay_ms, 500);
+        assert!(cfg.agent_commands.is_empty());
+    }
+
+    #[test]
+    fn launch_config_serde_roundtrip() {
+        let mut commands = HashMap::new();
+        commands.insert("claude_code".into(), "cd {cwd} && claude --resume".into());
+        let cfg = LaunchConfig {
+            launch_shells: false,
+            launch_agents: true,
+            launch_delay_ms: 250,
+            agent_commands: commands,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let cfg2: LaunchConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg2.launch_shells, false);
+        assert_eq!(cfg2.launch_agents, true);
+        assert_eq!(cfg2.launch_delay_ms, 250);
+        assert_eq!(
+            cfg2.agent_commands.get("claude_code").unwrap(),
+            "cd {cwd} && claude --resume"
+        );
+    }
+
+    #[test]
+    fn launch_config_clone() {
+        let cfg = LaunchConfig {
+            launch_shells: false,
+            launch_agents: true,
+            launch_delay_ms: 100,
+            agent_commands: HashMap::new(),
+        };
+        let cfg2 = cfg.clone();
+        assert_eq!(cfg2.launch_shells, cfg.launch_shells);
+        assert_eq!(cfg2.launch_agents, cfg.launch_agents);
+        assert_eq!(cfg2.launch_delay_ms, cfg.launch_delay_ms);
+    }
+
+    // =========================================================================
+    // LaunchAction — serde tagged enum
+    // =========================================================================
+
+    #[test]
+    fn launch_action_serde_launch_shell() {
+        let action = LaunchAction::LaunchShell {
+            shell: "zsh".into(),
+            cwd: PathBuf::from("/tmp"),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("\"action\":\"launch_shell\""));
+        let roundtrip: LaunchAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, action);
+    }
+
+    #[test]
+    fn launch_action_serde_launch_agent() {
+        let action = LaunchAction::LaunchAgent {
+            command: "cd /proj && claude".into(),
+            cwd: PathBuf::from("/proj"),
+            agent_type: "claude_code".into(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("\"action\":\"launch_agent\""));
+        let roundtrip: LaunchAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, action);
+    }
+
+    #[test]
+    fn launch_action_serde_skip() {
+        let action = LaunchAction::Skip {
+            reason: "no info".into(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("\"action\":\"skip\""));
+        let roundtrip: LaunchAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, action);
+    }
+
+    #[test]
+    fn launch_action_serde_manual() {
+        let action = LaunchAction::Manual {
+            hint: "Was running vim".into(),
+            original_process: "vim".into(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("\"action\":\"manual\""));
+        let roundtrip: LaunchAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, action);
+    }
+
+    #[test]
+    fn launch_action_equality() {
+        let a = LaunchAction::LaunchShell {
+            shell: "bash".into(),
+            cwd: PathBuf::from("/home"),
+        };
+        let b = LaunchAction::LaunchShell {
+            shell: "bash".into(),
+            cwd: PathBuf::from("/home"),
+        };
+        let c = LaunchAction::LaunchShell {
+            shell: "zsh".into(),
+            cwd: PathBuf::from("/home"),
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+
+        let skip1 = LaunchAction::Skip {
+            reason: "x".into(),
+        };
+        let skip2 = LaunchAction::Skip {
+            reason: "y".into(),
+        };
+        assert_ne!(skip1, skip2);
+    }
+
+    // =========================================================================
+    // ProcessPlan / LaunchResult / LaunchReport — serde
+    // =========================================================================
+
+    #[test]
+    fn process_plan_serde_roundtrip() {
+        let plan = ProcessPlan {
+            old_pane_id: 42,
+            new_pane_id: 100,
+            action: LaunchAction::LaunchShell {
+                shell: "fish".into(),
+                cwd: PathBuf::from("/data"),
+            },
+            state_warning: Some("careful!".into()),
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        let plan2: ProcessPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(plan2.old_pane_id, 42);
+        assert_eq!(plan2.new_pane_id, 100);
+        assert_eq!(plan2.state_warning.as_deref(), Some("careful!"));
+        assert_eq!(plan2.action, plan.action);
+    }
+
+    #[test]
+    fn launch_result_serde_roundtrip() {
+        let result = LaunchResult {
+            old_pane_id: 1,
+            new_pane_id: 10,
+            action: LaunchAction::Skip {
+                reason: "test".into(),
+            },
+            success: true,
+            error: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let result2: LaunchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(result2.old_pane_id, 1);
+        assert_eq!(result2.new_pane_id, 10);
+        assert!(result2.success);
+        assert!(result2.error.is_none());
+    }
+
+    #[test]
+    fn launch_result_with_error() {
+        let result = LaunchResult {
+            old_pane_id: 5,
+            new_pane_id: 50,
+            action: LaunchAction::LaunchAgent {
+                command: "claude".into(),
+                cwd: PathBuf::from("/x"),
+                agent_type: "claude_code".into(),
+            },
+            success: false,
+            error: Some("connection refused".into()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let result2: LaunchResult = serde_json::from_str(&json).unwrap();
+        assert!(!result2.success);
+        assert_eq!(result2.error.as_deref(), Some("connection refused"));
+    }
+
+    #[test]
+    fn launch_report_default() {
+        let report = LaunchReport::default();
+        assert!(report.results.is_empty());
+        assert_eq!(report.shells_launched, 0);
+        assert_eq!(report.agents_launched, 0);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.manual, 0);
+        assert_eq!(report.failed, 0);
+    }
+
+    #[test]
+    fn launch_report_serde_roundtrip() {
+        let report = LaunchReport {
+            results: vec![LaunchResult {
+                old_pane_id: 1,
+                new_pane_id: 10,
+                action: LaunchAction::Skip {
+                    reason: "r".into(),
+                },
+                success: true,
+                error: None,
+            }],
+            shells_launched: 3,
+            agents_launched: 1,
+            skipped: 2,
+            manual: 1,
+            failed: 0,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let report2: LaunchReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report2.shells_launched, 3);
+        assert_eq!(report2.agents_launched, 1);
+        assert_eq!(report2.results.len(), 1);
+    }
+
+    // =========================================================================
+    // normalize_cwd — edge cases
+    // =========================================================================
+
+    #[test]
+    fn normalize_cwd_bare_path() {
+        assert_eq!(normalize_cwd("/usr/local/bin"), PathBuf::from("/usr/local/bin"));
+    }
+
+    #[test]
+    fn normalize_cwd_file_triple_slash() {
+        assert_eq!(
+            normalize_cwd("file:///var/log"),
+            PathBuf::from("/var/log")
+        );
+    }
+
+    #[test]
+    fn normalize_cwd_file_hostname_path() {
+        // file://myhost/share/data → /share/data
+        assert_eq!(
+            normalize_cwd("file://myhost/share/data"),
+            PathBuf::from("/share/data")
+        );
+    }
+
+    #[test]
+    fn normalize_cwd_multiple_percent_encoded() {
+        assert_eq!(
+            normalize_cwd("file:///home/user/my%20big%20project"),
+            PathBuf::from("/home/user/my big project")
+        );
+    }
+
+    #[test]
+    fn normalize_cwd_root_only() {
+        assert_eq!(normalize_cwd("/"), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn normalize_cwd_empty_string() {
+        // Empty string → empty path
+        assert_eq!(normalize_cwd(""), PathBuf::from(""));
+    }
+
+    // =========================================================================
+    // percent_decode — edge cases
+    // =========================================================================
+
+    #[test]
+    fn percent_decode_empty() {
+        assert_eq!(percent_decode(""), "");
+    }
+
+    #[test]
+    fn percent_decode_no_encoding() {
+        assert_eq!(percent_decode("hello world"), "hello world");
+    }
+
+    #[test]
+    fn percent_decode_space() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+    }
+
+    #[test]
+    fn percent_decode_multiple_sequences() {
+        assert_eq!(
+            percent_decode("a%20b%20c%20d"),
+            "a b c d"
+        );
+    }
+
+    #[test]
+    fn percent_decode_special_chars() {
+        // %23 = '#', %26 = '&', %3D = '='
+        assert_eq!(percent_decode("key%3Dvalue%26other%23tag"), "key=value&other#tag");
+    }
+
+    #[test]
+    fn percent_decode_invalid_hex() {
+        // Invalid hex after % → preserved as-is
+        assert_eq!(percent_decode("100%XY"), "100%XY");
+    }
+
+    #[test]
+    fn percent_decode_trailing_percent() {
+        // Trailing % with nothing after → incomplete but we still get output
+        let result = percent_decode("test%");
+        // With only 0 chars taken, from_str_radix("", 16) fails → preserved
+        assert!(result.contains("test"));
+    }
+
+    #[test]
+    fn percent_decode_single_char_after_percent() {
+        // Only 1 hex char after % → from_str_radix with 1 char
+        let result = percent_decode("test%4");
+        // With only 1 char, it may parse as 4 (valid hex) or error depending on take(2)
+        assert!(result.starts_with("test"));
+    }
+
+    // =========================================================================
+    // shell_escape — additional special characters
+    // =========================================================================
+
+    #[test]
+    fn shell_escape_dollar() {
+        let result = shell_escape(&PathBuf::from("/home/$USER"));
+        assert!(result.starts_with('"'));
+        assert!(result.contains("$USER"));
+    }
+
+    #[test]
+    fn shell_escape_backtick() {
+        let result = shell_escape(&PathBuf::from("/foo/`bar`"));
+        assert!(result.starts_with('"'));
+    }
+
+    #[test]
+    fn shell_escape_exclamation() {
+        let result = shell_escape(&PathBuf::from("/foo/bar!"));
+        assert!(result.starts_with('"'));
+    }
+
+    #[test]
+    fn shell_escape_ampersand() {
+        let result = shell_escape(&PathBuf::from("/foo&bar"));
+        assert!(result.starts_with('"'));
+    }
+
+    #[test]
+    fn shell_escape_hash() {
+        let result = shell_escape(&PathBuf::from("/foo#bar"));
+        assert!(result.starts_with('"'));
+    }
+
+    #[test]
+    fn shell_escape_quotes_in_path() {
+        let result = shell_escape(&PathBuf::from("/foo/it's"));
+        assert!(result.starts_with('"'));
+    }
+
+    #[test]
+    fn shell_escape_double_quote_escaped() {
+        let path = PathBuf::from("/foo/\"bar\"");
+        let result = shell_escape(&path);
+        // Double quotes should be escaped as \"
+        assert!(result.contains("\\\""));
+    }
+
+    #[test]
+    fn shell_escape_parentheses() {
+        let result = shell_escape(&PathBuf::from("/foo/(copy)"));
+        assert!(result.starts_with('"'));
+    }
+
+    #[test]
+    fn shell_escape_tilde() {
+        let result = shell_escape(&PathBuf::from("/foo/~backup"));
+        assert!(result.starts_with('"'));
+    }
+
+    // =========================================================================
+    // is_shell — comprehensive coverage
+    // =========================================================================
+
+    #[test]
+    fn is_shell_all_recognized_names() {
+        let shells = [
+            "bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "nu", "nushell",
+        ];
+        for shell in &shells {
+            assert!(is_shell(shell), "expected {} to be detected as shell", shell);
+        }
+    }
+
+    #[test]
+    fn is_shell_with_full_paths() {
+        assert!(is_shell("/usr/bin/bash"));
+        assert!(is_shell("/bin/zsh"));
+        assert!(is_shell("/usr/local/bin/fish"));
+        assert!(is_shell("/usr/bin/nu"));
+    }
+
+    #[test]
+    fn is_shell_rejects_non_shells() {
+        assert!(!is_shell("basher"));
+        assert!(!is_shell("zshrc"));
+        assert!(!is_shell("fishing"));
+        assert!(!is_shell("vim"));
+        assert!(!is_shell("claude"));
+        assert!(!is_shell("cargo"));
+        assert!(!is_shell(""));
+    }
+
+    // =========================================================================
+    // is_interactive_program — comprehensive coverage
+    // =========================================================================
+
+    #[test]
+    fn is_interactive_all_recognized_programs() {
+        let programs = [
+            "vim", "nvim", "vi", "nano", "emacs", "helix", "hx", "htop", "btop", "top",
+            "less", "more", "man", "tmux", "screen", "python", "python3", "ipython", "node",
+            "irb", "ghci", "psql", "mysql", "sqlite3",
+        ];
+        for prog in &programs {
+            assert!(
+                is_interactive_program(prog),
+                "expected {} to be detected as interactive",
+                prog
+            );
+        }
+    }
+
+    #[test]
+    fn is_interactive_with_paths() {
+        assert!(is_interactive_program("/usr/bin/vim"));
+        assert!(is_interactive_program("/usr/local/bin/nvim"));
+        assert!(is_interactive_program("/usr/bin/python3"));
+    }
+
+    #[test]
+    fn is_interactive_rejects_non_interactive() {
+        assert!(!is_interactive_program("bash"));
+        assert!(!is_interactive_program("cargo"));
+        assert!(!is_interactive_program("gcc"));
+        assert!(!is_interactive_program("ls"));
+        assert!(!is_interactive_program("cat"));
+    }
+
+    // =========================================================================
+    // agent_type_from_process_name — comprehensive
+    // =========================================================================
+
+    #[test]
+    fn agent_type_all_recognized_names() {
+        assert_eq!(agent_type_from_process_name("claude"), AgentType::ClaudeCode);
+        assert_eq!(
+            agent_type_from_process_name("claude-code"),
+            AgentType::ClaudeCode
+        );
+        assert_eq!(agent_type_from_process_name("codex"), AgentType::Codex);
+        assert_eq!(agent_type_from_process_name("codex-cli"), AgentType::Codex);
+        assert_eq!(agent_type_from_process_name("gemini"), AgentType::Gemini);
+        assert_eq!(
+            agent_type_from_process_name("gemini-cli"),
+            AgentType::Gemini
+        );
+    }
+
+    #[test]
+    fn agent_type_with_full_paths() {
+        assert_eq!(
+            agent_type_from_process_name("/usr/local/bin/claude"),
+            AgentType::ClaudeCode
+        );
+        assert_eq!(
+            agent_type_from_process_name("/home/user/.local/bin/codex"),
+            AgentType::Codex
+        );
+        assert_eq!(
+            agent_type_from_process_name("/opt/bin/gemini"),
+            AgentType::Gemini
+        );
+    }
+
+    #[test]
+    fn agent_type_unknown_names() {
+        assert_eq!(agent_type_from_process_name("bash"), AgentType::Unknown);
+        assert_eq!(agent_type_from_process_name("vim"), AgentType::Unknown);
+        assert_eq!(agent_type_from_process_name(""), AgentType::Unknown);
+        assert_eq!(agent_type_from_process_name("gpt"), AgentType::Unknown);
+    }
+
+    // =========================================================================
+    // parse_agent_type — all mappings
+    // =========================================================================
+
+    #[test]
+    fn parse_agent_type_all_variants() {
+        assert_eq!(parse_agent_type("claude_code"), AgentType::ClaudeCode);
+        assert_eq!(parse_agent_type("ClaudeCode"), AgentType::ClaudeCode);
+        assert_eq!(parse_agent_type("codex"), AgentType::Codex);
+        assert_eq!(parse_agent_type("Codex"), AgentType::Codex);
+        assert_eq!(parse_agent_type("gemini"), AgentType::Gemini);
+        assert_eq!(parse_agent_type("Gemini"), AgentType::Gemini);
+    }
+
+    #[test]
+    fn parse_agent_type_unknown_strings() {
+        assert_eq!(parse_agent_type(""), AgentType::Unknown);
+        assert_eq!(parse_agent_type("gpt4"), AgentType::Unknown);
+        assert_eq!(parse_agent_type("CLAUDE_CODE"), AgentType::Unknown);
+        assert_eq!(parse_agent_type("wezterm"), AgentType::Unknown);
+    }
+
+    // =========================================================================
+    // default_agent_command — comprehensive
+    // =========================================================================
+
+    #[test]
+    fn default_agent_command_gemini() {
+        let cwd = PathBuf::from("/project");
+        let cmd = default_agent_command(AgentType::Gemini, &cwd).unwrap();
+        assert!(cmd.contains("gemini-cli"));
+        assert!(cmd.contains("/project"));
+    }
+
+    #[test]
+    fn default_agent_command_wezterm_returns_none() {
+        let cwd = PathBuf::from("/project");
+        assert!(default_agent_command(AgentType::Wezterm, &cwd).is_none());
+    }
+
+    #[test]
+    fn default_agent_command_unknown_returns_none() {
+        let cwd = PathBuf::from("/project");
+        assert!(default_agent_command(AgentType::Unknown, &cwd).is_none());
+    }
+
+    #[test]
+    fn default_agent_command_escapes_spaces_in_path() {
+        let cwd = PathBuf::from("/my project/code");
+        let cmd = default_agent_command(AgentType::ClaudeCode, &cwd).unwrap();
+        // The path should be quoted
+        assert!(cmd.contains('"'));
+        assert!(cmd.contains("claude"));
+    }
+
+    // =========================================================================
+    // resolve_action — additional edge cases
+    // =========================================================================
+
+    #[test]
+    fn plan_no_info_shells_disabled() {
+        let config = LaunchConfig {
+            launch_shells: false,
+            ..Default::default()
+        };
+        let wez = crate::wezterm::mock_wezterm_handle();
+        let launcher = ProcessLauncher::new(wez, config);
+        let id_map = test_pane_id_map();
+
+        let mut state = test_pane_state(1);
+        state.shell = None;
+        state.foreground_process = None;
+        state.cwd = Some("/home/user/code".into());
+
+        let plans = launcher.plan(&id_map, &[state]);
+        match &plans[0].action {
+            LaunchAction::Skip { reason } => {
+                assert!(reason.contains("no process information"));
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_foreground_shell_process() {
+        let launcher = test_launcher();
+        let id_map = test_pane_id_map();
+
+        let mut state = test_pane_state(1);
+        state.shell = None;
+        state.foreground_process = Some(ProcessInfo {
+            name: "zsh".into(),
+            pid: Some(9999),
+            argv: None,
+        });
+
+        let plans = launcher.plan(&id_map, &[state]);
+        match &plans[0].action {
+            LaunchAction::LaunchShell { shell, .. } => {
+                assert_eq!(shell, "zsh");
+            }
+            other => panic!("expected LaunchShell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_unknown_process_with_argv_hint() {
+        let launcher = test_launcher();
+        let id_map = test_pane_id_map();
+
+        let mut state = test_pane_state(1);
+        state.shell = None;
+        state.foreground_process = Some(ProcessInfo {
+            name: "cargo".into(),
+            pid: Some(2222),
+            argv: Some(vec!["cargo".into(), "test".into(), "--release".into()]),
+        });
+
+        let plans = launcher.plan(&id_map, &[state]);
+        match &plans[0].action {
+            LaunchAction::Manual {
+                hint,
+                original_process,
+            } => {
+                assert!(hint.contains("cargo test --release"));
+                assert_eq!(original_process, "cargo");
+            }
+            other => panic!("expected Manual, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_unknown_process_without_argv() {
+        let launcher = test_launcher();
+        let id_map = test_pane_id_map();
+
+        let mut state = test_pane_state(1);
+        state.shell = None;
+        state.foreground_process = Some(ProcessInfo {
+            name: "mysterious".into(),
+            pid: None,
+            argv: None,
+        });
+
+        let plans = launcher.plan(&id_map, &[state]);
+        match &plans[0].action {
+            LaunchAction::Manual {
+                hint,
+                original_process,
+            } => {
+                // Without argv, hint uses the name
+                assert!(hint.contains("mysterious"));
+                assert_eq!(original_process, "mysterious");
+            }
+            other => panic!("expected Manual, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_no_cwd_defaults_to_root() {
+        let launcher = test_launcher();
+        let id_map = test_pane_id_map();
+
+        let mut state = test_pane_state(1);
+        state.cwd = None;
+        state.shell = None;
+        state.foreground_process = None;
+
+        let plans = launcher.plan(&id_map, &[state]);
+        // With no cwd (defaults to "/") and shells enabled but cwd == "/",
+        // should skip
+        match &plans[0].action {
+            LaunchAction::Skip { reason } => {
+                assert!(reason.contains("no process information"));
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_codex_agent_detected_from_process() {
+        let launcher = test_launcher();
+        let id_map = test_pane_id_map();
+
+        let mut state = test_pane_state(1);
+        state.shell = None;
+        state.foreground_process = Some(ProcessInfo {
+            name: "codex-cli".into(),
+            pid: Some(5555),
+            argv: None,
+        });
+
+        let plans = launcher.plan(&id_map, &[state]);
+        // Agents default to Manual without opt-in
+        assert!(plans[0].state_warning.is_some());
+        match &plans[0].action {
+            LaunchAction::Manual { hint, .. } => {
+                assert!(hint.contains("codex"));
+            }
+            other => panic!("expected Manual, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_gemini_agent_with_opt_in() {
+        let config = LaunchConfig {
+            launch_agents: true,
+            ..Default::default()
+        };
+        let wez = crate::wezterm::mock_wezterm_handle();
+        let launcher = ProcessLauncher::new(wez, config);
+        let id_map = test_pane_id_map();
+
+        let mut state = test_pane_state(1);
+        state.agent = Some(AgentMetadata {
+            agent_type: "Gemini".into(),
+            session_id: Some("sess-abc".into()),
+            state: Some("idle".into()),
+        });
+
+        let plans = launcher.plan(&id_map, &[state]);
+        assert!(plans[0].state_warning.is_some());
+        match &plans[0].action {
+            LaunchAction::LaunchAgent {
+                command,
+                agent_type,
+                ..
+            } => {
+                assert!(command.contains("gemini-cli"));
+                assert_eq!(agent_type, "Gemini");
+            }
+            other => panic!("expected LaunchAgent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_unknown_agent_type_manual() {
+        let config = LaunchConfig {
+            launch_agents: true,
+            ..Default::default()
+        };
+        let wez = crate::wezterm::mock_wezterm_handle();
+        let launcher = ProcessLauncher::new(wez, config);
+        let id_map = test_pane_id_map();
+
+        let mut state = test_pane_state(1);
+        state.agent = Some(AgentMetadata {
+            agent_type: "custom_bot".into(),
+            session_id: None,
+            state: None,
+        });
+
+        let plans = launcher.plan(&id_map, &[state]);
+        match &plans[0].action {
+            LaunchAction::Manual { hint, .. } => {
+                assert!(hint.contains("Unknown agent type"));
+                assert!(hint.contains("custom_bot"));
+            }
+            other => panic!("expected Manual, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_state_warning_contains_agent_name() {
+        let config = LaunchConfig {
+            launch_agents: true,
+            ..Default::default()
+        };
+        let wez = crate::wezterm::mock_wezterm_handle();
+        let launcher = ProcessLauncher::new(wez, config);
+        let id_map = test_pane_id_map();
+
+        let mut state = test_pane_state(1);
+        state.agent = Some(AgentMetadata {
+            agent_type: "claude_code".into(),
+            session_id: None,
+            state: None,
+        });
+
+        let plans = launcher.plan(&id_map, &[state]);
+        let warning = plans[0].state_warning.as_ref().unwrap();
+        assert!(warning.contains("claude_code"));
+        assert!(warning.contains("NEW session"));
+        assert!(warning.contains("lost"));
+    }
+
+    // =========================================================================
+    // Execute — additional scenarios
+    // =========================================================================
+
+    #[tokio::test]
+    async fn execute_empty_plans() {
+        let wez = mock_with_panes(&[]).await;
+        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+        let report = launcher.execute(&[]).await;
+        assert_eq!(report.results.len(), 0);
+        assert_eq!(report.shells_launched, 0);
+        assert_eq!(report.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn execute_skip_only() {
+        let wez = mock_with_panes(&[]).await;
+        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+        let plans = vec![
+            ProcessPlan {
+                old_pane_id: 1,
+                new_pane_id: 100,
+                action: LaunchAction::Skip {
+                    reason: "disabled".into(),
+                },
+                state_warning: None,
+            },
+            ProcessPlan {
+                old_pane_id: 2,
+                new_pane_id: 200,
+                action: LaunchAction::Skip {
+                    reason: "no info".into(),
+                },
+                state_warning: None,
+            },
+        ];
+        let report = launcher.execute(&plans).await;
+        assert_eq!(report.skipped, 2);
+        assert_eq!(report.shells_launched, 0);
+        assert_eq!(report.agents_launched, 0);
+        assert_eq!(report.results.len(), 2);
+        assert!(report.results.iter().all(|r| r.success));
+    }
+
+    #[tokio::test]
+    async fn execute_manual_only() {
+        let wez = mock_with_panes(&[]).await;
+        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+        let plans = vec![ProcessPlan {
+            old_pane_id: 1,
+            new_pane_id: 100,
+            action: LaunchAction::Manual {
+                hint: "Restart vim manually".into(),
+                original_process: "vim".into(),
+            },
+            state_warning: None,
+        }];
+        let report = launcher.execute(&plans).await;
+        assert_eq!(report.manual, 1);
+        assert_eq!(report.shells_launched, 0);
+        assert!(report.results[0].success);
+    }
+
+    #[tokio::test]
+    async fn execute_agent_launch() {
+        let wez = mock_with_panes(&[100]).await;
+        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+        let plans = vec![ProcessPlan {
+            old_pane_id: 1,
+            new_pane_id: 100,
+            action: LaunchAction::LaunchAgent {
+                command: "cd /proj && claude".into(),
+                cwd: PathBuf::from("/proj"),
+                agent_type: "claude_code".into(),
+            },
+            state_warning: Some("new session warning".into()),
+        }];
+        let report = launcher.execute(&plans).await;
+        assert_eq!(report.agents_launched, 1);
+        assert_eq!(report.failed, 0);
+        assert!(report.results[0].success);
+    }
+
+    #[tokio::test]
+    async fn execute_report_result_order_preserved() {
+        let wez = mock_with_panes(&[100, 200]).await;
+        let launcher = ProcessLauncher::new(
+            wez,
+            LaunchConfig {
+                launch_delay_ms: 0,
+                ..Default::default()
+            },
+        );
+        let plans = vec![
+            ProcessPlan {
+                old_pane_id: 1,
+                new_pane_id: 100,
+                action: LaunchAction::LaunchShell {
+                    shell: "bash".into(),
+                    cwd: PathBuf::from("/a"),
+                },
+                state_warning: None,
+            },
+            ProcessPlan {
+                old_pane_id: 2,
+                new_pane_id: 200,
+                action: LaunchAction::Skip {
+                    reason: "skip".into(),
+                },
+                state_warning: None,
+            },
+        ];
+        let report = launcher.execute(&plans).await;
+        assert_eq!(report.results[0].old_pane_id, 1);
+        assert_eq!(report.results[1].old_pane_id, 2);
+    }
 }
