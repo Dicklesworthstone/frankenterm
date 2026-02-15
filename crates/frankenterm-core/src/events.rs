@@ -2962,4 +2962,500 @@ mod tests {
             );
         }
     }
+
+    // =========================================================================
+    // Batch: DarkBadger wa-1u90p.7.1 — trait & edge coverage
+    // =========================================================================
+
+    // --- UserVarPayload ---
+
+    #[test]
+    fn user_var_payload_debug_clone_serde() {
+        let p = UserVarPayload {
+            value: "test".to_string(),
+            event_type: Some("cmd".to_string()),
+            event_data: Some(serde_json::json!({"key": "val"})),
+        };
+        let cloned = p.clone();
+        assert_eq!(cloned.value, "test");
+        assert_eq!(cloned.event_type.as_deref(), Some("cmd"));
+        let dbg = format!("{:?}", p);
+        assert!(dbg.contains("UserVarPayload"));
+
+        let json = serde_json::to_string(&p).unwrap();
+        let parsed: UserVarPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.value, "test");
+        assert_eq!(parsed.event_type.as_deref(), Some("cmd"));
+    }
+
+    // --- UserVarError ---
+
+    #[test]
+    fn user_var_error_debug_clone() {
+        let e = UserVarError::WatcherNotRunning {
+            socket_path: "/tmp/test.sock".to_string(),
+        };
+        let cloned = e.clone();
+        let dbg = format!("{:?}", cloned);
+        assert!(dbg.contains("WatcherNotRunning"));
+    }
+
+    #[test]
+    fn user_var_error_display_all_variants() {
+        let e1 = UserVarError::WatcherNotRunning {
+            socket_path: "/tmp/x.sock".to_string(),
+        };
+        assert!(e1.to_string().contains("/tmp/x.sock"));
+
+        let e2 = UserVarError::IpcSendFailed {
+            message: "timeout".to_string(),
+        };
+        assert!(e2.to_string().contains("timeout"));
+
+        let e3 = UserVarError::ParseFailed("bad data".to_string());
+        assert!(e3.to_string().contains("bad data"));
+    }
+
+    #[test]
+    fn user_var_error_is_std_error() {
+        let e = UserVarError::ParseFailed("test".to_string());
+        let _: &dyn std::error::Error = &e;
+    }
+
+    // --- Event ---
+
+    #[test]
+    fn event_type_name_all_nine_variants() {
+        let events: Vec<(Event, &str)> = vec![
+            (
+                Event::SegmentCaptured {
+                    pane_id: 1,
+                    seq: 0,
+                    content_len: 0,
+                },
+                "segment_captured",
+            ),
+            (
+                Event::GapDetected {
+                    pane_id: 1,
+                    reason: "x".into(),
+                },
+                "gap_detected",
+            ),
+            (
+                Event::PatternDetected {
+                    pane_id: 1,
+                    pane_uuid: None,
+                    detection: make_detection(
+                        "test.rule",
+                        crate::patterns::Severity::Info,
+                        crate::patterns::AgentType::Codex,
+                    ),
+                    event_id: None,
+                },
+                "pattern_detected",
+            ),
+            (
+                Event::PaneDiscovered {
+                    pane_id: 1,
+                    domain: "d".into(),
+                    title: "t".into(),
+                },
+                "pane_discovered",
+            ),
+            (Event::PaneDisappeared { pane_id: 1 }, "pane_disappeared"),
+            (
+                Event::WorkflowStarted {
+                    workflow_id: "w".into(),
+                    workflow_name: "n".into(),
+                    pane_id: 1,
+                },
+                "workflow_started",
+            ),
+            (
+                Event::WorkflowStep {
+                    workflow_id: "w".into(),
+                    step_name: "s".into(),
+                    result: "ok".into(),
+                },
+                "workflow_step",
+            ),
+            (
+                Event::WorkflowCompleted {
+                    workflow_id: "w".into(),
+                    success: true,
+                    reason: None,
+                },
+                "workflow_completed",
+            ),
+            (
+                Event::UserVarReceived {
+                    pane_id: 1,
+                    name: "FT_EVENT".into(),
+                    payload: UserVarPayload {
+                        value: "x".into(),
+                        event_type: None,
+                        event_data: None,
+                    },
+                },
+                "user_var_received",
+            ),
+        ];
+        for (event, expected_name) in &events {
+            assert_eq!(
+                event.type_name(),
+                *expected_name,
+                "type_name mismatch for {:?}",
+                expected_name
+            );
+        }
+    }
+
+    #[test]
+    fn event_pane_id_all_variants() {
+        // Variants with pane_id
+        assert_eq!(
+            Event::SegmentCaptured {
+                pane_id: 42,
+                seq: 0,
+                content_len: 0
+            }
+            .pane_id(),
+            Some(42)
+        );
+        assert_eq!(Event::PaneDisappeared { pane_id: 99 }.pane_id(), Some(99));
+        // Variants without pane_id
+        assert_eq!(
+            Event::WorkflowStep {
+                workflow_id: "w".into(),
+                step_name: "s".into(),
+                result: "r".into()
+            }
+            .pane_id(),
+            None
+        );
+        assert_eq!(
+            Event::WorkflowCompleted {
+                workflow_id: "w".into(),
+                success: false,
+                reason: Some("fail".into())
+            }
+            .pane_id(),
+            None
+        );
+    }
+
+    #[test]
+    fn event_serde_segment_captured_roundtrip() {
+        let e = Event::SegmentCaptured {
+            pane_id: 1,
+            seq: 42,
+            content_len: 100,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"segment_captured\""));
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.type_name(), "segment_captured");
+    }
+
+    #[test]
+    fn event_serde_workflow_completed_with_reason() {
+        let e = Event::WorkflowCompleted {
+            workflow_id: "wf-1".into(),
+            success: false,
+            reason: Some("timeout".into()),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        if let Event::WorkflowCompleted { reason, .. } = parsed {
+            assert_eq!(reason.as_deref(), Some("timeout"));
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    // --- MetricsSnapshot ---
+
+    #[test]
+    fn metrics_snapshot_debug_clone_serde() {
+        let snap = MetricsSnapshot {
+            events_published: 100,
+            events_dropped_no_subscribers: 5,
+            active_subscribers: 3,
+            subscriber_lag_events: 2,
+        };
+        let cloned = snap.clone();
+        assert_eq!(cloned.events_published, 100);
+        let dbg = format!("{:?}", snap);
+        assert!(dbg.contains("MetricsSnapshot"));
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: MetricsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.events_published, 100);
+        assert_eq!(parsed.active_subscribers, 3);
+    }
+
+    // --- EventBusStats ---
+
+    #[test]
+    fn event_bus_stats_debug_clone_serde() {
+        let stats = EventBusStats {
+            capacity: 1000,
+            delta_queued: 10,
+            detection_queued: 5,
+            signal_queued: 2,
+            delta_subscribers: 3,
+            detection_subscribers: 1,
+            signal_subscribers: 0,
+            delta_oldest_lag_ms: Some(500),
+            detection_oldest_lag_ms: None,
+            signal_oldest_lag_ms: None,
+        };
+        let cloned = stats.clone();
+        assert_eq!(cloned.capacity, 1000);
+        let dbg = format!("{:?}", stats);
+        assert!(dbg.contains("EventBusStats"));
+
+        let json = serde_json::to_string(&stats).unwrap();
+        let parsed: EventBusStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.delta_oldest_lag_ms, Some(500));
+        assert_eq!(parsed.detection_oldest_lag_ms, None);
+    }
+
+    // --- EventBusMetrics ---
+
+    #[test]
+    fn event_bus_metrics_new_equals_default() {
+        let a = EventBusMetrics::new();
+        let b = EventBusMetrics::default();
+        assert_eq!(
+            a.events_published.load(Ordering::Relaxed),
+            b.events_published.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            a.active_subscribers.load(Ordering::Relaxed),
+            b.active_subscribers.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn event_bus_metrics_snapshot_reflects_increments() {
+        let m = EventBusMetrics::new();
+        m.events_published.fetch_add(10, Ordering::Relaxed);
+        m.subscriber_lag_events.fetch_add(3, Ordering::Relaxed);
+        let snap = m.snapshot();
+        assert_eq!(snap.events_published, 10);
+        assert_eq!(snap.subscriber_lag_events, 3);
+    }
+
+    // --- RecvError ---
+
+    #[test]
+    fn recv_error_debug_clone() {
+        let e = RecvError::Lagged { missed_count: 42 };
+        let cloned = e.clone();
+        let dbg = format!("{:?}", cloned);
+        assert!(dbg.contains("Lagged"));
+        assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn recv_error_display_both_variants() {
+        let closed = RecvError::Closed;
+        assert_eq!(closed.to_string(), "event bus closed");
+
+        let lagged = RecvError::Lagged { missed_count: 5 };
+        assert!(lagged.to_string().contains("missed 5 events"));
+    }
+
+    #[test]
+    fn recv_error_is_std_error() {
+        let e = RecvError::Closed;
+        let _: &dyn std::error::Error = &e;
+    }
+
+    // --- DedupeVerdict ---
+
+    #[test]
+    fn dedupe_verdict_debug_clone_eq() {
+        let v = DedupeVerdict::New;
+        let cloned = v.clone();
+        assert_eq!(v, cloned);
+        assert_ne!(
+            DedupeVerdict::New,
+            DedupeVerdict::Duplicate {
+                suppressed_count: 0
+            }
+        );
+        assert_eq!(
+            DedupeVerdict::Duplicate {
+                suppressed_count: 3
+            },
+            DedupeVerdict::Duplicate {
+                suppressed_count: 3
+            }
+        );
+        assert_ne!(
+            DedupeVerdict::Duplicate {
+                suppressed_count: 1
+            },
+            DedupeVerdict::Duplicate {
+                suppressed_count: 2
+            }
+        );
+    }
+
+    // --- CooldownVerdict ---
+
+    #[test]
+    fn cooldown_verdict_debug_clone_eq() {
+        let s = CooldownVerdict::Send {
+            suppressed_since_last: 0,
+        };
+        let cloned = s.clone();
+        assert_eq!(s, cloned);
+
+        let sup = CooldownVerdict::Suppress {
+            total_suppressed: 5,
+        };
+        assert_ne!(s, sup);
+        let dbg = format!("{:?}", sup);
+        assert!(dbg.contains("Suppress"));
+    }
+
+    // --- EventDeduplicator ---
+
+    #[test]
+    fn event_deduplicator_debug_clone() {
+        let d = EventDeduplicator::new();
+        let cloned = d.clone();
+        assert_eq!(cloned.len(), 0);
+        assert!(cloned.is_empty());
+        let dbg = format!("{:?}", d);
+        assert!(dbg.contains("EventDeduplicator"));
+    }
+
+    #[test]
+    fn event_deduplicator_default_equals_new() {
+        let a = EventDeduplicator::new();
+        let b = EventDeduplicator::default();
+        assert_eq!(a.len(), b.len());
+        assert!(a.is_empty());
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn event_deduplicator_clone_independence() {
+        let mut d = EventDeduplicator::new();
+        d.check("key1");
+        let mut cloned = d.clone();
+        cloned.check("key2");
+        assert_eq!(d.len(), 1);
+        assert_eq!(cloned.len(), 2);
+    }
+
+    #[test]
+    fn event_deduplicator_clear_resets() {
+        let mut d = EventDeduplicator::new();
+        d.check("a");
+        d.check("b");
+        assert_eq!(d.len(), 2);
+        d.clear();
+        assert!(d.is_empty());
+        // After clear, same key is New again
+        assert_eq!(d.check("a"), DedupeVerdict::New);
+    }
+
+    // --- NotificationCooldown ---
+
+    #[test]
+    fn notification_cooldown_debug_clone() {
+        let c = NotificationCooldown::new();
+        let cloned = c.clone();
+        assert_eq!(cloned.len(), 0);
+        assert!(cloned.is_empty());
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("NotificationCooldown"));
+    }
+
+    #[test]
+    fn notification_cooldown_default_equals_new() {
+        let a = NotificationCooldown::new();
+        let b = NotificationCooldown::default();
+        assert_eq!(a.len(), b.len());
+    }
+
+    #[test]
+    fn notification_cooldown_clear_resets() {
+        let mut c = NotificationCooldown::new();
+        c.check("k");
+        assert_eq!(c.len(), 1);
+        c.clear();
+        assert!(c.is_empty());
+    }
+
+    // --- EventFilter ---
+
+    #[test]
+    fn event_filter_debug_clone() {
+        let f = EventFilter::allow_all();
+        let cloned = f.clone();
+        let dbg = format!("{:?}", cloned);
+        assert!(dbg.contains("EventFilter"));
+    }
+
+    // --- severity_level ordering ---
+
+    #[test]
+    fn severity_level_ordering() {
+        use crate::patterns::Severity;
+        assert!(severity_level(Severity::Info) < severity_level(Severity::Warning));
+        assert!(severity_level(Severity::Warning) < severity_level(Severity::Critical));
+        assert_eq!(severity_level(Severity::Info), 0);
+        assert_eq!(severity_level(Severity::Warning), 1);
+        assert_eq!(severity_level(Severity::Critical), 2);
+    }
+
+    // --- parse_severity ---
+
+    #[test]
+    fn parse_severity_case_insensitive() {
+        use crate::patterns::Severity;
+        assert_eq!(parse_severity("INFO"), Some(Severity::Info));
+        assert_eq!(parse_severity("Warning"), Some(Severity::Warning));
+        assert_eq!(parse_severity("CRITICAL"), Some(Severity::Critical));
+        assert_eq!(parse_severity("InFo"), Some(Severity::Info));
+        assert_eq!(parse_severity("unknown"), None);
+    }
+
+    // --- parse_agent_type ---
+
+    #[test]
+    fn parse_agent_type_case_insensitive() {
+        use crate::patterns::AgentType;
+        assert_eq!(parse_agent_type("CODEX"), Some(AgentType::Codex));
+        assert_eq!(parse_agent_type("Claude_Code"), Some(AgentType::ClaudeCode));
+        assert_eq!(parse_agent_type("GEMINI"), Some(AgentType::Gemini));
+        assert_eq!(parse_agent_type("nope"), None);
+    }
+
+    // --- match_rule_glob ---
+
+    #[test]
+    fn match_rule_glob_exact_no_wildcard() {
+        assert!(match_rule_glob("codex.error", "codex.error"));
+        assert!(!match_rule_glob("codex.error", "codex.warn"));
+    }
+
+    #[test]
+    fn match_rule_glob_star_prefix() {
+        assert!(match_rule_glob("*.error", "codex.error"));
+        assert!(!match_rule_glob("*.error", "codex.warn"));
+    }
+
+    #[test]
+    fn match_rule_glob_question_mark() {
+        assert!(match_rule_glob("codex.err?r", "codex.error"));
+        assert!(!match_rule_glob("codex.err?r", "codex.errrr"));
+    }
 }

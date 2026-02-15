@@ -2048,4 +2048,303 @@ mod tests {
         assert_eq!(player.position().frame_index, 3);
         assert_eq!(sink.output, b"abc");
     }
+
+    // =========================================================================
+    // Batch: DarkBadger wa-1u90p.7.1 — trait & edge coverage
+    // =========================================================================
+
+    // --- PlayerState ---
+
+    #[test]
+    fn player_state_debug_clone_copy() {
+        let s = PlayerState::Playing;
+        let c = s; // Copy
+        let cl = s.clone();
+        assert_eq!(s, c);
+        assert_eq!(s, cl);
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("Playing"));
+    }
+
+    #[test]
+    fn player_state_eq_all_variants() {
+        assert_eq!(PlayerState::Playing, PlayerState::Playing);
+        assert_eq!(PlayerState::Paused, PlayerState::Paused);
+        assert_eq!(PlayerState::Stopped, PlayerState::Stopped);
+        assert_eq!(PlayerState::Finished, PlayerState::Finished);
+        assert_ne!(PlayerState::Playing, PlayerState::Paused);
+        assert_ne!(PlayerState::Stopped, PlayerState::Finished);
+    }
+
+    #[test]
+    fn player_state_serde_all_variants() {
+        let variants = [
+            PlayerState::Playing,
+            PlayerState::Paused,
+            PlayerState::Stopped,
+            PlayerState::Finished,
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let parsed: PlayerState = serde_json::from_str(&json).unwrap();
+            assert_eq!(&parsed, v);
+        }
+    }
+
+    // --- PlaybackPosition ---
+
+    #[test]
+    fn playback_position_debug_clone_copy() {
+        let p = PlaybackPosition {
+            frame_index: 42,
+            timestamp_ms: 1000,
+        };
+        let c = p; // Copy
+        let cl = p.clone();
+        assert_eq!(c.frame_index, 42);
+        assert_eq!(cl.timestamp_ms, 1000);
+        let dbg = format!("{:?}", p);
+        assert!(dbg.contains("PlaybackPosition"));
+    }
+
+    // --- PlaybackSpeed ---
+
+    #[test]
+    fn playback_speed_debug_clone_copy() {
+        let s = PlaybackSpeed::NORMAL;
+        let c = s; // Copy
+        let cl = s.clone();
+        assert_eq!(s, c);
+        assert_eq!(s, cl);
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("PlaybackSpeed"));
+    }
+
+    #[test]
+    fn playback_speed_const_values() {
+        assert_eq!(PlaybackSpeed::HALF.as_f32(), 0.5);
+        assert_eq!(PlaybackSpeed::NORMAL.as_f32(), 1.0);
+        assert_eq!(PlaybackSpeed::DOUBLE.as_f32(), 2.0);
+        assert_eq!(PlaybackSpeed::QUAD.as_f32(), 4.0);
+    }
+
+    #[test]
+    fn playback_speed_default_is_normal() {
+        assert_eq!(PlaybackSpeed::default(), PlaybackSpeed::NORMAL);
+    }
+
+    #[test]
+    fn playback_speed_new_zero_errors() {
+        assert!(PlaybackSpeed::new(0.0).is_err());
+        assert!(PlaybackSpeed::new(-1.0).is_err());
+    }
+
+    #[test]
+    fn playback_speed_new_positive_ok() {
+        let s = PlaybackSpeed::new(3.5).unwrap();
+        assert_eq!(s.as_f32(), 3.5);
+    }
+
+    // --- PlayerControl ---
+
+    #[test]
+    fn player_control_debug_clone_copy() {
+        let c = PlayerControl::Play;
+        let b = c; // Copy
+        let d = c.clone();
+        assert_eq!(c, b);
+        assert_eq!(c, d);
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("Play"));
+    }
+
+    #[test]
+    fn player_control_eq_all_variants() {
+        assert_eq!(PlayerControl::Play, PlayerControl::Play);
+        assert_eq!(PlayerControl::Pause, PlayerControl::Pause);
+        assert_eq!(PlayerControl::Stop, PlayerControl::Stop);
+        assert_eq!(
+            PlayerControl::SetSpeed(PlaybackSpeed::DOUBLE),
+            PlayerControl::SetSpeed(PlaybackSpeed::DOUBLE)
+        );
+        assert_ne!(PlayerControl::Play, PlayerControl::Pause);
+    }
+
+    // --- DecodedFrame ---
+
+    #[test]
+    fn decoded_frame_debug_clone_all_variants() {
+        let variants: Vec<DecodedFrame> = vec![
+            DecodedFrame::Output(b"hello".to_vec()),
+            DecodedFrame::Resize { cols: 80, rows: 24 },
+            DecodedFrame::Event(serde_json::json!({"key": "val"})),
+            DecodedFrame::Marker("test".to_string()),
+            DecodedFrame::Input(b"input".to_vec()),
+        ];
+        for v in &variants {
+            let cloned = v.clone();
+            let dbg = format!("{:?}", cloned);
+            assert!(!dbg.is_empty());
+        }
+    }
+
+    // --- ExportFormat ---
+
+    #[test]
+    fn export_format_debug_clone_copy_eq() {
+        let f = ExportFormat::Asciinema;
+        let c = f; // Copy
+        let cl = f.clone();
+        assert_eq!(f, c);
+        assert_eq!(f, cl);
+        assert_ne!(ExportFormat::Asciinema, ExportFormat::Html);
+        let dbg = format!("{:?}", f);
+        assert!(dbg.contains("Asciinema"));
+    }
+
+    // --- ExportOptions ---
+
+    #[test]
+    fn export_options_debug_clone() {
+        let opts = ExportOptions::default();
+        let cloned = opts.clone();
+        assert_eq!(cloned.cols, 80);
+        assert_eq!(cloned.rows, 24);
+        assert!(cloned.redact);
+        assert!(cloned.extra_redact_patterns.is_empty());
+        assert!(cloned.title.is_none());
+        let dbg = format!("{:?}", opts);
+        assert!(dbg.contains("ExportOptions"));
+    }
+
+    #[test]
+    fn export_options_clone_independence() {
+        let mut opts = ExportOptions::default();
+        opts.extra_redact_patterns.push("secret.*".to_string());
+        let cloned = opts.clone();
+        opts.extra_redact_patterns.clear();
+        assert_eq!(cloned.extra_redact_patterns.len(), 1);
+    }
+
+    // --- RecordingInfo ---
+
+    #[test]
+    fn recording_info_debug_clone() {
+        let data = build_recording(&[(0, FrameType::Output, b"hi".to_vec())]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        let info = rec.info();
+        let cloned = info.clone();
+        assert_eq!(cloned.frame_count, 1);
+        assert_eq!(cloned.output_frames, 1);
+        let dbg = format!("{:?}", info);
+        assert!(dbg.contains("RecordingInfo"));
+    }
+
+    #[test]
+    fn recording_info_serialize() {
+        let data = build_recording(&[(0, FrameType::Output, b"hi".to_vec())]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        let info = rec.info();
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"frame_count\":1"));
+        assert!(json.contains("\"output_frames\":1"));
+    }
+
+    // --- Recording ---
+
+    #[test]
+    fn recording_debug_clone() {
+        let data = build_recording(&[(0, FrameType::Output, b"x".to_vec())]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        let cloned = rec.clone();
+        assert_eq!(cloned.frames.len(), 1);
+        assert_eq!(cloned.duration_ms, rec.duration_ms);
+        let dbg = format!("{:?}", rec);
+        assert!(dbg.contains("Recording"));
+    }
+
+    // --- CollectorSink ---
+
+    #[test]
+    fn collector_sink_default() {
+        let sink = CollectorSink::default();
+        assert!(sink.output.is_empty());
+        assert!(sink.events.is_empty());
+        assert!(sink.markers.is_empty());
+    }
+
+    #[test]
+    fn collector_sink_collects_all_types() {
+        let mut sink = CollectorSink::new();
+        sink.write_output(b"hello").unwrap();
+        sink.show_event(&serde_json::json!({"a": 1})).unwrap();
+        sink.show_marker("mark").unwrap();
+        assert_eq!(sink.output, b"hello");
+        assert_eq!(sink.events.len(), 1);
+        assert_eq!(sink.markers, vec!["mark"]);
+    }
+
+    // --- HeadlessSink ---
+
+    #[test]
+    fn headless_sink_discards_all() {
+        let mut sink = HeadlessSink;
+        assert!(sink.write_output(b"data").is_ok());
+        assert!(sink.show_event(&serde_json::json!(null)).is_ok());
+        assert!(sink.show_marker("").is_ok());
+    }
+
+    // --- parse_duration_ms edge cases ---
+
+    #[test]
+    fn parse_duration_ms_zero() {
+        assert_eq!(parse_duration_ms("0").unwrap(), 0);
+        assert_eq!(parse_duration_ms("0s").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_duration_ms_decimal_seconds() {
+        assert_eq!(parse_duration_ms("1.5s").unwrap(), 1500);
+        assert_eq!(parse_duration_ms("0.1s").unwrap(), 100);
+    }
+
+    #[test]
+    fn parse_duration_ms_unknown_unit_errors() {
+        assert!(parse_duration_ms("5d").is_err());
+        assert!(parse_duration_ms("10x").is_err());
+    }
+
+    #[test]
+    fn parse_duration_ms_whitespace_trimmed() {
+        assert_eq!(parse_duration_ms("  90  ").unwrap(), 90);
+        assert_eq!(parse_duration_ms("  2s  ").unwrap(), 2000);
+    }
+
+    // --- html_escape ---
+
+    #[test]
+    fn html_escape_empty_string() {
+        assert_eq!(html_escape(""), "");
+    }
+
+    #[test]
+    fn html_escape_no_special_chars() {
+        assert_eq!(html_escape("hello world"), "hello world");
+    }
+
+    #[test]
+    fn html_escape_all_special_chars() {
+        assert_eq!(html_escape("&<>\"'"), "&amp;&lt;&gt;&quot;&#39;");
+    }
+
+    // --- find_terminal_size ---
+
+    #[test]
+    fn find_terminal_size_zero_dims_skipped() {
+        let zero_payload = vec![0u8, 0, 0, 0]; // cols=0, rows=0
+        let data = build_recording(&[(0, FrameType::Resize, zero_payload)]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        let (cols, rows) = find_terminal_size(&rec, 80, 24);
+        assert_eq!((cols, rows), (80, 24)); // falls through to defaults
+    }
 }
