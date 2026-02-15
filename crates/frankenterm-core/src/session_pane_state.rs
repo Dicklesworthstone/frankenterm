@@ -851,7 +851,7 @@ mod tests {
             argv: Some(vec![
                 "claude-code".to_string(),
                 "--flag".to_string(),
-                "".to_string(),
+                String::new(),
             ]),
         };
         let json = serde_json::to_string(&p).unwrap();
@@ -1030,12 +1030,11 @@ mod tests {
     #[test]
     fn size_budget_only_argv_large_removes_env_first() {
         // Snapshot with no env but large argv still under budget is not truncated
-        let snapshot = PaneStateSnapshot::new(0, 1000, make_terminal())
-            .with_process(ProcessInfo {
-                name: "test".to_string(),
-                pid: Some(1),
-                argv: Some(vec!["arg".to_string(); 10]),
-            });
+        let snapshot = PaneStateSnapshot::new(0, 1000, make_terminal()).with_process(ProcessInfo {
+            name: "test".to_string(),
+            pid: Some(1),
+            argv: Some(vec!["arg".to_string(); 10]),
+        });
         let (_, truncated) = snapshot.to_json_budgeted().unwrap();
         assert!(!truncated);
     }
@@ -1043,12 +1042,11 @@ mod tests {
     #[test]
     fn size_budget_only_argv_oversized_no_env_to_remove() {
         // Snapshot with no env but argv so large it exceeds budget
-        let snapshot = PaneStateSnapshot::new(0, 1000, make_terminal())
-            .with_process(ProcessInfo {
-                name: "test".to_string(),
-                pid: Some(1),
-                argv: Some(vec!["x".repeat(70_000)]),
-            });
+        let snapshot = PaneStateSnapshot::new(0, 1000, make_terminal()).with_process(ProcessInfo {
+            name: "test".to_string(),
+            pid: Some(1),
+            argv: Some(vec!["x".repeat(70_000)]),
+        });
         let (json, truncated) = snapshot.to_json_budgeted().unwrap();
         assert!(truncated);
         // argv should be removed in the result
@@ -1208,10 +1206,7 @@ mod tests {
 
         let vars = vec![
             ("FT_WORKSPACE".to_string(), "/workspace".to_string()),
-            (
-                "FT_OUTPUT_FORMAT".to_string(),
-                "json".to_string(),
-            ),
+            ("FT_OUTPUT_FORMAT".to_string(), "json".to_string()),
             ("FT_CUSTOM".to_string(), "not_safe".to_string()),
         ];
         let env = capture_env_from_iter(vars.into_iter());
@@ -1246,14 +1241,18 @@ mod tests {
 
     #[test]
     fn snapshot_zero_ids_roundtrip() {
-        let snapshot = PaneStateSnapshot::new(0, 0, TerminalState {
-            rows: 1,
-            cols: 1,
-            cursor_row: 0,
-            cursor_col: 0,
-            is_alt_screen: false,
-            title: String::new(),
-        });
+        let snapshot = PaneStateSnapshot::new(
+            0,
+            0,
+            TerminalState {
+                rows: 1,
+                cols: 1,
+                cursor_row: 0,
+                cursor_col: 0,
+                is_alt_screen: false,
+                title: String::new(),
+            },
+        );
         let json = snapshot.to_json().unwrap();
         let restored = PaneStateSnapshot::from_json(&json).unwrap();
         assert_eq!(restored.pane_id, 0);

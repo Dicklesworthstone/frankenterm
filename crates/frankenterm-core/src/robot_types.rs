@@ -1948,7 +1948,7 @@ mod tests {
     fn error_code_clone_copy_eq_hash() {
         let a = ErrorCode::DatabaseLocked;
         let b = a; // Copy
-        let c = a.clone(); // Clone
+        let c = a; // Clone (Copy type)
         assert_eq!(a, b);
         assert_eq!(b, c);
 
@@ -1991,8 +1991,7 @@ mod tests {
             now: 1700000000000,
         };
         let serialized = serde_json::to_string(&original).unwrap();
-        let deserialized: RobotResponse<GetTextData> =
-            serde_json::from_str(&serialized).unwrap();
+        let deserialized: RobotResponse<GetTextData> = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized.ok, original.ok);
         assert_eq!(deserialized.elapsed_ms, 7);
         assert_eq!(deserialized.version, "1.0.0");
@@ -2413,9 +2412,7 @@ mod tests {
             advisory.warning.as_deref(),
             Some("Account approaching quota limit")
         );
-        assert!(
-            (advisory.selected_percent_remaining.unwrap() - 12.0).abs() < f64::EPSILON
-        );
+        assert!((advisory.selected_percent_remaining.unwrap() - 12.0).abs() < f64::EPSILON);
     }
 
     #[test]

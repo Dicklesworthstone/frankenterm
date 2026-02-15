@@ -1930,4 +1930,525 @@ mod tests {
     fn schema_version_constant() {
         assert_eq!(RECORDER_EVENT_SCHEMA_VERSION_V1, "ft.recorder.event.v1");
     }
+
+    // ========================================================================
+    // Batch 3: RubyBeaver — expanded inline unit tests
+    // ========================================================================
+
+    #[test]
+    fn frame_type_serde_roundtrip() {
+        let variants = [
+            FrameType::Output,
+            FrameType::Resize,
+            FrameType::Event,
+            FrameType::Marker,
+            FrameType::Input,
+        ];
+        for v in variants {
+            let serialized = serde_json::to_value(v).unwrap();
+            let deserialized: FrameType = serde_json::from_value(serialized.clone()).unwrap();
+            assert_eq!(v, deserialized, "roundtrip failed for {:?}", v);
+        }
+    }
+
+    #[test]
+    fn frame_type_copy_semantics() {
+        let a = FrameType::Marker;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        // Verify all variants can be copied and remain equal
+        let c = FrameType::Input;
+        let d = c;
+        assert_eq!(c, d);
+    }
+
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn recorder_state_copy_semantics() {
+        let a = RecorderState::Idle;
+        let b = a; // Copy
+        assert_eq!(a, b);
+
+        let c = RecorderState::Recording;
+        let d = c;
+        assert_eq!(c, d);
+
+        let e = RecorderState::Paused;
+        let f = e;
+        assert_eq!(e, f);
+
+        let g = RecorderState::Stopped;
+        let h = g;
+        assert_eq!(g, h);
+    }
+
+    #[test]
+    fn recorder_state_eq_all_variants() {
+        let variants = [
+            RecorderState::Idle,
+            RecorderState::Recording,
+            RecorderState::Paused,
+            RecorderState::Stopped,
+        ];
+        // Each variant is equal to itself and distinct from all others
+        for (i, a) in variants.iter().enumerate() {
+            assert_eq!(a, a);
+            for (j, b) in variants.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b, "variant {} should equal itself", i);
+                } else {
+                    assert_ne!(a, b, "variant {} should differ from variant {}", i, j);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recording_options_clone() {
+        let original = RecordingOptions {
+            flush_threshold: 128,
+            redact_output: false,
+            redact_events: true,
+        };
+        let cloned = original;
+        assert_eq!(original, cloned);
+        assert_eq!(cloned.flush_threshold, 128);
+        assert!(!cloned.redact_output);
+        assert!(cloned.redact_events);
+    }
+
+    #[test]
+    fn recording_options_debug() {
+        let opts = RecordingOptions::default();
+        let debug_str = format!("{:?}", opts);
+        assert!(
+            debug_str.contains("RecordingOptions"),
+            "Debug output should contain type name, got: {}",
+            debug_str
+        );
+    }
+
+    #[test]
+    fn recorder_event_source_serde_roundtrip() {
+        let variants = [
+            RecorderEventSource::WeztermMux,
+            RecorderEventSource::RobotMode,
+            RecorderEventSource::WorkflowEngine,
+            RecorderEventSource::OperatorAction,
+            RecorderEventSource::RecoveryFlow,
+        ];
+        for v in variants {
+            let json_val = serde_json::to_value(v).unwrap();
+            let back: RecorderEventSource = serde_json::from_value(json_val).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn recorder_text_encoding_serde_roundtrip() {
+        let enc = RecorderTextEncoding::Utf8;
+        let json_val = serde_json::to_value(enc).unwrap();
+        assert_eq!(json_val, json!("utf8"));
+        let back: RecorderTextEncoding = serde_json::from_value(json_val).unwrap();
+        assert_eq!(enc, back);
+    }
+
+    #[test]
+    fn recorder_redaction_level_serde_roundtrip() {
+        let variants = [
+            RecorderRedactionLevel::None,
+            RecorderRedactionLevel::Partial,
+            RecorderRedactionLevel::Full,
+        ];
+        for v in variants {
+            let json_val = serde_json::to_value(v).unwrap();
+            let back: RecorderRedactionLevel = serde_json::from_value(json_val).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn recorder_ingress_kind_serde_roundtrip() {
+        let variants = [
+            RecorderIngressKind::SendText,
+            RecorderIngressKind::Paste,
+            RecorderIngressKind::WorkflowAction,
+        ];
+        for v in variants {
+            let json_val = serde_json::to_value(v).unwrap();
+            let back: RecorderIngressKind = serde_json::from_value(json_val).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn recorder_segment_kind_serde_roundtrip() {
+        let variants = [
+            RecorderSegmentKind::Delta,
+            RecorderSegmentKind::Gap,
+            RecorderSegmentKind::Snapshot,
+        ];
+        for v in variants {
+            let json_val = serde_json::to_value(v).unwrap();
+            let back: RecorderSegmentKind = serde_json::from_value(json_val).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn recorder_control_marker_type_serde_roundtrip() {
+        let variants = [
+            RecorderControlMarkerType::PromptBoundary,
+            RecorderControlMarkerType::Resize,
+            RecorderControlMarkerType::PolicyDecision,
+            RecorderControlMarkerType::ApprovalCheckpoint,
+        ];
+        for v in variants {
+            let json_val = serde_json::to_value(v).unwrap();
+            let back: RecorderControlMarkerType = serde_json::from_value(json_val).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn recorder_lifecycle_phase_serde_roundtrip() {
+        let variants = [
+            RecorderLifecyclePhase::CaptureStarted,
+            RecorderLifecyclePhase::CaptureStopped,
+            RecorderLifecyclePhase::PaneOpened,
+            RecorderLifecyclePhase::PaneClosed,
+            RecorderLifecyclePhase::ReplayStarted,
+            RecorderLifecyclePhase::ReplayFinished,
+        ];
+        for v in variants {
+            let json_val = serde_json::to_value(v).unwrap();
+            let back: RecorderLifecyclePhase = serde_json::from_value(json_val).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn recorder_event_causality_serde_roundtrip() {
+        let causality = RecorderEventCausality {
+            parent_event_id: Some("parent-abc".into()),
+            trigger_event_id: Some("trigger-def".into()),
+            root_event_id: Some("root-ghi".into()),
+        };
+        let json_str = serde_json::to_string(&causality).unwrap();
+        let back: RecorderEventCausality = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(causality, back);
+
+        // Also verify all-None case
+        let empty = RecorderEventCausality {
+            parent_event_id: None,
+            trigger_event_id: None,
+            root_event_id: None,
+        };
+        let json_str2 = serde_json::to_string(&empty).unwrap();
+        let back2: RecorderEventCausality = serde_json::from_str(&json_str2).unwrap();
+        assert_eq!(empty, back2);
+    }
+
+    #[test]
+    fn recorder_event_payload_ingress_serde_roundtrip() {
+        let payload = RecorderEventPayload::IngressText {
+            text: "echo hello".into(),
+            encoding: RecorderTextEncoding::Utf8,
+            redaction: RecorderRedactionLevel::Partial,
+            ingress_kind: RecorderIngressKind::Paste,
+        };
+        let json_str = serde_json::to_string(&payload).unwrap();
+        let back: RecorderEventPayload = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(payload, back);
+    }
+
+    #[test]
+    fn recorder_event_payload_egress_serde_roundtrip() {
+        let payload = RecorderEventPayload::EgressOutput {
+            text: "drwxr-xr-x  2 user user".into(),
+            encoding: RecorderTextEncoding::Utf8,
+            redaction: RecorderRedactionLevel::Full,
+            segment_kind: RecorderSegmentKind::Snapshot,
+            is_gap: true,
+        };
+        let json_str = serde_json::to_string(&payload).unwrap();
+        let back: RecorderEventPayload = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(payload, back);
+    }
+
+    #[test]
+    fn recorder_event_serde_roundtrip() {
+        let event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.into(),
+            event_id: "evt-roundtrip".into(),
+            pane_id: 7,
+            session_id: Some("sess-rt".into()),
+            workflow_id: Some("wf-rt".into()),
+            correlation_id: Some("corr-rt".into()),
+            source: RecorderEventSource::WorkflowEngine,
+            occurred_at_ms: 5000,
+            recorded_at_ms: 5001,
+            sequence: 42,
+            causality: RecorderEventCausality {
+                parent_event_id: Some("parent-rt".into()),
+                trigger_event_id: None,
+                root_event_id: Some("root-rt".into()),
+            },
+            payload: RecorderEventPayload::EgressOutput {
+                text: "output data".into(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                segment_kind: RecorderSegmentKind::Delta,
+                is_gap: false,
+            },
+        };
+        let json_str = serde_json::to_string(&event).unwrap();
+        let back: RecorderEvent = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn parse_recorder_event_json_valid_roundtrip() {
+        let event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.into(),
+            event_id: "parse-valid-rt".into(),
+            pane_id: 10,
+            session_id: None,
+            workflow_id: None,
+            correlation_id: None,
+            source: RecorderEventSource::RecoveryFlow,
+            occurred_at_ms: 999,
+            recorded_at_ms: 1000,
+            sequence: 0,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload: RecorderEventPayload::ControlMarker {
+                control_marker_type: RecorderControlMarkerType::PromptBoundary,
+                details: json!({"prompt": "$ "}),
+            },
+        };
+        let json_str = serde_json::to_string(&event).unwrap();
+        let parsed = parse_recorder_event_json(&json_str).unwrap();
+        assert_eq!(parsed.event_id, "parse-valid-rt");
+        assert_eq!(parsed.source, RecorderEventSource::RecoveryFlow);
+        assert_eq!(parsed.schema_version, RECORDER_EVENT_SCHEMA_VERSION_V1);
+    }
+
+    #[test]
+    fn parse_recorder_event_json_wrong_version_roundtrip() {
+        let bad_json = json!({
+            "schema_version": "ft.recorder.event.v2",
+            "event_id": "bad-version",
+            "pane_id": 1,
+            "session_id": null,
+            "workflow_id": null,
+            "correlation_id": null,
+            "source": "robot_mode",
+            "occurred_at_ms": 0,
+            "recorded_at_ms": 0,
+            "sequence": 0,
+            "causality": {
+                "parent_event_id": null,
+                "trigger_event_id": null,
+                "root_event_id": null
+            },
+            "event_type": "ingress_text",
+            "text": "x",
+            "encoding": "utf8",
+            "redaction": "none",
+            "ingress_kind": "send_text"
+        });
+        let result = parse_recorder_event_json(&bad_json.to_string());
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("v2"),
+            "error should mention wrong version, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn parse_recorder_event_json_missing_version() {
+        let no_version = json!({
+            "event_id": "no-ver",
+            "pane_id": 1,
+            "source": "robot_mode",
+            "occurred_at_ms": 0,
+            "recorded_at_ms": 0,
+            "sequence": 0,
+            "causality": {
+                "parent_event_id": null,
+                "trigger_event_id": null,
+                "root_event_id": null
+            },
+            "event_type": "ingress_text",
+            "text": "x",
+            "encoding": "utf8",
+            "redaction": "none",
+            "ingress_kind": "send_text"
+        });
+        let result = parse_recorder_event_json(&no_version.to_string());
+        assert!(result.is_err(), "missing schema_version should be rejected");
+    }
+
+    #[test]
+    fn ingress_outcome_clone_debug() {
+        let variants: Vec<IngressOutcome> = vec![
+            IngressOutcome::Allowed,
+            IngressOutcome::Denied {
+                reason: "blocked by policy".into(),
+            },
+            IngressOutcome::RequiresApproval,
+            IngressOutcome::Error {
+                error: "connection lost".into(),
+            },
+        ];
+        for v in &variants {
+            let cloned = v.clone();
+            assert_eq!(v, &cloned);
+            let debug_str = format!("{:?}", v);
+            assert!(!debug_str.is_empty());
+        }
+        // Verify Debug output contains variant-specific info
+        let denied_debug = format!("{:?}", variants[1]);
+        assert!(
+            denied_debug.contains("Denied"),
+            "Debug should contain variant name, got: {}",
+            denied_debug
+        );
+        let error_debug = format!("{:?}", variants[3]);
+        assert!(
+            error_debug.contains("connection lost"),
+            "Debug should contain error message, got: {}",
+            error_debug
+        );
+    }
+
+    #[test]
+    fn ingress_event_clone() {
+        let event = IngressEvent {
+            pane_id: 99,
+            text: "test-clone".into(),
+            source: RecorderEventSource::OperatorAction,
+            ingress_kind: RecorderIngressKind::Paste,
+            redaction: RecorderRedactionLevel::Full,
+            occurred_at_ms: 12345,
+            outcome: IngressOutcome::RequiresApproval,
+            workflow_id: Some("wf-clone".into()),
+        };
+        let cloned = event.clone();
+        assert_eq!(cloned.pane_id, 99);
+        assert_eq!(cloned.text, "test-clone");
+        assert_eq!(cloned.source, RecorderEventSource::OperatorAction);
+        assert_eq!(cloned.ingress_kind, RecorderIngressKind::Paste);
+        assert_eq!(cloned.redaction, RecorderRedactionLevel::Full);
+        assert_eq!(cloned.occurred_at_ms, 12345);
+        assert_eq!(cloned.outcome, IngressOutcome::RequiresApproval);
+        assert_eq!(cloned.workflow_id, Some("wf-clone".into()));
+    }
+
+    #[test]
+    fn global_sequence_monotonic_batch3() {
+        let seq = GlobalSequence::new();
+        let mut prev = seq.next();
+        for _ in 0..100 {
+            let current = seq.next();
+            assert!(
+                current > prev,
+                "sequence should be strictly monotonic: {} > {}",
+                current,
+                prev
+            );
+            prev = current;
+        }
+    }
+
+    #[test]
+    fn global_sequence_default_batch3() {
+        let seq = GlobalSequence::default();
+        let first = seq.next();
+        assert_eq!(first, 0, "default sequence should start at 0");
+        let second = seq.next();
+        assert_eq!(second, 1);
+    }
+
+    #[test]
+    fn captured_kind_to_segment_all_variants() {
+        // Delta variant
+        let (kind, is_gap) = captured_kind_to_segment(&CapturedSegmentKind::Delta);
+        assert_eq!(kind, RecorderSegmentKind::Delta);
+        assert!(!is_gap);
+
+        // Gap variant
+        let gap = CapturedSegmentKind::Gap {
+            reason: "poll timeout".into(),
+        };
+        let (kind2, is_gap2) = captured_kind_to_segment(&gap);
+        assert_eq!(kind2, RecorderSegmentKind::Gap);
+        assert!(is_gap2);
+    }
+
+    #[test]
+    fn collecting_egress_tap_accumulates_batch3() {
+        let tap = CollectingEgressTap::new();
+        assert!(tap.is_empty());
+        assert_eq!(tap.len(), 0);
+
+        for i in 0..5u64 {
+            tap.on_egress(EgressEvent {
+                pane_id: i,
+                text: format!("output-{}", i),
+                segment_kind: RecorderSegmentKind::Delta,
+                is_gap: false,
+                gap_reason: None,
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                occurred_at_ms: i * 100,
+                sequence: i,
+                global_sequence: i,
+            });
+        }
+
+        assert_eq!(tap.len(), 5);
+        assert!(!tap.is_empty());
+
+        let events = tap.events();
+        assert_eq!(events.len(), 5);
+        for (i, ev) in events.iter().enumerate() {
+            assert_eq!(ev.pane_id, i as u64);
+            assert_eq!(ev.text, format!("output-{}", i));
+        }
+    }
+
+    #[test]
+    fn egress_noop_tap_is_zero_cost() {
+        let tap = EgressNoopTap;
+        // Call with various segment kinds; should never panic
+        for kind in [
+            RecorderSegmentKind::Delta,
+            RecorderSegmentKind::Gap,
+            RecorderSegmentKind::Snapshot,
+        ] {
+            tap.on_egress(EgressEvent {
+                pane_id: 0,
+                text: String::new(),
+                segment_kind: kind,
+                is_gap: kind == RecorderSegmentKind::Gap,
+                gap_reason: if kind == RecorderSegmentKind::Gap {
+                    Some("test".into())
+                } else {
+                    None
+                },
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                occurred_at_ms: 0,
+                sequence: 0,
+                global_sequence: 0,
+            });
+        }
+    }
 }

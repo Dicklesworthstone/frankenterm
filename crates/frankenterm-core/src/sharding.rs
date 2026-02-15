@@ -1988,7 +1988,7 @@ mod tests {
         // using the raw pane_id on the only backend. The collect_panes call
         // will find pane 42, so 42 should be routable.
         let text = client.get_text(42, false).await.unwrap();
-        assert!(text.is_empty() || text.len() >= 0); // Just verify no error
+        let _ = text; // Just verify no error (get_text succeeded)
     }
 
     #[tokio::test]

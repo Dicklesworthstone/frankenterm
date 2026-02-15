@@ -2272,7 +2272,7 @@ mod tests {
     #[test]
     fn export_kind_clone_and_copy() {
         let kind = ExportKind::Events;
-        let cloned = kind.clone();
+        let cloned = kind;
         let copied = kind; // Copy
         assert_eq!(kind, cloned);
         assert_eq!(kind, copied);
@@ -2363,7 +2363,9 @@ mod tests {
             id: 1,
             pane_id: 1,
             seq: 1,
-            content: "CJK chars: \u{4e16}\u{754c}; emoji: \u{1f680}; accents: \u{00e9}\u{00e8}\u{00ea}".to_string(),
+            content:
+                "CJK chars: \u{4e16}\u{754c}; emoji: \u{1f680}; accents: \u{00e9}\u{00e8}\u{00ea}"
+                    .to_string(),
             content_len: 30,
             content_hash: None,
             captured_at: 1000,
@@ -2384,7 +2386,7 @@ mod tests {
             id: 1,
             pane_id: 1,
             seq: 1,
-            content: "".to_string(),
+            content: String::new(),
             content_len: 0,
             content_hash: None,
             captured_at: 1000,
@@ -2444,7 +2446,7 @@ mod tests {
         );
         // Both should deserialize to the same value
         let compact_val: serde_json::Value =
-            serde_json::from_str(&String::from_utf8(compact_buf).unwrap().trim()).unwrap();
+            serde_json::from_str(String::from_utf8(compact_buf).unwrap().trim()).unwrap();
         // Pretty has multiple lines; join them for parsing
         let pretty_str = String::from_utf8(pretty_buf).unwrap();
         let pretty_val: serde_json::Value = serde_json::from_str(pretty_str.trim()).unwrap();
@@ -2458,7 +2460,7 @@ mod tests {
             id: 1,
             pane_id: 1,
             seq: 1,
-            content: "".to_string(),
+            content: String::new(),
             content_len: 0,
             content_hash: None,
             captured_at: 1000,
@@ -2510,7 +2512,9 @@ mod tests {
             step_id: Some("step-abc".to_string()),
             step_kind: Some("action".to_string()),
             result_type: "success".to_string(),
-            result_data: Some("secret sk-abc123def456ghi789jkl012mno345pqr678stu901v leaked".to_string()),
+            result_data: Some(
+                "secret sk-abc123def456ghi789jkl012mno345pqr678stu901v leaked".to_string(),
+            ),
             policy_summary: Some("clean summary no secrets".to_string()),
             verification_refs: Some("[ref1, ref2]".to_string()),
             error_code: Some("E001".to_string()),
@@ -2565,10 +2569,7 @@ mod tests {
             ExportKind::from_str_loose("Reserves"),
             Some(ExportKind::Reservations)
         );
-        assert_eq!(
-            ExportKind::from_str_loose("Gap"),
-            Some(ExportKind::Gaps)
-        );
+        assert_eq!(ExportKind::from_str_loose("Gap"), Some(ExportKind::Gaps));
         assert_eq!(
             ExportKind::from_str_loose("Workflow"),
             Some(ExportKind::Workflows)
@@ -2746,7 +2747,8 @@ mod tests {
             let mut buf = Vec::new();
             let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
             assert_eq!(
-                count, 0,
+                count,
+                0,
                 "Empty DB should have 0 records for kind {}",
                 kind.as_str()
             );
@@ -2760,7 +2762,8 @@ mod tests {
                 kind.as_str()
             );
             assert_eq!(
-                header["record_count"], 0,
+                header["record_count"],
+                0,
                 "Header record_count should be 0 for {}",
                 kind.as_str()
             );

@@ -972,10 +972,7 @@ mod tests {
 
     #[test]
     fn action_display_all_variants() {
-        assert_eq!(
-            format!("{}", TriageAction::ForceKill),
-            "force_kill"
-        );
+        assert_eq!(format!("{}", TriageAction::ForceKill), "force_kill");
         assert_eq!(format!("{}", TriageAction::Renice), "renice");
         assert_eq!(format!("{}", TriageAction::Protect), "protect");
         assert_eq!(
@@ -1064,7 +1061,7 @@ mod tests {
         let cfg = TriageConfig::default();
         let cfg2 = cfg.clone();
         assert!(cfg2.enabled);
-        assert_eq!(cfg2.stuck_test_hours, cfg.stuck_test_hours);
+        assert!((cfg2.stuck_test_hours - cfg.stuck_test_hours).abs() < f64::EPSILON);
     }
 
     #[test]

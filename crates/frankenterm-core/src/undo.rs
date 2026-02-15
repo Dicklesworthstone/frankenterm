@@ -1594,7 +1594,7 @@ mod tests {
             undoable: true,
             undo_strategy: "manual".to_string(),
             undo_hint: None,
-            undo_payload: Some("".to_string()),
+            undo_payload: Some(String::new()),
             undone_at: None,
             undone_by: None,
         };
