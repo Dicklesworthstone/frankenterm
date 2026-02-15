@@ -657,4 +657,417 @@ mod tests {
         let result = load_profile_by_name(&dir, None, "nonexistent");
         assert!(result.is_err());
     }
+
+    // =========================================================================
+    // Serde roundtrip tests
+    // =========================================================================
+
+    #[test]
+    fn ruleset_manifest_serde_roundtrip() {
+        let manifest = RulesetManifest {
+            version: RULESET_MANIFEST_VERSION,
+            rulesets: vec![RulesetManifestEntry {
+                name: "ci-ops".to_string(),
+                path: "ci-ops.toml".to_string(),
+                description: Some("CI operations profile".to_string()),
+                created_at: Some(1000),
+                updated_at: Some(2000),
+                last_applied_at: Some(2000),
+            }],
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let back: RulesetManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.version, RULESET_MANIFEST_VERSION);
+        assert_eq!(back.rulesets.len(), 1);
+        assert_eq!(back.rulesets[0].name, "ci-ops");
+        assert_eq!(back.rulesets[0].description.as_deref(), Some("CI operations profile"));
+    }
+
+    #[test]
+    fn ruleset_manifest_serde_default_fills_missing() {
+        let back: RulesetManifest = serde_json::from_str("{}").unwrap();
+        assert_eq!(back.version, RULESET_MANIFEST_VERSION);
+        assert!(back.rulesets.is_empty());
+    }
+
+    #[test]
+    fn ruleset_manifest_entry_serde_default() {
+        let back: RulesetManifestEntry = serde_json::from_str("{}").unwrap();
+        assert!(back.name.is_empty());
+        assert!(back.path.is_empty());
+        assert!(back.description.is_none());
+        assert!(back.created_at.is_none());
+        assert!(back.updated_at.is_none());
+        assert!(back.last_applied_at.is_none());
+    }
+
+    #[test]
+    fn ruleset_profile_file_serde_roundtrip() {
+        let profile = RulesetProfileFile {
+            name: "staging".to_string(),
+            description: Some("Staging rules".to_string()),
+            inherits: Some("default".to_string()),
+            patterns: PatternsConfigPatch::default(),
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        let back: RulesetProfileFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "staging");
+        assert_eq!(back.inherits.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn patterns_config_patch_serde_roundtrip() {
+        let patch = PatternsConfigPatch {
+            packs: Some(vec!["agent-codex".to_string()]),
+            pack_overrides: Some(HashMap::new()),
+            quick_reject_enabled: Some(true),
+        };
+        let json = serde_json::to_string(&patch).unwrap();
+        let back: PatternsConfigPatch = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.packs.as_ref().unwrap().len(), 1);
+        assert_eq!(back.quick_reject_enabled, Some(true));
+    }
+
+    #[test]
+    fn ruleset_profile_summary_serializes() {
+        let summary = RulesetProfileSummary {
+            name: "ops".to_string(),
+            description: Some("Ops rules".to_string()),
+            path: Some("ops.toml".to_string()),
+            last_applied_at: Some(5000),
+            implicit: false,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("ops"));
+        assert!(json.contains("5000"));
+    }
+
+    // =========================================================================
+    // Default value tests
+    // =========================================================================
+
+    #[test]
+    fn ruleset_manifest_default() {
+        let m = RulesetManifest::default();
+        assert_eq!(m.version, RULESET_MANIFEST_VERSION);
+        assert!(m.rulesets.is_empty());
+    }
+
+    #[test]
+    fn ruleset_manifest_entry_default() {
+        let e = RulesetManifestEntry::default();
+        assert!(e.name.is_empty());
+        assert!(e.path.is_empty());
+        assert!(e.description.is_none());
+    }
+
+    #[test]
+    fn patterns_config_patch_default() {
+        let p = PatternsConfigPatch::default();
+        assert!(p.packs.is_none());
+        assert!(p.pack_overrides.is_none());
+        assert!(p.quick_reject_enabled.is_none());
+    }
+
+    #[test]
+    fn ruleset_profile_file_default() {
+        let f = RulesetProfileFile::default();
+        assert!(f.name.is_empty());
+        assert!(f.description.is_none());
+        assert!(f.inherits.is_none());
+    }
+
+    // =========================================================================
+    // touch_last_applied edge cases
+    // =========================================================================
+
+    #[test]
+    fn touch_last_applied_multiple_entries_only_updates_target() {
+        let mut manifest = RulesetManifest {
+            version: RULESET_MANIFEST_VERSION,
+            rulesets: vec![
+                RulesetManifestEntry {
+                    name: "alpha".to_string(),
+                    path: "alpha.toml".to_string(),
+                    description: None,
+                    created_at: Some(100),
+                    updated_at: Some(100),
+                    last_applied_at: Some(100),
+                },
+                RulesetManifestEntry {
+                    name: "beta".to_string(),
+                    path: "beta.toml".to_string(),
+                    description: None,
+                    created_at: Some(200),
+                    updated_at: Some(200),
+                    last_applied_at: Some(200),
+                },
+            ],
+        };
+
+        touch_last_applied(&mut manifest, "alpha", "alpha.toml", 500);
+
+        assert_eq!(manifest.rulesets[0].last_applied_at, Some(500));
+        assert_eq!(manifest.rulesets[0].updated_at, Some(500));
+        // Beta should be unchanged
+        assert_eq!(manifest.rulesets[1].last_applied_at, Some(200));
+        assert_eq!(manifest.rulesets[1].updated_at, Some(200));
+    }
+
+    #[test]
+    fn touch_last_applied_preserves_description() {
+        let mut manifest = RulesetManifest {
+            version: RULESET_MANIFEST_VERSION,
+            rulesets: vec![RulesetManifestEntry {
+                name: "ops".to_string(),
+                path: "ops.toml".to_string(),
+                description: Some("Operations profile".to_string()),
+                created_at: Some(100),
+                updated_at: Some(100),
+                last_applied_at: None,
+            }],
+        };
+
+        touch_last_applied(&mut manifest, "ops", "ops.toml", 300);
+
+        assert_eq!(manifest.rulesets[0].description.as_deref(), Some("Operations profile"));
+    }
+
+    // =========================================================================
+    // PatternsConfigPatch::apply_to edge cases
+    // =========================================================================
+
+    #[test]
+    fn patch_apply_empty_packs_clears_base() {
+        let base = PatternsConfig {
+            packs: vec!["agent-codex".to_string()],
+            ..Default::default()
+        };
+        let patch = PatternsConfigPatch {
+            packs: Some(vec![]),
+            ..Default::default()
+        };
+        let result = patch.apply_to(&base);
+        assert!(result.packs.is_empty());
+    }
+
+    #[test]
+    fn patch_apply_new_pack_override_key() {
+        let base = PatternsConfig::default();
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "new-pack".to_string(),
+            PackOverride {
+                disabled_rules: vec!["new-rule".to_string()],
+                ..Default::default()
+            },
+        );
+        let patch = PatternsConfigPatch {
+            pack_overrides: Some(overlay),
+            ..Default::default()
+        };
+        let result = patch.apply_to(&base);
+        assert!(result.pack_overrides.contains_key("new-pack"));
+    }
+
+    #[test]
+    fn patch_apply_severity_override_merged() {
+        let mut base_overrides = HashMap::new();
+        base_overrides.insert(
+            "pack-a".to_string(),
+            PackOverride {
+                severity_overrides: {
+                    let mut m = HashMap::new();
+                    m.insert("rule-1".to_string(), "warning".to_string());
+                    m
+                },
+                ..Default::default()
+            },
+        );
+        let base = PatternsConfig {
+            pack_overrides: base_overrides,
+            ..Default::default()
+        };
+
+        let mut overlay_overrides = HashMap::new();
+        overlay_overrides.insert(
+            "pack-a".to_string(),
+            PackOverride {
+                severity_overrides: {
+                    let mut m = HashMap::new();
+                    m.insert("rule-1".to_string(), "critical".to_string());
+                    m.insert("rule-2".to_string(), "info".to_string());
+                    m
+                },
+                ..Default::default()
+            },
+        );
+        let patch = PatternsConfigPatch {
+            pack_overrides: Some(overlay_overrides),
+            ..Default::default()
+        };
+
+        let result = patch.apply_to(&base);
+        let pack_a = result.pack_overrides.get("pack-a").unwrap();
+        // Overlay replaces existing severity
+        assert_eq!(pack_a.severity_overrides.get("rule-1").unwrap(), "critical");
+        // Overlay adds new severity
+        assert_eq!(pack_a.severity_overrides.get("rule-2").unwrap(), "info");
+    }
+
+    #[test]
+    fn patch_apply_disabled_rules_no_duplicates() {
+        let mut base_overrides = HashMap::new();
+        base_overrides.insert(
+            "pack-a".to_string(),
+            PackOverride {
+                disabled_rules: vec!["rule-1".to_string(), "rule-2".to_string()],
+                ..Default::default()
+            },
+        );
+        let base = PatternsConfig {
+            pack_overrides: base_overrides,
+            ..Default::default()
+        };
+
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "pack-a".to_string(),
+            PackOverride {
+                disabled_rules: vec!["rule-2".to_string(), "rule-3".to_string()],
+                ..Default::default()
+            },
+        );
+        let patch = PatternsConfigPatch {
+            pack_overrides: Some(overlay),
+            ..Default::default()
+        };
+
+        let result = patch.apply_to(&base);
+        let pack_a = result.pack_overrides.get("pack-a").unwrap();
+        // rule-2 should not be duplicated
+        let rule2_count = pack_a.disabled_rules.iter().filter(|r| *r == "rule-2").count();
+        assert_eq!(rule2_count, 1);
+        assert!(pack_a.disabled_rules.contains(&"rule-1".to_string()));
+        assert!(pack_a.disabled_rules.contains(&"rule-3".to_string()));
+    }
+
+    // =========================================================================
+    // is_valid_profile_name edge cases
+    // =========================================================================
+
+    #[test]
+    fn is_valid_profile_name_exactly_32_chars() {
+        let name = "a".repeat(32);
+        assert!(is_valid_profile_name(&name));
+    }
+
+    #[test]
+    fn is_valid_profile_name_33_chars_rejected() {
+        let name = "a".repeat(33);
+        assert!(!is_valid_profile_name(&name));
+    }
+
+    #[test]
+    fn is_valid_profile_name_single_char() {
+        assert!(is_valid_profile_name("a"));
+        assert!(is_valid_profile_name("0"));
+        assert!(is_valid_profile_name("_"));
+        assert!(is_valid_profile_name("-"));
+    }
+
+    #[test]
+    fn is_valid_profile_name_empty() {
+        assert!(!is_valid_profile_name(""));
+    }
+
+    // =========================================================================
+    // canonicalize_profile_name edge cases
+    // =========================================================================
+
+    #[test]
+    fn canonicalize_trims_whitespace() {
+        assert_eq!(canonicalize_profile_name("  dev  ").unwrap(), "dev");
+    }
+
+    #[test]
+    fn canonicalize_lowercases_mixed_case() {
+        assert_eq!(canonicalize_profile_name("Dev-CI").unwrap(), "dev-ci");
+    }
+
+    #[test]
+    fn canonicalize_preserves_digits() {
+        assert_eq!(canonicalize_profile_name("v2-beta-3").unwrap(), "v2-beta-3");
+    }
+
+    #[test]
+    fn canonicalize_rejects_dots() {
+        assert!(canonicalize_profile_name("my.profile").is_err());
+    }
+
+    #[test]
+    fn canonicalize_rejects_whitespace_in_middle() {
+        assert!(canonicalize_profile_name("my profile").is_err());
+    }
+
+    // =========================================================================
+    // Debug / Clone trait tests
+    // =========================================================================
+
+    #[test]
+    fn ruleset_manifest_debug() {
+        let m = RulesetManifest::default();
+        let dbg = format!("{m:?}");
+        assert!(dbg.contains("RulesetManifest"));
+    }
+
+    #[test]
+    fn ruleset_manifest_entry_clone() {
+        let e = RulesetManifestEntry {
+            name: "ops".to_string(),
+            path: "ops.toml".to_string(),
+            description: Some("desc".to_string()),
+            created_at: Some(1),
+            updated_at: Some(2),
+            last_applied_at: Some(3),
+        };
+        let e2 = e.clone();
+        assert_eq!(e2.name, "ops");
+        assert_eq!(e2.last_applied_at, Some(3));
+    }
+
+    #[test]
+    fn ruleset_profile_summary_debug_clone() {
+        let s = RulesetProfileSummary {
+            name: "test".to_string(),
+            description: None,
+            path: None,
+            last_applied_at: None,
+            implicit: true,
+        };
+        let s2 = s.clone();
+        assert_eq!(s2.name, "test");
+        assert!(s2.implicit);
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("RulesetProfileSummary"));
+    }
+
+    // =========================================================================
+    // system_time_to_epoch_ms (private, tested indirectly)
+    // =========================================================================
+
+    #[test]
+    fn resolve_rulesets_dir_with_config_path() {
+        let config_path = std::path::Path::new("/home/user/.config/ft/ft.toml");
+        let dir = resolve_rulesets_dir(Some(config_path));
+        assert_eq!(dir, std::path::PathBuf::from("/home/user/.config/ft/rulesets"));
+    }
+
+    #[test]
+    fn resolve_rulesets_dir_with_root_config_path() {
+        // Edge case: config in root directory
+        let config_path = std::path::Path::new("/ft.toml");
+        let dir = resolve_rulesets_dir(Some(config_path));
+        assert_eq!(dir, std::path::PathBuf::from("/rulesets"));
+    }
 }

@@ -1107,4 +1107,488 @@ url = "http://localhost:8080/hook"
             crate::events::NotifyDecision::Filtered,
         );
     }
+
+    // ====================================================================
+    // WebhookTemplate tests
+    // ====================================================================
+
+    #[test]
+    fn webhook_template_default_is_generic() {
+        assert_eq!(WebhookTemplate::default(), WebhookTemplate::Generic);
+    }
+
+    #[test]
+    fn webhook_template_serde_json_roundtrip() {
+        for t in [
+            WebhookTemplate::Generic,
+            WebhookTemplate::Slack,
+            WebhookTemplate::Discord,
+        ] {
+            let json = serde_json::to_string(&t).unwrap();
+            let back: WebhookTemplate = serde_json::from_str(&json).unwrap();
+            assert_eq!(t, back);
+        }
+    }
+
+    #[test]
+    fn webhook_template_serde_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&WebhookTemplate::Generic).unwrap(),
+            "\"generic\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WebhookTemplate::Slack).unwrap(),
+            "\"slack\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WebhookTemplate::Discord).unwrap(),
+            "\"discord\""
+        );
+    }
+
+    #[test]
+    fn webhook_template_debug() {
+        let dbg = format!("{:?}", WebhookTemplate::Slack);
+        assert!(dbg.contains("Slack"));
+    }
+
+    #[test]
+    fn webhook_template_copy() {
+        let t = WebhookTemplate::Discord;
+        let t2 = t;
+        assert_eq!(t, t2); // Copy semantics
+    }
+
+    // ====================================================================
+    // DeliveryResult additional tests
+    // ====================================================================
+
+    #[test]
+    fn delivery_result_ok_201() {
+        let r = DeliveryResult::ok(201);
+        assert!(r.accepted);
+        assert_eq!(r.status_code, 201);
+        assert!(r.error.is_none());
+    }
+
+    #[test]
+    fn delivery_result_err_zero_status_connection_failure() {
+        let r = DeliveryResult::err(0, "connection refused");
+        assert!(!r.accepted);
+        assert_eq!(r.status_code, 0);
+        assert_eq!(r.error.as_deref(), Some("connection refused"));
+    }
+
+    #[test]
+    fn delivery_result_debug() {
+        let r = DeliveryResult::ok(200);
+        let dbg = format!("{r:?}");
+        assert!(dbg.contains("DeliveryResult"));
+        assert!(dbg.contains("200"));
+    }
+
+    #[test]
+    fn delivery_result_clone() {
+        let r = DeliveryResult::err(429, "rate limited");
+        let r2 = r.clone();
+        assert_eq!(r2.status_code, 429);
+        assert!(!r2.accepted);
+        assert_eq!(r2.error.as_deref(), Some("rate limited"));
+    }
+
+    // ====================================================================
+    // render_template pure tests (using direct NotificationPayload)
+    // ====================================================================
+
+    fn make_payload(
+        severity: &str,
+        quick_fix: Option<&str>,
+        suppressed: u64,
+    ) -> NotificationPayload {
+        NotificationPayload {
+            event_type: "test.rule:event".to_string(),
+            pane_id: 42,
+            timestamp: "2026-02-14T00:00:00Z".to_string(),
+            summary: "Test summary".to_string(),
+            description: "Test description".to_string(),
+            severity: severity.to_string(),
+            agent_type: "codex".to_string(),
+            confidence: 0.85,
+            quick_fix: quick_fix.map(|s| s.to_string()),
+            suppressed_since_last: suppressed,
+        }
+    }
+
+    #[test]
+    fn render_slack_critical_emoji() {
+        let p = make_payload("critical", None, 0);
+        let json = render_template(WebhookTemplate::Slack, &p);
+        let text = json["text"].as_str().unwrap();
+        assert!(text.contains(":red_circle:"));
+    }
+
+    #[test]
+    fn render_slack_info_emoji() {
+        let p = make_payload("info", None, 0);
+        let json = render_template(WebhookTemplate::Slack, &p);
+        let text = json["text"].as_str().unwrap();
+        assert!(text.contains(":large_blue_circle:"));
+    }
+
+    #[test]
+    fn render_slack_warning_emoji() {
+        let p = make_payload("warning", None, 0);
+        let json = render_template(WebhookTemplate::Slack, &p);
+        let text = json["text"].as_str().unwrap();
+        assert!(text.contains(":large_yellow_circle:"));
+    }
+
+    #[test]
+    fn render_slack_unknown_severity_uses_blue() {
+        let p = make_payload("trace", None, 0);
+        let json = render_template(WebhookTemplate::Slack, &p);
+        let text = json["text"].as_str().unwrap();
+        assert!(text.contains(":large_blue_circle:"));
+    }
+
+    #[test]
+    fn render_slack_with_quick_fix() {
+        let p = make_payload("warning", Some("ft restart --pane 42"), 0);
+        let json = render_template(WebhookTemplate::Slack, &p);
+        let blocks = json["blocks"].as_array().unwrap();
+        let fields_block = &blocks[1];
+        let fields_json = serde_json::to_string(fields_block).unwrap();
+        assert!(fields_json.contains("Quick fix"));
+        assert!(fields_json.contains("ft restart --pane 42"));
+    }
+
+    #[test]
+    fn render_slack_without_quick_fix_has_3_fields() {
+        let p = make_payload("warning", None, 0);
+        let json = render_template(WebhookTemplate::Slack, &p);
+        let blocks = json["blocks"].as_array().unwrap();
+        let fields_block = &blocks[1];
+        let fields = fields_block["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 3); // Pane, Severity, Agent
+    }
+
+    #[test]
+    fn render_slack_with_quick_fix_has_4_fields() {
+        let p = make_payload("warning", Some("cmd"), 0);
+        let json = render_template(WebhookTemplate::Slack, &p);
+        let blocks = json["blocks"].as_array().unwrap();
+        let fields_block = &blocks[1];
+        let fields = fields_block["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 4); // Pane, Severity, Agent, Quick fix
+    }
+
+    #[test]
+    fn render_slack_has_context_block() {
+        let p = make_payload("info", None, 0);
+        let json = render_template(WebhookTemplate::Slack, &p);
+        let blocks = json["blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3); // section, section(fields), context
+        assert_eq!(blocks[2]["type"], "context");
+    }
+
+    #[test]
+    fn render_slack_context_has_timestamp() {
+        let p = make_payload("info", None, 0);
+        let json = render_template(WebhookTemplate::Slack, &p);
+        let ctx = &json["blocks"][2]["elements"][0]["text"];
+        assert!(ctx.as_str().unwrap().contains("2026-02-14T00:00:00Z"));
+    }
+
+    #[test]
+    fn render_slack_suppressed_count_in_text() {
+        let p = make_payload("warning", None, 7);
+        let json = render_template(WebhookTemplate::Slack, &p);
+        let text = json["text"].as_str().unwrap();
+        assert!(text.contains("(+7 suppressed)"));
+    }
+
+    #[test]
+    fn render_discord_info_color_blue() {
+        let p = make_payload("info", None, 0);
+        let json = render_template(WebhookTemplate::Discord, &p);
+        assert_eq!(json["embeds"][0]["color"], 0x3498DB);
+    }
+
+    #[test]
+    fn render_discord_warning_color_amber() {
+        let p = make_payload("warning", None, 0);
+        let json = render_template(WebhookTemplate::Discord, &p);
+        assert_eq!(json["embeds"][0]["color"], 0xFFAA00);
+    }
+
+    #[test]
+    fn render_discord_critical_color_red() {
+        let p = make_payload("critical", None, 0);
+        let json = render_template(WebhookTemplate::Discord, &p);
+        assert_eq!(json["embeds"][0]["color"], 0xFF0000);
+    }
+
+    #[test]
+    fn render_discord_unknown_severity_color_blue() {
+        let p = make_payload("debug", None, 0);
+        let json = render_template(WebhookTemplate::Discord, &p);
+        assert_eq!(json["embeds"][0]["color"], 0x3498DB);
+    }
+
+    #[test]
+    fn render_discord_with_quick_fix() {
+        let p = make_payload("warning", Some("ft fix"), 0);
+        let json = render_template(WebhookTemplate::Discord, &p);
+        let fields = json["embeds"][0]["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 4); // Pane, Severity, Agent, Quick Fix
+        assert_eq!(fields[3]["name"], "Quick Fix");
+        assert!(fields[3]["value"].as_str().unwrap().contains("ft fix"));
+        assert_eq!(fields[3]["inline"], false);
+    }
+
+    #[test]
+    fn render_discord_without_quick_fix_has_3_fields() {
+        let p = make_payload("warning", None, 0);
+        let json = render_template(WebhookTemplate::Discord, &p);
+        let fields = json["embeds"][0]["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 3);
+    }
+
+    #[test]
+    fn render_discord_suppressed_in_title() {
+        let p = make_payload("warning", None, 12);
+        let json = render_template(WebhookTemplate::Discord, &p);
+        let title = json["embeds"][0]["title"].as_str().unwrap();
+        assert!(title.contains("(+12 suppressed)"));
+    }
+
+    #[test]
+    fn render_discord_no_suppressed_omits_count() {
+        let p = make_payload("warning", None, 0);
+        let json = render_template(WebhookTemplate::Discord, &p);
+        let title = json["embeds"][0]["title"].as_str().unwrap();
+        assert!(!title.contains("suppressed"));
+    }
+
+    #[test]
+    fn render_discord_has_footer_with_timestamp() {
+        let p = make_payload("info", None, 0);
+        let json = render_template(WebhookTemplate::Discord, &p);
+        let footer = json["embeds"][0]["footer"]["text"].as_str().unwrap();
+        assert!(footer.contains("2026-02-14T00:00:00Z"));
+        assert!(footer.contains("test.rule:event"));
+    }
+
+    #[test]
+    fn render_discord_has_description() {
+        let p = make_payload("info", None, 0);
+        let json = render_template(WebhookTemplate::Discord, &p);
+        assert_eq!(
+            json["embeds"][0]["description"].as_str().unwrap(),
+            "Test description"
+        );
+    }
+
+    #[test]
+    fn render_discord_content_is_null() {
+        let p = make_payload("info", None, 0);
+        let json = render_template(WebhookTemplate::Discord, &p);
+        assert!(json["content"].is_null());
+    }
+
+    #[test]
+    fn render_generic_preserves_all_fields() {
+        let p = make_payload("warning", Some("cmd"), 3);
+        let json = render_template(WebhookTemplate::Generic, &p);
+        assert_eq!(json["event_type"], "test.rule:event");
+        assert_eq!(json["pane_id"], 42);
+        assert_eq!(json["severity"], "warning");
+        assert_eq!(json["agent_type"], "codex");
+        assert_eq!(json["summary"], "Test summary");
+        assert_eq!(json["description"], "Test description");
+        assert_eq!(json["quick_fix"], "cmd");
+        assert_eq!(json["suppressed_since_last"], 3);
+        assert!((json["confidence"].as_f64().unwrap() - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn render_generic_omits_quick_fix_when_none() {
+        let p = make_payload("info", None, 0);
+        let json = render_template(WebhookTemplate::Generic, &p);
+        assert!(json.get("quick_fix").is_none());
+    }
+
+    // ====================================================================
+    // WebhookEndpointConfig additional tests
+    // ====================================================================
+
+    #[test]
+    fn endpoint_config_clone() {
+        let ep = test_endpoint("x", "http://x.com", WebhookTemplate::Slack);
+        let ep2 = ep.clone();
+        assert_eq!(ep2.name, "x");
+        assert_eq!(ep2.template, WebhookTemplate::Slack);
+    }
+
+    #[test]
+    fn endpoint_config_debug() {
+        let ep = test_endpoint("dbg", "http://d.com", WebhookTemplate::Discord);
+        let dbg = format!("{ep:?}");
+        assert!(dbg.contains("WebhookEndpointConfig"));
+        assert!(dbg.contains("dbg"));
+    }
+
+    #[test]
+    fn matches_event_type_empty_events_matches_all() {
+        let ep = test_endpoint("all", "http://a.com", WebhookTemplate::Generic);
+        assert!(ep.matches_event_type("anything:goes"));
+        assert!(ep.matches_event_type(""));
+    }
+
+    #[test]
+    fn matches_event_type_specific_pattern() {
+        let mut ep = test_endpoint("test", "http://t.com", WebhookTemplate::Generic);
+        ep.events = vec!["core.codex:*".to_string()];
+        assert!(ep.matches_event_type("core.codex:usage_reached"));
+        assert!(!ep.matches_event_type("core.gemini:error"));
+    }
+
+    #[test]
+    fn matches_event_type_multiple_patterns() {
+        let mut ep = test_endpoint("multi", "http://m.com", WebhookTemplate::Generic);
+        ep.events = vec!["core.codex:*".to_string(), "core.gemini:*".to_string()];
+        assert!(ep.matches_event_type("core.codex:usage"));
+        assert!(ep.matches_event_type("core.gemini:error"));
+        assert!(!ep.matches_event_type("core.claude:stuck"));
+    }
+
+    #[test]
+    fn endpoint_disabled_false_in_toml() {
+        let toml_str = r#"
+name = "off"
+url = "http://localhost"
+enabled = false
+"#;
+        let ep: WebhookEndpointConfig = toml::from_str(toml_str).expect("parse");
+        assert!(!ep.enabled);
+    }
+
+    #[test]
+    fn endpoint_config_with_all_fields() {
+        let toml_str = r#"
+name = "full"
+url = "https://example.com/webhook"
+template = "discord"
+events = ["a.*", "b.*"]
+enabled = true
+
+[headers]
+X-Custom = "value"
+Authorization = "Bearer xyz"
+"#;
+        let ep: WebhookEndpointConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(ep.name, "full");
+        assert_eq!(ep.template, WebhookTemplate::Discord);
+        assert_eq!(ep.events.len(), 2);
+        assert_eq!(ep.headers.len(), 2);
+        assert_eq!(ep.headers["X-Custom"], "value");
+    }
+
+    #[test]
+    fn endpoint_config_json_roundtrip() {
+        let ep = WebhookEndpointConfig {
+            name: "json-test".to_string(),
+            url: "http://json.test".to_string(),
+            template: WebhookTemplate::Slack,
+            events: vec!["*.error".to_string()],
+            headers: {
+                let mut h = HashMap::new();
+                h.insert("X-Key".to_string(), "val".to_string());
+                h
+            },
+            enabled: true,
+        };
+        let json = serde_json::to_string(&ep).unwrap();
+        let back: WebhookEndpointConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "json-test");
+        assert_eq!(back.template, WebhookTemplate::Slack);
+        assert_eq!(back.events, vec!["*.error"]);
+        assert_eq!(back.headers["X-Key"], "val");
+    }
+
+    // ====================================================================
+    // Dispatcher pure tests
+    // ====================================================================
+
+    #[test]
+    fn dispatcher_zero_endpoints() {
+        let d = WebhookDispatcher::new(vec![], Box::new(MockTransport::success()));
+        assert_eq!(d.endpoint_count(), 0);
+        assert_eq!(d.active_endpoint_count(), 0);
+    }
+
+    #[test]
+    fn dispatcher_all_disabled() {
+        let mut ep1 = test_endpoint("a", "http://a", WebhookTemplate::Generic);
+        let mut ep2 = test_endpoint("b", "http://b", WebhookTemplate::Slack);
+        ep1.enabled = false;
+        ep2.enabled = false;
+        let d = WebhookDispatcher::new(vec![ep1, ep2], Box::new(MockTransport::success()));
+        assert_eq!(d.endpoint_count(), 2);
+        assert_eq!(d.active_endpoint_count(), 0);
+    }
+
+    #[test]
+    fn render_template_dispatches_to_generic() {
+        let p = make_payload("info", None, 0);
+        let generic = render_template(WebhookTemplate::Generic, &p);
+        // Generic renders the full payload as JSON
+        assert!(generic.is_object());
+        assert!(generic.get("event_type").is_some());
+    }
+
+    #[test]
+    fn render_template_dispatches_to_slack() {
+        let p = make_payload("info", None, 0);
+        let slack = render_template(WebhookTemplate::Slack, &p);
+        assert!(slack.get("blocks").is_some());
+    }
+
+    #[test]
+    fn render_template_dispatches_to_discord() {
+        let p = make_payload("info", None, 0);
+        let discord = render_template(WebhookTemplate::Discord, &p);
+        assert!(discord.get("embeds").is_some());
+    }
+
+    #[test]
+    fn render_discord_inline_fields() {
+        let p = make_payload("info", None, 0);
+        let json = render_template(WebhookTemplate::Discord, &p);
+        let fields = json["embeds"][0]["fields"].as_array().unwrap();
+        // First 3 fields (Pane, Severity, Agent) are inline
+        assert_eq!(fields[0]["inline"], true);
+        assert_eq!(fields[1]["inline"], true);
+        assert_eq!(fields[2]["inline"], true);
+    }
+
+    #[test]
+    fn render_discord_field_names() {
+        let p = make_payload("info", None, 0);
+        let json = render_template(WebhookTemplate::Discord, &p);
+        let fields = json["embeds"][0]["fields"].as_array().unwrap();
+        assert_eq!(fields[0]["name"], "Pane");
+        assert_eq!(fields[1]["name"], "Severity");
+        assert_eq!(fields[2]["name"], "Agent");
+    }
+
+    #[test]
+    fn render_slack_field_types_are_mrkdwn() {
+        let p = make_payload("warning", None, 0);
+        let json = render_template(WebhookTemplate::Slack, &p);
+        let fields = json["blocks"][1]["fields"].as_array().unwrap();
+        for field in fields {
+            assert_eq!(field["type"], "mrkdwn");
+        }
+    }
 }
