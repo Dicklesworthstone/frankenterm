@@ -941,4 +941,298 @@ mod tests {
         assert_eq!(decoded.max_events, 50);
         assert_eq!(decoded.label.as_deref(), Some("test"));
     }
+
+    // ── Batch 2: DarkBadger wa-1u90p.7.1 ─────────────────────────────────
+
+    // ── ExportFormat traits ──
+
+    #[test]
+    fn export_format_debug() {
+        assert_eq!(format!("{:?}", ExportFormat::JsonLines), "JsonLines");
+        assert_eq!(format!("{:?}", ExportFormat::Csv), "Csv");
+        assert_eq!(format!("{:?}", ExportFormat::Transcript), "Transcript");
+    }
+
+    #[test]
+    fn export_format_clone_and_copy() {
+        let fmt = ExportFormat::Csv;
+        let cloned = fmt;
+        let copied = fmt;
+        assert_eq!(fmt, cloned);
+        assert_eq!(fmt, copied);
+    }
+
+    #[test]
+    fn export_format_eq_and_ne() {
+        assert_eq!(ExportFormat::JsonLines, ExportFormat::JsonLines);
+        assert_ne!(ExportFormat::JsonLines, ExportFormat::Csv);
+        assert_ne!(ExportFormat::Csv, ExportFormat::Transcript);
+    }
+
+    #[test]
+    fn export_format_hash_distinct() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(ExportFormat::JsonLines);
+        set.insert(ExportFormat::Csv);
+        set.insert(ExportFormat::Transcript);
+        assert_eq!(set.len(), 3);
+        // Inserting duplicate should not increase size
+        set.insert(ExportFormat::Csv);
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn export_format_serde_roundtrip() {
+        for fmt in [
+            ExportFormat::JsonLines,
+            ExportFormat::Csv,
+            ExportFormat::Transcript,
+        ] {
+            let json = serde_json::to_string(&fmt).unwrap();
+            let decoded: ExportFormat = serde_json::from_str(&json).unwrap();
+            assert_eq!(fmt, decoded);
+        }
+    }
+
+    #[test]
+    fn export_format_serde_values() {
+        // Verify the snake_case rename
+        assert_eq!(
+            serde_json::to_string(&ExportFormat::JsonLines).unwrap(),
+            "\"json_lines\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExportFormat::Csv).unwrap(),
+            "\"csv\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExportFormat::Transcript).unwrap(),
+            "\"transcript\""
+        );
+    }
+
+    // ── ExportRequest constructors and required_tier ──
+
+    #[test]
+    fn export_request_transcript_constructor() {
+        let req = ExportRequest::transcript(1000, 5000);
+        assert_eq!(req.format, ExportFormat::Transcript);
+        assert_eq!(req.time_range.unwrap().start_ms, 1000);
+        assert_eq!(req.time_range.unwrap().end_ms, 5000);
+        assert!(req.pane_ids.is_empty());
+        assert!(req.include_text);
+    }
+
+    #[test]
+    fn export_request_csv_for_panes_constructor() {
+        let req = ExportRequest::csv_for_panes(vec![10, 20, 30]);
+        assert_eq!(req.format, ExportFormat::Csv);
+        assert_eq!(req.pane_ids, vec![10, 20, 30]);
+        assert!(req.time_range.is_none());
+    }
+
+    #[test]
+    fn export_request_required_tier_a1_single_pane_with_text() {
+        // Single pane with text → A1RedactedQuery
+        let req = ExportRequest {
+            pane_ids: vec![1],
+            include_text: true,
+            ..Default::default()
+        };
+        assert_eq!(req.required_tier(), AccessTier::A1RedactedQuery);
+    }
+
+    #[test]
+    fn export_request_required_tier_a1_no_pane_filter() {
+        // No pane filter, with text → A1RedactedQuery
+        let req = ExportRequest::default();
+        assert_eq!(req.required_tier(), AccessTier::A1RedactedQuery);
+    }
+
+    #[test]
+    fn export_request_default_values() {
+        let req = ExportRequest::default();
+        assert_eq!(req.format, ExportFormat::JsonLines);
+        assert!(req.time_range.is_none());
+        assert!(req.pane_ids.is_empty());
+        assert!(req.kind_filter.is_empty());
+        assert_eq!(req.max_events, 0);
+        assert!(req.include_text);
+        assert!(req.max_sensitivity.is_none());
+        assert!(req.label.is_none());
+    }
+
+    #[test]
+    fn export_request_debug_and_clone() {
+        let req = ExportRequest::jsonl(100, 200).with_label("debug-test");
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("ExportRequest"));
+        assert!(debug_str.contains("debug-test"));
+
+        let cloned = req.clone();
+        assert_eq!(cloned.format, ExportFormat::JsonLines);
+        assert_eq!(cloned.label.as_deref(), Some("debug-test"));
+    }
+
+    // ── ExportError traits and Display coverage ──
+
+    #[test]
+    fn export_error_display_no_matching_events() {
+        let err = ExportError::NoMatchingEvents;
+        assert_eq!(err.to_string(), "no events match export criteria");
+    }
+
+    #[test]
+    fn export_error_display_format_error() {
+        let err = ExportError::FormatError("bad json".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("format error"));
+        assert!(msg.contains("bad json"));
+    }
+
+    #[test]
+    fn export_error_display_elevation_required() {
+        let err = ExportError::ElevationRequired {
+            required_tier: AccessTier::A3PrivilegedRaw,
+            current_tier: AccessTier::A1RedactedQuery,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("elevation required"));
+    }
+
+    #[test]
+    fn export_error_clone_and_eq() {
+        let err1 = ExportError::NoMatchingEvents;
+        let err2 = err1.clone();
+        assert_eq!(err1, err2);
+
+        let err3 = ExportError::TooLarge {
+            event_count: 100,
+            max_events: 50,
+        };
+        let err4 = err3.clone();
+        assert_eq!(err3, err4);
+
+        assert_ne!(err1, err3);
+    }
+
+    #[test]
+    fn export_error_debug() {
+        let err = ExportError::FormatError("test".to_string());
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("FormatError"));
+        assert!(debug.contains("test"));
+    }
+
+    #[test]
+    fn export_error_is_std_error() {
+        let err: Box<dyn std::error::Error> =
+            Box::new(ExportError::FormatError("oops".to_string()));
+        assert!(err.to_string().contains("oops"));
+    }
+
+    // ── ExportResult traits ──
+
+    #[test]
+    fn export_result_debug_and_clone() {
+        let result = ExportResult {
+            data: "test data".to_string(),
+            event_count: 3,
+            format: ExportFormat::Csv,
+            redaction_applied: true,
+            effective_tier: AccessTier::A1RedactedQuery,
+            data_bytes: 9,
+        };
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("ExportResult"));
+        assert!(debug_str.contains("Csv"));
+
+        let cloned = result.clone();
+        assert_eq!(cloned.event_count, 3);
+        assert_eq!(cloned.format, ExportFormat::Csv);
+        assert!(cloned.redaction_applied);
+        assert_eq!(cloned.effective_tier, AccessTier::A1RedactedQuery);
+        assert_eq!(cloned.data_bytes, 9);
+        assert_eq!(cloned.data, "test data");
+    }
+
+    // ── Exporter with max events ──
+
+    #[test]
+    fn exporter_with_max_events_sets_limit() {
+        let store = InMemoryEventStore::new();
+        let executor = RecorderQueryExecutor::new(store, AuditLog::new(AuditLogConfig::default()));
+        let exporter = RecorderExporter::new(executor).with_max_events(42);
+        assert_eq!(exporter.max_export_events, 42);
+    }
+
+    #[test]
+    fn default_max_export_events_constant() {
+        assert_eq!(DEFAULT_MAX_EXPORT_EVENTS, 50_000);
+    }
+
+    // ── Transcript format edge cases ──
+
+    #[test]
+    fn transcript_with_long_text_truncated() {
+        // Create an event with text longer than 200 chars
+        let long_text = "x".repeat(300);
+        let exporter = test_exporter(vec![make_event(1, 0, 1000, &long_text)]);
+        let req = ExportRequest::transcript(0, 2000);
+
+        let result = exporter.export(&human(), &req, NOW).unwrap();
+        // The transcript should truncate the text
+        assert!(result.data.contains("..."));
+        // Should not contain the full 300-char text
+        assert!(!result.data.contains(&long_text));
+    }
+
+    #[test]
+    fn transcript_header_contains_metadata() {
+        let exporter = test_exporter(sample_events());
+        let req = ExportRequest::transcript(0, 5000);
+        let result = exporter.export(&human(), &req, NOW).unwrap();
+
+        assert!(result.data.contains("# Flight Recorder Transcript"));
+        assert!(result.data.contains("# Time range:"));
+        assert!(result.data.contains("# Panes:"));
+        assert!(result.data.contains("# Events: 4"));
+    }
+
+    // ── CSV content validation ──
+
+    #[test]
+    fn csv_data_rows_match_event_count() {
+        let exporter = test_exporter(sample_events());
+        let req = ExportRequest {
+            format: ExportFormat::Csv,
+            ..Default::default()
+        };
+        let result = exporter.export(&human(), &req, NOW).unwrap();
+        let lines: Vec<&str> = result.data.lines().collect();
+        // Header + 4 data rows
+        assert_eq!(lines.len(), 5);
+        assert_eq!(result.event_count, 4);
+    }
+
+    // ── ExportRequest serde skip_serializing_if ──
+
+    #[test]
+    fn export_request_serde_skips_none_fields() {
+        let req = ExportRequest::default();
+        let json = serde_json::to_string(&req).unwrap();
+        // time_range, max_sensitivity, and label are None → should be skipped
+        assert!(!json.contains("time_range"));
+        assert!(!json.contains("max_sensitivity"));
+        assert!(!json.contains("label"));
+    }
+
+    #[test]
+    fn export_request_serde_includes_set_fields() {
+        let req = ExportRequest::jsonl(100, 200).with_label("my-export");
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("time_range"));
+        assert!(json.contains("\"label\":\"my-export\""));
+    }
 }
