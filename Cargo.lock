@@ -158,9 +158,9 @@ dependencies = [
 
 [[package]]
 name = "arc-swap"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ded5f9a03ac8f24d1b8a25101ee812cd32cdc8c50a4c50237de2c4915850e73"
+checksum = "f9f3647c145568cec02c42054e07bdf9a5a698e15b466fb2341bfc393cd24aa5"
 dependencies = [
  "rustversion",
 ]
@@ -262,18 +262,23 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/asupersync#dd619274c10c3d949c54dc5eefa2f983177fa0c6"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9d95a917dcf2042c90a91c7f24a2053bf228759950c212ea1bc58427cacd6c3"
 dependencies = [
  "base64 0.22.1",
  "bincode",
  "crossbeam-queue",
- "getrandom 0.3.4",
+ "franken-decision 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "franken-evidence 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "franken-kernel 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "getrandom 0.4.1",
+ "hmac",
  "libc",
- "nix",
+ "nix 0.31.1",
  "parking_lot",
  "pin-project",
- "polling 2.8.0",
+ "polling",
  "ring",
  "rmp-serde",
  "rustls",
@@ -282,6 +287,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2",
  "slab",
  "smallvec",
  "socket2 0.6.2",
@@ -290,7 +296,40 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "visibility",
- "x509-parser 0.17.0",
+ "x509-parser",
+]
+
+[[package]]
+name = "asupersync"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/asupersync#835eacf9a2c83fd4872b75dfe97ffaba35a551fc"
+dependencies = [
+ "base64 0.22.1",
+ "bincode",
+ "crossbeam-queue",
+ "franken-decision 0.2.0 (git+https://github.com/Dicklesworthstone/asupersync)",
+ "franken-evidence 0.2.0 (git+https://github.com/Dicklesworthstone/asupersync)",
+ "franken-kernel 0.2.0 (git+https://github.com/Dicklesworthstone/asupersync)",
+ "getrandom 0.4.1",
+ "hmac",
+ "libc",
+ "nix 0.31.1",
+ "parking_lot",
+ "pin-project",
+ "polling",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "slab",
+ "smallvec",
+ "socket2 0.6.2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "visibility",
 ]
 
 [[package]]
@@ -342,7 +381,7 @@ dependencies = [
  "futures-io",
  "futures-lite",
  "parking",
- "polling 3.11.0",
+ "polling",
  "rustix 1.1.3",
  "slab",
  "windows-sys 0.61.2",
@@ -427,7 +466,7 @@ dependencies = [
 name = "async_ossl"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "async-io",
  "openssl",
 ]
@@ -1011,7 +1050,7 @@ name = "codec"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "asupersync",
+ "asupersync 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "base91",
  "config",
  "frankenterm-term",
@@ -1106,7 +1145,7 @@ dependencies = [
  "log",
  "luahelper",
  "mlua",
- "nix",
+ "nix 0.29.0",
  "notify",
  "ordered-float 4.6.0",
  "portable-pty",
@@ -2032,10 +2071,10 @@ dependencies = [
 
 [[package]]
 name = "fastapi-core"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#1170506a1c467cbed4481e048d075f7771735c8e"
 dependencies = [
- "asupersync",
+ "asupersync 0.2.0 (git+https://github.com/Dicklesworthstone/asupersync)",
  "fastapi-openapi",
  "fastapi-router",
  "fastapi-types",
@@ -2047,17 +2086,17 @@ dependencies = [
 
 [[package]]
 name = "fastapi-http"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#1170506a1c467cbed4481e048d075f7771735c8e"
 dependencies = [
- "asupersync",
+ "asupersync 0.2.0 (git+https://github.com/Dicklesworthstone/asupersync)",
  "fastapi-core",
 ]
 
 [[package]]
 name = "fastapi-macros"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#1170506a1c467cbed4481e048d075f7771735c8e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2068,8 +2107,8 @@ dependencies = [
 
 [[package]]
 name = "fastapi-openapi"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#1170506a1c467cbed4481e048d075f7771735c8e"
 dependencies = [
  "fastapi-router",
  "fastapi-types",
@@ -2079,8 +2118,8 @@ dependencies = [
 
 [[package]]
 name = "fastapi-output"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#1170506a1c467cbed4481e048d075f7771735c8e"
 dependencies = [
  "crossterm 0.28.1",
  "parking_lot",
@@ -2091,8 +2130,8 @@ dependencies = [
 
 [[package]]
 name = "fastapi-router"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#1170506a1c467cbed4481e048d075f7771735c8e"
 dependencies = [
  "fastapi-types",
  "serde_json",
@@ -2100,8 +2139,8 @@ dependencies = [
 
 [[package]]
 name = "fastapi-rust"
-version = "0.1.2"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#1170506a1c467cbed4481e048d075f7771735c8e"
 dependencies = [
  "fastapi-core",
  "fastapi-http",
@@ -2115,8 +2154,8 @@ dependencies = [
 
 [[package]]
 name = "fastapi-types"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#1170506a1c467cbed4481e048d075f7771735c8e"
 
 [[package]]
 name = "fastdivide"
@@ -2153,10 +2192,10 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-client"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#a682584f0638e2ca194176d04a4c2b4276cdd51f"
 dependencies = [
- "asupersync",
+ "asupersync 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "dirs",
  "fastmcp-core",
  "fastmcp-protocol",
@@ -2169,8 +2208,8 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-console"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#a682584f0638e2ca194176d04a4c2b4276cdd51f"
 dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
@@ -2187,10 +2226,10 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-core"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#a682584f0638e2ca194176d04a4c2b4276cdd51f"
 dependencies = [
- "asupersync",
+ "asupersync 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "log",
  "serde",
  "serde_json",
@@ -2198,8 +2237,8 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-derive"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#a682584f0638e2ca194176d04a4c2b4276cdd51f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2208,8 +2247,8 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-protocol"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#a682584f0638e2ca194176d04a4c2b4276cdd51f"
 dependencies = [
  "base64 0.22.1",
  "fastmcp-core",
@@ -2220,10 +2259,10 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-rust"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#a682584f0638e2ca194176d04a4c2b4276cdd51f"
 dependencies = [
- "asupersync",
+ "asupersync 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "fastmcp-client",
  "fastmcp-core",
  "fastmcp-derive",
@@ -2236,10 +2275,10 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-server"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#a682584f0638e2ca194176d04a4c2b4276cdd51f"
 dependencies = [
- "asupersync",
+ "asupersync 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "base64 0.22.1",
  "chrono",
  "fastmcp-client",
@@ -2257,10 +2296,10 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-transport"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#a682584f0638e2ca194176d04a4c2b4276cdd51f"
 dependencies = [
- "asupersync",
+ "asupersync 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "fastmcp-core",
  "fastmcp-protocol",
  "getrandom 0.3.4",
@@ -2454,12 +2493,69 @@ dependencies = [
 ]
 
 [[package]]
+name = "franken-decision"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e108d382a6dce0d26fbe0b745ca7b6f3138e3a18eb482faef75236a30b850d48"
+dependencies = [
+ "franken-evidence 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "franken-kernel 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde",
+]
+
+[[package]]
+name = "franken-decision"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/asupersync#835eacf9a2c83fd4872b75dfe97ffaba35a551fc"
+dependencies = [
+ "franken-evidence 0.2.0 (git+https://github.com/Dicklesworthstone/asupersync)",
+ "franken-kernel 0.2.0 (git+https://github.com/Dicklesworthstone/asupersync)",
+ "serde",
+]
+
+[[package]]
+name = "franken-evidence"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f488852cac41e26f1dc9e1c8c30e41d3f9411b8e01916588b0ddc07a517f0505"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "franken-evidence"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/asupersync#835eacf9a2c83fd4872b75dfe97ffaba35a551fc"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "franken-kernel"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfd6548ab43330038a66f2ba2a8afd0ce715dcd7100d7e8f7e8ca8d4933f15b7"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "franken-kernel"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/asupersync#835eacf9a2c83fd4872b75dfe97ffaba35a551fc"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "frankenterm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
- "asupersync",
+ "asupersync 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "chrono",
  "clap",
  "dirs",
@@ -2475,9 +2571,9 @@ dependencies = [
  "tokio",
  "toml",
  "toml_edit 0.24.1+spec-1.1.0",
- "toon",
  "tracing",
  "tracing-subscriber",
+ "tru",
  "zip",
  "zstd 0.11.2+zstd.1.5.2",
 ]
@@ -2559,7 +2655,7 @@ name = "frankenterm-core"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
- "asupersync",
+ "asupersync 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "base64 0.22.1",
  "bloomfilter",
  "chrono",
@@ -2601,10 +2697,10 @@ dependencies = [
  "tokenizers",
  "tokio",
  "toml",
- "toon",
  "tracing",
  "tracing-subscriber",
- "x509-parser 0.18.1",
+ "tru",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2644,7 +2740,7 @@ dependencies = [
  "image",
  "k9",
  "log",
- "nix",
+ "nix 0.29.0",
  "num-derive",
  "num-traits",
  "ordered-float 4.6.0",
@@ -2797,7 +2893,7 @@ dependencies = [
 name = "frankenterm-uds"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "async-io",
  "uds_windows",
 ]
@@ -2850,8 +2946,8 @@ dependencies = [
 
 [[package]]
 name = "ftui"
-version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui#82d959106038d69f449e84bb0d71bbc2a3b05ab8"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -2864,8 +2960,8 @@ dependencies = [
 
 [[package]]
 name = "ftui-backend"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui#82d959106038d69f449e84bb0d71bbc2a3b05ab8"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -2873,9 +2969,11 @@ dependencies = [
 
 [[package]]
 name = "ftui-core"
-version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui#82d959106038d69f449e84bb0d71bbc2a3b05ab8"
 dependencies = [
+ "ahash",
+ "arc-swap",
  "bitflags 2.10.0",
  "signal-hook 0.4.3",
  "unicode-display-width",
@@ -2886,13 +2984,13 @@ dependencies = [
 
 [[package]]
 name = "ftui-i18n"
-version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui#82d959106038d69f449e84bb0d71bbc2a3b05ab8"
 
 [[package]]
 name = "ftui-layout"
-version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui#82d959106038d69f449e84bb0d71bbc2a3b05ab8"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -2901,10 +2999,12 @@ dependencies = [
 
 [[package]]
 name = "ftui-render"
-version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui#82d959106038d69f449e84bb0d71bbc2a3b05ab8"
 dependencies = [
+ "ahash",
  "bitflags 2.10.0",
+ "bumpalo",
  "ftui-core",
  "memchr",
  "smallvec",
@@ -2914,8 +3014,8 @@ dependencies = [
 
 [[package]]
 name = "ftui-runtime"
-version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui#82d959106038d69f449e84bb0d71bbc2a3b05ab8"
 dependencies = [
  "ftui-backend",
  "ftui-core",
@@ -2932,17 +3032,19 @@ dependencies = [
 
 [[package]]
 name = "ftui-style"
-version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui#82d959106038d69f449e84bb0d71bbc2a3b05ab8"
 dependencies = [
+ "ahash",
+ "arc-swap",
  "ftui-render",
  "tracing",
 ]
 
 [[package]]
 name = "ftui-text"
-version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui#82d959106038d69f449e84bb0d71bbc2a3b05ab8"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -2958,9 +3060,10 @@ dependencies = [
 
 [[package]]
 name = "ftui-widgets"
-version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui#82d959106038d69f449e84bb0d71bbc2a3b05ab8"
 dependencies = [
+ "ahash",
  "bitflags 2.10.0",
  "ftui-core",
  "ftui-layout",
@@ -4768,9 +4871,9 @@ checksum = "0c2cdeb66e45e9f36bfad5bbdb4d2384e70936afbee843c6f6543f0c551ebb25"
 
 [[package]]
 name = "libc"
-version = "0.2.182"
+version = "0.2.180"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
+checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -4997,7 +5100,7 @@ version = "1.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0aeb26bf5e836cc1c341c8106051b573f1766dfa05aa87f0b98be5e51b02303"
 dependencies = [
- "nix",
+ "nix 0.29.0",
  "winapi",
 ]
 
@@ -5288,7 +5391,7 @@ dependencies = [
  "metrics",
  "mlua",
  "names",
- "nix",
+ "nix 0.29.0",
  "ntapi",
  "parking_lot",
  "percent-encoding",
@@ -5371,6 +5474,19 @@ name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.10.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "225e7cfe711e0ba79a68baeddb2982723e4235247aefce1482f2f16c27865b66"
 dependencies = [
  "bitflags 2.10.0",
  "cfg-if",
@@ -5985,22 +6101,6 @@ dependencies = [
 
 [[package]]
 name = "polling"
-version = "2.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b2d323e8ca7996b3e23126511a523f7e62924d93ecd5ae73b333815b0eb3dce"
-dependencies = [
- "autocfg",
- "bitflags 1.3.2",
- "cfg-if",
- "concurrent-queue",
- "libc",
- "log",
- "pin-project-lite",
- "windows-sys 0.48.0",
-]
-
-[[package]]
-name = "polling"
 version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d0e4f59085d47d8241c88ead0f274e8a0cb551f3625263c05eb8dd897c34218"
@@ -6040,7 +6140,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "log",
- "nix",
+ "nix 0.29.0",
  "serde",
  "serial2",
  "shared_library",
@@ -6189,7 +6289,7 @@ name = "promise"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "asupersync",
+ "asupersync 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "async-executor",
  "async-io",
  "async-task",
@@ -7764,7 +7864,7 @@ dependencies = [
  "libc",
  "log",
  "memmem",
- "nix",
+ "nix 0.29.0",
  "num-derive",
  "num-traits",
  "ordered-float 4.6.0",
@@ -7816,7 +7916,7 @@ dependencies = [
  "libc",
  "log",
  "memmem",
- "nix",
+ "nix 0.29.0",
  "num-derive",
  "num-traits",
  "ordered-float 4.6.0",
@@ -8180,23 +8280,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab16f14aed21ee8bfd8ec22513f7287cd4a91aa92e44edfe2c17ddd004e92607"
 
 [[package]]
-name = "toon"
-version = "0.1.3"
-source = "git+https://github.com/Dicklesworthstone/toon_rust?branch=master#35ec231f0e1dccd70eb715a71f4e9f084a7b6c39"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "clap_complete",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
- "vergen-gix",
-]
-
-[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8313,6 +8396,23 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "tru"
+version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/toon_rust?branch=master#c1c6dc6d08d5cbe30a90a9fc37e754d4af7aab7a"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "vergen-gix",
 ]
 
 [[package]]
@@ -9869,23 +9969,6 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
-
-[[package]]
-name = "x509-parser"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4569f339c0c402346d4a75a9e39cf8dad310e287eef1ff56d4c68e5067f53460"
-dependencies = [
- "asn1-rs",
- "data-encoding",
- "der-parser",
- "lazy_static",
- "nom 7.1.3",
- "oid-registry",
- "rusticata-macros",
- "thiserror 2.0.18",
- "time",
-]
 
 [[package]]
 name = "x509-parser"

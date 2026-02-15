@@ -1967,7 +1967,7 @@ mod tests {
         let (tx, rx) = watch::channel(PlayerControl::Play);
         let mut sink = CollectorSink::new();
 
-        tokio::spawn(async move {
+        crate::runtime_compat::task::spawn(async move {
             // Pause at 1s, resume at 2s
             sleep(Duration::from_secs(1)).await;
             let _ = tx.send(PlayerControl::Pause);

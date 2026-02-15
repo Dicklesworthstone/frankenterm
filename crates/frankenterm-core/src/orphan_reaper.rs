@@ -657,8 +657,8 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Should return immediately when interval is 0
-        let handle = tokio::spawn(run_orphan_reaper(config, shutdown));
-        let result = tokio::time::timeout(Duration::from_millis(100), handle).await;
+        let handle = crate::runtime_compat::task::spawn(run_orphan_reaper(config, shutdown));
+        let result = crate::runtime_compat::timeout(Duration::from_millis(100), handle).await;
         assert!(result.is_ok(), "disabled reaper should return immediately");
     }
 
@@ -671,14 +671,14 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
 
-        let handle = tokio::spawn(run_orphan_reaper(config, shutdown_clone));
+        let handle = crate::runtime_compat::task::spawn(run_orphan_reaper(config, shutdown_clone));
 
         // Signal shutdown after a short delay
         crate::runtime_compat::sleep(Duration::from_millis(50)).await;
         shutdown.store(true, Ordering::Relaxed);
 
         // Should exit within a reasonable time (after current sleep)
-        let result = tokio::time::timeout(Duration::from_secs(3), handle).await;
+        let result = crate::runtime_compat::timeout(Duration::from_secs(3), handle).await;
         assert!(result.is_ok(), "reaper should respond to shutdown signal");
     }
 }

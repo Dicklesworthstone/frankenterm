@@ -230,7 +230,7 @@ toml_edit = "0.24.0"
 serde_yaml = "0.9.34"
 
 # Serialization
-toon_rust = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/toon_rust", branch = "master", package = "toon" }
+toon_rust = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/toon_rust", branch = "master", package = "tru" }
 
 # FrankenTerm crates (in-tree, ex-WezTerm)
 async_ossl = { path = "frankenterm/async_ossl" }
@@ -425,8 +425,8 @@ strip = true        # Remove debug symbols
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", branch = "master" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
-asupersync = { path = "/dp/asupersync" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", branch = "master" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
-asupersync = { path = "/dp/asupersync" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }

@@ -1179,7 +1179,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
 
         let acceptor = TlsAcceptor::new((*server_config).clone());
-        let server_task = tokio::spawn(async move {
+        let server_task = crate::runtime_compat::task::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let mut tls_stream = acceptor.accept(stream).await.expect("accept tls");
             let mut buf = [0u8; 4];
@@ -1243,7 +1243,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
 
         let acceptor = TlsAcceptor::new((*server_tls).clone());
-        let server_task = tokio::spawn(async move {
+        let server_task = crate::runtime_compat::task::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let mut tls_stream = acceptor.accept(stream).await.expect("accept tls");
             let mut buf = [0u8; 2];
@@ -1295,7 +1295,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
 
         let acceptor = TlsAcceptor::new((*server_config).clone());
-        let server_task = tokio::spawn(async move {
+        let server_task = crate::runtime_compat::task::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             acceptor.accept(stream).await
         });
@@ -1359,7 +1359,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
 
         let acceptor = TlsAcceptor::new((*server_tls).clone());
-        let server_task = tokio::spawn(async move {
+        let server_task = crate::runtime_compat::task::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             acceptor.accept(stream).await
         });
@@ -1428,7 +1428,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
 
         let acceptor = TlsAcceptor::new((*server_tls).clone());
-        let server_task = tokio::spawn(async move {
+        let server_task = crate::runtime_compat::task::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             acceptor.accept(stream).await
         });
@@ -1477,7 +1477,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
 
         let acceptor = TlsAcceptor::new((*server_config).clone());
-        let server_task = tokio::spawn(async move {
+        let server_task = crate::runtime_compat::task::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             acceptor.accept(stream).await
         });
