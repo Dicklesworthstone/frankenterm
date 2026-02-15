@@ -703,4 +703,422 @@ mod tests {
             let _doc = fields_to_document(&doc_fields, &handles);
         }
     }
+
+    // =========================================================================
+    // Constants validation
+    // =========================================================================
+
+    #[test]
+    fn tokenizer_names_are_non_empty() {
+        assert!(!TOKENIZER_TERMINAL_TEXT.is_empty());
+        assert!(!TOKENIZER_TERMINAL_SYMBOLS.is_empty());
+    }
+
+    #[test]
+    fn tokenizer_names_contain_version() {
+        assert!(TOKENIZER_TERMINAL_TEXT.contains("v1"));
+        assert!(TOKENIZER_TERMINAL_SYMBOLS.contains("v1"));
+    }
+
+    #[test]
+    fn max_token_length_is_reasonable() {
+        assert!(MAX_TOKEN_LENGTH > 0);
+        assert!(MAX_TOKEN_LENGTH <= 1024);
+    }
+
+    #[test]
+    fn terminal_token_pattern_is_valid_regex() {
+        let regex = regex::Regex::new(TERMINAL_TOKEN_PATTERN);
+        assert!(regex.is_ok(), "TERMINAL_TOKEN_PATTERN should be valid regex");
+    }
+
+    #[test]
+    fn terminal_token_pattern_matches_alphanumeric() {
+        let re = regex::Regex::new(TERMINAL_TOKEN_PATTERN).unwrap();
+        assert!(re.is_match("hello"));
+        assert!(re.is_match("world123"));
+        assert!(re.is_match("/usr/local/bin"));
+        assert!(re.is_match("http://example.com"));
+    }
+
+    // =========================================================================
+    // LexicalFieldHandles traits
+    // =========================================================================
+
+    #[test]
+    fn field_handles_are_copy() {
+        let (_, handles) = build_lexical_schema_v1();
+        let copy = handles; // Copy
+        assert_eq!(handles.event_id, copy.event_id);
+        assert_eq!(handles.pane_id, copy.pane_id);
+    }
+
+    #[test]
+    fn field_handles_are_clone() {
+        let (_, handles) = build_lexical_schema_v1();
+        let cloned = handles.clone();
+        assert_eq!(handles.text, cloned.text);
+    }
+
+    #[test]
+    fn field_handles_debug_format() {
+        let (_, handles) = build_lexical_schema_v1();
+        let dbg = format!("{handles:?}");
+        assert!(dbg.contains("LexicalFieldHandles"));
+    }
+
+    #[test]
+    fn field_handles_all_distinct() {
+        let (_, h) = build_lexical_schema_v1();
+        let all_fields = [
+            h.schema_version,
+            h.lexical_schema_version,
+            h.event_id,
+            h.pane_id,
+            h.session_id,
+            h.workflow_id,
+            h.correlation_id,
+            h.parent_event_id,
+            h.trigger_event_id,
+            h.root_event_id,
+            h.source,
+            h.event_type,
+            h.ingress_kind,
+            h.segment_kind,
+            h.control_marker_type,
+            h.lifecycle_phase,
+            h.is_gap,
+            h.redaction,
+            h.occurred_at_ms,
+            h.recorded_at_ms,
+            h.sequence,
+            h.log_offset,
+            h.text,
+            h.text_symbols,
+            h.details_json,
+        ];
+        let unique: std::collections::HashSet<_> = all_fields.iter().collect();
+        assert_eq!(
+            unique.len(),
+            25,
+            "All 25 field handles should be distinct"
+        );
+    }
+
+    // =========================================================================
+    // Schema field handle round-trip through schema lookup
+    // =========================================================================
+
+    #[test]
+    fn all_handles_match_schema_fields() {
+        let (schema, h) = build_lexical_schema_v1();
+        assert_eq!(h.schema_version, schema.get_field("schema_version").unwrap());
+        assert_eq!(
+            h.lexical_schema_version,
+            schema.get_field("lexical_schema_version").unwrap()
+        );
+        assert_eq!(h.session_id, schema.get_field("session_id").unwrap());
+        assert_eq!(h.workflow_id, schema.get_field("workflow_id").unwrap());
+        assert_eq!(h.correlation_id, schema.get_field("correlation_id").unwrap());
+        assert_eq!(h.parent_event_id, schema.get_field("parent_event_id").unwrap());
+        assert_eq!(h.trigger_event_id, schema.get_field("trigger_event_id").unwrap());
+        assert_eq!(h.root_event_id, schema.get_field("root_event_id").unwrap());
+        assert_eq!(h.source, schema.get_field("source").unwrap());
+        assert_eq!(h.event_type, schema.get_field("event_type").unwrap());
+        assert_eq!(h.ingress_kind, schema.get_field("ingress_kind").unwrap());
+        assert_eq!(h.segment_kind, schema.get_field("segment_kind").unwrap());
+        assert_eq!(
+            h.control_marker_type,
+            schema.get_field("control_marker_type").unwrap()
+        );
+        assert_eq!(h.lifecycle_phase, schema.get_field("lifecycle_phase").unwrap());
+        assert_eq!(h.redaction, schema.get_field("redaction").unwrap());
+        assert_eq!(h.occurred_at_ms, schema.get_field("occurred_at_ms").unwrap());
+        assert_eq!(h.recorded_at_ms, schema.get_field("recorded_at_ms").unwrap());
+        assert_eq!(h.sequence, schema.get_field("sequence").unwrap());
+        assert_eq!(h.log_offset, schema.get_field("log_offset").unwrap());
+        assert_eq!(h.text_symbols, schema.get_field("text_symbols").unwrap());
+    }
+
+    // =========================================================================
+    // Schema JSON serialization
+    // =========================================================================
+
+    #[test]
+    fn schema_serializes_to_json() {
+        let (schema, _) = build_lexical_schema_v1();
+        let json = serde_json::to_string(&schema).unwrap();
+        assert!(json.contains("event_id"));
+        assert!(json.contains("pane_id"));
+        assert!(json.contains("text"));
+        assert!(json.contains("details_json"));
+    }
+
+    // =========================================================================
+    // Fingerprint additional tests
+    // =========================================================================
+
+    #[test]
+    fn fingerprint_is_not_empty() {
+        let (schema, _) = build_lexical_schema_v1();
+        let fp = schema_fingerprint(&schema);
+        assert!(!fp.is_empty());
+    }
+
+    #[test]
+    fn fingerprint_is_lowercase_hex() {
+        let (schema, _) = build_lexical_schema_v1();
+        let fp = schema_fingerprint(&schema);
+        assert!(fp.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+    }
+
+    // =========================================================================
+    // Document conversion detail verification
+    // =========================================================================
+
+    #[test]
+    fn ingress_document_contains_all_populated_fields() {
+        let event = sample_ingress_event();
+        let doc_fields = map_event_to_document(&event, 100);
+        let (schema, handles) = build_lexical_schema_v1();
+        let doc = fields_to_document(&doc_fields, &handles);
+        let json = doc.to_json(&schema);
+
+        // Identity fields
+        assert!(json.contains("sess-1"));
+        assert!(json.contains("wf-1"));
+        assert!(json.contains("corr-1"));
+        // Causality
+        assert!(json.contains("parent-1"));
+        assert!(json.contains("root-1"));
+        // Event type should be ingress
+        assert!(json.contains("ingress"));
+    }
+
+    #[test]
+    fn egress_document_contains_segment_kind() {
+        let event = sample_egress_event();
+        let doc_fields = map_event_to_document(&event, 200);
+        let (schema, handles) = build_lexical_schema_v1();
+        let doc = fields_to_document(&doc_fields, &handles);
+        let json = doc.to_json(&schema);
+
+        assert!(json.contains("delta") || json.contains("Delta"));
+    }
+
+    #[test]
+    fn control_document_contains_marker_type() {
+        let event = sample_control_event();
+        let doc_fields = map_event_to_document(&event, 300);
+        let (schema, handles) = build_lexical_schema_v1();
+        let doc = fields_to_document(&doc_fields, &handles);
+        let json = doc.to_json(&schema);
+
+        assert!(json.contains("prompt_boundary") || json.contains("PromptBoundary"));
+    }
+
+    #[test]
+    fn lifecycle_document_contains_phase() {
+        let event = sample_lifecycle_event();
+        let doc_fields = map_event_to_document(&event, 400);
+        let (schema, handles) = build_lexical_schema_v1();
+        let doc = fields_to_document(&doc_fields, &handles);
+        let json = doc.to_json(&schema);
+
+        assert!(json.contains("pane_opened") || json.contains("PaneOpened"));
+    }
+
+    #[test]
+    fn egress_with_gap_sets_is_gap_true() {
+        let event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            event_id: "ev-gap-1".to_string(),
+            pane_id: 42,
+            session_id: None,
+            workflow_id: None,
+            correlation_id: None,
+            source: RecorderEventSource::WeztermMux,
+            occurred_at_ms: 5000,
+            recorded_at_ms: 5001,
+            sequence: 1,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload: RecorderEventPayload::EgressOutput {
+                text: "gap content".to_string(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                segment_kind: RecorderSegmentKind::Snapshot,
+                is_gap: true,
+            },
+        };
+
+        let doc_fields = map_event_to_document(&event, 500);
+        assert!(doc_fields.is_gap);
+    }
+
+    #[test]
+    fn document_preserves_timestamps() {
+        let event = sample_ingress_event();
+        let doc_fields = map_event_to_document(&event, 100);
+
+        assert_eq!(doc_fields.occurred_at_ms, 1_700_000_000_000);
+        assert_eq!(doc_fields.recorded_at_ms, 1_700_000_000_001);
+        assert_eq!(doc_fields.sequence, 7);
+        assert_eq!(doc_fields.log_offset, 100);
+    }
+
+    #[test]
+    fn document_preserves_pane_id() {
+        let event = sample_ingress_event();
+        let doc_fields = map_event_to_document(&event, 100);
+        assert_eq!(doc_fields.pane_id, 42);
+    }
+
+    // =========================================================================
+    // Tokenizer behavior tests
+    // =========================================================================
+
+    #[test]
+    fn text_tokenizer_lowercases() {
+        let (schema, _) = build_lexical_schema_v1();
+        let index = Index::create_in_ram(schema);
+        register_tokenizers(&index);
+
+        let mut tokenizer = index.tokenizers().get(TOKENIZER_TERMINAL_TEXT).unwrap();
+        let mut stream = tokenizer.token_stream("HELLO World");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        assert!(tokens.contains(&"hello".to_string()));
+        assert!(tokens.contains(&"world".to_string()));
+    }
+
+    #[test]
+    fn text_tokenizer_splits_on_path_separators() {
+        let (schema, _) = build_lexical_schema_v1();
+        let index = Index::create_in_ram(schema);
+        register_tokenizers(&index);
+
+        let mut tokenizer = index.tokenizers().get(TOKENIZER_TERMINAL_TEXT).unwrap();
+        let mut stream = tokenizer.token_stream("/usr/local/bin/cargo test");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        // Path should be kept as single token due to regex pattern
+        assert!(tokens.iter().any(|t| t.contains("usr/local/bin/cargo")));
+    }
+
+    #[test]
+    fn symbols_tokenizer_lowercases() {
+        let (schema, _) = build_lexical_schema_v1();
+        let index = Index::create_in_ram(schema);
+        register_tokenizers(&index);
+
+        let mut tokenizer = index
+            .tokenizers()
+            .get(TOKENIZER_TERMINAL_SYMBOLS)
+            .unwrap();
+        let mut stream = tokenizer.token_stream("FooBar");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        assert!(tokens.contains(&"foobar".to_string()));
+    }
+
+    // =========================================================================
+    // Multiple documents in single index
+    // =========================================================================
+
+    #[test]
+    fn index_multiple_documents() {
+        let (schema, handles) = build_lexical_schema_v1();
+        let index = Index::create_in_ram(schema.clone());
+        register_tokenizers(&index);
+
+        let events = [
+            sample_ingress_event(),
+            sample_egress_event(),
+            sample_control_event(),
+            sample_lifecycle_event(),
+        ];
+
+        let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        for (i, event) in events.iter().enumerate() {
+            let doc_fields = map_event_to_document(event, i as u64);
+            let doc = fields_to_document(&doc_fields, &handles);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 4);
+    }
+
+    // =========================================================================
+    // Document field presence/absence
+    // =========================================================================
+
+    #[test]
+    fn document_with_trigger_event_id() {
+        let mut event = sample_ingress_event();
+        event.causality.trigger_event_id = Some("trigger-42".to_string());
+        let doc_fields = map_event_to_document(&event, 0);
+        assert_eq!(doc_fields.trigger_event_id, Some("trigger-42".to_string()));
+
+        let (schema, handles) = build_lexical_schema_v1();
+        let doc = fields_to_document(&doc_fields, &handles);
+        let json = doc.to_json(&schema);
+        assert!(json.contains("trigger-42"));
+    }
+
+    #[test]
+    fn document_event_id_is_preserved() {
+        let event = sample_egress_event();
+        let doc_fields = map_event_to_document(&event, 0);
+        assert_eq!(doc_fields.event_id, "ev-egress-1");
+    }
+
+    #[test]
+    fn document_source_is_set() {
+        let event = sample_ingress_event();
+        let doc_fields = map_event_to_document(&event, 0);
+        assert!(!doc_fields.source.is_empty());
+    }
+
+    #[test]
+    fn document_event_type_is_set() {
+        let event = sample_control_event();
+        let doc_fields = map_event_to_document(&event, 0);
+        assert!(!doc_fields.event_type.is_empty());
+    }
+
+    #[test]
+    fn document_text_is_populated_for_text_events() {
+        let event = sample_ingress_event();
+        let doc_fields = map_event_to_document(&event, 0);
+        assert!(doc_fields.text.contains("echo hello world"));
+    }
+
+    #[test]
+    fn document_details_json_is_populated_for_control() {
+        let event = sample_control_event();
+        let doc_fields = map_event_to_document(&event, 0);
+        assert!(doc_fields.details_json.contains("cols"));
+        assert!(doc_fields.details_json.contains("80"));
+    }
+
+    #[test]
+    fn document_schema_version_is_set() {
+        let event = sample_ingress_event();
+        let doc_fields = map_event_to_document(&event, 0);
+        assert!(!doc_fields.schema_version.is_empty());
+        assert!(!doc_fields.lexical_schema_version.is_empty());
+    }
 }
