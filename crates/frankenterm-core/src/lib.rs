@@ -128,6 +128,7 @@ pub mod output;
 pub mod output_compression;
 pub mod pane_lifecycle;
 pub mod pane_tiers;
+pub mod pane_typestate;
 pub mod patterns;
 pub mod persistent_ds;
 pub mod plan;
