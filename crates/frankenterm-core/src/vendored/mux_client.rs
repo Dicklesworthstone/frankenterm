@@ -613,6 +613,7 @@ async fn unix_stream_read(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::R
 
 #[cfg(not(feature = "asupersync-runtime"))]
 async fn unix_stream_read(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    use tokio::io::AsyncReadExt;
     stream.read(buf).await
 }
 

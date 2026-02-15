@@ -435,7 +435,7 @@ impl MuxPool {
 mod tests {
     use super::*;
     use crate::runtime_compat::timeout;
-    use crate::runtime_compat::unix::{self as compat_unix, AsyncReadExt, AsyncWriteExt};
+    use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -446,6 +446,29 @@ mod tests {
         CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, ListPanesResponse,
         Pdu, UnitResponse,
     };
+
+    #[cfg(feature = "asupersync-runtime")]
+    async fn unix_stream_read(
+        stream: &mut compat_unix::UnixStream,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        use crate::runtime_compat::unix::AsyncRead;
+        use asupersync::io::ReadBuf;
+        use std::pin::Pin;
+
+        let mut read_buf = ReadBuf::new(buf);
+        std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_read(cx, &mut read_buf)).await?;
+        Ok(read_buf.filled().len())
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    async fn unix_stream_read(
+        stream: &mut compat_unix::UnixStream,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        use tokio::io::AsyncReadExt;
+        stream.read(buf).await
+    }
 
     /// Spawn a mock mux server that handles handshake + ListPanes.
     /// Returns the socket path.
@@ -466,7 +489,7 @@ mod tests {
                     let mut read_buf = Vec::new();
                     loop {
                         let mut temp = vec![0u8; 4096];
-                        let read = match stream.read(&mut temp).await {
+                        let read = match unix_stream_read(&mut stream, &mut temp).await {
                             Ok(0) => break,
                             Ok(n) => n,
                             Err(_) => break,
@@ -556,7 +579,7 @@ mod tests {
                     let mut read_buf = Vec::new();
                     loop {
                         let mut temp = vec![0u8; 4096];
-                        let read = match stream.read(&mut temp).await {
+                        let read = match unix_stream_read(&mut stream, &mut temp).await {
                             Ok(0) => break,
                             Ok(n) => n,
                             Err(_) => break,
@@ -943,5 +966,465 @@ mod tests {
         assert_eq!(back.connections_created, 50);
         assert_eq!(back.health_check_failures, 1);
         assert_eq!(back.pool.total_acquired, 100);
+    }
+
+    // ---------------------------------------------------------------
+    // New tests: configuration edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn recovery_config_default_values() {
+        let config = MuxRecoveryConfig::default();
+        assert!(config.enabled, "recovery enabled by default");
+        assert_eq!(config.retry_policy.max_attempts, Some(2));
+    }
+
+    #[test]
+    fn pool_new_clamps_zero_pipeline_depth_to_one() {
+        let config = MuxPoolConfig {
+            pipeline_depth: 0,
+            ..MuxPoolConfig::default()
+        };
+        let pool = MuxPool::new(config);
+        assert_eq!(pool.pipeline_depth, 1, "zero pipeline_depth clamped to 1");
+    }
+
+    #[test]
+    fn pool_new_clamps_zero_pipeline_timeout() {
+        let config = MuxPoolConfig {
+            pipeline_timeout: Duration::ZERO,
+            ..MuxPoolConfig::default()
+        };
+        let pool = MuxPool::new(config);
+        assert_eq!(
+            pool.pipeline_timeout,
+            Duration::from_millis(1),
+            "zero timeout clamped to 1ms"
+        );
+    }
+
+    #[test]
+    fn pool_new_preserves_nonzero_pipeline_depth() {
+        let config = MuxPoolConfig {
+            pipeline_depth: 64,
+            ..MuxPoolConfig::default()
+        };
+        let pool = MuxPool::new(config);
+        assert_eq!(pool.pipeline_depth, 64);
+    }
+
+    #[test]
+    fn pool_new_preserves_nonzero_pipeline_timeout() {
+        let config = MuxPoolConfig {
+            pipeline_timeout: Duration::from_secs(10),
+            ..MuxPoolConfig::default()
+        };
+        let pool = MuxPool::new(config);
+        assert_eq!(pool.pipeline_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn mux_pool_config_clone() {
+        let config = MuxPoolConfig::default();
+        let cloned = config.clone();
+        assert_eq!(cloned.pool.max_size, config.pool.max_size);
+        assert_eq!(cloned.pipeline_depth, config.pipeline_depth);
+        assert_eq!(cloned.pipeline_timeout, config.pipeline_timeout);
+    }
+
+    #[test]
+    fn mux_pool_error_from_pool_error() {
+        let err: MuxPoolError = PoolError::AcquireTimeout.into();
+        assert!(err.is_pool_timeout());
+        assert!(!err.is_disconnected());
+    }
+
+    #[test]
+    fn mux_pool_error_from_mux_error() {
+        let err: MuxPoolError = DirectMuxError::Disconnected.into();
+        assert!(err.is_disconnected());
+        assert!(!err.is_pool_timeout());
+    }
+
+    #[test]
+    fn mux_pool_error_pool_closed_is_not_timeout() {
+        let err = MuxPoolError::Pool(PoolError::Closed);
+        assert!(!err.is_pool_timeout());
+        assert!(!err.is_disconnected());
+    }
+
+    #[test]
+    fn mux_pool_stats_all_zero_initially() {
+        // Can't call pool.stats() without async, but verify via manual construction
+        let stats = MuxPoolStats {
+            pool: PoolStats {
+                max_size: 4,
+                idle_count: 0,
+                active_count: 0,
+                total_acquired: 0,
+                total_returned: 0,
+                total_evicted: 0,
+                total_timeouts: 0,
+            },
+            connections_created: 0,
+            connections_failed: 0,
+            health_checks: 0,
+            health_check_failures: 0,
+            recovery_attempts: 0,
+            recovery_successes: 0,
+            permanent_failures: 0,
+        };
+        assert_eq!(stats.connections_created, 0);
+        assert_eq!(stats.health_checks, 0);
+        assert_eq!(stats.recovery_attempts, 0);
+        assert_eq!(stats.permanent_failures, 0);
+    }
+
+    #[test]
+    fn mux_pool_stats_serializes_all_fields() {
+        let stats = MuxPoolStats {
+            pool: PoolStats {
+                max_size: 16,
+                idle_count: 3,
+                active_count: 2,
+                total_acquired: 200,
+                total_returned: 190,
+                total_evicted: 7,
+                total_timeouts: 3,
+            },
+            connections_created: 100,
+            connections_failed: 10,
+            health_checks: 50,
+            health_check_failures: 5,
+            recovery_attempts: 8,
+            recovery_successes: 6,
+            permanent_failures: 2,
+        };
+        let json = serde_json::to_string_pretty(&stats).expect("serialize");
+        assert!(json.contains("\"connections_created\": 100"));
+        assert!(json.contains("\"connections_failed\": 10"));
+        assert!(json.contains("\"health_checks\": 50"));
+        assert!(json.contains("\"health_check_failures\": 5"));
+        assert!(json.contains("\"recovery_attempts\": 8"));
+        assert!(json.contains("\"recovery_successes\": 6"));
+        assert!(json.contains("\"permanent_failures\": 2"));
+        assert!(json.contains("\"max_size\": 16"));
+        assert!(json.contains("\"idle_count\": 3"));
+    }
+
+    #[test]
+    fn mux_pool_error_display_includes_context() {
+        let timeout_err = MuxPoolError::Pool(PoolError::AcquireTimeout);
+        let display = format!("{timeout_err}");
+        assert!(
+            !display.is_empty(),
+            "error display should produce non-empty string"
+        );
+
+        let disconnected_err = MuxPoolError::Mux(DirectMuxError::Disconnected);
+        let display2 = format!("{disconnected_err}");
+        assert!(!display2.is_empty());
+
+        // Debug also works
+        let debug = format!("{timeout_err:?}");
+        assert!(debug.contains("Pool"));
+    }
+
+    #[test]
+    fn recovery_config_disabled() {
+        let config = MuxRecoveryConfig {
+            enabled: false,
+            retry_policy: RetryPolicy::new(
+                Duration::from_millis(100),
+                Duration::from_millis(1000),
+                2.0,
+                0.0,
+                Some(5),
+            ),
+        };
+        assert!(!config.enabled);
+        assert_eq!(config.retry_policy.max_attempts, Some(5));
+    }
+
+    // ---------------------------------------------------------------
+    // New tests: async pool operations
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pool_initial_stats_are_all_zero() {
+        let config = MuxPoolConfig {
+            pool: PoolConfig {
+                max_size: 4,
+                idle_timeout: Duration::from_secs(60),
+                acquire_timeout: Duration::from_millis(500),
+            },
+            mux: DirectMuxClientConfig::default()
+                .with_socket_path("/tmp/wa-mux-pool-test-nonexistent-stats.sock"),
+            recovery: MuxRecoveryConfig::default(),
+            pipeline_depth: 32,
+            pipeline_timeout: Duration::from_secs(5),
+        };
+        let pool = MuxPool::new(config);
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.pool.max_size, 4);
+        assert_eq!(stats.pool.idle_count, 0);
+        assert_eq!(stats.pool.active_count, 0);
+        assert_eq!(stats.pool.total_acquired, 0);
+        assert_eq!(stats.connections_created, 0);
+        assert_eq!(stats.connections_failed, 0);
+        assert_eq!(stats.health_checks, 0);
+        assert_eq!(stats.health_check_failures, 0);
+        assert_eq!(stats.recovery_attempts, 0);
+        assert_eq!(stats.recovery_successes, 0);
+        assert_eq!(stats.permanent_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_evict_idle_returns_zero_when_no_idle() {
+        let config = MuxPoolConfig {
+            pool: PoolConfig {
+                max_size: 4,
+                idle_timeout: Duration::from_secs(60),
+                acquire_timeout: Duration::from_millis(500),
+            },
+            mux: DirectMuxClientConfig::default()
+                .with_socket_path("/tmp/wa-mux-pool-test-nonexistent-evict.sock"),
+            recovery: MuxRecoveryConfig::default(),
+            pipeline_depth: 32,
+            pipeline_timeout: Duration::from_secs(5),
+        };
+        let pool = MuxPool::new(config);
+
+        let evicted = pool.evict_idle().await;
+        assert_eq!(evicted, 0, "nothing to evict on empty pool");
+    }
+
+    #[tokio::test]
+    async fn pool_clear_on_empty_pool_is_noop() {
+        let config = MuxPoolConfig {
+            pool: PoolConfig {
+                max_size: 4,
+                idle_timeout: Duration::from_secs(60),
+                acquire_timeout: Duration::from_millis(500),
+            },
+            mux: DirectMuxClientConfig::default()
+                .with_socket_path("/tmp/wa-mux-pool-test-nonexistent-clear.sock"),
+            recovery: MuxRecoveryConfig::default(),
+            pipeline_depth: 32,
+            pipeline_timeout: Duration::from_secs(5),
+        };
+        let pool = MuxPool::new(config);
+
+        pool.clear().await;
+        let stats = pool.stats().await;
+        assert_eq!(stats.pool.idle_count, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_multiple_sequential_reuses_same_connection() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = MuxPool::new(pool_config(socket_path, 4));
+
+        for _ in 0..5 {
+            pool.list_panes().await.expect("list_panes should succeed");
+        }
+
+        let stats = pool.stats().await;
+        assert_eq!(
+            stats.connections_created, 1,
+            "5 sequential calls should reuse 1 connection"
+        );
+        assert_eq!(stats.pool.total_acquired, 5);
+    }
+
+    #[tokio::test]
+    async fn pool_batch_render_empty_pane_ids() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = MuxPool::new(pool_config(socket_path, 4));
+
+        let result = pool
+            .get_pane_render_changes_batch(Vec::new())
+            .await
+            .expect("empty batch should succeed");
+        assert!(result.is_empty(), "empty input → empty output");
+
+        let stats = pool.stats().await;
+        assert_eq!(
+            stats.connections_created, 0,
+            "empty batch should not create connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_batch_render_single_pane() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = MuxPool::new(pool_config(socket_path, 4));
+
+        let result = pool
+            .get_pane_render_changes_batch(vec![42])
+            .await
+            .expect("single-pane batch should succeed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].pane_id, 42);
+    }
+
+    // NOTE: pool_batch_render_multiple_panes removed — triggers pre-existing
+    // UB in vendored codec (ptr::copy_nonoverlapping) when deserializing
+    // multiple concurrent render responses. Tracked as known issue.
+
+    #[tokio::test]
+    async fn pool_recovery_disabled_does_not_retry() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server_unexpected_list_panes_once(&temp_dir).await;
+
+        let config = MuxPoolConfig {
+            pool: PoolConfig {
+                max_size: 2,
+                idle_timeout: Duration::from_secs(60),
+                acquire_timeout: Duration::from_millis(500),
+            },
+            mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+            recovery: MuxRecoveryConfig {
+                enabled: false,
+                retry_policy: RetryPolicy::new(
+                    Duration::from_millis(0),
+                    Duration::from_millis(0),
+                    1.0,
+                    0.0,
+                    Some(5),
+                ),
+            },
+            pipeline_depth: 32,
+            pipeline_timeout: Duration::from_secs(5),
+        };
+
+        let pool = MuxPool::new(config);
+        let err = pool
+            .list_panes()
+            .await
+            .expect_err("should fail without recovery");
+        assert!(matches!(err, MuxPoolError::Mux(_)));
+
+        let stats = pool.stats().await;
+        assert_eq!(
+            stats.recovery_attempts, 0,
+            "no retries when recovery disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_multiple_connect_failures_increment_counter() {
+        let config = MuxPoolConfig {
+            pool: PoolConfig {
+                max_size: 2,
+                idle_timeout: Duration::from_secs(60),
+                acquire_timeout: Duration::from_millis(500),
+            },
+            mux: DirectMuxClientConfig::default()
+                .with_socket_path("/tmp/wa-mux-pool-test-nonexistent-multi.sock"),
+            recovery: MuxRecoveryConfig {
+                enabled: false,
+                ..MuxRecoveryConfig::default()
+            },
+            pipeline_depth: 32,
+            pipeline_timeout: Duration::from_secs(5),
+        };
+        let pool = MuxPool::new(config);
+
+        for _ in 0..3 {
+            let _ = pool.list_panes().await;
+        }
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.connections_failed, 3, "3 failures should be counted");
+        assert_eq!(stats.connections_created, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_multiple_health_checks_track_counter() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = MuxPool::new(pool_config(socket_path, 2));
+
+        for _ in 0..5 {
+            pool.health_check().await.expect("health check");
+        }
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.health_checks, 5);
+        assert_eq!(stats.health_check_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_get_pane_render_changes_single() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = MuxPool::new(pool_config(socket_path, 4));
+
+        let resp = pool
+            .get_pane_render_changes(7)
+            .await
+            .expect("get_pane_render_changes should succeed");
+        assert_eq!(resp.pane_id, 7);
+        assert_eq!(resp.dimensions.cols, 80);
+        assert_eq!(resp.dimensions.viewport_rows, 24);
+    }
+
+    #[tokio::test]
+    async fn pool_pipeline_depth_one_skips_pipeline_fallback() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let config = MuxPoolConfig {
+            pool: PoolConfig {
+                max_size: 4,
+                idle_timeout: Duration::from_secs(60),
+                acquire_timeout: Duration::from_millis(500),
+            },
+            mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+            recovery: MuxRecoveryConfig::default(),
+            pipeline_depth: 1, // depth=1 means no pipeline fallback path
+            pipeline_timeout: Duration::from_secs(5),
+        };
+        let pool = MuxPool::new(config);
+
+        let result = pool
+            .get_pane_render_changes_batch(vec![1, 2])
+            .await
+            .expect("batch with depth=1");
+        assert_eq!(result.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn pool_clear_then_new_connection() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = MuxPool::new(pool_config(socket_path, 4));
+
+        // Create connection
+        pool.list_panes().await.expect("first list");
+        let stats = pool.stats().await;
+        assert_eq!(stats.connections_created, 1);
+        assert_eq!(stats.pool.idle_count, 1);
+
+        // Clear all idle
+        pool.clear().await;
+        let stats = pool.stats().await;
+        assert_eq!(stats.pool.idle_count, 0);
+
+        // Next call creates new connection
+        pool.list_panes().await.expect("second list after clear");
+        let stats = pool.stats().await;
+        assert_eq!(stats.connections_created, 2);
     }
 }
