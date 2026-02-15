@@ -218,6 +218,17 @@ proptest! {
             "Envelope JSON ({} bytes) should be under MAX_MESSAGE_SIZE ({})",
             bytes.len(), MAX_MESSAGE_SIZE);
     }
+
+    #[test]
+    fn envelope_sent_at_ms_is_positive(
+        seq in 1..10000u64,
+        sender in "[a-z-]{3,20}",
+        payload in arb_wire_payload(),
+    ) {
+        let envelope = WireEnvelope::new(seq, &sender, payload);
+        prop_assert!(envelope.sent_at_ms > 0,
+            "sent_at_ms should be positive (non-zero), got: {}", envelope.sent_at_ms);
+    }
 }
 
 // ============================================================================
@@ -230,6 +241,16 @@ proptest! {
         let json = serde_json::to_string(&state).unwrap();
         let back: ConnectionState = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(state, back);
+    }
+
+    #[test]
+    fn connection_state_display_format_non_empty(state in arb_connection_state()) {
+        let debug_str = format!("{:?}", state);
+        let display_str = format!("{:?}", state); // ConnectionState doesn't impl Display, so use Debug
+        prop_assert!(!debug_str.is_empty(),
+            "Debug format should be non-empty");
+        prop_assert!(!display_str.is_empty(),
+            "Display format should be non-empty");
     }
 }
 
@@ -279,6 +300,20 @@ proptest! {
         prop_assert_eq!(delay, initial_ms,
             "first delay should equal initial_ms");
     }
+
+    #[test]
+    fn backoff_custom_delay_formula_correct(
+        initial_ms in 100..1000u64,
+        max_ms in 5000..10000u64,
+        multiplier in 2.0..3.0f64,
+        attempt in 0..5u32,
+    ) {
+        let cfg = BackoffConfig { initial_ms, max_ms, multiplier };
+        let delay = cfg.delay_ms(attempt);
+        let expected = (initial_ms as f64 * multiplier.powi(attempt as i32)).min(max_ms as f64) as u64;
+        prop_assert_eq!(delay, expected,
+            "delay formula should be min(initial * multiplier^attempt, max)");
+    }
 }
 
 #[test]
@@ -323,6 +358,74 @@ proptest! {
         prop_assert_eq!(streamer.seq(), 0);
         prop_assert_eq!(streamer.messages_sent(), 0);
         prop_assert_eq!(streamer.messages_dropped(), 0);
+    }
+
+    #[test]
+    fn streamer_mark_connected_resets_state(_sender in "[a-z]{3,10}") {
+        let mut streamer = AgentStreamer::new("test");
+        // Start disconnected
+        prop_assert_eq!(streamer.state(), ConnectionState::Disconnected);
+        // Mark connected
+        streamer.mark_connected();
+        prop_assert_eq!(streamer.state(), ConnectionState::Connected,
+            "mark_connected should transition to Connected state");
+    }
+
+    #[test]
+    fn streamer_mark_disconnected_resets_state(_sender in "[a-z]{3,10}") {
+        let mut streamer = AgentStreamer::new("test");
+        // Mark connected first
+        streamer.mark_connected();
+        prop_assert_eq!(streamer.state(), ConnectionState::Connected);
+        // Mark disconnected
+        streamer.mark_disconnected();
+        prop_assert_eq!(streamer.state(), ConnectionState::Disconnected,
+            "mark_disconnected should transition to Disconnected state");
+    }
+
+    #[test]
+    fn streamer_with_custom_backoff_uses_config(
+        initial_ms in 100..2000u64,
+        max_ms in 5000..20000u64,
+        multiplier in 1.5..3.0f64,
+    ) {
+        let backoff = BackoffConfig { initial_ms, max_ms, multiplier };
+        let mut streamer = AgentStreamer::with_backoff("test", backoff.clone());
+
+        // Trigger first reconnect
+        let delay = streamer.mark_reconnecting();
+        prop_assert_eq!(delay, initial_ms,
+            "first reconnect delay should match custom initial_ms");
+
+        // Trigger second reconnect
+        let delay = streamer.mark_reconnecting();
+        let expected = (initial_ms as f64 * multiplier).min(max_ms as f64) as u64;
+        prop_assert_eq!(delay, expected,
+            "second reconnect delay should match custom backoff formula");
+    }
+}
+
+// ============================================================================
+// PanesMeta properties
+// ============================================================================
+
+proptest! {
+    #[test]
+    fn panes_meta_multiple_panes_serde_roundtrip(
+        panes in prop::collection::vec(arb_pane_meta(), 0..10),
+        timestamp_ms in 1_000_000_000_000i64..2_000_000_000_000i64,
+    ) {
+        let meta = PanesMeta { panes, timestamp_ms };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: PanesMeta = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(meta.panes.len(), back.panes.len(),
+            "panes count should be preserved");
+        prop_assert_eq!(meta.timestamp_ms, back.timestamp_ms,
+            "timestamp_ms should be preserved");
+        for (orig, decoded) in meta.panes.iter().zip(back.panes.iter()) {
+            prop_assert_eq!(orig.pane_id, decoded.pane_id);
+            prop_assert_eq!(&orig.domain, &decoded.domain);
+        }
     }
 }
 
@@ -413,6 +516,80 @@ proptest! {
         }
         prop_assert_eq!(agg.agent_count(), n_senders);
         prop_assert_eq!(agg.total_accepted(), (n_senders * n_messages) as u64);
+    }
+
+    /// Aggregator capacity limit: more agents than max_agents fails with TooManyAgents.
+    #[test]
+    fn aggregator_capacity_limit_rejects_excess_agents(
+        max_agents in 1..5usize,
+        n_agents in 5..10usize,
+    ) {
+        prop_assume!(n_agents > max_agents);
+        let mut agg = Aggregator::new(max_agents);
+        let gap = GapNotice {
+            pane_id: 1,
+            seq_before: 0,
+            seq_after: 1,
+            reason: "test".to_string(),
+            detected_at_ms: 0,
+        };
+
+        let mut accepted_count = 0;
+        let mut rejected_count = 0;
+
+        for i in 0..n_agents {
+            let sender = format!("agent-{}", i);
+            let envelope = WireEnvelope::new(1, &sender, WirePayload::Gap(gap.clone()));
+            match agg.ingest_envelope(envelope) {
+                Ok(IngestResult::Accepted(_)) => {
+                    accepted_count += 1;
+                }
+                Err(frankenterm_core::wire_protocol::WireProtocolError::TooManyAgents { .. }) => {
+                    rejected_count += 1;
+                }
+                other => {
+                    prop_assert!(false, "Unexpected result: {:?}", other);
+                }
+            }
+        }
+
+        prop_assert_eq!(accepted_count, max_agents,
+            "should accept exactly max_agents agents");
+        prop_assert_eq!(rejected_count, n_agents - max_agents,
+            "should reject excess agents");
+        prop_assert_eq!(agg.agent_count(), max_agents);
+    }
+
+    /// Conservation property: total_accepted + total_rejected = total processed.
+    #[test]
+    fn aggregator_conservation_property(
+        n_valid in 1..10usize,
+        n_invalid in 1..10usize,
+    ) {
+        let mut agg = Aggregator::new(100);
+        let gap = GapNotice {
+            pane_id: 1,
+            seq_before: 0,
+            seq_after: 1,
+            reason: "test".to_string(),
+            detected_at_ms: 0,
+        };
+
+        // Send n_valid valid messages
+        for i in 1..=n_valid {
+            let envelope = WireEnvelope::new(i as u64, "agent-a", WirePayload::Gap(gap.clone()));
+            let _ = agg.ingest_envelope(envelope);
+        }
+
+        // Send n_invalid invalid messages (malformed JSON)
+        for _ in 0..n_invalid {
+            let _ = agg.ingest(b"invalid json");
+        }
+
+        let total_processed = (n_valid + n_invalid) as u64;
+        let total_counted = agg.total_accepted() + agg.total_rejected();
+        prop_assert_eq!(total_counted, total_processed,
+            "total_accepted + total_rejected should equal total processed");
     }
 }
 

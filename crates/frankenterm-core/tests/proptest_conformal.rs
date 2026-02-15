@@ -27,6 +27,14 @@
 //! 22. ConformalForecaster: has_metric after observe
 //! 23. ConformalForecaster: observation_count tracks per-metric
 //! 24. ConformalForecaster: forecasts non-empty after warmup
+//! 25. HoltPredictor: linear series (y = slope*x) → trend converges toward slope
+//! 26. HoltPredictor: forecast(0) equals level after warmup
+//! 27. MetricForecaster: forecast_horizon returns Some for configured horizon
+//! 28. MetricForecaster: forecasts have correct metric_name after warmup
+//! 29. ConformalForecaster: observe same metric N times → observation_count = N
+//! 30. ConformalForecaster: forecast_all returns count = metrics × horizons
+//! 31. ResourceForecast: interval_width is non-negative when upper >= lower
+//! 32. HoltPredictor: update with same value twice → trend decreases in magnitude
 
 use proptest::prelude::*;
 
@@ -726,5 +734,225 @@ proptest! {
             "should have forecasts after 100 observations");
         prop_assert_eq!(forecasts.len(), 2,
             "should have 2 forecasts (one per horizon)");
+    }
+}
+
+// =============================================================================
+// Property 25: Linear series → trend converges toward slope
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn holt_linear_trend_convergence(
+        slope in 0.1_f64..10.0,
+        intercept in -100.0_f64..100.0,
+        alpha in 0.3_f64..0.7,
+        beta in 0.2_f64..0.5,
+    ) {
+        let mut holt = HoltPredictor::new(alpha, beta);
+        for i in 0..300 {
+            let value = slope.mul_add(i as f64, intercept);
+            holt.update(value);
+        }
+        // After 300 observations, trend should be close to slope
+        let trend_error = (holt.trend() - slope).abs();
+        prop_assert!(trend_error < slope * 0.15,
+            "trend {} should converge toward slope {} (error={})", holt.trend(), slope, trend_error);
+    }
+}
+
+// =============================================================================
+// Property 26: forecast(0) equals level after warmup
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(150))]
+
+    #[test]
+    fn holt_forecast_zero_equals_level(
+        values in proptest::collection::vec(arb_finite_value(), 10..50),
+    ) {
+        let mut holt = HoltPredictor::new(0.3, 0.1);
+        for &v in &values {
+            holt.update(v);
+        }
+        let forecast_zero = holt.forecast(0.0);
+        prop_assert!((forecast_zero - holt.level()).abs() < 1e-10,
+            "forecast(0) = {} should equal level = {}", forecast_zero, holt.level());
+    }
+}
+
+// =============================================================================
+// Property 27: forecast_horizon returns Some for configured horizon
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn forecaster_configured_horizon_returns_some(
+        horizon in 1_usize..200,
+    ) {
+        let mut mf = MetricForecaster::new(
+            "test".into(), 0.3, 0.1, &[horizon], 100, 1000, 0.95,
+        );
+        for i in 0..50 {
+            mf.observe(i as f64);
+        }
+        prop_assert!(mf.forecast_horizon(horizon).is_some(),
+            "configured horizon {} should return Some", horizon);
+    }
+}
+
+// =============================================================================
+// Property 28: forecasts have correct metric_name after warmup
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn forecaster_metric_name_correct(
+        name in "[a-z_]{3,20}",
+        horizons in proptest::collection::vec(1_usize..50, 1..4),
+    ) {
+        let mut mf = MetricForecaster::new(
+            name.clone(), 0.3, 0.1, &horizons, 100, 1000, 0.95,
+        );
+        for i in 0..100 {
+            mf.observe(i as f64);
+        }
+        let forecasts = mf.forecast_all();
+        for fc in &forecasts {
+            prop_assert_eq!(&fc.metric_name, &name,
+                "forecast metric_name should be {}", name);
+        }
+    }
+}
+
+// =============================================================================
+// Property 29: observe same metric N times → observation_count = N
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn conformal_observation_count_accumulates(
+        n in 1_usize..100,
+        name in "[a-z]{3,10}",
+    ) {
+        let config = ConformalConfig {
+            horizon_steps: vec![5],
+            ..ConformalConfig::default()
+        };
+        let mut f = ConformalForecaster::new(config);
+        for i in 0..n {
+            f.observe(&name, i as f64);
+        }
+        prop_assert_eq!(f.observation_count(&name), Some(n as u64),
+            "observation_count for {} should be {}", name, n);
+    }
+}
+
+// =============================================================================
+// Property 30: forecast_all returns count = metrics × horizons
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn conformal_forecast_all_count(
+        n_metrics in 1_usize..5,
+        n_horizons in 1_usize..4,
+    ) {
+        let horizons: Vec<usize> = (1..=n_horizons).map(|i| i * 10).collect();
+        let config = ConformalConfig {
+            horizon_steps: horizons,
+            calibration_window: 50,
+            max_history: 500,
+            ..ConformalConfig::default()
+        };
+        let mut f = ConformalForecaster::new(config);
+        for i in 0..n_metrics {
+            for _ in 0..100 {
+                f.observe(&format!("metric_{}", i), 42.0);
+            }
+        }
+        let forecasts = f.forecast_all();
+        let expected_count = n_metrics * n_horizons;
+        prop_assert_eq!(forecasts.len(), expected_count,
+            "forecast_all should return {} forecasts (metrics={}, horizons={})",
+            expected_count, n_metrics, n_horizons);
+    }
+}
+
+// =============================================================================
+// Property 31: interval_width is non-negative when upper >= lower
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(150))]
+
+    #[test]
+    fn forecast_interval_width_nonnegative(
+        lower in -1e8_f64..1e8,
+        delta in 0.0_f64..1e6,
+    ) {
+        let upper = lower + delta;
+        let fc = ResourceForecast {
+            metric_name: "test".into(),
+            horizon_steps: 5,
+            point_estimate: (lower + upper) / 2.0,
+            lower_bound: lower,
+            upper_bound: upper,
+            coverage: 0.95,
+            calibration_size: 100,
+            alert: None,
+        };
+        let width = fc.interval_width();
+        prop_assert!(width >= 0.0,
+            "interval_width {} should be non-negative when upper={} >= lower={}",
+            width, upper, lower);
+        prop_assert!((width - delta).abs() < 1e-6,
+            "interval_width {} should equal delta={}", width, delta);
+    }
+}
+
+// =============================================================================
+// Property 32: update with same value twice → trend decreases in magnitude
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn holt_same_value_dampens_trend(
+        initial_values in proptest::collection::vec(arb_finite_value(), 3..10),
+        constant_value in arb_finite_value(),
+    ) {
+        let mut holt = HoltPredictor::new(0.3, 0.1);
+        for &v in &initial_values {
+            holt.update(v);
+        }
+        // Ensure we have some non-zero trend
+        if holt.trend().abs() < 1e-6 {
+            holt.update(holt.level() + 100.0);
+        }
+        let trend_before = holt.trend().abs();
+
+        // Update with same value twice
+        holt.update(constant_value);
+        let trend_after_first = holt.trend().abs();
+        holt.update(constant_value);
+        let trend_after_second = holt.trend().abs();
+
+        // Trend magnitude should decrease (or stay same if already near zero)
+        prop_assert!(trend_after_second <= trend_after_first + 1e-10,
+            "second update with constant {} should not increase trend magnitude: {} -> {} -> {}",
+            constant_value, trend_before, trend_after_first, trend_after_second);
     }
 }

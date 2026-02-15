@@ -673,3 +673,240 @@ proptest! {
         prop_assert!(cloned.contains_node(&"extra".to_string()));
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// NEW TESTS: Adding one node increases node_count by exactly 1
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Adding one node to the ring increases node_count by exactly 1.
+    #[test]
+    fn prop_add_node_increments_count(
+        vnodes in arb_vnodes(),
+        n_nodes in 1usize..=10,
+    ) {
+        let nodes: Vec<String> = (0..n_nodes).map(|i| format!("n-{}", i)).collect();
+        let ring = HashRing::with_nodes(vnodes, nodes);
+
+        let before_count = ring.node_count();
+        let mut ring2 = ring.clone();
+        ring2.add_node("new-node".to_string());
+        let after_count = ring2.node_count();
+
+        prop_assert_eq!(after_count, before_count + 1, "node_count should increase by 1");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW TESTS: get_nodes consistency
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// get_nodes with same key always returns same ordered list.
+    #[test]
+    fn prop_get_nodes_consistency(
+        vnodes in arb_vnodes(),
+        n_nodes in 2usize..=10,
+        key in arb_key(),
+        count in 1usize..=5,
+    ) {
+        let nodes: Vec<String> = (0..n_nodes).map(|i| format!("n-{}", i)).collect();
+        let ring = HashRing::with_nodes(vnodes, nodes);
+
+        let first = ring.get_nodes(&key, count);
+        let second = ring.get_nodes(&key, count);
+
+        prop_assert_eq!(first, second, "get_nodes should return same ordered list");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW TESTS: After remove, get_node never returns the removed node
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// After removing a node, get_node never returns that node.
+    #[test]
+    fn prop_after_remove_node_not_returned(
+        vnodes in arb_vnodes(),
+        n_nodes in 2usize..=10,
+        keys in arb_keys(50),
+    ) {
+        let nodes: Vec<String> = (0..n_nodes).map(|i| format!("n-{}", i)).collect();
+        let mut ring = HashRing::with_nodes(vnodes, nodes.clone());
+
+        let removed = nodes[0].clone();
+        ring.remove_node(&removed);
+
+        for key in &keys {
+            if let Some(node) = ring.get_node(key) {
+                prop_assert_ne!(node, &removed, "removed node should not be returned");
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW TESTS: Re-add after remove restores node_count
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Removing then re-adding a node restores node_count.
+    #[test]
+    fn prop_readd_after_remove_restores_count(
+        vnodes in arb_vnodes(),
+        n_nodes in 1usize..=10,
+    ) {
+        let nodes: Vec<String> = (0..n_nodes).map(|i| format!("n-{}", i)).collect();
+        let mut ring = HashRing::with_nodes(vnodes, nodes.clone());
+
+        let original_count = ring.node_count();
+        let to_remove = nodes[0].clone();
+
+        ring.remove_node(&to_remove);
+        prop_assert_eq!(ring.node_count(), original_count - 1);
+
+        ring.add_node(to_remove);
+        prop_assert_eq!(ring.node_count(), original_count);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW TESTS: get_node_pair consistency across calls
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// get_node_pair returns the same result on repeated calls.
+    #[test]
+    fn prop_get_node_pair_consistency(
+        vnodes in arb_vnodes(),
+        n_nodes in 1usize..=10,
+        key in arb_key(),
+    ) {
+        let nodes: Vec<String> = (0..n_nodes).map(|i| format!("n-{}", i)).collect();
+        let ring = HashRing::with_nodes(vnodes, nodes);
+
+        let first = ring.get_node_pair(&key);
+        let second = ring.get_node_pair(&key);
+
+        prop_assert_eq!(first, second, "get_node_pair should be consistent");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW TESTS: Stats min_fraction + max_fraction sum is reasonable
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// For 2+ nodes, min_fraction + max_fraction should be reasonable.
+    #[test]
+    fn prop_stats_fraction_sum_reasonable(
+        vnodes in 50u32..=200,
+        n_nodes in 2usize..=8,
+    ) {
+        let nodes: Vec<String> = (0..n_nodes).map(|i| format!("n-{}", i)).collect();
+        let ring = HashRing::with_nodes(vnodes, nodes);
+
+        let stats = ring.stats();
+        let sum = stats.min_fraction + stats.max_fraction;
+
+        // For 2+ nodes, sum should be between 0.1 and 1.5 (reasonable bounds)
+        prop_assert!(
+            sum > 0.1 && sum < 1.5,
+            "min + max fraction = {} is unreasonable", sum
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW TESTS: Vnode count after remove decreases by vnodes_per_node
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Removing a node decreases vnode_count by vnodes_per_node.
+    #[test]
+    fn prop_remove_decreases_vnodes(
+        vnodes in arb_vnodes(),
+        n_nodes in 2usize..=10,
+    ) {
+        let nodes: Vec<String> = (0..n_nodes).map(|i| format!("n-{}", i)).collect();
+        let mut ring = HashRing::with_nodes(vnodes, nodes.clone());
+
+        let before_vnode_count = ring.vnode_count();
+        ring.remove_node(&nodes[0]);
+        let after_vnode_count = ring.vnode_count();
+
+        prop_assert_eq!(
+            after_vnode_count,
+            before_vnode_count - vnodes as usize,
+            "vnode_count should decrease by vnodes_per_node"
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW TESTS: All get_nodes replicas are members of the ring
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// All nodes returned by get_nodes are members of the ring.
+    #[test]
+    fn prop_get_nodes_replicas_are_members(
+        vnodes in arb_vnodes(),
+        n_nodes in 1usize..=10,
+        key in arb_key(),
+        count in 1usize..=15,
+    ) {
+        let nodes: Vec<String> = (0..n_nodes).map(|i| format!("n-{}", i)).collect();
+        let node_set: HashSet<String> = nodes.iter().cloned().collect();
+        let ring = HashRing::with_nodes(vnodes, nodes);
+
+        let replicas = ring.get_nodes(&key, count);
+
+        for replica in &replicas {
+            prop_assert!(
+                node_set.contains(*replica),
+                "replica '{}' is not in the ring", replica
+            );
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW TESTS: Single node get_nodes with any count returns vec of len 1
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// With a single node, get_nodes returns vec of length 1 for any count >= 1.
+    #[test]
+    fn prop_single_node_get_nodes_len_one(
+        vnodes in arb_vnodes(),
+        key in arb_key(),
+        count in 1usize..=20,
+    ) {
+        let mut ring = HashRing::new(vnodes);
+        ring.add_node("solo".to_string());
+
+        let replicas = ring.get_nodes(&key, count);
+        prop_assert_eq!(replicas.len(), 1, "single node should return vec of len 1");
+        prop_assert_eq!(replicas[0], "solo");
+    }
+}

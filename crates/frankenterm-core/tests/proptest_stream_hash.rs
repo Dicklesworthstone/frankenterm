@@ -8,6 +8,13 @@
 //! - IntegrityChecker matches/divergence detection
 //! - Digest serialization roundtrip
 //! - Collision resistance (distinct inputs → distinct digests)
+//! - Four-way homomorphic combine
+//! - Clone consistency
+//! - Multiple resets preserve invariants
+//! - IntegrityChecker multiple sequential checks
+//! - Combine length additivity
+//! - Prefix sensitivity (different prefixes → different digests)
+//! - IntegrityResult serde roundtrip
 
 use proptest::prelude::*;
 
@@ -27,6 +34,10 @@ fn arb_nonempty_bytes() -> impl Strategy<Value = Vec<u8>> {
 
 fn arb_byte_chunks() -> impl Strategy<Value = Vec<Vec<u8>>> {
     prop::collection::vec(arb_bytes(), 1..8)
+}
+
+fn arb_split_point() -> impl Strategy<Value = usize> {
+    0_usize..256
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -470,5 +481,311 @@ proptest! {
         let da = ha.digest();
         let db = hb.digest();
         prop_assert_eq!(da.matches(&db), db.matches(&da));
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Four-way homomorphic combine
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Four-way split: any grouping of H(A||B||C||D) produces the same digest.
+    #[test]
+    fn prop_homomorphic_four_way(
+        a in arb_bytes(),
+        b in arb_bytes(),
+        c in arb_bytes(),
+        d in arb_bytes(),
+    ) {
+        let mut full = StreamHash::new();
+        full.update(&a);
+        full.update(&b);
+        full.update(&c);
+        full.update(&d);
+
+        let mut ha = StreamHash::new();
+        ha.update(&a);
+        let mut hb = StreamHash::new();
+        hb.update(&b);
+        let mut hc = StreamHash::new();
+        hc.update(&c);
+        let mut hd = StreamHash::new();
+        hd.update(&d);
+
+        // ((A||B)||(C||D))
+        let ab = ha.combine(&hb);
+        let cd = hc.combine(&hd);
+        let grouped = ab.combine(&cd);
+
+        prop_assert_eq!(
+            full.digest(), grouped.digest(),
+            "((A||B)||(C||D)) should equal H(A||B||C||D)"
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Clone consistency
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Cloning a StreamHash preserves the digest.
+    #[test]
+    fn prop_clone_preserves_digest(
+        data in arb_bytes(),
+    ) {
+        let mut h = StreamHash::new();
+        h.update(&data);
+        let cloned = h.clone();
+
+        prop_assert_eq!(h.digest(), cloned.digest(), "Clone should preserve digest");
+        prop_assert_eq!(h.bytes_hashed(), cloned.bytes_hashed());
+    }
+
+    /// Cloned hash can be independently extended without affecting original.
+    #[test]
+    fn prop_clone_independence(
+        data1 in arb_bytes(),
+        data2 in arb_nonempty_bytes(),
+    ) {
+        let mut h = StreamHash::new();
+        h.update(&data1);
+        let original_digest = h.digest();
+
+        let mut cloned = h.clone();
+        cloned.update(&data2);
+
+        // Original should be unchanged
+        prop_assert_eq!(h.digest(), original_digest, "Original changed after clone mutation");
+        // Clone should have different digest
+        prop_assert_ne!(cloned.digest(), original_digest, "Clone should differ after extension");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Multiple resets
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Multiple resets leave hash in a clean state each time.
+    #[test]
+    fn prop_multiple_resets(
+        data1 in arb_bytes(),
+        data2 in arb_bytes(),
+        data3 in arb_bytes(),
+    ) {
+        let mut h = StreamHash::new();
+
+        h.update(&data1);
+        h.reset();
+        h.update(&data2);
+        h.reset();
+        h.update(&data3);
+
+        let mut fresh = StreamHash::new();
+        fresh.update(&data3);
+
+        prop_assert_eq!(h.digest(), fresh.digest(),
+            "After multiple resets, should match fresh hash of last data");
+        prop_assert_eq!(h.bytes_hashed(), data3.len() as u64);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Combine length additivity
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// Combined hash length equals sum of component lengths.
+    #[test]
+    fn prop_combine_length_additive(
+        a in arb_bytes(),
+        b in arb_bytes(),
+    ) {
+        let mut ha = StreamHash::new();
+        ha.update(&a);
+        let mut hb = StreamHash::new();
+        hb.update(&b);
+
+        let combined = ha.combine(&hb);
+        prop_assert_eq!(
+            combined.bytes_hashed(),
+            ha.bytes_hashed() + hb.bytes_hashed(),
+            "Combined length should be sum of parts"
+        );
+        prop_assert_eq!(
+            combined.digest().len,
+            (a.len() + b.len()) as u64,
+            "Digest len should reflect total bytes"
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Prefix sensitivity
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// Prepending any non-empty prefix changes the digest.
+    #[test]
+    fn prop_prefix_changes_digest(
+        prefix in arb_nonempty_bytes(),
+        suffix in arb_bytes(),
+    ) {
+        let mut h_suffix = StreamHash::new();
+        h_suffix.update(&suffix);
+
+        let mut h_full = StreamHash::new();
+        h_full.update(&prefix);
+        h_full.update(&suffix);
+
+        prop_assert_ne!(
+            h_suffix.digest(), h_full.digest(),
+            "Prepending bytes didn't change digest"
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: IntegrityChecker sequential checks
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// IntegrityChecker tracks check counts accurately over multiple checks.
+    #[test]
+    fn prop_integrity_checker_sequential_counts(
+        data in arb_nonempty_bytes(),
+        n_checks in 1_u32..5,
+    ) {
+        let mut producer = StreamHash::new();
+        producer.update(&data);
+
+        let mut checker = IntegrityChecker::new();
+        checker.update(&data);
+        checker.set_remote_digest(producer.digest());
+
+        for _ in 0..n_checks {
+            let result = checker.check().unwrap();
+            prop_assert!(result.matches);
+        }
+
+        prop_assert_eq!(checker.checks_performed(), n_checks as u64,
+            "checks_performed should equal {}", n_checks);
+        prop_assert_eq!(checker.checks_passed(), n_checks as u64,
+            "checks_passed should equal {}", n_checks);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Arbitrary split point homomorphism
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// Splitting data at any point and combining produces the same hash.
+    #[test]
+    fn prop_arbitrary_split_combine(
+        data in arb_nonempty_bytes(),
+        split in arb_split_point(),
+    ) {
+        let split = split % (data.len() + 1);
+
+        let mut full = StreamHash::new();
+        full.update(&data);
+
+        let mut left = StreamHash::new();
+        left.update(&data[..split]);
+        let mut right = StreamHash::new();
+        right.update(&data[split..]);
+
+        let combined = left.combine(&right);
+        prop_assert_eq!(full.digest(), combined.digest(),
+            "Split at {} of {} bytes should produce same hash",
+            split, data.len());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: IntegrityResult serde roundtrip
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// IntegrityResult JSON roundtrip preserves all fields.
+    #[test]
+    fn prop_integrity_result_serde_roundtrip(
+        data in arb_nonempty_bytes(),
+    ) {
+        let mut producer = StreamHash::new();
+        producer.update(&data);
+
+        let mut checker = IntegrityChecker::new();
+        checker.update(&data);
+        checker.set_remote_digest(producer.digest());
+
+        let result = checker.check().unwrap();
+        let json = serde_json::to_string(&result).unwrap();
+        let back: frankenterm_core::stream_hash::IntegrityResult =
+            serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(result.matches, back.matches);
+        prop_assert_eq!(result.byte_offset, back.byte_offset);
+        prop_assert_eq!(result.local_digest, back.local_digest);
+        prop_assert_eq!(result.remote_digest, back.remote_digest);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Default trait consistency
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Default::default() and new() produce identical hashes.
+    #[test]
+    fn prop_default_matches_new(
+        data in arb_bytes(),
+    ) {
+        let mut from_new = StreamHash::new();
+        from_new.update(&data);
+
+        let mut from_default = StreamHash::default();
+        from_default.update(&data);
+
+        prop_assert_eq!(from_new.digest(), from_default.digest(),
+            "Default and new should behave identically");
+    }
+
+    /// IntegrityChecker::default() and ::new() are equivalent.
+    #[test]
+    fn prop_integrity_checker_default_matches_new(
+        data in arb_nonempty_bytes(),
+    ) {
+        let mut checker_new = IntegrityChecker::new();
+        checker_new.update(&data);
+
+        let mut checker_default = IntegrityChecker::default();
+        checker_default.update(&data);
+
+        prop_assert_eq!(
+            checker_new.local_digest(),
+            checker_default.local_digest(),
+            "Default and new IntegrityChecker should produce same digest"
+        );
     }
 }

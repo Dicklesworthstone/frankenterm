@@ -9,6 +9,10 @@
 //! - Stats consistency: fill_ratio in [0, 1], serde roundtrip
 //! - Hierarchical atomicity: denied operations consume from neither bucket
 //! - Config build: start_empty vs start_full behavior
+//! - Clone preserves all state
+//! - Empty bucket denials
+//! - Sequential acquire accounting
+//! - Repeated reset invariants
 
 use proptest::prelude::*;
 
@@ -655,5 +659,272 @@ proptest! {
                 "Negative tokens: {} at t={}", avail, t
             );
         }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Clone preserves all state
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Clone creates an exact copy: capacity, rate, tokens, consumed, denied.
+    #[test]
+    fn prop_clone_preserves_all_state(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        ops in prop::collection::vec((arb_cost(), 0u64..1000), 1..10),
+    ) {
+        let mut b1 = TokenBucket::with_time(capacity, rate, 0);
+        let mut t = 0u64;
+
+        for &(cost, dt) in &ops {
+            t += dt;
+            b1.try_acquire(cost, t);
+        }
+
+        let mut b2 = b1.clone();
+
+        prop_assert!((b1.capacity() - b2.capacity()).abs() < 1e-9);
+        prop_assert!((b1.refill_rate() - b2.refill_rate()).abs() < 1e-9);
+        let b1_available = b1.available(t);
+        let b2_available = b2.available(t);
+        prop_assert!((b1_available - b2_available).abs() < 1e-9);
+        prop_assert_eq!(b1.total_consumed(), b2.total_consumed());
+        prop_assert_eq!(b1.total_denied(), b2.total_denied());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Empty bucket always denies
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Empty bucket denies any cost > 0 until refill.
+    #[test]
+    fn prop_empty_bucket_always_denies(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        cost in arb_cost(),
+    ) {
+        let mut b = TokenBucket::new_empty(capacity, rate);
+        let success = b.try_acquire(cost, 0);
+        prop_assert!(!success, "Empty bucket allowed cost={}", cost);
+        prop_assert_eq!(b.total_consumed(), 0);
+        prop_assert_eq!(b.total_denied(), 1);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Total consumed + total denied accounts for all attempts
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// total_consumed + total_denied reflects all acquire attempts.
+    #[test]
+    fn prop_total_attempts_accounting(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        costs in prop::collection::vec(arb_cost(), 1..20),
+        times in arb_time_sequence(20),
+    ) {
+        let mut b = TokenBucket::with_time(capacity, rate, 0);
+        let mut success_count = 0u64;
+
+        for (i, &cost) in costs.iter().enumerate() {
+            let t = times.get(i).copied().unwrap_or(0);
+            if b.try_acquire(cost, t) {
+                success_count += 1;
+            }
+        }
+
+        let total_operations = costs.len() as u64;
+        let accounted = success_count + b.total_denied();
+
+        prop_assert_eq!(
+            accounted, total_operations,
+            "Accounting mismatch: {} success + {} denied != {} ops",
+            success_count, b.total_denied(), total_operations
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Repeated resets keep capacity constant
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Multiple resets always restore to the same capacity.
+    #[test]
+    fn prop_repeated_resets_constant_capacity(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        n_resets in 1usize..10,
+        times in arb_time_sequence(10),
+    ) {
+        let mut b = TokenBucket::with_time(capacity, rate, 0);
+
+        for i in 0..n_resets {
+            let t = times.get(i).copied().unwrap_or(0);
+            b.try_acquire(1, t); // consume some
+            b.reset(t);
+            let avail = b.available(t);
+            prop_assert!(
+                (avail - capacity).abs() < 1e-9,
+                "Reset {} left {} tokens, expected {}", i, avail, capacity
+            );
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: BucketConfig with start_empty=false has full tokens
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// BucketConfig with start_empty=false creates a full bucket.
+    #[test]
+    fn prop_config_start_full_has_capacity(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        now_ms in arb_time_ms(),
+    ) {
+        let config = BucketConfig {
+            capacity,
+            refill_rate: rate,
+            start_empty: false,
+        };
+
+        let mut b = config.build(now_ms);
+        let avail = b.available(now_ms);
+
+        prop_assert!(
+            (avail - capacity).abs() < 1e-9,
+            "start_empty=false bucket has {} tokens, expected {}", avail, capacity
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Hierarchical both allowed means both consumed same count
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// When hierarchical allows, both buckets consume the same cost.
+    #[test]
+    fn prop_hierarchical_both_consume_same(
+        local_cap in 20.0f64..100.0,
+        local_rate in arb_refill_rate(),
+        global_cap in 100.0f64..200.0,
+        global_rate in arb_refill_rate(),
+        cost in 1u32..10,
+    ) {
+        let local = TokenBucket::with_time(local_cap, local_rate, 0);
+        let global = TokenBucket::with_time(global_cap, global_rate, 0);
+        let mut hb = HierarchicalBucket::new(local, global);
+
+        let result = hb.try_acquire(cost, 0);
+
+        if result.is_allowed() {
+            prop_assert_eq!(
+                hb.local().total_consumed(),
+                hb.global().total_consumed(),
+                "Local and global consumed different amounts"
+            );
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Wait time for cost=0 is always 0
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// wait_time_ms for cost=0 is always 0 (even if empty).
+    #[test]
+    fn prop_wait_time_zero_for_zero_cost(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        time in arb_time_ms(),
+    ) {
+        let mut b = TokenBucket::new_empty(capacity, rate);
+        let wait = b.wait_time_ms(0, time);
+        prop_assert_eq!(wait, 0, "wait_time_ms(0) should be 0");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Stats snapshot consistency (fill_ratio non-negative)
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Stats fill_ratio is non-negative (relaxed consistency check).
+    #[test]
+    fn prop_stats_fill_ratio_non_negative(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        ops in prop::collection::vec((arb_cost(), 0u64..1000), 1..15),
+    ) {
+        let mut b = TokenBucket::with_time(capacity, rate, 0);
+        let mut t = 0u64;
+
+        for &(cost, dt) in &ops {
+            t += dt;
+            b.try_acquire(cost, t);
+        }
+
+        let stats = b.stats();
+        prop_assert!(
+            stats.fill_ratio >= -1e-9,
+            "fill_ratio {} is negative", stats.fill_ratio
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Sequential acquires consumed equals sum of successful costs
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// Total consumed equals sum of costs from successful acquires.
+    #[test]
+    fn prop_consumed_equals_sum_of_costs(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        costs in prop::collection::vec(arb_cost(), 1..15),
+        times in arb_time_sequence(15),
+    ) {
+        let mut b = TokenBucket::with_time(capacity, rate, 0);
+        let mut expected_consumed = 0u64;
+
+        for (i, &cost) in costs.iter().enumerate() {
+            let t = times.get(i).copied().unwrap_or(0);
+            if b.try_acquire(cost, t) {
+                expected_consumed += cost as u64;
+            }
+        }
+
+        prop_assert_eq!(
+            b.total_consumed(), expected_consumed,
+            "total_consumed {} != sum of successful costs {}",
+            b.total_consumed(), expected_consumed
+        );
     }
 }

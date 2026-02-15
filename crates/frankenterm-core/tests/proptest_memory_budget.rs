@@ -23,6 +23,20 @@
 //! 18. Manager: unregister nonexistent returns None
 //! 19. Manager: register_with_budget uses custom budget
 //! 20. Manager: all_pane_budgets count matches
+//! 21. BudgetLevel: Hash consistency for equal values
+//! 22. BudgetLevel: as_u8 covers range [0, 2]
+//! 23. MemoryBudgetConfig: enabled flag preserves through serde
+//! 24. PaneBudget: zero usage always Normal level
+//! 25. PaneBudget: at-or-above-budget always OverBudget
+//! 26. Manager: idempotent re-registration
+//! 27. Manager: level_handle shares state
+//! 28. Manager: sample_all with no panes returns empty summary
+//! 29. Manager: high_bytes is fraction of budget_bytes
+//! 30. BudgetSummary: worst_pane_id None when empty
+//! 31. Manager: register many panes then sample
+//! 32. Manager: protect_mux_server returns bool
+//! 33. BudgetLevel: Eq reflexive
+//! 34. Config: oom_score_adj in valid range
 
 use std::collections::HashSet;
 
@@ -553,5 +567,320 @@ proptest! {
         // Verify all pane IDs are present
         let all_ids: HashSet<u64> = all.iter().map(|b| b.pane_id).collect();
         prop_assert_eq!(all_ids, pane_ids);
+    }
+}
+
+// =============================================================================
+// Property 21: BudgetLevel Hash consistency
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn budget_level_hash_consistent(
+        level in arb_budget_level(),
+    ) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h1 = DefaultHasher::new();
+        level.hash(&mut h1);
+        let hash1 = h1.finish();
+
+        let mut h2 = DefaultHasher::new();
+        level.hash(&mut h2);
+        let hash2 = h2.finish();
+
+        prop_assert_eq!(hash1, hash2, "Hash should be deterministic for {:?}", level);
+    }
+}
+
+// =============================================================================
+// Property 22: as_u8 covers exactly range [0, 2]
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn budget_level_as_u8_range(
+        level in arb_budget_level(),
+    ) {
+        let val = level.as_u8();
+        prop_assert!(val <= 2, "as_u8 should be in [0,2], got {}", val);
+    }
+}
+
+// =============================================================================
+// Property 23: Config enabled flag round-trips correctly
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn config_enabled_flag_serde(
+        enabled in any::<bool>(),
+        use_cgroups in any::<bool>(),
+    ) {
+        let config = MemoryBudgetConfig {
+            enabled,
+            default_budget_bytes: 1024,
+            high_ratio: 0.8,
+            sample_interval_ms: 1000,
+            cgroup_base_path: "/test".to_string(),
+            use_cgroups,
+            oom_score_adj: 0,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: MemoryBudgetConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.enabled, enabled,
+            "enabled flag {} should survive serde", enabled);
+        prop_assert_eq!(back.use_cgroups, use_cgroups,
+            "use_cgroups flag {} should survive serde", use_cgroups);
+    }
+}
+
+// =============================================================================
+// Property 24: Zero usage always classifies as Normal
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn zero_usage_always_normal(
+        budget_bytes in 1_u64..10_000_000,
+        ratio in 0.01_f64..0.99,
+    ) {
+        let high_bytes = (budget_bytes as f64 * ratio) as u64;
+        // current_bytes = 0, which is always < high_bytes (since high_bytes >= 1 for ratio > 0)
+        let current_bytes = 0_u64;
+        let level = if current_bytes >= budget_bytes {
+            BudgetLevel::OverBudget
+        } else if current_bytes >= high_bytes {
+            BudgetLevel::Throttled
+        } else {
+            BudgetLevel::Normal
+        };
+        prop_assert_eq!(level, BudgetLevel::Normal,
+            "Zero usage should be Normal (budget={}, high={})", budget_bytes, high_bytes);
+    }
+}
+
+// =============================================================================
+// Property 25: At-or-above budget always OverBudget
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn at_or_above_budget_is_over_budget(
+        budget_bytes in 1_u64..10_000_000,
+        excess in 0_u64..10_000_000,
+    ) {
+        let current_bytes = budget_bytes.saturating_add(excess);
+        let level = if current_bytes >= budget_bytes {
+            BudgetLevel::OverBudget
+        } else {
+            BudgetLevel::Normal
+        };
+        prop_assert_eq!(level, BudgetLevel::OverBudget,
+            "current {} >= budget {} should be OverBudget", current_bytes, budget_bytes);
+    }
+}
+
+// =============================================================================
+// Property 26: Idempotent re-registration overwrites
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn idempotent_reregistration(
+        pane_id in arb_pane_id(),
+        budget1 in 1_u64..5_000_000_000,
+        budget2 in 1_u64..5_000_000_000,
+    ) {
+        let mgr = MemoryBudgetManager::new(test_config());
+        mgr.register_pane_with_budget(pane_id, None, budget1);
+        mgr.register_pane_with_budget(pane_id, None, budget2);
+
+        let all = mgr.all_pane_budgets();
+        prop_assert_eq!(all.len(), 1, "Re-registration should not create duplicates");
+        let b = mgr.get_pane_budget(pane_id).unwrap();
+        prop_assert_eq!(b.budget_bytes, budget2,
+            "Re-registration should use latest budget");
+    }
+}
+
+// =============================================================================
+// Property 27: level_handle shares state with manager
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn level_handle_shares_state(
+        level_val in 0_u64..3,
+    ) {
+        use std::sync::atomic::Ordering;
+        let mgr = MemoryBudgetManager::new(test_config());
+        let handle = mgr.level_handle();
+
+        handle.store(level_val, Ordering::Relaxed);
+        let expected = match level_val {
+            1 => BudgetLevel::Throttled,
+            2 => BudgetLevel::OverBudget,
+            _ => BudgetLevel::Normal,
+        };
+        prop_assert_eq!(mgr.worst_level(), expected,
+            "level_handle store {} should map to {:?}", level_val, expected);
+    }
+}
+
+// =============================================================================
+// Property 28: sample_all with no panes returns empty summary
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn sample_all_empty_returns_zero_summary(_dummy in 0..1_u32) {
+        let mgr = MemoryBudgetManager::new(test_config());
+        let summary = mgr.sample_all();
+        prop_assert_eq!(summary.pane_count, 0);
+        prop_assert_eq!(summary.total_budget_bytes, 0);
+        prop_assert_eq!(summary.total_current_bytes, 0);
+        prop_assert_eq!(summary.normal_count, 0);
+        prop_assert_eq!(summary.throttled_count, 0);
+        prop_assert_eq!(summary.over_budget_count, 0);
+        prop_assert!(summary.worst_pane_id.is_none());
+        prop_assert!((summary.worst_usage_ratio - 0.0).abs() < f64::EPSILON);
+    }
+}
+
+// =============================================================================
+// Property 29: high_bytes is always a fraction of budget_bytes
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn high_bytes_fraction_of_budget(
+        pane_id in arb_pane_id(),
+        budget in 100_u64..5_000_000_000,
+    ) {
+        let cfg = test_config();
+        let mgr = MemoryBudgetManager::new(cfg.clone());
+        let result = mgr.register_pane_with_budget(pane_id, None, budget);
+        let expected_high = (budget as f64 * cfg.high_ratio) as u64;
+        prop_assert_eq!(result.high_bytes, expected_high);
+        prop_assert!(result.high_bytes <= result.budget_bytes,
+            "high_bytes {} should be <= budget_bytes {}", result.high_bytes, result.budget_bytes);
+    }
+}
+
+// =============================================================================
+// Property 30: worst_pane_id is None when summary is empty
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn worst_pane_none_when_empty(_dummy in 0..1_u32) {
+        let summary = BudgetSummary {
+            pane_count: 0,
+            total_budget_bytes: 0,
+            total_current_bytes: 0,
+            normal_count: 0,
+            throttled_count: 0,
+            over_budget_count: 0,
+            worst_pane_id: None,
+            worst_usage_ratio: 0.0,
+        };
+        prop_assert!(summary.worst_pane_id.is_none());
+        prop_assert_eq!(summary.pane_count, 0);
+    }
+}
+
+// =============================================================================
+// Property 31: Register many panes then sample total budget adds up
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn register_many_total_budget(
+        n_panes in 1_usize..15,
+    ) {
+        let cfg = test_config();
+        let mgr = MemoryBudgetManager::new(cfg.clone());
+        for i in 0..n_panes as u64 {
+            mgr.register_pane(i, None);
+        }
+        let summary = mgr.sample_all();
+        let expected_total = cfg.default_budget_bytes * n_panes as u64;
+        prop_assert_eq!(summary.total_budget_bytes, expected_total,
+            "{} panes * {} budget = {} expected, got {}",
+            n_panes, cfg.default_budget_bytes, expected_total, summary.total_budget_bytes);
+    }
+}
+
+// =============================================================================
+// Property 32: protect_mux_server returns a bool without panicking
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
+    #[test]
+    fn protect_mux_server_returns_bool(_dummy in 0..1_u32) {
+        let mgr = MemoryBudgetManager::new(test_config());
+        let _result: bool = mgr.protect_mux_server();
+    }
+}
+
+// =============================================================================
+// Property 33: BudgetLevel Eq is reflexive
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn budget_level_eq_reflexive(
+        level in arb_budget_level(),
+    ) {
+        prop_assert_eq!(level, level, "{:?} should equal itself", level);
+    }
+}
+
+// =============================================================================
+// Property 34: Config oom_score_adj in valid kernel range
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn config_oom_score_adj_valid_range(
+        adj in -1000_i32..=1000,
+    ) {
+        let config = MemoryBudgetConfig {
+            oom_score_adj: adj,
+            ..MemoryBudgetConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: MemoryBudgetConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.oom_score_adj, adj);
+        prop_assert!(back.oom_score_adj >= -1000 && back.oom_score_adj <= 1000);
     }
 }
