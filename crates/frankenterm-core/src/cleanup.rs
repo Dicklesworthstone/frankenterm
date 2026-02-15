@@ -1622,4 +1622,237 @@ mod tests {
 
         teardown(storage, &db_path).await;
     }
+
+    // ---------------------------------------------------------------
+    // Expanded pure unit tests (wa-1u90p.7.1)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cleanup_table_summary_default() {
+        let s = CleanupTableSummary::default();
+        assert!(s.table.is_empty());
+        assert_eq!(s.eligible_rows, 0);
+        assert_eq!(s.deleted_rows, 0);
+        assert_eq!(s.retention_days, 0);
+    }
+
+    #[test]
+    fn cleanup_table_summary_clone() {
+        let s = CleanupTableSummary {
+            table: "events".to_string(),
+            eligible_rows: 42,
+            deleted_rows: 10,
+            retention_days: 30,
+        };
+        let c = s.clone();
+        assert_eq!(c.table, "events");
+        assert_eq!(c.eligible_rows, 42);
+        assert_eq!(c.deleted_rows, 10);
+        assert_eq!(c.retention_days, 30);
+    }
+
+    #[test]
+    fn cleanup_table_summary_debug() {
+        let s = CleanupTableSummary {
+            table: "audit_actions".to_string(),
+            eligible_rows: 5,
+            deleted_rows: 3,
+            retention_days: 7,
+        };
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("audit_actions"));
+        assert!(dbg.contains("eligible_rows"));
+        assert!(dbg.contains("deleted_rows"));
+    }
+
+    #[test]
+    fn cleanup_table_summary_serialize_all_fields() {
+        let s = CleanupTableSummary {
+            table: "output_segments".to_string(),
+            eligible_rows: 999,
+            deleted_rows: 500,
+            retention_days: 90,
+        };
+        let json = serde_json::to_value(&s).expect("to_value");
+        assert_eq!(json["table"], "output_segments");
+        assert_eq!(json["eligible_rows"], 999);
+        assert_eq!(json["deleted_rows"], 500);
+        assert_eq!(json["retention_days"], 90);
+    }
+
+    #[test]
+    fn cleanup_table_summary_deleted_can_exceed_eligible() {
+        // The struct doesn't enforce eligible >= deleted; it's just data
+        let s = CleanupTableSummary {
+            table: "test".to_string(),
+            eligible_rows: 5,
+            deleted_rows: 10,
+            retention_days: 1,
+        };
+        assert_eq!(s.deleted_rows, 10);
+    }
+
+    #[test]
+    fn cleanup_plan_default() {
+        let p = CleanupPlan::default();
+        assert!(p.tables.is_empty());
+        assert_eq!(p.total_eligible, 0);
+        assert_eq!(p.total_deleted, 0);
+        assert!(!p.dry_run);
+    }
+
+    #[test]
+    fn cleanup_plan_clone() {
+        let p = CleanupPlan {
+            tables: vec![CleanupTableSummary {
+                table: "events".to_string(),
+                eligible_rows: 10,
+                deleted_rows: 5,
+                retention_days: 30,
+            }],
+            total_eligible: 10,
+            total_deleted: 5,
+            dry_run: true,
+        };
+        let c = p.clone();
+        assert_eq!(c.tables.len(), 1);
+        assert_eq!(c.total_eligible, 10);
+        assert_eq!(c.total_deleted, 5);
+        assert!(c.dry_run);
+    }
+
+    #[test]
+    fn cleanup_plan_debug() {
+        let p = CleanupPlan {
+            tables: vec![],
+            total_eligible: 42,
+            total_deleted: 0,
+            dry_run: true,
+        };
+        let dbg = format!("{:?}", p);
+        assert!(dbg.contains("CleanupPlan"));
+        assert!(dbg.contains("dry_run"));
+        assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn cleanup_plan_serialize_empty_tables() {
+        let p = CleanupPlan {
+            tables: vec![],
+            total_eligible: 0,
+            total_deleted: 0,
+            dry_run: true,
+        };
+        let json = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(json["tables"], serde_json::json!([]));
+        assert_eq!(json["dry_run"], true);
+    }
+
+    #[test]
+    fn cleanup_plan_serialize_multiple_tables() {
+        let p = CleanupPlan {
+            tables: vec![
+                CleanupTableSummary {
+                    table: "a".to_string(),
+                    eligible_rows: 1,
+                    deleted_rows: 1,
+                    retention_days: 7,
+                },
+                CleanupTableSummary {
+                    table: "b".to_string(),
+                    eligible_rows: 2,
+                    deleted_rows: 0,
+                    retention_days: 30,
+                },
+            ],
+            total_eligible: 3,
+            total_deleted: 1,
+            dry_run: false,
+        };
+        let json = serde_json::to_value(&p).expect("serialize");
+        let tables = json["tables"].as_array().unwrap();
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0]["table"], "a");
+        assert_eq!(tables[1]["table"], "b");
+    }
+
+    #[test]
+    fn retention_cutoff_ms_max_days() {
+        let now = 1_700_000_000_000i64;
+        // u32::MAX days is ~11.7 million years — cutoff should be far in the past
+        let cutoff = retention_cutoff_ms(now, u32::MAX);
+        assert!(cutoff < 0, "max retention days produces negative cutoff");
+    }
+
+    #[test]
+    fn retention_cutoff_ms_monotonic_in_days() {
+        let now = 1_700_000_000_000i64;
+        let c1 = retention_cutoff_ms(now, 1);
+        let c7 = retention_cutoff_ms(now, 7);
+        let c30 = retention_cutoff_ms(now, 30);
+        let c365 = retention_cutoff_ms(now, 365);
+        assert!(c1 > c7, "1 day cutoff is more recent than 7");
+        assert!(c7 > c30, "7 day cutoff is more recent than 30");
+        assert!(c30 > c365, "30 day cutoff is more recent than 365");
+    }
+
+    #[test]
+    fn retention_cutoff_ms_exact_day_boundary() {
+        let now = 86_400_000i64; // exactly 1 day in ms
+        let cutoff = retention_cutoff_ms(now, 1);
+        assert_eq!(cutoff, 0, "1 day cutoff from exactly 1 day = epoch");
+    }
+
+    #[test]
+    fn retention_cutoff_ms_small_now() {
+        // When now is smaller than the retention window, cutoff goes negative
+        let now = 1000i64;
+        let cutoff = retention_cutoff_ms(now, 1);
+        assert!(cutoff < 0);
+    }
+
+    #[test]
+    fn delete_batch_size_is_positive() {
+        assert!(DELETE_BATCH_SIZE > 0);
+    }
+
+    #[test]
+    fn delete_batch_size_is_reasonable() {
+        // Batch size should be large enough to be efficient but not so large
+        // as to cause long-running transactions
+        assert!(DELETE_BATCH_SIZE >= 100, "batch too small for efficiency");
+        assert!(DELETE_BATCH_SIZE <= 100_000, "batch too large for safety");
+    }
+
+    #[test]
+    fn cleanup_plan_dry_run_field_independent() {
+        // dry_run is just a flag — doesn't affect other fields
+        let mut p = CleanupPlan::default();
+        p.dry_run = true;
+        p.total_deleted = 42;
+        assert!(p.dry_run);
+        assert_eq!(p.total_deleted, 42);
+    }
+
+    #[test]
+    fn cleanup_table_summary_tier_name_format() {
+        // Tier names in plan use "events (tier: <name>)" format
+        let name = format!("events (tier: {})", "critical");
+        let s = CleanupTableSummary {
+            table: name.clone(),
+            eligible_rows: 0,
+            deleted_rows: 0,
+            retention_days: 90,
+        };
+        assert!(s.table.starts_with("events (tier: "));
+        assert!(s.table.ends_with(')'));
+    }
+
+    #[test]
+    fn retention_cutoff_ms_two_days_is_double_one_day() {
+        let now = 1_700_000_000_000i64;
+        let c1 = retention_cutoff_ms(now, 1);
+        let c2 = retention_cutoff_ms(now, 2);
+        assert_eq!(now - c2, 2 * (now - c1));
+    }
 }

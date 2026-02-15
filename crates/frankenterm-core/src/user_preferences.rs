@@ -1386,6 +1386,280 @@ mod tests {
     // Reward monotonicity
     // =========================================================================
 
+    // =========================================================================
+    // Data type coverage
+    // =========================================================================
+
+    #[test]
+    fn irl_config_default_values() {
+        let c = IrlConfig::default();
+        assert!((c.learning_rate - 0.01).abs() < 1e-10);
+        assert_eq!(c.max_iterations, 100);
+        assert!((c.convergence_threshold - 1e-4).abs() < 1e-10);
+        assert!((c.l2_regularization - 0.001).abs() < 1e-10);
+        assert!((c.discount - 0.99).abs() < 1e-10);
+        assert_eq!(c.min_observations, 20);
+        assert_eq!(c.max_trajectory_len, 1000);
+    }
+
+    #[test]
+    fn irl_config_debug_and_clone() {
+        let c = IrlConfig::default();
+        let dbg = format!("{c:?}");
+        assert!(dbg.contains("IrlConfig"));
+        let c2 = c.clone();
+        assert!((c2.learning_rate - c.learning_rate).abs() < 1e-10);
+    }
+
+    #[test]
+    fn pane_state_debug_clone_serde() {
+        let ps = PaneState {
+            has_new_output: true,
+            time_since_focus_s: 5.5,
+            output_rate: 2.0,
+            error_count: 1,
+            process_active: true,
+            scroll_depth: 0.7,
+            interaction_count: 3,
+            pane_id: 42,
+        };
+        let dbg = format!("{ps:?}");
+        assert!(dbg.contains("pane_id: 42"));
+        let cloned = ps.clone();
+        assert_eq!(cloned.pane_id, 42);
+        let json = serde_json::to_string(&ps).unwrap();
+        let parsed: PaneState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pane_id, 42);
+        assert!(parsed.has_new_output);
+    }
+
+    #[test]
+    fn user_action_debug_clone_eq_hash() {
+        let a1 = UserAction::FocusPane(1);
+        let a2 = UserAction::FocusPane(1);
+        let a3 = UserAction::Scroll;
+        let a4 = UserAction::Resize;
+        let a5 = UserAction::Ignore;
+
+        assert_eq!(a1, a2);
+        assert_ne!(a1, a3);
+
+        // Clone
+        let a1c = a1;
+        assert_eq!(a1, a1c);
+
+        // Debug
+        let dbg = format!("{a1:?}");
+        assert!(dbg.contains("FocusPane"));
+        let dbg3 = format!("{a3:?}");
+        assert!(dbg3.contains("Scroll"));
+        let dbg4 = format!("{a4:?}");
+        assert!(dbg4.contains("Resize"));
+        let dbg5 = format!("{a5:?}");
+        assert!(dbg5.contains("Ignore"));
+
+        // Hash (can be used as HashMap key)
+        let mut map = std::collections::HashMap::new();
+        map.insert(a1, 1);
+        map.insert(a3, 2);
+        assert_eq!(map.get(&a1), Some(&1));
+        assert_eq!(map.get(&a3), Some(&2));
+    }
+
+    #[test]
+    fn user_action_serde_roundtrip() {
+        let actions = [
+            UserAction::FocusPane(42),
+            UserAction::Scroll,
+            UserAction::Resize,
+            UserAction::Ignore,
+        ];
+        for action in &actions {
+            let json = serde_json::to_string(action).unwrap();
+            let parsed: UserAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(*action, parsed);
+        }
+    }
+
+    #[test]
+    fn observation_debug_clone_serde() {
+        let obs = Observation {
+            pane_states: make_test_panes(&[1, 2], 42),
+            current_pane_id: 1,
+            action: UserAction::FocusPane(2),
+        };
+        let dbg = format!("{obs:?}");
+        assert!(dbg.contains("Observation"));
+        let cloned = obs.clone();
+        assert_eq!(cloned.current_pane_id, 1);
+        let json = serde_json::to_string(&obs).unwrap();
+        let parsed: Observation = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.current_pane_id, 1);
+    }
+
+    #[test]
+    fn reward_function_default() {
+        let rf = RewardFunction::default();
+        assert_eq!(rf.theta, [0.0; NUM_FEATURES]);
+        assert_eq!(rf.observation_count, 0);
+    }
+
+    #[test]
+    fn reward_function_demo_expectation_empty() {
+        let rf = RewardFunction::new();
+        let expect = rf.demo_feature_expectation();
+        assert_eq!(expect, [0.0; NUM_FEATURES]);
+    }
+
+    #[test]
+    fn policy_with_empty_pane_states() {
+        let rf = RewardFunction::new();
+        let obs = Observation {
+            pane_states: vec![],
+            current_pane_id: 1,
+            action: UserAction::Ignore,
+        };
+        let policy = rf.policy(&obs);
+        // Should still have Scroll, Resize, Ignore actions
+        assert_eq!(policy.len(), 3);
+        let sum: f64 = policy.iter().map(|(_, p)| p).sum();
+        assert!((sum - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn policy_with_single_pane() {
+        let rf = RewardFunction::new();
+        let panes = make_test_panes(&[1], 42);
+        let obs = Observation {
+            pane_states: panes,
+            current_pane_id: 1,
+            action: UserAction::Ignore,
+        };
+        let policy = rf.policy(&obs);
+        // FocusPane(1), Scroll, Resize, Ignore = 4 actions
+        assert_eq!(policy.len(), 4);
+        let sum: f64 = policy.iter().map(|(_, p)| p).sum();
+        assert!((sum - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn available_actions_count() {
+        let obs = Observation {
+            pane_states: make_test_panes(&[1, 2, 3], 42),
+            current_pane_id: 1,
+            action: UserAction::Ignore,
+        };
+        let actions = available_actions(&obs);
+        // 3 FocusPane + Scroll + Resize + Ignore = 6
+        assert_eq!(actions.len(), 6);
+    }
+
+    #[test]
+    fn rank_correlation_single_element() {
+        let a = [1.0];
+        let b = [2.0];
+        let r = rank_correlation(&a, &b);
+        assert_eq!(r, 0.0); // n < 2
+    }
+
+    #[test]
+    fn rank_correlation_constant_values() {
+        let a = [3.0, 3.0, 3.0];
+        let b = [1.0, 2.0, 3.0];
+        let r = rank_correlation(&a, &b);
+        assert_eq!(r, 0.0); // zero variance in a
+    }
+
+    #[test]
+    fn cosine_similarity_opposite_vectors() {
+        let a = [1.0, 0.0];
+        let b = [-1.0, 0.0];
+        assert!((cosine_similarity(&a, &b) + 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn dot_product_empty() {
+        assert!(dot(&[], &[]).abs() < 1e-10);
+    }
+
+    #[test]
+    fn batch_result_debug_and_serde() {
+        let r = BatchResult {
+            iterations: 0,
+            converged: false,
+            final_gradient_norm: f64::NAN,
+        };
+        let dbg = format!("{r:?}");
+        assert!(dbg.contains("BatchResult"));
+        let cloned = r.clone();
+        assert_eq!(cloned.iterations, 0);
+        assert!(!cloned.converged);
+    }
+
+    #[test]
+    fn batch_update_below_min_observations() {
+        let config = IrlConfig {
+            min_observations: 100,
+            ..IrlConfig::default()
+        };
+        let mut irl = MaxEntIrl::new(config);
+        let panes = make_test_panes(&[1, 2], 42);
+        for _ in 0..5 {
+            irl.observe(Observation {
+                pane_states: panes.clone(),
+                current_pane_id: 1,
+                action: UserAction::FocusPane(2),
+            });
+        }
+        let result = irl.batch_update();
+        assert_eq!(result.iterations, 0);
+        assert!(!result.converged);
+        assert!(result.final_gradient_norm.is_nan());
+    }
+
+    #[test]
+    fn preference_monitor_empty_scores() {
+        let monitor = PreferenceMonitor::new(IrlConfig::default());
+        let scores = monitor.priority_scores();
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn preference_monitor_predict_with_no_training() {
+        let monitor = PreferenceMonitor::new(IrlConfig::default());
+        let panes = make_test_panes(&[1, 2], 42);
+        let obs = Observation {
+            pane_states: panes,
+            current_pane_id: 1,
+            action: UserAction::Ignore,
+        };
+        // With zero weights, all panes have equal reward
+        let predicted = monitor.predict_next_focus(&obs);
+        // Should return Some (any pane that isn't current)
+        assert!(predicted.is_some());
+        assert_ne!(predicted.unwrap(), 1);
+    }
+
+    #[test]
+    fn preference_monitor_serde_roundtrip() {
+        let config = IrlConfig {
+            min_observations: 2,
+            ..IrlConfig::default()
+        };
+        let mut monitor = PreferenceMonitor::new(config);
+        let panes = make_test_panes(&[1, 2], 42);
+        for _ in 0..5 {
+            monitor.record(Observation {
+                pane_states: panes.clone(),
+                current_pane_id: 1,
+                action: UserAction::FocusPane(2),
+            });
+        }
+        let json = serde_json::to_string(&monitor).unwrap();
+        let parsed: PreferenceMonitor = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.irl.observation_count(), monitor.irl.observation_count());
+    }
+
     #[test]
     fn reward_monotonic_in_positive_features() {
         let theta = [1.0, 0.5, 0.3, 2.0, 0.1, 0.0, 0.0, -1.0];

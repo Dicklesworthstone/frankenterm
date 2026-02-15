@@ -1199,4 +1199,340 @@ mod tests {
         assert!(report.all_passed);
         assert_eq!(report.errors, 0);
     }
+
+    // =========================================================================
+    // Expanded pure unit tests (wa-1u90p.7.1)
+    // =========================================================================
+
+    #[test]
+    fn query_class_eq_and_copy() {
+        let a = QueryClass::SimpleTerm;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(QueryClass::SimpleTerm, QueryClass::Forensic);
+    }
+
+    #[test]
+    fn query_class_all_variants_distinct() {
+        let variants = [
+            QueryClass::SimpleTerm,
+            QueryClass::MultiTerm,
+            QueryClass::Filtered,
+            QueryClass::Forensic,
+            QueryClass::HighCardinality,
+        ];
+        for i in 0..variants.len() {
+            for j in (i + 1)..variants.len() {
+                assert_ne!(variants[i], variants[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn query_class_serde_roundtrip() {
+        let variants = [
+            QueryClass::SimpleTerm,
+            QueryClass::MultiTerm,
+            QueryClass::Filtered,
+            QueryClass::Forensic,
+            QueryClass::HighCardinality,
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let parsed: QueryClass = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, parsed);
+        }
+    }
+
+    #[test]
+    fn query_class_hash_consistency() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(QueryClass::SimpleTerm);
+        set.insert(QueryClass::SimpleTerm); // duplicate
+        set.insert(QueryClass::Forensic);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn query_class_debug() {
+        let dbg = format!("{:?}", QueryClass::HighCardinality);
+        assert!(dbg.contains("HighCardinality"));
+    }
+
+    #[test]
+    fn relevance_assertion_serde_must_hit() {
+        let a = RelevanceAssertion::MustHit {
+            event_id: "evt-1".to_string(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let parsed: RelevanceAssertion = serde_json::from_str(&json).unwrap();
+        if let RelevanceAssertion::MustHit { event_id } = parsed {
+            assert_eq!(event_id, "evt-1");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn relevance_assertion_serde_min_total_hits() {
+        let a = RelevanceAssertion::MinTotalHits(42);
+        let json = serde_json::to_string(&a).unwrap();
+        let parsed: RelevanceAssertion = serde_json::from_str(&json).unwrap();
+        if let RelevanceAssertion::MinTotalHits(n) = parsed {
+            assert_eq!(n, 42);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn relevance_assertion_serde_ranked_before() {
+        let a = RelevanceAssertion::RankedBefore {
+            higher: "a".to_string(),
+            lower: "b".to_string(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let parsed: RelevanceAssertion = serde_json::from_str(&json).unwrap();
+        if let RelevanceAssertion::RankedBefore { higher, lower } = parsed {
+            assert_eq!(higher, "a");
+            assert_eq!(lower, "b");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn relevance_assertion_clone() {
+        let a = RelevanceAssertion::InTopN {
+            event_id: "x".to_string(),
+            n: 5,
+        };
+        let b = a.clone();
+        if let RelevanceAssertion::InTopN { event_id, n } = b {
+            assert_eq!(event_id, "x");
+            assert_eq!(n, 5);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn latency_budget_serde_roundtrip() {
+        let budget = LatencyBudget {
+            max_duration: Duration::from_millis(150),
+            class: QueryClass::Filtered,
+        };
+        let json = serde_json::to_string(&budget).unwrap();
+        let parsed: LatencyBudget = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.class, QueryClass::Filtered);
+        assert_eq!(parsed.max_duration, Duration::from_millis(150));
+    }
+
+    #[test]
+    fn latency_budget_debug() {
+        let budget = LatencyBudget {
+            max_duration: Duration::from_millis(50),
+            class: QueryClass::SimpleTerm,
+        };
+        let dbg = format!("{:?}", budget);
+        assert!(dbg.contains("SimpleTerm"));
+    }
+
+    #[test]
+    fn query_test_result_serde_roundtrip() {
+        let r = QueryTestResult {
+            name: "test-q".to_string(),
+            passed: true,
+            assertion_results: vec![],
+            latency_ok: true,
+            duration_us: 1500,
+            budget_us: Some(5000),
+            hits_returned: 10,
+            total_hits: 10,
+            error: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let parsed: QueryTestResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "test-q");
+        assert!(parsed.passed);
+        assert_eq!(parsed.duration_us, 1500);
+    }
+
+    #[test]
+    fn query_test_result_with_error() {
+        let r = QueryTestResult {
+            name: "fail-q".to_string(),
+            passed: false,
+            assertion_results: vec![],
+            latency_ok: false,
+            duration_us: 0,
+            budget_us: None,
+            hits_returned: 0,
+            total_hits: 0,
+            error: Some("index not found".to_string()),
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["error"], "index not found");
+        assert_eq!(json["passed"], false);
+    }
+
+    #[test]
+    fn assertion_result_serde_roundtrip() {
+        let r = AssertionResult {
+            description: "must hit event-1".to_string(),
+            passed: false,
+            message: Some("event-1 not in results".to_string()),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let parsed: AssertionResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.description, "must hit event-1");
+        assert!(!parsed.passed);
+        assert_eq!(
+            parsed.message.as_deref(),
+            Some("event-1 not in results")
+        );
+    }
+
+    #[test]
+    fn assertion_result_no_message() {
+        let r = AssertionResult {
+            description: "min hits".to_string(),
+            passed: true,
+            message: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json["message"].is_null());
+    }
+
+    #[test]
+    fn quality_report_serde_roundtrip() {
+        let report = QualityReport {
+            results: vec![],
+            total_queries: 10,
+            passed: 8,
+            failed: 1,
+            latency_violations: 1,
+            errors: 0,
+            all_passed: false,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: QualityReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_queries, 10);
+        assert_eq!(parsed.passed, 8);
+        assert_eq!(parsed.failed, 1);
+        assert!(!parsed.all_passed);
+    }
+
+    #[test]
+    fn quality_report_clone() {
+        let report = QualityReport {
+            results: vec![],
+            total_queries: 5,
+            passed: 5,
+            failed: 0,
+            latency_violations: 0,
+            errors: 0,
+            all_passed: true,
+        };
+        let c = report.clone();
+        assert_eq!(c.total_queries, 5);
+        assert!(c.all_passed);
+    }
+
+    #[test]
+    fn default_budgets_all_positive_durations() {
+        for budget in default_latency_budgets() {
+            assert!(budget.max_duration > Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn default_budgets_simple_term_is_fastest() {
+        let budgets = default_latency_budgets();
+        let simple = budgets
+            .iter()
+            .find(|b| b.class == QueryClass::SimpleTerm)
+            .unwrap();
+        for budget in &budgets {
+            assert!(
+                simple.max_duration <= budget.max_duration,
+                "SimpleTerm should have the tightest budget"
+            );
+        }
+    }
+
+    #[test]
+    fn forensic_queries_are_non_empty() {
+        let queries = forensic_golden_queries();
+        assert!(!queries.is_empty());
+        for q in &queries {
+            assert!(!q.name.is_empty());
+            assert!(!q.assertions.is_empty());
+        }
+    }
+
+    #[test]
+    fn agent_workflow_queries_are_non_empty() {
+        let queries = agent_workflow_golden_queries();
+        assert!(!queries.is_empty());
+        for q in &queries {
+            assert!(!q.name.is_empty());
+            assert!(!q.assertions.is_empty());
+        }
+    }
+
+    #[test]
+    fn forensic_corpus_timestamps_are_positive() {
+        let corpus = build_forensic_corpus();
+        for doc in &corpus {
+            assert!(doc.occurred_at_ms > 0, "doc {} has non-positive ts", doc.event_id);
+        }
+    }
+
+    #[test]
+    fn forensic_corpus_all_have_text() {
+        let corpus = build_forensic_corpus();
+        for doc in &corpus {
+            assert!(!doc.text.is_empty(), "doc {} has empty text", doc.event_id);
+        }
+    }
+
+    #[test]
+    fn forensic_corpus_event_ids_are_prefixed() {
+        let corpus = build_forensic_corpus();
+        let known_prefixes = ["out-", "evt-", "cmd-", "ctrl-"];
+        for doc in &corpus {
+            assert!(
+                known_prefixes.iter().any(|p| doc.event_id.starts_with(p)),
+                "unexpected event_id prefix: {}",
+                doc.event_id
+            );
+        }
+    }
+
+    #[test]
+    fn quality_harness_empty_queries() {
+        let harness = QualityHarness::new(vec![]);
+        let svc = corpus_service();
+        let report = harness.run(&svc);
+        assert_eq!(report.total_queries, 0);
+        assert!(report.all_passed);
+        assert_eq!(report.errors, 0);
+    }
+
+    #[test]
+    fn golden_query_clone() {
+        let q = GoldenQuery {
+            name: "test".to_string(),
+            class: QueryClass::SimpleTerm,
+            query: SearchQuery::simple("hello"),
+            assertions: vec![RelevanceAssertion::MinTotalHits(1)],
+            description: "desc".to_string(),
+        };
+        let c = q.clone();
+        assert_eq!(c.name, "test");
+        assert_eq!(c.class, QueryClass::SimpleTerm);
+        assert_eq!(c.assertions.len(), 1);
+    }
 }

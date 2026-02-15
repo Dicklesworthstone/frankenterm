@@ -1377,4 +1377,322 @@ mod tests {
         let deleted = delete_session(&db_path, "nonexistent").unwrap();
         assert!(!deleted);
     }
+
+    // ---------------------------------------------------------------
+    // Expanded pure unit tests (wa-1u90p.7.1)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn session_restore_config_default_values() {
+        let cfg = SessionRestoreConfig::default();
+        assert!(!cfg.auto_restore);
+        assert!(!cfg.restore_scrollback);
+        assert_eq!(cfg.restore_max_lines, 5000);
+    }
+
+    #[test]
+    fn session_restore_config_serde_roundtrip() {
+        let cfg = SessionRestoreConfig {
+            auto_restore: true,
+            restore_scrollback: true,
+            restore_max_lines: 10_000,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: SessionRestoreConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.auto_restore, true);
+        assert_eq!(parsed.restore_scrollback, true);
+        assert_eq!(parsed.restore_max_lines, 10_000);
+    }
+
+    #[test]
+    fn session_restore_config_serde_defaults_on_missing_fields() {
+        let json = "{}";
+        let parsed: SessionRestoreConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.auto_restore);
+        assert!(!parsed.restore_scrollback);
+        assert_eq!(parsed.restore_max_lines, 5000);
+    }
+
+    #[test]
+    fn session_restore_config_clone() {
+        let cfg = SessionRestoreConfig {
+            auto_restore: true,
+            restore_scrollback: false,
+            restore_max_lines: 100,
+        };
+        let c = cfg.clone();
+        assert_eq!(c.auto_restore, true);
+        assert_eq!(c.restore_max_lines, 100);
+    }
+
+    #[test]
+    fn session_restore_config_debug() {
+        let cfg = SessionRestoreConfig::default();
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("SessionRestoreConfig"));
+        assert!(dbg.contains("auto_restore"));
+    }
+
+    #[test]
+    fn restore_error_display_database() {
+        let err = RestoreError::Database("connection refused".to_string());
+        assert_eq!(err.to_string(), "database error: connection refused");
+    }
+
+    #[test]
+    fn restore_error_display_no_sessions() {
+        let err = RestoreError::NoSessions;
+        assert_eq!(err.to_string(), "no restorable sessions found");
+    }
+
+    #[test]
+    fn restore_error_display_corrupt_checkpoint() {
+        let err = RestoreError::CorruptCheckpoint("invalid JSON".to_string());
+        assert_eq!(err.to_string(), "checkpoint data corrupt: invalid JSON");
+    }
+
+    #[test]
+    fn restore_error_display_topology_parse() {
+        let err = RestoreError::TopologyParse("missing windows".to_string());
+        assert_eq!(
+            err.to_string(),
+            "topology deserialization failed: missing windows"
+        );
+    }
+
+    #[test]
+    fn restore_error_display_layout_restore() {
+        let err = RestoreError::LayoutRestore("split failed".to_string());
+        assert_eq!(err.to_string(), "layout restoration failed: split failed");
+    }
+
+    #[test]
+    fn restore_error_display_wezterm() {
+        let err = RestoreError::Wezterm("not running".to_string());
+        assert_eq!(err.to_string(), "wezterm command failed: not running");
+    }
+
+    #[test]
+    fn restore_error_debug_format() {
+        let err = RestoreError::NoSessions;
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("NoSessions"));
+    }
+
+    #[test]
+    fn session_candidate_clone() {
+        let c = SessionCandidate {
+            session_id: "sess-1".to_string(),
+            created_at: 1000,
+            last_checkpoint_at: Some(2000),
+            topology_json: "{}".to_string(),
+            ft_version: "0.1.0".to_string(),
+            host_id: Some("host-a".to_string()),
+        };
+        let c2 = c.clone();
+        assert_eq!(c2.session_id, "sess-1");
+        assert_eq!(c2.last_checkpoint_at, Some(2000));
+        assert_eq!(c2.host_id, Some("host-a".to_string()));
+    }
+
+    #[test]
+    fn session_candidate_debug() {
+        let c = SessionCandidate {
+            session_id: "s".to_string(),
+            created_at: 0,
+            last_checkpoint_at: None,
+            topology_json: "{}".to_string(),
+            ft_version: "0.1".to_string(),
+            host_id: None,
+        };
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("SessionCandidate"));
+    }
+
+    #[test]
+    fn checkpoint_data_clone() {
+        let d = CheckpointData {
+            checkpoint_id: 42,
+            session_id: "sess-x".to_string(),
+            checkpoint_at: 5000,
+            checkpoint_type: Some("periodic".to_string()),
+            pane_count: 3,
+            pane_states: vec![],
+        };
+        let d2 = d.clone();
+        assert_eq!(d2.checkpoint_id, 42);
+        assert_eq!(d2.pane_count, 3);
+        assert!(d2.pane_states.is_empty());
+    }
+
+    #[test]
+    fn restored_pane_state_clone() {
+        let s = RestoredPaneState {
+            pane_id: 7,
+            cwd: Some("/home".to_string()),
+            command: Some("zsh".to_string()),
+            terminal_state: None,
+            agent_metadata: None,
+        };
+        let s2 = s.clone();
+        assert_eq!(s2.pane_id, 7);
+        assert_eq!(s2.cwd.as_deref(), Some("/home"));
+        assert_eq!(s2.command.as_deref(), Some("zsh"));
+    }
+
+    #[test]
+    fn format_epoch_ms_midnight() {
+        // 0 = epoch = 00:00:00 UTC
+        assert_eq!(format_epoch_ms(0), "00:00:00 UTC");
+    }
+
+    #[test]
+    fn format_epoch_ms_one_hour() {
+        assert_eq!(format_epoch_ms(3_600_000), "01:00:00 UTC");
+    }
+
+    #[test]
+    fn format_epoch_ms_end_of_day() {
+        // 23:59:59 = 86399 seconds = 86_399_000 ms
+        assert_eq!(format_epoch_ms(86_399_000), "23:59:59 UTC");
+    }
+
+    #[test]
+    fn format_epoch_ms_wraps_past_24h() {
+        // 25 hours = 90_000_000 ms → 01:00:00 (wraps)
+        assert_eq!(format_epoch_ms(90_000_000), "01:00:00 UTC");
+    }
+
+    #[test]
+    fn format_epoch_ms_subsecond_ignored() {
+        // 999ms into first second → still 00:00:00
+        assert_eq!(format_epoch_ms(999), "00:00:00 UTC");
+    }
+
+    #[test]
+    fn restore_banner_no_pane_state() {
+        let banner = restore_banner(42, "sess-abc", 3_600_000, None);
+        assert!(banner.contains("01:00:00 UTC"));
+        assert!(banner.contains("sess-abc"));
+        assert!(banner.contains("--pane 42"));
+        assert!(!banner.contains("Previously running"));
+    }
+
+    #[test]
+    fn restore_banner_with_command_only() {
+        let state = RestoredPaneState {
+            pane_id: 1,
+            cwd: None,
+            command: Some("vim".to_string()),
+            terminal_state: None,
+            agent_metadata: None,
+        };
+        let banner = restore_banner(1, "s1", 0, Some(&state));
+        assert!(banner.contains("Process: vim"));
+        assert!(!banner.contains("Previously running"));
+    }
+
+    #[test]
+    fn restore_banner_with_agent_and_command() {
+        let state = RestoredPaneState {
+            pane_id: 2,
+            cwd: None,
+            command: Some("python agent.py".to_string()),
+            terminal_state: None,
+            agent_metadata: Some(AgentMetadata {
+                agent_type: "claude-code".to_string(),
+                session_id: Some("agent-sess".to_string()),
+                state: Some("running".to_string()),
+            }),
+        };
+        let banner = restore_banner(2, "s2", 0, Some(&state));
+        assert!(banner.contains("Previously running: claude-code"));
+        assert!(banner.contains("agent-sess"));
+        assert!(banner.contains("running"));
+        assert!(banner.contains("Process: python agent.py"));
+    }
+
+    #[test]
+    fn session_info_serialize() {
+        let info = SessionInfo {
+            session_id: "sess-1".to_string(),
+            created_at: 1000,
+            last_checkpoint_at: Some(2000),
+            shutdown_clean: true,
+            ft_version: "0.1.0".to_string(),
+            host_id: None,
+            checkpoint_count: 5,
+            pane_count: Some(3),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["session_id"], "sess-1");
+        assert_eq!(json["checkpoint_count"], 5);
+        assert_eq!(json["pane_count"], 3);
+        assert_eq!(json["shutdown_clean"], true);
+    }
+
+    #[test]
+    fn checkpoint_info_serialize() {
+        let info = CheckpointInfo {
+            id: 99,
+            checkpoint_at: 5000,
+            checkpoint_type: Some("periodic".to_string()),
+            pane_count: 4,
+            total_bytes: 8192,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["id"], 99);
+        assert_eq!(json["pane_count"], 4);
+        assert_eq!(json["total_bytes"], 8192);
+    }
+
+    #[test]
+    fn session_doctor_report_serialize() {
+        let report = SessionDoctorReport {
+            total_sessions: 3,
+            unclean_sessions: 1,
+            total_checkpoints: 10,
+            orphaned_pane_states: 2,
+            total_data_bytes: 4096,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["total_sessions"], 3);
+        assert_eq!(json["unclean_sessions"], 1);
+        assert_eq!(json["orphaned_pane_states"], 2);
+    }
+
+    #[test]
+    fn session_doctor_report_clone() {
+        let report = SessionDoctorReport {
+            total_sessions: 1,
+            unclean_sessions: 0,
+            total_checkpoints: 5,
+            orphaned_pane_states: 0,
+            total_data_bytes: 0,
+        };
+        let c = report.clone();
+        assert_eq!(c.total_sessions, 1);
+        assert_eq!(c.total_checkpoints, 5);
+    }
+
+    #[test]
+    fn session_restorer_auto_restore_default() {
+        let restorer = SessionRestorer::new(
+            Arc::new("/tmp/test.db".to_string()),
+            SessionRestoreConfig::default(),
+        );
+        assert!(!restorer.auto_restore());
+    }
+
+    #[test]
+    fn session_restorer_auto_restore_enabled() {
+        let restorer = SessionRestorer::new(
+            Arc::new("/tmp/test.db".to_string()),
+            SessionRestoreConfig {
+                auto_restore: true,
+                ..Default::default()
+            },
+        );
+        assert!(restorer.auto_restore());
+    }
 }
