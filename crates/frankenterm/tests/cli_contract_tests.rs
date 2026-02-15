@@ -13,7 +13,8 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 // =============================================================================
@@ -233,13 +234,28 @@ fn assert_resize_timeline_contract_shape(parsed: &serde_json::Value, expected_ev
     );
 
     for stage in stage_summary {
-        assert!(
-            stage["samples"].as_u64().unwrap_or(0) > 0,
-            "each stage should have at least one sample"
-        );
+        assert_eq!(stage["samples"], expected_events as u64);
         assert!(stage["total_duration_ns"].as_u64().is_some());
+        assert!(stage["p50_duration_ns"].as_u64().is_some());
         assert!(stage["p95_duration_ns"].as_u64().is_some());
+        assert!(stage["p99_duration_ns"].as_u64().is_some());
         assert!(stage["max_duration_ns"].as_u64().is_some());
+        assert!(
+            stage["p50_duration_ns"].as_u64().unwrap_or(0)
+                <= stage["p95_duration_ns"].as_u64().unwrap_or(0)
+        );
+        assert!(
+            stage["p95_duration_ns"].as_u64().unwrap_or(0)
+                <= stage["p99_duration_ns"].as_u64().unwrap_or(0)
+        );
+        assert!(
+            stage["total_duration_ns"].as_u64().unwrap_or(0)
+                >= stage["max_duration_ns"].as_u64().unwrap_or(0)
+        );
+        assert!(
+            stage["p99_duration_ns"].as_u64().unwrap_or(0)
+                <= stage["max_duration_ns"].as_u64().unwrap_or(0)
+        );
     }
 
     let flame = parsed["flame_samples"]
@@ -250,6 +266,187 @@ fn assert_resize_timeline_contract_shape(parsed: &serde_json::Value, expected_ev
         expected_events * 5,
         "expected one flame sample per event per stage"
     );
+
+    let aggregate = &parsed["aggregate_event_duration_ns"];
+    assert!(aggregate["p50"].as_u64().is_some());
+    assert!(aggregate["p95"].as_u64().is_some());
+    assert!(aggregate["p99"].as_u64().is_some());
+    assert!(
+        aggregate["p50"].as_u64().unwrap_or(0) <= aggregate["p95"].as_u64().unwrap_or(0)
+            && aggregate["p95"].as_u64().unwrap_or(0) <= aggregate["p99"].as_u64().unwrap_or(0)
+    );
+
+    let timeline_jsonl = parsed["timeline_jsonl"]
+        .as_array()
+        .expect("timeline_jsonl should be an array");
+    assert_eq!(
+        timeline_jsonl.len(),
+        expected_events,
+        "expected one JSONL row per timeline event"
+    );
+    for row in timeline_jsonl {
+        let row = row
+            .as_str()
+            .expect("timeline_jsonl entries should be strings");
+        let parsed_row: serde_json::Value =
+            serde_json::from_str(row).expect("timeline_jsonl row should be valid JSON");
+        assert!(parsed_row["resize_transaction_id"].as_str().is_some());
+        assert!(parsed_row["pane_id"].as_u64().is_some());
+        assert!(parsed_row["tab_id"].as_u64().is_some());
+        assert!(parsed_row["sequence_no"].as_u64().is_some());
+        assert_eq!(parsed_row["scheduler_decision"], "dequeue_latest_intent");
+        assert!(parsed_row["frame_id"].as_u64().is_some());
+        assert!(parsed_row["test_case_id"].as_str().is_some());
+        assert!(parsed_row["queue_wait_ms"].as_u64().is_some());
+        assert!(parsed_row["reflow_ms"].as_u64().is_some());
+        assert!(parsed_row["render_ms"].as_u64().is_some());
+        assert!(parsed_row["present_ms"].as_u64().is_some());
+    }
+}
+
+const RESIZE_TIMELINE_STAGE_ORDER: [&str; 5] = [
+    "input_intent",
+    "scheduler_queueing",
+    "logical_reflow",
+    "render_prep",
+    "presentation",
+];
+
+fn assert_resize_timeline_event_stage_contract(event: &serde_json::Value) {
+    assert!(event["resize_transaction_id"].as_str().is_some());
+    assert!(event["tab_id"].as_u64().is_some());
+    assert!(event["sequence_no"].as_u64().is_some());
+    assert_eq!(
+        event["scheduler_decision"], "dequeue_latest_intent",
+        "scheduler decision should be stable for resize timeline events"
+    );
+    assert!(event["frame_id"].as_u64().is_some());
+    assert!(event["test_case_id"].as_str().is_some());
+    assert!(event["queue_wait_ms"].as_u64().is_some());
+    assert!(event["reflow_ms"].as_u64().is_some());
+    assert!(event["render_ms"].as_u64().is_some());
+    assert!(event["present_ms"].as_u64().is_some());
+
+    let stages = event["stages"]
+        .as_array()
+        .expect("timeline event should include stage probes");
+    assert_eq!(stages.len(), RESIZE_TIMELINE_STAGE_ORDER.len());
+
+    let mut last_start_offset = 0u64;
+    for (index, stage) in stages.iter().enumerate() {
+        let expected_name = RESIZE_TIMELINE_STAGE_ORDER[index];
+        assert_eq!(stage["stage"], expected_name);
+
+        let start_offset = stage["start_offset_ns"]
+            .as_u64()
+            .expect("stage start_offset_ns should be present");
+        if index > 0 {
+            assert!(
+                start_offset >= last_start_offset,
+                "stage start offsets should be non-decreasing"
+            );
+        }
+        last_start_offset = start_offset;
+
+        assert!(
+            stage["duration_ns"].as_u64().is_some(),
+            "stage duration_ns should be present"
+        );
+
+        if expected_name == "scheduler_queueing" {
+            assert!(
+                stage["queue_metrics"]["depth_before"].as_u64().is_some(),
+                "scheduler queue metrics should include depth_before"
+            );
+            assert!(
+                stage["queue_metrics"]["depth_after"].as_u64().is_some(),
+                "scheduler queue metrics should include depth_after"
+            );
+        } else {
+            assert!(
+                stage["queue_metrics"].is_null(),
+                "only scheduler_queueing should expose queue metrics"
+            );
+        }
+    }
+
+    let expected_queue_wait_ms = stages[1]["duration_ns"].as_u64().unwrap_or(0) / 1_000_000;
+    let expected_reflow_ms = stages[2]["duration_ns"].as_u64().unwrap_or(0) / 1_000_000;
+    let expected_render_ms = stages[3]["duration_ns"].as_u64().unwrap_or(0) / 1_000_000;
+    let expected_present_ms = stages[4]["duration_ns"].as_u64().unwrap_or(0) / 1_000_000;
+    assert_eq!(
+        event["queue_wait_ms"].as_u64().unwrap_or(0),
+        expected_queue_wait_ms
+    );
+    assert_eq!(event["reflow_ms"].as_u64().unwrap_or(0), expected_reflow_ms);
+    assert_eq!(event["render_ms"].as_u64().unwrap_or(0), expected_render_ms);
+    assert_eq!(
+        event["present_ms"].as_u64().unwrap_or(0),
+        expected_present_ms
+    );
+}
+
+fn assert_resize_timeline_flame_contract(
+    parsed: &serde_json::Value,
+    expected_scenario: &str,
+    expected_events: usize,
+) {
+    let events = parsed["timeline"]["events"]
+        .as_array()
+        .expect("timeline.events should be array");
+    let mut known_event_pairs = BTreeSet::new();
+    for event in events {
+        let event_index = event["event_index"]
+            .as_u64()
+            .expect("timeline event should include event_index") as usize;
+        let pane_id = event["pane_id"]
+            .as_u64()
+            .expect("timeline event should include pane_id");
+        known_event_pairs.insert((event_index, pane_id));
+    }
+
+    let flame_samples = parsed["flame_samples"]
+        .as_array()
+        .expect("flame_samples should be array");
+    let mut per_event_counts: BTreeMap<usize, usize> = BTreeMap::new();
+    for sample in flame_samples {
+        let stack = sample["stack"]
+            .as_str()
+            .expect("flame sample should include stack");
+        let parts: Vec<_> = stack.split(';').collect();
+        assert_eq!(parts.len(), 3, "flame stack must be scenario;action;stage");
+        assert_eq!(parts[0], expected_scenario);
+        assert!(matches!(
+            parts[1],
+            "resize" | "set_font_size" | "generate_scrollback"
+        ));
+        assert!(RESIZE_TIMELINE_STAGE_ORDER.contains(&parts[2]));
+
+        let event_index = sample["event_index"]
+            .as_u64()
+            .expect("flame sample should include event_index") as usize;
+        let pane_id = sample["pane_id"]
+            .as_u64()
+            .expect("flame sample should include pane_id");
+        assert!(
+            known_event_pairs.contains(&(event_index, pane_id)),
+            "flame sample should map to a known timeline event"
+        );
+        *per_event_counts.entry(event_index).or_insert(0) += 1;
+    }
+
+    assert_eq!(
+        per_event_counts.len(),
+        expected_events,
+        "expected flame samples for every timeline event"
+    );
+    for count in per_event_counts.values() {
+        assert_eq!(
+            *count,
+            RESIZE_TIMELINE_STAGE_ORDER.len(),
+            "expected one flame sample per stage per event"
+        );
+    }
 }
 
 // =============================================================================
@@ -416,6 +613,101 @@ fn contract_simulate_resize_timeline_requires_json_flag() {
 }
 
 #[test]
+fn contract_simulate_resize_timeline_failure_emits_artifact_payload() {
+    let (_dir, ws) = setup_workspace();
+    let scenario_path = std::path::Path::new(&ws).join("contract_resize_timeline_failure.yaml");
+    std::fs::write(
+        &scenario_path,
+        r#"
+name: contract_resize_timeline_failure
+duration: "2s"
+metadata:
+  suite: resize_baseline
+  suite_version: "2026-02-13"
+  seed: "9090"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: resize
+    content: "100x40"
+expectations:
+  - contains:
+      pane: 0
+      text: "[MISSING_EXPECTATION]"
+"#,
+    )
+    .expect("write failing simulation scenario");
+    let scenario_arg = scenario_path.to_string_lossy().to_string();
+
+    let output = wa_cmd_for(&ws)
+        .args([
+            "simulate",
+            "run",
+            &scenario_arg,
+            "--json",
+            "--resize-timeline-json",
+        ])
+        .output()
+        .expect("simulate timeline mode should execute for failing scenario");
+    assert!(
+        !output.status.success(),
+        "failing expectation should return non-zero status"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("failing run should still emit JSON");
+    assert_eq!(parsed["mode"], "resize_timeline_json");
+    assert_eq!(parsed["completed"], false);
+    assert_eq!(parsed["expectations_passed"], 0);
+    assert_eq!(parsed["expectations_failed"], 1);
+    assert_eq!(parsed["events_executed"], 1);
+    assert_eq!(
+        parsed["scenario"]["name"],
+        "contract_resize_timeline_failure"
+    );
+    assert_eq!(
+        parsed["timeline"]["reproducibility_key"],
+        "resize_baseline:2026-02-13:contract_resize_timeline_failure:9090"
+    );
+    assert!(
+        parsed["timeline"]["events"]
+            .as_array()
+            .map(std::vec::Vec::len)
+            .unwrap_or_default()
+            > 0
+    );
+    assert!(
+        parsed["stage_summary"]
+            .as_array()
+            .map(std::vec::Vec::len)
+            .unwrap_or_default()
+            > 0
+    );
+    assert!(
+        parsed["flame_samples"]
+            .as_array()
+            .map(std::vec::Vec::len)
+            .unwrap_or_default()
+            > 0
+    );
+    let failure_artifacts = &parsed["failure_artifacts"];
+    assert!(
+        failure_artifacts["trace_bundle"]
+            .as_array()
+            .map(std::vec::Vec::len)
+            .unwrap_or_default()
+            > 0
+    );
+    assert!(failure_artifacts["frame_histogram"].is_object());
+    assert!(
+        failure_artifacts["failure_signature"].as_str().is_some(),
+        "failing run should emit a failure signature"
+    );
+}
+
+#[test]
 fn contract_simulate_resize_multi_tab_storm_timeline_contract() {
     let (_dir, ws) = setup_workspace();
     let scenario_path = resize_baseline_fixture_path("resize_multi_tab_storm.yaml");
@@ -426,13 +718,31 @@ fn contract_simulate_resize_multi_tab_storm_timeline_contract() {
     let events = parsed["timeline"]["events"]
         .as_array()
         .expect("timeline.events should be array");
+    assert_eq!(parsed["scenario"]["name"], "resize_multi_tab_storm");
+    assert_eq!(
+        parsed["scenario"]["reproducibility_key"],
+        "resize_baseline:2026-02-13:resize_multi_tab_storm:1002"
+    );
+    assert_eq!(
+        parsed["timeline"]["reproducibility_key"],
+        "resize_baseline:2026-02-13:resize_multi_tab_storm:1002"
+    );
+
     let panes: BTreeSet<_> = events
         .iter()
         .filter_map(|entry| entry["pane_id"].as_u64())
         .collect();
     assert_eq!(panes, BTreeSet::from([0, 1, 2, 3, 4, 5, 6, 7]));
 
+    let mut event_indexes = BTreeSet::new();
     for event in events {
+        let event_index = event["event_index"]
+            .as_u64()
+            .expect("event should include event_index");
+        assert!(
+            event_indexes.insert(event_index),
+            "event_index should be unique"
+        );
         assert!(
             matches!(
                 event["action"].as_str(),
@@ -441,27 +751,9 @@ fn contract_simulate_resize_multi_tab_storm_timeline_contract() {
             "only resize-class actions should appear in timeline"
         );
         assert!(event["total_duration_ns"].as_u64().is_some());
-
-        let stages = event["stages"]
-            .as_array()
-            .expect("timeline event should include stage probes");
-        let scheduler_stage = stages
-            .iter()
-            .find(|stage| stage["stage"] == "scheduler_queueing")
-            .expect("scheduler_queueing stage should be present");
-        assert!(
-            scheduler_stage["queue_metrics"]["depth_before"]
-                .as_u64()
-                .is_some(),
-            "scheduler queue metrics should include depth_before"
-        );
-        assert!(
-            scheduler_stage["queue_metrics"]["depth_after"]
-                .as_u64()
-                .is_some(),
-            "scheduler queue metrics should include depth_after"
-        );
+        assert_resize_timeline_event_stage_contract(event);
     }
+    assert_resize_timeline_flame_contract(&parsed, "resize_multi_tab_storm", 24);
 }
 
 #[test]
@@ -475,12 +767,32 @@ fn contract_simulate_resize_single_pane_scrollback_timeline_contract() {
     let events = parsed["timeline"]["events"]
         .as_array()
         .expect("timeline.events should be array");
+    assert_eq!(parsed["scenario"]["name"], "resize_single_pane_scrollback");
+    assert_eq!(
+        parsed["scenario"]["reproducibility_key"],
+        "resize_baseline:2026-02-13:resize_single_pane_scrollback:1001"
+    );
+    assert_eq!(
+        parsed["timeline"]["reproducibility_key"],
+        "resize_baseline:2026-02-13:resize_single_pane_scrollback:1001"
+    );
+    let captured_at_ms = parsed["timeline"]["captured_at_ms"]
+        .as_u64()
+        .expect("timeline should include captured_at_ms");
+    assert!(captured_at_ms >= 1_600_000_000_000);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after UNIX_EPOCH")
+        .as_millis() as u64;
+    assert!(captured_at_ms <= now_ms.saturating_add(600_000));
+
     assert!(events.iter().all(|entry| entry["pane_id"] == 0));
 
     let mut resize_count = 0usize;
     let mut font_count = 0usize;
     let mut scrollback_count = 0usize;
     for event in events {
+        assert_resize_timeline_event_stage_contract(event);
         match event["action"].as_str() {
             Some("resize") => resize_count += 1,
             Some("set_font_size") => font_count += 1,
@@ -488,8 +800,64 @@ fn contract_simulate_resize_single_pane_scrollback_timeline_contract() {
             other => panic!("unexpected action in resize timeline: {other:?}"),
         }
     }
+    assert_resize_timeline_flame_contract(&parsed, "resize_single_pane_scrollback", 8);
     assert_eq!(resize_count, 4, "expected four resize actions");
     assert_eq!(font_count, 3, "expected three set_font_size actions");
+    assert_eq!(
+        scrollback_count, 1,
+        "expected one generate_scrollback action"
+    );
+}
+
+#[test]
+fn contract_simulate_resize_mixed_workload_regression_timeline_contract() {
+    let (_dir, ws) = setup_workspace();
+    let scenario_path = resize_baseline_fixture_path("mixed_workload_interactive_streaming.yaml");
+    let parsed = run_resize_timeline_json(&ws, &scenario_path);
+
+    assert_resize_timeline_contract_shape(&parsed, 13);
+
+    let events = parsed["timeline"]["events"]
+        .as_array()
+        .expect("timeline.events should be array");
+    assert_eq!(
+        parsed["scenario"]["name"],
+        "mixed_workload_interactive_streaming"
+    );
+    assert_eq!(
+        parsed["scenario"]["reproducibility_key"],
+        "resize_baseline:2026-02-14:mixed_workload_interactive_streaming:1005"
+    );
+    assert_eq!(
+        parsed["timeline"]["reproducibility_key"],
+        "resize_baseline:2026-02-14:mixed_workload_interactive_streaming:1005"
+    );
+    assert_eq!(
+        parsed["scenario"]["metadata"]["regression_case"], "resize_wrap_jitter_2026_02",
+        "fixture regression case should be preserved in scenario metadata"
+    );
+
+    let panes: BTreeSet<_> = events
+        .iter()
+        .filter_map(|entry| entry["pane_id"].as_u64())
+        .collect();
+    assert_eq!(panes, BTreeSet::from([40, 41, 42, 43]));
+
+    let mut resize_count = 0usize;
+    let mut font_count = 0usize;
+    let mut scrollback_count = 0usize;
+    for event in events {
+        assert_resize_timeline_event_stage_contract(event);
+        match event["action"].as_str() {
+            Some("resize") => resize_count += 1,
+            Some("set_font_size") => font_count += 1,
+            Some("generate_scrollback") => scrollback_count += 1,
+            other => panic!("unexpected action in resize timeline: {other:?}"),
+        }
+    }
+    assert_resize_timeline_flame_contract(&parsed, "mixed_workload_interactive_streaming", 13);
+    assert_eq!(resize_count, 8, "expected eight resize actions");
+    assert_eq!(font_count, 4, "expected four set_font_size actions");
     assert_eq!(
         scrollback_count, 1,
         "expected one generate_scrollback action"

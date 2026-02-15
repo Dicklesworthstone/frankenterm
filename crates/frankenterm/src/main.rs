@@ -23272,6 +23272,84 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
 
+                    let timeline_jsonl: Vec<String> = timeline
+                        .events
+                        .iter()
+                        .filter_map(|event| {
+                            serde_json::to_string(&serde_json::json!({
+                                "resize_transaction_id": event.resize_transaction_id,
+                                "pane_id": event.pane_id,
+                                "tab_id": event.tab_id,
+                                "sequence_no": event.sequence_no,
+                                "scheduler_decision": event.scheduler_decision,
+                                "frame_id": event.frame_id,
+                                "test_case_id": event.test_case_id,
+                                "queue_wait_ms": event.queue_wait_ms,
+                                "reflow_ms": event.reflow_ms,
+                                "render_ms": event.render_ms,
+                                "present_ms": event.present_ms,
+                                "total_duration_ns": event.total_duration_ns,
+                            }))
+                            .ok()
+                        })
+                        .collect();
+
+                    let mut event_total_duration_ns: Vec<u64> = timeline
+                        .events
+                        .iter()
+                        .map(|event| event.total_duration_ns)
+                        .collect();
+                    event_total_duration_ns.sort_unstable();
+                    let percentile = |pct: usize| -> u64 {
+                        if event_total_duration_ns.is_empty() {
+                            0
+                        } else {
+                            let idx = ((event_total_duration_ns.len() - 1) * pct) / 100;
+                            event_total_duration_ns[idx]
+                        }
+                    };
+                    let aggregate_event_duration_ns = serde_json::json!({
+                        "p50": percentile(50),
+                        "p95": percentile(95),
+                        "p99": percentile(99),
+                    });
+
+                    let mut frame_histogram = std::collections::BTreeMap::<u64, usize>::new();
+                    for event in &timeline.events {
+                        *frame_histogram.entry(event.frame_id).or_insert(0) += 1;
+                    }
+                    let trace_bundle: Vec<serde_json::Value> = timeline
+                        .events
+                        .iter()
+                        .map(|event| {
+                            serde_json::json!({
+                                "resize_transaction_id": event.resize_transaction_id,
+                                "pane_id": event.pane_id,
+                                "tab_id": event.tab_id,
+                                "sequence_no": event.sequence_no,
+                                "scheduler_decision": event.scheduler_decision,
+                                "frame_id": event.frame_id,
+                                "test_case_id": event.test_case_id,
+                                "queue_wait_ms": event.queue_wait_ms,
+                                "reflow_ms": event.reflow_ms,
+                                "render_ms": event.render_ms,
+                                "present_ms": event.present_ms,
+                                "stages": event.stages,
+                            })
+                        })
+                        .collect();
+                    let failure_signature = if fail_count > 0 {
+                        Some(format!(
+                            "{}:failures={}:executed={}:passed={}",
+                            scenario.reproducibility_key(),
+                            fail_count,
+                            executed,
+                            pass_count
+                        ))
+                    } else {
+                        None
+                    };
+
                     let artifact = serde_json::json!({
                         "completed": fail_count == 0,
                         "mode": "resize_timeline_json",
@@ -23289,8 +23367,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         "expectations_passed": pass_count,
                         "expectations_failed": fail_count,
                         "timeline": timeline,
+                        "timeline_jsonl": timeline_jsonl,
+                        "aggregate_event_duration_ns": aggregate_event_duration_ns,
                         "stage_summary": stage_summary,
                         "flame_samples": flame_samples,
+                        "failure_artifacts": {
+                            "trace_bundle": trace_bundle,
+                            "frame_histogram": frame_histogram,
+                            "failure_signature": failure_signature,
+                        },
                     });
                     println!("{}", serde_json::to_string_pretty(&artifact)?);
 
@@ -28349,17 +28434,13 @@ const RECOMMENDED_SCROLLBACK_LINES: u64 = 50_000;
 const PRAGMASEVKA_BUNDLED_VERSION: &str = "1.7.0";
 const PRAGMASEVKA_BUNDLED_SOURCE_URL: &str =
     "https://github.com/shytikov/pragmasevka/releases/download/v1.7.0/Pragmasevka_NF.zip";
+// We repackage only the regular style as store-zip before outer zstd to minimize binary size.
 const PRAGMASEVKA_BUNDLED_ZIP_SHA256: &str =
-    "eeab758eff562d1caed761244488e56545be25e81a6b40cd84b31b032a37615c";
+    "ef1102723554cffe39b0703de9adebb17ef37e2eccbb7868009f4e0f2c3b5da6";
 const PRAGMASEVKA_BUNDLED_ZST_SHA256: &str =
-    "60379b739067c70e13a670c2b231b930050c69d6eb9a67265b992135f9bd780d";
+    "f82f680376dccc7063f750636e5d38dc7dc5cec6f6bf47cd3de5ad2632456a7f";
 const PRAGMASEVKA_BUNDLED_PAYLOAD_ZST: &[u8] = include_bytes!("../assets/Pragmasevka_NF.zip.zst");
-const PRAGMASEVKA_FONT_FILES: &[&str] = &[
-    "pragmasevka-nf-bold.ttf",
-    "pragmasevka-nf-bolditalic.ttf",
-    "pragmasevka-nf-italic.ttf",
-    "pragmasevka-nf-regular.ttf",
-];
+const PRAGMASEVKA_FONT_FILES: &[&str] = &["pragmasevka-nf-regular.ttf"];
 const PRAGMASEVKA_MARKER_FILE: &str = ".ft-pragmasevka-nf-v1.7.0.sha256";
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -28397,21 +28478,21 @@ fn decode_bundled_pragmasevka_zip() -> anyhow::Result<Vec<u8>> {
 fn default_font_install_dir() -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        return dirs::home_dir()
+        dirs::home_dir()
             .map(|home| home.join("Library/Fonts"))
-            .ok_or_else(|| anyhow::anyhow!("Could not resolve home directory for font install"));
+            .ok_or_else(|| anyhow::anyhow!("Could not resolve home directory for font install"))
     }
     #[cfg(target_os = "linux")]
     {
-        return dirs::home_dir()
+        dirs::home_dir()
             .map(|home| home.join(".local/share/fonts"))
-            .ok_or_else(|| anyhow::anyhow!("Could not resolve home directory for font install"));
+            .ok_or_else(|| anyhow::anyhow!("Could not resolve home directory for font install"))
     }
     #[cfg(target_os = "windows")]
     {
-        return dirs::data_local_dir()
+        dirs::data_local_dir()
             .map(|dir| dir.join("Microsoft/Windows/Fonts"))
-            .ok_or_else(|| anyhow::anyhow!("Could not resolve local data directory for fonts"));
+            .ok_or_else(|| anyhow::anyhow!("Could not resolve local data directory for fonts"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -28459,7 +28540,10 @@ fn install_bundled_pragmasevka(font_dir: &Path) -> anyhow::Result<Vec<PathBuf>> 
             .and_then(std::ffi::OsStr::to_str)
             .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 filename in bundled zip"))?;
 
-        if !file_name.ends_with(".ttf") {
+        if !Path::new(file_name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("ttf"))
+        {
             continue;
         }
 
@@ -28542,15 +28626,17 @@ fn refresh_linux_font_cache(_font_dir: &Path, _verbose: u8) -> Option<String> {
 }
 
 fn should_auto_install_bundled_font(command: Option<&Commands>) -> bool {
-    match command {
-        Some(Commands::Version { .. }) => false,
-        Some(Commands::Setup { dry_run: true, .. }) => false,
-        Some(Commands::Setup {
-            command: Some(SetupCommands::Font { .. }),
-            ..
-        }) => false,
-        _ => true,
-    }
+    !matches!(
+        command,
+        Some(
+            Commands::Version { .. }
+                | Commands::Setup { dry_run: true, .. }
+                | Commands::Setup {
+                    command: Some(SetupCommands::Font { .. }),
+                    ..
+                }
+        )
+    )
 }
 
 fn ensure_default_bundled_font(verbose: u8, command: Option<&Commands>) {
@@ -28582,9 +28668,7 @@ fn ensure_default_bundled_font(verbose: u8, command: Option<&Commands>) {
             }
         }
         Err(err) => {
-            tracing::warn!(
-                "Failed to install bundled Pragmasevka Nerd Font automatically: {err}"
-            );
+            tracing::warn!("Failed to install bundled Pragmasevka Nerd Font automatically: {err}");
         }
     }
 }
@@ -36053,9 +36137,9 @@ log_level = "debug"
 
     #[test]
     fn auto_font_install_respects_version_dry_run_and_setup_font() {
-        assert!(!should_auto_install_bundled_font(Some(&Commands::Version {
-            full: false,
-        })));
+        assert!(!should_auto_install_bundled_font(Some(
+            &Commands::Version { full: false }
+        )));
         assert!(!should_auto_install_bundled_font(Some(&Commands::Setup {
             list_hosts: false,
             apply: false,
@@ -36132,7 +36216,8 @@ log_level = "debug"
             "empty directory should not count as installed"
         );
 
-        for file in PRAGMASEVKA_FONT_FILES.iter().take(2) {
+        let partial_count = PRAGMASEVKA_FONT_FILES.len().saturating_sub(1);
+        for file in PRAGMASEVKA_FONT_FILES.iter().take(partial_count) {
             std::fs::write(temp_dir.join(file), b"placeholder").unwrap();
         }
         assert!(
