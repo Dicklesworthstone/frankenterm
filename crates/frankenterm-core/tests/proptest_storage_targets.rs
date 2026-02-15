@@ -503,4 +503,11 @@ proptest! {
         let parsed: LatencyBudgets = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(b, parsed);
     }
+
+    /// HealthTier Debug is non-empty.
+    #[test]
+    fn prop_health_tier_debug(tier in arb_health_tier()) {
+        let debug = format!("{:?}", tier);
+        prop_assert!(!debug.is_empty());
+    }
 }

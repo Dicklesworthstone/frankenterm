@@ -496,3 +496,9 @@ fn free_ratio_negative_values() {
     };
     assert!(stats2.free_ratio().abs() < f64::EPSILON);
 }
+
+#[test]
+fn correlation_type_debug_nonempty() {
+    let debug = format!("{:?}", CorrelationType::Failover);
+    assert!(!debug.is_empty());
+}

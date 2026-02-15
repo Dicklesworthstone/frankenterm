@@ -584,4 +584,18 @@ proptest! {
         prop_assert!(opts.window_before_ms > 0);
         prop_assert!(opts.window_after_ms > 0);
     }
+
+    /// CorrelationStatus Debug is non-empty.
+    #[test]
+    fn prop_correlation_status_debug(_dummy in 0..1u8) {
+        let statuses = [
+            CorrelationStatus::Linked,
+            CorrelationStatus::Unlinked,
+            CorrelationStatus::Error,
+        ];
+        for s in &statuses {
+            let debug = format!("{:?}", s);
+            prop_assert!(!debug.is_empty());
+        }
+    }
 }
