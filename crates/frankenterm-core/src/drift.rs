@@ -1080,4 +1080,308 @@ mod tests {
             50
         );
     }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──────────────────────
+
+    // ── AdwinWindow additional coverage ─────────────────────
+
+    #[test]
+    fn adwin_debug_format() {
+        let w = AdwinWindow::new(0.05);
+        let dbg = format!("{:?}", w);
+        assert!(dbg.contains("AdwinWindow"));
+    }
+
+    #[test]
+    fn adwin_clone_independence() {
+        let mut w1 = AdwinWindow::new(0.01);
+        w1.push(5.0);
+        w1.push(10.0);
+        let w2 = w1.clone();
+        w1.push(99.0);
+        // w2 should still have 2 observations
+        assert_eq!(w2.len(), 2);
+    }
+
+    #[test]
+    fn adwin_delta_accessor() {
+        let w = AdwinWindow::new(0.05);
+        assert!((w.delta() - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn adwin_variance_empty() {
+        let w = AdwinWindow::new(0.01);
+        assert!((w.variance() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn adwin_variance_single_observation() {
+        let mut w = AdwinWindow::new(0.01);
+        w.push(42.0);
+        assert!((w.variance() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn adwin_is_empty_after_reset() {
+        let mut w = AdwinWindow::new(0.01);
+        w.push(1.0);
+        w.push(2.0);
+        assert!(!w.is_empty());
+        w.reset();
+        assert!(w.is_empty());
+        assert_eq!(w.len(), 0);
+    }
+
+    // ── DriftInfo additional coverage ───────────────────────
+
+    #[test]
+    fn drift_info_debug_clone() {
+        let info = DriftInfo {
+            old_mean: 10.0,
+            new_mean: 5.0,
+            dropped_count: 50,
+            remaining_count: 30,
+            mean_diff: 5.0,
+            threshold: 2.0,
+        };
+        let dbg = format!("{:?}", info);
+        assert!(dbg.contains("DriftInfo"));
+        let cloned = info.clone();
+        assert!((cloned.old_mean - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn drift_info_equal_means() {
+        let info = DriftInfo {
+            old_mean: 5.0,
+            new_mean: 5.0,
+            dropped_count: 10,
+            remaining_count: 10,
+            mean_diff: 0.0,
+            threshold: 1.0,
+        };
+        assert!(!info.is_drop());
+        assert!(!info.is_spike());
+    }
+
+    // ── DriftType additional coverage ───────────────────────
+
+    #[test]
+    fn drift_type_debug_clone_copy() {
+        let dt = DriftType::RateDrop;
+        let dbg = format!("{:?}", dt);
+        assert!(dbg.contains("RateDrop"));
+        let copied = dt; // Copy
+        let cloned = dt.clone(); // Clone
+        assert_eq!(copied, cloned);
+    }
+
+    #[test]
+    fn drift_type_serde_roundtrip() {
+        let types = [DriftType::RateDrop, DriftType::RateSpike];
+        for dt in &types {
+            let json = serde_json::to_string(dt).unwrap();
+            let back: DriftType = serde_json::from_str(&json).unwrap();
+            assert_eq!(*dt, back);
+        }
+    }
+
+    #[test]
+    fn drift_type_equality_all_variants() {
+        assert_eq!(DriftType::RateDrop, DriftType::RateDrop);
+        assert_eq!(DriftType::RateSpike, DriftType::RateSpike);
+        assert_ne!(DriftType::RateDrop, DriftType::RateSpike);
+    }
+
+    // ── DriftEvent additional coverage ──────────────────────
+
+    #[test]
+    fn drift_event_debug_clone() {
+        let event = DriftEvent {
+            rule_id: "test".to_string(),
+            drift_type: DriftType::RateSpike,
+            info: DriftInfo {
+                old_mean: 1.0,
+                new_mean: 10.0,
+                dropped_count: 5,
+                remaining_count: 10,
+                mean_diff: 9.0,
+                threshold: 2.0,
+            },
+            suggestion: "check rule".to_string(),
+        };
+        let dbg = format!("{:?}", event);
+        assert!(dbg.contains("DriftEvent"));
+        let cloned = event.clone();
+        assert_eq!(cloned.rule_id, "test");
+    }
+
+    // ── DriftConfig additional coverage ─────────────────────
+
+    #[test]
+    fn config_debug_clone() {
+        let c = DriftConfig::default();
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("DriftConfig"));
+        let c2 = c.clone();
+        assert_eq!(c2.min_window_size, 10);
+    }
+
+    #[test]
+    fn config_min_mean_diff_default() {
+        let c = DriftConfig::default();
+        assert!((c.min_mean_diff - 0.5).abs() < f64::EPSILON);
+    }
+
+    // ── RuleMonitor additional coverage ─────────────────────
+
+    #[test]
+    fn rule_monitor_debug_clone() {
+        let mon = RuleMonitor::new("test.rule".to_string(), 0.01);
+        let dbg = format!("{:?}", mon);
+        assert!(dbg.contains("RuleMonitor"));
+        let m2 = mon.clone();
+        assert_eq!(m2.rule_id(), "test.rule");
+    }
+
+    #[test]
+    fn rule_monitor_rule_id_accessor() {
+        let mon = RuleMonitor::new("my_rule".to_string(), 0.05);
+        assert_eq!(mon.rule_id(), "my_rule");
+    }
+
+    #[test]
+    fn rule_monitor_last_drift_none_initially() {
+        let mon = RuleMonitor::new("test".to_string(), 0.01);
+        assert!(mon.last_drift().is_none());
+    }
+
+    #[test]
+    fn rule_monitor_current_rate_empty() {
+        let mon = RuleMonitor::new("test".to_string(), 0.01);
+        assert!((mon.current_rate() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rule_monitor_window_size_tracks_observations() {
+        let config = DriftConfig::default();
+        let mut mon = RuleMonitor::new("test".to_string(), 0.01);
+        for _ in 0..15 {
+            mon.observe(5.0, &config);
+        }
+        assert!(mon.window_size() > 0);
+        assert!(mon.window_size() <= 15);
+    }
+
+    // ── DriftMonitor additional coverage ────────────────────
+
+    #[test]
+    fn drift_monitor_debug_clone() {
+        let config = DriftConfig::default();
+        let dm = DriftMonitor::new(config);
+        let dbg = format!("{:?}", dm);
+        assert!(dbg.contains("DriftMonitor"));
+        let dm2 = dm.clone();
+        assert_eq!(dm2.rule_count(), 0);
+    }
+
+    #[test]
+    fn drift_monitor_config_accessor() {
+        let config = DriftConfig {
+            confidence: 0.05,
+            ..Default::default()
+        };
+        let dm = DriftMonitor::new(config);
+        assert!((dm.config().confidence - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn drift_monitor_rule_monitor_nonexistent() {
+        let dm = DriftMonitor::new(DriftConfig::default());
+        assert!(dm.rule_monitor("no_such_rule").is_none());
+    }
+
+    #[test]
+    fn drift_monitor_register_idempotent() {
+        let mut dm = DriftMonitor::new(DriftConfig::default());
+        dm.register_rule("dup");
+        dm.register_rule("dup");
+        assert_eq!(dm.rule_count(), 1);
+    }
+
+    // ── DriftSummary / RuleSummary coverage ─────────────────
+
+    #[test]
+    fn drift_summary_debug_clone() {
+        let summary = DriftSummary {
+            total_rules: 1,
+            total_drifts: 0,
+            rules: vec![RuleSummary {
+                rule_id: "test".to_string(),
+                window_size: 10,
+                current_rate: 5.0,
+                total_observations: 10,
+                total_drifts: 0,
+                last_drift: None,
+            }],
+        };
+        let dbg = format!("{:?}", summary);
+        assert!(dbg.contains("DriftSummary"));
+        let s2 = summary.clone();
+        assert_eq!(s2.total_rules, 1);
+    }
+
+    #[test]
+    fn rule_summary_debug_clone_serde() {
+        let summary = RuleSummary {
+            rule_id: "rule.x".to_string(),
+            window_size: 50,
+            current_rate: 3.5,
+            total_observations: 100,
+            total_drifts: 2,
+            last_drift: None,
+        };
+        let dbg = format!("{:?}", summary);
+        assert!(dbg.contains("RuleSummary"));
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: RuleSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rule_id, "rule.x");
+        assert_eq!(back.total_observations, 100);
+    }
+
+    #[test]
+    fn rule_summary_serde_with_last_drift() {
+        let summary = RuleSummary {
+            rule_id: "rule.y".to_string(),
+            window_size: 30,
+            current_rate: 2.0,
+            total_observations: 50,
+            total_drifts: 1,
+            last_drift: Some(DriftInfo {
+                old_mean: 10.0,
+                new_mean: 2.0,
+                dropped_count: 20,
+                remaining_count: 30,
+                mean_diff: 8.0,
+                threshold: 3.0,
+            }),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: RuleSummary = serde_json::from_str(&json).unwrap();
+        assert!(back.last_drift.is_some());
+        assert!((back.last_drift.unwrap().old_mean - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn drift_summary_serde_roundtrip() {
+        let config = DriftConfig::default();
+        let mut dm = DriftMonitor::new(config);
+        dm.observe("alpha", 5.0);
+        dm.observe("beta", 10.0);
+        let summary = dm.summary();
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: DriftSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total_rules, 2);
+    }
 }
