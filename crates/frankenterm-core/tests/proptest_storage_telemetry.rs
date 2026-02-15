@@ -528,4 +528,46 @@ proptest! {
         prop_assert!(cfg.slo_flush_p95_us > 0.0);
         prop_assert!(cfg.rate_ewma_half_life_ms > 0.0);
     }
+
+    /// StorageHealthTier Debug is non-empty.
+    #[test]
+    fn storage_health_tier_debug_nonempty(_dummy in 0..1u8) {
+        let tier = StorageHealthTier::Green;
+        let debug = format!("{:?}", tier);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// SloStatus Debug is non-empty.
+    #[test]
+    fn slo_status_debug_nonempty(_dummy in 0..1u8) {
+        let status = SloStatus::Unknown;
+        let debug = format!("{:?}", status);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// StorageTelemetryConfig Debug is non-empty.
+    #[test]
+    fn config_debug_nonempty(_dummy in 0..1u8) {
+        let cfg = StorageTelemetryConfig::default();
+        let debug = format!("{:?}", cfg);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ErrorCounts Debug is non-empty.
+    #[test]
+    fn error_counts_debug_nonempty(_dummy in 0..1u8) {
+        let ec = ErrorCounts::default();
+        let debug = format!("{:?}", ec);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// StorageTelemetryConfig Clone preserves thresholds.
+    #[test]
+    fn config_clone_preserves(_dummy in 0..1u8) {
+        let cfg = StorageTelemetryConfig::default();
+        let cloned = cfg.clone();
+        prop_assert_eq!(cloned.tier_thresholds[0], cfg.tier_thresholds[0]);
+        prop_assert_eq!(cloned.tier_thresholds[1], cfg.tier_thresholds[1]);
+        prop_assert_eq!(cloned.tier_thresholds[2], cfg.tier_thresholds[2]);
+    }
 }

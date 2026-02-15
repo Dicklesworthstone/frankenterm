@@ -843,3 +843,51 @@ proptest! {
         prop_assert_eq!(back.total_observations, snap.total_observations);
     }
 }
+
+// =============================================================================
+// Structural: Debug, Clone, deterministic
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// VoiConfig Debug is non-empty.
+    #[test]
+    fn voi_config_debug_nonempty(_dummy in 0..1u8) {
+        let cfg = VoiConfig::default();
+        let debug = format!("{:?}", cfg);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// VoiConfig Clone preserves fields.
+    #[test]
+    fn voi_config_clone_preserves(_dummy in 0..1u8) {
+        let cfg = VoiConfig::default();
+        let cloned = cfg.clone();
+        let json1 = serde_json::to_string(&cfg).unwrap();
+        let json2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// VoiSnapshot Debug is non-empty.
+    #[test]
+    fn voi_snapshot_debug_nonempty(snap in arb_voi_snapshot()) {
+        let debug = format!("{:?}", snap);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// PaneSnapshotEntry Debug is non-empty.
+    #[test]
+    fn pane_snapshot_entry_debug_nonempty(entry in arb_pane_snapshot_entry()) {
+        let debug = format!("{:?}", entry);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// VoiSnapshot deterministic serialization.
+    #[test]
+    fn voi_snapshot_deterministic_serde(snap in arb_voi_snapshot()) {
+        let json1 = serde_json::to_string(&snap).unwrap();
+        let json2 = serde_json::to_string(&snap).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+}

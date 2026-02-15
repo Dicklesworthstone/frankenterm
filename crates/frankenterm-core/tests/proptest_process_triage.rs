@@ -691,3 +691,51 @@ proptest! {
         }
     }
 }
+
+// =============================================================================
+// Structural: Debug, Clone, deterministic
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// TriageCategory Debug is non-empty.
+    #[test]
+    fn triage_category_debug_nonempty(cat in arb_triage_category()) {
+        let debug = format!("{:?}", cat);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// TriageCategory Clone preserves priority.
+    #[test]
+    fn triage_category_clone_preserves(cat in arb_triage_category()) {
+        let cloned = cat;
+        prop_assert_eq!(cloned.priority(), cat.priority());
+    }
+
+    /// TriageConfig Debug is non-empty.
+    #[test]
+    fn triage_config_debug_nonempty(_dummy in 0..1u8) {
+        let config = TriageConfig::default();
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// TriageConfig Clone preserves fields.
+    #[test]
+    fn triage_config_clone_preserves(_dummy in 0..1u8) {
+        let config = TriageConfig::default();
+        let cloned = config.clone();
+        let json1 = serde_json::to_string(&config).unwrap();
+        let json2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// TriageCategory serde deterministic.
+    #[test]
+    fn triage_category_serde_deterministic(cat in arb_triage_category()) {
+        let json1 = serde_json::to_string(&cat).unwrap();
+        let json2 = serde_json::to_string(&cat).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+}

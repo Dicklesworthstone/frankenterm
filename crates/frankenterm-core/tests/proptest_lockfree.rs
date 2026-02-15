@@ -789,4 +789,76 @@ proptest! {
             prop_assert_eq!(got, Some(*v), "get({}) should match entries value", k);
         }
     }
+
+    /// ShardedSnapshot Debug is non-empty.
+    #[test]
+    fn sharded_snapshot_debug_nonempty(
+        counters in prop::collection::vec(("[a-z]{3,6}", 0..1000u64), 0..3),
+        maxes in prop::collection::vec(("[a-z]{3,6}", 0..1000u64), 0..3),
+        gauges in prop::collection::vec(("[a-z]{3,6}", 0..1000u64), 0..3),
+    ) {
+        let snap = ShardedSnapshot { counters, maxes, gauges };
+        let debug = format!("{:?}", snap);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ShardedSnapshot deterministic serialization.
+    #[test]
+    fn sharded_snapshot_deterministic(
+        counters in prop::collection::vec(("[a-z]{3,6}", 0..1000u64), 0..3),
+        maxes in prop::collection::vec(("[a-z]{3,6}", 0..1000u64), 0..3),
+        gauges in prop::collection::vec(("[a-z]{3,6}", 0..1000u64), 0..3),
+    ) {
+        let snap = ShardedSnapshot { counters, maxes, gauges };
+        let json1 = serde_json::to_string(&snap).unwrap();
+        let json2 = serde_json::to_string(&snap).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// ShardedSnapshot Clone preserves fields.
+    #[test]
+    fn sharded_snapshot_clone_preserves(
+        counters in prop::collection::vec(("[a-z]{3,6}", 0..1000u64), 0..3),
+        maxes in prop::collection::vec(("[a-z]{3,6}", 0..1000u64), 0..3),
+        gauges in prop::collection::vec(("[a-z]{3,6}", 0..1000u64), 0..3),
+    ) {
+        let snap = ShardedSnapshot { counters, maxes, gauges };
+        let cloned = snap.clone();
+        prop_assert_eq!(cloned, snap);
+    }
+
+    /// Counter reset zeroes get.
+    #[test]
+    fn counter_reset_zeroes(adds in prop::collection::vec(1..1000u64, 1..50)) {
+        let counter = ShardedCounter::with_shards(4);
+        for v in &adds {
+            counter.add(*v);
+        }
+        prop_assert!(counter.get() > 0);
+        counter.reset();
+        prop_assert_eq!(counter.get(), 0, "reset should zero the counter");
+    }
+
+    /// ShardedMax reset zeroes get.
+    #[test]
+    fn max_reset_zeroes(vals in prop::collection::vec(1..10000u64, 1..50)) {
+        let max_tracker = ShardedMax::with_shards(4);
+        for v in &vals {
+            max_tracker.observe(*v);
+        }
+        prop_assert!(max_tracker.get() > 0);
+        max_tracker.reset();
+        prop_assert_eq!(max_tracker.get(), 0, "reset should zero the max");
+    }
+
+    /// PaneMap remove makes key absent.
+    #[test]
+    fn pane_map_remove_makes_absent(key in 0..1000u64, val in 0..1000u64) {
+        let map = PaneMap::<u64>::with_shards(8);
+        map.insert(key, val);
+        prop_assert!(map.contains(key));
+        map.remove(key);
+        prop_assert!(!map.contains(key), "key should be absent after remove");
+        prop_assert_eq!(map.get(key), None, "get should return None after remove");
+    }
 }

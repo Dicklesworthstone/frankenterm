@@ -556,4 +556,49 @@ proptest! {
             prev_count = count;
         }
     }
+
+    /// ClusteringConfig Debug is non-empty.
+    #[test]
+    fn config_debug_nonempty(config in arb_config()) {
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ClusteringConfig Clone preserves num_hashes.
+    #[test]
+    fn config_clone_preserves(config in arb_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.num_hashes, config.num_hashes);
+        prop_assert_eq!(cloned.num_bands, config.num_bands);
+        prop_assert_eq!(cloned.shingle_size, config.shingle_size);
+    }
+
+    /// ClusterInfo Debug is non-empty.
+    #[test]
+    fn cluster_info_debug_nonempty(
+        text in arb_error_text(),
+    ) {
+        let mut c = ErrorClusterer::with_defaults();
+        c.insert(&text, Some(1), 100);
+        let clusters = c.clusters();
+        prop_assert!(!clusters.is_empty());
+        let debug = format!("{:?}", clusters[0]);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// Empty clusterer has zero cluster_count.
+    #[test]
+    fn empty_clusterer_zero_cluster_count(_dummy in 0..1u8) {
+        let c = ErrorClusterer::with_defaults();
+        prop_assert_eq!(c.cluster_count(), 0);
+        prop_assert_eq!(c.error_count(), 0);
+    }
+
+    /// ClusteringConfig deterministic serialization.
+    #[test]
+    fn config_deterministic_serde(config in arb_config()) {
+        let json1 = serde_json::to_string(&config).unwrap();
+        let json2 = serde_json::to_string(&config).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
 }

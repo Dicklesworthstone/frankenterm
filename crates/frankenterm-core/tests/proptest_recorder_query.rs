@@ -823,3 +823,63 @@ proptest! {
         prop_assert_eq!(req.required_tier(), AccessTier::A2FullQuery);
     }
 }
+
+// =============================================================================
+// Structural: Debug, Clone, deterministic
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// RecorderQueryRequest Debug is non-empty.
+    #[test]
+    fn prop_query_request_debug_nonempty(
+        limit in 1_usize..1000,
+        offset in 0_usize..500,
+    ) {
+        let req = RecorderQueryRequest {
+            limit,
+            offset,
+            ..Default::default()
+        };
+        let debug = format!("{:?}", req);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// TimeRange Debug is non-empty.
+    #[test]
+    fn prop_time_range_debug_nonempty(range in arb_time_range()) {
+        let debug = format!("{:?}", range);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// QueryEventKind Clone preserves variant.
+    #[test]
+    fn prop_query_event_kind_clone(kind in arb_query_event_kind()) {
+        let cloned = kind;
+        prop_assert_eq!(cloned, kind);
+    }
+
+    /// QueryStats Debug is non-empty.
+    #[test]
+    fn prop_query_stats_debug_nonempty(stats in arb_query_stats()) {
+        let debug = format!("{:?}", stats);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// TimeRange deterministic serialization.
+    #[test]
+    fn prop_time_range_deterministic(range in arb_time_range()) {
+        let json1 = serde_json::to_string(&range).unwrap();
+        let json2 = serde_json::to_string(&range).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// QueryStats deterministic serialization.
+    #[test]
+    fn prop_query_stats_deterministic(stats in arb_query_stats()) {
+        let json1 = serde_json::to_string(&stats).unwrap();
+        let json2 = serde_json::to_string(&stats).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+}

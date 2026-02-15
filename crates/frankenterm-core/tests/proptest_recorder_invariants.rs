@@ -607,3 +607,69 @@ proptest! {
         let _ = check_merge_order;
     }
 }
+
+// ============================================================================
+// Structural: Debug, Clone, deterministic
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// ViolationKind Debug is non-empty.
+    #[test]
+    fn prop_violation_kind_debug_nonempty(_dummy in 0..1u8) {
+        let kind = ViolationKind::DuplicateEventId;
+        let debug = format!("{:?}", kind);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ViolationSeverity Debug is non-empty.
+    #[test]
+    fn prop_violation_severity_debug_nonempty(_dummy in 0..1u8) {
+        let sev = ViolationSeverity::Critical;
+        let debug = format!("{:?}", sev);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// InvariantCheckerConfig Debug is non-empty.
+    #[test]
+    fn prop_checker_config_debug_nonempty(
+        max_gap in 0u64..=1000,
+    ) {
+        let config = InvariantCheckerConfig {
+            max_sequence_gap: max_gap,
+            check_causality: true,
+            check_merge_order: false,
+            clock_future_skew_threshold_ms: 5000,
+            expected_schema_version: String::new(),
+        };
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// Empty event list produces passed report.
+    #[test]
+    fn prop_empty_events_passed(_dummy in 0..1u8) {
+        let checker = InvariantChecker::with_config(InvariantCheckerConfig::default());
+        let report = checker.check(&[]);
+        prop_assert!(report.passed, "empty events should produce passed report");
+        prop_assert_eq!(report.events_checked, 0);
+    }
+
+    /// InvariantCheckerConfig Clone preserves max_sequence_gap.
+    #[test]
+    fn prop_checker_config_clone_preserves(
+        max_gap in 0u64..=1000,
+    ) {
+        let config = InvariantCheckerConfig {
+            max_sequence_gap: max_gap,
+            check_causality: true,
+            check_merge_order: false,
+            clock_future_skew_threshold_ms: 5000,
+            expected_schema_version: String::new(),
+        };
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.max_sequence_gap, config.max_sequence_gap);
+        prop_assert_eq!(cloned.check_causality, config.check_causality);
+    }
+}

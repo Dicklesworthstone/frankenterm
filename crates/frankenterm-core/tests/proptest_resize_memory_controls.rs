@@ -559,4 +559,43 @@ proptest! {
             red.compaction_batch_size
         );
     }
+
+    /// ResizeMemoryConfig Debug is non-empty.
+    #[test]
+    fn config_debug_nonempty(config in arb_config()) {
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ResizeMemoryConfig Clone preserves fields.
+    #[test]
+    fn config_clone_preserves(config in arb_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(cloned, config);
+    }
+
+    /// ResizeMemoryBudget Debug is non-empty.
+    #[test]
+    fn budget_debug_nonempty(budget in arb_budget()) {
+        let debug = format!("{:?}", budget);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ResizeMemoryMetrics Debug is non-empty.
+    #[test]
+    fn metrics_debug_nonempty(tier in arb_tier()) {
+        let mut policy = ResizeMemoryPolicy::new(ResizeMemoryConfig::default());
+        let _ = policy.compute_budget(tier);
+        let metrics = policy.metrics();
+        let debug = format!("{:?}", metrics);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ResizeMemoryBudget deterministic serialization.
+    #[test]
+    fn budget_deterministic_serde(budget in arb_budget()) {
+        let json1 = serde_json::to_string(&budget).unwrap();
+        let json2 = serde_json::to_string(&budget).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
 }

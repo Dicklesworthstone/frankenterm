@@ -589,3 +589,50 @@ proptest! {
         prop_assert_eq!(ts1, ts2, "resolution should be idempotent for timestamp");
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Structural: Debug, Clone, deterministic
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// RulesetProfileState Debug is non-empty.
+    #[test]
+    fn profile_state_debug_nonempty(_dummy in 0..1u8) {
+        let state = RulesetProfileState::default();
+        let debug = format!("{:?}", state);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// PaneBookmarkView Debug is non-empty.
+    #[test]
+    fn bookmark_view_debug_nonempty(record in arb_bookmark_record()) {
+        let view = PaneBookmarkView::from(record);
+        let debug = format!("{:?}", view);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// SavedSearchView Debug is non-empty.
+    #[test]
+    fn saved_search_view_debug_nonempty(record in arb_saved_search_record()) {
+        let view = SavedSearchView::from(record);
+        let debug = format!("{:?}", view);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// RulesetProfileState Clone preserves active_profile.
+    #[test]
+    fn profile_state_clone_preserves(_dummy in 0..1u8) {
+        let state = RulesetProfileState::default();
+        let cloned = state.clone();
+        prop_assert_eq!(&cloned.active_profile, &state.active_profile);
+    }
+
+    /// RulesetProfileSummary Debug is non-empty.
+    #[test]
+    fn profile_summary_debug_nonempty(summary in arb_profile_summary()) {
+        let debug = format!("{:?}", summary);
+        prop_assert!(!debug.is_empty());
+    }
+}

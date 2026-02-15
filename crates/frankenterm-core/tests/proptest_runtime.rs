@@ -526,4 +526,41 @@ proptest! {
         let critical = crit_frac % (total + 1);
         prop_assert!(critical <= total);
     }
+
+    /// ResizeWatchdogSeverity Debug is non-empty.
+    #[test]
+    fn severity_debug_nonempty(sev in arb_severity()) {
+        let debug = format!("{:?}", sev);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ResizeExecutionPhase Debug is non-empty.
+    #[test]
+    fn execution_phase_debug_nonempty(phase in arb_execution_phase()) {
+        let debug = format!("{:?}", phase);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ResizeWatchdogSeverity deterministic serialization.
+    #[test]
+    fn severity_deterministic_serde(sev in arb_severity()) {
+        let json1 = serde_json::to_string(&sev).unwrap();
+        let json2 = serde_json::to_string(&sev).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// ResizeExecutionPhase deterministic serialization.
+    #[test]
+    fn execution_phase_deterministic_serde(phase in arb_execution_phase()) {
+        let json1 = serde_json::to_string(&phase).unwrap();
+        let json2 = serde_json::to_string(&phase).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// ResizeStalledTransaction Debug is non-empty.
+    #[test]
+    fn stalled_transaction_debug_nonempty(txn in arb_stalled_transaction()) {
+        let debug = format!("{:?}", txn);
+        prop_assert!(!debug.is_empty());
+    }
 }
