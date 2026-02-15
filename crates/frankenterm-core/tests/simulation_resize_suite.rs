@@ -1,5 +1,7 @@
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::simulation::{EventAction, ExpectationKind, ResizeTimelineStage, Scenario};
 use frankenterm_core::wezterm::{MockWezterm, WeztermInterface};
+use std::future::Future;
 
 struct SuiteFixture {
     name: &'static str,
@@ -48,6 +50,16 @@ const FIXTURES: &[SuiteFixture] = &[
         min_events: 24,
     },
 ];
+
+fn run_async_test<F>(future: F)
+where
+    F: Future<Output = ()>,
+{
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("failed to build runtime_compat current-thread runtime");
+    CompatRuntime::block_on(&runtime, future);
+}
 
 #[test]
 fn resize_suite_fixtures_parse_and_validate() {
@@ -121,108 +133,116 @@ fn mixed_workload_fixture_covers_interactive_streaming_and_scrollback() {
     );
 }
 
-#[tokio::test]
-async fn resize_suite_executes_and_satisfies_contains_expectations() {
-    for fixture in FIXTURES {
-        let scenario = Scenario::from_yaml(fixture.yaml)
-            .unwrap_or_else(|err| panic!("failed to parse {}: {err}", fixture.name));
-        let mock = MockWezterm::new();
+#[test]
+fn resize_suite_executes_and_satisfies_contains_expectations() {
+    run_async_test(async {
+        for fixture in FIXTURES {
+            let scenario = Scenario::from_yaml(fixture.yaml)
+                .unwrap_or_else(|err| panic!("failed to parse {}: {err}", fixture.name));
+            let mock = MockWezterm::new();
 
-        scenario
-            .setup(&mock)
-            .await
-            .unwrap_or_else(|err| panic!("setup failed for {}: {err}", fixture.name));
+            scenario
+                .setup(&mock)
+                .await
+                .unwrap_or_else(|err| panic!("setup failed for {}: {err}", fixture.name));
 
-        let executed = scenario
-            .execute_all(&mock)
-            .await
-            .unwrap_or_else(|err| panic!("execution failed for {}: {err}", fixture.name));
-        assert_eq!(executed, scenario.events.len());
+            let executed = scenario
+                .execute_all(&mock)
+                .await
+                .unwrap_or_else(|err| panic!("execution failed for {}: {err}", fixture.name));
+            assert_eq!(executed, scenario.events.len());
 
-        for exp in &scenario.expectations {
-            if let ExpectationKind::Contains { pane, text } = &exp.kind {
-                let content = mock.get_text(*pane, false).await.unwrap_or_else(|err| {
-                    panic!("get_text failed for {} pane {}: {err}", fixture.name, pane)
-                });
-                assert!(
-                    content.contains(text),
-                    "{} missing expectation text {:?} in pane {}",
-                    fixture.name,
-                    text,
-                    pane
-                );
+            for exp in &scenario.expectations {
+                if let ExpectationKind::Contains { pane, text } = &exp.kind {
+                    let content = mock.get_text(*pane, false).await.unwrap_or_else(|err| {
+                        panic!("get_text failed for {} pane {}: {err}", fixture.name, pane)
+                    });
+                    assert!(
+                        content.contains(text),
+                        "{} missing expectation text {:?} in pane {}",
+                        fixture.name,
+                        text,
+                        pane
+                    );
+                }
             }
         }
-    }
+    });
 }
 
-#[tokio::test]
-async fn resize_suite_preserves_window_and_tab_assignments() {
-    let scenario = Scenario::from_yaml(FIXTURES[1].yaml).unwrap();
-    let mock = MockWezterm::new();
-    scenario.setup(&mock).await.unwrap();
-
-    let pane_2 = mock.pane_state(2).await.unwrap();
-    assert_eq!(pane_2.window_id, 0);
-    assert_eq!(pane_2.tab_id, 1);
-
-    let pane_7 = mock.pane_state(7).await.unwrap();
-    assert_eq!(pane_7.window_id, 0);
-    assert_eq!(pane_7.tab_id, 3);
-}
-
-#[tokio::test]
-async fn resize_suite_timeline_probes_cover_required_stages() {
-    for fixture in FIXTURES {
-        let scenario = Scenario::from_yaml(fixture.yaml)
-            .unwrap_or_else(|err| panic!("failed to parse {}: {err}", fixture.name));
+#[test]
+fn resize_suite_preserves_window_and_tab_assignments() {
+    run_async_test(async {
+        let scenario = Scenario::from_yaml(FIXTURES[1].yaml).unwrap();
         let mock = MockWezterm::new();
         scenario.setup(&mock).await.unwrap();
 
-        let (executed, timeline) = scenario
-            .execute_all_with_resize_timeline(&mock)
-            .await
-            .unwrap_or_else(|err| panic!("timeline execution failed for {}: {err}", fixture.name));
-        assert_eq!(executed, scenario.events.len());
-        assert!(
-            !timeline.events.is_empty(),
-            "{} should contain resize timeline events",
-            fixture.name
-        );
+        let pane_2 = mock.pane_state(2).await.unwrap();
+        assert_eq!(pane_2.window_id, 0);
+        assert_eq!(pane_2.tab_id, 1);
 
-        for event in &timeline.events {
-            assert_eq!(
-                event.stages.len(),
-                ResizeTimelineStage::ALL.len(),
-                "{} stage count mismatch for event {}",
-                fixture.name,
-                event.event_index
+        let pane_7 = mock.pane_state(7).await.unwrap();
+        assert_eq!(pane_7.window_id, 0);
+        assert_eq!(pane_7.tab_id, 3);
+    });
+}
+
+#[test]
+fn resize_suite_timeline_probes_cover_required_stages() {
+    run_async_test(async {
+        for fixture in FIXTURES {
+            let scenario = Scenario::from_yaml(fixture.yaml)
+                .unwrap_or_else(|err| panic!("failed to parse {}: {err}", fixture.name));
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
+
+            let (executed, timeline) = scenario
+                .execute_all_with_resize_timeline(&mock)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("timeline execution failed for {}: {err}", fixture.name)
+                });
+            assert_eq!(executed, scenario.events.len());
+            assert!(
+                !timeline.events.is_empty(),
+                "{} should contain resize timeline events",
+                fixture.name
             );
-            for (sample, expected) in event.stages.iter().zip(ResizeTimelineStage::ALL.iter()) {
+
+            for event in &timeline.events {
                 assert_eq!(
-                    sample.stage, *expected,
-                    "{} stage order mismatch for event {}",
-                    fixture.name, event.event_index
+                    event.stages.len(),
+                    ResizeTimelineStage::ALL.len(),
+                    "{} stage count mismatch for event {}",
+                    fixture.name,
+                    event.event_index
+                );
+                for (sample, expected) in event.stages.iter().zip(ResizeTimelineStage::ALL.iter()) {
+                    assert_eq!(
+                        sample.stage, *expected,
+                        "{} stage order mismatch for event {}",
+                        fixture.name, event.event_index
+                    );
+                }
+                let queue = event.stages[1]
+                    .queue_metrics
+                    .as_ref()
+                    .expect("scheduler stage should emit queue metrics");
+                assert!(
+                    queue.depth_before >= queue.depth_after,
+                    "{} queue depth must be non-increasing for event {}",
+                    fixture.name,
+                    event.event_index
                 );
             }
-            let queue = event.stages[1]
-                .queue_metrics
-                .as_ref()
-                .expect("scheduler stage should emit queue metrics");
+
+            let summary = timeline.stage_summary();
+            assert_eq!(summary.len(), ResizeTimelineStage::ALL.len());
             assert!(
-                queue.depth_before >= queue.depth_after,
-                "{} queue depth must be non-increasing for event {}",
-                fixture.name,
-                event.event_index
+                summary.iter().all(|stage| stage.samples > 0),
+                "{} summary should include samples for each stage",
+                fixture.name
             );
         }
-
-        let summary = timeline.stage_summary();
-        assert_eq!(summary.len(), ResizeTimelineStage::ALL.len());
-        assert!(
-            summary.iter().all(|stage| stage.samples > 0),
-            "{} summary should include samples for each stage",
-            fixture.name
-        );
-    }
+    });
 }

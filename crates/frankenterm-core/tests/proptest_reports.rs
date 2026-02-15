@@ -10,14 +10,16 @@
 //!   - always ends with 'Z'
 //!   - contains expected field separators
 //!   - fixed output length for positive timestamps
+//!   - signed epoch roundtrip safety (including negative pre-1970 values)
 //! - `format_duration`: duration tier formatting
 //!   - tier boundaries: <1000 ms, <60000 seconds, >=60000 minutes
 //!   - suffix correctness per tier
 //!   - non-negative ms always produces non-empty output
-//! - `truncate`: string truncation (byte-based, ASCII-safe)
+//! - `truncate`: string truncation
 //!   - short strings unchanged (idempotent)
-//!   - output byte length bounded
+//!   - output length bounded
 //!   - ellipsis present only when truncated
+//!   - Unicode-safe (no panic on multibyte boundaries)
 
 use proptest::prelude::*;
 
@@ -59,6 +61,35 @@ fn days_in_month(y: i64, m: u32) -> u32 {
     }
 }
 
+/// Parse "YYYY-MM-DD HH:MM:SS.mmmZ" into components.
+fn parse_format_ts(s: &str) -> Option<(i64, u32, u32, u32, u32, u32, u32)> {
+    if s.len() != 24 {
+        return None;
+    }
+
+    let bytes = s.as_bytes();
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b' '
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'.'
+        || bytes[23] != b'Z'
+    {
+        return None;
+    }
+
+    Some((
+        s[0..4].parse().ok()?,
+        s[5..7].parse().ok()?,
+        s[8..10].parse().ok()?,
+        s[11..13].parse().ok()?,
+        s[14..16].parse().ok()?,
+        s[17..19].parse().ok()?,
+        s[20..23].parse().ok()?,
+    ))
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Strategies
 // ────────────────────────────────────────────────────────────────────
@@ -73,10 +104,20 @@ fn arb_epoch_ms() -> impl Strategy<Value = i64> {
     0i64..7_258_118_400_000i64 // up to ~year 2200
 }
 
+/// Signed epoch-ms timestamps (~1900 to ~2200) for negative-epoch coverage.
+fn arb_epoch_ms_signed() -> impl Strategy<Value = i64> {
+    -2_208_988_800_000i64..7_258_118_400_000i64
+}
+
 /// Arbitrary ASCII strings for truncation tests
 fn arb_ascii_string() -> impl Strategy<Value = String> {
     prop::collection::vec(32u8..127, 0..200)
         .prop_map(|v| v.into_iter().map(|b| b as char).collect::<String>())
+}
+
+/// Arbitrary Unicode strings for truncation boundary testing.
+fn arb_unicode_string() -> impl Strategy<Value = String> {
+    prop::collection::vec(any::<char>(), 0..120).prop_map(|v| v.into_iter().collect::<String>())
 }
 
 fn arb_max_len() -> impl Strategy<Value = usize> {
@@ -256,6 +297,48 @@ proptest! {
         prop_assert!(s.starts_with("1970-01-01 00:00:00."), "epoch millis {} gave '{}'", millis, s);
     }
 
+    /// Signed timestamps roundtrip through textual format without losing information.
+    #[test]
+    fn format_ts_signed_roundtrip(ms in arb_epoch_ms_signed()) {
+        let s = format_ts(ms);
+        let parsed = parse_format_ts(&s);
+        prop_assert!(parsed.is_some(), "failed to parse formatted signed timestamp '{}'", s);
+        let (y, month, day, hh, mm, ss, millis) = parsed.unwrap_or((0, 0, 0, 0, 0, 0, 0));
+
+        let reconstructed_ms = (ymd_to_days(y, month, day) * 86_400
+            + hh as i64 * 3_600
+            + mm as i64 * 60
+            + ss as i64)
+            * 1000
+            + millis as i64;
+        prop_assert_eq!(
+            reconstructed_ms,
+            ms,
+            "signed roundtrip mismatch: input={} formatted='{}' reconstructed={}",
+            ms,
+            s,
+            reconstructed_ms
+        );
+    }
+
+    /// Monotonic ordering must hold across pre-epoch and post-epoch ranges.
+    #[test]
+    fn format_ts_monotonic_signed(
+        a in -2_200_000_000_000i64..3_000_000_000_000i64,
+        delta in 0i64..1_000_000_000i64
+    ) {
+        let b = a + delta;
+        let sa = format_ts(a);
+        let sb = format_ts(b);
+        prop_assert!(
+            sb >= sa,
+            "signed monotonicity failed: {} ('{}') vs {} ('{}')",
+            a,
+            sa,
+            b,
+            sb
+        );
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -440,6 +523,38 @@ proptest! {
         prop_assert!(result.ends_with('…'), "max=0 should produce ellipsis: '{}'", result);
     }
 
+    /// Unicode input should never panic and should honor character count semantics.
+    #[test]
+    fn truncate_unicode_char_safe(s in arb_unicode_string(), max in 0usize..80) {
+        let result = truncate(&s, max);
+        let source_chars = s.chars().count();
+        let result_chars = result.chars().count();
+
+        if source_chars <= max {
+            prop_assert_eq!(result, s, "short unicode string should be unchanged");
+        } else {
+            prop_assert!(
+                result.ends_with('…'),
+                "truncated unicode string should end with ellipsis: '{}'",
+                result
+            );
+            // max chars + 1 ellipsis
+            prop_assert!(
+                result_chars <= max + 1,
+                "unicode truncation exceeded char budget: {} > {} (max={})",
+                result_chars,
+                max + 1,
+                max
+            );
+            let expected_prefix: String = s.chars().take(max).collect();
+            prop_assert!(
+                result.starts_with(&expected_prefix),
+                "unicode prefix mismatch: expected '{}', got '{}'",
+                expected_prefix,
+                result
+            );
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────

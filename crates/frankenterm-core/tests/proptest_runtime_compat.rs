@@ -65,6 +65,18 @@ fn arb_timeout_ms() -> impl Strategy<Value = u64> {
     100u64..=5000
 }
 
+fn arb_timeout_work_ms() -> impl Strategy<Value = u64> {
+    10u64..=40
+}
+
+fn arb_short_timeout_ms() -> impl Strategy<Value = u64> {
+    0u64..=2
+}
+
+fn arb_long_timeout_padding_ms() -> impl Strategy<Value = u64> {
+    80u64..=160
+}
+
 fn arb_sleep_ms() -> impl Strategy<Value = u64> {
     0u64..=50
 }
@@ -645,6 +657,33 @@ proptest! {
         });
         prop_assert_eq!(result, (a, b), "nested async must preserve both values");
     }
+
+    /// spawn_detached eventually runs and can signal completion through mpsc.
+    #[test]
+    fn spawn_detached_completes_and_signals(val in any::<i64>()) {
+        let rt = RuntimeBuilder::multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("build");
+        let (tx, mut rx) = mpsc::channel(1);
+
+        rt.spawn_detached(async move {
+            runtime_compat::mpsc_send(&tx, val)
+                .await
+                .expect("spawn_detached send");
+        });
+
+        let observed = rt.block_on(async {
+            runtime_compat::timeout(
+                Duration::from_secs(1),
+                runtime_compat::mpsc_recv_option(&mut rx),
+            )
+            .await
+            .expect("spawn_detached must signal")
+        });
+
+        prop_assert_eq!(observed, Some(val), "spawn_detached must preserve payload");
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -696,6 +735,38 @@ proptest! {
             .await;
             assert!(result.is_ok());
             assert_eq!(result.unwrap().unwrap(), val);
+        });
+    }
+
+    /// Timeout behavior is monotonic for the same bounded task:
+    /// a very short timeout fails, while a sufficiently longer timeout succeeds.
+    #[test]
+    fn timeout_deadline_monotonicity(
+        work_ms in arb_timeout_work_ms(),
+        short_timeout_ms in arb_short_timeout_ms(),
+        long_timeout_padding_ms in arb_long_timeout_padding_ms(),
+    ) {
+        with_tokio(move || async move {
+            let short = runtime_compat::timeout(
+                Duration::from_millis(short_timeout_ms),
+                async move {
+                    runtime_compat::sleep(Duration::from_millis(work_ms)).await;
+                    1u8
+                },
+            )
+            .await;
+
+            let long = runtime_compat::timeout(
+                Duration::from_millis(work_ms + long_timeout_padding_ms),
+                async move {
+                    runtime_compat::sleep(Duration::from_millis(work_ms)).await;
+                    1u8
+                },
+            )
+            .await;
+
+            assert!(short.is_err(), "very short timeout must expire");
+            assert_eq!(long, Ok(1u8), "long timeout should allow completion");
         });
     }
 }
