@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 
-use frankenterm_core::retry::{is_retryable, RetryPolicy};
+use frankenterm_core::retry::{RetryPolicy, is_retryable};
 
 // =============================================================================
 // Strategies

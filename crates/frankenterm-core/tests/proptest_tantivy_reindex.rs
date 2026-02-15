@@ -414,3 +414,39 @@ fn time_range_excludes_outside() {
     assert!(range.includes(0, 2000));
     assert!(!range.includes(0, 2001));
 }
+
+// =========================================================================
+// Additional property tests for coverage
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// BackfillRange Debug output is non-empty.
+    #[test]
+    fn prop_range_debug_nonempty(range in arb_backfill_range()) {
+        let dbg = format!("{:?}", range);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// BackfillRange Clone preserves variant equality.
+    #[test]
+    fn prop_range_clone(range in arb_backfill_range()) {
+        let cloned = range.clone();
+        prop_assert_eq!(range, cloned);
+    }
+
+    /// ReindexProgress Clone preserves all fields.
+    #[test]
+    fn prop_progress_clone(progress in arb_reindex_progress()) {
+        let cloned = progress.clone();
+        prop_assert_eq!(progress, cloned);
+    }
+
+    /// ReindexProgress Debug output is non-empty.
+    #[test]
+    fn prop_progress_debug_nonempty(progress in arb_reindex_progress()) {
+        let dbg = format!("{:?}", progress);
+        prop_assert!(!dbg.is_empty());
+    }
+}

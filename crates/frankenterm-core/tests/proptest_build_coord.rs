@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use frankenterm_core::build_coord::{detect_cargo_command, BuildCoordConfig, BuildLockMetadata};
+use frankenterm_core::build_coord::{BuildCoordConfig, BuildLockMetadata, detect_cargo_command};
 use proptest::prelude::*;
 
 // =========================================================================

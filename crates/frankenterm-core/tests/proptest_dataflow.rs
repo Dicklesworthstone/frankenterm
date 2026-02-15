@@ -7,8 +7,8 @@
 use frankenterm_core::dataflow::{DataflowError, DataflowGraph, NodeId, Value};
 use proptest::prelude::*;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // =============================================================================
 // Strategies

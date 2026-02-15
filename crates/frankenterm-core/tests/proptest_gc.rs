@@ -23,8 +23,8 @@ use std::collections::{HashMap, HashSet};
 use proptest::prelude::*;
 
 use frankenterm_core::gc::{
-    compact_u64_map, free_page_ratio, normalized_vacuum_threshold, should_vacuum,
-    CacheCompactionStats, CacheGcSettings,
+    CacheCompactionStats, CacheGcSettings, compact_u64_map, free_page_ratio,
+    normalized_vacuum_threshold, should_vacuum,
 };
 
 // =============================================================================
