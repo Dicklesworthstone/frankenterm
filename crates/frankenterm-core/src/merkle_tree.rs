@@ -52,7 +52,8 @@ impl MerkleHash {
         // hash each with FNV-1a to get 4x64-bit = 256 bits.
         let mut result = [0u8; 32];
         for chunk_idx in 0..4u64 {
-            let mut h: u64 = 0xcbf29ce484222325_u64.wrapping_add(chunk_idx.wrapping_mul(0x9e3779b97f4a7c15));
+            let mut h: u64 =
+                0xcbf29ce484222325_u64.wrapping_add(chunk_idx.wrapping_mul(0x9e3779b97f4a7c15));
             // Mix in all data with chunk_idx as salt
             for &byte in data {
                 h ^= byte as u64;
@@ -165,7 +166,10 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MerkleTree {
     /// Sorted entries (source of truth).
-    #[serde(serialize_with = "serialize_entries", deserialize_with = "deserialize_entries")]
+    #[serde(
+        serialize_with = "serialize_entries",
+        deserialize_with = "deserialize_entries"
+    )]
     entries: BTreeMap<Vec<u8>, Vec<u8>>,
     /// Cached root hash (recomputed on modification).
     root_hash: MerkleHash,
@@ -232,7 +236,9 @@ impl MerkleTree {
 
     /// Iterate over all key-value pairs in sorted order.
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        self.entries.iter().map(|(k, v)| (k.as_slice(), v.as_slice()))
+        self.entries
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
     }
 
     /// Get all keys.
@@ -364,7 +370,12 @@ impl MerkleTree {
         hashes
     }
 
-    fn collect_level_hashes(node: &Node, target_depth: usize, current: usize, out: &mut Vec<MerkleHash>) {
+    fn collect_level_hashes(
+        node: &Node,
+        target_depth: usize,
+        current: usize,
+        out: &mut Vec<MerkleHash>,
+    ) {
         if current == target_depth {
             out.push(node.hash());
             return;
@@ -691,6 +702,278 @@ mod tests {
             (b"b".to_vec(), b"2".to_vec()),
         ]);
         let keys: Vec<_> = tree.keys().collect();
-        assert_eq!(keys, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+        assert_eq!(
+            keys,
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+        );
+    }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──────────────────────
+
+    // ── MerkleHash coverage ─────────────────────────────────
+
+    #[test]
+    fn hash_zero_constant() {
+        let z = MerkleHash::ZERO;
+        assert!(z.is_zero());
+        assert_eq!(z.as_bytes(), &[0u8; 32]);
+    }
+
+    #[test]
+    fn hash_from_bytes_roundtrip() {
+        let bytes = [42u8; 32];
+        let h = MerkleHash::from_bytes(bytes);
+        assert_eq!(*h.as_bytes(), bytes);
+        assert!(!h.is_zero());
+    }
+
+    #[test]
+    fn hash_debug_format() {
+        let h = MerkleHash::from_bytes([0xDE; 32]);
+        let dbg = format!("{:?}", h);
+        assert!(dbg.starts_with("MerkleHash("));
+        assert!(dbg.contains("dededede"));
+        assert!(dbg.ends_with("..)"));
+    }
+
+    #[test]
+    fn hash_clone_copy() {
+        let h1 = MerkleHash::from_bytes([1; 32]);
+        let h2 = h1; // Copy
+        let h3 = h1.clone(); // Clone
+        assert_eq!(h1, h2);
+        assert_eq!(h1, h3);
+    }
+
+    #[test]
+    fn hash_equality() {
+        let h1 = MerkleHash::from_bytes([10; 32]);
+        let h2 = MerkleHash::from_bytes([10; 32]);
+        let h3 = MerkleHash::from_bytes([20; 32]);
+        assert_eq!(h1, h2);
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn hash_std_hash_trait() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(MerkleHash::from_bytes([1; 32]));
+        set.insert(MerkleHash::from_bytes([2; 32]));
+        set.insert(MerkleHash::from_bytes([1; 32])); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn hash_serde_roundtrip() {
+        let h = MerkleHash::from_bytes([0xAB; 32]);
+        let json = serde_json::to_string(&h).unwrap();
+        let back: MerkleHash = serde_json::from_str(&json).unwrap();
+        assert_eq!(h, back);
+    }
+
+    // ── MerkleTree additional coverage ──────────────────────
+
+    #[test]
+    fn tree_default_trait() {
+        let t = MerkleTree::default();
+        assert!(t.is_empty());
+        assert_eq!(t.root_hash(), MerkleHash::ZERO);
+    }
+
+    #[test]
+    fn tree_debug_format() {
+        let t = MerkleTree::from_entries(vec![(b"k".to_vec(), b"v".to_vec())]);
+        let dbg = format!("{:?}", t);
+        assert!(dbg.contains("MerkleTree"));
+    }
+
+    #[test]
+    fn tree_clone_independence() {
+        let mut t1 = MerkleTree::from_entries(vec![(b"a".to_vec(), b"1".to_vec())]);
+        let t2 = t1.clone();
+        t1.insert(b"b".to_vec(), b"2".to_vec());
+        assert_eq!(t2.len(), 1);
+        assert_eq!(t1.len(), 2);
+        assert_ne!(t1.root_hash(), t2.root_hash());
+    }
+
+    #[test]
+    fn tree_equality_and_inequality() {
+        let t1 = MerkleTree::from_entries(vec![(b"a".to_vec(), b"1".to_vec())]);
+        let t2 = MerkleTree::from_entries(vec![(b"a".to_vec(), b"1".to_vec())]);
+        let t3 = MerkleTree::from_entries(vec![(b"a".to_vec(), b"2".to_vec())]);
+        assert_eq!(t1, t2);
+        assert_ne!(t1, t3);
+    }
+
+    #[test]
+    fn tree_get_nonexistent() {
+        let t = MerkleTree::from_entries(vec![(b"x".to_vec(), b"y".to_vec())]);
+        assert!(t.get(b"missing").is_none());
+    }
+
+    #[test]
+    fn tree_remove_nonexistent_no_change() {
+        let mut t = MerkleTree::from_entries(vec![(b"a".to_vec(), b"1".to_vec())]);
+        let h_before = t.root_hash();
+        let result = t.remove(b"nonexistent");
+        assert!(result.is_none());
+        assert_eq!(t.root_hash(), h_before);
+    }
+
+    #[test]
+    fn tree_from_entries_empty() {
+        let t = MerkleTree::from_entries(Vec::<(Vec<u8>, Vec<u8>)>::new());
+        assert!(t.is_empty());
+        assert_eq!(t.root_hash(), MerkleHash::ZERO);
+    }
+
+    #[test]
+    fn tree_remove_to_empty() {
+        let mut t = MerkleTree::from_entries(vec![(b"only".to_vec(), b"one".to_vec())]);
+        assert!(!t.is_empty());
+        t.remove(b"only");
+        assert!(t.is_empty());
+        assert_eq!(t.root_hash(), MerkleHash::ZERO);
+    }
+
+    #[test]
+    fn tree_iter_key_value_pairs() {
+        let t = MerkleTree::from_entries(vec![
+            (b"b".to_vec(), b"2".to_vec()),
+            (b"a".to_vec(), b"1".to_vec()),
+        ]);
+        let pairs: Vec<_> = t.iter().collect();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], (b"a".as_slice(), b"1".as_slice()));
+        assert_eq!(pairs[1], (b"b".as_slice(), b"2".as_slice()));
+    }
+
+    // ── Proof additional coverage ───────────────────────────
+
+    #[test]
+    fn proof_single_element_tree() {
+        let t = MerkleTree::from_entries(vec![(b"only".to_vec(), b"val".to_vec())]);
+        let proof = t.proof(b"only").unwrap();
+        assert!(proof.verify(&t.root_hash()));
+        assert!(proof.path.is_empty()); // single leaf, no siblings
+    }
+
+    #[test]
+    fn proof_all_entries_verify() {
+        let t = MerkleTree::from_entries(vec![
+            (b"alpha".to_vec(), b"1".to_vec()),
+            (b"beta".to_vec(), b"2".to_vec()),
+            (b"gamma".to_vec(), b"3".to_vec()),
+            (b"delta".to_vec(), b"4".to_vec()),
+            (b"epsilon".to_vec(), b"5".to_vec()),
+        ]);
+        for (k, _) in t.iter() {
+            let proof = t.proof(k).unwrap();
+            assert!(proof.verify(&t.root_hash()), "proof failed for key {:?}", k);
+        }
+    }
+
+    #[test]
+    fn proof_debug_clone() {
+        let t = MerkleTree::from_entries(vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+        ]);
+        let proof = t.proof(b"a").unwrap();
+        let dbg = format!("{:?}", proof);
+        assert!(dbg.contains("MerkleProof"));
+        let p2 = proof.clone();
+        assert!(p2.verify(&t.root_hash()));
+    }
+
+    #[test]
+    fn proof_step_debug_clone_serde() {
+        let step = ProofStep::Left(MerkleHash::from_bytes([5; 32]));
+        let dbg = format!("{:?}", step);
+        assert!(dbg.contains("Left"));
+        let _cloned = step.clone();
+
+        let json = serde_json::to_string(&step).unwrap();
+        let back: ProofStep = serde_json::from_str(&json).unwrap();
+        let dbg2 = format!("{:?}", back);
+        assert!(dbg2.contains("Left"));
+    }
+
+    // ── TreeDiff additional coverage ────────────────────────
+
+    #[test]
+    fn tree_diff_debug_clone() {
+        let diff = TreeDiff {
+            added: vec![b"new".to_vec()],
+            removed: vec![],
+            changed: vec![],
+        };
+        let dbg = format!("{:?}", diff);
+        assert!(dbg.contains("TreeDiff"));
+        let d2 = diff.clone();
+        assert_eq!(diff, d2);
+    }
+
+    #[test]
+    fn tree_diff_total_changes_combined() {
+        let diff = TreeDiff {
+            added: vec![b"a".to_vec(), b"b".to_vec()],
+            removed: vec![b"c".to_vec()],
+            changed: vec![b"d".to_vec(), b"e".to_vec(), b"f".to_vec()],
+        };
+        assert_eq!(diff.total_changes(), 6);
+        assert!(!diff.is_empty());
+    }
+
+    #[test]
+    fn tree_diff_is_empty_only_when_all_empty() {
+        let empty = TreeDiff {
+            added: vec![],
+            removed: vec![],
+            changed: vec![],
+        };
+        assert!(empty.is_empty());
+        assert_eq!(empty.total_changes(), 0);
+    }
+
+    #[test]
+    fn tree_diff_combined_operations() {
+        let t1 = MerkleTree::from_entries(vec![
+            (b"keep".to_vec(), b"same".to_vec()),
+            (b"remove".to_vec(), b"gone".to_vec()),
+            (b"change".to_vec(), b"old".to_vec()),
+        ]);
+        let t2 = MerkleTree::from_entries(vec![
+            (b"keep".to_vec(), b"same".to_vec()),
+            (b"change".to_vec(), b"new".to_vec()),
+            (b"added".to_vec(), b"fresh".to_vec()),
+        ]);
+        let diff = t1.diff(&t2);
+        assert_eq!(diff.added.len(), 1);
+        assert_eq!(diff.removed.len(), 1);
+        assert_eq!(diff.changed.len(), 1);
+        assert_eq!(diff.total_changes(), 3);
+    }
+
+    // ── Level hashes additional coverage ────────────────────
+
+    #[test]
+    fn level_hashes_empty_tree() {
+        let t = MerkleTree::new();
+        let hashes = t.level_hashes(0);
+        assert_eq!(hashes.len(), 1);
+        assert!(hashes[0].is_zero());
+    }
+
+    #[test]
+    fn level_hashes_beyond_depth() {
+        let t = MerkleTree::from_entries(vec![(b"a".to_vec(), b"1".to_vec())]);
+        // Single leaf tree: depth 0 is the leaf itself
+        // Requesting depth > 0 should still return the leaf hash
+        let hashes = t.level_hashes(5);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0], t.root_hash());
     }
 }
