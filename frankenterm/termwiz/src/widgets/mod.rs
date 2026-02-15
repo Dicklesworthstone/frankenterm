@@ -57,6 +57,19 @@ pub struct RenderTelemetry {
     pub frame_dirty_rects: usize,
     /// Total dirty cells between the previous and current composed frame.
     pub frame_dirty_cells: usize,
+    /// Number of tile-aligned dirty regions between the previous and current composed frame.
+    pub frame_dirty_tiles: usize,
+    /// Total dirty cells across tile-aligned frame regions.
+    pub frame_dirty_tile_cells: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirtyRegionMode {
+    Rects,
+    Tiles {
+        tile_width: usize,
+        tile_height: usize,
+    },
 }
 
 /// UpdateArgs provides access to the widget and UI state during
@@ -467,16 +480,12 @@ impl<'widget> Ui<'widget> {
         Ok(())
     }
 
-    /// Apply the current state of the widgets to the screen.
-    /// This has the side effect of clearing out any unconsumed input queue.
-    /// Returns a tuple of:
-    /// - whether the Ui may need another update pass (e.g. layout changed)
-    /// - dirty rectangles for the composed frame diff, suitable for partial uploads
-    pub fn render_to_screen_with_dirty_rects(
+    fn render_to_screen_with_dirty_region_mode(
         &mut self,
         screen: &mut Surface,
+        mode: DirtyRegionMode,
     ) -> Result<(bool, Vec<DirtyRect>)> {
-        let mut frame_dirty_rects = Vec::new();
+        let mut frame_dirty_regions = Vec::new();
         if let Some(root) = self.graph.root {
             let mut telemetry = RenderTelemetry::default();
             let (width, height) = screen.dimensions();
@@ -488,11 +497,26 @@ impl<'widget> Ui<'widget> {
                 &ScreenRelativeCoords::new(0, 0),
                 &mut telemetry,
             )?;
-            frame_dirty_rects = screen.dirty_rects(&alt_screen);
+            let frame_dirty_rects = screen.dirty_rects(&alt_screen);
             let (frame_rect_count, frame_dirty_cells) =
                 Self::accumulate_dirty_rects(&frame_dirty_rects);
             telemetry.frame_dirty_rects = frame_rect_count;
             telemetry.frame_dirty_cells = frame_dirty_cells;
+            frame_dirty_regions = match mode {
+                DirtyRegionMode::Rects => frame_dirty_rects,
+                DirtyRegionMode::Tiles {
+                    tile_width,
+                    tile_height,
+                } => {
+                    let frame_dirty_tiles =
+                        screen.dirty_tiles(&alt_screen, tile_width, tile_height);
+                    let (frame_tile_count, frame_dirty_tile_cells) =
+                        Self::accumulate_dirty_rects(&frame_dirty_tiles);
+                    telemetry.frame_dirty_tiles = frame_tile_count;
+                    telemetry.frame_dirty_tile_cells = frame_dirty_tile_cells;
+                    frame_dirty_tiles
+                }
+            };
             // Now compute a delta and apply it to the actual screen
             let diff = screen.diff_screens(&alt_screen);
             screen.add_changes(diff);
@@ -517,7 +541,36 @@ impl<'widget> Ui<'widget> {
 
         let (width, height) = screen.dimensions();
         let needs_update = self.compute_layout(width, height)?;
-        Ok((needs_update, frame_dirty_rects))
+        Ok((needs_update, frame_dirty_regions))
+    }
+
+    /// Apply the current state of the widgets to the screen.
+    /// This has the side effect of clearing out any unconsumed input queue.
+    /// Returns a tuple of:
+    /// - whether the Ui may need another update pass (e.g. layout changed)
+    /// - dirty rectangles for the composed frame diff, suitable for partial uploads
+    pub fn render_to_screen_with_dirty_rects(
+        &mut self,
+        screen: &mut Surface,
+    ) -> Result<(bool, Vec<DirtyRect>)> {
+        self.render_to_screen_with_dirty_region_mode(screen, DirtyRegionMode::Rects)
+    }
+
+    /// Like [`Ui::render_to_screen_with_dirty_rects`], but returns tile-aligned
+    /// dirty regions for the composed frame diff.
+    pub fn render_to_screen_with_dirty_tiles(
+        &mut self,
+        screen: &mut Surface,
+        tile_width: usize,
+        tile_height: usize,
+    ) -> Result<(bool, Vec<DirtyRect>)> {
+        self.render_to_screen_with_dirty_region_mode(
+            screen,
+            DirtyRegionMode::Tiles {
+                tile_width,
+                tile_height,
+            },
+        )
     }
 
     /// Apply the current state of the widgets to the screen.
@@ -629,12 +682,16 @@ mod test {
         assert!(first.widget_dirty_cells >= 1);
         assert!(first.frame_dirty_rects >= 1);
         assert!(first.frame_dirty_cells >= 1);
+        assert_eq!(first.frame_dirty_tiles, 0);
+        assert_eq!(first.frame_dirty_tile_cells, 0);
 
         ui.render_to_screen(&mut surface).unwrap();
         let second = ui.last_render_telemetry();
         assert_eq!(second.widgets_rendered, 1);
         assert_eq!(second.frame_dirty_rects, 0);
         assert_eq!(second.frame_dirty_cells, 0);
+        assert_eq!(second.frame_dirty_tiles, 0);
+        assert_eq!(second.frame_dirty_tile_cells, 0);
     }
 
     #[test]
@@ -649,5 +706,29 @@ mod test {
 
         let (_, second_rects) = ui.render_to_screen_with_dirty_rects(&mut surface).unwrap();
         assert!(second_rects.is_empty());
+    }
+
+    #[test]
+    fn render_to_screen_with_dirty_tiles_reports_frame_regions() {
+        let mut ui = Ui::new();
+        ui.set_root(PaintCell);
+
+        let mut surface = Surface::new(4, 4);
+
+        let (_, first_tiles) = ui
+            .render_to_screen_with_dirty_tiles(&mut surface, 2, 2)
+            .unwrap();
+        assert!(!first_tiles.is_empty());
+        let first = ui.last_render_telemetry();
+        assert!(first.frame_dirty_tiles >= 1);
+        assert!(first.frame_dirty_tile_cells >= 1);
+
+        let (_, second_tiles) = ui
+            .render_to_screen_with_dirty_tiles(&mut surface, 2, 2)
+            .unwrap();
+        assert!(second_tiles.is_empty());
+        let second = ui.last_render_telemetry();
+        assert_eq!(second.frame_dirty_tiles, 0);
+        assert_eq!(second.frame_dirty_tile_cells, 0);
     }
 }
