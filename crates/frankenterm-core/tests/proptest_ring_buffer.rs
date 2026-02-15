@@ -587,3 +587,126 @@ proptest! {
         prop_assert_eq!(rb.len(), 1);
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Additional property tests for coverage
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// RingBufferStats Debug output is non-empty.
+    #[test]
+    fn prop_stats_debug_nonempty(
+        capacity in arb_capacity(),
+        items in arb_items(20),
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for &item in &items {
+            rb.push(item);
+        }
+        let dbg = format!("{:?}", rb.stats());
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// RingBufferStats serde is deterministic.
+    #[test]
+    fn prop_stats_serde_deterministic(
+        capacity in arb_capacity(),
+        items in arb_items(20),
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for &item in &items {
+            rb.push(item);
+        }
+        let stats = rb.stats();
+        let j1 = serde_json::to_string(&stats).unwrap();
+        let j2 = serde_json::to_string(&stats).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// Empty buffer has len 0, is_empty true, no front/back.
+    #[test]
+    fn prop_empty_buffer_state(capacity in arb_capacity()) {
+        let rb: RingBuffer<i32> = RingBuffer::new(capacity);
+        prop_assert_eq!(rb.len(), 0);
+        prop_assert!(rb.is_empty());
+        prop_assert_eq!(rb.front(), None);
+        prop_assert_eq!(rb.back(), None);
+        prop_assert_eq!(rb.total_pushed(), 0);
+        prop_assert_eq!(rb.total_evicted(), 0);
+    }
+
+    /// is_empty iff len == 0.
+    #[test]
+    fn prop_is_empty_correct(
+        capacity in arb_capacity(),
+        items in arb_items(30),
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for &item in &items {
+            rb.push(item);
+            prop_assert_eq!(rb.is_empty(), rb.len() == 0);
+        }
+    }
+
+    /// Capacity never changes after construction.
+    #[test]
+    fn prop_capacity_preserved(
+        capacity in arb_capacity(),
+        items in arb_items(30),
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for &item in &items {
+            rb.push(item);
+            prop_assert_eq!(rb.capacity(), capacity);
+        }
+        rb.clear();
+        prop_assert_eq!(rb.capacity(), capacity);
+    }
+
+    /// total_pushed increments by 1 on each push.
+    #[test]
+    fn prop_push_increments_total(
+        capacity in arb_capacity(),
+        items in arb_items(30),
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for (i, &item) in items.iter().enumerate() {
+            rb.push(item);
+            prop_assert_eq!(rb.total_pushed(), (i + 1) as u64);
+        }
+    }
+
+    /// Drain preserves total_pushed and total_evicted.
+    #[test]
+    fn prop_drain_preserves_totals(
+        capacity in arb_capacity(),
+        items in arb_items(30),
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for &item in &items {
+            rb.push(item);
+        }
+        let pushed_before = rb.total_pushed();
+        let evicted_before = rb.total_evicted();
+        let _ = rb.drain();
+        prop_assert_eq!(rb.total_pushed(), pushed_before);
+        prop_assert_eq!(rb.total_evicted(), evicted_before);
+    }
+
+    /// Stats capacity matches buffer capacity.
+    #[test]
+    fn prop_stats_capacity_matches(
+        capacity in arb_capacity(),
+        items in arb_items(20),
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for &item in &items {
+            rb.push(item);
+        }
+        let stats = rb.stats();
+        prop_assert_eq!(stats.capacity, capacity);
+        prop_assert_eq!(stats.len, rb.len());
+    }
+}

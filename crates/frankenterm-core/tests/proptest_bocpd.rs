@@ -681,6 +681,92 @@ fn empty_manager_snapshot() {
     assert!(snap.panes.is_empty());
 }
 
+// =============================================================================
+// Additional property tests for coverage
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// BocpdConfig Clone preserves all fields.
+    #[test]
+    fn prop_config_clone(config in arb_bocpd_config()) {
+        let cloned = config.clone();
+        prop_assert!((cloned.hazard_rate - config.hazard_rate).abs() < 1e-10);
+        prop_assert!((cloned.detection_threshold - config.detection_threshold).abs() < 1e-10);
+        prop_assert_eq!(cloned.min_observations, config.min_observations);
+        prop_assert_eq!(cloned.max_run_length, config.max_run_length);
+    }
+
+    /// BocpdConfig Debug output is non-empty.
+    #[test]
+    fn prop_config_debug_nonempty(config in arb_bocpd_config()) {
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// ChangePoint Clone preserves all fields.
+    #[test]
+    fn prop_change_point_clone(cp in arb_change_point()) {
+        let cloned = cp.clone();
+        prop_assert_eq!(cloned.observation_index, cp.observation_index);
+        prop_assert!((cloned.posterior_probability - cp.posterior_probability).abs() < 1e-10);
+        prop_assert_eq!(cloned.map_run_length, cp.map_run_length);
+    }
+
+    /// OutputFeatures Clone preserves all fields.
+    #[test]
+    fn prop_output_features_clone(f in arb_output_features()) {
+        let cloned = f.clone();
+        prop_assert!((cloned.output_rate - f.output_rate).abs() < 1e-10);
+        prop_assert!((cloned.byte_rate - f.byte_rate).abs() < 1e-10);
+        prop_assert!((cloned.entropy - f.entropy).abs() < 1e-10);
+    }
+
+    /// PaneChangePoint Clone preserves all fields.
+    #[test]
+    fn prop_pane_change_point_clone(pcp in arb_pane_change_point()) {
+        let cloned = pcp.clone();
+        prop_assert_eq!(cloned.pane_id, pcp.pane_id);
+        prop_assert_eq!(cloned.observation_index, pcp.observation_index);
+        prop_assert_eq!(cloned.timestamp_secs, pcp.timestamp_secs);
+    }
+
+    /// PaneBocpdSummary Clone preserves all fields.
+    #[test]
+    fn prop_pane_summary_clone(s in arb_pane_summary()) {
+        let cloned = s.clone();
+        prop_assert_eq!(cloned.pane_id, s.pane_id);
+        prop_assert_eq!(cloned.observation_count, s.observation_count);
+        prop_assert_eq!(cloned.change_point_count, s.change_point_count);
+        prop_assert_eq!(cloned.in_warmup, s.in_warmup);
+    }
+
+    /// BocpdSnapshot Clone preserves structure.
+    #[test]
+    fn prop_snapshot_clone(snap in arb_bocpd_snapshot()) {
+        let cloned = snap.clone();
+        prop_assert_eq!(cloned.pane_count, snap.pane_count);
+        prop_assert_eq!(cloned.total_change_points, snap.total_change_points);
+        prop_assert_eq!(cloned.panes.len(), snap.panes.len());
+    }
+
+    /// BocpdConfig serde is deterministic.
+    #[test]
+    fn prop_config_serde_deterministic(config in arb_bocpd_config()) {
+        let j1 = serde_json::to_string(&config).unwrap();
+        let j2 = serde_json::to_string(&config).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// OutputFeatures Debug output is non-empty.
+    #[test]
+    fn prop_output_features_debug_nonempty(f in arb_output_features()) {
+        let dbg = format!("{:?}", f);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
 #[test]
 fn features_primary_metric_is_output_rate() {
     let f = OutputFeatures {

@@ -670,7 +670,7 @@ proptest! {
 
     /// After reset, all components report healthy with 0 observations.
     #[test]
-    fn proptest_watchdog_reset_all(
+    fn proptest_watchdog_reset_all_components(
         heartbeats in prop::collection::vec(1000u64..10000, 5..20),
     ) {
         let config = AdaptiveWatchdogConfig::default();
@@ -690,5 +690,86 @@ proptest! {
             prop_assert_eq!(comp.classification.observations, 0,
                 "observations should be 0 after reset for {:?}", comp.component);
         }
+    }
+}
+
+// =============================================================================
+// Additional property tests for coverage
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// AdaptiveWatchdogConfig Clone preserves all fields.
+    #[test]
+    fn proptest_config_clone(config in arb_adaptive_config()) {
+        let cloned = config.clone();
+        prop_assert!((cloned.sensitivity_k - config.sensitivity_k).abs() < 1e-10);
+        prop_assert!((cloned.process_noise - config.process_noise).abs() < 1e-10);
+        prop_assert!((cloned.measurement_noise - config.measurement_noise).abs() < 1e-10);
+        prop_assert_eq!(cloned.min_observations, config.min_observations);
+    }
+
+    /// AdaptiveWatchdogConfig Debug output is non-empty.
+    #[test]
+    fn proptest_config_debug_nonempty(config in arb_adaptive_config()) {
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// HealthClassification Clone preserves all fields.
+    #[test]
+    fn proptest_health_classification_clone(hc in arb_health_classification()) {
+        let cloned = hc.clone();
+        prop_assert_eq!(cloned.status, hc.status);
+        prop_assert_eq!(cloned.observations, hc.observations);
+        prop_assert_eq!(cloned.adaptive_mode, hc.adaptive_mode);
+    }
+
+    /// AdaptiveHealthReport Clone preserves structure.
+    #[test]
+    fn proptest_health_report_clone(report in arb_adaptive_health_report()) {
+        let cloned = report.clone();
+        prop_assert_eq!(cloned.timestamp_ms, report.timestamp_ms);
+        prop_assert_eq!(cloned.overall, report.overall);
+        prop_assert_eq!(cloned.components.len(), report.components.len());
+    }
+
+    /// AdaptiveWatchdogConfig serde is deterministic.
+    #[test]
+    fn proptest_config_serde_deterministic(config in arb_adaptive_config()) {
+        let j1 = serde_json::to_string(&config).unwrap();
+        let j2 = serde_json::to_string(&config).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// AdaptiveHealthReport serde is deterministic.
+    #[test]
+    fn proptest_health_report_serde_deterministic(report in arb_adaptive_health_report()) {
+        let j1 = serde_json::to_string(&report).unwrap();
+        let j2 = serde_json::to_string(&report).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// ComponentClassification Clone preserves all fields.
+    #[test]
+    fn proptest_component_classification_clone(cc in arb_component_classification()) {
+        let cloned = cc.clone();
+        prop_assert_eq!(cloned.component, cc.component);
+        prop_assert_eq!(cloned.classification.status, cc.classification.status);
+    }
+
+    /// HealthClassification Debug output is non-empty.
+    #[test]
+    fn proptest_health_classification_debug_nonempty(hc in arb_health_classification()) {
+        let dbg = format!("{:?}", hc);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// AdaptiveHealthReport Debug output is non-empty.
+    #[test]
+    fn proptest_health_report_debug_nonempty(report in arb_adaptive_health_report()) {
+        let dbg = format!("{:?}", report);
+        prop_assert!(!dbg.is_empty());
     }
 }
