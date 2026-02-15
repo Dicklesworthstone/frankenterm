@@ -16,10 +16,10 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 
 use crate::runtime_compat::mpsc;
+use crate::runtime_compat::task::{self, JoinSet};
 use crate::runtime_compat::unix::{self as compat_unix, UnixListener, UnixStream};
 use base64::Engine as _;
 use serde::Deserialize;
-use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 const MAX_EVENT_LINE_BYTES: usize = 512 * 1024;
@@ -805,7 +805,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let handle = tokio::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+        let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
         let mut stream = compat_unix::connect(socket_path).await.expect("connect");
         let payload = r#"{"type":"pane_output","pane_id":7,"data_b64":"aGV5","ts":42}"#;
@@ -846,7 +846,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let handle = tokio::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+        let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
         let mut stream = compat_unix::connect(socket_path).await.expect("connect");
 
@@ -890,7 +890,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let handle = tokio::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+        let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
         let mut stream = compat_unix::connect(socket_path).await.expect("connect");
 
@@ -934,7 +934,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let shutdown_clone = Arc::clone(&shutdown);
-        let handle = tokio::spawn(listener.run(event_tx, shutdown_clone));
+        let handle = task::spawn(listener.run(event_tx, shutdown_clone));
 
         // Set shutdown flag
         shutdown.store(true, Ordering::SeqCst);

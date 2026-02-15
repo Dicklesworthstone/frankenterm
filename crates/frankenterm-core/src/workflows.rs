@@ -6638,7 +6638,7 @@ impl WorkflowRunner {
                                         config,
                                     };
 
-                                    tokio::spawn(async move {
+                                    crate::runtime_compat::task::spawn(async move {
                                         let result = runner
                                             .run_workflow(
                                                 pane_id,

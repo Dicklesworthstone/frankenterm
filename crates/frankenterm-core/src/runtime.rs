@@ -26,7 +26,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax};
 
-use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::{
@@ -43,7 +42,11 @@ use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
-use crate::runtime_compat::{RwLock, mpsc, sleep, timeout, watch};
+use crate::runtime_compat::{
+    RwLock, mpsc, sleep,
+    task::{self, JoinHandle, JoinSet},
+    timeout, watch,
+};
 use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
 #[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
@@ -1063,7 +1066,7 @@ impl ObservationRuntime {
                         None
                     };
 
-                    let handle = tokio::spawn(async move {
+                    let handle = task::spawn(async move {
                         engine
                             .run_periodic(shutdown_rx, move || {
                                 let wez = wezterm.clone();
@@ -1128,7 +1131,7 @@ impl ObservationRuntime {
         let registry = Arc::clone(&self.registry);
         let metrics = Arc::clone(&self.metrics);
 
-        tokio::spawn(async move {
+        task::spawn(async move {
             let mut subscriber = event_bus.as_ref().map(|bus| bus.subscribe());
             let idle_enabled = subscriber.is_some();
             let mut last_activity = Instant::now();
@@ -1250,7 +1253,7 @@ impl ObservationRuntime {
         let initial_checkpoint_secs = self.config.checkpoint_interval_secs;
         let cache_gc_settings = CacheGcSettings::default();
 
-        tokio::spawn(async move {
+        task::spawn(async move {
             let mut retention_days = initial_retention_days;
             let mut checkpoint_secs = initial_checkpoint_secs;
             let mut last_health_snapshot = Instant::now()
@@ -1608,7 +1611,7 @@ impl ObservationRuntime {
         let heartbeats = Arc::clone(&self.heartbeats);
         let wezterm = Arc::clone(&self.wezterm_handle);
 
-        tokio::spawn(async move {
+        task::spawn(async move {
             let mut current_interval = initial_interval;
 
             loop {
@@ -1789,7 +1792,7 @@ impl ObservationRuntime {
             send_timeout: Duration::from_millis(100),
         };
 
-        tokio::spawn(async move {
+        task::spawn(async move {
             let source = Arc::new(WeztermHandleSource::new(wezterm_handle));
             // Create tailer supervisor with budget enforcement
             let initial_budget = config_rx.borrow().capture_budgets.clone();
@@ -1929,7 +1932,7 @@ impl ObservationRuntime {
     fn spawn_idle_capture_task(&self) -> JoinHandle<()> {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
 
-        tokio::spawn(async move {
+        task::spawn(async move {
             let idle_capture_interval = Duration::from_millis(500);
             loop {
                 if shutdown_flag.load(Ordering::SeqCst) {
@@ -1955,7 +1958,7 @@ impl ObservationRuntime {
         let event_bus = self.event_bus.clone();
         let pane_filter = self.config.pane_filter.clone();
 
-        tokio::spawn(async move {
+        task::spawn(async move {
             let listener = match NativeEventListener::bind(socket_path.clone()).await {
                 Ok(listener) => listener,
                 Err(err) => {
@@ -1966,7 +1969,7 @@ impl ObservationRuntime {
 
             let (event_tx, mut event_rx) = mpsc::channel::<NativeEvent>(1024);
 
-            let accept_handle = tokio::spawn(listener.run(event_tx, Arc::clone(&shutdown_flag)));
+            let accept_handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown_flag)));
 
             let mut coalescer = NativeOutputCoalescer::new(
                 NATIVE_OUTPUT_COALESCE_WINDOW_MS,
@@ -2113,7 +2116,7 @@ impl ObservationRuntime {
     ) -> JoinHandle<()> {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
 
-        tokio::spawn(async move {
+        task::spawn(async move {
             loop {
                 match timeout(
                     Duration::from_millis(25),
@@ -2169,7 +2172,7 @@ impl ObservationRuntime {
         let patterns_root = self.config.patterns_root.clone();
         let registry = Arc::clone(&registry);
 
-        tokio::spawn(async move {
+        task::spawn(async move {
             // Process events until producer is closed and the ring is drained.
             while let Some(event) = capture_rx.recv().await {
                 heartbeats.record_persistence();

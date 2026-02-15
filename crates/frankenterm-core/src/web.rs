@@ -6,7 +6,7 @@
 
 use crate::events::{Event, EventBus, RecvError};
 use crate::policy::Redactor;
-use crate::runtime_compat::{mpsc, sleep, timeout};
+use crate::runtime_compat::{mpsc, sleep, task, timeout};
 use crate::storage::{
     EventQuery, PaneRecord, SearchOptions, SearchResult, SegmentScanQuery, StorageHandle,
 };
@@ -148,7 +148,7 @@ pub struct WebServerHandle {
     bound_addr: SocketAddr,
     server: Arc<TcpServer>,
     app: Arc<App>,
-    join: tokio::task::JoinHandle<std::result::Result<(), ServerError>>,
+    join: task::JoinHandle<std::result::Result<(), ServerError>>,
 }
 
 impl WebServerHandle {
@@ -668,7 +668,7 @@ fn handle_stream_events(
         };
 
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
-        tokio::spawn(async move {
+        task::spawn(async move {
             let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
             let mut next_emit_at = Instant::now();
             let mut seq = 0_u64;
@@ -796,7 +796,7 @@ fn handle_stream_deltas(
         let mut subscriber = event_bus.subscribe_deltas();
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
         let started_at_ms = epoch_ms_now();
-        tokio::spawn(async move {
+        task::spawn(async move {
             let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
             let mut next_emit_at = Instant::now();
             let mut seq = 0_u64;
@@ -1578,7 +1578,7 @@ pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle
 
     let server_task = {
         let server = Arc::clone(&server);
-        tokio::spawn(async move {
+        task::spawn(async move {
             let cx = Cx::for_testing();
             server.serve_on_handler(&cx, listener, handler).await
         })

@@ -80,21 +80,13 @@ pub async fn run_orphan_reaper(config: CliConfig, shutdown: Arc<AtomicBool>) {
 
 /// Scan for and kill orphaned `wezterm` CLI processes older than `max_age_secs`.
 pub async fn reap_orphans(max_age_secs: u64) -> ReapReport {
-    // Run the blocking process scan on the active runtime's blocking threadpool.
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        asupersync::runtime::spawn_blocking(move || reap_orphans_sync(max_age_secs)).await
-    }
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        tokio::task::spawn_blocking(move || reap_orphans_sync(max_age_secs))
-            .await
-            .unwrap_or_else(|e| {
-                let mut report = ReapReport::default();
-                report.errors.push(format!("spawn_blocking failed: {e}"));
-                report
-            })
-    }
+    crate::runtime_compat::spawn_blocking(move || reap_orphans_sync(max_age_secs))
+        .await
+        .unwrap_or_else(|e| {
+            let mut report = ReapReport::default();
+            report.errors.push(format!("spawn_blocking failed: {e}"));
+            report
+        })
 }
 
 /// Synchronous implementation of the orphan reaper.

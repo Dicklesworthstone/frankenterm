@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::config as wa_config;
 use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
-use crate::runtime_compat::{mpsc, timeout, watch};
+use crate::runtime_compat::{mpsc, task, timeout, watch};
 use codec::{
     CODEC_VERSION, CompressionMode, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
     GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, ListPanes,
@@ -756,7 +756,7 @@ pub fn subscribe_pane_output(
     let (tx, rx) = mpsc::channel(config.channel_capacity);
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
 
-    tokio::spawn(async move {
+    task::spawn(async move {
         let mut last_seqno: Option<u64> = None;
 
         loop {

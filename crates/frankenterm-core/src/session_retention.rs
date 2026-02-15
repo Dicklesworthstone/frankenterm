@@ -54,7 +54,7 @@ impl CleanupResult {
 
 /// Run the full session cleanup pipeline.
 ///
-/// Designed to be called from `tokio::task::spawn_blocking` since all
+/// Designed to be called from `runtime_compat::spawn_blocking` since all
 /// operations are synchronous SQLite calls.
 ///
 /// # Errors
@@ -258,33 +258,17 @@ pub async fn cleanup_sessions_async(
     db_path: Arc<String>,
     config: SessionRetentionConfig,
 ) -> Result<CleanupResult, String> {
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        asupersync::runtime::spawn_blocking(move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| format!("Failed to open database: {e}"))?;
-            conn.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
-            )
-            .map_err(|e| format!("Failed to set PRAGMAs: {e}"))?;
-            cleanup_sessions(&conn, &config).map_err(|e| format!("Cleanup failed: {e}"))
-        })
-        .await
-    }
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| format!("Failed to open database: {e}"))?;
-            conn.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
-            )
-            .map_err(|e| format!("Failed to set PRAGMAs: {e}"))?;
-            cleanup_sessions(&conn, &config).map_err(|e| format!("Cleanup failed: {e}"))
-        })
-        .await
-        .map_err(|e| format!("Task join error: {e}"))?
-    }
+    crate::runtime_compat::spawn_blocking(move || {
+        let conn = Connection::open(db_path.as_str())
+            .map_err(|e| format!("Failed to open database: {e}"))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+        )
+        .map_err(|e| format!("Failed to set PRAGMAs: {e}"))?;
+        cleanup_sessions(&conn, &config).map_err(|e| format!("Cleanup failed: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
 }
 
 /// Get current epoch time in milliseconds.

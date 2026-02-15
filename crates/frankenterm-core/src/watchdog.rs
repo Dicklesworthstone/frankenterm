@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::runtime_compat::task::{self, JoinHandle};
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 /// Per-component heartbeat timestamps (epoch milliseconds).
@@ -308,7 +308,7 @@ pub fn spawn_watchdog(
     let internal_flag = Arc::clone(&internal_shutdown);
     let check_interval = config.check_interval;
 
-    let task = tokio::spawn(async move {
+    let task = task::spawn(async move {
         loop {
             if shutdown_flag.load(Ordering::SeqCst) || internal_flag.load(Ordering::SeqCst) {
                 info!("Watchdog: shutdown signal received");
@@ -530,7 +530,7 @@ pub fn spawn_mux_watchdog(
     let check_interval = config.check_interval;
     let failure_threshold = config.failure_threshold;
 
-    tokio::spawn(async move {
+    task::spawn(async move {
         let mut watchdog = MuxWatchdog::new(config, wezterm);
 
         info!("Mux watchdog started");
@@ -595,17 +595,10 @@ pub fn spawn_mux_watchdog(
 
 /// Get the RSS (resident set size) of the wezterm-mux-server process.
 async fn get_mux_server_rss() -> Option<u64> {
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        asupersync::runtime::spawn_blocking(get_mux_server_rss_sync).await
-    }
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        tokio::task::spawn_blocking(get_mux_server_rss_sync)
-            .await
-            .ok()
-            .flatten()
-    }
+    crate::runtime_compat::spawn_blocking(get_mux_server_rss_sync)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Synchronous RSS lookup for wezterm-mux-server.

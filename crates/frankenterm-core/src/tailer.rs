@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use crate::runtime_compat::mpsc;
+use crate::runtime_compat::task::JoinSet;
 use crate::runtime_compat::timeout;
 use crate::runtime_compat::{RwLock, Semaphore};
-use tokio::task::JoinSet;
 use tracing::{debug, trace, warn};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, get_or_register_circuit};
@@ -1219,10 +1219,10 @@ impl StreamingHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::task::JoinSet;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::task::JoinSet;
 
     fn make_pane(id: u64) -> PaneInfo {
         PaneInfo {

@@ -14,12 +14,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::Result;
 use crate::events::EventBus;
 use crate::runtime::RuntimeHandle;
+use crate::runtime_compat::task::JoinHandle;
 
 /// Boxed future for async trait-like APIs without additional dependencies.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -451,7 +451,7 @@ impl MetricsServer {
         let collector = Arc::clone(&self.collector);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
 
-        let join = tokio::spawn(async move {
+        let join = crate::runtime_compat::task::spawn(async move {
             loop {
                 tokio::select! {
                     accept = listener.accept() => {
@@ -459,7 +459,7 @@ impl MetricsServer {
                             Ok((socket, peer)) => {
                                 let collector = Arc::clone(&collector);
                                 let prefix = prefix.clone();
-                                tokio::spawn(async move {
+                                crate::runtime_compat::task::spawn(async move {
                                     if let Err(err) = handle_connection(socket, &prefix, collector).await {
                                         debug!(error = %err, peer = %peer, "Metrics connection failed");
                                     }
