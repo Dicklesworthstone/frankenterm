@@ -6,13 +6,13 @@
 //! - **Preview** (dry-run): returns per-table counts without modifying data.
 //! - **Apply**: deletes rows in batches and returns a summary.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::StorageConfig;
 use crate::storage::{StorageHandle, now_ms};
 
 /// Per-table cleanup counts for preview and apply results.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CleanupTableSummary {
     pub table: String,
     pub eligible_rows: usize,
@@ -21,7 +21,7 @@ pub struct CleanupTableSummary {
 }
 
 /// Full cleanup plan: a list of per-table summaries.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CleanupPlan {
     pub tables: Vec<CleanupTableSummary>,
     pub total_eligible: usize,
@@ -1854,5 +1854,106 @@ mod tests {
         let c1 = retention_cutoff_ms(now, 1);
         let c2 = retention_cutoff_ms(now, 2);
         assert_eq!(now - c2, 2 * (now - c1));
+    }
+
+    // ---------------------------------------------------------------
+    // RubyBeaver wa-1u90p.7.1 — additional pure unit tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cleanup_table_summary_serde_roundtrip() {
+        let s = CleanupTableSummary {
+            table: "events (tier: critical)".to_string(),
+            eligible_rows: 42,
+            deleted_rows: 10,
+            retention_days: 90,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: CleanupTableSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.table, "events (tier: critical)");
+        assert_eq!(back.eligible_rows, 42);
+        assert_eq!(back.deleted_rows, 10);
+        assert_eq!(back.retention_days, 90);
+    }
+
+    #[test]
+    fn cleanup_plan_serde_roundtrip() {
+        let p = CleanupPlan {
+            tables: vec![
+                CleanupTableSummary {
+                    table: "events".to_string(),
+                    eligible_rows: 100,
+                    deleted_rows: 50,
+                    retention_days: 30,
+                },
+                CleanupTableSummary {
+                    table: "audit_actions".to_string(),
+                    eligible_rows: 20,
+                    deleted_rows: 20,
+                    retention_days: 30,
+                },
+            ],
+            total_eligible: 120,
+            total_deleted: 70,
+            dry_run: true,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: CleanupPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tables.len(), 2);
+        assert_eq!(back.total_eligible, 120);
+        assert_eq!(back.total_deleted, 70);
+        assert!(back.dry_run);
+    }
+
+    #[test]
+    fn cleanup_plan_total_matches_table_sum() {
+        let p = CleanupPlan {
+            tables: vec![
+                CleanupTableSummary {
+                    table: "a".to_string(),
+                    eligible_rows: 10,
+                    deleted_rows: 5,
+                    retention_days: 7,
+                },
+                CleanupTableSummary {
+                    table: "b".to_string(),
+                    eligible_rows: 20,
+                    deleted_rows: 15,
+                    retention_days: 30,
+                },
+                CleanupTableSummary {
+                    table: "c".to_string(),
+                    eligible_rows: 30,
+                    deleted_rows: 0,
+                    retention_days: 90,
+                },
+            ],
+            total_eligible: 60,
+            total_deleted: 20,
+            dry_run: false,
+        };
+        let sum_eligible: usize = p.tables.iter().map(|t| t.eligible_rows).sum();
+        let sum_deleted: usize = p.tables.iter().map(|t| t.deleted_rows).sum();
+        assert_eq!(sum_eligible, p.total_eligible);
+        assert_eq!(sum_deleted, p.total_deleted);
+    }
+
+    #[test]
+    fn retention_cutoff_ms_preserves_now_with_zero() {
+        // retention_days=0 means cutoff equals now (everything before now is eligible)
+        let now = 1_700_000_000_000i64;
+        assert_eq!(retention_cutoff_ms(now, 0), now);
+    }
+
+    #[test]
+    fn cleanup_table_summary_zero_retention_days() {
+        let s = CleanupTableSummary {
+            table: "events".to_string(),
+            eligible_rows: 0,
+            deleted_rows: 0,
+            retention_days: 0,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"retention_days\":0"));
     }
 }

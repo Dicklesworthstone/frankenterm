@@ -2813,4 +2813,117 @@ mod tests {
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
     }
+
+    // -----------------------------------------------------------------------
+    // RubyBeaver wa-1u90p.7.1 — additional tests (batch 2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn redact_step_log_all_none_sensitive_fields_stay_none() {
+        let r = Redactor::new();
+        let step = WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "wf-1".to_string(),
+            audit_action_id: None,
+            step_index: 0,
+            step_name: "check".to_string(),
+            step_id: None,
+            step_kind: None,
+            result_type: "skip".to_string(),
+            result_data: None,
+            policy_summary: None,
+            verification_refs: None,
+            error_code: None,
+            started_at: 1000,
+            completed_at: 2000,
+            duration_ms: 1000,
+        };
+        let redacted = redact_step_log(step, &r);
+        assert!(redacted.result_data.is_none());
+        assert!(redacted.policy_summary.is_none());
+    }
+
+    #[test]
+    fn redact_step_log_policy_summary_with_secret() {
+        let r = Redactor::new();
+        let step = WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "wf-1".to_string(),
+            audit_action_id: None,
+            step_index: 0,
+            step_name: "verify".to_string(),
+            step_id: None,
+            step_kind: None,
+            result_type: "ok".to_string(),
+            result_data: None,
+            policy_summary: Some(
+                "Policy used key sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string(),
+            ),
+            verification_refs: None,
+            error_code: None,
+            started_at: 1000,
+            completed_at: 2000,
+            duration_ms: 1000,
+        };
+        let redacted = redact_step_log(step, &r);
+        let summary = redacted.policy_summary.unwrap();
+        assert!(!summary.contains("sk-abc123"), "secret should be redacted");
+        assert!(summary.contains("REDACTED"));
+    }
+
+    #[test]
+    fn export_kind_all_names_count_matches_variants() {
+        // There are 7 ExportKind variants and all_names should have 7 entries
+        let names = ExportKind::all_names();
+        assert_eq!(names.len(), 7);
+        // Each name should be unique
+        let mut unique = std::collections::HashSet::new();
+        for name in names {
+            assert!(unique.insert(name), "duplicate name: {}", name);
+        }
+    }
+
+    #[test]
+    fn export_header_exported_at_ms_field_name() {
+        let header = ExportHeader {
+            export: true,
+            version: "0.1.0".to_string(),
+            kind: "gaps".to_string(),
+            redacted: false,
+            exported_at_ms: 42,
+            pane_id: None,
+            since: None,
+            until: None,
+            limit: None,
+            record_count: 0,
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(json.contains("\"exported_at_ms\":42"));
+    }
+
+    #[test]
+    fn write_record_large_content() {
+        // Verify write_record handles large content (10KB) without issues
+        let big = "x".repeat(10_000);
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: big.clone(),
+            content_len: 10_000,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let mut buf = Vec::new();
+        write_record(&mut buf, &seg, false).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(parsed["content"].as_str().unwrap().len(), 10_000);
+    }
+
+    #[test]
+    fn export_kind_from_str_loose_returns_none_for_numbers() {
+        assert_eq!(ExportKind::from_str_loose("123"), None);
+        assert_eq!(ExportKind::from_str_loose("0"), None);
+    }
 }
