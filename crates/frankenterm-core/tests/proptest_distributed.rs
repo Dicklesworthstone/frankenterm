@@ -439,3 +439,86 @@ fn evaluate_readiness_default_not_ready() {
 fn validate_token_mtls_no_token_ok() {
     assert!(validate_token(DistributedAuthMode::Mtls, None, None, None).is_ok());
 }
+
+// =========================================================================
+// Additional property tests for coverage
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// ReadinessItem Clone preserves all fields.
+    #[test]
+    fn prop_readiness_item_clone(item in arb_readiness_item()) {
+        let cloned = item.clone();
+        prop_assert_eq!(cloned, item);
+    }
+
+    /// ReadinessItem Debug output is non-empty.
+    #[test]
+    fn prop_readiness_item_debug_nonempty(item in arb_readiness_item()) {
+        let dbg = format!("{:?}", item);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// DistributedSecurityError Clone preserves variant equality.
+    #[test]
+    fn prop_security_error_clone(err in arb_security_error()) {
+        let cloned = err.clone();
+        prop_assert_eq!(cloned, err);
+    }
+
+    /// ReadinessReport serde is deterministic.
+    #[test]
+    fn prop_readiness_report_deterministic(
+        items in proptest::collection::vec(arb_readiness_item(), 0..3),
+        ready in any::<bool>(),
+    ) {
+        let req_pass = items.iter().filter(|i| i.required && i.pass).count();
+        let req_total = items.iter().filter(|i| i.required).count();
+        let adv_pass = items.iter().filter(|i| !i.required && i.pass).count();
+        let adv_total = items.iter().filter(|i| !i.required).count();
+        let report = ReadinessReport {
+            ready,
+            feature_compiled: true,
+            runtime_enabled: true,
+            items,
+            required_pass: req_pass,
+            required_total: req_total,
+            advisory_pass: adv_pass,
+            advisory_total: adv_total,
+        };
+        let j1 = serde_json::to_string(&report).unwrap();
+        let j2 = serde_json::to_string(&report).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// ReadinessReport JSON is a valid object.
+    #[test]
+    fn prop_readiness_report_json_valid_object(
+        items in proptest::collection::vec(arb_readiness_item(), 0..3),
+    ) {
+        let report = ReadinessReport {
+            ready: false,
+            feature_compiled: false,
+            runtime_enabled: false,
+            items,
+            required_pass: 0,
+            required_total: 0,
+            advisory_pass: 0,
+            advisory_total: 0,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+    }
+
+    /// ReadinessItem JSON has exactly 6 fields.
+    #[test]
+    fn prop_readiness_item_json_field_count(item in arb_readiness_item()) {
+        let json = serde_json::to_string(&item).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert_eq!(obj.len(), 6, "ReadinessItem should have 6 JSON fields");
+    }
+}

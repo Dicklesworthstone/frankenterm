@@ -407,6 +407,56 @@ proptest! {
         prop_assert_eq!(back.restore_max_lines, config.restore_max_lines,
             "restore_max_lines should be unchanged");
     }
+
+    /// Property 26: SessionRestoreConfig Clone preserves all fields.
+    #[test]
+    fn prop_restore_config_clone(config in arb_session_restore_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.auto_restore, config.auto_restore);
+        prop_assert_eq!(cloned.restore_scrollback, config.restore_scrollback);
+        prop_assert_eq!(cloned.restore_max_lines, config.restore_max_lines);
+    }
+
+    /// Property 27: SessionRestoreConfig Debug output is non-empty.
+    #[test]
+    fn prop_restore_config_debug_nonempty(config in arb_session_restore_config()) {
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// Property 28: SessionRestoreConfig JSON has exactly 3 fields.
+    #[test]
+    fn prop_restore_config_json_field_count(config in arb_session_restore_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert_eq!(obj.len(), 3, "SessionRestoreConfig should have 3 JSON fields");
+    }
+
+    /// Property 29: LogConfig Clone preserves all fields.
+    #[test]
+    fn prop_log_config_clone(config in arb_log_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(&cloned.level, &config.level);
+        prop_assert_eq!(cloned.format, config.format);
+        prop_assert_eq!(cloned.file, config.file);
+    }
+
+    /// Property 30: LogConfig Debug output is non-empty.
+    #[test]
+    fn prop_log_config_debug_nonempty(config in arb_log_config()) {
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// Property 31: LogConfig JSON is a valid UTF-8 object.
+    #[test]
+    fn prop_log_config_json_valid_utf8(config in arb_log_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(std::str::from_utf8(json.as_bytes()).is_ok());
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+    }
 }
 
 // =========================================================================

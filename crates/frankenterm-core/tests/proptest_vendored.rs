@@ -435,3 +435,42 @@ proptest! {
         prop_assert!(!report.message.is_empty(), "message should be non-empty");
     }
 }
+
+// ── Additional property tests for coverage ──────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// VendoredCompatibilityReport serde is deterministic.
+    #[test]
+    fn compat_report_deterministic(report in arb_compat_report()) {
+        let j1 = serde_json::to_string(&report).unwrap();
+        let j2 = serde_json::to_string(&report).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// VendoredCompatibilityReport Debug output is non-empty.
+    #[test]
+    fn compat_report_debug_nonempty(report in arb_compat_report()) {
+        let dbg = format!("{:?}", report);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// VendoredCompatibilityStatus Debug output is non-empty.
+    #[test]
+    fn compat_status_debug_nonempty(status in arb_compat_status()) {
+        let dbg = format!("{:?}", status);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// VendoredWeztermMetadata Clone preserves all fields.
+    #[test]
+    fn metadata_clone(_i in 0..5u8) {
+        let meta = VendoredWeztermMetadata::default();
+        let cloned = meta.clone();
+        prop_assert_eq!(cloned.commit, meta.commit);
+        prop_assert_eq!(cloned.version, meta.version);
+        prop_assert_eq!(cloned.source, meta.source);
+        prop_assert_eq!(cloned.enabled, meta.enabled);
+    }
+}
