@@ -1277,4 +1277,711 @@ mod tests {
         g.propagate();
         assert_eq!(g.propagation_count(), 2);
     }
+
+    // ================================================================
+    // Value type tests
+    // ================================================================
+
+    #[test]
+    fn value_serde_roundtrip_bool() {
+        let v = Value::Bool(true);
+        let json = serde_json::to_string(&v).unwrap();
+        let back: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn value_serde_roundtrip_float() {
+        let v = Value::Float(3.14);
+        let json = serde_json::to_string(&v).unwrap();
+        let back: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn value_serde_roundtrip_int() {
+        let v = Value::Int(-42);
+        let json = serde_json::to_string(&v).unwrap();
+        let back: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn value_serde_roundtrip_text() {
+        let v = Value::Text("hello world".to_string());
+        let json = serde_json::to_string(&v).unwrap();
+        let back: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn value_serde_roundtrip_none() {
+        let v = Value::None;
+        let json = serde_json::to_string(&v).unwrap();
+        let back: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn value_display_float_precision() {
+        assert_eq!(format!("{}", Value::Float(3.14159)), "3.1416");
+        assert_eq!(format!("{}", Value::Float(0.0)), "0.0000");
+    }
+
+    #[test]
+    fn value_display_text() {
+        assert_eq!(format!("{}", Value::Text("abc".into())), "abc");
+    }
+
+    #[test]
+    fn value_is_truthy_negative_int() {
+        assert!(Value::Int(-1).is_truthy());
+    }
+
+    #[test]
+    fn value_is_truthy_negative_float() {
+        assert!(Value::Float(-0.5).is_truthy());
+    }
+
+    #[test]
+    fn value_equality() {
+        assert_eq!(Value::Bool(true), Value::Bool(true));
+        assert_ne!(Value::Bool(true), Value::Bool(false));
+        assert_ne!(Value::Int(1), Value::Bool(true));
+        assert_ne!(Value::Float(1.0), Value::Int(1));
+        assert_eq!(Value::None, Value::None);
+    }
+
+    #[test]
+    fn value_clone() {
+        let v = Value::Text("cloned".to_string());
+        let v2 = v.clone();
+        assert_eq!(v, v2);
+    }
+
+    // ================================================================
+    // NodeId tests
+    // ================================================================
+
+    #[test]
+    fn node_id_serde_roundtrip() {
+        let id = NodeId(42);
+        let json = serde_json::to_string(&id).unwrap();
+        let back: NodeId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, back);
+    }
+
+    #[test]
+    fn node_id_hash_equality() {
+        let a = NodeId(1);
+        let b = NodeId(1);
+        let c = NodeId(2);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+
+        let mut set = HashSet::new();
+        set.insert(a);
+        assert!(set.contains(&b));
+        assert!(!set.contains(&c));
+    }
+
+    #[test]
+    fn node_id_debug() {
+        let id = NodeId(7);
+        assert_eq!(format!("{id:?}"), "NodeId(7)");
+    }
+
+    // ================================================================
+    // DataflowError tests
+    // ================================================================
+
+    #[test]
+    fn error_cycle_detected_display() {
+        let err = DataflowError::CycleDetected {
+            from: NodeId(1),
+            to: NodeId(2),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("cycle"));
+        assert!(msg.contains("node:1"));
+        assert!(msg.contains("node:2"));
+    }
+
+    #[test]
+    fn error_node_not_found_display() {
+        let err = DataflowError::NodeNotFound(NodeId(99));
+        let msg = format!("{err}");
+        assert!(msg.contains("not found"));
+        assert!(msg.contains("node:99"));
+    }
+
+    #[test]
+    fn error_not_a_source_display() {
+        let err = DataflowError::NotASource(NodeId(5));
+        let msg = format!("{err}");
+        assert!(msg.contains("not a source"));
+    }
+
+    #[test]
+    fn error_duplicate_edge_display() {
+        let err = DataflowError::DuplicateEdge {
+            from: NodeId(1),
+            to: NodeId(2),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("already exists"));
+    }
+
+    #[test]
+    fn error_clone() {
+        let err = DataflowError::NodeNotFound(NodeId(1));
+        let err2 = err.clone();
+        assert_eq!(format!("{err}"), format!("{err2}"));
+    }
+
+    // ================================================================
+    // PropagationStats tests
+    // ================================================================
+
+    #[test]
+    fn propagation_stats_default() {
+        let stats = PropagationStats::default();
+        assert_eq!(stats.nodes_recomputed, 0);
+        assert_eq!(stats.nodes_changed, 0);
+        assert_eq!(stats.total_nodes, 0);
+        assert_eq!(stats.elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn propagation_stats_serde_roundtrip() {
+        let stats = PropagationStats {
+            nodes_recomputed: 5,
+            nodes_changed: 3,
+            total_nodes: 10,
+            elapsed: Duration::from_millis(42),
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: PropagationStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.nodes_recomputed, 5);
+        assert_eq!(back.nodes_changed, 3);
+        assert_eq!(back.total_nodes, 10);
+    }
+
+    // ================================================================
+    // GraphSnapshot tests
+    // ================================================================
+
+    #[test]
+    fn snapshot_with_edges() {
+        let mut g = DataflowGraph::new();
+        let a = g.add_source("src_a", Value::Int(10));
+        let b = g.add_source("src_b", Value::Int(20));
+        let _c = g.add_combine("sum", vec![a, b], |inputs| {
+            match (&inputs[0], &inputs[1]) {
+                (Value::Int(x), Value::Int(y)) => Value::Int(x + y),
+                _ => Value::None,
+            }
+        });
+        g.propagate();
+
+        let snap = g.snapshot();
+        assert_eq!(snap.nodes.len(), 3);
+        assert_eq!(snap.edges.len(), 2);
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: GraphSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.nodes.len(), 3);
+        assert_eq!(back.edges.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_nodes_sorted_by_id() {
+        let mut g = DataflowGraph::new();
+        let _a = g.add_source("z_last", Value::None);
+        let _b = g.add_source("a_first", Value::None);
+
+        let snap = g.snapshot();
+        assert!(snap.nodes[0].id < snap.nodes[1].id);
+    }
+
+    #[test]
+    fn snapshot_edges_sorted() {
+        let mut g = DataflowGraph::new();
+        let b = g.add_source("b", Value::None);
+        let a = g.add_source("a", Value::None);
+        let _c = g.add_combine("c", vec![b, a], |_| Value::None);
+        g.propagate();
+
+        let snap = g.snapshot();
+        for i in 1..snap.edges.len() {
+            assert!(snap.edges[i - 1] <= snap.edges[i]);
+        }
+    }
+
+    // ================================================================
+    // DataflowGraph query tests
+    // ================================================================
+
+    #[test]
+    fn get_label_returns_correct_label() {
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("my_source", Value::None);
+        assert_eq!(g.get_label(s), Some("my_source"));
+    }
+
+    #[test]
+    fn get_label_nonexistent_returns_none() {
+        let g = DataflowGraph::new();
+        assert_eq!(g.get_label(NodeId(999)), None);
+    }
+
+    #[test]
+    fn get_value_nonexistent_returns_none() {
+        let g = DataflowGraph::new();
+        assert_eq!(g.get_value(NodeId(999)), None);
+    }
+
+    #[test]
+    fn is_stable_initially() {
+        let g = DataflowGraph::new();
+        assert!(g.is_stable());
+    }
+
+    #[test]
+    fn is_stable_after_adding_compute_node() {
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("s", Value::Int(0));
+        let _m = g.add_map("m", vec![s], |_| Value::None);
+        // Map node is initially dirty
+        assert!(!g.is_stable());
+    }
+
+    #[test]
+    fn is_stable_after_propagation() {
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("s", Value::Int(0));
+        let _m = g.add_map("m", vec![s], |_| Value::None);
+        g.propagate();
+        assert!(g.is_stable());
+    }
+
+    #[test]
+    fn is_stable_after_source_update() {
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("s", Value::Int(0));
+        let _m = g.add_map("m", vec![s], |_| Value::None);
+        g.propagate();
+        g.update_source(s, Value::Int(5)).unwrap();
+        assert!(!g.is_stable());
+    }
+
+    #[test]
+    fn node_ids_returns_all() {
+        let mut g = DataflowGraph::new();
+        let a = g.add_source("a", Value::None);
+        let b = g.add_source("b", Value::None);
+        let c = g.add_map("c", vec![a, b], |_| Value::None);
+        let ids = g.node_ids();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&a));
+        assert!(ids.contains(&b));
+        assert!(ids.contains(&c));
+    }
+
+    #[test]
+    fn node_count_empty_graph() {
+        let g = DataflowGraph::new();
+        assert_eq!(g.node_count(), 0);
+    }
+
+    #[test]
+    fn edge_count_empty_graph() {
+        let g = DataflowGraph::new();
+        assert_eq!(g.edge_count(), 0);
+    }
+
+    #[test]
+    fn default_creates_empty_graph() {
+        let g = DataflowGraph::default();
+        assert_eq!(g.node_count(), 0);
+        assert_eq!(g.edge_count(), 0);
+        assert_eq!(g.propagation_count(), 0);
+        assert!(g.is_stable());
+    }
+
+    #[test]
+    fn debug_format() {
+        let mut g = DataflowGraph::new();
+        let _s = g.add_source("s", Value::None);
+        let dbg = format!("{g:?}");
+        assert!(dbg.contains("DataflowGraph"));
+        assert!(dbg.contains("node_count"));
+    }
+
+    // ================================================================
+    // add_edge error tests
+    // ================================================================
+
+    #[test]
+    fn add_edge_nonexistent_from() {
+        let mut g = DataflowGraph::new();
+        let b = g.add_source("b", Value::None);
+        let result = g.add_edge(NodeId(999), b);
+        assert!(matches!(result, Err(DataflowError::NodeNotFound(_))));
+    }
+
+    #[test]
+    fn add_edge_nonexistent_to() {
+        let mut g = DataflowGraph::new();
+        let a = g.add_source("a", Value::None);
+        let result = g.add_edge(a, NodeId(999));
+        assert!(matches!(result, Err(DataflowError::NodeNotFound(_))));
+    }
+
+    #[test]
+    fn add_edge_valid_creates_dependency() {
+        let mut g = DataflowGraph::new();
+        let a = g.add_source("a", Value::Int(5));
+        let b = g.add_source("b", Value::None);
+        g.add_edge(a, b).unwrap();
+        assert_eq!(g.edge_count(), 1);
+    }
+
+    // ================================================================
+    // remove_node tests
+    // ================================================================
+
+    #[test]
+    fn remove_node_nonexistent_errors() {
+        let mut g = DataflowGraph::new();
+        let result = g.remove_node(NodeId(999));
+        assert!(matches!(result, Err(DataflowError::NodeNotFound(_))));
+    }
+
+    #[test]
+    fn remove_source_node() {
+        let mut g = DataflowGraph::new();
+        let a = g.add_source("a", Value::Int(1));
+        assert_eq!(g.node_count(), 1);
+        g.remove_node(a).unwrap();
+        assert_eq!(g.node_count(), 0);
+    }
+
+    #[test]
+    fn remove_middle_node_preserves_others() {
+        let mut g = DataflowGraph::new();
+        let a = g.add_source("a", Value::Int(1));
+        let b = g.add_map("b", vec![a], |_| Value::Int(2));
+        let c = g.add_map("c", vec![b], |_| Value::Int(3));
+        g.propagate();
+
+        g.remove_node(b).unwrap();
+        assert_eq!(g.node_count(), 2);
+        assert!(g.get_value(a).is_some());
+        assert!(g.get_value(c).is_some());
+        assert!(g.get_value(b).is_none()); // removed
+    }
+
+    // ================================================================
+    // add_sink tests
+    // ================================================================
+
+    #[test]
+    fn add_sink_nonexistent_node_errors() {
+        let mut g = DataflowGraph::new();
+        let result = g.add_sink(NodeId(999), |_| {});
+        assert!(matches!(result, Err(DataflowError::NodeNotFound(_))));
+    }
+
+    #[test]
+    fn sink_removed_with_node() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("s", Value::Int(0));
+        let m = g.add_map("m", vec![s], |i| i[0].clone());
+
+        let count = Arc::new(AtomicU32::new(0));
+        let count_clone = count.clone();
+        g.add_sink(m, move |_| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+
+        // Fire once
+        g.update_source(s, Value::Int(1)).unwrap();
+        g.propagate();
+        let c1 = count.load(Ordering::SeqCst);
+
+        // Remove the node with the sink
+        g.remove_node(m).unwrap();
+
+        // Update source again — sink should not fire
+        g.update_source(s, Value::Int(2)).unwrap();
+        g.propagate();
+        let c2 = count.load(Ordering::SeqCst);
+        assert_eq!(c1, c2, "Sink should not fire after node removed");
+    }
+
+    // ================================================================
+    // Debounce tests
+    // ================================================================
+
+    #[test]
+    fn debounce_node_created() {
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("s", Value::Int(0));
+        let d = g.add_debounce("deb", vec![s], Duration::from_millis(100), |i| i[0].clone());
+        assert_eq!(g.node_count(), 2);
+        assert!(g.get_value(d).is_some());
+    }
+
+    #[test]
+    fn debounce_emits_on_first_change() {
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("s", Value::Int(0));
+        let d = g.add_debounce("deb", vec![s], Duration::from_millis(100), |i| i[0].clone());
+
+        // First propagation should emit since no prior change
+        g.propagate();
+        assert_eq!(g.get_value(d), Some(&Value::Int(0)));
+    }
+
+    #[test]
+    fn flush_debounced_no_pending() {
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("s", Value::Int(0));
+        let _d = g.add_debounce("deb", vec![s], Duration::from_millis(100), |i| i[0].clone());
+        g.propagate();
+        // No pending value — flush should return 0
+        let flushed = g.flush_debounced();
+        assert_eq!(flushed, 0);
+    }
+
+    // ================================================================
+    // Merge tests
+    // ================================================================
+
+    #[test]
+    fn merge_empty_graph() {
+        let mut g1 = DataflowGraph::new();
+        let _s = g1.add_source("existing", Value::Int(1));
+        let g2 = DataflowGraph::new();
+
+        let id_map = g1.merge(&g2);
+        assert!(id_map.is_empty());
+        assert_eq!(g1.node_count(), 1);
+    }
+
+    #[test]
+    fn merge_adds_nodes() {
+        let mut g1 = DataflowGraph::new();
+        let _s1 = g1.add_source("s1", Value::Int(1));
+
+        let mut g2 = DataflowGraph::new();
+        let _s2 = g2.add_source("s2", Value::Int(2));
+        let _s3 = g2.add_source("s3", Value::Int(3));
+
+        let id_map = g1.merge(&g2);
+        assert_eq!(id_map.len(), 2);
+        assert_eq!(g1.node_count(), 3);
+    }
+
+    #[test]
+    fn merge_preserves_values() {
+        let mut g1 = DataflowGraph::new();
+
+        let mut g2 = DataflowGraph::new();
+        let s = g2.add_source("merged_src", Value::Float(42.5));
+
+        let id_map = g1.merge(&g2);
+        let new_id = id_map[&s];
+        assert_eq!(g1.get_value(new_id), Some(&Value::Float(42.5)));
+        assert_eq!(g1.get_label(new_id), Some("merged_src"));
+    }
+
+    #[test]
+    fn merge_preserves_edges() {
+        let mut g1 = DataflowGraph::new();
+
+        let mut g2 = DataflowGraph::new();
+        let a = g2.add_source("a", Value::Int(10));
+        let _b = g2.add_map("b", vec![a], |i| i[0].clone());
+
+        let id_map = g1.merge(&g2);
+        assert_eq!(g1.node_count(), 2);
+        assert_eq!(g1.edge_count(), 1);
+
+        // Merged nodes are sources (compute fns not cloneable), so values stay
+        let new_b = id_map[&_b];
+        assert_eq!(g1.get_value(new_b), Some(&Value::None)); // was compute, now source with None
+    }
+
+    #[test]
+    fn merge_remaps_ids() {
+        let mut g1 = DataflowGraph::new();
+        let orig = g1.add_source("orig", Value::Int(0));
+
+        let mut g2 = DataflowGraph::new();
+        let other = g2.add_source("other", Value::Int(1));
+
+        let id_map = g1.merge(&g2);
+        let new_id = id_map[&other];
+        // IDs should not collide
+        assert_ne!(new_id, orig);
+    }
+
+    // ================================================================
+    // is_acyclic tests
+    // ================================================================
+
+    #[test]
+    fn empty_graph_is_acyclic() {
+        let g = DataflowGraph::new();
+        assert!(g.is_acyclic());
+    }
+
+    #[test]
+    fn single_source_is_acyclic() {
+        let mut g = DataflowGraph::new();
+        let _s = g.add_source("s", Value::None);
+        assert!(g.is_acyclic());
+    }
+
+    #[test]
+    fn diamond_graph_is_acyclic() {
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("s", Value::None);
+        let a = g.add_map("a", vec![s], |_| Value::None);
+        let b = g.add_map("b", vec![s], |_| Value::None);
+        let _c = g.add_combine("c", vec![a, b], |_| Value::None);
+        assert!(g.is_acyclic());
+    }
+
+    // ================================================================
+    // Complex propagation scenarios
+    // ================================================================
+
+    #[test]
+    fn multi_level_diamond() {
+        // S → A → C
+        // S → B → C
+        // C → D
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("s", Value::Int(1));
+        let a = g.add_map("a", vec![s], |i| match &i[0] {
+            Value::Int(v) => Value::Int(v * 2),
+            _ => Value::None,
+        });
+        let b = g.add_map("b", vec![s], |i| match &i[0] {
+            Value::Int(v) => Value::Int(v * 3),
+            _ => Value::None,
+        });
+        let c = g.add_combine("c", vec![a, b], |inputs| {
+            match (&inputs[0], &inputs[1]) {
+                (Value::Int(x), Value::Int(y)) => Value::Int(x + y),
+                _ => Value::None,
+            }
+        });
+        let d = g.add_map("d", vec![c], |i| match &i[0] {
+            Value::Int(v) => Value::Int(v * 10),
+            _ => Value::None,
+        });
+
+        g.propagate();
+        // S=1, A=2, B=3, C=5, D=50
+        assert_eq!(g.get_value(d), Some(&Value::Int(50)));
+
+        g.update_source(s, Value::Int(2)).unwrap();
+        g.propagate();
+        // S=2, A=4, B=6, C=10, D=100
+        assert_eq!(g.get_value(d), Some(&Value::Int(100)));
+    }
+
+    #[test]
+    fn multiple_independent_subgraphs() {
+        let mut g = DataflowGraph::new();
+        let s1 = g.add_source("s1", Value::Int(1));
+        let m1 = g.add_map("m1", vec![s1], |i| match &i[0] {
+            Value::Int(v) => Value::Int(v + 10),
+            _ => Value::None,
+        });
+
+        let s2 = g.add_source("s2", Value::Text("hello".into()));
+        let m2 = g.add_map("m2", vec![s2], |i| match &i[0] {
+            Value::Text(s) => Value::Int(s.len() as i64),
+            _ => Value::None,
+        });
+
+        g.propagate();
+        assert_eq!(g.get_value(m1), Some(&Value::Int(11)));
+        assert_eq!(g.get_value(m2), Some(&Value::Int(5)));
+
+        // Update only s1
+        g.update_source(s1, Value::Int(100)).unwrap();
+        let stats = g.propagate();
+        assert_eq!(stats.nodes_recomputed, 1); // only m1
+        assert_eq!(g.get_value(m1), Some(&Value::Int(110)));
+        assert_eq!(g.get_value(m2), Some(&Value::Int(5))); // unchanged
+    }
+
+    #[test]
+    fn propagation_stats_reports_total_nodes() {
+        let mut g = DataflowGraph::new();
+        let a = g.add_source("a", Value::Int(0));
+        let _b = g.add_map("b", vec![a], |_| Value::None);
+        let stats = g.propagate();
+        assert_eq!(stats.total_nodes, 2);
+    }
+
+    #[test]
+    fn propagation_stats_elapsed_is_nonnegative() {
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("s", Value::Int(0));
+        let _m = g.add_map("m", vec![s], |i| i[0].clone());
+        let stats = g.propagate();
+        assert!(stats.elapsed >= Duration::ZERO);
+    }
+
+    #[test]
+    fn update_source_same_value_no_dirty() {
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("s", Value::Int(42));
+        let _m = g.add_map("m", vec![s], |i| i[0].clone());
+        g.propagate();
+
+        // Set to same value
+        g.update_source(s, Value::Int(42)).unwrap();
+        assert!(g.is_stable(), "Same value should not dirty dependents");
+    }
+
+    #[test]
+    fn snapshot_empty_graph() {
+        let g = DataflowGraph::new();
+        let snap = g.snapshot();
+        assert!(snap.nodes.is_empty());
+        assert!(snap.edges.is_empty());
+    }
+
+    #[test]
+    fn node_snapshot_has_kind_string() {
+        let mut g = DataflowGraph::new();
+        let _s = g.add_source("src", Value::None);
+        let snap = g.snapshot();
+        assert_eq!(snap.nodes[0].kind, "Source");
+    }
+
+    #[test]
+    fn node_snapshot_has_topo_depth() {
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("src", Value::Int(0));
+        let _m = g.add_map("map", vec![s], |_| Value::None);
+        g.propagate(); // triggers topo order computation
+
+        let snap = g.snapshot();
+        let depths: Vec<u32> = snap.nodes.iter().map(|n| n.topo_depth).collect();
+        assert!(depths.contains(&0)); // source
+        assert!(depths.contains(&1)); // map
+    }
 }
