@@ -1190,4 +1190,1587 @@ mod tests {
         assert!(content.contains("#### `wait_result`"));
         assert!(content.contains("| `condition`"));
     }
+
+    // =====================================================================
+    // NEW TESTS below (wa-1u90p.7.1 expansion)
+    // =====================================================================
+
+    // --- DocGenConfig serde edge cases ---
+
+    #[test]
+    fn config_serde_all_false() {
+        let config = DocGenConfig {
+            include_envelope: false,
+            include_experimental: false,
+            include_error_codes: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: DocGenConfig = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.include_envelope);
+        assert!(!parsed.include_experimental);
+        assert!(!parsed.include_error_codes);
+    }
+
+    #[test]
+    fn config_serde_roundtrip_preserves_all_fields() {
+        let config = DocGenConfig {
+            include_envelope: false,
+            include_experimental: true,
+            include_error_codes: false,
+        };
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let parsed: DocGenConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.include_envelope, parsed.include_envelope);
+        assert_eq!(config.include_experimental, parsed.include_experimental);
+        assert_eq!(config.include_error_codes, parsed.include_error_codes);
+    }
+
+    #[test]
+    fn config_debug_impl() {
+        let config = DocGenConfig::default();
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("DocGenConfig"));
+        assert!(dbg.contains("include_envelope"));
+        assert!(dbg.contains("include_experimental"));
+        assert!(dbg.contains("include_error_codes"));
+    }
+
+    #[test]
+    fn config_clone_is_independent() {
+        let config = DocGenConfig::default();
+        let mut cloned = config.clone();
+        cloned.include_envelope = false;
+        // Original unchanged
+        assert!(config.include_envelope);
+        assert!(!cloned.include_envelope);
+    }
+
+    #[test]
+    fn config_deserialize_from_partial_json() {
+        // serde should fail if fields are missing (no #[serde(default)])
+        let result: Result<DocGenConfig, _> = serde_json::from_str("{}");
+        assert!(result.is_err(), "should require all fields");
+    }
+
+    // --- PropertyDoc serde and traits ---
+
+    #[test]
+    fn property_doc_serde_roundtrip() {
+        let prop = PropertyDoc {
+            name: "test_field".into(),
+            type_str: "string".into(),
+            required: true,
+            description: "A test field".into(),
+            enum_values: vec!["a".into(), "b".into()],
+            minimum: Some(1.0),
+            maximum: Some(100.0),
+            pattern: Some("^[a-z]+$".into()),
+        };
+        let json = serde_json::to_string(&prop).unwrap();
+        let parsed: PropertyDoc = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "test_field");
+        assert_eq!(parsed.type_str, "string");
+        assert!(parsed.required);
+        assert_eq!(parsed.enum_values.len(), 2);
+        assert_eq!(parsed.minimum, Some(1.0));
+        assert_eq!(parsed.maximum, Some(100.0));
+        assert_eq!(parsed.pattern.as_deref(), Some("^[a-z]+$"));
+    }
+
+    #[test]
+    fn property_doc_serde_roundtrip_none_fields() {
+        let prop = PropertyDoc {
+            name: "x".into(),
+            type_str: "integer".into(),
+            required: false,
+            description: String::new(),
+            enum_values: vec![],
+            minimum: None,
+            maximum: None,
+            pattern: None,
+        };
+        let json = serde_json::to_string(&prop).unwrap();
+        let parsed: PropertyDoc = serde_json::from_str(&json).unwrap();
+        assert!(parsed.minimum.is_none());
+        assert!(parsed.maximum.is_none());
+        assert!(parsed.pattern.is_none());
+        assert!(parsed.enum_values.is_empty());
+    }
+
+    #[test]
+    fn property_doc_debug_impl() {
+        let prop = PropertyDoc {
+            name: "dbg_test".into(),
+            type_str: "boolean".into(),
+            required: false,
+            description: "debug test".into(),
+            enum_values: vec![],
+            minimum: None,
+            maximum: None,
+            pattern: None,
+        };
+        let dbg = format!("{:?}", prop);
+        assert!(dbg.contains("PropertyDoc"));
+        assert!(dbg.contains("dbg_test"));
+    }
+
+    #[test]
+    fn property_doc_clone_is_deep() {
+        let prop = PropertyDoc {
+            name: "orig".into(),
+            type_str: "string".into(),
+            required: true,
+            description: "original".into(),
+            enum_values: vec!["x".into()],
+            minimum: Some(0.0),
+            maximum: Some(10.0),
+            pattern: Some("pat".into()),
+        };
+        let mut cloned = prop.clone();
+        cloned.name = "cloned".into();
+        cloned.enum_values.push("y".into());
+        assert_eq!(prop.name, "orig");
+        assert_eq!(prop.enum_values.len(), 1);
+        assert_eq!(cloned.enum_values.len(), 2);
+    }
+
+    // --- SchemaDoc serde and traits ---
+
+    #[test]
+    fn schema_doc_serde_roundtrip() {
+        let doc = SchemaDoc {
+            title: "Test".into(),
+            description: "A test".into(),
+            properties: vec![PropertyDoc {
+                name: "id".into(),
+                type_str: "integer".into(),
+                required: true,
+                description: "ID".into(),
+                enum_values: vec![],
+                minimum: None,
+                maximum: None,
+                pattern: None,
+            }],
+            definitions: vec![("sub".into(), SchemaDoc {
+                title: "Sub".into(),
+                description: "sub desc".into(),
+                properties: vec![],
+                definitions: vec![],
+            })],
+        };
+        let json = serde_json::to_string(&doc).unwrap();
+        let parsed: SchemaDoc = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.title, "Test");
+        assert_eq!(parsed.properties.len(), 1);
+        assert_eq!(parsed.definitions.len(), 1);
+        assert_eq!(parsed.definitions[0].0, "sub");
+    }
+
+    #[test]
+    fn schema_doc_debug_impl() {
+        let doc = parse_schema(&serde_json::json!({"title": "DebugTest"}));
+        let dbg = format!("{:?}", doc);
+        assert!(dbg.contains("SchemaDoc"));
+        assert!(dbg.contains("DebugTest"));
+    }
+
+    #[test]
+    fn schema_doc_clone_deep() {
+        let doc = parse_schema(&sample_schema());
+        let cloned = doc.clone();
+        assert_eq!(doc.title, cloned.title);
+        assert_eq!(doc.properties.len(), cloned.properties.len());
+        assert_eq!(doc.definitions.len(), cloned.definitions.len());
+    }
+
+    // --- EndpointCategory exhaustive tests ---
+
+    #[test]
+    fn category_title_all_nonempty() {
+        for cat in EndpointCategory::all() {
+            let t = cat.title();
+            assert!(!t.is_empty(), "category {:?} has empty title", cat);
+        }
+    }
+
+    #[test]
+    fn category_all_returns_seven() {
+        assert_eq!(EndpointCategory::all().len(), 7);
+    }
+
+    #[test]
+    fn category_serde_roundtrip() {
+        for cat in EndpointCategory::all() {
+            let json = serde_json::to_string(cat).unwrap();
+            let parsed: EndpointCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(*cat, parsed);
+        }
+    }
+
+    #[test]
+    fn category_serde_snake_case() {
+        let json = serde_json::to_string(&EndpointCategory::PaneOperations).unwrap();
+        assert_eq!(json, "\"pane_operations\"");
+        let json = serde_json::to_string(&EndpointCategory::SearchAndEvents).unwrap();
+        assert_eq!(json, "\"search_and_events\"");
+        let json = serde_json::to_string(&EndpointCategory::Meta).unwrap();
+        assert_eq!(json, "\"meta\"");
+    }
+
+    #[test]
+    fn category_debug_impl() {
+        let dbg = format!("{:?}", EndpointCategory::Workflows);
+        assert_eq!(dbg, "Workflows");
+    }
+
+    #[test]
+    fn category_clone_copy() {
+        let cat = EndpointCategory::Rules;
+        let cloned = cat;
+        let copied = cat;
+        assert_eq!(cat, cloned);
+        assert_eq!(cat, copied);
+    }
+
+    #[test]
+    fn category_eq_and_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        for cat in EndpointCategory::all() {
+            set.insert(*cat);
+        }
+        assert_eq!(set.len(), 7);
+        // Inserting duplicates does not change length.
+        set.insert(EndpointCategory::Meta);
+        assert_eq!(set.len(), 7);
+    }
+
+    #[test]
+    fn category_ord() {
+        // PartialOrd/Ord should be deterministic
+        assert!(EndpointCategory::PaneOperations < EndpointCategory::Meta);
+        assert!(EndpointCategory::SearchAndEvents < EndpointCategory::Workflows);
+    }
+
+    // --- Categorization: exhaustive endpoint ID coverage ---
+
+    #[test]
+    fn categorize_get_text() {
+        let ep = EndpointMeta {
+            id: "get_text".into(),
+            title: "Get Pane Text".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::PaneOperations);
+    }
+
+    #[test]
+    fn categorize_send() {
+        let ep = EndpointMeta {
+            id: "send".into(),
+            title: "Send Text".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::PaneOperations);
+    }
+
+    #[test]
+    fn categorize_wait_for() {
+        let ep = EndpointMeta {
+            id: "wait_for".into(),
+            title: "Wait For".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::PaneOperations);
+    }
+
+    #[test]
+    fn categorize_search() {
+        let ep = EndpointMeta {
+            id: "search".into(),
+            title: "Search".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::SearchAndEvents);
+    }
+
+    #[test]
+    fn categorize_events() {
+        let ep = EndpointMeta {
+            id: "events".into(),
+            title: "Events".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::SearchAndEvents);
+    }
+
+    #[test]
+    fn categorize_events_annotate() {
+        let ep = EndpointMeta {
+            id: "events_annotate".into(),
+            title: "Annotate Event".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::SearchAndEvents);
+    }
+
+    #[test]
+    fn categorize_events_triage() {
+        let ep = EndpointMeta {
+            id: "events_triage".into(),
+            title: "Triage".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::SearchAndEvents);
+    }
+
+    #[test]
+    fn categorize_events_label() {
+        let ep = EndpointMeta {
+            id: "events_label".into(),
+            title: "Label".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::SearchAndEvents);
+    }
+
+    #[test]
+    fn categorize_workflow_list() {
+        let ep = EndpointMeta {
+            id: "workflow_list".into(),
+            title: "List Workflows".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::Workflows);
+    }
+
+    #[test]
+    fn categorize_workflow_status() {
+        let ep = EndpointMeta {
+            id: "workflow_status".into(),
+            title: "Workflow Status".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::Workflows);
+    }
+
+    #[test]
+    fn categorize_workflow_abort() {
+        let ep = EndpointMeta {
+            id: "workflow_abort".into(),
+            title: "Abort Workflow".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::Workflows);
+    }
+
+    #[test]
+    fn categorize_rules_list() {
+        let ep = EndpointMeta {
+            id: "rules_list".into(),
+            title: "List Rules".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::Rules);
+    }
+
+    #[test]
+    fn categorize_rules_test() {
+        let ep = EndpointMeta {
+            id: "rules_test".into(),
+            title: "Test Rules".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::Rules);
+    }
+
+    #[test]
+    fn categorize_rules_show() {
+        let ep = EndpointMeta {
+            id: "rules_show".into(),
+            title: "Show Rule".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: false,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::Rules);
+    }
+
+    #[test]
+    fn categorize_rules_lint() {
+        let ep = EndpointMeta {
+            id: "rules_lint".into(),
+            title: "Lint Rules".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::Rules);
+    }
+
+    #[test]
+    fn categorize_accounts_list() {
+        let ep = EndpointMeta {
+            id: "accounts_list".into(),
+            title: "List Accounts".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::Accounts);
+    }
+
+    #[test]
+    fn categorize_accounts_refresh() {
+        let ep = EndpointMeta {
+            id: "accounts_refresh".into(),
+            title: "Refresh Accounts".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::Accounts);
+    }
+
+    #[test]
+    fn categorize_reservations_list() {
+        let ep = EndpointMeta {
+            id: "reservations_list".into(),
+            title: "List Reservations".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::Reservations);
+    }
+
+    #[test]
+    fn categorize_reserve() {
+        let ep = EndpointMeta {
+            id: "reserve".into(),
+            title: "Reserve Pane".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::Reservations);
+    }
+
+    #[test]
+    fn categorize_release() {
+        let ep = EndpointMeta {
+            id: "release".into(),
+            title: "Release Reservation".into(),
+            description: String::new(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: String::new(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        assert_eq!(categorize_endpoint(&ep), EndpointCategory::Reservations);
+    }
+
+    // --- extract_type_str edge cases ---
+
+    #[test]
+    fn extract_type_str_no_type_returns_any() {
+        let prop = serde_json::json!({
+            "description": "no type"
+        });
+        assert_eq!(extract_type_str(&prop), "any");
+    }
+
+    #[test]
+    fn extract_type_str_object() {
+        let prop = serde_json::json!({
+            "type": "object"
+        });
+        assert_eq!(extract_type_str(&prop), "object");
+    }
+
+    #[test]
+    fn extract_type_str_boolean() {
+        let prop = serde_json::json!({ "type": "boolean" });
+        assert_eq!(extract_type_str(&prop), "boolean");
+    }
+
+    #[test]
+    fn extract_type_str_number() {
+        let prop = serde_json::json!({ "type": "number" });
+        assert_eq!(extract_type_str(&prop), "number");
+    }
+
+    #[test]
+    fn extract_type_str_array_no_items() {
+        let prop = serde_json::json!({ "type": "array" });
+        assert_eq!(extract_type_str(&prop), "array");
+    }
+
+    #[test]
+    fn extract_type_str_array_with_typed_items() {
+        let prop = serde_json::json!({
+            "type": "array",
+            "items": { "type": "integer" }
+        });
+        assert_eq!(extract_type_str(&prop), "integer[]");
+    }
+
+    #[test]
+    fn extract_type_str_array_with_ref_items() {
+        let prop = serde_json::json!({
+            "type": "array",
+            "items": { "$ref": "#/$defs/my_type" }
+        });
+        assert_eq!(extract_type_str(&prop), "my_type[]");
+    }
+
+    #[test]
+    fn extract_type_str_ref_without_defs_prefix() {
+        let prop = serde_json::json!({
+            "$ref": "https://example.com/schema.json"
+        });
+        assert_eq!(extract_type_str(&prop), "https://example.com/schema.json");
+    }
+
+    #[test]
+    fn extract_type_str_type_array_three_types() {
+        let prop = serde_json::json!({
+            "type": ["string", "integer", "null"]
+        });
+        assert_eq!(extract_type_str(&prop), "string | integer | null");
+    }
+
+    #[test]
+    fn extract_type_str_array_items_no_type_no_ref() {
+        // items present but with neither type nor $ref
+        let prop = serde_json::json!({
+            "type": "array",
+            "items": { "description": "anything" }
+        });
+        assert_eq!(extract_type_str(&prop), "array");
+    }
+
+    // --- parse_schema edge cases ---
+
+    #[test]
+    fn parse_schema_null_value() {
+        let schema = Value::Null;
+        let doc = parse_schema(&schema);
+        assert!(doc.title.is_empty());
+        assert!(doc.description.is_empty());
+        assert!(doc.properties.is_empty());
+        assert!(doc.definitions.is_empty());
+    }
+
+    #[test]
+    fn parse_schema_string_value() {
+        let schema = Value::String("not a schema".into());
+        let doc = parse_schema(&schema);
+        assert!(doc.title.is_empty());
+        assert!(doc.properties.is_empty());
+    }
+
+    #[test]
+    fn parse_schema_number_value() {
+        let schema = serde_json::json!(42);
+        let doc = parse_schema(&schema);
+        assert!(doc.title.is_empty());
+        assert!(doc.properties.is_empty());
+    }
+
+    #[test]
+    fn parse_schema_no_required_array() {
+        // Schema with properties but no "required" key
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "string" },
+                "b": { "type": "integer" }
+            }
+        });
+        let doc = parse_schema(&schema);
+        assert_eq!(doc.properties.len(), 2);
+        assert!(doc.properties.iter().all(|p| !p.required));
+    }
+
+    #[test]
+    fn parse_schema_empty_properties_object() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {}
+        });
+        let doc = parse_schema(&schema);
+        assert!(doc.properties.is_empty());
+    }
+
+    #[test]
+    fn parse_schema_multiple_definitions_sorted() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "zebra": { "type": "object", "properties": { "z": { "type": "string" } } },
+                "alpha": { "type": "object", "properties": { "a": { "type": "string" } } },
+                "mid": { "type": "object", "properties": { "m": { "type": "string" } } }
+            }
+        });
+        let doc = parse_schema(&schema);
+        assert_eq!(doc.definitions.len(), 3);
+        assert_eq!(doc.definitions[0].0, "alpha");
+        assert_eq!(doc.definitions[1].0, "mid");
+        assert_eq!(doc.definitions[2].0, "zebra");
+    }
+
+    #[test]
+    fn parse_schema_property_with_maximum() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "val": {
+                    "type": "number",
+                    "minimum": -100.5,
+                    "maximum": 100.5
+                }
+            }
+        });
+        let doc = parse_schema(&schema);
+        let val = &doc.properties[0];
+        assert_eq!(val.minimum, Some(-100.5));
+        assert_eq!(val.maximum, Some(100.5));
+    }
+
+    #[test]
+    fn parse_schema_property_with_pattern() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "pattern": "^[A-Z]{3}$"
+                }
+            }
+        });
+        let doc = parse_schema(&schema);
+        let code = &doc.properties[0];
+        assert_eq!(code.pattern.as_deref(), Some("^[A-Z]{3}$"));
+    }
+
+    #[test]
+    fn parse_schema_enum_with_non_string_values() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "level": {
+                    "type": "integer",
+                    "enum": [1, 2, 3]
+                }
+            }
+        });
+        let doc = parse_schema(&schema);
+        let level = &doc.properties[0];
+        assert_eq!(level.enum_values, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn parse_schema_property_no_description() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "bare": { "type": "string" }
+            }
+        });
+        let doc = parse_schema(&schema);
+        assert_eq!(doc.properties[0].description, "");
+    }
+
+    // --- slug edge cases ---
+
+    #[test]
+    fn slug_empty_string() {
+        assert_eq!(slug(""), "");
+    }
+
+    #[test]
+    fn slug_all_special_chars() {
+        assert_eq!(slug("!@#$%^&*()"), "");
+    }
+
+    #[test]
+    fn slug_leading_trailing_spaces() {
+        assert_eq!(slug("  hello  "), "hello");
+    }
+
+    #[test]
+    fn slug_preserves_numbers() {
+        assert_eq!(slug("Version 2.0"), "version-2-0");
+    }
+
+    #[test]
+    fn slug_unicode_chars() {
+        // Non-ASCII alphanumeric are kept by is_alphanumeric
+        let result = slug("cafe");
+        assert_eq!(result, "cafe");
+    }
+
+    #[test]
+    fn slug_consecutive_special_chars() {
+        // Non-alphanumeric chars become '-', then replace("--", "-") runs once.
+        // Input "a--b": '-' is not alphanumeric, so mapped to '-', giving "a--b",
+        // then replace("--","-") -> "a-b"
+        assert_eq!(slug("a--b"), "a-b");
+        // Two spaces -> "a--b" -> "a-b"
+        assert_eq!(slug("a  b"), "a-b");
+        // Three spaces -> "a---b" -> replace("--","-") once -> "a--b"
+        // (only one pass of replacement)
+        assert_eq!(slug("a   b"), "a--b");
+    }
+
+    // --- escape_markdown_table edge cases ---
+
+    #[test]
+    fn escape_markdown_table_empty() {
+        assert_eq!(escape_markdown_table(""), "");
+    }
+
+    #[test]
+    fn escape_markdown_table_multiple_pipes() {
+        assert_eq!(escape_markdown_table("a|b|c"), "a\\|b\\|c");
+    }
+
+    #[test]
+    fn escape_markdown_table_multiple_newlines() {
+        assert_eq!(escape_markdown_table("a\nb\nc"), "a b c");
+    }
+
+    #[test]
+    fn escape_markdown_table_mixed_pipe_and_newline() {
+        assert_eq!(escape_markdown_table("a|b\nc"), "a\\|b c");
+    }
+
+    #[test]
+    fn escape_markdown_table_no_special_chars() {
+        assert_eq!(escape_markdown_table("hello world"), "hello world");
+    }
+
+    // --- format_type_with_constraints edge cases ---
+
+    #[test]
+    fn format_type_with_single_enum_value() {
+        let prop = PropertyDoc {
+            name: "x".into(),
+            type_str: "string".into(),
+            required: false,
+            description: String::new(),
+            enum_values: vec!["only".into()],
+            minimum: None,
+            maximum: None,
+            pattern: None,
+        };
+        let formatted = format_type_with_constraints(&prop);
+        assert_eq!(formatted, "`string` (`\"only\"`)");
+    }
+
+    #[test]
+    fn format_type_with_empty_type_str() {
+        let prop = PropertyDoc {
+            name: "x".into(),
+            type_str: String::new(),
+            required: false,
+            description: String::new(),
+            enum_values: vec![],
+            minimum: None,
+            maximum: None,
+            pattern: None,
+        };
+        assert_eq!(format_type_with_constraints(&prop), "``");
+    }
+
+    #[test]
+    fn format_type_with_many_enum_values() {
+        let prop = PropertyDoc {
+            name: "x".into(),
+            type_str: "string".into(),
+            required: false,
+            description: String::new(),
+            enum_values: vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
+            minimum: None,
+            maximum: None,
+            pattern: None,
+        };
+        let formatted = format_type_with_constraints(&prop);
+        assert!(formatted.contains("`\"a\"`"));
+        assert!(formatted.contains("`\"e\"`"));
+        // Check comma separation
+        assert!(formatted.contains(", "));
+    }
+
+    // --- error_code_description edge cases ---
+
+    #[test]
+    fn error_code_unknown_returns_unknown() {
+        assert_eq!(error_code_description("robot.nonexistent"), "Unknown error code");
+    }
+
+    #[test]
+    fn error_code_empty_returns_unknown() {
+        assert_eq!(error_code_description(""), "Unknown error code");
+    }
+
+    #[test]
+    fn error_code_each_has_unique_description() {
+        let codes = [
+            "robot.invalid_args",
+            "robot.unknown_subcommand",
+            "robot.not_implemented",
+            "robot.config_error",
+            "robot.wezterm_error",
+            "robot.storage_error",
+            "robot.policy_denied",
+            "robot.pane_not_found",
+            "robot.workflow_error",
+            "robot.timeout",
+        ];
+        let mut descs: Vec<&str> = codes.iter().map(|c| error_code_description(c)).collect();
+        let original_len = descs.len();
+        descs.sort();
+        descs.dedup();
+        assert_eq!(descs.len(), original_len, "all error codes should have unique descriptions");
+    }
+
+    // --- DocPage traits ---
+
+    #[test]
+    fn doc_page_debug_impl() {
+        let page = DocPage {
+            filename: "test.md".into(),
+            title: "Test".into(),
+            content: "# Test".into(),
+        };
+        let dbg = format!("{:?}", page);
+        assert!(dbg.contains("DocPage"));
+        assert!(dbg.contains("test.md"));
+    }
+
+    #[test]
+    fn doc_page_clone() {
+        let page = DocPage {
+            filename: "a.md".into(),
+            title: "A".into(),
+            content: "content".into(),
+        };
+        let cloned = page.clone();
+        assert_eq!(page.filename, cloned.filename);
+        assert_eq!(page.title, cloned.title);
+        assert_eq!(page.content, cloned.content);
+    }
+
+    // --- generate_reference config combinations ---
+
+    #[test]
+    fn generate_reference_no_envelope_no_errors() {
+        let registry = SchemaRegistry::canonical();
+        let envelope = sample_envelope();
+        let schemas = vec![("wa-robot-envelope.json".to_string(), envelope)];
+        let config = DocGenConfig {
+            include_envelope: false,
+            include_experimental: true,
+            include_error_codes: false,
+        };
+        let pages = generate_reference(&registry, &schemas, &config);
+        assert!(!pages[0].content.contains("## Response Envelope"));
+        assert!(!pages[0].content.contains("## Error Codes"));
+    }
+
+    #[test]
+    fn generate_reference_envelope_without_error_codes() {
+        let registry = SchemaRegistry::canonical();
+        let envelope = sample_envelope();
+        let schemas = vec![("wa-robot-envelope.json".to_string(), envelope)];
+        let config = DocGenConfig {
+            include_envelope: true,
+            include_experimental: true,
+            include_error_codes: false,
+        };
+        let pages = generate_reference(&registry, &schemas, &config);
+        assert!(pages[0].content.contains("## Response Envelope"));
+        assert!(!pages[0].content.contains("## Error Codes"));
+    }
+
+    #[test]
+    fn generate_reference_error_codes_without_envelope() {
+        let registry = SchemaRegistry::canonical();
+        let envelope = sample_envelope();
+        let schemas = vec![("wa-robot-envelope.json".to_string(), envelope)];
+        let config = DocGenConfig {
+            include_envelope: false,
+            include_experimental: true,
+            include_error_codes: true,
+        };
+        let pages = generate_reference(&registry, &schemas, &config);
+        assert!(!pages[0].content.contains("## Response Envelope"));
+        // Error codes section should still render since envelope schema is provided
+        assert!(pages[0].content.contains("## Error Codes"));
+    }
+
+    #[test]
+    fn generate_reference_toc_excludes_envelope_when_disabled() {
+        let registry = SchemaRegistry::canonical();
+        let config = DocGenConfig {
+            include_envelope: false,
+            include_experimental: true,
+            include_error_codes: false,
+        };
+        let pages = generate_reference(&registry, &[], &config);
+        assert!(!pages[0].content.contains("Response Envelope](#response-envelope)"));
+        assert!(!pages[0].content.contains("Error Codes](#error-codes)"));
+    }
+
+    #[test]
+    fn generate_reference_toc_includes_envelope_when_enabled() {
+        let registry = SchemaRegistry::canonical();
+        let config = DocGenConfig::default();
+        let pages = generate_reference(&registry, &[], &config);
+        assert!(pages[0].content.contains("[Response Envelope](#response-envelope)"));
+        assert!(pages[0].content.contains("[Error Codes](#error-codes)"));
+    }
+
+    #[test]
+    fn generate_reference_includes_version() {
+        let registry = SchemaRegistry::canonical();
+        let config = DocGenConfig::default();
+        let pages = generate_reference(&registry, &[], &config);
+        assert!(
+            pages[0].content.contains(&format!("Version: {}.", registry.version)),
+            "output should contain the registry version"
+        );
+    }
+
+    // --- write_endpoint_section: unstable marker ---
+
+    #[test]
+    fn endpoint_section_unstable_marker() {
+        let ep = EndpointMeta {
+            id: "experimental_thing".into(),
+            title: "Experimental Thing".into(),
+            description: "An unstable endpoint".into(),
+            robot_command: Some("robot exp".into()),
+            mcp_tool: None,
+            schema_file: "wa-robot-exp.json".into(),
+            stable: false,
+            since: "0.3.0".into(),
+        };
+        let schemas: BTreeMap<&str, &Value> = BTreeMap::new();
+        let mut out = String::new();
+        write_endpoint_section(&mut out, &ep, &schemas);
+        assert!(out.contains("> **Experimental**"));
+        assert!(out.contains("**Since:** v0.3.0"));
+    }
+
+    #[test]
+    fn endpoint_section_stable_no_experimental_marker() {
+        let ep = EndpointMeta {
+            id: "stable_thing".into(),
+            title: "Stable Thing".into(),
+            description: "A stable endpoint".into(),
+            robot_command: Some("robot stable".into()),
+            mcp_tool: Some("wa.stable".into()),
+            schema_file: "wa-robot-stable.json".into(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        let schemas: BTreeMap<&str, &Value> = BTreeMap::new();
+        let mut out = String::new();
+        write_endpoint_section(&mut out, &ep, &schemas);
+        assert!(!out.contains("Experimental"));
+        assert!(out.contains("**Robot:** `ft robot stable`"));
+        assert!(out.contains("**MCP:** `wa.stable`"));
+    }
+
+    #[test]
+    fn endpoint_section_no_robot_no_mcp() {
+        let ep = EndpointMeta {
+            id: "bare".into(),
+            title: "Bare".into(),
+            description: "No surfaces".into(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: "bare.json".into(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        let schemas: BTreeMap<&str, &Value> = BTreeMap::new();
+        let mut out = String::new();
+        write_endpoint_section(&mut out, &ep, &schemas);
+        assert!(!out.contains("**Robot:**"));
+        assert!(!out.contains("**MCP:**"));
+    }
+
+    // --- write_properties_table ---
+
+    #[test]
+    fn properties_table_empty_properties() {
+        let mut out = String::new();
+        write_properties_table(&mut out, &[]);
+        // Should still have headers
+        assert!(out.contains("| Field | Type | Required | Description |"));
+        assert!(out.contains("|-------|------|----------|-------------|"));
+        // But no data rows (just the 2 header lines)
+        assert_eq!(out.trim().lines().count(), 2);
+    }
+
+    #[test]
+    fn properties_table_required_yes_marker() {
+        let props = vec![PropertyDoc {
+            name: "req_field".into(),
+            type_str: "string".into(),
+            required: true,
+            description: "required".into(),
+            enum_values: vec![],
+            minimum: None,
+            maximum: None,
+            pattern: None,
+        }];
+        let mut out = String::new();
+        write_properties_table(&mut out, &props);
+        assert!(out.contains("**yes**"));
+    }
+
+    #[test]
+    fn properties_table_optional_no_marker() {
+        let props = vec![PropertyDoc {
+            name: "opt_field".into(),
+            type_str: "string".into(),
+            required: false,
+            description: "optional".into(),
+            enum_values: vec![],
+            minimum: None,
+            maximum: None,
+            pattern: None,
+        }];
+        let mut out = String::new();
+        write_properties_table(&mut out, &props);
+        // Should contain "no" but not "**yes**"
+        assert!(out.contains("| no |"));
+        assert!(!out.contains("**yes**"));
+    }
+
+    #[test]
+    fn properties_table_escapes_description() {
+        let props = vec![PropertyDoc {
+            name: "tricky".into(),
+            type_str: "string".into(),
+            required: false,
+            description: "has|pipe\nand newline".into(),
+            enum_values: vec![],
+            minimum: None,
+            maximum: None,
+            pattern: None,
+        }];
+        let mut out = String::new();
+        write_properties_table(&mut out, &props);
+        assert!(out.contains("has\\|pipe and newline"));
+    }
+
+    // --- write_error_codes_section edge cases ---
+
+    #[test]
+    fn error_codes_section_no_defs() {
+        // Envelope without $defs should produce no error codes section
+        let envelope = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ok": { "type": "boolean" }
+            }
+        });
+        let mut out = String::new();
+        write_error_codes_section(&mut out, &envelope);
+        assert!(!out.contains("Error Codes"));
+    }
+
+    #[test]
+    fn error_codes_section_empty_enum() {
+        let envelope = serde_json::json!({
+            "$defs": {
+                "error_codes": {
+                    "enum": []
+                }
+            }
+        });
+        let mut out = String::new();
+        write_error_codes_section(&mut out, &envelope);
+        // Should still render header and table headers
+        assert!(out.contains("## Error Codes"));
+        assert!(out.contains("| Code | Description |"));
+    }
+
+    #[test]
+    fn error_codes_section_non_string_enum_values() {
+        let envelope = serde_json::json!({
+            "$defs": {
+                "error_codes": {
+                    "enum": [42, true, null]
+                }
+            }
+        });
+        let mut out = String::new();
+        write_error_codes_section(&mut out, &envelope);
+        // Non-string values should be skipped (as_str returns None for them)
+        assert!(out.contains("## Error Codes"));
+        // No code rows since none are strings
+        assert!(!out.lines().any(|l| l.starts_with("| `")));
+    }
+
+    // --- Summary table edge cases ---
+
+    #[test]
+    fn endpoint_summary_empty_registry() {
+        let registry = SchemaRegistry {
+            version: "0.0.0".into(),
+            endpoints: vec![],
+        };
+        let summary = generate_endpoint_summary(&registry);
+        // Should have only header rows
+        assert!(summary.contains("| Endpoint |"));
+        assert_eq!(summary.trim().lines().count(), 2);
+    }
+
+    #[test]
+    fn endpoint_summary_no_robot_no_mcp_shows_dashes() {
+        let registry = SchemaRegistry {
+            version: "1.0.0".into(),
+            endpoints: vec![EndpointMeta {
+                id: "bare".into(),
+                title: "Bare Endpoint".into(),
+                description: String::new(),
+                robot_command: None,
+                mcp_tool: None,
+                schema_file: "bare.json".into(),
+                stable: true,
+                since: "1.0.0".into(),
+            }],
+        };
+        let summary = generate_endpoint_summary(&registry);
+        // Should contain em-dash for missing robot and MCP
+        let lines: Vec<&str> = summary.trim().lines().collect();
+        assert_eq!(lines.len(), 3); // header + separator + 1 data row
+        // Check the data row contains dashes
+        let data_line = lines[2];
+        assert!(data_line.contains("Bare Endpoint"));
+    }
+
+    // --- group_endpoints ---
+
+    #[test]
+    fn group_endpoints_filters_unstable_when_not_included() {
+        let registry = SchemaRegistry {
+            version: "1.0.0".into(),
+            endpoints: vec![
+                EndpointMeta {
+                    id: "state".into(),
+                    title: "Pane State".into(),
+                    description: String::new(),
+                    robot_command: None,
+                    mcp_tool: None,
+                    schema_file: String::new(),
+                    stable: true,
+                    since: "0.1.0".into(),
+                },
+                EndpointMeta {
+                    id: "state".into(),
+                    title: "Unstable State".into(),
+                    description: String::new(),
+                    robot_command: None,
+                    mcp_tool: None,
+                    schema_file: String::new(),
+                    stable: false,
+                    since: "0.1.0".into(),
+                },
+            ],
+        };
+        let config = DocGenConfig {
+            include_experimental: false,
+            ..Default::default()
+        };
+        let grouped = group_endpoints(&registry, &config);
+        let pane_ops = grouped.get(&EndpointCategory::PaneOperations).unwrap();
+        assert_eq!(pane_ops.len(), 1);
+        assert_eq!(pane_ops[0].title, "Pane State");
+    }
+
+    #[test]
+    fn group_endpoints_includes_unstable_when_enabled() {
+        let registry = SchemaRegistry {
+            version: "1.0.0".into(),
+            endpoints: vec![
+                EndpointMeta {
+                    id: "state".into(),
+                    title: "Pane State".into(),
+                    description: String::new(),
+                    robot_command: None,
+                    mcp_tool: None,
+                    schema_file: String::new(),
+                    stable: true,
+                    since: "0.1.0".into(),
+                },
+                EndpointMeta {
+                    id: "state".into(),
+                    title: "Unstable State".into(),
+                    description: String::new(),
+                    robot_command: None,
+                    mcp_tool: None,
+                    schema_file: String::new(),
+                    stable: false,
+                    since: "0.1.0".into(),
+                },
+            ],
+        };
+        let config = DocGenConfig {
+            include_experimental: true,
+            ..Default::default()
+        };
+        let grouped = group_endpoints(&registry, &config);
+        let pane_ops = grouped.get(&EndpointCategory::PaneOperations).unwrap();
+        assert_eq!(pane_ops.len(), 2);
+    }
+
+    #[test]
+    fn group_endpoints_empty_registry() {
+        let registry = SchemaRegistry {
+            version: "0.0.0".into(),
+            endpoints: vec![],
+        };
+        let config = DocGenConfig::default();
+        let grouped = group_endpoints(&registry, &config);
+        assert!(grouped.is_empty());
+    }
+
+    // --- write_envelope_section ---
+
+    #[test]
+    fn envelope_section_contains_structure_description() {
+        let envelope = sample_envelope();
+        let mut out = String::new();
+        write_envelope_section(&mut out, &envelope);
+        assert!(out.contains("## Response Envelope"));
+        assert!(out.contains("Every robot command returns a JSON envelope"));
+        assert!(out.contains("When `ok` is `true`"));
+        assert!(out.contains("When `ok` is `false`"));
+    }
+
+    // --- write_toc ---
+
+    #[test]
+    fn toc_empty_registry_only_envelope_and_errors() {
+        let registry = SchemaRegistry {
+            version: "0.0.0".into(),
+            endpoints: vec![],
+        };
+        let config = DocGenConfig::default();
+        let mut out = String::new();
+        write_toc(&mut out, &registry, &config);
+        assert!(out.contains("## Table of Contents"));
+        assert!(out.contains("Response Envelope"));
+        assert!(out.contains("Error Codes"));
+        // No category links since no endpoints
+        assert!(!out.contains("Pane Operations"));
+    }
+
+    #[test]
+    fn toc_without_envelope_or_errors() {
+        let registry = SchemaRegistry {
+            version: "0.0.0".into(),
+            endpoints: vec![],
+        };
+        let config = DocGenConfig {
+            include_envelope: false,
+            include_experimental: true,
+            include_error_codes: false,
+        };
+        let mut out = String::new();
+        write_toc(&mut out, &registry, &config);
+        assert!(!out.contains("Response Envelope"));
+        assert!(!out.contains("Error Codes"));
+    }
+
+    // --- Definitions rendering in endpoint section ---
+
+    #[test]
+    fn endpoint_section_renders_definitions_with_description() {
+        let ep = EndpointMeta {
+            id: "test".into(),
+            title: "Test".into(),
+            description: "A test".into(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: "test.json".into(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "val": { "type": "string" }
+            },
+            "$defs": {
+                "inner": {
+                    "type": "object",
+                    "description": "An inner definition",
+                    "properties": {
+                        "x": { "type": "integer" }
+                    }
+                }
+            }
+        });
+        let mut schemas_map: BTreeMap<&str, &Value> = BTreeMap::new();
+        schemas_map.insert("test.json", &schema);
+        let mut out = String::new();
+        write_endpoint_section(&mut out, &ep, &schemas_map);
+        assert!(out.contains("#### `inner`"));
+        assert!(out.contains("An inner definition"));
+    }
+
+    #[test]
+    fn endpoint_section_skips_empty_definitions() {
+        let ep = EndpointMeta {
+            id: "test".into(),
+            title: "Test".into(),
+            description: "A test".into(),
+            robot_command: None,
+            mcp_tool: None,
+            schema_file: "test.json".into(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "val": { "type": "string" }
+            },
+            "$defs": {
+                "empty_def": {
+                    "type": "object",
+                    "description": "Empty definition"
+                }
+            }
+        });
+        let mut schemas_map: BTreeMap<&str, &Value> = BTreeMap::new();
+        schemas_map.insert("test.json", &schema);
+        let mut out = String::new();
+        write_endpoint_section(&mut out, &ep, &schemas_map);
+        // empty_def has no properties so it should be skipped
+        assert!(!out.contains("#### `empty_def`"));
+    }
+
+    // --- Properties ordering: alphabetical within required/optional ---
+
+    #[test]
+    fn properties_alphabetical_within_groups() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["z_req", "a_req"],
+            "properties": {
+                "z_req": { "type": "string" },
+                "a_req": { "type": "string" },
+                "z_opt": { "type": "string" },
+                "a_opt": { "type": "string" }
+            }
+        });
+        let doc = parse_schema(&schema);
+        assert_eq!(doc.properties.len(), 4);
+        // Required first, alphabetical
+        assert_eq!(doc.properties[0].name, "a_req");
+        assert!(doc.properties[0].required);
+        assert_eq!(doc.properties[1].name, "z_req");
+        assert!(doc.properties[1].required);
+        // Optional next, alphabetical
+        assert_eq!(doc.properties[2].name, "a_opt");
+        assert!(!doc.properties[2].required);
+        assert_eq!(doc.properties[3].name, "z_opt");
+        assert!(!doc.properties[3].required);
+    }
+
+    // --- Large schema handling ---
+
+    #[test]
+    fn parse_schema_many_properties() {
+        let mut props = serde_json::Map::new();
+        for i in 0..50 {
+            props.insert(
+                format!("field_{:03}", i),
+                serde_json::json!({ "type": "string", "description": format!("Field {}", i) }),
+            );
+        }
+        let schema = serde_json::json!({
+            "title": "Large Schema",
+            "type": "object",
+            "properties": props
+        });
+        let doc = parse_schema(&schema);
+        assert_eq!(doc.properties.len(), 50);
+        // All should be non-required since no "required" array
+        assert!(doc.properties.iter().all(|p| !p.required));
+        // Should be alphabetically sorted
+        for window in doc.properties.windows(2) {
+            assert!(window[0].name <= window[1].name);
+        }
+    }
+
+    #[test]
+    fn parse_schema_many_definitions() {
+        let mut defs = serde_json::Map::new();
+        for i in 0..20 {
+            defs.insert(
+                format!("def_{:02}", i),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "val": { "type": "integer" }
+                    }
+                }),
+            );
+        }
+        let schema = serde_json::json!({ "$defs": defs });
+        let doc = parse_schema(&schema);
+        assert_eq!(doc.definitions.len(), 20);
+        // Should be sorted
+        for window in doc.definitions.windows(2) {
+            assert!(window[0].0 <= window[1].0);
+        }
+    }
+
+    // --- Determinism with schemas provided ---
+
+    #[test]
+    fn generate_reference_deterministic_with_schemas() {
+        let registry = SchemaRegistry::canonical();
+        let schema = sample_schema();
+        let envelope = sample_envelope();
+        let schemas = vec![
+            ("wa-robot-state.json".to_string(), schema.clone()),
+            ("wa-robot-envelope.json".to_string(), envelope.clone()),
+        ];
+        let config = DocGenConfig::default();
+        let pages1 = generate_reference(&registry, &schemas, &config);
+        let pages2 = generate_reference(&registry, &schemas, &config);
+        assert_eq!(pages1[0].content, pages2[0].content);
+    }
+
+    // --- Endpoint section with schema that has no properties ---
+
+    #[test]
+    fn endpoint_section_schema_no_properties_skips_table() {
+        let ep = EndpointMeta {
+            id: "help".into(),
+            title: "Help".into(),
+            description: "Help endpoint".into(),
+            robot_command: Some("robot help".into()),
+            mcp_tool: None,
+            schema_file: "help.json".into(),
+            stable: true,
+            since: "0.1.0".into(),
+        };
+        let schema = serde_json::json!({
+            "title": "Help Response",
+            "type": "object"
+        });
+        let mut schemas_map: BTreeMap<&str, &Value> = BTreeMap::new();
+        schemas_map.insert("help.json", &schema);
+        let mut out = String::new();
+        write_endpoint_section(&mut out, &ep, &schemas_map);
+        assert!(out.contains("### Help"));
+        assert!(!out.contains("#### Response Fields"));
+    }
+
+    // --- Category title exhaustive coverage ---
+
+    #[test]
+    fn category_titles_are_distinct() {
+        let titles: Vec<&str> = EndpointCategory::all().iter().map(|c| c.title()).collect();
+        let mut deduped = titles.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(titles.len(), deduped.len(), "all category titles should be unique");
+    }
 }

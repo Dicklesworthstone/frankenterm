@@ -1915,4 +1915,986 @@ mod tests {
             "Degraded and Unavailable should not be equal even with same inner fields"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Batch 2 — RubyBeaver wa-1u90p.7.1 (48 → 95 tests)
+    // -----------------------------------------------------------------------
+
+    // -- Subsystem derive coverage --
+
+    #[test]
+    fn subsystem_debug_format_all_variants() {
+        // Verify Debug output contains variant name for all subsystems.
+        let all = ALL_SUBSYSTEMS;
+        let expected_substrs = [
+            "DbWrite",
+            "PatternEngine",
+            "WorkflowEngine",
+            "WeztermCli",
+            "MuxConnection",
+            "Capture",
+        ];
+        for (sub, expected) in all.iter().zip(expected_substrs.iter()) {
+            let dbg = format!("{:?}", sub);
+            assert!(
+                dbg.contains(expected),
+                "Debug for {:?} should contain {}, got {}",
+                sub,
+                expected,
+                dbg
+            );
+        }
+    }
+
+    #[test]
+    fn subsystem_clone_produces_equal_copy() {
+        for sub in &ALL_SUBSYSTEMS {
+            let cloned = *sub;
+            assert_eq!(*sub, cloned, "Clone/Copy should produce equal value for {:?}", sub);
+        }
+    }
+
+    #[test]
+    fn subsystem_hash_consistent_for_equal_values() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        for sub in &ALL_SUBSYSTEMS {
+            let mut h1 = DefaultHasher::new();
+            let mut h2 = DefaultHasher::new();
+            sub.hash(&mut h1);
+            sub.hash(&mut h2);
+            assert_eq!(
+                h1.finish(),
+                h2.finish(),
+                "hash should be consistent for {:?}",
+                sub
+            );
+        }
+    }
+
+    #[test]
+    fn subsystem_ord_consistent_with_all_subsystems_array() {
+        // ALL_SUBSYSTEMS is ordered by discriminant. Verify Ord agrees.
+        for i in 1..ALL_SUBSYSTEMS.len() {
+            assert!(
+                ALL_SUBSYSTEMS[i - 1] < ALL_SUBSYSTEMS[i],
+                "expected {:?} < {:?}",
+                ALL_SUBSYSTEMS[i - 1],
+                ALL_SUBSYSTEMS[i]
+            );
+        }
+    }
+
+    #[test]
+    fn subsystem_serde_json_string_format() {
+        // snake_case rename: DbWrite -> "db_write" etc.
+        assert_eq!(serde_json::to_string(&Subsystem::DbWrite).unwrap(), "\"db_write\"");
+        assert_eq!(serde_json::to_string(&Subsystem::PatternEngine).unwrap(), "\"pattern_engine\"");
+        assert_eq!(serde_json::to_string(&Subsystem::WorkflowEngine).unwrap(), "\"workflow_engine\"");
+        assert_eq!(serde_json::to_string(&Subsystem::WeztermCli).unwrap(), "\"wezterm_cli\"");
+        assert_eq!(serde_json::to_string(&Subsystem::MuxConnection).unwrap(), "\"mux_connection\"");
+        assert_eq!(serde_json::to_string(&Subsystem::Capture).unwrap(), "\"capture\"");
+    }
+
+    // -- DegradationLevel derive coverage --
+
+    #[test]
+    fn degradation_level_debug_normal() {
+        let dbg = format!("{:?}", DegradationLevel::Normal);
+        assert!(dbg.contains("Normal"), "Debug for Normal should contain 'Normal', got {}", dbg);
+    }
+
+    #[test]
+    fn degradation_level_debug_degraded() {
+        let level = DegradationLevel::Degraded {
+            reason: "test".into(),
+            since: Instant::now(),
+            since_epoch_ms: 42,
+            recovery_attempts: 3,
+        };
+        let dbg = format!("{:?}", level);
+        assert!(dbg.contains("Degraded"), "should contain 'Degraded'");
+        assert!(dbg.contains("test"), "should contain reason");
+        assert!(dbg.contains("42"), "should contain since_epoch_ms");
+        assert!(dbg.contains("3"), "should contain recovery_attempts");
+    }
+
+    #[test]
+    fn degradation_level_debug_unavailable() {
+        let level = DegradationLevel::Unavailable {
+            reason: "gone".into(),
+            since: Instant::now(),
+            since_epoch_ms: 99,
+            recovery_attempts: 7,
+        };
+        let dbg = format!("{:?}", level);
+        assert!(dbg.contains("Unavailable"), "should contain 'Unavailable'");
+        assert!(dbg.contains("gone"), "should contain reason");
+    }
+
+    #[test]
+    fn degradation_level_clone_all_variants() {
+        let normal = DegradationLevel::Normal;
+        let normal_clone = normal.clone();
+        assert_eq!(normal, normal_clone);
+
+        let degraded = DegradationLevel::Degraded {
+            reason: "cloned".into(),
+            since: Instant::now(),
+            since_epoch_ms: 100,
+            recovery_attempts: 5,
+        };
+        let degraded_clone = degraded.clone();
+        assert_eq!(degraded, degraded_clone);
+
+        let unavail = DegradationLevel::Unavailable {
+            reason: "also cloned".into(),
+            since: Instant::now(),
+            since_epoch_ms: 200,
+            recovery_attempts: 10,
+        };
+        let unavail_clone = unavail.clone();
+        assert_eq!(unavail, unavail_clone);
+    }
+
+    #[test]
+    fn degradation_level_eq_two_unavailable_equal_regardless_of_fields() {
+        let u1 = DegradationLevel::Unavailable {
+            reason: "reason X".into(),
+            since: Instant::now(),
+            since_epoch_ms: 0,
+            recovery_attempts: 0,
+        };
+        let u2 = DegradationLevel::Unavailable {
+            reason: "completely different".into(),
+            since: Instant::now(),
+            since_epoch_ms: 99999,
+            recovery_attempts: 100,
+        };
+        assert_eq!(u1, u2, "two Unavailable values should be equal regardless of inner fields");
+    }
+
+    #[test]
+    fn degradation_level_normal_ne_unavailable() {
+        let normal = DegradationLevel::Normal;
+        let unavail = DegradationLevel::Unavailable {
+            reason: String::new(),
+            since: Instant::now(),
+            since_epoch_ms: 0,
+            recovery_attempts: 0,
+        };
+        assert_ne!(normal, unavail);
+    }
+
+    // -- OverallStatus derive coverage --
+
+    #[test]
+    fn overall_status_debug_format() {
+        let dbg_h = format!("{:?}", OverallStatus::Healthy);
+        let dbg_d = format!("{:?}", OverallStatus::Degraded);
+        let dbg_c = format!("{:?}", OverallStatus::Critical);
+        assert!(dbg_h.contains("Healthy"));
+        assert!(dbg_d.contains("Degraded"));
+        assert!(dbg_c.contains("Critical"));
+    }
+
+    #[test]
+    fn overall_status_clone_copy() {
+        let h = OverallStatus::Healthy;
+        let h2 = h;
+        let h3 = h;
+        assert_eq!(h, h2);
+        assert_eq!(h, h3);
+    }
+
+    #[test]
+    fn overall_status_serde_json_string_format() {
+        assert_eq!(serde_json::to_string(&OverallStatus::Healthy).unwrap(), "\"healthy\"");
+        assert_eq!(serde_json::to_string(&OverallStatus::Degraded).unwrap(), "\"degraded\"");
+        assert_eq!(serde_json::to_string(&OverallStatus::Critical).unwrap(), "\"critical\"");
+    }
+
+    // -- DegradationSnapshot --
+
+    #[test]
+    fn snapshot_skip_serializing_none_fields() {
+        let snapshot = DegradationSnapshot {
+            subsystem: Subsystem::Capture,
+            level: "degraded".into(),
+            reason: None,
+            since_epoch_ms: None,
+            duration_ms: None,
+            recovery_attempts: 0,
+            affected_capabilities: vec![],
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        // None fields should be omitted due to skip_serializing_if
+        assert!(!json.contains("reason"), "None reason should be omitted from JSON");
+        assert!(!json.contains("since_epoch_ms"), "None since_epoch_ms should be omitted");
+        assert!(!json.contains("duration_ms"), "None duration_ms should be omitted");
+    }
+
+    #[test]
+    fn snapshot_serde_roundtrip_with_all_fields() {
+        let snapshot = DegradationSnapshot {
+            subsystem: Subsystem::MuxConnection,
+            level: "unavailable".into(),
+            reason: Some("socket timeout".into()),
+            since_epoch_ms: Some(1_700_000_000_000),
+            duration_ms: Some(12345),
+            recovery_attempts: 7,
+            affected_capabilities: vec!["mux socket operations".into(), "streaming tailers".into()],
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let parsed: DegradationSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.subsystem, Subsystem::MuxConnection);
+        assert_eq!(parsed.level, "unavailable");
+        assert_eq!(parsed.reason.as_deref(), Some("socket timeout"));
+        assert_eq!(parsed.since_epoch_ms, Some(1_700_000_000_000));
+        assert_eq!(parsed.duration_ms, Some(12345));
+        assert_eq!(parsed.recovery_attempts, 7);
+        assert_eq!(parsed.affected_capabilities.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_clone_and_debug() {
+        let snapshot = DegradationSnapshot {
+            subsystem: Subsystem::DbWrite,
+            level: "degraded".into(),
+            reason: Some("test".into()),
+            since_epoch_ms: Some(1),
+            duration_ms: Some(2),
+            recovery_attempts: 3,
+            affected_capabilities: vec!["cap".into()],
+        };
+        let cloned = snapshot.clone();
+        assert_eq!(cloned.subsystem, snapshot.subsystem);
+        assert_eq!(cloned.recovery_attempts, snapshot.recovery_attempts);
+
+        let dbg = format!("{:?}", snapshot);
+        assert!(dbg.contains("DegradationSnapshot"), "Debug should contain type name");
+    }
+
+    // -- QueuedWrite --
+
+    #[test]
+    fn queued_write_debug_and_clone() {
+        let qw = QueuedWrite {
+            kind: "segment".into(),
+            queued_at: Instant::now(),
+            data_size: 4096,
+        };
+        let cloned = qw.clone();
+        assert_eq!(cloned.kind, "segment");
+        assert_eq!(cloned.data_size, 4096);
+
+        let dbg = format!("{:?}", qw);
+        assert!(dbg.contains("QueuedWrite"));
+        assert!(dbg.contains("segment"));
+        assert!(dbg.contains("4096"));
+    }
+
+    // -- DegradationReport --
+
+    #[test]
+    fn report_clone_and_debug() {
+        let report = DegradationReport {
+            overall: OverallStatus::Critical,
+            active_degradations: vec![],
+            queued_write_count: 10,
+            disabled_pattern_count: 2,
+            paused_workflow_count: 1,
+        };
+        let cloned = report.clone();
+        assert_eq!(cloned.overall, OverallStatus::Critical);
+        assert_eq!(cloned.queued_write_count, 10);
+
+        let dbg = format!("{:?}", report);
+        assert!(dbg.contains("DegradationReport"));
+        assert!(dbg.contains("Critical"));
+    }
+
+    #[test]
+    fn report_serde_roundtrip_empty_degradations() {
+        let report = DegradationReport {
+            overall: OverallStatus::Healthy,
+            active_degradations: vec![],
+            queued_write_count: 0,
+            disabled_pattern_count: 0,
+            paused_workflow_count: 0,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: DegradationReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.overall, OverallStatus::Healthy);
+        assert!(parsed.active_degradations.is_empty());
+    }
+
+    // -- ResizeDegradationTier --
+
+    #[test]
+    fn resize_tier_serde_roundtrip_all_variants() {
+        let all = [
+            ResizeDegradationTier::FullQuality,
+            ResizeDegradationTier::QualityReduced,
+            ResizeDegradationTier::CorrectnessGuarded,
+            ResizeDegradationTier::EmergencyCompatibility,
+        ];
+        for tier in &all {
+            let json = serde_json::to_string(tier).unwrap();
+            let parsed: ResizeDegradationTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(*tier, parsed, "serde roundtrip failed for {:?}", tier);
+        }
+    }
+
+    #[test]
+    fn resize_tier_debug_format() {
+        let dbg = format!("{:?}", ResizeDegradationTier::EmergencyCompatibility);
+        assert!(dbg.contains("EmergencyCompatibility"));
+    }
+
+    #[test]
+    fn resize_tier_clone_copy_eq() {
+        let t = ResizeDegradationTier::CorrectnessGuarded;
+        let t2 = t;
+        let t3 = t;
+        assert_eq!(t, t2);
+        assert_eq!(t, t3);
+    }
+
+    #[test]
+    fn resize_tier_rank_matches_tier_rank_in_assessment() {
+        let all_tiers = [
+            ResizeDegradationTier::FullQuality,
+            ResizeDegradationTier::QualityReduced,
+            ResizeDegradationTier::CorrectnessGuarded,
+            ResizeDegradationTier::EmergencyCompatibility,
+        ];
+        for tier in &all_tiers {
+            assert_eq!(tier.rank(), tier.rank(), "rank should be deterministic for {:?}", tier);
+        }
+        // Ranks must be strictly increasing
+        for i in 1..all_tiers.len() {
+            assert!(
+                all_tiers[i - 1].rank() < all_tiers[i].rank(),
+                "rank of {:?} should be < rank of {:?}",
+                all_tiers[i - 1],
+                all_tiers[i]
+            );
+        }
+    }
+
+    // -- ResizeDegradationSignals --
+
+    #[test]
+    fn signals_debug_and_clone() {
+        let signals = ResizeDegradationSignals {
+            stalled_total: 1,
+            stalled_critical: 0,
+            warning_threshold_ms: 500,
+            critical_threshold_ms: 2000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+        };
+        let cloned = signals.clone();
+        assert_eq!(signals, cloned);
+
+        let dbg = format!("{:?}", signals);
+        assert!(dbg.contains("ResizeDegradationSignals"));
+    }
+
+    #[test]
+    fn signals_eq_reflexive_and_symmetric() {
+        let s1 = ResizeDegradationSignals {
+            stalled_total: 5,
+            stalled_critical: 2,
+            warning_threshold_ms: 1000,
+            critical_threshold_ms: 5000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: true,
+            safe_mode_active: true,
+            legacy_fallback_enabled: false,
+        };
+        let s2 = s1.clone();
+        assert_eq!(s1, s2);
+        assert_eq!(s2, s1);
+        assert_eq!(s1, s1);
+    }
+
+    // -- ResizeDegradationAssessment --
+
+    #[test]
+    fn assessment_debug_and_clone() {
+        let assessment = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 0,
+            stalled_critical: 0,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 8000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        });
+        let cloned = assessment.clone();
+        assert_eq!(assessment, cloned);
+
+        let dbg = format!("{:?}", assessment);
+        assert!(dbg.contains("ResizeDegradationAssessment"));
+    }
+
+    #[test]
+    fn assessment_eq_symmetric() {
+        let a = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 1,
+            stalled_critical: 0,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 8000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        });
+        let b = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(b, a);
+    }
+
+    // -- Ladder edge cases --
+
+    #[test]
+    fn ladder_all_zeros_yields_full_quality() {
+        let assessment = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 0,
+            stalled_critical: 0,
+            warning_threshold_ms: 0,
+            critical_threshold_ms: 0,
+            critical_stalled_limit: 0,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        });
+        assert_eq!(assessment.tier, ResizeDegradationTier::FullQuality);
+        assert_eq!(assessment.tier_rank, 0);
+    }
+
+    #[test]
+    fn ladder_safe_mode_active_overrides_all_other_signals() {
+        // Even with zero stalls, safe_mode_active forces EmergencyCompatibility
+        let assessment = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 0,
+            stalled_critical: 0,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 8000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: true,
+            legacy_fallback_enabled: false,
+        });
+        assert_eq!(assessment.tier, ResizeDegradationTier::EmergencyCompatibility);
+    }
+
+    #[test]
+    fn ladder_critical_stalls_without_safe_mode_yields_correctness_guarded() {
+        let assessment = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 5,
+            stalled_critical: 3,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 8000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        });
+        assert_eq!(assessment.tier, ResizeDegradationTier::CorrectnessGuarded);
+        assert!(assessment.trigger_condition.contains("critical_stalls_detected"));
+    }
+
+    #[test]
+    fn ladder_emergency_warning_line_without_legacy_fallback() {
+        let assessment = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 2,
+            stalled_critical: 1,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 8000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: true,
+            safe_mode_active: true,
+            legacy_fallback_enabled: false,
+        });
+        let line = assessment.warning_line().unwrap();
+        assert!(line.contains("emergency compatibility"));
+        assert!(!line.contains("legacy fallback"), "should not mention legacy fallback when disabled");
+    }
+
+    #[test]
+    fn ladder_emergency_warning_line_with_legacy_fallback() {
+        let assessment = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 2,
+            stalled_critical: 1,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 8000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: true,
+            safe_mode_active: true,
+            legacy_fallback_enabled: true,
+        });
+        let line = assessment.warning_line().unwrap();
+        assert!(line.contains("with legacy fallback"));
+    }
+
+    #[test]
+    fn ladder_quality_reduced_warning_line_includes_stall_count_and_threshold() {
+        let assessment = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 42,
+            stalled_critical: 0,
+            warning_threshold_ms: 3_333,
+            critical_threshold_ms: 8000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        });
+        let line = assessment.warning_line().unwrap();
+        assert!(line.contains("42"), "should contain stalled_total count");
+        assert!(line.contains("3333"), "should contain warning threshold");
+    }
+
+    #[test]
+    fn ladder_correctness_guarded_warning_line_includes_critical_count_and_threshold() {
+        let assessment = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 10,
+            stalled_critical: 7,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 9_999,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        });
+        let line = assessment.warning_line().unwrap();
+        assert!(line.contains("7"), "should contain stalled_critical count");
+        assert!(line.contains("9999"), "should contain critical threshold");
+    }
+
+    #[test]
+    fn ladder_tier_rank_matches_tier_in_assessment() {
+        let test_cases: Vec<(usize, usize, bool, bool, ResizeDegradationTier)> = vec![
+            (0, 0, false, false, ResizeDegradationTier::FullQuality),
+            (1, 0, false, false, ResizeDegradationTier::QualityReduced),
+            (1, 1, false, false, ResizeDegradationTier::CorrectnessGuarded),
+            (0, 0, true, false, ResizeDegradationTier::CorrectnessGuarded),
+            (0, 0, false, true, ResizeDegradationTier::EmergencyCompatibility),
+        ];
+        for (st, sc, smr, sma, expected_tier) in test_cases {
+            let assessment = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+                stalled_total: st,
+                stalled_critical: sc,
+                warning_threshold_ms: 2000,
+                critical_threshold_ms: 8000,
+                critical_stalled_limit: 2,
+                safe_mode_recommended: smr,
+                safe_mode_active: sma,
+                legacy_fallback_enabled: false,
+            });
+            assert_eq!(assessment.tier, expected_tier);
+            assert_eq!(
+                assessment.tier_rank,
+                expected_tier.rank(),
+                "tier_rank should match tier.rank() for {:?}",
+                expected_tier
+            );
+        }
+    }
+
+    #[test]
+    fn ladder_recovery_rules_are_non_empty_for_all_tiers() {
+        let signals_sets = [
+            (0, 0, false, false),
+            (1, 0, false, false),
+            (1, 1, false, false),
+            (1, 1, true, true),
+        ];
+        for (st, sc, smr, sma) in signals_sets {
+            let assessment = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+                stalled_total: st,
+                stalled_critical: sc,
+                warning_threshold_ms: 2000,
+                critical_threshold_ms: 8000,
+                critical_stalled_limit: 2,
+                safe_mode_recommended: smr,
+                safe_mode_active: sma,
+                legacy_fallback_enabled: false,
+            });
+            assert!(
+                !assessment.recovery_rule.is_empty(),
+                "recovery_rule should not be empty for tier {:?}",
+                assessment.tier
+            );
+            assert!(
+                !assessment.trigger_condition.is_empty(),
+                "trigger_condition should not be empty for tier {:?}",
+                assessment.tier
+            );
+        }
+    }
+
+    #[test]
+    fn ladder_signals_preserved_in_assessment() {
+        let signals = ResizeDegradationSignals {
+            stalled_total: 17,
+            stalled_critical: 4,
+            warning_threshold_ms: 1234,
+            critical_threshold_ms: 5678,
+            critical_stalled_limit: 9,
+            safe_mode_recommended: true,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+        };
+        let assessment = evaluate_resize_degradation_ladder(signals.clone());
+        assert_eq!(assessment.signals, signals, "assessment should preserve original signals");
+    }
+
+    // -- DegradationManager state transitions --
+
+    #[test]
+    fn unavailable_to_degraded_preserves_recovery_attempts() {
+        let mut dm = DegradationManager::new();
+        dm.enter_unavailable(Subsystem::WeztermCli, "crashed".into());
+        dm.record_recovery_attempt(Subsystem::WeztermCli);
+        dm.record_recovery_attempt(Subsystem::WeztermCli);
+
+        // Transition back to degraded should preserve the 2 attempts
+        dm.enter_degraded(Subsystem::WeztermCli, "partially recovered".into());
+        match dm.level(Subsystem::WeztermCli) {
+            DegradationLevel::Degraded {
+                reason,
+                recovery_attempts,
+                ..
+            } => {
+                assert_eq!(reason, "partially recovered");
+                assert_eq!(*recovery_attempts, 2);
+            }
+            other => panic!("expected degraded, got {:?}", other),
+        }
+        // Should no longer be unavailable
+        assert!(!dm.is_unavailable(Subsystem::WeztermCli));
+        assert!(dm.is_degraded(Subsystem::WeztermCli));
+    }
+
+    #[test]
+    fn recovery_attempt_on_unavailable_increments() {
+        let mut dm = DegradationManager::new();
+        dm.enter_unavailable(Subsystem::Capture, "total failure".into());
+        dm.record_recovery_attempt(Subsystem::Capture);
+        dm.record_recovery_attempt(Subsystem::Capture);
+        dm.record_recovery_attempt(Subsystem::Capture);
+
+        match dm.level(Subsystem::Capture) {
+            DegradationLevel::Unavailable {
+                recovery_attempts, ..
+            } => {
+                assert_eq!(*recovery_attempts, 3);
+            }
+            other => panic!("expected unavailable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn recover_unavailable_returns_to_normal() {
+        let mut dm = DegradationManager::new();
+        dm.enter_unavailable(Subsystem::DbWrite, "corruption".into());
+        assert!(dm.is_unavailable(Subsystem::DbWrite));
+        assert_eq!(dm.overall_status(), OverallStatus::Critical);
+
+        dm.recover(Subsystem::DbWrite);
+        assert!(!dm.is_unavailable(Subsystem::DbWrite));
+        assert!(!dm.is_degraded(Subsystem::DbWrite));
+        assert_eq!(dm.overall_status(), OverallStatus::Healthy);
+    }
+
+    #[test]
+    fn all_subsystems_degrade_independently() {
+        let mut dm = DegradationManager::new();
+        for sub in &ALL_SUBSYSTEMS {
+            dm.enter_degraded(*sub, format!("fail-{}", sub));
+        }
+        assert_eq!(dm.snapshots().len(), 6);
+        assert_eq!(dm.overall_status(), OverallStatus::Degraded);
+
+        // Recover all
+        for sub in &ALL_SUBSYSTEMS {
+            dm.recover(*sub);
+        }
+        assert!(dm.snapshots().is_empty());
+        assert_eq!(dm.overall_status(), OverallStatus::Healthy);
+    }
+
+    // -- Queued writes edge cases --
+
+    #[test]
+    fn queued_writes_max_boundary_exact_capacity() {
+        let mut dm = DegradationManager::new();
+        dm.max_queued_writes = 3;
+
+        // Fill exactly to capacity
+        dm.queue_write("a".into(), 10);
+        dm.queue_write("b".into(), 20);
+        dm.queue_write("c".into(), 30);
+        assert_eq!(dm.queued_write_count(), 3);
+
+        // One more pushes out the oldest
+        dm.queue_write("d".into(), 40);
+        assert_eq!(dm.queued_write_count(), 3);
+        let writes = dm.drain_queued_writes();
+        assert_eq!(writes[0].kind, "b");
+        assert_eq!(writes[1].kind, "c");
+        assert_eq!(writes[2].kind, "d");
+    }
+
+    #[test]
+    fn queued_writes_with_max_data_size() {
+        let mut dm = DegradationManager::new();
+        dm.queue_write("big".into(), usize::MAX);
+        assert_eq!(dm.queued_write_count(), 1);
+        assert_eq!(dm.queued_write_bytes(), usize::MAX);
+    }
+
+    #[test]
+    fn queued_writes_single_capacity() {
+        let mut dm = DegradationManager::new();
+        dm.max_queued_writes = 1;
+        dm.queue_write("first".into(), 100);
+        dm.queue_write("second".into(), 200);
+        assert_eq!(dm.queued_write_count(), 1);
+        let writes = dm.drain_queued_writes();
+        assert_eq!(writes[0].kind, "second");
+    }
+
+    // -- Workflow/pattern edge cases --
+
+    #[test]
+    fn resume_nonexistent_workflow_is_noop() {
+        let mut dm = DegradationManager::new();
+        dm.resume_workflow("does-not-exist");
+        assert!(dm.paused_workflows().is_empty());
+    }
+
+    #[test]
+    fn multiple_patterns_disabled_and_checked() {
+        let mut dm = DegradationManager::new();
+        dm.disable_pattern("rule-1".into());
+        dm.disable_pattern("rule-2".into());
+        dm.disable_pattern("rule-3".into());
+        assert_eq!(dm.disabled_patterns().len(), 3);
+        assert!(dm.is_pattern_disabled("rule-1"));
+        assert!(dm.is_pattern_disabled("rule-2"));
+        assert!(dm.is_pattern_disabled("rule-3"));
+        assert!(!dm.is_pattern_disabled("rule-4"));
+    }
+
+    #[test]
+    fn multiple_workflows_paused_and_selectively_resumed() {
+        let mut dm = DegradationManager::new();
+        dm.pause_workflow("wf-a".into());
+        dm.pause_workflow("wf-b".into());
+        dm.pause_workflow("wf-c".into());
+        assert_eq!(dm.paused_workflows().len(), 3);
+
+        dm.resume_workflow("wf-b");
+        assert_eq!(dm.paused_workflows().len(), 2);
+        assert!(!dm.is_workflow_paused("wf-b"));
+        assert!(dm.is_workflow_paused("wf-a"));
+        assert!(dm.is_workflow_paused("wf-c"));
+    }
+
+    // -- Snapshot content verification --
+
+    #[test]
+    fn snapshot_for_unavailable_shows_unavailable_level() {
+        let mut dm = DegradationManager::new();
+        dm.enter_unavailable(Subsystem::Capture, "hardware failure".into());
+        let snaps = dm.snapshots();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].level, "unavailable");
+        assert_eq!(snaps[0].subsystem, Subsystem::Capture);
+        assert_eq!(snaps[0].reason.as_deref(), Some("hardware failure"));
+        assert!(snaps[0].since_epoch_ms.is_some());
+    }
+
+    #[test]
+    fn snapshots_ordered_by_all_subsystems_constant() {
+        let mut dm = DegradationManager::new();
+        // Degrade in reverse order
+        dm.enter_degraded(Subsystem::Capture, "cap".into());
+        dm.enter_degraded(Subsystem::DbWrite, "db".into());
+        dm.enter_unavailable(Subsystem::WeztermCli, "wez".into());
+
+        let snaps = dm.snapshots();
+        assert_eq!(snaps.len(), 3);
+        // Should follow ALL_SUBSYSTEMS order: DbWrite, WeztermCli, Capture
+        assert_eq!(snaps[0].subsystem, Subsystem::DbWrite);
+        assert_eq!(snaps[1].subsystem, Subsystem::WeztermCli);
+        assert_eq!(snaps[2].subsystem, Subsystem::Capture);
+    }
+
+    // -- Affected capabilities content verification --
+
+    #[test]
+    fn affected_capabilities_db_write_content() {
+        let caps = affected_capabilities(Subsystem::DbWrite);
+        assert_eq!(caps.len(), 3);
+        assert!(caps.contains(&"segment persistence".to_string()));
+        assert!(caps.contains(&"event recording".to_string()));
+        assert!(caps.contains(&"search indexing".to_string()));
+    }
+
+    #[test]
+    fn affected_capabilities_pattern_engine_content() {
+        let caps = affected_capabilities(Subsystem::PatternEngine);
+        assert_eq!(caps.len(), 3);
+        assert!(caps.contains(&"pattern detection".to_string()));
+        assert!(caps.contains(&"event generation".to_string()));
+        assert!(caps.contains(&"workflow triggering".to_string()));
+    }
+
+    #[test]
+    fn affected_capabilities_workflow_engine_content() {
+        let caps = affected_capabilities(Subsystem::WorkflowEngine);
+        assert_eq!(caps.len(), 2);
+        assert!(caps.contains(&"automated responses".to_string()));
+        assert!(caps.contains(&"workflow execution".to_string()));
+    }
+
+    #[test]
+    fn affected_capabilities_wezterm_cli_content() {
+        let caps = affected_capabilities(Subsystem::WeztermCli);
+        assert_eq!(caps.len(), 3);
+        assert!(caps.contains(&"pane discovery".to_string()));
+        assert!(caps.contains(&"content capture".to_string()));
+        assert!(caps.contains(&"text sending".to_string()));
+    }
+
+    #[test]
+    fn affected_capabilities_mux_connection_content() {
+        let caps = affected_capabilities(Subsystem::MuxConnection);
+        assert_eq!(caps.len(), 3);
+        assert!(caps.contains(&"mux socket operations".to_string()));
+        assert!(caps.contains(&"streaming tailers".to_string()));
+        assert!(caps.contains(&"pane I/O (direct)".to_string()));
+    }
+
+    #[test]
+    fn affected_capabilities_capture_content() {
+        let caps = affected_capabilities(Subsystem::Capture);
+        assert_eq!(caps.len(), 3);
+        assert!(caps.contains(&"tailer polling".to_string()));
+        assert!(caps.contains(&"delta extraction".to_string()));
+        assert!(caps.contains(&"segment emission".to_string()));
+    }
+
+    // -- epoch_ms sanity --
+
+    #[test]
+    fn epoch_ms_returns_reasonable_value() {
+        let ms = epoch_ms();
+        // Should be after 2024-01-01 00:00:00 UTC (1704067200000)
+        assert!(ms > 1_704_067_200_000, "epoch_ms should be after 2024-01-01, got {}", ms);
+        // Should be before 2100-01-01 00:00:00 UTC (4102444800000)
+        assert!(ms < 4_102_444_800_000, "epoch_ms should be before 2100-01-01, got {}", ms);
+    }
+
+    // -- Report comprehensive --
+
+    #[test]
+    fn report_healthy_has_no_degradations_and_zero_counts() {
+        let dm = DegradationManager::new();
+        let report = dm.report();
+        assert_eq!(report.overall, OverallStatus::Healthy);
+        assert!(report.active_degradations.is_empty());
+        assert_eq!(report.queued_write_count, 0);
+        assert_eq!(report.disabled_pattern_count, 0);
+        assert_eq!(report.paused_workflow_count, 0);
+    }
+
+    #[test]
+    fn report_critical_with_mixed_degradations() {
+        let mut dm = DegradationManager::new();
+        dm.enter_degraded(Subsystem::DbWrite, "disk full".into());
+        dm.enter_degraded(Subsystem::PatternEngine, "regex timeout".into());
+        dm.enter_unavailable(Subsystem::Capture, "hardware gone".into());
+        dm.queue_write("seg1".into(), 100);
+        dm.queue_write("seg2".into(), 200);
+        dm.disable_pattern("rule-x".into());
+        dm.pause_workflow("wf-99".into());
+        dm.pause_workflow("wf-100".into());
+
+        let report = dm.report();
+        assert_eq!(report.overall, OverallStatus::Critical);
+        assert_eq!(report.active_degradations.len(), 3);
+        assert_eq!(report.queued_write_count, 2);
+        assert_eq!(report.disabled_pattern_count, 1);
+        assert_eq!(report.paused_workflow_count, 2);
+    }
+
+    // -- Default trait --
+
+    #[test]
+    fn default_manager_has_correct_initial_counts() {
+        let dm = DegradationManager::default();
+        assert_eq!(dm.queued_write_count(), 0);
+        assert_eq!(dm.queued_write_bytes(), 0);
+        assert!(dm.disabled_patterns().is_empty());
+        assert!(dm.paused_workflows().is_empty());
+        assert!(dm.snapshots().is_empty());
+    }
+
+    // -- is_degraded includes unavailable --
+
+    #[test]
+    fn is_degraded_returns_true_for_unavailable_subsystem() {
+        let mut dm = DegradationManager::new();
+        dm.enter_unavailable(Subsystem::MuxConnection, "socket error".into());
+        // is_degraded should return true for unavailable subsystems
+        assert!(dm.is_degraded(Subsystem::MuxConnection));
+        assert!(dm.is_unavailable(Subsystem::MuxConnection));
+    }
+
+    // -- overall_status transitions --
+
+    #[test]
+    fn overall_status_transitions_through_all_levels() {
+        let mut dm = DegradationManager::new();
+        assert_eq!(dm.overall_status(), OverallStatus::Healthy);
+
+        dm.enter_degraded(Subsystem::DbWrite, "slow disk".into());
+        assert_eq!(dm.overall_status(), OverallStatus::Degraded);
+
+        dm.enter_unavailable(Subsystem::Capture, "gone".into());
+        assert_eq!(dm.overall_status(), OverallStatus::Critical);
+
+        // Recovering the unavailable subsystem should drop to Degraded
+        dm.recover(Subsystem::Capture);
+        assert_eq!(dm.overall_status(), OverallStatus::Degraded);
+
+        // Recovering the last degraded subsystem should return to Healthy
+        dm.recover(Subsystem::DbWrite);
+        assert_eq!(dm.overall_status(), OverallStatus::Healthy);
+    }
+
+    // -- Recover does not clear unrelated subsystem-specific state --
+
+    #[test]
+    fn recover_dbwrite_does_not_clear_patterns_or_workflows() {
+        let mut dm = DegradationManager::new();
+        dm.enter_degraded(Subsystem::DbWrite, "disk full".into());
+        dm.disable_pattern("rule-x".into());
+        dm.pause_workflow("wf-1".into());
+
+        dm.recover(Subsystem::DbWrite);
+        // Patterns and workflows belong to other subsystems; should not be cleared
+        assert_eq!(dm.disabled_patterns().len(), 1);
+        assert_eq!(dm.paused_workflows().len(), 1);
+    }
 }

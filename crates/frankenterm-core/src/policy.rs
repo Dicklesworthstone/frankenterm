@@ -5962,4 +5962,140 @@ mod tests {
             _ => unreachable!(),
         }
     }
+
+    // ========================================================================
+    // Additional Pure Tests
+    // ========================================================================
+
+    #[test]
+    fn risk_factor_new_clamps_base_weight_to_100() {
+        // RiskFactor::new should cap base_weight at 100
+        let factor = RiskFactor::new("test.factor", RiskCategory::Content, 200, "over limit");
+        assert_eq!(factor.base_weight, 100, "base_weight above 100 must be clamped");
+        assert_eq!(factor.id, "test.factor");
+        assert_eq!(factor.category, RiskCategory::Content);
+
+        let factor_exact = RiskFactor::new("test.exact", RiskCategory::State, 100, "at limit");
+        assert_eq!(factor_exact.base_weight, 100);
+
+        let factor_normal = RiskFactor::new("test.normal", RiskCategory::Action, 42, "normal");
+        assert_eq!(factor_normal.base_weight, 42);
+    }
+
+    #[test]
+    fn risk_score_level_predicates_cover_all_ranges() {
+        // Verify is_low / is_medium / is_elevated / is_high partition 0..=100
+        let make = |score: u8| RiskScore {
+            score,
+            factors: vec![],
+            summary: RiskScore::summary_for_score(score),
+        };
+
+        // Boundary: 0 is low
+        let s0 = make(0);
+        assert!(s0.is_low());
+        assert!(!s0.is_medium());
+        assert!(!s0.is_elevated());
+        assert!(!s0.is_high());
+
+        // Boundary: 20 is low
+        let s20 = make(20);
+        assert!(s20.is_low());
+        assert!(!s20.is_medium());
+
+        // Boundary: 21 is medium
+        let s21 = make(21);
+        assert!(!s21.is_low());
+        assert!(s21.is_medium());
+
+        // Boundary: 50 is medium
+        let s50 = make(50);
+        assert!(s50.is_medium());
+        assert!(!s50.is_elevated());
+
+        // Boundary: 51 is elevated
+        let s51 = make(51);
+        assert!(!s51.is_medium());
+        assert!(s51.is_elevated());
+
+        // Boundary: 70 is elevated
+        let s70 = make(70);
+        assert!(s70.is_elevated());
+        assert!(!s70.is_high());
+
+        // Boundary: 71 is high
+        let s71 = make(71);
+        assert!(!s71.is_elevated());
+        assert!(s71.is_high());
+
+        // Boundary: 100 is high
+        let s100 = make(100);
+        assert!(s100.is_high());
+    }
+
+    #[test]
+    fn risk_config_get_weight_uses_override_then_clamps() {
+        let mut config = RiskConfig::default();
+
+        // No override: returns base_weight
+        assert_eq!(config.get_weight("foo", 42), 42);
+
+        // Override with a value
+        config.weights.insert("foo".to_string(), 75);
+        assert_eq!(config.get_weight("foo", 42), 75);
+
+        // Override above 100 is clamped
+        config.weights.insert("bar".to_string(), 200);
+        assert_eq!(config.get_weight("bar", 10), 100);
+
+        // Disabled factor always returns 0
+        config.disabled.insert("baz".to_string());
+        assert_eq!(config.get_weight("baz", 50), 0);
+        assert!(config.is_disabled("baz"));
+        assert!(!config.is_disabled("foo"));
+    }
+
+    #[test]
+    fn decision_context_record_rule_and_evidence_roundtrip() {
+        let mut ctx = DecisionContext::empty();
+
+        // Verify empty defaults
+        assert_eq!(ctx.timestamp_ms, 0);
+        assert!(ctx.rules_evaluated.is_empty());
+        assert!(ctx.determining_rule.is_none());
+        assert!(ctx.evidence.is_empty());
+        assert!(ctx.risk.is_none());
+
+        // Record a rule
+        ctx.record_rule("test.rule.1", true, Some("deny"), Some("matched pattern".to_string()));
+        ctx.record_rule("test.rule.2", false, None, None);
+        assert_eq!(ctx.rules_evaluated.len(), 2);
+        assert!(ctx.rules_evaluated[0].matched);
+        assert_eq!(ctx.rules_evaluated[0].decision.as_deref(), Some("deny"));
+        assert!(!ctx.rules_evaluated[1].matched);
+
+        // Set determining rule
+        ctx.set_determining_rule("test.rule.1");
+        assert_eq!(ctx.determining_rule.as_deref(), Some("test.rule.1"));
+
+        // Add evidence
+        ctx.add_evidence("key1", "value1");
+        ctx.add_evidence("key2", "value2");
+        assert_eq!(ctx.evidence.len(), 2);
+        assert_eq!(ctx.evidence[0].key, "key1");
+        assert_eq!(ctx.evidence[0].value, "value1");
+
+        // Set risk
+        ctx.set_risk(RiskScore::zero());
+        assert!(ctx.risk.is_some());
+        assert_eq!(ctx.risk.as_ref().unwrap().score, 0);
+
+        // Serde roundtrip
+        let json = serde_json::to_string(&ctx).unwrap();
+        let ctx2: DecisionContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(ctx2.rules_evaluated.len(), 2);
+        assert_eq!(ctx2.evidence.len(), 2);
+        assert_eq!(ctx2.determining_rule.as_deref(), Some("test.rule.1"));
+        assert_eq!(ctx2.risk.as_ref().unwrap().score, 0);
+    }
 }

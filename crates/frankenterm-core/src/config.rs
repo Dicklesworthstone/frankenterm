@@ -5528,4 +5528,190 @@ retention_tiers = []
         ensure_dir(temp.path()).unwrap();
         assert!(temp.path().exists());
     }
+
+    // =========================================================================
+    // Additional Coverage Tests
+    // =========================================================================
+
+    #[test]
+    fn ipc_scope_allows_hierarchy() {
+        // All scope allows everything
+        assert!(IpcScope::All.allows(IpcScope::Read));
+        assert!(IpcScope::All.allows(IpcScope::Write));
+        assert!(IpcScope::All.allows(IpcScope::All));
+
+        // Write scope allows Write and Read
+        assert!(IpcScope::Write.allows(IpcScope::Read));
+        assert!(IpcScope::Write.allows(IpcScope::Write));
+        assert!(!IpcScope::Write.allows(IpcScope::All));
+
+        // Read scope allows only Read
+        assert!(IpcScope::Read.allows(IpcScope::Read));
+        assert!(!IpcScope::Read.allows(IpcScope::Write));
+        assert!(!IpcScope::Read.allows(IpcScope::All));
+    }
+
+    #[test]
+    fn policy_rule_match_specificity_scoring() {
+        // Empty match has zero specificity
+        let empty = PolicyRuleMatch::default();
+        assert_eq!(empty.specificity(), 0);
+        assert!(empty.is_catch_all());
+
+        // Single action criterion adds 1
+        let with_actions = PolicyRuleMatch {
+            actions: vec!["send_text".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(with_actions.specificity(), 1);
+        assert!(!with_actions.is_catch_all());
+
+        // Pane IDs add 2 (very specific)
+        let with_pane_ids = PolicyRuleMatch {
+            pane_ids: vec![42],
+            ..Default::default()
+        };
+        assert_eq!(with_pane_ids.specificity(), 2);
+
+        // Command patterns add 2 (very specific)
+        let with_commands = PolicyRuleMatch {
+            command_patterns: vec!["rm -rf.*".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(with_commands.specificity(), 2);
+
+        // Multiple criteria accumulate
+        let multi = PolicyRuleMatch {
+            actions: vec!["send_text".to_string()],   // +1
+            actors: vec!["robot".to_string()],         // +1
+            pane_ids: vec![1],                         // +2
+            pane_titles: vec!["bash".to_string()],     // +1
+            pane_cwds: vec!["/tmp".to_string()],       // +1
+            pane_domains: vec!["local".to_string()],   // +1
+            command_patterns: vec!["ls".to_string()],  // +2
+            agent_types: vec!["codex".to_string()],    // +1
+        };
+        assert_eq!(multi.specificity(), 10);
+        assert!(!multi.is_catch_all());
+    }
+
+    #[test]
+    fn policy_rule_decision_priority_and_as_str() {
+        // Deny has highest priority (lowest number)
+        assert_eq!(PolicyRuleDecision::Deny.priority(), 0);
+        assert_eq!(PolicyRuleDecision::RequireApproval.priority(), 1);
+        assert_eq!(PolicyRuleDecision::Allow.priority(), 2);
+
+        // Deny beats RequireApproval beats Allow
+        assert!(PolicyRuleDecision::Deny.priority() < PolicyRuleDecision::RequireApproval.priority());
+        assert!(PolicyRuleDecision::RequireApproval.priority() < PolicyRuleDecision::Allow.priority());
+
+        // as_str returns serde-compatible names
+        assert_eq!(PolicyRuleDecision::Allow.as_str(), "allow");
+        assert_eq!(PolicyRuleDecision::Deny.as_str(), "deny");
+        assert_eq!(PolicyRuleDecision::RequireApproval.as_str(), "require_approval");
+    }
+
+    #[test]
+    fn distributed_auth_mode_requires_token_and_mtls() {
+        // Token mode requires token but not mTLS
+        assert!(DistributedAuthMode::Token.requires_token());
+        assert!(!DistributedAuthMode::Token.requires_mtls());
+
+        // Mtls mode requires mTLS but not token
+        assert!(!DistributedAuthMode::Mtls.requires_token());
+        assert!(DistributedAuthMode::Mtls.requires_mtls());
+
+        // TokenAndMtls requires both
+        assert!(DistributedAuthMode::TokenAndMtls.requires_token());
+        assert!(DistributedAuthMode::TokenAndMtls.requires_mtls());
+
+        // Default is Token
+        assert_eq!(DistributedAuthMode::default(), DistributedAuthMode::Token);
+    }
+
+    #[test]
+    fn pane_priority_for_pane_returns_matching_rule_or_default() {
+        let config = PanePriorityConfig {
+            default_priority: 100,
+            rules: vec![
+                PanePriorityRule {
+                    matcher: PaneFilterRule::new("codex_pane").with_title("codex"),
+                    priority: 10,
+                },
+                PanePriorityRule {
+                    matcher: PaneFilterRule::new("ssh_pane").with_domain("SSH:*"),
+                    priority: 50,
+                },
+            ],
+        };
+
+        // First matching rule wins
+        assert_eq!(config.priority_for_pane("local", "codex agent", "/home"), 10);
+        assert_eq!(config.priority_for_pane("SSH:remote", "bash", "/home"), 50);
+
+        // No match -> default
+        assert_eq!(config.priority_for_pane("local", "bash", "/home"), 100);
+    }
+
+    #[test]
+    fn sync_direction_serde_roundtrip() {
+        // Default is Push
+        assert_eq!(SyncDirection::default(), SyncDirection::Push);
+
+        // JSON roundtrip
+        let push_json = serde_json::to_string(&SyncDirection::Push).unwrap();
+        let pull_json = serde_json::to_string(&SyncDirection::Pull).unwrap();
+        assert_eq!(push_json, "\"push\"");
+        assert_eq!(pull_json, "\"pull\"");
+        let push_parsed: SyncDirection = serde_json::from_str(&push_json).unwrap();
+        let pull_parsed: SyncDirection = serde_json::from_str(&pull_json).unwrap();
+        assert_eq!(push_parsed, SyncDirection::Push);
+        assert_eq!(pull_parsed, SyncDirection::Pull);
+    }
+
+    #[test]
+    fn snapshot_scheduling_mode_defaults_and_serde() {
+        // Default is Intelligent
+        assert_eq!(SnapshotSchedulingMode::default(), SnapshotSchedulingMode::Intelligent);
+
+        // TOML roundtrip
+        let toml_str = r#"
+[snapshots.scheduling]
+mode = "periodic"
+"#;
+        let config = Config::from_toml(toml_str).expect("parse");
+        assert_eq!(config.snapshots.scheduling.mode, SnapshotSchedulingMode::Periodic);
+
+        // Default scheduling values
+        let sched = SnapshotSchedulingConfig::default();
+        assert!((sched.snapshot_threshold - 5.0).abs() < 0.001);
+        assert!((sched.hazard_trigger_value - 10.0).abs() < 0.001);
+        assert_eq!(sched.periodic_fallback_minutes, 30);
+    }
+
+    #[test]
+    fn vendored_compression_mode_default_and_serde() {
+        // Default is Auto
+        assert_eq!(VendoredCompressionMode::default(), VendoredCompressionMode::Auto);
+
+        // JSON roundtrip for all variants
+        for mode in [
+            VendoredCompressionMode::Auto,
+            VendoredCompressionMode::Always,
+            VendoredCompressionMode::Never,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let parsed: VendoredCompressionMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, mode);
+        }
+
+        // Verify serde rename_all = lowercase
+        let auto_json = serde_json::to_string(&VendoredCompressionMode::Auto).unwrap();
+        assert_eq!(auto_json, "\"auto\"");
+        let always_json = serde_json::to_string(&VendoredCompressionMode::Always).unwrap();
+        assert_eq!(always_json, "\"always\"");
+        let never_json = serde_json::to_string(&VendoredCompressionMode::Never).unwrap();
+        assert_eq!(never_json, "\"never\"");
+    }
 }

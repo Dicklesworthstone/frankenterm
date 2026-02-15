@@ -2926,4 +2926,152 @@ mod tests {
         assert_eq!(ExportKind::from_str_loose("123"), None);
         assert_eq!(ExportKind::from_str_loose("0"), None);
     }
+
+    // -----------------------------------------------------------------------
+    // RubyBeaver wa-1u90p — additional pure tests (batch 3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn export_header_export_field_renamed_to_underscore() {
+        // The `export` field has `#[serde(rename = "_export")]` — verify the
+        // serialized JSON key is literally "_export" and that "export" as a
+        // bare key does NOT appear (it would if the rename were missing).
+        let header = ExportHeader {
+            export: true,
+            version: "0.2.0".to_string(),
+            kind: "segments".to_string(),
+            redacted: false,
+            exported_at_ms: 5000,
+            pane_id: None,
+            since: None,
+            until: None,
+            limit: None,
+            record_count: 3,
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(
+            json.contains("\"_export\":true"),
+            "JSON must contain the renamed key \"_export\""
+        );
+        // Strip the `_export` occurrence and verify bare `"export"` key is absent
+        let without_underscore = json.replace("\"_export\"", "");
+        assert!(
+            !without_underscore.contains("\"export\""),
+            "No bare \"export\" key should exist; got: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn write_record_sequential_produces_valid_ndjson() {
+        // Writing multiple records to the same buffer must produce one valid
+        // JSON object per line (NDJSON/JSONL format).
+        let mut buf = Vec::new();
+        for i in 0u64..4 {
+            let seg = Segment {
+                id: i as i64,
+                pane_id: i,
+                seq: i,
+                content: format!("record_{}", i),
+                content_len: 8,
+                content_hash: None,
+                captured_at: 1000 + i as i64,
+            };
+            write_record(&mut buf, &seg, false).unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert_eq!(lines.len(), 4, "Should have exactly 4 NDJSON lines");
+        for (idx, line) in lines.iter().enumerate() {
+            let parsed: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("Line {} is not valid JSON: {} — {}", idx, line, e);
+            });
+            let expected_content = format!("record_{}", idx);
+            assert_eq!(
+                parsed["content"], expected_content,
+                "Line {} content mismatch",
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn redact_segment_multiple_different_secret_types() {
+        // Verify that redaction handles multiple distinct secret patterns
+        // (OpenAI key + GitHub PAT) within the same content string.
+        let r = Redactor::new();
+        let openai_key = "sk-abc123def456ghi789jkl012mno345pqr678stu901v";
+        let github_pat = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456789012";
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: format!("key1={} key2={}", openai_key, github_pat),
+            content_len: 100,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let redacted = redact_segment(seg, &r);
+        assert!(
+            !redacted.content.contains("sk-abc123"),
+            "OpenAI key should be redacted"
+        );
+        assert!(
+            !redacted.content.contains("ghp_"),
+            "GitHub PAT should be redacted"
+        );
+        // At least one REDACTED marker should be present
+        assert!(
+            redacted.content.contains("[REDACTED]"),
+            "Redacted content should contain [REDACTED] marker(s)"
+        );
+    }
+
+    #[test]
+    fn export_header_field_types_in_serde_value() {
+        // Verify that each ExportHeader field serializes to the expected
+        // JSON type (bool, string, number, etc.) via serde_json::Value.
+        let header = ExportHeader {
+            export: true,
+            version: "1.0.0".to_string(),
+            kind: "workflows".to_string(),
+            redacted: true,
+            exported_at_ms: 123456789,
+            pane_id: Some(7),
+            since: Some(100),
+            until: Some(999),
+            limit: Some(50),
+            record_count: 25,
+        };
+        let val: serde_json::Value = serde_json::to_value(&header).unwrap();
+        let map = val.as_object().unwrap();
+
+        // Boolean fields
+        assert!(map["_export"].is_boolean(), "_export must be boolean");
+        assert!(map["redacted"].is_boolean(), "redacted must be boolean");
+
+        // String fields
+        assert!(map["version"].is_string(), "version must be string");
+        assert!(map["kind"].is_string(), "kind must be string");
+
+        // Numeric fields
+        assert!(
+            map["exported_at_ms"].is_number(),
+            "exported_at_ms must be number"
+        );
+        assert!(
+            map["record_count"].is_number(),
+            "record_count must be number"
+        );
+        assert!(map["pane_id"].is_number(), "pane_id must be number");
+        assert!(map["since"].is_number(), "since must be number");
+        assert!(map["until"].is_number(), "until must be number");
+        assert!(map["limit"].is_number(), "limit must be number");
+
+        // Verify actual values
+        assert_eq!(map["version"].as_str().unwrap(), "1.0.0");
+        assert_eq!(map["kind"].as_str().unwrap(), "workflows");
+        assert_eq!(map["exported_at_ms"].as_i64().unwrap(), 123456789);
+        assert_eq!(map["record_count"].as_u64().unwrap(), 25);
+    }
 }
