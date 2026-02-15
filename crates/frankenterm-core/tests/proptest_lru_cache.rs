@@ -944,3 +944,105 @@ proptest! {
         prop_assert_eq!(cache.peek(&last_key), Some(&last_val));
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Structural and trait tests
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// LruCache Debug output is nonempty.
+    #[test]
+    fn prop_cache_debug_nonempty(
+        capacity in arb_capacity(),
+        entries in prop::collection::vec((arb_key(), arb_value()), 0..10),
+    ) {
+        let mut cache = LruCache::new(capacity);
+        for &(k, v) in &entries {
+            cache.put(k, v);
+        }
+        let debug = format!("{:?}", cache);
+        prop_assert!(!debug.is_empty(), "LruCache Debug should not be empty");
+    }
+
+    /// is_empty() matches len() == 0.
+    #[test]
+    fn prop_is_empty_matches_len(
+        capacity in arb_capacity(),
+        entries in prop::collection::vec((arb_key(), arb_value()), 0..10),
+    ) {
+        let mut cache = LruCache::new(capacity);
+        for &(k, v) in &entries {
+            cache.put(k, v);
+        }
+        prop_assert_eq!(cache.is_empty(), cache.len() == 0,
+            "is_empty() doesn't match len() == 0");
+    }
+
+    /// capacity() is preserved across put/get operations.
+    #[test]
+    fn prop_capacity_preserved(
+        capacity in arb_capacity(),
+        ops in arb_ops(30),
+    ) {
+        let mut cache = LruCache::new(capacity);
+        for op in &ops {
+            match op {
+                Op::Put(k, v) => { cache.put(*k, *v); }
+                Op::Get(k) => { cache.get(k); }
+                Op::Peek(k) => { cache.peek(k); }
+                Op::Remove(k) => { cache.remove(k); }
+                Op::ContainsKey(k) => { cache.contains_key(k); }
+            }
+        }
+        prop_assert_eq!(cache.capacity(), capacity,
+            "capacity changed from {} to {}", capacity, cache.capacity());
+    }
+
+    /// contains_key agrees with peek.
+    #[test]
+    fn prop_contains_key_matches_peek(
+        capacity in arb_capacity(),
+        entries in prop::collection::vec((arb_key(), arb_value()), 0..20),
+        query_key in arb_key(),
+    ) {
+        let mut cache = LruCache::new(capacity);
+        for &(k, v) in &entries {
+            cache.put(k, v);
+        }
+        let has = cache.contains_key(&query_key);
+        let peeked = cache.peek(&query_key);
+        prop_assert_eq!(has, peeked.is_some(),
+            "contains_key({}) = {} but peek is {:?}", query_key, has, peeked);
+    }
+
+    /// LruCache::new creates an empty cache.
+    #[test]
+    fn prop_new_cache_is_empty(capacity in arb_capacity()) {
+        let cache: LruCache<u16, i32> = LruCache::new(capacity);
+        prop_assert!(cache.is_empty(), "new cache should be empty");
+        prop_assert_eq!(cache.len(), 0);
+        prop_assert_eq!(cache.capacity(), capacity);
+    }
+
+    /// Stats Debug output is nonempty.
+    #[test]
+    fn prop_stats_debug_nonempty(
+        capacity in arb_capacity(),
+        ops in arb_ops(20),
+    ) {
+        let mut cache = LruCache::new(capacity);
+        for op in &ops {
+            match op {
+                Op::Put(k, v) => { cache.put(*k, *v); }
+                Op::Get(k) => { cache.get(k); }
+                Op::Peek(k) => { cache.peek(k); }
+                Op::Remove(k) => { cache.remove(k); }
+                Op::ContainsKey(k) => { cache.contains_key(k); }
+            }
+        }
+        let debug = format!("{:?}", cache.stats());
+        prop_assert!(!debug.is_empty(), "Stats Debug should not be empty");
+    }
+}

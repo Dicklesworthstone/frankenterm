@@ -618,3 +618,85 @@ proptest! {
         }
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Structural and trait tests
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// BloomFilter Debug output is nonempty.
+    #[test]
+    fn prop_bloom_filter_debug_nonempty(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bf = BloomFilter::with_capacity(capacity, fp_rate);
+        let debug = format!("{:?}", bf);
+        prop_assert!(!debug.is_empty(), "BloomFilter Debug should not be empty");
+    }
+
+    /// CountingBloomFilter Debug output is nonempty.
+    #[test]
+    fn prop_counting_bloom_debug_nonempty(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let cbf = CountingBloomFilter::with_capacity(capacity, fp_rate);
+        let debug = format!("{:?}", cbf);
+        prop_assert!(!debug.is_empty(), "CountingBloomFilter Debug should not be empty");
+    }
+
+    /// num_bits() is always positive.
+    #[test]
+    fn prop_num_bits_positive(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bf = BloomFilter::with_capacity(capacity, fp_rate);
+        prop_assert!(bf.num_bits() > 0, "num_bits should be positive");
+    }
+
+    /// num_hashes() is always positive.
+    #[test]
+    fn prop_num_hashes_positive(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bf = BloomFilter::with_capacity(capacity, fp_rate);
+        prop_assert!(bf.num_hashes() > 0, "num_hashes should be positive");
+    }
+
+    /// CountingBloomFilter count matches number of inserts.
+    #[test]
+    fn prop_counting_count_matches_inserts(
+        items in arb_item_set(30),
+    ) {
+        let mut cbf = CountingBloomFilter::with_capacity(100, 0.01);
+        for item in &items {
+            cbf.insert(item);
+        }
+        prop_assert_eq!(cbf.count(), items.len(), "counting filter count mismatch");
+    }
+
+    /// BloomFilter stats fields are consistent.
+    #[test]
+    fn prop_stats_fields_consistent(
+        items in arb_item_set(30),
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let cap = capacity.max(items.len());
+        let mut bf = BloomFilter::with_capacity(cap, fp_rate);
+        for item in &items {
+            bf.insert(item);
+        }
+        let stats = bf.stats();
+        let fill = stats.fill_ratio;
+        prop_assert!((0.0..=1.0).contains(&fill),
+            "stats fill_ratio {} out of [0,1]", fill);
+        prop_assert!(stats.num_bits > 0, "stats num_bits should be positive");
+        prop_assert!(stats.num_hashes > 0, "stats num_hashes should be positive");
+    }
+}

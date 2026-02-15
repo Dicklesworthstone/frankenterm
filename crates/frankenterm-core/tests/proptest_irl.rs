@@ -442,3 +442,67 @@ proptest! {
             "Focusing current pane should have is_switch=0, got {}", f[7]);
     }
 }
+
+// =============================================================================
+// Structural and trait tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// RewardFunction implements Clone correctly.
+    #[test]
+    fn prop_reward_function_clone(theta in arb_theta()) {
+        let mut rf = RewardFunction::new();
+        rf.theta = theta;
+        let cloned = rf.clone();
+        for i in 0..NUM_FEATURES {
+            prop_assert!((cloned.theta[i] - rf.theta[i]).abs() < 1e-15,
+                "theta[{}] mismatch: {} vs {}", i, cloned.theta[i], rf.theta[i]);
+        }
+    }
+
+    /// RewardFunction Debug output is nonempty.
+    #[test]
+    fn prop_reward_function_debug_nonempty(theta in arb_theta()) {
+        let mut rf = RewardFunction::new();
+        rf.theta = theta;
+        let debug = format!("{:?}", rf);
+        prop_assert!(!debug.is_empty(), "RewardFunction Debug should not be empty");
+    }
+
+    /// IrlConfig implements Clone correctly.
+    #[test]
+    fn prop_irl_config_clone(config in arb_irl_config()) {
+        let cloned = config.clone();
+        prop_assert!((cloned.learning_rate - config.learning_rate).abs() < 1e-12);
+        prop_assert_eq!(cloned.max_iterations, config.max_iterations);
+        prop_assert_eq!(cloned.min_observations, config.min_observations);
+        prop_assert_eq!(cloned.max_trajectory_len, config.max_trajectory_len);
+    }
+
+    /// IrlConfig Debug output is nonempty.
+    #[test]
+    fn prop_irl_config_debug_nonempty(config in arb_irl_config()) {
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty(), "IrlConfig Debug should not be empty");
+    }
+
+    /// PaneState implements Clone correctly.
+    #[test]
+    fn prop_pane_state_clone(state in arb_pane_state(42)) {
+        let cloned = state.clone();
+        prop_assert_eq!(cloned.pane_id, state.pane_id);
+        prop_assert_eq!(cloned.has_new_output, state.has_new_output);
+        prop_assert_eq!(cloned.error_count, state.error_count);
+        prop_assert_eq!(cloned.process_active, state.process_active);
+    }
+
+    /// extract_features always returns exactly NUM_FEATURES elements.
+    #[test]
+    fn prop_features_length_correct(obs in arb_observation(4)) {
+        let f = extract_features(&obs, &obs.action);
+        prop_assert_eq!(f.len(), NUM_FEATURES,
+            "extract_features should return {} features, got {}", NUM_FEATURES, f.len());
+    }
+}
