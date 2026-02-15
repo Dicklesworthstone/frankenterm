@@ -1485,4 +1485,334 @@ mod tests {
 
         teardown(storage, &db_path).await;
     }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ───────────────────────────────────
+
+    // ── SecretScanOptions traits ──
+
+    #[test]
+    fn secret_scan_options_debug() {
+        let opts = SecretScanOptions {
+            pane_id: Some(42),
+            batch_size: 500,
+            ..Default::default()
+        };
+        let dbg = format!("{:?}", opts);
+        assert!(dbg.contains("SecretScanOptions"));
+        assert!(dbg.contains("42"));
+        assert!(dbg.contains("500"));
+    }
+
+    #[test]
+    fn secret_scan_options_clone() {
+        let opts = SecretScanOptions {
+            pane_id: Some(7),
+            since: Some(100),
+            until: Some(200),
+            max_segments: Some(50),
+            batch_size: 250,
+            sample_limit: 10,
+        };
+        let cloned = opts.clone();
+        assert_eq!(cloned.pane_id, Some(7));
+        assert_eq!(cloned.since, Some(100));
+        assert_eq!(cloned.until, Some(200));
+        assert_eq!(cloned.max_segments, Some(50));
+        assert_eq!(cloned.batch_size, 250);
+        assert_eq!(cloned.sample_limit, 10);
+    }
+
+    #[test]
+    fn secret_scan_options_serde_roundtrip() {
+        let opts = SecretScanOptions {
+            pane_id: Some(3),
+            since: Some(1000),
+            until: Some(2000),
+            max_segments: Some(100),
+            batch_size: 500,
+            sample_limit: 50,
+        };
+        let json = serde_json::to_string(&opts).unwrap();
+        let back: SecretScanOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pane_id, Some(3));
+        assert_eq!(back.since, Some(1000));
+        assert_eq!(back.until, Some(2000));
+        assert_eq!(back.max_segments, Some(100));
+        assert_eq!(back.batch_size, 500);
+        assert_eq!(back.sample_limit, 50);
+    }
+
+    #[test]
+    fn secret_scan_options_serde_defaults_none_fields() {
+        let opts = SecretScanOptions::default();
+        let json = serde_json::to_string(&opts).unwrap();
+        let back: SecretScanOptions = serde_json::from_str(&json).unwrap();
+        assert!(back.pane_id.is_none());
+        assert!(back.since.is_none());
+        assert!(back.until.is_none());
+        assert!(back.max_segments.is_none());
+    }
+
+    // ── SecretScanScope traits ──
+
+    #[test]
+    fn secret_scan_scope_debug() {
+        let scope = SecretScanScope {
+            pane_id: Some(5),
+            since: Some(100),
+            until: None,
+        };
+        let dbg = format!("{:?}", scope);
+        assert!(dbg.contains("SecretScanScope"));
+        assert!(dbg.contains("5"));
+    }
+
+    #[test]
+    fn secret_scan_scope_clone() {
+        let scope = SecretScanScope {
+            pane_id: Some(10),
+            since: Some(500),
+            until: Some(1000),
+        };
+        let cloned = scope.clone();
+        assert_eq!(cloned.pane_id, Some(10));
+        assert_eq!(cloned.since, Some(500));
+        assert_eq!(cloned.until, Some(1000));
+    }
+
+    #[test]
+    fn secret_scan_scope_serde_roundtrip() {
+        let scope = SecretScanScope {
+            pane_id: Some(99),
+            since: Some(1),
+            until: Some(999),
+        };
+        let json = serde_json::to_string(&scope).unwrap();
+        let back: SecretScanScope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pane_id, Some(99));
+        assert_eq!(back.since, Some(1));
+        assert_eq!(back.until, Some(999));
+    }
+
+    // ── SecretScanSample traits ──
+
+    #[test]
+    fn secret_scan_sample_debug() {
+        let sample = SecretScanSample {
+            pattern: "openai_key".to_string(),
+            segment_id: 1,
+            pane_id: 2,
+            captured_at: 3,
+            secret_hash: "a".repeat(64),
+            match_len: 48,
+        };
+        let dbg = format!("{:?}", sample);
+        assert!(dbg.contains("SecretScanSample"));
+        assert!(dbg.contains("openai_key"));
+    }
+
+    #[test]
+    fn secret_scan_sample_clone() {
+        let sample = SecretScanSample {
+            pattern: "github_token".to_string(),
+            segment_id: 10,
+            pane_id: 20,
+            captured_at: 12345,
+            secret_hash: "b".repeat(64),
+            match_len: 40,
+        };
+        let cloned = sample.clone();
+        assert_eq!(cloned.pattern, "github_token");
+        assert_eq!(cloned.segment_id, 10);
+        assert_eq!(cloned.pane_id, 20);
+        assert_eq!(cloned.captured_at, 12345);
+        assert_eq!(cloned.match_len, 40);
+    }
+
+    #[test]
+    fn secret_scan_sample_serde_roundtrip() {
+        let sample = SecretScanSample {
+            pattern: "aws_key".to_string(),
+            segment_id: 42,
+            pane_id: 7,
+            captured_at: 999_999,
+            secret_hash: "c".repeat(64),
+            match_len: 20,
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        let back: SecretScanSample = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pattern, "aws_key");
+        assert_eq!(back.segment_id, 42);
+        assert_eq!(back.pane_id, 7);
+        assert_eq!(back.captured_at, 999_999);
+        assert_eq!(back.secret_hash, "c".repeat(64));
+        assert_eq!(back.match_len, 20);
+    }
+
+    // ── SecretScanReport traits ──
+
+    #[test]
+    fn secret_scan_report_debug() {
+        let report = make_report();
+        let dbg = format!("{:?}", report);
+        assert!(dbg.contains("SecretScanReport"));
+        assert!(dbg.contains("report_version"));
+    }
+
+    #[test]
+    fn secret_scan_report_clone() {
+        let mut report = make_report();
+        report.scanned_segments = 10;
+        report.matches_total = 5;
+        report.matches_by_pattern.insert("test".to_string(), 3);
+        let cloned = report.clone();
+        assert_eq!(cloned.scanned_segments, 10);
+        assert_eq!(cloned.matches_total, 5);
+        assert_eq!(cloned.matches_by_pattern.get("test"), Some(&3));
+    }
+
+    #[test]
+    fn secret_scan_report_serde_full_roundtrip() {
+        let mut report = make_report();
+        report.scanned_segments = 100;
+        report.scanned_bytes = 50_000;
+        report.matches_total = 7;
+        report.last_segment_id = Some(99);
+        report
+            .matches_by_pattern
+            .insert("openai_key".to_string(), 4);
+        report
+            .matches_by_pattern
+            .insert("github_token".to_string(), 3);
+        report.samples.push(SecretScanSample {
+            pattern: "openai_key".to_string(),
+            segment_id: 1,
+            pane_id: 1,
+            captured_at: 0,
+            secret_hash: "d".repeat(64),
+            match_len: 48,
+        });
+
+        let json = serde_json::to_string(&report).unwrap();
+        let back: SecretScanReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.scanned_segments, 100);
+        assert_eq!(back.scanned_bytes, 50_000);
+        assert_eq!(back.matches_total, 7);
+        assert_eq!(back.last_segment_id, Some(99));
+        assert_eq!(back.matches_by_pattern.len(), 2);
+        assert_eq!(back.samples.len(), 1);
+    }
+
+    // ── SecretScanEngine traits ──
+
+    #[test]
+    fn secret_scan_engine_debug() {
+        let engine = SecretScanEngine::new();
+        let dbg = format!("{:?}", engine);
+        assert!(dbg.contains("SecretScanEngine"));
+    }
+
+    // ── Constants ──
+
+    #[test]
+    fn secret_scan_report_version_is_one() {
+        assert_eq!(SECRET_SCAN_REPORT_VERSION, 1);
+    }
+
+    // ── scope_hash edge cases ──
+
+    #[test]
+    fn scope_hash_default_options_produces_valid_hash() {
+        let opts = SecretScanOptions::default();
+        let h = scope_hash(&opts).unwrap();
+        assert_eq!(h.len(), 64);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn scope_hash_ignores_non_scope_fields() {
+        // batch_size and sample_limit are NOT part of the scope
+        let opts1 = SecretScanOptions {
+            pane_id: Some(1),
+            batch_size: 100,
+            sample_limit: 10,
+            ..Default::default()
+        };
+        let opts2 = SecretScanOptions {
+            pane_id: Some(1),
+            batch_size: 500,
+            sample_limit: 200,
+            ..Default::default()
+        };
+        assert_eq!(
+            scope_hash(&opts1).unwrap(),
+            scope_hash(&opts2).unwrap(),
+            "scope hash should only depend on pane_id/since/until"
+        );
+    }
+
+    // ── hex_encode edge cases ──
+
+    #[test]
+    fn hex_encode_all_zeros() {
+        assert_eq!(hex_encode(&[0, 0, 0, 0]), "00000000");
+    }
+
+    #[test]
+    fn hex_encode_all_ff() {
+        assert_eq!(hex_encode(&[0xff, 0xff]), "ffff");
+    }
+
+    #[test]
+    fn hex_encode_single_byte_range() {
+        // Verify low nibble correctness
+        assert_eq!(hex_encode(&[0x0a]), "0a");
+        assert_eq!(hex_encode(&[0xa0]), "a0");
+        assert_eq!(hex_encode(&[0x1f]), "1f");
+    }
+
+    // ── hash_bytes edge cases ──
+
+    #[test]
+    fn hash_bytes_empty_input() {
+        let h = hash_bytes(b"");
+        assert_eq!(h.len(), 64);
+        // SHA-256 of empty input is a well-known value
+        assert_eq!(
+            h,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn hash_bytes_stability() {
+        let h1 = hash_bytes(b"deterministic");
+        let h2 = hash_bytes(b"deterministic");
+        assert_eq!(h1, h2);
+    }
+
+    // ── scan_segment: scanned_bytes not incremented by scan_segment ──
+
+    #[test]
+    fn scan_segment_does_not_increment_scanned_bytes() {
+        let engine = SecretScanEngine::new();
+        let options = SecretScanOptions::default();
+        let mut report = make_report();
+        let segment = make_segment(1, 1, "password=secret123abc!");
+        engine.scan_segment(&segment, &options, &mut report);
+        assert_eq!(report.scanned_bytes, 0);
+    }
+
+    // ── Report: matches_by_pattern BTreeMap ordering ──
+
+    #[test]
+    fn report_matches_by_pattern_sorted_keys() {
+        let mut report = make_report();
+        report.matches_by_pattern.insert("z_pattern".to_string(), 1);
+        report.matches_by_pattern.insert("a_pattern".to_string(), 2);
+        report.matches_by_pattern.insert("m_pattern".to_string(), 3);
+
+        let keys: Vec<&String> = report.matches_by_pattern.keys().collect();
+        assert_eq!(keys, vec!["a_pattern", "m_pattern", "z_pattern"]);
+    }
 }

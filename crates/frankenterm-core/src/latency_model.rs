@@ -1181,4 +1181,444 @@ mod tests {
         let svc = ServiceCurve::rate_latency(100.0, 0.01);
         assert!(approx_eq(svc.eval(-1.0), 0.0));
     }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ───────────────────────────────────
+
+    // ── CurvePoint traits ──
+
+    #[test]
+    fn curve_point_debug() {
+        let p = CurvePoint { t: 1.0, y: 2.0 };
+        let dbg = format!("{:?}", p);
+        assert!(dbg.contains("CurvePoint"));
+    }
+
+    #[test]
+    fn curve_point_clone_copy_eq() {
+        let p = CurvePoint { t: 3.0, y: 7.0 };
+        let p2 = p; // Copy
+        let p3 = p.clone();
+        assert_eq!(p, p2);
+        assert_eq!(p, p3);
+    }
+
+    #[test]
+    fn curve_point_serde_roundtrip() {
+        let p = CurvePoint { t: 1.5, y: 42.0 };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: CurvePoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    // ── PiecewiseLinear additional ──
+
+    #[test]
+    fn piecewise_linear_len_and_is_empty() {
+        let pw = PiecewiseLinear::constant(5.0);
+        assert_eq!(pw.len(), 1);
+        assert!(!pw.is_empty());
+
+        let pw2 = PiecewiseLinear::linear(0.0, 1.0);
+        assert_eq!(pw2.len(), 2);
+    }
+
+    #[test]
+    fn piecewise_linear_debug() {
+        let pw = PiecewiseLinear::constant(10.0);
+        let dbg = format!("{:?}", pw);
+        assert!(dbg.contains("PiecewiseLinear"));
+    }
+
+    #[test]
+    fn piecewise_linear_clone_eq() {
+        let pw = PiecewiseLinear::linear(1.0, 2.0);
+        let cloned = pw.clone();
+        assert_eq!(pw, cloned);
+    }
+
+    #[test]
+    fn piecewise_linear_serde_roundtrip() {
+        let pw = PiecewiseLinear::new(vec![
+            CurvePoint { t: 0.0, y: 0.0 },
+            CurvePoint { t: 1.0, y: 5.0 },
+            CurvePoint { t: 3.0, y: 15.0 },
+        ]);
+        let json = serde_json::to_string(&pw).unwrap();
+        let back: PiecewiseLinear = serde_json::from_str(&json).unwrap();
+        assert_eq!(pw, back);
+    }
+
+    #[test]
+    fn piecewise_linear_points_accessor() {
+        let pw = PiecewiseLinear::new(vec![
+            CurvePoint { t: 0.0, y: 1.0 },
+            CurvePoint { t: 2.0, y: 3.0 },
+        ]);
+        let pts = pw.points();
+        assert_eq!(pts.len(), 2);
+        assert!(approx_eq(pts[0].t, 0.0));
+        assert!(approx_eq(pts[1].y, 3.0));
+    }
+
+    #[test]
+    fn piecewise_trailing_slope_constant() {
+        let pw = PiecewiseLinear::constant(42.0);
+        assert!(approx_eq(pw.trailing_slope(), 0.0));
+    }
+
+    // ── ArrivalCurve additional ──
+
+    #[test]
+    fn arrival_curve_token_bucket_serde_roundtrip() {
+        let arr = ArrivalCurve::token_bucket(50.0, 10.0, 30.0);
+        let json = serde_json::to_string(&arr).unwrap();
+        let back: ArrivalCurve = serde_json::from_str(&json).unwrap();
+        assert_eq!(arr, back);
+    }
+
+    #[test]
+    fn arrival_curve_staircase_serde_roundtrip() {
+        let arr = ArrivalCurve::staircase(2.0, 5.0);
+        let json = serde_json::to_string(&arr).unwrap();
+        let back: ArrivalCurve = serde_json::from_str(&json).unwrap();
+        assert_eq!(arr, back);
+    }
+
+    #[test]
+    fn arrival_curve_piecewise_serde_roundtrip() {
+        let pw = PiecewiseLinear::linear(0.0, 10.0);
+        let arr = ArrivalCurve::Piecewise(pw);
+        let json = serde_json::to_string(&arr).unwrap();
+        let back: ArrivalCurve = serde_json::from_str(&json).unwrap();
+        assert_eq!(arr, back);
+    }
+
+    #[test]
+    fn arrival_curve_burst_all_variants() {
+        assert!(approx_eq(
+            ArrivalCurve::leaky_bucket(100.0, 10.0).burst(),
+            100.0
+        ));
+        assert!(approx_eq(
+            ArrivalCurve::token_bucket(200.0, 10.0, 50.0).burst(),
+            200.0
+        ));
+        assert!(approx_eq(ArrivalCurve::staircase(2.0, 5.0).burst(), 5.0));
+    }
+
+    #[test]
+    fn arrival_curve_sustained_rate_token_bucket() {
+        let arr = ArrivalCurve::token_bucket(100.0, 15.0, 50.0);
+        assert!(approx_eq(arr.sustained_rate(), 15.0));
+    }
+
+    #[test]
+    fn staircase_zero_period() {
+        let arr = ArrivalCurve::staircase(0.0, 5.0);
+        assert!(approx_eq(arr.eval(1.0), 0.0));
+        assert!(approx_eq(arr.sustained_rate(), 0.0));
+    }
+
+    #[test]
+    fn arrival_curve_debug() {
+        let arr = ArrivalCurve::leaky_bucket(100.0, 10.0);
+        let dbg = format!("{:?}", arr);
+        assert!(dbg.contains("LeakyBucket"));
+    }
+
+    #[test]
+    fn arrival_curve_clone_eq() {
+        let arr = ArrivalCurve::leaky_bucket(100.0, 10.0);
+        let cloned = arr.clone();
+        assert_eq!(arr, cloned);
+    }
+
+    // ── ServiceCurve additional ──
+
+    #[test]
+    fn service_curve_strict_rate_serde_roundtrip() {
+        let svc = ServiceCurve::strict_rate(200.0);
+        let json = serde_json::to_string(&svc).unwrap();
+        let back: ServiceCurve = serde_json::from_str(&json).unwrap();
+        assert_eq!(svc, back);
+    }
+
+    #[test]
+    fn service_curve_piecewise_serde_roundtrip() {
+        let pw = PiecewiseLinear::linear(0.0, 50.0);
+        let svc = ServiceCurve::Piecewise(pw);
+        let json = serde_json::to_string(&svc).unwrap();
+        let back: ServiceCurve = serde_json::from_str(&json).unwrap();
+        assert_eq!(svc, back);
+    }
+
+    #[test]
+    fn service_curve_rate_all_variants() {
+        assert!(approx_eq(
+            ServiceCurve::rate_latency(100.0, 0.01).rate(),
+            100.0
+        ));
+        assert!(approx_eq(ServiceCurve::strict_rate(200.0).rate(), 200.0));
+    }
+
+    #[test]
+    fn service_curve_latency_all_variants() {
+        assert!(approx_eq(
+            ServiceCurve::rate_latency(100.0, 0.01).latency(),
+            0.01
+        ));
+        assert!(approx_eq(ServiceCurve::strict_rate(200.0).latency(), 0.0));
+    }
+
+    #[test]
+    fn service_curve_piecewise_latency() {
+        // First positive y determines the "latency"
+        let pw = PiecewiseLinear::new(vec![
+            CurvePoint { t: 0.0, y: 0.0 },
+            CurvePoint { t: 0.5, y: 0.0 },
+            CurvePoint { t: 1.0, y: 10.0 },
+        ]);
+        let svc = ServiceCurve::Piecewise(pw);
+        assert!(approx_eq(svc.latency(), 1.0));
+    }
+
+    #[test]
+    fn service_curve_debug() {
+        let svc = ServiceCurve::rate_latency(100.0, 0.01);
+        let dbg = format!("{:?}", svc);
+        assert!(dbg.contains("RateLatency"));
+    }
+
+    #[test]
+    fn service_curve_clone_eq() {
+        let svc = ServiceCurve::rate_latency(100.0, 0.01);
+        let cloned = svc.clone();
+        assert_eq!(svc, cloned);
+    }
+
+    // ── Convolution: mixed strict/rate-latency ──
+
+    #[test]
+    fn convolution_strict_rate_with_rate_latency() {
+        let a = ServiceCurve::strict_rate(100.0);
+        let b = ServiceCurve::rate_latency(200.0, 0.01);
+        let c = min_plus_convolution(&a, &b);
+        match c {
+            ServiceCurve::RateLatency { rate, latency } => {
+                assert!(approx_eq(rate, 100.0));
+                assert!(approx_eq(latency, 0.01));
+            }
+            _ => panic!("expected RateLatency"),
+        }
+    }
+
+    #[test]
+    fn convolution_rate_latency_with_strict_rate() {
+        let a = ServiceCurve::rate_latency(150.0, 0.02);
+        let b = ServiceCurve::strict_rate(300.0);
+        let c = min_plus_convolution(&a, &b);
+        match c {
+            ServiceCurve::RateLatency { rate, latency } => {
+                assert!(approx_eq(rate, 150.0));
+                assert!(approx_eq(latency, 0.02));
+            }
+            _ => panic!("expected RateLatency"),
+        }
+    }
+
+    // ── Pipeline + Analysis traits ──
+
+    #[test]
+    fn pipeline_stage_debug_clone_eq() {
+        let stage = PipelineStage {
+            name: "test".to_string(),
+            service: ServiceCurve::strict_rate(100.0),
+        };
+        let cloned = stage.clone();
+        assert_eq!(stage, cloned);
+        let dbg = format!("{:?}", stage);
+        assert!(dbg.contains("PipelineStage"));
+    }
+
+    #[test]
+    fn pipeline_debug_clone_eq() {
+        let pipeline = Pipeline::new(vec![PipelineStage {
+            name: "s1".to_string(),
+            service: ServiceCurve::strict_rate(100.0),
+        }]);
+        let cloned = pipeline.clone();
+        assert_eq!(pipeline, cloned);
+        let dbg = format!("{:?}", pipeline);
+        assert!(dbg.contains("Pipeline"));
+    }
+
+    #[test]
+    fn pipeline_analysis_debug_clone() {
+        let analysis = PipelineAnalysis {
+            delay_bound: 0.01,
+            backlog_bound: 1000.0,
+            per_stage_delays: vec![0.005],
+            per_stage_backlogs: vec![500.0],
+            total_service_rate: 100_000.0,
+            total_service_latency: 0.005,
+        };
+        let cloned = analysis.clone();
+        assert_eq!(analysis, cloned);
+        let dbg = format!("{:?}", analysis);
+        assert!(dbg.contains("PipelineAnalysis"));
+    }
+
+    // ── FrankenTerm-specific types traits ──
+
+    #[test]
+    fn pane_output_profile_debug_clone_eq_serde() {
+        let profile = PaneOutputProfile {
+            burst_bytes: 10_000.0,
+            sustained_rate_bps: 1_000.0,
+        };
+        let cloned = profile.clone();
+        assert_eq!(profile, cloned);
+        let dbg = format!("{:?}", profile);
+        assert!(dbg.contains("PaneOutputProfile"));
+
+        let json = serde_json::to_string(&profile).unwrap();
+        let back: PaneOutputProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(profile, back);
+    }
+
+    #[test]
+    fn pipeline_config_debug_clone_eq_serde() {
+        let config = PipelineConfig {
+            capture_rate_bps: 1_000_000.0,
+            capture_latency_s: 0.001,
+            process_rate_bps: 500_000.0,
+            process_latency_s: 0.002,
+            storage_rate_bps: 200_000.0,
+            storage_latency_s: 0.003,
+        };
+        let cloned = config.clone();
+        assert_eq!(config, cloned);
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("PipelineConfig"));
+
+        let json = serde_json::to_string(&config).unwrap();
+        let back: PipelineConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, back);
+    }
+
+    #[test]
+    fn frankenterm_analysis_debug_clone_eq_serde() {
+        let analysis = FrankenTermAnalysis {
+            max_delay_ms: 5.0,
+            max_backlog_bytes: 10_000.0,
+            stages: vec![StageAnalysis {
+                name: "capture".to_string(),
+                delay_bound_ms: 2.0,
+                backlog_bound_bytes: 5_000.0,
+            }],
+            is_stable: true,
+        };
+        let cloned = analysis.clone();
+        assert_eq!(analysis, cloned);
+        let dbg = format!("{:?}", analysis);
+        assert!(dbg.contains("FrankenTermAnalysis"));
+
+        let json = serde_json::to_string(&analysis).unwrap();
+        let back: FrankenTermAnalysis = serde_json::from_str(&json).unwrap();
+        assert_eq!(analysis, back);
+    }
+
+    #[test]
+    fn stage_analysis_debug_clone_eq_serde() {
+        let sa = StageAnalysis {
+            name: "storage".to_string(),
+            delay_bound_ms: 3.0,
+            backlog_bound_bytes: 2_000.0,
+        };
+        let cloned = sa.clone();
+        assert_eq!(sa, cloned);
+        let dbg = format!("{:?}", sa);
+        assert!(dbg.contains("StageAnalysis"));
+
+        let json = serde_json::to_string(&sa).unwrap();
+        let back: StageAnalysis = serde_json::from_str(&json).unwrap();
+        assert_eq!(sa, back);
+    }
+
+    // ── Delay/backlog bounds: leaky bucket + strict rate ──
+
+    #[test]
+    fn delay_bound_leaky_strict_rate() {
+        // D = σ / (R - ρ)
+        let arr = ArrivalCurve::leaky_bucket(500.0, 10.0);
+        let svc = ServiceCurve::strict_rate(1000.0);
+        let d = delay_bound(&arr, &svc);
+        let expected = 500.0 / (1000.0 - 10.0);
+        assert!(approx_eq(d, expected));
+    }
+
+    #[test]
+    fn delay_bound_unstable_strict_rate() {
+        let arr = ArrivalCurve::leaky_bucket(100.0, 200.0);
+        let svc = ServiceCurve::strict_rate(100.0);
+        let d = delay_bound(&arr, &svc);
+        assert!(d.is_infinite());
+    }
+
+    #[test]
+    fn backlog_bound_unstable() {
+        let arr = ArrivalCurve::leaky_bucket(100.0, 200.0);
+        let svc = ServiceCurve::rate_latency(100.0, 0.01);
+        let b = backlog_bound(&arr, &svc);
+        assert!(b.is_infinite());
+    }
+
+    // ── Aggregate: mixed arrival curves ──
+
+    #[test]
+    fn aggregate_mixed_triggers_numerical() {
+        let arrivals = vec![
+            ArrivalCurve::leaky_bucket(100.0, 10.0),
+            ArrivalCurve::staircase(2.0, 5.0),
+        ];
+        let agg = aggregate_arrival(&arrivals);
+        // Mixed types → Piecewise result
+        match &agg {
+            ArrivalCurve::Piecewise(_) => {}
+            _ => panic!("expected Piecewise for mixed arrivals"),
+        }
+        // At t=1: leaky=110, staircase=5 → sum=115
+        let val = agg.eval(1.0);
+        assert!(val > 100.0, "aggregate should be > 100 at t=1");
+    }
+
+    // ── Pipeline: single stage ──
+
+    #[test]
+    fn pipeline_single_stage() {
+        let pipeline = Pipeline::new(vec![PipelineStage {
+            name: "only".into(),
+            service: ServiceCurve::rate_latency(1000.0, 0.01),
+        }]);
+        let total = pipeline.total_service_curve();
+        assert!(approx_eq(total.rate(), 1000.0));
+        assert!(approx_eq(total.latency(), 0.01));
+    }
+
+    // ── FrankenTerm: empty pane list ──
+
+    #[test]
+    fn frankenterm_analysis_empty_panes() {
+        let config = PipelineConfig {
+            capture_rate_bps: 1_000_000.0,
+            capture_latency_s: 0.001,
+            process_rate_bps: 500_000.0,
+            process_latency_s: 0.002,
+            storage_rate_bps: 200_000.0,
+            storage_latency_s: 0.003,
+        };
+        let analysis = analyze_frankenterm_pipeline(&[], &config);
+        assert!(analysis.is_stable);
+        assert_eq!(analysis.stages.len(), 3);
+    }
 }
