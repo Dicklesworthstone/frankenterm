@@ -116,6 +116,7 @@ pub mod lru_cache;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memory_budget;
+pub mod merkle_tree;
 pub mod memory_pressure;
 #[cfg(feature = "metrics")]
 pub mod metrics;
