@@ -848,4 +848,324 @@ mod tests {
         assert!(!r.summary.is_empty());
         assert!(!r.commands.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Batch 10 — TopazBay wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    // ---- RemediationCommand ----
+
+    #[test]
+    fn remediation_command_debug() {
+        let cmd = RemediationCommand {
+            label: "Run".to_string(),
+            command: "ft doctor".to_string(),
+            platform: None,
+        };
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("RemediationCommand"));
+        assert!(debug.contains("ft doctor"));
+    }
+
+    #[test]
+    fn remediation_command_clone() {
+        let cmd = RemediationCommand {
+            label: "Install".to_string(),
+            command: "brew install wezterm".to_string(),
+            platform: Some("macOS".to_string()),
+        };
+        let cloned = cmd.clone();
+        assert_eq!(cloned.label, "Install");
+        assert_eq!(cloned.platform.as_deref(), Some("macOS"));
+    }
+
+    #[test]
+    fn remediation_command_serde_no_platform() {
+        let cmd = RemediationCommand {
+            label: "Check".to_string(),
+            command: "ft status".to_string(),
+            platform: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: RemediationCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.label, "Check");
+        assert!(back.platform.is_none());
+    }
+
+    // ---- Remediation builder edge cases ----
+
+    #[test]
+    fn remediation_multiple_commands() {
+        let r = Remediation::new("fix")
+            .command("A", "cmd-a")
+            .command("B", "cmd-b")
+            .command("C", "cmd-c");
+        assert_eq!(r.commands.len(), 3);
+        assert_eq!(r.commands[0].label, "A");
+        assert_eq!(r.commands[1].label, "B");
+        assert_eq!(r.commands[2].label, "C");
+    }
+
+    #[test]
+    fn remediation_multiple_alternatives() {
+        let r = Remediation::new("fix")
+            .alternative("alt 1")
+            .alternative("alt 2");
+        assert_eq!(r.alternatives.len(), 2);
+        assert_eq!(r.alternatives[0], "alt 1");
+        assert_eq!(r.alternatives[1], "alt 2");
+    }
+
+    #[test]
+    fn remediation_learn_more_overwrites() {
+        let r = Remediation::new("fix")
+            .learn_more("first")
+            .learn_more("second");
+        assert_eq!(r.learn_more.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn remediation_debug() {
+        let r = Remediation::new("Fix the thing");
+        let debug = format!("{r:?}");
+        assert!(debug.contains("Remediation"));
+        assert!(debug.contains("Fix the thing"));
+    }
+
+    #[test]
+    fn remediation_clone() {
+        let r = Remediation::new("Fix")
+            .command("Run", "ft doctor")
+            .alternative("Alt")
+            .learn_more("link");
+        let cloned = r.clone();
+        assert_eq!(cloned.summary, "Fix");
+        assert_eq!(cloned.commands.len(), 1);
+        assert_eq!(cloned.alternatives.len(), 1);
+        assert_eq!(cloned.learn_more.as_deref(), Some("link"));
+    }
+
+    // ---- render_plain edge cases ----
+
+    #[test]
+    fn render_plain_multiple_commands_preserve_order() {
+        let r = Remediation::new("fix")
+            .command("First", "cmd1")
+            .platform_command("Second", "cmd2", "Linux")
+            .command("Third", "cmd3");
+        let text = r.render_plain();
+        let pos1 = text.find("First").unwrap();
+        let pos2 = text.find("Second (Linux)").unwrap();
+        let pos3 = text.find("Third").unwrap();
+        assert!(pos1 < pos2);
+        assert!(pos2 < pos3);
+    }
+
+    #[test]
+    fn render_plain_all_sections_present() {
+        let r = Remediation::new("summary")
+            .command("Cmd", "run")
+            .alternative("Alt")
+            .learn_more("https://docs.example.com");
+        let text = r.render_plain();
+        assert!(text.contains("To fix:"));
+        assert!(text.contains("summary"));
+        assert!(text.contains("Commands:"));
+        assert!(text.contains("Cmd: run"));
+        assert!(text.contains("Alternatives:"));
+        assert!(text.contains("Alt"));
+        assert!(text.contains("Learn more: https://docs.example.com"));
+    }
+
+    // ---- WeztermError::is_circuit_breaker_trigger ----
+
+    #[test]
+    fn wezterm_circuit_breaker_trigger_variants() {
+        assert!(WeztermError::CliNotFound.is_circuit_breaker_trigger());
+        assert!(WeztermError::NotRunning.is_circuit_breaker_trigger());
+        assert!(WeztermError::SocketNotFound("path".to_string()).is_circuit_breaker_trigger());
+        assert!(WeztermError::Timeout(5).is_circuit_breaker_trigger());
+        assert!(WeztermError::CommandFailed("err".to_string()).is_circuit_breaker_trigger());
+    }
+
+    #[test]
+    fn wezterm_non_circuit_breaker_trigger_variants() {
+        assert!(!WeztermError::PaneNotFound(1).is_circuit_breaker_trigger());
+        assert!(!WeztermError::ParseError("bad".to_string()).is_circuit_breaker_trigger());
+        assert!(
+            !WeztermError::CircuitOpen {
+                retry_after_ms: 100
+            }
+            .is_circuit_breaker_trigger()
+        );
+    }
+
+    // ---- Error Display remaining variants ----
+
+    #[test]
+    fn error_display_setup_error() {
+        let err = Error::SetupError("missing config".to_string());
+        assert!(err.to_string().contains("missing config"));
+        assert!(err.to_string().contains("Setup"));
+    }
+
+    #[test]
+    fn error_display_cancelled() {
+        let err = Error::Cancelled("user triggered".to_string());
+        assert!(err.to_string().contains("user triggered"));
+        assert!(err.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn error_display_panicked() {
+        let err = Error::Panicked("index out of bounds".to_string());
+        assert!(err.to_string().contains("index out of bounds"));
+        assert!(err.to_string().contains("panicked"));
+    }
+
+    // ---- Sub-error Display ----
+
+    #[test]
+    fn pattern_error_display() {
+        assert!(PatternError::InvalidRule("bad rule".to_string())
+            .to_string()
+            .contains("bad rule"));
+        assert!(PatternError::InvalidRegex("bad regex".to_string())
+            .to_string()
+            .contains("bad regex"));
+        assert!(PatternError::PackNotFound("core".to_string())
+            .to_string()
+            .contains("core"));
+        assert!(PatternError::MatchTimeout.to_string().contains("timeout"));
+    }
+
+    #[test]
+    fn workflow_error_display() {
+        assert!(WorkflowError::NotFound("flow1".to_string())
+            .to_string()
+            .contains("flow1"));
+        assert!(WorkflowError::Aborted("reason".to_string())
+            .to_string()
+            .contains("reason"));
+        assert!(WorkflowError::GuardFailed("precondition".to_string())
+            .to_string()
+            .contains("precondition"));
+        assert!(WorkflowError::PaneLocked.to_string().contains("locked"));
+    }
+
+    #[test]
+    fn config_error_display() {
+        assert!(ConfigError::FileNotFound("ft.toml".to_string())
+            .to_string()
+            .contains("ft.toml"));
+        assert!(ConfigError::ReadFailed("path".to_string(), "err".to_string())
+            .to_string()
+            .contains("path"));
+        assert!(ConfigError::ParseError("syntax".to_string())
+            .to_string()
+            .contains("syntax"));
+        assert!(ConfigError::ParseFailed("toml".to_string())
+            .to_string()
+            .contains("toml"));
+        assert!(ConfigError::SerializeFailed("err".to_string())
+            .to_string()
+            .contains("err"));
+        assert!(ConfigError::ValidationError("invalid".to_string())
+            .to_string()
+            .contains("invalid"));
+    }
+
+    #[test]
+    fn storage_error_corruption_display() {
+        let err = StorageError::Corruption {
+            details: "checksum mismatch".to_string(),
+        };
+        assert!(err.to_string().contains("checksum mismatch"));
+        assert!(err.to_string().contains("corruption"));
+    }
+
+    #[test]
+    fn storage_error_not_found_display() {
+        let err = StorageError::NotFound("session-42".to_string());
+        assert!(err.to_string().contains("session-42"));
+    }
+
+    // ---- From conversions remaining ----
+
+    #[test]
+    fn from_pattern_error() {
+        let inner = PatternError::MatchTimeout;
+        let err: Error = inner.into();
+        assert!(matches!(err, Error::Pattern(PatternError::MatchTimeout)));
+    }
+
+    #[test]
+    fn from_workflow_error() {
+        let inner = WorkflowError::PaneLocked;
+        let err: Error = inner.into();
+        assert!(matches!(err, Error::Workflow(WorkflowError::PaneLocked)));
+    }
+
+    #[test]
+    fn from_config_error() {
+        let inner = ConfigError::ValidationError("invalid".to_string());
+        let err: Error = inner.into();
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::ValidationError(_))
+        ));
+    }
+
+    // ---- format_error_with_remediation ----
+
+    #[test]
+    fn format_error_with_remediation_includes_error_and_guidance() {
+        let err = Error::Runtime("channel closed".to_string());
+        let output = format_error_with_remediation(&err);
+        assert!(output.starts_with("Error:"));
+        assert!(output.contains("channel closed"));
+        assert!(output.contains("To fix:"));
+        assert!(output.contains("Commands:"));
+    }
+
+    #[test]
+    fn format_error_with_remediation_policy() {
+        let err = Error::Policy("rate limit exceeded".to_string());
+        let output = format_error_with_remediation(&err);
+        assert!(output.contains("rate limit exceeded"));
+        assert!(output.contains("ft status") || output.contains("ft doctor"));
+    }
+
+    // ---- Sub-error remediation details ----
+
+    #[test]
+    fn storage_corruption_remediation_mentions_diagnostics() {
+        let r = StorageError::Corruption {
+            details: "bad page".to_string(),
+        }
+        .remediation();
+        assert!(!r.summary.is_empty());
+        assert!(!r.commands.is_empty());
+    }
+
+    #[test]
+    fn pattern_match_timeout_remediation() {
+        let r = PatternError::MatchTimeout.remediation();
+        assert!(!r.summary.is_empty());
+        assert!(!r.commands.is_empty());
+    }
+
+    #[test]
+    fn config_validation_error_remediation() {
+        let r = ConfigError::ValidationError("bad field".to_string()).remediation();
+        assert!(!r.summary.is_empty());
+        assert!(!r.commands.is_empty());
+    }
+
+    #[test]
+    fn wezterm_timeout_remediation_includes_seconds() {
+        let r = WeztermError::Timeout(30).remediation();
+        let text = r.render_plain();
+        assert!(text.contains("30"));
+    }
 }

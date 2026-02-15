@@ -783,4 +783,352 @@ sound = true
         assert!(json.contains("linux"));
         assert!(json.contains("true"));
     }
+
+    // -----------------------------------------------------------------------
+    // Batch 10 — TopazBay wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    // ---- urgency_from_str ----
+
+    #[test]
+    fn urgency_from_str_critical() {
+        assert_eq!(urgency_from_str("critical"), Urgency::Critical);
+    }
+
+    #[test]
+    fn urgency_from_str_warning() {
+        assert_eq!(urgency_from_str("warning"), Urgency::Normal);
+    }
+
+    #[test]
+    fn urgency_from_str_info_is_low() {
+        assert_eq!(urgency_from_str("info"), Urgency::Low);
+    }
+
+    #[test]
+    fn urgency_from_str_empty_is_low() {
+        assert_eq!(urgency_from_str(""), Urgency::Low);
+    }
+
+    #[test]
+    fn urgency_from_str_unknown_is_low() {
+        assert_eq!(urgency_from_str("unknown"), Urgency::Low);
+    }
+
+    #[test]
+    fn urgency_from_str_case_sensitive() {
+        // "Critical" (capitalized) is not "critical" — falls to default
+        assert_eq!(urgency_from_str("Critical"), Urgency::Low);
+        assert_eq!(urgency_from_str("WARNING"), Urgency::Low);
+    }
+
+    // ---- escape_applescript edge cases ----
+
+    #[test]
+    fn escape_applescript_empty() {
+        assert_eq!(escape_applescript(""), "");
+    }
+
+    #[test]
+    fn escape_applescript_no_special_chars() {
+        assert_eq!(escape_applescript("hello world"), "hello world");
+    }
+
+    #[test]
+    fn escape_applescript_combined_backslash_and_quote() {
+        assert_eq!(
+            escape_applescript(r#"path \"to" file"#),
+            r#"path \\\"to\" file"#
+        );
+    }
+
+    #[test]
+    fn escape_applescript_multiple_backslashes() {
+        assert_eq!(escape_applescript(r"a\\b"), r"a\\\\b");
+    }
+
+    // ---- escape_powershell edge cases ----
+
+    #[test]
+    fn escape_powershell_empty() {
+        assert_eq!(escape_powershell(""), "");
+    }
+
+    #[test]
+    fn escape_powershell_no_quotes() {
+        assert_eq!(escape_powershell("hello world"), "hello world");
+    }
+
+    #[test]
+    fn escape_powershell_multiple_quotes() {
+        assert_eq!(escape_powershell("it's a 'test'"), "it''s a ''test''");
+    }
+
+    #[test]
+    fn escape_powershell_adjacent_quotes() {
+        assert_eq!(escape_powershell("''"), "''''");
+    }
+
+    // ---- Urgency serde ----
+
+    #[test]
+    fn urgency_serde_roundtrip() {
+        for urgency in [Urgency::Low, Urgency::Normal, Urgency::Critical] {
+            let json = serde_json::to_string(&urgency).expect("serialize");
+            let back: Urgency = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, urgency);
+        }
+    }
+
+    #[test]
+    fn urgency_serde_lowercase_values() {
+        let low: Urgency = serde_json::from_str(r#""low""#).unwrap();
+        assert_eq!(low, Urgency::Low);
+        let normal: Urgency = serde_json::from_str(r#""normal""#).unwrap();
+        assert_eq!(normal, Urgency::Normal);
+        let critical: Urgency = serde_json::from_str(r#""critical""#).unwrap();
+        assert_eq!(critical, Urgency::Critical);
+    }
+
+    #[test]
+    fn urgency_copy_clone() {
+        let u = Urgency::Critical;
+        let u2 = u; // Copy
+        let u3 = u.clone();
+        assert_eq!(u, u2);
+        assert_eq!(u, u3);
+    }
+
+    // ---- NotifyBackend serde ----
+
+    #[test]
+    fn notify_backend_serde_roundtrip() {
+        for backend in [
+            NotifyBackend::MacOs,
+            NotifyBackend::Linux,
+            NotifyBackend::Windows,
+            NotifyBackend::None,
+        ] {
+            let json = serde_json::to_string(&backend).expect("serialize");
+            let back: NotifyBackend = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, backend);
+        }
+    }
+
+    #[test]
+    fn notify_backend_serde_snake_case_values() {
+        let mac: NotifyBackend = serde_json::from_str(r#""mac_os""#).unwrap();
+        assert_eq!(mac, NotifyBackend::MacOs);
+        let none: NotifyBackend = serde_json::from_str(r#""none""#).unwrap();
+        assert_eq!(none, NotifyBackend::None);
+    }
+
+    #[test]
+    fn notify_backend_copy_clone() {
+        let b = NotifyBackend::Linux;
+        let b2 = b; // Copy
+        let b3 = b.clone();
+        assert_eq!(b, b2);
+        assert_eq!(b, b3);
+    }
+
+    // ---- DesktopNotifyConfig ----
+
+    #[test]
+    fn config_json_roundtrip() {
+        let config = DesktopNotifyConfig {
+            enabled: true,
+            sound: true,
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: DesktopNotifyConfig = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.enabled);
+        assert!(back.sound);
+    }
+
+    #[test]
+    fn config_debug() {
+        let config = DesktopNotifyConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("DesktopNotifyConfig"));
+        assert!(debug.contains("enabled"));
+        assert!(debug.contains("sound"));
+    }
+
+    #[test]
+    fn config_clone() {
+        let config = DesktopNotifyConfig {
+            enabled: true,
+            sound: false,
+        };
+        let cloned = config.clone();
+        assert!(cloned.enabled);
+        assert!(!cloned.sound);
+    }
+
+    // ---- NotifyCommand ----
+
+    #[test]
+    fn notify_command_debug() {
+        let cmd = NotifyCommand {
+            program: "osascript".to_string(),
+            args: vec!["-e".to_string(), "test".to_string()],
+        };
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("NotifyCommand"));
+        assert!(debug.contains("osascript"));
+    }
+
+    #[test]
+    fn notify_command_clone() {
+        let cmd = NotifyCommand {
+            program: "notify-send".to_string(),
+            args: vec!["title".to_string(), "body".to_string()],
+        };
+        let cloned = cmd.clone();
+        assert_eq!(cloned.program, "notify-send");
+        assert_eq!(cloned.args.len(), 2);
+    }
+
+    // ---- DesktopDeliveryResult ----
+
+    #[test]
+    fn delivery_result_debug() {
+        let r = DesktopDeliveryResult {
+            backend: "macos".to_string(),
+            success: false,
+            error: Some("test error".to_string()),
+        };
+        let debug = format!("{r:?}");
+        assert!(debug.contains("DesktopDeliveryResult"));
+        assert!(debug.contains("test error"));
+    }
+
+    #[test]
+    fn delivery_result_clone() {
+        let r = DesktopDeliveryResult {
+            backend: "linux".to_string(),
+            success: true,
+            error: None,
+        };
+        let cloned = r.clone();
+        assert_eq!(cloned.backend, "linux");
+        assert!(cloned.success);
+        assert!(cloned.error.is_none());
+    }
+
+    #[test]
+    fn delivery_result_with_error_serializes() {
+        let r = DesktopDeliveryResult {
+            backend: "none".to_string(),
+            success: false,
+            error: Some("command not found".to_string()),
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert!(json.contains("command not found"));
+        assert!(json.contains("false"));
+    }
+
+    // ---- build_command edge cases ----
+
+    #[test]
+    fn build_command_empty_title_and_body() {
+        let cmd = build_command(NotifyBackend::Linux, "", "", Urgency::Low, false).unwrap();
+        assert_eq!(cmd.program, "notify-send");
+        assert!(cmd.args.contains(&String::new()));
+    }
+
+    #[test]
+    fn build_command_special_chars_in_body_macos() {
+        let cmd = build_command(
+            NotifyBackend::MacOs,
+            "title",
+            r#"body with "quotes" and \backslash"#,
+            Urgency::Normal,
+            false,
+        )
+        .unwrap();
+        // AppleScript escaping should handle quotes and backslashes
+        assert!(cmd.args[1].contains("\\\""));
+        assert!(cmd.args[1].contains("\\\\"));
+    }
+
+    #[test]
+    fn build_command_special_chars_in_title_windows() {
+        let cmd = build_command(
+            NotifyBackend::Windows,
+            "it's a test",
+            "body",
+            Urgency::Normal,
+            false,
+        )
+        .unwrap();
+        // PowerShell escaping should double the single quotes
+        assert!(cmd.args[1].contains("it''s a test"));
+    }
+
+    // ---- DesktopNotifier ----
+
+    #[test]
+    fn notifier_with_backend_stores_backend() {
+        let n = DesktopNotifier::with_backend(
+            NotifyBackend::Windows,
+            DesktopNotifyConfig {
+                enabled: true,
+                sound: true,
+            },
+        );
+        assert_eq!(n.backend(), NotifyBackend::Windows);
+        assert!(n.is_available());
+    }
+
+    #[test]
+    fn notifier_notify_message_disabled() {
+        let n = DesktopNotifier::with_backend(NotifyBackend::Linux, DesktopNotifyConfig::default());
+        let result = n.notify_message("title", "body", Urgency::Normal);
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("disabled"));
+    }
+
+    #[test]
+    fn notifier_notify_message_none_backend() {
+        let n = DesktopNotifier::with_backend(
+            NotifyBackend::None,
+            DesktopNotifyConfig {
+                enabled: true,
+                sound: false,
+            },
+        );
+        let result = n.notify_message("title", "body", Urgency::Critical);
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("no notification backend"));
+    }
+
+    #[test]
+    fn notifier_debug() {
+        let n = DesktopNotifier::with_backend(NotifyBackend::MacOs, DesktopNotifyConfig::default());
+        let debug = format!("{n:?}");
+        assert!(debug.contains("DesktopNotifier"));
+        assert!(debug.contains("MacOs"));
+    }
+
+    #[test]
+    fn notifier_clone() {
+        let n = DesktopNotifier::with_backend(
+            NotifyBackend::Linux,
+            DesktopNotifyConfig {
+                enabled: true,
+                sound: true,
+            },
+        );
+        let cloned = n.clone();
+        assert_eq!(cloned.backend(), NotifyBackend::Linux);
+        assert!(cloned.is_available());
+    }
+
+    #[test]
+    fn notifier_name_is_desktop() {
+        let n = DesktopNotifier::new(DesktopNotifyConfig::default());
+        assert_eq!(n.name(), "desktop");
+    }
 }
