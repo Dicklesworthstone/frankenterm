@@ -2327,6 +2327,680 @@ mod tests {
         let tail = tail_text(text, 2);
         assert_eq!(tail, "three\nfour\n");
     }
+
+    // =====================================================================
+    // tail_text edge cases
+    // =====================================================================
+
+    #[test]
+    fn tail_text_zero_lines_returns_empty() {
+        let text = "one\ntwo\nthree\n";
+        assert_eq!(tail_text(text, 0), "");
+    }
+
+    #[test]
+    fn tail_text_more_than_available_returns_all() {
+        let text = "one\ntwo\n";
+        assert_eq!(tail_text(text, 100), "one\ntwo\n");
+    }
+
+    #[test]
+    fn tail_text_empty_string() {
+        assert_eq!(tail_text("", 5), "");
+    }
+
+    #[test]
+    fn tail_text_no_trailing_newline() {
+        let text = "one\ntwo\nthree";
+        let tail = tail_text(text, 2);
+        assert_eq!(tail, "two\nthree");
+    }
+
+    #[test]
+    fn tail_text_single_line_no_newline() {
+        assert_eq!(tail_text("hello", 1), "hello");
+    }
+
+    #[test]
+    fn tail_text_single_line_with_newline() {
+        assert_eq!(tail_text("hello\n", 1), "hello\n");
+    }
+
+    #[test]
+    fn tail_text_exact_count() {
+        let text = "a\nb\nc\n";
+        assert_eq!(tail_text(text, 3), "a\nb\nc\n");
+    }
+
+    // =====================================================================
+    // stable_hash
+    // =====================================================================
+
+    #[test]
+    fn stable_hash_empty_is_fnv1a_offset() {
+        // FNV-1a offset basis
+        assert_eq!(stable_hash(b""), 0xcbf2_9ce4_8422_2325);
+    }
+
+    #[test]
+    fn stable_hash_deterministic() {
+        let h1 = stable_hash(b"hello world");
+        let h2 = stable_hash(b"hello world");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn stable_hash_different_inputs_differ() {
+        let h1 = stable_hash(b"hello");
+        let h2 = stable_hash(b"world");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn stable_hash_single_byte() {
+        let h = stable_hash(b"A");
+        assert_ne!(h, 0);
+        assert_ne!(h, 0xcbf2_9ce4_8422_2325);
+    }
+
+    // =====================================================================
+    // ms_u64
+    // =====================================================================
+
+    #[test]
+    fn ms_u64_converts_duration() {
+        assert_eq!(ms_u64(Duration::from_millis(42)), 42);
+        assert_eq!(ms_u64(Duration::from_secs(1)), 1000);
+        assert_eq!(ms_u64(Duration::ZERO), 0);
+    }
+
+    // =====================================================================
+    // is_retryable_error
+    // =====================================================================
+
+    #[test]
+    fn is_retryable_not_running() {
+        let err: crate::Error = WeztermError::NotRunning.into();
+        assert!(is_retryable_error(&err));
+    }
+
+    #[test]
+    fn is_retryable_timeout() {
+        let err: crate::Error = WeztermError::Timeout(30).into();
+        assert!(is_retryable_error(&err));
+    }
+
+    #[test]
+    fn is_retryable_command_failed() {
+        let err: crate::Error = WeztermError::CommandFailed("oops".to_string()).into();
+        assert!(is_retryable_error(&err));
+    }
+
+    #[test]
+    fn is_not_retryable_pane_not_found() {
+        let err: crate::Error = WeztermError::PaneNotFound(1).into();
+        assert!(!is_retryable_error(&err));
+    }
+
+    #[test]
+    fn is_not_retryable_cli_not_found() {
+        let err: crate::Error = WeztermError::CliNotFound.into();
+        assert!(!is_retryable_error(&err));
+    }
+
+    #[test]
+    fn is_not_retryable_circuit_open() {
+        let err: crate::Error = WeztermError::CircuitOpen { retry_after_ms: 100 }.into();
+        assert!(!is_retryable_error(&err));
+    }
+
+    #[test]
+    fn is_not_retryable_non_wezterm_error() {
+        let err = crate::Error::Runtime("generic error".to_string());
+        assert!(!is_retryable_error(&err));
+    }
+
+    // =====================================================================
+    // parse_pane_id
+    // =====================================================================
+
+    #[test]
+    fn parse_pane_id_valid() {
+        assert_eq!(WeztermClient::parse_pane_id("42\n").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_pane_id_no_trailing_newline() {
+        assert_eq!(WeztermClient::parse_pane_id("7").unwrap(), 7);
+    }
+
+    #[test]
+    fn parse_pane_id_with_whitespace() {
+        assert_eq!(WeztermClient::parse_pane_id("  123  \n").unwrap(), 123);
+    }
+
+    #[test]
+    fn parse_pane_id_invalid() {
+        let result = WeztermClient::parse_pane_id("not-a-number");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_pane_id_empty() {
+        assert!(WeztermClient::parse_pane_id("").is_err());
+    }
+
+    #[test]
+    fn parse_pane_id_zero() {
+        assert_eq!(WeztermClient::parse_pane_id("0\n").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_pane_id_large() {
+        assert_eq!(
+            WeztermClient::parse_pane_id("18446744073709551615\n").unwrap(),
+            u64::MAX
+        );
+    }
+
+    // =====================================================================
+    // categorize_io_error catch-all
+    // =====================================================================
+
+    #[test]
+    fn categorize_io_error_other() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        let wez_err = WeztermClient::categorize_io_error(&e);
+        match wez_err {
+            WeztermError::CommandFailed(msg) => assert!(msg.contains("connection refused")),
+            other => panic!("expected CommandFailed, got {:?}", other),
+        }
+    }
+
+    // =====================================================================
+    // CwdInfo edge cases
+    // =====================================================================
+
+    #[test]
+    fn cwd_info_whitespace_trimmed() {
+        let cwd = CwdInfo::parse("  file:///home/user  ");
+        assert!(!cwd.is_remote);
+        assert_eq!(cwd.path, "/home/user");
+    }
+
+    #[test]
+    fn cwd_info_host_only_no_path() {
+        let cwd = CwdInfo::parse("file://myhost");
+        assert!(cwd.is_remote);
+        assert_eq!(cwd.host, "myhost");
+        assert_eq!(cwd.path, "");
+    }
+
+    #[test]
+    fn cwd_info_remote_nested_path() {
+        let cwd = CwdInfo::parse("file://server.example.com/var/log/syslog");
+        assert!(cwd.is_remote);
+        assert_eq!(cwd.host, "server.example.com");
+        assert_eq!(cwd.path, "/var/log/syslog");
+    }
+
+    #[test]
+    fn cwd_info_default_is_empty() {
+        let cwd = CwdInfo::default();
+        assert_eq!(cwd.raw_uri, "");
+        assert_eq!(cwd.path, "");
+        assert_eq!(cwd.host, "");
+        assert!(!cwd.is_remote);
+    }
+
+    // =====================================================================
+    // WaitMatcher
+    // =====================================================================
+
+    #[test]
+    fn wait_matcher_substring_matches() {
+        let m = WaitMatcher::substring("hello");
+        assert!(m.matches("say hello world").unwrap());
+        assert!(!m.matches("goodbye").unwrap());
+    }
+
+    #[test]
+    fn wait_matcher_regex_matches() {
+        let re = fancy_regex::Regex::new(r"\d+\.\d+").unwrap();
+        let m = WaitMatcher::regex(re);
+        assert!(m.matches("version 1.23 released").unwrap());
+        assert!(!m.matches("no numbers here").unwrap());
+    }
+
+    #[test]
+    fn wait_matcher_substring_description() {
+        let m = WaitMatcher::substring("test");
+        let desc = m.description();
+        assert!(desc.starts_with("substring(len=4"));
+        assert!(desc.contains("hash="));
+    }
+
+    #[test]
+    fn wait_matcher_regex_description() {
+        let re = fancy_regex::Regex::new(r"\w+").unwrap();
+        let m = WaitMatcher::regex(re);
+        let desc = m.description();
+        assert!(desc.starts_with("regex(len="));
+        assert!(desc.contains("hash="));
+    }
+
+    #[test]
+    fn wait_matcher_substring_empty_needle() {
+        let m = WaitMatcher::substring("");
+        // Empty substring matches everything
+        assert!(m.matches("anything").unwrap());
+        assert!(m.matches("").unwrap());
+    }
+
+    // =====================================================================
+    // WaitOptions defaults
+    // =====================================================================
+
+    #[test]
+    fn wait_options_defaults() {
+        let opts = WaitOptions::default();
+        assert_eq!(opts.tail_lines, 200);
+        assert!(!opts.escapes);
+        assert_eq!(opts.poll_initial, Duration::from_millis(50));
+        assert_eq!(opts.poll_max, Duration::from_secs(1));
+        assert_eq!(opts.max_polls, 10_000);
+    }
+
+    // =====================================================================
+    // WaitResult traits
+    // =====================================================================
+
+    #[test]
+    fn wait_result_eq() {
+        let r1 = WaitResult::Matched {
+            elapsed_ms: 100,
+            polls: 5,
+        };
+        let r2 = WaitResult::Matched {
+            elapsed_ms: 100,
+            polls: 5,
+        };
+        assert_eq!(r1, r2);
+
+        let r3 = WaitResult::TimedOut {
+            elapsed_ms: 200,
+            polls: 10,
+            last_tail_hash: Some(42),
+        };
+        assert_ne!(r1, r3);
+    }
+
+    #[test]
+    fn wait_result_debug() {
+        let r = WaitResult::Matched {
+            elapsed_ms: 50,
+            polls: 2,
+        };
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("Matched"));
+        assert!(dbg.contains("50"));
+    }
+
+    // =====================================================================
+    // CodexSummaryMarkers
+    // =====================================================================
+
+    #[test]
+    fn codex_markers_complete_when_both_present() {
+        let m = CodexSummaryMarkers {
+            token_usage: true,
+            resume_hint: true,
+        };
+        assert!(m.complete());
+    }
+
+    #[test]
+    fn codex_markers_incomplete_missing_token_usage() {
+        let m = CodexSummaryMarkers {
+            token_usage: false,
+            resume_hint: true,
+        };
+        assert!(!m.complete());
+    }
+
+    #[test]
+    fn codex_markers_incomplete_missing_resume_hint() {
+        let m = CodexSummaryMarkers {
+            token_usage: true,
+            resume_hint: false,
+        };
+        assert!(!m.complete());
+    }
+
+    #[test]
+    fn codex_markers_incomplete_both_missing() {
+        let m = CodexSummaryMarkers {
+            token_usage: false,
+            resume_hint: false,
+        };
+        assert!(!m.complete());
+    }
+
+    #[test]
+    fn codex_markers_copy_eq() {
+        let m1 = CodexSummaryMarkers {
+            token_usage: true,
+            resume_hint: false,
+        };
+        let m2 = m1; // Copy
+        assert_eq!(m1, m2);
+    }
+
+    // =====================================================================
+    // PaneSize defaults
+    // =====================================================================
+
+    #[test]
+    fn pane_size_default() {
+        let size = PaneSize::default();
+        assert_eq!(size.rows, 0);
+        assert_eq!(size.cols, 0);
+        assert!(size.pixel_width.is_none());
+        assert!(size.pixel_height.is_none());
+        assert!(size.dpi.is_none());
+    }
+
+    #[test]
+    fn pane_size_serde_roundtrip() {
+        let size = PaneSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: Some(640),
+            pixel_height: Some(480),
+            dpi: Some(96),
+        };
+        let json = serde_json::to_string(&size).unwrap();
+        let back: PaneSize = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rows, 24);
+        assert_eq!(back.cols, 80);
+        assert_eq!(back.pixel_width, Some(640));
+    }
+
+    // =====================================================================
+    // CursorVisibility default
+    // =====================================================================
+
+    #[test]
+    fn cursor_visibility_default_is_visible() {
+        assert_eq!(CursorVisibility::default(), CursorVisibility::Visible);
+    }
+
+    #[test]
+    fn cursor_visibility_serde_roundtrip() {
+        let json = serde_json::to_string(&CursorVisibility::Hidden).unwrap();
+        assert_eq!(json, r#""Hidden""#);
+        let back: CursorVisibility = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, CursorVisibility::Hidden);
+    }
+
+    // =====================================================================
+    // SplitDirection / MoveDirection trait coverage
+    // =====================================================================
+
+    #[test]
+    fn split_direction_debug_clone_eq() {
+        let d = SplitDirection::Left;
+        let d2 = d; // Copy
+        assert_eq!(d, d2);
+        assert_eq!(format!("{:?}", d), "Left");
+
+        assert_ne!(SplitDirection::Left, SplitDirection::Right);
+        assert_ne!(SplitDirection::Top, SplitDirection::Bottom);
+    }
+
+    #[test]
+    fn move_direction_debug_clone_eq() {
+        let d = MoveDirection::Up;
+        let d2 = d; // Copy
+        assert_eq!(d, d2);
+        assert_eq!(format!("{:?}", d), "Up");
+
+        assert_ne!(MoveDirection::Left, MoveDirection::Right);
+        assert_ne!(MoveDirection::Up, MoveDirection::Down);
+    }
+
+    // =====================================================================
+    // WeztermClient builder edge cases
+    // =====================================================================
+
+    #[test]
+    fn client_with_retries_clamps_to_min_one() {
+        let client = WeztermClient::new().with_retries(0);
+        assert_eq!(client.retry_attempts, 1);
+    }
+
+    #[test]
+    fn client_default_trait() {
+        let client = WeztermClient::default();
+        assert_eq!(client.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(client.retry_attempts, DEFAULT_RETRY_ATTEMPTS);
+        assert_eq!(client.retry_delay_ms, DEFAULT_RETRY_DELAY_MS);
+        assert!(client.socket_path.is_none());
+    }
+
+    #[test]
+    fn client_circuit_status_default_is_closed() {
+        let client = WeztermClient::new();
+        let status = client.circuit_status();
+        assert_eq!(status.state, CircuitStateKind::Closed);
+    }
+
+    // =====================================================================
+    // PaneInfo serialization roundtrip
+    // =====================================================================
+
+    #[test]
+    fn pane_info_serde_roundtrip() {
+        let json = r#"{
+            "pane_id": 5,
+            "tab_id": 1,
+            "window_id": 0,
+            "domain_name": "ssh:remote",
+            "title": "vim",
+            "is_active": true,
+            "is_zoomed": false
+        }"#;
+        let pane: PaneInfo = serde_json::from_str(json).unwrap();
+        let back_json = serde_json::to_string(&pane).unwrap();
+        let back: PaneInfo = serde_json::from_str(&back_json).unwrap();
+        assert_eq!(back.pane_id, 5);
+        assert_eq!(back.effective_domain(), "ssh:remote");
+        assert_eq!(back.effective_title(), "vim");
+        assert!(back.is_active);
+    }
+
+    // =====================================================================
+    // PaneInfo edge cases
+    // =====================================================================
+
+    #[test]
+    fn pane_info_effective_title_default() {
+        let json = r#"{"pane_id": 0, "tab_id": 0, "window_id": 0}"#;
+        let pane: PaneInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(pane.effective_title(), "");
+    }
+
+    #[test]
+    fn pane_info_inferred_domain_empty_domain_name() {
+        let json = r#"{
+            "pane_id": 0, "tab_id": 0, "window_id": 0,
+            "domain_name": ""
+        }"#;
+        let pane: PaneInfo = serde_json::from_str(json).unwrap();
+        // Empty domain_name should fall through to cwd inference → "local"
+        assert_eq!(pane.inferred_domain(), "local");
+    }
+
+    #[test]
+    fn pane_info_parsed_cwd_none() {
+        let json = r#"{"pane_id": 0, "tab_id": 0, "window_id": 0}"#;
+        let pane: PaneInfo = serde_json::from_str(json).unwrap();
+        let cwd = pane.parsed_cwd();
+        assert_eq!(cwd.path, "");
+        assert!(!cwd.is_remote);
+    }
+
+    #[test]
+    fn pane_info_size_overrides_flat_rows_cols() {
+        let json = r#"{
+            "pane_id": 0, "tab_id": 0, "window_id": 0,
+            "rows": 30,
+            "cols": 100,
+            "size": {"rows": 48, "cols": 120}
+        }"#;
+        let pane: PaneInfo = serde_json::from_str(json).unwrap();
+        // size takes precedence over flat rows/cols
+        assert_eq!(pane.effective_rows(), 48);
+        assert_eq!(pane.effective_cols(), 120);
+    }
+
+    // =====================================================================
+    // mock_wezterm_handle / mock_wezterm_handle_failing
+    // =====================================================================
+
+    #[tokio::test]
+    async fn mock_handle_returns_empty_panes() {
+        let handle = mock_wezterm_handle();
+        let panes = handle.list_panes().await.unwrap();
+        assert!(panes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_handle_failing_list_errors() {
+        let handle = mock_wezterm_handle_failing();
+        let result = handle.list_panes().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn mock_handle_failing_get_text_errors() {
+        let handle = mock_wezterm_handle_failing();
+        let result = handle.get_text(0, false).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn mock_handle_failing_send_text_errors() {
+        let handle = mock_wezterm_handle_failing();
+        let result = handle.send_text(0, "test").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn mock_handle_failing_spawn_errors() {
+        let handle = mock_wezterm_handle_failing();
+        let result = handle.spawn(None, None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn mock_handle_failing_circuit_status_default() {
+        let handle = mock_wezterm_handle_failing();
+        let status = handle.circuit_status();
+        assert_eq!(status.state, CircuitStateKind::Closed);
+    }
+
+    // =====================================================================
+    // control module constants
+    // =====================================================================
+
+    #[test]
+    fn control_constants_are_single_byte() {
+        assert_eq!(control::CTRL_C.len(), 1);
+        assert_eq!(control::CTRL_D.len(), 1);
+        assert_eq!(control::CTRL_Z.len(), 1);
+        assert_eq!(control::CTRL_BACKSLASH.len(), 1);
+        assert_eq!(control::ENTER.len(), 1);
+        assert_eq!(control::ESCAPE.len(), 1);
+    }
+
+    // =====================================================================
+    // CodexSummaryWaitResult
+    // =====================================================================
+
+    #[test]
+    fn codex_summary_wait_result_debug_eq() {
+        let r1 = CodexSummaryWaitResult {
+            matched: true,
+            elapsed_ms: 100,
+            polls: 3,
+            last_tail_hash: Some(42),
+            last_markers: CodexSummaryMarkers {
+                token_usage: true,
+                resume_hint: true,
+            },
+        };
+        let r2 = r1.clone();
+        assert_eq!(r1, r2);
+        let dbg = format!("{:?}", r1);
+        assert!(dbg.contains("matched: true"));
+    }
+
+    // =====================================================================
+    // WeztermHandleSource
+    // =====================================================================
+
+    #[tokio::test]
+    async fn wezterm_handle_source_delegates_get_text() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+        mock.inject_output(0, "source test").await.unwrap();
+
+        let handle: WeztermHandle = Arc::new(mock);
+        let source = WeztermHandleSource::new(handle);
+        let text = source.get_text(0, false).await.unwrap();
+        assert_eq!(text, "source test");
+    }
+
+    // =====================================================================
+    // PaneWaiter with max_polls limit
+    // =====================================================================
+
+    #[tokio::test(start_paused = true)]
+    async fn waiter_stops_at_max_polls() {
+        let source = TestTextSource::new(vec!["no match"]);
+        let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
+            tail_lines: 50,
+            escapes: false,
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(1),
+            max_polls: 3,
+        });
+
+        let matcher = WaitMatcher::substring("never-found");
+        let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(60)));
+
+        // Advance time enough for polling
+        for _ in 0..10 {
+            tokio::select! {
+                result = &mut fut => {
+                    let result = result.unwrap();
+                    match result {
+                        WaitResult::TimedOut { polls, .. } => {
+                            assert!(polls <= 3);
+                        }
+                        WaitResult::Matched { .. } => panic!("unexpected match"),
+                    }
+                    return;
+                }
+                () = tokio::time::advance(Duration::from_millis(5)) => {}
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let result = fut.await.unwrap();
+        assert!(matches!(result, WaitResult::TimedOut { .. }));
+    }
 }
 
 // ---------------------------------------------------------------------------
