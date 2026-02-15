@@ -19186,4 +19186,1217 @@ You've hit your usage limit. Try again at 5:00 PM.";
         assert_eq!(parse_number(""), None);
         assert_eq!(parse_number("abc"), None);
     }
+
+    // =========================================================================
+    // RubyBeaver wa-1u90p.7.1 — additional pure unit tests
+    // =========================================================================
+
+    #[test]
+    fn parse_number_negative() {
+        assert_eq!(parse_number("-1"), Some(-1));
+    }
+
+    #[test]
+    fn parse_number_zero() {
+        assert_eq!(parse_number("0"), Some(0));
+    }
+
+    #[test]
+    fn parse_number_large_with_commas() {
+        assert_eq!(parse_number("1,000,000,000"), Some(1_000_000_000));
+    }
+
+    #[test]
+    fn capture_number_from_total_regex() {
+        assert_eq!(capture_number(&CODEX_TOTAL_RE, "total=42"), Some(42));
+    }
+
+    #[test]
+    fn capture_number_from_input_regex() {
+        assert_eq!(capture_number(&CODEX_INPUT_RE, "input=100"), Some(100));
+    }
+
+    #[test]
+    fn capture_number_from_output_regex() {
+        assert_eq!(capture_number(&CODEX_OUTPUT_RE, "output=200"), Some(200));
+    }
+
+    #[test]
+    fn capture_number_no_match_returns_none() {
+        assert_eq!(capture_number(&CODEX_TOTAL_RE, "nothing here"), None);
+    }
+
+    #[test]
+    fn capture_number_cached_with_comma() {
+        assert_eq!(
+            capture_number(&CODEX_CACHED_RE, "(+ 1,234 cached)"),
+            Some(1234)
+        );
+    }
+
+    #[test]
+    fn capture_number_reasoning() {
+        assert_eq!(
+            capture_number(&CODEX_REASONING_RE, "(reasoning 500)"),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn extract_token_usage_full_line() {
+        let line =
+            "Token usage: total=1,000 input=400 output=500 (+ 50 cached) (reasoning 100)";
+        let usage = extract_token_usage(line);
+        assert_eq!(usage.total, Some(1000));
+        assert_eq!(usage.input, Some(400));
+        assert_eq!(usage.output, Some(500));
+        assert_eq!(usage.cached, Some(50));
+        assert_eq!(usage.reasoning, Some(100));
+        assert!(usage.has_any());
+    }
+
+    #[test]
+    fn codex_token_usage_has_any_true_with_total_only() {
+        let usage = CodexTokenUsage {
+            total: Some(100),
+            input: None,
+            output: None,
+            cached: None,
+            reasoning: None,
+        };
+        assert!(usage.has_any());
+    }
+
+    #[test]
+    fn codex_token_usage_has_any_false_all_none() {
+        let usage = CodexTokenUsage {
+            total: None,
+            input: None,
+            output: None,
+            cached: None,
+            reasoning: None,
+        };
+        assert!(!usage.has_any());
+    }
+
+    #[test]
+    fn codex_token_usage_has_any_true_with_cached_only() {
+        let usage = CodexTokenUsage {
+            total: None,
+            input: None,
+            output: None,
+            cached: Some(42),
+            reasoning: None,
+        };
+        assert!(usage.has_any());
+    }
+
+    #[test]
+    fn codex_exit_options_default_grace_timeout() {
+        let opts = CodexExitOptions::default();
+        assert_eq!(opts.grace_timeout_ms, 2_000);
+    }
+
+    #[test]
+    fn codex_exit_options_default_summary_timeout() {
+        let opts = CodexExitOptions::default();
+        assert_eq!(opts.summary_timeout_ms, 20_000);
+    }
+
+    #[test]
+    fn codex_session_parse_error_display_includes_fields() {
+        let err = CodexSessionParseError {
+            missing: vec!["session_id"],
+            tail_hash: 0xCAFE,
+            tail_len: 100,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("session_id"));
+        assert!(msg.contains("tail_len=100"));
+    }
+
+    #[test]
+    fn codex_session_parse_error_is_error_trait() {
+        let err = CodexSessionParseError {
+            missing: vec!["token_usage"],
+            tail_hash: 0,
+            tail_len: 0,
+        };
+        // Verify it implements std::error::Error
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn step_result_cont_builder() {
+        assert!(matches!(StepResult::cont(), StepResult::Continue));
+    }
+
+    #[test]
+    fn step_result_done_builder_with_value() {
+        let result = StepResult::done(serde_json::json!({"key": "value"}));
+        assert!(result.is_done());
+        assert!(result.is_terminal());
+    }
+
+    #[test]
+    fn step_result_done_empty_is_null() {
+        if let StepResult::Done { result } = StepResult::done_empty() {
+            assert!(result.is_null());
+        } else {
+            panic!("expected Done");
+        }
+    }
+
+    #[test]
+    fn step_result_retry_builder() {
+        if let StepResult::Retry { delay_ms } = StepResult::retry(5000) {
+            assert_eq!(delay_ms, 5000);
+        } else {
+            panic!("expected Retry");
+        }
+    }
+
+    #[test]
+    fn step_result_abort_builder() {
+        if let StepResult::Abort { reason } = StepResult::abort("failed") {
+            assert_eq!(reason, "failed");
+        } else {
+            panic!("expected Abort");
+        }
+    }
+
+    #[test]
+    fn step_result_wait_for_builder_default_timeout() {
+        let result = StepResult::wait_for(WaitCondition::external("key"));
+        if let StepResult::WaitFor { timeout_ms, .. } = result {
+            assert!(timeout_ms.is_none());
+        } else {
+            panic!("expected WaitFor");
+        }
+    }
+
+    #[test]
+    fn step_result_wait_for_with_timeout_builder() {
+        let result =
+            StepResult::wait_for_with_timeout(WaitCondition::external("key"), 3000);
+        if let StepResult::WaitFor { timeout_ms, .. } = result {
+            assert_eq!(timeout_ms, Some(3000));
+        } else {
+            panic!("expected WaitFor");
+        }
+    }
+
+    #[test]
+    fn step_result_send_text_builder() {
+        let result = StepResult::send_text("hello");
+        assert!(result.is_send_text());
+        if let StepResult::SendText {
+            text,
+            wait_for,
+            wait_timeout_ms,
+        } = result
+        {
+            assert_eq!(text, "hello");
+            assert!(wait_for.is_none());
+            assert!(wait_timeout_ms.is_none());
+        } else {
+            panic!("expected SendText");
+        }
+    }
+
+    #[test]
+    fn step_result_send_text_and_wait_builder() {
+        let result = StepResult::send_text_and_wait(
+            "hello",
+            WaitCondition::pane_idle(1000),
+            5000,
+        );
+        assert!(result.is_send_text());
+        if let StepResult::SendText {
+            wait_for,
+            wait_timeout_ms,
+            ..
+        } = result
+        {
+            assert!(wait_for.is_some());
+            assert_eq!(wait_timeout_ms, Some(5000));
+        } else {
+            panic!("expected SendText");
+        }
+    }
+
+    #[test]
+    fn step_result_is_continue_only_for_continue() {
+        assert!(StepResult::cont().is_continue());
+        assert!(!StepResult::done_empty().is_continue());
+        assert!(!StepResult::abort("e").is_continue());
+        assert!(!StepResult::retry(1).is_continue());
+    }
+
+    #[test]
+    fn step_result_is_send_text_only_for_send_text() {
+        assert!(StepResult::send_text("x").is_send_text());
+        assert!(!StepResult::cont().is_send_text());
+        assert!(!StepResult::done_empty().is_send_text());
+    }
+
+    #[test]
+    fn step_result_is_terminal_done_and_abort_only() {
+        assert!(StepResult::done_empty().is_terminal());
+        assert!(StepResult::abort("e").is_terminal());
+        assert!(!StepResult::cont().is_terminal());
+        assert!(!StepResult::retry(1).is_terminal());
+        assert!(!StepResult::send_text("x").is_terminal());
+        assert!(!StepResult::wait_for(WaitCondition::external("k")).is_terminal());
+    }
+
+    #[test]
+    fn text_match_substring_builder() {
+        let m = TextMatch::substring("hello");
+        assert!(matches!(m, TextMatch::Substring { value } if value == "hello"));
+    }
+
+    #[test]
+    fn text_match_regex_builder() {
+        let m = TextMatch::regex(r"\d+");
+        assert!(matches!(m, TextMatch::Regex { pattern } if pattern == r"\d+"));
+    }
+
+    #[test]
+    fn text_match_description_substring() {
+        let m = TextMatch::substring("test");
+        let desc = m.description();
+        assert!(desc.starts_with("substring(len=4"));
+    }
+
+    #[test]
+    fn text_match_description_regex() {
+        let m = TextMatch::regex(r"pat");
+        let desc = m.description();
+        assert!(desc.starts_with("regex(len=3"));
+    }
+
+    #[test]
+    fn execution_status_all_variants_serde() {
+        for (variant, expected) in [
+            (ExecutionStatus::Running, "\"running\""),
+            (ExecutionStatus::Waiting, "\"waiting\""),
+            (ExecutionStatus::Completed, "\"completed\""),
+            (ExecutionStatus::Aborted, "\"aborted\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected);
+            let back: ExecutionStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn workflow_engine_default_max_concurrent() {
+        let engine = WorkflowEngine::default();
+        assert_eq!(engine.max_concurrent(), 3);
+    }
+
+    #[test]
+    fn workflow_engine_custom_max_concurrent() {
+        let engine = WorkflowEngine::new(10);
+        assert_eq!(engine.max_concurrent(), 10);
+    }
+
+    #[test]
+    fn lock_acquisition_result_acquired_methods() {
+        let result = LockAcquisitionResult::Acquired;
+        assert!(result.is_acquired());
+        assert!(!result.is_already_locked());
+    }
+
+    #[test]
+    fn lock_acquisition_result_already_locked_methods() {
+        let result = LockAcquisitionResult::AlreadyLocked {
+            held_by_workflow: "test_wf".to_string(),
+            held_by_execution: "exec-1".to_string(),
+            locked_since_ms: 1000,
+        };
+        assert!(!result.is_acquired());
+        assert!(result.is_already_locked());
+    }
+
+    #[test]
+    fn pane_lock_info_serde_roundtrip() {
+        let info = PaneLockInfo {
+            pane_id: 42,
+            workflow_name: "test_wf".to_string(),
+            execution_id: "exec-1".to_string(),
+            locked_at_ms: 1234567890,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: PaneLockInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pane_id, 42);
+        assert_eq!(back.workflow_name, "test_wf");
+    }
+
+    #[test]
+    fn step_error_code_abort_returns_ft5002() {
+        let result = StepResult::abort("some error");
+        assert_eq!(
+            step_error_code_from_result(&result),
+            Some("FT-5002".to_string())
+        );
+    }
+
+    #[test]
+    fn step_error_code_continue_returns_none() {
+        assert_eq!(step_error_code_from_result(&StepResult::cont()), None);
+    }
+
+    #[test]
+    fn step_error_code_done_returns_none() {
+        assert_eq!(
+            step_error_code_from_result(&StepResult::done_empty()),
+            None
+        );
+    }
+
+    #[test]
+    fn step_error_code_retry_returns_none() {
+        assert_eq!(
+            step_error_code_from_result(&StepResult::retry(100)),
+            None
+        );
+    }
+
+    #[test]
+    fn step_error_code_send_text_returns_none() {
+        assert_eq!(
+            step_error_code_from_result(&StepResult::send_text("x")),
+            None
+        );
+    }
+
+    #[test]
+    fn redact_text_for_log_short_unchanged() {
+        let result = redact_text_for_log("hello", 100);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn redact_text_for_log_truncates_long() {
+        let long = "a".repeat(200);
+        let result = redact_text_for_log(&long, 10);
+        assert!(result.len() <= 13); // 10 chars + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn redact_text_for_log_exact_boundary() {
+        let result = redact_text_for_log("12345", 5);
+        assert_eq!(result, "12345"); // exactly at limit, no truncation
+    }
+
+    #[test]
+    fn redacted_step_result_for_logging_preserves_continue() {
+        let result = StepResult::cont();
+        let redacted = redacted_step_result_for_logging(&result);
+        assert!(matches!(redacted, StepResult::Continue));
+    }
+
+    #[test]
+    fn redacted_step_result_for_logging_preserves_abort() {
+        let result = StepResult::abort("reason");
+        let redacted = redacted_step_result_for_logging(&result);
+        if let StepResult::Abort { reason } = redacted {
+            assert_eq!(reason, "reason");
+        } else {
+            panic!("expected Abort");
+        }
+    }
+
+    #[test]
+    fn redacted_step_result_for_logging_truncates_send_text() {
+        let long_text = "x".repeat(500);
+        let result = StepResult::send_text(long_text);
+        let redacted = redacted_step_result_for_logging(&result);
+        if let StepResult::SendText { text, .. } = redacted {
+            assert!(text.len() <= 163); // 160 + "..."
+        } else {
+            panic!("expected SendText");
+        }
+    }
+
+    #[test]
+    fn fallback_reason_display_needs_human_auth() {
+        let reason = FallbackReason::NeedsHumanAuth {
+            account: "openai".to_string(),
+            detail: "MFA required".to_string(),
+        };
+        let msg = reason.to_string();
+        assert!(msg.contains("openai"));
+        assert!(msg.contains("MFA required"));
+    }
+
+    #[test]
+    fn fallback_reason_display_failover_disabled() {
+        let reason = FallbackReason::FailoverDisabled;
+        assert!(reason.to_string().contains("disabled"));
+    }
+
+    #[test]
+    fn fallback_reason_display_tool_missing() {
+        let reason = FallbackReason::ToolMissing {
+            tool: "playwright".to_string(),
+        };
+        assert!(reason.to_string().contains("playwright"));
+    }
+
+    #[test]
+    fn fallback_reason_display_policy_denied() {
+        let reason = FallbackReason::PolicyDenied {
+            rule: "alt_screen".to_string(),
+        };
+        assert!(reason.to_string().contains("alt_screen"));
+    }
+
+    #[test]
+    fn fallback_reason_display_all_accounts_exhausted() {
+        let reason = FallbackReason::AllAccountsExhausted {
+            accounts_checked: 3,
+        };
+        assert!(reason.to_string().contains("3"));
+    }
+
+    #[test]
+    fn fallback_reason_display_other() {
+        let reason = FallbackReason::Other {
+            detail: "custom detail".to_string(),
+        };
+        assert_eq!(reason.to_string(), "custom detail");
+    }
+
+    #[test]
+    fn fallback_reason_serde_needs_human_auth() {
+        let reason = FallbackReason::NeedsHumanAuth {
+            account: "test".to_string(),
+            detail: "details".to_string(),
+        };
+        let json = serde_json::to_string(&reason).unwrap();
+        let back: FallbackReason = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, FallbackReason::NeedsHumanAuth { .. }));
+    }
+
+    #[test]
+    fn fallback_reason_serde_failover_disabled() {
+        let reason = FallbackReason::FailoverDisabled;
+        let json = serde_json::to_string(&reason).unwrap();
+        let back: FallbackReason = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, FallbackReason::FailoverDisabled));
+    }
+
+    #[test]
+    fn fallback_reason_serde_tool_missing() {
+        let reason = FallbackReason::ToolMissing {
+            tool: "caut".to_string(),
+        };
+        let json = serde_json::to_string(&reason).unwrap();
+        let back: FallbackReason = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, FallbackReason::ToolMissing { .. }));
+    }
+
+    #[test]
+    fn fallback_reason_serde_all_accounts_exhausted() {
+        let reason = FallbackReason::AllAccountsExhausted {
+            accounts_checked: 5,
+        };
+        let json = serde_json::to_string(&reason).unwrap();
+        let back: FallbackReason = serde_json::from_str(&json).unwrap();
+        if let FallbackReason::AllAccountsExhausted { accounts_checked } = back {
+            assert_eq!(accounts_checked, 5);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn fallback_next_step_plan_serde_roundtrip() {
+        let plan = FallbackNextStepPlan {
+            version: FallbackNextStepPlan::CURRENT_VERSION,
+            reason: FallbackReason::FailoverDisabled,
+            pane_id: 42,
+            operator_steps: vec!["Step 1".to_string()],
+            retry_after_ms: Some(1000),
+            resume_session_id: Some("abc-123".to_string()),
+            account_id: Some("acct-1".to_string()),
+            suggested_commands: vec!["ft auth bootstrap".to_string()],
+            created_at_ms: 9999,
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: FallbackNextStepPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.version, FallbackNextStepPlan::CURRENT_VERSION);
+        assert_eq!(back.pane_id, 42);
+        assert_eq!(back.operator_steps.len(), 1);
+        assert_eq!(back.retry_after_ms, Some(1000));
+        assert_eq!(back.resume_session_id.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn fallback_next_step_plan_current_version_is_one() {
+        assert_eq!(FallbackNextStepPlan::CURRENT_VERSION, 1);
+    }
+
+    #[test]
+    fn fallback_next_step_plan_optional_fields_skip_none() {
+        let plan = FallbackNextStepPlan {
+            version: 1,
+            reason: FallbackReason::FailoverDisabled,
+            pane_id: 1,
+            operator_steps: vec![],
+            retry_after_ms: None,
+            resume_session_id: None,
+            account_id: None,
+            suggested_commands: vec![],
+            created_at_ms: 0,
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        // skip_serializing_if = "Option::is_none" should omit these
+        assert!(!json.contains("retry_after_ms"));
+        assert!(!json.contains("resume_session_id"));
+        assert!(!json.contains("account_id"));
+        assert!(!json.contains("suggested_commands"));
+    }
+
+    #[test]
+    fn now_ms_returns_plausible_timestamp() {
+        let ms = now_ms();
+        // Should be after 2020-01-01
+        assert!(ms > 1_577_836_800_000);
+    }
+
+    #[test]
+    fn generate_workflow_id_contains_workflow_name() {
+        let id = generate_workflow_id("handle_usage");
+        assert!(id.starts_with("handle_usage-"));
+    }
+
+    #[test]
+    fn generate_workflow_id_has_three_parts() {
+        let id = generate_workflow_id("test");
+        let parts: Vec<&str> = id.splitn(3, '-').collect();
+        assert_eq!(parts.len(), 3, "expected name-timestamp-hex");
+    }
+
+    #[test]
+    fn find_token_usage_line_returns_none_when_absent() {
+        assert!(find_token_usage_line("no usage here").is_none());
+    }
+
+    #[test]
+    fn find_session_id_extracts_uuid_style() {
+        let tail = "codex resume a1b2c3d4-e5f6-7890-abcd-1234567890ab";
+        let id = find_session_id(tail).unwrap();
+        assert!(id.contains("a1b2c3d4"));
+    }
+
+    #[test]
+    fn find_reset_time_multiple_prefers_last() {
+        let tail = "try again at 3:00 PM.\ntry again at 5:00 PM.";
+        let time = find_reset_time(tail).unwrap();
+        assert!(time.contains("5:00 PM"));
+    }
+
+    #[test]
+    fn ctrl_c_injection_ok_allowed() {
+        let result = InjectionResult::Allowed {
+            decision: crate::policy::PolicyDecision::Allow {
+                rule_id: Some("test".to_string()),
+                context: None,
+            },
+            summary: "ctrl-c".to_string(),
+            pane_id: 1,
+            action: crate::policy::ActionKind::SendCtrlC,
+            audit_action_id: None,
+        };
+        assert!(ctrl_c_injection_ok(result).is_ok());
+    }
+
+    #[test]
+    fn ctrl_c_injection_ok_denied() {
+        let result = InjectionResult::Denied {
+            decision: crate::policy::PolicyDecision::Deny {
+                reason: "blocked".to_string(),
+                rule_id: None,
+                context: None,
+            },
+            summary: "ctrl-c".to_string(),
+            pane_id: 1,
+            action: crate::policy::ActionKind::SendCtrlC,
+            audit_action_id: None,
+        };
+        let err = ctrl_c_injection_ok(result).unwrap_err();
+        assert!(err.contains("denied"));
+    }
+
+    #[test]
+    fn ctrl_c_injection_ok_error() {
+        let result = InjectionResult::Error {
+            error: "connection lost".to_string(),
+            pane_id: 1,
+            action: crate::policy::ActionKind::SendCtrlC,
+            audit_action_id: None,
+        };
+        let err = ctrl_c_injection_ok(result).unwrap_err();
+        assert!(err.contains("connection lost"));
+    }
+
+    #[test]
+    fn wait_condition_stable_tail_serde() {
+        let cond = WaitCondition::StableTail {
+            pane_id: None,
+            stable_for_ms: 2000,
+        };
+        let json = serde_json::to_string(&cond).unwrap();
+        let back: WaitCondition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cond);
+    }
+
+    #[test]
+    fn wait_condition_stable_tail_with_pane() {
+        let cond = WaitCondition::StableTail {
+            pane_id: Some(10),
+            stable_for_ms: 500,
+        };
+        assert_eq!(cond.pane_id(), Some(10));
+    }
+
+    #[test]
+    fn text_match_to_wait_matcher_substring() {
+        let m = TextMatch::substring("hello");
+        let wm = m.to_wait_matcher().unwrap();
+        assert!(format!("{:?}", wm).contains("hello"));
+    }
+
+    #[test]
+    fn text_match_to_wait_matcher_regex_valid() {
+        let m = TextMatch::regex(r"\d+");
+        assert!(m.to_wait_matcher().is_ok());
+    }
+
+    #[test]
+    fn text_match_to_wait_matcher_regex_invalid() {
+        let m = TextMatch::regex(r"(unclosed");
+        assert!(m.to_wait_matcher().is_err());
+    }
+
+    #[test]
+    fn build_verification_refs_empty_for_continue() {
+        let result = StepResult::cont();
+        assert!(build_verification_refs(&result, None).is_none());
+    }
+
+    #[test]
+    fn build_verification_refs_populated_for_wait_for() {
+        let result = StepResult::wait_for_with_timeout(
+            WaitCondition::external("signal"),
+            5000,
+        );
+        let refs = build_verification_refs(&result, None).unwrap();
+        assert!(refs.contains("wait_for"));
+        assert!(refs.contains("5000"));
+    }
+
+    #[test]
+    fn build_verification_refs_populated_for_send_text_wait() {
+        let result = StepResult::send_text_and_wait(
+            "hello",
+            WaitCondition::pane_idle(1000),
+            3000,
+        );
+        let refs = build_verification_refs(&result, None).unwrap();
+        assert!(refs.contains("post_send_wait"));
+    }
+
+    #[test]
+    fn parse_codex_session_summary_full() {
+        let tail = "codex resume abc12345\nToken usage: total=500 input=200 output=300\ntry again at 5:00 PM.";
+        let summary = parse_codex_session_summary(tail).unwrap();
+        assert_eq!(summary.session_id, "abc12345");
+        assert_eq!(summary.token_usage.total, Some(500));
+        assert_eq!(summary.reset_time.as_deref(), Some("5:00 PM"));
+    }
+
+    #[test]
+    fn parse_codex_session_summary_missing_session_id() {
+        let tail = "Token usage: total=500";
+        let err = parse_codex_session_summary(tail).unwrap_err();
+        assert!(err.missing.contains(&"session_id"));
+    }
+
+    #[test]
+    fn parse_codex_session_summary_missing_token_usage() {
+        let tail = "codex resume abc12345";
+        let err = parse_codex_session_summary(tail).unwrap_err();
+        assert!(err.missing.contains(&"token_usage"));
+    }
+
+    // =========================================================================
+    // RubyBeaver wa-1u90p.7.1 batch 2
+    // =========================================================================
+
+    #[test]
+    fn parse_codex_session_summary_missing_both() {
+        let tail = "nothing useful";
+        let err = parse_codex_session_summary(tail).unwrap_err();
+        assert!(err.missing.contains(&"session_id"));
+        assert!(err.missing.contains(&"token_usage"));
+    }
+
+    #[test]
+    fn parse_codex_session_summary_no_reset_time() {
+        let tail =
+            "codex resume abc12345\nToken usage: total=500 input=200 output=300";
+        let summary = parse_codex_session_summary(tail).unwrap();
+        assert!(summary.reset_time.is_none());
+    }
+
+    #[test]
+    fn codex_session_parse_error_tail_hash_nonzero() {
+        let err = parse_codex_session_summary("some content").unwrap_err();
+        // tail_hash should be deterministic and non-zero for non-empty input
+        assert!(err.tail_hash != 0 || err.tail_len == 0);
+        assert_eq!(err.tail_len, "some content".len());
+    }
+
+    #[test]
+    fn descriptor_limits_default_max_steps() {
+        let limits = DescriptorLimits::default();
+        assert!(limits.max_steps > 0);
+        assert!(limits.max_steps <= 100);
+    }
+
+    #[test]
+    fn descriptor_limits_default_max_wait_timeout() {
+        let limits = DescriptorLimits::default();
+        assert!(limits.max_wait_timeout_ms > 0);
+    }
+
+    #[test]
+    fn descriptor_limits_default_max_sleep() {
+        let limits = DescriptorLimits::default();
+        assert!(limits.max_sleep_ms > 0);
+    }
+
+    #[test]
+    fn descriptor_limits_default_max_text_len() {
+        let limits = DescriptorLimits::default();
+        assert!(limits.max_text_len > 0);
+    }
+
+    #[test]
+    fn descriptor_limits_default_max_match_len() {
+        let limits = DescriptorLimits::default();
+        assert!(limits.max_match_len > 0);
+    }
+
+    #[test]
+    fn descriptor_failure_handler_interpolate_notify() {
+        let handler = DescriptorFailureHandler::Notify {
+            message: "Step ${failed_step} failed".to_string(),
+        };
+        let msg = handler.interpolate_message("send_ctrl_c");
+        assert_eq!(msg, "Step send_ctrl_c failed");
+    }
+
+    #[test]
+    fn descriptor_failure_handler_interpolate_log() {
+        let handler = DescriptorFailureHandler::Log {
+            message: "Error in ${failed_step}".to_string(),
+        };
+        let msg = handler.interpolate_message("wait_idle");
+        assert_eq!(msg, "Error in wait_idle");
+    }
+
+    #[test]
+    fn descriptor_failure_handler_interpolate_abort_no_placeholder() {
+        let handler = DescriptorFailureHandler::Abort {
+            message: "workflow failed".to_string(),
+        };
+        let msg = handler.interpolate_message("step1");
+        assert_eq!(msg, "workflow failed");
+    }
+
+    #[test]
+    fn descriptor_matcher_to_text_match_substring() {
+        let dm = DescriptorMatcher::Substring {
+            value: "hello".to_string(),
+        };
+        let tm = dm.to_text_match();
+        assert!(matches!(tm, TextMatch::Substring { value } if value == "hello"));
+    }
+
+    #[test]
+    fn descriptor_matcher_to_text_match_regex() {
+        let dm = DescriptorMatcher::Regex {
+            pattern: r"\d+".to_string(),
+        };
+        let tm = dm.to_text_match();
+        assert!(matches!(tm, TextMatch::Regex { pattern } if pattern == r"\d+"));
+    }
+
+    #[test]
+    fn descriptor_trigger_serde_roundtrip() {
+        let trigger = DescriptorTrigger {
+            event_types: vec!["session.end".to_string()],
+            agent_types: vec!["codex".to_string()],
+            rule_ids: vec!["compaction.detected".to_string()],
+        };
+        let json = serde_json::to_string(&trigger).unwrap();
+        let back: DescriptorTrigger = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_types, vec!["session.end"]);
+        assert_eq!(back.agent_types, vec!["codex"]);
+    }
+
+    #[test]
+    fn descriptor_trigger_empty_defaults() {
+        let json = "{}";
+        let trigger: DescriptorTrigger = serde_json::from_str(json).unwrap();
+        assert!(trigger.event_types.is_empty());
+        assert!(trigger.agent_types.is_empty());
+        assert!(trigger.rule_ids.is_empty());
+    }
+
+    #[test]
+    fn device_code_struct_fields() {
+        let dc = DeviceCode {
+            code: "ABCD-1234".to_string(),
+            url: Some("https://example.com/device".to_string()),
+        };
+        assert_eq!(dc.code, "ABCD-1234");
+        assert!(dc.url.unwrap().contains("device"));
+    }
+
+    #[test]
+    fn device_code_parse_error_display_format() {
+        let err = DeviceCodeParseError {
+            expected: "XXXX-YYYY",
+            tail_hash: 0xBEEF,
+            tail_len: 50,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("XXXX-YYYY"));
+        assert!(msg.contains("tail_len=50"));
+    }
+
+    #[test]
+    fn device_code_parse_error_is_std_error() {
+        let err = DeviceCodeParseError {
+            expected: "test",
+            tail_hash: 0,
+            tail_len: 0,
+        };
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn validate_device_code_empty_string() {
+        assert!(!validate_device_code(""));
+    }
+
+    #[test]
+    fn validate_device_code_no_dash() {
+        assert!(!validate_device_code("ABCD1234"));
+    }
+
+    #[test]
+    fn validate_device_code_too_short_parts() {
+        assert!(!validate_device_code("AB-CD"));
+    }
+
+    #[test]
+    fn parse_device_code_from_text() {
+        let tail = "Enter code: ABCD-1234";
+        let dc = parse_device_code(tail).unwrap();
+        assert_eq!(dc.code, "ABCD-1234");
+    }
+
+    #[test]
+    fn parse_device_code_no_match() {
+        let err = parse_device_code("nothing here").unwrap_err();
+        assert!(err.expected.contains("device code"));
+    }
+
+    #[test]
+    fn account_selection_step_error_display_caut() {
+        let err = AccountSelectionStepError::Storage("db locked".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("db locked"));
+    }
+
+    #[test]
+    fn account_selection_step_error_is_std_error() {
+        let err = AccountSelectionStepError::Storage("test".to_string());
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn pane_group_strategy_serde_by_domain() {
+        let s = PaneGroupStrategy::ByDomain;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: PaneGroupStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn pane_group_strategy_serde_by_agent() {
+        let s = PaneGroupStrategy::ByAgent;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: PaneGroupStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn pane_group_strategy_serde_by_project() {
+        let s = PaneGroupStrategy::ByProject;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: PaneGroupStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn pane_group_strategy_serde_explicit() {
+        let s = PaneGroupStrategy::Explicit {
+            pane_ids: vec![1, 2, 3],
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: PaneGroupStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn pane_group_new_and_accessors() {
+        let g = PaneGroup::new("test", vec![1, 2], PaneGroupStrategy::ByDomain);
+        assert_eq!(g.name, "test");
+        assert_eq!(g.len(), 2);
+        assert!(!g.is_empty());
+    }
+
+    #[test]
+    fn pane_group_empty() {
+        let g = PaneGroup::new("empty", vec![], PaneGroupStrategy::ByAgent);
+        assert_eq!(g.len(), 0);
+        assert!(g.is_empty());
+    }
+
+    #[test]
+    fn wait_condition_result_satisfied_elapsed() {
+        let r = WaitConditionResult::Satisfied {
+            elapsed_ms: 100,
+            polls: 5,
+            context: Some("matched".to_string()),
+        };
+        assert!(r.is_satisfied());
+        assert!(!r.is_timed_out());
+        assert_eq!(r.elapsed_ms(), Some(100));
+    }
+
+    #[test]
+    fn wait_condition_result_timed_out_elapsed() {
+        let r = WaitConditionResult::TimedOut {
+            elapsed_ms: 5000,
+            polls: 50,
+            last_observed: None,
+        };
+        assert!(!r.is_satisfied());
+        assert!(r.is_timed_out());
+        assert_eq!(r.elapsed_ms(), Some(5000));
+    }
+
+    #[test]
+    fn wait_condition_result_unsupported_no_elapsed() {
+        let r = WaitConditionResult::Unsupported {
+            reason: "not impl".to_string(),
+        };
+        assert!(!r.is_satisfied());
+        assert!(!r.is_timed_out());
+        assert_eq!(r.elapsed_ms(), None);
+    }
+
+    #[test]
+    fn wait_condition_options_default_has_sensible_values() {
+        let opts = WaitConditionOptions::default();
+        assert!(opts.tail_lines > 0);
+        assert!(opts.max_polls > 0);
+        assert!(opts.poll_initial > Duration::ZERO);
+        assert!(opts.poll_max >= opts.poll_initial);
+    }
+
+    #[test]
+    fn auth_recovery_strategy_label_device_code() {
+        let s = AuthRecoveryStrategy::DeviceCode {
+            code: None,
+            url: None,
+        };
+        assert_eq!(s.label(), "device_code");
+    }
+
+    #[test]
+    fn auth_recovery_strategy_label_api_key_error() {
+        let s = AuthRecoveryStrategy::ApiKeyError { key_hint: None };
+        assert_eq!(s.label(), "api_key_error");
+    }
+
+    #[test]
+    fn auth_recovery_strategy_label_manual() {
+        let s = AuthRecoveryStrategy::ManualIntervention {
+            agent_type: "codex".to_string(),
+            hint: "login".to_string(),
+        };
+        assert_eq!(s.label(), "manual_intervention");
+    }
+
+    #[test]
+    fn auth_recovery_strategy_from_detection_device_code() {
+        let trigger = serde_json::json!({
+            "event_type": "auth.device_code",
+            "extracted": { "code": "ABCD-1234", "url": "https://example.com" }
+        });
+        let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+        assert_eq!(strategy.label(), "device_code");
+    }
+
+    #[test]
+    fn auth_recovery_strategy_from_detection_api_key() {
+        let trigger = serde_json::json!({
+            "event_type": "auth.error",
+            "extracted": { "key_name": "OPENAI_API_KEY" }
+        });
+        let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+        assert_eq!(strategy.label(), "api_key_error");
+    }
+
+    #[test]
+    fn auth_recovery_strategy_from_detection_manual_fallback() {
+        let trigger = serde_json::json!({
+            "event_type": "auth.unknown",
+            "agent_type": "claude_code"
+        });
+        let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+        assert_eq!(strategy.label(), "manual_intervention");
+    }
+
+    #[test]
+    fn build_needs_human_auth_plan_includes_account() {
+        let plan = build_needs_human_auth_plan(
+            42,
+            "openai-team",
+            "MFA required",
+            Some("sess-123"),
+            Some(9999),
+            1000,
+        );
+        assert_eq!(plan.version, FallbackNextStepPlan::CURRENT_VERSION);
+        assert_eq!(plan.pane_id, 42);
+        assert!(plan
+            .operator_steps
+            .iter()
+            .any(|s| s.contains("openai-team")));
+        assert_eq!(plan.retry_after_ms, Some(9999));
+        assert_eq!(plan.resume_session_id.as_deref(), Some("sess-123"));
+    }
+
+    #[test]
+    fn build_needs_human_auth_plan_no_resume() {
+        let plan = build_needs_human_auth_plan(1, "acct", "detail", None, None, 0);
+        assert!(plan.resume_session_id.is_none());
+        assert!(plan.retry_after_ms.is_none());
+    }
+
+    #[test]
+    fn validate_session_id_accepts_long_hex() {
+        assert!(validate_session_id("a1b2c3d4e5f60000"));
+    }
+
+    #[test]
+    fn validate_session_id_rejects_special_chars() {
+        assert!(!validate_session_id("abc!@#$"));
+    }
+
+    #[test]
+    fn format_resume_command_with_session_id() {
+        let config = ResumeSessionConfig::default();
+        let cmd = format_resume_command("test-session-123", &config);
+        assert!(cmd.contains("test-session-123"));
+    }
+
+    #[test]
+    fn elapsed_ms_is_zero_for_recent_instant() {
+        let start = Instant::now();
+        let ms = elapsed_ms(start);
+        assert!(ms < 1000); // Should be near-zero
+    }
+
+    #[test]
+    fn workflow_step_new() {
+        let step = WorkflowStep::new("step1", "First step");
+        assert_eq!(step.name, "step1");
+        assert_eq!(step.description, "First step");
+    }
+
+    #[test]
+    fn wait_condition_pane_id_pattern() {
+        let cond = WaitCondition::pattern("rule");
+        assert_eq!(cond.pane_id(), None);
+    }
+
+    #[test]
+    fn wait_condition_pane_id_pattern_on_pane() {
+        let cond = WaitCondition::pattern_on_pane(42, "rule");
+        assert_eq!(cond.pane_id(), Some(42));
+    }
+
+    #[test]
+    fn wait_condition_pane_id_pane_idle() {
+        let cond = WaitCondition::pane_idle(1000);
+        assert_eq!(cond.pane_id(), None);
+    }
+
+    #[test]
+    fn wait_condition_pane_id_pane_idle_on() {
+        let cond = WaitCondition::pane_idle_on(10, 1000);
+        assert_eq!(cond.pane_id(), Some(10));
+    }
+
+    #[test]
+    fn wait_condition_pane_id_stable_tail() {
+        let cond = WaitCondition::stable_tail(2000);
+        assert_eq!(cond.pane_id(), None);
+    }
+
+    #[test]
+    fn wait_condition_pane_id_stable_tail_on() {
+        let cond = WaitCondition::stable_tail_on(5, 2000);
+        assert_eq!(cond.pane_id(), Some(5));
+    }
+
+    #[test]
+    fn wait_condition_pane_id_text_match() {
+        let cond = WaitCondition::text_match(TextMatch::substring("x"));
+        assert_eq!(cond.pane_id(), None);
+    }
+
+    #[test]
+    fn wait_condition_pane_id_text_match_on_pane() {
+        let cond =
+            WaitCondition::text_match_on_pane(99, TextMatch::substring("x"));
+        assert_eq!(cond.pane_id(), Some(99));
+    }
+
+    #[test]
+    fn wait_condition_pane_id_sleep() {
+        let cond = WaitCondition::sleep(100);
+        assert_eq!(cond.pane_id(), None);
+    }
+
+    #[test]
+    fn wait_condition_pane_id_external() {
+        let cond = WaitCondition::external("signal");
+        assert_eq!(cond.pane_id(), None);
+    }
 }
