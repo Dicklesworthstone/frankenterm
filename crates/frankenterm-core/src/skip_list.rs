@@ -1,0 +1,614 @@
+//! Skip list — probabilistic ordered map with O(log n) operations.
+//!
+//! A skip list is a layered linked list that provides O(log n) search,
+//! insertion, and deletion with simpler implementation than balanced trees.
+//! Random level assignment gives probabilistic balance guarantees equivalent
+//! to a balanced BST.
+//!
+//! # Design
+//!
+//! ```text
+//! Level 3:  HEAD ──────────────────────────────────→ 50 ──→ NIL
+//! Level 2:  HEAD ──────→ 20 ──────────────────────→ 50 ──→ NIL
+//! Level 1:  HEAD ──→ 10 → 20 ──→ 30 ──────────────→ 50 ──→ NIL
+//! Level 0:  HEAD → 5 → 10 → 20 → 25 → 30 → 40 → 50 → 60 → NIL
+//! ```
+//!
+//! # Use Cases in FrankenTerm
+//!
+//! - **Time-indexed event lookup**: O(log n) search by timestamp.
+//! - **Priority scheduling**: Ordered by priority, efficient insert/remove.
+//! - **Range queries**: "All events between t1 and t2" in O(log n + k).
+//! - **Concurrent-friendly**: Simpler to make lock-free than red-black trees.
+
+use serde::{Deserialize, Serialize};
+
+// ── Constants ───────────────────────────────────────────────────────
+
+/// Maximum number of levels in the skip list.
+const MAX_LEVEL: usize = 16;
+
+/// Probability factor for level promotion (1/P chance of going up).
+const P_DENOM: u64 = 4;
+
+// ── Deterministic RNG (SplitMix64) ──────────────────────────────────
+
+/// SplitMix64 PRNG for deterministic level generation.
+#[derive(Debug, Clone)]
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+
+    fn random_level(&mut self) -> usize {
+        let mut level = 0;
+        while level < MAX_LEVEL - 1 && (self.next() % P_DENOM) == 0 {
+            level += 1;
+        }
+        level
+    }
+}
+
+// ── Skip List Node ──────────────────────────────────────────────────
+
+/// A node in the skip list.
+#[derive(Debug, Clone)]
+struct Node<K, V> {
+    key: Option<K>,
+    value: Option<V>,
+    /// Forward pointers for each level. `None` = end of list at that level.
+    forward: Vec<Option<usize>>,
+}
+
+impl<K, V> Node<K, V> {
+    fn head() -> Self {
+        Self {
+            key: None,
+            value: None,
+            forward: vec![None; MAX_LEVEL],
+        }
+    }
+
+    fn new(key: K, value: V, level: usize) -> Self {
+        Self {
+            key: Some(key),
+            value: Some(value),
+            forward: vec![None; level + 1],
+        }
+    }
+
+    fn level(&self) -> usize {
+        self.forward.len().saturating_sub(1)
+    }
+}
+
+// ── SkipList ────────────────────────────────────────────────────────
+
+/// An ordered map backed by a skip list.
+///
+/// Keys must be `Ord`. Values can be any type. The list uses a
+/// deterministic PRNG (SplitMix64) so that behavior is reproducible
+/// given the same seed.
+#[derive(Debug, Clone)]
+pub struct SkipList<K: Ord, V> {
+    /// Node storage (arena-style). Index 0 is always the head sentinel.
+    nodes: Vec<Node<K, V>>,
+    /// Current maximum level in use.
+    current_level: usize,
+    /// Number of key-value pairs.
+    len: usize,
+    /// PRNG for level generation.
+    rng: SplitMix64,
+    /// Free list of deleted node indices for reuse.
+    free: Vec<usize>,
+}
+
+impl<K: Ord, V> SkipList<K, V> {
+    /// Create a new empty skip list with the given seed.
+    pub fn new(seed: u64) -> Self {
+        Self {
+            nodes: vec![Node::head()],
+            current_level: 0,
+            len: 0,
+            rng: SplitMix64::new(seed),
+            free: Vec::new(),
+        }
+    }
+
+    /// Number of key-value pairs.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the list is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Current maximum level in use.
+    pub fn current_level(&self) -> usize {
+        self.current_level
+    }
+
+    /// Insert a key-value pair. Returns the previous value if the key existed.
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let mut update = [0usize; MAX_LEVEL];
+        let mut current = 0; // head
+
+        // Find position at each level
+        for level in (0..=self.current_level).rev() {
+            loop {
+                if let Some(next_idx) = self.nodes[current].forward[level] {
+                    if let Some(ref next_key) = self.nodes[next_idx].key {
+                        if *next_key < key {
+                            current = next_idx;
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
+            update[level] = current;
+        }
+
+        // Check if key already exists
+        if let Some(next_idx) = self.nodes[current].forward[0] {
+            if let Some(ref next_key) = self.nodes[next_idx].key {
+                if *next_key == key {
+                    // Update existing value
+                    let old = self.nodes[next_idx].value.take();
+                    self.nodes[next_idx].value = Some(value);
+                    return old;
+                }
+            }
+        }
+
+        // Generate random level for new node
+        let new_level = self.rng.random_level();
+
+        // If new level exceeds current, update head pointers
+        if new_level > self.current_level {
+            for level in (self.current_level + 1)..=new_level {
+                update[level] = 0; // head
+            }
+            self.current_level = new_level;
+        }
+
+        // Allocate node
+        let new_node = Node::new(key, value, new_level);
+        let new_idx = if let Some(idx) = self.free.pop() {
+            self.nodes[idx] = new_node;
+            idx
+        } else {
+            self.nodes.push(new_node);
+            self.nodes.len() - 1
+        };
+
+        // Wire in forward pointers
+        for level in 0..=new_level {
+            self.nodes[new_idx].forward[level] = self.nodes[update[level]].forward[level];
+            self.nodes[update[level]].forward[level] = Some(new_idx);
+        }
+
+        self.len += 1;
+        None
+    }
+
+    /// Look up a value by key.
+    pub fn get(&self, key: &K) -> Option<&V> {
+        let mut current = 0; // head
+
+        for level in (0..=self.current_level).rev() {
+            loop {
+                if let Some(next_idx) = self.nodes[current].forward[level] {
+                    if let Some(ref next_key) = self.nodes[next_idx].key {
+                        match next_key.cmp(key) {
+                            std::cmp::Ordering::Less => {
+                                current = next_idx;
+                                continue;
+                            }
+                            std::cmp::Ordering::Equal => {
+                                return self.nodes[next_idx].value.as_ref();
+                            }
+                            std::cmp::Ordering::Greater => break,
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        None
+    }
+
+    /// Check if a key exists.
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Remove a key-value pair. Returns the value if found.
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let mut update = [0usize; MAX_LEVEL];
+        let mut current = 0;
+
+        for level in (0..=self.current_level).rev() {
+            loop {
+                if let Some(next_idx) = self.nodes[current].forward[level] {
+                    if let Some(ref next_key) = self.nodes[next_idx].key {
+                        if *next_key < *key {
+                            current = next_idx;
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
+            update[level] = current;
+        }
+
+        // Check if the next node at level 0 has the target key
+        if let Some(target_idx) = self.nodes[current].forward[0] {
+            if let Some(ref target_key) = self.nodes[target_idx].key {
+                if *target_key != *key {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+
+            // Unwire from all levels
+            let target_level = self.nodes[target_idx].level();
+            for level in 0..=target_level {
+                if self.nodes[update[level]].forward[level] == Some(target_idx) {
+                    self.nodes[update[level]].forward[level] =
+                        self.nodes[target_idx].forward[level];
+                }
+            }
+
+            // Extract value
+            let value = self.nodes[target_idx].value.take();
+            self.nodes[target_idx].key = None;
+            self.free.push(target_idx);
+
+            // Adjust current_level if needed
+            while self.current_level > 0 && self.nodes[0].forward[self.current_level].is_none() {
+                self.current_level -= 1;
+            }
+
+            self.len -= 1;
+            value
+        } else {
+            None
+        }
+    }
+
+    /// Get the minimum key-value pair.
+    pub fn min(&self) -> Option<(&K, &V)> {
+        self.nodes[0].forward[0].and_then(|idx| {
+            let node = &self.nodes[idx];
+            match (node.key.as_ref(), node.value.as_ref()) {
+                (Some(k), Some(v)) => Some((k, v)),
+                _ => None,
+            }
+        })
+    }
+
+    /// Get the maximum key-value pair.
+    pub fn max(&self) -> Option<(&K, &V)> {
+        let mut current = 0;
+        for level in (0..=self.current_level).rev() {
+            while let Some(next_idx) = self.nodes[current].forward[level] {
+                current = next_idx;
+            }
+        }
+        if current == 0 {
+            return None;
+        }
+        let node = &self.nodes[current];
+        match (node.key.as_ref(), node.value.as_ref()) {
+            (Some(k), Some(v)) => Some((k, v)),
+            _ => None,
+        }
+    }
+
+    /// Iterate over all key-value pairs in order.
+    pub fn iter(&self) -> SkipListIter<'_, K, V> {
+        SkipListIter {
+            list: self,
+            current: self.nodes[0].forward[0],
+        }
+    }
+
+    /// Iterate over key-value pairs in the range [from, to].
+    pub fn range(&self, from: &K, to: &K) -> Vec<(&K, &V)> {
+        let mut result = Vec::new();
+        let mut current = 0;
+
+        // Find the starting position
+        for level in (0..=self.current_level).rev() {
+            loop {
+                if let Some(next_idx) = self.nodes[current].forward[level] {
+                    if let Some(ref next_key) = self.nodes[next_idx].key {
+                        if *next_key < *from {
+                            current = next_idx;
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        // Walk level 0 collecting entries in range
+        let mut idx = self.nodes[current].forward[0];
+        while let Some(i) = idx {
+            if let (Some(k), Some(v)) = (&self.nodes[i].key, &self.nodes[i].value) {
+                if *k > *to {
+                    break;
+                }
+                if *k >= *from {
+                    result.push((k, v));
+                }
+            }
+            idx = self.nodes[i].forward[0];
+        }
+
+        result
+    }
+
+    /// Clear all entries.
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.nodes.push(Node::head());
+        self.current_level = 0;
+        self.len = 0;
+        self.free.clear();
+    }
+}
+
+/// Iterator over skip list key-value pairs in order.
+pub struct SkipListIter<'a, K: Ord, V> {
+    list: &'a SkipList<K, V>,
+    current: Option<usize>,
+}
+
+impl<'a, K: Ord, V> Iterator for SkipListIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(idx) = self.current {
+            self.current = self.list.nodes[idx].forward[0];
+            if let (Some(k), Some(v)) =
+                (&self.list.nodes[idx].key, &self.list.nodes[idx].value)
+            {
+                return Some((k, v));
+            }
+        }
+        None
+    }
+}
+
+// ── Statistics ──────────────────────────────────────────────────────
+
+/// Statistics about the skip list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkipListStats {
+    /// Number of key-value pairs.
+    pub len: usize,
+    /// Current maximum level.
+    pub current_level: usize,
+    /// Total number of node slots (including free and head).
+    pub total_nodes: usize,
+    /// Number of free (reusable) slots.
+    pub free_slots: usize,
+}
+
+impl<K: Ord, V> SkipList<K, V> {
+    /// Get statistics.
+    pub fn stats(&self) -> SkipListStats {
+        SkipListStats {
+            len: self.len,
+            current_level: self.current_level,
+            total_nodes: self.nodes.len(),
+            free_slots: self.free.len(),
+        }
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_list() {
+        let list: SkipList<i32, String> = SkipList::new(42);
+        assert!(list.is_empty());
+        assert_eq!(list.len(), 0);
+        assert!(list.get(&1).is_none());
+        assert!(list.min().is_none());
+        assert!(list.max().is_none());
+    }
+
+    #[test]
+    fn insert_and_get() {
+        let mut list = SkipList::new(42);
+        assert!(list.insert(5, "five").is_none());
+        assert_eq!(list.get(&5), Some(&"five"));
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn insert_overwrites() {
+        let mut list = SkipList::new(42);
+        list.insert(1, "one");
+        let old = list.insert(1, "ONE");
+        assert_eq!(old, Some("one"));
+        assert_eq!(list.get(&1), Some(&"ONE"));
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn insert_multiple_ordered() {
+        let mut list = SkipList::new(42);
+        for i in 0..20 {
+            list.insert(i, i * 10);
+        }
+        assert_eq!(list.len(), 20);
+
+        let items: Vec<_> = list.iter().map(|(k, v)| (*k, *v)).collect();
+        for i in 0..20 {
+            assert_eq!(items[i], (i, i * 10));
+        }
+    }
+
+    #[test]
+    fn insert_reverse_ordered() {
+        let mut list = SkipList::new(42);
+        for i in (0..20).rev() {
+            list.insert(i, i * 10);
+        }
+        let items: Vec<_> = list.iter().map(|(k, _)| *k).collect();
+        for i in 0..20 {
+            assert_eq!(items[i], i);
+        }
+    }
+
+    #[test]
+    fn remove() {
+        let mut list = SkipList::new(42);
+        list.insert(1, "a");
+        list.insert(2, "b");
+        list.insert(3, "c");
+
+        assert_eq!(list.remove(&2), Some("b"));
+        assert_eq!(list.len(), 2);
+        assert!(list.get(&2).is_none());
+        assert_eq!(list.get(&1), Some(&"a"));
+        assert_eq!(list.get(&3), Some(&"c"));
+    }
+
+    #[test]
+    fn remove_nonexistent() {
+        let mut list: SkipList<i32, i32> = SkipList::new(42);
+        list.insert(1, 10);
+        assert!(list.remove(&99).is_none());
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn min_max() {
+        let mut list = SkipList::new(42);
+        list.insert(30, "thirty");
+        list.insert(10, "ten");
+        list.insert(50, "fifty");
+
+        assert_eq!(list.min(), Some((&10, &"ten")));
+        assert_eq!(list.max(), Some((&50, &"fifty")));
+    }
+
+    #[test]
+    fn range_query() {
+        let mut list = SkipList::new(42);
+        for i in 0..10 {
+            list.insert(i * 10, i);
+        }
+        let range: Vec<_> = list.range(&20, &60);
+        assert_eq!(range.len(), 5); // 20, 30, 40, 50, 60
+        assert_eq!(*range[0].0, 20);
+        assert_eq!(*range[4].0, 60);
+    }
+
+    #[test]
+    fn clear() {
+        let mut list = SkipList::new(42);
+        for i in 0..10 {
+            list.insert(i, i);
+        }
+        list.clear();
+        assert!(list.is_empty());
+        assert!(list.get(&5).is_none());
+    }
+
+    #[test]
+    fn contains_key() {
+        let mut list = SkipList::new(42);
+        list.insert(1, "one");
+        assert!(list.contains_key(&1));
+        assert!(!list.contains_key(&2));
+    }
+
+    #[test]
+    fn stats() {
+        let mut list = SkipList::new(42);
+        for i in 0..5 {
+            list.insert(i, i);
+        }
+        let stats = list.stats();
+        assert_eq!(stats.len, 5);
+        assert!(stats.total_nodes >= 6); // 5 + head
+    }
+
+    #[test]
+    fn stats_serde() {
+        let stats = SkipListStats {
+            len: 10,
+            current_level: 3,
+            total_nodes: 15,
+            free_slots: 2,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: SkipListStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(stats, back);
+    }
+
+    #[test]
+    fn remove_and_reinsert() {
+        let mut list = SkipList::new(42);
+        list.insert(1, 10);
+        list.remove(&1);
+        list.insert(1, 20);
+        assert_eq!(list.get(&1), Some(&20));
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn insert_delete_many() {
+        let mut list = SkipList::new(42);
+        for i in 0..100 {
+            list.insert(i, i * 2);
+        }
+        for i in (0..100).step_by(2) {
+            list.remove(&i);
+        }
+        assert_eq!(list.len(), 50);
+        for i in (1..100).step_by(2) {
+            assert!(list.contains_key(&i));
+        }
+    }
+
+    #[test]
+    fn deterministic_with_same_seed() {
+        let mut list1 = SkipList::new(42);
+        let mut list2 = SkipList::new(42);
+        for i in 0..20 {
+            list1.insert(i, i);
+            list2.insert(i, i);
+        }
+        assert_eq!(list1.current_level(), list2.current_level());
+        assert_eq!(list1.len(), list2.len());
+    }
+}
