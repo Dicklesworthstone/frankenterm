@@ -1757,7 +1757,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (tx, rx) = mpsc::channel(10);
+        let (tx, mut rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1821,7 +1821,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (tx, rx) = mpsc::channel(10);
+        let (tx, mut rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));

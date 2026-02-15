@@ -3228,9 +3228,7 @@ mod tests {
         #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::for_testing();
-            rx.recv(&cx)
-                .await
-                .expect("test mpsc recv should succeed")
+            rx.recv(&cx).await.expect("test mpsc recv should succeed")
         }
         #[cfg(not(feature = "asupersync-runtime"))]
         {

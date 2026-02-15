@@ -669,8 +669,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::recording::{
-        RecorderEventCausality, RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel,
-        RecorderSegmentKind, RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEventCausality, RecorderEventSource,
+        RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
     };
 
     // ── Test helpers ──────────────────────────────────────────────────────
@@ -678,8 +678,8 @@ mod tests {
     fn make_offset(segment_id: u64, ordinal: u64, byte_offset: u64) -> RecorderOffset {
         RecorderOffset {
             segment_id,
-            ordinal,
             byte_offset,
+            ordinal,
         }
     }
 
@@ -1120,12 +1120,8 @@ mod tests {
         let config = default_config();
         let inputs: Vec<_> = (0..5)
             .map(|i| {
-                let event = make_egress_event(
-                    1,
-                    &format!("line {i}"),
-                    1000 + i * 100,
-                    &format!("evt-{i}"),
-                );
+                let event =
+                    make_egress_event(1, &format!("line {i}"), 1000 + i * 100, &format!("evt-{i}"));
                 make_input(event, make_offset(0, i, i * 50))
             })
             .collect();
@@ -1176,7 +1172,7 @@ mod tests {
 
         let chunks = build_semantic_chunks(&events, &default_config());
         // May be 1 (glued) or 2 depending on glue rules (tiny fragments)
-        assert!(chunks.len() >= 1);
+        assert!(!chunks.is_empty());
         // At least verify the text contents exist
         let all_text: String = chunks.iter().map(|c| c.text.clone()).collect();
         assert!(all_text.contains("[OUT] output"));
@@ -1189,6 +1185,7 @@ mod tests {
     fn hard_gap_ms_triggers_boundary() {
         let config = ChunkPolicyConfig {
             hard_gap_ms: 5_000,
+            min_chunk_chars: 1, // prevent glue-back of tiny chunks
             ..default_config()
         };
         let events = vec![
@@ -1258,6 +1255,7 @@ mod tests {
     fn exceeds_max_events_triggers_split() {
         let config = ChunkPolicyConfig {
             max_chunk_events: 3,
+            min_chunk_chars: 1, // prevent glue-back of tiny chunks
             ..default_config()
         };
         let events: Vec<_> = (0..6)
@@ -1282,6 +1280,7 @@ mod tests {
         let config = ChunkPolicyConfig {
             max_window_ms: 5_000,
             hard_gap_ms: 100_000, // high to avoid hard boundary
+            min_chunk_chars: 1,   // prevent glue-back of tiny chunks
             ..default_config()
         };
         let events = vec![
@@ -1565,17 +1564,17 @@ mod tests {
 
     #[test]
     fn session_id_set_to_none_when_mixed() {
-        let mut event1 = make_egress_event(1, "output1", 1000, "evt-1");
-        event1.session_id = Some("sess-a".to_string());
-        let mut event2 = make_egress_event(1, "output2", 1100, "evt-2");
-        event2.session_id = Some("sess-b".to_string());
+        let mut ev_a = make_egress_event(1, "output1", 1000, "evt-1");
+        ev_a.session_id = Some("sess-a".to_string());
+        let mut ev_b = make_egress_event(1, "output2", 1100, "evt-2");
+        ev_b.session_id = Some("sess-b".to_string());
 
-        let events = vec![
-            make_input(event1, make_offset(0, 0, 0)),
-            make_input(event2, make_offset(0, 1, 50)),
+        let inputs = vec![
+            make_input(ev_a, make_offset(0, 0, 0)),
+            make_input(ev_b, make_offset(0, 1, 50)),
         ];
 
-        let chunks = build_semantic_chunks(&events, &default_config());
+        let chunks = build_semantic_chunks(&inputs, &default_config());
         // When merged, mixed session IDs should result in None
         if chunks.len() == 1 {
             assert!(chunks[0].session_id.is_none());
@@ -1784,14 +1783,8 @@ mod tests {
     #[test]
     fn only_boundary_events_produce_empty_result() {
         let events = vec![
-            make_input(
-                make_control_event(1, 1000, "ctrl-1"),
-                make_offset(0, 0, 0),
-            ),
-            make_input(
-                make_lifecycle_event(1, 1100, "lc-1"),
-                make_offset(0, 1, 50),
-            ),
+            make_input(make_control_event(1, 1000, "ctrl-1"), make_offset(0, 0, 0)),
+            make_input(make_lifecycle_event(1, 1100, "lc-1"), make_offset(0, 1, 50)),
             make_input(make_gap_event(1, 1200, "gap-1"), make_offset(0, 2, 100)),
         ];
 

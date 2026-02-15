@@ -920,7 +920,7 @@ mod tests {
 
     #[test]
     fn embedding_blob_roundtrip() {
-        let original = vec![1.0f32, -0.5, 0.25, 3.14];
+        let original = vec![1.0f32, -0.5, 0.25, 2.75];
         let blob = encode_f32_embedding_blob(&original);
         let decoded = decode_f32_embedding_blob(&blob, original.len()).unwrap();
         assert_eq!(original, decoded);
@@ -1186,7 +1186,9 @@ mod tests {
         let mut store = open_in_memory();
         setup_generation(&store);
 
-        let outcome = store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
+        let outcome = store
+            .upsert_chunk_embedding(make_upsert("c1", 0, 5, 4))
+            .unwrap();
         assert!(!outcome.was_update);
         assert_eq!(outcome.chunk_id, "c1");
     }
@@ -1196,8 +1198,12 @@ mod tests {
         let mut store = open_in_memory();
         setup_generation(&store);
 
-        store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
-        let outcome = store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
+        store
+            .upsert_chunk_embedding(make_upsert("c1", 0, 5, 4))
+            .unwrap();
+        let outcome = store
+            .upsert_chunk_embedding(make_upsert("c1", 0, 5, 4))
+            .unwrap();
         assert!(outcome.was_update);
     }
 
@@ -1248,9 +1254,15 @@ mod tests {
         let mut store = open_in_memory();
         setup_generation(&store);
 
-        store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
-        store.upsert_chunk_embedding(make_upsert("c2", 6, 10, 4)).unwrap();
-        store.upsert_chunk_embedding(make_upsert("c3", 11, 15, 4)).unwrap();
+        store
+            .upsert_chunk_embedding(make_upsert("c1", 0, 5, 4))
+            .unwrap();
+        store
+            .upsert_chunk_embedding(make_upsert("c2", 6, 10, 4))
+            .unwrap();
+        store
+            .upsert_chunk_embedding(make_upsert("c3", 11, 15, 4))
+            .unwrap();
 
         let deleted = store
             .prune_chunks_through_ordinal("prof-1", "gen-1", 10)
@@ -1292,9 +1304,7 @@ mod tests {
     #[test]
     fn semantic_search_empty_query_returns_empty() {
         let store = open_in_memory();
-        let hits = store
-            .semantic_search("prof-1", "gen-1", &[], 10)
-            .unwrap();
+        let hits = store.semantic_search("prof-1", "gen-1", &[], 10).unwrap();
         assert!(hits.is_empty());
     }
 
@@ -1336,12 +1346,7 @@ mod tests {
 
         for i in 0..5 {
             store
-                .upsert_chunk_embedding(make_upsert(
-                    &format!("c{i}"),
-                    i * 10,
-                    i * 10 + 5,
-                    4,
-                ))
+                .upsert_chunk_embedding(make_upsert(&format!("c{i}"), i * 10, i * 10 + 5, 4))
                 .unwrap();
         }
 
@@ -1356,7 +1361,9 @@ mod tests {
         let mut store = open_in_memory();
         setup_generation(&store);
 
-        store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
+        store
+            .upsert_chunk_embedding(make_upsert("c1", 0, 5, 4))
+            .unwrap();
 
         // Query with different dimension
         let hits = store
@@ -1398,8 +1405,12 @@ mod tests {
         let mut store = open_in_memory();
         setup_generation(&store);
 
-        store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
-        store.upsert_chunk_embedding(make_upsert("c2", 6, 15, 4)).unwrap();
+        store
+            .upsert_chunk_embedding(make_upsert("c1", 0, 5, 4))
+            .unwrap();
+        store
+            .upsert_chunk_embedding(make_upsert("c2", 6, 15, 4))
+            .unwrap();
 
         let report = store
             .drift_report("prof-1", "gen-1", "lex-v1", Some(10))
@@ -1421,7 +1432,9 @@ mod tests {
         setup_generation(&store);
 
         // Insert a chunk with normalized vector
-        store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
+        store
+            .upsert_chunk_embedding(make_upsert("c1", 0, 5, 4))
+            .unwrap();
 
         // Directly insert a non-normalized vector via SQL
         let blob = encode_f32_embedding_blob(&[2.0, 0.0, 0.0, 0.0]);
@@ -1479,7 +1492,7 @@ mod tests {
         let json = serde_json::to_string(&hit).unwrap();
         let parsed: ChunkVectorHit = serde_json::from_str(&json).unwrap();
         assert_eq!(hit.chunk_id, parsed.chunk_id);
-        assert_eq!(hit.score, parsed.score);
+        assert!((hit.score - parsed.score).abs() < f64::EPSILON);
     }
 
     // ── ChunkVectorDriftReport serde roundtrip ────────────────────────────

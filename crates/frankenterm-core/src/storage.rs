@@ -20868,9 +20868,7 @@ mod backpressure_integration_tests {
         #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::for_testing();
-            rx.recv(&cx)
-                .await
-                .expect("test mpsc recv should succeed")
+            rx.recv(&cx).await.expect("test mpsc recv should succeed")
         }
         #[cfg(not(feature = "asupersync-runtime"))]
         {
@@ -20894,8 +20892,8 @@ mod backpressure_integration_tests {
         send_mpsc(&tx, 2).await;
 
         // Channel is full — next send should block and timeout.
-        let result = crate::runtime_compat::timeout(Duration::from_millis(50), send_mpsc(&tx, 3))
-            .await;
+        let result =
+            crate::runtime_compat::timeout(Duration::from_millis(50), send_mpsc(&tx, 3)).await;
         assert!(result.is_err(), "Should timeout when channel is full");
 
         // Verify depth

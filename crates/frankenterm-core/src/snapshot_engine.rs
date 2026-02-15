@@ -1351,10 +1351,7 @@ mod tests {
         assert!(engine.emit_trigger(SnapshotTrigger::StateTransition));
 
         let mut rx = engine.trigger_rx.lock().await.take().unwrap();
-        assert_eq!(
-            recv_trigger(&mut rx).await,
-            SnapshotTrigger::WorkCompleted
-        );
+        assert_eq!(recv_trigger(&mut rx).await, SnapshotTrigger::WorkCompleted);
         assert_eq!(
             recv_trigger(&mut rx).await,
             SnapshotTrigger::StateTransition
