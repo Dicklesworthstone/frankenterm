@@ -139,6 +139,7 @@ pub mod priority;
 pub mod process_tree;
 pub mod process_triage;
 pub mod protocol_recovery;
+pub mod quantile_sketch;
 pub mod query_contract;
 pub mod recorder_audit;
 pub mod recorder_export;
