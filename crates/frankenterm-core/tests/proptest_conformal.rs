@@ -932,7 +932,6 @@ proptest! {
     #[test]
     fn holt_same_value_dampens_trend(
         initial_values in proptest::collection::vec(arb_finite_value(), 3..10),
-        constant_value in arb_finite_value(),
     ) {
         let mut holt = HoltPredictor::new(0.3, 0.1);
         for &v in &initial_values {
@@ -942,17 +941,23 @@ proptest! {
         if holt.trend().abs() < 1e-6 {
             holt.update(holt.level() + 100.0);
         }
+
+        // Feed the *current level* repeatedly — this is the scenario where
+        // the trend should genuinely dampen (no new level change to track).
+        let constant_value = holt.level();
         let trend_before = holt.trend().abs();
 
-        // Update with same value twice
-        holt.update(constant_value);
-        let trend_after_first = holt.trend().abs();
-        holt.update(constant_value);
-        let trend_after_second = holt.trend().abs();
+        // Update with current level multiple times
+        for _ in 0..5 {
+            holt.update(constant_value);
+        }
+        let trend_after = holt.trend().abs();
 
-        // Trend magnitude should decrease (or stay same if already near zero)
-        prop_assert!(trend_after_second <= trend_after_first + 1e-10,
-            "second update with constant {} should not increase trend magnitude: {} -> {} -> {}",
-            constant_value, trend_before, trend_after_first, trend_after_second);
+        // Trend magnitude should decrease when observations match the level.
+        // Allow small floating-point tolerance.
+        let tol = trend_before * 1e-10 + 1e-6;
+        prop_assert!(trend_after <= trend_before + tol,
+            "repeated updates at current level should dampen trend: {} -> {}",
+            trend_before, trend_after);
     }
 }
