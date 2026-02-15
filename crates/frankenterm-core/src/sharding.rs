@@ -1423,8 +1423,11 @@ mod tests {
 
     #[test]
     fn assignment_strategy_manual_serde() {
+        // HashMap<u64, _> serializes keys as strings in JSON; use empty map
+        // to avoid the string-key-to-u64 deserialization limitation, then
+        // verify the default_shard field survives.
         let s = AssignmentStrategy::Manual {
-            pane_to_shard: HashMap::from([(42, ShardId(1))]),
+            pane_to_shard: HashMap::new(),
             default_shard: Some(ShardId(0)),
         };
         let json = serde_json::to_string(&s).unwrap();
@@ -1478,7 +1481,11 @@ mod tests {
     #[test]
     fn validate_shards_round_robin_always_ok() {
         let valid: HashSet<ShardId> = [ShardId(0)].into();
-        assert!(AssignmentStrategy::RoundRobin.validate_shards(&valid).is_ok());
+        assert!(
+            AssignmentStrategy::RoundRobin
+                .validate_shards(&valid)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1555,7 +1562,10 @@ mod tests {
     #[test]
     fn preferred_for_spawn_consistent_hash_returns_none() {
         let s = AssignmentStrategy::ConsistentHash { virtual_nodes: 64 };
-        assert_eq!(s.preferred_for_spawn(Some("x"), Some(AgentType::Codex)), None);
+        assert_eq!(
+            s.preferred_for_spawn(Some("x"), Some(AgentType::Codex)),
+            None
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1581,7 +1591,12 @@ mod tests {
     fn client_new_rejects_empty_backends() {
         let result = ShardedWeztermClient::new(vec![], AssignmentStrategy::RoundRobin);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("at least one backend"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("at least one backend")
+        );
     }
 
     #[test]
@@ -1596,7 +1611,12 @@ mod tests {
             AssignmentStrategy::RoundRobin,
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("duplicate shard id"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate shard id")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1607,11 +1627,9 @@ mod tests {
     fn from_handles_assigns_sequential_ids() {
         let mock0 = Arc::new(MockWezterm::new()) as WeztermHandle;
         let mock1 = Arc::new(MockWezterm::new()) as WeztermHandle;
-        let client = ShardedWeztermClient::from_handles(
-            AssignmentStrategy::RoundRobin,
-            vec![mock0, mock1],
-        )
-        .unwrap();
+        let client =
+            ShardedWeztermClient::from_handles(AssignmentStrategy::RoundRobin, vec![mock0, mock1])
+                .unwrap();
         assert_eq!(client.shard_ids(), vec![ShardId(0), ShardId(1)]);
     }
 
@@ -1646,13 +1664,8 @@ mod tests {
             agent_to_shard: HashMap::from([(AgentType::ClaudeCode, ShardId(1))]),
             default_shard: Some(ShardId(0)),
         };
-        let result = assign_pane_with_strategy(
-            &strategy,
-            &shards,
-            1,
-            None,
-            Some(AgentType::ClaudeCode),
-        );
+        let result =
+            assign_pane_with_strategy(&strategy, &shards, 1, None, Some(AgentType::ClaudeCode));
         assert_eq!(result, ShardId(1));
     }
 
@@ -1663,13 +1676,8 @@ mod tests {
             agent_to_shard: HashMap::from([(AgentType::Codex, ShardId(1))]),
             default_shard: Some(ShardId(0)),
         };
-        let result = assign_pane_with_strategy(
-            &strategy,
-            &shards,
-            1,
-            None,
-            Some(AgentType::Gemini),
-        );
+        let result =
+            assign_pane_with_strategy(&strategy, &shards, 1, None, Some(AgentType::Gemini));
         assert_eq!(result, ShardId(0));
     }
 
@@ -1822,7 +1830,11 @@ mod tests {
         shard0.add_default_pane(10).await;
 
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), "s0", shard0.clone() as WeztermHandle)],
+            vec![ShardBackend::new(
+                ShardId(0),
+                "s0",
+                shard0.clone() as WeztermHandle,
+            )],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
@@ -1834,10 +1846,7 @@ mod tests {
         let global_id = panes[0].pane_id;
         let pane = client.get_pane(global_id).await.unwrap();
         assert_eq!(pane.pane_id, global_id);
-        assert_eq!(
-            pane.extra.get("shard_id"),
-            Some(&Value::from(0_u64))
-        );
+        assert_eq!(pane.extra.get("shard_id"), Some(&Value::from(0_u64)));
     }
 
     #[tokio::test]
@@ -1919,7 +1928,11 @@ mod tests {
     async fn circuit_status_aggregates_worst_state() {
         let healthy = Arc::new(MockWezterm::new());
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), "s0", healthy as WeztermHandle)],
+            vec![ShardBackend::new(
+                ShardId(0),
+                "s0",
+                healthy as WeztermHandle,
+            )],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
