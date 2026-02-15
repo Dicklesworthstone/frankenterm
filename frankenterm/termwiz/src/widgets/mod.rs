@@ -61,6 +61,10 @@ pub struct RenderTelemetry {
     pub frame_dirty_tiles: usize,
     /// Total dirty cells across tile-aligned frame regions.
     pub frame_dirty_tile_cells: usize,
+    /// Number of dirty regions selected for upload in the active render mode.
+    pub frame_upload_regions: usize,
+    /// Total dirty cells selected for upload in the active render mode.
+    pub frame_upload_cells: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -517,6 +521,10 @@ impl<'widget> Ui<'widget> {
                     frame_dirty_tiles
                 }
             };
+            let (upload_region_count, upload_dirty_cells) =
+                Self::accumulate_dirty_rects(&frame_dirty_regions);
+            telemetry.frame_upload_regions = upload_region_count;
+            telemetry.frame_upload_cells = upload_dirty_cells;
             // Now compute a delta and apply it to the actual screen
             let diff = screen.diff_screens(&alt_screen);
             screen.add_changes(diff);
@@ -684,6 +692,8 @@ mod test {
         assert!(first.frame_dirty_cells >= 1);
         assert_eq!(first.frame_dirty_tiles, 0);
         assert_eq!(first.frame_dirty_tile_cells, 0);
+        assert_eq!(first.frame_upload_regions, first.frame_dirty_rects);
+        assert_eq!(first.frame_upload_cells, first.frame_dirty_cells);
 
         ui.render_to_screen(&mut surface).unwrap();
         let second = ui.last_render_telemetry();
@@ -692,6 +702,8 @@ mod test {
         assert_eq!(second.frame_dirty_cells, 0);
         assert_eq!(second.frame_dirty_tiles, 0);
         assert_eq!(second.frame_dirty_tile_cells, 0);
+        assert_eq!(second.frame_upload_regions, 0);
+        assert_eq!(second.frame_upload_cells, 0);
     }
 
     #[test]
@@ -703,9 +715,16 @@ mod test {
 
         let (_, first_rects) = ui.render_to_screen_with_dirty_rects(&mut surface).unwrap();
         assert!(!first_rects.is_empty());
+        let first = ui.last_render_telemetry();
+        assert_eq!(first.frame_upload_regions, first_rects.len());
+        assert_eq!(first.frame_upload_regions, first.frame_dirty_rects);
+        assert_eq!(first.frame_upload_cells, first.frame_dirty_cells);
 
         let (_, second_rects) = ui.render_to_screen_with_dirty_rects(&mut surface).unwrap();
         assert!(second_rects.is_empty());
+        let second = ui.last_render_telemetry();
+        assert_eq!(second.frame_upload_regions, 0);
+        assert_eq!(second.frame_upload_cells, 0);
     }
 
     #[test]
@@ -722,6 +741,9 @@ mod test {
         let first = ui.last_render_telemetry();
         assert!(first.frame_dirty_tiles >= 1);
         assert!(first.frame_dirty_tile_cells >= 1);
+        assert_eq!(first.frame_upload_regions, first_tiles.len());
+        assert_eq!(first.frame_upload_regions, first.frame_dirty_tiles);
+        assert_eq!(first.frame_upload_cells, first.frame_dirty_tile_cells);
 
         let (_, second_tiles) = ui
             .render_to_screen_with_dirty_tiles(&mut surface, 2, 2)
@@ -730,5 +752,7 @@ mod test {
         let second = ui.last_render_telemetry();
         assert_eq!(second.frame_dirty_tiles, 0);
         assert_eq!(second.frame_dirty_tile_cells, 0);
+        assert_eq!(second.frame_upload_regions, 0);
+        assert_eq!(second.frame_upload_cells, 0);
     }
 }
