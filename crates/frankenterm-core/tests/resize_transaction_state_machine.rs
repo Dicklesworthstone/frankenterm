@@ -194,3 +194,211 @@ fn stale_commit_is_prevented_by_boundary_cancellation() {
     assert_eq!(model.committed, vec![11]);
     assert_ne!(model.committed, vec![10]);
 }
+
+// ── DarkBadger wa-1u90p.7.1 ──────────────────────────────────────
+
+#[test]
+fn default_model_starts_idle_with_no_sequences() {
+    let model = ResizeTxnModel::default();
+    assert_eq!(model.phase, TxPhase::Idle);
+    assert_eq!(model.active_seq, None);
+    assert_eq!(model.latest_seq, None);
+    assert!(model.cancelled.is_empty());
+    assert!(model.committed.is_empty());
+}
+
+#[test]
+fn cannot_prepare_from_idle_without_intent() {
+    let mut model = ResizeTxnModel::default();
+    assert!(!model.start_prepare());
+    assert_eq!(model.phase, TxPhase::Idle);
+}
+
+#[test]
+fn cannot_reflow_from_idle() {
+    let mut model = ResizeTxnModel::default();
+    assert!(!model.start_reflow());
+    assert_eq!(model.phase, TxPhase::Idle);
+}
+
+#[test]
+fn cannot_present_from_idle() {
+    let mut model = ResizeTxnModel::default();
+    assert!(!model.start_present());
+    assert_eq!(model.phase, TxPhase::Idle);
+}
+
+#[test]
+fn cannot_commit_from_idle() {
+    let mut model = ResizeTxnModel::default();
+    assert!(!model.commit());
+    assert_eq!(model.phase, TxPhase::Idle);
+}
+
+#[test]
+fn cannot_skip_prepare_phase() {
+    let mut model = ResizeTxnModel::default();
+    model.submit_intent(1);
+    // Try to jump straight to reflow without prepare
+    assert!(!model.start_reflow());
+    assert_eq!(model.phase, TxPhase::Queued);
+}
+
+#[test]
+fn cannot_skip_reflow_phase() {
+    let mut model = ResizeTxnModel::default();
+    model.submit_intent(1);
+    assert!(model.start_prepare());
+    // Try to jump straight to present without reflow
+    assert!(!model.start_present());
+    assert_eq!(model.phase, TxPhase::Preparing);
+}
+
+#[test]
+fn cannot_commit_from_preparing() {
+    let mut model = ResizeTxnModel::default();
+    model.submit_intent(1);
+    assert!(model.start_prepare());
+    assert!(!model.commit());
+    assert_eq!(model.phase, TxPhase::Preparing);
+}
+
+#[test]
+fn cannot_commit_from_reflowing() {
+    let mut model = ResizeTxnModel::default();
+    model.submit_intent(1);
+    assert!(model.start_prepare());
+    assert!(model.start_reflow());
+    assert!(!model.commit());
+    assert_eq!(model.phase, TxPhase::Reflowing);
+}
+
+#[test]
+fn sequential_transactions_commit_independently() {
+    let mut model = ResizeTxnModel::default();
+
+    // First transaction
+    model.submit_intent(1);
+    assert!(model.start_prepare());
+    assert!(model.start_reflow());
+    assert!(model.start_present());
+    assert!(model.commit());
+    assert_eq!(model.committed, vec![1]);
+
+    // Second transaction
+    model.submit_intent(2);
+    assert!(model.start_prepare());
+    assert!(model.start_reflow());
+    assert!(model.start_present());
+    assert!(model.commit());
+    assert_eq!(model.committed, vec![1, 2]);
+    assert!(model.cancelled.is_empty());
+}
+
+#[test]
+fn supersede_at_reflow_stage_cancels_and_requeues() {
+    let mut model = ResizeTxnModel::default();
+    model.submit_intent(1);
+    assert!(model.start_prepare());
+    assert!(model.start_reflow());
+
+    model.submit_intent(2);
+
+    // Next transition attempt detects supersession
+    assert!(!model.start_present());
+    assert_eq!(model.phase, TxPhase::Queued);
+    assert_eq!(model.cancelled, vec![1]);
+    assert_eq!(model.active_seq, Some(2));
+}
+
+#[test]
+fn supersede_at_presenting_stage_cancels_on_commit() {
+    let mut model = ResizeTxnModel::default();
+    model.submit_intent(1);
+    assert!(model.start_prepare());
+    assert!(model.start_reflow());
+    assert!(model.start_present());
+
+    model.submit_intent(2);
+
+    // Commit detects supersession
+    assert!(!model.commit());
+    assert_eq!(model.cancelled, vec![1]);
+    assert_eq!(model.active_seq, Some(2));
+    assert_eq!(model.phase, TxPhase::Queued);
+}
+
+#[test]
+fn multiple_supersede_chains_accumulate_cancellations() {
+    let mut model = ResizeTxnModel::default();
+    model.submit_intent(1);
+    assert!(model.start_prepare());
+
+    model.submit_intent(2);
+    assert!(!model.start_reflow()); // cancels 1
+    assert_eq!(model.cancelled, vec![1]);
+
+    assert!(model.start_prepare());
+    model.submit_intent(3);
+    assert!(!model.start_reflow()); // cancels 2
+    assert_eq!(model.cancelled, vec![1, 2]);
+
+    // Final transaction completes
+    assert!(model.start_prepare());
+    assert!(model.start_reflow());
+    assert!(model.start_present());
+    assert!(model.commit());
+    assert_eq!(model.committed, vec![3]);
+}
+
+#[test]
+#[should_panic(expected = "intent sequence must be monotonic")]
+fn non_monotonic_sequence_panics() {
+    let mut model = ResizeTxnModel::default();
+    model.submit_intent(5);
+    model.submit_intent(3); // violation: 3 < 5
+}
+
+#[test]
+#[should_panic(expected = "intent sequence must be monotonic")]
+fn duplicate_sequence_panics() {
+    let mut model = ResizeTxnModel::default();
+    model.submit_intent(1);
+    model.submit_intent(1); // violation: 1 == 1
+}
+
+#[test]
+fn tx_phase_default_is_idle() {
+    assert_eq!(TxPhase::default(), TxPhase::Idle);
+}
+
+#[test]
+fn tx_phase_clone_and_debug() {
+    let phase = TxPhase::Reflowing;
+    let cloned = phase.clone();
+    assert_eq!(phase, cloned);
+    let dbg = format!("{:?}", phase);
+    assert!(dbg.contains("Reflowing"));
+}
+
+#[test]
+fn submit_intent_when_active_does_not_replace_active_seq() {
+    let mut model = ResizeTxnModel::default();
+    model.submit_intent(1);
+    assert_eq!(model.active_seq, Some(1));
+
+    model.submit_intent(2);
+    // active_seq stays as 1 until a phase boundary check
+    assert_eq!(model.active_seq, Some(1));
+    assert_eq!(model.latest_seq, Some(2));
+}
+
+#[test]
+fn cancel_if_superseded_is_noop_when_latest_equals_active() {
+    let mut model = ResizeTxnModel::default();
+    model.submit_intent(1);
+    model.phase = TxPhase::Preparing;
+    assert!(!model.cancel_if_superseded());
+    assert_eq!(model.phase, TxPhase::Preparing);
+    assert!(model.cancelled.is_empty());
+}
