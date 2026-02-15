@@ -2306,4 +2306,249 @@ mod tests {
         // PlanValidationError implements std::error::Error
         let _: &dyn std::error::Error = &err;
     }
+
+    // ========================================================================
+    // Batch — RubyBeaver wa-1u90p.7.1 validation + serde edge-case tests
+    // ========================================================================
+
+    #[test]
+    fn validation_rejects_duplicate_step_ids() {
+        let key = IdempotencyKey::from_hash("same_key");
+        let plan = ActionPlan {
+            plan_version: PLAN_SCHEMA_VERSION,
+            plan_id: PlanId::placeholder(),
+            title: "dup".into(),
+            workspace_id: "ws".into(),
+            created_at: None,
+            steps: vec![
+                StepPlan::with_key(
+                    1,
+                    key.clone(),
+                    StepAction::ReleaseLock {
+                        lock_name: "a".into(),
+                    },
+                    "Step 1",
+                ),
+                StepPlan::with_key(
+                    2,
+                    key,
+                    StepAction::ReleaseLock {
+                        lock_name: "b".into(),
+                    },
+                    "Step 2",
+                ),
+            ],
+            preconditions: vec![],
+            on_failure: None,
+            metadata: None,
+        };
+        let err = plan.validate().unwrap_err();
+        assert!(matches!(err, PlanValidationError::DuplicateStepId(_)));
+    }
+
+    #[test]
+    fn validation_rejects_wrong_step_numbering() {
+        let plan = ActionPlan {
+            plan_version: PLAN_SCHEMA_VERSION,
+            plan_id: PlanId::placeholder(),
+            title: "bad numbering".into(),
+            workspace_id: "ws".into(),
+            created_at: None,
+            steps: vec![StepPlan::new(
+                5, // should be 1
+                StepAction::MarkEventHandled { event_id: 1 },
+                "Wrong number",
+            )],
+            preconditions: vec![],
+            on_failure: None,
+            metadata: None,
+        };
+        let err = plan.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            PlanValidationError::InvalidStepNumber {
+                expected: 1,
+                actual: 5
+            }
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_unknown_step_reference_in_precondition() {
+        let plan = ActionPlan {
+            plan_version: PLAN_SCHEMA_VERSION,
+            plan_id: PlanId::placeholder(),
+            title: "bad ref".into(),
+            workspace_id: "ws".into(),
+            created_at: None,
+            steps: vec![],
+            preconditions: vec![Precondition::StepCompleted {
+                step_id: IdempotencyKey::from_hash("nonexistent"),
+            }],
+            on_failure: None,
+            metadata: None,
+        };
+        let err = plan.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            PlanValidationError::UnknownStepReference(_)
+        ));
+    }
+
+    #[test]
+    fn plan_hash_changes_when_title_changes() {
+        let plan1 = ActionPlan::builder("Plan A", "ws").build();
+        let plan2 = ActionPlan::builder("Plan B", "ws").build();
+        assert_ne!(plan1.compute_hash(), plan2.compute_hash());
+    }
+
+    #[test]
+    fn plan_hash_changes_when_workspace_changes() {
+        let plan1 = ActionPlan::builder("Same", "ws-1").build();
+        let plan2 = ActionPlan::builder("Same", "ws-2").build();
+        assert_ne!(plan1.compute_hash(), plan2.compute_hash());
+    }
+
+    #[test]
+    fn plan_hash_ignores_created_at() {
+        let plan1 = ActionPlan::builder("Same", "ws")
+            .created_at(1000)
+            .build();
+        let plan2 = ActionPlan::builder("Same", "ws")
+            .created_at(2000)
+            .build();
+        assert_eq!(plan1.compute_hash(), plan2.compute_hash());
+    }
+
+    #[test]
+    fn idempotency_key_for_action_is_deterministic() {
+        let action = StepAction::SendText {
+            pane_id: 1,
+            text: "hello".into(),
+            paste_mode: None,
+        };
+        let k1 = IdempotencyKey::for_action("ws", 1, &action);
+        let k2 = IdempotencyKey::for_action("ws", 1, &action);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn idempotency_key_for_action_differs_by_workspace() {
+        let action = StepAction::MarkEventHandled { event_id: 1 };
+        let k1 = IdempotencyKey::for_action("ws-a", 1, &action);
+        let k2 = IdempotencyKey::for_action("ws-b", 1, &action);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn step_action_serde_roundtrip_all_variants() {
+        let actions = vec![
+            StepAction::SendText {
+                pane_id: 42,
+                text: "hi".into(),
+                paste_mode: Some(true),
+            },
+            StepAction::WaitFor {
+                pane_id: Some(1),
+                condition: WaitCondition::PaneIdle {
+                    pane_id: Some(1),
+                    idle_threshold_ms: 3000,
+                },
+                timeout_ms: 5000,
+            },
+            StepAction::AcquireLock {
+                lock_name: "lock1".into(),
+                timeout_ms: Some(1000),
+            },
+            StepAction::ReleaseLock {
+                lock_name: "lock1".into(),
+            },
+            StepAction::StoreData {
+                key: "k".into(),
+                value: serde_json::json!({"x": 1}),
+            },
+            StepAction::RunWorkflow {
+                workflow_id: "wf-1".into(),
+                params: Some(serde_json::json!([])),
+            },
+            StepAction::MarkEventHandled { event_id: 99 },
+            StepAction::ValidateApproval {
+                approval_code: "CODE".into(),
+            },
+            StepAction::Custom {
+                action_type: "my_type".into(),
+                payload: serde_json::json!(null),
+            },
+        ];
+        for action in &actions {
+            let json = serde_json::to_string(action).unwrap();
+            let back: StepAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                action.action_type_name(),
+                back.action_type_name(),
+                "action type mismatch for: {}",
+                json
+            );
+        }
+    }
+
+    #[test]
+    fn on_failure_serde_roundtrip_all_variants() {
+        let variants = vec![
+            OnFailure::abort(),
+            OnFailure::abort_with_message("fail"),
+            OnFailure::retry(3, 1000),
+            OnFailure::skip(),
+            OnFailure::RequireApproval {
+                summary: "help".into(),
+            },
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: OnFailure = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                v.canonical_string(),
+                back.canonical_string(),
+                "on_failure mismatch for: {}",
+                json
+            );
+        }
+    }
+
+    #[test]
+    fn wait_condition_serde_roundtrip_all_variants() {
+        let conditions = vec![
+            WaitCondition::Pattern {
+                pane_id: Some(1),
+                rule_id: "r".into(),
+            },
+            WaitCondition::PaneIdle {
+                pane_id: None,
+                idle_threshold_ms: 500,
+            },
+            WaitCondition::StableTail {
+                pane_id: Some(2),
+                stable_for_ms: 1000,
+            },
+            WaitCondition::External {
+                key: "sig".into(),
+            },
+        ];
+        for cond in &conditions {
+            let json = serde_json::to_string(cond).unwrap();
+            let back: WaitCondition = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                cond.canonical_string(),
+                back.canonical_string(),
+                "wait_condition mismatch for: {}",
+                json
+            );
+        }
+    }
+
+    #[test]
+    fn plan_no_preconditions_helper() {
+        let plan = ActionPlan::builder("Test", "ws").build();
+        assert!(!plan.has_preconditions());
+    }
 }
