@@ -13,6 +13,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::collections::BTreeSet;
 use tempfile::TempDir;
 
 // =============================================================================
@@ -158,6 +159,97 @@ fn run_wa_json(workspace: &str, args: &[&str]) -> serde_json::Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON")
+}
+
+fn resize_baseline_fixture_path(file_name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/simulations/resize_baseline")
+        .join(file_name)
+}
+
+fn run_resize_timeline_json(workspace: &str, scenario_path: &std::path::Path) -> serde_json::Value {
+    assert!(
+        scenario_path.exists(),
+        "scenario fixture should exist: {}",
+        scenario_path.display()
+    );
+    let scenario_arg = scenario_path.to_string_lossy().to_string();
+    let output = wa_cmd_for(workspace)
+        .args([
+            "simulate",
+            "run",
+            &scenario_arg,
+            "--json",
+            "--resize-timeline-json",
+        ])
+        .output()
+        .expect("ft simulate run --resize-timeline-json should execute");
+    assert!(
+        output.status.success(),
+        "simulate timeline mode should succeed for fixture {}, stderr: {}",
+        scenario_path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("simulate timeline output should be JSON")
+}
+
+fn assert_resize_timeline_contract_shape(parsed: &serde_json::Value, expected_events: usize) {
+    assert_eq!(parsed["mode"], "resize_timeline_json");
+    assert_eq!(parsed["expectations_failed"], 0);
+    assert_eq!(
+        parsed["timeline"]["executed_resize_events"],
+        expected_events as u64
+    );
+    assert_eq!(
+        parsed["timeline"]["events"]
+            .as_array()
+            .map(std::vec::Vec::len)
+            .unwrap_or_default(),
+        expected_events
+    );
+
+    let stage_summary = parsed["stage_summary"]
+        .as_array()
+        .expect("stage_summary should be an array");
+    assert_eq!(
+        stage_summary.len(),
+        5,
+        "expected five resize timeline stages"
+    );
+
+    let stage_names: BTreeSet<_> = stage_summary
+        .iter()
+        .filter_map(|entry| entry["stage"].as_str())
+        .collect();
+    assert_eq!(
+        stage_names,
+        BTreeSet::from([
+            "input_intent",
+            "scheduler_queueing",
+            "logical_reflow",
+            "render_prep",
+            "presentation",
+        ])
+    );
+
+    for stage in stage_summary {
+        assert!(
+            stage["samples"].as_u64().unwrap_or(0) > 0,
+            "each stage should have at least one sample"
+        );
+        assert!(stage["total_duration_ns"].as_u64().is_some());
+        assert!(stage["p95_duration_ns"].as_u64().is_some());
+        assert!(stage["max_duration_ns"].as_u64().is_some());
+    }
+
+    let flame = parsed["flame_samples"]
+        .as_array()
+        .expect("flame_samples should be an array");
+    assert_eq!(
+        flame.len(),
+        expected_events * 5,
+        "expected one flame sample per event per stage"
+    );
 }
 
 // =============================================================================
@@ -321,6 +413,87 @@ fn contract_simulate_resize_timeline_requires_json_flag() {
         .stderr(predicate::str::contains(
             "--resize-timeline-json requires --json",
         ));
+}
+
+#[test]
+fn contract_simulate_resize_multi_tab_storm_timeline_contract() {
+    let (_dir, ws) = setup_workspace();
+    let scenario_path = resize_baseline_fixture_path("resize_multi_tab_storm.yaml");
+    let parsed = run_resize_timeline_json(&ws, &scenario_path);
+
+    assert_resize_timeline_contract_shape(&parsed, 24);
+
+    let events = parsed["timeline"]["events"]
+        .as_array()
+        .expect("timeline.events should be array");
+    let panes: BTreeSet<_> = events
+        .iter()
+        .filter_map(|entry| entry["pane_id"].as_u64())
+        .collect();
+    assert_eq!(panes, BTreeSet::from([0, 1, 2, 3, 4, 5, 6, 7]));
+
+    for event in events {
+        assert!(
+            matches!(
+                event["action"].as_str(),
+                Some("resize" | "set_font_size" | "generate_scrollback")
+            ),
+            "only resize-class actions should appear in timeline"
+        );
+        assert!(event["total_duration_ns"].as_u64().is_some());
+
+        let stages = event["stages"]
+            .as_array()
+            .expect("timeline event should include stage probes");
+        let scheduler_stage = stages
+            .iter()
+            .find(|stage| stage["stage"] == "scheduler_queueing")
+            .expect("scheduler_queueing stage should be present");
+        assert!(
+            scheduler_stage["queue_metrics"]["depth_before"]
+                .as_u64()
+                .is_some(),
+            "scheduler queue metrics should include depth_before"
+        );
+        assert!(
+            scheduler_stage["queue_metrics"]["depth_after"]
+                .as_u64()
+                .is_some(),
+            "scheduler queue metrics should include depth_after"
+        );
+    }
+}
+
+#[test]
+fn contract_simulate_resize_single_pane_scrollback_timeline_contract() {
+    let (_dir, ws) = setup_workspace();
+    let scenario_path = resize_baseline_fixture_path("resize_single_pane_scrollback.yaml");
+    let parsed = run_resize_timeline_json(&ws, &scenario_path);
+
+    assert_resize_timeline_contract_shape(&parsed, 8);
+
+    let events = parsed["timeline"]["events"]
+        .as_array()
+        .expect("timeline.events should be array");
+    assert!(events.iter().all(|entry| entry["pane_id"] == 0));
+
+    let mut resize_count = 0usize;
+    let mut font_count = 0usize;
+    let mut scrollback_count = 0usize;
+    for event in events {
+        match event["action"].as_str() {
+            Some("resize") => resize_count += 1,
+            Some("set_font_size") => font_count += 1,
+            Some("generate_scrollback") => scrollback_count += 1,
+            other => panic!("unexpected action in resize timeline: {other:?}"),
+        }
+    }
+    assert_eq!(resize_count, 4, "expected four resize actions");
+    assert_eq!(font_count, 3, "expected three set_font_size actions");
+    assert_eq!(
+        scrollback_count, 1,
+        "expected one generate_scrollback action"
+    );
 }
 
 // =============================================================================
