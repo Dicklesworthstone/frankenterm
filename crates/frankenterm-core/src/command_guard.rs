@@ -1536,4 +1536,323 @@ mod tests {
         assert!(log[0].command.len() <= 260);
         assert!(log[0].command.ends_with("..."));
     }
+
+    // -------------------------------------------------------------------
+    // Batch: DarkBadger wa-1u90p.7.1
+    // -------------------------------------------------------------------
+
+    // -- TrustLevel trait coverage --
+
+    #[test]
+    fn trust_level_debug() {
+        let dbg = format!("{:?}", TrustLevel::Strict);
+        assert!(dbg.contains("Strict"), "got: {}", dbg);
+    }
+
+    #[test]
+    fn trust_level_clone_copy() {
+        let t = TrustLevel::Permissive;
+        let cloned = t.clone();
+        let copied = t;
+        assert_eq!(cloned, copied);
+    }
+
+    #[test]
+    fn trust_level_default() {
+        assert_eq!(TrustLevel::default(), TrustLevel::Strict);
+    }
+
+    #[test]
+    fn trust_level_display_all() {
+        assert_eq!(TrustLevel::Strict.to_string(), "strict");
+        assert_eq!(TrustLevel::Permissive.to_string(), "permissive");
+        assert_eq!(TrustLevel::ReadOnly.to_string(), "read_only");
+    }
+
+    #[test]
+    fn trust_level_serde_roundtrip() {
+        let levels = [
+            TrustLevel::Strict,
+            TrustLevel::Permissive,
+            TrustLevel::ReadOnly,
+        ];
+        for level in &levels {
+            let json = serde_json::to_string(level).unwrap();
+            let back: TrustLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(*level, back);
+        }
+    }
+
+    #[test]
+    fn trust_level_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(TrustLevel::Strict);
+        set.insert(TrustLevel::Permissive);
+        set.insert(TrustLevel::ReadOnly);
+        assert_eq!(set.len(), 3);
+        // Duplicate insertion doesn't increase size
+        set.insert(TrustLevel::Strict);
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn trust_level_eq() {
+        assert_eq!(TrustLevel::Strict, TrustLevel::Strict);
+        assert_ne!(TrustLevel::Strict, TrustLevel::Permissive);
+        assert_ne!(TrustLevel::Permissive, TrustLevel::ReadOnly);
+    }
+
+    // -- GuardDecision trait coverage --
+
+    #[test]
+    fn guard_decision_debug() {
+        let d = GuardDecision::Allow;
+        let dbg = format!("{:?}", d);
+        assert!(dbg.contains("Allow"), "got: {}", dbg);
+    }
+
+    #[test]
+    fn guard_decision_clone() {
+        let d = GuardDecision::Block {
+            rule_id: "r1".to_string(),
+            pack: "p1".to_string(),
+            reason: "test".to_string(),
+            suggestions: vec!["s1".to_string()],
+        };
+        let cloned = d.clone();
+        assert!(cloned.is_blocked());
+        assert_eq!(cloned.rule_id(), Some("r1"));
+    }
+
+    #[test]
+    fn guard_decision_allow_rule_id_none() {
+        let d = GuardDecision::Allow;
+        assert!(d.is_allowed());
+        assert!(!d.is_blocked());
+        assert!(!d.is_warning());
+        assert_eq!(d.rule_id(), None);
+    }
+
+    #[test]
+    fn guard_decision_warn_accessors() {
+        let d = GuardDecision::Warn {
+            rule_id: "test:warn".to_string(),
+            pack: "test".to_string(),
+            reason: "reason".to_string(),
+        };
+        assert!(d.is_warning());
+        assert!(!d.is_blocked());
+        assert!(!d.is_allowed());
+        assert_eq!(d.rule_id(), Some("test:warn"));
+    }
+
+    #[test]
+    fn guard_decision_serde_roundtrip_all() {
+        let decisions = vec![
+            GuardDecision::Allow,
+            GuardDecision::Block {
+                rule_id: "r1".to_string(),
+                pack: "p1".to_string(),
+                reason: "blocked".to_string(),
+                suggestions: vec!["fix".to_string()],
+            },
+            GuardDecision::Warn {
+                rule_id: "r2".to_string(),
+                pack: "p2".to_string(),
+                reason: "warned".to_string(),
+            },
+        ];
+        for d in &decisions {
+            let json = serde_json::to_string(d).unwrap();
+            let back: GuardDecision = serde_json::from_str(&json).unwrap();
+            assert_eq!(d.is_blocked(), back.is_blocked());
+            assert_eq!(d.is_warning(), back.is_warning());
+            assert_eq!(d.is_allowed(), back.is_allowed());
+        }
+    }
+
+    // -- PaneGuardConfig --
+
+    #[test]
+    fn pane_guard_config_debug_clone() {
+        let config = PaneGuardConfig::default();
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("PaneGuardConfig"), "got: {}", dbg);
+        let cloned = config.clone();
+        assert_eq!(cloned.trust_level, config.trust_level);
+    }
+
+    #[test]
+    fn pane_guard_config_default_values() {
+        let config = PaneGuardConfig::default();
+        assert_eq!(config.trust_level, TrustLevel::Strict);
+        assert!(config.enabled_packs.is_none());
+        assert!(config.allowlist_patterns.is_empty());
+        assert_eq!(config.budget_us, 100);
+    }
+
+    #[test]
+    fn pane_guard_config_serde_roundtrip() {
+        let config = PaneGuardConfig {
+            trust_level: TrustLevel::Permissive,
+            enabled_packs: Some(vec!["core.git".to_string()]),
+            allowlist_patterns: vec!["^safe_.*".to_string()],
+            budget_us: 500,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: PaneGuardConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.trust_level, TrustLevel::Permissive);
+        assert_eq!(back.budget_us, 500);
+    }
+
+    // -- GuardPolicy --
+
+    #[test]
+    fn guard_policy_debug_clone() {
+        let policy = GuardPolicy::default();
+        let dbg = format!("{:?}", policy);
+        assert!(dbg.contains("GuardPolicy"), "got: {}", dbg);
+        let cloned = policy.clone();
+        assert_eq!(cloned.default_trust, policy.default_trust);
+    }
+
+    #[test]
+    fn guard_policy_default_values() {
+        let policy = GuardPolicy::default();
+        assert_eq!(policy.default_trust, TrustLevel::Strict);
+        assert_eq!(policy.enabled_packs.len(), 8);
+        assert!(policy.disabled_packs.is_empty());
+        assert!(policy.pane_overrides.is_empty());
+        assert_eq!(policy.audit_capacity, 10_000);
+    }
+
+    #[test]
+    fn guard_policy_serde_roundtrip() {
+        let policy = GuardPolicy::default();
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: GuardPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.default_trust, TrustLevel::Strict);
+        assert_eq!(back.enabled_packs.len(), policy.enabled_packs.len());
+    }
+
+    // -- AuditEntry --
+
+    #[test]
+    fn audit_entry_debug_clone() {
+        let entry = AuditEntry {
+            pane_id: 1,
+            command: "ls".to_string(),
+            decision: "allow".to_string(),
+            rule_id: None,
+            pack: None,
+            eval_us: 5,
+            timestamp_s: 1000,
+        };
+        let dbg = format!("{:?}", entry);
+        assert!(dbg.contains("AuditEntry"), "got: {}", dbg);
+        let cloned = entry.clone();
+        assert_eq!(cloned.pane_id, 1);
+    }
+
+    #[test]
+    fn audit_entry_serde_roundtrip() {
+        let entry = AuditEntry {
+            pane_id: 42,
+            command: "rm -rf /tmp".to_string(),
+            decision: "block".to_string(),
+            rule_id: Some("core.filesystem:rm-rf".to_string()),
+            pack: Some("core.filesystem".to_string()),
+            eval_us: 50,
+            timestamp_s: 1700000000,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: AuditEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pane_id, 42);
+        assert_eq!(back.rule_id, Some("core.filesystem:rm-rf".to_string()));
+    }
+
+    // -- CommandGuard --
+
+    #[test]
+    fn guard_with_defaults() {
+        let guard = CommandGuard::with_defaults();
+        assert_eq!(guard.policy().default_trust, TrustLevel::Strict);
+        assert_eq!(guard.audit_count(), 0);
+    }
+
+    #[test]
+    fn guard_policy_accessor() {
+        let guard = strict_guard();
+        let policy = guard.policy();
+        assert_eq!(policy.default_trust, TrustLevel::Strict);
+    }
+
+    #[test]
+    fn guard_set_policy() {
+        let mut guard = strict_guard();
+        let new_policy = GuardPolicy {
+            default_trust: TrustLevel::ReadOnly,
+            ..GuardPolicy::default()
+        };
+        guard.set_policy(new_policy);
+        assert_eq!(guard.policy().default_trust, TrustLevel::ReadOnly);
+    }
+
+    #[test]
+    fn guard_clear_audit_log() {
+        let mut guard = strict_guard();
+        guard.evaluate("rm -rf /tmp/x", 1);
+        assert!(guard.audit_count() > 0);
+        guard.clear_audit_log();
+        assert_eq!(guard.audit_count(), 0);
+    }
+
+    #[test]
+    fn guard_evaluate_timed_returns_duration() {
+        let mut guard = strict_guard();
+        let (decision, elapsed_us) = guard.evaluate_timed("ls -la", 1);
+        assert!(decision.is_allowed());
+        // Elapsed should be reasonable (< 10ms = 10_000 us)
+        assert!(elapsed_us < 10_000, "elapsed_us={}", elapsed_us);
+    }
+
+    #[test]
+    fn guard_set_pane_config() {
+        let mut guard = strict_guard();
+        guard.set_pane_config(
+            42,
+            PaneGuardConfig {
+                trust_level: TrustLevel::ReadOnly,
+                ..PaneGuardConfig::default()
+            },
+        );
+        // Pane 42 should now be ReadOnly
+        let decision = guard.evaluate("rm -rf /", 42);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn guard_audit_records_pane_id() {
+        let mut guard = strict_guard();
+        guard.evaluate("ls", 99);
+        let log = guard.audit_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].pane_id, 99);
+    }
+
+    #[test]
+    fn stateless_safe_returns_none() {
+        let result = evaluate_stateless("echo hello");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn stateless_destructive_returns_some() {
+        let result = evaluate_stateless("rm -rf /tmp/important");
+        assert!(result.is_some());
+        let (rule_id, pack, _reason, _suggestions) = result.unwrap();
+        assert!(!rule_id.is_empty());
+        assert!(!pack.is_empty());
+    }
 }

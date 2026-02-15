@@ -1566,4 +1566,389 @@ mod tests {
         assert_eq!(deser.text, "hello");
         assert_eq!(deser.pagination.limit, 10);
     }
+
+    // -------------------------------------------------------------------
+    // Batch: DarkBadger wa-1u90p.7.1
+    // -------------------------------------------------------------------
+
+    // -- SearchQuery trait coverage --
+
+    #[test]
+    fn search_query_debug() {
+        let q = SearchQuery::simple("test");
+        let dbg = format!("{:?}", q);
+        assert!(dbg.contains("SearchQuery"), "got: {}", dbg);
+    }
+
+    #[test]
+    fn search_query_clone() {
+        let q = SearchQuery::simple("test").with_limit(5);
+        let cloned = q.clone();
+        assert_eq!(cloned.text, "test");
+        assert_eq!(cloned.pagination.limit, 5);
+    }
+
+    #[test]
+    fn search_query_text_boost_default() {
+        let q = SearchQuery::simple("test");
+        assert!((q.text_boost() - 1.0).abs() < f32::EPSILON);
+        assert!((q.text_symbols_boost() - 1.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn search_query_with_cursor() {
+        let cursor = PaginationCursor {
+            score_millis: 500,
+            occurred_at_ms: 1000,
+            sequence: 1,
+            log_offset: 0,
+        };
+        let q = SearchQuery::simple("test").with_cursor(cursor);
+        assert!(q.pagination.after.is_some());
+    }
+
+    // -- SearchSortOrder --
+
+    #[test]
+    fn sort_order_debug_clone() {
+        let s = SearchSortOrder::default();
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("SearchSortOrder"), "got: {}", dbg);
+        let cloned = s.clone();
+        assert_eq!(s, cloned);
+    }
+
+    #[test]
+    fn sort_order_default_values() {
+        let s = SearchSortOrder::default();
+        assert_eq!(s.primary, SortField::Relevance);
+        assert!(s.descending);
+    }
+
+    #[test]
+    fn sort_order_serde_roundtrip() {
+        let s = SearchSortOrder {
+            primary: SortField::OccurredAt,
+            descending: false,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: SearchSortOrder = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
+
+    // -- SortField --
+
+    #[test]
+    fn sort_field_debug_clone_copy() {
+        let f = SortField::Sequence;
+        let cloned = f.clone();
+        let copied = f;
+        assert_eq!(cloned, copied);
+        let dbg = format!("{:?}", f);
+        assert!(dbg.contains("Sequence"), "got: {}", dbg);
+    }
+
+    #[test]
+    fn sort_field_serde_all_variants() {
+        let fields = [
+            SortField::Relevance,
+            SortField::OccurredAt,
+            SortField::RecordedAt,
+            SortField::Sequence,
+            SortField::LogOffset,
+        ];
+        for field in &fields {
+            let json = serde_json::to_string(field).unwrap();
+            let back: SortField = serde_json::from_str(&json).unwrap();
+            assert_eq!(*field, back);
+        }
+    }
+
+    // -- TieBreakKey --
+
+    #[test]
+    fn tie_break_key_debug_clone() {
+        let key = TieBreakKey {
+            neg_occurred_at_ms: -1000,
+            neg_sequence: -5,
+            neg_log_offset: -10,
+        };
+        let dbg = format!("{:?}", key);
+        assert!(dbg.contains("TieBreakKey"), "got: {}", dbg);
+        let cloned = key.clone();
+        assert_eq!(key, cloned);
+    }
+
+    #[test]
+    fn tie_break_key_ordering() {
+        // Higher timestamps should sort first (smaller negated value)
+        let a = TieBreakKey {
+            neg_occurred_at_ms: -2000,
+            neg_sequence: -1,
+            neg_log_offset: -1,
+        };
+        let b = TieBreakKey {
+            neg_occurred_at_ms: -1000,
+            neg_sequence: -1,
+            neg_log_offset: -1,
+        };
+        // -2000 < -1000, so a < b, meaning a (ts=2000) sorts before b (ts=1000)
+        assert!(a < b);
+    }
+
+    #[test]
+    fn tie_break_key_sequence_tiebreak() {
+        let a = TieBreakKey {
+            neg_occurred_at_ms: -1000,
+            neg_sequence: -10,
+            neg_log_offset: -1,
+        };
+        let b = TieBreakKey {
+            neg_occurred_at_ms: -1000,
+            neg_sequence: -5,
+            neg_log_offset: -1,
+        };
+        // Same timestamp, seq 10 > seq 5, so -10 < -5, a < b
+        assert!(a < b);
+    }
+
+    // -- Pagination --
+
+    #[test]
+    fn pagination_debug_clone() {
+        let p = Pagination::default();
+        let dbg = format!("{:?}", p);
+        assert!(dbg.contains("Pagination"), "got: {}", dbg);
+        let cloned = p.clone();
+        assert_eq!(cloned.limit, p.limit);
+    }
+
+    #[test]
+    fn pagination_default_values() {
+        let p = Pagination::default();
+        assert_eq!(p.limit, 20);
+        assert!(p.after.is_none());
+    }
+
+    #[test]
+    fn pagination_serde_roundtrip() {
+        let p = Pagination {
+            limit: 50,
+            after: Some(PaginationCursor {
+                score_millis: 100,
+                occurred_at_ms: 5000,
+                sequence: 42,
+                log_offset: 99,
+            }),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Pagination = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.limit, 50);
+        assert!(back.after.is_some());
+    }
+
+    // -- PaginationCursor --
+
+    #[test]
+    fn pagination_cursor_debug_clone_eq() {
+        let cursor = PaginationCursor {
+            score_millis: 500,
+            occurred_at_ms: 1000,
+            sequence: 1,
+            log_offset: 0,
+        };
+        let dbg = format!("{:?}", cursor);
+        assert!(dbg.contains("PaginationCursor"), "got: {}", dbg);
+        let cloned = cursor.clone();
+        assert_eq!(cursor, cloned);
+    }
+
+    #[test]
+    fn pagination_cursor_serde_roundtrip() {
+        let cursor = PaginationCursor {
+            score_millis: 750,
+            occurred_at_ms: 2000,
+            sequence: 10,
+            log_offset: 55,
+        };
+        let json = serde_json::to_string(&cursor).unwrap();
+        let back: PaginationCursor = serde_json::from_str(&json).unwrap();
+        assert_eq!(cursor, back);
+    }
+
+    // -- SnippetConfig --
+
+    #[test]
+    fn snippet_config_debug_clone() {
+        let config = SnippetConfig::default();
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("SnippetConfig"), "got: {}", dbg);
+        let _cloned = config.clone();
+    }
+
+    #[test]
+    fn snippet_config_default_values() {
+        let config = SnippetConfig::default();
+        assert_eq!(config.max_fragment_len, 200);
+        assert_eq!(config.max_fragments, 3);
+        assert_eq!(config.highlight_pre, "\u{ab}"); // «
+        assert_eq!(config.highlight_post, "\u{bb}"); // »
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn snippet_config_serde_roundtrip() {
+        let config = SnippetConfig {
+            max_fragment_len: 100,
+            max_fragments: 5,
+            highlight_pre: "<em>".to_string(),
+            highlight_post: "</em>".to_string(),
+            enabled: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: SnippetConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.max_fragment_len, 100);
+        assert!(!back.enabled);
+    }
+
+    // -- Snippet --
+
+    #[test]
+    fn snippet_debug_clone_eq() {
+        let s = Snippet {
+            fragment: "hello «world»".to_string(),
+            field: "text".to_string(),
+        };
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("Snippet"), "got: {}", dbg);
+        let cloned = s.clone();
+        assert_eq!(s, cloned);
+    }
+
+    #[test]
+    fn snippet_serde_roundtrip() {
+        let s = Snippet {
+            fragment: "test «match»".to_string(),
+            field: "text_symbols".to_string(),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Snippet = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
+
+    // -- SearchResults --
+
+    #[test]
+    fn search_results_debug_clone() {
+        let r = SearchResults::empty(42);
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("SearchResults"), "got: {}", dbg);
+        let cloned = r.clone();
+        assert_eq!(cloned.total_hits, 0);
+        assert_eq!(cloned.elapsed_us, 42);
+    }
+
+    #[test]
+    fn search_results_empty_fields() {
+        let r = SearchResults::empty(100);
+        assert!(r.hits.is_empty());
+        assert_eq!(r.total_hits, 0);
+        assert!(!r.has_more);
+        assert!(r.next_cursor.is_none());
+    }
+
+    #[test]
+    fn search_results_serde_roundtrip() {
+        let r = SearchResults::empty(55);
+        let json = serde_json::to_string(&r).unwrap();
+        let back: SearchResults = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total_hits, 0);
+        assert_eq!(back.elapsed_us, 55);
+    }
+
+    // -- SearchError --
+
+    #[test]
+    fn search_error_debug() {
+        let e = SearchError::InvalidQuery {
+            reason: "bad syntax".to_string(),
+        };
+        let dbg = format!("{:?}", e);
+        assert!(dbg.contains("InvalidQuery"), "got: {}", dbg);
+    }
+
+    #[test]
+    fn search_error_display_all() {
+        let errors = [
+            SearchError::InvalidQuery {
+                reason: "bad".to_string(),
+            },
+            SearchError::Internal {
+                reason: "oops".to_string(),
+            },
+            SearchError::IndexUnavailable {
+                reason: "down".to_string(),
+            },
+        ];
+        let expected = [
+            "invalid query: bad",
+            "internal error: oops",
+            "index unavailable: down",
+        ];
+        for (e, exp) in errors.iter().zip(expected.iter()) {
+            assert_eq!(e.to_string(), *exp);
+        }
+    }
+
+    #[test]
+    fn search_error_is_error_trait() {
+        let e = SearchError::Internal {
+            reason: "test".to_string(),
+        };
+        let err: &dyn std::error::Error = &e;
+        assert!(!err.to_string().is_empty());
+    }
+
+    // -- InMemorySearchService --
+
+    #[test]
+    fn in_memory_service_default() {
+        let svc = InMemorySearchService::default();
+        assert!(svc.is_empty());
+        assert_eq!(svc.len(), 0);
+    }
+
+    #[test]
+    fn in_memory_service_add() {
+        let mut svc = InMemorySearchService::new();
+        svc.add(make_doc(1, "hello world", 1000));
+        assert_eq!(svc.len(), 1);
+        assert!(!svc.is_empty());
+    }
+
+    // -- EventDirection --
+
+    #[test]
+    fn event_direction_debug_clone_copy() {
+        let d = EventDirection::Ingress;
+        let cloned = d.clone();
+        let copied = d;
+        assert_eq!(cloned, copied);
+        let dbg = format!("{:?}", d);
+        assert!(dbg.contains("Ingress"), "got: {}", dbg);
+    }
+
+    #[test]
+    fn event_direction_serde_all() {
+        let dirs = [
+            EventDirection::Ingress,
+            EventDirection::Egress,
+            EventDirection::Both,
+        ];
+        for d in &dirs {
+            let json = serde_json::to_string(d).unwrap();
+            let back: EventDirection = serde_json::from_str(&json).unwrap();
+            assert_eq!(*d, back);
+        }
+    }
 }
