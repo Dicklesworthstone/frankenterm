@@ -319,4 +319,242 @@ mod tests {
         assert!(sender.await.unwrap().is_ok());
         assert_eq!(rx.recv().await, Some(2));
     }
+
+    // ----------------------------------------------------------------
+    // Additional coverage
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn try_send_returns_value_on_full() {
+        let (tx, _rx) = channel::<u32>(1);
+        tx.try_send(10).unwrap();
+        let err = tx.try_send(20).unwrap_err();
+        assert_eq!(err, 20, "try_send should return the rejected value");
+    }
+
+    #[test]
+    fn try_send_returns_value_on_closed() {
+        let (tx, _rx) = channel::<String>(4);
+        tx.close();
+        let err = tx.try_send("hello".to_string()).unwrap_err();
+        assert_eq!(err, "hello", "try_send should return the value on closed");
+    }
+
+    #[test]
+    fn close_is_idempotent() {
+        let (tx, rx) = channel::<u32>(4);
+        tx.close();
+        assert!(tx.is_closed());
+        assert!(rx.is_closed());
+        // Second close should not panic or change state
+        tx.close();
+        assert!(tx.is_closed());
+        assert!(rx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn try_recv_drains_after_producer_drop() {
+        let (tx, rx) = channel::<u32>(4);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        tx.try_send(3).unwrap();
+        drop(tx);
+
+        assert!(rx.is_closed());
+        assert_eq!(rx.try_recv(), Some(1));
+        assert_eq!(rx.try_recv(), Some(2));
+        assert_eq!(rx.try_recv(), Some(3));
+        assert_eq!(rx.try_recv(), None);
+    }
+
+    #[tokio::test]
+    async fn large_batch_1000_items() {
+        let (tx, rx) = channel(64);
+        let sender = tokio::spawn(async move {
+            for i in 0..1000u32 {
+                tx.send(i).await.unwrap();
+            }
+        });
+
+        for i in 0..1000u32 {
+            let val = rx.recv().await.unwrap();
+            assert_eq!(val, i);
+        }
+        sender.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn string_payload() {
+        let (tx, rx) = channel(4);
+        tx.send("hello".to_string()).await.unwrap();
+        tx.send("world".to_string()).await.unwrap();
+        assert_eq!(rx.recv().await, Some("hello".to_string()));
+        assert_eq!(rx.recv().await, Some("world".to_string()));
+    }
+
+    #[tokio::test]
+    async fn vec_payload() {
+        let (tx, rx) = channel(2);
+        tx.send(vec![1, 2, 3]).await.unwrap();
+        tx.send(vec![4, 5]).await.unwrap();
+        assert_eq!(rx.recv().await, Some(vec![1, 2, 3]));
+        assert_eq!(rx.recv().await, Some(vec![4, 5]));
+    }
+
+    #[test]
+    fn depth_updates_after_try_recv() {
+        let (tx, rx) = channel::<u32>(4);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        tx.try_send(3).unwrap();
+        assert_eq!(tx.depth(), 3);
+        assert_eq!(rx.depth(), 3);
+
+        rx.try_recv();
+        assert_eq!(tx.depth(), 2);
+        assert_eq!(rx.depth(), 2);
+
+        rx.try_recv();
+        rx.try_recv();
+        assert_eq!(tx.depth(), 0);
+        assert_eq!(rx.depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn capacity_1_stress() {
+        let (tx, rx) = channel(1);
+        let sender = tokio::spawn(async move {
+            for i in 0..100u32 {
+                tx.send(i).await.unwrap();
+            }
+        });
+
+        for i in 0..100u32 {
+            let val = rx.recv().await.unwrap();
+            assert_eq!(val, i);
+        }
+        sender.await.unwrap();
+    }
+
+    #[test]
+    fn fill_to_exact_capacity() {
+        let (tx, rx) = channel::<u32>(3);
+        assert!(tx.try_send(1).is_ok());
+        assert!(tx.try_send(2).is_ok());
+        assert!(tx.try_send(3).is_ok());
+        assert!(tx.try_send(4).is_err()); // Full
+        assert_eq!(tx.depth(), 3);
+        assert_eq!(rx.depth(), 3);
+    }
+
+    #[tokio::test]
+    async fn alternating_send_recv() {
+        let (tx, rx) = channel(2);
+        for i in 0..50u32 {
+            tx.send(i).await.unwrap();
+            assert_eq!(rx.recv().await, Some(i));
+        }
+        assert_eq!(tx.depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn send_on_closed_returns_original_value() {
+        let (tx, _rx) = channel::<u32>(4);
+        tx.close();
+        let result = tx.send(42).await;
+        assert_eq!(result.unwrap_err(), 42);
+    }
+
+    #[tokio::test]
+    async fn recv_returns_none_immediately_on_empty_closed() {
+        let (tx, rx) = channel::<u32>(4);
+        tx.close();
+        let start = std::time::Instant::now();
+        let result = rx.recv().await;
+        assert!(result.is_none());
+        // Should return almost immediately, not block
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn multiple_try_send_fill_drain_partial() {
+        let (tx, rx) = channel::<u32>(2);
+        // Fill
+        assert!(tx.try_send(1).is_ok());
+        assert!(tx.try_send(2).is_ok());
+        assert!(tx.try_send(3).is_err()); // Full
+
+        // Drain one
+        assert_eq!(rx.try_recv(), Some(1));
+
+        // Now one slot is free
+        assert!(tx.try_send(3).is_ok());
+        assert!(tx.try_send(4).is_err()); // Full again
+
+        assert_eq!(rx.try_recv(), Some(2));
+        assert_eq!(rx.try_recv(), Some(3));
+        assert_eq!(rx.try_recv(), None);
+    }
+
+    #[tokio::test]
+    async fn concurrent_producer_consumer_stress() {
+        let (tx, rx) = channel(16);
+        let n = 5000u32;
+
+        let producer = tokio::spawn(async move {
+            for i in 0..n {
+                tx.send(i).await.unwrap();
+            }
+        });
+
+        let consumer = tokio::spawn(async move {
+            let mut received = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                received.push(rx.recv().await.unwrap());
+            }
+            received
+        });
+
+        producer.await.unwrap();
+        let received = consumer.await.unwrap();
+        assert_eq!(received.len(), n as usize);
+        // FIFO order preserved
+        for (i, &v) in received.iter().enumerate() {
+            assert_eq!(v, i as u32);
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_wakes_on_close() {
+        let (tx, rx) = channel::<u32>(4);
+
+        let consumer = tokio::spawn(async move { rx.recv().await });
+
+        // Give consumer time to block on empty queue
+        crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+
+        // Close should wake the consumer
+        tx.close();
+        let result = consumer.await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn producer_and_consumer_capacity_agree() {
+        let (tx, rx) = channel::<u8>(42);
+        assert_eq!(tx.capacity(), rx.capacity());
+        assert_eq!(tx.capacity(), 42);
+    }
+
+    #[test]
+    fn producer_and_consumer_depth_agree() {
+        let (tx, rx) = channel::<u32>(8);
+        assert_eq!(tx.depth(), rx.depth());
+        tx.try_send(1).unwrap();
+        assert_eq!(tx.depth(), rx.depth());
+        tx.try_send(2).unwrap();
+        assert_eq!(tx.depth(), rx.depth());
+        rx.try_recv();
+        assert_eq!(tx.depth(), rx.depth());
+    }
 }

@@ -147,4 +147,126 @@ mod tests {
             "Stage 1 default should be Ratatui (legacy)"
         );
     }
+
+    // ----------------------------------------------------------------
+    // Trait impls
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn backend_debug_format() {
+        let dbg = format!("{:?}", TuiBackend::Ratatui);
+        assert!(dbg.contains("Ratatui"));
+        let dbg2 = format!("{:?}", TuiBackend::Ftui);
+        assert!(dbg2.contains("Ftui"));
+    }
+
+    #[test]
+    fn backend_clone() {
+        let a = TuiBackend::Ratatui;
+        let b = a;
+        assert_eq!(a, b);
+        let c = TuiBackend::Ftui;
+        let d = c;
+        assert_eq!(c, d);
+    }
+
+    #[test]
+    fn backend_partial_eq_symmetry() {
+        assert_eq!(TuiBackend::Ratatui, TuiBackend::Ratatui);
+        assert_eq!(TuiBackend::Ftui, TuiBackend::Ftui);
+        assert_ne!(TuiBackend::Ratatui, TuiBackend::Ftui);
+        assert_ne!(TuiBackend::Ftui, TuiBackend::Ratatui);
+    }
+
+    #[test]
+    fn backend_eq_reflexive() {
+        let a = TuiBackend::Ratatui;
+        assert!(a == a);
+        let b = TuiBackend::Ftui;
+        assert!(b == b);
+    }
+
+    // ----------------------------------------------------------------
+    // parse_backend edge cases
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn parse_backend_case_sensitive() {
+        // These should NOT match — parse_backend is case-sensitive
+        assert_eq!(parse_backend(Some("FTUI")), TuiBackend::STAGE_DEFAULT);
+        assert_eq!(parse_backend(Some("Ftui")), TuiBackend::STAGE_DEFAULT);
+        assert_eq!(parse_backend(Some("RATATUI")), TuiBackend::STAGE_DEFAULT);
+        assert_eq!(parse_backend(Some("Ratatui")), TuiBackend::STAGE_DEFAULT);
+        assert_eq!(parse_backend(Some("LEGACY")), TuiBackend::STAGE_DEFAULT);
+        assert_eq!(
+            parse_backend(Some("FRANKENTUI")),
+            TuiBackend::STAGE_DEFAULT
+        );
+    }
+
+    #[test]
+    fn parse_backend_whitespace_not_trimmed() {
+        assert_eq!(parse_backend(Some(" ftui")), TuiBackend::STAGE_DEFAULT);
+        assert_eq!(parse_backend(Some("ftui ")), TuiBackend::STAGE_DEFAULT);
+        assert_eq!(parse_backend(Some(" ratatui ")), TuiBackend::STAGE_DEFAULT);
+    }
+
+    #[test]
+    fn parse_backend_numeric_input() {
+        assert_eq!(parse_backend(Some("0")), TuiBackend::STAGE_DEFAULT);
+        assert_eq!(parse_backend(Some("1")), TuiBackend::STAGE_DEFAULT);
+        assert_eq!(parse_backend(Some("42")), TuiBackend::STAGE_DEFAULT);
+    }
+
+    #[test]
+    fn parse_backend_special_characters() {
+        assert_eq!(parse_backend(Some("ftui\n")), TuiBackend::STAGE_DEFAULT);
+        assert_eq!(parse_backend(Some("ftui\0")), TuiBackend::STAGE_DEFAULT);
+        assert_eq!(
+            parse_backend(Some("ratatui\t")),
+            TuiBackend::STAGE_DEFAULT
+        );
+    }
+
+    #[test]
+    fn display_matches_parse_roundtrip() {
+        // Display output for Ratatui should parse back to Ratatui
+        let display = TuiBackend::Ratatui.to_string();
+        assert_eq!(parse_backend(Some(&display)), TuiBackend::Ratatui);
+
+        // Display output for Ftui should parse back to Ftui
+        let display = TuiBackend::Ftui.to_string();
+        assert_eq!(parse_backend(Some(&display)), TuiBackend::Ftui);
+    }
+
+    #[test]
+    fn all_recognized_values() {
+        // Exhaustive list of all recognized values
+        let ftui_inputs = ["ftui", "frankentui"];
+        let ratatui_inputs = ["ratatui", "legacy"];
+
+        for input in ftui_inputs {
+            assert_eq!(
+                parse_backend(Some(input)),
+                TuiBackend::Ftui,
+                "expected Ftui for input: {input}"
+            );
+        }
+        for input in ratatui_inputs {
+            assert_eq!(
+                parse_backend(Some(input)),
+                TuiBackend::Ratatui,
+                "expected Ratatui for input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_default_is_a_valid_variant() {
+        // STAGE_DEFAULT must be one of the two valid variants
+        assert!(
+            TuiBackend::STAGE_DEFAULT == TuiBackend::Ratatui
+                || TuiBackend::STAGE_DEFAULT == TuiBackend::Ftui
+        );
+    }
 }
