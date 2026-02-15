@@ -495,7 +495,10 @@ impl TransitionLog {
 
     /// Get records for a specific pane.
     pub fn records_for_pane(&self, pane_id: u64) -> Vec<&TransitionRecord> {
-        self.records.iter().filter(|r| r.pane_id == pane_id).collect()
+        self.records
+            .iter()
+            .filter(|r| r.pane_id == pane_id)
+            .collect()
     }
 
     /// Count transitions for a pane.
@@ -611,12 +614,10 @@ mod tests {
 
     #[test]
     fn snapshot_roundtrip() {
-        let mut pane = TypedPane::new(
-            PaneConfig::new(7)
-        )
-        .with_shell("/bin/bash")
-        .with_title("test-pane")
-        .activate();
+        let mut pane = TypedPane::new(PaneConfig::new(7))
+            .with_shell("/bin/bash")
+            .with_title("test-pane")
+            .activate();
         pane.write_output(b"data");
 
         let snapshotting = pane.begin_snapshot();
@@ -730,7 +731,10 @@ mod tests {
 
     #[test]
     fn valid_transitions() {
-        assert!(is_valid_transition(StateLabel::Creating, StateLabel::Active));
+        assert!(is_valid_transition(
+            StateLabel::Creating,
+            StateLabel::Active
+        ));
         assert!(is_valid_transition(
             StateLabel::Active,
             StateLabel::Snapshotting
@@ -758,10 +762,7 @@ mod tests {
             StateLabel::Snapshotting,
             StateLabel::Closed
         ));
-        assert!(!is_valid_transition(
-            StateLabel::Closed,
-            StateLabel::Active
-        ));
+        assert!(!is_valid_transition(StateLabel::Closed, StateLabel::Active));
         assert!(!is_valid_transition(
             StateLabel::Creating,
             StateLabel::Snapshotting
@@ -910,10 +911,7 @@ mod tests {
         let mut restoring = TypedPane::<Restoring>::from_snapshot(&data);
         restoring.restore_env("KEY", "VALUE");
         let active = restoring.finish_restore();
-        assert_eq!(
-            active.env().get("KEY").map(String::as_str),
-            Some("VALUE")
-        );
+        assert_eq!(active.env().get("KEY").map(String::as_str), Some("VALUE"));
     }
 
     #[test]
@@ -955,5 +953,233 @@ mod tests {
         assert_eq!(active.title(), Some("restored"));
         let closed = active.close();
         assert!(closed.is_closed());
+    }
+
+    // Batch: DarkBadger wa-1u90p.7.1
+
+    #[test]
+    fn state_label_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(StateLabel::Creating);
+        set.insert(StateLabel::Active);
+        set.insert(StateLabel::Snapshotting);
+        set.insert(StateLabel::Restoring);
+        set.insert(StateLabel::Closed);
+        set.insert(StateLabel::Creating); // dup
+        assert_eq!(set.len(), 5);
+    }
+
+    #[test]
+    fn state_label_all_five_distinct() {
+        let labels = [
+            StateLabel::Creating,
+            StateLabel::Active,
+            StateLabel::Snapshotting,
+            StateLabel::Restoring,
+            StateLabel::Closed,
+        ];
+        for (i, a) in labels.iter().enumerate() {
+            for (j, b) in labels.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn state_label_copy_semantics() {
+        let a = StateLabel::Active;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn state_label_serde_snake_case_all() {
+        let expected = [
+            (StateLabel::Creating, "\"creating\""),
+            (StateLabel::Active, "\"active\""),
+            (StateLabel::Snapshotting, "\"snapshotting\""),
+            (StateLabel::Restoring, "\"restoring\""),
+            (StateLabel::Closed, "\"closed\""),
+        ];
+        for (label, json_str) in expected {
+            let json = serde_json::to_string(&label).unwrap();
+            assert_eq!(json, json_str);
+            let back: StateLabel = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, label);
+        }
+    }
+
+    #[test]
+    fn state_label_display_matches_serde() {
+        let labels = [
+            StateLabel::Creating,
+            StateLabel::Active,
+            StateLabel::Snapshotting,
+            StateLabel::Restoring,
+            StateLabel::Closed,
+        ];
+        for label in labels {
+            let display = label.to_string();
+            let serde_str = serde_json::to_string(&label).unwrap();
+            // serde has quotes; display doesn't
+            assert_eq!(format!("\"{}\"", display), serde_str);
+        }
+    }
+
+    #[test]
+    fn pane_config_debug_clone_serde() {
+        let mut config = PaneConfig::new(42);
+        config.env.insert("KEY".into(), "VAL".into());
+        let c = config.clone();
+        assert_eq!(c.pane_id, 42);
+        assert_eq!(c.env.get("KEY").map(String::as_str), Some("VAL"));
+        let _ = format!("{:?}", config);
+
+        let json = serde_json::to_string(&config).unwrap();
+        let back: PaneConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pane_id, 42);
+        assert_eq!(back.env.get("KEY").map(String::as_str), Some("VAL"));
+    }
+
+    #[test]
+    fn snapshot_data_eq_and_serde() {
+        let a = SnapshotData {
+            pane_id: 1,
+            output: b"data".to_vec(),
+            title: Some("t".into()),
+            cwd: Some("/tmp".into()),
+            shell: Some("/bin/sh".into()),
+            env: HashMap::new(),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+
+        let json = serde_json::to_string(&a).unwrap();
+        let back: SnapshotData = serde_json::from_str(&json).unwrap();
+        assert_eq!(a, back);
+    }
+
+    #[test]
+    fn snapshot_data_debug_format() {
+        let s = SnapshotData {
+            pane_id: 7,
+            output: vec![],
+            title: None,
+            cwd: None,
+            shell: None,
+            env: HashMap::new(),
+        };
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("SnapshotData"));
+        assert!(dbg.contains("7"));
+    }
+
+    #[test]
+    fn transition_record_serde_roundtrip() {
+        let record = TransitionRecord {
+            pane_id: 5,
+            from: StateLabel::Creating,
+            to: StateLabel::Active,
+            timestamp_ms: 12345,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let back: TransitionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record, back);
+    }
+
+    #[test]
+    fn transition_record_debug_clone_eq() {
+        let a = TransitionRecord {
+            pane_id: 1,
+            from: StateLabel::Active,
+            to: StateLabel::Closed,
+            timestamp_ms: 999,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn transition_log_default_vs_new() {
+        let a = TransitionLog::default();
+        let b = TransitionLog::new();
+        assert_eq!(a.len(), b.len());
+        assert!(a.is_empty());
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn transition_log_records_accessor() {
+        let mut log = TransitionLog::new();
+        log.record(1, StateLabel::Creating, StateLabel::Active, 100);
+        log.record(2, StateLabel::Creating, StateLabel::Active, 200);
+        let records = log.records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].pane_id, 1);
+        assert_eq!(records[1].pane_id, 2);
+    }
+
+    #[test]
+    fn transition_log_records_for_nonexistent_pane() {
+        let mut log = TransitionLog::new();
+        log.record(1, StateLabel::Creating, StateLabel::Active, 100);
+        let filtered = log.records_for_pane(999);
+        assert!(filtered.is_empty());
+        assert_eq!(log.count_for_pane(999), 0);
+    }
+
+    #[test]
+    fn transition_log_clone_independence() {
+        let mut log = TransitionLog::new();
+        log.record(1, StateLabel::Creating, StateLabel::Active, 100);
+        let mut cloned = log.clone();
+        cloned.record(2, StateLabel::Active, StateLabel::Closed, 200);
+        assert_eq!(log.len(), 1);
+        assert_eq!(cloned.len(), 2);
+    }
+
+    #[test]
+    fn with_env_overwrite_key() {
+        let pane = TypedPane::new(PaneConfig::new(1))
+            .with_env("FOO", "bar")
+            .with_env("FOO", "baz")
+            .activate();
+        assert_eq!(pane.env().get("FOO").map(String::as_str), Some("baz"));
+    }
+
+    #[test]
+    fn empty_write_output() {
+        let mut pane = TypedPane::new(test_config()).activate();
+        pane.write_output(b"");
+        assert_eq!(pane.get_text(), b"");
+        pane.write_output(b"data");
+        pane.write_output(b"");
+        assert_eq!(pane.get_text(), b"data");
+    }
+
+    #[test]
+    fn typed_pane_debug_contains_state() {
+        let pane = TypedPane::new(PaneConfig::new(77)).activate();
+        let dbg = format!("{:?}", pane);
+        assert!(dbg.contains("TypedPane"));
+        assert!(dbg.contains("77"));
+        assert!(dbg.contains("Active"));
+    }
+
+    #[test]
+    fn has_label_all_five_states() {
+        assert_eq!(Creating::label(), StateLabel::Creating);
+        assert_eq!(Active::label(), StateLabel::Active);
+        assert_eq!(Snapshotting::label(), StateLabel::Snapshotting);
+        assert_eq!(Restoring::label(), StateLabel::Restoring);
+        assert_eq!(Closed::label(), StateLabel::Closed);
     }
 }
