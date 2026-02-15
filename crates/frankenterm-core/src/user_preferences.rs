@@ -1683,4 +1683,356 @@ mod tests {
             }
         }
     }
+
+    // =========================================================================
+    // Batch: DarkBadger wa-1u90p.7.1 — trait & edge coverage
+    // =========================================================================
+
+    // --- PaneState ---
+
+    #[test]
+    fn pane_state_debug_clone() {
+        let ps = PaneState {
+            has_new_output: true,
+            time_since_focus_s: 42.0,
+            output_rate: 3.14,
+            error_count: 2,
+            process_active: false,
+            scroll_depth: 0.75,
+            interaction_count: 10,
+            pane_id: 99,
+        };
+        let cloned = ps.clone();
+        assert_eq!(cloned.pane_id, 99);
+        assert_eq!(cloned.error_count, 2);
+        let dbg = format!("{:?}", ps);
+        assert!(dbg.contains("PaneState"));
+    }
+
+    #[test]
+    fn pane_state_serde_roundtrip() {
+        let ps = PaneState {
+            has_new_output: false,
+            time_since_focus_s: 0.0,
+            output_rate: 0.0,
+            error_count: 0,
+            process_active: true,
+            scroll_depth: 1.0,
+            interaction_count: u32::MAX,
+            pane_id: u64::MAX,
+        };
+        let json = serde_json::to_string(&ps).unwrap();
+        let parsed: PaneState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pane_id, u64::MAX);
+        assert_eq!(parsed.interaction_count, u32::MAX);
+        assert!(parsed.process_active);
+        assert!(!parsed.has_new_output);
+    }
+
+    // --- UserAction ---
+
+    #[test]
+    fn user_action_debug_clone_copy() {
+        let a = UserAction::FocusPane(42);
+        let b = a; // Copy
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        let dbg = format!("{:?}", a);
+        assert!(dbg.contains("FocusPane"));
+    }
+
+    #[test]
+    fn user_action_eq_all_variants() {
+        assert_eq!(UserAction::Scroll, UserAction::Scroll);
+        assert_eq!(UserAction::Resize, UserAction::Resize);
+        assert_eq!(UserAction::Ignore, UserAction::Ignore);
+        assert_eq!(UserAction::FocusPane(1), UserAction::FocusPane(1));
+        assert_ne!(UserAction::FocusPane(1), UserAction::FocusPane(2));
+        assert_ne!(UserAction::Scroll, UserAction::Resize);
+    }
+
+    #[test]
+    fn user_action_hash_in_hashset() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(UserAction::Scroll);
+        set.insert(UserAction::Resize);
+        set.insert(UserAction::Ignore);
+        set.insert(UserAction::FocusPane(1));
+        set.insert(UserAction::FocusPane(2));
+        set.insert(UserAction::FocusPane(1)); // duplicate
+        assert_eq!(set.len(), 5);
+    }
+
+    #[test]
+    fn user_action_serde_all_variants() {
+        let variants = [
+            UserAction::FocusPane(100),
+            UserAction::Scroll,
+            UserAction::Resize,
+            UserAction::Ignore,
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let parsed: UserAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(&parsed, v);
+        }
+    }
+
+    // --- Observation ---
+
+    #[test]
+    fn observation_debug_clone_serde() {
+        let obs = Observation {
+            pane_states: vec![PaneState {
+                has_new_output: true,
+                time_since_focus_s: 1.0,
+                output_rate: 2.0,
+                error_count: 0,
+                process_active: true,
+                scroll_depth: 0.5,
+                interaction_count: 3,
+                pane_id: 7,
+            }],
+            current_pane_id: 7,
+            action: UserAction::Ignore,
+        };
+        let cloned = obs.clone();
+        assert_eq!(cloned.current_pane_id, 7);
+        let dbg = format!("{:?}", obs);
+        assert!(dbg.contains("Observation"));
+
+        let json = serde_json::to_string(&obs).unwrap();
+        let parsed: Observation = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.current_pane_id, 7);
+        assert_eq!(parsed.action, UserAction::Ignore);
+    }
+
+    // --- IrlConfig ---
+
+    #[test]
+    fn irl_config_debug_clone() {
+        let cfg = IrlConfig::default();
+        let cloned = cfg.clone();
+        assert_eq!(cloned.learning_rate, cfg.learning_rate);
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("IrlConfig"));
+    }
+
+    #[test]
+    fn irl_config_default_values() {
+        let cfg = IrlConfig::default();
+        assert_eq!(cfg.learning_rate, 0.01);
+        assert_eq!(cfg.max_iterations, 100);
+        assert_eq!(cfg.convergence_threshold, 1e-4);
+        assert_eq!(cfg.l2_regularization, 0.001);
+        assert_eq!(cfg.discount, 0.99);
+        assert_eq!(cfg.min_observations, 20);
+        assert_eq!(cfg.max_trajectory_len, 1000);
+    }
+
+    #[test]
+    fn irl_config_serde_default_fills_missing() {
+        // Since #[serde(default)], missing fields should fill from Default
+        let json = r#"{"learning_rate": 0.05}"#;
+        let cfg: IrlConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.learning_rate, 0.05);
+        assert_eq!(cfg.max_iterations, 100); // default
+        assert_eq!(cfg.min_observations, 20); // default
+    }
+
+    // --- RewardFunction ---
+
+    #[test]
+    fn reward_function_debug_clone() {
+        let rf = RewardFunction::new();
+        let cloned = rf.clone();
+        assert_eq!(cloned.observation_count, 0);
+        let dbg = format!("{:?}", rf);
+        assert!(dbg.contains("RewardFunction"));
+    }
+
+    #[test]
+    fn reward_function_new_zero_weights() {
+        let rf = RewardFunction::new();
+        assert_eq!(rf.theta, [0.0; NUM_FEATURES]);
+        assert_eq!(rf.observation_count, 0);
+    }
+
+    #[test]
+    fn reward_function_serde_roundtrip() {
+        let mut rf = RewardFunction::new();
+        rf.theta[0] = 1.5;
+        rf.theta[7] = -0.3;
+        rf.observation_count = 42;
+        let json = serde_json::to_string(&rf).unwrap();
+        let parsed: RewardFunction = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.theta[0], 1.5);
+        assert_eq!(parsed.theta[7], -0.3);
+        assert_eq!(parsed.observation_count, 42);
+    }
+
+    // --- MaxEntIrl ---
+
+    #[test]
+    fn max_ent_irl_debug_clone() {
+        let irl = MaxEntIrl::new(IrlConfig::default());
+        let cloned = irl.clone();
+        assert_eq!(cloned.observation_count(), 0);
+        let dbg = format!("{:?}", irl);
+        assert!(dbg.contains("MaxEntIrl"));
+    }
+
+    #[test]
+    fn max_ent_irl_observation_count_before_wrap() {
+        let config = IrlConfig {
+            max_trajectory_len: 5,
+            min_observations: 100, // prevent gradient steps
+            ..IrlConfig::default()
+        };
+        let mut irl = MaxEntIrl::new(config);
+        let panes = make_test_panes(&[1, 2], 42);
+        for _ in 0..3 {
+            irl.observe(Observation {
+                pane_states: panes.clone(),
+                current_pane_id: 1,
+                action: UserAction::Ignore,
+            });
+        }
+        assert_eq!(irl.observation_count(), 3);
+    }
+
+    #[test]
+    fn max_ent_irl_trajectory_wraps() {
+        let config = IrlConfig {
+            max_trajectory_len: 3,
+            min_observations: 100, // prevent gradient steps
+            ..IrlConfig::default()
+        };
+        let mut irl = MaxEntIrl::new(config);
+        let panes = make_test_panes(&[1], 42);
+        for i in 0..5 {
+            irl.observe(Observation {
+                pane_states: panes.clone(),
+                current_pane_id: 1,
+                action: UserAction::FocusPane(i),
+            });
+        }
+        // Wrapped: capacity is 3, wrote 5 observations
+        assert_eq!(irl.observation_count(), 3);
+        assert_eq!(irl.trajectory().len(), 3);
+    }
+
+    #[test]
+    fn max_ent_irl_serde_roundtrip() {
+        let config = IrlConfig {
+            min_observations: 100,
+            ..IrlConfig::default()
+        };
+        let mut irl = MaxEntIrl::new(config);
+        let panes = make_test_panes(&[1, 2], 42);
+        irl.observe(Observation {
+            pane_states: panes,
+            current_pane_id: 1,
+            action: UserAction::Scroll,
+        });
+        let json = serde_json::to_string(&irl).unwrap();
+        let parsed: MaxEntIrl = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.observation_count(), 1);
+    }
+
+    // --- BatchResult ---
+
+    #[test]
+    fn batch_result_debug_clone_serde() {
+        let br = BatchResult {
+            iterations: 50,
+            converged: true,
+            final_gradient_norm: 0.001,
+        };
+        let cloned = br.clone();
+        assert_eq!(cloned.iterations, 50);
+        assert!(cloned.converged);
+        let dbg = format!("{:?}", br);
+        assert!(dbg.contains("BatchResult"));
+
+        let json = serde_json::to_string(&br).unwrap();
+        let parsed: BatchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.iterations, 50);
+        assert!(parsed.converged);
+        assert_eq!(parsed.final_gradient_norm, 0.001);
+    }
+
+    // --- NUM_FEATURES ---
+
+    #[test]
+    fn num_features_is_eight() {
+        assert_eq!(NUM_FEATURES, 8);
+    }
+
+    // --- dot ---
+
+    #[test]
+    fn dot_zero_vectors() {
+        let z = [0.0; 8];
+        assert_eq!(dot(&z, &z), 0.0);
+    }
+
+    #[test]
+    fn dot_orthogonal() {
+        let a = [1.0, 0.0];
+        let b = [0.0, 1.0];
+        assert_eq!(dot(&a, &b), 0.0);
+    }
+
+    // --- cosine_similarity ---
+
+    #[test]
+    fn cosine_similarity_identical_vectors() {
+        let v = [1.0, 2.0, 3.0];
+        let sim = cosine_similarity(&v, &v);
+        assert!((sim - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn cosine_similarity_zero_vector() {
+        let v = [1.0, 2.0];
+        let z = [0.0, 0.0];
+        assert_eq!(cosine_similarity(&v, &z), 0.0);
+        assert_eq!(cosine_similarity(&z, &z), 0.0);
+    }
+
+    #[test]
+    fn cosine_similarity_opposite_vectors() {
+        let a = [1.0, 0.0];
+        let b = [-1.0, 0.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!((sim + 1.0).abs() < 1e-10);
+    }
+
+    // --- rank_correlation ---
+
+    #[test]
+    fn rank_correlation_identical_rankings() {
+        let a = [1.0, 2.0, 3.0, 4.0];
+        let b = [10.0, 20.0, 30.0, 40.0];
+        let corr = rank_correlation(&a, &b);
+        assert!((corr - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rank_correlation_single_element() {
+        let a = [5.0];
+        let b = [10.0];
+        assert_eq!(rank_correlation(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn rank_correlation_reversed() {
+        let a = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let b = [5.0, 4.0, 3.0, 2.0, 1.0];
+        let corr = rank_correlation(&a, &b);
+        assert!((corr + 1.0).abs() < 1e-10);
+    }
 }

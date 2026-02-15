@@ -1088,4 +1088,303 @@ mod tests {
         let debug = format!("{clf:?}");
         assert!(debug.contains("BayesianClassifier"));
     }
+
+    // =========================================================================
+    // Batch: DarkBadger wa-1u90p.7.1 — trait impls and edge cases
+    // =========================================================================
+
+    // -- LedgerConfig --
+
+    #[test]
+    fn ledger_config_debug_clone() {
+        let cfg = LedgerConfig::default();
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("LedgerConfig"));
+        let cloned = cfg.clone();
+        assert_eq!(cloned.min_observations, 10);
+    }
+
+    #[test]
+    fn ledger_config_default_values() {
+        let cfg = LedgerConfig::default();
+        assert_eq!(cfg.min_observations, 10);
+        assert!((cfg.bayes_factor_threshold - 3.0).abs() < f64::EPSILON);
+        assert!((cfg.dirichlet_alpha - 1.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_ledger_entries, 100);
+    }
+
+    // -- PaneState --
+
+    #[test]
+    fn pane_state_debug_clone_copy() {
+        let s = PaneState::Active;
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("Active"));
+        let cloned = s.clone();
+        let copied = s;
+        assert_eq!(cloned, copied);
+    }
+
+    #[test]
+    fn pane_state_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        for state in PaneState::ALL {
+            set.insert(state);
+        }
+        assert_eq!(set.len(), 7);
+    }
+
+    #[test]
+    fn pane_state_all_count() {
+        assert_eq!(PaneState::ALL.len(), PaneState::COUNT);
+        assert_eq!(PaneState::COUNT, 7);
+    }
+
+    #[test]
+    fn pane_state_display_all_variants() {
+        assert_eq!(PaneState::Active.to_string(), "active");
+        assert_eq!(PaneState::Thinking.to_string(), "thinking");
+        assert_eq!(PaneState::Idle.to_string(), "idle");
+        assert_eq!(PaneState::RateLimited.to_string(), "rate_limited");
+        assert_eq!(PaneState::Error.to_string(), "error");
+        assert_eq!(PaneState::Stuck.to_string(), "stuck");
+        assert_eq!(PaneState::Background.to_string(), "background");
+    }
+
+    #[test]
+    fn pane_state_from_index_out_of_range() {
+        assert!(PaneState::from_index(7).is_none());
+        assert!(PaneState::from_index(100).is_none());
+    }
+
+    #[test]
+    fn pane_state_serde_snake_case_all() {
+        for state in PaneState::ALL {
+            let json = serde_json::to_string(&state).unwrap();
+            let parsed: PaneState = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, state);
+        }
+    }
+
+    // -- Evidence --
+
+    #[test]
+    fn evidence_debug_clone() {
+        let ev = Evidence::OutputRate(15.0);
+        let dbg = format!("{:?}", ev);
+        assert!(dbg.contains("OutputRate"));
+        let _cloned = ev.clone();
+    }
+
+    #[test]
+    fn evidence_serde_entropy() {
+        let ev = Evidence::Entropy(4.5);
+        let json = serde_json::to_string(&ev).unwrap();
+        let parsed: Evidence = serde_json::from_str(&json).unwrap();
+        if let Evidence::Entropy(v) = parsed {
+            assert!((v - 4.5).abs() < f64::EPSILON);
+        } else {
+            panic!("expected Entropy variant");
+        }
+    }
+
+    #[test]
+    fn evidence_serde_time_since_output() {
+        let ev = Evidence::TimeSinceOutput(30.0);
+        let json = serde_json::to_string(&ev).unwrap();
+        let parsed: Evidence = serde_json::from_str(&json).unwrap();
+        if let Evidence::TimeSinceOutput(v) = parsed {
+            assert!((v - 30.0).abs() < f64::EPSILON);
+        } else {
+            panic!("expected TimeSinceOutput variant");
+        }
+    }
+
+    #[test]
+    fn evidence_serde_scrollback_growth() {
+        let ev = Evidence::ScrollbackGrowth(1024.0);
+        let json = serde_json::to_string(&ev).unwrap();
+        let parsed: Evidence = serde_json::from_str(&json).unwrap();
+        if let Evidence::ScrollbackGrowth(v) = parsed {
+            assert!((v - 1024.0).abs() < f64::EPSILON);
+        } else {
+            panic!("expected ScrollbackGrowth variant");
+        }
+    }
+
+    #[test]
+    fn evidence_source_name_all_variants() {
+        assert_eq!(Evidence::OutputRate(0.0).source_name(), "output_rate");
+        assert_eq!(Evidence::Entropy(0.0).source_name(), "entropy");
+        assert_eq!(
+            Evidence::PatternDetection("x".to_string()).source_name(),
+            "pattern_detection"
+        );
+        assert_eq!(
+            Evidence::TimeSinceOutput(0.0).source_name(),
+            "time_since_output"
+        );
+        assert_eq!(
+            Evidence::ScrollbackGrowth(0.0).source_name(),
+            "scrollback_growth"
+        );
+    }
+
+    // -- LedgerEntry --
+
+    #[test]
+    fn ledger_entry_debug_clone() {
+        let entry = LedgerEntry {
+            source: "output_rate".to_string(),
+            value_description: "rate=15.0".to_string(),
+            log_lr_top_vs_second: 2.5,
+            favors: PaneState::Active,
+            strength: EvidenceStrength::Strong,
+        };
+        let dbg = format!("{:?}", entry);
+        assert!(dbg.contains("LedgerEntry"));
+        let cloned = entry.clone();
+        assert_eq!(cloned.source, "output_rate");
+    }
+
+    #[test]
+    fn ledger_entry_serde_roundtrip() {
+        let entry = LedgerEntry {
+            source: "entropy".to_string(),
+            value_description: "entropy=5.2".to_string(),
+            log_lr_top_vs_second: 1.8,
+            favors: PaneState::Stuck,
+            strength: EvidenceStrength::Moderate,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: LedgerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.favors, PaneState::Stuck);
+    }
+
+    // -- EvidenceStrength --
+
+    #[test]
+    fn evidence_strength_debug_clone_copy() {
+        let s = EvidenceStrength::Strong;
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("Strong"));
+        let cloned = s.clone();
+        let copied = s;
+        assert_eq!(cloned, copied);
+    }
+
+    #[test]
+    fn evidence_strength_serde_snake_case() {
+        let json = serde_json::to_string(&EvidenceStrength::Weak).unwrap();
+        assert_eq!(json, "\"weak\"");
+        let json = serde_json::to_string(&EvidenceStrength::VeryStrong).unwrap();
+        assert_eq!(json, "\"very_strong\"");
+        let parsed: EvidenceStrength = serde_json::from_str("\"moderate\"").unwrap();
+        assert_eq!(parsed, EvidenceStrength::Moderate);
+    }
+
+    #[test]
+    fn evidence_strength_eq_all_variants() {
+        assert_eq!(EvidenceStrength::Weak, EvidenceStrength::Weak);
+        assert_eq!(EvidenceStrength::Moderate, EvidenceStrength::Moderate);
+        assert_eq!(EvidenceStrength::Strong, EvidenceStrength::Strong);
+        assert_eq!(EvidenceStrength::VeryStrong, EvidenceStrength::VeryStrong);
+        assert_ne!(EvidenceStrength::Weak, EvidenceStrength::Strong);
+    }
+
+    // -- ClassificationResult --
+
+    #[test]
+    fn classification_result_debug_clone() {
+        let result = ClassificationResult {
+            classification: PaneState::Idle,
+            posterior: HashMap::new(),
+            ledger: vec![],
+            bayes_factor: 5.0,
+            confident: true,
+            observation_count: 20,
+        };
+        let dbg = format!("{:?}", result);
+        assert!(dbg.contains("ClassificationResult"));
+        let cloned = result.clone();
+        assert_eq!(cloned.classification, PaneState::Idle);
+    }
+
+    // -- ClassifierSnapshot --
+
+    #[test]
+    fn classifier_snapshot_debug_clone() {
+        let snap = ClassifierSnapshot {
+            pane_count: 2,
+            feedback_count: 0,
+            prior: HashMap::new(),
+            panes: vec![],
+            config: LedgerConfig::default(),
+        };
+        let dbg = format!("{:?}", snap);
+        assert!(dbg.contains("ClassifierSnapshot"));
+        let cloned = snap.clone();
+        assert_eq!(cloned.pane_count, 2);
+    }
+
+    // -- PaneClassificationSummary --
+
+    #[test]
+    fn pane_classification_summary_debug_clone_serde() {
+        let summary = PaneClassificationSummary {
+            pane_id: 42,
+            classification: PaneState::Active,
+            bayes_factor: 12.0,
+            confident: true,
+            observation_count: 50,
+        };
+        let dbg = format!("{:?}", summary);
+        assert!(dbg.contains("PaneClassificationSummary"));
+        let cloned = summary.clone();
+        assert_eq!(cloned.pane_id, 42);
+        let json = serde_json::to_string(&summary).unwrap();
+        let parsed: PaneClassificationSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.classification, PaneState::Active);
+        assert!(parsed.confident);
+    }
+
+    // -- BayesianClassifier edge cases --
+
+    #[test]
+    fn classifier_pane_count_and_feedback() {
+        let mut clf = BayesianClassifier::new(LedgerConfig::default());
+        assert_eq!(clf.pane_count(), 0);
+        assert_eq!(clf.feedback_count(), 0);
+        clf.update(1, Evidence::OutputRate(5.0));
+        clf.update(2, Evidence::OutputRate(10.0));
+        assert_eq!(clf.pane_count(), 2);
+        clf.record_feedback(1, PaneState::Active);
+        assert_eq!(clf.feedback_count(), 1);
+    }
+
+    #[test]
+    fn classifier_log_prior_uniform_initial() {
+        let clf = BayesianClassifier::new(LedgerConfig::default());
+        let prior = clf.log_prior();
+        let expected = -(PaneState::COUNT as f64).ln();
+        for &val in prior {
+            assert!(
+                (val - expected).abs() < f64::EPSILON,
+                "Expected uniform prior {}, got {}",
+                expected,
+                val
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_snapshot_captures_state() {
+        let mut clf = BayesianClassifier::new(LedgerConfig::default());
+        clf.update(1, Evidence::OutputRate(15.0));
+        let snap = clf.snapshot();
+        assert_eq!(snap.pane_count, 1);
+        assert_eq!(snap.panes.len(), 1);
+        assert_eq!(snap.panes[0].pane_id, 1);
+    }
 }
