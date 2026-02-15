@@ -2152,4 +2152,389 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("elevation required"));
     }
+
+    // =========================================================================
+    // Batch: DarkBadger wa-1u90p.7.1 — trait impls and edge cases
+    // =========================================================================
+
+    // -- RecorderQueryRequest --
+
+    #[test]
+    fn recorder_query_request_debug() {
+        let req = RecorderQueryRequest::default();
+        let dbg = format!("{:?}", req);
+        assert!(dbg.contains("RecorderQueryRequest"));
+    }
+
+    #[test]
+    fn recorder_query_request_clone_independence() {
+        let req = RecorderQueryRequest::text_search("hello");
+        let mut cloned = req.clone();
+        cloned.text_pattern = Some("world".to_string());
+        assert_eq!(req.text_pattern.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn recorder_query_request_serde_roundtrip() {
+        let req = RecorderQueryRequest::in_range(100, 500)
+            .with_panes(vec![1, 2])
+            .with_limit(50)
+            .with_offset(10);
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: RecorderQueryRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.limit, 50);
+        assert_eq!(parsed.offset, 10);
+        assert_eq!(parsed.pane_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn recorder_query_request_default_values() {
+        let req = RecorderQueryRequest::default();
+        assert!(req.time_range.is_none());
+        assert!(req.pane_ids.is_empty());
+        assert!(req.sources.is_empty());
+        assert!(req.text_pattern.is_none());
+        assert_eq!(req.limit, 100);
+        assert_eq!(req.offset, 0);
+        assert!(req.include_text);
+        assert!(req.min_sensitivity.is_none());
+        assert!(req.max_sensitivity.is_none());
+    }
+
+    #[test]
+    fn recorder_query_request_required_tier_no_filters() {
+        let req = RecorderQueryRequest::default();
+        // Single pane, no text pattern, include_text=true → A1
+        assert_eq!(req.required_tier(), AccessTier::A1RedactedQuery);
+    }
+
+    // -- TimeRange --
+
+    #[test]
+    fn time_range_debug_clone_copy() {
+        let tr = TimeRange {
+            start_ms: 100,
+            end_ms: 200,
+        };
+        let dbg = format!("{:?}", tr);
+        assert!(dbg.contains("TimeRange"));
+        let cloned = tr.clone();
+        let copied = tr;
+        assert_eq!(cloned.start_ms, copied.start_ms);
+    }
+
+    #[test]
+    fn time_range_serde_roundtrip() {
+        let tr = TimeRange {
+            start_ms: 1000,
+            end_ms: 9999,
+        };
+        let json = serde_json::to_string(&tr).unwrap();
+        let parsed: TimeRange = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.start_ms, 1000);
+        assert_eq!(parsed.end_ms, 9999);
+    }
+
+    #[test]
+    fn time_range_contains_single_point() {
+        let tr = TimeRange {
+            start_ms: 100,
+            end_ms: 100,
+        };
+        assert!(tr.contains(100));
+        assert!(!tr.contains(99));
+        assert!(!tr.contains(101));
+    }
+
+    #[test]
+    fn time_range_contains_zero_range() {
+        let tr = TimeRange {
+            start_ms: 0,
+            end_ms: 0,
+        };
+        assert!(tr.contains(0));
+        assert!(!tr.contains(1));
+    }
+
+    // -- QueryEventKind --
+
+    #[test]
+    fn query_event_kind_debug_clone_copy() {
+        let kind = QueryEventKind::IngressText;
+        let dbg = format!("{:?}", kind);
+        assert!(dbg.contains("IngressText"));
+        let cloned = kind.clone();
+        let copied = kind;
+        assert_eq!(cloned, copied);
+    }
+
+    #[test]
+    fn query_event_kind_eq_all_variants() {
+        assert_eq!(QueryEventKind::IngressText, QueryEventKind::IngressText);
+        assert_eq!(QueryEventKind::EgressOutput, QueryEventKind::EgressOutput);
+        assert_eq!(QueryEventKind::ControlMarker, QueryEventKind::ControlMarker);
+        assert_eq!(
+            QueryEventKind::LifecycleMarker,
+            QueryEventKind::LifecycleMarker
+        );
+        assert_ne!(QueryEventKind::IngressText, QueryEventKind::EgressOutput);
+    }
+
+    #[test]
+    fn query_event_kind_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(QueryEventKind::IngressText);
+        set.insert(QueryEventKind::EgressOutput);
+        set.insert(QueryEventKind::ControlMarker);
+        set.insert(QueryEventKind::LifecycleMarker);
+        assert_eq!(set.len(), 4);
+        // Duplicate insert should not increase count
+        set.insert(QueryEventKind::IngressText);
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn query_event_kind_serde_snake_case() {
+        let json = serde_json::to_string(&QueryEventKind::IngressText).unwrap();
+        assert_eq!(json, "\"ingress_text\"");
+        let json = serde_json::to_string(&QueryEventKind::EgressOutput).unwrap();
+        assert_eq!(json, "\"egress_output\"");
+        let json = serde_json::to_string(&QueryEventKind::ControlMarker).unwrap();
+        assert_eq!(json, "\"control_marker\"");
+        let json = serde_json::to_string(&QueryEventKind::LifecycleMarker).unwrap();
+        assert_eq!(json, "\"lifecycle_marker\"");
+        // Roundtrip
+        let parsed: QueryEventKind = serde_json::from_str("\"ingress_text\"").unwrap();
+        assert_eq!(parsed, QueryEventKind::IngressText);
+    }
+
+    // -- QueryStats --
+
+    #[test]
+    fn query_stats_debug_clone_default() {
+        let stats = QueryStats::default();
+        let dbg = format!("{:?}", stats);
+        assert!(dbg.contains("QueryStats"));
+        let cloned = stats.clone();
+        assert_eq!(cloned.events_scanned, 0);
+        assert_eq!(cloned.events_matched, 0);
+        assert_eq!(cloned.events_redacted, 0);
+        assert_eq!(cloned.events_excluded, 0);
+    }
+
+    #[test]
+    fn query_stats_serde_duration_skipped() {
+        let stats = QueryStats {
+            events_scanned: 100,
+            events_matched: 50,
+            events_redacted: 5,
+            events_excluded: 3,
+            duration: Duration::from_millis(42),
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        // duration should be skipped
+        assert!(!json.contains("duration"));
+        let parsed: QueryStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.events_scanned, 100);
+        assert_eq!(parsed.duration, Duration::ZERO);
+    }
+
+    // -- QueryPlan --
+
+    #[test]
+    fn query_plan_debug_clone() {
+        let plan = QueryPlan {
+            required_tier: AccessTier::A1RedactedQuery,
+            actor_tier: AccessTier::A2FullQuery,
+            can_execute: true,
+            elevation_needed: false,
+            estimated_scan_count: 42,
+            sensitivity_tiers_accessed: vec![SensitivityTier::T1Standard],
+            explanation: "test plan".to_string(),
+        };
+        let dbg = format!("{:?}", plan);
+        assert!(dbg.contains("QueryPlan"));
+        let cloned = plan.clone();
+        assert!(cloned.can_execute);
+        assert_eq!(cloned.estimated_scan_count, 42);
+    }
+
+    #[test]
+    fn query_plan_serde_roundtrip() {
+        let plan = QueryPlan {
+            required_tier: AccessTier::A2FullQuery,
+            actor_tier: AccessTier::A1RedactedQuery,
+            can_execute: false,
+            elevation_needed: true,
+            estimated_scan_count: 1000,
+            sensitivity_tiers_accessed: vec![
+                SensitivityTier::T1Standard,
+                SensitivityTier::T2Sensitive,
+            ],
+            explanation: "needs elevation".to_string(),
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        let parsed: QueryPlan = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.can_execute);
+        assert!(parsed.elevation_needed);
+    }
+
+    // -- ElevationGrant --
+
+    #[test]
+    fn elevation_grant_debug_clone() {
+        let grant = ElevationGrant {
+            actor: human_actor(),
+            tier: AccessTier::A3PrivilegedRaw,
+            justification: "investigating incident".to_string(),
+            granted_at_ms: 1000,
+            ttl_ms: 60_000,
+        };
+        let dbg = format!("{:?}", grant);
+        assert!(dbg.contains("ElevationGrant"));
+        let cloned = grant.clone();
+        assert_eq!(cloned.ttl_ms, 60_000);
+    }
+
+    #[test]
+    fn elevation_grant_is_valid_at_boundary() {
+        let grant = ElevationGrant {
+            actor: human_actor(),
+            tier: AccessTier::A3PrivilegedRaw,
+            justification: "test".to_string(),
+            granted_at_ms: 1000,
+            ttl_ms: 500,
+        };
+        // Valid at start
+        assert!(grant.is_valid_at(1000));
+        // Valid just before expiry
+        assert!(grant.is_valid_at(1499));
+        // Invalid at expiry
+        assert!(!grant.is_valid_at(1500));
+        // Invalid after expiry
+        assert!(!grant.is_valid_at(2000));
+    }
+
+    #[test]
+    fn elevation_grant_is_valid_at_zero_ttl() {
+        let grant = ElevationGrant {
+            actor: human_actor(),
+            tier: AccessTier::A2FullQuery,
+            justification: "instant".to_string(),
+            granted_at_ms: 1000,
+            ttl_ms: 0,
+        };
+        // Zero TTL: invalid at grant time
+        assert!(!grant.is_valid_at(1000));
+    }
+
+    // -- QueryError --
+
+    #[test]
+    fn query_error_debug_clone() {
+        let err = QueryError::Internal("oops".to_string());
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("Internal"));
+        let cloned = err.clone();
+        assert_eq!(cloned, err);
+    }
+
+    #[test]
+    fn query_error_partial_eq() {
+        let a = QueryError::InvalidRequest("bad".to_string());
+        let b = QueryError::InvalidRequest("bad".to_string());
+        let c = QueryError::InvalidRequest("other".to_string());
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn query_error_display_invalid_request() {
+        let err = QueryError::InvalidRequest("missing field".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("invalid query"));
+        assert!(msg.contains("missing field"));
+    }
+
+    #[test]
+    fn query_error_display_internal() {
+        let err = QueryError::Internal("db timeout".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("internal query error"));
+        assert!(msg.contains("db timeout"));
+    }
+
+    #[test]
+    fn query_error_is_std_error() {
+        let err = QueryError::Internal("test".to_string());
+        let _: &dyn std::error::Error = &err;
+    }
+
+    // -- EventFilter --
+
+    #[test]
+    fn event_filter_debug_clone_default() {
+        let filter = EventFilter::default();
+        let dbg = format!("{:?}", filter);
+        assert!(dbg.contains("EventFilter"));
+        let cloned = filter.clone();
+        assert!(cloned.time_range.is_none());
+        assert!(cloned.pane_ids.is_empty());
+        assert!(cloned.sources.is_empty());
+        assert!(cloned.text_pattern.is_none());
+    }
+
+    // -- InMemoryEventStore --
+
+    #[test]
+    fn in_memory_event_store_default() {
+        let store = InMemoryEventStore::default();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+    }
+
+    // -- QueryStatsAggregator --
+
+    #[test]
+    fn query_stats_aggregator_debug_clone_default() {
+        let agg = QueryStatsAggregator::default();
+        let dbg = format!("{:?}", agg);
+        assert!(dbg.contains("QueryStatsAggregator"));
+        let cloned = agg.clone();
+        assert_eq!(cloned.total_queries, 0);
+        assert_eq!(cloned.total_results, 0);
+        assert_eq!(cloned.total_redacted, 0);
+        assert_eq!(cloned.total_denied, 0);
+    }
+
+    #[test]
+    fn query_stats_aggregator_new_is_default() {
+        let a = QueryStatsAggregator::new();
+        let b = QueryStatsAggregator::default();
+        assert_eq!(a.total_queries, b.total_queries);
+        assert_eq!(a.total_denied, b.total_denied);
+    }
+
+    // -- mask_text edge cases --
+
+    #[test]
+    fn mask_text_len_nine_boundary() {
+        // 9 chars: should show first 2 + mask 5 + last 2
+        let masked = mask_text("123456789");
+        assert_eq!(masked, "12*****89");
+    }
+
+    #[test]
+    fn mask_text_len_eight_all_masked() {
+        // 8 chars: all masked
+        let masked = mask_text("12345678");
+        assert_eq!(masked, "********");
+    }
+
+    #[test]
+    fn mask_text_single_char() {
+        let masked = mask_text("x");
+        assert_eq!(masked, "*");
+    }
 }

@@ -1313,4 +1313,178 @@ anchors = ["custom anchor"]
                 .is_ok()
         );
     }
+
+    // =========================================================================
+    // Batch: DarkBadger wa-1u90p.7.1 — extension listing type trait coverage
+    // =========================================================================
+
+    // -- ExtensionSource --
+
+    #[test]
+    fn extension_source_debug_clone() {
+        let src = ExtensionSource::Builtin;
+        let dbg = format!("{:?}", src);
+        assert!(dbg.contains("Builtin"));
+        let cloned = src.clone();
+        assert_eq!(cloned, ExtensionSource::Builtin);
+    }
+
+    #[test]
+    fn extension_source_eq_all_variants() {
+        assert_eq!(ExtensionSource::Builtin, ExtensionSource::Builtin);
+        assert_eq!(ExtensionSource::File, ExtensionSource::File);
+        assert_ne!(ExtensionSource::Builtin, ExtensionSource::File);
+    }
+
+    #[test]
+    fn extension_source_serde_snake_case() {
+        let json = serde_json::to_string(&ExtensionSource::Builtin).unwrap();
+        assert_eq!(json, "\"builtin\"");
+        let json = serde_json::to_string(&ExtensionSource::File).unwrap();
+        assert_eq!(json, "\"file\"");
+        let parsed: ExtensionSource = serde_json::from_str("\"builtin\"").unwrap();
+        assert_eq!(parsed, ExtensionSource::Builtin);
+    }
+
+    // -- ExtensionInfo --
+
+    #[test]
+    fn extension_info_debug_clone() {
+        let info = ExtensionInfo {
+            name: "test-pack".to_string(),
+            version: "1.0.0".to_string(),
+            source: ExtensionSource::Builtin,
+            rule_count: 5,
+            path: None,
+            active: true,
+        };
+        let dbg = format!("{:?}", info);
+        assert!(dbg.contains("ExtensionInfo"));
+        let cloned = info.clone();
+        assert_eq!(cloned.name, "test-pack");
+        assert!(cloned.active);
+    }
+
+    #[test]
+    fn extension_info_serde_roundtrip() {
+        let info = ExtensionInfo {
+            name: "my-ext".to_string(),
+            version: "2.1.0".to_string(),
+            source: ExtensionSource::File,
+            rule_count: 3,
+            path: Some("/etc/ft/ext.toml".to_string()),
+            active: false,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: ExtensionInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "my-ext");
+        assert_eq!(parsed.source, ExtensionSource::File);
+        assert_eq!(parsed.path.as_deref(), Some("/etc/ft/ext.toml"));
+        assert!(!parsed.active);
+    }
+
+    // -- ExtensionDetail --
+
+    #[test]
+    fn extension_detail_debug_clone() {
+        let detail = ExtensionDetail {
+            name: "detailed".to_string(),
+            version: "0.1.0".to_string(),
+            source: ExtensionSource::Builtin,
+            path: None,
+            rules: vec![],
+        };
+        let dbg = format!("{:?}", detail);
+        assert!(dbg.contains("ExtensionDetail"));
+        let cloned = detail.clone();
+        assert_eq!(cloned.name, "detailed");
+        assert!(cloned.rules.is_empty());
+    }
+
+    #[test]
+    fn extension_detail_serde_roundtrip() {
+        let detail = ExtensionDetail {
+            name: "serde-test".to_string(),
+            version: "3.0.0".to_string(),
+            source: ExtensionSource::File,
+            path: Some("/path/to/ext.toml".to_string()),
+            rules: vec![ExtensionRuleInfo {
+                id: "rule-1".to_string(),
+                agent_type: "any".to_string(),
+                event_type: "output".to_string(),
+                severity: "warning".to_string(),
+                description: "test rule".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&detail).unwrap();
+        let parsed: ExtensionDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.rules.len(), 1);
+        assert_eq!(parsed.rules[0].id, "rule-1");
+    }
+
+    // -- ExtensionRuleInfo --
+
+    #[test]
+    fn extension_rule_info_debug_clone() {
+        let rule = ExtensionRuleInfo {
+            id: "r1".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "ingress".to_string(),
+            severity: "critical".to_string(),
+            description: "dangerous command".to_string(),
+        };
+        let dbg = format!("{:?}", rule);
+        assert!(dbg.contains("ExtensionRuleInfo"));
+        let cloned = rule.clone();
+        assert_eq!(cloned.id, "r1");
+    }
+
+    #[test]
+    fn extension_rule_info_serde_roundtrip() {
+        let rule = ExtensionRuleInfo {
+            id: "r2".to_string(),
+            agent_type: "any".to_string(),
+            event_type: "egress".to_string(),
+            severity: "info".to_string(),
+            description: "log output".to_string(),
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let parsed: ExtensionRuleInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.severity, "info");
+    }
+
+    // -- ValidationResult --
+
+    #[test]
+    fn validation_result_debug_clone() {
+        let vr = ValidationResult {
+            valid: true,
+            pack_name: Some("my-pack".to_string()),
+            version: Some("1.0".to_string()),
+            rule_count: 10,
+            errors: vec![],
+            warnings: vec!["unused field".to_string()],
+        };
+        let dbg = format!("{:?}", vr);
+        assert!(dbg.contains("ValidationResult"));
+        let cloned = vr.clone();
+        assert!(cloned.valid);
+        assert_eq!(cloned.warnings.len(), 1);
+    }
+
+    #[test]
+    fn validation_result_serde_roundtrip() {
+        let vr = ValidationResult {
+            valid: false,
+            pack_name: None,
+            version: None,
+            rule_count: 0,
+            errors: vec!["parse error".to_string()],
+            warnings: vec![],
+        };
+        let json = serde_json::to_string(&vr).unwrap();
+        let parsed: ValidationResult = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.valid);
+        assert_eq!(parsed.errors.len(), 1);
+    }
 }
