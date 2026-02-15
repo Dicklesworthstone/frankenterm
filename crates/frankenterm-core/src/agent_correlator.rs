@@ -649,4 +649,479 @@ mod tests {
         );
         assert_eq!(correlator.tracked_pane_count(), 0);
     }
+
+    // ====================================================================
+    // detect_agent_from_title edge cases
+    // ====================================================================
+
+    #[test]
+    fn detect_title_empty() {
+        assert_eq!(detect_agent_from_title(""), None);
+    }
+
+    #[test]
+    fn detect_title_case_insensitive_claude() {
+        assert_eq!(
+            detect_agent_from_title("CLAUDE-CODE"),
+            Some(AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            detect_agent_from_title("Claude Code"),
+            Some(AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            detect_agent_from_title("cLaUdE"),
+            Some(AgentType::ClaudeCode)
+        );
+    }
+
+    #[test]
+    fn detect_title_case_insensitive_codex() {
+        assert_eq!(
+            detect_agent_from_title("CODEX --model o4-mini"),
+            Some(AgentType::Codex)
+        );
+        assert_eq!(
+            detect_agent_from_title("OpenAI CLI"),
+            Some(AgentType::Codex)
+        );
+    }
+
+    #[test]
+    fn detect_title_case_insensitive_gemini() {
+        assert_eq!(
+            detect_agent_from_title("GEMINI"),
+            Some(AgentType::Gemini)
+        );
+        assert_eq!(
+            detect_agent_from_title("Gemini Pro"),
+            Some(AgentType::Gemini)
+        );
+    }
+
+    #[test]
+    fn detect_title_claude_substring() {
+        // "claude" keyword is contained in longer string
+        assert_eq!(
+            detect_agent_from_title("running claude-code in tmux"),
+            Some(AgentType::ClaudeCode)
+        );
+    }
+
+    #[test]
+    fn detect_title_no_match_similar_words() {
+        assert_eq!(detect_agent_from_title("cloudy weather app"), None);
+        assert_eq!(detect_agent_from_title("codec"), None);
+        assert_eq!(detect_agent_from_title("gem"), None);
+    }
+
+    #[test]
+    fn detect_title_whitespace_only() {
+        assert_eq!(detect_agent_from_title("   "), None);
+    }
+
+    #[test]
+    fn detect_title_with_path_prefix() {
+        assert_eq!(
+            detect_agent_from_title("/usr/local/bin/claude-code"),
+            Some(AgentType::ClaudeCode)
+        );
+    }
+
+    // ====================================================================
+    // detect_agent_from_process edge cases
+    // ====================================================================
+
+    #[test]
+    fn detect_process_empty() {
+        assert_eq!(detect_agent_from_process(""), None);
+    }
+
+    #[test]
+    fn detect_process_case_insensitive() {
+        assert_eq!(
+            detect_agent_from_process("Claude-Code"),
+            Some(AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            detect_agent_from_process("CODEX"),
+            Some(AgentType::Codex)
+        );
+        assert_eq!(
+            detect_agent_from_process("GEMINI-CLI"),
+            Some(AgentType::Gemini)
+        );
+    }
+
+    #[test]
+    fn detect_process_no_match() {
+        assert_eq!(detect_agent_from_process("vim"), None);
+        assert_eq!(detect_agent_from_process("zsh"), None);
+        assert_eq!(detect_agent_from_process("python3"), None);
+    }
+
+    #[test]
+    fn detect_process_with_path() {
+        assert_eq!(
+            detect_agent_from_process("/home/user/.local/bin/claude"),
+            Some(AgentType::ClaudeCode)
+        );
+    }
+
+    // ====================================================================
+    // infer_state_from_rule comprehensive branch coverage
+    // ====================================================================
+
+    #[test]
+    fn infer_state_session_start() {
+        assert_eq!(
+            infer_state_from_rule("core.claude_code:session.start"),
+            "starting"
+        );
+    }
+
+    #[test]
+    fn infer_state_compaction() {
+        assert_eq!(
+            infer_state_from_rule("core.codex:compaction"),
+            "working"
+        );
+    }
+
+    #[test]
+    fn infer_state_rate_limited_variants() {
+        assert_eq!(
+            infer_state_from_rule("core.codex:rate_limited"),
+            "rate_limited"
+        );
+        assert_eq!(
+            infer_state_from_rule("core.codex:usage_reached"),
+            "rate_limited"
+        );
+        assert_eq!(
+            infer_state_from_rule("core.gemini:quota_exceeded"),
+            "rate_limited"
+        );
+    }
+
+    #[test]
+    fn infer_state_waiting_approval_variants() {
+        assert_eq!(
+            infer_state_from_rule("core.claude_code:approval_needed"),
+            "waiting_approval"
+        );
+        assert_eq!(
+            infer_state_from_rule("core.claude_code:approval_required"),
+            "waiting_approval"
+        );
+    }
+
+    #[test]
+    fn infer_state_idle_variants() {
+        assert_eq!(
+            infer_state_from_rule("core.codex:session.end"),
+            "idle"
+        );
+        assert_eq!(
+            infer_state_from_rule("core.claude_code:token_usage"),
+            "idle"
+        );
+    }
+
+    #[test]
+    fn infer_state_auth_error_variants() {
+        assert_eq!(
+            infer_state_from_rule("core.codex:auth.api_key_error"),
+            "auth_error"
+        );
+        assert_eq!(
+            infer_state_from_rule("core.gemini:auth.login_required"),
+            "auth_error"
+        );
+    }
+
+    #[test]
+    fn infer_state_usage_warning_prefix() {
+        assert_eq!(
+            infer_state_from_rule("core.codex:usage.warning.90pct"),
+            "active"
+        );
+    }
+
+    #[test]
+    fn infer_state_no_colon_defaults_active() {
+        assert_eq!(infer_state_from_rule("no_colon_rule_id"), "active");
+    }
+
+    #[test]
+    fn infer_state_empty_string() {
+        assert_eq!(infer_state_from_rule(""), "active");
+    }
+
+    #[test]
+    fn infer_state_multiple_colons_uses_last() {
+        // rsplit(':').next() gets the part after the last colon
+        assert_eq!(
+            infer_state_from_rule("a:b:c:banner"),
+            "starting"
+        );
+    }
+
+    // ====================================================================
+    // extract_session_id edge cases
+    // ====================================================================
+
+    #[test]
+    fn extract_session_id_from_session_key() {
+        let data = serde_json::json!({"session": "s-789"});
+        assert_eq!(extract_session_id(&data), Some("s-789".to_string()));
+    }
+
+    #[test]
+    fn extract_session_id_priority_order() {
+        // "session_id" has priority over "resume_session_id" and "session"
+        let data = serde_json::json!({
+            "session_id": "first",
+            "resume_session_id": "second",
+            "session": "third"
+        });
+        assert_eq!(extract_session_id(&data), Some("first".to_string()));
+    }
+
+    #[test]
+    fn extract_session_id_falls_to_resume() {
+        let data = serde_json::json!({"resume_session_id": "resume-x"});
+        assert_eq!(extract_session_id(&data), Some("resume-x".to_string()));
+    }
+
+    #[test]
+    fn extract_session_id_null_value() {
+        let data = serde_json::json!({"session_id": null});
+        assert_eq!(extract_session_id(&data), None);
+    }
+
+    #[test]
+    fn extract_session_id_numeric_value() {
+        // as_str() returns None for numbers
+        let data = serde_json::json!({"session_id": 42});
+        assert_eq!(extract_session_id(&data), None);
+    }
+
+    #[test]
+    fn extract_session_id_empty_object() {
+        let data = serde_json::json!({});
+        assert_eq!(extract_session_id(&data), None);
+    }
+
+    #[test]
+    fn extract_session_id_array_value() {
+        let data = serde_json::json!({"session_id": ["a", "b"]});
+        assert_eq!(extract_session_id(&data), None);
+    }
+
+    // ====================================================================
+    // DetectionSource serde tests
+    // ====================================================================
+
+    #[test]
+    fn detection_source_serde_roundtrip() {
+        for src in [
+            DetectionSource::PatternEngine,
+            DetectionSource::PaneTitle,
+            DetectionSource::ProcessName,
+        ] {
+            let json = serde_json::to_string(&src).unwrap();
+            let back: DetectionSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(src, back);
+        }
+    }
+
+    #[test]
+    fn detection_source_serde_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&DetectionSource::PatternEngine).unwrap(),
+            "\"pattern_engine\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DetectionSource::PaneTitle).unwrap(),
+            "\"pane_title\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DetectionSource::ProcessName).unwrap(),
+            "\"process_name\""
+        );
+    }
+
+    #[test]
+    fn detection_source_debug() {
+        let dbg = format!("{:?}", DetectionSource::PatternEngine);
+        assert!(dbg.contains("PatternEngine"));
+    }
+
+    #[test]
+    fn detection_source_copy() {
+        let s = DetectionSource::PaneTitle;
+        let s2 = s;
+        assert_eq!(s, s2);
+    }
+
+    // ====================================================================
+    // AgentCorrelator additional behavior tests
+    // ====================================================================
+
+    #[test]
+    fn correlator_default_is_new() {
+        let c = AgentCorrelator::default();
+        assert_eq!(c.tracked_pane_count(), 0);
+    }
+
+    #[test]
+    fn correlator_debug() {
+        let c = AgentCorrelator::new();
+        let dbg = format!("{c:?}");
+        assert!(dbg.contains("AgentCorrelator"));
+    }
+
+    #[test]
+    fn remove_nonexistent_pane_is_noop() {
+        let mut c = AgentCorrelator::new();
+        c.remove_pane(999); // should not panic
+        assert_eq!(c.tracked_pane_count(), 0);
+    }
+
+    #[test]
+    fn multiple_panes_tracked_independently() {
+        let mut c = AgentCorrelator::new();
+        c.ingest_detections(
+            1,
+            &[make_detection("core.claude_code:banner", AgentType::ClaudeCode)],
+        );
+        c.ingest_detections(
+            2,
+            &[make_detection("core.codex:tool_use", AgentType::Codex)],
+        );
+        c.ingest_detections(
+            3,
+            &[make_detection("core.gemini:rate_limited", AgentType::Gemini)],
+        );
+
+        assert_eq!(c.tracked_pane_count(), 3);
+        assert_eq!(c.get_metadata(1).unwrap().agent_type, "claude_code");
+        assert_eq!(c.get_metadata(1).unwrap().state.as_deref(), Some("starting"));
+        assert_eq!(c.get_metadata(2).unwrap().agent_type, "codex");
+        assert_eq!(c.get_metadata(2).unwrap().state.as_deref(), Some("working"));
+        assert_eq!(c.get_metadata(3).unwrap().agent_type, "gemini");
+        assert_eq!(
+            c.get_metadata(3).unwrap().state.as_deref(),
+            Some("rate_limited")
+        );
+    }
+
+    #[test]
+    fn ingest_empty_detections_is_noop() {
+        let mut c = AgentCorrelator::new();
+        c.ingest_detections(1, &[]);
+        assert_eq!(c.tracked_pane_count(), 0);
+    }
+
+    #[test]
+    fn ingest_multiple_detections_uses_last() {
+        let mut c = AgentCorrelator::new();
+        c.ingest_detections(
+            1,
+            &[
+                make_detection("core.claude_code:banner", AgentType::ClaudeCode),
+                make_detection("core.claude_code:tool_use", AgentType::ClaudeCode),
+                make_detection("core.claude_code:cost_summary", AgentType::ClaudeCode),
+            ],
+        );
+        // Last detection wins for state
+        assert_eq!(c.get_metadata(1).unwrap().state.as_deref(), Some("idle"));
+    }
+
+    #[test]
+    fn session_id_preserved_across_updates() {
+        let mut c = AgentCorrelator::new();
+        c.ingest_detections(
+            1,
+            &[make_detection_with_session(
+                "core.codex:banner",
+                AgentType::Codex,
+                "sess-original",
+            )],
+        );
+        // Second detection without session_id should not clear it
+        c.ingest_detections(
+            1,
+            &[make_detection("core.codex:tool_use", AgentType::Codex)],
+        );
+        // session_id comes from extract_session_id which returns None for empty extracted
+        // But the code only updates session_id when Some is returned
+        // So the original should be preserved
+        let meta = c.get_metadata(1).unwrap();
+        assert_eq!(meta.session_id.as_deref(), Some("sess-original"));
+    }
+
+    #[test]
+    fn session_id_updated_when_new_provided() {
+        let mut c = AgentCorrelator::new();
+        c.ingest_detections(
+            1,
+            &[make_detection_with_session(
+                "core.codex:banner",
+                AgentType::Codex,
+                "sess-1",
+            )],
+        );
+        c.ingest_detections(
+            1,
+            &[make_detection_with_session(
+                "core.codex:tool_use",
+                AgentType::Codex,
+                "sess-2",
+            )],
+        );
+        assert_eq!(
+            c.get_metadata(1).unwrap().session_id.as_deref(),
+            Some("sess-2")
+        );
+    }
+
+    #[test]
+    fn agent_type_updated_on_new_detection() {
+        let mut c = AgentCorrelator::new();
+        c.ingest_detections(
+            1,
+            &[make_detection("core.codex:banner", AgentType::Codex)],
+        );
+        assert_eq!(c.get_metadata(1).unwrap().agent_type, "codex");
+
+        // Different agent type on same pane
+        c.ingest_detections(
+            1,
+            &[make_detection(
+                "core.claude_code:banner",
+                AgentType::ClaudeCode,
+            )],
+        );
+        assert_eq!(c.get_metadata(1).unwrap().agent_type, "claude_code");
+    }
+
+    #[test]
+    fn remove_pane_then_redetect() {
+        let mut c = AgentCorrelator::new();
+        c.ingest_detections(
+            1,
+            &[make_detection("core.codex:banner", AgentType::Codex)],
+        );
+        c.remove_pane(1);
+        assert!(c.get_metadata(1).is_none());
+
+        // Re-add
+        c.ingest_detections(
+            1,
+            &[make_detection("core.gemini:banner", AgentType::Gemini)],
+        );
+        assert_eq!(c.get_metadata(1).unwrap().agent_type, "gemini");
+    }
 }
