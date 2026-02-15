@@ -669,4 +669,35 @@ proptest! {
         prop_assert!(result.batches.is_empty());
         prop_assert_eq!(result.frame_work_units, 0);
     }
+
+    /// ReflowPlannerInput Debug is non-empty.
+    #[test]
+    fn input_debug_nonempty(input in arb_planner_input()) {
+        let debug = format!("{:?}", input);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ReflowPlannerInput Clone preserves viewport_height.
+    #[test]
+    fn input_clone_preserves(input in arb_planner_input()) {
+        let cloned = input.clone();
+        prop_assert_eq!(cloned.viewport_height, input.viewport_height);
+        prop_assert_eq!(cloned.total_logical_lines, input.total_logical_lines);
+    }
+
+    /// ReflowBatchPriority Debug is non-empty.
+    #[test]
+    fn batch_priority_debug_nonempty(_dummy in 0..1u8) {
+        let debug = format!("{:?}", ReflowBatchPriority::ViewportCore);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ReflowPlan Clone preserves batch count and frame_work_units.
+    #[test]
+    fn plan_clone_preserves(input in arb_planner_input()) {
+        let result = plan(&input);
+        let cloned = result.clone();
+        prop_assert_eq!(cloned.batches.len(), result.batches.len());
+        prop_assert_eq!(cloned.frame_work_units, result.frame_work_units);
+    }
 }

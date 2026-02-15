@@ -543,4 +543,56 @@ proptest! {
         prop_assert!(c >= 0.0, "centroid {} should be >= 0", c);
         prop_assert!(c.is_finite(), "centroid should be finite");
     }
+
+    /// Spectral centroid of uniform PSD is near center frequency.
+    #[test]
+    fn prop_centroid_uniform_near_center(
+        n in 4usize..64,
+        sample_rate in 10.0f64..1000.0,
+    ) {
+        let psd: Vec<f64> = vec![1.0; n];
+        let c = spectral_centroid(&psd, sample_rate);
+        // For uniform PSD, centroid should be near sr/4 (midpoint of [0, sr/2])
+        let expected_center = sample_rate / 4.0;
+        prop_assert!((c - expected_center).abs() < sample_rate / 2.0 + 1.0,
+            "uniform PSD centroid {} should be near {}", c, expected_center);
+    }
+
+    /// Spectral centroid of single-bin PSD matches that bin's frequency.
+    #[test]
+    fn prop_centroid_single_bin(
+        n in 4usize..64,
+        bin_idx in 0usize..4,
+        sample_rate in 10.0f64..1000.0,
+    ) {
+        let idx = bin_idx.min(n - 1);
+        let mut psd = vec![0.0; n];
+        psd[idx] = 1.0;
+        let c = spectral_centroid(&psd, sample_rate);
+        let expected = idx as f64 * sample_rate / (2.0 * (n - 1) as f64);
+        prop_assert!((c - expected).abs() < 1e-6,
+            "single-bin centroid {} should be near {}", c, expected);
+    }
+
+    /// Spectral centroid is bounded by [0, sr/2].
+    #[test]
+    fn prop_centroid_bounded(
+        psd in prop::collection::vec(0.001f64..100.0, 2..128),
+        sample_rate in 1.0f64..100.0,
+    ) {
+        let c = spectral_centroid(&psd, sample_rate);
+        prop_assert!(c >= 0.0 && c <= sample_rate / 2.0 + 1e-6,
+            "centroid {} should be in [0, {}]", c, sample_rate / 2.0);
+    }
+
+    /// Spectral centroid is deterministic.
+    #[test]
+    fn prop_centroid_deterministic(
+        psd in prop::collection::vec(0.001f64..100.0, 2..64),
+        sample_rate in 1.0f64..100.0,
+    ) {
+        let c1 = spectral_centroid(&psd, sample_rate);
+        let c2 = spectral_centroid(&psd, sample_rate);
+        prop_assert!((c1 - c2).abs() < 1e-15);
+    }
 }

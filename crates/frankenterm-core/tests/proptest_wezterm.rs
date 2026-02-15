@@ -561,3 +561,51 @@ fn cwd_parse_host_only() {
     assert_eq!(info.host, "myhost");
     assert!(info.path.is_empty());
 }
+
+#[test]
+fn pane_size_debug_nonempty() {
+    let size = PaneSize { rows: 24, cols: 80, pixel_width: None, pixel_height: None, dpi: None };
+    let debug = format!("{:?}", size);
+    assert!(!debug.is_empty());
+}
+
+#[test]
+fn cursor_visibility_debug_nonempty() {
+    let vis = CursorVisibility::Visible;
+    let debug = format!("{:?}", vis);
+    assert!(!debug.is_empty());
+}
+
+#[test]
+fn cwd_info_debug_nonempty() {
+    let info = CwdInfo::parse("file:///home/user");
+    let debug = format!("{:?}", info);
+    assert!(!debug.is_empty());
+}
+
+#[test]
+fn pane_info_minimal_extra_is_empty() {
+    let pane = PaneInfo {
+        pane_id: 0,
+        tab_id: 0,
+        window_id: 0,
+        domain_id: None,
+        domain_name: None,
+        workspace: None,
+        size: None,
+        rows: None,
+        cols: None,
+        title: None,
+        cwd: None,
+        tty_name: None,
+        cursor_x: None,
+        cursor_y: None,
+        cursor_visibility: None,
+        left_col: None,
+        top_row: None,
+        is_active: false,
+        is_zoomed: false,
+        extra: std::collections::HashMap::new(),
+    };
+    assert!(pane.extra.is_empty());
+}

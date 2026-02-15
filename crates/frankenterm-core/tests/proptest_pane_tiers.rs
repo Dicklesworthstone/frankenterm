@@ -568,4 +568,33 @@ proptest! {
         prop_assert!((back.estimated_rps - rps).abs() < 1e-10,
             "rps should survive roundtrip: {} vs {}", back.estimated_rps, rps);
     }
+
+    /// TierMetrics Debug is non-empty.
+    #[test]
+    fn tier_metrics_debug_nonempty(metrics in arb_tier_metrics()) {
+        let debug = format!("{:?}", metrics);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// TierMetrics Clone preserves total_panes.
+    #[test]
+    fn tier_metrics_clone_preserves(metrics in arb_tier_metrics()) {
+        let cloned = metrics.clone();
+        prop_assert_eq!(cloned.total_panes, metrics.total_panes);
+        prop_assert_eq!(cloned.total_transitions, metrics.total_transitions);
+    }
+
+    /// TierConfig Debug is non-empty.
+    #[test]
+    fn tier_config_debug_nonempty(config in arb_config()) {
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// TierConfig Clone preserves active_interval_ms.
+    #[test]
+    fn tier_config_clone_preserves(config in arb_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.active_ms, config.active_ms);
+    }
 }
