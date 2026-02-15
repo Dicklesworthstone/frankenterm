@@ -587,4 +587,111 @@ mod tests {
         assert_ne!(InsertResult::Ok, InsertResult::Full);
         assert_ne!(InsertResult::Full, InsertResult::Duplicate);
     }
+
+    // -- Batch: DarkBadger wa-1u90p.7.1 ----------------------------------------
+
+    #[test]
+    fn insert_result_debug_clone_copy() {
+        let a = InsertResult::Ok;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+        let dbg = format!("{:?}", a);
+        assert_eq!(dbg, "Ok");
+    }
+
+    #[test]
+    fn insert_result_all_three_distinct() {
+        let variants = [
+            InsertResult::Ok,
+            InsertResult::Full,
+            InsertResult::Duplicate,
+        ];
+        for i in 0..variants.len() {
+            for j in (i + 1)..variants.len() {
+                assert_ne!(variants[i], variants[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn cuckoo_config_debug_clone_eq() {
+        let a = CuckooConfig::default();
+        let b = a.clone();
+        assert_eq!(a, b);
+        let dbg = format!("{:?}", a);
+        assert!(dbg.contains("CuckooConfig"));
+    }
+
+    #[test]
+    fn cuckoo_stats_debug_clone_eq() {
+        let a = CuckooStats {
+            capacity: 100,
+            count: 10,
+            load_percent: 10,
+            num_buckets: 25,
+            bucket_size: 4,
+            occupied_buckets: 5,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+        let dbg = format!("{:?}", a);
+        assert!(dbg.contains("CuckooStats"));
+    }
+
+    #[test]
+    fn cuckoo_filter_default_trait() {
+        let filter = CuckooFilter::default();
+        assert!(filter.is_empty());
+        assert_eq!(filter.count(), 0);
+    }
+
+    #[test]
+    fn cuckoo_filter_accessors() {
+        let filter = CuckooFilter::new();
+        assert!(filter.num_buckets().is_power_of_two());
+        assert_eq!(filter.bucket_size(), 4);
+    }
+
+    #[test]
+    fn cuckoo_filter_capacity() {
+        let filter = CuckooFilter::new();
+        assert_eq!(
+            filter.capacity(),
+            filter.num_buckets() * filter.bucket_size()
+        );
+    }
+
+    #[test]
+    fn cuckoo_filter_delete_reduces_count() {
+        let mut filter = CuckooFilter::new();
+        filter.insert(&1);
+        filter.insert(&2);
+        assert_eq!(filter.count(), 2);
+        filter.delete(&1);
+        assert_eq!(filter.count(), 1);
+    }
+
+    #[test]
+    fn cuckoo_config_min_bucket_size() {
+        // bucket_size of 0 gets clamped to 1
+        let filter = CuckooFilter::with_config(CuckooConfig {
+            num_buckets: 4,
+            bucket_size: 0,
+            max_kicks: 10,
+        });
+        assert_eq!(filter.bucket_size(), 1);
+    }
+
+    #[test]
+    fn cuckoo_config_min_num_buckets() {
+        // num_buckets rounds up to power of 2, minimum 2
+        let filter = CuckooFilter::with_config(CuckooConfig {
+            num_buckets: 1,
+            bucket_size: 4,
+            max_kicks: 10,
+        });
+        assert!(filter.num_buckets() >= 2);
+    }
 }

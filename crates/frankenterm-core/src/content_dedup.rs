@@ -837,4 +837,171 @@ mod tests {
         assert_eq!(parsed.total_processed, 100);
         assert!((parsed.dedup_rate() - (60.0 / 90.0)).abs() < 1e-10);
     }
+
+    // -- Batch: DarkBadger wa-1u90p.7.1 ----------------------------------------
+
+    #[test]
+    fn content_block_debug_clone_serde() {
+        let block = ContentBlock {
+            hash: "abc123".to_string(),
+            byte_size: 100,
+            ref_count: 3,
+            first_seen_ms: 1000,
+            last_seen_ms: 2000,
+        };
+        let cloned = block.clone();
+        assert_eq!(cloned.hash, "abc123");
+        assert_eq!(cloned.ref_count, 3);
+        let dbg = format!("{:?}", block);
+        assert!(dbg.contains("ContentBlock"));
+
+        let json = serde_json::to_string(&block).unwrap();
+        let parsed: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.byte_size, 100);
+    }
+
+    #[test]
+    fn dedup_config_default_values() {
+        let cfg = DedupConfig::default();
+        assert_eq!(cfg.min_dedup_size, 32);
+        assert_eq!(cfg.max_inline_size, 256);
+    }
+
+    #[test]
+    fn dedup_config_debug_clone_serde() {
+        let cfg = DedupConfig::default();
+        let cloned = cfg.clone();
+        assert_eq!(cloned.min_dedup_size, 32);
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("DedupConfig"));
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: DedupConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.min_dedup_size, 32);
+    }
+
+    #[test]
+    fn dedup_config_should_dedup_boundary() {
+        let cfg = DedupConfig {
+            min_dedup_size: 32,
+            max_inline_size: 256,
+        };
+        assert!(!cfg.should_dedup(31));
+        assert!(cfg.should_dedup(32));
+        assert!(cfg.should_dedup(33));
+    }
+
+    #[test]
+    fn dedup_stats_default() {
+        let stats = DedupStats::default();
+        assert_eq!(stats.total_references, 0);
+        assert_eq!(stats.unique_blocks, 0);
+        assert_eq!(stats.unique_bytes, 0);
+        assert_eq!(stats.logical_bytes, 0);
+        assert!((stats.dedup_ratio - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn dedup_stats_finalize_zero_unique() {
+        let stats = DedupStats {
+            unique_bytes: 0,
+            logical_bytes: 100,
+            ..Default::default()
+        }
+        .finalize();
+        assert!((stats.dedup_ratio - 1.0).abs() < f64::EPSILON);
+        assert_eq!(stats.bytes_saved, 100);
+    }
+
+    #[test]
+    fn dedup_stats_debug_clone_serde() {
+        let stats = DedupStats {
+            total_references: 10,
+            unique_blocks: 5,
+            unique_bytes: 500,
+            logical_bytes: 1000,
+            dedup_ratio: 2.0,
+            bytes_saved: 500,
+        };
+        let cloned = stats.clone();
+        assert_eq!(cloned.unique_blocks, 5);
+        let dbg = format!("{:?}", stats);
+        assert!(dbg.contains("DedupStats"));
+
+        let json = serde_json::to_string(&stats).unwrap();
+        let parsed: DedupStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_references, 10);
+    }
+
+    #[test]
+    fn store_result_debug_clone_eq() {
+        let a = StoreResult::Inserted;
+        let b = a.clone();
+        assert_eq!(a, b);
+        assert_ne!(StoreResult::Inserted, StoreResult::Deduplicated);
+        let dbg = format!("{:?}", a);
+        assert_eq!(dbg, "Inserted");
+    }
+
+    #[test]
+    fn dedup_result_debug_clone() {
+        let r = DedupResult {
+            hash: "abc".to_string(),
+            outcome: StoreResult::Inserted,
+            content_len: 42,
+            stored_inline: false,
+        };
+        let cloned = r.clone();
+        assert_eq!(cloned.hash, "abc");
+        assert_eq!(cloned.content_len, 42);
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("DedupResult"));
+    }
+
+    #[test]
+    fn engine_counters_dedup_rate_zero() {
+        let c = EngineCounters {
+            total_processed: 0,
+            total_deduplicated: 0,
+            total_inserted: 0,
+            total_inline: 0,
+        };
+        assert!((c.dedup_rate() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn engine_counters_debug_clone() {
+        let c = EngineCounters {
+            total_processed: 10,
+            total_deduplicated: 3,
+            total_inserted: 5,
+            total_inline: 2,
+        };
+        let cloned = c.clone();
+        assert_eq!(cloned.total_processed, 10);
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("EngineCounters"));
+    }
+
+    #[test]
+    fn content_hash_deterministic() {
+        let data = b"hello world";
+        let h1 = content_hash(data);
+        let h2 = content_hash(data);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn content_hash_different_for_different_input() {
+        let h1 = content_hash(b"hello");
+        let h2 = content_hash(b"world");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn content_hash_is_hex() {
+        let hash = content_hash(b"test");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(hash.len(), 64); // SHA-256 = 32 bytes = 64 hex chars
+    }
 }

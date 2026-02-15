@@ -390,9 +390,7 @@ impl<'a, K: Ord, V> Iterator for SkipListIter<'a, K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(idx) = self.current {
             self.current = self.list.nodes[idx].forward[0];
-            if let (Some(k), Some(v)) =
-                (&self.list.nodes[idx].key, &self.list.nodes[idx].value)
-            {
+            if let (Some(k), Some(v)) = (&self.list.nodes[idx].key, &self.list.nodes[idx].value) {
                 return Some((k, v));
             }
         }
@@ -610,5 +608,113 @@ mod tests {
         }
         assert_eq!(list1.current_level(), list2.current_level());
         assert_eq!(list1.len(), list2.len());
+    }
+
+    // -- Batch: DarkBadger wa-1u90p.7.1 ----------------------------------------
+
+    #[test]
+    fn skip_list_debug_clone() {
+        let mut list = SkipList::new(42);
+        list.insert(1, "a");
+        list.insert(2, "b");
+        let cloned = list.clone();
+        assert_eq!(cloned.len(), 2);
+        assert_eq!(cloned.get(&1), Some(&"a"));
+        let dbg = format!("{:?}", list);
+        assert!(dbg.contains("SkipList"));
+    }
+
+    #[test]
+    fn skip_list_stats_debug_clone_eq() {
+        let stats = SkipListStats {
+            len: 10,
+            current_level: 3,
+            total_nodes: 15,
+            free_slots: 2,
+        };
+        let cloned = stats.clone();
+        assert_eq!(stats, cloned);
+        let dbg = format!("{:?}", stats);
+        assert!(dbg.contains("SkipListStats"));
+    }
+
+    #[test]
+    fn skip_list_stats_free_slots_after_remove() {
+        let mut list = SkipList::new(42);
+        for i in 0..10 {
+            list.insert(i, i);
+        }
+        list.remove(&5);
+        let stats = list.stats();
+        assert_eq!(stats.len, 9);
+        assert_eq!(stats.free_slots, 1);
+    }
+
+    #[test]
+    fn skip_list_iter_empty() {
+        let list: SkipList<i32, i32> = SkipList::new(42);
+        let items: Vec<_> = list.iter().collect();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn skip_list_range_empty_result() {
+        let mut list = SkipList::new(42);
+        list.insert(10, "ten");
+        list.insert(20, "twenty");
+        let result = list.range(&100, &200);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn skip_list_range_single_element() {
+        let mut list = SkipList::new(42);
+        list.insert(10, "ten");
+        list.insert(20, "twenty");
+        list.insert(30, "thirty");
+        let result = list.range(&20, &20);
+        assert_eq!(result.len(), 1);
+        assert_eq!(*result[0].0, 20);
+    }
+
+    #[test]
+    fn skip_list_min_max_single() {
+        let mut list = SkipList::new(42);
+        list.insert(7, "seven");
+        assert_eq!(list.min(), Some((&7, &"seven")));
+        assert_eq!(list.max(), Some((&7, &"seven")));
+    }
+
+    #[test]
+    fn skip_list_current_level_increases() {
+        let mut list = SkipList::new(42);
+        assert_eq!(list.current_level(), 0);
+        // Inserting many items should increase the level
+        for i in 0..100 {
+            list.insert(i, i);
+        }
+        assert!(list.current_level() > 0);
+    }
+
+    #[test]
+    fn skip_list_clear_resets_level() {
+        let mut list = SkipList::new(42);
+        for i in 0..50 {
+            list.insert(i, i);
+        }
+        let level_before = list.current_level();
+        assert!(level_before > 0);
+        list.clear();
+        assert_eq!(list.current_level(), 0);
+    }
+
+    #[test]
+    fn skip_list_get_after_overwrite() {
+        let mut list = SkipList::new(42);
+        list.insert(1, 100);
+        list.insert(1, 200);
+        list.insert(1, 300);
+        assert_eq!(list.get(&1), Some(&300));
+        assert_eq!(list.len(), 1);
     }
 }
