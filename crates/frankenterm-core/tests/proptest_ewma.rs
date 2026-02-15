@@ -640,4 +640,48 @@ proptest! {
             prop_assert!(stddev < 1e-10, "stddev should be ~0 when variance is ~0");
         }
     }
+
+    /// Ewma Debug is non-empty.
+    #[test]
+    fn ewma_debug_nonempty(hl in 1.0f64..10_000.0) {
+        let ewma = Ewma::with_half_life_ms(hl);
+        let debug = format!("{:?}", ewma);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// Ewma Clone preserves value.
+    #[test]
+    fn ewma_clone_preserves(
+        hl in 1.0f64..10_000.0,
+        values in proptest::collection::vec(arb_value(), 1..10),
+    ) {
+        let mut ewma = Ewma::with_half_life_ms(hl);
+        for (i, &v) in values.iter().enumerate() {
+            ewma.observe(v, i as u64 * 100);
+        }
+        let cloned = ewma.clone();
+        prop_assert!((cloned.value() - ewma.value()).abs() < 1e-10);
+    }
+
+    /// RateEstimator Debug is non-empty.
+    #[test]
+    fn rate_estimator_debug_nonempty(hl in 1.0f64..10_000.0) {
+        let rate = RateEstimator::with_half_life_ms(hl);
+        let debug = format!("{:?}", rate);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// EwmaWithVariance Clone preserves mean and variance.
+    #[test]
+    fn ewma_with_variance_clone_preserves(
+        values in proptest::collection::vec(arb_value(), 2..10),
+    ) {
+        let mut tracker = EwmaWithVariance::with_half_life_ms(1000.0);
+        for (i, &v) in values.iter().enumerate() {
+            tracker.observe(v, i as u64 * 100);
+        }
+        let cloned = tracker.clone();
+        prop_assert!((cloned.mean() - tracker.mean()).abs() < 1e-10);
+        prop_assert!((cloned.variance() - tracker.variance()).abs() < 1e-10);
+    }
 }

@@ -875,4 +875,49 @@ proptest! {
                 et, manual_count, matrix.marginal(et));
         }
     }
+
+    /// CoOccurrenceMatrix Debug is non-empty.
+    #[test]
+    fn matrix_debug_nonempty(
+        windows in prop::collection::vec(arb_window_events(), 1..5),
+    ) {
+        let mut matrix = CoOccurrenceMatrix::new();
+        for w in &windows {
+            matrix.record_window(w);
+        }
+        let debug = format!("{:?}", matrix);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// Empty matrix has zero total_windows.
+    #[test]
+    fn empty_matrix_zero_windows(_dummy in 0..1u8) {
+        let matrix = CoOccurrenceMatrix::new();
+        prop_assert_eq!(matrix.total_windows(), 0);
+    }
+
+    /// CoOccurrenceMatrix Clone preserves total_windows.
+    #[test]
+    fn matrix_clone_preserves(
+        windows in prop::collection::vec(arb_window_events(), 1..5),
+    ) {
+        let mut matrix = CoOccurrenceMatrix::new();
+        for w in &windows {
+            matrix.record_window(w);
+        }
+        let cloned = matrix.clone();
+        prop_assert_eq!(cloned.total_windows(), matrix.total_windows());
+    }
+
+    /// total_windows matches number of record_window calls.
+    #[test]
+    fn total_windows_matches_records(
+        windows in prop::collection::vec(arb_window_events(), 1..20),
+    ) {
+        let mut matrix = CoOccurrenceMatrix::new();
+        for w in &windows {
+            matrix.record_window(w);
+        }
+        prop_assert_eq!(matrix.total_windows(), windows.len() as u64);
+    }
 }

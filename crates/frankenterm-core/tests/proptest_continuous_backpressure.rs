@@ -669,4 +669,35 @@ proptest! {
                 norm_pane, norm_detect, s);
         }
     }
+
+    /// BackpressureConfig Debug is non-empty.
+    #[test]
+    fn config_debug_nonempty(config in arb_config()) {
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// BackpressureConfig Clone preserves center_threshold.
+    #[test]
+    fn config_clone_preserves(config in arb_config()) {
+        let cloned = config.clone();
+        prop_assert!((cloned.center_threshold - config.center_threshold).abs() < 1e-12);
+    }
+
+    /// ThrottleActions Debug is non-empty.
+    #[test]
+    fn throttle_actions_debug_nonempty(config in arb_config()) {
+        let bp = ContinuousBackpressure::new(config);
+        let actions = bp.current_actions();
+        let debug = format!("{:?}", actions);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// Initial severity is zero.
+    #[test]
+    fn initial_severity_zero(config in arb_config()) {
+        let bp = ContinuousBackpressure::new(config);
+        prop_assert!(bp.severity().abs() < 1e-10,
+            "initial severity should be 0, got {}", bp.severity());
+    }
 }
