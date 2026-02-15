@@ -1803,4 +1803,637 @@ mod tests {
         assert_eq!(data.refreshed_count, 2);
         assert_eq!(data.accounts.len(), 2);
     }
+
+    // -----------------------------------------------------------------------
+    // Batch — RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_json_bytes_convenience() {
+        let raw = br#"{"ok":true,"data":{"pane_id":5,"text":"bytes","tail_lines":1,"escapes_included":true},"elapsed_ms":2,"version":"0.2.0","now":99}"#;
+        let resp = RobotResponse::<GetTextData>::from_json_bytes(raw).unwrap();
+        let data = resp.data.unwrap();
+        assert_eq!(data.pane_id, 5);
+        assert_eq!(data.text, "bytes");
+        assert!(data.escapes_included);
+    }
+
+    #[test]
+    fn into_result_err_no_message_uses_fallback() {
+        // Error response with no `error` field should produce "unknown error".
+        let json = json!({
+            "ok": false,
+            "elapsed_ms": 1,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<GetTextData> = serde_json::from_value(json).unwrap();
+        let err = resp.into_result().unwrap_err();
+        assert_eq!(err.message, "unknown error");
+        assert!(err.code.is_none());
+        assert!(err.hint.is_none());
+    }
+
+    #[test]
+    fn into_result_err_preserves_hint() {
+        let json = json!({
+            "ok": false,
+            "error": "rate limited",
+            "error_code": "FT-4002",
+            "hint": "wait 60 seconds",
+            "elapsed_ms": 1,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<GetTextData> = serde_json::from_value(json).unwrap();
+        let err = resp.into_result().unwrap_err();
+        assert_eq!(err.hint.as_deref(), Some("wait 60 seconds"));
+        assert_eq!(err.message, "rate limited");
+    }
+
+    #[test]
+    fn parsed_error_code_returns_none_when_absent() {
+        let json = json!({
+            "ok": true,
+            "data": {"pane_id": 1, "text": "ok", "tail_lines": 1, "escapes_included": false},
+            "elapsed_ms": 1,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<GetTextData> = serde_json::from_value(json).unwrap();
+        assert!(resp.parsed_error_code().is_none());
+    }
+
+    #[test]
+    fn parsed_error_code_returns_none_for_invalid_prefix() {
+        let json = json!({
+            "ok": false,
+            "error": "bad",
+            "error_code": "XX-9999",
+            "elapsed_ms": 1,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<GetTextData> = serde_json::from_value(json).unwrap();
+        assert!(resp.parsed_error_code().is_none());
+    }
+
+    #[test]
+    fn error_code_parse_non_numeric_suffix() {
+        assert!(ErrorCode::parse("FT-abc").is_none());
+        assert!(ErrorCode::parse("FT-").is_none());
+        assert!(ErrorCode::parse("FT-12.5").is_none());
+    }
+
+    #[test]
+    fn error_code_display_trait() {
+        assert_eq!(format!("{}", ErrorCode::PaneNotFound), "FT-1003");
+        assert_eq!(format!("{}", ErrorCode::DiskFull), "FT-2005");
+        assert_eq!(format!("{}", ErrorCode::Unknown(7777)), "FT-7777");
+    }
+
+    #[test]
+    fn error_code_unknown_category_is_internal() {
+        // Unknown codes with number >= 9000 or in unmapped ranges
+        // fall into the Internal category via the catch-all.
+        let code = ErrorCode::Unknown(0);
+        assert_eq!(code.category(), ErrorCategory::Internal);
+
+        let code2 = ErrorCode::Unknown(8500);
+        assert_eq!(code2.category(), ErrorCategory::Internal);
+    }
+
+    #[test]
+    fn error_code_retryable_exhaustive() {
+        // All 6 retryable codes
+        assert!(ErrorCode::DatabaseLocked.is_retryable());
+        assert!(ErrorCode::RateLimitExceeded.is_retryable());
+        assert!(ErrorCode::NetworkTimeout.is_retryable());
+        assert!(ErrorCode::ConnectionRefused.is_retryable());
+        assert!(ErrorCode::PatternTimeout.is_retryable());
+        assert!(ErrorCode::WeztermConnectionRefused.is_retryable());
+
+        // Spot-check a selection of non-retryable codes
+        let non_retryable = [
+            ErrorCode::WeztermNotFound,
+            ErrorCode::WeztermExecFailed,
+            ErrorCode::PaneNotFound,
+            ErrorCode::WeztermParseFailed,
+            ErrorCode::StorageCorruption,
+            ErrorCode::FtsIndexError,
+            ErrorCode::MigrationFailed,
+            ErrorCode::DiskFull,
+            ErrorCode::InvalidRegex,
+            ErrorCode::RulePackNotFound,
+            ErrorCode::ActionDenied,
+            ErrorCode::ApprovalRequired,
+            ErrorCode::ApprovalExpired,
+            ErrorCode::WorkflowNotFound,
+            ErrorCode::WorkflowStepFailed,
+            ErrorCode::WorkflowTimeout,
+            ErrorCode::WorkflowAlreadyRunning,
+            ErrorCode::ConfigInvalid,
+            ErrorCode::ConfigNotFound,
+            ErrorCode::InternalError,
+            ErrorCode::FeatureNotAvailable,
+            ErrorCode::VersionMismatch,
+            ErrorCode::Unknown(9999),
+        ];
+        for code in non_retryable {
+            assert!(!code.is_retryable(), "expected non-retryable: {}", code);
+        }
+    }
+
+    #[test]
+    fn error_code_clone_copy_eq_hash() {
+        let a = ErrorCode::DatabaseLocked;
+        let b = a; // Copy
+        let c = a.clone(); // Clone
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+
+        // Verify Hash works by inserting into a HashSet
+        let mut set = std::collections::HashSet::new();
+        set.insert(a);
+        set.insert(b);
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn robot_error_implements_std_error() {
+        let err = RobotError {
+            code: Some("FT-9001".to_string()),
+            message: "internal".to_string(),
+            hint: None,
+        };
+        // Verify the Error trait is implemented (source returns None by default)
+        let as_error: &dyn std::error::Error = &err;
+        assert!(as_error.source().is_none());
+    }
+
+    #[test]
+    fn envelope_serialize_deserialize_roundtrip() {
+        let original = RobotResponse {
+            ok: true,
+            data: Some(GetTextData {
+                pane_id: 42,
+                text: "roundtrip".to_string(),
+                tail_lines: 200,
+                escapes_included: true,
+                truncated: false,
+                truncation_info: None,
+            }),
+            error: None,
+            error_code: None,
+            hint: None,
+            elapsed_ms: 7,
+            version: "1.0.0".to_string(),
+            now: 1700000000000,
+        };
+        let serialized = serde_json::to_string(&original).unwrap();
+        let deserialized: RobotResponse<GetTextData> =
+            serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.ok, original.ok);
+        assert_eq!(deserialized.elapsed_ms, 7);
+        assert_eq!(deserialized.version, "1.0.0");
+        let data = deserialized.data.unwrap();
+        assert_eq!(data.pane_id, 42);
+        assert_eq!(data.text, "roundtrip");
+    }
+
+    #[test]
+    fn pane_state_data_minimal_optional_fields() {
+        let json = json!({
+            "pane_id": 10,
+            "tab_id": 20,
+            "window_id": 30,
+            "domain": "ssh"
+        });
+        let psd: PaneStateData = serde_json::from_value(json).unwrap();
+        assert_eq!(psd.pane_id, 10);
+        assert_eq!(psd.domain, "ssh");
+        assert!(psd.pane_uuid.is_none());
+        assert!(psd.title.is_none());
+        assert!(psd.cwd.is_none());
+        assert!(!psd.observed);
+        assert!(psd.ignore_reason.is_none());
+    }
+
+    #[test]
+    fn search_hit_with_semantic_and_fusion_fields() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "query": "deploy",
+                "results": [{
+                    "segment_id": 10,
+                    "pane_id": 3,
+                    "seq": 100,
+                    "captured_at": 1700000000000i64,
+                    "score": 2.5,
+                    "snippet": "deploying...",
+                    "content": "full content here",
+                    "semantic_score": 0.87,
+                    "fusion_rank": 1
+                }],
+                "total_hits": 1,
+                "limit": 10,
+                "mode": "hybrid",
+                "pane_filter": 3,
+                "since_filter": 1699999000000i64,
+                "until_filter": 1700001000000i64
+            },
+            "elapsed_ms": 15,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<SearchData> = serde_json::from_value(json).unwrap();
+        let data = resp.into_result().unwrap();
+        assert_eq!(data.mode.as_deref(), Some("hybrid"));
+        assert_eq!(data.pane_filter, Some(3));
+        assert_eq!(data.since_filter, Some(1699999000000));
+        assert_eq!(data.until_filter, Some(1700001000000));
+        let hit = &data.results[0];
+        assert!((hit.semantic_score.unwrap() - 0.87).abs() < f64::EPSILON);
+        assert_eq!(hit.fusion_rank, Some(1));
+        assert_eq!(hit.content.as_deref(), Some("full content here"));
+    }
+
+    #[test]
+    fn event_item_with_would_handle_with() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "events": [{
+                    "id": 100,
+                    "pane_id": 5,
+                    "rule_id": "test.timeout",
+                    "pack_id": "test",
+                    "event_type": "warning",
+                    "severity": "medium",
+                    "confidence": 0.80,
+                    "captured_at": 1700000000000i64,
+                    "handled_at": 1700000010000i64,
+                    "workflow_id": "wf-99",
+                    "extracted": {"key": "val"},
+                    "annotations": {"label": "timeout"},
+                    "would_handle_with": {
+                        "workflow": "restart_service",
+                        "preview_command": "systemctl restart app",
+                        "first_step": "check_health",
+                        "estimated_duration_ms": 5000,
+                        "would_run": true,
+                        "reason": "auto policy"
+                    }
+                }],
+                "total_count": 1,
+                "limit": 10,
+                "would_handle": true,
+                "dry_run": true
+            },
+            "elapsed_ms": 20,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<EventsData> = serde_json::from_value(json).unwrap();
+        let data = resp.into_result().unwrap();
+        assert!(data.would_handle);
+        assert!(data.dry_run);
+        let ev = &data.events[0];
+        assert_eq!(ev.handled_at, Some(1700000010000));
+        assert_eq!(ev.workflow_id.as_deref(), Some("wf-99"));
+        let wh = ev.would_handle_with.as_ref().unwrap();
+        assert_eq!(wh.workflow, "restart_service");
+        assert_eq!(wh.first_step.as_deref(), Some("check_health"));
+        assert_eq!(wh.estimated_duration_ms, Some(5000));
+        assert_eq!(wh.would_run, Some(true));
+    }
+
+    #[test]
+    fn workflow_info_with_trigger_event_types() {
+        let json = json!({
+            "name": "auto_fix",
+            "enabled": true,
+            "trigger_event_types": ["error", "warning"],
+            "requires_pane": true
+        });
+        let info: WorkflowInfo = serde_json::from_value(json).unwrap();
+        assert!(info.enabled);
+        assert_eq!(
+            info.trigger_event_types.as_ref().unwrap(),
+            &["error", "warning"]
+        );
+        assert_eq!(info.requires_pane, Some(true));
+    }
+
+    #[test]
+    fn workflow_status_data_full_parse() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "execution_id": "exec-full",
+                "workflow_name": "deploy",
+                "pane_id": 8,
+                "trigger_event_id": 55,
+                "status": "running",
+                "message": "step 2 of 4",
+                "started_at": 1700000000000i64,
+                "completed_at": null,
+                "current_step": 2,
+                "total_steps": 4,
+                "plan": {"steps": ["a", "b", "c", "d"]},
+                "created_at": 1699999990000i64
+            },
+            "elapsed_ms": 5,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<WorkflowStatusData> = serde_json::from_value(json).unwrap();
+        let data = resp.into_result().unwrap();
+        assert_eq!(data.execution_id, "exec-full");
+        assert_eq!(data.pane_id, Some(8));
+        assert_eq!(data.trigger_event_id, Some(55));
+        assert_eq!(data.current_step, Some(2));
+        assert_eq!(data.total_steps, Some(4));
+        assert!(data.plan.is_some());
+        assert!(data.completed_at.is_none());
+        assert_eq!(data.created_at, Some(1699999990000));
+    }
+
+    #[test]
+    fn account_info_with_all_optional_fields() {
+        let json = json!({
+            "account_id": "acc-full",
+            "service": "openai",
+            "name": "Work Account",
+            "percent_remaining": 42.5,
+            "reset_at": "2025-02-01T00:00:00Z",
+            "tokens_used": 100000,
+            "tokens_remaining": 400000,
+            "tokens_limit": 500000,
+            "last_refreshed_at": 1700000000000i64,
+            "last_used_at": 1700000005000i64
+        });
+        let info: AccountInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(info.name.as_deref(), Some("Work Account"));
+        assert_eq!(info.tokens_used, Some(100000));
+        assert_eq!(info.tokens_remaining, Some(400000));
+        assert_eq!(info.tokens_limit, Some(500000));
+        assert_eq!(info.reset_at.as_deref(), Some("2025-02-01T00:00:00Z"));
+        assert_eq!(info.last_used_at, Some(1700000005000));
+    }
+
+    #[test]
+    fn rules_lint_with_fixture_coverage() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "total_rules": 10,
+                "rules_checked": 10,
+                "errors": [{"rule_id": "a.b", "category": "error", "message": "bad regex", "suggestion": "fix it"}],
+                "warnings": [],
+                "fixture_coverage": {
+                    "rules_with_fixtures": 8,
+                    "rules_without_fixtures": ["c.d", "e.f"],
+                    "total_fixtures": 24
+                },
+                "passed": false
+            },
+            "elapsed_ms": 10,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<RulesLintData> = serde_json::from_value(json).unwrap();
+        let data = resp.into_result().unwrap();
+        assert!(!data.passed);
+        assert_eq!(data.errors.len(), 1);
+        assert_eq!(data.errors[0].suggestion.as_deref(), Some("fix it"));
+        let fc = data.fixture_coverage.unwrap();
+        assert_eq!(fc.rules_with_fixtures, 8);
+        assert_eq!(fc.rules_without_fixtures, vec!["c.d", "e.f"]);
+        assert_eq!(fc.total_fixtures, 24);
+    }
+
+    #[test]
+    fn parse_response_typed_convenience() {
+        let raw = r#"{"ok":true,"data":{"pane_id":1,"pattern":"ok","matched":false,"elapsed_ms":100,"polls":5},"elapsed_ms":110,"version":"0.1.0","now":0}"#;
+        let resp: RobotResponse<WaitForData> = parse_response(raw).unwrap();
+        let data = resp.into_result().unwrap();
+        assert!(!data.matched);
+        assert_eq!(data.polls, 5);
+        assert!(!data.is_regex);
+    }
+
+    #[test]
+    fn events_data_with_all_filters_populated() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "events": [],
+                "total_count": 0,
+                "limit": 100,
+                "pane_filter": 7,
+                "rule_id_filter": "codex.panic",
+                "event_type_filter": "error",
+                "triage_state_filter": "open",
+                "label_filter": "critical",
+                "unhandled_only": true,
+                "since_filter": 1699000000000i64
+            },
+            "elapsed_ms": 1,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<EventsData> = serde_json::from_value(json).unwrap();
+        let data = resp.into_result().unwrap();
+        assert_eq!(data.pane_filter, Some(7));
+        assert_eq!(data.rule_id_filter.as_deref(), Some("codex.panic"));
+        assert_eq!(data.event_type_filter.as_deref(), Some("error"));
+        assert_eq!(data.triage_state_filter.as_deref(), Some("open"));
+        assert_eq!(data.label_filter.as_deref(), Some("critical"));
+        assert!(data.unhandled_only);
+        assert_eq!(data.since_filter, Some(1699000000000));
+    }
+
+    #[test]
+    fn error_code_all_variants_roundtrip_via_number() {
+        // Exhaustively verify every named variant survives number() -> from_number() roundtrip.
+        let variants: Vec<ErrorCode> = vec![
+            ErrorCode::WeztermNotFound,
+            ErrorCode::WeztermExecFailed,
+            ErrorCode::PaneNotFound,
+            ErrorCode::WeztermParseFailed,
+            ErrorCode::WeztermConnectionRefused,
+            ErrorCode::DatabaseLocked,
+            ErrorCode::StorageCorruption,
+            ErrorCode::FtsIndexError,
+            ErrorCode::MigrationFailed,
+            ErrorCode::DiskFull,
+            ErrorCode::InvalidRegex,
+            ErrorCode::RulePackNotFound,
+            ErrorCode::PatternTimeout,
+            ErrorCode::ActionDenied,
+            ErrorCode::RateLimitExceeded,
+            ErrorCode::ApprovalRequired,
+            ErrorCode::ApprovalExpired,
+            ErrorCode::WorkflowNotFound,
+            ErrorCode::WorkflowStepFailed,
+            ErrorCode::WorkflowTimeout,
+            ErrorCode::WorkflowAlreadyRunning,
+            ErrorCode::NetworkTimeout,
+            ErrorCode::ConnectionRefused,
+            ErrorCode::ConfigInvalid,
+            ErrorCode::ConfigNotFound,
+            ErrorCode::InternalError,
+            ErrorCode::FeatureNotAvailable,
+            ErrorCode::VersionMismatch,
+        ];
+        for v in &variants {
+            let n = v.number();
+            let reconstructed = ErrorCode::from_number(n);
+            assert_eq!(*v, reconstructed, "roundtrip failed for number {}", n);
+        }
+    }
+
+    #[test]
+    fn send_data_with_wait_for_and_verification_error() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "pane_id": 3,
+                "injection": {"status": "allowed"},
+                "wait_for": {
+                    "pane_id": 3,
+                    "pattern": "\\$",
+                    "matched": false,
+                    "elapsed_ms": 10000,
+                    "polls": 50,
+                    "is_regex": true
+                },
+                "verification_error": "timed out waiting for prompt"
+            },
+            "elapsed_ms": 10050,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<SendData> = serde_json::from_value(json).unwrap();
+        let data = resp.into_result().unwrap();
+        assert_eq!(data.pane_id, 3);
+        let wf = data.wait_for.unwrap();
+        assert!(!wf.matched);
+        assert_eq!(wf.polls, 50);
+        assert!(wf.is_regex);
+        assert_eq!(
+            data.verification_error.as_deref(),
+            Some("timed out waiting for prompt")
+        );
+    }
+
+    #[test]
+    fn truncation_info_serialize_roundtrip() {
+        let info = TruncationInfo {
+            original_bytes: 50000,
+            returned_bytes: 8000,
+            original_lines: 1000,
+            returned_lines: 100,
+        };
+        let serialized = serde_json::to_string(&info).unwrap();
+        let deserialized: TruncationInfo = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.original_bytes, 50000);
+        assert_eq!(deserialized.returned_bytes, 8000);
+        assert_eq!(deserialized.original_lines, 1000);
+        assert_eq!(deserialized.returned_lines, 100);
+    }
+
+    #[test]
+    fn approve_data_with_dry_run_and_fingerprint() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "code": "AP-dry",
+                "valid": false,
+                "dry_run": true,
+                "action_fingerprint": "sha256:abc123def456"
+            },
+            "elapsed_ms": 1,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<ApproveData> = serde_json::from_value(json).unwrap();
+        let data = resp.into_result().unwrap();
+        assert!(!data.valid);
+        assert_eq!(data.dry_run, Some(true));
+        assert_eq!(
+            data.action_fingerprint.as_deref(),
+            Some("sha256:abc123def456")
+        );
+        // Optional fields absent
+        assert!(data.created_at.is_none());
+        assert!(data.pane_id.is_none());
+        assert!(data.expires_at.is_none());
+    }
+
+    #[test]
+    fn why_data_with_see_also() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "code": "FT-1001",
+                "category": "wezterm",
+                "title": "CLI not found",
+                "explanation": "WezTerm CLI binary could not be located.",
+                "suggestions": ["install wezterm"],
+                "see_also": ["FT-1002", "FT-1005"]
+            },
+            "elapsed_ms": 1,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<WhyData> = serde_json::from_value(json).unwrap();
+        let data = resp.into_result().unwrap();
+        let see_also = data.see_also.unwrap();
+        assert_eq!(see_also.len(), 2);
+        assert_eq!(see_also[0], "FT-1002");
+        assert_eq!(see_also[1], "FT-1005");
+    }
+
+    #[test]
+    fn quota_advisory_with_warning() {
+        let json = json!({
+            "availability": "low",
+            "low_quota_threshold_percent": 15.0,
+            "selected_percent_remaining": 12.0,
+            "warning": "Account approaching quota limit",
+            "blocking": true
+        });
+        let advisory: AccountQuotaAdvisoryInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(advisory.availability, "low");
+        assert!(advisory.blocking);
+        assert_eq!(
+            advisory.warning.as_deref(),
+            Some("Account approaching quota limit")
+        );
+        assert!(
+            (advisory.selected_percent_remaining.unwrap() - 12.0).abs() < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn reservation_info_with_released_at() {
+        let json = json!({
+            "id": 42,
+            "pane_id": 10,
+            "owner_kind": "human",
+            "owner_id": "user-1",
+            "reason": "debugging",
+            "created_at": 1700000000000i64,
+            "expires_at": 1700000060000i64,
+            "released_at": 1700000030000i64,
+            "status": "released"
+        });
+        let info: ReservationInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(info.status, "released");
+        assert_eq!(info.released_at, Some(1700000030000));
+        assert_eq!(info.owner_kind, "human");
+    }
 }

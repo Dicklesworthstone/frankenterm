@@ -2339,4 +2339,389 @@ mod tests {
         let suggestion = rule.generate(&ctx).expect("expected suggestion");
         assert_eq!(suggestion.suggestion_type, SuggestionType::Optimization);
     }
+
+    // -----------------------------------------------------------------------
+    // Batch — RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pane_info_with_domain() {
+        let pane = PaneInfo::new(7).with_domain("local");
+        assert_eq!(pane.domain.as_deref(), Some("local"));
+        // Domain is not shown in Display impl
+        assert_eq!(format!("{pane}"), "7");
+    }
+
+    #[test]
+    fn test_pane_info_with_alt_screen_field() {
+        let pane = PaneInfo::new(2).with_alt_screen(true);
+        assert!(pane.is_alt_screen);
+        let pane2 = PaneInfo::new(3).with_alt_screen(false);
+        assert!(!pane2.is_alt_screen);
+    }
+
+    #[test]
+    fn test_state_change_future_timestamp_returns_just_now() {
+        use std::time::Duration;
+        // Timestamp in the future causes elapsed() to return Err
+        let future_ts = SystemTime::now() + Duration::from_secs(600);
+        let change = StateChange::new(1, "future event").with_timestamp(future_ts);
+        assert_eq!(change.time_ago(), "just now");
+    }
+
+    #[test]
+    fn test_state_change_time_ago_singular_minute() {
+        use std::time::Duration;
+        let one_min_ago = SystemTime::now() - Duration::from_secs(60);
+        let change = StateChange::new(1, "minute test").with_timestamp(one_min_ago);
+        let ago = change.time_ago();
+        assert!(
+            ago.contains("1 minute ago"),
+            "expected '1 minute ago', got: {}",
+            ago
+        );
+    }
+
+    #[test]
+    fn test_state_change_time_ago_multiple_hours() {
+        use std::time::Duration;
+        let five_hours_ago = SystemTime::now() - Duration::from_secs(5 * 3600);
+        let change = StateChange::new(1, "hours test").with_timestamp(five_hours_ago);
+        let ago = change.time_ago();
+        assert!(
+            ago.contains("5 hours ago"),
+            "expected '5 hours ago', got: {}",
+            ago
+        );
+    }
+
+    #[test]
+    fn test_user_history_record_and_query() {
+        let mut hist = UserHistory::default();
+        assert!(!hist.has_used_command("workflow"));
+        assert!(!hist.has_used_feature("search"));
+
+        hist.record_command("ft workflow run my_flow");
+        hist.record_feature("search");
+
+        assert!(hist.has_used_command("workflow"));
+        // Substring match
+        assert!(hist.has_used_command("my_flow"));
+        // Exact match for features
+        assert!(hist.has_used_feature("search"));
+        assert!(!hist.has_used_feature("searc"));
+    }
+
+    #[test]
+    fn test_feature_hint_builders() {
+        let hint = FeatureHint::new("search", "Try search", "ft search")
+            .with_used(true)
+            .with_learn_more("https://docs.example.com/search");
+
+        assert!(hint.used);
+        assert_eq!(hint.learn_more.as_deref(), Some("https://docs.example.com/search"));
+        assert_eq!(hint.feature, "search");
+        assert_eq!(hint.command, "ft search");
+    }
+
+    #[test]
+    fn test_system_metrics_with_storage_size_bytes() {
+        let m = SystemMetrics::default().with_storage_size_bytes(1_000_000_000);
+        assert_eq!(m.storage_size_bytes, Some(1_000_000_000));
+        assert_eq!(m.poll_interval_ms, None);
+    }
+
+    #[test]
+    fn test_suggest_pane_empty_returns_none() {
+        let ctx = SuggestionContext::new();
+        assert!(ctx.suggest_pane(42).is_none());
+    }
+
+    #[test]
+    fn test_suggest_rule_typo() {
+        let mut ctx = SuggestionContext::new();
+        ctx.add_rule("codex.usage.reached");
+        ctx.add_rule("codex.usage.warning");
+        ctx.add_rule("claude.rate.limited");
+
+        let result = ctx.suggest_rule("codex.usage.reched");
+        assert_eq!(result, Some("codex.usage.reached"));
+    }
+
+    #[test]
+    fn test_format_available_panes_empty() {
+        let ctx = SuggestionContext::new();
+        assert_eq!(ctx.format_available_panes(), "No panes available");
+    }
+
+    #[test]
+    fn test_format_available_workflows_empty() {
+        let ctx = SuggestionContext::new();
+        assert_eq!(ctx.format_available_workflows(), "No workflows available");
+    }
+
+    #[test]
+    fn test_format_available_rules_empty() {
+        let ctx = SuggestionContext::new();
+        assert_eq!(ctx.format_available_rules(), "No rules available");
+    }
+
+    #[test]
+    fn test_suggest_closest_input_is_prefix_of_candidate() {
+        // Input "handle" is a prefix of "handle_compaction"
+        let candidates = vec!["handle_compaction", "run_tests"];
+        assert_eq!(
+            suggest_closest("handle", &candidates),
+            Some("handle_compaction")
+        );
+    }
+
+    #[test]
+    fn test_platform_display_all_variants() {
+        assert_eq!(format!("{}", Platform::MacOS), "macOS");
+        assert_eq!(format!("{}", Platform::Linux), "Linux");
+        assert_eq!(format!("{}", Platform::Windows), "Windows");
+        assert_eq!(format!("{}", Platform::Container), "Container");
+        assert_eq!(format!("{}", Platform::Unknown), "Unknown");
+    }
+
+    #[test]
+    fn test_platform_package_manager_known() {
+        assert_eq!(Platform::MacOS.package_manager(), Some("brew"));
+        assert_eq!(Platform::Windows.package_manager(), Some("winget"));
+        assert_eq!(Platform::Container.package_manager(), Some("apt"));
+        assert_eq!(Platform::Unknown.package_manager(), None);
+    }
+
+    #[test]
+    fn test_platform_install_command_macos_and_windows() {
+        assert_eq!(
+            Platform::MacOS.install_command("tmux"),
+            Some("brew install tmux".to_string())
+        );
+        assert_eq!(
+            Platform::Windows.install_command("wezterm"),
+            Some("winget install wezterm".to_string())
+        );
+        assert_eq!(Platform::Unknown.install_command("anything"), None);
+    }
+
+    #[test]
+    fn test_dismissed_store_count() {
+        let mut store = DismissedStore::new();
+        assert_eq!(store.count(), 0);
+
+        store.dismiss_permanent(&SuggestionId::new("a"));
+        assert_eq!(store.count(), 1);
+
+        store.dismiss_temporary(
+            &SuggestionId::new("b"),
+            std::time::Duration::from_secs(60),
+        );
+        assert_eq!(store.count(), 2);
+
+        // Permanent dismissal replaces temporary if same ID
+        store.dismiss_permanent(&SuggestionId::new("b"));
+        // "b" moves from temporary to permanent, count stays 2
+        assert_eq!(store.count(), 2);
+    }
+
+    #[test]
+    fn test_suggestion_engine_empty_has_no_rules() {
+        let engine = SuggestionEngine::empty(SuggestionConfig::default());
+        assert_eq!(engine.rule_count(), 0);
+
+        let ctx = SuggestionContext::new();
+        let suggestions = engine.suggest(&ctx);
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_suggestion_engine_add_custom_rule() {
+        struct AlwaysRule;
+        impl SuggestionRule for AlwaysRule {
+            fn id(&self) -> &'static str {
+                "custom.always"
+            }
+            fn applies(&self, _ctx: &SuggestionContext) -> bool {
+                true
+            }
+            fn generate(&self, _ctx: &SuggestionContext) -> Option<Suggestion> {
+                Some(Suggestion::new(
+                    "always",
+                    SuggestionType::Tip,
+                    "Always fires",
+                    self.id(),
+                ))
+            }
+        }
+
+        let mut engine = SuggestionEngine::empty(SuggestionConfig::default());
+        assert_eq!(engine.rule_count(), 0);
+        engine.add_rule(Box::new(AlwaysRule));
+        assert_eq!(engine.rule_count(), 1);
+
+        let ctx = SuggestionContext::new();
+        let suggestions = engine.suggest(&ctx);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].id.as_str(), "always");
+    }
+
+    #[test]
+    fn test_suggestion_engine_dismiss_temporarily() {
+        let config = SuggestionConfig {
+            dismiss_cooldown: std::time::Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let mut engine = SuggestionEngine::new(config);
+
+        let ctx = SuggestionContext::new();
+        let suggestions = engine.suggest(&ctx);
+        assert!(!suggestions.is_empty());
+
+        let first_id = suggestions[0].id.clone();
+        engine.dismiss_temporarily(&first_id);
+        assert!(engine.is_dismissed(&first_id));
+    }
+
+    #[test]
+    fn test_suggestion_engine_dismiss_for_custom_duration() {
+        let mut engine = SuggestionEngine::new(SuggestionConfig::default());
+        let id = SuggestionId::new("custom_dur");
+        engine.dismiss_for(&id, std::time::Duration::from_secs(10));
+        assert!(engine.is_dismissed(&id));
+    }
+
+    #[test]
+    fn test_suggestion_engine_set_config_and_config() {
+        let mut engine = SuggestionEngine::new(SuggestionConfig::default());
+        assert!(engine.config().enabled);
+        assert_eq!(engine.config().max_suggestions, 3);
+
+        engine.set_config(SuggestionConfig {
+            enabled: false,
+            max_suggestions: 5,
+            ..Default::default()
+        });
+        assert!(!engine.config().enabled);
+        assert_eq!(engine.config().max_suggestions, 5);
+    }
+
+    #[test]
+    fn test_rule_not_found_suggestion_with_match() {
+        let mut ctx = SuggestionContext::new();
+        ctx.add_rule("codex.usage.reached");
+        ctx.add_rule("claude.rate.limited");
+
+        let result = rule_not_found_suggestion("codex.usage.reched", &ctx);
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("codex.usage.reached"));
+        assert!(text.contains("Available rules:"));
+    }
+
+    #[test]
+    fn test_rule_not_found_suggestion_no_rules() {
+        let ctx = SuggestionContext::new();
+        let result = rule_not_found_suggestion("anything", &ctx);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_optimization_rule_storage_large() {
+        let rule = OptimizationRule;
+        let mut ctx = SuggestionContext::new();
+        // 1 GB > 500 MB threshold
+        ctx.set_system_metrics(SystemMetrics::default().with_storage_size_bytes(1_073_741_824));
+
+        assert!(rule.applies(&ctx));
+        let suggestion = rule.generate(&ctx).expect("expected suggestion");
+        assert!(suggestion.message.contains("database is large"));
+        assert_eq!(suggestion.id.as_str(), "optimization.storage_size");
+    }
+
+    #[test]
+    fn test_optimization_rule_unused_packs() {
+        let rule = OptimizationRule;
+        let mut ctx = SuggestionContext::new();
+        let mut metrics = SystemMetrics::default();
+        metrics.unused_pattern_packs = vec!["python-pack".to_string(), "ruby-pack".to_string()];
+        ctx.set_system_metrics(metrics);
+
+        assert!(rule.applies(&ctx));
+        let suggestion = rule.generate(&ctx).expect("expected suggestion");
+        assert!(suggestion.message.contains("python-pack"));
+        assert!(suggestion.message.contains("ruby-pack"));
+        assert_eq!(suggestion.id.as_str(), "optimization.unused_packs");
+    }
+
+    #[test]
+    fn test_alt_screen_warning_multiple_panes() {
+        let rule = AltScreenWarningRule;
+        let mut ctx = SuggestionContext::new();
+        ctx.add_pane(PaneInfo::new(1).with_alt_screen(true));
+        ctx.add_pane(PaneInfo::new(5).with_alt_screen(true));
+        ctx.add_pane(PaneInfo::new(9).with_alt_screen(false));
+
+        assert!(rule.applies(&ctx));
+        let suggestion = rule.generate(&ctx).expect("expected suggestion");
+        // Plural form for multiple panes
+        assert!(
+            suggestion.message.contains("Panes"),
+            "expected 'Panes' in message, got: {}",
+            suggestion.message
+        );
+        assert!(suggestion.message.contains("1"));
+        assert!(suggestion.message.contains("5"));
+    }
+
+    #[test]
+    fn test_error_code_fallback_to_rule_id() {
+        let event = make_event("error.generic", "my_rule_id", now_epoch_ms(), None);
+        let code = error_code_from_event(&event);
+        assert_eq!(code, "my_rule_id");
+    }
+
+    #[test]
+    fn test_error_code_fallback_to_event_type() {
+        let mut event = make_event("error.unknown_type", "", now_epoch_ms(), None);
+        event.rule_id = String::new();
+        let code = error_code_from_event(&event);
+        assert_eq!(code, "error.unknown_type");
+    }
+
+    #[test]
+    fn test_format_available_exactly_ten_items() {
+        let items: Vec<i32> = (1..=10).collect();
+        let formatted = format_available(&items);
+        // Should NOT contain "... and X more"
+        assert!(!formatted.contains("more"));
+        assert!(formatted.contains("10"));
+    }
+
+    #[test]
+    fn test_suggestion_engine_cleanup() {
+        let mut engine = SuggestionEngine::new(SuggestionConfig::default());
+        let id = SuggestionId::new("temp_id");
+        engine.dismiss_for(&id, std::time::Duration::from_secs(3600));
+        assert!(engine.is_dismissed(&id));
+        // cleanup should not remove non-expired
+        engine.cleanup();
+        assert!(engine.is_dismissed(&id));
+    }
+
+    #[test]
+    fn test_levenshtein_distance_unicode() {
+        // Unicode characters are handled correctly
+        assert_eq!(levenshtein_distance("cafe", "cafe"), 0);
+        assert_eq!(levenshtein_distance("a", "b"), 1);
+        assert_eq!(levenshtein_distance("abc", "axc"), 1);
+    }
+
+    #[test]
+    fn test_suggest_closest_single_candidate() {
+        let candidates = vec!["alpha"];
+        // Close enough (3 edits, threshold max(6/2, 3) = 3)
+        assert_eq!(suggest_closest("alphax", &candidates), Some("alpha"));
+    }
 }
