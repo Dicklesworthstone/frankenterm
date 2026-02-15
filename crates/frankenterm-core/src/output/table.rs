@@ -319,4 +319,337 @@ mod tests {
         assert!(output.contains("\"1\""));
         assert!(output.contains("\"Alice\""));
     }
+
+    // =====================================================================
+    // Column builder tests
+    // =====================================================================
+
+    #[test]
+    fn column_new_defaults() {
+        let col = Column::new("Test");
+        assert_eq!(col.header, "Test");
+        assert_eq!(col.min_width, 0);
+        assert_eq!(col.max_width, 0);
+        assert!(matches!(col.alignment, Alignment::Left));
+    }
+
+    #[test]
+    fn column_builder_chain() {
+        let col = Column::new("Price")
+            .align(Alignment::Right)
+            .min_width(8)
+            .max_width(20);
+        assert_eq!(col.header, "Price");
+        assert_eq!(col.min_width, 8);
+        assert_eq!(col.max_width, 20);
+        assert!(matches!(col.alignment, Alignment::Right));
+    }
+
+    #[test]
+    fn column_center_alignment() {
+        let col = Column::new("Status").align(Alignment::Center);
+        assert!(matches!(col.alignment, Alignment::Center));
+    }
+
+    #[test]
+    fn column_from_various_string_types() {
+        let col_str = Column::new("header");
+        assert_eq!(col_str.header, "header");
+
+        let col_string = Column::new(String::from("header2"));
+        assert_eq!(col_string.header, "header2");
+    }
+
+    // =====================================================================
+    // Table builder and metadata tests
+    // =====================================================================
+
+    #[test]
+    fn table_empty() {
+        let table = Table::new(vec![Column::new("A"), Column::new("B")]);
+        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn table_len_after_adds() {
+        let mut table = Table::new(vec![Column::new("X")]);
+        table.add_row(vec!["1"]);
+        table.add_row(vec!["2"]);
+        table.add_row(vec!["3"]);
+        assert_eq!(table.len(), 3);
+        assert!(!table.is_empty());
+    }
+
+    #[test]
+    fn table_with_separator() {
+        let mut table = Table::new(vec![Column::new("A"), Column::new("B")])
+            .with_format(OutputFormat::Plain)
+            .with_separator(" | ");
+        table.add_row(vec!["x", "y"]);
+        let output = table.render();
+        assert!(output.contains(" | "), "Should use custom separator");
+    }
+
+    #[test]
+    #[should_panic(expected = "Row has 2 cells, expected 3")]
+    fn add_row_wrong_column_count_panics() {
+        let mut table = Table::new(vec![Column::new("A"), Column::new("B"), Column::new("C")]);
+        table.add_row(vec!["only", "two"]);
+    }
+
+    // =====================================================================
+    // format_cell alignment tests
+    // =====================================================================
+
+    #[test]
+    fn format_cell_exact_width() {
+        let result = Table::format_cell("abcd", 4, Alignment::Left);
+        assert_eq!(result, "abcd");
+    }
+
+    #[test]
+    fn format_cell_left_padding() {
+        let result = Table::format_cell("hi", 6, Alignment::Left);
+        assert_eq!(result, "hi    ");
+    }
+
+    #[test]
+    fn format_cell_right_padding() {
+        let result = Table::format_cell("hi", 6, Alignment::Right);
+        assert_eq!(result, "    hi");
+    }
+
+    #[test]
+    fn format_cell_center_padding_even() {
+        let result = Table::format_cell("ab", 6, Alignment::Center);
+        assert_eq!(result, "  ab  ");
+    }
+
+    #[test]
+    fn format_cell_center_padding_odd() {
+        // "abc" is 3 chars, width 6 => padding=3, left=1, right=2
+        let result = Table::format_cell("abc", 6, Alignment::Center);
+        assert_eq!(result.len(), 6);
+        assert!(result.contains("abc"));
+    }
+
+    #[test]
+    fn format_cell_truncation_with_ellipsis() {
+        let result = Table::format_cell("a very long string here", 10, Alignment::Left);
+        assert_eq!(result.len(), 10);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn format_cell_truncation_width_3_no_ellipsis() {
+        // Width <= 3 means no room for "..." so just return cell as-is
+        let result = Table::format_cell("abcdefg", 3, Alignment::Left);
+        assert_eq!(result, "abcdefg");
+    }
+
+    #[test]
+    fn format_cell_width_4_truncation() {
+        let result = Table::format_cell("abcdefg", 4, Alignment::Left);
+        assert_eq!(result, "a...");
+        assert_eq!(result.len(), 4);
+    }
+
+    #[test]
+    fn format_cell_empty_string() {
+        let result = Table::format_cell("", 5, Alignment::Left);
+        assert_eq!(result, "     ");
+    }
+
+    #[test]
+    fn format_cell_zero_width() {
+        // Visible len (0) >= width (0), so returns cell as-is
+        let result = Table::format_cell("", 0, Alignment::Left);
+        assert_eq!(result, "");
+    }
+
+    // =====================================================================
+    // strip_ansi tests
+    // =====================================================================
+
+    #[test]
+    fn strip_ansi_no_escapes() {
+        assert_eq!(strip_ansi("hello world"), "hello world");
+    }
+
+    #[test]
+    fn strip_ansi_single_color() {
+        assert_eq!(strip_ansi("\x1b[31mred text\x1b[0m"), "red text");
+    }
+
+    #[test]
+    fn strip_ansi_nested_codes() {
+        assert_eq!(strip_ansi("\x1b[1m\x1b[31mbold red\x1b[0m"), "bold red");
+    }
+
+    #[test]
+    fn strip_ansi_multi_param_code() {
+        assert_eq!(strip_ansi("\x1b[38;5;196mcolor\x1b[0m"), "color");
+    }
+
+    #[test]
+    fn strip_ansi_empty_string() {
+        assert_eq!(strip_ansi(""), "");
+    }
+
+    #[test]
+    fn strip_ansi_only_escape_codes() {
+        assert_eq!(strip_ansi("\x1b[31m\x1b[0m"), "");
+    }
+
+    #[test]
+    fn strip_ansi_escape_without_bracket() {
+        // ESC not followed by '[' — just the ESC is consumed, rest preserved
+        let result = strip_ansi("\x1bXhello");
+        assert_eq!(result, "Xhello");
+    }
+
+    #[test]
+    fn strip_ansi_preserves_non_escape_special_chars() {
+        assert_eq!(strip_ansi("tab\there"), "tab\there");
+        assert_eq!(strip_ansi("line\nbreak"), "line\nbreak");
+    }
+
+    // =====================================================================
+    // calculate_widths tests
+    // =====================================================================
+
+    #[test]
+    fn calculate_widths_header_only() {
+        let table = Table::new(vec![Column::new("Name"), Column::new("ID")]);
+        let widths = table.calculate_widths();
+        assert_eq!(widths, vec![4, 2]); // "Name"=4, "ID"=2
+    }
+
+    #[test]
+    fn calculate_widths_respects_min_width() {
+        let table = Table::new(vec![Column::new("A").min_width(10)]);
+        let widths = table.calculate_widths();
+        assert_eq!(widths, vec![10]);
+    }
+
+    #[test]
+    fn calculate_widths_respects_max_width() {
+        let mut table = Table::new(vec![Column::new("X").max_width(5)]);
+        table.add_row(vec!["a very long cell value"]);
+        let widths = table.calculate_widths();
+        assert_eq!(widths, vec![5]);
+    }
+
+    #[test]
+    fn calculate_widths_content_wider_than_header() {
+        let mut table = Table::new(vec![Column::new("ID")]);
+        table.add_row(vec!["12345"]);
+        let widths = table.calculate_widths();
+        assert_eq!(widths, vec![5]); // "12345" > "ID"
+    }
+
+    #[test]
+    fn calculate_widths_ansi_not_counted() {
+        let mut table = Table::new(vec![Column::new("Status")]);
+        table.add_row(vec!["\x1b[32mOK\x1b[0m"]);
+        let widths = table.calculate_widths();
+        // "Status"=6, "\x1b[32mOK\x1b[0m" visible is "OK"=2, so max is 6
+        assert_eq!(widths, vec![6]);
+    }
+
+    // =====================================================================
+    // Render tests
+    // =====================================================================
+
+    #[test]
+    fn render_plain_no_separator_line() {
+        let mut table = Table::new(vec![Column::new("Col")]).with_format(OutputFormat::Plain);
+        table.add_row(vec!["val"]);
+        let output = table.render();
+        assert!(
+            !output.contains('─'),
+            "Plain format should not have separator lines"
+        );
+    }
+
+    #[test]
+    fn render_plain_contains_all_data() {
+        let mut table =
+            Table::new(vec![Column::new("A"), Column::new("B")]).with_format(OutputFormat::Plain);
+        table.add_row(vec!["hello", "world"]);
+        table.add_row(vec!["foo", "bar"]);
+        let output = table.render();
+        assert!(output.contains("hello"));
+        assert!(output.contains("world"));
+        assert!(output.contains("foo"));
+        assert!(output.contains("bar"));
+    }
+
+    #[test]
+    fn render_json_valid_array() {
+        let mut table = Table::new(vec![Column::new("Name"), Column::new("Age")])
+            .with_format(OutputFormat::Json);
+        table.add_row(vec!["Alice", "30"]);
+        table.add_row(vec!["Bob", "25"]);
+        let output = table.render();
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&output).expect("should be valid JSON array");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["name"], "Alice");
+        assert_eq!(parsed[0]["age"], "30");
+        assert_eq!(parsed[1]["name"], "Bob");
+    }
+
+    #[test]
+    fn render_json_header_normalization() {
+        let mut table = Table::new(vec![Column::new("Full Name"), Column::new("Pane ID")])
+            .with_format(OutputFormat::Json);
+        table.add_row(vec!["test", "42"]);
+        let output = table.render();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert!(parsed[0].get("full_name").is_some(), "spaces → underscores");
+        assert!(parsed[0].get("pane_id").is_some());
+    }
+
+    #[test]
+    fn render_json_empty_table() {
+        let table = Table::new(vec![Column::new("A")]).with_format(OutputFormat::Json);
+        let output = table.render();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn render_json_strips_ansi_from_cells() {
+        let mut table = Table::new(vec![Column::new("V")]).with_format(OutputFormat::Json);
+        table.add_row(vec!["\x1b[31mred\x1b[0m"]);
+        let output = table.render();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed[0]["v"], "red", "ANSI should be stripped in JSON");
+    }
+
+    #[test]
+    fn render_multiple_columns_alignment() {
+        let mut table = Table::new(vec![
+            Column::new("Left").align(Alignment::Left),
+            Column::new("Right").align(Alignment::Right),
+            Column::new("Center").align(Alignment::Center),
+        ])
+        .with_format(OutputFormat::Plain);
+        table.add_row(vec!["a", "b", "c"]);
+        let output = table.render();
+        // Just verify it renders without panic and contains data
+        assert!(output.contains('a'));
+        assert!(output.contains('b'));
+        assert!(output.contains('c'));
+    }
+
+    #[test]
+    fn render_single_column_single_row() {
+        let mut table = Table::new(vec![Column::new("Only")]).with_format(OutputFormat::Plain);
+        table.add_row(vec!["value"]);
+        let rendered = table.render();
+        assert!(rendered.lines().count() >= 2); // header + data row
+    }
 }
