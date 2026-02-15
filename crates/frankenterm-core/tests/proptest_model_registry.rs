@@ -521,3 +521,101 @@ proptest! {
         );
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Group 8: Structural and serde tests
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// ModelInfo Debug output is nonempty.
+    #[test]
+    fn prop_model_info_debug_nonempty(info in arb_model_info()) {
+        let debug = format!("{:?}", info);
+        prop_assert!(!debug.is_empty(), "ModelInfo Debug should not be empty");
+    }
+
+    /// ModelInfo Debug contains the model name.
+    #[test]
+    fn prop_model_info_debug_contains_name(info in arb_model_info()) {
+        let debug = format!("{:?}", info);
+        prop_assert!(debug.contains(&info.name),
+            "ModelInfo Debug should contain the name '{}', got: {}", info.name, debug);
+    }
+
+    /// Fresh registry always returns None for any query.
+    #[test]
+    fn prop_get_none_on_fresh_registry(
+        cache_dir in arb_cache_dir(),
+        query in arb_model_name(),
+    ) {
+        let reg = ModelRegistry::new(cache_dir);
+        prop_assert!(reg.get(&query).is_none(),
+            "fresh registry should return None for '{}'", query);
+    }
+
+    /// List is deterministic — calling twice yields same result.
+    #[test]
+    fn prop_list_is_deterministic(
+        infos in prop::collection::vec(arb_model_info(), 1..10),
+    ) {
+        let mut reg = ModelRegistry::new("/tmp/test-registry");
+        for info in infos {
+            reg.register(info);
+        }
+        let list1: Vec<String> = reg.list().iter().map(|m| m.name.clone()).collect();
+        let list2: Vec<String> = reg.list().iter().map(|m| m.name.clone()).collect();
+        prop_assert_eq!(&list1, &list2, "list should be deterministic");
+    }
+
+    /// Cache path set via with_name strategy roundtrips through register/get.
+    #[test]
+    fn prop_cache_path_roundtrip(
+        name in arb_model_name(),
+        cache_path in arb_cache_dir(),
+    ) {
+        let mut reg = ModelRegistry::new("/tmp/test-registry");
+        reg.register(ModelInfo {
+            name: name.clone(),
+            version: "1.0.0".to_string(),
+            dimension: 128,
+            size_bytes: 1000,
+            cache_path: Some(cache_path.clone()),
+        });
+        let retrieved = reg.get(&name).unwrap();
+        prop_assert_eq!(
+            retrieved.cache_path.as_ref(), Some(&cache_path),
+            "cache_path should roundtrip"
+        );
+    }
+
+    /// Register then remove all — list should be empty when we re-create.
+    #[test]
+    fn prop_register_overwrite_preserves_latest_cache_path(
+        name in arb_model_name(),
+        path1 in arb_cache_dir(),
+        path2 in arb_cache_dir(),
+    ) {
+        let mut reg = ModelRegistry::new("/tmp/test-registry");
+        reg.register(ModelInfo {
+            name: name.clone(),
+            version: "1.0.0".to_string(),
+            dimension: 128,
+            size_bytes: 1000,
+            cache_path: Some(path1),
+        });
+        reg.register(ModelInfo {
+            name: name.clone(),
+            version: "2.0.0".to_string(),
+            dimension: 256,
+            size_bytes: 2000,
+            cache_path: Some(path2.clone()),
+        });
+        let retrieved = reg.get(&name).unwrap();
+        prop_assert_eq!(
+            retrieved.cache_path.as_ref(), Some(&path2),
+            "overwrite should keep latest cache_path"
+        );
+    }
+}

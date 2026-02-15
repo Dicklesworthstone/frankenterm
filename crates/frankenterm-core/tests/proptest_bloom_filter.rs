@@ -673,3 +673,71 @@ proptest! {
         prop_assert_eq!(bf.memory_bytes(), num_bits.div_ceil(64) * 8);
     }
 }
+
+// =============================================================================
+// Structural and trait tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// BloomFilter Debug output is nonempty.
+    #[test]
+    fn prop_bloom_debug_nonempty(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bf = BloomFilter::with_capacity(capacity, fp_rate);
+        let debug = format!("{:?}", bf);
+        prop_assert!(!debug.is_empty(), "BloomFilter Debug should not be empty");
+    }
+
+    /// CountingBloomFilter Debug output is nonempty.
+    #[test]
+    fn prop_counting_debug_nonempty(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let cbf = CountingBloomFilter::with_capacity(capacity, fp_rate);
+        let debug = format!("{:?}", cbf);
+        prop_assert!(!debug.is_empty(), "CountingBloomFilter Debug should not be empty");
+    }
+
+    /// BloomStats Debug output is nonempty.
+    #[test]
+    fn prop_bloom_stats_debug_nonempty(
+        n in 0_usize..50,
+    ) {
+        let mut bf = BloomFilter::with_capacity(100, 0.01);
+        for i in 0..n {
+            bf.insert(&i.to_le_bytes());
+        }
+        let stats = bf.stats();
+        let debug = format!("{:?}", stats);
+        prop_assert!(!debug.is_empty(), "BloomStats Debug should not be empty");
+    }
+
+    /// Empty bloom filter never contains any item.
+    #[test]
+    fn prop_empty_bloom_contains_nothing(
+        items in arb_items(20),
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bf = BloomFilter::with_capacity(capacity, fp_rate);
+        for item in &items {
+            prop_assert!(!bf.contains(item), "empty filter should not contain anything");
+        }
+    }
+
+    /// BloomFilter num_bits and num_hashes are always positive.
+    #[test]
+    fn prop_bloom_params_positive(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bf = BloomFilter::with_capacity(capacity, fp_rate);
+        prop_assert!(bf.num_bits() > 0, "num_bits should be positive");
+        prop_assert!(bf.num_hashes() > 0, "num_hashes should be positive");
+    }
+}

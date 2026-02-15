@@ -991,3 +991,90 @@ proptest! {
             max_deferrals);
     }
 }
+
+// ===========================================================================
+// Structural and trait tests
+// ===========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// ResizeSchedulerConfig implements Clone correctly.
+    #[test]
+    fn prop_config_clone(
+        frame_budget in 1u32..100,
+        enabled in any::<bool>(),
+        emergency in any::<bool>(),
+    ) {
+        let config = ResizeSchedulerConfig {
+            frame_budget_units: frame_budget,
+            control_plane_enabled: enabled,
+            emergency_disable: emergency,
+            ..ResizeSchedulerConfig::default()
+        };
+        let cloned = config.clone();
+        prop_assert_eq!(config, cloned, "Config Clone should produce equal value");
+    }
+
+    /// ResizeSchedulerConfig Debug output is nonempty.
+    #[test]
+    fn prop_config_debug_nonempty(
+        frame_budget in 1u32..100,
+    ) {
+        let config = ResizeSchedulerConfig {
+            frame_budget_units: frame_budget,
+            ..ResizeSchedulerConfig::default()
+        };
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty(), "Config Debug should not be empty");
+    }
+
+    /// Config serde is deterministic — serialize twice yields same JSON.
+    #[test]
+    fn prop_config_serde_deterministic(
+        frame_budget in 1u32..100,
+        enabled in any::<bool>(),
+    ) {
+        let config = ResizeSchedulerConfig {
+            frame_budget_units: frame_budget,
+            control_plane_enabled: enabled,
+            ..ResizeSchedulerConfig::default()
+        };
+        let json1 = serde_json::to_string(&config).unwrap();
+        let json2 = serde_json::to_string(&config).unwrap();
+        prop_assert_eq!(&json1, &json2, "Config serialization not deterministic");
+    }
+
+    /// ResizeIntent Debug output is nonempty.
+    #[test]
+    fn prop_intent_debug_nonempty(
+        pane_id in 1u64..100,
+        seq in 1u64..100,
+    ) {
+        let intent = ResizeIntent {
+            pane_id,
+            intent_seq: seq,
+            scheduler_class: ResizeWorkClass::Interactive,
+            work_units: 1,
+            submitted_at_ms: 1000,
+            domain: ResizeDomain::Local,
+            tab_id: None,
+        };
+        let debug = format!("{:?}", intent);
+        prop_assert!(!debug.is_empty(), "Intent Debug should not be empty");
+    }
+
+    /// ResizeDomain implements Clone correctly.
+    #[test]
+    fn prop_domain_clone(domain in arb_domain()) {
+        let cloned = domain.clone();
+        prop_assert_eq!(domain.key(), cloned.key(), "Domain Clone should produce same key");
+    }
+
+    /// ResizeWorkClass implements Clone correctly.
+    #[test]
+    fn prop_work_class_clone(class in arb_work_class()) {
+        let cloned = class.clone();
+        prop_assert_eq!(class, cloned, "WorkClass Clone should produce equal value");
+    }
+}
