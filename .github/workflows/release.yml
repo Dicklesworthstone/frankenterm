@@ -75,6 +75,8 @@ jobs:
           "$BINARY" version --full
           echo "=== ft --help ==="
           "$BINARY" --help
+          echo "=== ft doctor --json ==="
+          "$BINARY" doctor --json
           echo "=== All smoke tests passed ==="
 
       - name: Create tarball (Unix)

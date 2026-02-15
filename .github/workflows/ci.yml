@@ -20,15 +20,21 @@ env:
 
 jobs:
   lint:
-    name: Lint
-    runs-on: ubuntu-latest
+    name: Lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint-${{ matrix.os }}
 
       - name: Environment info
         run: |
@@ -42,13 +48,32 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (default features)
-        run: cargo clippy --workspace -- -W clippy::all
+        run: |
+          set -eo pipefail
+          mkdir -p target/ci-logs
+          cargo clippy --workspace --all-targets -- -D warnings -D clippy::all 2>&1 | tee target/ci-logs/lint-clippy-default.log
 
       - name: Clippy (with optional features)
-        run: cargo clippy --workspace --features tui,ftui,rollout,mcp,browser,web,metrics,distributed -- -W clippy::all
+        run: |
+          set -eo pipefail
+          mkdir -p target/ci-logs
+          cargo clippy --workspace --all-targets --features tui,ftui,rollout,mcp,browser,web,metrics,distributed -- -D warnings -D clippy::all 2>&1 | tee target/ci-logs/lint-clippy-optional.log
 
       - name: Compile benches (frankenterm-core)
+        if: matrix.os == 'ubuntu-latest'
         run: cargo bench -p frankenterm-core --benches --no-run
+
+      - name: Upload lint logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-logs-${{ matrix.os }}
+          path: |
+            target/ci-logs/**/*.log
+            target/**/*.stderr
+            target/**/*.stdout
+          if-no-files-found: ignore
+          retention-days: 7
 
   generated-artifacts:
     name: Generated Artifacts
@@ -128,16 +153,18 @@ jobs:
       - name: Check compilation (no features)
         if: matrix.feature == 'default'
         run: |
-          set -x
-          cargo check --workspace
-          cargo clippy --workspace -- -W clippy::all
+          set -exo pipefail
+          mkdir -p target/ci-logs
+          cargo check --workspace 2>&1 | tee target/ci-logs/feature-${{ matrix.feature }}-check.log
+          cargo clippy --workspace --all-targets -- -D warnings -D clippy::all 2>&1 | tee target/ci-logs/feature-${{ matrix.feature }}-clippy.log
 
       - name: Check compilation (feature-gated)
         if: matrix.feature != 'default'
         run: |
-          set -x
-          cargo check --workspace --features ${{ matrix.feature }}
-          cargo clippy --workspace --features ${{ matrix.feature }} -- -W clippy::all
+          set -exo pipefail
+          mkdir -p target/ci-logs
+          cargo check --workspace --features ${{ matrix.feature }} 2>&1 | tee target/ci-logs/feature-${{ matrix.feature }}-check.log
+          cargo clippy --workspace --all-targets --features ${{ matrix.feature }} -- -D warnings -D clippy::all 2>&1 | tee target/ci-logs/feature-${{ matrix.feature }}-clippy.log
 
       - name: Run tests (no features)
         if: matrix.feature == 'default'
@@ -153,6 +180,7 @@ jobs:
         with:
           name: feature-test-logs-${{ matrix.feature }}
           path: |
+            target/ci-logs/**/*.log
             target/**/*.stderr
             target/**/*.stdout
           if-no-files-found: ignore
@@ -172,9 +200,10 @@ jobs:
 
       - name: Check vendored compilation
         run: |
-          set -x
-          cargo check --workspace --features vendored
-          cargo clippy --workspace --features vendored -- -W clippy::all
+          set -exo pipefail
+          mkdir -p target/ci-logs
+          cargo check --workspace --features vendored 2>&1 | tee target/ci-logs/feature-vendored-check.log
+          cargo clippy --workspace --all-targets --features vendored -- -D warnings -D clippy::all 2>&1 | tee target/ci-logs/feature-vendored-clippy.log
 
       - name: Run vendored tests
         run: cargo test --workspace --features vendored --verbose
@@ -185,6 +214,7 @@ jobs:
         with:
           name: feature-test-logs-vendored
           path: |
+            target/ci-logs/**/*.log
             target/**/*.stderr
             target/**/*.stdout
           if-no-files-found: ignore
