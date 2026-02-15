@@ -396,4 +396,234 @@ mod tests {
         assert_eq!(view.last_result_count, Some(3));
         assert_eq!(view.last_error.as_deref(), Some("none"));
     }
+
+    // ====================================================================
+    // PaneBookmarkView additional tests
+    // ====================================================================
+
+    #[test]
+    fn pane_bookmark_view_debug() {
+        let view = PaneBookmarkView {
+            pane_id: 1,
+            alias: "test".to_string(),
+            tags: vec![],
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let dbg = format!("{view:?}");
+        assert!(dbg.contains("PaneBookmarkView"));
+        assert!(dbg.contains("test"));
+    }
+
+    #[test]
+    fn pane_bookmark_view_clone() {
+        let view = PaneBookmarkView {
+            pane_id: 42,
+            alias: "cloned".to_string(),
+            tags: vec!["tag1".to_string()],
+            description: Some("desc".to_string()),
+            created_at: 100,
+            updated_at: 200,
+        };
+        let view2 = view.clone();
+        assert_eq!(view2.pane_id, 42);
+        assert_eq!(view2.alias, "cloned");
+        assert_eq!(view2.tags, vec!["tag1"]);
+        assert_eq!(view2.description.as_deref(), Some("desc"));
+    }
+
+    #[test]
+    fn pane_bookmark_view_json_all_fields() {
+        let view = PaneBookmarkView {
+            pane_id: 10,
+            alias: "bookmark".to_string(),
+            tags: vec!["a".to_string(), "b".to_string()],
+            description: Some("A bookmark".to_string()),
+            created_at: 5000,
+            updated_at: 6000,
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["pane_id"], 10);
+        assert_eq!(json["alias"], "bookmark");
+        assert_eq!(json["tags"].as_array().unwrap().len(), 2);
+        assert_eq!(json["description"], "A bookmark");
+        assert_eq!(json["created_at"], 5000);
+        assert_eq!(json["updated_at"], 6000);
+    }
+
+    #[test]
+    fn pane_bookmark_view_from_record_empty_tags_vec() {
+        let record = PaneBookmarkRecord {
+            id: 3,
+            pane_id: 7,
+            alias: "empty-tags".to_string(),
+            tags: Some(vec![]),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let view = PaneBookmarkView::from(record);
+        assert!(view.tags.is_empty());
+    }
+
+    // ====================================================================
+    // SavedSearchView additional tests
+    // ====================================================================
+
+    #[test]
+    fn saved_search_view_debug() {
+        let view = SavedSearchView {
+            id: "id-1".to_string(),
+            name: "test".to_string(),
+            query: "q".to_string(),
+            pane_id: None,
+            limit: 10,
+            since_mode: "last_run".to_string(),
+            since_ms: None,
+            schedule_interval_ms: None,
+            enabled: false,
+            last_run_at: None,
+            last_result_count: None,
+            last_error: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let dbg = format!("{view:?}");
+        assert!(dbg.contains("SavedSearchView"));
+    }
+
+    #[test]
+    fn saved_search_view_clone() {
+        let view = SavedSearchView {
+            id: "id-2".to_string(),
+            name: "cloned".to_string(),
+            query: "error".to_string(),
+            pane_id: Some(5),
+            limit: 50,
+            since_mode: "last_run".to_string(),
+            since_ms: Some(1000),
+            schedule_interval_ms: Some(30_000),
+            enabled: true,
+            last_run_at: Some(500),
+            last_result_count: Some(10),
+            last_error: None,
+            created_at: 100,
+            updated_at: 200,
+        };
+        let view2 = view.clone();
+        assert_eq!(view2.id, "id-2");
+        assert_eq!(view2.name, "cloned");
+        assert_eq!(view2.pane_id, Some(5));
+        assert!(view2.enabled);
+    }
+
+    #[test]
+    fn saved_search_view_json_serialization() {
+        let view = SavedSearchView {
+            id: "s1".to_string(),
+            name: "search".to_string(),
+            query: "pattern".to_string(),
+            pane_id: Some(3),
+            limit: 20,
+            since_mode: "absolute".to_string(),
+            since_ms: Some(5000),
+            schedule_interval_ms: None,
+            enabled: true,
+            last_run_at: None,
+            last_result_count: None,
+            last_error: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["id"], "s1");
+        assert_eq!(json["query"], "pattern");
+        assert_eq!(json["pane_id"], 3);
+        assert_eq!(json["limit"], 20);
+        assert!(json["enabled"].as_bool().unwrap());
+    }
+
+    // ====================================================================
+    // RulesetProfileState additional tests
+    // ====================================================================
+
+    #[test]
+    fn ruleset_profile_state_debug() {
+        let state = RulesetProfileState::default();
+        let dbg = format!("{state:?}");
+        assert!(dbg.contains("RulesetProfileState"));
+        assert!(dbg.contains("default"));
+    }
+
+    #[test]
+    fn ruleset_profile_state_clone() {
+        let state = RulesetProfileState {
+            active_profile: "custom".to_string(),
+            active_last_applied_at: Some(999),
+            profiles: vec![],
+        };
+        let state2 = state.clone();
+        assert_eq!(state2.active_profile, "custom");
+        assert_eq!(state2.active_last_applied_at, Some(999));
+    }
+
+    #[test]
+    fn ruleset_profile_state_json_serialization() {
+        let state = RulesetProfileState::default();
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["active_profile"], "default");
+        assert!(json["active_last_applied_at"].is_null());
+        assert_eq!(json["profiles"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ruleset_profile_state_default_profile_description() {
+        let state = RulesetProfileState::default();
+        let default_profile = &state.profiles[0];
+        assert_eq!(
+            default_profile.description.as_deref(),
+            Some("Base ft.toml patterns")
+        );
+        assert!(default_profile.implicit);
+    }
+
+    // ====================================================================
+    // resolve_ruleset_profile_state edge cases
+    // ====================================================================
+
+    #[test]
+    fn resolve_profile_state_no_manifest_file() {
+        let root = unique_temp_dir("nomanifest");
+        let rulesets_dir = root.join("rulesets");
+        std::fs::create_dir_all(&rulesets_dir).expect("create rulesets dir");
+        let config_path = root.join("ft.toml");
+        std::fs::write(&config_path, "").expect("write temp config");
+        // No manifest.json written
+
+        let state = resolve_ruleset_profile_state(Some(&config_path)).expect("resolve state");
+        // Should still return default profile
+        assert_eq!(state.active_profile, "default");
+        assert!(state.active_last_applied_at.is_none());
+    }
+
+    #[test]
+    fn resolve_profile_state_no_rulesets_dir() {
+        let root = unique_temp_dir("norulesets");
+        std::fs::create_dir_all(&root).expect("create root");
+        let config_path = root.join("ft.toml");
+        std::fs::write(&config_path, "").expect("write temp config");
+        // No rulesets/ directory
+
+        let state = resolve_ruleset_profile_state(Some(&config_path)).expect("resolve state");
+        assert_eq!(state.active_profile, "default");
+    }
+
+    #[test]
+    fn resolve_profile_state_none_config_path() {
+        // This will use a fallback rulesets dir, which likely won't exist
+        // Should still return a valid state with defaults
+        let state = resolve_ruleset_profile_state(None).expect("resolve state");
+        assert_eq!(state.active_profile, "default");
+    }
 }

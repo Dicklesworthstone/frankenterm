@@ -576,4 +576,219 @@ mod tests {
         assert_eq!(result.total_sessions_deleted(), 0);
         assert!(!result.any_work_done());
     }
+
+    // ====================================================================
+    // CleanupResult additional tests
+    // ====================================================================
+
+    #[test]
+    fn cleanup_result_any_work_done_orphan_checkpoints_only() {
+        let result = CleanupResult {
+            orphaned_checkpoints: 5,
+            ..Default::default()
+        };
+        assert!(result.any_work_done());
+        assert_eq!(result.total_sessions_deleted(), 0);
+    }
+
+    #[test]
+    fn cleanup_result_any_work_done_orphan_pane_states_only() {
+        let result = CleanupResult {
+            orphaned_pane_states: 3,
+            ..Default::default()
+        };
+        assert!(result.any_work_done());
+    }
+
+    #[test]
+    fn cleanup_result_debug() {
+        let result = CleanupResult {
+            deleted_by_age: 1,
+            deleted_by_count: 2,
+            deleted_by_size: 3,
+            orphaned_checkpoints: 4,
+            orphaned_pane_states: 5,
+            vacuumed: true,
+        };
+        let dbg = format!("{result:?}");
+        assert!(dbg.contains("CleanupResult"));
+        assert!(dbg.contains("vacuumed: true"));
+    }
+
+    #[test]
+    fn cleanup_result_clone() {
+        let result = CleanupResult {
+            deleted_by_age: 10,
+            vacuumed: true,
+            ..Default::default()
+        };
+        let result2 = result.clone();
+        assert_eq!(result2.deleted_by_age, 10);
+        assert!(result2.vacuumed);
+        assert_eq!(result2.total_sessions_deleted(), 10);
+    }
+
+    #[test]
+    fn cleanup_result_total_combines_all_sources() {
+        let result = CleanupResult {
+            deleted_by_age: 5,
+            deleted_by_count: 3,
+            deleted_by_size: 2,
+            ..Default::default()
+        };
+        assert_eq!(result.total_sessions_deleted(), 10);
+    }
+
+    #[test]
+    fn cleanup_result_any_work_done_all_zero_sessions_but_orphans() {
+        let result = CleanupResult {
+            deleted_by_age: 0,
+            deleted_by_count: 0,
+            deleted_by_size: 0,
+            orphaned_checkpoints: 1,
+            orphaned_pane_states: 0,
+            vacuumed: false,
+        };
+        assert!(result.any_work_done());
+    }
+
+    #[test]
+    fn cleanup_result_vacuumed_not_counted_as_work() {
+        // vacuumed alone doesn't mean work was done (no deletions)
+        let result = CleanupResult {
+            vacuumed: true,
+            ..Default::default()
+        };
+        assert!(!result.any_work_done());
+    }
+
+    // ====================================================================
+    // epoch_ms test
+    // ====================================================================
+
+    #[test]
+    fn epoch_ms_returns_positive() {
+        let ms = epoch_ms();
+        assert!(ms > 0);
+    }
+
+    #[test]
+    fn epoch_ms_reasonable_range() {
+        // Should be after 2024-01-01 (1704067200000ms)
+        let ms = epoch_ms();
+        assert!(ms > 1_704_067_200_000);
+    }
+
+    // ====================================================================
+    // Config serde
+    // ====================================================================
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let config = SessionRetentionConfig {
+            max_age_days: 60,
+            max_closed_sessions: 100,
+            max_total_size_mb: 1000,
+            cleanup_interval_hours: 12,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: SessionRetentionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.max_age_days, 60);
+        assert_eq!(back.max_closed_sessions, 100);
+        assert_eq!(back.max_total_size_mb, 1000);
+        assert_eq!(back.cleanup_interval_hours, 12);
+    }
+
+    // ====================================================================
+    // Edge case: empty database cleanup
+    // ====================================================================
+
+    #[test]
+    fn cleanup_empty_database() {
+        let conn = make_test_db();
+        let config = SessionRetentionConfig {
+            max_age_days: 30,
+            max_closed_sessions: 50,
+            max_total_size_mb: 500,
+            cleanup_interval_hours: 24,
+        };
+        let result = cleanup_sessions(&conn, &config).unwrap();
+        assert_eq!(result.total_sessions_deleted(), 0);
+        assert!(!result.any_work_done());
+        assert!(!result.vacuumed);
+    }
+
+    // ====================================================================
+    // Edge case: only active sessions
+    // ====================================================================
+
+    #[test]
+    fn cleanup_only_active_sessions_deletes_nothing() {
+        let conn = make_test_db();
+        let old = (epoch_ms() as i64) - 90 * 86_400_000; // 90 days ago
+
+        // All sessions are active (shutdown_clean = false)
+        for i in 0..5 {
+            insert_session(&conn, &format!("active-{i}"), old, false);
+        }
+
+        let config = SessionRetentionConfig {
+            max_age_days: 30,
+            max_closed_sessions: 2,
+            max_total_size_mb: 0, // disabled
+            cleanup_interval_hours: 24,
+        };
+        let result = cleanup_sessions(&conn, &config).unwrap();
+        assert_eq!(result.deleted_by_age, 0);
+        // excess closed sessions check also skips active
+        assert_eq!(count_sessions(&conn), 5);
+    }
+
+    // ====================================================================
+    // VACUUM threshold
+    // ====================================================================
+
+    #[test]
+    fn cleanup_vacuum_triggers_at_10_deletions() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        let old = now - 31 * 86_400_000;
+
+        // Create 11 old closed sessions
+        for i in 0..11 {
+            insert_session(&conn, &format!("old-{i}"), old, true);
+        }
+
+        let config = SessionRetentionConfig {
+            max_age_days: 30,
+            max_closed_sessions: 0,
+            max_total_size_mb: 0,
+            cleanup_interval_hours: 24,
+        };
+        let result = cleanup_sessions(&conn, &config).unwrap();
+        assert_eq!(result.deleted_by_age, 11);
+        assert!(result.vacuumed);
+    }
+
+    #[test]
+    fn cleanup_no_vacuum_under_10_deletions() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        let old = now - 31 * 86_400_000;
+
+        // Create 5 old closed sessions
+        for i in 0..5 {
+            insert_session(&conn, &format!("old-{i}"), old, true);
+        }
+
+        let config = SessionRetentionConfig {
+            max_age_days: 30,
+            max_closed_sessions: 0,
+            max_total_size_mb: 0,
+            cleanup_interval_hours: 24,
+        };
+        let result = cleanup_sessions(&conn, &config).unwrap();
+        assert_eq!(result.deleted_by_age, 5);
+        assert!(!result.vacuumed);
+    }
 }
