@@ -1569,6 +1569,303 @@ mod tests {
         assert_eq!(progress, deser);
     }
 
+    // -----------------------------------------------------------------------
+    // Batch 11 — TopazBay wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    // ---- BackfillRange edge cases ----
+
+    #[test]
+    fn range_ordinal_start_equals_end() {
+        let r = BackfillRange::OrdinalRange { start: 5, end: 5 };
+        assert!(!r.includes(4, 0));
+        assert!(r.includes(5, 0));
+        assert!(!r.includes(6, 0));
+        assert!(!r.past_end(5));
+        assert!(r.past_end(6));
+    }
+
+    #[test]
+    fn range_time_start_equals_end() {
+        let r = BackfillRange::TimeRange {
+            start_ms: 1000,
+            end_ms: 1000,
+        };
+        assert!(!r.includes(0, 999));
+        assert!(r.includes(0, 1000));
+        assert!(!r.includes(0, 1001));
+    }
+
+    #[test]
+    fn range_ordinal_zero_to_zero() {
+        let r = BackfillRange::OrdinalRange { start: 0, end: 0 };
+        assert!(r.includes(0, 0));
+        assert!(!r.includes(1, 0));
+        assert!(r.past_end(1));
+    }
+
+    #[test]
+    fn range_ordinal_max_values() {
+        let r = BackfillRange::OrdinalRange {
+            start: u64::MAX - 1,
+            end: u64::MAX,
+        };
+        assert!(r.includes(u64::MAX, 0));
+        assert!(!r.includes(u64::MAX - 2, 0));
+    }
+
+    #[test]
+    fn range_time_zero() {
+        let r = BackfillRange::TimeRange {
+            start_ms: 0,
+            end_ms: 0,
+        };
+        assert!(r.includes(0, 0));
+        assert!(!r.includes(0, 1));
+    }
+
+    // ---- BackfillRange serde individual variants ----
+
+    #[test]
+    fn range_ordinal_serde() {
+        let r = BackfillRange::OrdinalRange { start: 10, end: 20 };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: BackfillRange = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, back);
+        assert!(json.contains("OrdinalRange"));
+    }
+
+    #[test]
+    fn range_time_serde() {
+        let r = BackfillRange::TimeRange {
+            start_ms: 1000,
+            end_ms: 2000,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: BackfillRange = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, back);
+        assert!(json.contains("TimeRange"));
+    }
+
+    #[test]
+    fn range_all_serde() {
+        let r = BackfillRange::All;
+        let json = serde_json::to_string(&r).unwrap();
+        let back: BackfillRange = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, back);
+        assert!(json.contains("All"));
+    }
+
+    // ---- BackfillRange Debug/Clone ----
+
+    #[test]
+    fn range_debug() {
+        let r = BackfillRange::OrdinalRange { start: 1, end: 10 };
+        let debug = format!("{r:?}");
+        assert!(debug.contains("OrdinalRange"));
+        assert!(debug.contains("10"));
+    }
+
+    #[test]
+    fn range_clone() {
+        let r = BackfillRange::TimeRange {
+            start_ms: 100,
+            end_ms: 200,
+        };
+        let cloned = r.clone();
+        assert_eq!(r, cloned);
+    }
+
+    // ---- ReindexProgress ----
+
+    #[test]
+    fn reindex_progress_new_all_zeros() {
+        let p = ReindexProgress::new();
+        assert_eq!(p.events_read, 0);
+        assert_eq!(p.events_indexed, 0);
+        assert_eq!(p.events_skipped, 0);
+        assert_eq!(p.events_filtered, 0);
+        assert_eq!(p.batches_committed, 0);
+        assert_eq!(p.current_ordinal, None);
+        assert!(!p.caught_up);
+        assert_eq!(p.docs_cleared, 0);
+    }
+
+    #[test]
+    fn reindex_progress_debug() {
+        let p = ReindexProgress::new();
+        let debug = format!("{p:?}");
+        assert!(debug.contains("ReindexProgress"));
+    }
+
+    #[test]
+    fn reindex_progress_clone() {
+        let p = ReindexProgress {
+            events_read: 50,
+            events_indexed: 45,
+            events_skipped: 3,
+            events_filtered: 2,
+            batches_committed: 5,
+            current_ordinal: Some(49),
+            caught_up: true,
+            docs_cleared: 10,
+        };
+        let cloned = p.clone();
+        assert_eq!(p, cloned);
+    }
+
+    // ---- OffsetMismatch ----
+
+    #[test]
+    fn offset_mismatch_serde_roundtrip() {
+        let m = OffsetMismatch {
+            event_id: "evt-42".to_string(),
+            expected_offset: 42,
+            actual_offset: 99,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: OffsetMismatch = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, back);
+    }
+
+    #[test]
+    fn offset_mismatch_debug_clone() {
+        let m = OffsetMismatch {
+            event_id: "e1".to_string(),
+            expected_offset: 1,
+            actual_offset: 100,
+        };
+        let debug = format!("{m:?}");
+        assert!(debug.contains("OffsetMismatch"));
+        assert!(debug.contains("e1"));
+        let cloned = m.clone();
+        assert_eq!(m, cloned);
+    }
+
+    // ---- CheckedRange ----
+
+    #[test]
+    fn checked_range_serde_roundtrip() {
+        let cr = CheckedRange {
+            start_ordinal: 0,
+            end_ordinal: 999,
+            events_checked: 500,
+        };
+        let json = serde_json::to_string(&cr).unwrap();
+        let back: CheckedRange = serde_json::from_str(&json).unwrap();
+        assert_eq!(cr, back);
+    }
+
+    #[test]
+    fn checked_range_debug_clone() {
+        let cr = CheckedRange {
+            start_ordinal: 10,
+            end_ordinal: 20,
+            events_checked: 11,
+        };
+        let debug = format!("{cr:?}");
+        assert!(debug.contains("CheckedRange"));
+        let cloned = cr.clone();
+        assert_eq!(cr, cloned);
+    }
+
+    // ---- IntegrityReport ----
+
+    #[test]
+    fn integrity_report_debug() {
+        let report = IntegrityReport {
+            log_events_scanned: 10,
+            index_matches: 10,
+            missing_from_index: vec![],
+            offset_mismatches: vec![],
+            is_consistent: true,
+            total_index_docs: Some(10),
+            checked_range: CheckedRange {
+                start_ordinal: 0,
+                end_ordinal: 9,
+                events_checked: 10,
+            },
+        };
+        let debug = format!("{report:?}");
+        assert!(debug.contains("IntegrityReport"));
+        assert!(debug.contains("is_consistent"));
+    }
+
+    #[test]
+    fn integrity_report_clone() {
+        let report = IntegrityReport {
+            log_events_scanned: 5,
+            index_matches: 3,
+            missing_from_index: vec!["e1".to_string()],
+            offset_mismatches: vec![],
+            is_consistent: false,
+            total_index_docs: None,
+            checked_range: CheckedRange {
+                start_ordinal: 0,
+                end_ordinal: 4,
+                events_checked: 5,
+            },
+        };
+        let cloned = report.clone();
+        assert_eq!(report, cloned);
+    }
+
+    // ---- Config Debug/Clone ----
+
+    #[test]
+    fn reindex_config_debug() {
+        let cfg = ReindexConfig::default();
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains("ReindexConfig"));
+        assert!(debug.contains("batch_size"));
+    }
+
+    #[test]
+    fn reindex_config_clone() {
+        let cfg = ReindexConfig::default();
+        let cloned = cfg.clone();
+        assert_eq!(cloned.batch_size, cfg.batch_size);
+        assert_eq!(cloned.dedup_on_replay, cfg.dedup_on_replay);
+    }
+
+    #[test]
+    fn backfill_config_debug() {
+        let cfg = BackfillConfig::default();
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains("BackfillConfig"));
+    }
+
+    #[test]
+    fn backfill_config_clone() {
+        let cfg = BackfillConfig::default();
+        let cloned = cfg.clone();
+        assert_eq!(cloned.batch_size, cfg.batch_size);
+        assert_eq!(cloned.range, cfg.range);
+    }
+
+    #[test]
+    fn integrity_check_config_debug() {
+        let cfg = IntegrityCheckConfig::default();
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains("IntegrityCheckConfig"));
+    }
+
+    #[test]
+    fn integrity_check_config_clone() {
+        let cfg = IntegrityCheckConfig::default();
+        let cloned = cfg.clone();
+        assert_eq!(cloned.max_events, cfg.max_events);
+        assert_eq!(cloned.ordinal_range, cfg.ordinal_range);
+    }
+
+    // ---- Constants ----
+
+    #[test]
+    fn consumer_prefixes() {
+        assert_eq!(REINDEX_CONSUMER_PREFIX, "tantivy-reindex");
+        assert_eq!(BACKFILL_CONSUMER_PREFIX, "tantivy-backfill");
+    }
+
     #[test]
     fn integrity_report_serialization_roundtrip() {
         let report = IntegrityReport {

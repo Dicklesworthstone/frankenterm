@@ -595,10 +595,17 @@ pub fn spawn_mux_watchdog(
 
 /// Get the RSS (resident set size) of the wezterm-mux-server process.
 async fn get_mux_server_rss() -> Option<u64> {
-    tokio::task::spawn_blocking(get_mux_server_rss_sync)
-        .await
-        .ok()
-        .flatten()
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        asupersync::runtime::spawn_blocking(get_mux_server_rss_sync).await
+    }
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        tokio::task::spawn_blocking(get_mux_server_rss_sync)
+            .await
+            .ok()
+            .flatten()
+    }
 }
 
 /// Synchronous RSS lookup for wezterm-mux-server.

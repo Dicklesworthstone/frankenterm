@@ -13,6 +13,8 @@
 //! 8. BloomStats serde roundtrip and invariants
 //! 9. Union commutativity
 //! 10. Counting filter counter saturation
+//! 11. Idempotent insert, double clear, union self, fill ratio monotone
+//! 12. Counting double insert/remove, counting stats
 
 use proptest::prelude::*;
 
@@ -211,7 +213,7 @@ proptest! {
             bf_b_clone = bf_b;
         }
 
-        // Union A ∪ B.
+        // Union A U B.
         bf_a.union(&bf_b_clone);
 
         // All items from both sets should be found.
@@ -430,7 +432,7 @@ proptest! {
 }
 
 // =============================================================================
-// BloomStats — serde roundtrip
+// BloomStats -- serde roundtrip
 // =============================================================================
 
 proptest! {
@@ -495,7 +497,7 @@ proptest! {
 }
 
 // =============================================================================
-// BloomStats — consistency with filter state
+// BloomStats -- consistency with filter state
 // =============================================================================
 
 proptest! {
@@ -586,9 +588,9 @@ proptest! {
             bf_b2.insert(item);
         }
 
-        // A ∪ B
+        // A U B
         bf_a1.union(&bf_b1);
-        // B ∪ A
+        // B U A
         bf_b2.union(&bf_a2);
 
         // Membership should be identical for all items.
@@ -739,5 +741,220 @@ proptest! {
         let bf = BloomFilter::with_capacity(capacity, fp_rate);
         prop_assert!(bf.num_bits() > 0, "num_bits should be positive");
         prop_assert!(bf.num_hashes() > 0, "num_hashes should be positive");
+    }
+}
+
+// =============================================================================
+// Idempotent insert: inserting same item twice still finds it
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Inserting an item twice doesn't break contains.
+    #[test]
+    fn prop_idempotent_insert(
+        item in arb_item(),
+    ) {
+        let mut bf = BloomFilter::with_capacity(100, 0.01);
+        bf.insert(&item);
+        bf.insert(&item);
+        prop_assert!(bf.contains(&item),
+            "item should still be found after double insert");
+        // Count tracks total insertions (not unique)
+        prop_assert_eq!(bf.count(), 2,
+            "count should be 2 after double insert");
+    }
+
+    /// Double clear is idempotent.
+    #[test]
+    fn prop_double_clear_idempotent(
+        items in arb_items(20),
+    ) {
+        let mut bf = BloomFilter::with_capacity(100, 0.01);
+        for item in &items {
+            bf.insert(item);
+        }
+        bf.clear();
+        bf.clear();
+        prop_assert_eq!(bf.count(), 0);
+        prop_assert!((bf.estimated_fp_rate() - 0.0).abs() < 1e-10);
+    }
+}
+
+// =============================================================================
+// Union self: A U A should preserve A's membership
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Union with a copy of self preserves all membership.
+    #[test]
+    fn prop_union_self_preserves(
+        items in arb_items(20),
+    ) {
+        let mut bf = BloomFilter::with_capacity(100, 0.01);
+        let mut bf_copy = BloomFilter::with_capacity(100, 0.01);
+        for item in &items {
+            bf.insert(item);
+            bf_copy.insert(item);
+        }
+
+        bf.union(&bf_copy);
+
+        for item in &items {
+            prop_assert!(bf.contains(item),
+                "A U A should preserve all items from A");
+        }
+    }
+
+    /// Union preserves no-false-negatives: after union, all items
+    /// from both filters are still found.
+    #[test]
+    fn prop_union_preserves_no_false_negatives(
+        items_a in arb_items(15),
+        items_b in arb_items(15),
+    ) {
+        let mut bf_a = BloomFilter::with_capacity(200, 0.01);
+        let mut bf_b = BloomFilter::with_capacity(200, 0.01);
+        for item in &items_a { bf_a.insert(item); }
+        for item in &items_b { bf_b.insert(item); }
+
+        bf_a.union(&bf_b);
+
+        // No false negatives for either set
+        for item in &items_a {
+            prop_assert!(bf_a.contains(item), "union lost item from set A");
+        }
+        for item in &items_b {
+            prop_assert!(bf_a.contains(item), "union lost item from set B");
+        }
+    }
+}
+
+// =============================================================================
+// Counting filter: double insert requires double remove
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Inserting an item twice, then removing once: item should still be present.
+    #[test]
+    fn prop_counting_double_insert_single_remove(
+        item in arb_item(),
+    ) {
+        let mut cbf = CountingBloomFilter::with_capacity(100, 0.01);
+        cbf.insert(&item);
+        cbf.insert(&item);
+        prop_assert_eq!(cbf.count(), 2);
+
+        cbf.remove(&item);
+        prop_assert_eq!(cbf.count(), 1);
+        prop_assert!(cbf.contains(&item),
+            "item should still be present after 2 inserts and 1 remove");
+    }
+
+    /// Counting filter clear then reuse works.
+    #[test]
+    fn prop_counting_clear_reuse(
+        items1 in arb_items(15),
+        items2 in arb_items(15),
+    ) {
+        let mut cbf = CountingBloomFilter::with_capacity(100, 0.01);
+        for item in &items1 { cbf.insert(item); }
+        cbf.clear();
+        prop_assert_eq!(cbf.count(), 0);
+
+        for item in &items2 { cbf.insert(item); }
+        // All items2 should be found
+        for item in &items2 {
+            prop_assert!(cbf.contains(item),
+                "item should be found after clear+reinsert");
+        }
+    }
+}
+
+// =============================================================================
+// Fill ratio monotone with insertions
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Fill ratio is monotonically non-decreasing as items are inserted.
+    #[test]
+    fn prop_fill_ratio_monotone(
+        n in 10_usize..100,
+    ) {
+        let mut bf = BloomFilter::with_capacity(200, 0.01);
+        let mut prev_ratio = 0.0f64;
+
+        for i in 0..n {
+            bf.insert(&i.to_le_bytes());
+            let stats = bf.stats();
+            prop_assert!(stats.fill_ratio >= prev_ratio,
+                "fill_ratio should not decrease: {} -> {} at count {}",
+                prev_ratio, stats.fill_ratio, bf.count());
+            prev_ratio = stats.fill_ratio;
+        }
+    }
+
+    /// Theoretical FP rate monotonically increases with item count.
+    #[test]
+    fn prop_theoretical_fp_monotone_with_count(
+        capacity in 200_usize..1000,
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bits = optimal_num_bits(capacity, fp_rate);
+        let hashes = optimal_num_hashes(bits, capacity);
+
+        let mut prev = 0.0;
+        for n in (1..capacity).step_by(capacity / 10 + 1) {
+            let rate = theoretical_fp_rate(bits, hashes, n);
+            prop_assert!(rate >= prev - 1e-15,
+                "theoretical FP should be monotone: {} -> {} at n={}",
+                prev, rate, n);
+            prev = rate;
+        }
+    }
+}
+
+// =============================================================================
+// Memory is always positive
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Memory bytes is always positive for any filter.
+    #[test]
+    fn prop_memory_always_positive(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bf = BloomFilter::with_capacity(capacity, fp_rate);
+        prop_assert!(bf.memory_bytes() > 0,
+            "memory_bytes should be positive, got 0");
+    }
+
+    /// BloomStats Clone preserves all fields.
+    #[test]
+    fn prop_stats_clone_preserves(
+        n in 0_usize..100,
+    ) {
+        let mut bf = BloomFilter::with_capacity(200, 0.01);
+        for i in 0..n {
+            bf.insert(&i.to_le_bytes());
+        }
+        let stats = bf.stats();
+        let cloned = stats.clone();
+        prop_assert_eq!(cloned.count, stats.count);
+        prop_assert_eq!(cloned.num_bits, stats.num_bits);
+        prop_assert_eq!(cloned.num_hashes, stats.num_hashes);
+        prop_assert_eq!(cloned.memory_bytes, stats.memory_bytes);
+        prop_assert!((cloned.estimated_fp_rate - stats.estimated_fp_rate).abs() < 1e-15);
+        prop_assert!((cloned.fill_ratio - stats.fill_ratio).abs() < 1e-15);
     }
 }
