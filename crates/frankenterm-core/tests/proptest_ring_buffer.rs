@@ -646,7 +646,9 @@ proptest! {
         let mut rb = RingBuffer::new(capacity);
         for &item in &items {
             rb.push(item);
-            prop_assert_eq!(rb.is_empty(), rb.len() == 0);
+            #[allow(clippy::len_zero)]
+            let len_is_zero = rb.len() == 0;
+            prop_assert_eq!(rb.is_empty(), len_is_zero);
         }
     }
 

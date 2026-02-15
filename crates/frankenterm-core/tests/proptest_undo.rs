@@ -277,7 +277,7 @@ proptest! {
     /// Clone produces an equal UndoOutcome.
     #[test]
     fn prop_outcome_clone_eq(outcome in arb_undo_outcome()) {
-        let cloned = outcome.clone();
+        let cloned = outcome;
         prop_assert_eq!(cloned, outcome);
     }
 

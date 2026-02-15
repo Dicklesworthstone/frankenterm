@@ -491,7 +491,7 @@ fn detection_source_debug_nonempty() {
 #[test]
 fn detection_source_clone_preserves() {
     let src = DetectionSource::PatternEngine;
-    let cloned = src.clone();
+    let cloned = src;
     assert_eq!(cloned, src);
 }
 

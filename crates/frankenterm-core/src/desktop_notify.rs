@@ -894,7 +894,7 @@ sound = true
     fn urgency_copy_clone() {
         let u = Urgency::Critical;
         let u2 = u; // Copy
-        let u3 = u.clone();
+        let u3 = u;
         assert_eq!(u, u2);
         assert_eq!(u, u3);
     }
@@ -927,7 +927,7 @@ sound = true
     fn notify_backend_copy_clone() {
         let b = NotifyBackend::Linux;
         let b2 = b; // Copy
-        let b3 = b.clone();
+        let b3 = b;
         assert_eq!(b, b2);
         assert_eq!(b, b3);
     }

@@ -5284,7 +5284,7 @@ retention_tiers = []
     fn log_format_traits() {
         let a = LogFormat::Pretty;
         let b = a;
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, b);
         assert_eq!(a, c);
         assert_ne!(LogFormat::Pretty, LogFormat::Json);

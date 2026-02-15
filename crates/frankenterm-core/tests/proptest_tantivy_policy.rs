@@ -386,7 +386,7 @@ proptest! {
     /// LoadRegime Clone preserves variant.
     #[test]
     fn prop_regime_clone(regime in arb_load_regime()) {
-        let cloned = regime.clone();
+        let cloned = regime;
         prop_assert_eq!(regime, cloned);
     }
 
@@ -400,7 +400,7 @@ proptest! {
     /// MergeStrategy Clone preserves variant.
     #[test]
     fn prop_strategy_clone(strategy in arb_merge_strategy()) {
-        let cloned = strategy.clone();
+        let cloned = strategy;
         prop_assert_eq!(strategy, cloned);
     }
 

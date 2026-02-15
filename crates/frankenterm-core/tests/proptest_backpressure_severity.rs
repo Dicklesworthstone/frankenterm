@@ -366,7 +366,7 @@ proptest! {
     #[test]
     fn prop_throttle_clone(s in 0.0_f64..1.0) {
         let actions = ThrottleActions::from_severity(s);
-        let cloned = actions.clone();
+        let cloned = actions;
         prop_assert!((cloned.severity - actions.severity).abs() < f64::EPSILON);
         prop_assert!((cloned.poll_backoff_multiplier - actions.poll_backoff_multiplier).abs() < f64::EPSILON);
         prop_assert!((cloned.pane_skip_fraction - actions.pane_skip_fraction).abs() < f64::EPSILON);

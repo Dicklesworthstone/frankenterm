@@ -72,6 +72,7 @@ fn chrono_lite_format(unix_secs: u64) -> String {
 /// An acquired single-instance lock.
 ///
 /// The lock is automatically released when this guard is dropped.
+#[derive(Debug)]
 pub struct WatcherLock {
     _lock_file: File,
     lock_path: PathBuf,
@@ -458,5 +459,270 @@ mod tests {
         let lock = WatcherLock::acquire(&lock_path).unwrap();
         assert!(lock_path.exists());
         drop(lock);
+    }
+
+    // ── Batch: RubyBeaver wa-1u90p.7.1 ──────────────────────────────────
+
+    #[test]
+    fn lock_error_variants_debug() {
+        let already = LockError::AlreadyRunning {
+            pid: 1,
+            started_at: "now".to_string(),
+        };
+        let dbg = format!("{already:?}");
+        assert!(dbg.contains("AlreadyRunning"));
+
+        let no_meta = LockError::AlreadyRunningNoMeta;
+        let dbg2 = format!("{no_meta:?}");
+        assert!(dbg2.contains("AlreadyRunningNoMeta"));
+    }
+
+    #[test]
+    fn lock_error_io_kind_preserved() {
+        let io_err = io::Error::new(io::ErrorKind::NotFound, "file gone");
+        let lock_err = LockError::Io(io_err);
+        match lock_err {
+            LockError::Io(ref e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
+            _ => panic!("expected Io variant"),
+        }
+    }
+
+    #[test]
+    fn lock_metadata_debug() {
+        let meta = LockMetadata::new();
+        let dbg = format!("{meta:?}");
+        assert!(dbg.contains("pid"));
+        assert!(dbg.contains("started_at"));
+        assert!(dbg.contains("wa_version"));
+    }
+
+    #[test]
+    fn lock_metadata_clone() {
+        let meta = LockMetadata {
+            pid: 123,
+            started_at: 456,
+            started_at_human: "unix:456".to_string(),
+            wa_version: "1.0".to_string(),
+        };
+        let cloned = meta.clone();
+        assert_eq!(cloned.pid, 123);
+        assert_eq!(cloned.started_at, 456);
+    }
+
+    #[test]
+    fn chrono_lite_format_large_number() {
+        let result = chrono_lite_format(u64::MAX);
+        assert!(result.starts_with("unix:"));
+        assert!(result.contains(&u64::MAX.to_string()));
+    }
+
+    #[test]
+    fn chrono_lite_format_typical_epoch() {
+        let result = chrono_lite_format(1_708_000_000);
+        assert_eq!(result, "unix:1708000000");
+    }
+
+    #[test]
+    fn metadata_path_with_dots_in_name() {
+        let path = PathBuf::from("/tmp/my.watcher.lock");
+        let meta = metadata_path(&path);
+        assert_eq!(meta, PathBuf::from("/tmp/my.watcher.lock.meta.json"));
+    }
+
+    #[test]
+    fn metadata_path_root_level() {
+        let path = PathBuf::from("/lockfile");
+        let meta = metadata_path(&path);
+        assert_eq!(meta, PathBuf::from("/lockfile.meta.json"));
+    }
+
+    #[test]
+    fn lock_file_persists_while_held() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("persist.lock");
+        let lock = WatcherLock::acquire(&lock_path).unwrap();
+
+        // Lock file should exist
+        assert!(lock_path.exists());
+        // Metadata file should exist
+        assert!(lock.meta_path().exists());
+
+        // Read metadata to verify content
+        let contents = fs::read_to_string(lock.meta_path()).unwrap();
+        let meta: LockMetadata = serde_json::from_str(&contents).unwrap();
+        assert_eq!(meta.pid, std::process::id());
+
+        drop(lock);
+    }
+
+    #[test]
+    fn metadata_cleaned_up_after_drop() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("cleanup.lock");
+        let meta_path;
+        {
+            let lock = WatcherLock::acquire(&lock_path).unwrap();
+            meta_path = lock.meta_path().to_path_buf();
+            assert!(meta_path.exists());
+        }
+        // After drop, metadata should be gone
+        assert!(!meta_path.exists());
+        // Lock file itself remains (it's just a file, the OS lock is released)
+        assert!(lock_path.exists());
+    }
+
+    #[test]
+    fn check_running_after_release_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("released.lock");
+
+        let lock = WatcherLock::acquire(&lock_path).unwrap();
+        drop(lock);
+
+        assert!(check_running(&lock_path).is_none());
+    }
+
+    #[test]
+    fn double_acquire_error_includes_pid() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("double.lock");
+
+        let _lock = WatcherLock::acquire(&lock_path).unwrap();
+        let err = WatcherLock::acquire(&lock_path).unwrap_err();
+
+        match err {
+            LockError::AlreadyRunning { pid, started_at } => {
+                assert_eq!(pid, std::process::id());
+                assert!(started_at.starts_with("unix:"));
+            }
+            other => panic!("expected AlreadyRunning, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn lock_metadata_serde_with_special_chars() {
+        let meta = LockMetadata {
+            pid: 0,
+            started_at: 0,
+            started_at_human: "unix:0".to_string(),
+            wa_version: "0.0.0-alpha+special\"chars".to_string(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: LockMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.wa_version, "0.0.0-alpha+special\"chars");
+    }
+
+    #[test]
+    fn lock_metadata_serde_empty_version() {
+        let meta = LockMetadata {
+            pid: 1,
+            started_at: 1,
+            started_at_human: "unix:1".to_string(),
+            wa_version: String::new(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: LockMetadata = serde_json::from_str(&json).unwrap();
+        assert!(back.wa_version.is_empty());
+    }
+
+    #[test]
+    fn lock_metadata_pid_zero() {
+        let meta = LockMetadata {
+            pid: 0,
+            started_at: 100,
+            started_at_human: "unix:100".to_string(),
+            wa_version: "test".to_string(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: LockMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pid, 0);
+    }
+
+    #[test]
+    fn lock_path_accessor_matches_input() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("accessor.lock");
+        let lock = WatcherLock::acquire(&lock_path).unwrap();
+        assert_eq!(lock.lock_path(), lock_path.as_path());
+        drop(lock);
+    }
+
+    #[test]
+    fn meta_path_accessor_matches_computed() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("meta-acc.lock");
+        let lock = WatcherLock::acquire(&lock_path).unwrap();
+        let expected_meta = metadata_path(&lock_path);
+        assert_eq!(lock.meta_path(), expected_meta.as_path());
+        drop(lock);
+    }
+
+    #[test]
+    fn acquire_release_acquire_cycle() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("cycle.lock");
+
+        for _ in 0..5 {
+            let lock = WatcherLock::acquire(&lock_path).unwrap();
+            assert!(lock_path.exists());
+            drop(lock);
+        }
+    }
+
+    #[test]
+    fn read_existing_lock_error_empty_meta_file() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("empty.lock");
+        let meta_path = metadata_path(&lock_path);
+
+        fs::write(&meta_path, "").unwrap();
+
+        assert!(matches!(
+            read_existing_lock_error(&lock_path),
+            LockError::AlreadyRunningNoMeta
+        ));
+    }
+
+    #[test]
+    fn read_existing_lock_error_partial_json() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("partial.lock");
+        let meta_path = metadata_path(&lock_path);
+
+        fs::write(&meta_path, r#"{"pid": 42"#).unwrap();
+
+        assert!(matches!(
+            read_existing_lock_error(&lock_path),
+            LockError::AlreadyRunningNoMeta
+        ));
+    }
+
+    #[test]
+    fn check_running_with_stale_meta_but_no_lock() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("stale.lock");
+
+        // Create and release a lock
+        let lock = WatcherLock::acquire(&lock_path).unwrap();
+        drop(lock);
+
+        // Manually recreate a metadata file (simulating stale)
+        let meta_path = metadata_path(&lock_path);
+        let meta = LockMetadata {
+            pid: 99999,
+            started_at: 1,
+            started_at_human: "unix:1".to_string(),
+            wa_version: "old".to_string(),
+        };
+        fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+
+        // check_running should return None because the lock is NOT held
+        assert!(check_running(&lock_path).is_none());
+    }
+
+    #[test]
+    fn lock_error_display_contains_io_message() {
+        let err = LockError::Io(io::Error::other("custom error message"));
+        assert!(err.to_string().contains("custom error message"));
     }
 }

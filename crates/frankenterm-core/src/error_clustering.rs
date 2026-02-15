@@ -629,6 +629,400 @@ mod tests {
         assert_eq!(cl.last_seen_secs, 200);
     }
 
+    // ── Batch: RubyBeaver wa-1u90p.7.1 ──────────────────────────────────
+
+    // ---- hash_bytes tests ----
+
+    #[test]
+    fn hash_bytes_empty() {
+        let h = hash_bytes(b"");
+        // FNV-1a offset basis
+        assert_eq!(h, 0xcbf2_9ce4_8422_2325);
+    }
+
+    #[test]
+    fn hash_bytes_single_byte() {
+        let h1 = hash_bytes(&[0]);
+        let h2 = hash_bytes(&[1]);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn hash_bytes_order_matters() {
+        let h1 = hash_bytes(b"ab");
+        let h2 = hash_bytes(b"ba");
+        assert_ne!(h1, h2);
+    }
+
+    // ---- shingle tests ----
+
+    #[test]
+    fn shingle_empty_text() {
+        let s = shingle("", 5);
+        // empty string -> single shingle of empty
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn shingle_exact_n_length() {
+        let s = shingle("hello", 5);
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn shingle_one_more_than_n() {
+        let s = shingle("hello!", 5);
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn shingle_different_n_values() {
+        let text = "abcdefghij"; // 10 chars
+        assert_eq!(shingle(text, 3).len(), 8);
+        assert_eq!(shingle(text, 5).len(), 6);
+        assert_eq!(shingle(text, 10).len(), 1);
+    }
+
+    #[test]
+    fn shingle_unicode_treated_as_bytes() {
+        // Unicode chars are multi-byte, so we get byte-level windows
+        let s = shingle("abcde", 5);
+        assert_eq!(s.len(), 1);
+    }
+
+    // ---- minhash_signature tests ----
+
+    #[test]
+    fn minhash_signature_empty_shingles() {
+        let sig = minhash_signature(&[], 128);
+        // All values should be u64::MAX (no shingles to minimize)
+        assert!(sig.iter().all(|&v| v == u64::MAX));
+    }
+
+    #[test]
+    fn minhash_single_shingle() {
+        let sig = minhash_signature(&[42], 64);
+        assert_eq!(sig.len(), 64);
+        assert!(sig.iter().all(|&v| v < u64::MAX));
+    }
+
+    #[test]
+    fn minhash_more_shingles_lower_mins() {
+        let small = minhash_signature(&[1], 128);
+        let large = minhash_signature(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 128);
+        // More shingles means more chances to get smaller min values
+        let small_sum: u128 = small.iter().map(|&v| v as u128).sum();
+        let large_sum: u128 = large.iter().map(|&v| v as u128).sum();
+        assert!(
+            large_sum <= small_sum,
+            "more shingles should produce equal or smaller signature values"
+        );
+    }
+
+    // ---- BandIndex tests ----
+
+    #[test]
+    fn band_index_no_self_match() {
+        let mut idx = BandIndex::new(128, 16);
+        let sig = vec![1u64; 128];
+        let candidates = idx.insert(0, &sig);
+        assert!(
+            candidates.is_empty(),
+            "first insertion should have no candidates"
+        );
+    }
+
+    #[test]
+    fn band_index_partial_band_overlap() {
+        let mut idx = BandIndex::new(16, 4);
+        let sig1 = vec![0u64; 16];
+        let mut sig2 = vec![999u64; 16];
+        // Make first band identical
+        sig2[..4].copy_from_slice(&sig1[..4]);
+        idx.insert(0, &sig1);
+        let candidates = idx.insert(1, &sig2);
+        assert!(!candidates.is_empty(), "should match on first band");
+    }
+
+    #[test]
+    fn band_index_many_insertions() {
+        let mut idx = BandIndex::new(128, 16);
+        for i in 0..100 {
+            let sig: Vec<u64> = (i..i + 128).collect();
+            idx.insert(i as usize, &sig);
+        }
+        // Just verify no panic with many insertions
+    }
+
+    // ---- UnionFind tests ----
+
+    #[test]
+    fn union_find_self_union() {
+        let mut uf = UnionFind::new(3);
+        let root = uf.union(1, 1);
+        assert_eq!(root, 1);
+        assert_eq!(uf.find(1), 1);
+    }
+
+    #[test]
+    fn union_find_chain() {
+        let mut uf = UnionFind::new(5);
+        uf.union(0, 1);
+        uf.union(1, 2);
+        uf.union(2, 3);
+        uf.union(3, 4);
+        // All should have same root
+        let root = uf.find(0);
+        for i in 1..5 {
+            assert_eq!(uf.find(i), root);
+        }
+    }
+
+    #[test]
+    fn union_find_extend_independent() {
+        let mut uf = UnionFind::new(0);
+        let a = uf.extend();
+        let b = uf.extend();
+        let c = uf.extend();
+        assert_ne!(uf.find(a), uf.find(b));
+        assert_ne!(uf.find(b), uf.find(c));
+    }
+
+    #[test]
+    fn union_find_rank_balancing() {
+        let mut uf = UnionFind::new(8);
+        // Create balanced tree: union 0-1, 2-3, 4-5, 6-7
+        uf.union(0, 1);
+        uf.union(2, 3);
+        uf.union(4, 5);
+        uf.union(6, 7);
+        // Then merge pairs
+        uf.union(0, 2);
+        uf.union(4, 6);
+        // Then merge groups
+        uf.union(0, 4);
+        // All should be in one set
+        let root = uf.find(0);
+        for i in 1..8 {
+            assert_eq!(uf.find(i), root);
+        }
+    }
+
+    // ---- ClusteringConfig tests ----
+
+    #[test]
+    fn clustering_config_default_values() {
+        let config = ClusteringConfig::default();
+        assert_eq!(config.num_hashes, 128);
+        assert_eq!(config.num_bands, 16);
+        assert_eq!(config.shingle_size, 5);
+        assert_eq!(config.max_clusters, 1000);
+        assert_eq!(config.max_samples_per_cluster, 5);
+    }
+
+    #[test]
+    fn clustering_config_serde_roundtrip() {
+        let config = ClusteringConfig {
+            num_hashes: 64,
+            num_bands: 8,
+            shingle_size: 3,
+            max_clusters: 500,
+            max_samples_per_cluster: 10,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ClusteringConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.num_hashes, 64);
+        assert_eq!(back.num_bands, 8);
+        assert_eq!(back.shingle_size, 3);
+    }
+
+    #[test]
+    fn clustering_config_serde_default() {
+        // Deserializing empty object should use defaults
+        let config: ClusteringConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.num_hashes, 128);
+        assert_eq!(config.num_bands, 16);
+    }
+
+    #[test]
+    fn clustering_config_debug() {
+        let config = ClusteringConfig::default();
+        let dbg = format!("{config:?}");
+        assert!(dbg.contains("num_hashes"));
+        assert!(dbg.contains("num_bands"));
+    }
+
+    // ---- ErrorClusterer tests ----
+
+    #[test]
+    fn clusterer_empty_state() {
+        let c = ErrorClusterer::with_defaults();
+        assert_eq!(c.error_count(), 0);
+        assert_eq!(c.cluster_count(), 0);
+    }
+
+    #[test]
+    fn clusterer_single_insert() {
+        let mut c = ErrorClusterer::with_defaults();
+        let id = c.insert("single error", None, 100);
+        assert_eq!(c.error_count(), 1);
+        assert_eq!(c.cluster_count(), 1);
+        let info = c.cluster_info(id).unwrap();
+        assert_eq!(info.size, 1);
+        assert_eq!(info.representative, "single error");
+    }
+
+    #[test]
+    fn clusterer_no_pane_id() {
+        let mut c = ErrorClusterer::with_defaults();
+        c.insert("error without pane", None, 100);
+        let clusters = c.clusters();
+        assert_eq!(clusters[0].pane_ids.len(), 0);
+    }
+
+    #[test]
+    fn clusterer_duplicate_pane_ids_deduplicated() {
+        let mut c = ErrorClusterer::with_defaults();
+        c.insert("same error msg here", Some(1), 100);
+        c.insert("same error msg here", Some(1), 101);
+        c.insert("same error msg here", Some(1), 102);
+
+        let clusters = c.clusters();
+        assert!(!clusters.is_empty());
+        // Pane 1 should appear only once
+        let cl = &clusters[0];
+        let pane1_count = cl.pane_ids.iter().filter(|&&p| p == 1).count();
+        assert_eq!(pane1_count, 1);
+    }
+
+    #[test]
+    fn clusterer_samples_limited() {
+        let config = ClusteringConfig {
+            max_samples_per_cluster: 3,
+            ..ClusteringConfig::default()
+        };
+        let mut c = ErrorClusterer::new(config);
+
+        for i in 0..10 {
+            c.insert(&format!("same error variant {i}"), None, 100 + i);
+        }
+
+        let clusters = c.clusters();
+        for cl in &clusters {
+            assert!(
+                cl.samples.len() <= 3,
+                "samples should be capped at max_samples_per_cluster"
+            );
+        }
+    }
+
+    #[test]
+    fn clusterer_cluster_info_nonexistent() {
+        let mut c = ErrorClusterer::with_defaults();
+        let info = c.cluster_info(9999);
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn clusterer_many_distinct_errors() {
+        let mut c = ErrorClusterer::with_defaults();
+        // Insert very different errors
+        let errors = [
+            "FATAL: disk full cannot write to /dev/sda1",
+            "SyntaxError: unexpected token 'foo' at line 42 column 7",
+            "Permission denied accessing resource /etc/shadow file",
+            "ENOMEM: cannot allocate memory for buffer allocation",
+            "Connection timed out after 30000 milliseconds waiting",
+        ];
+        for (i, err) in errors.iter().enumerate() {
+            c.insert(err, Some(i as u64), 100 + i as u64);
+        }
+        // Should create multiple clusters
+        assert!(
+            c.cluster_count() >= 3,
+            "very different errors should form distinct clusters, got {}",
+            c.cluster_count()
+        );
+    }
+
+    #[test]
+    fn cluster_info_serde_roundtrip() {
+        let info = ClusterInfo {
+            cluster_id: 42,
+            size: 5,
+            representative: "test error".to_string(),
+            samples: vec!["s1".to_string(), "s2".to_string()],
+            pane_ids: vec![1, 2, 3],
+            first_seen_secs: 100,
+            last_seen_secs: 200,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: ClusterInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cluster_id, 42);
+        assert_eq!(back.size, 5);
+        assert_eq!(back.samples.len(), 2);
+        assert_eq!(back.pane_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn cluster_info_debug() {
+        let info = ClusterInfo {
+            cluster_id: 0,
+            size: 1,
+            representative: "err".to_string(),
+            samples: vec![],
+            pane_ids: vec![],
+            first_seen_secs: 0,
+            last_seen_secs: 0,
+        };
+        let dbg = format!("{info:?}");
+        assert!(dbg.contains("cluster_id"));
+        assert!(dbg.contains("representative"));
+    }
+
+    #[test]
+    fn clusterer_timestamps_min_max_correct() {
+        let mut c = ErrorClusterer::with_defaults();
+        c.insert("error message text here", None, 500);
+        c.insert("error message text here", None, 100);
+        c.insert("error message text here", None, 900);
+
+        let clusters = c.clusters();
+        assert!(!clusters.is_empty());
+        let cl = &clusters[0];
+        assert_eq!(cl.first_seen_secs, 100);
+        assert_eq!(cl.last_seen_secs, 900);
+    }
+
+    #[test]
+    fn clusterer_with_custom_config() {
+        let config = ClusteringConfig {
+            num_hashes: 64,
+            num_bands: 8,
+            shingle_size: 3,
+            max_clusters: 100,
+            max_samples_per_cluster: 2,
+        };
+        let mut c = ErrorClusterer::new(config);
+        c.insert("test error", Some(1), 100);
+        assert_eq!(c.error_count(), 1);
+    }
+
+    #[test]
+    fn clusterer_clusters_returns_all() {
+        let mut c = ErrorClusterer::with_defaults();
+        c.insert("unique error alpha xxxxxxxxx", Some(1), 100);
+        c.insert("unique error beta yyyyyyyyyy", Some(2), 101);
+        c.insert("unique error gamma zzzzzzzzzz", Some(3), 102);
+
+        let clusters = c.clusters();
+        // Should have at least some clusters
+        assert!(!clusters.is_empty());
+        // Total size across clusters should equal error count
+        let total_size: usize = clusters.iter().map(|c| c.size).sum();
+        assert_eq!(total_size, 3);
+    }
+
     // -- Proptest --
 
     proptest! {

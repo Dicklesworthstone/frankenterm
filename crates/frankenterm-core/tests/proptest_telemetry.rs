@@ -630,7 +630,7 @@ proptest! {
     ) {
         let reg = MetricRegistry::new();
         for i in 0..n {
-            reg.register_histogram(&format!("h_{}", i), 100);
+            reg.register_histogram(format!("h_{}", i), 100);
         }
         prop_assert_eq!(reg.histogram_count(), n);
     }

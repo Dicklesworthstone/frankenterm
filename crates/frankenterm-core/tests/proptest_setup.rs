@@ -397,7 +397,7 @@ proptest! {
     /// ShellType Clone preserves variant.
     #[test]
     fn prop_shell_clone(shell in arb_shell_type()) {
-        let cloned = shell.clone();
+        let cloned = shell;
         prop_assert_eq!(shell.name(), cloned.name());
     }
 

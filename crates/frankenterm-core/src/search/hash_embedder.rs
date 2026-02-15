@@ -364,13 +364,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "assertion")]
     fn hash_embedder_ngram_min_zero_panics() {
         let _ = HashEmbedder::new(64).with_ngram_range(0, 2);
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "assertion")]
     fn hash_embedder_ngram_min_exceeds_max_panics() {
         let _ = HashEmbedder::new(64).with_ngram_range(5, 3);
     }

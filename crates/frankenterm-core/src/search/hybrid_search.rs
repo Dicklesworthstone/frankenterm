@@ -554,4 +554,313 @@ mod tests {
             .fuse(&lexical, &semantic, 10);
         assert_eq!(fused[0].id, 1);
     }
+
+    // -----------------------------------------------------------------------
+    // Batch 11 — TopazBay wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    // ---- rrf_component_score direct tests ----
+
+    #[test]
+    fn rrf_component_score_zero_weight() {
+        assert!(rrf_component_score(0, 60, 0.0).abs() < f32::EPSILON);
+        assert!(rrf_component_score(5, 60, 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn rrf_component_score_negative_weight() {
+        assert!(rrf_component_score(0, 60, -1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn rrf_component_score_normal() {
+        // weight / (k + rank + 1) = 1.0 / (60 + 0 + 1) = 1/61
+        let score = rrf_component_score(0, 60, 1.0);
+        assert!((score - 1.0 / 61.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rrf_component_score_higher_rank_lower_score() {
+        let s0 = rrf_component_score(0, 60, 1.0);
+        let s5 = rrf_component_score(5, 60, 1.0);
+        let s100 = rrf_component_score(100, 60, 1.0);
+        assert!(s0 > s5);
+        assert!(s5 > s100);
+    }
+
+    #[test]
+    fn rrf_component_score_k_zero() {
+        // weight / (0 + rank + 1) = 1.0 / (0 + 0 + 1) = 1.0
+        let score = rrf_component_score(0, 0, 1.0);
+        assert!((score - 1.0).abs() < 1e-6);
+    }
+
+    // ---- rrf_fuse_weighted edge cases ----
+
+    #[test]
+    fn rrf_fuse_weighted_zero_weights_returns_zeros() {
+        let lexical = vec![(1, 10.0), (2, 8.0)];
+        let semantic = vec![(3, 0.9)];
+        let fused = rrf_fuse_weighted(&lexical, &semantic, 60, 0.0, 0.0);
+        assert!(fused.iter().all(|r| r.score.abs() < f32::EPSILON));
+    }
+
+    #[test]
+    fn rrf_fuse_weighted_semantic_only() {
+        let lexical = vec![(1, 10.0)];
+        let semantic = vec![(2, 0.9)];
+        let fused = rrf_fuse_weighted(&lexical, &semantic, 60, 0.0, 1.0);
+        // id=2 (semantic) should have higher score; id=1 (lexical zero weight) should be 0
+        let r1 = fused.iter().find(|r| r.id == 1).unwrap();
+        let r2 = fused.iter().find(|r| r.id == 2).unwrap();
+        assert!(r1.score.abs() < f32::EPSILON);
+        assert!(r2.score > 0.0);
+    }
+
+    #[test]
+    fn rrf_fuse_duplicate_ids_in_same_list() {
+        // When the same id appears twice in lexical, the second occurrence takes its own rank
+        let lexical = vec![(1, 10.0), (1, 8.0)];
+        let fused = rrf_fuse(&lexical, &[], 60);
+        // HashMap deduplicates by id, last rank wins in entry
+        assert_eq!(fused.len(), 1);
+    }
+
+    // ---- blend_two_tier edge cases ----
+
+    #[test]
+    fn blend_alpha_one() {
+        let tier1 = vec![FusedResult {
+            id: 1,
+            score: 1.0,
+            lexical_rank: None,
+            semantic_rank: None,
+        }];
+        let tier2 = vec![FusedResult {
+            id: 2,
+            score: 0.5,
+            lexical_rank: None,
+            semantic_rank: None,
+        }];
+        let (results, _) = blend_two_tier(&tier1, &tier2, 10, 1.0);
+        // alpha=1.0: tier1 score * 1.0, tier2 score * 0.0
+        assert!((results[0].score - 1.0).abs() < f32::EPSILON);
+        assert!(results[1].score.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn blend_empty_tier1() {
+        let tier2 = vec![
+            FusedResult {
+                id: 1,
+                score: 0.9,
+                lexical_rank: None,
+                semantic_rank: None,
+            },
+            FusedResult {
+                id: 2,
+                score: 0.8,
+                lexical_rank: None,
+                semantic_rank: None,
+            },
+        ];
+        let (results, metrics) = blend_two_tier(&[], &tier2, 5, 0.7);
+        assert_eq!(results.len(), 2);
+        assert_eq!(metrics.tier1_count, 0);
+        assert_eq!(metrics.tier2_count, 2);
+        assert_eq!(metrics.overlap_count, 0);
+    }
+
+    #[test]
+    fn blend_empty_tier2() {
+        let tier1 = vec![FusedResult {
+            id: 1,
+            score: 1.0,
+            lexical_rank: Some(0),
+            semantic_rank: Some(0),
+        }];
+        let (results, metrics) = blend_two_tier(&tier1, &[], 5, 0.7);
+        assert_eq!(results.len(), 1);
+        assert_eq!(metrics.tier1_count, 1);
+        assert_eq!(metrics.tier2_count, 0);
+    }
+
+    #[test]
+    fn blend_top_k_limits_output() {
+        let tier1 = vec![
+            FusedResult {
+                id: 1,
+                score: 1.0,
+                lexical_rank: None,
+                semantic_rank: None,
+            },
+            FusedResult {
+                id: 2,
+                score: 0.9,
+                lexical_rank: None,
+                semantic_rank: None,
+            },
+            FusedResult {
+                id: 3,
+                score: 0.8,
+                lexical_rank: None,
+                semantic_rank: None,
+            },
+        ];
+        let (results, _) = blend_two_tier(&tier1, &[], 2, 0.7);
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn blend_top_k_zero() {
+        let tier1 = vec![FusedResult {
+            id: 1,
+            score: 1.0,
+            lexical_rank: None,
+            semantic_rank: None,
+        }];
+        let (results, _) = blend_two_tier(&tier1, &[], 0, 0.7);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn blend_alpha_clamped_above_one() {
+        let tier1 = vec![FusedResult {
+            id: 1,
+            score: 1.0,
+            lexical_rank: None,
+            semantic_rank: None,
+        }];
+        let tier2 = vec![FusedResult {
+            id: 2,
+            score: 1.0,
+            lexical_rank: None,
+            semantic_rank: None,
+        }];
+        // alpha > 1.0 is clamped to 1.0
+        let (results, _) = blend_two_tier(&tier1, &tier2, 10, 2.0);
+        assert!((results[0].score - 1.0).abs() < f32::EPSILON);
+        assert!(results[1].score.abs() < f32::EPSILON);
+    }
+
+    // ---- kendall_tau edge cases ----
+
+    #[test]
+    fn kendall_tau_single_element() {
+        // Single common element means n < 2, returns 0.0
+        assert!(kendall_tau(&[1], &[1]).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn kendall_tau_two_elements_same_order() {
+        let tau = kendall_tau(&[1, 2], &[1, 2]);
+        assert!((tau - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn kendall_tau_two_elements_reversed() {
+        let tau = kendall_tau(&[1, 2], &[2, 1]);
+        assert!((tau - (-1.0)).abs() < f32::EPSILON);
+    }
+
+    // ---- SearchMode ----
+
+    #[test]
+    fn search_mode_debug() {
+        assert_eq!(format!("{:?}", SearchMode::Lexical), "Lexical");
+        assert_eq!(format!("{:?}", SearchMode::Semantic), "Semantic");
+        assert_eq!(format!("{:?}", SearchMode::Hybrid), "Hybrid");
+    }
+
+    #[test]
+    fn search_mode_copy_clone() {
+        let m = SearchMode::Hybrid;
+        let m2 = m; // Copy
+        let m3 = m;
+        assert_eq!(m, m2);
+        assert_eq!(m, m3);
+    }
+
+    // ---- FusedResult ----
+
+    #[test]
+    fn fused_result_debug() {
+        let r = FusedResult {
+            id: 42,
+            score: 0.5,
+            lexical_rank: Some(3),
+            semantic_rank: None,
+        };
+        let debug = format!("{r:?}");
+        assert!(debug.contains("FusedResult"));
+        assert!(debug.contains("42"));
+    }
+
+    #[test]
+    fn fused_result_clone() {
+        let r = FusedResult {
+            id: 1,
+            score: 0.99,
+            lexical_rank: Some(0),
+            semantic_rank: Some(1),
+        };
+        let cloned = r.clone();
+        assert_eq!(cloned.id, 1);
+        assert!((cloned.score - 0.99).abs() < f32::EPSILON);
+        assert_eq!(cloned.lexical_rank, Some(0));
+        assert_eq!(cloned.semantic_rank, Some(1));
+    }
+
+    // ---- TwoTierMetrics ----
+
+    #[test]
+    fn two_tier_metrics_default() {
+        let m = TwoTierMetrics::default();
+        assert_eq!(m.tier1_count, 0);
+        assert_eq!(m.tier2_count, 0);
+        assert_eq!(m.overlap_count, 0);
+        assert!(m.rank_correlation.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn two_tier_metrics_debug_clone() {
+        let m = TwoTierMetrics {
+            tier1_count: 5,
+            tier2_count: 3,
+            overlap_count: 2,
+            rank_correlation: 0.85,
+        };
+        let debug = format!("{m:?}");
+        assert!(debug.contains("TwoTierMetrics"));
+        let cloned = m.clone();
+        assert_eq!(cloned.tier1_count, 5);
+        assert_eq!(cloned.overlap_count, 2);
+    }
+
+    // ---- HybridSearchService ----
+
+    #[test]
+    fn hybrid_service_default_trait() {
+        let svc = HybridSearchService::default();
+        assert_eq!(svc.rrf_k(), 60);
+        assert_eq!(svc.mode(), SearchMode::Hybrid);
+    }
+
+    #[test]
+    fn hybrid_service_with_rrf_weights_negative_clamped() {
+        let svc = HybridSearchService::new().with_rrf_weights(-1.0, -2.0);
+        assert!(svc.lexical_weight().abs() < f32::EPSILON);
+        assert!(svc.semantic_weight().abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn hybrid_fuse_respects_top_k() {
+        let lexical: Vec<(u64, f32)> = (0..10).map(|i| (i, 10.0 - i as f32)).collect();
+        let semantic: Vec<(u64, f32)> = (10..20)
+            .map(|i| (i, 1.0 - (i - 10) as f32 / 10.0))
+            .collect();
+        let svc = HybridSearchService::new();
+        let results = svc.fuse(&lexical, &semantic, 3);
+        assert_eq!(results.len(), 3);
+    }
 }

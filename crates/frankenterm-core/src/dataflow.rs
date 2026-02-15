@@ -1292,7 +1292,7 @@ mod tests {
 
     #[test]
     fn value_serde_roundtrip_float() {
-        let v = Value::Float(3.14);
+        let v = Value::Float(std::f64::consts::PI);
         let json = serde_json::to_string(&v).unwrap();
         let back: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v, back);
@@ -1324,7 +1324,7 @@ mod tests {
 
     #[test]
     fn value_display_float_precision() {
-        assert_eq!(format!("{}", Value::Float(3.14159)), "3.1416");
+        assert_eq!(format!("{}", Value::Float(std::f64::consts::PI)), "3.1416");
         assert_eq!(format!("{}", Value::Float(0.0)), "0.0000");
     }
 
@@ -1472,6 +1472,7 @@ mod tests {
     // ================================================================
 
     #[test]
+    #[allow(clippy::many_single_char_names)]
     fn snapshot_with_edges() {
         let mut g = DataflowGraph::new();
         let a = g.add_source("src_a", Value::Int(10));
@@ -1862,6 +1863,7 @@ mod tests {
     // ================================================================
 
     #[test]
+    #[allow(clippy::many_single_char_names)]
     fn multi_level_diamond() {
         // S → A → C
         // S → B → C

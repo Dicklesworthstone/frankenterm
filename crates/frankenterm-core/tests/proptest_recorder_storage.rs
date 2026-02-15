@@ -415,19 +415,19 @@ proptest! {
 
     #[test]
     fn prop_backend_kind_clone_eq(kind in arb_backend_kind()) {
-        let cloned = kind.clone();
+        let cloned = kind;
         prop_assert_eq!(cloned, kind);
     }
 
     #[test]
     fn prop_durability_level_clone_eq(level in arb_durability_level()) {
-        let cloned = level.clone();
+        let cloned = level;
         prop_assert_eq!(cloned, level);
     }
 
     #[test]
     fn prop_flush_mode_clone_eq(mode in arb_flush_mode()) {
-        let cloned = mode.clone();
+        let cloned = mode;
         prop_assert_eq!(cloned, mode);
     }
 
@@ -439,13 +439,13 @@ proptest! {
 
     #[test]
     fn prop_error_class_clone_eq(class in arb_error_class()) {
-        let cloned = class.clone();
+        let cloned = class;
         prop_assert_eq!(cloned, class);
     }
 
     #[test]
     fn prop_commit_outcome_clone_eq(outcome in arb_commit_outcome()) {
-        let cloned = outcome.clone();
+        let cloned = outcome;
         prop_assert_eq!(cloned, outcome);
     }
 }
@@ -727,31 +727,31 @@ proptest! {
 
     #[test]
     fn prop_backend_kind_json_is_string(kind in arb_backend_kind()) {
-        let v: serde_json::Value = serde_json::to_value(&kind).unwrap();
+        let v: serde_json::Value = serde_json::to_value(kind).unwrap();
         prop_assert!(v.is_string(), "backend kind should serialize as a JSON string");
     }
 
     #[test]
     fn prop_durability_json_is_string(level in arb_durability_level()) {
-        let v: serde_json::Value = serde_json::to_value(&level).unwrap();
+        let v: serde_json::Value = serde_json::to_value(level).unwrap();
         prop_assert!(v.is_string(), "durability level should serialize as a JSON string");
     }
 
     #[test]
     fn prop_flush_mode_json_is_string(mode in arb_flush_mode()) {
-        let v: serde_json::Value = serde_json::to_value(&mode).unwrap();
+        let v: serde_json::Value = serde_json::to_value(mode).unwrap();
         prop_assert!(v.is_string(), "flush mode should serialize as a JSON string");
     }
 
     #[test]
     fn prop_commit_outcome_json_is_string(outcome in arb_commit_outcome()) {
-        let v: serde_json::Value = serde_json::to_value(&outcome).unwrap();
+        let v: serde_json::Value = serde_json::to_value(outcome).unwrap();
         prop_assert!(v.is_string(), "commit outcome should serialize as a JSON string");
     }
 
     #[test]
     fn prop_error_class_json_is_string(class in arb_error_class()) {
-        let v: serde_json::Value = serde_json::to_value(&class).unwrap();
+        let v: serde_json::Value = serde_json::to_value(class).unwrap();
         prop_assert!(v.is_string(), "error class should serialize as a JSON string");
     }
 }

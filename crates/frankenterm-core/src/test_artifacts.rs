@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn empty_test_case_id_rejected() {
         let mut manifest = valid_manifest(ArtifactRunOutcome::Passed);
-        manifest.correlation.test_case_id = "".to_string();
+        manifest.correlation.test_case_id = String::new();
         let err = manifest.validate().unwrap_err();
         assert!(matches!(err, TestArtifactSchemaError::MissingTestCaseId));
     }

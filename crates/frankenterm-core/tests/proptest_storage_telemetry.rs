@@ -566,8 +566,8 @@ proptest! {
     fn config_clone_preserves(_dummy in 0..1u8) {
         let cfg = StorageTelemetryConfig::default();
         let cloned = cfg.clone();
-        prop_assert_eq!(cloned.tier_thresholds[0], cfg.tier_thresholds[0]);
-        prop_assert_eq!(cloned.tier_thresholds[1], cfg.tier_thresholds[1]);
-        prop_assert_eq!(cloned.tier_thresholds[2], cfg.tier_thresholds[2]);
+        prop_assert!((cloned.tier_thresholds[0] - cfg.tier_thresholds[0]).abs() < f64::EPSILON);
+        prop_assert!((cloned.tier_thresholds[1] - cfg.tier_thresholds[1]).abs() < f64::EPSILON);
+        prop_assert!((cloned.tier_thresholds[2] - cfg.tier_thresholds[2]).abs() < f64::EPSILON);
     }
 }

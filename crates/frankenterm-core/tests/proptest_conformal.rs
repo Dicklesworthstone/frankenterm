@@ -906,7 +906,7 @@ proptest! {
         let fc = ResourceForecast {
             metric_name: "test".into(),
             horizon_steps: 5,
-            point_estimate: (lower + upper) / 2.0,
+            point_estimate: f64::midpoint(lower, upper),
             lower_bound: lower,
             upper_bound: upper,
             coverage: 0.95,

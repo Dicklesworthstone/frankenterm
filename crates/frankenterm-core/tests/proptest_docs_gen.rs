@@ -636,7 +636,7 @@ proptest! {
 
     #[test]
     fn prop_endpoint_category_clone(cat in arb_endpoint_category()) {
-        let cloned = cat.clone();
+        let cloned = cat;
         prop_assert_eq!(cloned, cat);
     }
 

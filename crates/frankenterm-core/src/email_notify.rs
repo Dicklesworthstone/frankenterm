@@ -342,7 +342,7 @@ mod tests {
             username: Some("user@example.com".to_string()),
             password: Some("pass".to_string()),
             from: "wa@example.com".to_string(),
-            to: vec!["".to_string()],
+            to: vec![String::new()],
             ..EmailNotifyConfig::default()
         };
         let err = config.validate().unwrap_err();

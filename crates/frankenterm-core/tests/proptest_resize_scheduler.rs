@@ -1074,7 +1074,7 @@ proptest! {
     /// ResizeWorkClass implements Clone correctly.
     #[test]
     fn prop_work_class_clone(class in arb_work_class()) {
-        let cloned = class.clone();
-        prop_assert_eq!(class, cloned, "WorkClass Clone should produce equal value");
+        let cloned = class;
+        prop_assert_eq!(class, cloned, "WorkClass Copy should produce equal value");
     }
 }

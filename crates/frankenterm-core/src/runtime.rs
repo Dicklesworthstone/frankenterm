@@ -4316,7 +4316,7 @@ mod tests {
         let samples = StdMutex::new(VecDeque::from([100, 10, 50, 90, 30]));
         let p50 = percentile_from_samples(&samples, 50);
         // Sorted: [10, 30, 50, 90, 100], p50 index = (4*50+99)/100 = 2 => 50
-        assert!(p50 >= 30 && p50 <= 90);
+        assert!((30..=90).contains(&p50));
     }
 
     // =========================================================================

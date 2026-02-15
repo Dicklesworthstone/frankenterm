@@ -2753,7 +2753,7 @@ alias ll='ls -la'
     fn shell_type_copy_clone() {
         let s = ShellType::Bash;
         let s2 = s; // Copy
-        let s3 = s.clone();
+        let s3 = s;
         assert_eq!(s, s2);
         assert_eq!(s, s3);
     }
@@ -2819,7 +2819,7 @@ alias ll='ls -la'
     fn wizard_choice_copy_clone_eq() {
         let a = WizardChoice::Accept;
         let b = a; // Copy
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, b);
         assert_eq!(a, c);
         assert_ne!(WizardChoice::Accept, WizardChoice::Skip);

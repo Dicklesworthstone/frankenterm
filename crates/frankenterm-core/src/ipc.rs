@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{IpcAuthToken, IpcScope};
 use crate::crash::HealthSnapshot;
@@ -31,6 +31,10 @@ pub const IPC_SOCKET_NAME: &str = "ipc.sock";
 
 /// Maximum message size in bytes (128KB).
 pub const MAX_MESSAGE_SIZE: usize = 131_072;
+#[cfg(unix)]
+const IPC_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(unix)]
+const IPC_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -533,40 +537,68 @@ impl IpcServer {
         ctx: Arc<IpcHandlerContext>,
         shutdown_rx: &mut mpsc::Receiver<()>,
     ) {
-        #[cfg(feature = "asupersync-runtime")]
-        let shutdown_cx = crate::cx::for_testing();
+        let mut connection_tasks = tokio::task::JoinSet::new();
 
         loop {
-            #[cfg(feature = "asupersync-runtime")]
-            let shutdown_fut = shutdown_rx.recv(&shutdown_cx);
-            #[cfg(not(feature = "asupersync-runtime"))]
-            let shutdown_fut = shutdown_rx.recv();
+            if shutdown_signal_pending(shutdown_rx).await {
+                tracing::info!("IPC server shutting down");
+                break;
+            }
 
-            tokio::select! {
-                result = self.listener.accept() => {
-                    match result {
-                        Ok((stream, _addr)) => {
-                            let ctx = ctx.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_client_with_context(stream, ctx).await {
-                                    tracing::warn!(error = %e, "IPC client error");
-                                }
-                            });
+            match crate::runtime_compat::timeout(IPC_ACCEPT_POLL_INTERVAL, self.listener.accept())
+                .await
+            {
+                Ok(Ok((stream, _addr))) => {
+                    let ctx = ctx.clone();
+                    connection_tasks.spawn(async move {
+                        if let Err(e) = handle_client_with_context(stream, ctx).await {
+                            tracing::warn!(error = %e, "IPC client error");
                         }
-                        Err(e) => {
-                            tracing::error!(error = %e, "Failed to accept IPC connection");
-                        }
-                    }
+                    });
                 }
-                _ = shutdown_fut => {
-                    tracing::info!("IPC server shutting down");
-                    break;
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "Failed to accept IPC connection");
                 }
+                Err(_elapsed) => {}
+            }
+
+            while let Some(join_result) = connection_tasks.try_join_next() {
+                if let Err(join_err) = join_result {
+                    tracing::debug!(error = %join_err, "IPC client task failed");
+                }
+            }
+        }
+
+        while let Some(join_result) = connection_tasks.join_next().await {
+            if let Err(join_err) = join_result {
+                tracing::debug!(error = %join_err, "IPC client task failed during shutdown");
             }
         }
 
         // Clean up socket file
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal_pending(shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_testing();
+        match crate::runtime_compat::timeout(IPC_SHUTDOWN_POLL_INTERVAL, shutdown_rx.recv(&cx))
+            .await
+        {
+            Ok(Ok(())) | Ok(Err(_)) => true,
+            Err(_elapsed) => false,
+        }
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        match crate::runtime_compat::timeout(IPC_SHUTDOWN_POLL_INTERVAL, shutdown_rx.recv()).await {
+            Ok(Some(()) | None) => true,
+            Err(_elapsed) => false,
+        }
     }
 }
 

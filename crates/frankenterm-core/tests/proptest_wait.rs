@@ -524,7 +524,7 @@ proptest! {
         let w = WaitFor::ready(val);
         match w {
             WaitFor::Ready(v) => prop_assert_eq!(v, val),
-            _ => prop_assert!(false, "expected Ready"),
+            WaitFor::NotReady { .. } => prop_assert!(false, "expected Ready"),
         }
     }
 

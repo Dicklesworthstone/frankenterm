@@ -380,7 +380,7 @@ proptest! {
     /// CassAgent Clone preserves variant.
     #[test]
     fn prop_agent_clone(agent in arb_cass_agent()) {
-        let cloned = agent.clone();
+        let cloned = agent;
         prop_assert_eq!(agent.as_str(), cloned.as_str());
     }
 

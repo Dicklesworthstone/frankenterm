@@ -575,7 +575,7 @@ fn clock_skew_policy_default_is_ignore() {
 fn clock_skew_policy_clone_copy_eq() {
     let a = ClockSkewPolicy::FlagOnly;
     let b = a; // Copy
-    let c = a.clone();
+    let c = a;
     assert_eq!(a, b);
     assert_eq!(a, c);
     assert_ne!(a, ClockSkewPolicy::IgnoreUseSequence);

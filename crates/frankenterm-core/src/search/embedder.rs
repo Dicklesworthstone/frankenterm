@@ -213,7 +213,7 @@ mod tests {
     fn embedder_tier_clone_copy() {
         let t = EmbedderTier::Fast;
         let t2 = t; // Copy
-        let t3 = t.clone(); // Clone
+        let t3 = t; // Copy (also Clone)
         assert_eq!(t, t2);
         assert_eq!(t, t3);
     }

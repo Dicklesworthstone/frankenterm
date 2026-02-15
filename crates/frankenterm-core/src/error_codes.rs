@@ -1404,7 +1404,7 @@ mod tests {
     #[test]
     fn error_category_copy_and_clone() {
         let cat = ErrorCategory::Wezterm;
-        let cloned = cat.clone();
+        let cloned = cat;
         let copied = cat; // Copy
         assert_eq!(cat, cloned);
         assert_eq!(cat, copied);
@@ -1433,9 +1433,9 @@ mod tests {
         ];
         let mut hashes = std::collections::HashSet::new();
         for cat in &categories {
-            let mut hasher = DefaultHasher::new();
-            cat.hash(&mut hasher);
-            hashes.insert(hasher.finish());
+            let mut hash_state = DefaultHasher::new();
+            cat.hash(&mut hash_state);
+            hashes.insert(hash_state.finish());
         }
         // All categories should have distinct hashes (with very high probability)
         assert_eq!(hashes.len(), categories.len());

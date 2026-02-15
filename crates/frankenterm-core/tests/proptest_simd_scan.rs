@@ -628,6 +628,7 @@ proptest! {
     #[test]
     fn metrics_clone_preserves(data in arb_bytes(500)) {
         let scan = scan_newlines_and_ansi(&data);
+        #[allow(clippy::clone_on_copy)]
         let cloned = scan.clone();
         prop_assert_eq!(cloned, scan);
     }

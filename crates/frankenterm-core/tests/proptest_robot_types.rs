@@ -577,7 +577,7 @@ proptest! {
     /// ErrorCode Clone preserves number.
     #[test]
     fn prop_error_code_clone_preserves(code in arb_known_error_code()) {
-        let cloned = code.clone();
+        let cloned = code;
         prop_assert_eq!(cloned.number(), code.number());
     }
 

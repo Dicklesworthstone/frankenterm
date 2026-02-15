@@ -976,7 +976,9 @@ proptest! {
         for &(k, v) in &entries {
             cache.put(k, v);
         }
-        prop_assert_eq!(cache.is_empty(), cache.len() == 0,
+        #[allow(clippy::len_zero)]
+        let len_is_zero = cache.len() == 0;
+        prop_assert_eq!(cache.is_empty(), len_is_zero,
             "is_empty() doesn't match len() == 0");
     }
 

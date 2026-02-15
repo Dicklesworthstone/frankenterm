@@ -460,7 +460,7 @@ mod tests {
         let test_values = [0.5, 0.25, 2.0, 10.0, 100.0, 0.001, -0.5, -42.0];
         for &v in &test_values {
             let rt = f16_to_f32(f32_to_f16(v));
-            let tol = v.abs() * 0.01 + 0.001;
+            let tol = v.abs().mul_add(0.01, 0.001);
             assert!(
                 (v - rt).abs() < tol,
                 "f16 roundtrip for {v}: got {rt}, tol={tol}"

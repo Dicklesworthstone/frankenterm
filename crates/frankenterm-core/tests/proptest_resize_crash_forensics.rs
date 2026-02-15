@@ -565,14 +565,14 @@ proptest! {
     /// ResizeQueueDepths Clone preserves all fields.
     #[test]
     fn prop_queue_depths_clone(d in arb_queue_depths()) {
-        let cloned = d.clone();
+        let cloned = d;
         prop_assert_eq!(d, cloned);
     }
 
     /// StormState Clone preserves all fields.
     #[test]
     fn prop_storm_state_clone(s in arb_storm_state()) {
-        let cloned = s.clone();
+        let cloned = s;
         prop_assert_eq!(s, cloned);
     }
 

@@ -976,6 +976,538 @@ mod tests {
         assert!(tuner.history.len() <= 5);
     }
 
+    // -----------------------------------------------------------------------
+    // Batch — RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn with_params_sets_initial_params() {
+        let custom = TunableParams {
+            poll_interval_ms: 500.0,
+            scrollback_lines: 2000.0,
+            snapshot_interval_secs: 120.0,
+            pool_size: 8.0,
+            backpressure_threshold: 0.6,
+        };
+        let tuner = AutoTuner::with_params(default_config(), custom.clone());
+        let p = tuner.params();
+        assert!(
+            (p.poll_interval_ms - 500.0).abs() < f64::EPSILON,
+            "poll_interval_ms: {}",
+            p.poll_interval_ms
+        );
+        assert!(
+            (p.scrollback_lines - 2000.0).abs() < f64::EPSILON,
+            "scrollback_lines: {}",
+            p.scrollback_lines
+        );
+        assert!(
+            (p.snapshot_interval_secs - 120.0).abs() < f64::EPSILON,
+            "snapshot_interval_secs: {}",
+            p.snapshot_interval_secs
+        );
+        assert!(
+            (p.pool_size - 8.0).abs() < f64::EPSILON,
+            "pool_size: {}",
+            p.pool_size
+        );
+        assert!(
+            (p.backpressure_threshold - 0.6).abs() < f64::EPSILON,
+            "backpressure_threshold: {}",
+            p.backpressure_threshold
+        );
+        assert_eq!(tuner.tick_count(), 0);
+        assert!(tuner.adjustments().is_empty());
+    }
+
+    #[test]
+    fn param_range_clamp_at_min() {
+        let range = ParamRange {
+            min: 10.0,
+            max: 100.0,
+        };
+        assert!((range.clamp(10.0) - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn param_range_clamp_at_max() {
+        let range = ParamRange {
+            min: 10.0,
+            max: 100.0,
+        };
+        assert!((range.clamp(100.0) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn param_range_clamp_in_range() {
+        let range = ParamRange {
+            min: 10.0,
+            max: 100.0,
+        };
+        assert!((range.clamp(55.0) - 55.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn param_range_clamp_below_min() {
+        let range = ParamRange {
+            min: 10.0,
+            max: 100.0,
+        };
+        assert!((range.clamp(-5.0) - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn param_range_clamp_above_max() {
+        let range = ParamRange {
+            min: 10.0,
+            max: 100.0,
+        };
+        assert!((range.clamp(999.0) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn auto_tune_config_default_values() {
+        let cfg = AutoTuneConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.tick_interval_secs, 30);
+        assert!((cfg.max_change_per_tick - 0.1).abs() < f64::EPSILON);
+        assert_eq!(cfg.hysteresis_ticks, 3);
+        assert_eq!(cfg.history_limit, 100);
+    }
+
+    #[test]
+    fn tuning_targets_default_values() {
+        let t = TuningTargets::default();
+        assert!((t.target_rss_fraction - 0.5).abs() < f64::EPSILON);
+        assert!((t.target_latency_ms - 10.0).abs() < f64::EPSILON);
+        assert!((t.target_cpu_fraction - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pinned_params_default_all_false() {
+        let p = PinnedParams::default();
+        assert!(!p.poll_interval_ms);
+        assert!(!p.scrollback_lines);
+        assert!(!p.snapshot_interval_secs);
+        assert!(!p.pool_size);
+        assert!(!p.backpressure_threshold);
+    }
+
+    #[test]
+    fn tunable_params_serde_roundtrip() {
+        let params = TunableParams {
+            poll_interval_ms: 350.0,
+            scrollback_lines: 7500.0,
+            snapshot_interval_secs: 180.0,
+            pool_size: 6.0,
+            backpressure_threshold: 0.55,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        let deserialized: TunableParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(params, deserialized);
+    }
+
+    #[test]
+    fn auto_tune_config_serde_roundtrip() {
+        let cfg = AutoTuneConfig {
+            enabled: false,
+            tick_interval_secs: 60,
+            targets: TuningTargets {
+                target_rss_fraction: 0.4,
+                target_latency_ms: 20.0,
+                target_cpu_fraction: 0.5,
+            },
+            max_change_per_tick: 0.2,
+            hysteresis_ticks: 5,
+            history_limit: 50,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let deserialized: AutoTuneConfig = serde_json::from_str(&json).unwrap();
+        assert!(!deserialized.enabled);
+        assert_eq!(deserialized.tick_interval_secs, 60);
+        assert!((deserialized.max_change_per_tick - 0.2).abs() < f64::EPSILON);
+        assert_eq!(deserialized.hysteresis_ticks, 5);
+        assert_eq!(deserialized.history_limit, 50);
+        assert!((deserialized.targets.target_rss_fraction - 0.4).abs() < f64::EPSILON);
+        assert!((deserialized.targets.target_latency_ms - 20.0).abs() < f64::EPSILON);
+        assert!((deserialized.targets.target_cpu_fraction - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn low_memory_pressure_restores_scrollback() {
+        // When rss_fraction is low (pressure < 0.95), scrollback should increase
+        let config = AutoTuneConfig {
+            hysteresis_ticks: 1,
+            ..default_config()
+        };
+        // Start with reduced scrollback
+        let params = TunableParams {
+            scrollback_lines: 2000.0,
+            ..TunableParams::default()
+        };
+        let mut tuner = AutoTuner::with_params(config, params);
+        let initial = tuner.params().scrollback_lines;
+
+        // Very low memory usage: rss_fraction=0.1 => pressure = 0.1/0.5 = 0.2 (< 0.95)
+        let low_mem = TunerMetrics {
+            rss_fraction: 0.1,
+            mux_latency_ms: 10.0,
+            cpu_fraction: 0.3,
+        };
+        for _ in 0..5 {
+            tuner.tick(&low_mem);
+        }
+
+        assert!(
+            tuner.params().scrollback_lines > initial,
+            "scrollback should increase when memory pressure is low: initial={}, got={}",
+            initial,
+            tuner.params().scrollback_lines
+        );
+    }
+
+    #[test]
+    fn low_latency_decreases_poll_interval() {
+        // When latency is low (pressure < 0.95), poll interval should decrease
+        let config = AutoTuneConfig {
+            hysteresis_ticks: 1,
+            ..default_config()
+        };
+        // Start with elevated poll interval
+        let params = TunableParams {
+            poll_interval_ms: 1000.0,
+            ..TunableParams::default()
+        };
+        let mut tuner = AutoTuner::with_params(config, params);
+        let initial = tuner.params().poll_interval_ms;
+
+        // Very low latency: 2ms => pressure = 2/10 = 0.2 (< 0.95)
+        let low_lat = TunerMetrics {
+            rss_fraction: 0.5,
+            mux_latency_ms: 2.0,
+            cpu_fraction: 0.3,
+        };
+        for _ in 0..5 {
+            tuner.tick(&low_lat);
+        }
+
+        assert!(
+            tuner.params().poll_interval_ms < initial,
+            "poll_interval should decrease when latency is low: initial={}, got={}",
+            initial,
+            tuner.params().poll_interval_ms
+        );
+    }
+
+    #[test]
+    fn low_cpu_restores_pool_size() {
+        // When cpu_fraction is low (pressure < 0.95), pool_size should increase
+        let config = AutoTuneConfig {
+            hysteresis_ticks: 1,
+            ..default_config()
+        };
+        // Start with reduced pool size
+        let params = TunableParams {
+            pool_size: 2.0,
+            ..TunableParams::default()
+        };
+        let mut tuner = AutoTuner::with_params(config, params);
+        let initial = tuner.params().pool_size;
+
+        // Very low CPU: 0.05 => pressure = 0.05/0.3 = 0.167 (< 0.95)
+        let low_cpu = TunerMetrics {
+            rss_fraction: 0.5,
+            mux_latency_ms: 10.0,
+            cpu_fraction: 0.05,
+        };
+        for _ in 0..5 {
+            tuner.tick(&low_cpu);
+        }
+
+        assert!(
+            tuner.params().pool_size > initial,
+            "pool_size should increase when CPU is low: initial={}, got={}",
+            initial,
+            tuner.params().pool_size
+        );
+    }
+
+    #[test]
+    fn multiple_concurrent_pressures() {
+        // High memory + high latency + high CPU simultaneously
+        let config = AutoTuneConfig {
+            hysteresis_ticks: 1,
+            ..default_config()
+        };
+        let mut tuner = AutoTuner::new(config);
+        let initial = tuner.params().clone();
+
+        let all_high = TunerMetrics {
+            rss_fraction: 0.85,   // high memory
+            mux_latency_ms: 30.0, // high latency
+            cpu_fraction: 0.7,    // high CPU
+        };
+
+        for _ in 0..10 {
+            tuner.tick(&all_high);
+        }
+
+        let p = tuner.params();
+        // Memory pressure: scrollback should decrease
+        assert!(
+            p.scrollback_lines < initial.scrollback_lines,
+            "scrollback should decrease under memory pressure"
+        );
+        // Memory pressure: snapshot interval should increase
+        assert!(
+            p.snapshot_interval_secs > initial.snapshot_interval_secs,
+            "snapshot_interval should increase under memory pressure"
+        );
+        // Latency + CPU pressure: poll interval should increase
+        assert!(
+            p.poll_interval_ms > initial.poll_interval_ms,
+            "poll_interval should increase under latency+CPU pressure"
+        );
+        // CPU pressure: pool size should decrease
+        assert!(
+            p.pool_size < initial.pool_size,
+            "pool_size should decrease under CPU pressure"
+        );
+    }
+
+    #[test]
+    fn pinned_snapshot_interval_not_modified_under_memory_pressure() {
+        let config = AutoTuneConfig {
+            hysteresis_ticks: 1,
+            ..default_config()
+        };
+        let mut tuner = AutoTuner::new(config);
+        tuner.set_pinned(PinnedParams {
+            snapshot_interval_secs: true,
+            ..PinnedParams::default()
+        });
+        let initial = tuner.params().snapshot_interval_secs;
+
+        for _ in 0..10 {
+            tuner.tick(&high_memory_metrics());
+        }
+
+        assert!(
+            (tuner.params().snapshot_interval_secs - initial).abs() < f64::EPSILON,
+            "pinned snapshot_interval_secs should not change: initial={}, got={}",
+            initial,
+            tuner.params().snapshot_interval_secs
+        );
+    }
+
+    #[test]
+    fn pinned_backpressure_threshold_not_modified() {
+        // backpressure_threshold is never directly adjusted by the tuner,
+        // but verify pinning it doesn't cause issues and it stays unchanged
+        let config = AutoTuneConfig {
+            hysteresis_ticks: 1,
+            ..default_config()
+        };
+        let mut tuner = AutoTuner::new(config);
+        tuner.set_pinned(PinnedParams {
+            backpressure_threshold: true,
+            ..PinnedParams::default()
+        });
+        let initial = tuner.params().backpressure_threshold;
+
+        let all_high = TunerMetrics {
+            rss_fraction: 0.9,
+            mux_latency_ms: 50.0,
+            cpu_fraction: 0.8,
+        };
+        for _ in 0..10 {
+            tuner.tick(&all_high);
+        }
+
+        assert!(
+            (tuner.params().backpressure_threshold - initial).abs() < f64::EPSILON,
+            "pinned backpressure_threshold should not change"
+        );
+    }
+
+    #[test]
+    fn apply_gradual_change_delta_at_max_boundary() {
+        // When the requested change is exactly at the max boundary,
+        // the target should be reached immediately.
+        let config = AutoTuneConfig {
+            hysteresis_ticks: 1,
+            max_change_per_tick: 0.1,
+            ..default_config()
+        };
+        let tuner = AutoTuner::new(config);
+
+        // current=100, target=110 => delta=10, max_delta=100*0.1=10 => delta==max_delta
+        let result = tuner.apply_gradual_change(100.0, 110.0);
+        assert!(
+            (result - 110.0).abs() < f64::EPSILON,
+            "should reach target when delta equals max: got {}",
+            result
+        );
+
+        // current=100, target=90 => delta=-10, |delta|=10 = max_delta
+        let result_down = tuner.apply_gradual_change(100.0, 90.0);
+        assert!(
+            (result_down - 90.0).abs() < f64::EPSILON,
+            "should reach target when negative delta equals max: got {}",
+            result_down
+        );
+    }
+
+    #[test]
+    fn very_high_max_change_allows_immediate_convergence() {
+        // With max_change_per_tick = 1.0 (100%), one tick should fully converge
+        let config = AutoTuneConfig {
+            hysteresis_ticks: 1,
+            max_change_per_tick: 1.0,
+            ..default_config()
+        };
+        let tuner = AutoTuner::new(config);
+
+        // current=200, target=50 => delta=-150, max_delta=200*1.0=200 => |delta|<max_delta
+        let result = tuner.apply_gradual_change(200.0, 50.0);
+        assert!(
+            (result - 50.0).abs() < f64::EPSILON,
+            "100% max_change should allow full convergence: got {}",
+            result
+        );
+    }
+
+    #[test]
+    fn zero_hysteresis_ticks_immediate_response() {
+        // hysteresis_ticks=0 means the first tick of pressure triggers a change
+        // (threshold=0 => ticks(1) >= 0 is always true)
+        let config = AutoTuneConfig {
+            hysteresis_ticks: 0,
+            ..default_config()
+        };
+        let mut tuner = AutoTuner::new(config);
+        let initial = tuner.params().scrollback_lines;
+
+        // A single tick of high memory should already change scrollback
+        tuner.tick(&high_memory_metrics());
+        assert!(
+            tuner.params().scrollback_lines < initial,
+            "with hysteresis=0, first tick should trigger change: initial={}, got={}",
+            initial,
+            tuner.params().scrollback_lines
+        );
+    }
+
+    #[test]
+    fn history_limit_one_still_works() {
+        let config = AutoTuneConfig {
+            history_limit: 1,
+            hysteresis_ticks: 1,
+            ..default_config()
+        };
+        let mut tuner = AutoTuner::new(config);
+
+        for _ in 0..10 {
+            tuner.tick(&high_memory_metrics());
+        }
+
+        assert!(tuner.history.len() <= 1);
+        assert_eq!(tuner.tick_count(), 10);
+        // Tuner should still function with minimal history
+        assert!(tuner.params().scrollback_lines < TunableParams::default().scrollback_lines);
+    }
+
+    #[test]
+    fn adjustment_records_contain_correct_param_and_reason() {
+        let config = AutoTuneConfig {
+            hysteresis_ticks: 1,
+            ..default_config()
+        };
+        let mut tuner = AutoTuner::new(config);
+
+        // Trigger memory adjustments
+        for _ in 0..3 {
+            tuner.tick(&high_memory_metrics());
+        }
+
+        let mem_adjs: Vec<&Adjustment> = tuner
+            .adjustments()
+            .iter()
+            .filter(|a| a.reason == "memory pressure")
+            .collect();
+        assert!(
+            !mem_adjs.is_empty(),
+            "should have memory pressure adjustments"
+        );
+        for adj in &mem_adjs {
+            assert!(
+                adj.param == "scrollback_lines" || adj.param == "snapshot_interval_secs",
+                "unexpected param under memory pressure: {}",
+                adj.param
+            );
+            assert!(adj.pressure > 1.0, "memory pressure ratio should be > 1.0");
+            assert!(
+                (adj.old_value - adj.new_value).abs() > f64::EPSILON,
+                "old and new values should differ"
+            );
+        }
+
+        // Now trigger CPU adjustments
+        tuner.clear_adjustments();
+        for _ in 0..3 {
+            tuner.tick(&high_cpu_metrics());
+        }
+
+        let cpu_adjs: Vec<&Adjustment> = tuner
+            .adjustments()
+            .iter()
+            .filter(|a| a.reason == "CPU pressure")
+            .collect();
+        for adj in &cpu_adjs {
+            assert_eq!(adj.param, "pool_size");
+            assert!(adj.pressure > 1.0);
+        }
+    }
+
+    #[test]
+    fn tick_count_after_mixed_ticks() {
+        let mut tuner = AutoTuner::new(default_config());
+        assert_eq!(tuner.tick_count(), 0);
+
+        tuner.tick(&calm_metrics());
+        tuner.tick(&high_memory_metrics());
+        tuner.tick(&high_latency_metrics());
+        tuner.tick(&high_cpu_metrics());
+        tuner.tick(&calm_metrics());
+
+        assert_eq!(
+            tuner.tick_count(),
+            5,
+            "tick_count should be 5 after 5 mixed ticks"
+        );
+    }
+
+    #[test]
+    fn integer_getters_with_non_default_values() {
+        // Test rounding behavior of integer getters
+        let params = TunableParams {
+            poll_interval_ms: 150.4,
+            scrollback_lines: 3500.6,
+            snapshot_interval_secs: 90.5,
+            pool_size: 5.7,
+            backpressure_threshold: 0.8,
+        };
+        // 150.4 rounds to 150
+        assert_eq!(params.poll_interval_ms_u64(), 150);
+        // 3500.6 rounds to 3501
+        assert_eq!(params.scrollback_lines_usize(), 3501);
+        // 90.5 rounds to 91 (banker's rounding: .5 rounds to even... actually f64::round
+        // rounds away from zero for .5)
+        assert_eq!(params.snapshot_interval_secs_u64(), 91);
+        // 5.7 rounds to 6
+        assert_eq!(params.pool_size_usize(), 6);
+    }
+
     // ---- proptest ----
 
     mod prop {
