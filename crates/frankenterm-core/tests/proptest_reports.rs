@@ -14,7 +14,7 @@
 //!   - tier boundaries: <1000 ms, <60000 seconds, >=60000 minutes
 //!   - suffix correctness per tier
 //!   - non-negative ms always produces non-empty output
-//! - `truncate`: string truncation
+//! - `truncate`: string truncation (byte-based, ASCII-safe)
 //!   - short strings unchanged (idempotent)
 //!   - output byte length bounded
 //!   - ellipsis present only when truncated
@@ -73,16 +73,10 @@ fn arb_epoch_ms() -> impl Strategy<Value = i64> {
     0i64..7_258_118_400_000i64 // up to ~year 2200
 }
 
-/// Non-negative durations in ms
-fn arb_duration_ms() -> impl Strategy<Value = i64> {
-    0i64..i64::MAX / 2
-}
-
 /// Arbitrary ASCII strings for truncation tests
 fn arb_ascii_string() -> impl Strategy<Value = String> {
-    prop::collection::vec(32u8..127, 0..200).prop_map(|v| {
-        v.into_iter().map(|b| b as char).collect::<String>()
-    })
+    prop::collection::vec(32u8..127, 0..200)
+        .prop_map(|v| v.into_iter().map(|b| b as char).collect::<String>())
 }
 
 fn arb_max_len() -> impl Strategy<Value = usize> {
@@ -261,6 +255,7 @@ proptest! {
         let s = format_ts(millis);
         prop_assert!(s.starts_with("1970-01-01 00:00:00."), "epoch millis {} gave '{}'", millis, s);
     }
+
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -444,6 +439,7 @@ proptest! {
         let result = truncate(&s, 0);
         prop_assert!(result.ends_with('…'), "max=0 should produce ellipsis: '{}'", result);
     }
+
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -478,7 +474,7 @@ proptest! {
 
     /// days_to_ymd feeds into format_ts consistently: same day → same date prefix.
     #[test]
-    fn days_ymd_format_ts_consistent(days in 0i64..20000) {
+    fn days_ymd_format_ts_consistent(days in -25567i64..20000i64) {
         let (y, m, d) = days_to_ymd(days);
         let ms = days * 86_400_000; // midnight of that day
         let formatted = format_ts(ms);

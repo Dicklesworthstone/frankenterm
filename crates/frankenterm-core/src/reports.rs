@@ -226,12 +226,12 @@ pub async fn generate_session_report(
 /// Format epoch-ms timestamp as a human-readable string.
 pub fn format_ts(epoch_ms: i64) -> String {
     // Simple UTC formatting without external deps
-    let secs = epoch_ms / 1000;
-    let millis = epoch_ms % 1000;
+    let secs = epoch_ms.div_euclid(1000);
+    let millis = epoch_ms.rem_euclid(1000);
 
     // Calculate date/time components from unix timestamp
-    let days_since_epoch = secs / 86400;
-    let time_of_day = secs % 86400;
+    let days_since_epoch = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
@@ -273,10 +273,11 @@ pub fn format_duration(ms: i64) -> String {
 
 /// Truncate string to max chars, adding ellipsis if needed.
 pub fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max.min(s.len())])
+        let prefix: String = s.chars().take(max).collect();
+        format!("{prefix}…")
     }
 }
 
@@ -411,6 +412,21 @@ mod tests {
             formatted.contains("2100-01-01"),
             "Expected far future date, got: {formatted}"
         );
+    }
+
+    #[test]
+    fn format_ts_negative_one_millis() {
+        assert_eq!(format_ts(-1), "1969-12-31 23:59:59.999Z");
+    }
+
+    #[test]
+    fn format_ts_negative_one_second() {
+        assert_eq!(format_ts(-1_000), "1969-12-31 23:59:59.000Z");
+    }
+
+    #[test]
+    fn format_ts_negative_with_millis_component() {
+        assert_eq!(format_ts(-1_001), "1969-12-31 23:59:58.999Z");
     }
 
     #[test]
