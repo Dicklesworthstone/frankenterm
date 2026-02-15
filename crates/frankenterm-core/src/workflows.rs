@@ -19779,8 +19779,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
     #[test]
     fn generate_workflow_id_has_three_parts() {
         let id = generate_workflow_id("test");
-        let parts: Vec<&str> = id.splitn(3, '-').collect();
-        assert_eq!(parts.len(), 3, "expected name-timestamp-hex");
+        assert_eq!(id.splitn(3, '-').count(), 3, "expected name-timestamp-hex");
     }
 
     #[test]

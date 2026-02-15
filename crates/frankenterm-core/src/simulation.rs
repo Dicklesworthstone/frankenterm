@@ -227,10 +227,22 @@ pub struct ResizeTimelineStageSample {
 pub struct ResizeTimelineEvent {
     /// 0-based event index in scenario event list.
     pub event_index: usize,
+    /// Deterministic correlation ID for this resize transaction.
+    pub resize_transaction_id: String,
     /// Target pane ID.
     pub pane_id: u64,
+    /// Target tab ID for the pane at execution time.
+    pub tab_id: u64,
+    /// Monotonic sequence number within scenario execution.
+    pub sequence_no: u64,
     /// Action executed.
     pub action: EventAction,
+    /// Scheduler decision label used for this event.
+    pub scheduler_decision: String,
+    /// Synthetic frame identifier for render/present attribution.
+    pub frame_id: u64,
+    /// Scenario-level test case identifier.
+    pub test_case_id: String,
     /// Scheduled scenario timestamp offset (nanoseconds).
     pub scheduled_at_ns: u64,
     /// Actual dispatch offset relative to scenario execution start (nanoseconds).
@@ -265,8 +277,12 @@ pub struct ResizeTimelineStageSummary {
     pub total_duration_ns: u64,
     /// Arithmetic mean duration (nanoseconds).
     pub avg_duration_ns: f64,
+    /// p50 duration (nanoseconds).
+    pub p50_duration_ns: u64,
     /// p95 duration (nanoseconds).
     pub p95_duration_ns: u64,
+    /// p99 duration (nanoseconds).
+    pub p99_duration_ns: u64,
     /// Maximum observed duration (nanoseconds).
     pub max_duration_ns: u64,
 }
@@ -336,18 +352,25 @@ impl ResizeTimeline {
                     total as f64 / count as f64
                 };
                 let max = samples.last().copied().unwrap_or(0);
-                let p95 = if count == 0 {
-                    0
-                } else {
-                    let idx = ((count - 1) * 95) / 100;
-                    samples[idx]
+                let percentile = |pct: usize| -> u64 {
+                    if count == 0 {
+                        0
+                    } else {
+                        let idx = ((count - 1) * pct) / 100;
+                        samples[idx]
+                    }
                 };
+                let p50 = percentile(50);
+                let p95 = percentile(95);
+                let p99 = percentile(99);
                 ResizeTimelineStageSummary {
                     stage,
                     samples: count,
                     total_duration_ns: total,
                     avg_duration_ns: avg,
+                    p50_duration_ns: p50,
                     p95_duration_ns: p95,
+                    p99_duration_ns: p99,
                     max_duration_ns: max,
                 }
             })
@@ -580,6 +603,7 @@ impl Scenario {
     ) -> Result<(usize, ResizeTimeline)> {
         let mut count = 0usize;
         let run_started = Instant::now();
+        let reproducibility_key = self.reproducibility_key();
         let events_in_window = self.events.iter().take_while(|e| e.at <= elapsed);
         let resize_total = events_in_window
             .clone()
@@ -678,10 +702,28 @@ impl Scenario {
             });
 
             let total_duration_ns = duration_ns_u64(event_started.elapsed());
+            let sequence_no = u64::try_from(index).unwrap_or(u64::MAX);
+            let tab_id = self
+                .panes
+                .iter()
+                .find(|pane| pane.id == event.pane)
+                .map_or(0, |pane| pane.tab_id);
+            let scheduler_decision = if depth_before > depth_after {
+                "dequeue_latest_intent"
+            } else {
+                "noop"
+            }
+            .to_string();
             timeline_events.push(ResizeTimelineEvent {
                 event_index: index,
+                resize_transaction_id: format!("{reproducibility_key}:{index}"),
                 pane_id: event.pane,
+                tab_id,
+                sequence_no,
                 action: event.action.clone(),
+                scheduler_decision,
+                frame_id: sequence_no,
+                test_case_id: self.name.clone(),
                 scheduled_at_ns,
                 dispatch_offset_ns,
                 total_duration_ns,
@@ -695,7 +737,7 @@ impl Scenario {
             count,
             ResizeTimeline {
                 scenario: self.name.clone(),
-                reproducibility_key: self.reproducibility_key(),
+                reproducibility_key,
                 captured_at_ms: epoch_ms_u64(),
                 executed_resize_events: timeline_events.len(),
                 events: timeline_events,
@@ -1440,6 +1482,14 @@ events:
         assert_eq!(timeline.events.len(), 3);
 
         for event in &timeline.events {
+            assert_eq!(event.sequence_no, event.event_index as u64);
+            assert_eq!(event.frame_id, event.sequence_no);
+            assert_eq!(event.scheduler_decision, "dequeue_latest_intent");
+            assert_eq!(event.test_case_id, scenario.name);
+            assert!(event.resize_transaction_id.starts_with(&format!(
+                "{}:{}",
+                timeline.reproducibility_key, event.event_index
+            )));
             assert_eq!(event.stages.len(), ResizeTimelineStage::ALL.len());
             for (sample, expected) in event.stages.iter().zip(ResizeTimelineStage::ALL.iter()) {
                 assert_eq!(sample.stage, *expected);
@@ -1484,6 +1534,12 @@ events:
         let summary = timeline.stage_summary();
         assert_eq!(summary.len(), ResizeTimelineStage::ALL.len());
         assert!(summary.iter().all(|entry| entry.samples == 3));
+        assert!(summary.iter().all(|entry| {
+            entry.p50_duration_ns <= entry.p95_duration_ns
+                && entry.p95_duration_ns <= entry.p99_duration_ns
+                && entry.p99_duration_ns <= entry.max_duration_ns
+                && entry.total_duration_ns >= entry.max_duration_ns
+        }));
 
         let flame = timeline.flame_samples();
         assert_eq!(
@@ -2058,5 +2114,1571 @@ events: []
         assert_eq!(pass, 0);
         assert_eq!(fail, 0);
         assert_eq!(skip, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: parse_duration edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_duration_bare_number_treated_as_seconds() {
+        // A bare number with no unit is treated as seconds
+        assert_eq!(parse_duration("10").unwrap(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn parse_duration_leading_trailing_whitespace() {
+        assert_eq!(parse_duration("  5s  ").unwrap(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn parse_duration_zero() {
+        assert_eq!(parse_duration("0s").unwrap(), Duration::from_millis(0));
+    }
+
+    #[test]
+    fn parse_duration_fractional_minutes() {
+        // 0.5m = 30s
+        assert_eq!(parse_duration("0.5m").unwrap(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn parse_duration_fractional_hours() {
+        // 0.5h = 30m = 1800s
+        assert_eq!(parse_duration("0.5h").unwrap(), Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn parse_duration_large_value() {
+        // 24h = 86400s
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn parse_duration_hour_minute_second() {
+        // 1h2m3s = 3723s
+        assert_eq!(parse_duration("1h2m3s").unwrap(), Duration::from_secs(3723));
+    }
+
+    #[test]
+    fn parse_duration_unknown_unit_returns_error() {
+        let err = parse_duration("5d").unwrap_err();
+        assert!(err.contains("Unknown duration unit"));
+    }
+
+    #[test]
+    fn parse_duration_invalid_number() {
+        let err = parse_duration("abcs").unwrap_err();
+        assert!(err.contains("Invalid number"));
+    }
+
+    #[test]
+    fn parse_duration_empty_string() {
+        // Empty after trim => empty num_buf, 0ms
+        assert_eq!(parse_duration("").unwrap(), Duration::from_millis(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: parse_resize_spec edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_resize_spec_valid() {
+        assert_eq!(parse_resize_spec("80x24").unwrap(), (80, 24));
+    }
+
+    #[test]
+    fn parse_resize_spec_uppercase_x() {
+        assert_eq!(parse_resize_spec("120X40").unwrap(), (120, 40));
+    }
+
+    #[test]
+    fn parse_resize_spec_with_whitespace() {
+        assert_eq!(parse_resize_spec(" 80 x 24 ").unwrap(), (80, 24));
+    }
+
+    #[test]
+    fn parse_resize_spec_zero_cols() {
+        let err = parse_resize_spec("0x24");
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("must be > 0"));
+    }
+
+    #[test]
+    fn parse_resize_spec_zero_rows() {
+        let err = parse_resize_spec("80x0");
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("must be > 0"));
+    }
+
+    #[test]
+    fn parse_resize_spec_no_separator() {
+        assert!(parse_resize_spec("8024").is_err());
+    }
+
+    #[test]
+    fn parse_resize_spec_non_numeric_cols() {
+        assert!(parse_resize_spec("abcx24").is_err());
+    }
+
+    #[test]
+    fn parse_resize_spec_non_numeric_rows() {
+        assert!(parse_resize_spec("80xabc").is_err());
+    }
+
+    #[test]
+    fn parse_resize_spec_large_dimensions() {
+        assert_eq!(parse_resize_spec("4096x2160").unwrap(), (4096, 2160));
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: parse_scrollback_spec edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_scrollback_spec_lines_only_defaults_width_96() {
+        let (lines, width) = parse_scrollback_spec("100").unwrap();
+        assert_eq!(lines, 100);
+        assert_eq!(width, 96);
+    }
+
+    #[test]
+    fn parse_scrollback_spec_lines_and_width() {
+        let (lines, width) = parse_scrollback_spec("50x80").unwrap();
+        assert_eq!(lines, 50);
+        assert_eq!(width, 80);
+    }
+
+    #[test]
+    fn parse_scrollback_spec_uppercase_x() {
+        let (lines, width) = parse_scrollback_spec("10X40").unwrap();
+        assert_eq!(lines, 10);
+        assert_eq!(width, 40);
+    }
+
+    #[test]
+    fn parse_scrollback_spec_empty_is_error() {
+        assert!(parse_scrollback_spec("").is_err());
+        assert!(parse_scrollback_spec("   ").is_err());
+    }
+
+    #[test]
+    fn parse_scrollback_spec_zero_lines() {
+        let err = parse_scrollback_spec("0x80");
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("must be > 0"));
+    }
+
+    #[test]
+    fn parse_scrollback_spec_too_many_lines() {
+        let err = parse_scrollback_spec("300000x80");
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("too large"));
+    }
+
+    #[test]
+    fn parse_scrollback_spec_max_lines_boundary() {
+        // Exactly 250000 should succeed
+        let (lines, _width) = parse_scrollback_spec("250000").unwrap();
+        assert_eq!(lines, 250_000);
+    }
+
+    #[test]
+    fn parse_scrollback_spec_over_max_lines_boundary() {
+        // 250001 should fail
+        assert!(parse_scrollback_spec("250001").is_err());
+    }
+
+    #[test]
+    fn parse_scrollback_spec_width_too_small() {
+        let err = parse_scrollback_spec("10x19");
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("out of range"));
+    }
+
+    #[test]
+    fn parse_scrollback_spec_width_too_large() {
+        let err = parse_scrollback_spec("10x4097");
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("out of range"));
+    }
+
+    #[test]
+    fn parse_scrollback_spec_width_boundary_min() {
+        let (lines, width) = parse_scrollback_spec("1x20").unwrap();
+        assert_eq!(lines, 1);
+        assert_eq!(width, 20);
+    }
+
+    #[test]
+    fn parse_scrollback_spec_width_boundary_max() {
+        let (lines, width) = parse_scrollback_spec("1x4096").unwrap();
+        assert_eq!(lines, 1);
+        assert_eq!(width, 4096);
+    }
+
+    #[test]
+    fn parse_scrollback_spec_invalid_lines() {
+        assert!(parse_scrollback_spec("notanumber").is_err());
+    }
+
+    #[test]
+    fn parse_scrollback_spec_invalid_width() {
+        assert!(parse_scrollback_spec("10xnotanumber").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: generate_scrollback content verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn generate_scrollback_content_has_correct_line_count() {
+        let text = generate_scrollback(5, 40);
+        assert_eq!(text.lines().count(), 5);
+    }
+
+    #[test]
+    fn generate_scrollback_each_line_has_correct_width() {
+        let text = generate_scrollback(3, 60);
+        for line in text.lines() {
+            assert_eq!(line.len(), 60);
+        }
+    }
+
+    #[test]
+    fn generate_scrollback_lines_have_monotonic_indices() {
+        let text = generate_scrollback(10, 96);
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let expected_prefix = format!("[scrollback:{:06}]", i);
+            assert!(
+                line.starts_with(&expected_prefix),
+                "Line {} should start with '{}', got '{}'",
+                i,
+                expected_prefix,
+                &line[..expected_prefix.len().min(line.len())]
+            );
+        }
+    }
+
+    #[test]
+    fn generate_scrollback_single_line() {
+        let text = generate_scrollback(1, 30);
+        assert_eq!(text.lines().count(), 1);
+        assert_eq!(text.lines().next().unwrap().len(), 30);
+    }
+
+    #[test]
+    fn generate_scrollback_minimum_width() {
+        let text = generate_scrollback(2, 20);
+        for line in text.lines() {
+            assert_eq!(line.len(), 20);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: EventAction exhaustive coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn event_action_as_str_all_variants() {
+        assert_eq!(EventAction::Append.as_str(), "append");
+        assert_eq!(EventAction::Clear.as_str(), "clear");
+        assert_eq!(EventAction::SetTitle.as_str(), "set_title");
+        assert_eq!(EventAction::Resize.as_str(), "resize");
+        assert_eq!(EventAction::SetFontSize.as_str(), "set_font_size");
+        assert_eq!(EventAction::GenerateScrollback.as_str(), "generate_scrollback");
+        assert_eq!(EventAction::Marker.as_str(), "marker");
+    }
+
+    #[test]
+    fn event_action_is_resize_timeline_exhaustive() {
+        assert!(!EventAction::Append.is_resize_timeline_action());
+        assert!(!EventAction::Clear.is_resize_timeline_action());
+        assert!(!EventAction::SetTitle.is_resize_timeline_action());
+        assert!(EventAction::Resize.is_resize_timeline_action());
+        assert!(EventAction::SetFontSize.is_resize_timeline_action());
+        assert!(EventAction::GenerateScrollback.is_resize_timeline_action());
+        assert!(!EventAction::Marker.is_resize_timeline_action());
+    }
+
+    #[test]
+    fn event_action_clone_and_eq() {
+        let action = EventAction::Resize;
+        let cloned = action.clone();
+        assert_eq!(action, cloned);
+        assert_ne!(EventAction::Append, EventAction::Clear);
+    }
+
+    #[test]
+    fn event_action_debug_format() {
+        let dbg = format!("{:?}", EventAction::GenerateScrollback);
+        assert_eq!(dbg, "GenerateScrollback");
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: ResizeTimelineStage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resize_timeline_stage_all_has_five_entries() {
+        assert_eq!(ResizeTimelineStage::ALL.len(), 5);
+    }
+
+    #[test]
+    fn resize_timeline_stage_as_str_all_variants() {
+        assert_eq!(ResizeTimelineStage::InputIntent.as_str(), "input_intent");
+        assert_eq!(ResizeTimelineStage::SchedulerQueueing.as_str(), "scheduler_queueing");
+        assert_eq!(ResizeTimelineStage::LogicalReflow.as_str(), "logical_reflow");
+        assert_eq!(ResizeTimelineStage::RenderPrep.as_str(), "render_prep");
+        assert_eq!(ResizeTimelineStage::Presentation.as_str(), "presentation");
+    }
+
+    #[test]
+    fn resize_timeline_stage_ordering() {
+        assert!(ResizeTimelineStage::InputIntent < ResizeTimelineStage::SchedulerQueueing);
+        assert!(ResizeTimelineStage::SchedulerQueueing < ResizeTimelineStage::LogicalReflow);
+        assert!(ResizeTimelineStage::LogicalReflow < ResizeTimelineStage::RenderPrep);
+        assert!(ResizeTimelineStage::RenderPrep < ResizeTimelineStage::Presentation);
+    }
+
+    #[test]
+    fn resize_timeline_stage_all_order_matches_ord() {
+        for pair in ResizeTimelineStage::ALL.windows(2) {
+            assert!(pair[0] < pair[1]);
+        }
+    }
+
+    #[test]
+    fn resize_timeline_stage_hash_distinct() {
+        use std::collections::HashSet;
+        let set: HashSet<ResizeTimelineStage> = ResizeTimelineStage::ALL.iter().copied().collect();
+        assert_eq!(set.len(), 5);
+    }
+
+    #[test]
+    fn resize_timeline_stage_copy_semantics() {
+        let stage = ResizeTimelineStage::LogicalReflow;
+        let copied = stage;
+        assert_eq!(stage, copied);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: Serde roundtrips (JSON)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn event_action_serde_json_roundtrip() {
+        for action in [
+            EventAction::Append,
+            EventAction::Clear,
+            EventAction::SetTitle,
+            EventAction::Resize,
+            EventAction::SetFontSize,
+            EventAction::GenerateScrollback,
+            EventAction::Marker,
+        ] {
+            let json = serde_json::to_string(&action).unwrap();
+            let back: EventAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(action, back);
+        }
+    }
+
+    #[test]
+    fn event_action_serde_snake_case() {
+        let json = serde_json::to_string(&EventAction::SetFontSize).unwrap();
+        assert_eq!(json, "\"set_font_size\"");
+        let json = serde_json::to_string(&EventAction::GenerateScrollback).unwrap();
+        assert_eq!(json, "\"generate_scrollback\"");
+    }
+
+    #[test]
+    fn resize_timeline_stage_serde_json_roundtrip() {
+        for stage in ResizeTimelineStage::ALL {
+            let json = serde_json::to_string(&stage).unwrap();
+            let back: ResizeTimelineStage = serde_json::from_str(&json).unwrap();
+            assert_eq!(stage, back);
+        }
+    }
+
+    #[test]
+    fn resize_timeline_stage_serde_snake_case() {
+        let json = serde_json::to_string(&ResizeTimelineStage::SchedulerQueueing).unwrap();
+        assert_eq!(json, "\"scheduler_queueing\"");
+    }
+
+    #[test]
+    fn resize_queue_metrics_serde_json_roundtrip() {
+        let m = ResizeQueueMetrics {
+            depth_before: 10,
+            depth_after: 9,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: ResizeQueueMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, back);
+    }
+
+    #[test]
+    fn resize_timeline_stage_sample_serde_with_queue_metrics() {
+        let sample = ResizeTimelineStageSample {
+            stage: ResizeTimelineStage::SchedulerQueueing,
+            start_offset_ns: 100,
+            duration_ns: 500,
+            queue_metrics: Some(ResizeQueueMetrics {
+                depth_before: 3,
+                depth_after: 2,
+            }),
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert!(json.contains("queue_metrics"));
+        let back: ResizeTimelineStageSample = serde_json::from_str(&json).unwrap();
+        assert_eq!(sample, back);
+    }
+
+    #[test]
+    fn resize_timeline_stage_sample_serde_without_queue_metrics() {
+        let sample = ResizeTimelineStageSample {
+            stage: ResizeTimelineStage::InputIntent,
+            start_offset_ns: 0,
+            duration_ns: 42,
+            queue_metrics: None,
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        // skip_serializing_if means queue_metrics should not appear
+        assert!(!json.contains("queue_metrics"));
+        let back: ResizeTimelineStageSample = serde_json::from_str(&json).unwrap();
+        assert_eq!(sample, back);
+    }
+
+    #[test]
+    fn resize_timeline_flame_sample_serde_roundtrip() {
+        let fs = ResizeTimelineFlameSample {
+            stack: "test;resize;input_intent".to_string(),
+            duration_ns: 12345,
+            event_index: 0,
+            pane_id: 42,
+        };
+        let json = serde_json::to_string(&fs).unwrap();
+        let back: ResizeTimelineFlameSample = serde_json::from_str(&json).unwrap();
+        assert_eq!(fs, back);
+    }
+
+    #[test]
+    fn scenario_pane_serde_json_roundtrip() {
+        let pane = ScenarioPane {
+            id: 5,
+            title: "Test".to_string(),
+            domain: "remote".to_string(),
+            cwd: "/tmp".to_string(),
+            window_id: 1,
+            tab_id: 2,
+            cols: 120,
+            rows: 40,
+            initial_content: "hello".to_string(),
+        };
+        let json = serde_json::to_string(&pane).unwrap();
+        let back: ScenarioPane = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, 5);
+        assert_eq!(back.title, "Test");
+        assert_eq!(back.cols, 120);
+        assert_eq!(back.rows, 40);
+        assert_eq!(back.initial_content, "hello");
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: Scenario validation edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_empty_set_font_size_content() {
+        let yaml = r#"
+name: bad_font_size
+duration: "5s"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: set_font_size
+    content: ""
+"#;
+        let err = Scenario::from_yaml(yaml);
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("SetFontSize requires non-empty content"));
+    }
+
+    #[test]
+    fn validate_set_font_size_whitespace_only() {
+        let yaml = r#"
+name: bad_font_size_ws
+duration: "5s"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: set_font_size
+    content: "   "
+"#;
+        let err = Scenario::from_yaml(yaml);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn validate_resize_bad_spec_in_scenario() {
+        let yaml = r#"
+name: bad_resize_spec
+duration: "5s"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: resize
+    content: "not_a_resize"
+"#;
+        assert!(Scenario::from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn validate_resize_zero_dimensions_in_scenario() {
+        let yaml = r#"
+name: zero_resize
+duration: "5s"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: resize
+    content: "0x0"
+"#;
+        assert!(Scenario::from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn validate_events_at_same_time_is_ok() {
+        let yaml = r#"
+name: same_time
+duration: "5s"
+panes:
+  - id: 0
+events:
+  - at: "2s"
+    pane: 0
+    action: append
+    content: "a"
+  - at: "2s"
+    pane: 0
+    action: append
+    content: "b"
+"#;
+        // Same time is not out-of-order, it should be valid
+        assert!(Scenario::from_yaml(yaml).is_ok());
+    }
+
+    #[test]
+    fn validate_single_event_always_in_order() {
+        let yaml = r#"
+name: single_event
+duration: "5s"
+panes:
+  - id: 0
+events:
+  - at: "3s"
+    pane: 0
+    action: append
+    content: "only one"
+"#;
+        assert!(Scenario::from_yaml(yaml).is_ok());
+    }
+
+    #[test]
+    fn validate_many_panes_unique_ids() {
+        let yaml = r#"
+name: many_panes
+duration: "5s"
+panes:
+  - id: 0
+  - id: 1
+  - id: 2
+  - id: 100
+  - id: 999
+events: []
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        assert_eq!(scenario.panes.len(), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: Reproducibility key variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reproducibility_key_defaults_when_no_metadata() {
+        let yaml = r#"
+name: bare
+duration: "1s"
+panes: []
+events: []
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        assert_eq!(scenario.reproducibility_key(), "ad_hoc:v1:bare:0");
+    }
+
+    #[test]
+    fn reproducibility_key_partial_metadata() {
+        let yaml = r#"
+name: partial
+duration: "1s"
+metadata:
+  suite: my_suite
+panes: []
+events: []
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        // suite_version and seed should use defaults
+        assert_eq!(scenario.reproducibility_key(), "my_suite:v1:partial:0");
+    }
+
+    #[test]
+    fn reproducibility_key_only_seed() {
+        let yaml = r#"
+name: seeded
+duration: "1s"
+metadata:
+  seed: "42"
+panes: []
+events: []
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        assert_eq!(scenario.reproducibility_key(), "ad_hoc:v1:seeded:42");
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: ResizeTimeline summary/flame edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_timeline_stage_summary_returns_zero_samples() {
+        let timeline = ResizeTimeline {
+            scenario: "empty".to_string(),
+            reproducibility_key: "test:v1:empty:0".to_string(),
+            captured_at_ms: 0,
+            executed_resize_events: 0,
+            events: vec![],
+        };
+        let summary = timeline.stage_summary();
+        assert_eq!(summary.len(), 5); // all 5 stages present
+        for entry in &summary {
+            assert_eq!(entry.samples, 0);
+            assert_eq!(entry.total_duration_ns, 0);
+            assert!(entry.avg_duration_ns.abs() < f64::EPSILON);
+            assert_eq!(entry.p50_duration_ns, 0);
+            assert_eq!(entry.p95_duration_ns, 0);
+            assert_eq!(entry.p99_duration_ns, 0);
+            assert_eq!(entry.max_duration_ns, 0);
+        }
+    }
+
+    #[test]
+    fn empty_timeline_flame_samples_returns_empty() {
+        let timeline = ResizeTimeline {
+            scenario: "empty".to_string(),
+            reproducibility_key: "test:v1:empty:0".to_string(),
+            captured_at_ms: 0,
+            executed_resize_events: 0,
+            events: vec![],
+        };
+        assert!(timeline.flame_samples().is_empty());
+    }
+
+    #[test]
+    fn timeline_summary_single_sample_percentiles() {
+        // With a single sample, p50/p95/p99/max should all equal that sample
+        let timeline = ResizeTimeline {
+            scenario: "one".to_string(),
+            reproducibility_key: "test:v1:one:0".to_string(),
+            captured_at_ms: 100,
+            executed_resize_events: 1,
+            events: vec![ResizeTimelineEvent {
+                event_index: 0,
+                resize_transaction_id: "t:0".to_string(),
+                pane_id: 0,
+                tab_id: 0,
+                sequence_no: 0,
+                action: EventAction::Resize,
+                scheduler_decision: "dequeue_latest_intent".to_string(),
+                frame_id: 0,
+                test_case_id: "one".to_string(),
+                scheduled_at_ns: 0,
+                dispatch_offset_ns: 0,
+                total_duration_ns: 1000,
+                stages: vec![
+                    ResizeTimelineStageSample {
+                        stage: ResizeTimelineStage::InputIntent,
+                        start_offset_ns: 0,
+                        duration_ns: 100,
+                        queue_metrics: None,
+                    },
+                    ResizeTimelineStageSample {
+                        stage: ResizeTimelineStage::SchedulerQueueing,
+                        start_offset_ns: 100,
+                        duration_ns: 200,
+                        queue_metrics: Some(ResizeQueueMetrics {
+                            depth_before: 1,
+                            depth_after: 0,
+                        }),
+                    },
+                    ResizeTimelineStageSample {
+                        stage: ResizeTimelineStage::LogicalReflow,
+                        start_offset_ns: 300,
+                        duration_ns: 300,
+                        queue_metrics: None,
+                    },
+                    ResizeTimelineStageSample {
+                        stage: ResizeTimelineStage::RenderPrep,
+                        start_offset_ns: 600,
+                        duration_ns: 150,
+                        queue_metrics: None,
+                    },
+                    ResizeTimelineStageSample {
+                        stage: ResizeTimelineStage::Presentation,
+                        start_offset_ns: 750,
+                        duration_ns: 250,
+                        queue_metrics: None,
+                    },
+                ],
+            }],
+        };
+        let summary = timeline.stage_summary();
+        for entry in &summary {
+            assert_eq!(entry.samples, 1);
+            assert_eq!(entry.p50_duration_ns, entry.max_duration_ns);
+            assert_eq!(entry.p95_duration_ns, entry.max_duration_ns);
+            assert_eq!(entry.p99_duration_ns, entry.max_duration_ns);
+            assert!((entry.avg_duration_ns - entry.total_duration_ns as f64).abs() < f64::EPSILON);
+        }
+        // Verify a specific stage
+        let input_intent_summary = summary.iter().find(|s| s.stage == ResizeTimelineStage::InputIntent).unwrap();
+        assert_eq!(input_intent_summary.total_duration_ns, 100);
+    }
+
+    #[test]
+    fn flame_sample_stack_format() {
+        let timeline = ResizeTimeline {
+            scenario: "my_scenario".to_string(),
+            reproducibility_key: "key".to_string(),
+            captured_at_ms: 0,
+            executed_resize_events: 1,
+            events: vec![ResizeTimelineEvent {
+                event_index: 0,
+                resize_transaction_id: "t:0".to_string(),
+                pane_id: 7,
+                tab_id: 0,
+                sequence_no: 0,
+                action: EventAction::SetFontSize,
+                scheduler_decision: "dequeue_latest_intent".to_string(),
+                frame_id: 0,
+                test_case_id: "test".to_string(),
+                scheduled_at_ns: 0,
+                dispatch_offset_ns: 0,
+                total_duration_ns: 100,
+                stages: vec![ResizeTimelineStageSample {
+                    stage: ResizeTimelineStage::Presentation,
+                    start_offset_ns: 0,
+                    duration_ns: 100,
+                    queue_metrics: None,
+                }],
+            }],
+        };
+        let flames = timeline.flame_samples();
+        assert_eq!(flames.len(), 1);
+        assert_eq!(flames[0].stack, "my_scenario;set_font_size;presentation");
+        assert_eq!(flames[0].pane_id, 7);
+        assert_eq!(flames[0].event_index, 0);
+        assert_eq!(flames[0].duration_ns, 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: ResizeTimeline serde roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resize_timeline_serde_json_roundtrip() {
+        let timeline = ResizeTimeline {
+            scenario: "rt_test".to_string(),
+            reproducibility_key: "suite:v1:rt_test:0".to_string(),
+            captured_at_ms: 1000,
+            executed_resize_events: 0,
+            events: vec![],
+        };
+        let json = serde_json::to_string(&timeline).unwrap();
+        let back: ResizeTimeline = serde_json::from_str(&json).unwrap();
+        assert_eq!(timeline, back);
+    }
+
+    #[test]
+    fn resize_timeline_event_serde_json_roundtrip() {
+        let event = ResizeTimelineEvent {
+            event_index: 3,
+            resize_transaction_id: "key:3".to_string(),
+            pane_id: 1,
+            tab_id: 2,
+            sequence_no: 3,
+            action: EventAction::Resize,
+            scheduler_decision: "dequeue_latest_intent".to_string(),
+            frame_id: 3,
+            test_case_id: "roundtrip".to_string(),
+            scheduled_at_ns: 1_000_000_000,
+            dispatch_offset_ns: 1_000_100_000,
+            total_duration_ns: 5000,
+            stages: vec![],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ResizeTimelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: ExpectationKind serde
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expectation_event_kind_yaml_roundtrip() {
+        let yaml = r#"
+event:
+  event: usage_limit
+  detected_at: "~5s"
+"#;
+        let exp: Expectation = serde_yaml::from_str(yaml).unwrap();
+        match &exp.kind {
+            ExpectationKind::Event { event, detected_at } => {
+                assert_eq!(event, "usage_limit");
+                assert_eq!(detected_at.as_deref(), Some("~5s"));
+            }
+            _ => panic!("Expected Event kind"),
+        }
+    }
+
+    #[test]
+    fn expectation_workflow_kind_yaml_roundtrip() {
+        let yaml = "
+workflow:
+  workflow: handle_usage
+";
+        let exp: Expectation = serde_yaml::from_str(yaml).unwrap();
+        match &exp.kind {
+            ExpectationKind::Workflow {
+                workflow,
+                started_at,
+            } => {
+                assert_eq!(workflow, "handle_usage");
+                assert!(started_at.is_none());
+            }
+            _ => panic!("Expected Workflow kind"),
+        }
+    }
+
+    #[test]
+    fn expectation_contains_kind_yaml_roundtrip() {
+        let yaml = r#"
+contains:
+  pane: 42
+  text: "hello world"
+"#;
+        let exp: Expectation = serde_yaml::from_str(yaml).unwrap();
+        match &exp.kind {
+            ExpectationKind::Contains { pane, text } => {
+                assert_eq!(*pane, 42);
+                assert_eq!(text, "hello world");
+            }
+            _ => panic!("Expected Contains kind"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: Scenario Debug/Clone
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scenario_debug_contains_name() {
+        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+        let dbg = format!("{:?}", scenario);
+        assert!(dbg.contains("basic_test"));
+    }
+
+    #[test]
+    fn scenario_clone_is_independent() {
+        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+        let mut cloned = scenario.clone();
+        cloned.name = "modified".to_string();
+        assert_eq!(scenario.name, "basic_test");
+        assert_eq!(cloned.name, "modified");
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: to_mock_event edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn to_mock_event_append_empty_content() {
+        let event = ScenarioEvent {
+            at: Duration::from_secs(0),
+            pane: 0,
+            action: EventAction::Append,
+            content: String::new(),
+            name: String::new(),
+            comment: None,
+        };
+        let mock_event = Scenario::to_mock_event(&event).unwrap();
+        assert!(matches!(mock_event, MockEvent::AppendOutput(ref s) if s.is_empty()));
+    }
+
+    #[test]
+    fn to_mock_event_set_title_empty_content() {
+        let event = ScenarioEvent {
+            at: Duration::from_secs(0),
+            pane: 0,
+            action: EventAction::SetTitle,
+            content: String::new(),
+            name: String::new(),
+            comment: None,
+        };
+        let mock_event = Scenario::to_mock_event(&event).unwrap();
+        assert!(matches!(mock_event, MockEvent::SetTitle(ref s) if s.is_empty()));
+    }
+
+    #[test]
+    fn to_mock_event_font_size_trims_whitespace() {
+        let event = ScenarioEvent {
+            at: Duration::from_secs(0),
+            pane: 0,
+            action: EventAction::SetFontSize,
+            content: "  1.50  ".to_string(),
+            name: String::new(),
+            comment: None,
+        };
+        let mock_event = Scenario::to_mock_event(&event).unwrap();
+        assert!(matches!(mock_event, MockEvent::AppendOutput(ref s) if s == "[FONT_SIZE:1.50]"));
+    }
+
+    #[test]
+    fn to_mock_event_marker_with_empty_name() {
+        let event = ScenarioEvent {
+            at: Duration::from_secs(0),
+            pane: 0,
+            action: EventAction::Marker,
+            content: String::new(),
+            name: String::new(),
+            comment: None,
+        };
+        let mock_event = Scenario::to_mock_event(&event).unwrap();
+        assert!(matches!(mock_event, MockEvent::AppendOutput(ref s) if s == "[MARKER:]"));
+    }
+
+    #[test]
+    fn to_mock_event_resize_with_whitespace_in_spec() {
+        let event = ScenarioEvent {
+            at: Duration::from_secs(0),
+            pane: 0,
+            action: EventAction::Resize,
+            content: " 100 x 50 ".to_string(),
+            name: String::new(),
+            comment: None,
+        };
+        let mock_event = Scenario::to_mock_event(&event).unwrap();
+        assert!(matches!(mock_event, MockEvent::Resize(100, 50)));
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: ScenarioPane defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scenario_pane_defaults_match_default_functions() {
+        assert_eq!(default_title(), "pane");
+        assert_eq!(default_domain(), "local");
+        assert_eq!(default_cwd(), "/home/user");
+        assert_eq!(default_cols(), 80);
+        assert_eq!(default_rows(), 24);
+        assert_eq!(default_window_id(), 0);
+        assert_eq!(default_tab_id(), 0);
+    }
+
+    #[test]
+    fn scenario_pane_with_custom_window_and_tab() {
+        let yaml = r#"
+name: custom_ids
+duration: "1s"
+panes:
+  - id: 5
+    window_id: 10
+    tab_id: 20
+    cols: 132
+    rows: 50
+events: []
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        let pane = &scenario.panes[0];
+        assert_eq!(pane.id, 5);
+        assert_eq!(pane.window_id, 10);
+        assert_eq!(pane.tab_id, 20);
+        assert_eq!(pane.cols, 132);
+        assert_eq!(pane.rows, 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: duration_ns_u64 and epoch_ms_u64 helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn duration_ns_u64_zero() {
+        assert_eq!(duration_ns_u64(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn duration_ns_u64_one_second() {
+        assert_eq!(duration_ns_u64(Duration::from_secs(1)), 1_000_000_000);
+    }
+
+    #[test]
+    fn duration_ns_u64_sub_nanosecond_precision() {
+        assert_eq!(duration_ns_u64(Duration::from_nanos(42)), 42);
+    }
+
+    #[test]
+    fn epoch_ms_u64_returns_nonzero() {
+        // Current time should be well past epoch
+        assert!(epoch_ms_u64() > 0);
+    }
+
+    #[test]
+    fn epoch_ms_u64_reasonable_range() {
+        // Should be after 2020-01-01 (epoch ms ~ 1577836800000)
+        let ms = epoch_ms_u64();
+        assert!(ms > 1_577_836_800_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: Async execution edge cases
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn execute_until_exact_boundary() {
+        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+
+        // Execute exactly at 1s boundary (first event is at 1s)
+        let count = scenario
+            .execute_until(&mock, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn execute_until_just_before_first_event() {
+        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+
+        let count = scenario
+            .execute_until(&mock, Duration::from_millis(999))
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn execute_until_far_future() {
+        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+
+        // Way past all events
+        let count = scenario
+            .execute_until(&mock, Duration::from_secs(9999))
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn setup_pane_0_is_active() {
+        let yaml = r#"
+name: active_test
+duration: "1s"
+panes:
+  - id: 0
+  - id: 5
+events: []
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+
+        let p0 = mock.pane_state(0).await.unwrap();
+        assert!(p0.is_active);
+        let p5 = mock.pane_state(5).await.unwrap();
+        assert!(!p5.is_active);
+    }
+
+    #[tokio::test]
+    async fn setup_panes_not_zoomed() {
+        let yaml = r#"
+name: zoom_test
+duration: "1s"
+panes:
+  - id: 0
+events: []
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+
+        let p0 = mock.pane_state(0).await.unwrap();
+        assert!(!p0.is_zoomed);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: resize timeline with partial execution
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn execute_until_with_resize_timeline_partial() {
+        let yaml = r#"
+name: partial_resize
+duration: "10s"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: resize
+    content: "100x30"
+  - at: "5s"
+    pane: 0
+    action: resize
+    content: "120x40"
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+
+        // Only up to 3s: first resize but not second
+        let (count, timeline) = scenario
+            .execute_until_with_resize_timeline(&mock, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(timeline.executed_resize_events, 1);
+        assert_eq!(timeline.events.len(), 1);
+        assert_eq!(timeline.events[0].action, EventAction::Resize);
+    }
+
+    #[tokio::test]
+    async fn execute_until_with_resize_timeline_no_resize_events() {
+        let yaml = r#"
+name: no_resize
+duration: "5s"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: append
+    content: "text"
+  - at: "2s"
+    pane: 0
+    action: clear
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+
+        let (count, timeline) = scenario
+            .execute_all_with_resize_timeline(&mock)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(timeline.executed_resize_events, 0);
+        assert!(timeline.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resize_timeline_captured_at_is_recent() {
+        let yaml = r#"
+name: ts_check
+duration: "1s"
+panes:
+  - id: 0
+events: []
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+
+        let (_count, timeline) = scenario
+            .execute_all_with_resize_timeline(&mock)
+            .await
+            .unwrap();
+        // Should be a recent epoch ms
+        assert!(timeline.captured_at_ms > 1_577_836_800_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: TutorialSandbox extended
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sandbox_check_event_expectation_returns_false() {
+        let sandbox = TutorialSandbox::new().await;
+        // Event expectations always return false (need runtime)
+        let result = sandbox
+            .check_expectation(&ExpectationKind::Event {
+                event: "test".to_string(),
+                detected_at: None,
+            })
+            .await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn sandbox_check_workflow_expectation_returns_false() {
+        let sandbox = TutorialSandbox::new().await;
+        let result = sandbox
+            .check_expectation(&ExpectationKind::Workflow {
+                workflow: "test".to_string(),
+                started_at: None,
+            })
+            .await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn sandbox_check_contains_nonexistent_pane() {
+        let sandbox = TutorialSandbox::new().await;
+        let result = sandbox
+            .check_expectation(&ExpectationKind::Contains {
+                pane: 999,
+                text: "anything".to_string(),
+            })
+            .await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn sandbox_check_contains_missing_text() {
+        let sandbox = TutorialSandbox::new().await;
+        let result = sandbox
+            .check_expectation(&ExpectationKind::Contains {
+                pane: 0,
+                text: "this text does not exist".to_string(),
+            })
+            .await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn sandbox_check_contains_present_text() {
+        let sandbox = TutorialSandbox::new().await;
+        // Pane 0 has initial content "$ "
+        let result = sandbox
+            .check_expectation(&ExpectationKind::Contains {
+                pane: 0,
+                text: "$ ".to_string(),
+            })
+            .await;
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn sandbox_indicator_toggle() {
+        let mut sandbox = TutorialSandbox::new().await;
+        assert_eq!(sandbox.format_output("x"), "[SANDBOX] x");
+        sandbox.set_show_indicator(false);
+        assert_eq!(sandbox.format_output("x"), "x");
+        sandbox.set_show_indicator(true);
+        assert_eq!(sandbox.format_output("x"), "[SANDBOX] x");
+    }
+
+    #[tokio::test]
+    async fn sandbox_command_log_timestamps_are_monotonic() {
+        let mut sandbox = TutorialSandbox::new().await;
+        sandbox.log_command("cmd1", None);
+        sandbox.log_command("cmd2", None);
+        sandbox.log_command("cmd3", None);
+
+        let log = sandbox.command_log();
+        assert_eq!(log.len(), 3);
+        // Timestamps should be non-decreasing
+        assert!(log[0].timestamp_ms <= log[1].timestamp_ms);
+        assert!(log[1].timestamp_ms <= log[2].timestamp_ms);
+    }
+
+    #[tokio::test]
+    async fn sandbox_format_output_empty_text() {
+        let sandbox = TutorialSandbox::new().await;
+        assert_eq!(sandbox.format_output(""), "[SANDBOX] ");
+    }
+
+    #[tokio::test]
+    async fn sandbox_with_expectations_mixed_types() {
+        let yaml = r#"
+name: mixed_exp
+duration: "5s"
+panes:
+  - id: 0
+    initial_content: "present text"
+events: []
+expectations:
+  - contains:
+      pane: 0
+      text: "present text"
+  - event:
+      event: some_event
+  - workflow:
+      workflow: some_workflow
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        let sandbox = TutorialSandbox::with_scenario(scenario).await.unwrap();
+
+        let (pass, fail, skip) = sandbox.check_all_expectations().await;
+        assert_eq!(pass, 1); // contains passes
+        assert_eq!(fail, 0);
+        assert_eq!(skip, 2); // event and workflow are skipped
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: SandboxCommand serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sandbox_command_serialize() {
+        let cmd = SandboxCommand {
+            command: "ft status".to_string(),
+            timestamp_ms: 12345,
+            exercise_id: Some("ex1".to_string()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("ft status"));
+        assert!(json.contains("12345"));
+        assert!(json.contains("ex1"));
+    }
+
+    #[test]
+    fn sandbox_command_serialize_no_exercise() {
+        let cmd = SandboxCommand {
+            command: "ls".to_string(),
+            timestamp_ms: 0,
+            exercise_id: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("null"));
+    }
+
+    #[test]
+    fn sandbox_command_debug() {
+        let cmd = SandboxCommand {
+            command: "test".to_string(),
+            timestamp_ms: 100,
+            exercise_id: None,
+        };
+        let dbg = format!("{:?}", cmd);
+        assert!(dbg.contains("test"));
+        assert!(dbg.contains("100"));
+    }
+
+    #[test]
+    fn sandbox_command_clone() {
+        let cmd = SandboxCommand {
+            command: "original".to_string(),
+            timestamp_ms: 42,
+            exercise_id: Some("e1".to_string()),
+        };
+        let cloned = cmd.clone();
+        assert_eq!(cmd.command, cloned.command);
+        assert_eq!(cmd.timestamp_ms, cloned.timestamp_ms);
+        assert_eq!(cmd.exercise_id, cloned.exercise_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: Scenario YAML file I/O edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scenario_load_from_temp_file_with_metadata() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.yaml");
+        let yaml = r#"
+name: file_meta
+duration: "5s"
+metadata:
+  suite: file_suite
+  suite_version: v2
+  seed: "99"
+panes:
+  - id: 0
+events: []
+"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "{}", yaml).unwrap();
+        drop(f);
+
+        let scenario = Scenario::load(&path).unwrap();
+        assert_eq!(
+            scenario.reproducibility_key(),
+            "file_suite:v2:file_meta:99"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: ScenarioEvent Debug/Clone
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scenario_event_debug_format() {
+        let event = ScenarioEvent {
+            at: Duration::from_secs(5),
+            pane: 3,
+            action: EventAction::Clear,
+            content: String::new(),
+            name: String::new(),
+            comment: Some("a comment".to_string()),
+        };
+        let dbg = format!("{:?}", event);
+        assert!(dbg.contains("Clear"));
+        assert!(dbg.contains("a comment"));
+    }
+
+    #[test]
+    fn scenario_event_clone() {
+        let event = ScenarioEvent {
+            at: Duration::from_secs(1),
+            pane: 0,
+            action: EventAction::Append,
+            content: "hello".to_string(),
+            name: "marker".to_string(),
+            comment: None,
+        };
+        let cloned = event.clone();
+        assert_eq!(cloned.at, event.at);
+        assert_eq!(cloned.pane, event.pane);
+        assert_eq!(cloned.action, event.action);
+        assert_eq!(cloned.content, event.content);
+        assert_eq!(cloned.name, event.name);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: ResizeQueueMetrics edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resize_queue_metrics_zero_depth() {
+        let m = ResizeQueueMetrics {
+            depth_before: 0,
+            depth_after: 0,
+        };
+        assert_eq!(m.depth_before, 0);
+        assert_eq!(m.depth_after, 0);
+    }
+
+    #[test]
+    fn resize_queue_metrics_clone_eq() {
+        let m1 = ResizeQueueMetrics {
+            depth_before: 5,
+            depth_after: 4,
+        };
+        let m2 = m1.clone();
+        assert_eq!(m1, m2);
+    }
+
+    #[test]
+    fn resize_queue_metrics_debug() {
+        let m = ResizeQueueMetrics {
+            depth_before: 10,
+            depth_after: 9,
+        };
+        let dbg = format!("{:?}", m);
+        assert!(dbg.contains("10"));
+        assert!(dbg.contains("9"));
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: ResizeTimelineStageSummary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resize_timeline_stage_summary_debug() {
+        let s = ResizeTimelineStageSummary {
+            stage: ResizeTimelineStage::RenderPrep,
+            samples: 10,
+            total_duration_ns: 5000,
+            avg_duration_ns: 500.0,
+            p50_duration_ns: 400,
+            p95_duration_ns: 900,
+            p99_duration_ns: 950,
+            max_duration_ns: 1000,
+        };
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("RenderPrep"));
+        assert!(dbg.contains("5000"));
+    }
+
+    #[test]
+    fn resize_timeline_stage_summary_clone() {
+        let s = ResizeTimelineStageSummary {
+            stage: ResizeTimelineStage::Presentation,
+            samples: 1,
+            total_duration_ns: 100,
+            avg_duration_ns: 100.0,
+            p50_duration_ns: 100,
+            p95_duration_ns: 100,
+            p99_duration_ns: 100,
+            max_duration_ns: 100,
+        };
+        let c = s.clone();
+        assert_eq!(s.stage, c.stage);
+        assert_eq!(s.samples, c.samples);
+        assert_eq!(s.total_duration_ns, c.total_duration_ns);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW TESTS: Scenario description default
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scenario_description_defaults_to_empty() {
+        let yaml = r#"
+name: no_desc
+duration: "1s"
+panes: []
+events: []
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        assert!(scenario.description.is_empty());
+    }
+
+    #[test]
+    fn scenario_description_preserved() {
+        let yaml = r#"
+name: with_desc
+description: "My detailed description"
+duration: "1s"
+panes: []
+events: []
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        assert_eq!(scenario.description, "My detailed description");
     }
 }
