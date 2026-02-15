@@ -936,4 +936,152 @@ Done.";
             assert_eq!(reconstructed, line);
         }
     }
+
+    // Batch: DarkBadger wa-1u90p.7.1
+
+    #[test]
+    fn compression_config_default_values() {
+        let c = CompressionConfig::default();
+        assert!((c.similarity_threshold - 0.3).abs() < 0.001);
+        assert_eq!(c.min_group_size, 3);
+        assert_eq!(c.max_templates, 1000);
+    }
+
+    #[test]
+    fn compression_config_debug_clone() {
+        let c = CompressionConfig::default();
+        let c2 = c.clone();
+        assert_eq!(c2.min_group_size, 3);
+        let _ = format!("{:?}", c);
+    }
+
+    #[test]
+    fn output_template_eq_and_clone() {
+        let t = OutputTemplate {
+            pattern: "hello \0 world".into(),
+            variable_positions: vec![6],
+            instance_count: 5,
+        };
+        let t2 = t.clone();
+        assert_eq!(t, t2);
+        assert_ne!(
+            t,
+            OutputTemplate {
+                pattern: "other".into(),
+                variable_positions: vec![],
+                instance_count: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn output_template_serde_roundtrip() {
+        let t = OutputTemplate {
+            pattern: "test \0 done".into(),
+            variable_positions: vec![5],
+            instance_count: 3,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: OutputTemplate = serde_json::from_str(&json).unwrap();
+        assert_eq!(t, back);
+    }
+
+    #[test]
+    fn compressed_entry_serde_template_instance() {
+        let entry = CompressedEntry::TemplateInstance {
+            template_idx: 0,
+            variables: vec!["foo".into(), "bar".into()],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: CompressedEntry = serde_json::from_str(&json).unwrap();
+        let _ = format!("{:?}", back);
+    }
+
+    #[test]
+    fn compressed_entry_serde_literal() {
+        let entry = CompressedEntry::Literal("raw line".into());
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: CompressedEntry = serde_json::from_str(&json).unwrap();
+        let _ = format!("{:?}", back);
+    }
+
+    #[test]
+    fn compressed_output_serde_roundtrip() {
+        let output = CompressedOutput {
+            templates: vec![OutputTemplate {
+                pattern: "step \0".into(),
+                variable_positions: vec![5],
+                instance_count: 2,
+            }],
+            entries: vec![
+                CompressedEntry::TemplateInstance {
+                    template_idx: 0,
+                    variables: vec!["1".into()],
+                },
+                CompressedEntry::Literal("done".into()),
+            ],
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let back: CompressedOutput = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.templates.len(), 1);
+        assert_eq!(back.entries.len(), 2);
+    }
+
+    #[test]
+    fn compression_stats_default() {
+        let s = CompressionStats::default();
+        assert_eq!(s.input_lines, 0);
+        assert_eq!(s.input_bytes, 0);
+        assert_eq!(s.template_count, 0);
+        assert_eq!(s.templated_lines, 0);
+        assert_eq!(s.literal_lines, 0);
+        assert_eq!(s.compressed_bytes, 0);
+        assert!((s.ratio - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compression_stats_finalize_recalculates_ratio() {
+        let s = CompressionStats {
+            input_bytes: 1000,
+            compressed_bytes: 200,
+            ..Default::default()
+        }
+        .finalize();
+        assert!((s.ratio - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn compression_stats_finalize_zero_compressed() {
+        let s = CompressionStats {
+            input_bytes: 100,
+            compressed_bytes: 0,
+            ..Default::default()
+        }
+        .finalize();
+        // compressed_bytes=0 but input_bytes>0: ratio stays 0 (no division)
+        assert!((s.ratio - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compression_stats_finalize_zero_both() {
+        let s = CompressionStats::default().finalize();
+        assert!((s.ratio - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn compression_stats_clone_debug() {
+        let s = CompressionStats {
+            input_lines: 10,
+            input_bytes: 500,
+            template_count: 2,
+            templated_lines: 8,
+            literal_lines: 2,
+            compressed_bytes: 100,
+            ratio: 5.0,
+        };
+        let c = s.clone();
+        assert_eq!(c.input_lines, 10);
+        assert_eq!(c.literal_lines, 2);
+        let _ = format!("{:?}", s);
+    }
 }

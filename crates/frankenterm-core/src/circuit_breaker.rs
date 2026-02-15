@@ -975,4 +975,109 @@ mod tests {
         let breaker = CircuitBreaker::new(CircuitBreakerConfig::default());
         assert_eq!(breaker.name, "unnamed");
     }
+
+    // Batch: DarkBadger wa-1u90p.7.1
+
+    #[test]
+    fn circuit_breaker_config_default_values() {
+        let c = CircuitBreakerConfig::default();
+        assert_eq!(c.failure_threshold, 3);
+        assert_eq!(c.success_threshold, 1);
+        assert_eq!(c.open_cooldown, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn circuit_breaker_config_debug_clone() {
+        let c = CircuitBreakerConfig::default();
+        let c2 = c.clone();
+        assert_eq!(c2.failure_threshold, 3);
+        let _ = format!("{:?}", c);
+    }
+
+    #[test]
+    fn circuit_breaker_config_new_clamps_zero() {
+        let c = CircuitBreakerConfig::new(0, 0, Duration::from_millis(100));
+        assert_eq!(c.failure_threshold, 1); // clamped from 0
+        assert_eq!(c.success_threshold, 1); // clamped from 0
+    }
+
+    #[test]
+    fn circuit_state_kind_debug_clone_copy_eq() {
+        let a = CircuitStateKind::Closed;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+        assert_ne!(CircuitStateKind::Closed, CircuitStateKind::Open);
+        assert_ne!(CircuitStateKind::Open, CircuitStateKind::HalfOpen);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn circuit_state_kind_serde_all() {
+        let expected = [
+            (CircuitStateKind::Closed, "\"closed\""),
+            (CircuitStateKind::Open, "\"open\""),
+            (CircuitStateKind::HalfOpen, "\"half_open\""),
+        ];
+        for (kind, json_str) in expected {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, json_str);
+            let back: CircuitStateKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, kind);
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_status_default() {
+        let s = CircuitBreakerStatus::default();
+        assert_eq!(s.state, CircuitStateKind::Closed);
+        assert_eq!(s.consecutive_failures, 0);
+        assert_eq!(s.failure_threshold, 3);
+        assert_eq!(s.success_threshold, 1);
+        assert_eq!(s.open_cooldown_ms, 10_000);
+        assert!(s.open_for_ms.is_none());
+        assert!(s.cooldown_remaining_ms.is_none());
+        assert!(s.half_open_successes.is_none());
+    }
+
+    #[test]
+    fn circuit_breaker_status_serde_roundtrip() {
+        let s = CircuitBreakerStatus::default();
+        let json = serde_json::to_string(&s).unwrap();
+        let back: CircuitBreakerStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.state, CircuitStateKind::Closed);
+        assert_eq!(back.failure_threshold, 3);
+    }
+
+    #[test]
+    fn circuit_breaker_status_debug_clone() {
+        let s = CircuitBreakerStatus::default();
+        let c = s.clone();
+        assert_eq!(c.state, CircuitStateKind::Closed);
+        let _ = format!("{:?}", s);
+    }
+
+    #[test]
+    fn circuit_breaker_snapshot_serde_roundtrip() {
+        let snap = CircuitBreakerSnapshot {
+            name: "test_circuit".into(),
+            status: CircuitBreakerStatus::default(),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: CircuitBreakerSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "test_circuit");
+        assert_eq!(back.status.state, CircuitStateKind::Closed);
+    }
+
+    #[test]
+    fn circuit_breaker_snapshot_debug_clone() {
+        let snap = CircuitBreakerSnapshot {
+            name: "cb".into(),
+            status: CircuitBreakerStatus::default(),
+        };
+        let c = snap.clone();
+        assert_eq!(c.name, "cb");
+        let _ = format!("{:?}", snap);
+    }
 }

@@ -897,6 +897,120 @@ mod tests {
         assert_eq!(order, vec![5, 10, 20]);
     }
 
+    // Batch: DarkBadger wa-1u90p.7.1
+
+    #[test]
+    fn pane_priority_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(PanePriority::Background);
+        set.insert(PanePriority::Low);
+        set.insert(PanePriority::Medium);
+        set.insert(PanePriority::High);
+        set.insert(PanePriority::Critical);
+        set.insert(PanePriority::Medium); // dup
+        assert_eq!(set.len(), 5);
+    }
+
+    #[test]
+    fn pane_priority_serde_snake_case_all() {
+        let expected = [
+            (PanePriority::Background, "\"background\""),
+            (PanePriority::Low, "\"low\""),
+            (PanePriority::Medium, "\"medium\""),
+            (PanePriority::High, "\"high\""),
+            (PanePriority::Critical, "\"critical\""),
+        ];
+        for (p, json_str) in expected {
+            let json = serde_json::to_string(&p).unwrap();
+            assert_eq!(json, json_str);
+            let back: PanePriority = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, p);
+        }
+    }
+
+    #[test]
+    fn pane_priority_label_matches_serde() {
+        let all = [
+            PanePriority::Background,
+            PanePriority::Low,
+            PanePriority::Medium,
+            PanePriority::High,
+            PanePriority::Critical,
+        ];
+        for p in all {
+            let label = p.label();
+            let serde_str = serde_json::to_string(&p).unwrap();
+            assert_eq!(format!("\"{}\"", label), serde_str);
+        }
+    }
+
+    #[test]
+    fn priority_config_default_values() {
+        let c = PriorityConfig::default();
+        assert!((c.rate_half_life_secs - 10.0).abs() < 0.01);
+        assert!((c.high_rate_threshold - 10.0).abs() < 0.01);
+        assert!((c.medium_rate_threshold - 1.0).abs() < 0.01);
+        assert!((c.error_retention_secs - 30.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn priority_config_debug_clone_serde() {
+        let c = PriorityConfig::default();
+        let c2 = c.clone();
+        assert!((c2.high_rate_threshold - 10.0).abs() < 0.01);
+        let _ = format!("{:?}", c);
+
+        let json = serde_json::to_string(&c).unwrap();
+        let back: PriorityConfig = serde_json::from_str(&json).unwrap();
+        assert!((back.rate_half_life_secs - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn priority_metrics_debug_clone_default_serde() {
+        let m = PriorityMetrics::default();
+        assert!(m.counts.is_empty());
+        assert_eq!(m.total_classifications, 0);
+        assert_eq!(m.override_count, 0);
+        assert_eq!(m.tracked_panes, 0);
+        let _ = format!("{:?}", m);
+
+        let json = serde_json::to_string(&m).unwrap();
+        let back: PriorityMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total_classifications, 0);
+    }
+
+    #[test]
+    fn priority_metrics_clone_independence() {
+        let mut m = PriorityMetrics::default();
+        m.counts.insert("high".into(), 5);
+        m.total_classifications = 100;
+        let mut cloned = m.clone();
+        cloned.counts.insert("low".into(), 3);
+        assert_eq!(m.counts.len(), 1);
+        assert_eq!(cloned.counts.len(), 2);
+    }
+
+    #[test]
+    fn pane_priority_all_five_distinct() {
+        let priorities = [
+            PanePriority::Background,
+            PanePriority::Low,
+            PanePriority::Medium,
+            PanePriority::High,
+            PanePriority::Critical,
+        ];
+        for (i, a) in priorities.iter().enumerate() {
+            for (j, b) in priorities.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+
     // -- Proptest --
 
     #[cfg(test)]
