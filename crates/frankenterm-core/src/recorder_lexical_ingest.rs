@@ -733,4 +733,481 @@ mod tests {
         assert_eq!(cfg.writer_memory_bytes, 50_000_000);
         assert!(cfg.index_dir.to_str().unwrap().contains("tantivy-lexical"));
     }
+
+    // =========================================================================
+    // Constants
+    // =========================================================================
+
+    #[test]
+    fn constants_valid() {
+        assert_eq!(DEFAULT_WRITER_MEMORY_BYTES, 50_000_000);
+        assert_eq!(FINGERPRINT_FILENAME, ".ft_schema_fingerprint");
+        assert!(FINGERPRINT_FILENAME.starts_with('.'));
+    }
+
+    // =========================================================================
+    // LexicalIndexerConfig — traits
+    // =========================================================================
+
+    #[test]
+    fn config_clone_preserves_fields() {
+        let cfg = LexicalIndexerConfig {
+            index_dir: PathBuf::from("/custom/path"),
+            writer_memory_bytes: 100_000,
+        };
+        let cfg2 = cfg.clone();
+        assert_eq!(cfg2.index_dir, PathBuf::from("/custom/path"));
+        assert_eq!(cfg2.writer_memory_bytes, 100_000);
+    }
+
+    #[test]
+    fn config_debug_formatting() {
+        let cfg = LexicalIndexerConfig::default();
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("LexicalIndexerConfig"));
+        assert!(dbg.contains("writer_memory_bytes"));
+    }
+
+    // =========================================================================
+    // LexicalIngestError — comprehensive coverage
+    // =========================================================================
+
+    #[test]
+    fn error_display_io_permission() {
+        let e = LexicalIngestError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "access denied",
+        ));
+        let msg = e.to_string();
+        assert!(msg.contains("I/O error"));
+        assert!(msg.contains("access denied"));
+    }
+
+    #[test]
+    fn error_display_fingerprint_exact_format() {
+        let e = LexicalIngestError::SchemaFingerprintMismatch {
+            expected: "abc123".to_string(),
+            found: "xyz789".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("expected=abc123"));
+        assert!(msg.contains("found=xyz789"));
+    }
+
+    #[test]
+    fn error_is_error_trait() {
+        let e: Box<dyn std::error::Error> = Box::new(LexicalIngestError::Io(
+            std::io::Error::new(std::io::ErrorKind::Other, "test"),
+        ));
+        assert!(e.to_string().contains("I/O error"));
+    }
+
+    #[test]
+    fn error_from_io_conversion() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken");
+        let err: LexicalIngestError = io_err.into();
+        match err {
+            LexicalIngestError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe),
+            other => panic!("expected Io variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_debug_formatting() {
+        let e = LexicalIngestError::SchemaFingerprintMismatch {
+            expected: "a".into(),
+            found: "b".into(),
+        };
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("SchemaFingerprintMismatch"));
+    }
+
+    // =========================================================================
+    // TantivyIndexWriterAdapter — counter behaviors
+    // =========================================================================
+
+    #[test]
+    fn writer_empty_commit_returns_zeroed_stats() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let indexer = LexicalIndexer::open(config).unwrap();
+
+        let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
+        let stats = writer.commit().unwrap();
+        assert_eq!(stats.docs_added, 0);
+        assert_eq!(stats.docs_deleted, 0);
+        assert_eq!(stats.segment_count, 0);
+    }
+
+    #[test]
+    fn writer_delete_increments_counter() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let indexer = LexicalIndexer::open(config).unwrap();
+
+        let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
+
+        // Add a document, then delete it
+        let ev = sample_event("ev-1", "hello");
+        writer
+            .add_document(&map_event_to_document(&ev, 0))
+            .unwrap();
+        writer.delete_by_event_id("ev-1").unwrap();
+
+        let stats = writer.commit().unwrap();
+        assert_eq!(stats.docs_added, 1);
+        assert_eq!(stats.docs_deleted, 1);
+    }
+
+    #[test]
+    fn writer_interleaved_add_delete() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let indexer = LexicalIndexer::open(config).unwrap();
+
+        let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
+
+        // Add 3, delete 1
+        for i in 0..3 {
+            let ev = sample_event(&format!("ev-{i}"), &format!("text-{i}"));
+            writer
+                .add_document(&map_event_to_document(&ev, i))
+                .unwrap();
+        }
+        writer.delete_by_event_id("ev-0").unwrap();
+
+        let stats = writer.commit().unwrap();
+        assert_eq!(stats.docs_added, 3);
+        assert_eq!(stats.docs_deleted, 1);
+    }
+
+    #[test]
+    fn writer_multiple_deletes() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let indexer = LexicalIndexer::open(config).unwrap();
+
+        let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
+
+        // Delete 3 events (even if they don't exist, counter still increments)
+        writer.delete_by_event_id("ev-a").unwrap();
+        writer.delete_by_event_id("ev-b").unwrap();
+        writer.delete_by_event_id("ev-c").unwrap();
+
+        let stats = writer.commit().unwrap();
+        assert_eq!(stats.docs_added, 0);
+        assert_eq!(stats.docs_deleted, 3);
+    }
+
+    #[test]
+    fn writer_counters_reset_each_commit() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let indexer = LexicalIndexer::open(config).unwrap();
+
+        let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
+
+        // Commit 1: 2 adds, 1 delete
+        let ev1 = sample_event("ev-1", "a");
+        let ev2 = sample_event("ev-2", "b");
+        writer
+            .add_document(&map_event_to_document(&ev1, 0))
+            .unwrap();
+        writer
+            .add_document(&map_event_to_document(&ev2, 1))
+            .unwrap();
+        writer.delete_by_event_id("ev-1").unwrap();
+        let s1 = writer.commit().unwrap();
+        assert_eq!(s1.docs_added, 2);
+        assert_eq!(s1.docs_deleted, 1);
+
+        // Commit 2: counters should be reset
+        let ev3 = sample_event("ev-3", "c");
+        writer
+            .add_document(&map_event_to_document(&ev3, 2))
+            .unwrap();
+        let s2 = writer.commit().unwrap();
+        assert_eq!(s2.docs_added, 1);
+        assert_eq!(s2.docs_deleted, 0);
+    }
+
+    // =========================================================================
+    // LexicalIndexer — accessors and lifecycle
+    // =========================================================================
+
+    #[test]
+    fn indexer_fingerprint_deterministic() {
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+
+        let idx1 = LexicalIndexer::open(test_config(dir1.path())).unwrap();
+        let idx2 = LexicalIndexer::open(test_config(dir2.path())).unwrap();
+
+        // Same schema → same fingerprint
+        assert_eq!(idx1.fingerprint(), idx2.fingerprint());
+    }
+
+    #[test]
+    fn indexer_handles_returns_valid_fields() {
+        let dir = tempdir().unwrap();
+        let indexer = LexicalIndexer::open(test_config(dir.path())).unwrap();
+
+        let handles = indexer.handles();
+        // Verify field handles are distinct (event_id != pane_id)
+        assert_ne!(handles.event_id, handles.pane_id);
+        assert_ne!(handles.event_id, handles.occurred_at_ms);
+    }
+
+    #[test]
+    fn indexer_index_reference() {
+        let dir = tempdir().unwrap();
+        let indexer = LexicalIndexer::open(test_config(dir.path())).unwrap();
+
+        let index = indexer.index();
+        // Index should have a schema with the expected fields
+        let schema = index.schema();
+        assert!(schema.get_field("event_id").is_ok());
+        assert!(schema.get_field("pane_id").is_ok());
+    }
+
+    #[test]
+    fn indexer_create_writer_default() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let indexer = LexicalIndexer::open(config).unwrap();
+
+        // create_writer uses the config's memory budget
+        let mut writer = indexer.create_writer().unwrap();
+        // Verify it works by adding a doc
+        let ev = sample_event("ev-default", "test");
+        writer
+            .add_document(&map_event_to_document(&ev, 0))
+            .unwrap();
+        let stats = writer.commit().unwrap();
+        assert_eq!(stats.docs_added, 1);
+    }
+
+    #[test]
+    fn indexer_doc_count_tracks_operations() {
+        let dir = tempdir().unwrap();
+        let indexer = LexicalIndexer::open(test_config(dir.path())).unwrap();
+
+        assert_eq!(indexer.doc_count().unwrap(), 0);
+
+        let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
+        for i in 0..3 {
+            let ev = sample_event(&format!("ev-{i}"), &format!("text-{i}"));
+            writer
+                .add_document(&map_event_to_document(&ev, i))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        assert_eq!(indexer.doc_count().unwrap(), 3);
+    }
+
+    // =========================================================================
+    // read_stored_fingerprint — edge cases
+    // =========================================================================
+
+    #[test]
+    fn read_stored_fingerprint_trims_whitespace() {
+        let dir = tempdir().unwrap();
+        let fp_path = dir.path().join(FINGERPRINT_FILENAME);
+        std::fs::write(&fp_path, "  abc123  \n").unwrap();
+        assert_eq!(
+            read_stored_fingerprint(dir.path()),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn read_stored_fingerprint_trims_newlines() {
+        let dir = tempdir().unwrap();
+        let fp_path = dir.path().join(FINGERPRINT_FILENAME);
+        std::fs::write(&fp_path, "fp-value\n\n").unwrap();
+        assert_eq!(
+            read_stored_fingerprint(dir.path()),
+            Some("fp-value".to_string())
+        );
+    }
+
+    #[test]
+    fn read_stored_fingerprint_empty_file() {
+        let dir = tempdir().unwrap();
+        let fp_path = dir.path().join(FINGERPRINT_FILENAME);
+        std::fs::write(&fp_path, "").unwrap();
+        assert_eq!(
+            read_stored_fingerprint(dir.path()),
+            Some("".to_string())
+        );
+    }
+
+    #[test]
+    fn read_stored_fingerprint_nonexistent_dir() {
+        assert!(read_stored_fingerprint(Path::new("/nonexistent/dir/99999")).is_none());
+    }
+
+    // =========================================================================
+    // Index lifecycle — directory creation
+    // =========================================================================
+
+    #[test]
+    fn open_creates_missing_directory() {
+        let dir = tempdir().unwrap();
+        let index_dir = dir.path().join("deep/nested/index");
+        assert!(!index_dir.exists());
+
+        let config = LexicalIndexerConfig {
+            index_dir: index_dir.clone(),
+            writer_memory_bytes: 15_000_000,
+        };
+        let indexer = LexicalIndexer::open(config).unwrap();
+        assert!(index_dir.exists());
+        assert_eq!(indexer.doc_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn open_persists_fingerprint_for_new_index() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let indexer = LexicalIndexer::open(config.clone()).unwrap();
+
+        let fp_path = config.index_dir.join(FINGERPRINT_FILENAME);
+        let stored = std::fs::read_to_string(&fp_path).unwrap();
+        assert_eq!(stored.trim(), indexer.fingerprint());
+    }
+
+    #[test]
+    fn open_without_fingerprint_file_succeeds() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+
+        // Create index
+        let indexer = LexicalIndexer::open(config.clone()).unwrap();
+        drop(indexer);
+
+        // Remove the fingerprint file
+        let fp_path = config.index_dir.join(FINGERPRINT_FILENAME);
+        std::fs::remove_file(&fp_path).unwrap();
+
+        // Reopen should succeed (fingerprint check is skipped if file absent)
+        let indexer2 = LexicalIndexer::open(config).unwrap();
+        assert!(!indexer2.fingerprint().is_empty());
+    }
+
+    // =========================================================================
+    // Delete semantics
+    // =========================================================================
+
+    #[test]
+    fn delete_nonexistent_event_succeeds() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let indexer = LexicalIndexer::open(config).unwrap();
+
+        let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
+
+        // Deleting a non-existent event should not error
+        writer.delete_by_event_id("no-such-event").unwrap();
+        let stats = writer.commit().unwrap();
+        assert_eq!(stats.docs_deleted, 1); // counter increments regardless
+        assert_eq!(indexer.doc_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_same_event_twice() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let indexer = LexicalIndexer::open(config).unwrap();
+
+        let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
+
+        let ev = sample_event("ev-dup", "text");
+        writer
+            .add_document(&map_event_to_document(&ev, 0))
+            .unwrap();
+        writer.commit().unwrap();
+        assert_eq!(indexer.doc_count().unwrap(), 1);
+
+        // Delete same event twice
+        writer.delete_by_event_id("ev-dup").unwrap();
+        writer.delete_by_event_id("ev-dup").unwrap();
+        let stats = writer.commit().unwrap();
+        assert_eq!(stats.docs_deleted, 2); // counter tracks calls, not unique docs
+        assert_eq!(indexer.doc_count().unwrap(), 0);
+    }
+
+    // =========================================================================
+    // Large batch
+    // =========================================================================
+
+    #[test]
+    fn large_batch_commit() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let indexer = LexicalIndexer::open(config).unwrap();
+
+        let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
+
+        let count = 100;
+        for i in 0..count {
+            let ev = sample_event(&format!("ev-{i}"), &format!("command number {i}"));
+            writer
+                .add_document(&map_event_to_document(&ev, i))
+                .unwrap();
+        }
+        let stats = writer.commit().unwrap();
+        assert_eq!(stats.docs_added, count as u64);
+        assert_eq!(indexer.doc_count().unwrap(), count as u64);
+    }
+
+    // =========================================================================
+    // Egress-only indexing
+    // =========================================================================
+
+    #[test]
+    fn index_egress_only_events() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let indexer = LexicalIndexer::open(config).unwrap();
+
+        let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
+
+        for i in 0..3 {
+            let ev = egress_event(&format!("eg-{i}"), &format!("output line {i}"));
+            writer
+                .add_document(&map_event_to_document(&ev, i))
+                .unwrap();
+        }
+        let stats = writer.commit().unwrap();
+        assert_eq!(stats.docs_added, 3);
+        assert_eq!(indexer.doc_count().unwrap(), 3);
+    }
+
+    // =========================================================================
+    // Index reopen preserves documents
+    // =========================================================================
+
+    #[test]
+    fn reopen_index_preserves_documents() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+
+        // Create index and add documents
+        let indexer = LexicalIndexer::open(config.clone()).unwrap();
+        let mut writer = indexer.create_writer_with_memory(15_000_000).unwrap();
+        let ev = sample_event("ev-persist", "persisted data");
+        writer
+            .add_document(&map_event_to_document(&ev, 0))
+            .unwrap();
+        writer.commit().unwrap();
+        assert_eq!(indexer.doc_count().unwrap(), 1);
+        drop(writer);
+        drop(indexer);
+
+        // Reopen and verify
+        let indexer2 = LexicalIndexer::open(config).unwrap();
+        assert_eq!(indexer2.doc_count().unwrap(), 1);
+    }
 }
