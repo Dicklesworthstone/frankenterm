@@ -4890,4 +4890,210 @@ mod tests {
         assert!(STORAGE_LOCK_HOLD_WARN_MS > 0.0);
         assert!(CURSOR_SNAPSHOT_MEMORY_WARN_BYTES > 0);
     }
+
+    // =========================================================================
+    // RubyBeaver wa-1u90p.7.1 — additional pure unit tests
+    // =========================================================================
+
+    #[test]
+    fn bytes_to_mib_conversion() {
+        assert!((bytes_to_mib(0) - 0.0).abs() < f64::EPSILON);
+        assert!((bytes_to_mib(1_048_576) - 1.0).abs() < f64::EPSILON);
+        assert!((bytes_to_mib(2_097_152) - 2.0).abs() < f64::EPSILON);
+        // 512 KB = 0.5 MiB
+        assert!((bytes_to_mib(524_288) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn epoch_ms_returns_plausible_timestamp() {
+        let ms = epoch_ms();
+        // Should be after 2020-01-01 and positive
+        assert!(ms > 1_577_836_800_000);
+    }
+
+    #[test]
+    fn epoch_ms_u64_returns_plausible_timestamp() {
+        let ms = epoch_ms_u64();
+        assert!(ms > 1_577_836_800_000);
+    }
+
+    #[test]
+    fn duration_ms_u64_conversion() {
+        assert_eq!(duration_ms_u64(Duration::from_millis(0)), 0);
+        assert_eq!(duration_ms_u64(Duration::from_millis(42)), 42);
+        assert_eq!(duration_ms_u64(Duration::from_secs(1)), 1000);
+        assert_eq!(duration_ms_u64(Duration::from_secs(60)), 60_000);
+    }
+
+    #[test]
+    fn lock_memory_telemetry_snapshot_serde_roundtrip() {
+        let snap = RuntimeLockMemoryTelemetrySnapshot {
+            timestamp_ms: 12345,
+            avg_storage_lock_wait_ms: 1.5,
+            p50_storage_lock_wait_ms: 1.0,
+            p95_storage_lock_wait_ms: 3.0,
+            max_storage_lock_wait_ms: 5.0,
+            storage_lock_contention_events: 10,
+            avg_storage_lock_hold_ms: 2.0,
+            p50_storage_lock_hold_ms: 1.5,
+            p95_storage_lock_hold_ms: 6.0,
+            max_storage_lock_hold_ms: 8.0,
+            cursor_snapshot_bytes_last: 1024,
+            p50_cursor_snapshot_bytes: 1024,
+            p95_cursor_snapshot_bytes: 2048,
+            cursor_snapshot_bytes_max: 4096,
+            avg_cursor_snapshot_bytes: 1500.0,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: RuntimeLockMemoryTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn watchdog_assessment_warning_severity_roundtrip() {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Warning,
+            stalled_total: 2,
+            stalled_critical: 0,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 5000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+            recommended_action: "monitor".into(),
+            sample_stalled: vec![],
+        };
+        let json = serde_json::to_string(&assessment).unwrap();
+        let back: ResizeWatchdogAssessment = serde_json::from_str(&json).unwrap();
+        assert_eq!(assessment, back);
+    }
+
+    #[test]
+    fn runtime_config_default_channel_buffer() {
+        let config = RuntimeConfig::default();
+        assert_eq!(config.channel_buffer, 1024);
+    }
+
+    #[test]
+    fn event_counts_as_activity_pattern_detected() {
+        let detection = test_detection("session.tool_use", Severity::Info);
+        let event = Event::PatternDetected {
+            pane_id: 1,
+            pane_uuid: None,
+            detection,
+            event_id: None,
+        };
+        assert!(event_counts_as_activity(&event));
+    }
+
+    #[test]
+    fn event_counts_as_activity_workflow_step() {
+        let event = Event::WorkflowStep {
+            workflow_id: "wf-1".to_string(),
+            step_name: "step1".to_string(),
+            result: "ok".to_string(),
+        };
+        assert!(event_counts_as_activity(&event));
+    }
+
+    #[test]
+    fn event_counts_as_activity_user_var_received() {
+        let event = Event::UserVarReceived {
+            pane_id: 1,
+            name: "FT_EVENT".to_string(),
+            payload: crate::events::UserVarPayload {
+                value: String::new(),
+                event_type: None,
+                event_data: None,
+            },
+        };
+        assert!(event_counts_as_activity(&event));
+    }
+
+    #[test]
+    fn runtime_metrics_native_output_input_tracking() {
+        let m = RuntimeMetrics::default();
+        assert_eq!(m.native_output_input_events(), 0);
+        assert_eq!(m.native_output_input_bytes(), 0);
+        m.record_native_output_input(256);
+        assert_eq!(m.native_output_input_events(), 1);
+        assert_eq!(m.native_output_input_bytes(), 256);
+        m.record_native_output_input(128);
+        assert_eq!(m.native_output_input_events(), 2);
+        assert_eq!(m.native_output_input_bytes(), 384);
+    }
+
+    #[test]
+    fn runtime_metrics_native_output_batch_tracking() {
+        let m = RuntimeMetrics::default();
+        assert_eq!(m.native_output_batches_emitted(), 0);
+        assert_eq!(m.native_output_emitted_bytes(), 0);
+        m.record_native_output_batch(3, 512);
+        assert_eq!(m.native_output_batches_emitted(), 1);
+        assert_eq!(m.native_output_emitted_bytes(), 512);
+        assert_eq!(m.native_output_max_batch_events(), 3);
+        assert_eq!(m.native_output_max_batch_bytes(), 512);
+        // second batch smaller — max stays
+        m.record_native_output_batch(2, 256);
+        assert_eq!(m.native_output_batches_emitted(), 2);
+        assert_eq!(m.native_output_max_batch_events(), 3);
+        assert_eq!(m.native_output_max_batch_bytes(), 512);
+    }
+
+    #[test]
+    fn runtime_metrics_avg_ingest_lag_zero_samples() {
+        let m = RuntimeMetrics::default();
+        assert!((m.avg_ingest_lag_ms() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn runtime_metrics_avg_storage_lock_wait_zero_samples() {
+        let m = RuntimeMetrics::default();
+        assert!((m.avg_storage_lock_wait_ms() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn runtime_metrics_avg_storage_lock_hold_zero_samples() {
+        let m = RuntimeMetrics::default();
+        assert!((m.avg_storage_lock_hold_ms() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn runtime_metrics_avg_cursor_snapshot_zero_samples() {
+        let m = RuntimeMetrics::default();
+        assert!((m.avg_cursor_snapshot_bytes() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn runtime_config_default_discovery_interval() {
+        let config = RuntimeConfig::default();
+        assert_eq!(config.discovery_interval, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn runtime_config_default_overlap_size() {
+        let config = RuntimeConfig::default();
+        assert_eq!(config.overlap_size, 1_048_576);
+    }
+
+    #[test]
+    fn derive_resize_degradation_ladder_from_warning() {
+        let watchdog = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Warning,
+            stalled_total: 1,
+            stalled_critical: 0,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 5000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+            recommended_action: "monitor".into(),
+            sample_stalled: vec![],
+        };
+        let ladder = derive_resize_degradation_ladder(&watchdog);
+        // Warning with no critical stalls should NOT recommend safe-mode
+        assert!(!ladder.signals.safe_mode_recommended);
+    }
 }
