@@ -3570,7 +3570,7 @@ mod tests {
     }
 
     #[test]
-    fn config_serde_roundtrip() {
+    fn config_serde_roundtrip_nondefault() {
         let cfg = ResizeSchedulerConfig {
             frame_budget_units: 16,
             max_deferrals_before_force: 5,
