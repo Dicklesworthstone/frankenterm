@@ -224,7 +224,7 @@ pub async fn generate_session_report(
 }
 
 /// Format epoch-ms timestamp as a human-readable string.
-fn format_ts(epoch_ms: i64) -> String {
+pub fn format_ts(epoch_ms: i64) -> String {
     // Simple UTC formatting without external deps
     let secs = epoch_ms / 1000;
     let millis = epoch_ms % 1000;
@@ -243,7 +243,7 @@ fn format_ts(epoch_ms: i64) -> String {
 }
 
 /// Convert days since Unix epoch to (year, month, day).
-fn days_to_ymd(days: i64) -> (i64, u32, u32) {
+pub fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     // Algorithm from http://howardhinnant.github.io/date_algorithms.html
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -259,7 +259,7 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 }
 
 /// Format duration in milliseconds as human-readable.
-fn format_duration(ms: i64) -> String {
+pub fn format_duration(ms: i64) -> String {
     if ms < 1000 {
         format!("{ms}ms")
     } else if ms < 60_000 {
@@ -272,7 +272,7 @@ fn format_duration(ms: i64) -> String {
 }
 
 /// Truncate string to max chars, adding ellipsis if needed.
-fn truncate(s: &str, max: usize) -> String {
+pub fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
