@@ -150,8 +150,8 @@ ft undo
 Robot mode uses a stable envelope and mirrors MCP schemas.
 
 ```bash
-ft robot state [--domain <name>] [--agent <type>]
-ft robot get-text <pane_id> [--tail <n>] [--escapes]
+ft robot state [--include-text] [--tail <n>] [--escapes]
+ft robot get-text <pane_id>|--panes <id,id,...>|--all [--tail <n>] [--escapes]
 ft robot send <pane_id> "<text>" [--dry-run] [--wait-for "<pat>"] [--timeout-secs <n>]
 ft robot wait-for <pane_id> "<pat>" [--timeout-secs <n>] [--regex]
 ft robot search "<fts query>" [--pane <id>] [--since <epoch_ms>] [--until <epoch_ms>] [--limit <n>] [--snippets[=<true|false>]] [--mode <lexical|semantic|hybrid>]

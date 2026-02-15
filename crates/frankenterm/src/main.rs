@@ -10811,7 +10811,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             tail,
                             escapes,
                         } => {
-                            let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+                            let wezterm =
+                                frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                             match wezterm.list_panes().await {
                                 Ok(panes) => {
                                     let filter = &config.ingest.panes;
@@ -10881,7 +10882,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             tail,
                             escapes,
                         } => {
-                            let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+                            let wezterm =
+                                frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                             let panes_specified = panes.is_some();
                             let selector_count = usize::from(pane_id.is_some())
                                 + usize::from(panes_specified)
@@ -34162,6 +34164,97 @@ log_level = "debug"
                 assert!(escapes);
             }
             _ => panic!("expected GetText command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_state_parses_include_text_flags() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "state",
+            "--include-text",
+            "--tail",
+            "25",
+            "--escapes",
+        ])
+        .expect("robot state include-text flags should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::State {
+                    include_text,
+                    tail,
+                    escapes,
+                }) => {
+                    assert!(include_text);
+                    assert_eq!(tail, 25);
+                    assert!(escapes);
+                }
+                _ => panic!("expected RobotCommands::State"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_get_text_parses_panes_selector() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "get-text",
+            "--panes",
+            "0,1,2",
+            "--tail",
+            "15",
+            "--escapes",
+        ])
+        .expect("robot get-text --panes should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::GetText {
+                    pane_id,
+                    panes,
+                    all,
+                    tail,
+                    escapes,
+                }) => {
+                    assert_eq!(pane_id, None);
+                    assert_eq!(panes, Some(vec![0, 1, 2]));
+                    assert!(!all);
+                    assert_eq!(tail, 15);
+                    assert!(escapes);
+                }
+                _ => panic!("expected RobotCommands::GetText"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_get_text_parses_all_selector() {
+        let cli = Cli::try_parse_from(["ft", "robot", "get-text", "--all", "--tail", "10"])
+            .expect("robot get-text --all should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::GetText {
+                    pane_id,
+                    panes,
+                    all,
+                    tail,
+                    escapes,
+                }) => {
+                    assert_eq!(pane_id, None);
+                    assert_eq!(panes, None);
+                    assert!(all);
+                    assert_eq!(tail, 10);
+                    assert!(!escapes);
+                }
+                _ => panic!("expected RobotCommands::GetText"),
+            },
+            _ => panic!("expected Robot command"),
         }
     }
 

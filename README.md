@@ -345,7 +345,10 @@ Use `--format toon` for token-efficient output and `ft robot help` for the full 
 
 ```bash
 ft robot state               # All panes as JSON
-ft robot get-text <id> --tail 50      # Pane output as JSON
+ft robot state --include-text --tail 20  # Pane metadata + per-pane tail output
+ft robot get-text <id> --tail 50      # Single pane output as JSON
+ft robot get-text --panes 0,1,2 --tail 20  # Batch pane output in one call
+ft robot get-text --all --tail 10     # Batch all active panes in one call
 ft robot send <id> "<text>" # Send input (with policy)
 ft robot send <id> "<text>" --dry-run  # Preview without executing
 ft robot wait-for <id> <rule_id>       # Wait for pattern
