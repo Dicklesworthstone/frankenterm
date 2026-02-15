@@ -1369,4 +1369,292 @@ mod tests {
         let result = verify_replay_determinism(&[], &[]);
         assert!(result.deterministic);
     }
+
+    // Batch: DarkBadger wa-1u90p.7.1
+
+    #[test]
+    fn violation_severity_debug_clone_copy_eq() {
+        let a = ViolationSeverity::Warning;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+        assert_ne!(ViolationSeverity::Warning, ViolationSeverity::Error);
+        assert_ne!(ViolationSeverity::Error, ViolationSeverity::Critical);
+        assert_ne!(ViolationSeverity::Warning, ViolationSeverity::Critical);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn violation_severity_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(ViolationSeverity::Warning);
+        set.insert(ViolationSeverity::Error);
+        set.insert(ViolationSeverity::Critical);
+        set.insert(ViolationSeverity::Warning); // dup
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn violation_kind_all_twelve_distinct() {
+        let kinds = [
+            ViolationKind::SequenceRegression,
+            ViolationKind::SequenceGap,
+            ViolationKind::DuplicateSequence,
+            ViolationKind::DuplicateEventId,
+            ViolationKind::ClockRegression,
+            ViolationKind::ClockFutureSkew,
+            ViolationKind::DanglingParentRef,
+            ViolationKind::DanglingTriggerRef,
+            ViolationKind::DanglingRootRef,
+            ViolationKind::MergeOrderViolation,
+            ViolationKind::EmptyEventId,
+            ViolationKind::SchemaVersionMismatch,
+        ];
+        for (i, a) in kinds.iter().enumerate() {
+            for (j, b) in kinds.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn violation_kind_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(ViolationKind::SequenceRegression);
+        set.insert(ViolationKind::SequenceGap);
+        set.insert(ViolationKind::DuplicateSequence);
+        set.insert(ViolationKind::DuplicateEventId);
+        set.insert(ViolationKind::ClockRegression);
+        set.insert(ViolationKind::ClockFutureSkew);
+        set.insert(ViolationKind::DanglingParentRef);
+        set.insert(ViolationKind::DanglingTriggerRef);
+        set.insert(ViolationKind::DanglingRootRef);
+        set.insert(ViolationKind::MergeOrderViolation);
+        set.insert(ViolationKind::EmptyEventId);
+        set.insert(ViolationKind::SchemaVersionMismatch);
+        assert_eq!(set.len(), 12);
+    }
+
+    #[test]
+    fn violation_kind_debug_clone_copy() {
+        let a = ViolationKind::MergeOrderViolation;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+        let dbg = format!("{:?}", a);
+        assert!(dbg.contains("MergeOrderViolation"));
+    }
+
+    #[test]
+    fn violation_clone_preserves_fields() {
+        let v = Violation {
+            kind: ViolationKind::SequenceGap,
+            severity: ViolationSeverity::Warning,
+            event_id: "evt-42".to_string(),
+            pane_id: 7,
+            message: "gap of 10".to_string(),
+            event_index: 3,
+        };
+        let c = v.clone();
+        assert_eq!(c.kind, ViolationKind::SequenceGap);
+        assert_eq!(c.severity, ViolationSeverity::Warning);
+        assert_eq!(c.event_id, "evt-42");
+        assert_eq!(c.pane_id, 7);
+        assert_eq!(c.message, "gap of 10");
+        assert_eq!(c.event_index, 3);
+    }
+
+    #[test]
+    fn violation_debug_format() {
+        let v = Violation {
+            kind: ViolationKind::EmptyEventId,
+            severity: ViolationSeverity::Error,
+            event_id: String::new(),
+            pane_id: 1,
+            message: "empty".to_string(),
+            event_index: 0,
+        };
+        let dbg = format!("{:?}", v);
+        assert!(dbg.contains("EmptyEventId"));
+        assert!(dbg.contains("Error"));
+    }
+
+    #[test]
+    fn invariant_report_clone_preserves_all() {
+        let report = InvariantReport {
+            violations: vec![Violation {
+                kind: ViolationKind::ClockRegression,
+                severity: ViolationSeverity::Warning,
+                event_id: "e1".into(),
+                pane_id: 1,
+                message: "clock went back".into(),
+                event_index: 5,
+            }],
+            events_checked: 10,
+            panes_observed: 2,
+            domains_observed: 3,
+            passed: true,
+        };
+        let c = report.clone();
+        assert_eq!(c.violations.len(), 1);
+        assert_eq!(c.events_checked, 10);
+        assert_eq!(c.panes_observed, 2);
+        assert_eq!(c.domains_observed, 3);
+        assert!(c.passed);
+    }
+
+    #[test]
+    fn invariant_report_has_errors_false_when_only_warnings() {
+        let report = InvariantReport {
+            violations: vec![
+                Violation {
+                    kind: ViolationKind::ClockRegression,
+                    severity: ViolationSeverity::Warning,
+                    event_id: "e1".into(),
+                    pane_id: 1,
+                    message: "warn".into(),
+                    event_index: 0,
+                },
+                Violation {
+                    kind: ViolationKind::SequenceGap,
+                    severity: ViolationSeverity::Warning,
+                    event_id: "e2".into(),
+                    pane_id: 1,
+                    message: "warn2".into(),
+                    event_index: 1,
+                },
+            ],
+            events_checked: 5,
+            panes_observed: 1,
+            domains_observed: 1,
+            passed: true,
+        };
+        assert!(!report.has_errors());
+        assert!(!report.has_critical());
+        assert_eq!(report.count_by_severity(ViolationSeverity::Warning), 2);
+        assert_eq!(report.count_by_severity(ViolationSeverity::Error), 0);
+        assert_eq!(report.count_by_severity(ViolationSeverity::Critical), 0);
+    }
+
+    #[test]
+    fn invariant_report_count_by_kind_no_matches() {
+        let report = InvariantReport {
+            violations: vec![],
+            events_checked: 0,
+            panes_observed: 0,
+            domains_observed: 0,
+            passed: true,
+        };
+        assert_eq!(report.count_by_kind(ViolationKind::SequenceRegression), 0);
+        assert_eq!(report.count_by_kind(ViolationKind::DuplicateEventId), 0);
+    }
+
+    #[test]
+    fn invariant_report_debug_format() {
+        let report = InvariantReport {
+            violations: vec![],
+            events_checked: 42,
+            panes_observed: 3,
+            domains_observed: 5,
+            passed: true,
+        };
+        let dbg = format!("{:?}", report);
+        assert!(dbg.contains("InvariantReport"));
+        assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn invariant_checker_config_default_values() {
+        let c = InvariantCheckerConfig::default();
+        assert_eq!(c.max_sequence_gap, 100);
+        assert!(c.check_causality);
+        assert!(c.check_merge_order);
+        assert_eq!(c.clock_future_skew_threshold_ms, 60_000);
+        assert!(c.expected_schema_version.is_empty());
+    }
+
+    #[test]
+    fn invariant_checker_config_clone_debug() {
+        let c = InvariantCheckerConfig {
+            max_sequence_gap: 50,
+            check_causality: false,
+            check_merge_order: false,
+            clock_future_skew_threshold_ms: 10_000,
+            expected_schema_version: "v2".to_string(),
+        };
+        let c2 = c.clone();
+        assert_eq!(c2.max_sequence_gap, 50);
+        assert!(!c2.check_causality);
+        assert!(!c2.check_merge_order);
+        assert_eq!(c2.clock_future_skew_threshold_ms, 10_000);
+        assert_eq!(c2.expected_schema_version, "v2");
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("InvariantCheckerConfig"));
+    }
+
+    #[test]
+    fn invariant_checker_default_trait() {
+        let checker = InvariantChecker::default();
+        // Default checker should pass empty events
+        let report = checker.check(&[]);
+        assert!(report.passed);
+        assert_eq!(report.events_checked, 0);
+    }
+
+    #[test]
+    fn invariant_checker_with_config_uses_provided() {
+        let config = InvariantCheckerConfig {
+            max_sequence_gap: 1,
+            check_causality: false,
+            check_merge_order: false,
+            clock_future_skew_threshold_ms: 0,
+            expected_schema_version: String::new(),
+        };
+        let checker = InvariantChecker::with_config(config);
+        // gap of 2 > max_sequence_gap=1 → error
+        let events = vec![
+            make_event("e1", 1, 0, 1000, "a"),
+            make_event("e2", 1, 3, 1001, "b"),
+        ];
+        let report = checker.check(&events);
+        assert!(!report.passed);
+        assert_eq!(report.count_by_kind(ViolationKind::SequenceGap), 1);
+        assert_eq!(report.count_by_severity(ViolationSeverity::Error), 1);
+    }
+
+    #[test]
+    fn replay_determinism_result_debug_clone() {
+        let r = ReplayDeterminismResult {
+            deterministic: false,
+            divergence_index: Some(42),
+            message: "diverged at event 42".into(),
+        };
+        let c = r.clone();
+        assert!(!c.deterministic);
+        assert_eq!(c.divergence_index, Some(42));
+        assert_eq!(c.message, "diverged at event 42");
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("ReplayDeterminismResult"));
+        assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn replay_determinism_result_deterministic_case() {
+        let r = ReplayDeterminismResult {
+            deterministic: true,
+            divergence_index: None,
+            message: String::new(),
+        };
+        assert!(r.deterministic);
+        assert!(r.divergence_index.is_none());
+        assert!(r.message.is_empty());
+    }
 }

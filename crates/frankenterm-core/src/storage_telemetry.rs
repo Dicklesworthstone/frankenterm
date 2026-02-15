@@ -1149,4 +1149,196 @@ mod tests {
         assert_eq!(inner, 42);
         assert!(Arc::ptr_eq(&t, &telem));
     }
+
+    // Batch: DarkBadger wa-1u90p.7.1
+
+    #[test]
+    fn storage_telemetry_config_debug_clone() {
+        let c = StorageTelemetryConfig::default();
+        let c2 = c.clone();
+        assert_eq!(c.histogram_max_samples, c2.histogram_max_samples);
+        let _ = format!("{:?}", c);
+    }
+
+    #[test]
+    fn storage_telemetry_config_default_values() {
+        let c = StorageTelemetryConfig::default();
+        assert_eq!(c.histogram_max_samples, 1024);
+        assert!((c.tier_thresholds[0] - 0.5).abs() < 0.001);
+        assert!((c.tier_thresholds[1] - 0.8).abs() < 0.001);
+        assert!((c.tier_thresholds[2] - 0.95).abs() < 0.001);
+        assert!((c.rate_ewma_half_life_ms - 5000.0).abs() < 0.1);
+        assert!((c.slo_append_p95_us - 10_000.0).abs() < 0.1);
+        assert!((c.slo_flush_p95_us - 100_000.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn storage_telemetry_config_serde_roundtrip() {
+        let c = StorageTelemetryConfig::default();
+        let json = serde_json::to_string(&c).unwrap();
+        let back: StorageTelemetryConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.histogram_max_samples, c.histogram_max_samples);
+        assert!((back.tier_thresholds[0] - c.tier_thresholds[0]).abs() < 0.001);
+    }
+
+    #[test]
+    fn storage_health_tier_debug_clone_copy_eq() {
+        let a = StorageHealthTier::Green;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+        assert_ne!(StorageHealthTier::Green, StorageHealthTier::Yellow);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn storage_health_tier_ord_ordering() {
+        assert!(StorageHealthTier::Green < StorageHealthTier::Yellow);
+        assert!(StorageHealthTier::Yellow < StorageHealthTier::Red);
+        assert!(StorageHealthTier::Red < StorageHealthTier::Black);
+    }
+
+    #[test]
+    fn storage_health_tier_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(StorageHealthTier::Green);
+        set.insert(StorageHealthTier::Black);
+        set.insert(StorageHealthTier::Green); // dup
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn storage_health_tier_serde_all_four() {
+        let expected = [
+            (StorageHealthTier::Green, "\"green\""),
+            (StorageHealthTier::Yellow, "\"yellow\""),
+            (StorageHealthTier::Red, "\"red\""),
+            (StorageHealthTier::Black, "\"black\""),
+        ];
+        for (tier, json_str) in expected {
+            let json = serde_json::to_string(&tier).unwrap();
+            assert_eq!(json, json_str);
+            let back: StorageHealthTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, tier);
+        }
+    }
+
+    #[test]
+    fn storage_health_tier_classify_boundary_zero() {
+        let thresholds = [0.5, 0.8, 0.95];
+        assert_eq!(
+            StorageHealthTier::classify(0.0, false, &thresholds),
+            StorageHealthTier::Green
+        );
+    }
+
+    #[test]
+    fn slo_status_debug_clone_copy_eq() {
+        let a = SloStatus::Met;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(SloStatus::Met, SloStatus::Breached);
+        assert_ne!(SloStatus::Breached, SloStatus::Unknown);
+        let _ = format!("{:?}", a);
+    }
+
+    #[test]
+    fn slo_status_serde_all_three() {
+        let expected = [
+            (SloStatus::Met, "\"met\""),
+            (SloStatus::Breached, "\"breached\""),
+            (SloStatus::Unknown, "\"unknown\""),
+        ];
+        for (status, json_str) in expected {
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, json_str);
+            let back: SloStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, status);
+        }
+    }
+
+    #[test]
+    fn error_counts_debug_clone_default() {
+        let e = ErrorCounts::default();
+        assert_eq!(e.total(), 0);
+        assert_eq!(e.overload, 0);
+        assert_eq!(e.retryable, 0);
+        assert_eq!(e.terminal_data, 0);
+        assert_eq!(e.corruption, 0);
+        let c = e.clone();
+        assert_eq!(c.total(), 0);
+        let _ = format!("{:?}", e);
+    }
+
+    #[test]
+    fn error_counts_serde_roundtrip() {
+        let e = ErrorCounts {
+            overload: 1,
+            retryable: 2,
+            terminal_data: 3,
+            corruption: 4,
+        };
+        assert_eq!(e.total(), 10);
+        let json = serde_json::to_string(&e).unwrap();
+        let back: ErrorCounts = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total(), 10);
+        assert_eq!(back.overload, 1);
+    }
+
+    #[test]
+    fn storage_diagnostic_summary_debug_clone() {
+        let s = StorageDiagnosticSummary {
+            tier: StorageHealthTier::Green,
+            status: "ok".into(),
+            recommendation: None,
+            errors: ErrorCounts::default(),
+            slo_append: SloStatus::Met,
+            slo_flush: SloStatus::Unknown,
+        };
+        let c = s.clone();
+        assert_eq!(c.status, "ok");
+        assert!(c.recommendation.is_none());
+        let _ = format!("{:?}", s);
+    }
+
+    #[test]
+    fn storage_telemetry_config_accessor() {
+        let telem = StorageTelemetry::with_defaults();
+        let config = telem.config();
+        assert_eq!(config.histogram_max_samples, 1024);
+    }
+
+    #[test]
+    fn storage_telemetry_debug_impl() {
+        let telem = StorageTelemetry::with_defaults();
+        let dbg = format!("{:?}", telem);
+        assert!(dbg.contains("StorageTelemetry"));
+        assert!(dbg.contains("Green"));
+    }
+
+    #[test]
+    fn instrumented_storage_telemetry_accessor() {
+        let telem = Arc::new(StorageTelemetry::with_defaults());
+        let instrumented = InstrumentedStorage::new((), telem.clone());
+        assert!(Arc::ptr_eq(instrumented.telemetry(), &telem));
+    }
+
+    #[test]
+    fn metric_constants_not_empty() {
+        assert!(!METRIC_APPEND_LATENCY_US.is_empty());
+        assert!(!METRIC_FLUSH_LATENCY_US.is_empty());
+        assert!(!METRIC_CHECKPOINT_LATENCY_US.is_empty());
+        assert!(!METRIC_BATCH_SIZE.is_empty());
+        assert!(!COUNTER_EVENTS_APPENDED.is_empty());
+        assert!(!COUNTER_BATCHES_PROCESSED.is_empty());
+        assert!(!COUNTER_BYTES_WRITTEN.is_empty());
+        assert!(!COUNTER_FLUSHES.is_empty());
+        assert!(!COUNTER_CHECKPOINTS.is_empty());
+        assert!(!COUNTER_CHECKPOINT_ADVANCED.is_empty());
+        assert!(!COUNTER_CHECKPOINT_NOOP.is_empty());
+        assert!(!COUNTER_IDEMPOTENT_REPLAYS.is_empty());
+        assert!(!COUNTER_ERROR_OVERLOAD.is_empty());
+    }
 }
