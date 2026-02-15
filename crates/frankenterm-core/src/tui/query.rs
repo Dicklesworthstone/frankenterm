@@ -1035,4 +1035,666 @@ mod tests {
         );
         assert_eq!(infer_agent_type(Some("plain shell"), None), None);
     }
+
+    // =====================================================================
+    // infer_agent_type — exhaustive tests
+    // =====================================================================
+
+    #[test]
+    fn infer_agent_type_none_none() {
+        assert_eq!(infer_agent_type(None, None), None);
+    }
+
+    #[test]
+    fn infer_agent_type_empty_strings() {
+        assert_eq!(infer_agent_type(Some(""), Some("")), None);
+    }
+
+    #[test]
+    fn infer_agent_type_codex_in_title_case_insensitive() {
+        assert_eq!(
+            infer_agent_type(Some("CODEX SESSION"), None),
+            Some("codex".to_string())
+        );
+        assert_eq!(
+            infer_agent_type(Some("Codex"), None),
+            Some("codex".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_agent_type_codex_in_cwd() {
+        assert_eq!(
+            infer_agent_type(None, Some("/home/user/.codex/workspace")),
+            Some("codex".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_agent_type_claude_in_title_case_insensitive() {
+        assert_eq!(
+            infer_agent_type(Some("CLAUDE code"), None),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            infer_agent_type(Some("claude-code"), None),
+            Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_agent_type_claude_in_cwd() {
+        assert_eq!(
+            infer_agent_type(None, Some("/tmp/claude-session")),
+            Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_agent_type_gemini_in_title() {
+        assert_eq!(
+            infer_agent_type(Some("gemini chat"), None),
+            Some("gemini".to_string())
+        );
+        assert_eq!(
+            infer_agent_type(Some("GEMINI"), None),
+            Some("gemini".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_agent_type_gemini_in_cwd() {
+        assert_eq!(
+            infer_agent_type(None, Some("/workspace/gemini-agent")),
+            Some("gemini".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_agent_type_priority_codex_over_claude() {
+        // codex is checked first
+        assert_eq!(
+            infer_agent_type(Some("codex claude gemini"), None),
+            Some("codex".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_agent_type_priority_claude_over_gemini() {
+        // claude is checked before gemini
+        assert_eq!(
+            infer_agent_type(Some("claude gemini"), None),
+            Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_agent_type_title_takes_precedence_over_cwd() {
+        // If title matches codex, cwd matching claude doesn't matter
+        assert_eq!(
+            infer_agent_type(Some("codex"), Some("/claude-dir")),
+            Some("codex".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_agent_type_unrecognized_returns_none() {
+        assert_eq!(infer_agent_type(Some("vim"), Some("/home/user")), None);
+        assert_eq!(infer_agent_type(Some("htop"), None), None);
+        assert_eq!(infer_agent_type(Some("bash"), Some("/usr/bin")), None);
+    }
+
+    // =====================================================================
+    // infer_pane_state — exhaustive tests
+    // =====================================================================
+
+    fn make_pane_info() -> PaneInfo {
+        PaneInfo {
+            pane_id: 1,
+            tab_id: 1,
+            window_id: 1,
+            domain_id: None,
+            domain_name: None,
+            workspace: None,
+            size: None,
+            rows: None,
+            cols: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            cursor_x: None,
+            cursor_y: None,
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
+            is_active: false,
+            is_zoomed: false,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn infer_pane_state_unknown_default() {
+        let info = make_pane_info();
+        assert_eq!(infer_pane_state(&info), "unknown");
+    }
+
+    #[test]
+    fn infer_pane_state_alt_screen() {
+        let mut info = make_pane_info();
+        info.extra.insert(
+            "is_alt_screen_active".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        assert_eq!(infer_pane_state(&info), "AltScreen");
+    }
+
+    #[test]
+    fn infer_pane_state_alt_screen_false() {
+        let mut info = make_pane_info();
+        info.extra.insert(
+            "is_alt_screen_active".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        assert_eq!(infer_pane_state(&info), "unknown");
+    }
+
+    #[test]
+    fn infer_pane_state_alt_screen_non_bool_ignored() {
+        let mut info = make_pane_info();
+        info.extra.insert(
+            "is_alt_screen_active".to_string(),
+            serde_json::Value::String("yes".to_string()),
+        );
+        // Non-bool values default to false via and_then(as_bool)
+        assert_eq!(infer_pane_state(&info), "unknown");
+    }
+
+    #[test]
+    fn infer_pane_state_cursor_hidden() {
+        let mut info = make_pane_info();
+        info.cursor_visibility = Some(crate::wezterm::CursorVisibility::Hidden);
+        assert_eq!(infer_pane_state(&info), "CommandRunning");
+    }
+
+    #[test]
+    fn infer_pane_state_cursor_visible_not_active() {
+        let mut info = make_pane_info();
+        info.cursor_visibility = Some(crate::wezterm::CursorVisibility::Visible);
+        info.is_active = false;
+        assert_eq!(infer_pane_state(&info), "unknown");
+    }
+
+    #[test]
+    fn infer_pane_state_prompt_active() {
+        let mut info = make_pane_info();
+        info.is_active = true;
+        assert_eq!(infer_pane_state(&info), "PromptActive");
+    }
+
+    #[test]
+    fn infer_pane_state_alt_screen_takes_priority_over_cursor() {
+        let mut info = make_pane_info();
+        info.extra.insert(
+            "is_alt_screen_active".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        info.cursor_visibility = Some(crate::wezterm::CursorVisibility::Hidden);
+        info.is_active = true;
+        assert_eq!(infer_pane_state(&info), "AltScreen");
+    }
+
+    #[test]
+    fn infer_pane_state_cursor_hidden_takes_priority_over_active() {
+        let mut info = make_pane_info();
+        info.cursor_visibility = Some(crate::wezterm::CursorVisibility::Hidden);
+        info.is_active = true;
+        assert_eq!(infer_pane_state(&info), "CommandRunning");
+    }
+
+    // =====================================================================
+    // PaneView::from — conversion tests
+    // =====================================================================
+
+    #[test]
+    fn pane_view_from_pane_info_basic() {
+        let info = make_pane_info();
+        let view = PaneView::from(&info);
+        assert_eq!(view.pane_id, 1);
+        assert_eq!(view.title, "");
+        assert_eq!(view.domain, "local");
+        assert!(view.cwd.is_none());
+        assert!(!view.is_excluded);
+        assert!(view.agent_type.is_none());
+        assert_eq!(view.pane_state, "unknown");
+        assert!(view.last_activity_ts.is_none());
+        assert_eq!(view.unhandled_event_count, 0);
+    }
+
+    #[test]
+    fn pane_view_from_with_title_and_cwd() {
+        let mut info = make_pane_info();
+        info.title = Some("Claude Code".to_string());
+        info.cwd = Some("/home/user/project".to_string());
+        let view = PaneView::from(&info);
+        assert_eq!(view.title, "Claude Code");
+        assert_eq!(view.cwd, Some("/home/user/project".to_string()));
+        assert_eq!(view.agent_type, Some("claude".to_string()));
+    }
+
+    #[test]
+    fn pane_view_from_with_domain_name() {
+        let mut info = make_pane_info();
+        info.domain_name = Some("ssh:remote".to_string());
+        let view = PaneView::from(&info);
+        assert_eq!(view.domain, "ssh:remote");
+    }
+
+    #[test]
+    fn pane_view_from_with_active_pane() {
+        let mut info = make_pane_info();
+        info.is_active = true;
+        let view = PaneView::from(&info);
+        assert_eq!(view.pane_state, "PromptActive");
+    }
+
+    #[test]
+    fn pane_view_from_with_alt_screen() {
+        let mut info = make_pane_info();
+        info.extra.insert(
+            "is_alt_screen_active".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let view = PaneView::from(&info);
+        assert_eq!(view.pane_state, "AltScreen");
+    }
+
+    // =====================================================================
+    // QueryError tests
+    // =====================================================================
+
+    #[test]
+    fn query_error_display_watcher_not_running() {
+        let e = QueryError::WatcherNotRunning;
+        assert_eq!(e.to_string(), "Watcher is not running");
+    }
+
+    #[test]
+    fn query_error_display_database_not_initialized() {
+        let e = QueryError::DatabaseNotInitialized("no db file".into());
+        let msg = e.to_string();
+        assert!(msg.contains("Database not initialized"));
+        assert!(msg.contains("no db file"));
+    }
+
+    #[test]
+    fn query_error_display_wezterm_error() {
+        let e = QueryError::WeztermError("connection refused".into());
+        let msg = e.to_string();
+        assert!(msg.contains("WezTerm error"));
+        assert!(msg.contains("connection refused"));
+    }
+
+    #[test]
+    fn query_error_display_storage_error() {
+        let e = QueryError::StorageError("disk full".into());
+        let msg = e.to_string();
+        assert!(msg.contains("Storage error"));
+        assert!(msg.contains("disk full"));
+    }
+
+    #[test]
+    fn query_error_display_query_failed() {
+        let e = QueryError::QueryFailed("syntax error".into());
+        let msg = e.to_string();
+        assert!(msg.contains("Query failed"));
+        assert!(msg.contains("syntax error"));
+    }
+
+    #[test]
+    fn query_error_debug_contains_variant_name() {
+        let e = QueryError::WatcherNotRunning;
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("WatcherNotRunning"));
+    }
+
+    // =====================================================================
+    // EventFilters tests
+    // =====================================================================
+
+    #[test]
+    fn event_filters_default_values() {
+        let f = EventFilters::default();
+        assert!(f.pane_id.is_none());
+        assert!(f.rule_id.is_none());
+        assert!(f.event_type.is_none());
+        assert!(!f.unhandled_only);
+        assert_eq!(f.limit, 0);
+    }
+
+    #[test]
+    fn event_filters_clone() {
+        let f = EventFilters {
+            pane_id: Some(42),
+            rule_id: Some("error_pattern".into()),
+            event_type: Some("pattern".into()),
+            unhandled_only: true,
+            limit: 100,
+        };
+        let f2 = f.clone();
+        assert_eq!(f2.pane_id, Some(42));
+        assert_eq!(f2.rule_id, Some("error_pattern".into()));
+        assert_eq!(f2.event_type, Some("pattern".into()));
+        assert!(f2.unhandled_only);
+        assert_eq!(f2.limit, 100);
+    }
+
+    #[test]
+    fn event_filters_debug() {
+        let f = EventFilters::default();
+        let dbg = format!("{f:?}");
+        assert!(dbg.contains("EventFilters"));
+    }
+
+    // =====================================================================
+    // View struct construction tests
+    // =====================================================================
+
+    #[test]
+    fn event_view_construction_and_clone() {
+        let ev = EventView {
+            id: 1,
+            rule_id: "test_rule".to_string(),
+            pane_id: 42,
+            severity: "error".to_string(),
+            message: "Something broke".to_string(),
+            timestamp: 1_700_000_000_000,
+            handled: false,
+            triage_state: Some("open".to_string()),
+            labels: vec!["critical".to_string()],
+            note: Some("investigate".to_string()),
+        };
+        let ev2 = ev.clone();
+        assert_eq!(ev2.id, 1);
+        assert_eq!(ev2.rule_id, "test_rule");
+        assert_eq!(ev2.pane_id, 42);
+        assert_eq!(ev2.severity, "error");
+        assert_eq!(ev2.message, "Something broke");
+        assert!(!ev2.handled);
+        assert_eq!(ev2.triage_state, Some("open".to_string()));
+        assert_eq!(ev2.labels.len(), 1);
+        assert_eq!(ev2.note, Some("investigate".to_string()));
+    }
+
+    #[test]
+    fn event_view_debug() {
+        let ev = EventView {
+            id: 0,
+            rule_id: String::new(),
+            pane_id: 0,
+            severity: String::new(),
+            message: String::new(),
+            timestamp: 0,
+            handled: true,
+            triage_state: None,
+            labels: Vec::new(),
+            note: None,
+        };
+        let dbg = format!("{ev:?}");
+        assert!(dbg.contains("EventView"));
+    }
+
+    #[test]
+    fn triage_action_construction_and_clone() {
+        let a = TriageAction {
+            label: "Fix it".to_string(),
+            command: "ft fix --auto".to_string(),
+        };
+        let a2 = a.clone();
+        assert_eq!(a2.label, "Fix it");
+        assert_eq!(a2.command, "ft fix --auto");
+    }
+
+    #[test]
+    fn triage_item_view_construction() {
+        let item = TriageItemView {
+            section: "events".to_string(),
+            severity: "warning".to_string(),
+            title: "Test item".to_string(),
+            detail: "Some detail".to_string(),
+            actions: vec![TriageAction {
+                label: "Fix".to_string(),
+                command: "ft fix".to_string(),
+            }],
+            event_id: Some(10),
+            pane_id: Some(5),
+            workflow_id: None,
+        };
+        let item2 = item.clone();
+        assert_eq!(item2.section, "events");
+        assert_eq!(item2.actions.len(), 1);
+        assert_eq!(item2.event_id, Some(10));
+        assert!(item2.workflow_id.is_none());
+    }
+
+    #[test]
+    fn search_result_view_construction() {
+        let sr = SearchResultView {
+            pane_id: 7,
+            timestamp: 12345,
+            snippet: "match here".to_string(),
+            rank: 0.95,
+        };
+        let sr2 = sr.clone();
+        assert_eq!(sr2.pane_id, 7);
+        assert_eq!(sr2.timestamp, 12345);
+        assert_eq!(sr2.snippet, "match here");
+        assert!((sr2.rank - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn workflow_progress_view_construction() {
+        let wf = WorkflowProgressView {
+            id: "wf-1".to_string(),
+            workflow_name: "auto-fix".to_string(),
+            pane_id: 3,
+            current_step: 2,
+            total_steps: 5,
+            status: "running".to_string(),
+            error: None,
+            started_at: 1000,
+            updated_at: 2000,
+        };
+        let wf2 = wf.clone();
+        assert_eq!(wf2.id, "wf-1");
+        assert_eq!(wf2.current_step, 2);
+        assert_eq!(wf2.total_steps, 5);
+        assert!(wf2.error.is_none());
+    }
+
+    #[test]
+    fn history_entry_view_construction() {
+        let h = HistoryEntryView {
+            audit_id: 100,
+            timestamp: 5000,
+            pane_id: Some(1),
+            workflow_id: Some("wf-x".to_string()),
+            action_kind: "send_text".to_string(),
+            result: "success".to_string(),
+            actor_kind: "robot".to_string(),
+            step_name: Some("step1".to_string()),
+            undoable: true,
+            undone: false,
+            undo_strategy: Some("workflow_abort".to_string()),
+            undo_hint: None,
+            rule_id: Some("r1".to_string()),
+            summary: "sent text to pane".to_string(),
+        };
+        let h2 = h.clone();
+        assert_eq!(h2.audit_id, 100);
+        assert!(h2.undoable);
+        assert!(!h2.undone);
+        assert_eq!(h2.actor_kind, "robot");
+        assert_eq!(h2.summary, "sent text to pane");
+    }
+
+    #[test]
+    fn health_status_construction() {
+        let hs = HealthStatus {
+            watcher_running: true,
+            db_accessible: true,
+            wezterm_accessible: false,
+            wezterm_circuit: CircuitBreakerStatus::default(),
+            pane_count: 5,
+            event_count: 100,
+            last_capture_ts: Some(999),
+        };
+        let hs2 = hs.clone();
+        assert!(hs2.watcher_running);
+        assert!(!hs2.wezterm_accessible);
+        assert_eq!(hs2.pane_count, 5);
+        assert_eq!(hs2.last_capture_ts, Some(999));
+    }
+
+    // =====================================================================
+    // PaneView direct construction and field tests
+    // =====================================================================
+
+    #[test]
+    fn pane_view_clone_and_debug() {
+        let pv = PaneView {
+            pane_id: 99,
+            title: "my pane".to_string(),
+            domain: "local".to_string(),
+            cwd: Some("/tmp".to_string()),
+            is_excluded: true,
+            agent_type: Some("codex".to_string()),
+            pane_state: "AltScreen".to_string(),
+            last_activity_ts: Some(42),
+            unhandled_event_count: 3,
+        };
+        let pv2 = pv.clone();
+        assert_eq!(pv2.pane_id, 99);
+        assert!(pv2.is_excluded);
+        assert_eq!(pv2.unhandled_event_count, 3);
+        let dbg = format!("{pv:?}");
+        assert!(dbg.contains("PaneView"));
+        assert!(dbg.contains("99"));
+    }
+
+    // =====================================================================
+    // MockQueryClient — trait method tests
+    // =====================================================================
+
+    #[test]
+    fn mock_client_list_events_empty() {
+        let client = MockQueryClient::new();
+        let events = client.list_events(&EventFilters::default()).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn mock_client_triage_items() {
+        let client = MockQueryClient::new();
+        let items = client.list_triage_items().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, "warning");
+        assert_eq!(items[0].section, "events");
+    }
+
+    #[test]
+    fn mock_client_search_empty() {
+        let client = MockQueryClient::new();
+        let results = client.search("test", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn mock_client_mark_event_muted() {
+        let client = MockQueryClient::new();
+        assert!(client.mark_event_muted(1).is_ok());
+    }
+
+    #[test]
+    fn mock_client_list_active_workflows_empty() {
+        let client = MockQueryClient::new();
+        let workflows = client.list_active_workflows().unwrap();
+        assert!(workflows.is_empty());
+    }
+
+    #[test]
+    fn mock_client_watcher_running() {
+        let client = MockQueryClient::new();
+        assert!(client.is_watcher_running());
+    }
+
+    #[test]
+    fn mock_client_watcher_not_running() {
+        let mut client = MockQueryClient::new();
+        client.watcher_running = false;
+        assert!(!client.is_watcher_running());
+        let health = client.health().unwrap();
+        assert!(!health.watcher_running);
+    }
+
+    // =====================================================================
+    // QueryClient default method implementations
+    // =====================================================================
+
+    #[test]
+    fn query_client_default_list_action_history() {
+        let client = MockQueryClient::new();
+        let history = client.list_action_history(10).unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn query_client_default_list_pane_bookmarks() {
+        let client = MockQueryClient::new();
+        let bookmarks = client.list_pane_bookmarks().unwrap();
+        assert!(bookmarks.is_empty());
+    }
+
+    #[test]
+    fn query_client_default_list_saved_searches() {
+        let client = MockQueryClient::new();
+        let searches = client.list_saved_searches().unwrap();
+        assert!(searches.is_empty());
+    }
+
+    #[test]
+    fn query_client_default_ruleset_profile_state() {
+        let client = MockQueryClient::new();
+        let state = client.ruleset_profile_state().unwrap();
+        // Default should be the default value
+        let dbg = format!("{state:?}");
+        assert!(dbg.contains("RulesetProfileState"));
+    }
+
+    #[test]
+    fn query_client_default_get_timeline() {
+        let client = MockQueryClient::new();
+        let timeline = client.get_timeline(1000, 50).unwrap();
+        assert_eq!(timeline.total_count, 0);
+        assert!(!timeline.has_more);
+        assert!(timeline.events.is_empty());
+    }
+
+    // =====================================================================
+    // epoch_ms sanity test
+    // =====================================================================
+
+    #[test]
+    fn epoch_ms_returns_positive_value() {
+        let ms = epoch_ms();
+        // Should be after 2024-01-01 in epoch ms
+        assert!(ms > 1_704_067_200_000);
+    }
+
+    #[test]
+    fn epoch_ms_is_monotonic_ish() {
+        let ms1 = epoch_ms();
+        let ms2 = epoch_ms();
+        assert!(ms2 >= ms1);
+    }
 }
