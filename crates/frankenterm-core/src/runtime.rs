@@ -4202,4 +4202,692 @@ mod tests {
         assert!(snapshot.scheduler.is_none());
         assert!(snapshot.backpressure_tier.is_none());
     }
+
+    // =========================================================================
+    // Pure function tests: bytes_to_mib, epoch_ms, duration_ms
+    // =========================================================================
+
+    #[test]
+    fn bytes_to_mib_zero() {
+        assert!((bytes_to_mib(0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn bytes_to_mib_one_mib() {
+        assert!((bytes_to_mib(1024 * 1024) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn bytes_to_mib_fractional() {
+        let result = bytes_to_mib(512 * 1024);
+        assert!((result - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn bytes_to_mib_large() {
+        let result = bytes_to_mib(10 * 1024 * 1024);
+        assert!((result - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn epoch_ms_returns_positive() {
+        let ms = epoch_ms();
+        assert!(ms > 0, "epoch_ms should return positive value");
+    }
+
+    #[test]
+    fn epoch_ms_u64_returns_positive() {
+        let ms = epoch_ms_u64();
+        assert!(ms > 0, "epoch_ms_u64 should return positive value");
+    }
+
+    #[test]
+    fn epoch_ms_and_u64_are_consistent() {
+        let signed = epoch_ms();
+        let unsigned = epoch_ms_u64();
+        assert_eq!(signed as u64, unsigned);
+    }
+
+    #[test]
+    fn duration_ms_u64_zero() {
+        assert_eq!(duration_ms_u64(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn duration_ms_u64_one_second() {
+        assert_eq!(duration_ms_u64(Duration::from_secs(1)), 1000);
+    }
+
+    #[test]
+    fn duration_ms_u64_sub_millisecond() {
+        // 500 microseconds = 0 milliseconds (truncated)
+        assert_eq!(duration_ms_u64(Duration::from_micros(500)), 0);
+    }
+
+    // =========================================================================
+    // record_bounded_sample and percentile_from_samples
+    // =========================================================================
+
+    #[test]
+    fn record_bounded_sample_adds_value() {
+        let samples = StdMutex::new(VecDeque::new());
+        record_bounded_sample(&samples, 42);
+        let guard = samples.lock().unwrap();
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0], 42);
+    }
+
+    #[test]
+    fn record_bounded_sample_respects_capacity() {
+        let samples = StdMutex::new(VecDeque::new());
+        for i in 0..TELEMETRY_PERCENTILE_WINDOW_CAPACITY + 10 {
+            record_bounded_sample(&samples, i as u64);
+        }
+        let guard = samples.lock().unwrap();
+        assert_eq!(guard.len(), TELEMETRY_PERCENTILE_WINDOW_CAPACITY);
+        // First values should have been evicted
+        assert_eq!(*guard.front().unwrap(), 10);
+    }
+
+    #[test]
+    fn percentile_from_samples_empty_returns_zero() {
+        let samples = StdMutex::new(VecDeque::new());
+        assert_eq!(percentile_from_samples(&samples, 50), 0);
+    }
+
+    #[test]
+    fn percentile_from_samples_single_value() {
+        let samples = StdMutex::new(VecDeque::from([42]));
+        assert_eq!(percentile_from_samples(&samples, 50), 42);
+        assert_eq!(percentile_from_samples(&samples, 95), 42);
+    }
+
+    #[test]
+    fn percentile_from_samples_p50_of_two() {
+        let samples = StdMutex::new(VecDeque::from([10, 20]));
+        let p50 = percentile_from_samples(&samples, 50);
+        // With 2 values, p50 should return 20 (index = (2-1)*50+99 / 100 = 1)
+        assert_eq!(p50, 20);
+    }
+
+    #[test]
+    fn percentile_from_samples_sorted_correctly() {
+        // Values added out of order should still give correct percentiles
+        let samples = StdMutex::new(VecDeque::from([100, 10, 50, 90, 30]));
+        let p50 = percentile_from_samples(&samples, 50);
+        // Sorted: [10, 30, 50, 90, 100], p50 index = (4*50+99)/100 = 2 => 50
+        assert!(p50 >= 30 && p50 <= 90);
+    }
+
+    // =========================================================================
+    // event_counts_as_activity
+    // =========================================================================
+
+    #[test]
+    fn event_counts_as_activity_segment_captured() {
+        let event = Event::SegmentCaptured {
+            pane_id: 1,
+            seq: 1,
+            content_len: 100,
+        };
+        assert!(event_counts_as_activity(&event));
+    }
+
+    #[test]
+    fn event_counts_as_activity_gap_detected() {
+        let event = Event::GapDetected {
+            pane_id: 1,
+            reason: "test gap".to_string(),
+        };
+        assert!(event_counts_as_activity(&event));
+    }
+
+    #[test]
+    fn event_counts_as_activity_pane_discovered() {
+        let event = Event::PaneDiscovered {
+            pane_id: 1,
+            domain: "local".to_string(),
+            title: "shell".to_string(),
+        };
+        assert!(event_counts_as_activity(&event));
+    }
+
+    #[test]
+    fn event_counts_as_activity_pane_disappeared() {
+        let event = Event::PaneDisappeared { pane_id: 1 };
+        assert!(event_counts_as_activity(&event));
+    }
+
+    #[test]
+    fn event_counts_as_activity_workflow_started() {
+        let event = Event::WorkflowStarted {
+            workflow_id: "wf-1".to_string(),
+            workflow_name: "test".to_string(),
+            pane_id: 1,
+        };
+        assert!(event_counts_as_activity(&event));
+    }
+
+    #[test]
+    fn event_counts_as_activity_workflow_completed() {
+        let event = Event::WorkflowCompleted {
+            workflow_id: "wf-1".to_string(),
+            success: true,
+            reason: None,
+        };
+        assert!(event_counts_as_activity(&event));
+    }
+
+    // =========================================================================
+    // snapshot_trigger_from_detection — additional event types
+    // =========================================================================
+
+    #[test]
+    fn snapshot_trigger_critical_severity_always_hazard() {
+        let detection = test_detection("any.random.type", Severity::Critical);
+        let trigger = snapshot_trigger_from_detection(&detection);
+        assert_eq!(
+            trigger,
+            Some(crate::snapshot_engine::SnapshotTrigger::HazardThreshold)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_usage_reached_is_hazard() {
+        let detection = test_detection("usage.reached", Severity::Info);
+        let trigger = snapshot_trigger_from_detection(&detection);
+        assert_eq!(
+            trigger,
+            Some(crate::snapshot_engine::SnapshotTrigger::HazardThreshold)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_error_network_is_hazard() {
+        let detection = test_detection("error.network", Severity::Warning);
+        let trigger = snapshot_trigger_from_detection(&detection);
+        assert_eq!(
+            trigger,
+            Some(crate::snapshot_engine::SnapshotTrigger::HazardThreshold)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_auth_error_is_hazard() {
+        let detection = test_detection("auth.error", Severity::Warning);
+        assert_eq!(
+            snapshot_trigger_from_detection(&detection),
+            Some(crate::snapshot_engine::SnapshotTrigger::HazardThreshold)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_session_compaction_complete_is_work_completed() {
+        let detection = test_detection("session.compaction_complete", Severity::Info);
+        assert_eq!(
+            snapshot_trigger_from_detection(&detection),
+            Some(crate::snapshot_engine::SnapshotTrigger::WorkCompleted)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_session_summary_is_work_completed() {
+        let detection = test_detection("session.summary", Severity::Info);
+        assert_eq!(
+            snapshot_trigger_from_detection(&detection),
+            Some(crate::snapshot_engine::SnapshotTrigger::WorkCompleted)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_session_end_is_work_completed() {
+        let detection = test_detection("session.end", Severity::Info);
+        assert_eq!(
+            snapshot_trigger_from_detection(&detection),
+            Some(crate::snapshot_engine::SnapshotTrigger::WorkCompleted)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_session_resume_hint_is_state_transition() {
+        let detection = test_detection("session.resume_hint", Severity::Info);
+        assert_eq!(
+            snapshot_trigger_from_detection(&detection),
+            Some(crate::snapshot_engine::SnapshotTrigger::StateTransition)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_session_thinking_is_state_transition() {
+        let detection = test_detection("session.thinking", Severity::Info);
+        assert_eq!(
+            snapshot_trigger_from_detection(&detection),
+            Some(crate::snapshot_engine::SnapshotTrigger::StateTransition)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_session_approval_needed_is_state_transition() {
+        let detection = test_detection("session.approval_needed", Severity::Info);
+        assert_eq!(
+            snapshot_trigger_from_detection(&detection),
+            Some(crate::snapshot_engine::SnapshotTrigger::StateTransition)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_unknown_event_type_returns_none() {
+        let detection = test_detection("completely.unknown.event", Severity::Info);
+        assert_eq!(snapshot_trigger_from_detection(&detection), None);
+    }
+
+    // =========================================================================
+    // snapshot_trigger_from_user_var — additional variants
+    // =========================================================================
+
+    #[test]
+    fn snapshot_trigger_user_var_cmd_start() {
+        let payload = UserVarPayload {
+            value: "x".to_string(),
+            event_type: Some("cmd_start".to_string()),
+            event_data: None,
+        };
+        assert_eq!(
+            snapshot_trigger_from_user_var(&payload),
+            Some(crate::snapshot_engine::SnapshotTrigger::StateTransition)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_user_var_preexec() {
+        let payload = UserVarPayload {
+            value: "x".to_string(),
+            event_type: Some("preexec".to_string()),
+            event_data: None,
+        };
+        assert_eq!(
+            snapshot_trigger_from_user_var(&payload),
+            Some(crate::snapshot_engine::SnapshotTrigger::StateTransition)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_user_var_cmd_end() {
+        let payload = UserVarPayload {
+            value: "x".to_string(),
+            event_type: Some("cmd_end".to_string()),
+            event_data: None,
+        };
+        assert_eq!(
+            snapshot_trigger_from_user_var(&payload),
+            Some(crate::snapshot_engine::SnapshotTrigger::WorkCompleted)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_user_var_postexec() {
+        let payload = UserVarPayload {
+            value: "x".to_string(),
+            event_type: Some("postexec".to_string()),
+            event_data: None,
+        };
+        assert_eq!(
+            snapshot_trigger_from_user_var(&payload),
+            Some(crate::snapshot_engine::SnapshotTrigger::WorkCompleted)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_user_var_none_event_type() {
+        let payload = UserVarPayload {
+            value: "x".to_string(),
+            event_type: None,
+            event_data: None,
+        };
+        assert_eq!(snapshot_trigger_from_user_var(&payload), None);
+    }
+
+    #[test]
+    fn snapshot_trigger_user_var_unknown_event_type() {
+        let payload = UserVarPayload {
+            value: "x".to_string(),
+            event_type: Some("random_type".to_string()),
+            event_data: None,
+        };
+        assert_eq!(snapshot_trigger_from_user_var(&payload), None);
+    }
+
+    // =========================================================================
+    // snapshot_trigger_from_event — additional variants
+    // =========================================================================
+
+    #[test]
+    fn snapshot_trigger_event_pane_discovered() {
+        let event = Event::PaneDiscovered {
+            pane_id: 1,
+            domain: "local".to_string(),
+            title: "shell".to_string(),
+        };
+        assert_eq!(
+            snapshot_trigger_from_event(&event),
+            Some(crate::snapshot_engine::SnapshotTrigger::StateTransition)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_event_pane_disappeared() {
+        let event = Event::PaneDisappeared { pane_id: 1 };
+        assert_eq!(
+            snapshot_trigger_from_event(&event),
+            Some(crate::snapshot_engine::SnapshotTrigger::StateTransition)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_event_segment_captured_returns_none() {
+        let event = Event::SegmentCaptured {
+            pane_id: 1,
+            seq: 1,
+            content_len: 100,
+        };
+        assert_eq!(snapshot_trigger_from_event(&event), None);
+    }
+
+    #[test]
+    fn snapshot_trigger_event_gap_detected_returns_none() {
+        let event = Event::GapDetected {
+            pane_id: 1,
+            reason: "test".to_string(),
+        };
+        assert_eq!(snapshot_trigger_from_event(&event), None);
+    }
+
+    #[test]
+    fn snapshot_trigger_event_workflow_started_returns_none() {
+        let event = Event::WorkflowStarted {
+            workflow_id: "wf-1".to_string(),
+            workflow_name: "test".to_string(),
+            pane_id: 1,
+        };
+        assert_eq!(snapshot_trigger_from_event(&event), None);
+    }
+
+    // =========================================================================
+    // detection_to_stored_event — additional edge cases
+    // =========================================================================
+
+    #[test]
+    fn detection_to_stored_event_warning_severity() {
+        let detection = Detection {
+            rule_id: "rule.warn".to_string(),
+            agent_type: crate::patterns::AgentType::Codex,
+            event_type: "error.timeout".to_string(),
+            severity: Severity::Warning,
+            confidence: 0.8,
+            extracted: serde_json::json!(null),
+            matched_text: String::new(),
+            span: (10, 20),
+        };
+
+        let event = detection_to_stored_event(99, None, &detection, None);
+        assert_eq!(event.pane_id, 99);
+        assert_eq!(event.severity, "warning");
+        assert_eq!(event.segment_id, None);
+        assert!(event.detected_at > 0);
+    }
+
+    #[test]
+    fn detection_to_stored_event_critical_severity() {
+        let detection = Detection {
+            rule_id: "rule.crit".to_string(),
+            agent_type: crate::patterns::AgentType::ClaudeCode,
+            event_type: "error.fatal".to_string(),
+            severity: Severity::Critical,
+            confidence: 1.0,
+            extracted: serde_json::json!({"detail": "oom"}),
+            matched_text: "out of memory".to_string(),
+            span: (0, 13),
+        };
+
+        let event = detection_to_stored_event(1, Some("uuid-abc"), &detection, Some(42));
+        assert_eq!(event.severity, "critical");
+        assert_eq!(event.segment_id, Some(42));
+        assert!(event.matched_text.as_deref() == Some("out of memory"));
+        assert!(event.extracted.is_some());
+    }
+
+    #[test]
+    fn detection_to_stored_event_dedupe_key_contains_bucket() {
+        let detection = test_detection("test.event", Severity::Info);
+        let event = detection_to_stored_event(1, None, &detection, None);
+        let key = event.dedupe_key.as_ref().unwrap();
+        // Dedupe key should contain a colon separating identity key from bucket
+        assert!(key.contains(':'));
+    }
+
+    // =========================================================================
+    // RuntimeConfig field tests
+    // =========================================================================
+
+    #[test]
+    fn runtime_config_default_min_capture_interval() {
+        let config = RuntimeConfig::default();
+        assert_eq!(config.min_capture_interval, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn runtime_config_default_max_concurrent_captures() {
+        let config = RuntimeConfig::default();
+        assert_eq!(config.max_concurrent_captures, 10);
+    }
+
+    #[test]
+    fn runtime_config_default_retention_days() {
+        let config = RuntimeConfig::default();
+        assert_eq!(config.retention_days, 30);
+    }
+
+    #[test]
+    fn runtime_config_default_retention_max_mb_unlimited() {
+        let config = RuntimeConfig::default();
+        assert_eq!(config.retention_max_mb, 0);
+    }
+
+    #[test]
+    fn runtime_config_default_checkpoint_interval() {
+        let config = RuntimeConfig::default();
+        assert_eq!(config.checkpoint_interval_secs, 60);
+    }
+
+    #[test]
+    fn runtime_config_default_no_native_event_socket() {
+        let config = RuntimeConfig::default();
+        assert!(config.native_event_socket.is_none());
+    }
+
+    #[test]
+    fn runtime_config_default_no_patterns_root() {
+        let config = RuntimeConfig::default();
+        assert!(config.patterns_root.is_none());
+    }
+
+    #[test]
+    fn runtime_config_clone() {
+        let config = RuntimeConfig::default();
+        let cloned = config.clone();
+        assert_eq!(cloned.discovery_interval, config.discovery_interval);
+        assert_eq!(cloned.channel_buffer, config.channel_buffer);
+    }
+
+    // =========================================================================
+    // ResizeWatchdogSeverity additional tests
+    // =========================================================================
+
+    #[test]
+    fn watchdog_severity_copy_and_eq() {
+        let a = ResizeWatchdogSeverity::Warning;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(a, ResizeWatchdogSeverity::Healthy);
+    }
+
+    #[test]
+    fn watchdog_severity_debug() {
+        let dbg = format!("{:?}", ResizeWatchdogSeverity::Critical);
+        assert_eq!(dbg, "Critical");
+    }
+
+    // =========================================================================
+    // derive_resize_degradation_ladder — Healthy and Critical cases
+    // =========================================================================
+
+    #[test]
+    fn derive_resize_degradation_ladder_healthy_is_nominal() {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Healthy,
+            stalled_total: 0,
+            stalled_critical: 0,
+            warning_threshold_ms: 2_000,
+            critical_threshold_ms: 8_000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+            recommended_action: "none".into(),
+            sample_stalled: vec![],
+        };
+
+        let ladder = derive_resize_degradation_ladder(&assessment);
+        assert_eq!(
+            ladder.tier,
+            crate::degradation::ResizeDegradationTier::FullQuality
+        );
+    }
+
+    #[test]
+    fn derive_resize_degradation_ladder_critical_is_correctness() {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Critical,
+            stalled_total: 4,
+            stalled_critical: 3,
+            warning_threshold_ms: 2_000,
+            critical_threshold_ms: 8_000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: true,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+            recommended_action: "enable_safe_mode_fallback".into(),
+            sample_stalled: vec![],
+        };
+
+        let ladder = derive_resize_degradation_ladder(&assessment);
+        assert_eq!(
+            ladder.tier,
+            crate::degradation::ResizeDegradationTier::CorrectnessGuarded
+        );
+    }
+
+    // =========================================================================
+    // ResizeWatchdogAssessment field tests
+    // =========================================================================
+
+    #[test]
+    fn watchdog_assessment_debug_format() {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Healthy,
+            stalled_total: 0,
+            stalled_critical: 0,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 5000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+            recommended_action: "none".into(),
+            sample_stalled: vec![],
+        };
+        let dbg = format!("{assessment:?}");
+        assert!(dbg.contains("ResizeWatchdogAssessment"));
+        assert!(dbg.contains("Healthy"));
+    }
+
+    #[test]
+    fn watchdog_assessment_eq() {
+        let a = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Warning,
+            stalled_total: 1,
+            stalled_critical: 0,
+            warning_threshold_ms: 2000,
+            critical_threshold_ms: 5000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+            recommended_action: "monitor".into(),
+            sample_stalled: vec![],
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // =========================================================================
+    // RuntimeLockMemoryTelemetrySnapshot tests
+    // =========================================================================
+
+    #[test]
+    fn lock_memory_snapshot_clone_and_debug() {
+        let snap = RuntimeLockMemoryTelemetrySnapshot {
+            timestamp_ms: 100,
+            avg_storage_lock_wait_ms: 1.0,
+            p50_storage_lock_wait_ms: 0.5,
+            p95_storage_lock_wait_ms: 3.0,
+            max_storage_lock_wait_ms: 5.0,
+            storage_lock_contention_events: 2,
+            avg_storage_lock_hold_ms: 2.0,
+            p50_storage_lock_hold_ms: 1.5,
+            p95_storage_lock_hold_ms: 6.0,
+            max_storage_lock_hold_ms: 8.0,
+            cursor_snapshot_bytes_last: 1024,
+            p50_cursor_snapshot_bytes: 1024,
+            p95_cursor_snapshot_bytes: 2048,
+            cursor_snapshot_bytes_max: 4096,
+            avg_cursor_snapshot_bytes: 1500.0,
+        };
+        let cloned = snap.clone();
+        assert_eq!(snap, cloned);
+        let dbg = format!("{snap:?}");
+        assert!(dbg.contains("RuntimeLockMemoryTelemetrySnapshot"));
+    }
+
+    // =========================================================================
+    // Constant validation tests
+    // =========================================================================
+
+    #[test]
+    fn telemetry_percentile_window_capacity_is_positive() {
+        assert!(TELEMETRY_PERCENTILE_WINDOW_CAPACITY > 0);
+    }
+
+    #[test]
+    fn resize_watchdog_thresholds_are_ordered() {
+        assert!(RESIZE_WATCHDOG_WARNING_THRESHOLD_MS < RESIZE_WATCHDOG_CRITICAL_THRESHOLD_MS);
+    }
+
+    #[test]
+    fn resize_watchdog_critical_stalled_limit_is_positive() {
+        assert!(RESIZE_WATCHDOG_CRITICAL_STALLED_LIMIT > 0);
+    }
+
+    #[test]
+    fn resize_watchdog_sample_limit_is_positive() {
+        assert!(RESIZE_WATCHDOG_SAMPLE_LIMIT > 0);
+    }
+
+    #[test]
+    fn storage_lock_warn_thresholds_exist() {
+        // These constants are used in health snapshot warnings
+        assert!(STORAGE_LOCK_WAIT_WARN_MS > 0.0);
+        assert!(STORAGE_LOCK_HOLD_WARN_MS > 0.0);
+        assert!(CURSOR_SNAPSHOT_MEMORY_WARN_BYTES > 0);
+    }
 }
