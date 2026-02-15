@@ -355,6 +355,168 @@ mod tests {
         assert_eq!(days_to_ymd(20089), (2025, 1, 1));
     }
 
+    // ── Additional pure helper tests ────────────────────────────────────
+
+    #[test]
+    fn format_ts_one_second() {
+        let ts = 1000; // 1 second since epoch
+        let formatted = format_ts(ts);
+        assert_eq!(formatted, "1970-01-01 00:00:01.000Z");
+    }
+
+    #[test]
+    fn format_ts_with_millis() {
+        let ts = 999; // sub-second
+        let formatted = format_ts(ts);
+        assert!(formatted.contains("00:00:00.999Z"));
+    }
+
+    #[test]
+    fn format_ts_y2k() {
+        // 2000-01-01 00:00:00 UTC = 946684800000 ms
+        let ts = 946_684_800_000;
+        let formatted = format_ts(ts);
+        assert!(
+            formatted.contains("2000-01-01"),
+            "Expected Y2K date, got: {formatted}"
+        );
+        assert!(formatted.contains("00:00:00.000Z"));
+    }
+
+    #[test]
+    fn format_ts_leap_year_feb29() {
+        // 2024-02-29 12:00:00 UTC = 1709208000000 ms
+        let ts = 1_709_208_000_000;
+        let formatted = format_ts(ts);
+        assert!(
+            formatted.contains("2024-02-29"),
+            "Expected leap day, got: {formatted}"
+        );
+    }
+
+    #[test]
+    fn format_ts_end_of_day() {
+        // 1970-01-01 23:59:59.999 = 86399999 ms
+        let ts = 86_399_999;
+        let formatted = format_ts(ts);
+        assert!(formatted.contains("23:59:59.999Z"));
+    }
+
+    #[test]
+    fn format_ts_far_future() {
+        // 2100-01-01 00:00:00 UTC = 4102444800000 ms
+        let ts = 4_102_444_800_000;
+        let formatted = format_ts(ts);
+        assert!(
+            formatted.contains("2100-01-01"),
+            "Expected far future date, got: {formatted}"
+        );
+    }
+
+    #[test]
+    fn days_to_ymd_leap_year_2000() {
+        // 2000 is a leap year (divisible by 400)
+        // 2000-02-29 = day 11016 from epoch
+        assert_eq!(days_to_ymd(11016), (2000, 2, 29));
+    }
+
+    #[test]
+    fn days_to_ymd_non_leap_century() {
+        // 1900 is NOT a leap year (divisible by 100 but not 400)
+        // 1900-03-01 = day -25508 from epoch
+        assert_eq!(days_to_ymd(-25508), (1900, 3, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_dec_31() {
+        // 2024-12-31 = day 20088 from epoch
+        assert_eq!(days_to_ymd(20088), (2024, 12, 31));
+    }
+
+    #[test]
+    fn days_to_ymd_negative_day() {
+        // Day -1 = 1969-12-31
+        assert_eq!(days_to_ymd(-1), (1969, 12, 31));
+    }
+
+    #[test]
+    fn format_duration_boundary_999ms() {
+        assert_eq!(format_duration(999), "999ms");
+    }
+
+    #[test]
+    fn format_duration_boundary_1000ms() {
+        assert_eq!(format_duration(1000), "1.0s");
+    }
+
+    #[test]
+    fn format_duration_boundary_59999ms() {
+        assert_eq!(format_duration(59999), "60.0s");
+    }
+
+    #[test]
+    fn format_duration_boundary_60000ms() {
+        assert_eq!(format_duration(60_000), "1m 0s");
+    }
+
+    #[test]
+    fn format_duration_large_value() {
+        // 2 hours = 7200000 ms
+        assert_eq!(format_duration(7_200_000), "120m 0s");
+    }
+
+    #[test]
+    fn format_duration_one_ms() {
+        assert_eq!(format_duration(1), "1ms");
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate("", 10), "");
+    }
+
+    #[test]
+    fn truncate_max_zero() {
+        let result = truncate("hello", 0);
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_max_one() {
+        let result = truncate("hello", 1);
+        assert!(result.starts_with('h'));
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_preserves_exact_fit() {
+        assert_eq!(truncate("abc", 3), "abc");
+        assert_eq!(truncate("abc", 4), "abc");
+    }
+
+    #[test]
+    fn truncate_pipe_char_in_input() {
+        // Pipes are special in Markdown tables
+        let result = truncate("a|b|c|d|e|f|g|h", 5);
+        assert!(result.len() <= 8); // 5 + ellipsis
+    }
+
+    #[test]
+    fn report_options_fields() {
+        let opts = ReportOptions {
+            pane_id: Some(42),
+            since: Some(1000),
+            until: Some(2000),
+            limit: Some(100),
+            redact: true,
+        };
+        assert_eq!(opts.pane_id, Some(42));
+        assert_eq!(opts.since, Some(1000));
+        assert_eq!(opts.until, Some(2000));
+        assert_eq!(opts.limit, Some(100));
+        assert!(opts.redact);
+    }
+
     // ── Fixture-driven integration tests ────────────────────────────────
 
     async fn test_db(suffix: &str) -> (StorageHandle, std::path::PathBuf) {

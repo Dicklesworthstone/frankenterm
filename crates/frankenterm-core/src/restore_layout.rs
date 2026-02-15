@@ -921,4 +921,312 @@ mod tests {
         assert!(c.restore_split_ratios);
         assert!(c.continue_on_error);
     }
+
+    // =================================================================
+    // RestoreConfig additional tests
+    // =================================================================
+
+    #[test]
+    fn restore_config_serde_roundtrip() {
+        let config = RestoreConfig {
+            restore_working_dirs: false,
+            restore_split_ratios: true,
+            continue_on_error: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: RestoreConfig = serde_json::from_str(&json).unwrap();
+        assert!(!back.restore_working_dirs);
+        assert!(back.restore_split_ratios);
+        assert!(!back.continue_on_error);
+    }
+
+    #[test]
+    fn restore_config_serde_default_fills_missing() {
+        // Empty JSON object should deserialize with defaults (#[serde(default)])
+        let back: RestoreConfig = serde_json::from_str("{}").unwrap();
+        assert!(back.restore_working_dirs);
+        assert!(back.restore_split_ratios);
+        assert!(back.continue_on_error);
+    }
+
+    #[test]
+    fn restore_config_debug() {
+        let c = RestoreConfig::default();
+        let dbg = format!("{c:?}");
+        assert!(dbg.contains("RestoreConfig"));
+        assert!(dbg.contains("restore_working_dirs"));
+    }
+
+    // =================================================================
+    // normalize_cwd edge cases
+    // =================================================================
+
+    #[test]
+    fn normalize_cwd_empty_string() {
+        assert_eq!(normalize_cwd(""), "");
+    }
+
+    #[test]
+    fn normalize_cwd_file_uri_with_hostname() {
+        // file://hostname/path should extract /path
+        assert_eq!(normalize_cwd("file://myhost/home/user"), "/home/user");
+    }
+
+    #[test]
+    fn normalize_cwd_file_uri_empty_authority() {
+        // file:// with no authority and no path
+        assert_eq!(normalize_cwd("file://"), "");
+    }
+
+    #[test]
+    fn normalize_cwd_file_uri_root_only() {
+        assert_eq!(normalize_cwd("file:///"), "/");
+    }
+
+    #[test]
+    fn normalize_cwd_file_uri_with_spaces() {
+        assert_eq!(normalize_cwd("file:///home/my user/project"), "/home/my user/project");
+    }
+
+    #[test]
+    fn normalize_cwd_tilde_path() {
+        // Non-file:// paths pass through unchanged
+        assert_eq!(normalize_cwd("~/projects"), "~/projects");
+    }
+
+    #[test]
+    fn normalize_cwd_windows_style_path() {
+        assert_eq!(normalize_cwd("C:\\Users\\test"), "C:\\Users\\test");
+    }
+
+    // =================================================================
+    // shell_escape edge cases
+    // =================================================================
+
+    #[test]
+    fn shell_escape_empty_string() {
+        assert_eq!(shell_escape(""), "''");
+    }
+
+    #[test]
+    fn shell_escape_with_dollar_sign() {
+        assert_eq!(shell_escape("/home/$USER"), "'/home/$USER'");
+    }
+
+    #[test]
+    fn shell_escape_with_special_chars() {
+        // Shell special chars (;, &, |, >) should be safely quoted
+        assert_eq!(shell_escape("cmd; rm -rf /"), "'cmd; rm -rf /'");
+    }
+
+    #[test]
+    fn shell_escape_with_newline() {
+        assert_eq!(shell_escape("line1\nline2"), "'line1\nline2'");
+    }
+
+    #[test]
+    fn shell_escape_multiple_single_quotes() {
+        assert_eq!(
+            shell_escape("it's a 'test'"),
+            "'it'\\''s a '\\''test'\\'''",
+        );
+    }
+
+    #[test]
+    fn shell_escape_only_single_quote() {
+        assert_eq!(shell_escape("'"), "''\\'''");
+    }
+
+    // =================================================================
+    // collect_leaf_ids edge cases
+    // =================================================================
+
+    #[test]
+    fn collect_leaf_ids_single_leaf() {
+        let node = leaf(42, None);
+        assert_eq!(collect_leaf_ids(&node), vec![42]);
+    }
+
+    #[test]
+    fn collect_leaf_ids_empty_hsplit() {
+        let node = hsplit(vec![]);
+        assert_eq!(collect_leaf_ids(&node), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn collect_leaf_ids_empty_vsplit() {
+        let node = vsplit(vec![]);
+        assert_eq!(collect_leaf_ids(&node), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn collect_leaf_ids_deeply_nested() {
+        let tree = hsplit(vec![(
+            1.0,
+            vsplit(vec![(
+                1.0,
+                hsplit(vec![(
+                    1.0,
+                    vsplit(vec![(1.0, leaf(99, None))]),
+                )]),
+            )]),
+        )]);
+        assert_eq!(collect_leaf_ids(&tree), vec![99]);
+    }
+
+    #[test]
+    fn collect_leaf_ids_preserves_order() {
+        // Left-to-right, depth-first traversal order
+        let tree = vsplit(vec![
+            (0.33, leaf(5, None)),
+            (0.33, hsplit(vec![(0.5, leaf(3, None)), (0.5, leaf(7, None))])),
+            (0.34, leaf(1, None)),
+        ]);
+        assert_eq!(collect_leaf_ids(&tree), vec![5, 3, 7, 1]);
+    }
+
+    // =================================================================
+    // first_leaf_cwd edge cases
+    // =================================================================
+
+    #[test]
+    fn first_leaf_cwd_nested_three_levels() {
+        let tree = hsplit(vec![(
+            1.0,
+            vsplit(vec![(
+                1.0,
+                hsplit(vec![(1.0, leaf(1, Some("/deep/path")))]),
+            )]),
+        )]);
+        assert_eq!(first_leaf_cwd(&tree), Some("/deep/path".to_string()));
+    }
+
+    #[test]
+    fn first_leaf_cwd_file_uri_normalized() {
+        let node = leaf(1, Some("file:///home/agent"));
+        assert_eq!(first_leaf_cwd(&node), Some("/home/agent".to_string()));
+    }
+
+    #[test]
+    fn first_leaf_cwd_empty_children() {
+        let node = hsplit(vec![]);
+        assert_eq!(first_leaf_cwd(&node), None);
+    }
+
+    #[test]
+    fn first_leaf_cwd_first_child_no_cwd_second_has() {
+        // first_leaf_cwd returns the FIRST leaf's cwd, even if None
+        let tree = vsplit(vec![
+            (0.5, leaf(1, None)),
+            (0.5, leaf(2, Some("/home/user"))),
+        ]);
+        assert_eq!(first_leaf_cwd(&tree), None);
+    }
+
+    #[test]
+    fn first_leaf_cwd_hsplit_vs_vsplit() {
+        let tree_h = hsplit(vec![(1.0, leaf(1, Some("/h")))]);
+        let tree_v = vsplit(vec![(1.0, leaf(1, Some("/v")))]);
+        assert_eq!(first_leaf_cwd(&tree_h), Some("/h".to_string()));
+        assert_eq!(first_leaf_cwd(&tree_v), Some("/v".to_string()));
+    }
+
+    // =================================================================
+    // count_leaves / count_panes edge cases
+    // =================================================================
+
+    #[test]
+    fn count_leaves_single() {
+        assert_eq!(count_leaves(&leaf(1, None)), 1);
+    }
+
+    #[test]
+    fn count_leaves_empty_split() {
+        assert_eq!(count_leaves(&hsplit(vec![])), 0);
+        assert_eq!(count_leaves(&vsplit(vec![])), 0);
+    }
+
+    #[test]
+    fn count_leaves_deeply_nested() {
+        let tree = vsplit(vec![(
+            1.0,
+            hsplit(vec![
+                (0.5, leaf(1, None)),
+                (0.5, vsplit(vec![(0.5, leaf(2, None)), (0.5, leaf(3, None))])),
+            ]),
+        )]);
+        assert_eq!(count_leaves(&tree), 3);
+    }
+
+    #[test]
+    fn count_panes_empty_snapshot() {
+        let snapshot = TopologySnapshot {
+            schema_version: 1,
+            captured_at: 0,
+            workspace_id: None,
+            windows: vec![],
+        };
+        assert_eq!(count_panes(&snapshot), 0);
+    }
+
+    #[test]
+    fn count_panes_multi_window_multi_tab() {
+        let snapshot = TopologySnapshot {
+            schema_version: 1,
+            captured_at: 0,
+            workspace_id: None,
+            windows: vec![
+                WindowSnapshot {
+                    window_id: 0,
+                    title: None,
+                    position: None,
+                    size: None,
+                    tabs: vec![
+                        TabSnapshot {
+                            tab_id: 0,
+                            title: None,
+                            pane_tree: vsplit(vec![(0.5, leaf(1, None)), (0.5, leaf(2, None))]),
+                            active_pane_id: None,
+                        },
+                        TabSnapshot {
+                            tab_id: 1,
+                            title: None,
+                            pane_tree: leaf(3, None),
+                            active_pane_id: None,
+                        },
+                    ],
+                    active_tab_index: None,
+                },
+                WindowSnapshot {
+                    window_id: 1,
+                    title: None,
+                    position: None,
+                    size: None,
+                    tabs: vec![TabSnapshot {
+                        tab_id: 2,
+                        title: None,
+                        pane_tree: hsplit(vec![
+                            (0.5, leaf(4, None)),
+                            (0.5, leaf(5, None)),
+                        ]),
+                        active_pane_id: None,
+                    }],
+                    active_tab_index: None,
+                },
+            ],
+        };
+        assert_eq!(count_panes(&snapshot), 5);
+    }
+
+    // =================================================================
+    // RestoreResult tests
+    // =================================================================
+
+    #[test]
+    fn restore_result_debug() {
+        let r = RestoreResult::new();
+        let dbg = format!("{r:?}");
+        assert!(dbg.contains("RestoreResult"));
+        assert!(dbg.contains("pane_id_map"));
+    }
 }
