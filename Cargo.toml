@@ -230,7 +230,7 @@ toml_edit = "0.24.0"
 serde_yaml = "0.9.34"
 
 # Serialization
-toon_rust = { git = "https://github.com/Dicklesworthstone/toon_rust", branch = "master", package = "toon" }
+toon_rust = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/toon_rust", branch = "master", package = "toon" }
 
 # FrankenTerm crates (in-tree, ex-WezTerm)
 async_ossl = { path = "frankenterm/async_ossl" }
@@ -367,7 +367,7 @@ crossterm = "0.29.0"
 
 # FrankenTUI (optional, migration target for TUI — see docs/adr/0001-adopt-frankentui-for-tui-migration.md)
 # Git dep; use .cargo/config.toml for local path overrides during development.
-ftui = { git = "https://github.com/Dicklesworthstone/frankentui", default-features = false, features = ["runtime"] }
+ftui = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/frankentui", default-features = false, features = ["runtime"] }
 
 # ZIP archives (for .ftx extension packages)
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -382,7 +382,7 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 # FastMCP (optional MCP server dependencies)
 asupersync = { version = "0.2.0" }
 asupersync-macros = { version = "0.2.0" }
-rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", branch = "master" }
+rich_rust = { version = "0.2.0" }
 log = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 glob = "0.3"
@@ -391,21 +391,21 @@ getrandom = "0.3"
 trybuild = { version = "1", default-features = false }
 rustls = "0.23"
 rustls-pemfile = "2"
-fastmcp = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", package = "fastmcp-rust" }
-fastmcp-core = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastmcp-transport = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastmcp-protocol = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastmcp-server = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastmcp-client = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastmcp-macros = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastmcp-console = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastapi = { git = "https://github.com/Dicklesworthstone/fastapi_rust", package = "fastapi-rust" }
-fastapi-core = { git = "https://github.com/Dicklesworthstone/fastapi_rust" }
-fastapi-http = { git = "https://github.com/Dicklesworthstone/fastapi_rust" }
-fastapi-router = { git = "https://github.com/Dicklesworthstone/fastapi_rust" }
-fastapi-macros = { git = "https://github.com/Dicklesworthstone/fastapi_rust" }
-fastapi-openapi = { git = "https://github.com/Dicklesworthstone/fastapi_rust" }
-fastapi-output = { git = "https://github.com/Dicklesworthstone/fastapi_rust" }
+fastmcp = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", package = "fastmcp-rust" }
+fastmcp-core = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
+fastmcp-transport = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
+fastmcp-protocol = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
+fastmcp-server = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
+fastmcp-client = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
+fastmcp-macros = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
+fastmcp-console = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
+fastapi = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", package = "fastapi-rust" }
+fastapi-core = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust" }
+fastapi-http = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust" }
+fastapi-router = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust" }
+fastapi-macros = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust" }
+fastapi-openapi = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust" }
+fastapi-output = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust" }
 
 # Internal crates
 frankenterm-core = { path = "crates/frankenterm-core" }
