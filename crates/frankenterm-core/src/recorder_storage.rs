@@ -2174,4 +2174,224 @@ mod tests {
             "subsequent flush timestamp should be >= previous"
         );
     }
+
+    // ── DarkBadger wa-1u90p.7.1 ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn whitespace_only_batch_id_rejected() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let err = storage
+            .append_batch(AppendRequest {
+                batch_id: "   \t  ".to_string(),
+                events: vec![sample_event("e1", 1, 0, "data")],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RecorderStorageError::InvalidRequest { .. }),
+            "whitespace-only batch_id should be rejected"
+        );
+        assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
+    }
+
+    #[test]
+    fn corrupt_record_error_class_is_corruption() {
+        let err = RecorderStorageError::CorruptRecord {
+            offset: 1024,
+            reason: "bad CRC".to_string(),
+        };
+        assert_eq!(err.class(), RecorderStorageErrorClass::Corruption);
+        let msg = format!("{err}");
+        assert!(msg.contains("1024"), "display should contain offset");
+        assert!(msg.contains("bad CRC"), "display should contain reason");
+    }
+
+    #[test]
+    fn queue_full_error_class_is_overload() {
+        let err = RecorderStorageError::QueueFull { capacity: 64 };
+        assert_eq!(err.class(), RecorderStorageErrorClass::Overload);
+        let msg = format!("{err}");
+        assert!(msg.contains("64"), "display should contain capacity");
+    }
+
+    #[test]
+    fn checkpoint_regression_error_display() {
+        let err = RecorderStorageError::CheckpointRegression {
+            consumer: "indexer".to_string(),
+            current_ordinal: 100,
+            attempted_ordinal: 50,
+        };
+        assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
+        let msg = format!("{err}");
+        assert!(msg.contains("indexer"));
+        assert!(msg.contains("100"));
+        assert!(msg.contains("50"));
+    }
+
+    #[test]
+    fn default_config_has_expected_paths_and_limits() {
+        let cfg = AppendLogStorageConfig::default();
+        assert!(cfg.data_path.to_str().unwrap().contains("events.log"));
+        assert!(cfg.state_path.to_str().unwrap().contains("state.json"));
+        assert_eq!(cfg.queue_capacity, 1024);
+        assert_eq!(cfg.max_batch_events, 256);
+        assert_eq!(cfg.max_batch_bytes, 256 * 1024);
+        assert_eq!(cfg.max_idempotency_entries, 4096);
+        cfg.validate().expect("default config should be valid");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_noop_when_same_ordinal() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let _ = storage
+            .append_batch(AppendRequest {
+                batch_id: "b1".to_string(),
+                events: vec![sample_event("e1", 1, 0, "data")],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        let checkpoint = RecorderCheckpoint {
+            consumer: CheckpointConsumerId("c1".to_string()),
+            upto_offset: RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 0,
+            },
+            schema_version: "v1".to_string(),
+            committed_at_ms: 100,
+        };
+        let outcome = storage.commit_checkpoint(checkpoint.clone()).await.unwrap();
+        assert_eq!(outcome, CheckpointCommitOutcome::Advanced);
+
+        // Same ordinal → noop
+        let outcome2 = storage.commit_checkpoint(checkpoint).await.unwrap();
+        assert_eq!(outcome2, CheckpointCommitOutcome::NoopAlreadyAdvanced);
+    }
+
+    #[tokio::test]
+    async fn lag_consumers_sorted_alphabetically() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let _ = storage
+            .append_batch(AppendRequest {
+                batch_id: "b1".to_string(),
+                events: vec![sample_event("e1", 1, 0, "data")],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        // Commit checkpoints for consumers in non-alphabetical order
+        for name in &["zebra", "alpha", "middle"] {
+            storage
+                .commit_checkpoint(RecorderCheckpoint {
+                    consumer: CheckpointConsumerId(name.to_string()),
+                    upto_offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 0,
+                        ordinal: 0,
+                    },
+                    schema_version: "v1".to_string(),
+                    committed_at_ms: 100,
+                })
+                .await
+                .unwrap();
+        }
+
+        let lag = storage.lag_metrics().await.unwrap();
+        let names: Vec<&str> = lag
+            .consumers
+            .iter()
+            .map(|c| c.consumer.0.as_str())
+            .collect();
+        assert_eq!(names, vec!["alpha", "middle", "zebra"]);
+    }
+
+    #[test]
+    fn recorder_offset_clone_eq() {
+        let offset = RecorderOffset {
+            segment_id: 3,
+            byte_offset: 1024,
+            ordinal: 42,
+        };
+        let cloned = offset.clone();
+        assert_eq!(offset, cloned);
+    }
+
+    #[test]
+    fn error_class_serde_all_variants() {
+        let variants = [
+            RecorderStorageErrorClass::Retryable,
+            RecorderStorageErrorClass::Overload,
+            RecorderStorageErrorClass::TerminalConfig,
+            RecorderStorageErrorClass::TerminalData,
+            RecorderStorageErrorClass::Corruption,
+            RecorderStorageErrorClass::DependencyUnavailable,
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: RecorderStorageErrorClass = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[test]
+    fn checkpoint_commit_outcome_serde_all_variants() {
+        let variants = [
+            CheckpointCommitOutcome::Advanced,
+            CheckpointCommitOutcome::NoopAlreadyAdvanced,
+            CheckpointCommitOutcome::RejectedOutOfOrder,
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: CheckpointCommitOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[tokio::test]
+    async fn health_queue_depth_reflects_zero_when_idle() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let health = storage.health().await;
+        assert_eq!(health.queue_depth, 0);
+        assert!(!health.degraded);
+        assert!(health.last_error.is_none());
+        assert!(health.latest_offset.is_none());
+    }
+
+    #[test]
+    fn recorder_storage_lag_serde_roundtrip() {
+        let lag = RecorderStorageLag {
+            latest_offset: Some(RecorderOffset {
+                segment_id: 0,
+                byte_offset: 500,
+                ordinal: 10,
+            }),
+            consumers: vec![
+                RecorderConsumerLag {
+                    consumer: CheckpointConsumerId("a".to_string()),
+                    offsets_behind: 3,
+                },
+                RecorderConsumerLag {
+                    consumer: CheckpointConsumerId("b".to_string()),
+                    offsets_behind: 7,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&lag).unwrap();
+        let back: RecorderStorageLag = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.consumers.len(), 2);
+        assert_eq!(back.consumers[0].offsets_behind, 3);
+        assert_eq!(back.consumers[1].offsets_behind, 7);
+        assert_eq!(back.latest_offset.unwrap().ordinal, 10);
+    }
 }

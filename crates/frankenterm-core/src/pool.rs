@@ -889,4 +889,132 @@ mod tests {
         assert_eq!(stats.idle_count, 50);
         assert_eq!(stats.total_returned, 50);
     }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──────────────────────────────────
+
+    #[test]
+    fn pool_error_variants_not_equal() {
+        assert_ne!(PoolError::AcquireTimeout, PoolError::Closed);
+    }
+
+    #[test]
+    fn pool_error_closed_is_std_error() {
+        let err: &dyn std::error::Error = &PoolError::Closed;
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn pool_config_zero_max_size() {
+        let config = PoolConfig {
+            max_size: 0,
+            idle_timeout: Duration::ZERO,
+            acquire_timeout: Duration::ZERO,
+        };
+        assert_eq!(config.max_size, 0);
+    }
+
+    #[test]
+    fn pool_config_very_large_timeout() {
+        let config = PoolConfig {
+            max_size: 1,
+            idle_timeout: Duration::from_secs(u64::MAX / 2),
+            acquire_timeout: Duration::from_secs(1),
+        };
+        assert!(config.idle_timeout > Duration::from_secs(1_000_000));
+    }
+
+    #[test]
+    fn pool_stats_serde_json_keys() {
+        let stats = PoolStats {
+            max_size: 1,
+            idle_count: 0,
+            active_count: 0,
+            total_acquired: 0,
+            total_returned: 0,
+            total_evicted: 0,
+            total_timeouts: 0,
+        };
+        let json: serde_json::Value = serde_json::to_value(&stats).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(obj.contains_key("max_size"));
+        assert!(obj.contains_key("idle_count"));
+        assert!(obj.contains_key("active_count"));
+        assert!(obj.contains_key("total_acquired"));
+        assert!(obj.contains_key("total_returned"));
+        assert!(obj.contains_key("total_evicted"));
+        assert!(obj.contains_key("total_timeouts"));
+        assert_eq!(obj.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn pool_multiple_timeouts_accumulate() {
+        let pool: Pool<String> = Pool::new(test_config(1));
+        let _held = pool.acquire().await.expect("acquire slot");
+
+        for _ in 0..3 {
+            let _ = pool.acquire().await;
+        }
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.total_timeouts, 3);
+    }
+
+    #[tokio::test]
+    async fn pool_put_and_clear_and_stats_consistent() {
+        let pool: Pool<String> = Pool::new(test_config(4));
+        pool.put("a".to_string()).await;
+        pool.put("b".to_string()).await;
+        pool.put("c".to_string()).await;
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.idle_count, 3);
+        assert_eq!(stats.total_returned, 3);
+        assert_eq!(stats.total_evicted, 0);
+
+        pool.clear().await;
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.idle_count, 0);
+        assert_eq!(stats.total_returned, 3);
+        assert_eq!(stats.total_evicted, 3);
+    }
+
+    #[tokio::test]
+    async fn pool_acquire_counts_only_acquire_not_put() {
+        let pool: Pool<String> = Pool::new(test_config(4));
+        pool.put("a".to_string()).await;
+        pool.put("b".to_string()).await;
+
+        let stats = pool.stats().await;
+        assert_eq!(
+            stats.total_acquired, 0,
+            "put should not increment total_acquired"
+        );
+
+        let _r = pool.acquire().await.unwrap();
+        let stats = pool.stats().await;
+        assert_eq!(stats.total_acquired, 1);
+    }
+
+    #[tokio::test]
+    async fn pool_try_acquire_increments_acquired() {
+        let pool: Pool<String> = Pool::new(test_config(2));
+        let _r = pool.try_acquire().await.unwrap();
+        let stats = pool.stats().await;
+        assert_eq!(stats.total_acquired, 1);
+    }
+
+    #[tokio::test]
+    async fn pool_has_connection_method() {
+        let pool: Pool<String> = Pool::new(test_config(4));
+        pool.put("conn".to_string()).await;
+
+        let with_conn = pool.acquire().await.unwrap();
+        assert!(with_conn.has_connection());
+        drop(with_conn);
+
+        // Now pool is empty (connection was taken, not returned)
+        let without_conn = pool.acquire().await.unwrap();
+        assert!(!without_conn.has_connection());
+    }
 }
