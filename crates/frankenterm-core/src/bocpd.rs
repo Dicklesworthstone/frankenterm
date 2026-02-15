@@ -1622,7 +1622,7 @@ mod tests {
         // Should be close to log(e^1000 + e^1001 + e^1002)
         // = 1002 + log(e^-2 + e^-1 + 1)
         let expected =
-            1002.0 + ((-2.0f64).exp() + (-1.0f64).exp() + 1.0f64).ln();
+            1002.0 + ((-2.0f64).exp() + (-1.0f64).exp()).ln_1p();
         assert!(
             (result - expected).abs() < 1e-10,
             "result={}, expected={}",

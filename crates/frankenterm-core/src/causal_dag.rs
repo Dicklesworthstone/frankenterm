@@ -963,7 +963,7 @@ mod tests {
         let y: Vec<f64> = (0..80).map(|i| (i as f64 * 0.4).cos()).collect();
         let te = transfer_entropy(&x, &y, 1, 1, 4);
         let p = permutation_test(&x, &y, 1, 1, 4, 30, te);
-        assert!(p >= 0.0 && p <= 1.0, "p-value must be in [0,1], got {}", p);
+        assert!((0.0..=1.0).contains(&p), "p-value must be in [0,1], got {}", p);
     }
 
     #[test]
@@ -973,7 +973,7 @@ mod tests {
         let te = transfer_entropy(&x, &y, 1, 1, 4);
         let p = permutation_test(&x, &y, 1, 1, 4, 1, te);
         // With n_permutations=1: p = (count_ge + 1) / (1 + 1) = {1/2 or 2/2}
-        assert!(p >= 0.5 && p <= 1.0, "single-perm p-value should be 0.5 or 1.0, got {}", p);
+        assert!((0.5..=1.0).contains(&p), "single-perm p-value should be 0.5 or 1.0, got {}", p);
     }
 
     // ── Fisher-Yates edge cases ───────────────────────────────────────────

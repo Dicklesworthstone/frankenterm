@@ -1351,7 +1351,7 @@ mod tests {
     fn dirty_field_clone_copy_eq_hash() {
         let a = DirtyField::Scrollback;
         let b = a; // Copy
-        let c = a.clone(); // Clone
+        let c = a; // Copy (also Clone)
         assert_eq!(a, b);
         assert_eq!(a, c);
 
