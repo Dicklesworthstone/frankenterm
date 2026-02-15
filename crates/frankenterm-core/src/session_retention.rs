@@ -791,4 +791,348 @@ mod tests {
         assert_eq!(result.deleted_by_age, 5);
         assert!(!result.vacuumed);
     }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ───────────────────────────────────
+
+    // ── CleanupResult trait coverage ──
+
+    #[test]
+    fn cleanup_result_default_all_zeros() {
+        let r = CleanupResult::default();
+        assert_eq!(r.deleted_by_age, 0);
+        assert_eq!(r.deleted_by_count, 0);
+        assert_eq!(r.deleted_by_size, 0);
+        assert_eq!(r.orphaned_checkpoints, 0);
+        assert_eq!(r.orphaned_pane_states, 0);
+        assert!(!r.vacuumed);
+        assert_eq!(r.total_sessions_deleted(), 0);
+        assert!(!r.any_work_done());
+    }
+
+    #[test]
+    fn cleanup_result_total_single_source_age() {
+        let r = CleanupResult {
+            deleted_by_age: 7,
+            ..Default::default()
+        };
+        assert_eq!(r.total_sessions_deleted(), 7);
+        assert!(r.any_work_done());
+    }
+
+    #[test]
+    fn cleanup_result_total_single_source_count() {
+        let r = CleanupResult {
+            deleted_by_count: 4,
+            ..Default::default()
+        };
+        assert_eq!(r.total_sessions_deleted(), 4);
+        assert!(r.any_work_done());
+    }
+
+    #[test]
+    fn cleanup_result_total_single_source_size() {
+        let r = CleanupResult {
+            deleted_by_size: 2,
+            ..Default::default()
+        };
+        assert_eq!(r.total_sessions_deleted(), 2);
+        assert!(r.any_work_done());
+    }
+
+    // ── Multi-phase cleanup ──
+
+    #[test]
+    fn full_cleanup_all_phases_fire() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        let old = now - 31 * 86_400_000; // 31 days ago
+
+        // 1 old closed session → age cleanup
+        insert_session(&conn, "age-victim", old, true);
+
+        // 5 recent closed sessions → count cleanup (keep only 2)
+        for i in 0..5 {
+            let id = format!("recent-{i}");
+            insert_session(&conn, &id, now + i * 1000, true);
+            // give each 600KB of checkpoint data → total 3000KB > 2MB budget for last 2
+            insert_checkpoint(&conn, &id, now + i * 1000, 600 * 1024);
+        }
+
+        let config = SessionRetentionConfig {
+            max_age_days: 30,
+            max_closed_sessions: 2,
+            max_total_size_mb: 2,
+            cleanup_interval_hours: 24,
+        };
+        let result = cleanup_sessions(&conn, &config).unwrap();
+
+        // age should delete "age-victim"
+        assert!(result.deleted_by_age >= 1);
+        // count should delete excess beyond 2
+        // After age delete: 5 remain, keep 2 → delete 3
+        assert!(result.deleted_by_count >= 1);
+    }
+
+    // ── Size cleanup: multiple deletions needed ──
+
+    #[test]
+    fn size_cleanup_deletes_multiple_sessions() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+
+        // 4 sessions × 400KB = 1600KB. Budget: 500KB. Need to free ~1100KB.
+        for i in 0..4 {
+            let id = format!("big-{i}");
+            insert_session(&conn, &id, now + i * 1000, true);
+            insert_checkpoint(&conn, &id, now + i * 1000, 400 * 1024);
+        }
+
+        // Budget: 0.5 MB = 512KB. Need to free ~1088KB → delete 3 sessions (3×400KB)
+        let deleted = delete_sessions_by_size(&conn, 1).unwrap();
+        // Should have deleted at least 2 (800KB frees enough)
+        assert!(deleted >= 2, "Expected >=2 deletions, got {}", deleted);
+        assert!(count_sessions(&conn) <= 2);
+    }
+
+    // ── Excess closed: mixed active and closed ──
+
+    #[test]
+    fn excess_closed_ignores_active_sessions() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+
+        // 3 active sessions (should NOT be counted or deleted)
+        for i in 0..3 {
+            insert_session(&conn, &format!("active-{i}"), now + i * 1000, false);
+        }
+
+        // 4 closed sessions → keep 2 → delete 2
+        for i in 0..4 {
+            insert_session(&conn, &format!("closed-{i}"), now + (i + 3) * 1000, true);
+        }
+
+        let deleted = delete_excess_closed_sessions(&conn, 2).unwrap();
+        assert_eq!(deleted, 2);
+        // All 3 active remain + 2 closed = 5
+        assert_eq!(count_sessions(&conn), 5);
+    }
+
+    #[test]
+    fn excess_closed_noop_when_under_limit() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+
+        insert_session(&conn, "s1", now, true);
+        insert_session(&conn, "s2", now + 1000, true);
+
+        let deleted = delete_excess_closed_sessions(&conn, 10).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(count_sessions(&conn), 2);
+    }
+
+    // ── Age boundary ──
+
+    #[test]
+    fn age_cleanup_boundary_exactly_at_cutoff() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        // Exactly 30 days ago
+        let exactly_30_days = now - 30 * 86_400_000;
+
+        insert_session(&conn, "boundary", exactly_30_days, true);
+
+        // cutoff = now - 30 days = exactly_30_days. Query: created_at < cutoff
+        // Since created_at == cutoff, it should NOT be deleted (< not <=)
+        let deleted = delete_sessions_by_age(&conn, 30).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn age_cleanup_one_ms_past_cutoff() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        // 1ms past the 30-day cutoff
+        let just_past = now - 30 * 86_400_000 - 1;
+
+        insert_session(&conn, "just-past", just_past, true);
+
+        let deleted = delete_sessions_by_age(&conn, 30).unwrap();
+        assert_eq!(deleted, 1);
+    }
+
+    // ── Cascade: multiple checkpoints per session ──
+
+    #[test]
+    fn cascade_deletes_multiple_checkpoints_and_pane_states() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        let old = now - 31 * 86_400_000;
+
+        insert_session(&conn, "multi-cp", old, true);
+        let cp1 = insert_checkpoint(&conn, "multi-cp", old, 1024);
+        let cp2 = insert_checkpoint(&conn, "multi-cp", old + 1000, 2048);
+        let cp3 = insert_checkpoint(&conn, "multi-cp", old + 2000, 512);
+        insert_pane_state(&conn, cp1, 1);
+        insert_pane_state(&conn, cp1, 2);
+        insert_pane_state(&conn, cp2, 3);
+        insert_pane_state(&conn, cp3, 4);
+        insert_pane_state(&conn, cp3, 5);
+
+        assert_eq!(count_checkpoints(&conn), 3);
+        assert_eq!(count_pane_states(&conn), 5);
+
+        delete_sessions_by_age(&conn, 30).unwrap();
+
+        assert_eq!(count_sessions(&conn), 0);
+        assert_eq!(count_checkpoints(&conn), 0);
+        assert_eq!(count_pane_states(&conn), 0);
+    }
+
+    // ── Orphan cleanup noop ──
+
+    #[test]
+    fn orphan_cleanup_noop_when_no_orphans() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+
+        insert_session(&conn, "valid", now, true);
+        let cp = insert_checkpoint(&conn, "valid", now, 1024);
+        insert_pane_state(&conn, cp, 1);
+
+        let (orphan_cp, orphan_ps) = cleanup_orphaned_data(&conn).unwrap();
+        assert_eq!(orphan_cp, 0);
+        assert_eq!(orphan_ps, 0);
+    }
+
+    #[test]
+    fn orphan_cleanup_on_empty_db() {
+        let conn = make_test_db();
+        let (orphan_cp, orphan_ps) = cleanup_orphaned_data(&conn).unwrap();
+        assert_eq!(orphan_cp, 0);
+        assert_eq!(orphan_ps, 0);
+    }
+
+    // ── Size cleanup: sessions with no checkpoints ──
+
+    #[test]
+    fn size_cleanup_with_zero_checkpoint_data() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+
+        // Sessions with no checkpoint data → total size is 0, always under budget
+        for i in 0..5 {
+            insert_session(&conn, &format!("nochk-{i}"), now + i * 1000, true);
+        }
+
+        let deleted = delete_sessions_by_size(&conn, 1).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(count_sessions(&conn), 5);
+    }
+
+    // ── Config edge cases ──
+
+    #[test]
+    fn config_all_max_values() {
+        let config = SessionRetentionConfig {
+            max_age_days: u64::MAX,
+            max_closed_sessions: usize::MAX,
+            max_total_size_mb: u64::MAX,
+            cleanup_interval_hours: u64::MAX,
+        };
+        // With extreme limits, nothing should be deleted from an empty DB
+        let conn = make_test_db();
+        let result = cleanup_sessions(&conn, &config).unwrap();
+        assert_eq!(result.total_sessions_deleted(), 0);
+    }
+
+    #[test]
+    fn config_serde_preserves_zero_values() {
+        let config = SessionRetentionConfig {
+            max_age_days: 0,
+            max_closed_sessions: 0,
+            max_total_size_mb: 0,
+            cleanup_interval_hours: 0,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: SessionRetentionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.max_age_days, 0);
+        assert_eq!(back.max_closed_sessions, 0);
+        assert_eq!(back.max_total_size_mb, 0);
+        assert_eq!(back.cleanup_interval_hours, 0);
+    }
+
+    #[test]
+    fn config_debug_impl() {
+        let config = SessionRetentionConfig::default();
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("SessionRetentionConfig"));
+    }
+
+    #[test]
+    fn config_clone_preserves_all_fields() {
+        let config = SessionRetentionConfig {
+            max_age_days: 7,
+            max_closed_sessions: 10,
+            max_total_size_mb: 100,
+            cleanup_interval_hours: 6,
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.max_age_days, 7);
+        assert_eq!(cloned.max_closed_sessions, 10);
+        assert_eq!(cloned.max_total_size_mb, 100);
+        assert_eq!(cloned.cleanup_interval_hours, 6);
+    }
+
+    // ── Vacuum exact threshold ──
+
+    #[test]
+    fn cleanup_vacuum_exactly_10_deletions() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        let old = now - 31 * 86_400_000;
+
+        for i in 0..10 {
+            insert_session(&conn, &format!("v-{i}"), old, true);
+        }
+
+        let config = SessionRetentionConfig {
+            max_age_days: 30,
+            max_closed_sessions: 0,
+            max_total_size_mb: 0,
+            cleanup_interval_hours: 24,
+        };
+        let result = cleanup_sessions(&conn, &config).unwrap();
+        assert_eq!(result.deleted_by_age, 10);
+        assert!(result.vacuumed); // threshold is >= 10
+    }
+
+    #[test]
+    fn cleanup_vacuum_9_deletions_no_vacuum() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        let old = now - 31 * 86_400_000;
+
+        for i in 0..9 {
+            insert_session(&conn, &format!("nv-{i}"), old, true);
+        }
+
+        let config = SessionRetentionConfig {
+            max_age_days: 30,
+            max_closed_sessions: 0,
+            max_total_size_mb: 0,
+            cleanup_interval_hours: 24,
+        };
+        let result = cleanup_sessions(&conn, &config).unwrap();
+        assert_eq!(result.deleted_by_age, 9);
+        assert!(!result.vacuumed); // under threshold
+    }
+
+    // ── epoch_ms additional ──
+
+    #[test]
+    fn epoch_ms_monotonic_across_calls() {
+        let a = epoch_ms();
+        let b = epoch_ms();
+        assert!(b >= a, "epoch_ms should be monotonic");
+    }
 }

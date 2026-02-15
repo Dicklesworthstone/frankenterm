@@ -712,4 +712,326 @@ mod tests {
             other => panic!("Expected Io, got: {other:?}"),
         }
     }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ───────────────────────────────────
+
+    // ── CautError Display ──
+
+    #[test]
+    fn caut_error_display_not_installed() {
+        let err = CautError::NotInstalled;
+        assert_eq!(
+            err.to_string(),
+            "caut is not installed or not found on PATH"
+        );
+    }
+
+    #[test]
+    fn caut_error_display_timeout() {
+        let err = CautError::Timeout { timeout_secs: 30 };
+        assert_eq!(err.to_string(), "caut timed out after 30s");
+    }
+
+    #[test]
+    fn caut_error_display_non_zero_exit() {
+        let err = CautError::NonZeroExit {
+            status: 127,
+            stderr: "command not found".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("127"));
+        assert!(msg.contains("command not found"));
+    }
+
+    #[test]
+    fn caut_error_display_output_too_large() {
+        let err = CautError::OutputTooLarge {
+            bytes: 500_000,
+            max_bytes: 262_144,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("500000"));
+        assert!(msg.contains("262144"));
+    }
+
+    #[test]
+    fn caut_error_display_invalid_json() {
+        let err = CautError::InvalidJson {
+            message: "expected value at line 1".to_string(),
+            preview: "{bad".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("invalid JSON"));
+        assert!(msg.contains("expected value at line 1"));
+    }
+
+    #[test]
+    fn caut_error_display_io() {
+        let err = CautError::Io {
+            message: "broken pipe".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("broken pipe"));
+    }
+
+    // ── CautError serde roundtrip ──
+
+    #[test]
+    fn caut_error_serde_roundtrip() {
+        let errors = vec![
+            CautError::NotInstalled,
+            CautError::Timeout { timeout_secs: 5 },
+            CautError::NonZeroExit {
+                status: 1,
+                stderr: "fail".to_string(),
+            },
+            CautError::OutputTooLarge {
+                bytes: 100,
+                max_bytes: 50,
+            },
+            CautError::InvalidJson {
+                message: "bad".to_string(),
+                preview: "...".to_string(),
+            },
+            CautError::Io {
+                message: "oops".to_string(),
+            },
+        ];
+        for err in &errors {
+            let json = serde_json::to_string(err).unwrap();
+            let decoded: CautError = serde_json::from_str(&json).unwrap();
+            assert_eq!(err, &decoded);
+        }
+    }
+
+    // ── CautError Clone/PartialEq/Eq ──
+
+    #[test]
+    fn caut_error_clone_and_eq() {
+        let err1 = CautError::NotInstalled;
+        let err2 = err1.clone();
+        assert_eq!(err1, err2);
+
+        let err3 = CautError::Timeout { timeout_secs: 10 };
+        let err4 = CautError::Timeout { timeout_secs: 10 };
+        assert_eq!(err3, err4);
+
+        assert_ne!(err1, err3);
+    }
+
+    #[test]
+    fn caut_error_debug() {
+        let err = CautError::NotInstalled;
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("NotInstalled"));
+    }
+
+    // ── CautService traits ──
+
+    #[test]
+    fn caut_service_debug() {
+        let debug = format!("{:?}", CautService::OpenAI);
+        assert_eq!(debug, "OpenAI");
+    }
+
+    #[test]
+    fn caut_service_clone_copy_eq() {
+        let s1 = CautService::OpenAI;
+        let s2 = s1; // Copy
+        let s3 = s1.clone();
+        assert_eq!(s1, s2);
+        assert_eq!(s1, s3);
+    }
+
+    // ── CautClient defaults and builders ──
+
+    #[test]
+    fn caut_client_default_values() {
+        let client = CautClient::default();
+        assert_eq!(client.binary, "caut");
+        assert_eq!(client.timeout, Duration::from_secs(10));
+        assert_eq!(client.max_output_bytes, 256 * 1024);
+        assert_eq!(client.max_error_bytes, 8 * 1024);
+    }
+
+    #[test]
+    fn caut_client_new_equals_default() {
+        let c1 = CautClient::new();
+        let c2 = CautClient::default();
+        assert_eq!(c1.binary, c2.binary);
+        assert_eq!(c1.timeout, c2.timeout);
+        assert_eq!(c1.max_output_bytes, c2.max_output_bytes);
+        assert_eq!(c1.max_error_bytes, c2.max_error_bytes);
+    }
+
+    #[test]
+    fn caut_client_with_binary() {
+        let client = CautClient::new().with_binary("/usr/local/bin/caut");
+        assert_eq!(client.binary, "/usr/local/bin/caut");
+    }
+
+    #[test]
+    fn caut_client_with_timeout_secs() {
+        let client = CautClient::new().with_timeout_secs(30);
+        assert_eq!(client.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn caut_client_with_max_output_bytes() {
+        let client = CautClient::new().with_max_output_bytes(1_000_000);
+        assert_eq!(client.max_output_bytes, 1_000_000);
+    }
+
+    #[test]
+    fn caut_client_with_max_error_bytes() {
+        let client = CautClient::new().with_max_error_bytes(16_384);
+        assert_eq!(client.max_error_bytes, 16_384);
+    }
+
+    #[test]
+    fn caut_client_builder_chaining() {
+        let client = CautClient::new()
+            .with_binary("my-caut")
+            .with_timeout_secs(60)
+            .with_max_output_bytes(512_000)
+            .with_max_error_bytes(4_096);
+        assert_eq!(client.binary, "my-caut");
+        assert_eq!(client.timeout, Duration::from_secs(60));
+        assert_eq!(client.max_output_bytes, 512_000);
+        assert_eq!(client.max_error_bytes, 4_096);
+    }
+
+    #[test]
+    fn caut_client_debug() {
+        let client = CautClient::new();
+        let debug = format!("{:?}", client);
+        assert!(debug.contains("CautClient"));
+        assert!(debug.contains("caut"));
+    }
+
+    #[test]
+    fn caut_client_clone() {
+        let client = CautClient::new()
+            .with_binary("custom")
+            .with_timeout_secs(20);
+        let cloned = client.clone();
+        assert_eq!(cloned.binary, "custom");
+        assert_eq!(cloned.timeout, Duration::from_secs(20));
+    }
+
+    // ── CautUsage/CautRefresh/CautAccountUsage defaults ──
+
+    #[test]
+    fn caut_usage_default() {
+        let usage = CautUsage::default();
+        assert!(usage.service.is_none());
+        assert!(usage.generated_at.is_none());
+        assert!(usage.accounts.is_empty());
+        assert!(usage.extra.is_empty());
+    }
+
+    #[test]
+    fn caut_refresh_default() {
+        let refresh = CautRefresh::default();
+        assert!(refresh.service.is_none());
+        assert!(refresh.refreshed_at.is_none());
+        assert!(refresh.accounts.is_empty());
+        assert!(refresh.extra.is_empty());
+    }
+
+    #[test]
+    fn caut_account_usage_default() {
+        let acct = CautAccountUsage::default();
+        assert!(acct.id.is_none());
+        assert!(acct.name.is_none());
+        assert!(acct.percent_remaining.is_none());
+        assert!(acct.limit_hours.is_none());
+        assert!(acct.reset_at.is_none());
+        assert!(acct.tokens_used.is_none());
+        assert!(acct.tokens_remaining.is_none());
+        assert!(acct.tokens_limit.is_none());
+        assert!(acct.extra.is_empty());
+    }
+
+    #[test]
+    fn caut_usage_debug_and_clone() {
+        let usage = CautUsage {
+            service: Some("openai".to_string()),
+            generated_at: Some("now".to_string()),
+            accounts: vec![],
+            extra: HashMap::new(),
+        };
+        let debug = format!("{:?}", usage);
+        assert!(debug.contains("CautUsage"));
+        assert!(debug.contains("openai"));
+
+        let cloned = usage.clone();
+        assert_eq!(cloned.service, Some("openai".to_string()));
+    }
+
+    #[test]
+    fn caut_refresh_debug_and_clone() {
+        let refresh = CautRefresh {
+            service: Some("openai".to_string()),
+            refreshed_at: Some("2026-01-01".to_string()),
+            accounts: vec![],
+            extra: HashMap::new(),
+        };
+        let debug = format!("{:?}", refresh);
+        assert!(debug.contains("CautRefresh"));
+
+        let cloned = refresh.clone();
+        assert_eq!(cloned.refreshed_at, Some("2026-01-01".to_string()));
+    }
+
+    #[test]
+    fn caut_account_usage_debug_and_clone() {
+        let acct = CautAccountUsage {
+            id: Some("acc-1".to_string()),
+            name: Some("Test".to_string()),
+            percent_remaining: Some(42.5),
+            ..Default::default()
+        };
+        let debug = format!("{:?}", acct);
+        assert!(debug.contains("CautAccountUsage"));
+        assert!(debug.contains("acc-1"));
+
+        let cloned = acct.clone();
+        assert_eq!(cloned.id, Some("acc-1".to_string()));
+        assert_eq!(cloned.percent_remaining, Some(42.5));
+    }
+
+    // ── redact_and_truncate edge cases ──
+
+    #[test]
+    fn redact_and_truncate_short_input_unchanged() {
+        let result = redact_and_truncate("hello world", 100);
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn redact_and_truncate_zero_max_len() {
+        let result = redact_and_truncate("some text", 0);
+        assert_eq!(result, "...");
+    }
+
+    #[test]
+    fn redact_and_truncate_empty_input() {
+        let result = redact_and_truncate("", 100);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn redact_and_truncate_exact_limit() {
+        let input = "abcde"; // 5 bytes
+        let result = redact_and_truncate(input, 5);
+        assert_eq!(result, "abcde"); // no truncation needed
+    }
+
+    #[test]
+    fn redact_and_truncate_one_over_limit() {
+        let input = "abcdef"; // 6 bytes
+        let result = redact_and_truncate(input, 5);
+        assert_eq!(result, "abcde...");
+    }
 }
