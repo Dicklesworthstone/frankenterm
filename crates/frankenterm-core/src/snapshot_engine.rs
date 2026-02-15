@@ -207,14 +207,30 @@ impl SnapshotEngine {
         let cutoff_ms: i64 =
             now_ms.saturating_sub(STATE_DETECTION_MAX_AGE.as_millis() as u64) as i64;
 
-        let detections_by_pane = tokio::task::spawn_blocking(move || {
-            load_latest_detections_by_pane_sync(
-                db_path_for_detections.as_str(),
-                &pane_ids,
-                cutoff_ms,
-            )
-        })
-        .await
+        let detections_by_pane = {
+            #[cfg(feature = "asupersync-runtime")]
+            {
+                asupersync::runtime::spawn_blocking(move || {
+                    load_latest_detections_by_pane_sync(
+                        db_path_for_detections.as_str(),
+                        &pane_ids,
+                        cutoff_ms,
+                    )
+                })
+                .await
+            }
+            #[cfg(not(feature = "asupersync-runtime"))]
+            {
+                tokio::task::spawn_blocking(move || {
+                    load_latest_detections_by_pane_sync(
+                        db_path_for_detections.as_str(),
+                        &pane_ids,
+                        cutoff_ms,
+                    )
+                })
+                .await
+            }
+        }
         .ok()
         .and_then(|res| res.ok())
         .unwrap_or_default();
@@ -261,18 +277,38 @@ impl SnapshotEngine {
         let db_path = Arc::clone(&self.db_path);
         let state_hash_clone = state_hash.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
-            save_checkpoint_sync(
-                &db_path,
-                &session_id,
-                now_ms,
-                &checkpoint_type,
-                &state_hash_clone,
-                &topology_json,
-                &pane_states,
-            )
-        })
-        .await
+        let result = {
+            #[cfg(feature = "asupersync-runtime")]
+            {
+                asupersync::runtime::spawn_blocking(move || {
+                    save_checkpoint_sync(
+                        &db_path,
+                        &session_id,
+                        now_ms,
+                        &checkpoint_type,
+                        &state_hash_clone,
+                        &topology_json,
+                        &pane_states,
+                    )
+                })
+                .await
+            }
+            #[cfg(not(feature = "asupersync-runtime"))]
+            {
+                tokio::task::spawn_blocking(move || {
+                    save_checkpoint_sync(
+                        &db_path,
+                        &session_id,
+                        now_ms,
+                        &checkpoint_type,
+                        &state_hash_clone,
+                        &topology_json,
+                        &pane_states,
+                    )
+                })
+                .await
+            }
+        }
         .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
         .map_err(|e| SnapshotError::Database(e.to_string()))?;
 
@@ -294,10 +330,24 @@ impl SnapshotEngine {
         let retention_count = self.config.retention_count;
         let retention_days = self.config.retention_days;
 
-        tokio::task::spawn_blocking(move || cleanup_sync(&db_path, retention_count, retention_days))
-            .await
-            .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
-            .map_err(|e| SnapshotError::Database(e.to_string()))
+        {
+            #[cfg(feature = "asupersync-runtime")]
+            {
+                asupersync::runtime::spawn_blocking(move || {
+                    cleanup_sync(&db_path, retention_count, retention_days)
+                })
+                .await
+            }
+            #[cfg(not(feature = "asupersync-runtime"))]
+            {
+                tokio::task::spawn_blocking(move || {
+                    cleanup_sync(&db_path, retention_count, retention_days)
+                })
+                .await
+            }
+        }
+        .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
+        .map_err(|e| SnapshotError::Database(e.to_string()))
     }
 
     /// Configured value contribution for a trigger type.
@@ -526,10 +576,22 @@ impl SnapshotEngine {
             let db_path = Arc::clone(&self.db_path);
             let topo = topology_json.to_string();
             let id_for_closure = id.clone();
-            tokio::task::spawn_blocking(move || {
-                update_session_sync(&db_path, &id_for_closure, now_ms, &topo)
-            })
-            .await
+            {
+                #[cfg(feature = "asupersync-runtime")]
+                {
+                    asupersync::runtime::spawn_blocking(move || {
+                        update_session_sync(&db_path, &id_for_closure, now_ms, &topo)
+                    })
+                    .await
+                }
+                #[cfg(not(feature = "asupersync-runtime"))]
+                {
+                    tokio::task::spawn_blocking(move || {
+                        update_session_sync(&db_path, &id_for_closure, now_ms, &topo)
+                    })
+                    .await
+                }
+            }
             .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
             .map_err(|e| SnapshotError::Database(e.to_string()))?;
             return Ok(id);
@@ -541,10 +603,22 @@ impl SnapshotEngine {
         let id = session_id.clone();
         let topo = topology_json.to_string();
         let version = crate::VERSION.to_string();
-        tokio::task::spawn_blocking(move || {
-            create_session_sync(&db_path, &id, now_ms, &topo, &version)
-        })
-        .await
+        {
+            #[cfg(feature = "asupersync-runtime")]
+            {
+                asupersync::runtime::spawn_blocking(move || {
+                    create_session_sync(&db_path, &id, now_ms, &topo, &version)
+                })
+                .await
+            }
+            #[cfg(not(feature = "asupersync-runtime"))]
+            {
+                tokio::task::spawn_blocking(move || {
+                    create_session_sync(&db_path, &id, now_ms, &topo, &version)
+                })
+                .await
+            }
+        }
         .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
         .map_err(|e| SnapshotError::Database(e.to_string()))?;
 
@@ -594,10 +668,19 @@ impl SnapshotEngine {
         let session_id = { self.session_id.read().await.clone() };
         if let Some(id) = session_id {
             let db_path = Arc::clone(&self.db_path);
-            tokio::task::spawn_blocking(move || mark_shutdown_sync(&db_path, &id))
-                .await
-                .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
-                .map_err(|e| SnapshotError::Database(e.to_string()))?;
+            {
+                #[cfg(feature = "asupersync-runtime")]
+                {
+                    asupersync::runtime::spawn_blocking(move || mark_shutdown_sync(&db_path, &id))
+                        .await
+                }
+                #[cfg(not(feature = "asupersync-runtime"))]
+                {
+                    tokio::task::spawn_blocking(move || mark_shutdown_sync(&db_path, &id)).await
+                }
+            }
+            .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
+            .map_err(|e| SnapshotError::Database(e.to_string()))?;
         }
         Ok(())
     }
@@ -2405,7 +2488,10 @@ mod tests {
 
         let h1 = compute_state_hash(&[p1]);
         let h2 = compute_state_hash(&[p2]);
-        assert_ne!(h1, h2, "different cursor position should produce different hash");
+        assert_ne!(
+            h1, h2,
+            "different cursor position should produce different hash"
+        );
     }
 
     #[test]
@@ -2671,9 +2757,7 @@ mod tests {
             .unwrap();
 
         // WorkCompleted should NOT be deduped
-        let r2 = engine
-            .capture(&panes, SnapshotTrigger::WorkCompleted)
-            .await;
+        let r2 = engine.capture(&panes, SnapshotTrigger::WorkCompleted).await;
         assert!(r2.is_ok(), "WorkCompleted bypasses dedup");
     }
 
@@ -2709,7 +2793,10 @@ mod tests {
         }
 
         let deleted = engine.cleanup().await.unwrap();
-        assert_eq!(deleted, 3, "retention_count=0 should delete all checkpoints");
+        assert_eq!(
+            deleted, 3,
+            "retention_count=0 should delete all checkpoints"
+        );
 
         let count = checkpoint_count(db_path.as_str());
         assert_eq!(count, 0);
@@ -2718,8 +2805,17 @@ mod tests {
     #[test]
     fn snapshot_config_default_has_sane_values() {
         let config = SnapshotConfig::default();
-        assert!(config.interval_seconds >= 30, "interval should be at least 30s");
-        assert!(config.retention_count > 0, "retention count should be positive");
-        assert!(config.retention_days > 0, "retention days should be positive");
+        assert!(
+            config.interval_seconds >= 30,
+            "interval should be at least 30s"
+        );
+        assert!(
+            config.retention_count > 0,
+            "retention count should be positive"
+        );
+        assert!(
+            config.retention_days > 0,
+            "retention days should be positive"
+        );
     }
 }

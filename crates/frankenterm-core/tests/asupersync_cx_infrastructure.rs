@@ -1,5 +1,6 @@
 #![cfg(feature = "asupersync-runtime")]
 
+use asupersync::CancelKind;
 use frankenterm_core::cx::{
     Cx, CxRuntimeBuilder, RuntimeTuning, for_testing, spawn_bounded_with_cx, spawn_with_cx,
     spawn_with_timeout, try_spawn_with_cx, with_cx,
@@ -131,6 +132,87 @@ fn spawn_bounded_helper_limits_concurrency_and_preserves_order() {
     assert_eq!(outputs, (0usize..12).collect::<Vec<_>>());
     assert!(max_seen.load(Ordering::SeqCst) <= 3);
     assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn spawn_bounded_helper_clamps_zero_concurrency_to_one() {
+    let runtime = CxRuntimeBuilder::multi_thread()
+        .with_tuning(RuntimeTuning {
+            worker_threads: 4,
+            poll_budget: 64,
+            blocking_min_threads: 0,
+            blocking_max_threads: 0,
+        })
+        .build()
+        .expect("build runtime");
+
+    let root_cx = for_testing();
+    let handle = runtime.handle();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+
+    let tasks = (0usize..8)
+        .map(|i| {
+            let in_flight = Arc::clone(&in_flight);
+            let max_seen = Arc::clone(&max_seen);
+            move |_child_cx: Cx| async move {
+                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+
+                let mut observed = max_seen.load(Ordering::SeqCst);
+                while current > observed {
+                    match max_seen.compare_exchange(
+                        observed,
+                        current,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(next) => observed = next,
+                    }
+                }
+
+                runtime_compat::sleep(Duration::from_millis(5)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                i
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let outputs = runtime.block_on(spawn_bounded_with_cx(&handle, &root_cx, 0, tasks));
+    assert_eq!(outputs, (0usize..8).collect::<Vec<_>>());
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        1,
+        "max_concurrency=0 should clamp to a single in-flight task"
+    );
+    assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn spawn_bounded_children_observe_parent_cancellation() {
+    let runtime = CxRuntimeBuilder::current_thread()
+        .with_tuning(RuntimeTuning {
+            worker_threads: 1,
+            poll_budget: 64,
+            blocking_min_threads: 0,
+            blocking_max_threads: 0,
+        })
+        .build()
+        .expect("build runtime");
+
+    let root_cx = for_testing();
+    root_cx.cancel_with(
+        CancelKind::User,
+        Some("wa-1bznu cancellation propagation test"),
+    );
+    let handle = runtime.handle();
+
+    let tasks = (0..5)
+        .map(|_| move |child_cx: Cx| async move { child_cx.checkpoint().is_err() })
+        .collect::<Vec<_>>();
+
+    let outputs = runtime.block_on(spawn_bounded_with_cx(&handle, &root_cx, 3, tasks));
+    assert_eq!(outputs, vec![true; 5]);
 }
 
 #[test]

@@ -121,6 +121,11 @@ harness = false
 required-features = ["asupersync-runtime"]
 
 [[bench]]
+name = "task_spawn"
+harness = false
+required-features = ["asupersync-runtime"]
+
+[[bench]]
 name = "sizing_benchmark"
 harness = false
 

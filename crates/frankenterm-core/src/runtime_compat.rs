@@ -594,6 +594,38 @@ where
         .map_err(|err| err.to_string())
 }
 
+/// Receives one message from an mpsc receiver, normalized to Option semantics.
+///
+/// Returns:
+/// - `Some(value)` when a message was received.
+/// - `None` when the channel is closed.
+pub async fn mpsc_recv_option<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_testing();
+        rx.recv(&cx).await.ok()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        rx.recv().await
+    }
+}
+
+/// Sends one message through an mpsc sender using the active runtime semantics.
+pub async fn mpsc_send<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::SendError<T>> {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_testing();
+        tx.send(&cx, value).await
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        tx.send(value).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,16 +845,20 @@ mod tests {
 
     #[tokio::test]
     async fn mpsc_send_recv() {
+        #[cfg(feature = "asupersync-runtime")]
+        let (tx, rx) = mpsc::channel(10);
+        #[cfg(not(feature = "asupersync-runtime"))]
         let (tx, mut rx) = mpsc::channel(10);
-        tx.send(42).await.expect("send");
         #[cfg(feature = "asupersync-runtime")]
         {
             let cx = asupersync::Cx::for_testing();
+            tx.send(&cx, 42).await.expect("send");
             let val = rx.recv(&cx).await.expect("recv");
             assert_eq!(val, 42);
         }
         #[cfg(not(feature = "asupersync-runtime"))]
         {
+            tx.send(42).await.expect("send");
             let val = rx.recv().await.expect("recv");
             assert_eq!(val, 42);
         }
@@ -830,9 +866,22 @@ mod tests {
 
     #[tokio::test]
     async fn mpsc_multiple_messages_fifo() {
+        #[cfg(feature = "asupersync-runtime")]
+        let (tx, rx) = mpsc::channel(10);
+        #[cfg(not(feature = "asupersync-runtime"))]
         let (tx, mut rx) = mpsc::channel(10);
-        for i in 0..5 {
-            tx.send(i).await.expect("send");
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = asupersync::Cx::for_testing();
+            for i in 0..5 {
+                tx.send(&cx, i).await.expect("send");
+            }
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            for i in 0..5 {
+                tx.send(i).await.expect("send");
+            }
         }
         for i in 0..5 {
             #[cfg(feature = "asupersync-runtime")]
