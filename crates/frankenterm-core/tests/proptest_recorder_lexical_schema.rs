@@ -720,4 +720,12 @@ proptest! {
         let searcher = reader.searcher();
         prop_assert_eq!(searcher.num_docs() as usize, count);
     }
+
+    /// Schema fingerprint is a non-empty string.
+    #[test]
+    fn prop_fingerprint_nonempty(_dummy in 0..1u32) {
+        let (schema, _handles) = build_lexical_schema_v1();
+        let fp = schema_fingerprint(&schema);
+        prop_assert!(!fp.is_empty(), "fingerprint should be non-empty");
+    }
 }

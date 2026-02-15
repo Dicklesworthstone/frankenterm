@@ -507,3 +507,15 @@ fn delivery_with_records_serializes() {
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value["records"].as_array().unwrap().len(), 2);
 }
+
+#[test]
+fn delivery_record_debug_nonempty() {
+    let record = NotificationDeliveryRecord {
+        target: "test".to_string(),
+        accepted: true,
+        status_code: 200,
+        error: None,
+    };
+    let debug = format!("{:?}", record);
+    assert!(!debug.is_empty());
+}

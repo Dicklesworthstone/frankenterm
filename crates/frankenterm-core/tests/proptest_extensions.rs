@@ -609,3 +609,11 @@ fn capability_level_hierarchy() {
     // Full: everything
     assert!(full.send_text);
 }
+
+#[test]
+fn sandbox_capabilities_debug_nonempty() {
+    let caps = CapabilityLevel::Full.to_capabilities();
+    let debug = format!("{:?}", caps);
+    assert!(!debug.is_empty());
+    assert!(debug.contains("SandboxCapabilities"));
+}
