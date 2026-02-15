@@ -2089,4 +2089,558 @@ mod tests {
         assert!(json.get("advisory_total").is_some());
         assert!(json["items"].is_array());
     }
+
+    // =====================================================================
+    // normalize_identity (non-feature-gated pure function)
+    // =====================================================================
+
+    #[test]
+    fn normalize_identity_trims_and_lowercases() {
+        assert_eq!(normalize_identity("  Agent-1  "), "agent-1");
+    }
+
+    #[test]
+    fn normalize_identity_already_normalized() {
+        assert_eq!(normalize_identity("agent-1"), "agent-1");
+    }
+
+    #[test]
+    fn normalize_identity_empty() {
+        assert_eq!(normalize_identity(""), "");
+    }
+
+    #[test]
+    fn normalize_identity_mixed_case() {
+        assert_eq!(normalize_identity("MyAgent_ID"), "myagent_id");
+    }
+
+    #[test]
+    fn normalize_identity_whitespace_only() {
+        assert_eq!(normalize_identity("   "), "");
+    }
+
+    // =====================================================================
+    // constant_time_eq (non-feature-gated pure function)
+    // =====================================================================
+
+    #[test]
+    fn constant_time_eq_equal_strings() {
+        assert!(constant_time_eq("secret", "secret"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_strings() {
+        assert!(!constant_time_eq("secret", "wrong"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq("short", "longer-string"));
+    }
+
+    #[test]
+    fn constant_time_eq_empty_strings() {
+        assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn constant_time_eq_one_empty() {
+        assert!(!constant_time_eq("a", ""));
+        assert!(!constant_time_eq("", "a"));
+    }
+
+    #[test]
+    fn constant_time_eq_single_char_diff() {
+        assert!(!constant_time_eq("abc", "abd"));
+    }
+
+    // =====================================================================
+    // TokenParts::parse (non-feature-gated)
+    // =====================================================================
+
+    #[test]
+    fn token_parts_parse_with_identity() {
+        let parts = TokenParts::parse("agent-1:mysecret");
+        assert_eq!(parts.identity, Some("agent-1"));
+        assert_eq!(parts.secret, "mysecret");
+    }
+
+    #[test]
+    fn token_parts_parse_without_identity() {
+        let parts = TokenParts::parse("bare-secret");
+        assert!(parts.identity.is_none());
+        assert_eq!(parts.secret, "bare-secret");
+    }
+
+    #[test]
+    fn token_parts_parse_empty_identity() {
+        // ":secret" => empty identity, treated as no identity
+        let parts = TokenParts::parse(":secret");
+        assert!(parts.identity.is_none());
+        assert_eq!(parts.secret, ":secret");
+    }
+
+    #[test]
+    fn token_parts_parse_empty_secret() {
+        // "identity:" => empty secret, treated as no identity
+        let parts = TokenParts::parse("identity:");
+        assert!(parts.identity.is_none());
+        assert_eq!(parts.secret, "identity:");
+    }
+
+    #[test]
+    fn token_parts_parse_multiple_colons() {
+        // First colon splits identity from secret
+        let parts = TokenParts::parse("agent:secret:extra");
+        assert_eq!(parts.identity, Some("agent"));
+        assert_eq!(parts.secret, "secret:extra");
+    }
+
+    // =====================================================================
+    // validate_token (non-feature-gated)
+    // =====================================================================
+
+    #[test]
+    fn validate_token_no_auth_required() {
+        // MtlsOnly mode doesn't require token
+        assert!(validate_token(DistributedAuthMode::Mtls, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn validate_token_missing_expected() {
+        assert!(matches!(
+            validate_token(DistributedAuthMode::Token, None, Some("x"), None),
+            Err(DistributedSecurityError::MissingToken)
+        ));
+    }
+
+    #[test]
+    fn validate_token_missing_presented() {
+        assert!(matches!(
+            validate_token(DistributedAuthMode::Token, Some("x"), None, None),
+            Err(DistributedSecurityError::MissingToken)
+        ));
+    }
+
+    #[test]
+    fn validate_token_matching_bare_secret() {
+        assert!(
+            validate_token(
+                DistributedAuthMode::Token,
+                Some("secret"),
+                Some("secret"),
+                None
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_token_wrong_bare_secret() {
+        assert!(matches!(
+            validate_token(
+                DistributedAuthMode::Token,
+                Some("correct"),
+                Some("wrong"),
+                None
+            ),
+            Err(DistributedSecurityError::AuthFailed)
+        ));
+    }
+
+    #[test]
+    fn validate_token_identity_match() {
+        assert!(
+            validate_token(
+                DistributedAuthMode::Token,
+                Some("agent:secret"),
+                Some("agent:secret"),
+                None,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_token_identity_mismatch() {
+        assert!(matches!(
+            validate_token(
+                DistributedAuthMode::Token,
+                Some("agent-a:secret"),
+                Some("agent-b:secret"),
+                None,
+            ),
+            Err(DistributedSecurityError::AuthFailed)
+        ));
+    }
+
+    #[test]
+    fn validate_token_identity_case_insensitive() {
+        assert!(
+            validate_token(
+                DistributedAuthMode::Token,
+                Some("Agent-A:secret"),
+                Some("agent-a:secret"),
+                None,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_token_client_identity_mismatch() {
+        assert!(matches!(
+            validate_token(
+                DistributedAuthMode::TokenAndMtls,
+                Some("agent-1:secret"),
+                Some("agent-1:secret"),
+                Some("agent-2"),
+            ),
+            Err(DistributedSecurityError::AuthFailed)
+        ));
+    }
+
+    // =====================================================================
+    // DistributedSecurityError::code (non-feature-gated)
+    // =====================================================================
+
+    #[test]
+    fn security_error_codes_all_stable() {
+        assert_eq!(
+            DistributedSecurityError::MissingToken.code(),
+            "dist.auth_failed"
+        );
+        assert_eq!(
+            DistributedSecurityError::AuthFailed.code(),
+            "dist.auth_failed"
+        );
+        assert_eq!(
+            DistributedSecurityError::ReplayDetected.code(),
+            "dist.replay_detected"
+        );
+        assert_eq!(
+            DistributedSecurityError::SessionLimitReached.code(),
+            "dist.session_limit"
+        );
+        assert_eq!(
+            DistributedSecurityError::ConnectionLimitReached.code(),
+            "dist.connection_limit"
+        );
+        assert_eq!(
+            DistributedSecurityError::MessageTooLarge.code(),
+            "dist.message_too_large"
+        );
+        assert_eq!(
+            DistributedSecurityError::RateLimited.code(),
+            "dist.rate_limited"
+        );
+        assert_eq!(
+            DistributedSecurityError::HandshakeTimeout.code(),
+            "dist.handshake_timeout"
+        );
+        assert_eq!(
+            DistributedSecurityError::MessageTimeout.code(),
+            "dist.message_timeout"
+        );
+    }
+
+    // =====================================================================
+    // DistributedSecurityError traits (non-feature-gated)
+    // =====================================================================
+
+    #[test]
+    fn security_error_display() {
+        let err = DistributedSecurityError::AuthFailed;
+        let msg = err.to_string();
+        assert!(msg.contains("auth failed"));
+    }
+
+    #[test]
+    fn security_error_clone_eq() {
+        let err1 = DistributedSecurityError::ReplayDetected;
+        let err2 = err1.clone();
+        assert_eq!(err1, err2);
+    }
+
+    #[test]
+    fn security_error_debug() {
+        let err = DistributedSecurityError::RateLimited;
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("RateLimited"));
+    }
+
+    #[test]
+    fn security_error_inequality() {
+        assert_ne!(
+            DistributedSecurityError::MissingToken,
+            DistributedSecurityError::AuthFailed
+        );
+    }
+
+    // =====================================================================
+    // configured_token_source_kind (non-feature-gated)
+    // =====================================================================
+
+    #[test]
+    fn token_source_kind_inline() {
+        let mut config = DistributedConfig::default();
+        config.token = Some("inline-token".to_string());
+        assert_eq!(
+            configured_token_source_kind(&config),
+            Some(DistributedTokenSourceKind::Inline)
+        );
+    }
+
+    #[test]
+    fn token_source_kind_env() {
+        let mut config = DistributedConfig::default();
+        config.token_env = Some("FT_TOKEN".to_string());
+        assert_eq!(
+            configured_token_source_kind(&config),
+            Some(DistributedTokenSourceKind::Env)
+        );
+    }
+
+    #[test]
+    fn token_source_kind_file() {
+        let mut config = DistributedConfig::default();
+        config.token_path = Some("/run/secrets/token".to_string());
+        assert_eq!(
+            configured_token_source_kind(&config),
+            Some(DistributedTokenSourceKind::File)
+        );
+    }
+
+    #[test]
+    fn token_source_kind_none_when_nothing_set() {
+        let config = DistributedConfig::default();
+        assert_eq!(configured_token_source_kind(&config), None);
+    }
+
+    #[test]
+    fn token_source_kind_none_when_ambiguous() {
+        let mut config = DistributedConfig::default();
+        config.token = Some("inline".to_string());
+        config.token_env = Some("ENV".to_string());
+        assert_eq!(configured_token_source_kind(&config), None);
+    }
+
+    #[test]
+    fn token_source_kind_ignores_empty_strings() {
+        let mut config = DistributedConfig::default();
+        config.token = Some("  ".to_string()); // whitespace only
+        config.token_env = Some("REAL_VAR".to_string());
+        assert_eq!(
+            configured_token_source_kind(&config),
+            Some(DistributedTokenSourceKind::Env)
+        );
+    }
+
+    // =====================================================================
+    // DistributedTokenSourceKind traits
+    // =====================================================================
+
+    #[test]
+    fn token_source_kind_debug_clone_copy_eq() {
+        let k = DistributedTokenSourceKind::File;
+        let k2 = k; // Copy
+        assert_eq!(k, k2);
+        let dbg = format!("{:?}", k);
+        assert!(dbg.contains("File"));
+    }
+
+    // =====================================================================
+    // resolve_expected_token edge cases (non-feature-gated)
+    // =====================================================================
+
+    #[test]
+    fn resolve_token_inline() {
+        let mut config = DistributedConfig::default();
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("my-secret".to_string());
+
+        let tok = resolve_expected_token(&config).unwrap().unwrap();
+        assert_eq!(tok, "my-secret");
+    }
+
+    #[test]
+    fn resolve_token_no_auth_returns_none() {
+        let mut config = DistributedConfig::default();
+        config.auth_mode = DistributedAuthMode::Mtls;
+        // Mtls doesn't require token
+
+        assert_eq!(resolve_expected_token(&config).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_token_missing_all_sources() {
+        let mut config = DistributedConfig::default();
+        config.auth_mode = DistributedAuthMode::Token;
+        // No token, token_env, or token_path
+
+        assert!(matches!(
+            resolve_expected_token(&config),
+            Err(DistributedCredentialError::TokenMissing)
+        ));
+    }
+
+    #[test]
+    fn resolve_token_empty_inline() {
+        let mut config = DistributedConfig::default();
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("  ".to_string()); // whitespace only, treated as empty
+
+        assert!(matches!(
+            resolve_expected_token(&config),
+            Err(DistributedCredentialError::TokenMissing)
+        ));
+    }
+
+    #[test]
+    fn resolve_token_env_missing_var() {
+        let mut config = DistributedConfig::default();
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token_env = Some("FT_NONEXISTENT_TEST_VAR_12345".to_string());
+
+        assert!(matches!(
+            resolve_expected_token(&config),
+            Err(DistributedCredentialError::TokenEnvMissing(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_token_file_not_found() {
+        let mut config = DistributedConfig::default();
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token_path = Some("/nonexistent/path/to/token".to_string());
+
+        assert!(matches!(
+            resolve_expected_token(&config),
+            Err(DistributedCredentialError::TokenFileRead { .. })
+        ));
+    }
+
+    // =====================================================================
+    // DistributedTlsError Display
+    // =====================================================================
+
+    #[test]
+    fn tls_error_display_variants() {
+        assert!(
+            DistributedTlsError::TlsDisabled
+                .to_string()
+                .contains("not enabled")
+        );
+        assert!(
+            DistributedTlsError::MissingCertPath
+                .to_string()
+                .contains("certificate")
+        );
+        assert!(
+            DistributedTlsError::MissingKeyPath
+                .to_string()
+                .contains("key")
+        );
+        assert!(
+            DistributedTlsError::MissingClientCaPath
+                .to_string()
+                .contains("client")
+        );
+        assert!(
+            DistributedTlsError::MissingServerCaPath
+                .to_string()
+                .contains("server")
+        );
+        assert!(
+            DistributedTlsError::EmptyCertChain("test.pem".to_string())
+                .to_string()
+                .contains("test.pem")
+        );
+        assert!(
+            DistributedTlsError::EmptyPrivateKey("key.pem".to_string())
+                .to_string()
+                .contains("key.pem")
+        );
+        assert!(
+            DistributedTlsError::InvalidMinTlsVersion("0.9".to_string())
+                .to_string()
+                .contains("0.9")
+        );
+        assert!(
+            DistributedTlsError::Config("bad config".to_string())
+                .to_string()
+                .contains("bad config")
+        );
+    }
+
+    // =====================================================================
+    // DistributedCredentialError Display
+    // =====================================================================
+
+    #[test]
+    fn credential_error_display() {
+        assert!(
+            DistributedCredentialError::TokenMissing
+                .to_string()
+                .contains("required")
+        );
+        assert!(
+            DistributedCredentialError::TokenAmbiguous
+                .to_string()
+                .contains("ambiguous")
+        );
+        assert!(
+            DistributedCredentialError::TokenEmpty
+                .to_string()
+                .contains("empty")
+        );
+        assert!(
+            DistributedCredentialError::TokenEnvMissing("MY_VAR".to_string())
+                .to_string()
+                .contains("MY_VAR")
+        );
+    }
+
+    // =====================================================================
+    // ReadinessItem / ReadinessReport additional traits
+    // =====================================================================
+
+    #[test]
+    fn readiness_item_equality() {
+        let item1 = ReadinessItem {
+            id: "test".to_string(),
+            category: "Cat".to_string(),
+            description: "Desc".to_string(),
+            pass: true,
+            detail: "ok".to_string(),
+            required: true,
+        };
+        let item2 = item1.clone();
+        assert_eq!(item1, item2);
+    }
+
+    #[test]
+    fn readiness_item_inequality() {
+        let item1 = ReadinessItem {
+            id: "a".to_string(),
+            category: "Cat".to_string(),
+            description: "Desc".to_string(),
+            pass: true,
+            detail: "ok".to_string(),
+            required: true,
+        };
+        let item2 = ReadinessItem {
+            id: "b".to_string(),
+            ..item1.clone()
+        };
+        assert_ne!(item1, item2);
+    }
+
+    #[test]
+    fn readiness_report_debug() {
+        let config = DistributedConfig::default();
+        let report = evaluate_readiness(&config);
+        let dbg = format!("{:?}", report);
+        assert!(dbg.contains("ReadinessReport"));
+    }
 }
