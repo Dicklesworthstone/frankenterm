@@ -92,12 +92,12 @@ fn arb_config() -> impl Strategy<Value = TierConfig> {
 
 fn arb_tier_metrics() -> impl Strategy<Value = TierMetrics> {
     (
-        0_u64..1000,   // active count
-        0_u64..1000,   // thinking count
-        0_u64..1000,   // idle count
-        0_u64..1000,   // background count
-        0_u64..1000,   // dormant count
-        0_u64..100_000, // total_transitions
+        0_u64..1000,       // active count
+        0_u64..1000,       // thinking count
+        0_u64..1000,       // idle count
+        0_u64..1000,       // background count
+        0_u64..1000,       // dormant count
+        0_u64..100_000,    // total_transitions
         0.001_f64..1000.0, // estimated_rps
     )
         .prop_map(|(ac, tc, ic, bc, dc, transitions, rps)| {

@@ -92,7 +92,7 @@ fn arb_pane_state() -> impl Strategy<Value = PaneState> {
 
 fn arb_backpressure_multipliers() -> impl Strategy<Value = BackpressureMultipliers> {
     (
-        0.5_f64..5.0, // green
+        0.5_f64..5.0,  // green
         1.0_f64..10.0, // yellow
         2.0_f64..20.0, // red
     )
@@ -105,33 +105,35 @@ fn arb_backpressure_multipliers() -> impl Strategy<Value = BackpressureMultiplie
 
 fn arb_scheduling_decision() -> impl Strategy<Value = SchedulingDecision> {
     (
-        1_u64..10_000,      // pane_id
-        0.0_f64..100.0,     // voi
-        0.0_f64..10.0,      // entropy
-        0.1_f64..10.0,      // importance
-        0.1_f64..100.0,     // effective_cost
-        arb_pane_state(),    // map_state
-        0_u64..1_000_000,   // staleness_ms
+        1_u64..10_000,    // pane_id
+        0.0_f64..100.0,   // voi
+        0.0_f64..10.0,    // entropy
+        0.1_f64..10.0,    // importance
+        0.1_f64..100.0,   // effective_cost
+        arb_pane_state(), // map_state
+        0_u64..1_000_000, // staleness_ms
     )
-        .prop_map(|(pid, voi, entropy, importance, cost, state, stale)| SchedulingDecision {
-            pane_id: pid,
-            voi,
-            entropy,
-            importance,
-            effective_cost: cost,
-            map_state: state,
-            staleness_ms: stale,
-        })
+        .prop_map(
+            |(pid, voi, entropy, importance, cost, state, stale)| SchedulingDecision {
+                pane_id: pid,
+                voi,
+                entropy,
+                importance,
+                effective_cost: cost,
+                map_state: state,
+                staleness_ms: stale,
+            },
+        )
 }
 
 fn arb_pane_snapshot_entry() -> impl Strategy<Value = PaneSnapshotEntry> {
     (
-        1_u64..10_000,      // pane_id
-        0.0_f64..10.0,      // entropy
-        arb_pane_state(),    // map_state
-        0_u64..1_000_000,   // staleness_ms
-        0_u64..100_000,     // observations
-        0.1_f64..10.0,      // importance
+        1_u64..10_000,    // pane_id
+        0.0_f64..10.0,    // entropy
+        arb_pane_state(), // map_state
+        0_u64..1_000_000, // staleness_ms
+        0_u64..100_000,   // observations
+        0.1_f64..10.0,    // importance
     )
         .prop_map(|(pid, entropy, state, stale, obs, imp)| PaneSnapshotEntry {
             pane_id: pid,
@@ -149,11 +151,13 @@ fn arb_schedule_result() -> impl Strategy<Value = ScheduleResult> {
         0.0_f64..100.0,
         0_usize..50,
     )
-        .prop_map(|(schedule, total_entropy, above_threshold)| ScheduleResult {
-            schedule,
-            total_entropy,
-            above_threshold,
-        })
+        .prop_map(
+            |(schedule, total_entropy, above_threshold)| ScheduleResult {
+                schedule,
+                total_entropy,
+                above_threshold,
+            },
+        )
 }
 
 fn arb_voi_snapshot() -> impl Strategy<Value = VoiSnapshot> {
