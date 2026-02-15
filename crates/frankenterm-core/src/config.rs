@@ -5126,4 +5126,414 @@ retention_tiers = []
             45
         );
     }
+
+    // =========================================================================
+    // expand_tilde Tests
+    // =========================================================================
+
+    #[test]
+    fn expand_tilde_bare_tilde() {
+        let result = expand_tilde("~");
+        let home = dirs::home_dir();
+        if let Some(home) = home {
+            assert_eq!(result, home);
+        }
+    }
+
+    #[test]
+    fn expand_tilde_tilde_slash_path() {
+        let result = expand_tilde("~/Documents/file.txt");
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(result, home.join("Documents/file.txt"));
+        }
+    }
+
+    #[test]
+    fn expand_tilde_absolute_path_unchanged() {
+        let result = expand_tilde("/usr/bin/test");
+        assert_eq!(result, PathBuf::from("/usr/bin/test"));
+    }
+
+    #[test]
+    fn expand_tilde_relative_path_unchanged() {
+        let result = expand_tilde("relative/path");
+        assert_eq!(result, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn expand_tilde_tilde_no_slash_unchanged() {
+        let result = expand_tilde("~user/path");
+        assert_eq!(result, PathBuf::from("~user/path"));
+    }
+
+    #[test]
+    fn expand_tilde_empty_string() {
+        let result = expand_tilde("");
+        assert_eq!(result, PathBuf::from(""));
+    }
+
+    // =========================================================================
+    // bind_addr_is_loopback Tests
+    // =========================================================================
+
+    #[test]
+    fn bind_addr_is_loopback_ipv4_loopback() {
+        assert!(bind_addr_is_loopback("127.0.0.1:8080").unwrap());
+    }
+
+    #[test]
+    fn bind_addr_is_loopback_ipv6_loopback() {
+        assert!(bind_addr_is_loopback("[::1]:8080").unwrap());
+    }
+
+    #[test]
+    fn bind_addr_is_loopback_non_loopback() {
+        assert!(!bind_addr_is_loopback("0.0.0.0:8080").unwrap());
+    }
+
+    #[test]
+    fn bind_addr_is_loopback_localhost() {
+        assert!(bind_addr_is_loopback("localhost:8080").unwrap());
+    }
+
+    #[test]
+    fn bind_addr_is_loopback_invalid() {
+        assert!(bind_addr_is_loopback("not-a-valid-addr").is_err());
+    }
+
+    #[test]
+    fn bind_addr_is_loopback_localhost_invalid_port() {
+        assert!(bind_addr_is_loopback("localhost:notaport").is_err());
+    }
+
+    // =========================================================================
+    // parse_env_bool Tests
+    // =========================================================================
+
+    #[test]
+    fn parse_env_bool_truthy_values() {
+        assert!(parse_env_bool("1").unwrap());
+        assert!(parse_env_bool("true").unwrap());
+        assert!(parse_env_bool("yes").unwrap());
+        assert!(parse_env_bool("on").unwrap());
+        assert!(parse_env_bool("TRUE").unwrap());
+        assert!(parse_env_bool("Yes").unwrap());
+        assert!(parse_env_bool("ON").unwrap());
+    }
+
+    #[test]
+    fn parse_env_bool_falsy_values() {
+        assert!(!parse_env_bool("0").unwrap());
+        assert!(!parse_env_bool("false").unwrap());
+        assert!(!parse_env_bool("no").unwrap());
+        assert!(!parse_env_bool("off").unwrap());
+        assert!(!parse_env_bool("FALSE").unwrap());
+        assert!(!parse_env_bool("No").unwrap());
+    }
+
+    #[test]
+    fn parse_env_bool_whitespace_trimmed() {
+        assert!(parse_env_bool("  true  ").unwrap());
+        assert!(!parse_env_bool(" false ").unwrap());
+    }
+
+    #[test]
+    fn parse_env_bool_invalid() {
+        assert!(parse_env_bool("maybe").is_err());
+        assert!(parse_env_bool("").is_err());
+        assert!(parse_env_bool("2").is_err());
+    }
+
+    // =========================================================================
+    // LogFormat Tests
+    // =========================================================================
+
+    #[test]
+    fn log_format_display() {
+        assert_eq!(LogFormat::Pretty.to_string(), "pretty");
+        assert_eq!(LogFormat::Json.to_string(), "json");
+    }
+
+    #[test]
+    fn log_format_from_str_valid() {
+        assert_eq!("pretty".parse::<LogFormat>().unwrap(), LogFormat::Pretty);
+        assert_eq!("json".parse::<LogFormat>().unwrap(), LogFormat::Json);
+        assert_eq!("PRETTY".parse::<LogFormat>().unwrap(), LogFormat::Pretty);
+        assert_eq!("JSON".parse::<LogFormat>().unwrap(), LogFormat::Json);
+    }
+
+    #[test]
+    fn log_format_from_str_invalid() {
+        assert!("xml".parse::<LogFormat>().is_err());
+        assert!("".parse::<LogFormat>().is_err());
+    }
+
+    #[test]
+    fn log_format_default_is_pretty() {
+        assert_eq!(LogFormat::default(), LogFormat::Pretty);
+    }
+
+    #[test]
+    fn log_format_serde_roundtrip() {
+        let json = serde_json::to_string(&LogFormat::Json).unwrap();
+        let parsed: LogFormat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, LogFormat::Json);
+    }
+
+    #[test]
+    fn log_format_traits() {
+        let a = LogFormat::Pretty;
+        let b = a;
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_ne!(LogFormat::Pretty, LogFormat::Json);
+        let dbg = format!("{:?}", LogFormat::Pretty);
+        assert!(dbg.contains("Pretty"));
+    }
+
+    // =========================================================================
+    // validate_compaction_prompt_template Tests
+    // =========================================================================
+
+    #[test]
+    fn validate_compaction_prompt_valid() {
+        let template = "Hello {{agent_type}}, pane {{pane_id}} at {{pane_cwd}}";
+        assert!(validate_compaction_prompt_template(template).is_ok());
+    }
+
+    #[test]
+    fn validate_compaction_prompt_all_tokens() {
+        let template =
+            "{{agent_type}} {{pane_id}} {{pane_domain}} {{pane_title}} {{pane_cwd}}";
+        assert!(validate_compaction_prompt_template(template).is_ok());
+    }
+
+    #[test]
+    fn validate_compaction_prompt_no_tokens() {
+        assert!(validate_compaction_prompt_template("plain string").is_ok());
+    }
+
+    #[test]
+    fn validate_compaction_prompt_unknown_token() {
+        let err = validate_compaction_prompt_template("{{unknown_token}}").unwrap_err();
+        assert!(err.contains("unknown_token"));
+    }
+
+    #[test]
+    fn validate_compaction_prompt_unterminated() {
+        let err = validate_compaction_prompt_template("{{agent_type").unwrap_err();
+        assert!(err.contains("Unterminated"));
+    }
+
+    #[test]
+    fn validate_compaction_prompt_empty_placeholder() {
+        let err = validate_compaction_prompt_template("{{}}").unwrap_err();
+        assert!(err.contains("Empty"));
+    }
+
+    // =========================================================================
+    // extract_prompt_placeholders Tests
+    // =========================================================================
+
+    #[test]
+    fn extract_prompt_placeholders_multiple() {
+        let result =
+            extract_prompt_placeholders("{{agent_type}} and {{pane_id}}").unwrap();
+        assert_eq!(result, vec!["agent_type", "pane_id"]);
+    }
+
+    #[test]
+    fn extract_prompt_placeholders_none() {
+        let result = extract_prompt_placeholders("no placeholders").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extract_prompt_placeholders_whitespace_trimmed() {
+        let result = extract_prompt_placeholders("{{ agent_type }}").unwrap();
+        assert_eq!(result, vec!["agent_type"]);
+    }
+
+    // =========================================================================
+    // is_valid_agent_key Tests
+    // =========================================================================
+
+    #[test]
+    fn is_valid_agent_key_valid() {
+        assert!(is_valid_agent_key("codex"));
+        assert!(is_valid_agent_key("claude_code"));
+        assert!(is_valid_agent_key("gemini"));
+        assert!(is_valid_agent_key("unknown"));
+    }
+
+    #[test]
+    fn is_valid_agent_key_invalid() {
+        assert!(!is_valid_agent_key("wezterm"));
+        assert!(!is_valid_agent_key("gpt4"));
+        assert!(!is_valid_agent_key(""));
+        assert!(!is_valid_agent_key("CODEX"));
+    }
+
+    // =========================================================================
+    // Sub-config Default Tests
+    // =========================================================================
+
+    #[test]
+    fn ingest_config_defaults() {
+        let config = IngestConfig::default();
+        assert_eq!(config.poll_interval_ms, 200);
+        assert_eq!(config.min_poll_interval_ms, 50);
+        assert_eq!(config.max_concurrent_captures, 10);
+        assert_eq!(config.backpressure_threshold, 1000);
+        assert!(config.gap_detection);
+        assert_eq!(config.gap_detection_threshold_percent, 50);
+        assert_eq!(config.max_segment_bytes, 65536);
+    }
+
+    #[test]
+    fn storage_config_defaults() {
+        let config = StorageConfig::default();
+        assert!(config.retention_days > 0);
+        assert!(config.checkpoint_interval_secs > 0);
+    }
+
+    #[test]
+    fn backup_config_defaults() {
+        let config = BackupConfig::default();
+        assert!(!config.scheduled.enabled);
+        assert!(!config.scheduled.schedule.is_empty());
+    }
+
+    #[test]
+    fn search_config_defaults() {
+        let config = SearchConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.mode, "fts5");
+        assert_eq!(config.rrf_k, 60);
+        assert!((config.quality_weight - 0.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn search_daemon_config_defaults() {
+        let config = SearchDaemonConfig::default();
+        assert!(!config.enabled);
+        assert!(config.auto_spawn);
+        assert_eq!(config.worker_scan_interval_secs, 30);
+        assert_eq!(config.worker_batch_size, 64);
+    }
+
+    #[test]
+    fn general_config_defaults() {
+        let config = GeneralConfig::default();
+        assert_eq!(config.log_level, "info");
+        assert_eq!(config.log_format, LogFormat::Pretty);
+        assert!(config.log_file.is_none());
+        assert!(config.workspace.is_none());
+    }
+
+    // =========================================================================
+    // resolve_path Tests
+    // =========================================================================
+
+    #[test]
+    fn resolve_path_absolute() {
+        let result = resolve_path(Path::new("/usr/bin/test")).unwrap();
+        assert_eq!(result, PathBuf::from("/usr/bin/test"));
+    }
+
+    #[test]
+    fn resolve_path_tilde_expansion() {
+        if dirs::home_dir().is_some() {
+            let result = resolve_path(Path::new("~/test")).unwrap();
+            assert!(result.is_absolute());
+            assert!(result.to_string_lossy().contains("test"));
+        }
+    }
+
+    #[test]
+    fn resolve_path_relative_becomes_absolute() {
+        let result = resolve_path(Path::new("relative/path")).unwrap();
+        assert!(result.is_absolute());
+    }
+
+    // =========================================================================
+    // resolve_workspace_root_with_env Tests
+    // =========================================================================
+
+    #[test]
+    fn resolve_workspace_root_with_explicit_path() {
+        let result = resolve_workspace_root_with_env(
+            Some(Path::new("/tmp/test-workspace")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result, PathBuf::from("/tmp/test-workspace"));
+    }
+
+    #[test]
+    fn resolve_workspace_root_with_env_path() {
+        let result =
+            resolve_workspace_root_with_env(None, Some("/tmp/env-workspace")).unwrap();
+        assert_eq!(result, PathBuf::from("/tmp/env-workspace"));
+    }
+
+    #[test]
+    fn resolve_workspace_root_explicit_overrides_env() {
+        let result = resolve_workspace_root_with_env(
+            Some(Path::new("/tmp/explicit")),
+            Some("/tmp/env"),
+        )
+        .unwrap();
+        assert_eq!(result, PathBuf::from("/tmp/explicit"));
+    }
+
+    #[test]
+    fn resolve_workspace_root_fallback_to_cwd() {
+        let result = resolve_workspace_root_with_env(None, None).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(result, cwd);
+    }
+
+    // =========================================================================
+    // Misc Helper Tests
+    // =========================================================================
+
+    #[test]
+    fn path_to_string_works() {
+        assert_eq!(path_to_string(Path::new("/foo/bar")), "/foo/bar");
+        assert_eq!(path_to_string(Path::new("")), "");
+    }
+
+    #[test]
+    fn default_data_dir_is_non_empty() {
+        let dir = default_data_dir();
+        assert!(!dir.is_empty());
+        #[cfg(target_os = "macos")]
+        assert!(dir.contains("Library"));
+        #[cfg(not(target_os = "macos"))]
+        assert!(dir.contains(".local/share"));
+    }
+
+    #[test]
+    fn ensure_dir_creates_missing_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("new_dir");
+        assert!(!target.exists());
+        ensure_dir(&target).unwrap();
+        assert!(target.exists());
+        assert!(target.is_dir());
+        #[cfg(unix)]
+        {
+            let perms = std::fs::metadata(&target).unwrap().permissions();
+            assert_eq!(perms.mode() & 0o777, 0o700);
+        }
+    }
+
+    #[test]
+    fn ensure_dir_existing_directory_is_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_dir(temp.path()).unwrap();
+        assert!(temp.path().exists());
+    }
 }
