@@ -380,8 +380,8 @@ wasmtime-wasi = { version = "41", default-features = false, features = ["p1"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 # FastMCP (optional MCP server dependencies)
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
-asupersync-macros = { git = "https://github.com/Dicklesworthstone/asupersync" }
+asupersync = { version = "0.2.0" }
+asupersync-macros = { version = "0.2.0" }
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", branch = "master" }
 log = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
@@ -422,12 +422,11 @@ strip = true        # Remove debug symbols
 # Without these patches, cargo cannot resolve those transitive path deps when fetching
 # the upstream repos as git dependencies.
 [patch.crates-io]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", branch = "master" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
+asupersync = { path = "/dp/asupersync" }
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", branch = "master" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
+asupersync = { path = "/dp/asupersync" }
