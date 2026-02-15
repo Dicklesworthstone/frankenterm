@@ -4732,4 +4732,343 @@ mod tests {
         assert!(ok);
         assert!(ch.is_full());
     }
+
+    // =========================================================================
+    // Batch: DarkBadger wa-1u90p.7.1 — trait & edge coverage
+    // =========================================================================
+
+    // --- PaneFingerprint ---
+
+    #[test]
+    fn pane_fingerprint_debug_clone() {
+        let fp = PaneFingerprint {
+            domain: "local".to_string(),
+            initial_title: "zsh".to_string(),
+            initial_cwd: "/home/user".to_string(),
+            content_hash: 12345,
+        };
+        let cloned = fp.clone();
+        assert_eq!(cloned.domain, "local");
+        let dbg = format!("{:?}", fp);
+        assert!(dbg.contains("PaneFingerprint"));
+    }
+
+    #[test]
+    fn pane_fingerprint_hash_in_hashset() {
+        use std::collections::HashSet;
+        let fp1 = PaneFingerprint {
+            domain: "a".into(),
+            initial_title: "b".into(),
+            initial_cwd: "c".into(),
+            content_hash: 0,
+        };
+        let fp2 = fp1.clone();
+        let fp3 = PaneFingerprint {
+            domain: "x".into(),
+            ..fp1.clone()
+        };
+        let mut set = HashSet::new();
+        set.insert(fp1);
+        set.insert(fp2); // duplicate
+        set.insert(fp3);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn pane_fingerprint_is_same_generation_domain_mismatch() {
+        let a = PaneFingerprint {
+            domain: "local".into(),
+            initial_title: "zsh".into(),
+            initial_cwd: "/home".into(),
+            content_hash: 0,
+        };
+        let b = PaneFingerprint {
+            domain: "SSH:remote".into(),
+            ..a.clone()
+        };
+        assert!(!a.is_same_generation(&b));
+    }
+
+    // --- ObservationDecision ---
+
+    #[test]
+    fn observation_decision_debug_clone_eq() {
+        let obs = ObservationDecision::Observed;
+        let ign = ObservationDecision::Ignored {
+            reason: "test".into(),
+        };
+        assert_eq!(obs.clone(), ObservationDecision::Observed);
+        assert_ne!(obs, ign);
+        assert!(obs.is_observed());
+        assert!(!ign.is_observed());
+        assert_eq!(ign.ignore_reason(), Some("test"));
+        assert_eq!(obs.ignore_reason(), None);
+        let dbg = format!("{:?}", ign);
+        assert!(dbg.contains("Ignored"));
+    }
+
+    // --- PanePriorityOverride ---
+
+    #[test]
+    fn pane_priority_override_debug_clone_serde() {
+        let ov = PanePriorityOverride {
+            priority: 10,
+            set_at: 1000,
+            expires_at: Some(2000),
+        };
+        let cloned = ov.clone();
+        assert_eq!(cloned.priority, 10);
+        let dbg = format!("{:?}", ov);
+        assert!(dbg.contains("PanePriorityOverride"));
+
+        let json = serde_json::to_string(&ov).unwrap();
+        let parsed: PanePriorityOverride = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.priority, 10);
+        assert_eq!(parsed.expires_at, Some(2000));
+    }
+
+    #[test]
+    fn pane_priority_override_no_expiry_serde() {
+        let ov = PanePriorityOverride {
+            priority: 0,
+            set_at: 500,
+            expires_at: None,
+        };
+        let json = serde_json::to_string(&ov).unwrap();
+        let parsed: PanePriorityOverride = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.expires_at, None);
+    }
+
+    // --- DiscoveryDiff ---
+
+    #[test]
+    fn discovery_diff_default_is_empty() {
+        let d = DiscoveryDiff::default();
+        assert!(d.is_empty());
+        assert_eq!(d.change_count(), 0);
+    }
+
+    #[test]
+    fn discovery_diff_debug_clone() {
+        let mut d = DiscoveryDiff::default();
+        d.new_panes.push(1);
+        d.closed_panes.push(2);
+        let cloned = d.clone();
+        assert_eq!(cloned.change_count(), 2);
+        assert!(!cloned.is_empty());
+        let dbg = format!("{:?}", d);
+        assert!(dbg.contains("DiscoveryDiff"));
+    }
+
+    // --- PaneCursor ---
+
+    #[test]
+    fn pane_cursor_from_seq() {
+        let c = PaneCursor::from_seq(42, 10);
+        assert_eq!(c.pane_id, 42);
+        assert_eq!(c.next_seq, 10);
+        assert_eq!(c.last_seq(), 9);
+    }
+
+    #[test]
+    fn pane_cursor_last_seq_at_zero() {
+        let c = PaneCursor::new(1);
+        assert_eq!(c.last_seq(), -1);
+    }
+
+    #[test]
+    fn pane_cursor_debug_clone() {
+        let c = PaneCursor::new(5);
+        let cloned = c.clone();
+        assert_eq!(cloned.pane_id, 5);
+        assert_eq!(cloned.next_seq, 0);
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("PaneCursor"));
+    }
+
+    // --- CapturedSegment ---
+
+    #[test]
+    fn captured_segment_debug_clone_eq() {
+        let seg = CapturedSegment {
+            pane_id: 1,
+            seq: 0,
+            content: "hello".to_string(),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 1000,
+        };
+        let cloned = seg.clone();
+        assert_eq!(seg, cloned);
+        let dbg = format!("{:?}", seg);
+        assert!(dbg.contains("CapturedSegment"));
+    }
+
+    // --- CapturedSegmentKind ---
+
+    #[test]
+    fn captured_segment_kind_eq_variants() {
+        assert_eq!(CapturedSegmentKind::Delta, CapturedSegmentKind::Delta);
+        let g1 = CapturedSegmentKind::Gap { reason: "a".into() };
+        let g2 = CapturedSegmentKind::Gap { reason: "a".into() };
+        let g3 = CapturedSegmentKind::Gap { reason: "b".into() };
+        assert_eq!(g1, g2);
+        assert_ne!(g1, g3);
+        assert_ne!(CapturedSegmentKind::Delta, g1);
+    }
+
+    // --- PersistedCapture ---
+
+    #[test]
+    fn persisted_capture_debug_clone() {
+        let pc = PersistedCapture {
+            segment: Segment {
+                id: 0,
+                pane_id: 1,
+                pane_uuid: None,
+                seq: 0,
+                content: "data".into(),
+                captured_at: 100,
+            },
+            gap: None,
+        };
+        let cloned = pc.clone();
+        assert_eq!(cloned.segment.pane_id, 1);
+        assert!(cloned.gap.is_none());
+        let dbg = format!("{:?}", pc);
+        assert!(dbg.contains("PersistedCapture"));
+    }
+
+    // --- ShellState ---
+
+    #[test]
+    fn shell_state_default_is_unknown() {
+        assert_eq!(ShellState::default(), ShellState::Unknown);
+    }
+
+    #[test]
+    fn shell_state_is_at_prompt_all_variants() {
+        assert!(!ShellState::Unknown.is_at_prompt());
+        assert!(ShellState::PromptActive.is_at_prompt());
+        assert!(ShellState::InputActive.is_at_prompt());
+        assert!(!ShellState::CommandRunning.is_at_prompt());
+        assert!(ShellState::CommandFinished { exit_code: Some(0) }.is_at_prompt());
+    }
+
+    #[test]
+    fn shell_state_is_command_running_all() {
+        assert!(ShellState::CommandRunning.is_command_running());
+        assert!(!ShellState::PromptActive.is_command_running());
+        assert!(!ShellState::Unknown.is_command_running());
+    }
+
+    #[test]
+    fn shell_state_copy_eq() {
+        let s = ShellState::CommandRunning;
+        let c = s; // Copy
+        assert_eq!(s, c);
+    }
+
+    // --- AltScreenChange ---
+
+    #[test]
+    fn alt_screen_change_debug_clone_copy_eq() {
+        let e = AltScreenChange::Entered;
+        let x = AltScreenChange::Exited;
+        let c = e; // Copy
+        assert_eq!(e, c);
+        assert_ne!(e, x);
+        let dbg = format!("{:?}", e);
+        assert!(dbg.contains("Entered"));
+    }
+
+    // --- Osc133Marker ---
+
+    #[test]
+    fn osc133_marker_debug_clone_copy_eq() {
+        let m = Osc133Marker::PromptStart;
+        let c = m; // Copy
+        assert_eq!(m, c);
+        assert_ne!(Osc133Marker::PromptStart, Osc133Marker::CommandStart);
+        assert_ne!(Osc133Marker::CommandExecuted, Osc133Marker::PromptStart);
+        let dbg = format!("{:?}", m);
+        assert!(dbg.contains("PromptStart"));
+    }
+
+    // --- OverflowPolicy ---
+
+    #[test]
+    fn overflow_policy_debug_clone_copy_eq() {
+        let e = OverflowPolicy::EmitGap;
+        let d = OverflowPolicy::DropOldest;
+        let c = e; // Copy
+        assert_eq!(e, c);
+        assert_ne!(e, d);
+        assert_eq!(OverflowPolicy::default(), OverflowPolicy::EmitGap);
+    }
+
+    // --- StreamChannelConfig ---
+
+    #[test]
+    fn stream_channel_config_default_values() {
+        let cfg = StreamChannelConfig::default();
+        assert_eq!(cfg.capacity, 4096);
+        assert_eq!(cfg.overflow_policy, OverflowPolicy::EmitGap);
+    }
+
+    // --- StreamEvent ---
+
+    #[test]
+    fn stream_event_debug_clone_eq() {
+        let e1 = StreamEvent::OutputData {
+            pane_id: 1,
+            data: "hello".into(),
+            received_at: 100,
+            overflow: false,
+        };
+        let e2 = e1.clone();
+        assert_eq!(e1, e2);
+
+        let e3 = StreamEvent::PaneClosed { pane_id: 1 };
+        assert_ne!(e1, e3);
+
+        let e4 = StreamEvent::Disconnected {
+            reason: "gone".into(),
+        };
+        let dbg = format!("{:?}", e4);
+        assert!(dbg.contains("Disconnected"));
+    }
+
+    // --- hex_encode ---
+
+    #[test]
+    fn hex_encode_empty() {
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn hex_encode_known_values() {
+        assert_eq!(hex_encode(&[0xff, 0x00, 0x01]), "ff0001");
+        assert_eq!(hex_encode(&[0xab, 0xcd]), "abcd");
+    }
+
+    // --- trim_utf8_tail_to_max_bytes ---
+
+    #[test]
+    fn trim_utf8_tail_within_limit() {
+        assert_eq!(trim_utf8_tail_to_max_bytes("hello", 10), "hello");
+    }
+
+    #[test]
+    fn trim_utf8_tail_zero_max() {
+        assert_eq!(trim_utf8_tail_to_max_bytes("hello", 0), "");
+    }
+
+    #[test]
+    fn trim_utf8_tail_truncates_to_char_boundary() {
+        // "é" is 2 bytes; "café" is 5 bytes
+        let result = trim_utf8_tail_to_max_bytes("café", 4);
+        // Should be 4 bytes from the tail, staying on char boundary
+        assert!(result.is_char_boundary(0));
+        assert!(result.len() <= 4);
+    }
 }

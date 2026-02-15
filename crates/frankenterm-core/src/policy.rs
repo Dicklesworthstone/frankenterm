@@ -6106,4 +6106,369 @@ mod tests {
         assert_eq!(ctx2.determining_rule.as_deref(), Some("test.rule.1"));
         assert_eq!(ctx2.risk.as_ref().unwrap().score, 0);
     }
+
+    // =========================================================================
+    // Batch: DarkBadger wa-1u90p.7.1 — trait & edge coverage
+    // =========================================================================
+
+    // --- ActionKind ---
+
+    #[test]
+    fn action_kind_debug_clone_copy_eq_hash() {
+        use std::collections::HashSet;
+        let a = ActionKind::SendText;
+        let b = a; // Copy
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+
+        let mut set = HashSet::new();
+        set.insert(ActionKind::SendText);
+        set.insert(ActionKind::Spawn);
+        set.insert(ActionKind::SendText); // dup
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn action_kind_serde_snake_case() {
+        let variants = [
+            (ActionKind::SendText, "\"send_text\""),
+            (ActionKind::SendCtrlC, "\"send_ctrl_c\""),
+            (ActionKind::Close, "\"close\""),
+            (ActionKind::BrowserAuth, "\"browser_auth\""),
+            (ActionKind::ReadOutput, "\"read_output\""),
+        ];
+        for (v, expected) in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            assert_eq!(&json, *expected, "serde mismatch for {:?}", v);
+            let parsed: ActionKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(&parsed, v);
+        }
+    }
+
+    #[test]
+    fn action_kind_as_str_roundtrip() {
+        let all = [
+            ActionKind::SendText,
+            ActionKind::SendCtrlC,
+            ActionKind::SendCtrlD,
+            ActionKind::SendCtrlZ,
+            ActionKind::SendControl,
+            ActionKind::Spawn,
+            ActionKind::Split,
+            ActionKind::Activate,
+            ActionKind::Close,
+            ActionKind::BrowserAuth,
+            ActionKind::WorkflowRun,
+            ActionKind::ReservePane,
+            ActionKind::ReleasePane,
+            ActionKind::ReadOutput,
+            ActionKind::SearchOutput,
+            ActionKind::WriteFile,
+            ActionKind::DeleteFile,
+            ActionKind::ExecCommand,
+        ];
+        for a in &all {
+            let s = a.as_str();
+            assert!(!s.is_empty(), "as_str empty for {:?}", a);
+        }
+        assert_eq!(all.len(), 18);
+    }
+
+    #[test]
+    fn action_kind_is_mutating() {
+        assert!(ActionKind::SendText.is_mutating());
+        assert!(ActionKind::Close.is_mutating());
+        assert!(!ActionKind::ReadOutput.is_mutating());
+        assert!(!ActionKind::Activate.is_mutating());
+    }
+
+    #[test]
+    fn action_kind_is_destructive() {
+        assert!(ActionKind::Close.is_destructive());
+        assert!(ActionKind::SendCtrlC.is_destructive());
+        assert!(!ActionKind::SendText.is_destructive());
+        assert!(!ActionKind::ReadOutput.is_destructive());
+    }
+
+    // --- ActorKind ---
+
+    #[test]
+    fn actor_kind_debug_clone_copy_eq_hash() {
+        use std::collections::HashSet;
+        let a = ActorKind::Human;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let mut set = HashSet::new();
+        set.insert(ActorKind::Human);
+        set.insert(ActorKind::Robot);
+        set.insert(ActorKind::Mcp);
+        set.insert(ActorKind::Workflow);
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn actor_kind_serde_snake_case() {
+        let variants = [
+            (ActorKind::Human, "\"human\""),
+            (ActorKind::Robot, "\"robot\""),
+            (ActorKind::Mcp, "\"mcp\""),
+            (ActorKind::Workflow, "\"workflow\""),
+        ];
+        for (v, expected) in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            assert_eq!(&json, *expected);
+            let parsed: ActorKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(&parsed, v);
+        }
+    }
+
+    #[test]
+    fn actor_kind_is_trusted() {
+        assert!(ActorKind::Human.is_trusted());
+        assert!(!ActorKind::Robot.is_trusted());
+        assert!(!ActorKind::Mcp.is_trusted());
+        assert!(!ActorKind::Workflow.is_trusted());
+    }
+
+    // --- RiskCategory ---
+
+    #[test]
+    fn risk_category_debug_clone_copy_eq_hash() {
+        use std::collections::HashSet;
+        let c = RiskCategory::State;
+        let b = c; // Copy
+        assert_eq!(c, b);
+        let mut set = HashSet::new();
+        set.insert(RiskCategory::State);
+        set.insert(RiskCategory::Action);
+        set.insert(RiskCategory::Context);
+        set.insert(RiskCategory::Content);
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn risk_category_serde_snake_case() {
+        let variants = [
+            (RiskCategory::State, "\"state\""),
+            (RiskCategory::Action, "\"action\""),
+            (RiskCategory::Context, "\"context\""),
+            (RiskCategory::Content, "\"content\""),
+        ];
+        for (v, expected) in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            assert_eq!(&json, *expected);
+        }
+    }
+
+    // --- RiskScore ---
+
+    #[test]
+    fn risk_score_zero() {
+        let r = RiskScore::zero();
+        assert_eq!(r.score, 0);
+        assert!(r.factors.is_empty());
+    }
+
+    #[test]
+    fn risk_score_serde_roundtrip() {
+        let r = RiskScore {
+            score: 42,
+            factors: vec![AppliedRiskFactor {
+                id: "test.factor".into(),
+                weight: 20,
+                explanation: "test reason".into(),
+            }],
+            summary: "Medium risk".into(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let parsed: RiskScore = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.score, 42);
+        assert_eq!(parsed.factors.len(), 1);
+        assert_eq!(parsed.factors[0].weight, 20);
+    }
+
+    // --- PolicyDecision ---
+
+    #[test]
+    fn policy_decision_allow_eq() {
+        let a = PolicyDecision::allow();
+        let b = PolicyDecision::allow();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn policy_decision_serde_roundtrip_all_variants() {
+        let allow = PolicyDecision::allow();
+        let json = serde_json::to_string(&allow).unwrap();
+        assert!(json.contains("\"decision\":\"allow\""));
+        let parsed: PolicyDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, allow);
+
+        let deny = PolicyDecision::deny("forbidden");
+        let json = serde_json::to_string(&deny).unwrap();
+        assert!(json.contains("\"decision\":\"deny\""));
+        let parsed: PolicyDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, deny);
+    }
+
+    // --- RateLimitHit ---
+
+    #[test]
+    fn rate_limit_hit_debug_clone() {
+        let h = RateLimitHit {
+            scope: RateLimitScope::Global,
+            action: ActionKind::SendText,
+            limit: 60,
+            current: 61,
+            retry_after: Duration::from_secs(5),
+        };
+        let cloned = h.clone();
+        assert_eq!(cloned.limit, 60);
+        let dbg = format!("{:?}", h);
+        assert!(dbg.contains("RateLimitHit"));
+    }
+
+    #[test]
+    fn rate_limit_hit_reason_global() {
+        let h = RateLimitHit {
+            scope: RateLimitScope::Global,
+            action: ActionKind::SendText,
+            limit: 10,
+            current: 11,
+            retry_after: Duration::from_secs(3),
+        };
+        let reason = h.reason();
+        assert!(reason.contains("Global rate limit"));
+        assert!(reason.contains("send_text"));
+        assert!(reason.contains("retry after"));
+    }
+
+    #[test]
+    fn rate_limit_hit_reason_per_pane() {
+        let h = RateLimitHit {
+            scope: RateLimitScope::PerPane { pane_id: 42 },
+            action: ActionKind::Close,
+            limit: 5,
+            current: 6,
+            retry_after: Duration::ZERO,
+        };
+        let reason = h.reason();
+        assert!(reason.contains("pane 42"));
+        assert!(reason.contains("close"));
+    }
+
+    // --- RateLimitOutcome ---
+
+    #[test]
+    fn rate_limit_outcome_debug_clone() {
+        let allowed = RateLimitOutcome::Allowed;
+        let cloned = allowed.clone();
+        assert!(cloned.is_allowed());
+        let dbg = format!("{:?}", allowed);
+        assert!(dbg.contains("Allowed"));
+
+        let limited = RateLimitOutcome::Limited(RateLimitHit {
+            scope: RateLimitScope::Global,
+            action: ActionKind::Spawn,
+            limit: 1,
+            current: 2,
+            retry_after: Duration::from_secs(1),
+        });
+        assert!(!limited.is_allowed());
+    }
+
+    // --- Redactor ---
+
+    #[test]
+    fn redactor_debug_default() {
+        let r = Redactor::new();
+        let d = Redactor::default();
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("Redactor"));
+        let dbg2 = format!("{:?}", d);
+        assert!(dbg2.contains("Redactor"));
+    }
+
+    #[test]
+    fn redactor_no_secrets_passthrough() {
+        let r = Redactor::new();
+        let text = "just some normal text with no secrets";
+        assert_eq!(r.redact(text), text);
+        assert!(!r.contains_secrets(text));
+    }
+
+    // --- SendTextAuditSummary ---
+
+    #[test]
+    fn send_text_audit_summary_debug_clone_serde() {
+        let s = SendTextAuditSummary {
+            text_length: 42,
+            text_preview_redacted: "echo hello".into(),
+            text_hash: "abc123".into(),
+            command_candidate: true,
+            workflow_execution_id: Some("wf-1".into()),
+            parent_action_id: Some(99),
+        };
+        let cloned = s.clone();
+        assert_eq!(cloned.text_length, 42);
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("SendTextAuditSummary"));
+
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: SendTextAuditSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.text_length, 42);
+        assert!(parsed.command_candidate);
+    }
+
+    #[test]
+    fn send_text_audit_summary_serde_skip_none() {
+        let s = SendTextAuditSummary {
+            text_length: 5,
+            text_preview_redacted: "ls".into(),
+            text_hash: "x".into(),
+            command_candidate: false,
+            workflow_execution_id: None,
+            parent_action_id: None,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("workflow_execution_id"));
+        assert!(!json.contains("parent_action_id"));
+    }
+
+    // --- RuleEvaluationResult ---
+
+    #[test]
+    fn rule_evaluation_result_debug_clone() {
+        let r = RuleEvaluationResult {
+            matching_rule: None,
+            decision: None,
+            rules_checked: vec!["rule.1".into(), "rule.2".into()],
+        };
+        let cloned = r.clone();
+        assert_eq!(cloned.rules_checked.len(), 2);
+        assert!(cloned.matching_rule.is_none());
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("RuleEvaluationResult"));
+    }
+
+    // --- glob_match ---
+
+    #[test]
+    fn glob_match_empty_pattern_matches_empty() {
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "anything"));
+    }
+
+    #[test]
+    fn glob_match_star_matches_anything() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn glob_match_question_mark_single_char() {
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "abbc"));
+    }
 }
