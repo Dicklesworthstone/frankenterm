@@ -3054,4 +3054,106 @@ mod tests {
                 .any(|a| a.id == "track_advanced_complete")
         );
     }
+
+    // ========================================================================
+    // Batch — RubyBeaver wa-1u90p.7.1 type-level and edge-case tests
+    // ========================================================================
+
+    #[test]
+    fn rarity_label_returns_correct_strings() {
+        assert_eq!(Rarity::Common.label(), "Common");
+        assert_eq!(Rarity::Uncommon.label(), "Uncommon");
+        assert_eq!(Rarity::Rare.label(), "Rare");
+        assert_eq!(Rarity::Epic.label(), "Epic");
+    }
+
+    #[test]
+    fn rarity_display_matches_label() {
+        for r in [Rarity::Common, Rarity::Uncommon, Rarity::Rare, Rarity::Epic] {
+            assert_eq!(format!("{r}"), r.label());
+        }
+    }
+
+    #[test]
+    fn rarity_serde_roundtrip() {
+        for r in [Rarity::Common, Rarity::Uncommon, Rarity::Rare, Rarity::Epic] {
+            let json = serde_json::to_string(&r).unwrap();
+            let back: Rarity = serde_json::from_str(&json).unwrap();
+            assert_eq!(r, back);
+        }
+    }
+
+    #[test]
+    fn rarity_serde_uses_snake_case() {
+        assert_eq!(serde_json::to_string(&Rarity::Common).unwrap(), "\"common\"");
+        assert_eq!(
+            serde_json::to_string(&Rarity::Uncommon).unwrap(),
+            "\"uncommon\""
+        );
+        assert_eq!(serde_json::to_string(&Rarity::Rare).unwrap(), "\"rare\"");
+        assert_eq!(serde_json::to_string(&Rarity::Epic).unwrap(), "\"epic\"");
+    }
+
+    #[test]
+    fn rarity_copy_semantics() {
+        let a = Rarity::Rare;
+        let b = a;
+        assert_eq!(a, b); // a still usable after copy
+    }
+
+    #[test]
+    fn builtin_achievements_have_unique_ids() {
+        let mut ids = HashSet::new();
+        for ach in BUILTIN_ACHIEVEMENTS {
+            assert!(ids.insert(ach.id), "duplicate achievement id: {}", ach.id);
+        }
+    }
+
+    #[test]
+    fn builtin_achievements_non_empty_names() {
+        for ach in BUILTIN_ACHIEVEMENTS {
+            assert!(!ach.name.is_empty(), "achievement {} has empty name", ach.id);
+            assert!(
+                !ach.description.is_empty(),
+                "achievement {} has empty description",
+                ach.id
+            );
+        }
+    }
+
+    #[test]
+    fn learn_error_display_variants() {
+        let io_err = LearnError::ReadProgress(io::Error::new(io::ErrorKind::NotFound, "gone"));
+        assert!(io_err.to_string().contains("read progress"));
+
+        let json_err = serde_json::from_str::<serde_json::Value>("bad").unwrap_err();
+        let parse_err = LearnError::ParseProgress(json_err);
+        assert!(parse_err.to_string().contains("parse progress"));
+
+        let track_err = LearnError::UnknownTrack("mystery".into());
+        assert!(track_err.to_string().contains("mystery"));
+    }
+
+    #[test]
+    fn unknown_track_start_does_not_change_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+        // StartTrack for unknown track is a no-op (warns but doesn't error)
+        engine
+            .handle_event(TutorialEvent::StartTrack("nonexistent".into()))
+            .unwrap();
+        assert!(engine.state().current_track.is_none());
+        assert!(engine.state().current_exercise.is_none());
+    }
+
+    #[test]
+    fn track_progress_unknown_track_returns_zero() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+        let (done, total) = engine.track_progress("nonexistent");
+        assert_eq!(done, 0);
+        assert_eq!(total, 0);
+    }
 }
