@@ -8,7 +8,7 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use frankenterm_core::concurrent_map::{PaneMap, ShardedMap};
+use frankenterm_core::concurrent_map::{DistributionStats, PaneMap, ShardedMap};
 use frankenterm_core::sharded_counter::{
     ShardedCounter, ShardedGauge, ShardedMax, ShardedSnapshot,
 };
@@ -218,7 +218,7 @@ fn sequential_generic_map(ops: &[GenericMapOp]) -> Vec<Option<u64>> {
 }
 
 // ===========================================================================
-// Property tests — sequential linearizability
+// Property tests -- sequential linearizability
 // ===========================================================================
 
 proptest! {
@@ -400,7 +400,7 @@ proptest! {
 }
 
 // ===========================================================================
-// Property tests — concurrent correctness
+// Property tests -- concurrent correctness
 // ===========================================================================
 
 proptest! {
@@ -577,7 +577,7 @@ proptest! {
 }
 
 // ===========================================================================
-// Property tests — structural invariants
+// Property tests -- structural invariants
 // ===========================================================================
 
 proptest! {
@@ -860,5 +860,458 @@ proptest! {
         map.remove(key);
         prop_assert!(!map.contains(key), "key should be absent after remove");
         prop_assert_eq!(map.get(key), None, "get should return None after remove");
+    }
+}
+
+// ===========================================================================
+// Property tests -- read_with / write_with accessor methods
+// ===========================================================================
+
+proptest! {
+    /// PaneMap read_with returns value via closure without cloning.
+    #[test]
+    fn pane_map_read_with(key in 0..1000u64, val in 0..10000u64) {
+        let map = PaneMap::<u64>::with_shards(8);
+        map.insert(key, val);
+
+        let result = map.read_with(key, |v| *v * 2);
+        prop_assert_eq!(result, Some(val * 2),
+            "read_with should apply closure to value");
+
+        // Non-existent key returns None
+        let missing = map.read_with(key + 1, |v| *v);
+        prop_assert_eq!(missing, None,
+            "read_with on missing key should return None");
+    }
+
+    /// PaneMap write_with mutates value in-place.
+    #[test]
+    fn pane_map_write_with(key in 0..1000u64, val in 0..5000u64, delta in 1..5000u64) {
+        let map = PaneMap::<u64>::with_shards(8);
+        map.insert(key, val);
+
+        let old = map.write_with(key, |v| {
+            let old = *v;
+            *v += delta;
+            old
+        });
+        prop_assert_eq!(old, Some(val), "write_with should return old value via closure");
+        prop_assert_eq!(map.get(key), Some(val + delta),
+            "value should be mutated after write_with");
+    }
+
+    /// ShardedMap read_with works the same as PaneMap.
+    #[test]
+    fn sharded_map_read_with(val in 0..10000u64) {
+        let map = ShardedMap::<String, u64>::with_shards(4);
+        let key = "test".to_string();
+        map.insert(key.clone(), val);
+
+        let doubled = map.read_with(&key, |v| *v * 2);
+        prop_assert_eq!(doubled, Some(val * 2));
+
+        let missing = map.read_with(&"absent".to_string(), |v: &u64| *v);
+        prop_assert_eq!(missing, None);
+    }
+
+    /// ShardedMap write_with mutates value in-place.
+    #[test]
+    fn sharded_map_write_with(val in 0..5000u64, delta in 1..5000u64) {
+        let map = ShardedMap::<String, u64>::with_shards(4);
+        let key = "test".to_string();
+        map.insert(key.clone(), val);
+
+        map.write_with(&key, |v| { *v += delta; });
+        prop_assert_eq!(map.get(&key), Some(val + delta));
+
+        // write_with on missing key returns None
+        let missing_result = map.write_with(&"absent".to_string(), |v: &mut u64| { *v += 1; });
+        prop_assert!(missing_result.is_none());
+    }
+}
+
+// ===========================================================================
+// Property tests -- for_each_mut / map_all_mut
+// ===========================================================================
+
+proptest! {
+    /// PaneMap for_each_mut applies mutation to all entries.
+    #[test]
+    fn pane_map_for_each_mut(entries in prop::collection::vec((0..100u64, 1..1000u64), 1..30)) {
+        let map = PaneMap::<u64>::with_shards(8);
+        let mut expected: HashMap<u64, u64> = HashMap::new();
+        for (k, v) in &entries {
+            map.insert(*k, *v);
+            expected.insert(*k, *v); // last-write-wins
+        }
+
+        // Double all values
+        map.for_each_mut(|_k, v| { *v *= 2; });
+
+        for (k, original) in &expected {
+            let got = map.get(*k);
+            prop_assert_eq!(got, Some(original * 2),
+                "for_each_mut should have doubled value for key {}", k);
+        }
+    }
+
+    /// PaneMap map_all_mut collects results from all entries.
+    #[test]
+    fn pane_map_map_all_mut(entries in prop::collection::vec((0..100u64, 1..1000u64), 1..30)) {
+        let map = PaneMap::<u64>::with_shards(8);
+        let mut expected: HashMap<u64, u64> = HashMap::new();
+        for (k, v) in &entries {
+            map.insert(*k, *v);
+            expected.insert(*k, *v);
+        }
+
+        let results: Vec<(u64, u64)> = map.map_all_mut(|_k, v| {
+            let old = *v;
+            *v += 10;
+            old
+        });
+
+        // Results should contain one entry per unique key
+        prop_assert_eq!(results.len(), expected.len(),
+            "map_all_mut should return one result per entry");
+
+        // Each result should be the old value
+        for (k, old_val) in &results {
+            let exp = expected.get(k);
+            prop_assert_eq!(exp, Some(old_val),
+                "map_all_mut result for key {} should be original value", k);
+        }
+
+        // Values should now be original + 10
+        for (k, original) in &expected {
+            let got = map.get(*k);
+            prop_assert_eq!(got, Some(original + 10),
+                "value for key {} should be incremented by 10", k);
+        }
+    }
+}
+
+// ===========================================================================
+// Property tests -- insert returns old value
+// ===========================================================================
+
+proptest! {
+    /// PaneMap insert returns None for new key, Some(old) for existing key.
+    #[test]
+    fn pane_map_insert_returns_old(key in 0..1000u64, v1 in 0..1000u64, v2 in 0..1000u64) {
+        let map = PaneMap::<u64>::with_shards(8);
+
+        let first = map.insert(key, v1);
+        prop_assert_eq!(first, None, "first insert should return None");
+
+        let second = map.insert(key, v2);
+        prop_assert_eq!(second, Some(v1), "second insert should return old value");
+
+        prop_assert_eq!(map.get(key), Some(v2), "value should be updated");
+    }
+
+    /// ShardedMap insert returns None for new key, Some(old) for existing key.
+    #[test]
+    fn sharded_map_insert_returns_old(v1 in 0..1000u64, v2 in 0..1000u64) {
+        let map = ShardedMap::<String, u64>::with_shards(4);
+        let key = "k".to_string();
+
+        let first = map.insert(key.clone(), v1);
+        prop_assert_eq!(first, None);
+
+        let second = map.insert(key.clone(), v2);
+        prop_assert_eq!(second, Some(v1));
+
+        prop_assert_eq!(map.get(&key), Some(v2));
+    }
+
+    /// ShardedMap remove returns the removed value or None.
+    #[test]
+    fn sharded_map_remove_returns_value(v1 in 0..1000u64) {
+        let map = ShardedMap::<String, u64>::with_shards(4);
+        let key = "k".to_string();
+
+        let absent = map.remove(&key);
+        prop_assert_eq!(absent, None, "removing absent key returns None");
+
+        map.insert(key.clone(), v1);
+        let removed = map.remove(&key);
+        prop_assert_eq!(removed, Some(v1), "removing existing key returns the value");
+
+        prop_assert!(!map.contains_key(&key), "key should be gone after remove");
+    }
+}
+
+// ===========================================================================
+// Property tests -- monotonicity and mathematical properties
+// ===========================================================================
+
+proptest! {
+    /// ShardedMax is monotonically non-decreasing with observe (no resets).
+    #[test]
+    fn max_monotone_without_resets(values in prop::collection::vec(0..10000u64, 2..100)) {
+        let max_tracker = ShardedMax::with_shards(4);
+        let mut prev = 0u64;
+        for v in &values {
+            max_tracker.observe(*v);
+            let current = max_tracker.get();
+            prop_assert!(current >= prev,
+                "max should be monotone: {} >= {}", current, prev);
+            prev = current;
+        }
+    }
+
+    /// ShardedCounter is monotonically non-decreasing with add (no resets).
+    #[test]
+    fn counter_monotone_without_resets(adds in prop::collection::vec(1..100u64, 2..100)) {
+        let counter = ShardedCounter::with_shards(4);
+        let mut prev = 0u64;
+        for v in &adds {
+            counter.add(*v);
+            let current = counter.get();
+            prop_assert!(current > prev,
+                "counter should strictly increase: {} > {}", current, prev);
+            prev = current;
+        }
+    }
+
+    /// ShardedMax.get() >= any observed value (no resets).
+    #[test]
+    fn max_dominates_all_observed(values in prop::collection::vec(0..10000u64, 1..50)) {
+        let max_tracker = ShardedMax::with_shards(4);
+        for v in &values {
+            max_tracker.observe(*v);
+        }
+        let result = max_tracker.get();
+        for v in &values {
+            prop_assert!(result >= *v,
+                "max {} should be >= observed {}", result, v);
+        }
+    }
+
+    /// ShardedCounter add is commutative: sum is order-independent.
+    #[test]
+    fn counter_add_commutative(values in prop::collection::vec(1..1000u64, 2..50)) {
+        let c1 = ShardedCounter::with_shards(4);
+        let c2 = ShardedCounter::with_shards(4);
+
+        // Forward order
+        for v in &values {
+            c1.add(*v);
+        }
+
+        // Reverse order
+        for v in values.iter().rev() {
+            c2.add(*v);
+        }
+
+        prop_assert_eq!(c1.get(), c2.get(),
+            "counter sum should be independent of add order");
+    }
+
+    /// Double reset is idempotent: reset twice still yields zero.
+    #[test]
+    fn counter_double_reset_idempotent(adds in prop::collection::vec(1..1000u64, 1..20)) {
+        let counter = ShardedCounter::with_shards(4);
+        for v in &adds {
+            counter.add(*v);
+        }
+        counter.reset();
+        counter.reset();
+        prop_assert_eq!(counter.get(), 0, "double reset should still yield 0");
+    }
+
+    /// ShardedMax double reset is idempotent.
+    #[test]
+    fn max_double_reset_idempotent(vals in prop::collection::vec(1..10000u64, 1..20)) {
+        let m = ShardedMax::with_shards(4);
+        for v in &vals {
+            m.observe(*v);
+        }
+        m.reset();
+        m.reset();
+        prop_assert_eq!(m.get(), 0, "double max reset should still yield 0");
+    }
+}
+
+// ===========================================================================
+// Property tests -- DistributionStats
+// ===========================================================================
+
+proptest! {
+    /// DistributionStats total_entries equals sum of shard sizes.
+    #[test]
+    fn distribution_stats_total(sizes in prop::collection::vec(0..100usize, 1..20)) {
+        let stats = DistributionStats::from_shard_sizes(&sizes);
+        let expected_total: usize = sizes.iter().sum();
+        prop_assert_eq!(stats.total_entries, expected_total,
+            "total_entries should equal sum of sizes");
+        prop_assert_eq!(stats.shard_count, sizes.len());
+    }
+
+    /// DistributionStats min <= mean <= max.
+    #[test]
+    fn distribution_stats_ordering(sizes in prop::collection::vec(0..100usize, 1..20)) {
+        let stats = DistributionStats::from_shard_sizes(&sizes);
+        prop_assert!(stats.min_shard_size as f64 <= stats.mean_shard_size + 0.001,
+            "min {} should be <= mean {}", stats.min_shard_size, stats.mean_shard_size);
+        prop_assert!(stats.mean_shard_size <= stats.max_shard_size as f64 + 0.001,
+            "mean {} should be <= max {}", stats.mean_shard_size, stats.max_shard_size);
+    }
+
+    /// DistributionStats stddev is non-negative.
+    #[test]
+    fn distribution_stats_stddev_nonneg(sizes in prop::collection::vec(0..100usize, 1..20)) {
+        let stats = DistributionStats::from_shard_sizes(&sizes);
+        prop_assert!(stats.stddev_shard_size >= 0.0,
+            "stddev should be non-negative, got {}", stats.stddev_shard_size);
+    }
+
+    /// DistributionStats for uniform sizes has zero stddev.
+    #[test]
+    fn distribution_stats_uniform_zero_stddev(val in 0..100usize, n in 1..20usize) {
+        let sizes = vec![val; n];
+        let stats = DistributionStats::from_shard_sizes(&sizes);
+        prop_assert!(stats.stddev_shard_size < 0.001,
+            "uniform sizes should have ~0 stddev, got {}", stats.stddev_shard_size);
+        prop_assert_eq!(stats.min_shard_size, val);
+        prop_assert_eq!(stats.max_shard_size, val);
+    }
+}
+
+// ===========================================================================
+// Property tests -- ShardedMap retain / clear / shard_sizes
+// ===========================================================================
+
+proptest! {
+    /// ShardedMap retain keeps only matching entries.
+    #[test]
+    fn sharded_map_retain_filters(
+        entries in prop::collection::vec(
+            ("[a-z]{2,4}", 0..1000u64),
+            1..30
+        )
+    ) {
+        let map = ShardedMap::<String, u64>::with_shards(8);
+        let mut expected: HashMap<String, u64> = HashMap::new();
+        for (k, v) in &entries {
+            map.insert(k.clone(), *v);
+            expected.insert(k.clone(), *v);
+        }
+
+        let threshold = 500u64;
+        map.retain(|_k, v| *v >= threshold);
+
+        // All remaining values should be >= threshold
+        for (_, v) in map.entries() {
+            prop_assert!(v >= threshold,
+                "retained value {} should be >= threshold {}", v, threshold);
+        }
+
+        // Count surviving entries matches expected
+        let expected_count = expected.values().filter(|v| **v >= threshold).count();
+        prop_assert_eq!(map.len(), expected_count);
+    }
+
+    /// ShardedMap clear empties all entries.
+    #[test]
+    fn sharded_map_clear_empties(
+        entries in prop::collection::vec(
+            ("[a-z]{2,4}", 0..1000u64),
+            1..20
+        )
+    ) {
+        let map = ShardedMap::<String, u64>::with_shards(4);
+        for (k, v) in &entries {
+            map.insert(k.clone(), *v);
+        }
+        prop_assert!(!map.is_empty());
+
+        map.clear();
+        prop_assert_eq!(map.len(), 0);
+        prop_assert!(map.is_empty());
+        prop_assert!(map.keys().is_empty());
+    }
+
+    /// ShardedMap shard_sizes sum equals len.
+    #[test]
+    fn sharded_map_shard_sizes_sum(
+        entries in prop::collection::vec(
+            ("[a-z]{2,5}", 0..1000u64),
+            1..30
+        )
+    ) {
+        let map = ShardedMap::<String, u64>::with_shards(8);
+        for (k, v) in &entries {
+            map.insert(k.clone(), *v);
+        }
+
+        let shard_sum: usize = map.shard_sizes().iter().sum();
+        prop_assert_eq!(shard_sum, map.len(),
+            "shard sizes sum should equal len");
+    }
+
+    /// ShardedMap shard_count matches constructor.
+    #[test]
+    fn sharded_map_shard_count(n in 1..32usize) {
+        let map = ShardedMap::<String, u64>::with_shards(n);
+        prop_assert_eq!(map.shard_count(), n.clamp(1, 64));
+    }
+}
+
+// ===========================================================================
+// Property tests -- counter load() consistency
+// ===========================================================================
+
+proptest! {
+    /// ShardedCounter load() returns the same as get().
+    #[test]
+    fn counter_load_equals_get(adds in prop::collection::vec(1..1000u64, 1..50)) {
+        let counter = ShardedCounter::with_shards(4);
+        for v in &adds {
+            counter.add(*v);
+        }
+        let via_get = counter.get();
+        let via_load = counter.load(std::sync::atomic::Ordering::Relaxed);
+        prop_assert_eq!(via_get, via_load,
+            "get() and load() should return the same value");
+    }
+
+    /// ShardedGauge reset zeroes get_max.
+    #[test]
+    fn gauge_reset_zeroes(vals in prop::collection::vec(1..10000u64, 1..30)) {
+        let gauge = ShardedGauge::with_shards(4);
+        for v in &vals {
+            gauge.set(*v);
+        }
+        prop_assert!(gauge.get_max() > 0);
+        gauge.reset();
+        prop_assert_eq!(gauge.get_max(), 0, "reset should zero the gauge");
+    }
+
+    /// ShardedMax shard_count matches constructor.
+    #[test]
+    fn max_shard_count(n in 1..32usize) {
+        let m = ShardedMax::with_shards(n);
+        prop_assert_eq!(m.shard_count(), n.clamp(1, 64));
+    }
+
+    /// new() defaults produce zero-valued structures.
+    #[test]
+    fn defaults_are_zero(_dummy in 0..1u8) {
+        let counter = ShardedCounter::new();
+        prop_assert_eq!(counter.get(), 0);
+
+        let max = ShardedMax::new();
+        prop_assert_eq!(max.get(), 0);
+
+        let gauge = ShardedGauge::new();
+        prop_assert_eq!(gauge.get_max(), 0);
+
+        let pmap = PaneMap::<u64>::new();
+        prop_assert!(pmap.is_empty());
+
+        let smap = ShardedMap::<String, u64>::new();
+        prop_assert!(smap.is_empty());
     }
 }

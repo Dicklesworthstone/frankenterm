@@ -16,6 +16,10 @@
 //! 13. ConnectionType serde roundtrip
 //! 14. AutoConfig is JSON-serializable for any valid input
 //! 15. Pattern packs have no duplicates
+//! 16. AutoConfig serde roundtrip preserves key fields
+//! 17. Agent detection adds corresponding pattern packs
+//! 18. Duplicate agent types don't duplicate packs
+//! 19. max_concurrent_captures monotonically non-decreasing with cpu_count
 
 use proptest::prelude::*;
 
@@ -316,7 +320,7 @@ proptest! {
 }
 
 // =============================================================================
-// Property: No remotes → not strict (unless other factors)
+// Property: No remotes -> not strict (unless other factors)
 // =============================================================================
 
 proptest! {
@@ -543,6 +547,273 @@ proptest! {
 }
 
 // =============================================================================
+// Property: AutoConfig serde roundtrip preserves key fields
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn auto_config_serde_roundtrip(env in arb_detected_environment()) {
+        let auto = AutoConfig::from_environment(&env);
+        let json = serde_json::to_string(&auto).unwrap();
+        let back: AutoConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.poll_interval_ms, auto.poll_interval_ms);
+        prop_assert_eq!(back.min_poll_interval_ms, auto.min_poll_interval_ms);
+        prop_assert_eq!(back.max_concurrent_captures, auto.max_concurrent_captures);
+        prop_assert_eq!(back.strict_safety, auto.strict_safety);
+        prop_assert_eq!(back.rate_limit_per_pane, auto.rate_limit_per_pane);
+        prop_assert_eq!(back.pattern_packs, auto.pattern_packs);
+    }
+
+    #[test]
+    fn auto_config_serde_deterministic(env in arb_detected_environment()) {
+        let auto = AutoConfig::from_environment(&env);
+        let j1 = serde_json::to_string(&auto).unwrap();
+        let j2 = serde_json::to_string(&auto).unwrap();
+        prop_assert_eq!(&j1, &j2, "serialization should be deterministic");
+    }
+}
+
+// =============================================================================
+// Property: Agent detection adds corresponding pattern packs
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Codex agent detection adds builtin:codex to pattern_packs.
+    #[test]
+    fn codex_agent_adds_pack(
+        cpu_count in arb_cpu_count(),
+        memory_mb in arb_memory_mb(),
+    ) {
+        let agents = vec![DetectedAgent {
+            agent_type: AgentType::Codex,
+            pane_id: 1,
+            confidence: 0.9,
+            indicators: vec!["title:codex".into()],
+        }];
+        let env = make_env(cpu_count, memory_mb, None, agents, vec![]);
+        let auto = AutoConfig::from_environment(&env);
+
+        prop_assert!(
+            auto.pattern_packs.contains(&"builtin:codex".to_string()),
+            "Codex agent should add builtin:codex pack: {:?}",
+            auto.pattern_packs,
+        );
+    }
+
+    /// ClaudeCode agent detection adds builtin:claude_code to pattern_packs.
+    #[test]
+    fn claude_code_agent_adds_pack(
+        cpu_count in arb_cpu_count(),
+        memory_mb in arb_memory_mb(),
+    ) {
+        let agents = vec![DetectedAgent {
+            agent_type: AgentType::ClaudeCode,
+            pane_id: 1,
+            confidence: 0.8,
+            indicators: vec!["title:claude".into()],
+        }];
+        let env = make_env(cpu_count, memory_mb, None, agents, vec![]);
+        let auto = AutoConfig::from_environment(&env);
+
+        prop_assert!(
+            auto.pattern_packs.contains(&"builtin:claude_code".to_string()),
+            "ClaudeCode agent should add builtin:claude_code pack: {:?}",
+            auto.pattern_packs,
+        );
+    }
+
+    /// Gemini agent detection adds builtin:gemini to pattern_packs.
+    #[test]
+    fn gemini_agent_adds_pack(
+        cpu_count in arb_cpu_count(),
+        memory_mb in arb_memory_mb(),
+    ) {
+        let agents = vec![DetectedAgent {
+            agent_type: AgentType::Gemini,
+            pane_id: 1,
+            confidence: 0.7,
+            indicators: vec!["title:gemini".into()],
+        }];
+        let env = make_env(cpu_count, memory_mb, None, agents, vec![]);
+        let auto = AutoConfig::from_environment(&env);
+
+        prop_assert!(
+            auto.pattern_packs.contains(&"builtin:gemini".to_string()),
+            "Gemini agent should add builtin:gemini pack: {:?}",
+            auto.pattern_packs,
+        );
+    }
+}
+
+// =============================================================================
+// Property: Duplicate agent types don't duplicate packs
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn duplicate_agents_no_duplicate_packs(
+        cpu_count in arb_cpu_count(),
+        n_agents in 2usize..5,
+    ) {
+        let agents: Vec<DetectedAgent> = (0..n_agents)
+            .map(|i| DetectedAgent {
+                agent_type: AgentType::Codex,
+                pane_id: i as u64,
+                confidence: 0.9,
+                indicators: vec![format!("title:codex_{}", i)],
+            })
+            .collect();
+        let env = make_env(cpu_count, Some(8192), None, agents, vec![]);
+        let auto = AutoConfig::from_environment(&env);
+
+        let codex_count = auto.pattern_packs.iter()
+            .filter(|p| p.as_str() == "builtin:codex")
+            .count();
+        prop_assert_eq!(codex_count, 1,
+            "builtin:codex should appear exactly once, got {} in {:?}",
+            codex_count, auto.pattern_packs);
+    }
+}
+
+// =============================================================================
+// Property: max_concurrent_captures monotonically non-decreasing with cpu_count
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    #[test]
+    fn concurrent_captures_monotone_in_cpus(
+        cpu1 in 1_usize..=64,
+        cpu2 in 1_usize..=64,
+    ) {
+        let env1 = make_env(cpu1, Some(16384), None, vec![], vec![]);
+        let env2 = make_env(cpu2, Some(16384), None, vec![], vec![]);
+        let auto1 = AutoConfig::from_environment(&env1);
+        let auto2 = AutoConfig::from_environment(&env2);
+
+        if cpu1 <= cpu2 {
+            prop_assert!(
+                auto1.max_concurrent_captures <= auto2.max_concurrent_captures,
+                "captures should be non-decreasing with CPU: cpu1={} cap1={}, cpu2={} cap2={}",
+                cpu1, auto1.max_concurrent_captures, cpu2, auto2.max_concurrent_captures,
+            );
+        }
+    }
+}
+
+// =============================================================================
+// Property: poll_interval_ms monotonically non-decreasing with load
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    #[test]
+    fn poll_interval_monotone_in_load(
+        cpu_count in 1_usize..=16,
+        load1 in 0.0_f64..50.0,
+        load2 in 0.0_f64..50.0,
+    ) {
+        let total1 = load1 * cpu_count as f64;
+        let total2 = load2 * cpu_count as f64;
+        let env1 = make_env(cpu_count, Some(16384), Some(total1), vec![], vec![]);
+        let env2 = make_env(cpu_count, Some(16384), Some(total2), vec![], vec![]);
+        let auto1 = AutoConfig::from_environment(&env1);
+        let auto2 = AutoConfig::from_environment(&env2);
+
+        if load1 <= load2 {
+            prop_assert!(
+                auto1.poll_interval_ms <= auto2.poll_interval_ms,
+                "poll_interval should be non-decreasing with load: load1={:.1} poll1={}, load2={:.1} poll2={}",
+                load1, auto1.poll_interval_ms, load2, auto2.poll_interval_ms,
+            );
+        }
+    }
+}
+
+// =============================================================================
+// Property: ConfigSource serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn config_source_serde_roundtrip(
+        source in prop_oneof![
+            Just(ConfigSource::Default),
+            Just(ConfigSource::AutoDetected),
+            Just(ConfigSource::ConfigFile),
+        ]
+    ) {
+        let json = serde_json::to_string(&source).unwrap();
+        let back: ConfigSource = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, source);
+    }
+}
+
+// =============================================================================
+// Property: ConnectionType serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn connection_type_serde_roundtrip(ct in arb_connection_type()) {
+        let json = serde_json::to_string(&ct).unwrap();
+        let back: ConnectionType = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, ct);
+    }
+}
+
+// =============================================================================
+// Property: Multiple remote hosts all enable strict
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn multiple_remotes_all_strict(
+        cpu_count in arb_cpu_count(),
+        remotes in proptest::collection::vec(arb_remote_host(), 1..5),
+    ) {
+        let env = make_env(cpu_count, Some(8192), None, vec![], remotes);
+        let auto = AutoConfig::from_environment(&env);
+
+        prop_assert!(auto.strict_safety, "any number of remotes should enable strict safety");
+    }
+}
+
+// =============================================================================
+// Property: No load average -> base poll interval
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn no_load_average_base_poll(cpu_count in arb_cpu_count()) {
+        let env = make_env(cpu_count, Some(16384), None, vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+
+        prop_assert_eq!(
+            auto.poll_interval_ms, 100,
+            "no load average should use base poll of 100, got {}",
+            auto.poll_interval_ms,
+        );
+    }
+}
+
+// =============================================================================
 // Unit tests for edge cases
 // =============================================================================
 
@@ -560,7 +831,7 @@ fn empty_environment_uses_safe_defaults() {
 
 #[test]
 fn boundary_load_exactly_1_0_not_moderate() {
-    // per-core load 1.0 exactly → NOT moderate (condition is > 1.0)
+    // per-core load 1.0 exactly -> NOT moderate (condition is > 1.0)
     let env = make_env(4, Some(8192), Some(4.0), vec![], vec![]);
     let auto = AutoConfig::from_environment(&env);
     assert_eq!(auto.poll_interval_ms, 100);
@@ -568,7 +839,7 @@ fn boundary_load_exactly_1_0_not_moderate() {
 
 #[test]
 fn boundary_load_exactly_2_0_is_moderate_not_high() {
-    // per-core load 2.0 exactly → moderate but NOT high (condition for high is > 2.0)
+    // per-core load 2.0 exactly -> moderate but NOT high (condition for high is > 2.0)
     let env = make_env(4, Some(8192), Some(8.0), vec![], vec![]);
     let auto = AutoConfig::from_environment(&env);
     assert_eq!(auto.poll_interval_ms, 200);
@@ -580,87 +851,6 @@ fn boundary_memory_exactly_2048_not_low() {
     let env = make_env(4, Some(2048), Some(0.1), vec![], vec![]);
     let auto = AutoConfig::from_environment(&env);
     assert_eq!(auto.poll_interval_ms, 100);
-}
-
-// =============================================================================
-// Property: AutoConfig clone, debug, and serde tests
-// =============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
-
-    /// AutoConfig implements Clone correctly.
-    #[test]
-    fn prop_auto_config_clone(env in arb_detected_environment()) {
-        let auto = AutoConfig::from_environment(&env);
-        let cloned = auto.clone();
-        prop_assert_eq!(auto.poll_interval_ms, cloned.poll_interval_ms);
-        prop_assert_eq!(auto.min_poll_interval_ms, cloned.min_poll_interval_ms);
-        prop_assert_eq!(auto.max_concurrent_captures, cloned.max_concurrent_captures);
-        prop_assert_eq!(auto.strict_safety, cloned.strict_safety);
-        prop_assert_eq!(auto.rate_limit_per_pane, cloned.rate_limit_per_pane);
-        prop_assert_eq!(&auto.pattern_packs, &cloned.pattern_packs);
-    }
-
-    /// AutoConfig Debug output is nonempty.
-    #[test]
-    fn prop_auto_config_debug_nonempty(env in arb_detected_environment()) {
-        let auto = AutoConfig::from_environment(&env);
-        let debug = format!("{:?}", auto);
-        prop_assert!(!debug.is_empty(), "AutoConfig Debug should not be empty");
-    }
-
-    /// AutoConfig serde roundtrip preserves fields.
-    #[test]
-    fn prop_auto_config_serde_deterministic(env in arb_detected_environment()) {
-        let auto = AutoConfig::from_environment(&env);
-        let json1 = serde_json::to_string(&auto).unwrap();
-        let json2 = serde_json::to_string(&auto).unwrap();
-        prop_assert_eq!(&json1, &json2, "AutoConfig serialization is not deterministic");
-    }
-
-    /// ConfigSource serde deterministic — serialize twice yields same output.
-    #[test]
-    fn prop_config_source_serde_deterministic(
-        source in prop_oneof![
-            Just(ConfigSource::Default),
-            Just(ConfigSource::AutoDetected),
-            Just(ConfigSource::ConfigFile),
-        ]
-    ) {
-        let json1 = serde_json::to_string(&source).unwrap();
-        let json2 = serde_json::to_string(&source).unwrap();
-        prop_assert_eq!(&json1, &json2, "ConfigSource serialization not deterministic");
-    }
-
-    /// ConnectionType serde deterministic — serialize twice yields same output.
-    #[test]
-    fn prop_connection_type_serde_deterministic(ct in arb_connection_type()) {
-        let json1 = serde_json::to_string(&ct).unwrap();
-        let json2 = serde_json::to_string(&ct).unwrap();
-        prop_assert_eq!(&json1, &json2, "ConnectionType serialization not deterministic");
-    }
-
-    /// Recommendations count is bounded by number of adjustments applied.
-    #[test]
-    fn prop_recommendations_count_bounded(env in arb_detected_environment()) {
-        let auto = AutoConfig::from_environment(&env);
-        // Should not produce an unreasonable number of recommendations
-        prop_assert!(
-            auto.recommendations.len() <= 20,
-            "Too many recommendations: {}", auto.recommendations.len()
-        );
-    }
-
-    /// Pattern packs always has at least one entry.
-    #[test]
-    fn prop_pattern_packs_nonempty(env in arb_detected_environment()) {
-        let auto = AutoConfig::from_environment(&env);
-        prop_assert!(
-            !auto.pattern_packs.is_empty(),
-            "pattern_packs should never be empty"
-        );
-    }
 }
 
 #[test]

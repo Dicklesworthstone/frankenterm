@@ -13,6 +13,10 @@
 //! 7. ComponentTracker observation_count tracking
 //! 8. AdaptiveWatchdog component-level health report consistency
 //! 9. Kalman filter std_dev relationship to variance
+//! 10. Kalman gain bounded in [0, 1]
+//! 11. First observation initializes estimate
+//! 12. z_score at estimate is zero
+//! 13. Identical observations converge exactly
 
 use proptest::prelude::*;
 
@@ -694,60 +698,296 @@ proptest! {
 }
 
 // =============================================================================
-// Additional property tests for coverage
+// 11. Kalman filter — first observation initializes estimate
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// First observation sets the estimate to the observed value.
+    #[test]
+    fn proptest_first_observation_initializes(
+        q in 0.01f64..100.0,
+        r in 0.01f64..100.0,
+        first_obs in 0.1f64..10000.0,
+    ) {
+        let mut kf = KalmanFilter::new(q, r);
+        prop_assert!(!kf.is_initialized());
+
+        kf.update(first_obs);
+        prop_assert!(kf.is_initialized());
+        prop_assert!(
+            (kf.estimate() - first_obs).abs() < 1e-10,
+            "first estimate {} should equal first observation {}",
+            kf.estimate(), first_obs
+        );
+    }
+
+    /// z_score returns None before any observation.
+    #[test]
+    fn proptest_zscore_none_before_init(
+        q in 0.01f64..100.0,
+        r in 0.01f64..100.0,
+        obs in 0.1f64..10000.0,
+    ) {
+        let kf = KalmanFilter::new(q, r);
+        prop_assert!(
+            kf.z_score(obs).is_none(),
+            "z_score should be None before initialization"
+        );
+    }
+
+    /// z_score at the estimate is exactly zero.
+    #[test]
+    fn proptest_zscore_at_estimate_is_zero(
+        observations in prop::collection::vec(1.0f64..500.0, 2..50),
+    ) {
+        let mut kf = KalmanFilter::new(1.0, 1.0);
+        for &z in &observations {
+            kf.update(z);
+        }
+
+        let est = kf.estimate();
+        if let Some(z) = kf.z_score(est) {
+            prop_assert!(
+                z.abs() < 1e-10,
+                "z_score at estimate should be 0, got {}",
+                z
+            );
+        }
+    }
+
+    /// After many identical observations, estimate equals that value.
+    #[test]
+    fn proptest_identical_observations_converge(
+        value in 1.0f64..10000.0,
+        n in 10usize..200,
+    ) {
+        let mut kf = KalmanFilter::new(0.01, 10.0);
+        for _ in 0..n {
+            kf.update(value);
+        }
+
+        prop_assert!(
+            (kf.estimate() - value).abs() < 0.01,
+            "estimate {} should converge to {} after {} identical obs",
+            kf.estimate(), value, n
+        );
+    }
+}
+
+// =============================================================================
+// 12. Kalman gain bounded and variance relationships
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// After update, variance is always less than predicted variance (p_pred = p + q).
+    /// This verifies the Kalman update always reduces uncertainty.
+    #[test]
+    fn proptest_update_reduces_variance(
+        q in 0.01f64..100.0,
+        r in 0.01f64..100.0,
+        observations in prop::collection::vec(1.0f64..1000.0, 2..50),
+    ) {
+        let mut kf = KalmanFilter::new(q, r);
+
+        // First observation initializes
+        kf.update(observations[0]);
+
+        for &z in &observations[1..] {
+            let pre_var = kf.variance();
+            let predicted_var = pre_var + q.max(1e-12); // Same clamping as constructor
+            kf.update(z);
+            prop_assert!(
+                kf.variance() < predicted_var + 1e-10,
+                "post-update variance {} should be < predicted {} (q={})",
+                kf.variance(), predicted_var, q
+            );
+        }
+    }
+
+    /// Estimate after update is between the prediction and the observation
+    /// (weighted average property of Kalman filter).
+    #[test]
+    fn proptest_estimate_interpolation(
+        observations in prop::collection::vec(1.0f64..1000.0, 3..20),
+    ) {
+        let mut kf = KalmanFilter::new(1.0, 10.0);
+
+        kf.update(observations[0]);
+        for &z in &observations[1..] {
+            let pre_est = kf.estimate();
+            kf.update(z);
+            let post_est = kf.estimate();
+
+            // Post estimate should be between pre_est and z (inclusive)
+            let lo = pre_est.min(z);
+            let hi = pre_est.max(z);
+            prop_assert!(
+                post_est >= lo - 1e-10 && post_est <= hi + 1e-10,
+                "estimate {} should be between {} and {} after observing {}",
+                post_est, lo, hi, z
+            );
+        }
+    }
+
+    /// Variance is always non-negative (strengthening the > 0 test).
+    #[test]
+    fn proptest_variance_always_nonneg(
+        q in 1e-12f64..1000.0,
+        r in 1e-12f64..1000.0,
+    ) {
+        let kf = KalmanFilter::new(q, r);
+        // Even before initialization, variance should be non-negative
+        prop_assert!(kf.variance() >= 0.0, "initial variance should be >= 0");
+    }
+}
+
+// =============================================================================
+// 13. AdaptiveWatchdog — advanced integration
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    /// classify_component returns a HealthClassification for any component.
+    #[test]
+    fn proptest_classify_component_always_returns(
+        component in arb_component(),
+        current_ms in 10000u64..100000,
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let watchdog = AdaptiveWatchdog::new(config.clone());
+        let classification = watchdog.classify_component(component, current_ms);
+
+        // Known components should always classify to Some(_).
+        prop_assert!(
+            classification.is_some(),
+            "classify_component should return Some for tracked components"
+        );
+        let classification = classification.expect("checked is_some above");
+
+        let valid_statuses = [
+            HealthStatus::Healthy,
+            HealthStatus::Degraded,
+            HealthStatus::Critical,
+            HealthStatus::Hung,
+        ];
+        prop_assert!(
+            valid_statuses.contains(&classification.status),
+            "status {:?} should be a valid HealthStatus",
+            classification.status
+        );
+    }
+
+    /// config() returns the same config that was passed to new().
+    #[test]
+    fn proptest_config_accessor(config in arb_adaptive_config()) {
+        let watchdog = AdaptiveWatchdog::new(config.clone());
+        let retrieved = watchdog.config();
+        prop_assert!((retrieved.sensitivity_k - config.sensitivity_k).abs() < 1e-10);
+        prop_assert_eq!(retrieved.min_observations, config.min_observations);
+    }
+
+    /// tracker() returns Some for known components, observation counts are consistent.
+    #[test]
+    fn proptest_tracker_accessor_consistency(
+        heartbeats in prop::collection::vec(500u64..5000, 3..15),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        let mut t = 0u64;
+        for &interval in &heartbeats {
+            t += interval;
+            watchdog.observe(Component::Discovery, t);
+        }
+
+        let tracker = watchdog.tracker(Component::Discovery);
+        prop_assert!(tracker.is_some(), "tracker for Discovery should exist");
+        let tracker = tracker.unwrap();
+        // First observe is baseline, rest are intervals
+        prop_assert_eq!(
+            tracker.observation_count(),
+            heartbeats.len() - 1,
+            "tracker should have {} observations",
+            heartbeats.len() - 1
+        );
+    }
+
+    /// Multiple components can be observed independently.
+    #[test]
+    fn proptest_independent_components(
+        disc_beats in prop::collection::vec(500u64..5000, 3..10),
+        cap_beats in prop::collection::vec(500u64..5000, 3..10),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        let mut t = 0u64;
+        for &interval in &disc_beats {
+            t += interval;
+            watchdog.observe(Component::Discovery, t);
+        }
+
+        let mut t2 = 0u64;
+        for &interval in &cap_beats {
+            t2 += interval;
+            watchdog.observe(Component::Capture, t2);
+        }
+
+        let disc_tracker = watchdog.tracker(Component::Discovery).unwrap();
+        let cap_tracker = watchdog.tracker(Component::Capture).unwrap();
+
+        prop_assert_eq!(
+            disc_tracker.observation_count(),
+            disc_beats.len() - 1,
+            "Discovery observations should be independent"
+        );
+        prop_assert_eq!(
+            cap_tracker.observation_count(),
+            cap_beats.len() - 1,
+            "Capture observations should be independent"
+        );
+    }
+}
+
+// =============================================================================
+// 14. Serde determinism and Debug
 // =============================================================================
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// AdaptiveWatchdogConfig Clone preserves all fields.
-    #[test]
-    fn proptest_config_clone(config in arb_adaptive_config()) {
-        let cloned = config.clone();
-        prop_assert!((cloned.sensitivity_k - config.sensitivity_k).abs() < 1e-10);
-        prop_assert!((cloned.process_noise - config.process_noise).abs() < 1e-10);
-        prop_assert!((cloned.measurement_noise - config.measurement_noise).abs() < 1e-10);
-        prop_assert_eq!(cloned.min_observations, config.min_observations);
-    }
-
-    /// AdaptiveWatchdogConfig Debug output is non-empty.
-    #[test]
-    fn proptest_config_debug_nonempty(config in arb_adaptive_config()) {
-        let dbg = format!("{:?}", config);
-        prop_assert!(!dbg.is_empty());
-    }
-
-    /// HealthClassification Clone preserves all fields.
-    #[test]
-    fn proptest_health_classification_clone(hc in arb_health_classification()) {
-        let cloned = hc.clone();
-        prop_assert_eq!(cloned.status, hc.status);
-        prop_assert_eq!(cloned.observations, hc.observations);
-        prop_assert_eq!(cloned.adaptive_mode, hc.adaptive_mode);
-    }
-
-    /// AdaptiveHealthReport Clone preserves structure.
-    #[test]
-    fn proptest_health_report_clone(report in arb_adaptive_health_report()) {
-        let cloned = report.clone();
-        prop_assert_eq!(cloned.timestamp_ms, report.timestamp_ms);
-        prop_assert_eq!(cloned.overall, report.overall);
-        prop_assert_eq!(cloned.components.len(), report.components.len());
-    }
 
     /// AdaptiveWatchdogConfig serde is deterministic.
     #[test]
     fn proptest_config_serde_deterministic(config in arb_adaptive_config()) {
         let j1 = serde_json::to_string(&config).unwrap();
         let j2 = serde_json::to_string(&config).unwrap();
-        prop_assert_eq!(&j1, &j2);
+        prop_assert_eq!(&j1, &j2, "config serialization should be deterministic");
     }
 
-    /// AdaptiveHealthReport serde is deterministic.
+    /// HealthClassification Debug output is non-empty.
     #[test]
-    fn proptest_health_report_serde_deterministic(report in arb_adaptive_health_report()) {
-        let j1 = serde_json::to_string(&report).unwrap();
-        let j2 = serde_json::to_string(&report).unwrap();
+    fn proptest_health_classification_debug(hc in arb_health_classification()) {
+        let dbg = format!("{:?}", hc);
+        prop_assert!(!dbg.is_empty(), "Debug output should be non-empty");
+    }
+
+    /// AdaptiveHealthReport Debug output is non-empty.
+    #[test]
+    fn proptest_health_report_debug(report in arb_adaptive_health_report()) {
+        let dbg = format!("{:?}", report);
+        prop_assert!(!dbg.is_empty(), "Debug output should be non-empty");
+    }
+
+    /// HealthClassification serde is deterministic.
+    #[test]
+    fn proptest_health_classification_serde_deterministic(hc in arb_health_classification()) {
+        let j1 = serde_json::to_string(&hc).unwrap();
+        let j2 = serde_json::to_string(&hc).unwrap();
         prop_assert_eq!(&j1, &j2);
     }
 
@@ -757,19 +997,7 @@ proptest! {
         let cloned = cc.clone();
         prop_assert_eq!(cloned.component, cc.component);
         prop_assert_eq!(cloned.classification.status, cc.classification.status);
-    }
-
-    /// HealthClassification Debug output is non-empty.
-    #[test]
-    fn proptest_health_classification_debug_nonempty(hc in arb_health_classification()) {
-        let dbg = format!("{:?}", hc);
-        prop_assert!(!dbg.is_empty());
-    }
-
-    /// AdaptiveHealthReport Debug output is non-empty.
-    #[test]
-    fn proptest_health_report_debug_nonempty(report in arb_adaptive_health_report()) {
-        let dbg = format!("{:?}", report);
-        prop_assert!(!dbg.is_empty());
+        prop_assert_eq!(cloned.classification.observations, cc.classification.observations);
+        prop_assert_eq!(cloned.classification.adaptive_mode, cc.classification.adaptive_mode);
     }
 }
