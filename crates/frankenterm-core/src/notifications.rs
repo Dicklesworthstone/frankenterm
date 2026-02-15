@@ -976,4 +976,264 @@ mod tests {
         assert!(json.contains("timeout"));
         assert!(json.contains("connection reset"));
     }
+
+    // ========================================================================
+    // Expanded pure unit tests (wa-1u90p.7.1)
+    // ========================================================================
+
+    #[test]
+    fn notification_payload_serde_roundtrip() {
+        let payload = NotificationPayload {
+            event_type: "test.event".to_string(),
+            pane_id: 42,
+            timestamp: "2026-01-15T00:00:00Z".to_string(),
+            summary: "Test summary".to_string(),
+            description: "Test description".to_string(),
+            severity: "warning".to_string(),
+            agent_type: "codex".to_string(),
+            confidence: 0.95,
+            quick_fix: Some("fix-cmd".to_string()),
+            suppressed_since_last: 3,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let parsed: NotificationPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, "test.event");
+        assert_eq!(parsed.pane_id, 42);
+        assert_eq!(parsed.severity, "warning");
+        assert!((parsed.confidence - 0.95).abs() < f64::EPSILON);
+        assert_eq!(parsed.quick_fix.as_deref(), Some("fix-cmd"));
+        assert_eq!(parsed.suppressed_since_last, 3);
+    }
+
+    #[test]
+    fn notification_payload_serde_without_quick_fix() {
+        let payload = NotificationPayload {
+            event_type: "evt".to_string(),
+            pane_id: 1,
+            timestamp: "now".to_string(),
+            summary: "s".to_string(),
+            description: "d".to_string(),
+            severity: "info".to_string(),
+            agent_type: "claude_code".to_string(),
+            confidence: 1.0,
+            quick_fix: None,
+            suppressed_since_last: 0,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        // quick_fix should be absent from JSON (skip_serializing_if = None)
+        assert!(!json.contains("quick_fix"));
+    }
+
+    #[test]
+    fn notification_payload_clone() {
+        let payload = NotificationPayload {
+            event_type: "e".to_string(),
+            pane_id: 5,
+            timestamp: "t".to_string(),
+            summary: "s".to_string(),
+            description: "d".to_string(),
+            severity: "info".to_string(),
+            agent_type: "gemini".to_string(),
+            confidence: 0.5,
+            quick_fix: None,
+            suppressed_since_last: 0,
+        };
+        let c = payload.clone();
+        assert_eq!(c.event_type, "e");
+        assert_eq!(c.pane_id, 5);
+    }
+
+    #[test]
+    fn notification_payload_debug() {
+        let payload = NotificationPayload {
+            event_type: "debug-test".to_string(),
+            pane_id: 0,
+            timestamp: "now".to_string(),
+            summary: "s".to_string(),
+            description: "d".to_string(),
+            severity: "critical".to_string(),
+            agent_type: "a".to_string(),
+            confidence: 0.0,
+            quick_fix: None,
+            suppressed_since_last: 0,
+        };
+        let dbg = format!("{:?}", payload);
+        assert!(dbg.contains("NotificationPayload"));
+        assert!(dbg.contains("debug-test"));
+    }
+
+    #[test]
+    fn delivery_record_clone() {
+        let record = NotificationDeliveryRecord {
+            target: "slack".to_string(),
+            accepted: true,
+            status_code: 200,
+            error: None,
+        };
+        let c = record.clone();
+        assert_eq!(c.target, "slack");
+        assert!(c.accepted);
+        assert_eq!(c.status_code, 200);
+        assert!(c.error.is_none());
+    }
+
+    #[test]
+    fn delivery_record_debug() {
+        let record = NotificationDeliveryRecord {
+            target: "webhook".to_string(),
+            accepted: false,
+            status_code: 500,
+            error: Some("server error".to_string()),
+        };
+        let dbg = format!("{:?}", record);
+        assert!(dbg.contains("webhook"));
+        assert!(dbg.contains("500"));
+    }
+
+    #[test]
+    fn delivery_clone() {
+        let delivery = NotificationDelivery {
+            sender: "test".to_string(),
+            success: true,
+            rate_limited: false,
+            error: None,
+            records: vec![],
+        };
+        let c = delivery.clone();
+        assert_eq!(c.sender, "test");
+        assert!(c.success);
+        assert!(c.records.is_empty());
+    }
+
+    #[test]
+    fn delivery_debug() {
+        let delivery = NotificationDelivery {
+            sender: "test".to_string(),
+            success: false,
+            rate_limited: true,
+            error: Some("rate_limited".to_string()),
+            records: vec![],
+        };
+        let dbg = format!("{:?}", delivery);
+        assert!(dbg.contains("NotificationDelivery"));
+        assert!(dbg.contains("rate_limited"));
+    }
+
+    #[test]
+    fn delivery_with_multiple_records_serializes() {
+        let delivery = NotificationDelivery {
+            sender: "multi".to_string(),
+            success: true,
+            rate_limited: false,
+            error: None,
+            records: vec![
+                NotificationDeliveryRecord {
+                    target: "target-a".to_string(),
+                    accepted: true,
+                    status_code: 200,
+                    error: None,
+                },
+                NotificationDeliveryRecord {
+                    target: "target-b".to_string(),
+                    accepted: false,
+                    status_code: 503,
+                    error: Some("unavailable".to_string()),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&delivery).unwrap();
+        assert!(json.contains("target-a"));
+        assert!(json.contains("target-b"));
+        assert!(json.contains("503"));
+    }
+
+    #[test]
+    fn notification_outcome_debug() {
+        let outcome = NotificationOutcome {
+            decision: NotifyDecision::Filtered,
+            deliveries: vec![],
+        };
+        let dbg = format!("{:?}", outcome);
+        assert!(dbg.contains("NotificationOutcome"));
+        assert!(dbg.contains("Filtered"));
+    }
+
+    #[test]
+    fn notification_outcome_clone() {
+        let outcome = NotificationOutcome {
+            decision: NotifyDecision::Filtered,
+            deliveries: vec![NotificationDelivery {
+                sender: "s".to_string(),
+                success: true,
+                rate_limited: false,
+                error: None,
+                records: vec![],
+            }],
+        };
+        let c = outcome.clone();
+        assert_eq!(c.deliveries.len(), 1);
+    }
+
+    #[test]
+    fn pipeline_sender_count_zero() {
+        let filter = EventFilter::allow_all();
+        let gate =
+            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+        let pipeline = NotificationPipeline::new(gate, vec![]);
+        assert_eq!(pipeline.sender_count(), 0);
+    }
+
+    #[test]
+    fn severity_str_info() {
+        let mut d = test_detection();
+        d.severity = Severity::Info;
+        assert_eq!(severity_str(&d), "info");
+    }
+
+    #[test]
+    fn severity_str_critical() {
+        let mut d = test_detection();
+        d.severity = Severity::Critical;
+        assert_eq!(severity_str(&d), "critical");
+    }
+
+    #[test]
+    fn now_epoch_ms_is_positive() {
+        let ms = now_epoch_ms();
+        assert!(ms > 0, "epoch ms should be positive");
+    }
+
+    #[test]
+    fn now_iso8601_contains_year() {
+        let ts = now_iso8601();
+        assert!(ts.starts_with("20"), "should start with year: {ts}");
+    }
+
+    #[test]
+    fn payload_confidence_boundary_zero() {
+        let mut detection = test_detection();
+        detection.confidence = 0.0;
+        let rendered = RenderedEvent {
+            summary: "test".to_string(),
+            description: "test".to_string(),
+            suggestions: vec![],
+            severity: Severity::Info,
+        };
+        let payload = NotificationPayload::from_detection(&detection, 1, &rendered, 0);
+        assert!(payload.confidence.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn payload_confidence_boundary_one() {
+        let mut detection = test_detection();
+        detection.confidence = 1.0;
+        let rendered = RenderedEvent {
+            summary: "test".to_string(),
+            description: "test".to_string(),
+            suggestions: vec![],
+            severity: Severity::Info,
+        };
+        let payload = NotificationPayload::from_detection(&detection, 1, &rendered, 0);
+        assert!((payload.confidence - 1.0).abs() < f64::EPSILON);
+    }
 }

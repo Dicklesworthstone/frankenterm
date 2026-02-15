@@ -881,6 +881,193 @@ mod pure_tests {
         let collector = FixedMetricsCollector::new(snap);
         let _cloned = collector.clone();
     }
+
+    // -----------------------------------------------------------------------
+    // Expanded pure unit tests (wa-1u90p.7.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metrics_snapshot_clone() {
+        let snap = MetricsSnapshot {
+            uptime_seconds: 42.5,
+            observed_panes: 3,
+            capture_queue_depth: 10,
+            segments_persisted: 99,
+            ..MetricsSnapshot::default()
+        };
+        let c = snap.clone();
+        assert!((c.uptime_seconds - 42.5).abs() < f64::EPSILON);
+        assert_eq!(c.observed_panes, 3);
+        assert_eq!(c.segments_persisted, 99);
+    }
+
+    #[test]
+    fn metrics_snapshot_debug() {
+        let snap = MetricsSnapshot::default();
+        let dbg = format!("{:?}", snap);
+        assert!(dbg.contains("MetricsSnapshot"));
+        assert!(dbg.contains("uptime_seconds"));
+    }
+
+    #[test]
+    fn event_bus_snapshot_clone() {
+        let snap = EventBusSnapshot {
+            events_published: 100,
+            active_subscribers: 3,
+            capacity: 1024,
+            ..EventBusSnapshot::default()
+        };
+        let c = snap.clone();
+        assert_eq!(c.events_published, 100);
+        assert_eq!(c.active_subscribers, 3);
+        assert_eq!(c.capacity, 1024);
+    }
+
+    #[test]
+    fn event_bus_snapshot_debug() {
+        let snap = EventBusSnapshot::default();
+        let dbg = format!("{:?}", snap);
+        assert!(dbg.contains("EventBusSnapshot"));
+        assert!(dbg.contains("events_published"));
+    }
+
+    #[test]
+    fn render_prometheus_output_is_nonempty() {
+        let snap = MetricsSnapshot::default();
+        let rendered = snap.render_prometheus("ft");
+        assert!(!rendered.is_empty());
+    }
+
+    #[test]
+    fn render_prometheus_counters_are_counters() {
+        let snap = MetricsSnapshot {
+            segments_persisted: 10,
+            events_recorded: 20,
+            ..MetricsSnapshot::default()
+        };
+        let rendered = snap.render_prometheus("ft");
+        // Counter metrics should have _total suffix and "counter" type
+        assert!(rendered.contains("# TYPE ft_segments_persisted_total counter"));
+        assert!(rendered.contains("# TYPE ft_events_recorded_total counter"));
+    }
+
+    #[test]
+    fn render_prometheus_gauges_are_gauges() {
+        let snap = MetricsSnapshot::default();
+        let rendered = snap.render_prometheus("ft");
+        assert!(rendered.contains("# TYPE ft_uptime_seconds gauge"));
+        assert!(rendered.contains("# TYPE ft_observed_panes gauge"));
+        assert!(rendered.contains("# TYPE ft_capture_queue_depth gauge"));
+    }
+
+    #[test]
+    fn render_prometheus_ingest_lag_histogram_fields() {
+        let snap = MetricsSnapshot {
+            ingest_lag_avg_ms: 5.0,
+            ingest_lag_max_ms: 20,
+            ingest_lag_sum_ms: 100,
+            ingest_lag_count: 20,
+            ..MetricsSnapshot::default()
+        };
+        let rendered = snap.render_prometheus("ft");
+        assert!(rendered.contains("ft_ingest_lag_avg_ms"));
+        assert!(rendered.contains("ft_ingest_lag_max_ms"));
+        assert!(rendered.contains("ft_ingest_lag_ms_sum"));
+        assert!(rendered.contains("ft_ingest_lag_ms_count"));
+    }
+
+    #[test]
+    fn render_prometheus_write_queue_depth() {
+        let snap = MetricsSnapshot {
+            write_queue_depth: 42,
+            ..MetricsSnapshot::default()
+        };
+        let rendered = snap.render_prometheus("ft");
+        assert!(rendered.contains("ft_write_queue_depth 42"));
+    }
+
+    #[test]
+    fn format_float_negative_renders_value() {
+        assert_eq!(format_float(-1.5), "-1.5");
+    }
+
+    #[test]
+    fn format_float_very_small_renders_value() {
+        let result = format_float(0.001);
+        assert!(result.contains("0.001"));
+    }
+
+    #[test]
+    fn format_float_integer_no_trailing_zeros() {
+        // 42.0 should render as "42" (no trailing .0)
+        assert_eq!(format_float(42.0), "42");
+    }
+
+    #[test]
+    fn sanitize_prefix_unicode_replaced() {
+        let result = sanitize_prefix("café");
+        // Non-ASCII chars should be replaced with _
+        assert!(result.starts_with("caf"));
+    }
+
+    #[test]
+    fn sanitize_prefix_underscores_preserved() {
+        assert_eq!(sanitize_prefix("a_b_c"), "a_b_c");
+    }
+
+    #[test]
+    fn is_localhost_bind_ipv6_loopback() {
+        assert!(is_localhost_bind("[::1]:8080"));
+    }
+
+    #[test]
+    fn is_localhost_bind_unparseable() {
+        // Unparseable addresses should not be considered localhost
+        assert!(!is_localhost_bind("not-an-address"));
+    }
+
+    #[test]
+    fn metric_name_double_underscore_avoided() {
+        // When prefix is present, result should be prefix_name, not prefix__name
+        let name = metric_name("ft", "test");
+        assert!(!name.contains("__"));
+    }
+
+    #[test]
+    fn render_prometheus_event_bus_all_lag_none() {
+        let snap = MetricsSnapshot {
+            event_bus: Some(EventBusSnapshot {
+                delta_oldest_lag_ms: None,
+                detection_oldest_lag_ms: None,
+                signal_oldest_lag_ms: None,
+                ..EventBusSnapshot::default()
+            }),
+            ..MetricsSnapshot::default()
+        };
+        let rendered = snap.render_prometheus("ft");
+        // All lag metrics should render as -1
+        assert!(rendered.contains("ft_event_bus_delta_oldest_lag_ms -1"));
+        assert!(rendered.contains("ft_event_bus_detection_oldest_lag_ms -1"));
+        assert!(rendered.contains("ft_event_bus_signal_oldest_lag_ms -1"));
+    }
+
+    #[test]
+    fn render_prometheus_native_output_zeros() {
+        let snap = MetricsSnapshot::default();
+        let rendered = snap.render_prometheus("ft");
+        assert!(rendered.contains("ft_native_output_input_events_total 0"));
+        assert!(rendered.contains("ft_native_output_batches_emitted_total 0"));
+    }
+
+    #[test]
+    fn render_prometheus_coalesce_ratio_float() {
+        let snap = MetricsSnapshot {
+            native_output_coalesce_ratio: 3.14,
+            ..MetricsSnapshot::default()
+        };
+        let rendered = snap.render_prometheus("ft");
+        assert!(rendered.contains("ft_native_output_coalesce_ratio 3.14"));
+    }
 }
 
 #[cfg(all(test, feature = "metrics"))]

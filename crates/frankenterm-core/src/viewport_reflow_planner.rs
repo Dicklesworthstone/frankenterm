@@ -1043,4 +1043,295 @@ mod tests {
             );
         }
     }
+
+    // ── Expanded pure unit tests (wa-1u90p.7.1) ──────────────
+
+    #[test]
+    fn reflow_batch_priority_serde_roundtrip() {
+        let variants = [
+            ReflowBatchPriority::ViewportCore,
+            ReflowBatchPriority::ViewportOverscan,
+            ReflowBatchPriority::ColdScrollback,
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let parsed: ReflowBatchPriority = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, parsed);
+        }
+    }
+
+    #[test]
+    fn reflow_batch_priority_copy_and_eq() {
+        let a = ReflowBatchPriority::ViewportCore;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(
+            ReflowBatchPriority::ViewportCore,
+            ReflowBatchPriority::ColdScrollback
+        );
+    }
+
+    #[test]
+    fn reflow_batch_priority_debug() {
+        let dbg = format!("{:?}", ReflowBatchPriority::ViewportOverscan);
+        assert!(dbg.contains("ViewportOverscan"));
+    }
+
+    #[test]
+    fn reflow_batch_priority_scheduler_class_mapping() {
+        assert_eq!(
+            ReflowBatchPriority::ViewportCore.scheduler_class(),
+            ResizeWorkClass::Interactive
+        );
+        assert_eq!(
+            ReflowBatchPriority::ViewportOverscan.scheduler_class(),
+            ResizeWorkClass::Interactive
+        );
+        assert_eq!(
+            ReflowBatchPriority::ColdScrollback.scheduler_class(),
+            ResizeWorkClass::Background
+        );
+    }
+
+    #[test]
+    fn reflow_batch_priority_rationale_non_empty() {
+        let variants = [
+            ReflowBatchPriority::ViewportCore,
+            ReflowBatchPriority::ViewportOverscan,
+            ReflowBatchPriority::ColdScrollback,
+        ];
+        for v in variants {
+            assert!(!v.rationale().is_empty());
+        }
+    }
+
+    #[test]
+    fn reflow_line_range_len() {
+        let r = ReflowLineRange {
+            start_line: 10,
+            end_line_exclusive: 20,
+        };
+        assert_eq!(r.len(), 10);
+    }
+
+    #[test]
+    fn reflow_line_range_len_zero() {
+        let r = ReflowLineRange {
+            start_line: 5,
+            end_line_exclusive: 5,
+        };
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn reflow_line_range_len_saturating() {
+        // If start > end (shouldn't happen in practice), len saturates to 0
+        let r = ReflowLineRange {
+            start_line: 100,
+            end_line_exclusive: 50,
+        };
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn reflow_line_range_serde_roundtrip() {
+        let r = ReflowLineRange {
+            start_line: 42,
+            end_line_exclusive: 100,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let parsed: ReflowLineRange = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, r);
+    }
+
+    #[test]
+    fn reflow_planner_input_default_values() {
+        let input = ReflowPlannerInput::default();
+        assert_eq!(input.total_logical_lines, 0);
+        assert_eq!(input.viewport_top, 0);
+        assert_eq!(input.viewport_height, 0);
+        assert_eq!(input.overscan_lines, 16);
+        assert_eq!(input.max_batch_lines, 64);
+        assert_eq!(input.lines_per_work_unit, 32);
+        assert_eq!(input.frame_budget_units, 8);
+    }
+
+    #[test]
+    fn reflow_planner_input_serde_roundtrip() {
+        let input = ReflowPlannerInput {
+            total_logical_lines: 500,
+            viewport_top: 100,
+            viewport_height: 30,
+            overscan_lines: 10,
+            max_batch_lines: 32,
+            lines_per_work_unit: 16,
+            frame_budget_units: 5,
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        let parsed: ReflowPlannerInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, input);
+    }
+
+    #[test]
+    fn reflow_planner_input_serde_defaults_on_missing() {
+        let json = "{}";
+        let parsed: ReflowPlannerInput = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, ReflowPlannerInput::default());
+    }
+
+    #[test]
+    fn reflow_plan_default() {
+        let plan = ReflowPlan::default();
+        assert_eq!(plan.frame_budget_units, 0);
+        assert_eq!(plan.frame_work_units, 0);
+        assert!(plan.batches.is_empty());
+    }
+
+    #[test]
+    fn reflow_plan_scheduling_hooks_empty() {
+        let plan = ReflowPlan::default();
+        assert!(plan.scheduling_hooks().is_empty());
+    }
+
+    #[test]
+    fn reflow_plan_log_lines_empty() {
+        let plan = ReflowPlan::default();
+        assert!(plan.log_lines().is_empty());
+    }
+
+    #[test]
+    fn reflow_plan_serde_roundtrip() {
+        let plan = ReflowPlan {
+            frame_budget_units: 8,
+            frame_work_units: 3,
+            batches: vec![ReflowBatch {
+                range: ReflowLineRange {
+                    start_line: 0,
+                    end_line_exclusive: 10,
+                },
+                priority: ReflowBatchPriority::ViewportCore,
+                scheduler_class: ResizeWorkClass::Interactive,
+                work_units: 1,
+                selected_for_frame: true,
+                rationale: "test".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        let parsed: ReflowPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, plan);
+    }
+
+    #[test]
+    fn reflow_scheduling_hook_serde_roundtrip() {
+        let hook = ReflowSchedulingHook {
+            range: ReflowLineRange {
+                start_line: 50,
+                end_line_exclusive: 70,
+            },
+            scheduler_class: ResizeWorkClass::Background,
+            work_units: 3,
+            selected_for_frame: false,
+            rationale: "cold scrollback convergence".to_string(),
+        };
+        let json = serde_json::to_string(&hook).unwrap();
+        let parsed: ReflowSchedulingHook = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, hook);
+    }
+
+    #[test]
+    fn div_ceil_exact_division() {
+        assert_eq!(div_ceil(10, 5), 2);
+        assert_eq!(div_ceil(100, 10), 10);
+    }
+
+    #[test]
+    fn div_ceil_with_remainder() {
+        assert_eq!(div_ceil(11, 5), 3);
+        assert_eq!(div_ceil(1, 3), 1);
+    }
+
+    #[test]
+    fn div_ceil_zero_numerator() {
+        assert_eq!(div_ceil(0, 5), 0);
+    }
+
+    #[test]
+    fn div_ceil_zero_denominator() {
+        // Should return numerator (graceful fallback, not panic)
+        assert_eq!(div_ceil(10, 0), 10);
+    }
+
+    #[test]
+    fn chunk_range_empty_when_start_equals_end() {
+        let result = chunk_range(5, 5, 8, ChunkDirection::Forward);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn chunk_range_empty_when_start_exceeds_end() {
+        let result = chunk_range(10, 5, 8, ChunkDirection::Forward);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn chunk_range_forward_single_chunk() {
+        let result = chunk_range(0, 5, 10, ChunkDirection::Forward);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start_line, 0);
+        assert_eq!(result[0].end_line_exclusive, 5);
+    }
+
+    #[test]
+    fn chunk_range_reverse_single_chunk() {
+        let result = chunk_range(0, 5, 10, ChunkDirection::Reverse);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start_line, 0);
+        assert_eq!(result[0].end_line_exclusive, 5);
+    }
+
+    #[test]
+    fn interleave_empty_vecs() {
+        let result = interleave(vec![], vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn interleave_one_empty() {
+        let left = vec![ReflowLineRange {
+            start_line: 0,
+            end_line_exclusive: 5,
+        }];
+        let result = interleave(left, vec![]);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn interleave_alternates() {
+        let left = vec![
+            ReflowLineRange {
+                start_line: 0,
+                end_line_exclusive: 5,
+            },
+            ReflowLineRange {
+                start_line: 10,
+                end_line_exclusive: 15,
+            },
+        ];
+        let right = vec![
+            ReflowLineRange {
+                start_line: 50,
+                end_line_exclusive: 55,
+            },
+            ReflowLineRange {
+                start_line: 60,
+                end_line_exclusive: 65,
+            },
+        ];
+        let result = interleave(left, right);
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].start_line, 0); // left[0]
+        assert_eq!(result[1].start_line, 50); // right[0]
+        assert_eq!(result[2].start_line, 10); // left[1]
+        assert_eq!(result[3].start_line, 60); // right[1]
+    }
 }

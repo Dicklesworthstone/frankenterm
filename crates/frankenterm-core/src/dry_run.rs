@@ -1103,4 +1103,288 @@ mod tests {
         assert!(check.details.is_some());
         assert!(check.details.unwrap().contains("30 seconds"));
     }
+
+    // ---------------------------------------------------------------
+    // Expanded pure unit tests (wa-1u90p.7.1)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn command_context_clone() {
+        let ctx = CommandContext::new("ft send 1 hello", true);
+        let c = ctx.clone();
+        assert_eq!(c.command, "ft send 1 hello");
+        assert!(c.dry_run);
+    }
+
+    #[test]
+    fn command_context_debug() {
+        let ctx = CommandContext::new("cmd", false);
+        let dbg = format!("{:?}", ctx);
+        assert!(dbg.contains("CommandContext"));
+        assert!(dbg.contains("cmd"));
+    }
+
+    #[test]
+    fn command_context_not_dry_run() {
+        let ctx = CommandContext::new("ft send 1 test", false);
+        assert!(!ctx.is_dry_run());
+        let dry_ctx = ctx.dry_run_context();
+        assert!(!dry_ctx.is_dry_run());
+    }
+
+    #[test]
+    fn dry_run_context_default() {
+        let ctx = DryRunContext::default();
+        assert!(!ctx.enabled);
+        assert!(ctx.report.command.is_empty());
+        assert!(ctx.report.expected_actions.is_empty());
+    }
+
+    #[test]
+    fn dry_run_context_clone() {
+        let mut ctx = DryRunContext::enabled();
+        ctx.set_command("test");
+        ctx.add_warning("w1");
+        let c = ctx.clone();
+        assert!(c.enabled);
+        assert_eq!(c.report.command, "test");
+        assert_eq!(c.report.warnings.len(), 1);
+    }
+
+    #[test]
+    fn dry_run_context_multiple_warnings() {
+        let mut ctx = DryRunContext::enabled();
+        ctx.add_warning("w1");
+        ctx.add_warning("w2");
+        ctx.add_warning("w3");
+        let report = ctx.take_report();
+        assert_eq!(report.warnings.len(), 3);
+        assert_eq!(report.warnings[0], "w1");
+        assert_eq!(report.warnings[2], "w3");
+    }
+
+    #[test]
+    fn dry_run_context_multiple_actions() {
+        let mut ctx = DryRunContext::enabled();
+        ctx.add_action(PlannedAction::new(1, ActionType::AcquireLock, "lock"));
+        ctx.add_action(PlannedAction::new(2, ActionType::SendText, "send"));
+        ctx.add_action(PlannedAction::new(3, ActionType::ReleaseLock, "unlock"));
+        let report = ctx.take_report();
+        assert_eq!(report.action_count(), 3);
+        assert_eq!(report.expected_actions[0].step, 1);
+        assert_eq!(report.expected_actions[2].step, 3);
+    }
+
+    #[test]
+    fn dry_run_report_new_is_default() {
+        let r = DryRunReport::new();
+        assert!(r.command.is_empty());
+        assert!(r.target_resolution.is_none());
+        assert!(r.policy_evaluation.is_none());
+        assert!(r.expected_actions.is_empty());
+        assert!(!r.has_warnings());
+    }
+
+    #[test]
+    fn dry_run_report_with_command_sets_command() {
+        let r = DryRunReport::with_command("my-cmd");
+        assert_eq!(r.command, "my-cmd");
+    }
+
+    #[test]
+    fn dry_run_report_has_warnings() {
+        let mut r = DryRunReport::new();
+        assert!(!r.has_warnings());
+        r.warnings.push("warning".to_string());
+        assert!(r.has_warnings());
+    }
+
+    #[test]
+    fn dry_run_report_policy_passed_none() {
+        let r = DryRunReport::new();
+        assert!(r.policy_passed(), "no policy = passed");
+    }
+
+    #[test]
+    fn dry_run_report_policy_passed_all_pass() {
+        let mut r = DryRunReport::new();
+        let mut eval = PolicyEvaluation::new();
+        eval.add_check(PolicyCheck::passed("a", "ok"));
+        eval.add_check(PolicyCheck::passed("b", "ok"));
+        r.policy_evaluation = Some(eval);
+        assert!(r.policy_passed());
+    }
+
+    #[test]
+    fn dry_run_report_policy_passed_with_failure() {
+        let mut r = DryRunReport::new();
+        let mut eval = PolicyEvaluation::new();
+        eval.add_check(PolicyCheck::passed("a", "ok"));
+        eval.add_check(PolicyCheck::failed("b", "denied"));
+        r.policy_evaluation = Some(eval);
+        assert!(!r.policy_passed());
+    }
+
+    #[test]
+    fn dry_run_report_action_count() {
+        let mut r = DryRunReport::new();
+        assert_eq!(r.action_count(), 0);
+        r.expected_actions
+            .push(PlannedAction::new(1, ActionType::Other, "x"));
+        assert_eq!(r.action_count(), 1);
+    }
+
+    #[test]
+    fn dry_run_report_serde_roundtrip() {
+        let mut r = DryRunReport::with_command("test");
+        r.target_resolution = Some(TargetResolution::new(5, "local"));
+        r.warnings.push("w".to_string());
+        r.expected_actions
+            .push(PlannedAction::new(1, ActionType::StoreData, "store"));
+
+        let json = serde_json::to_string(&r).unwrap();
+        let parsed: DryRunReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.command, "test");
+        assert!(parsed.target_resolution.is_some());
+        assert_eq!(parsed.warnings.len(), 1);
+        assert_eq!(parsed.action_count(), 1);
+    }
+
+    #[test]
+    fn target_resolution_builder_chain() {
+        let target = TargetResolution::new(42, "local")
+            .with_title("my-pane")
+            .with_cwd("/home/user")
+            .with_is_active(true)
+            .with_agent_type("claude-code");
+
+        assert_eq!(target.pane_id, 42);
+        assert_eq!(target.domain, "local");
+        assert_eq!(target.title.as_deref(), Some("my-pane"));
+        assert_eq!(target.cwd.as_deref(), Some("/home/user"));
+        assert_eq!(target.is_active, Some(true));
+        assert_eq!(target.agent_type.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn target_resolution_serde_roundtrip() {
+        let target = TargetResolution::new(1, "ssh:host1")
+            .with_title("remote")
+            .with_cwd("/tmp");
+
+        let json = serde_json::to_string(&target).unwrap();
+        let parsed: TargetResolution = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pane_id, 1);
+        assert_eq!(parsed.domain, "ssh:host1");
+        assert_eq!(parsed.title.as_deref(), Some("remote"));
+    }
+
+    #[test]
+    fn target_resolution_minimal() {
+        let target = TargetResolution::new(0, "local");
+        assert_eq!(target.pane_id, 0);
+        assert!(target.title.is_none());
+        assert!(target.cwd.is_none());
+        assert!(target.is_active.is_none());
+        assert!(target.agent_type.is_none());
+    }
+
+    #[test]
+    fn policy_evaluation_empty_all_passed() {
+        let eval = PolicyEvaluation::new();
+        assert!(eval.all_passed(), "empty checks = all passed");
+        assert!(eval.failed_checks().is_empty());
+    }
+
+    #[test]
+    fn policy_evaluation_failed_checks() {
+        let mut eval = PolicyEvaluation::new();
+        eval.add_check(PolicyCheck::passed("a", "ok"));
+        eval.add_check(PolicyCheck::failed("b", "nope"));
+        eval.add_check(PolicyCheck::failed("c", "denied"));
+        let failed = eval.failed_checks();
+        assert_eq!(failed.len(), 2);
+        assert_eq!(failed[0].name, "b");
+        assert_eq!(failed[1].name, "c");
+    }
+
+    #[test]
+    fn policy_evaluation_serde_roundtrip() {
+        let mut eval = PolicyEvaluation::new();
+        eval.add_check(PolicyCheck::passed("rate_limit", "ok"));
+        let json = serde_json::to_string(&eval).unwrap();
+        let parsed: PolicyEvaluation = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.checks.len(), 1);
+        assert!(parsed.all_passed());
+    }
+
+    #[test]
+    fn policy_check_passed_and_failed() {
+        let p = PolicyCheck::passed("a", "good");
+        assert!(p.passed);
+        assert_eq!(p.name, "a");
+        assert!(p.details.is_none());
+
+        let f = PolicyCheck::failed("b", "bad");
+        assert!(!f.passed);
+        assert_eq!(f.name, "b");
+    }
+
+    #[test]
+    fn policy_check_serde_roundtrip() {
+        let check = PolicyCheck::failed("rate_limit", "exceeded")
+            .with_details("5/5 sends in 30s");
+        let json = serde_json::to_string(&check).unwrap();
+        let parsed: PolicyCheck = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.passed);
+        assert_eq!(parsed.details.as_deref(), Some("5/5 sends in 30s"));
+    }
+
+    #[test]
+    fn planned_action_builder_with_metadata() {
+        let meta = serde_json::json!({"target_pane": 42, "text": "hello"});
+        let action = PlannedAction::new(1, ActionType::SendText, "send text")
+            .with_metadata(meta.clone());
+        assert_eq!(action.step, 1);
+        assert_eq!(action.action_type, ActionType::SendText);
+        assert_eq!(action.metadata.unwrap(), meta);
+    }
+
+    #[test]
+    fn planned_action_serde_roundtrip() {
+        let action = PlannedAction::new(3, ActionType::WorkflowStep, "execute step");
+        let json = serde_json::to_string(&action).unwrap();
+        let parsed: PlannedAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.step, 3);
+        assert_eq!(parsed.action_type, ActionType::WorkflowStep);
+        assert_eq!(parsed.description, "execute step");
+    }
+
+    #[test]
+    fn action_type_eq_and_copy() {
+        let a = ActionType::SendText;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(ActionType::SendText, ActionType::WaitFor);
+    }
+
+    #[test]
+    fn action_type_serde_roundtrip() {
+        let variants = [
+            ActionType::SendText,
+            ActionType::WaitFor,
+            ActionType::AcquireLock,
+            ActionType::ReleaseLock,
+            ActionType::StoreData,
+            ActionType::WorkflowStep,
+            ActionType::MarkEventHandled,
+            ActionType::ValidateApproval,
+            ActionType::Other,
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let parsed: ActionType = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, parsed);
+        }
+    }
 }
