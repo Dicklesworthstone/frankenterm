@@ -769,4 +769,30 @@ proptest! {
         prop_assert!(d.is_allowed(),
             "after set_policy to ReadOnly, should allow");
     }
+
+    /// GuardPolicy Debug is non-empty.
+    #[test]
+    fn guard_policy_debug_nonempty(_dummy in 0..1u32) {
+        let policy = GuardPolicy::default();
+        let debug = format!("{:?}", policy);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// GuardPolicy Clone preserves default_trust.
+    #[test]
+    fn guard_policy_clone_preserves(_dummy in 0..1u32) {
+        let policy = GuardPolicy::default();
+        let cloned = policy.clone();
+        prop_assert_eq!(cloned.default_trust, policy.default_trust);
+    }
+
+    /// TrustLevel Debug is non-empty.
+    #[test]
+    fn trust_level_debug_nonempty(_dummy in 0..1u32) {
+        let levels = [TrustLevel::Strict, TrustLevel::ReadOnly];
+        for l in &levels {
+            let debug = format!("{:?}", l);
+            prop_assert!(!debug.is_empty());
+        }
+    }
 }

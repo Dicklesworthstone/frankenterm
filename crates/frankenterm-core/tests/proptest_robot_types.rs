@@ -565,4 +565,26 @@ proptest! {
                 "from_number({}) should produce Unknown", n);
         }
     }
+
+    /// ErrorCategory Debug is non-empty.
+    #[test]
+    fn prop_error_category_debug_nonempty(code in arb_known_error_code()) {
+        let cat = code.category();
+        let debug = format!("{:?}", cat);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ErrorCode Clone preserves number.
+    #[test]
+    fn prop_error_code_clone_preserves(code in arb_known_error_code()) {
+        let cloned = code.clone();
+        prop_assert_eq!(cloned.number(), code.number());
+    }
+
+    /// ErrorCode Debug is non-empty.
+    #[test]
+    fn prop_error_code_debug_nonempty(code in arb_known_error_code()) {
+        let debug = format!("{:?}", code);
+        prop_assert!(!debug.is_empty());
+    }
 }

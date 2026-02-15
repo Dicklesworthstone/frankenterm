@@ -623,4 +623,28 @@ proptest! {
         prop_assert_eq!(scan1, scan2);
         prop_assert_eq!(scan2, scan3);
     }
+
+    /// OutputScanMetrics Clone preserves all fields.
+    #[test]
+    fn metrics_clone_preserves(data in arb_bytes(500)) {
+        let scan = scan_newlines_and_ansi(&data);
+        let cloned = scan.clone();
+        prop_assert_eq!(cloned, scan);
+    }
+
+    /// OutputScanMetrics Debug is non-empty.
+    #[test]
+    fn metrics_debug_nonempty(data in arb_bytes(500)) {
+        let scan = scan_newlines_and_ansi(&data);
+        let debug = format!("{:?}", scan);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// Empty data produces zero newlines and zero ANSI bytes.
+    #[test]
+    fn empty_data_zero_metrics(_dummy in 0..1u8) {
+        let scan = scan_newlines_and_ansi(&[]);
+        prop_assert_eq!(scan.newline_count, 0);
+        prop_assert_eq!(scan.ansi_byte_count, 0);
+    }
 }

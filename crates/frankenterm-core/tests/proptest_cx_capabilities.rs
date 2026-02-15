@@ -519,4 +519,39 @@ proptest! {
         let config = runtime.config();
         prop_assert_eq!(config.poll_budget, pb);
     }
+
+    /// RuntimeTuning Debug is non-empty.
+    #[test]
+    fn runtime_tuning_debug_nonempty(pb in 1u32..=512) {
+        let tuning = RuntimeTuning {
+            worker_threads: 1,
+            poll_budget: pb,
+            blocking_min_threads: 0,
+            blocking_max_threads: 0,
+        };
+        let debug = format!("{:?}", tuning);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// RuntimeTuning Clone preserves fields.
+    #[test]
+    fn runtime_tuning_clone_preserves(pb in 1u32..=512) {
+        let tuning = RuntimeTuning {
+            worker_threads: 2,
+            poll_budget: pb,
+            blocking_min_threads: 1,
+            blocking_max_threads: 4,
+        };
+        let cloned = tuning.clone();
+        prop_assert_eq!(cloned.poll_budget, tuning.poll_budget);
+        prop_assert_eq!(cloned.worker_threads, tuning.worker_threads);
+    }
+
+    /// RuntimePreset MultiThread Debug is non-empty.
+    #[test]
+    fn runtime_preset_multi_thread_debug(_dummy in 0..1u8) {
+        let debug = format!("{:?}", RuntimePreset::MultiThread);
+        prop_assert!(!debug.is_empty());
+        prop_assert!(debug.contains("MultiThread"));
+    }
 }

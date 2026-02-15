@@ -587,3 +587,28 @@ fn config_serde_deterministic() {
     let j2 = serde_json::to_string(&config).unwrap();
     assert_eq!(j1, j2);
 }
+
+#[test]
+fn config_debug_nonempty() {
+    let config = CausalDagConfig::default();
+    let debug = format!("{:?}", config);
+    assert!(!debug.is_empty());
+}
+
+#[test]
+fn config_clone_preserves() {
+    let config = CausalDagConfig::default();
+    let cloned = config.clone();
+    let j1 = serde_json::to_string(&config).unwrap();
+    let j2 = serde_json::to_string(&cloned).unwrap();
+    assert_eq!(j1, j2);
+}
+
+#[test]
+fn time_series_capacity_respected() {
+    let mut ts = PaneTimeSeries::new(5);
+    for i in 0..10 {
+        ts.push(i as f64);
+    }
+    assert!(ts.len() <= 5);
+}

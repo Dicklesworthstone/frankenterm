@@ -931,4 +931,33 @@ proptest! {
             );
         }
     }
+
+    /// DirtyTracker Debug is non-empty.
+    #[test]
+    fn dirty_tracker_debug_nonempty(_dummy in 0..1u8) {
+        let tracker = DirtyTracker::new();
+        let debug = format!("{:?}", tracker);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// DiffSnapshot Clone preserves seq.
+    #[test]
+    fn diff_snapshot_clone_preserves_seq(seq in 0u64..1000) {
+        let diff = DiffSnapshot {
+            seq,
+            captured_at: 1000,
+            diffs: vec![],
+        };
+        let cloned = diff.clone();
+        prop_assert_eq!(cloned.seq, diff.seq);
+        prop_assert_eq!(cloned.captured_at, diff.captured_at);
+    }
+
+    /// BaseSnapshot Debug is non-empty.
+    #[test]
+    fn base_snapshot_debug_nonempty(ids in arb_pane_ids()) {
+        let base = make_base(&ids);
+        let debug = format!("{:?}", base);
+        prop_assert!(!debug.is_empty());
+    }
 }
