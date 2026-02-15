@@ -426,3 +426,125 @@ fn wait_error_is_std_error() {
     };
     let _: &dyn std::error::Error = &err;
 }
+
+// =========================================================================
+// Additional property tests for coverage
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Backoff Clone preserves all fields.
+    #[test]
+    fn prop_backoff_clone(
+        initial_ms in 1_u64..1000,
+        max_ms in 1_u64..10_000,
+        factor in 1_u32..10,
+    ) {
+        let backoff = Backoff {
+            initial: Duration::from_millis(initial_ms),
+            max: Duration::from_millis(max_ms),
+            factor,
+            max_retries: None,
+        };
+        let cloned = backoff.clone();
+        prop_assert_eq!(backoff.initial, cloned.initial);
+        prop_assert_eq!(backoff.max, cloned.max);
+        prop_assert_eq!(backoff.factor, cloned.factor);
+        prop_assert_eq!(backoff.max_retries, cloned.max_retries);
+    }
+
+    /// Backoff Debug output is non-empty.
+    #[test]
+    fn prop_backoff_debug_nonempty(
+        initial_ms in 1_u64..1000,
+        max_ms in 1_u64..10_000,
+    ) {
+        let backoff = Backoff {
+            initial: Duration::from_millis(initial_ms),
+            max: Duration::from_millis(max_ms),
+            factor: 2,
+            max_retries: None,
+        };
+        let dbg = format!("{:?}", backoff);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// WaitError Clone preserves all fields.
+    #[test]
+    fn prop_wait_error_clone(
+        expected in "[a-z]{3,15}",
+        retries in 0_usize..50,
+        elapsed_ms in 0_u64..10_000,
+    ) {
+        let err = WaitError {
+            expected: expected.clone(),
+            last_observed: Some("observed".to_string()),
+            retries,
+            elapsed: Duration::from_millis(elapsed_ms),
+        };
+        let cloned = err.clone();
+        prop_assert_eq!(cloned.expected.as_str(), err.expected.as_str());
+        prop_assert_eq!(cloned.last_observed, err.last_observed);
+        prop_assert_eq!(cloned.retries, err.retries);
+        prop_assert_eq!(cloned.elapsed, err.elapsed);
+    }
+
+    /// WaitError Debug output is non-empty.
+    #[test]
+    fn prop_wait_error_debug_nonempty(
+        expected in "[a-z]{3,10}",
+    ) {
+        let err = WaitError {
+            expected,
+            last_observed: None,
+            retries: 0,
+            elapsed: Duration::ZERO,
+        };
+        let dbg = format!("{:?}", err);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// QuiescenceState with pending=0 and recent activity is not quiet.
+    #[test]
+    fn prop_quiescence_recent_activity_not_quiet(window_ms in 100_u64..10_000) {
+        let state = QuiescenceState {
+            pending: 0,
+            last_activity: Some(Instant::now()),
+            quiet_window: Duration::from_millis(window_ms),
+        };
+        // Just recorded activity, so quiet_window hasn't elapsed yet
+        prop_assert!(!state.is_quiet(Instant::now()),
+            "recent activity with {}ms window should not be quiet", window_ms);
+    }
+
+    /// WaitFor::ready unwraps to the correct value.
+    #[test]
+    fn prop_wait_for_ready_value(val in any::<u64>()) {
+        let w = WaitFor::ready(val);
+        match w {
+            WaitFor::Ready(v) => prop_assert_eq!(v, val),
+            _ => prop_assert!(false, "expected Ready"),
+        }
+    }
+
+    /// Backoff next_delay is deterministic.
+    #[test]
+    fn prop_backoff_next_delay_deterministic(
+        initial_ms in 1_u64..100,
+        max_ms in 100_u64..10_000,
+        factor in 1_u32..5,
+        current_ms in 1_u64..500,
+    ) {
+        let backoff = Backoff {
+            initial: Duration::from_millis(initial_ms),
+            max: Duration::from_millis(max_ms),
+            factor,
+            max_retries: None,
+        };
+        let current = Duration::from_millis(current_ms);
+        let d1 = backoff.next_delay(current);
+        let d2 = backoff.next_delay(current);
+        prop_assert_eq!(d1, d2);
+    }
+}

@@ -416,4 +416,110 @@ proptest! {
         prop_assert_ne!(info, error);
         prop_assert_ne!(warn, error);
     }
+
+    /// Clone preserves HealthDiagnosticStatus variant.
+    #[test]
+    fn health_status_clone(s in arb_health_status()) {
+        let cloned = Clone::clone(&s);
+        prop_assert_eq!(s, cloned);
+    }
+}
+
+// ── Additional structural properties ─────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// AnalyticsSummaryData Debug output is non-empty.
+    #[test]
+    fn analytics_summary_debug_nonempty(data in arb_analytics_summary()) {
+        let dbg = format!("{:?}", data);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// AnalyticsSummaryData serialization is deterministic.
+    #[test]
+    fn analytics_summary_deterministic(data in arb_analytics_summary()) {
+        let j1 = serde_json::to_string(&data).unwrap();
+        let j2 = serde_json::to_string(&data).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// RuleListItem Clone preserves all fields.
+    #[test]
+    fn rule_list_item_clone(item in arb_rule_list_item()) {
+        let cloned = item.clone();
+        prop_assert_eq!(cloned.id.as_str(), item.id.as_str());
+        prop_assert_eq!(cloned.agent_type.as_str(), item.agent_type.as_str());
+        prop_assert_eq!(cloned.severity.as_str(), item.severity.as_str());
+        prop_assert_eq!(cloned.anchor_count, item.anchor_count);
+        prop_assert_eq!(cloned.has_regex, item.has_regex);
+    }
+
+    /// RuleListItem Debug output is non-empty.
+    #[test]
+    fn rule_list_item_debug_nonempty(item in arb_rule_list_item()) {
+        let dbg = format!("{:?}", item);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// RuleTestMatch Clone preserves all fields.
+    #[test]
+    fn rule_test_match_clone(m in arb_rule_test_match()) {
+        let cloned = m.clone();
+        prop_assert_eq!(cloned.rule_id.as_str(), m.rule_id.as_str());
+        prop_assert_eq!(cloned.severity.as_str(), m.severity.as_str());
+        prop_assert_eq!(cloned.matched_text.as_str(), m.matched_text.as_str());
+    }
+
+    /// RuleTestMatch Debug output is non-empty.
+    #[test]
+    fn rule_test_match_debug_nonempty(m in arb_rule_test_match()) {
+        let dbg = format!("{:?}", m);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// RuleDetail Debug output is non-empty.
+    #[test]
+    fn rule_detail_debug_nonempty(detail in arb_rule_detail()) {
+        let dbg = format!("{:?}", detail);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// RuleDetail serialization is deterministic.
+    #[test]
+    fn rule_detail_deterministic(detail in arb_rule_detail()) {
+        let j1 = serde_json::to_string(&detail).unwrap();
+        let j2 = serde_json::to_string(&detail).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// AnalyticsSummaryData JSON has exactly 5 fields.
+    #[test]
+    fn analytics_summary_field_count(data in arb_analytics_summary()) {
+        let json = serde_json::to_string(&data).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert_eq!(obj.len(), 5,
+            "AnalyticsSummaryData should have 5 fields, got {}", obj.len());
+    }
+
+    /// RuleListItem JSON has exactly 8 fields.
+    #[test]
+    fn rule_list_item_field_count(item in arb_rule_list_item()) {
+        let json = serde_json::to_string(&item).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert_eq!(obj.len(), 8,
+            "RuleListItem should have 8 fields, got {}", obj.len());
+    }
+
+    /// HealthDiagnosticStatus Debug contains known variant name.
+    #[test]
+    fn health_status_debug_contains_variant(s in arb_health_status()) {
+        let dbg = format!("{:?}", s);
+        let known = dbg.contains("Ok") || dbg.contains("Info")
+            || dbg.contains("Warning") || dbg.contains("Error");
+        prop_assert!(known, "Debug '{}' should contain a known variant", dbg);
+    }
 }
