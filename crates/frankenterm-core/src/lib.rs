@@ -182,6 +182,7 @@ pub mod setup;
 pub mod sharded_counter;
 pub mod sharding;
 pub mod simd_scan;
+pub mod skip_list;
 pub mod snapshot_engine;
 pub mod spectral;
 pub mod spsc_ring_buffer;
