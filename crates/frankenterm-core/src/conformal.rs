@@ -998,6 +998,331 @@ mod tests {
         assert_eq!(f.metric_count(), 6);
     }
 
+    // === Batch: DarkBadger wa-1u90p.7.1 ===
+
+    #[test]
+    fn conformal_config_default_values() {
+        let c = ConformalConfig::default();
+        assert!((c.coverage - 0.95).abs() < f64::EPSILON);
+        assert_eq!(c.calibration_window, 200);
+        assert_eq!(c.horizon_steps, vec![60, 120, 240, 480, 960]);
+        assert!((c.holt_alpha - 0.3).abs() < f64::EPSILON);
+        assert!((c.holt_beta - 0.1).abs() < f64::EPSILON);
+        assert_eq!(c.observation_interval_secs, 30);
+        assert!((c.rss_alarm_fraction - 0.80).abs() < f64::EPSILON);
+        assert!((c.cpu_alarm_percent - 90.0).abs() < f64::EPSILON);
+        assert_eq!(c.max_history, 8640);
+    }
+
+    #[test]
+    fn conformal_config_serde_roundtrip() {
+        let config = ConformalConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ConformalConfig = serde_json::from_str(&json).unwrap();
+        assert!((back.coverage - config.coverage).abs() < f64::EPSILON);
+        assert_eq!(back.calibration_window, config.calibration_window);
+        assert_eq!(back.horizon_steps, config.horizon_steps);
+        assert!((back.holt_alpha - config.holt_alpha).abs() < f64::EPSILON);
+        assert!((back.holt_beta - config.holt_beta).abs() < f64::EPSILON);
+        assert_eq!(
+            back.observation_interval_secs,
+            config.observation_interval_secs
+        );
+        assert!((back.rss_alarm_fraction - config.rss_alarm_fraction).abs() < f64::EPSILON);
+        assert!((back.cpu_alarm_percent - config.cpu_alarm_percent).abs() < f64::EPSILON);
+        assert_eq!(back.max_history, config.max_history);
+    }
+
+    #[test]
+    fn conformal_config_debug_clone() {
+        let c = ConformalConfig::default();
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("ConformalConfig"));
+        assert!(dbg.contains("coverage"));
+        let cloned = c.clone();
+        assert!((cloned.coverage - c.coverage).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn conformal_config_serde_default_annotation() {
+        // Empty JSON should produce default values due to #[serde(default)]
+        let back: ConformalConfig = serde_json::from_str("{}").unwrap();
+        assert!((back.coverage - 0.95).abs() < f64::EPSILON);
+        assert_eq!(back.calibration_window, 200);
+    }
+
+    #[test]
+    fn holt_predictor_debug_clone() {
+        let holt = HoltPredictor::new(0.3, 0.1);
+        let dbg = format!("{:?}", holt);
+        assert!(dbg.contains("HoltPredictor"));
+        let cloned = holt.clone();
+        assert!((cloned.level() - holt.level()).abs() < f64::EPSILON);
+        assert!((cloned.trend() - holt.trend()).abs() < f64::EPSILON);
+        assert_eq!(cloned.observation_count(), holt.observation_count());
+    }
+
+    #[test]
+    fn holt_predictor_clamps_extreme_params() {
+        // Both extremes should produce finite results after updates
+        let mut h_low = HoltPredictor::new(0.0, 0.0);
+        h_low.update(10.0);
+        h_low.update(20.0);
+        assert!(h_low.level().is_finite());
+        assert!(h_low.trend().is_finite());
+
+        let mut h_high = HoltPredictor::new(100.0, 100.0);
+        h_high.update(10.0);
+        h_high.update(20.0);
+        assert!(h_high.level().is_finite());
+        assert!(h_high.trend().is_finite());
+    }
+
+    #[test]
+    fn holt_forecast_zero_steps() {
+        let mut holt = HoltPredictor::new(0.3, 0.1);
+        holt.update(42.0);
+        assert!((holt.forecast(0.0) - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn holt_forecast_negative_steps() {
+        let mut holt = HoltPredictor::new(0.3, 0.1);
+        for i in 0..50 {
+            holt.update(i as f64);
+        }
+        let back = holt.forecast(-10.0);
+        assert!(back < holt.forecast(0.0));
+    }
+
+    #[test]
+    fn resource_forecast_debug_clone() {
+        let fc = ResourceForecast {
+            metric_name: "test".into(),
+            horizon_steps: 60,
+            point_estimate: 100.0,
+            lower_bound: 90.0,
+            upper_bound: 110.0,
+            coverage: 0.95,
+            calibration_size: 50,
+            alert: None,
+        };
+        let dbg = format!("{:?}", fc);
+        assert!(dbg.contains("ResourceForecast"));
+        assert!(dbg.contains("test"));
+        let cloned = fc.clone();
+        assert_eq!(cloned.metric_name, "test");
+        assert_eq!(cloned.horizon_steps, 60);
+    }
+
+    #[test]
+    fn resource_forecast_serde_roundtrip() {
+        let fc = ResourceForecast {
+            metric_name: "rss_bytes".into(),
+            horizon_steps: 120,
+            point_estimate: 500_000.0,
+            lower_bound: 400_000.0,
+            upper_bound: 600_000.0,
+            coverage: 0.95,
+            calibration_size: 100,
+            alert: None,
+        };
+        let json = serde_json::to_string(&fc).unwrap();
+        let back: ResourceForecast = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.metric_name, "rss_bytes");
+        assert_eq!(back.horizon_steps, 120);
+        assert!((back.point_estimate - 500_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn resource_forecast_uncalibrated_infinite_width() {
+        let fc = ResourceForecast {
+            metric_name: "x".into(),
+            horizon_steps: 5,
+            point_estimate: 0.0,
+            lower_bound: f64::NEG_INFINITY,
+            upper_bound: f64::INFINITY,
+            coverage: 0.95,
+            calibration_size: 0,
+            alert: None,
+        };
+        assert!(!fc.is_calibrated());
+        assert!(fc.interval_width().is_infinite());
+    }
+
+    #[test]
+    fn resource_forecast_serde_with_alert() {
+        let fc = ResourceForecast {
+            metric_name: "cpu_percent".into(),
+            horizon_steps: 60,
+            point_estimate: 95.0,
+            lower_bound: 85.0,
+            upper_bound: 105.0,
+            coverage: 0.95,
+            calibration_size: 100,
+            alert: Some(ForecastAlert::CpuThreshold {
+                upper_bound_percent: 105.0,
+                threshold_percent: 90.0,
+                horizon_steps: 60,
+            }),
+        };
+        let json = serde_json::to_string(&fc).unwrap();
+        let back: ResourceForecast = serde_json::from_str(&json).unwrap();
+        assert!(back.alert.is_some());
+        assert_eq!(back.metric_name, "cpu_percent");
+    }
+
+    #[test]
+    fn forecast_alert_rss_debug_clone_serde() {
+        let alert = ForecastAlert::RssThreshold {
+            upper_bound_bytes: 900_000.0,
+            threshold_bytes: 800_000.0,
+            horizon_steps: 60,
+        };
+        let dbg = format!("{:?}", alert);
+        assert!(dbg.contains("RssThreshold"));
+        let cloned = alert.clone();
+        assert!(format!("{:?}", cloned).contains("RssThreshold"));
+        let json = serde_json::to_string(&alert).unwrap();
+        let back: ForecastAlert = serde_json::from_str(&json).unwrap();
+        assert!(format!("{:?}", back).contains("RssThreshold"));
+    }
+
+    #[test]
+    fn forecast_alert_cpu_debug_clone_serde() {
+        let alert = ForecastAlert::CpuThreshold {
+            upper_bound_percent: 95.0,
+            threshold_percent: 90.0,
+            horizon_steps: 120,
+        };
+        let dbg = format!("{:?}", alert);
+        assert!(dbg.contains("CpuThreshold"));
+        let cloned = alert.clone();
+        assert!(format!("{:?}", cloned).contains("CpuThreshold"));
+        let json = serde_json::to_string(&alert).unwrap();
+        let back: ForecastAlert = serde_json::from_str(&json).unwrap();
+        assert!(format!("{:?}", back).contains("CpuThreshold"));
+    }
+
+    #[test]
+    fn metric_forecaster_debug_clone() {
+        let mf = MetricForecaster::new("rss".into(), 0.3, 0.1, &[5], 100, 500, 0.95);
+        let dbg = format!("{:?}", mf);
+        assert!(dbg.contains("MetricForecaster"));
+        assert!(dbg.contains("rss"));
+        let cloned = mf.clone();
+        assert_eq!(cloned.name(), "rss");
+        assert_eq!(cloned.observation_count(), 0);
+    }
+
+    #[test]
+    fn metric_forecaster_name_accessor() {
+        let mf = MetricForecaster::new("cpu_percent".into(), 0.3, 0.1, &[10], 50, 200, 0.90);
+        assert_eq!(mf.name(), "cpu_percent");
+    }
+
+    #[test]
+    fn metric_forecaster_observe_skips_nan() {
+        let mut mf = MetricForecaster::new("test".into(), 0.3, 0.1, &[5], 100, 500, 0.95);
+        mf.observe(100.0);
+        mf.observe(f64::NAN);
+        mf.observe(f64::INFINITY);
+        assert_eq!(mf.observation_count(), 1);
+    }
+
+    #[test]
+    fn metric_forecaster_coverage_clamped() {
+        // Coverage is clamped to [0.01, 0.999] — should not panic
+        let mf_low = MetricForecaster::new("x".into(), 0.3, 0.1, &[5], 100, 500, -1.0);
+        assert_eq!(mf_low.observation_count(), 0);
+        let mf_high = MetricForecaster::new("x".into(), 0.3, 0.1, &[5], 100, 500, 5.0);
+        assert_eq!(mf_high.observation_count(), 0);
+    }
+
+    #[test]
+    fn conformal_forecaster_debug() {
+        let f = ConformalForecaster::with_defaults();
+        let dbg = format!("{:?}", f);
+        assert!(dbg.contains("ConformalForecaster"));
+    }
+
+    #[test]
+    fn conformal_forecaster_forecast_unknown_metric() {
+        let f = ConformalForecaster::with_defaults();
+        let forecasts = f.forecast_metric("nonexistent");
+        assert!(forecasts.is_empty());
+    }
+
+    #[test]
+    fn conformal_forecaster_has_metric_after_observe() {
+        let config = ConformalConfig {
+            horizon_steps: vec![5],
+            ..Default::default()
+        };
+        let mut f = ConformalForecaster::new(config);
+        assert!(!f.has_metric("rss"));
+        f.observe("rss", 100.0);
+        assert!(f.has_metric("rss"));
+        assert!(!f.has_metric("cpu"));
+    }
+
+    #[test]
+    fn conformal_forecaster_no_alert_uncalibrated() {
+        let config = ConformalConfig {
+            horizon_steps: vec![50],
+            calibration_window: 100,
+            max_history: 500,
+            rss_alarm_fraction: 0.80,
+            ..Default::default()
+        };
+        let mut f = ConformalForecaster::new(config);
+        f.set_available_memory(1_000_000);
+        // Only 5 observations — not enough for calibration at horizon=50
+        for _ in 0..5 {
+            f.observe("rss_bytes", 900_000.0);
+        }
+        let forecasts = f.forecast_metric("rss_bytes");
+        assert!(forecasts.iter().all(|fc| fc.alert.is_none()));
+    }
+
+    #[test]
+    fn conformal_forecaster_no_rss_alert_without_memory() {
+        let config = ConformalConfig {
+            horizon_steps: vec![5],
+            calibration_window: 50,
+            max_history: 500,
+            rss_alarm_fraction: 0.80,
+            ..Default::default()
+        };
+        let mut f = ConformalForecaster::new(config);
+        // Don't set available memory (stays 0)
+        for i in 0..200 {
+            f.observe("rss_bytes", (i as f64).mul_add(5000.0, 500_000.0));
+        }
+        let forecasts = f.forecast_metric("rss_bytes");
+        assert!(forecasts.iter().all(|fc| fc.alert.is_none()));
+    }
+
+    #[test]
+    fn calibration_quantile_coverage_one_returns_none() {
+        let mut cal = CalibrationSet::new(100);
+        for i in 1..=10 {
+            cal.push(i as f64);
+        }
+        // coverage=1.0: k = ceil(1.0 * 11) = 11 > 10
+        assert_eq!(cal.quantile(1.0), None);
+    }
+
+    #[test]
+    fn calibration_quantile_very_low_coverage() {
+        let mut cal = CalibrationSet::new(100);
+        for i in 1..=10 {
+            cal.push(i as f64);
+        }
+        // coverage=0.01: k = ceil(0.01 * 11) = 1
+        assert_eq!(cal.quantile(0.01), Some(1.0));
+    }
+
     // -- Proptest --
 
     proptest! {

@@ -1165,4 +1165,538 @@ mod tests {
             assert_eq!(back, h);
         }
     }
+
+    // === Batch: DarkBadger wa-1u90p.7.1 ===
+
+    #[test]
+    fn protocol_error_kind_debug_format() {
+        assert!(format!("{:?}", ProtocolErrorKind::Recoverable).contains("Recoverable"));
+        assert!(format!("{:?}", ProtocolErrorKind::Transient).contains("Transient"));
+        assert!(format!("{:?}", ProtocolErrorKind::Permanent).contains("Permanent"));
+    }
+
+    #[test]
+    fn protocol_error_kind_clone_copy() {
+        let a = ProtocolErrorKind::Recoverable;
+        let b = a; // Copy
+        let c = a.clone(); // Clone
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn protocol_error_kind_hash_consistent() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(ProtocolErrorKind::Recoverable);
+        set.insert(ProtocolErrorKind::Transient);
+        set.insert(ProtocolErrorKind::Permanent);
+        assert_eq!(set.len(), 3);
+        set.insert(ProtocolErrorKind::Recoverable);
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn recovery_config_serde_roundtrip() {
+        let config = RecoveryConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: RecoveryConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.enabled, config.enabled);
+        assert_eq!(back.max_retries, config.max_retries);
+        assert_eq!(back.initial_delay, config.initial_delay);
+        assert_eq!(back.max_delay, config.max_delay);
+        assert!((back.backoff_factor - config.backoff_factor).abs() < f64::EPSILON);
+        assert!((back.jitter_fraction - config.jitter_fraction).abs() < f64::EPSILON);
+        assert_eq!(
+            back.circuit_failure_threshold,
+            config.circuit_failure_threshold
+        );
+        assert_eq!(
+            back.circuit_success_threshold,
+            config.circuit_success_threshold
+        );
+        assert_eq!(back.circuit_cooldown, config.circuit_cooldown);
+        assert_eq!(back.report_degradation, config.report_degradation);
+        assert_eq!(back.permanent_failure_limit, config.permanent_failure_limit);
+    }
+
+    #[test]
+    fn recovery_config_debug_impl() {
+        let dbg = format!("{:?}", RecoveryConfig::default());
+        assert!(dbg.contains("RecoveryConfig"));
+        assert!(dbg.contains("enabled"));
+        assert!(dbg.contains("max_retries"));
+    }
+
+    #[test]
+    fn recovery_config_clone_preserves_fields() {
+        let a = RecoveryConfig::for_interactive();
+        let b = a.clone();
+        assert_eq!(a.max_retries, b.max_retries);
+        assert_eq!(a.initial_delay, b.initial_delay);
+        assert_eq!(a.max_delay, b.max_delay);
+        assert_eq!(a.circuit_cooldown, b.circuit_cooldown);
+    }
+
+    #[test]
+    fn recovery_config_for_capture_values() {
+        let c = RecoveryConfig::for_capture();
+        assert_eq!(c.max_retries, 2);
+        assert_eq!(c.initial_delay, Duration::from_millis(10));
+        assert_eq!(c.max_delay, Duration::from_millis(100));
+        assert_eq!(c.circuit_failure_threshold, 3);
+        assert_eq!(c.circuit_success_threshold, 1);
+        assert_eq!(c.circuit_cooldown, Duration::from_secs(5));
+        assert!(c.enabled);
+    }
+
+    #[test]
+    fn recovery_config_for_interactive_values() {
+        let i = RecoveryConfig::for_interactive();
+        assert_eq!(i.max_retries, 5);
+        assert_eq!(i.initial_delay, Duration::from_millis(100));
+        assert_eq!(i.max_delay, Duration::from_secs(2));
+        assert_eq!(i.circuit_failure_threshold, 8);
+        assert_eq!(i.circuit_success_threshold, 2);
+        assert_eq!(i.circuit_cooldown, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn delay_for_attempt_zero_returns_near_initial() {
+        let config = RecoveryConfig {
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
+            jitter_fraction: 0.0,
+            ..RecoveryConfig::default()
+        };
+        assert_eq!(config.delay_for_attempt(0), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn delay_for_attempt_increases_with_backoff() {
+        let config = RecoveryConfig {
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
+            jitter_fraction: 0.0,
+            ..RecoveryConfig::default()
+        };
+        let d0 = config.delay_for_attempt(0);
+        let d1 = config.delay_for_attempt(1);
+        let d2 = config.delay_for_attempt(2);
+        assert!(
+            d1 > d0,
+            "attempt 1 ({:?}) should > attempt 0 ({:?})",
+            d1,
+            d0
+        );
+        assert!(
+            d2 > d1,
+            "attempt 2 ({:?}) should > attempt 1 ({:?})",
+            d2,
+            d1
+        );
+    }
+
+    #[test]
+    fn delay_for_attempt_never_below_one_ms() {
+        let config = RecoveryConfig {
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            backoff_factor: 0.001,
+            jitter_fraction: 0.5,
+            ..RecoveryConfig::default()
+        };
+        for attempt in 0..10 {
+            assert!(config.delay_for_attempt(attempt) >= Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn recovery_error_display_all_variants() {
+        let e1 = RecoveryError::CircuitOpen;
+        assert!(e1.to_string().contains("circuit breaker open"));
+
+        let e2 = RecoveryError::RetriesExhausted {
+            attempts: 5,
+            last_error: "timed out".into(),
+            last_kind: ProtocolErrorKind::Transient,
+        };
+        let msg = e2.to_string();
+        assert!(msg.contains("5"), "should contain attempt count");
+        assert!(msg.contains("timed out"), "should contain last error");
+
+        let e3 = RecoveryError::Permanent("codec mismatch".into());
+        assert!(e3.to_string().contains("codec mismatch"));
+
+        let e4 = RecoveryError::PermanentLimitReached { limit: 3 };
+        assert!(e4.to_string().contains("3"));
+
+        let e5 = RecoveryError::Disabled;
+        assert!(e5.to_string().contains("disabled"));
+    }
+
+    #[test]
+    fn recovery_error_debug() {
+        let dbg = format!("{:?}", RecoveryError::CircuitOpen);
+        assert!(dbg.contains("CircuitOpen"));
+    }
+
+    #[test]
+    fn recovery_error_is_circuit_open_negatives() {
+        assert!(!RecoveryError::Disabled.is_circuit_open());
+        assert!(!RecoveryError::Permanent("x".into()).is_circuit_open());
+        assert!(!RecoveryError::PermanentLimitReached { limit: 1 }.is_circuit_open());
+        assert!(
+            !RecoveryError::RetriesExhausted {
+                attempts: 1,
+                last_error: "e".into(),
+                last_kind: ProtocolErrorKind::Transient,
+            }
+            .is_circuit_open()
+        );
+    }
+
+    #[test]
+    fn recovery_error_is_permanent_exhaustive() {
+        assert!(!RecoveryError::CircuitOpen.is_permanent());
+        assert!(!RecoveryError::Disabled.is_permanent());
+        assert!(
+            !RecoveryError::RetriesExhausted {
+                attempts: 1,
+                last_error: "e".into(),
+                last_kind: ProtocolErrorKind::Recoverable,
+            }
+            .is_permanent()
+        );
+        assert!(RecoveryError::Permanent("x".into()).is_permanent());
+        assert!(RecoveryError::PermanentLimitReached { limit: 1 }.is_permanent());
+    }
+
+    #[test]
+    fn recovery_stats_debug_and_clone() {
+        let stats = RecoveryStats {
+            total_operations: 10,
+            first_try_successes: 8,
+            retry_successes: 1,
+            total_retries: 2,
+            recoverable_failures: 1,
+            transient_failures: 1,
+            permanent_failures: 0,
+            circuit_rejections: 0,
+            consecutive_permanent: 0,
+            circuit_state: "Closed".into(),
+        };
+        let dbg = format!("{:?}", stats);
+        assert!(dbg.contains("RecoveryStats"));
+        assert!(dbg.contains("total_operations"));
+        let cloned = stats.clone();
+        assert_eq!(cloned.total_operations, 10);
+        assert_eq!(cloned.circuit_state, "Closed");
+    }
+
+    #[test]
+    fn connection_health_debug_clone_copy() {
+        let h = ConnectionHealth::Healthy;
+        let dbg = format!("{:?}", h);
+        assert!(dbg.contains("Healthy"));
+        let copied = h; // Copy
+        let cloned = h.clone(); // Clone
+        assert_eq!(copied, ConnectionHealth::Healthy);
+        assert_eq!(cloned, ConnectionHealth::Healthy);
+    }
+
+    #[test]
+    fn classify_io_connection_reset() {
+        assert_eq!(
+            classify_error_message("io error: connection reset"),
+            ProtocolErrorKind::Recoverable
+        );
+    }
+
+    #[test]
+    fn classify_io_not_connected() {
+        assert_eq!(
+            classify_error_message("io error: not connected"),
+            ProtocolErrorKind::Recoverable
+        );
+    }
+
+    #[test]
+    fn classify_io_interrupted() {
+        assert_eq!(
+            classify_error_message("io error: interrupted"),
+            ProtocolErrorKind::Transient
+        );
+    }
+
+    #[test]
+    fn classify_remote_error() {
+        assert_eq!(
+            classify_error_message("remote error: domain not found"),
+            ProtocolErrorKind::Recoverable
+        );
+    }
+
+    #[test]
+    fn classify_serial_exhausted() {
+        assert_eq!(
+            classify_error_message("request serial space exhausted"),
+            ProtocolErrorKind::Recoverable
+        );
+    }
+
+    #[test]
+    fn classify_proxy_unsupported() {
+        assert_eq!(
+            classify_error_message("proxy command not supported by remote"),
+            ProtocolErrorKind::Permanent
+        );
+    }
+
+    #[test]
+    fn classify_incompatible_generic() {
+        assert_eq!(
+            classify_error_message("client version incompatible with server"),
+            ProtocolErrorKind::Permanent
+        );
+    }
+
+    #[test]
+    fn classify_connection_refused() {
+        assert_eq!(
+            classify_error_message("connection refused by server"),
+            ProtocolErrorKind::Transient
+        );
+    }
+
+    #[test]
+    fn classify_generic_io_error_fallback() {
+        assert_eq!(
+            classify_error_message("io error: some unknown problem"),
+            ProtocolErrorKind::Recoverable
+        );
+    }
+
+    #[test]
+    fn classify_case_insensitive() {
+        assert_eq!(
+            classify_error_message("CODEC VERSION MISMATCH: local 4 != remote 3"),
+            ProtocolErrorKind::Permanent
+        );
+        assert_eq!(
+            classify_error_message("TIMED OUT waiting for response"),
+            ProtocolErrorKind::Transient
+        );
+    }
+
+    #[test]
+    fn detector_codec_error_counting() {
+        let mut d = FrameCorruptionDetector::new(100, 2);
+        d.record_error(ProtocolErrorKind::Recoverable, "codec error: bad frame");
+        assert_eq!(d.error_counts(), (0, 1));
+        d.record_error(ProtocolErrorKind::Recoverable, "frame exceeded max size");
+        assert_eq!(d.error_counts(), (0, 2));
+        assert!(d.is_corrupted());
+    }
+
+    #[test]
+    fn detector_mixed_unexpected_and_codec() {
+        let mut d = FrameCorruptionDetector::new(100, 3);
+        d.record_error(ProtocolErrorKind::Recoverable, "unexpected response: X");
+        d.record_error(ProtocolErrorKind::Recoverable, "codec error: bad");
+        assert_eq!(d.error_counts(), (1, 1));
+        assert!(!d.is_corrupted()); // 1+1 = 2 < 3
+        d.record_error(ProtocolErrorKind::Recoverable, "unexpected response: Y");
+        assert_eq!(d.error_counts(), (2, 1));
+        assert!(d.is_corrupted()); // 2+1 = 3 >= 3
+    }
+
+    #[test]
+    fn detector_default_params() {
+        let d = FrameCorruptionDetector::default();
+        assert_eq!(d.error_counts(), (0, 0));
+        assert!(!d.is_corrupted());
+    }
+
+    #[test]
+    fn detector_record_error_returns_corruption_state() {
+        let mut d = FrameCorruptionDetector::new(100, 2);
+        let r1 = d.record_error(ProtocolErrorKind::Recoverable, "unexpected response: X");
+        assert!(!r1);
+        let r2 = d.record_error(ProtocolErrorKind::Recoverable, "unexpected response: Y");
+        assert!(r2);
+    }
+
+    #[test]
+    fn detector_permanent_errors_not_counted() {
+        let mut d = FrameCorruptionDetector::new(100, 2);
+        d.record_error(ProtocolErrorKind::Permanent, "codec version mismatch");
+        d.record_error(ProtocolErrorKind::Permanent, "codec version mismatch");
+        assert!(!d.is_corrupted());
+        assert_eq!(d.error_counts(), (0, 0));
+    }
+
+    #[test]
+    fn tracker_degraded_on_single_recoverable() {
+        let mut t = ConnectionHealthTracker::new();
+        let h = t.record_error(ProtocolErrorKind::Recoverable, "disconnected");
+        assert_eq!(h, ConnectionHealth::Degraded);
+    }
+
+    #[test]
+    fn tracker_recovery_needs_exactly_5_successes() {
+        let mut t = ConnectionHealthTracker::new();
+        t.record_error(ProtocolErrorKind::Recoverable, "disconnected");
+        assert_eq!(t.health(), ConnectionHealth::Degraded);
+        for _ in 0..4 {
+            t.record_success();
+        }
+        assert_eq!(t.health(), ConnectionHealth::Degraded);
+        t.record_success();
+        assert_eq!(t.health(), ConnectionHealth::Healthy);
+    }
+
+    #[test]
+    fn tracker_error_resets_consecutive_successes() {
+        let mut t = ConnectionHealthTracker::new();
+        t.record_error(ProtocolErrorKind::Recoverable, "disconnected");
+        assert_eq!(t.health(), ConnectionHealth::Degraded);
+        for _ in 0..4 {
+            t.record_success();
+        }
+        t.record_error(ProtocolErrorKind::Transient, "timeout");
+        // Need 5 more consecutive successes now (counter was reset)
+        for _ in 0..4 {
+            t.record_success();
+        }
+        assert_eq!(t.health(), ConnectionHealth::Degraded);
+        t.record_success();
+        assert_eq!(t.health(), ConnectionHealth::Healthy);
+    }
+
+    #[test]
+    fn tracker_default_impl() {
+        let t = ConnectionHealthTracker::default();
+        assert_eq!(t.health(), ConnectionHealth::Healthy);
+    }
+
+    #[test]
+    fn recovery_outcome_debug() {
+        let outcome: RecoveryOutcome<i32> = RecoveryOutcome {
+            result: Ok(42),
+            attempts: 1,
+            error_kinds: vec![],
+        };
+        let dbg = format!("{:?}", outcome);
+        assert!(dbg.contains("RecoveryOutcome"));
+    }
+
+    #[tokio::test]
+    async fn engine_with_name_works() {
+        let mut e = RecoveryEngine::with_name("test_engine", RecoveryConfig::default());
+        let stats = e.stats();
+        assert_eq!(stats.total_operations, 0);
+        let o = e
+            .execute(
+                |_| async { Ok::<_, String>(42) },
+                |_: &String| ProtocolErrorKind::Transient,
+            )
+            .await;
+        assert_eq!(o.result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn engine_stats_initial_all_zeros() {
+        let e = RecoveryEngine::new(RecoveryConfig::default());
+        let s = e.stats();
+        assert_eq!(s.total_operations, 0);
+        assert_eq!(s.first_try_successes, 0);
+        assert_eq!(s.retry_successes, 0);
+        assert_eq!(s.total_retries, 0);
+        assert_eq!(s.recoverable_failures, 0);
+        assert_eq!(s.transient_failures, 0);
+        assert_eq!(s.permanent_failures, 0);
+        assert_eq!(s.circuit_rejections, 0);
+        assert_eq!(s.consecutive_permanent, 0);
+    }
+
+    #[tokio::test]
+    async fn engine_circuit_state_accessor() {
+        let e = RecoveryEngine::new(RecoveryConfig::default());
+        assert_eq!(e.circuit_state(), CircuitStateKind::Closed);
+    }
+
+    #[tokio::test]
+    async fn engine_config_accessor() {
+        let config = RecoveryConfig {
+            max_retries: 7,
+            ..RecoveryConfig::default()
+        };
+        let e = RecoveryEngine::new(config);
+        assert_eq!(e.config().max_retries, 7);
+    }
+
+    #[tokio::test]
+    async fn engine_is_available_when_enabled() {
+        let mut e = RecoveryEngine::new(RecoveryConfig::default());
+        assert!(e.is_available());
+    }
+
+    #[tokio::test]
+    async fn engine_is_not_available_when_disabled() {
+        let mut e = RecoveryEngine::new(RecoveryConfig {
+            enabled: false,
+            ..RecoveryConfig::default()
+        });
+        assert!(!e.is_available());
+    }
+
+    #[tokio::test]
+    async fn engine_reset_permanent_counter_works() {
+        let config = RecoveryConfig {
+            max_retries: 0,
+            permanent_failure_limit: 3,
+            circuit_failure_threshold: 10,
+            report_degradation: false,
+            ..RecoveryConfig::default()
+        };
+        let mut e = RecoveryEngine::new(config);
+        let _ = e
+            .execute(
+                |_| async {
+                    Err::<i32, _>("codec version mismatch: local 4 != remote 3".to_string())
+                },
+                |err: &String| classify_error_message(err),
+            )
+            .await;
+        assert_eq!(e.stats().consecutive_permanent, 1);
+        e.reset_permanent_counter();
+        assert_eq!(e.stats().consecutive_permanent, 0);
+    }
+
+    #[tokio::test]
+    async fn engine_outcome_error_kinds_populated() {
+        let config = RecoveryConfig {
+            max_retries: 2,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            report_degradation: false,
+            ..RecoveryConfig::default()
+        };
+        let mut e = RecoveryEngine::new(config);
+        let o = e
+            .execute(
+                |_| async { Err::<i32, _>("mux socket disconnected".to_string()) },
+                |err: &String| classify_error_message(err),
+            )
+            .await;
+        assert_eq!(o.error_kinds.len(), 3);
+        assert!(
+            o.error_kinds
+                .iter()
+                .all(|k| *k == ProtocolErrorKind::Recoverable)
+        );
+    }
 }
