@@ -1397,4 +1397,244 @@ mod tests {
         assert_eq!(agg.agent_last_seq("agent-b"), None);
         assert_eq!(agg.total_rejected(), 1);
     }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──────────────────────
+
+    // ── ConnectionState coverage ────────────────────────────
+
+    #[test]
+    fn connection_state_debug_clone_copy() {
+        let s = ConnectionState::Connected;
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("Connected"));
+        let copied = s; // Copy
+        let cloned = s.clone(); // Clone
+        assert_eq!(copied, cloned);
+    }
+
+    #[test]
+    fn connection_state_serde_roundtrip_all() {
+        let states = [
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+            ConnectionState::Connected,
+            ConnectionState::Reconnecting { attempt: 3 },
+        ];
+        for state in &states {
+            let json = serde_json::to_string(state).unwrap();
+            let back: ConnectionState = serde_json::from_str(&json).unwrap();
+            assert_eq!(*state, back);
+        }
+    }
+
+    #[test]
+    fn connection_state_equality() {
+        assert_eq!(ConnectionState::Disconnected, ConnectionState::Disconnected);
+        assert_ne!(ConnectionState::Connected, ConnectionState::Disconnected);
+        assert_eq!(
+            ConnectionState::Reconnecting { attempt: 2 },
+            ConnectionState::Reconnecting { attempt: 2 }
+        );
+        assert_ne!(
+            ConnectionState::Reconnecting { attempt: 1 },
+            ConnectionState::Reconnecting { attempt: 2 }
+        );
+    }
+
+    // ── BackoffConfig coverage ──────────────────────────────
+
+    #[test]
+    fn backoff_default_values() {
+        let b = BackoffConfig::default();
+        assert_eq!(b.initial_ms, 500);
+        assert_eq!(b.max_ms, 30_000);
+        assert!((b.multiplier - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn backoff_debug_clone() {
+        let b = BackoffConfig::default();
+        let dbg = format!("{:?}", b);
+        assert!(dbg.contains("BackoffConfig"));
+        let b2 = b.clone();
+        assert_eq!(b2.initial_ms, 500);
+    }
+
+    #[test]
+    fn backoff_delay_attempt_zero() {
+        let b = BackoffConfig::default();
+        assert_eq!(b.delay_ms(0), 500);
+    }
+
+    // ── WireProtocolError coverage ──────────────────────────
+
+    #[test]
+    fn wire_error_debug_format() {
+        let err = WireProtocolError::MessageTooLarge {
+            size: 2_000_000,
+            max: MAX_MESSAGE_SIZE,
+        };
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("MessageTooLarge"));
+    }
+
+    #[test]
+    fn wire_error_display_all_variants() {
+        let e1 = WireProtocolError::MessageTooLarge {
+            size: 999,
+            max: 100,
+        };
+        let d1 = format!("{}", e1);
+        assert!(d1.contains("too large"));
+
+        let e2 = WireProtocolError::VersionMismatch {
+            expected: 1,
+            got: 2,
+        };
+        let d2 = format!("{}", e2);
+        assert!(d2.contains("mismatch"));
+
+        let e3 = WireProtocolError::TooManyAgents {
+            max: 5,
+            sender: "x".to_string(),
+        };
+        let d3 = format!("{}", e3);
+        assert!(d3.contains("capacity"));
+    }
+
+    // ── IngestResult coverage ───────────────────────────────
+
+    #[test]
+    fn ingest_result_debug_clone() {
+        let r = IngestResult::Duplicate {
+            sender: "agent-x".to_string(),
+            seq: 42,
+        };
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("Duplicate"));
+        let r2 = r.clone();
+        assert_eq!(r, r2);
+    }
+
+    #[test]
+    fn ingest_result_accepted_partial_eq() {
+        let r1 = IngestResult::Accepted(WirePayload::Gap(sample_gap()));
+        let r2 = IngestResult::Accepted(WirePayload::Gap(sample_gap()));
+        assert_eq!(r1, r2);
+    }
+
+    // ── WireEnvelope coverage ───────────────────────────────
+
+    #[test]
+    fn envelope_debug_clone() {
+        let e = WireEnvelope::new(1, "agent", WirePayload::Gap(sample_gap()));
+        let dbg = format!("{:?}", e);
+        assert!(dbg.contains("WireEnvelope"));
+        let e2 = e.clone();
+        assert_eq!(e, e2);
+    }
+
+    // ── AgentStreamer coverage ───────────────────────────────
+
+    #[test]
+    fn streamer_messages_dropped_initially_zero() {
+        let s = AgentStreamer::new("test");
+        assert_eq!(s.messages_dropped(), 0);
+        assert_eq!(s.messages_sent(), 0);
+    }
+
+    #[test]
+    fn streamer_with_backoff_custom() {
+        let backoff = BackoffConfig {
+            initial_ms: 100,
+            max_ms: 5_000,
+            multiplier: 1.5,
+        };
+        let s = AgentStreamer::with_backoff("test", backoff);
+        assert_eq!(s.state(), ConnectionState::Disconnected);
+        assert_eq!(s.seq(), 0);
+    }
+
+    #[test]
+    fn streamer_mark_disconnected() {
+        let mut s = AgentStreamer::new("test");
+        s.mark_connected();
+        assert_eq!(s.state(), ConnectionState::Connected);
+        s.mark_disconnected();
+        assert_eq!(s.state(), ConnectionState::Disconnected);
+    }
+
+    // ── Aggregator coverage ─────────────────────────────────
+
+    #[test]
+    fn aggregator_agent_count_tracks_senders() {
+        let mut agg = Aggregator::new(10);
+        assert_eq!(agg.agent_count(), 0);
+        let e = WireEnvelope::new(1, "a", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope(e);
+        assert_eq!(agg.agent_count(), 1);
+    }
+
+    #[test]
+    fn aggregator_agent_last_seq_nonexistent() {
+        let agg = Aggregator::new(10);
+        assert_eq!(agg.agent_last_seq("nonexistent"), None);
+    }
+
+    // ── Constants coverage ──────────────────────────────────
+
+    #[test]
+    fn protocol_constants() {
+        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(MAX_MESSAGE_SIZE, 1_048_576);
+        assert!(DEFAULT_AGENT_STALE_AFTER_MS > 0);
+    }
+
+    // ── WirePayload coverage ────────────────────────────────
+
+    #[test]
+    fn payload_debug_clone_all_variants() {
+        let payloads = vec![
+            WirePayload::PaneMeta(sample_pane_meta()),
+            WirePayload::PaneDelta(sample_pane_delta()),
+            WirePayload::Gap(sample_gap()),
+            WirePayload::Detection(sample_detection()),
+            WirePayload::PanesMeta(sample_panes_meta()),
+        ];
+        for p in &payloads {
+            let dbg = format!("{:?}", p);
+            assert!(!dbg.is_empty());
+            let p2 = p.clone();
+            assert_eq!(*p, p2);
+        }
+    }
+
+    // ── PaneMeta/PaneDelta/GapNotice/DetectionNotice ────────
+
+    #[test]
+    fn pane_meta_debug_clone_eq() {
+        let pm = sample_pane_meta();
+        let dbg = format!("{:?}", pm);
+        assert!(dbg.contains("PaneMeta"));
+        let pm2 = pm.clone();
+        assert_eq!(pm, pm2);
+    }
+
+    #[test]
+    fn gap_notice_debug_clone_eq() {
+        let g = sample_gap();
+        let dbg = format!("{:?}", g);
+        assert!(dbg.contains("GapNotice"));
+        let g2 = g.clone();
+        assert_eq!(g, g2);
+    }
+
+    #[test]
+    fn detection_notice_debug_clone() {
+        let d = sample_detection();
+        let dbg = format!("{:?}", d);
+        assert!(dbg.contains("DetectionNotice"));
+        let d2 = d.clone();
+        assert_eq!(d, d2);
+    }
 }
