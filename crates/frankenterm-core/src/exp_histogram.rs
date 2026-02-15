@@ -656,4 +656,110 @@ mod tests {
         assert_eq!(h.count(), 100);
         assert!((h.sum() - 500.0).abs() < f64::EPSILON);
     }
+
+    // -- Batch: DarkBadger wa-1u90p.7.1 ----------------------------------------
+
+    #[test]
+    fn bucket_detail_debug_clone_serde() {
+        let bd = BucketDetail {
+            lower: 1.0,
+            upper: 2.0,
+            count: 5,
+        };
+        let cloned = bd.clone();
+        assert_eq!(cloned.count, 5);
+        let dbg = format!("{:?}", bd);
+        assert!(dbg.contains("BucketDetail"));
+
+        let json = serde_json::to_string(&bd).unwrap();
+        let parsed: BucketDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.count, 5);
+    }
+
+    #[test]
+    fn histogram_stats_debug_clone_serde() {
+        let s = HistogramStats {
+            count: 100,
+            sum: 5000.0,
+            mean: Some(50.0),
+            min: Some(1.0),
+            max: Some(1000.0),
+            p50: Some(32.0),
+            p90: Some(512.0),
+            p99: Some(1024.0),
+            underflow: 0,
+            overflow: 2,
+            num_buckets: 20,
+        };
+        let cloned = s.clone();
+        assert_eq!(cloned.count, 100);
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("HistogramStats"));
+
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: HistogramStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.num_buckets, 20);
+    }
+
+    #[test]
+    fn exp_histogram_num_buckets() {
+        let h = ExpHistogram::new(2.0, 0, 10);
+        assert_eq!(h.num_buckets(), 10);
+    }
+
+    #[test]
+    fn exp_histogram_underflow_overflow() {
+        let mut h = ExpHistogram::new(2.0, 3, 10); // buckets for [8, 1024)
+        h.record(0.5); // underflow
+        h.record(2000.0); // overflow
+        assert_eq!(h.underflow(), 1);
+        assert_eq!(h.overflow(), 1);
+        assert_eq!(h.count(), 2);
+    }
+
+    #[test]
+    fn exp_histogram_negative_underflow() {
+        let mut h = ExpHistogram::power_of_two(10);
+        h.record(-5.0);
+        assert_eq!(h.underflow(), 1);
+        assert_eq!(h.count(), 1);
+    }
+
+    #[test]
+    fn exp_histogram_zero_underflow() {
+        let mut h = ExpHistogram::power_of_two(10);
+        h.record(0.0);
+        assert_eq!(h.underflow(), 1);
+    }
+
+    #[test]
+    fn exp_histogram_clear() {
+        let mut h = ExpHistogram::power_of_two(10);
+        h.record(5.0);
+        h.record(50.0);
+        h.clear();
+        assert_eq!(h.count(), 0);
+        assert!(h.sum().abs() < f64::EPSILON);
+        assert_eq!(h.min(), None);
+        assert_eq!(h.max(), None);
+    }
+
+    #[test]
+    fn percentile_monotonic() {
+        let mut h = ExpHistogram::power_of_two(20);
+        for v in [1.0, 10.0, 100.0, 1000.0, 10000.0] {
+            h.record(v);
+        }
+        let p50 = h.p50().unwrap();
+        let p90 = h.p90().unwrap();
+        let p99 = h.p99().unwrap();
+        assert!(p50 <= p90, "p50={p50} should be <= p90={p90}");
+        assert!(p90 <= p99, "p90={p90} should be <= p99={p99}");
+    }
+
+    #[test]
+    fn bucket_details_empty() {
+        let h = ExpHistogram::power_of_two(10);
+        assert!(h.bucket_details().is_empty());
+    }
 }

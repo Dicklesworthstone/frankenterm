@@ -665,4 +665,151 @@ mod tests {
         assert!(back.matches);
         assert_eq!(back.byte_offset, 10);
     }
+
+    // -- Batch: DarkBadger wa-1u90p.7.1 ----------------------------------------
+
+    #[test]
+    fn stream_hash_debug_clone() {
+        let mut h = StreamHash::new();
+        h.update(b"hello");
+        let cloned = h.clone();
+        assert_eq!(h.digest(), cloned.digest());
+        let dbg = format!("{:?}", h);
+        assert!(dbg.contains("StreamHash"));
+    }
+
+    #[test]
+    fn stream_hash_default_trait() {
+        let h = StreamHash::default();
+        assert_eq!(h.bytes_hashed(), 0);
+        assert_eq!(h.digest(), StreamHash::new().digest());
+    }
+
+    #[test]
+    fn stream_digest_hash_in_set() {
+        use std::collections::HashSet;
+        let d1 = StreamDigest {
+            h1: 1,
+            h2: 2,
+            len: 3,
+        };
+        let d2 = StreamDigest {
+            h1: 4,
+            h2: 5,
+            len: 6,
+        };
+        let d3 = StreamDigest {
+            h1: 1,
+            h2: 2,
+            len: 3,
+        };
+        let mut set = HashSet::new();
+        assert!(set.insert(d1));
+        assert!(set.insert(d2));
+        assert!(!set.insert(d3)); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn stream_digest_copy_semantics() {
+        let a = StreamDigest {
+            h1: 10,
+            h2: 20,
+            len: 5,
+        };
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn stream_digest_hex_length() {
+        let d = StreamDigest {
+            h1: 0,
+            h2: 0,
+            len: 0,
+        };
+        let hex = d.hex();
+        assert_eq!(hex.len(), 32); // 16 + 16 hex chars
+    }
+
+    #[test]
+    fn stream_digest_display_format() {
+        let d = StreamDigest {
+            h1: 1,
+            h2: 2,
+            len: 100,
+        };
+        let s = d.to_string();
+        assert!(s.contains(":100")); // ends with :len
+    }
+
+    #[test]
+    fn stream_digest_matches() {
+        let d1 = StreamDigest {
+            h1: 1,
+            h2: 2,
+            len: 10,
+        };
+        let d2 = StreamDigest {
+            h1: 1,
+            h2: 2,
+            len: 10,
+        };
+        let d3 = StreamDigest {
+            h1: 1,
+            h2: 3,
+            len: 10,
+        };
+        assert!(d1.matches(&d2));
+        assert!(!d1.matches(&d3));
+    }
+
+    #[test]
+    fn integrity_checker_default_trait() {
+        let ic = IntegrityChecker::default();
+        assert_eq!(ic.checks_performed(), 0);
+        assert_eq!(ic.checks_passed(), 0);
+    }
+
+    #[test]
+    fn integrity_checker_no_remote_returns_none() {
+        let mut ic = IntegrityChecker::new();
+        ic.update(b"data");
+        assert!(ic.check().is_none());
+    }
+
+    #[test]
+    fn integrity_result_debug_clone() {
+        let r = IntegrityResult {
+            matches: true,
+            local_digest: StreamDigest {
+                h1: 1,
+                h2: 2,
+                len: 5,
+            },
+            remote_digest: StreamDigest {
+                h1: 1,
+                h2: 2,
+                len: 5,
+            },
+            byte_offset: 5,
+        };
+        let cloned = r.clone();
+        assert!(cloned.matches);
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("IntegrityResult"));
+    }
+
+    #[test]
+    fn update_byte_matches_update() {
+        let mut h1 = StreamHash::new();
+        h1.update(&[42, 99, 7]);
+
+        let mut h2 = StreamHash::new();
+        h2.update_byte(42);
+        h2.update_byte(99);
+        h2.update_byte(7);
+
+        assert_eq!(h1.digest(), h2.digest());
+    }
 }

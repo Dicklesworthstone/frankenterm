@@ -662,4 +662,96 @@ mod tests {
         let s2 = wr2.into_sample();
         assert_eq!(s1, s2);
     }
+
+    // -- Batch: DarkBadger wa-1u90p.7.1 ----------------------------------------
+
+    #[test]
+    fn reservoir_debug_format() {
+        let rs: ReservoirSampler<i32> = ReservoirSampler::new(5);
+        let s = format!("{rs:?}");
+        assert!(s.contains("ReservoirSampler"));
+        assert!(s.contains("capacity"));
+    }
+
+    #[test]
+    fn reservoir_clear() {
+        let mut rs = ReservoirSampler::new(5);
+        for i in 0..10 {
+            rs.observe(i);
+        }
+        assert!(!rs.is_empty());
+        rs.clear();
+        assert!(rs.is_empty());
+        assert_eq!(rs.seen(), 0);
+    }
+
+    #[test]
+    fn reservoir_into_sample() {
+        let mut rs = ReservoirSampler::new(3);
+        rs.observe(10);
+        rs.observe(20);
+        let sample = rs.into_sample();
+        assert_eq!(sample.len(), 2);
+    }
+
+    #[test]
+    fn reservoir_stats_fill_phase() {
+        let mut rs = ReservoirSampler::new(10);
+        for i in 0..5 {
+            rs.observe(i);
+        }
+        let stats = rs.stats();
+        assert_eq!(stats.capacity, 10);
+        assert_eq!(stats.current_size, 5);
+        assert_eq!(stats.total_seen, 5);
+        assert!((stats.sampling_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn reservoir_stats_replace_phase() {
+        let mut rs = ReservoirSampler::new(5);
+        for i in 0..100 {
+            rs.observe(i);
+        }
+        let stats = rs.stats();
+        assert_eq!(stats.capacity, 5);
+        assert_eq!(stats.current_size, 5);
+        assert_eq!(stats.total_seen, 100);
+        assert!((stats.sampling_rate - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sampler_stats_debug_clone_serde() {
+        let s = SamplerStats {
+            capacity: 10,
+            current_size: 5,
+            total_seen: 50,
+            sampling_rate: 0.2,
+        };
+        let cloned = s.clone();
+        assert_eq!(cloned.capacity, 10);
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("SamplerStats"));
+
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: SamplerStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_seen, 50);
+    }
+
+    #[test]
+    fn reservoir_with_seed_deterministic() {
+        let mut rs1 = ReservoirSampler::with_seed(5, 42);
+        let mut rs2 = ReservoirSampler::with_seed(5, 42);
+        for i in 0..100 {
+            rs1.observe(i);
+            rs2.observe(i);
+        }
+        assert_eq!(rs1.sample(), rs2.sample());
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity must be > 0")]
+    fn weighted_zero_capacity_panics() {
+        let _: WeightedReservoir<i32> = WeightedReservoir::new(0);
+    }
 }
