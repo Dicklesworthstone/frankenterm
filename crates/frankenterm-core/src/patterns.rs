@@ -4465,4 +4465,852 @@ description = "Project lint warning"
         assert_eq!(detections.len(), 1);
         assert_eq!(detections[0].rule_id, "project.lint_warning");
     }
+
+    // ========================================================================
+    // Batch 2: RubyBeaver wa-1u90p.7.1 — expanded coverage
+    // ========================================================================
+
+    // --- AgentType serde round-trip ---
+
+    #[test]
+    fn agent_type_serde_round_trip() {
+        for agent in [
+            AgentType::Codex,
+            AgentType::ClaudeCode,
+            AgentType::Gemini,
+            AgentType::Wezterm,
+            AgentType::Unknown,
+        ] {
+            let json = serde_json::to_string(&agent).unwrap();
+            let back: AgentType = serde_json::from_str(&json).unwrap();
+            assert_eq!(agent, back);
+        }
+    }
+
+    #[test]
+    fn agent_type_deserialize_snake_case() {
+        let cc: AgentType = serde_json::from_str("\"claude_code\"").unwrap();
+        assert_eq!(cc, AgentType::ClaudeCode);
+        let wez: AgentType = serde_json::from_str("\"wezterm\"").unwrap();
+        assert_eq!(wez, AgentType::Wezterm);
+    }
+
+    // --- Severity serde round-trip ---
+
+    #[test]
+    fn severity_serde_round_trip() {
+        for sev in [Severity::Info, Severity::Warning, Severity::Critical] {
+            let json = serde_json::to_string(&sev).unwrap();
+            let back: Severity = serde_json::from_str(&json).unwrap();
+            assert_eq!(sev, back);
+        }
+    }
+
+    // --- Detection serde (span is skipped) ---
+
+    #[test]
+    fn detection_serde_skips_span() {
+        let d = Detection {
+            rule_id: "codex.test".into(),
+            agent_type: AgentType::Codex,
+            event_type: "usage".into(),
+            severity: Severity::Info,
+            confidence: 0.95,
+            extracted: serde_json::json!({"key": "val"}),
+            matched_text: "hello".into(),
+            span: (10, 20),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("span"), "span should be skipped in serialization");
+        let back: Detection = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rule_id, "codex.test");
+        assert_eq!(back.span, (0, 0), "deserialized span should default to (0,0)");
+    }
+
+    // --- TraceSpan serde ---
+
+    #[test]
+    fn trace_span_serde_round_trip() {
+        let span = TraceSpan { start: 5, end: 42 };
+        let json = serde_json::to_string(&span).unwrap();
+        let back: TraceSpan = serde_json::from_str(&json).unwrap();
+        assert_eq!(span, back);
+    }
+
+    // --- TraceEvidence serde (skip_serializing_if) ---
+
+    #[test]
+    fn trace_evidence_serde_omits_none_fields() {
+        let ev = TraceEvidence {
+            kind: "anchor".into(),
+            label: None,
+            span: None,
+            excerpt: None,
+            truncated: false,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("label"), "None label should be omitted");
+        assert!(!json.contains("span"), "None span should be omitted");
+        assert!(!json.contains("excerpt"), "None excerpt should be omitted");
+        assert!(!json.contains("truncated"), "false truncated should be omitted");
+    }
+
+    #[test]
+    fn trace_evidence_serde_includes_present_fields() {
+        let ev = TraceEvidence {
+            kind: "match".into(),
+            label: Some("test_label".into()),
+            span: Some(TraceSpan { start: 0, end: 10 }),
+            excerpt: Some("hello".into()),
+            truncated: true,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: TraceEvidence = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, back);
+    }
+
+    // --- TraceGate serde ---
+
+    #[test]
+    fn trace_gate_serde_round_trip() {
+        let gate = TraceGate {
+            gate: "agent_type".into(),
+            passed: false,
+            reason: Some("mismatch".into()),
+        };
+        let json = serde_json::to_string(&gate).unwrap();
+        let back: TraceGate = serde_json::from_str(&json).unwrap();
+        assert_eq!(gate, back);
+    }
+
+    // --- TraceBounds serde ---
+
+    #[test]
+    fn trace_bounds_serde_round_trip() {
+        let bounds = TraceBounds {
+            max_evidence_items: 8,
+            max_excerpt_bytes: 160,
+            max_capture_bytes: 120,
+            evidence_total: 5,
+            evidence_truncated: false,
+            truncated_fields: vec!["matched_text".into()],
+        };
+        let json = serde_json::to_string(&bounds).unwrap();
+        let back: TraceBounds = serde_json::from_str(&json).unwrap();
+        assert_eq!(bounds, back);
+    }
+
+    #[test]
+    fn trace_bounds_omits_empty_truncated_fields() {
+        let bounds = TraceBounds {
+            max_evidence_items: 4,
+            max_excerpt_bytes: 80,
+            max_capture_bytes: 60,
+            evidence_total: 2,
+            evidence_truncated: false,
+            truncated_fields: Vec::new(),
+        };
+        let json = serde_json::to_string(&bounds).unwrap();
+        assert!(
+            !json.contains("truncated_fields"),
+            "empty truncated_fields should be omitted"
+        );
+    }
+
+    // --- TraceOptions defaults ---
+
+    #[test]
+    fn trace_options_default_values() {
+        let opts = TraceOptions::default();
+        assert_eq!(opts.max_evidence_items, 8);
+        assert_eq!(opts.max_excerpt_bytes, 160);
+        assert_eq!(opts.max_capture_bytes, 120);
+        assert!(!opts.include_non_matches);
+    }
+
+    // --- PatternLibrary::empty ---
+
+    #[test]
+    fn pattern_library_empty_has_no_rules() {
+        let lib = PatternLibrary::empty();
+        assert!(lib.rules().is_empty());
+        assert!(lib.packs().is_empty());
+        assert!(lib.pack_for_rule("codex.test").is_none());
+    }
+
+    // --- RuleDef::interpolate_template ---
+
+    #[test]
+    fn interpolate_template_all_placeholders() {
+        let result = RuleDef::interpolate_template(
+            "ft events --pane {pane} --event {event_id} --agent {agent} --rule {rule_id}",
+            42,
+            Some(100),
+            &AgentType::Codex,
+            "codex.usage.reached",
+        );
+        assert_eq!(
+            result,
+            "ft events --pane 42 --event 100 --agent codex --rule codex.usage.reached"
+        );
+    }
+
+    #[test]
+    fn interpolate_template_none_event_id() {
+        let result = RuleDef::interpolate_template(
+            "event={event_id}",
+            1,
+            None,
+            &AgentType::Gemini,
+            "gemini.test",
+        );
+        assert_eq!(result, "event=unknown");
+    }
+
+    // --- RuleDef::get_preview_command ---
+
+    #[test]
+    fn get_preview_command_with_template() {
+        let rule = RuleDef {
+            id: "codex.test".into(),
+            agent_type: AgentType::Codex,
+            event_type: "test".into(),
+            severity: Severity::Info,
+            anchors: vec!["anchor".into()],
+            regex: None,
+            description: "test".into(),
+            remediation: None,
+            workflow: None,
+            manual_fix: None,
+            preview_command: Some("ft preview --pane {pane}".into()),
+            learn_more_url: None,
+        };
+        let cmd = rule.get_preview_command(7, Some(99));
+        assert_eq!(cmd, Some("ft preview --pane 7".to_string()));
+    }
+
+    #[test]
+    fn get_preview_command_none_when_missing() {
+        let rule = sample_rule("codex.test");
+        assert!(rule.get_preview_command(1, None).is_none());
+    }
+
+    // --- RuleDef::get_manual_fix ---
+
+    #[test]
+    fn get_manual_fix_with_template() {
+        let mut rule = sample_rule("codex.test");
+        rule.manual_fix = Some("Check pane {pane} for {agent}".into());
+        let fix = rule.get_manual_fix(5, Some(10));
+        assert_eq!(fix, Some("Check pane 5 for codex".to_string()));
+    }
+
+    #[test]
+    fn get_manual_fix_none_when_missing() {
+        let rule = sample_rule("codex.test");
+        assert!(rule.get_manual_fix(1, None).is_none());
+    }
+
+    // --- parse_severity_override ---
+
+    #[test]
+    fn parse_severity_override_all_valid() {
+        assert_eq!(parse_severity_override("info").unwrap(), Severity::Info);
+        assert_eq!(parse_severity_override("warning").unwrap(), Severity::Warning);
+        assert_eq!(parse_severity_override("critical").unwrap(), Severity::Critical);
+        // Case-insensitive
+        assert_eq!(parse_severity_override("INFO").unwrap(), Severity::Info);
+        assert_eq!(parse_severity_override("  Warning  ").unwrap(), Severity::Warning);
+    }
+
+    #[test]
+    fn parse_severity_override_invalid() {
+        assert!(parse_severity_override("error").is_err());
+        assert!(parse_severity_override("").is_err());
+        assert!(parse_severity_override("debug").is_err());
+    }
+
+    // --- bound_utf8 ---
+
+    #[test]
+    fn bound_utf8_within_limit() {
+        let (s, trunc) = PatternEngine::bound_utf8("hello", 10);
+        assert_eq!(s, "hello");
+        assert!(!trunc);
+    }
+
+    #[test]
+    fn bound_utf8_at_exact_limit() {
+        let (s, trunc) = PatternEngine::bound_utf8("hello", 5);
+        assert_eq!(s, "hello");
+        assert!(!trunc);
+    }
+
+    #[test]
+    fn bound_utf8_truncates() {
+        let (s, trunc) = PatternEngine::bound_utf8("hello world", 5);
+        assert_eq!(s, "hello");
+        assert!(trunc);
+    }
+
+    #[test]
+    fn bound_utf8_respects_char_boundary() {
+        // Multi-byte character: "é" is 2 bytes in UTF-8
+        let (s, trunc) = PatternEngine::bound_utf8("café", 4);
+        assert_eq!(s, "caf");
+        assert!(trunc);
+    }
+
+    // --- slice_bytes ---
+
+    #[test]
+    fn slice_bytes_valid_range() {
+        assert_eq!(PatternEngine::slice_bytes("hello world", 6, 11), Some("world"));
+    }
+
+    #[test]
+    fn slice_bytes_invalid_range() {
+        assert!(PatternEngine::slice_bytes("hello", 3, 2).is_none()); // start > end
+        assert!(PatternEngine::slice_bytes("hello", 0, 10).is_none()); // end > len
+    }
+
+    #[test]
+    fn slice_bytes_empty_range() {
+        assert_eq!(PatternEngine::slice_bytes("hello", 2, 2), Some(""));
+    }
+
+    // --- DetectionContext::set_ttl ---
+
+    #[test]
+    fn context_set_ttl_changes_ttl() {
+        let mut ctx = DetectionContext::new();
+        assert_eq!(ctx.ttl, Duration::from_secs(300)); // default 5 min
+        ctx.set_ttl(Duration::from_secs(60));
+        assert_eq!(ctx.ttl, Duration::from_secs(60));
+    }
+
+    // --- DetectionContext MAX_SEEN_KEYS eviction ---
+
+    #[test]
+    fn context_evicts_oldest_when_at_capacity() {
+        let mut ctx = DetectionContext::new();
+        ctx.set_ttl(Duration::from_secs(3600)); // long TTL
+
+        // Fill to capacity
+        for i in 0..DetectionContext::MAX_SEEN_KEYS {
+            let d = Detection {
+                rule_id: format!("test.rule_{i}"),
+                agent_type: AgentType::Codex,
+                event_type: "test".into(),
+                severity: Severity::Info,
+                confidence: 0.9,
+                extracted: serde_json::json!({"i": i}),
+                matched_text: "test".into(),
+                span: (0, 0),
+            };
+            assert!(ctx.mark_seen(&d), "should be new at index {i}");
+        }
+        assert_eq!(ctx.seen_count(), DetectionContext::MAX_SEEN_KEYS);
+
+        // Add one more — should evict oldest
+        let overflow = Detection {
+            rule_id: "test.overflow".into(),
+            agent_type: AgentType::Codex,
+            event_type: "test".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::json!({}),
+            matched_text: "test".into(),
+            span: (0, 0),
+        };
+        assert!(ctx.mark_seen(&overflow));
+        assert_eq!(ctx.seen_count(), DetectionContext::MAX_SEEN_KEYS);
+
+        // The first item should have been evicted
+        let first = Detection {
+            rule_id: "test.rule_0".into(),
+            agent_type: AgentType::Codex,
+            event_type: "test".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::json!({"i": 0}),
+            matched_text: "test".into(),
+            span: (0, 0),
+        };
+        assert!(!ctx.is_seen(&first), "oldest should have been evicted");
+    }
+
+    // --- Cross-segment matching (tail buffer) ---
+
+    #[test]
+    fn cross_segment_tail_buffer_catches_split_pattern() {
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.split",
+            "SPLIT_MATCH",
+            None,
+        )]);
+
+        let mut ctx = DetectionContext::new();
+
+        // First segment ends with partial anchor
+        let seg1 = "some text SPLIT_";
+        let d1 = engine.detect_with_context(seg1, &mut ctx);
+        assert!(d1.is_empty(), "partial anchor should not match");
+
+        // Second segment completes it
+        let seg2 = "MATCH more text";
+        let d2 = engine.detect_with_context(seg2, &mut ctx);
+        assert!(
+            d2.iter().any(|d| d.rule_id == "codex.split"),
+            "cross-segment match should fire"
+        );
+    }
+
+    #[test]
+    fn tail_buffer_does_not_reemit_old_matches() {
+        let engine = engine_with_rules(vec![rule_with_anchor("codex.tail", "TAILTEST", None)]);
+
+        let mut ctx = DetectionContext::new();
+
+        // First segment has the match
+        let seg1 = "xTAILTESTx";
+        let d1 = engine.detect_with_context(seg1, &mut ctx);
+        assert!(!d1.is_empty(), "should match in first segment");
+
+        // Second segment with overlap — match is in overlap and deduped
+        let seg2 = "new text after";
+        let d2 = engine.detect_with_context(seg2, &mut ctx);
+        // The overlap region contains the old match, but dedup prevents re-emission
+        let reemitted = d2.iter().any(|d| d.rule_id == "codex.tail");
+        assert!(!reemitted, "should not re-emit from overlap/dedup");
+    }
+
+    // --- builtin_pack_by_name ---
+
+    #[test]
+    fn builtin_pack_by_name_known() {
+        assert!(builtin_pack_by_name("core").is_some());
+        assert!(builtin_pack_by_name("codex").is_some());
+        assert!(builtin_pack_by_name("claude_code").is_some());
+        assert!(builtin_pack_by_name("gemini").is_some());
+        assert!(builtin_pack_by_name("wezterm").is_some());
+    }
+
+    #[test]
+    fn builtin_pack_by_name_unknown() {
+        assert!(builtin_pack_by_name("unknown_pack").is_none());
+        assert!(builtin_pack_by_name("").is_none());
+    }
+
+    // --- builtin_packs count ---
+
+    #[test]
+    fn builtin_packs_count() {
+        let packs = builtin_packs();
+        assert_eq!(packs.len(), 5, "expected 5 builtin packs");
+    }
+
+    // --- is_pack_file ---
+
+    #[test]
+    fn is_pack_file_accepts_valid_extensions() {
+        assert!(is_pack_file(Path::new("rules.toml")));
+        assert!(is_pack_file(Path::new("rules.yaml")));
+        assert!(is_pack_file(Path::new("rules.yml")));
+        assert!(is_pack_file(Path::new("rules.json")));
+        assert!(is_pack_file(Path::new("rules.TOML")));
+        assert!(is_pack_file(Path::new("rules.YAML")));
+    }
+
+    #[test]
+    fn is_pack_file_rejects_invalid_extensions() {
+        assert!(!is_pack_file(Path::new("rules.txt")));
+        assert!(!is_pack_file(Path::new("rules.rs")));
+        assert!(!is_pack_file(Path::new("rules")));
+        assert!(!is_pack_file(Path::new(".toml")));
+    }
+
+    // --- load_pack_from_id ---
+
+    #[test]
+    fn load_pack_from_id_builtin() {
+        let pack = load_pack_from_id("builtin:codex", None).unwrap();
+        assert_eq!(pack.name, "builtin:codex");
+    }
+
+    #[test]
+    fn load_pack_from_id_unknown_builtin() {
+        assert!(load_pack_from_id("builtin:nonexistent", None).is_err());
+    }
+
+    #[test]
+    fn load_pack_from_id_unknown_scheme() {
+        assert!(load_pack_from_id("unknown:something", None).is_err());
+    }
+
+    #[test]
+    fn load_pack_from_id_file_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_path = dir.path().join("test.json");
+        let json = r#"{"name":"test","version":"1.0","rules":[{"id":"codex.t","agent_type":"codex","event_type":"t","severity":"info","anchors":["a"],"description":"t"}]}"#;
+        fs::write(&pack_path, json).unwrap();
+
+        let pack_id = format!("file:{}", pack_path.display());
+        let pack = load_pack_from_id(&pack_id, None).unwrap();
+        assert_eq!(pack.name, pack_id);
+    }
+
+    // --- normalize_pack_key ---
+
+    #[test]
+    fn normalize_pack_key_exact_match() {
+        let packs = vec![PatternPack::new("builtin:codex", "1.0", Vec::new())];
+        assert_eq!(
+            normalize_pack_key("builtin:codex", &packs),
+            Some("builtin:codex".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_pack_key_strips_builtin_prefix() {
+        let packs = vec![PatternPack::new("builtin:codex", "1.0", Vec::new())];
+        assert_eq!(
+            normalize_pack_key("codex", &packs),
+            Some("builtin:codex".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_pack_key_no_match() {
+        let packs = vec![PatternPack::new("builtin:codex", "1.0", Vec::new())];
+        assert!(normalize_pack_key("nonexistent", &packs).is_none());
+    }
+
+    // --- merge_pack_overrides ---
+
+    #[test]
+    fn merge_pack_overrides_combines_disabled_rules() {
+        let base = PackOverride {
+            disabled_rules: vec!["rule_a".into()],
+            ..PackOverride::default()
+        };
+        let overlay = PackOverride {
+            disabled_rules: vec!["rule_b".into()],
+            ..PackOverride::default()
+        };
+        let merged = merge_pack_overrides(&base, &overlay);
+        assert!(merged.disabled_rules.contains(&"rule_a".to_string()));
+        assert!(merged.disabled_rules.contains(&"rule_b".to_string()));
+    }
+
+    #[test]
+    fn merge_pack_overrides_no_duplicate_disabled_rules() {
+        let base = PackOverride {
+            disabled_rules: vec!["rule_a".into()],
+            ..PackOverride::default()
+        };
+        let overlay = PackOverride {
+            disabled_rules: vec!["rule_a".into()],
+            ..PackOverride::default()
+        };
+        let merged = merge_pack_overrides(&base, &overlay);
+        assert_eq!(
+            merged
+                .disabled_rules
+                .iter()
+                .filter(|r| r.as_str() == "rule_a")
+                .count(),
+            1,
+            "should not duplicate disabled rules"
+        );
+    }
+
+    #[test]
+    fn merge_pack_overrides_severity_overlay_wins() {
+        let mut base = PackOverride::default();
+        base.severity_overrides.insert("rule_a".into(), "info".into());
+        let mut overlay = PackOverride::default();
+        overlay
+            .severity_overrides
+            .insert("rule_a".into(), "critical".into());
+        let merged = merge_pack_overrides(&base, &overlay);
+        assert_eq!(
+            merged.severity_overrides.get("rule_a").map(String::as_str),
+            Some("critical")
+        );
+    }
+
+    // --- apply_pack_overrides empty ---
+
+    #[test]
+    fn apply_pack_overrides_empty_is_noop() {
+        let packs = vec![PatternPack::new(
+            "test",
+            "1.0",
+            vec![sample_rule("codex.test")],
+        )];
+        let overrides = HashMap::new();
+        let result = apply_pack_overrides(packs.clone(), &overrides).unwrap();
+        assert_eq!(result.len(), packs.len());
+        assert_eq!(result[0].rules.len(), 1);
+    }
+
+    // --- PatternEngine::quick_reject with disabled ---
+
+    #[test]
+    fn quick_reject_returns_true_when_disabled() {
+        let engine = PatternEngine::with_packs_and_settings(
+            vec![PatternPack::new(
+                "pack",
+                "1.0",
+                vec![rule_with_anchor("codex.q", "XYZ", None)],
+            )],
+            false, // quick_reject_enabled = false
+        )
+        .unwrap();
+        // When disabled, quick_reject always returns true
+        assert!(engine.quick_reject("no match here"));
+    }
+
+    // --- detect empty text ---
+
+    #[test]
+    fn detect_empty_text_returns_empty() {
+        let engine = PatternEngine::new();
+        assert!(engine.detect("").is_empty());
+    }
+
+    // --- detect_with_context empty text ---
+
+    #[test]
+    fn detect_with_context_empty_text_returns_empty() {
+        let engine = PatternEngine::new();
+        let mut ctx = DetectionContext::new();
+        assert!(engine.detect_with_context("", &mut ctx).is_empty());
+    }
+
+    // --- detect_with_context_and_trace empty text ---
+
+    #[test]
+    fn detect_with_context_and_trace_empty_text() {
+        let engine = PatternEngine::new();
+        let mut ctx = DetectionContext::new();
+        let opts = TraceOptions::default();
+        let (d, t) = engine.detect_with_context_and_trace("", &mut ctx, &opts);
+        assert!(d.is_empty());
+        assert!(t.is_empty());
+    }
+
+    // --- Detection::dedup_key with non-object extracted ---
+
+    #[test]
+    fn dedup_key_non_object_extracted() {
+        let d = Detection {
+            rule_id: "test.rule".into(),
+            agent_type: AgentType::Codex,
+            event_type: "test".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::Value::Null,
+            matched_text: "test".into(),
+            span: (0, 0),
+        };
+        // Non-object extracted should produce empty hash part
+        assert_eq!(d.dedup_key(), "test.rule:");
+    }
+
+    // --- PatternEngine::packs / rules accessors ---
+
+    #[test]
+    fn engine_packs_returns_all_builtin_packs() {
+        let engine = PatternEngine::new();
+        let _ = engine.detect("warmup");
+        assert_eq!(engine.packs().len(), 5);
+    }
+
+    #[test]
+    fn engine_rules_non_empty_for_builtins() {
+        let engine = PatternEngine::new();
+        assert!(
+            !engine.rules().is_empty(),
+            "builtin engine should have rules"
+        );
+    }
+
+    // --- load_pack_from_file with various formats ---
+
+    #[test]
+    fn load_pack_from_file_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.yaml");
+        let yaml = r#"
+name: "test-yaml"
+version: "1.0.0"
+rules:
+  - id: "codex.yaml_test"
+    agent_type: "codex"
+    event_type: "test"
+    severity: "info"
+    anchors: ["yaml_anchor"]
+    description: "YAML test rule"
+"#;
+        fs::write(&path, yaml).unwrap();
+        let pack = load_pack_from_file(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(pack.name, "test-yaml");
+        assert_eq!(pack.rules.len(), 1);
+    }
+
+    #[test]
+    fn load_pack_from_file_unsupported_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.xml");
+        fs::write(&path, "<rules/>").unwrap();
+        assert!(load_pack_from_file(path.to_str().unwrap(), None).is_err());
+    }
+
+    // --- MatchTrace serde round-trip ---
+
+    #[test]
+    fn match_trace_serde_round_trip() {
+        let trace = MatchTrace {
+            pack_id: "builtin:codex".into(),
+            rule_id: "codex.test".into(),
+            extractor_id: Some("regex".into()),
+            matched_text: Some("test match".into()),
+            confidence: Some(0.95),
+            eligible: true,
+            gates: vec![TraceGate {
+                gate: "agent_type".into(),
+                passed: true,
+                reason: None,
+            }],
+            evidence: vec![TraceEvidence {
+                kind: "anchor".into(),
+                label: Some("test".into()),
+                span: Some(TraceSpan { start: 0, end: 4 }),
+                excerpt: Some("test".into()),
+                truncated: false,
+            }],
+            bounds: TraceBounds {
+                max_evidence_items: 8,
+                max_excerpt_bytes: 160,
+                max_capture_bytes: 120,
+                evidence_total: 1,
+                evidence_truncated: false,
+                truncated_fields: vec!["matched_text".into()],
+            },
+        };
+        let json = serde_json::to_string(&trace).unwrap();
+        let back: MatchTrace = serde_json::from_str(&json).unwrap();
+        assert_eq!(trace.pack_id, back.pack_id);
+        assert_eq!(trace.rule_id, back.rule_id);
+        assert_eq!(trace.confidence, back.confidence);
+        assert_eq!(trace.eligible, back.eligible);
+    }
+
+    // --- RuleDef serde round-trip ---
+
+    #[test]
+    fn rule_def_serde_round_trip() {
+        let rule = RuleDef {
+            id: "codex.serde_test".into(),
+            agent_type: AgentType::Codex,
+            event_type: "test".into(),
+            severity: Severity::Warning,
+            anchors: vec!["anchor1".into(), "anchor2".into()],
+            regex: Some(r"test (?P<val>\d+)".into()),
+            description: "serde test rule".into(),
+            remediation: Some("fix it".into()),
+            workflow: Some("handle_test".into()),
+            manual_fix: Some("do it manually".into()),
+            preview_command: Some("ft preview --pane {pane}".into()),
+            learn_more_url: Some("https://example.com".into()),
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let back: RuleDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, "codex.serde_test");
+        assert_eq!(back.anchors.len(), 2);
+        assert_eq!(back.severity, Severity::Warning);
+        assert!(back.regex.is_some());
+        assert!(back.remediation.is_some());
+        assert!(back.workflow.is_some());
+        assert!(back.manual_fix.is_some());
+        assert!(back.preview_command.is_some());
+        assert!(back.learn_more_url.is_some());
+    }
+
+    // --- PatternPack serde round-trip ---
+
+    #[test]
+    fn pattern_pack_serde_round_trip() {
+        let pack = PatternPack::new(
+            "test-pack",
+            "2.0.0",
+            vec![sample_rule("codex.serde")],
+        );
+        let json = serde_json::to_string(&pack).unwrap();
+        let back: PatternPack = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "test-pack");
+        assert_eq!(back.version, "2.0.0");
+        assert_eq!(back.rules.len(), 1);
+    }
+
+    // --- EngineIndex debug ---
+
+    #[test]
+    fn engine_index_debug_does_not_panic() {
+        let index = build_engine_index(&[sample_rule("codex.debug")]).unwrap();
+        let debug = format!("{index:?}");
+        assert!(debug.contains("EngineIndex"));
+    }
+
+    // --- trace_gates_skeleton ---
+
+    #[test]
+    fn trace_gates_skeleton_has_four_gates() {
+        let gates = PatternEngine::trace_gates_skeleton();
+        assert_eq!(gates.len(), 4);
+        assert_eq!(gates[0].gate, "agent_type");
+        assert_eq!(gates[1].gate, "overlap");
+        assert_eq!(gates[2].gate, "dedupe");
+        assert_eq!(gates[3].gate, "match");
+        assert!(gates.iter().all(|g| g.passed));
+    }
+
+    // --- Claude Code specific rule detection ---
+
+    #[test]
+    fn detect_claude_code_tool_use() {
+        let engine = PatternEngine::new();
+        let text = "Using tool: Bash to run tests";
+        let detections = engine.detect(text);
+        let d = detections.iter().find(|d| d.rule_id == "claude_code.tool_use");
+        assert!(d.is_some(), "Should match claude_code.tool_use");
+        assert_eq!(
+            d.unwrap().extracted.get("tool_name").and_then(|v| v.as_str()),
+            Some("Bash")
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_overloaded() {
+        let engine = PatternEngine::new();
+        let text = "Error: API overloaded, retry in 30 seconds";
+        let detections = engine.detect(text);
+        let d = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.error.overloaded");
+        assert!(d.is_some(), "Should match claude_code.error.overloaded");
+    }
+
+    #[test]
+    fn detect_gemini_oauth_required() {
+        let engine = PatternEngine::new();
+        let text = "Please authorize this app to access your Google account";
+        let detections = engine.detect(text);
+        let d = detections
+            .iter()
+            .find(|d| d.rule_id == "gemini.auth.oauth_required");
+        assert!(d.is_some(), "Should match gemini.auth.oauth_required");
+    }
 }
