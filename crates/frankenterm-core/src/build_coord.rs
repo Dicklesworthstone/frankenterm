@@ -723,4 +723,325 @@ mod tests {
         let dir = lock_dir(&project, &config);
         assert_eq!(dir, PathBuf::from("/tmp/ft-locks"));
     }
+
+    // ====================================================================
+    // detect_cargo_command edge cases
+    // ====================================================================
+
+    #[test]
+    fn detect_cargo_command_empty() {
+        assert_eq!(detect_cargo_command(""), None);
+    }
+
+    #[test]
+    fn detect_cargo_command_whitespace_only() {
+        assert_eq!(detect_cargo_command("   "), None);
+    }
+
+    #[test]
+    fn detect_cargo_command_cargo_alone() {
+        // "cargo " with nothing after — split_whitespace returns None
+        assert_eq!(detect_cargo_command("cargo "), None);
+    }
+
+    #[test]
+    fn detect_cargo_command_leading_whitespace() {
+        assert_eq!(detect_cargo_command("  cargo build"), Some("build"));
+    }
+
+    #[test]
+    fn detect_cargo_command_trailing_whitespace() {
+        assert_eq!(detect_cargo_command("cargo test  "), Some("test"));
+    }
+
+    #[test]
+    fn detect_cargo_command_nextest_alias() {
+        assert_eq!(detect_cargo_command("cargo nextest run"), Some("test"));
+    }
+
+    #[test]
+    fn detect_cargo_command_cargo_nextest_binary() {
+        assert_eq!(detect_cargo_command("cargo-nextest run"), Some("test"));
+    }
+
+    #[test]
+    fn detect_cargo_command_unknown_subcommand() {
+        assert_eq!(detect_cargo_command("cargo install"), None);
+        assert_eq!(detect_cargo_command("cargo publish"), None);
+        assert_eq!(detect_cargo_command("cargo add"), None);
+    }
+
+    #[test]
+    fn detect_cargo_command_r_alias() {
+        assert_eq!(detect_cargo_command("cargo r"), Some("run"));
+    }
+
+    #[test]
+    fn detect_cargo_command_not_cargo() {
+        assert_eq!(detect_cargo_command("make build"), None);
+        assert_eq!(detect_cargo_command("npm test"), None);
+        assert_eq!(detect_cargo_command("python test.py"), None);
+    }
+
+    #[test]
+    fn detect_cargo_command_with_flags() {
+        assert_eq!(
+            detect_cargo_command("cargo build --release --features tui"),
+            Some("build")
+        );
+        assert_eq!(
+            detect_cargo_command("cargo test -p frankenterm-core -- --nocapture"),
+            Some("test")
+        );
+        assert_eq!(
+            detect_cargo_command("cargo clippy -- -D warnings"),
+            Some("clippy")
+        );
+    }
+
+    // ====================================================================
+    // BuildCoordConfig tests
+    // ====================================================================
+
+    #[test]
+    fn config_serde_json_roundtrip() {
+        let config = BuildCoordConfig {
+            enabled: false,
+            wait_timeout: Duration::from_secs(120),
+            poll_interval: Duration::from_millis(200),
+            shared_target_dir: false,
+            target_dir_override: Some(PathBuf::from("/custom/target")),
+            auto_sccache: false,
+            lock_dir_override: Some(PathBuf::from("/custom/locks")),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: BuildCoordConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.enabled, false);
+        assert_eq!(back.wait_timeout, Duration::from_secs(120));
+        assert_eq!(back.poll_interval, Duration::from_millis(200));
+        assert_eq!(back.shared_target_dir, false);
+        assert_eq!(
+            back.target_dir_override,
+            Some(PathBuf::from("/custom/target"))
+        );
+        assert_eq!(back.auto_sccache, false);
+        assert_eq!(
+            back.lock_dir_override,
+            Some(PathBuf::from("/custom/locks"))
+        );
+    }
+
+    #[test]
+    fn config_debug() {
+        let config = BuildCoordConfig::default();
+        let dbg = format!("{config:?}");
+        assert!(dbg.contains("BuildCoordConfig"));
+        assert!(dbg.contains("enabled"));
+    }
+
+    #[test]
+    fn config_clone() {
+        let config = BuildCoordConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let config2 = config.clone();
+        assert_eq!(config2.enabled, false);
+    }
+
+    // ====================================================================
+    // BuildEnv tests
+    // ====================================================================
+
+    #[test]
+    fn build_env_default_empty_vars() {
+        let env = BuildEnv::default();
+        assert!(env.vars.is_empty());
+    }
+
+    #[test]
+    fn build_env_debug() {
+        let env = BuildEnv::default();
+        let dbg = format!("{env:?}");
+        assert!(dbg.contains("BuildEnv"));
+    }
+
+    #[test]
+    fn build_env_clone() {
+        let mut env = BuildEnv::default();
+        env.vars.insert("KEY".to_string(), "VALUE".to_string());
+        let env2 = env.clone();
+        assert_eq!(env2.vars["KEY"], "VALUE");
+    }
+
+    #[test]
+    fn build_env_apply_to_command() {
+        let mut env = BuildEnv::default();
+        env.vars
+            .insert("CARGO_TARGET_DIR".to_string(), "/tmp/target".to_string());
+        env.vars
+            .insert("RUSTC_WRAPPER".to_string(), "sccache".to_string());
+
+        let mut cmd = std::process::Command::new("cargo");
+        env.apply_to_command(&mut cmd);
+        // Command internal env is not directly inspectable,
+        // but this exercises the path without errors
+    }
+
+    // ====================================================================
+    // BuildCoordError tests
+    // ====================================================================
+
+    #[test]
+    fn build_coord_error_build_in_progress_display() {
+        let e = BuildCoordError::BuildInProgress {
+            pid: 12345,
+            project: "/home/user/project".to_string(),
+            started_at: "unix:1700000000".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("12345"));
+        assert!(msg.contains("/home/user/project"));
+    }
+
+    #[test]
+    fn build_coord_error_wait_timeout_display() {
+        let e = BuildCoordError::WaitTimeout {
+            project: "test-project".to_string(),
+            elapsed: Duration::from_secs(600),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("timed out"));
+        assert!(msg.contains("test-project"));
+    }
+
+    #[test]
+    fn build_coord_error_not_cargo_project_display() {
+        let e = BuildCoordError::NotCargoProject(PathBuf::from("/tmp/not-cargo"));
+        let msg = e.to_string();
+        assert!(msg.contains("not a cargo project"));
+        assert!(msg.contains("/tmp/not-cargo"));
+    }
+
+    #[test]
+    fn build_coord_error_debug() {
+        let e = BuildCoordError::BuildInProgress {
+            pid: 1,
+            project: "p".to_string(),
+            started_at: "t".to_string(),
+        };
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("BuildInProgress"));
+    }
+
+    // ====================================================================
+    // BuildLockMetadata tests
+    // ====================================================================
+
+    #[test]
+    fn build_lock_metadata_serde_roundtrip() {
+        let meta = BuildLockMetadata {
+            pid: 42,
+            cargo_command: "test".to_string(),
+            project_root: "/home/user/proj".to_string(),
+            started_at: 1700000000,
+            started_at_human: "unix:1700000000".to_string(),
+            ft_version: "0.1.0".to_string(),
+            agent_name: Some("TestAgent".to_string()),
+            pane_id: Some(5),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: BuildLockMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pid, 42);
+        assert_eq!(back.cargo_command, "test");
+        assert_eq!(back.agent_name.as_deref(), Some("TestAgent"));
+        assert_eq!(back.pane_id, Some(5));
+    }
+
+    #[test]
+    fn build_lock_metadata_debug() {
+        let meta = BuildLockMetadata {
+            pid: 1,
+            cargo_command: "build".to_string(),
+            project_root: "/tmp".to_string(),
+            started_at: 0,
+            started_at_human: "unix:0".to_string(),
+            ft_version: "test".to_string(),
+            agent_name: None,
+            pane_id: None,
+        };
+        let dbg = format!("{meta:?}");
+        assert!(dbg.contains("BuildLockMetadata"));
+    }
+
+    #[test]
+    fn build_lock_metadata_optional_fields_none() {
+        let meta = BuildLockMetadata {
+            pid: 1,
+            cargo_command: "check".to_string(),
+            project_root: "/tmp".to_string(),
+            started_at: 0,
+            started_at_human: "unix:0".to_string(),
+            ft_version: "0.1.0".to_string(),
+            agent_name: None,
+            pane_id: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: BuildLockMetadata = serde_json::from_str(&json).unwrap();
+        assert!(back.agent_name.is_none());
+        assert!(back.pane_id.is_none());
+    }
+
+    // ====================================================================
+    // find_project_root edge cases
+    // ====================================================================
+
+    #[test]
+    fn find_project_root_from_nested_subdir() {
+        let tmp = setup_project();
+        let sub = tmp.path().join("src").join("deep");
+        fs::create_dir_all(&sub).unwrap();
+        let root = find_project_root(&sub);
+        assert_eq!(root, Some(tmp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn find_project_root_from_file_path() {
+        let tmp = setup_project();
+        let file = tmp.path().join("Cargo.toml");
+        let root = find_project_root(&file);
+        assert_eq!(root, Some(tmp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn find_project_root_workspace_from_nested_src() {
+        let tmp = setup_workspace();
+        let src_dir = tmp.path().join("crates").join("foo").join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let root = find_project_root(&src_dir);
+        assert_eq!(root, Some(tmp.path().to_path_buf()));
+    }
+
+    // ====================================================================
+    // lock_dir edge cases
+    // ====================================================================
+
+    #[test]
+    fn lock_dir_root_project() {
+        let config = BuildCoordConfig::default();
+        let dir = lock_dir(Path::new("/"), &config);
+        assert_eq!(dir, PathBuf::from("/.ft/build"));
+    }
+
+    // ====================================================================
+    // BuildLock project_root accessor
+    // ====================================================================
+
+    #[test]
+    fn build_lock_project_root() {
+        let tmp = setup_project();
+        let config = BuildCoordConfig::default();
+        let lock = BuildLock::try_acquire(tmp.path(), "build", &config).unwrap();
+        assert_eq!(lock.project_root(), tmp.path());
+    }
 }

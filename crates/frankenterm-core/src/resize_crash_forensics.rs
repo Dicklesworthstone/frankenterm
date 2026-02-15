@@ -620,4 +620,412 @@ mod tests {
         assert_eq!(s.total_storm_events, 0);
         assert_eq!(s.total_storm_throttled, 0);
     }
+
+    // ====================================================================
+    // summary_line edge cases
+    // ====================================================================
+
+    #[test]
+    fn summary_line_with_many_in_flight() {
+        let mut builder = ResizeCrashContextBuilder::new(8000);
+        for i in 0..10 {
+            builder = builder.add_in_flight(InFlightTransaction {
+                pane_id: i,
+                intent_seq: i,
+                work_class: ResizeWorkClass::Interactive,
+                phase: None,
+                phase_started_at_ms: None,
+                domain: ResizeDomain::Local,
+                tab_id: None,
+                deferrals: 0,
+                force_served: false,
+            });
+        }
+        let ctx = builder.build();
+        let line = ctx.summary_line();
+        assert!(line.contains("in_flight=10"));
+    }
+
+    #[test]
+    fn summary_line_with_decisions_and_storm() {
+        let ctx = ResizeCrashContextBuilder::new(9000)
+            .add_policy_decision(PolicyDecision {
+                at_ms: 8999,
+                kind: PolicyDecisionKind::OverloadReject,
+                pane_id: Some(1),
+                rationale: "overloaded".into(),
+            })
+            .add_policy_decision(PolicyDecision {
+                at_ms: 9000,
+                kind: PolicyDecisionKind::GateSuppressed,
+                pane_id: None,
+                rationale: "gate closed".into(),
+            })
+            .storm_state(StormState {
+                tabs_in_storm: 3,
+                storm_window_ms: 100,
+                storm_threshold: 5,
+                total_storm_events: 50,
+                total_storm_throttled: 10,
+            })
+            .build();
+        let line = ctx.summary_line();
+        assert!(line.contains("storm_tabs=3"));
+        assert!(line.contains("decisions=2"));
+    }
+
+    #[test]
+    fn summary_line_zero_everything() {
+        let ctx = ResizeCrashContextBuilder::new(0).build();
+        let line = ctx.summary_line();
+        assert!(line.contains("captured_at=0"));
+        assert!(line.contains("pending=0"));
+        assert!(line.contains("active=0"));
+        assert!(line.contains("in_flight=0"));
+        assert!(line.contains("storm_tabs=0"));
+        assert!(line.contains("decisions=0"));
+    }
+
+    // ====================================================================
+    // Serde roundtrip for individual types
+    // ====================================================================
+
+    #[test]
+    fn resize_queue_depths_serde_roundtrip() {
+        let d = ResizeQueueDepths {
+            pending_intents: 5,
+            active_transactions: 2,
+            input_backlog: 10,
+            tracked_panes: 20,
+            frame_budget_units: 16,
+            last_frame_spent_units: 12,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: ResizeQueueDepths = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, back);
+    }
+
+    #[test]
+    fn storm_state_serde_roundtrip() {
+        let s = StormState {
+            tabs_in_storm: 2,
+            storm_window_ms: 5000,
+            storm_threshold: 10,
+            total_storm_events: 100,
+            total_storm_throttled: 50,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: StormState = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn domain_budget_entry_serde_roundtrip() {
+        let e = DomainBudgetEntry {
+            domain_key: "mux:server-1".into(),
+            weight: 3,
+            allocated_units: 5,
+            consumed_units: 4,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let back: DomainBudgetEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn policy_decision_serde_roundtrip() {
+        let d = PolicyDecision {
+            at_ms: 12345,
+            kind: PolicyDecisionKind::StarvationBypass,
+            pane_id: Some(42),
+            rationale: "background starved for 5 frames".into(),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: PolicyDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, back);
+    }
+
+    #[test]
+    fn in_flight_transaction_serde_roundtrip() {
+        let t = sample_in_flight();
+        let json = serde_json::to_string(&t).unwrap();
+        let back: InFlightTransaction = serde_json::from_str(&json).unwrap();
+        assert_eq!(t, back);
+    }
+
+    // ====================================================================
+    // PolicyDecisionKind snake_case values
+    // ====================================================================
+
+    #[test]
+    fn policy_decision_kind_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&PolicyDecisionKind::StormThrottle).unwrap(),
+            "\"storm_throttle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PolicyDecisionKind::DomainBudgetThrottle).unwrap(),
+            "\"domain_budget_throttle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PolicyDecisionKind::StarvationBypass).unwrap(),
+            "\"starvation_bypass\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PolicyDecisionKind::OverloadReject).unwrap(),
+            "\"overload_reject\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PolicyDecisionKind::OverloadEvict).unwrap(),
+            "\"overload_evict\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PolicyDecisionKind::InputGuardrailActivated).unwrap(),
+            "\"input_guardrail_activated\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PolicyDecisionKind::GateSuppressed).unwrap(),
+            "\"gate_suppressed\""
+        );
+    }
+
+    // ====================================================================
+    // Debug/Clone trait tests
+    // ====================================================================
+
+    #[test]
+    fn resize_crash_context_debug() {
+        let ctx = ResizeCrashContextBuilder::new(1).build();
+        let dbg = format!("{ctx:?}");
+        assert!(dbg.contains("ResizeCrashContext"));
+    }
+
+    #[test]
+    fn resize_crash_context_clone() {
+        let ctx = ResizeCrashContextBuilder::new(1234)
+            .gate(sample_gate())
+            .add_in_flight(sample_in_flight())
+            .build();
+        let ctx2 = ctx.clone();
+        assert_eq!(ctx, ctx2);
+    }
+
+    #[test]
+    fn resize_queue_depths_debug() {
+        let d = ResizeQueueDepths::default();
+        let dbg = format!("{d:?}");
+        assert!(dbg.contains("ResizeQueueDepths"));
+    }
+
+    #[test]
+    fn resize_queue_depths_copy() {
+        let d = ResizeQueueDepths {
+            pending_intents: 5,
+            ..Default::default()
+        };
+        let d2 = d;
+        assert_eq!(d, d2);
+    }
+
+    #[test]
+    fn storm_state_debug() {
+        let s = StormState::default();
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("StormState"));
+    }
+
+    #[test]
+    fn storm_state_copy() {
+        let s = StormState {
+            tabs_in_storm: 5,
+            ..Default::default()
+        };
+        let s2 = s;
+        assert_eq!(s, s2);
+    }
+
+    #[test]
+    fn policy_decision_kind_debug() {
+        let dbg = format!("{:?}", PolicyDecisionKind::StormThrottle);
+        assert!(dbg.contains("StormThrottle"));
+    }
+
+    #[test]
+    fn policy_decision_kind_copy() {
+        let k = PolicyDecisionKind::OverloadEvict;
+        let k2 = k;
+        assert_eq!(k, k2);
+    }
+
+    #[test]
+    fn domain_budget_entry_debug() {
+        let e = DomainBudgetEntry {
+            domain_key: "local".into(),
+            weight: 1,
+            allocated_units: 1,
+            consumed_units: 0,
+        };
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("DomainBudgetEntry"));
+        assert!(dbg.contains("local"));
+    }
+
+    // ====================================================================
+    // Builder edge cases
+    // ====================================================================
+
+    #[test]
+    fn builder_default_is_zeroed() {
+        let b = ResizeCrashContextBuilder::default();
+        let ctx = b.build();
+        assert_eq!(ctx.captured_at_ms, 0);
+        assert!(!ctx.gate.control_plane_enabled);
+        assert!(!ctx.gate.active);
+    }
+
+    #[test]
+    fn builder_debug() {
+        let b = ResizeCrashContextBuilder::new(42);
+        let dbg = format!("{b:?}");
+        assert!(dbg.contains("ResizeCrashContextBuilder"));
+    }
+
+    #[test]
+    fn builder_multiple_domain_budgets() {
+        let ctx = ResizeCrashContextBuilder::new(1000)
+            .add_domain_budget(DomainBudgetEntry {
+                domain_key: "local".into(),
+                weight: 4,
+                allocated_units: 8,
+                consumed_units: 6,
+            })
+            .add_domain_budget(DomainBudgetEntry {
+                domain_key: "ssh:host-a".into(),
+                weight: 2,
+                allocated_units: 4,
+                consumed_units: 2,
+            })
+            .add_domain_budget(DomainBudgetEntry {
+                domain_key: "ssh:host-b".into(),
+                weight: 1,
+                allocated_units: 2,
+                consumed_units: 0,
+            })
+            .build();
+        assert_eq!(ctx.domain_budgets.len(), 3);
+    }
+
+    #[test]
+    fn in_flight_mux_domain() {
+        let txn = InFlightTransaction {
+            pane_id: 1,
+            intent_seq: 1,
+            work_class: ResizeWorkClass::Interactive,
+            phase: Some(ResizeExecutionPhase::Reflowing),
+            phase_started_at_ms: Some(500),
+            domain: ResizeDomain::Mux {
+                endpoint: "unix:///tmp/mux.sock".into(),
+            },
+            tab_id: Some(2),
+            deferrals: 0,
+            force_served: false,
+        };
+        let json = serde_json::to_string(&txn).unwrap();
+        let back: InFlightTransaction = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.domain,
+            ResizeDomain::Mux {
+                endpoint: "unix:///tmp/mux.sock".into()
+            }
+        );
+    }
+
+    #[test]
+    fn in_flight_no_phase() {
+        let txn = InFlightTransaction {
+            pane_id: 1,
+            intent_seq: 1,
+            work_class: ResizeWorkClass::Background,
+            phase: None,
+            phase_started_at_ms: None,
+            domain: ResizeDomain::Local,
+            tab_id: None,
+            deferrals: 10,
+            force_served: true,
+        };
+        let json = serde_json::to_string(&txn).unwrap();
+        let back: InFlightTransaction = serde_json::from_str(&json).unwrap();
+        assert!(back.phase.is_none());
+        assert!(back.phase_started_at_ms.is_none());
+        assert_eq!(back.deferrals, 10);
+        assert!(back.force_served);
+    }
+
+    #[test]
+    fn policy_decision_no_pane_id() {
+        let d = PolicyDecision {
+            at_ms: 100,
+            kind: PolicyDecisionKind::GateSuppressed,
+            pane_id: None,
+            rationale: "global gate".into(),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: PolicyDecision = serde_json::from_str(&json).unwrap();
+        assert!(back.pane_id.is_none());
+    }
+
+    #[test]
+    fn full_context_serde_roundtrip_all_populated() {
+        let ctx = ResizeCrashContextBuilder::new(50000)
+            .gate(sample_gate())
+            .queue_depths(ResizeQueueDepths {
+                pending_intents: 10,
+                active_transactions: 3,
+                input_backlog: 20,
+                tracked_panes: 50,
+                frame_budget_units: 16,
+                last_frame_spent_units: 14,
+            })
+            .add_in_flight(sample_in_flight())
+            .add_in_flight(InFlightTransaction {
+                pane_id: 99,
+                intent_seq: 2,
+                work_class: ResizeWorkClass::Background,
+                phase: None,
+                phase_started_at_ms: None,
+                domain: ResizeDomain::Ssh {
+                    host: "remote".into(),
+                },
+                tab_id: None,
+                deferrals: 3,
+                force_served: true,
+            })
+            .add_policy_decision(PolicyDecision {
+                at_ms: 49999,
+                kind: PolicyDecisionKind::StarvationBypass,
+                pane_id: Some(99),
+                rationale: "background pane starved".into(),
+            })
+            .storm_state(StormState {
+                tabs_in_storm: 1,
+                storm_window_ms: 50,
+                storm_threshold: 4,
+                total_storm_events: 10,
+                total_storm_throttled: 5,
+            })
+            .add_domain_budget(DomainBudgetEntry {
+                domain_key: "local".into(),
+                weight: 4,
+                allocated_units: 12,
+                consumed_units: 10,
+            })
+            .build();
+
+        let json = serde_json::to_string_pretty(&ctx).unwrap();
+        let back: ResizeCrashContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(ctx, back);
+        assert_eq!(back.in_flight.len(), 2);
+        assert_eq!(back.policy_decisions.len(), 1);
+        assert_eq!(back.domain_budgets.len(), 1);
+    }
 }
