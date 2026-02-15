@@ -543,4 +543,30 @@ proptest! {
         prop_assert_eq!(m.override_count, back.override_count);
         prop_assert_eq!(m.tracked_panes, back.tracked_panes);
     }
+
+    /// PriorityMetrics Debug is non-empty.
+    #[test]
+    fn prop_metrics_debug_nonempty(total in 0u64..100) {
+        let m = PriorityMetrics {
+            counts: HashMap::new(),
+            total_classifications: total,
+            override_count: 0,
+            tracked_panes: 0,
+        };
+        let debug = format!("{:?}", m);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// PriorityConfig Debug is non-empty.
+    #[test]
+    fn prop_config_debug_nonempty(hl in 1.0f64..600.0) {
+        let config = PriorityConfig {
+            rate_half_life_secs: hl,
+            high_rate_threshold: 100.0,
+            medium_rate_threshold: 10.0,
+            error_retention_secs: 300.0,
+        };
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+    }
 }

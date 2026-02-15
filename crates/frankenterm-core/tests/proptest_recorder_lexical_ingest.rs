@@ -792,4 +792,20 @@ proptest! {
         );
         prop_assert!(!io_err.to_string().is_empty());
     }
+
+    /// LexicalIndexerConfig default has positive writer memory.
+    #[test]
+    fn config_default_writer_memory_positive(_seed in any::<u64>()) {
+        let config = LexicalIndexerConfig::default();
+        prop_assert!(config.writer_memory_bytes > 0,
+            "default writer_memory_bytes should be positive");
+    }
+
+    /// LexicalIndexerConfig Clone preserves writer_memory_bytes.
+    #[test]
+    fn config_clone_preserves_memory(_seed in any::<u64>()) {
+        let config = LexicalIndexerConfig::default();
+        let cloned = config.clone();
+        prop_assert_eq!(config.writer_memory_bytes, cloned.writer_memory_bytes);
+    }
 }

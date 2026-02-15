@@ -765,4 +765,35 @@ proptest! {
             agent_name, depth
         );
     }
+
+    /// ProcessState Debug is non-empty.
+    #[test]
+    fn prop_process_state_debug(
+        state in prop_oneof![
+            Just(ProcessState::Running),
+            Just(ProcessState::Sleeping),
+            Just(ProcessState::Stopped),
+            Just(ProcessState::Zombie),
+        ],
+    ) {
+        let debug = format!("{:?}", state);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// PaneActivity Debug is non-empty.
+    #[test]
+    fn prop_pane_activity_debug(
+        activity in prop_oneof![
+            Just(PaneActivity::Idle),
+            Just(PaneActivity::Active),
+            Just(PaneActivity::Editing),
+            Just(PaneActivity::VersionControl),
+            Just(PaneActivity::Testing),
+            Just(PaneActivity::Compiling),
+            Just(PaneActivity::AgentRunning),
+        ],
+    ) {
+        let debug = format!("{:?}", activity);
+        prop_assert!(!debug.is_empty());
+    }
 }

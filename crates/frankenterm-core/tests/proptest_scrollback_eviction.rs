@@ -938,4 +938,18 @@ proptest! {
         prop_assert_eq!(plan.panes_affected, 0);
         prop_assert!(plan.targets.is_empty());
     }
+
+    /// EvictionConfig Debug is non-empty.
+    #[test]
+    fn proptest_eviction_config_debug(config in arb_eviction_config()) {
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// EvictionConfig Clone preserves fields.
+    #[test]
+    fn proptest_eviction_config_clone(config in arb_eviction_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.min_segments, config.min_segments);
+    }
 }
