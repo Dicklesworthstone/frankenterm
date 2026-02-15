@@ -667,6 +667,7 @@ pub async fn mpsc_send<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::Se
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn runtime_builder_current_thread_builds() {
@@ -1691,5 +1692,340 @@ mod tests {
         handle.await.expect("spawned task should complete");
         let guard = rw.read().await;
         assert_eq!(*guard, 99);
+    }
+
+    // ========================================================================
+    // Property-based tests
+    // ========================================================================
+
+    proptest! {
+        #[test]
+        fn proptest_mpsc_preserves_fifo(values in proptest::collection::vec(any::<i16>(), 0..64)) {
+            let expected = values.clone();
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime should build");
+
+            let received = rt.block_on(async move {
+                let (tx, mut rx) = mpsc::channel(expected.len().max(1));
+                for value in &expected {
+                    mpsc_send(&tx, *value).await.expect("send should succeed");
+                }
+                drop(tx);
+
+                let mut out = Vec::with_capacity(expected.len());
+                while let Some(value) = mpsc_recv_option(&mut rx).await {
+                    out.push(value);
+                }
+                out
+            });
+
+            prop_assert_eq!(received, values);
+        }
+
+        #[test]
+        fn proptest_watch_receiver_sees_latest(values in proptest::collection::vec(any::<u32>(), 1..64)) {
+            let expected_latest = *values.last().expect("non-empty");
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime should build");
+
+            let observed_latest = rt.block_on(async move {
+                let (tx, rx) = watch::channel(values[0]);
+                for value in values.iter().skip(1) {
+                    tx.send(*value).expect("watch send should succeed");
+                }
+                *rx.borrow()
+            });
+
+            prop_assert_eq!(observed_latest, expected_latest);
+        }
+
+        #[test]
+        fn proptest_semaphore_permit_accounting(
+            permits in 1usize..16,
+            acquire_count in 0usize..16,
+        ) {
+            prop_assume!(acquire_count <= permits);
+
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime should build");
+
+            let (during, after) = rt.block_on(async move {
+                let sem = Semaphore::new(permits);
+                let mut held = Vec::with_capacity(acquire_count);
+                for _ in 0..acquire_count {
+                    held.push(sem.acquire().await.expect("acquire should succeed"));
+                }
+
+                let during = sem.available_permits();
+                drop(held);
+                let after = sem.available_permits();
+                (during, after)
+            });
+
+            prop_assert_eq!(during, permits - acquire_count);
+            prop_assert_eq!(after, permits);
+        }
+
+        #[test]
+        fn proptest_mutex_preserves_write_sequence(values in proptest::collection::vec(any::<i32>(), 0..128)) {
+            let expected = values.clone();
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime should build");
+
+            let observed = rt.block_on(async move {
+                let mutex = Mutex::new(Vec::<i32>::new());
+                for value in &expected {
+                    let mut guard = mutex.lock().await;
+                    guard.push(*value);
+                }
+                let guard = mutex.lock().await;
+                guard.clone()
+            });
+
+            prop_assert_eq!(observed, values);
+        }
+
+        #[test]
+        fn proptest_rwlock_accumulates_deltas(
+            initial in any::<i64>(),
+            deltas in proptest::collection::vec(-1000i64..1000i64, 0..64),
+        ) {
+            let expected = initial + deltas.iter().copied().sum::<i64>();
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime should build");
+
+            let observed = rt.block_on(async move {
+                let lock = RwLock::new(initial);
+                for delta in &deltas {
+                    let mut guard = lock.write().await;
+                    *guard += *delta;
+                }
+                let guard = lock.read().await;
+                *guard
+            });
+
+            prop_assert_eq!(observed, expected);
+        }
+
+        #[test]
+        fn proptest_timeout_ready_future_returns_value(value in any::<i64>()) {
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime should build");
+
+            let observed = rt.block_on(async move {
+                timeout(Duration::from_millis(1), async move { value })
+                    .await
+                    .expect("ready future should not timeout")
+            });
+
+            prop_assert_eq!(observed, value);
+        }
+
+        #[test]
+        fn proptest_spawn_blocking_returns_computed_result(values in proptest::collection::vec(any::<i32>(), 0..64)) {
+            let expected: i64 = values.iter().map(|v| i64::from(*v)).sum();
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime should build");
+
+            let observed = rt.block_on(async move {
+                spawn_blocking(move || values.iter().map(|v| i64::from(*v)).sum::<i64>())
+                    .await
+                    .expect("spawn_blocking should succeed")
+            });
+
+            prop_assert_eq!(observed, expected);
+        }
+    }
+
+    // =========================================================================
+    // Batch: DarkBadger wa-1u90p.7.1 — trait impls and edge cases
+    // =========================================================================
+
+    // -- TryAcquireError --
+
+    #[tokio::test]
+    async fn try_acquire_error_debug_no_permits() {
+        let sem = Semaphore::new(0);
+        let err = sem.try_acquire().unwrap_err();
+        let dbg = format!("{:?}", err);
+        assert!(!dbg.is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_acquire_error_debug_closed() {
+        let sem = Semaphore::new(5);
+        sem.close();
+        let err = sem.try_acquire().unwrap_err();
+        let dbg = format!("{:?}", err);
+        assert!(!dbg.is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_acquire_error_display_no_permits() {
+        let sem = Semaphore::new(0);
+        let err = sem.try_acquire().unwrap_err();
+        let display = format!("{}", err);
+        assert!(!display.is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_acquire_error_display_closed() {
+        let sem = Semaphore::new(5);
+        sem.close();
+        let err = sem.try_acquire().unwrap_err();
+        let display = format!("{}", err);
+        assert!(!display.is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_acquire_error_is_std_error() {
+        let sem = Semaphore::new(0);
+        let err = sem.try_acquire().unwrap_err();
+        // Verify it implements std::error::Error
+        let _: &dyn std::error::Error = &err;
+    }
+
+    // -- AcquireError --
+
+    #[tokio::test]
+    async fn acquire_error_debug() {
+        let sem = Semaphore::new(1);
+        sem.close();
+        let err = sem.acquire().await.unwrap_err();
+        let dbg = format!("{:?}", err);
+        assert!(!dbg.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acquire_error_display() {
+        let sem = Semaphore::new(1);
+        sem.close();
+        let err = sem.acquire().await.unwrap_err();
+        let display = format!("{}", err);
+        assert!(!display.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acquire_error_is_std_error() {
+        let sem = Semaphore::new(1);
+        sem.close();
+        let err = sem.acquire().await.unwrap_err();
+        let _: &dyn std::error::Error = &err;
+    }
+
+    // -- MutexGuard DerefMut edge cases --
+
+    #[tokio::test]
+    async fn mutex_guard_deref_mut_vec_indexing() {
+        let m = Mutex::new(vec![1, 2, 3]);
+        {
+            let mut guard = m.lock().await;
+            guard[0] = 99;
+            guard[2] = 77;
+        }
+        let guard = m.lock().await;
+        assert_eq!(*guard, vec![99, 2, 77]);
+    }
+
+    // -- RwLockWriteGuard DerefMut edge cases --
+
+    #[tokio::test]
+    async fn rwlock_write_guard_deref_mut_vec_indexing() {
+        let rw = RwLock::new(vec![10, 20, 30]);
+        {
+            let mut guard = rw.write().await;
+            guard[1] = 99;
+        }
+        let guard = rw.read().await;
+        assert_eq!(*guard, vec![10, 99, 30]);
+    }
+
+    // -- spawn_blocking --
+
+    #[tokio::test]
+    async fn spawn_blocking_basic_computation() {
+        let result = spawn_blocking(|| 2 + 2).await;
+        assert_eq!(result.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn spawn_blocking_string_computation() {
+        let result = spawn_blocking(|| {
+            let mut s = String::new();
+            for i in 0..5 {
+                s.push_str(&i.to_string());
+            }
+            s
+        })
+        .await;
+        assert_eq!(result.unwrap(), "01234");
+    }
+
+    #[tokio::test]
+    async fn spawn_blocking_heavy_computation() {
+        let result = spawn_blocking(|| {
+            let mut sum: u64 = 0;
+            for i in 0..1000 {
+                sum += i;
+            }
+            sum
+        })
+        .await;
+        assert_eq!(result.unwrap(), 499_500);
+    }
+
+    // -- task::spawn --
+
+    #[tokio::test]
+    async fn task_spawn_returns_value() {
+        let handle = task::spawn(async { 42 });
+        let result = handle.await.expect("task should complete");
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn task_spawn_string_value() {
+        let handle = task::spawn(async { String::from("from task") });
+        let result = handle.await.expect("task should complete");
+        assert_eq!(result, "from task");
+    }
+
+    // -- Semaphore permit count verification --
+
+    #[tokio::test]
+    async fn semaphore_multiple_try_acquire_exhaust_permits() {
+        let sem = Semaphore::new(3);
+        let _p1 = sem.try_acquire().expect("1st acquire");
+        let _p2 = sem.try_acquire().expect("2nd acquire");
+        let _p3 = sem.try_acquire().expect("3rd acquire");
+        assert_eq!(sem.available_permits(), 0);
+        assert!(sem.try_acquire().is_err());
+    }
+
+    // -- Channel edge cases --
+
+    #[tokio::test]
+    async fn watch_channel_drop_sender_borrow_still_works() {
+        let (tx, rx) = watch::channel(42);
+        tx.send(100).expect("send");
+        drop(tx);
+        // After sender dropped, receiver should still see last value
+        assert_eq!(*rx.borrow(), 100);
+    }
+
+    #[tokio::test]
+    async fn broadcast_receiver_clone_both_receive() {
+        let (tx, mut rx1) = broadcast::channel(16);
+        let mut rx2 = tx.subscribe();
+        tx.send(7).expect("send");
+        assert_eq!(rx1.recv().await.expect("r1"), 7);
+        assert_eq!(rx2.recv().await.expect("r2"), 7);
     }
 }

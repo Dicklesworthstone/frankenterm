@@ -1374,4 +1374,421 @@ mod tests {
         assert_eq!(report.tab_count, 4);
         assert_eq!(report.pane_count, 4);
     }
+
+    // =========================================================================
+    // Batch: DarkBadger wa-1u90p.7.1 — trait impls and edge cases
+    // =========================================================================
+
+    // -- TopologySnapshot --
+
+    #[test]
+    fn topology_snapshot_debug() {
+        let snap = TopologySnapshot::empty(1000);
+        let dbg = format!("{:?}", snap);
+        assert!(dbg.contains("TopologySnapshot"));
+    }
+
+    #[test]
+    fn topology_snapshot_clone_independence() {
+        let snap = TopologySnapshot::empty(1000);
+        let mut cloned = snap.clone();
+        cloned.captured_at = 9999;
+        assert_eq!(snap.captured_at, 1000);
+    }
+
+    #[test]
+    fn topology_snapshot_partial_eq() {
+        let a = TopologySnapshot::empty(1000);
+        let b = TopologySnapshot::empty(1000);
+        let c = TopologySnapshot::empty(2000);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn topology_snapshot_pane_ids_empty() {
+        let snap = TopologySnapshot::empty(1000);
+        assert!(snap.pane_ids().is_empty());
+    }
+
+    #[test]
+    fn topology_snapshot_pane_count_zero() {
+        let snap = TopologySnapshot::empty(1000);
+        assert_eq!(snap.pane_count(), 0);
+    }
+
+    // -- WindowSnapshot --
+
+    #[test]
+    fn window_snapshot_debug_clone() {
+        let win = WindowSnapshot {
+            window_id: 1,
+            title: Some("Test".to_string()),
+            position: Some((100, 200)),
+            size: Some((1920, 1080)),
+            tabs: vec![],
+            active_tab_index: Some(0),
+        };
+        let dbg = format!("{:?}", win);
+        assert!(dbg.contains("WindowSnapshot"));
+        let cloned = win.clone();
+        assert_eq!(cloned.window_id, 1);
+        assert_eq!(cloned.title.as_deref(), Some("Test"));
+    }
+
+    #[test]
+    fn window_snapshot_serde_with_all_fields() {
+        let win = WindowSnapshot {
+            window_id: 42,
+            title: Some("My Window".to_string()),
+            position: Some((10, 20)),
+            size: Some((800, 600)),
+            tabs: vec![],
+            active_tab_index: Some(1),
+        };
+        let json = serde_json::to_string(&win).unwrap();
+        let parsed: WindowSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, win);
+    }
+
+    #[test]
+    fn window_snapshot_partial_eq() {
+        let a = WindowSnapshot {
+            window_id: 1,
+            title: None,
+            position: None,
+            size: None,
+            tabs: vec![],
+            active_tab_index: None,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // -- TabSnapshot --
+
+    #[test]
+    fn tab_snapshot_debug_clone() {
+        let tab = TabSnapshot {
+            tab_id: 5,
+            title: Some("Tab Title".to_string()),
+            pane_tree: PaneNode::Leaf {
+                pane_id: 10,
+                rows: 24,
+                cols: 80,
+                cwd: None,
+                title: None,
+                is_active: true,
+            },
+            active_pane_id: Some(10),
+        };
+        let dbg = format!("{:?}", tab);
+        assert!(dbg.contains("TabSnapshot"));
+        let cloned = tab.clone();
+        assert_eq!(cloned.tab_id, 5);
+    }
+
+    #[test]
+    fn tab_snapshot_serde_roundtrip() {
+        let tab = TabSnapshot {
+            tab_id: 3,
+            title: None,
+            pane_tree: PaneNode::Leaf {
+                pane_id: 1,
+                rows: 30,
+                cols: 120,
+                cwd: Some("/home".to_string()),
+                title: Some("bash".to_string()),
+                is_active: false,
+            },
+            active_pane_id: None,
+        };
+        let json = serde_json::to_string(&tab).unwrap();
+        let parsed: TabSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, tab);
+    }
+
+    // -- PaneNode --
+
+    #[test]
+    fn pane_node_leaf_debug() {
+        let leaf = PaneNode::Leaf {
+            pane_id: 1,
+            rows: 24,
+            cols: 80,
+            cwd: None,
+            title: None,
+            is_active: false,
+        };
+        let dbg = format!("{:?}", leaf);
+        assert!(dbg.contains("Leaf"));
+    }
+
+    #[test]
+    fn pane_node_hsplit_serde_roundtrip() {
+        let node = PaneNode::HSplit {
+            children: vec![
+                (
+                    0.5,
+                    PaneNode::Leaf {
+                        pane_id: 1,
+                        rows: 12,
+                        cols: 80,
+                        cwd: None,
+                        title: None,
+                        is_active: true,
+                    },
+                ),
+                (
+                    0.5,
+                    PaneNode::Leaf {
+                        pane_id: 2,
+                        rows: 12,
+                        cols: 80,
+                        cwd: None,
+                        title: None,
+                        is_active: false,
+                    },
+                ),
+            ],
+        };
+        let json = serde_json::to_string(&node).unwrap();
+        let parsed: PaneNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pane_count(), 2);
+    }
+
+    #[test]
+    fn pane_node_vsplit_collect_ids() {
+        let node = PaneNode::VSplit {
+            children: vec![
+                (
+                    0.3,
+                    PaneNode::Leaf {
+                        pane_id: 10,
+                        rows: 24,
+                        cols: 40,
+                        cwd: None,
+                        title: None,
+                        is_active: false,
+                    },
+                ),
+                (
+                    0.7,
+                    PaneNode::Leaf {
+                        pane_id: 20,
+                        rows: 24,
+                        cols: 40,
+                        cwd: None,
+                        title: None,
+                        is_active: false,
+                    },
+                ),
+            ],
+        };
+        let ids = node.collect_pane_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&10));
+        assert!(ids.contains(&20));
+    }
+
+    #[test]
+    fn pane_node_deeply_nested_pane_count() {
+        // 3 levels: VSplit > HSplit > Leaf
+        let node = PaneNode::VSplit {
+            children: vec![
+                (
+                    0.5,
+                    PaneNode::HSplit {
+                        children: vec![
+                            (
+                                0.5,
+                                PaneNode::Leaf {
+                                    pane_id: 1,
+                                    rows: 12,
+                                    cols: 40,
+                                    cwd: None,
+                                    title: None,
+                                    is_active: false,
+                                },
+                            ),
+                            (
+                                0.5,
+                                PaneNode::Leaf {
+                                    pane_id: 2,
+                                    rows: 12,
+                                    cols: 40,
+                                    cwd: None,
+                                    title: None,
+                                    is_active: false,
+                                },
+                            ),
+                        ],
+                    },
+                ),
+                (
+                    0.5,
+                    PaneNode::Leaf {
+                        pane_id: 3,
+                        rows: 24,
+                        cols: 40,
+                        cwd: None,
+                        title: None,
+                        is_active: false,
+                    },
+                ),
+            ],
+        };
+        assert_eq!(node.pane_count(), 3);
+    }
+
+    // -- InferenceQuality --
+
+    #[test]
+    fn inference_quality_debug_clone() {
+        let q = InferenceQuality::Inferred;
+        let dbg = format!("{:?}", q);
+        assert!(dbg.contains("Inferred"));
+        let cloned = q.clone();
+        assert_eq!(cloned, InferenceQuality::Inferred);
+    }
+
+    #[test]
+    fn inference_quality_eq_all_variants() {
+        assert_eq!(InferenceQuality::Inferred, InferenceQuality::Inferred);
+        assert_eq!(
+            InferenceQuality::FlatFallback,
+            InferenceQuality::FlatFallback
+        );
+        assert_ne!(InferenceQuality::Inferred, InferenceQuality::FlatFallback);
+    }
+
+    // -- CaptureReport --
+
+    #[test]
+    fn capture_report_debug() {
+        let report = CaptureReport {
+            window_count: 2,
+            tab_count: 3,
+            pane_count: 5,
+            inference_quality: HashMap::new(),
+        };
+        let dbg = format!("{:?}", report);
+        assert!(dbg.contains("CaptureReport"));
+        assert!(dbg.contains("window_count"));
+    }
+
+    #[test]
+    fn capture_report_clone_independence() {
+        let mut quality = HashMap::new();
+        quality.insert(0u64, InferenceQuality::Inferred);
+        let report = CaptureReport {
+            window_count: 1,
+            tab_count: 2,
+            pane_count: 3,
+            inference_quality: quality,
+        };
+        let cloned = report.clone();
+        assert_eq!(cloned.window_count, 1);
+        assert_eq!(
+            cloned.inference_quality.get(&0),
+            Some(&InferenceQuality::Inferred)
+        );
+    }
+
+    // -- PaneMapping --
+
+    #[test]
+    fn pane_mapping_debug() {
+        let mapping = PaneMapping {
+            mappings: HashMap::new(),
+            unmatched_old: vec![],
+            unmatched_new: vec![],
+        };
+        let dbg = format!("{:?}", mapping);
+        assert!(dbg.contains("PaneMapping"));
+    }
+
+    #[test]
+    fn pane_mapping_clone_independence() {
+        let mut m = HashMap::new();
+        m.insert(1u64, 10u64);
+        let mapping = PaneMapping {
+            mappings: m,
+            unmatched_old: vec![2],
+            unmatched_new: vec![20],
+        };
+        let cloned = mapping.clone();
+        assert_eq!(cloned.mappings.get(&1), Some(&10));
+        assert_eq!(cloned.unmatched_old, vec![2]);
+        assert_eq!(cloned.unmatched_new, vec![20]);
+    }
+
+    // -- TOPOLOGY_SCHEMA_VERSION --
+
+    #[test]
+    fn topology_schema_version_is_one() {
+        assert_eq!(TOPOLOGY_SCHEMA_VERSION, 1);
+    }
+
+    // -- TopologySnapshot serde edge cases --
+
+    #[test]
+    fn topology_snapshot_serde_preserves_workspace_id() {
+        let snap = TopologySnapshot {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            captured_at: 5000,
+            workspace_id: Some("my-workspace".to_string()),
+            windows: vec![],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: TopologySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.workspace_id.as_deref(), Some("my-workspace"));
+    }
+
+    #[test]
+    fn topology_snapshot_serde_missing_workspace_defaults_none() {
+        let json = r#"{"schema_version":1,"captured_at":1000,"windows":[]}"#;
+        let parsed: TopologySnapshot = serde_json::from_str(json).unwrap();
+        assert!(parsed.workspace_id.is_none());
+    }
+
+    // -- PaneNode split ratio precision --
+
+    #[test]
+    fn pane_node_split_ratio_precision_roundtrip() {
+        let node = PaneNode::HSplit {
+            children: vec![
+                (
+                    0.333_333_333,
+                    PaneNode::Leaf {
+                        pane_id: 1,
+                        rows: 8,
+                        cols: 80,
+                        cwd: None,
+                        title: None,
+                        is_active: false,
+                    },
+                ),
+                (
+                    0.666_666_667,
+                    PaneNode::Leaf {
+                        pane_id: 2,
+                        rows: 16,
+                        cols: 80,
+                        cwd: None,
+                        title: None,
+                        is_active: false,
+                    },
+                ),
+            ],
+        };
+        let json = serde_json::to_string(&node).unwrap();
+        let parsed: PaneNode = serde_json::from_str(&json).unwrap();
+        if let PaneNode::HSplit { children } = parsed {
+            assert!((children[0].0 - 0.333_333_333).abs() < 0.01);
+            assert!((children[1].0 - 0.666_666_667).abs() < 0.01);
+        } else {
+            panic!("expected HSplit");
+        }
+    }
 }
