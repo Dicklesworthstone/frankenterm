@@ -158,6 +158,231 @@ mod tests {
         assert_eq!(second.freed_slots(), 0);
     }
 
+    // =====================================================================
+    // CacheGcSettings tests
+    // =====================================================================
+
+    #[test]
+    fn gc_settings_default_values() {
+        let s = CacheGcSettings::default();
+        assert!(s.enabled);
+        assert_eq!(s.interval_secs, 3600);
+        assert!((s.vacuum_threshold - 0.20).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn gc_settings_clone_eq() {
+        let s = CacheGcSettings {
+            enabled: false,
+            interval_secs: 600,
+            vacuum_threshold: 0.5,
+        };
+        let s2 = s;
+        assert_eq!(s, s2);
+    }
+
+    #[test]
+    fn gc_settings_debug() {
+        let s = CacheGcSettings::default();
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("CacheGcSettings"));
+        assert!(dbg.contains("3600"));
+    }
+
+    // =====================================================================
+    // CacheCompactionStats tests
+    // =====================================================================
+
+    #[test]
+    fn compaction_stats_default() {
+        let s = CacheCompactionStats::default();
+        assert_eq!(s.before_len, 0);
+        assert_eq!(s.before_capacity, 0);
+        assert_eq!(s.after_len, 0);
+        assert_eq!(s.after_capacity, 0);
+        assert_eq!(s.removed_entries, 0);
+    }
+
+    #[test]
+    fn compaction_stats_freed_slots() {
+        let s = CacheCompactionStats {
+            before_len: 10,
+            before_capacity: 32,
+            after_len: 5,
+            after_capacity: 8,
+            removed_entries: 5,
+        };
+        assert_eq!(s.freed_slots(), 24);
+    }
+
+    #[test]
+    fn compaction_stats_freed_slots_zero_when_no_change() {
+        let s = CacheCompactionStats {
+            before_capacity: 16,
+            after_capacity: 16,
+            ..Default::default()
+        };
+        assert_eq!(s.freed_slots(), 0);
+    }
+
+    #[test]
+    fn compaction_stats_freed_slots_saturating() {
+        // after_capacity > before_capacity shouldn't happen in practice,
+        // but freed_slots() uses saturating_sub for safety
+        let s = CacheCompactionStats {
+            before_capacity: 4,
+            after_capacity: 8,
+            ..Default::default()
+        };
+        assert_eq!(s.freed_slots(), 0);
+    }
+
+    #[test]
+    fn compaction_stats_clone_eq() {
+        let s = CacheCompactionStats {
+            before_len: 3,
+            before_capacity: 16,
+            after_len: 2,
+            after_capacity: 4,
+            removed_entries: 1,
+        };
+        let s2 = s;
+        assert_eq!(s, s2);
+    }
+
+    // =====================================================================
+    // normalized_vacuum_threshold tests
+    // =====================================================================
+
+    #[test]
+    fn normalized_threshold_exact_boundaries() {
+        assert!((normalized_vacuum_threshold(0.0) - 0.0).abs() < f64::EPSILON);
+        assert!((normalized_vacuum_threshold(0.5) - 0.5).abs() < f64::EPSILON);
+        assert!((normalized_vacuum_threshold(1.0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn normalized_threshold_infinity() {
+        let def = CacheGcSettings::default().vacuum_threshold;
+        assert!((normalized_vacuum_threshold(f64::INFINITY) - def).abs() < f64::EPSILON);
+        assert!((normalized_vacuum_threshold(f64::NEG_INFINITY) - def).abs() < f64::EPSILON);
+    }
+
+    // =====================================================================
+    // free_page_ratio tests
+    // =====================================================================
+
+    #[test]
+    fn free_page_ratio_zero_pages() {
+        assert!((free_page_ratio(0, 10) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn free_page_ratio_zero_free() {
+        assert!((free_page_ratio(100, 0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn free_page_ratio_negative_pages() {
+        assert!((free_page_ratio(-10, 5) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn free_page_ratio_negative_free() {
+        assert!((free_page_ratio(100, -5) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn free_page_ratio_all_free() {
+        assert!((free_page_ratio(100, 100) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn free_page_ratio_free_exceeds_total() {
+        // free_pages clamped to page_count
+        assert!((free_page_ratio(100, 200) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn free_page_ratio_normal() {
+        assert!((free_page_ratio(100, 25) - 0.25).abs() < f64::EPSILON);
+    }
+
+    // =====================================================================
+    // should_vacuum tests
+    // =====================================================================
+
+    #[test]
+    fn should_vacuum_exact_boundary() {
+        // At exactly the threshold ratio (not strictly greater), should NOT vacuum
+        assert!(!should_vacuum(100, 20, 0.20)); // 0.20 == 0.20
+    }
+
+    #[test]
+    fn should_vacuum_just_above() {
+        assert!(should_vacuum(1000, 201, 0.20)); // 0.201 > 0.20
+    }
+
+    #[test]
+    fn should_vacuum_zero_threshold() {
+        // With threshold 0.0, any non-zero free pages trigger vacuum
+        assert!(should_vacuum(100, 1, 0.0));
+    }
+
+    #[test]
+    fn should_vacuum_threshold_one() {
+        // Threshold 1.0: never triggers (ratio can't exceed 1.0)
+        assert!(!should_vacuum(100, 100, 1.0));
+    }
+
+    // =====================================================================
+    // compact_u64_map additional tests
+    // =====================================================================
+
+    #[test]
+    fn compact_empty_map() {
+        let mut map: HashMap<u64, &str> = HashMap::new();
+        let active: HashSet<u64> = HashSet::new();
+        let stats = compact_u64_map(&mut map, &active);
+        assert_eq!(stats.before_len, 0);
+        assert_eq!(stats.after_len, 0);
+        assert_eq!(stats.removed_entries, 0);
+    }
+
+    #[test]
+    fn compact_empty_active_set_removes_all() {
+        let mut map = HashMap::new();
+        map.insert(1, "a");
+        map.insert(2, "b");
+        map.insert(3, "c");
+        let active: HashSet<u64> = HashSet::new();
+        let stats = compact_u64_map(&mut map, &active);
+        assert_eq!(stats.removed_entries, 3);
+        assert_eq!(stats.after_len, 0);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn compact_all_keys_active_removes_none() {
+        let mut map = HashMap::new();
+        map.insert(1, "a");
+        map.insert(2, "b");
+        let active: HashSet<u64> = [1, 2].into_iter().collect();
+        let stats = compact_u64_map(&mut map, &active);
+        assert_eq!(stats.removed_entries, 0);
+        assert_eq!(stats.after_len, 2);
+    }
+
+    #[test]
+    fn compact_active_keys_superset_of_map() {
+        let mut map = HashMap::new();
+        map.insert(1, "a");
+        let active: HashSet<u64> = [1, 2, 3, 4, 5].into_iter().collect();
+        let stats = compact_u64_map(&mut map, &active);
+        assert_eq!(stats.removed_entries, 0);
+        assert_eq!(stats.after_len, 1);
+    }
+
     proptest! {
         #[test]
         fn capacity_never_increases_after_compaction(
