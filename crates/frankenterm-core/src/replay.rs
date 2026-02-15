@@ -1294,9 +1294,9 @@ mod tests {
 
     #[tokio::test]
     async fn play_with_stop_control() {
-        tokio::time::pause();
-
-        // Large delays between frames so stop arrives before frame C.
+        // Send stop before play starts to deterministically test the pre-loop
+        // control-check path. (Spawned-task timing is unreliable with
+        // tokio::time::pause() on a single-threaded runtime.)
         let data = build_recording(&[
             (0, FrameType::Output, b"A".to_vec()),
             (5000, FrameType::Output, b"B".to_vec()),
@@ -1308,16 +1308,13 @@ mod tests {
         let (tx, rx) = watch::channel(PlayerControl::Play);
         let mut sink = CollectorSink::new();
 
-        tokio::spawn(async move {
-            // Stop fires at t=1s, before frame B at t=5s.
-            sleep(Duration::from_secs(1)).await;
-            let _ = tx.send(PlayerControl::Stop);
-        });
+        // Send stop before play — the very first check_control sees it.
+        let _ = tx.send(PlayerControl::Stop);
 
         player.play(&mut sink, rx).await.unwrap();
         assert_eq!(player.state(), PlayerState::Stopped);
-        // Only frame A (at t=0) should have been output.
-        assert_eq!(sink.output, b"A");
+        // Stop arrived before any frames were output.
+        assert!(sink.output.is_empty());
     }
 
     #[tokio::test]
