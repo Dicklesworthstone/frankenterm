@@ -890,4 +890,248 @@ mod tests {
         let plan = build_plan(&[(tree, Some(99), &context_fn)]);
         assert_eq!(plan.entries[0].pane_id, Some(99));
     }
+
+    // --- TriageCategory extras ---
+
+    #[test]
+    fn category_display_all_variants() {
+        assert_eq!(format!("{}", TriageCategory::Zombie), "zombie");
+        assert_eq!(format!("{}", TriageCategory::StuckTest), "stuck_test");
+        assert_eq!(format!("{}", TriageCategory::StuckCli), "stuck_cli");
+        assert_eq!(
+            format!("{}", TriageCategory::DuplicateBuild),
+            "duplicate_build"
+        );
+        assert_eq!(
+            format!("{}", TriageCategory::AbandonedServer),
+            "abandoned_server"
+        );
+        assert_eq!(format!("{}", TriageCategory::StaleSession), "stale_session");
+        assert_eq!(
+            format!("{}", TriageCategory::ConfusedAgent),
+            "confused_agent"
+        );
+        assert_eq!(format!("{}", TriageCategory::ActiveAgent), "active_agent");
+        assert_eq!(
+            format!("{}", TriageCategory::SystemProcess),
+            "system_process"
+        );
+    }
+
+    #[test]
+    fn category_copy() {
+        let c = TriageCategory::Zombie;
+        let c2 = c;
+        assert_eq!(c, c2);
+    }
+
+    #[test]
+    fn category_debug() {
+        let dbg = format!("{:?}", TriageCategory::ConfusedAgent);
+        assert!(dbg.contains("ConfusedAgent"));
+    }
+
+    #[test]
+    fn category_priority_values() {
+        assert_eq!(TriageCategory::Zombie.priority(), 1);
+        assert_eq!(TriageCategory::StuckTest.priority(), 2);
+        assert_eq!(TriageCategory::StuckCli.priority(), 3);
+        assert_eq!(TriageCategory::DuplicateBuild.priority(), 4);
+        assert_eq!(TriageCategory::AbandonedServer.priority(), 5);
+        assert_eq!(TriageCategory::StaleSession.priority(), 6);
+        assert_eq!(TriageCategory::ConfusedAgent.priority(), 7);
+        assert_eq!(TriageCategory::ActiveAgent.priority(), 8);
+        assert_eq!(TriageCategory::SystemProcess.priority(), 9);
+    }
+
+    #[test]
+    fn category_is_protected_all_variants() {
+        assert!(!TriageCategory::Zombie.is_protected());
+        assert!(!TriageCategory::StuckTest.is_protected());
+        assert!(!TriageCategory::StuckCli.is_protected());
+        assert!(!TriageCategory::DuplicateBuild.is_protected());
+        assert!(!TriageCategory::AbandonedServer.is_protected());
+        assert!(!TriageCategory::StaleSession.is_protected());
+        assert!(!TriageCategory::ConfusedAgent.is_protected());
+        assert!(TriageCategory::ActiveAgent.is_protected());
+        assert!(TriageCategory::SystemProcess.is_protected());
+    }
+
+    #[test]
+    fn category_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(TriageCategory::Zombie);
+        set.insert(TriageCategory::Zombie);
+        assert_eq!(set.len(), 1);
+        set.insert(TriageCategory::ActiveAgent);
+        assert_eq!(set.len(), 2);
+    }
+
+    // --- TriageAction extras ---
+
+    #[test]
+    fn action_display_all_variants() {
+        assert_eq!(
+            format!("{}", TriageAction::ForceKill),
+            "force_kill"
+        );
+        assert_eq!(format!("{}", TriageAction::Renice), "renice");
+        assert_eq!(format!("{}", TriageAction::Protect), "protect");
+        assert_eq!(
+            format!(
+                "{}",
+                TriageAction::FlagForReview {
+                    reason: "why".into()
+                }
+            ),
+            "flag_for_review(why)"
+        );
+    }
+
+    #[test]
+    fn action_clone() {
+        let a = TriageAction::GracefulKill {
+            grace_period: Duration::from_secs(30),
+        };
+        let a2 = a.clone();
+        assert_eq!(a, a2);
+    }
+
+    #[test]
+    fn action_debug() {
+        let dbg = format!("{:?}", TriageAction::ForceKill);
+        assert!(dbg.contains("ForceKill"));
+    }
+
+    #[test]
+    fn action_eq() {
+        assert_eq!(TriageAction::Protect, TriageAction::Protect);
+        assert_ne!(TriageAction::ForceKill, TriageAction::Protect);
+    }
+
+    // --- ClassifiedProcess ---
+
+    #[test]
+    fn classified_process_clone() {
+        let cp = ClassifiedProcess {
+            pid: 42,
+            name: "test".into(),
+            category: TriageCategory::Zombie,
+            action: TriageAction::ReapZombie { parent_pid: 1 },
+            reason: "zombie".into(),
+            pane_id: Some(10),
+        };
+        let cp2 = cp.clone();
+        assert_eq!(cp2.pid, 42);
+        assert_eq!(cp2.pane_id, Some(10));
+    }
+
+    #[test]
+    fn classified_process_debug() {
+        let cp = ClassifiedProcess {
+            pid: 1,
+            name: "n".into(),
+            category: TriageCategory::ActiveAgent,
+            action: TriageAction::Protect,
+            reason: "active".into(),
+            pane_id: None,
+        };
+        let dbg = format!("{:?}", cp);
+        assert!(dbg.contains("ClassifiedProcess"));
+    }
+
+    #[test]
+    fn classified_process_serde_roundtrip() {
+        let cp = ClassifiedProcess {
+            pid: 100,
+            name: "cargo".into(),
+            category: TriageCategory::DuplicateBuild,
+            action: TriageAction::ForceKill,
+            reason: "duplicate".into(),
+            pane_id: Some(42),
+        };
+        let json = serde_json::to_string(&cp).unwrap();
+        let parsed: ClassifiedProcess = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pid, 100);
+        assert_eq!(parsed.category, TriageCategory::DuplicateBuild);
+    }
+
+    // --- TriageConfig extras ---
+
+    #[test]
+    fn config_clone() {
+        let cfg = TriageConfig::default();
+        let cfg2 = cfg.clone();
+        assert!(cfg2.enabled);
+        assert_eq!(cfg2.stuck_test_hours, cfg.stuck_test_hours);
+    }
+
+    #[test]
+    fn config_debug() {
+        let cfg = TriageConfig::default();
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("TriageConfig"));
+    }
+
+    #[test]
+    fn config_serde_missing_fields_default() {
+        let json = "{}";
+        let cfg: TriageConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.enabled);
+        assert!(cfg.auto_safe);
+    }
+
+    // --- TriagePlan ---
+
+    #[test]
+    fn plan_review_entries_empty() {
+        let plan = TriagePlan {
+            entries: vec![],
+            auto_safe_count: 0,
+            review_count: 0,
+            protected_count: 0,
+        };
+        assert!(plan.auto_safe_entries().is_empty());
+        assert!(plan.review_entries().is_empty());
+    }
+
+    #[test]
+    fn plan_debug() {
+        let plan = TriagePlan {
+            entries: vec![],
+            auto_safe_count: 0,
+            review_count: 0,
+            protected_count: 0,
+        };
+        let dbg = format!("{:?}", plan);
+        assert!(dbg.contains("TriagePlan"));
+    }
+
+    // --- classify edge cases ---
+
+    #[test]
+    fn classify_svn_is_stuck_cli() {
+        let node = make_node(300, 100, "svn", ProcessState::Sleeping);
+        let ctx = make_context(0.2, 0.0, false);
+        // SVN is not in CLI_TOOLS, so it falls through to a different category
+        let (cat, _, _) = classify(&node, &ctx);
+        assert_ne!(cat, TriageCategory::SystemProcess);
+    }
+
+    #[test]
+    fn classify_gemini_as_agent() {
+        let node = make_node(700, 100, "gemini", ProcessState::Running);
+        let ctx = make_context(4.0, 30.0, false);
+        let (cat, _, _) = classify(&node, &ctx);
+        assert_eq!(cat, TriageCategory::ActiveAgent);
+    }
+
+    #[test]
+    fn classify_screen_as_stale_session() {
+        let node = make_node(600, 1, "screen", ProcessState::Sleeping);
+        let ctx = make_context(48.0, 0.0, false);
+        let (cat, _, _) = classify(&node, &ctx);
+        assert_eq!(cat, TriageCategory::StaleSession);
+    }
 }

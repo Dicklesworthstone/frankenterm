@@ -737,4 +737,248 @@ mod tests {
             assert!(!q.relevant_ids.is_empty());
         }
     }
+
+    // --- Clone & Debug ---
+
+    #[test]
+    fn semantic_eval_query_clone() {
+        let q = SemanticEvalQuery {
+            name: "test".to_string(),
+            description: "d".to_string(),
+            lexical_ranked: vec![(1, 0.9)],
+            semantic_ranked: vec![(2, 0.8)],
+            relevant_ids: vec![1, 2],
+            top_k: 3,
+        };
+        let q2 = q.clone();
+        assert_eq!(q2.name, "test");
+        assert_eq!(q2.top_k, 3);
+    }
+
+    #[test]
+    fn semantic_eval_query_debug() {
+        let q = SemanticEvalQuery {
+            name: "q".to_string(),
+            description: String::new(),
+            lexical_ranked: vec![],
+            semantic_ranked: vec![],
+            relevant_ids: vec![],
+            top_k: 1,
+        };
+        let dbg = format!("{:?}", q);
+        assert!(dbg.contains("SemanticEvalQuery"));
+    }
+
+    #[test]
+    fn ranking_metrics_clone() {
+        let m = RankingMetrics {
+            precision_at_k: 0.5,
+            recall_at_k: 0.7,
+            ndcg_at_k: 0.8,
+            mrr: 1.0,
+        };
+        let m2 = m.clone();
+        assert!((m2.precision_at_k - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ranking_metrics_debug() {
+        let m = RankingMetrics::default();
+        let dbg = format!("{:?}", m);
+        assert!(dbg.contains("RankingMetrics"));
+    }
+
+    #[test]
+    fn ranking_metrics_serde_roundtrip() {
+        let m = RankingMetrics {
+            precision_at_k: 0.8,
+            recall_at_k: 0.6,
+            ndcg_at_k: 0.9,
+            mrr: 0.5,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let parsed: RankingMetrics = serde_json::from_str(&json).unwrap();
+        assert!((parsed.ndcg_at_k - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn lane_evaluation_clone() {
+        let le = LaneEvaluation {
+            ranked_ids: vec![1, 2, 3],
+            metrics: RankingMetrics::default(),
+        };
+        let le2 = le.clone();
+        assert_eq!(le2.ranked_ids.len(), 3);
+    }
+
+    #[test]
+    fn lane_evaluation_debug() {
+        let le = LaneEvaluation {
+            ranked_ids: vec![],
+            metrics: RankingMetrics::default(),
+        };
+        let dbg = format!("{:?}", le);
+        assert!(dbg.contains("LaneEvaluation"));
+    }
+
+    #[test]
+    fn lane_evaluation_serde_roundtrip() {
+        let le = LaneEvaluation {
+            ranked_ids: vec![10, 20],
+            metrics: RankingMetrics {
+                precision_at_k: 0.5,
+                recall_at_k: 0.5,
+                ndcg_at_k: 0.5,
+                mrr: 0.5,
+            },
+        };
+        let json = serde_json::to_string(&le).unwrap();
+        let parsed: LaneEvaluation = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.ranked_ids, vec![10, 20]);
+    }
+
+    #[test]
+    fn regression_thresholds_clone() {
+        let t = RegressionThresholds::default();
+        let t2 = t.clone();
+        assert!((t2.min_hybrid_precision_at_k - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn regression_thresholds_debug() {
+        let t = RegressionThresholds::default();
+        let dbg = format!("{:?}", t);
+        assert!(dbg.contains("RegressionThresholds"));
+    }
+
+    #[test]
+    fn regression_thresholds_serde_roundtrip() {
+        let t = RegressionThresholds {
+            min_hybrid_ndcg_delta_vs_lexical: -0.1,
+            min_hybrid_precision_at_k: 0.3,
+            min_hybrid_recall_at_k: 0.4,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let parsed: RegressionThresholds = serde_json::from_str(&json).unwrap();
+        assert!((parsed.min_hybrid_recall_at_k - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn threshold_violation_clone() {
+        let v = ThresholdViolation {
+            query: "q".to_string(),
+            metric: "m".to_string(),
+            actual: 0.1,
+            required: 0.5,
+        };
+        let v2 = v.clone();
+        assert_eq!(v2.query, "q");
+    }
+
+    #[test]
+    fn threshold_violation_debug() {
+        let v = ThresholdViolation {
+            query: "q".to_string(),
+            metric: "m".to_string(),
+            actual: 0.0,
+            required: 1.0,
+        };
+        let dbg = format!("{:?}", v);
+        assert!(dbg.contains("ThresholdViolation"));
+    }
+
+    #[test]
+    fn quality_summary_clone() {
+        let s = QualitySummary {
+            total_queries: 5,
+            mean_hybrid_precision_at_k: 0.8,
+            mean_hybrid_recall_at_k: 0.7,
+            mean_hybrid_ndcg_at_k: 0.9,
+            mean_hybrid_vs_lexical_ndcg_delta: 0.1,
+        };
+        let s2 = s.clone();
+        assert_eq!(s2.total_queries, 5);
+    }
+
+    #[test]
+    fn quality_summary_debug() {
+        let s = summarize(&[]);
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("QualitySummary"));
+    }
+
+    #[test]
+    fn quality_summary_serde_roundtrip() {
+        let s = QualitySummary {
+            total_queries: 2,
+            mean_hybrid_precision_at_k: 0.5,
+            mean_hybrid_recall_at_k: 0.6,
+            mean_hybrid_ndcg_at_k: 0.7,
+            mean_hybrid_vs_lexical_ndcg_delta: 0.05,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: QualitySummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_queries, 2);
+    }
+
+    #[test]
+    fn semantic_quality_report_clone() {
+        let report = SemanticQualityHarness::new(vec![]).run();
+        let report2 = report.clone();
+        assert!(report2.passed);
+        assert_eq!(report2.summary.total_queries, 0);
+    }
+
+    #[test]
+    fn semantic_quality_report_debug() {
+        let report = SemanticQualityHarness::new(vec![]).run();
+        let dbg = format!("{:?}", report);
+        assert!(dbg.contains("SemanticQualityReport"));
+    }
+
+    #[test]
+    fn semantic_quality_report_serde_roundtrip() {
+        let report = SemanticQualityHarness::new(default_semantic_eval_queries()).run();
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: SemanticQualityReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.queries.len(), report.queries.len());
+        assert_eq!(parsed.passed, report.passed);
+    }
+
+    // --- Metric computation edge cases ---
+
+    #[test]
+    fn compute_metrics_ndcg_imperfect_ranking() {
+        // Relevant = {1, 2, 3}, ranked = [1, 99, 2, 3] at top_k=4
+        // Position 1: hit, pos 2: miss, pos 3: hit, pos 4: hit
+        let relevant: HashSet<u64> = [1, 2, 3].into_iter().collect();
+        let ranked = vec![1, 99, 2, 3];
+        let m = compute_metrics(&ranked, &relevant, 4);
+        assert!(m.ndcg_at_k > 0.5, "ndcg_at_k={}", m.ndcg_at_k);
+        assert!(m.ndcg_at_k < 1.0, "ndcg_at_k={}", m.ndcg_at_k);
+    }
+
+    #[test]
+    fn harness_with_strict_thresholds_detects_violations() {
+        let queries = default_semantic_eval_queries();
+        let strict = RegressionThresholds {
+            min_hybrid_ndcg_delta_vs_lexical: 10.0, // impossibly high
+            min_hybrid_precision_at_k: 1.0,
+            min_hybrid_recall_at_k: 1.0,
+        };
+        let report = SemanticQualityHarness::new(queries)
+            .with_thresholds(strict)
+            .run();
+        assert!(!report.passed);
+        assert!(!report.violations.is_empty());
+    }
+
+    #[test]
+    fn query_comparison_clone() {
+        let report = SemanticQualityHarness::new(default_semantic_eval_queries()).run();
+        if let Some(q) = report.queries.first() {
+            let q2 = q.clone();
+            assert_eq!(q2.name, q.name);
+        }
+    }
 }
