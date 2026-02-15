@@ -19,11 +19,20 @@ use crate::runtime_compat::mpsc;
 use crate::runtime_compat::unix::{self as compat_unix, UnixListener, UnixStream};
 use base64::Engine as _;
 use serde::Deserialize;
+use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 const MAX_EVENT_LINE_BYTES: usize = 512 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const EVENT_SEND_TIMEOUT: Duration = Duration::from_millis(25);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventDispatchOutcome {
+    Sent,
+    Backpressure,
+    Closed,
+}
 
 #[derive(Debug, Clone)]
 pub struct NativePaneState {
@@ -156,6 +165,8 @@ impl NativeEventListener {
     }
 
     pub async fn run(self, event_tx: mpsc::Sender<NativeEvent>, shutdown_flag: Arc<AtomicBool>) {
+        let mut connection_tasks = JoinSet::new();
+
         loop {
             if shutdown_flag.load(Ordering::SeqCst) {
                 break;
@@ -165,7 +176,7 @@ impl NativeEventListener {
             {
                 Ok(Ok((stream, _addr))) => {
                     let tx = event_tx.clone();
-                    tokio::spawn(async move {
+                    connection_tasks.spawn(async move {
                         if let Err(err) = handle_connection(stream, tx).await {
                             debug!(error = %err, "native event connection closed with error");
                         }
@@ -175,6 +186,18 @@ impl NativeEventListener {
                     warn!(error = %err, path = %self.socket_path.display(), "native event accept failed");
                 }
                 Err(_) => {} // timeout, loop to check shutdown flag
+            }
+
+            while let Some(join_result) = connection_tasks.try_join_next() {
+                if let Err(err) = join_result {
+                    debug!(error = %err, "native event connection task failed");
+                }
+            }
+        }
+
+        while let Some(join_result) = connection_tasks.join_next().await {
+            if let Err(err) = join_result {
+                debug!(error = %err, "native event connection task failed during shutdown");
             }
         }
     }
@@ -245,6 +268,7 @@ async fn handle_connection(
     stream: UnixStream,
     event_tx: mpsc::Sender<NativeEvent>,
 ) -> Result<(), std::io::Error> {
+    debug!("native event connection accepted");
     let mut lines = compat_unix::lines(compat_unix::buffered(stream));
 
     while let Some(line) = compat_unix::next_line(&mut lines).await? {
@@ -255,8 +279,21 @@ async fn handle_connection(
 
         match decode_wire_event(&line) {
             Ok(Some(event)) => {
-                if event_tx.try_send(event).is_err() {
-                    debug!("native event queue full; dropping event");
+                let (event_kind, pane_id) = event_metadata(&event);
+                match dispatch_event(&event_tx, event).await {
+                    EventDispatchOutcome::Sent => {
+                        debug!(event_kind, pane_id, "native event dispatched");
+                    }
+                    EventDispatchOutcome::Backpressure => {
+                        debug!(
+                            event_kind,
+                            pane_id, "native event queue full; dropping event"
+                        );
+                    }
+                    EventDispatchOutcome::Closed => {
+                        debug!(event_kind, pane_id, "native event channel closed");
+                        break;
+                    }
                 }
             }
             Ok(None) => {}
@@ -266,7 +303,56 @@ async fn handle_connection(
         }
     }
 
+    debug!("native event connection closed");
     Ok(())
+}
+
+fn event_metadata(event: &NativeEvent) -> (&'static str, u64) {
+    match event {
+        NativeEvent::PaneOutput { pane_id, .. } => ("pane_output", *pane_id),
+        NativeEvent::StateChange { pane_id, .. } => ("state_change", *pane_id),
+        NativeEvent::UserVarChanged { pane_id, .. } => ("user_var", *pane_id),
+        NativeEvent::PaneCreated { pane_id, .. } => ("pane_created", *pane_id),
+        NativeEvent::PaneDestroyed { pane_id, .. } => ("pane_destroyed", *pane_id),
+    }
+}
+
+async fn dispatch_event(
+    event_tx: &mpsc::Sender<NativeEvent>,
+    event: NativeEvent,
+) -> EventDispatchOutcome {
+    dispatch_event_with_timeout(event_tx, event, EVENT_SEND_TIMEOUT).await
+}
+
+async fn dispatch_event_with_timeout(
+    event_tx: &mpsc::Sender<NativeEvent>,
+    event: NativeEvent,
+    send_timeout: Duration,
+) -> EventDispatchOutcome {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let reserve_cx = crate::cx::for_testing();
+        match crate::runtime_compat::timeout(send_timeout, event_tx.reserve(&reserve_cx)).await {
+            Ok(Ok(permit)) => {
+                permit.send(event);
+                EventDispatchOutcome::Sent
+            }
+            Ok(Err(_)) => EventDispatchOutcome::Closed,
+            Err(_) => EventDispatchOutcome::Backpressure,
+        }
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        match crate::runtime_compat::timeout(send_timeout, event_tx.reserve()).await {
+            Ok(Ok(permit)) => {
+                permit.send(event);
+                EventDispatchOutcome::Sent
+            }
+            Ok(Err(_)) => EventDispatchOutcome::Closed,
+            Err(_) => EventDispatchOutcome::Backpressure,
+        }
+    }
 }
 
 fn decode_wire_event(line: &str) -> Result<Option<NativeEvent>, String> {
@@ -860,5 +946,53 @@ mod tests {
             !socket_path.exists(),
             "socket path should be removed after listener shutdown"
         );
+    }
+
+    fn pane_destroyed_event(pane_id: u64) -> NativeEvent {
+        NativeEvent::PaneDestroyed {
+            pane_id,
+            timestamp_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_sends_when_capacity_available() {
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let outcome =
+            dispatch_event_with_timeout(&tx, pane_destroyed_event(7), Duration::from_millis(20))
+                .await;
+
+        assert_eq!(outcome, EventDispatchOutcome::Sent);
+        let event = rx.recv().await.expect("event should be delivered");
+        assert!(matches!(
+            event,
+            NativeEvent::PaneDestroyed { pane_id: 7, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_reports_closed_when_receiver_dropped() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        let outcome =
+            dispatch_event_with_timeout(&tx, pane_destroyed_event(8), Duration::from_millis(20))
+                .await;
+
+        assert_eq!(outcome, EventDispatchOutcome::Closed);
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_reports_backpressure_when_queue_full() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(pane_destroyed_event(1))
+            .expect("first send should fit in queue");
+
+        let outcome =
+            dispatch_event_with_timeout(&tx, pane_destroyed_event(2), Duration::from_millis(10))
+                .await;
+
+        assert_eq!(outcome, EventDispatchOutcome::Backpressure);
     }
 }

@@ -597,4 +597,202 @@ mod tests {
         assert!(!is_sensitive_var("SHELL"));
         assert!(!is_sensitive_var("TERM"));
     }
+
+    // -----------------------------------------------------------------------
+    // Batch 14 — PearlHeron wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    // ---- Builder chain ----
+
+    #[test]
+    fn builder_chain_sets_all_optional_fields() {
+        let snapshot = PaneStateSnapshot::new(1, 5000, make_terminal())
+            .with_cwd("/home/user".to_string())
+            .with_shell("zsh".to_string())
+            .with_process(ProcessInfo {
+                name: "cargo".to_string(),
+                pid: Some(999),
+                argv: Some(vec!["cargo".to_string(), "test".to_string()]),
+            })
+            .with_scrollback(ScrollbackRef {
+                output_segments_seq: 10,
+                total_lines_captured: 500,
+                last_capture_at: 4999,
+            })
+            .with_agent(AgentMetadata {
+                agent_type: "codex".to_string(),
+                session_id: Some("s-1".to_string()),
+                state: Some("idle".to_string()),
+            });
+
+        assert_eq!(snapshot.cwd.as_deref(), Some("/home/user"));
+        assert_eq!(snapshot.shell.as_deref(), Some("zsh"));
+        assert_eq!(snapshot.foreground_process.as_ref().unwrap().name, "cargo");
+        assert_eq!(
+            snapshot
+                .scrollback_ref
+                .as_ref()
+                .unwrap()
+                .total_lines_captured,
+            500
+        );
+        assert_eq!(snapshot.agent.as_ref().unwrap().agent_type, "codex");
+    }
+
+    // ---- Schema version ----
+
+    #[test]
+    fn new_snapshot_uses_current_schema_version() {
+        let snapshot = PaneStateSnapshot::new(0, 0, make_terminal());
+        assert_eq!(snapshot.schema_version, PANE_STATE_SCHEMA_VERSION);
+    }
+
+    // ---- Env capture from iterator: empty input ----
+
+    #[test]
+    fn env_capture_empty_iterator() {
+        let env = capture_env_from_iter(std::iter::empty());
+        assert!(env.vars.is_empty());
+        assert_eq!(env.redacted_count, 0);
+    }
+
+    // ---- Env capture: sensitive patterns are case-insensitive ----
+
+    #[test]
+    fn is_sensitive_case_insensitive() {
+        assert!(is_sensitive_var("aws_secret_key"));
+        assert!(is_sensitive_var("Api_Key_Value"));
+        assert!(is_sensitive_var("credential_store"));
+        assert!(is_sensitive_var("PASSWD_FILE"));
+    }
+
+    // ---- Env capture: all safe vars captured when present ----
+
+    #[test]
+    fn env_captures_all_safe_vars() {
+        let env = capture_env_from_iter(
+            SAFE_ENV_VARS
+                .iter()
+                .map(|&name| (name.to_string(), format!("val_{name}"))),
+        );
+        for &name in SAFE_ENV_VARS {
+            assert!(
+                env.vars.contains_key(name),
+                "Safe var {name} should be captured"
+            );
+        }
+        assert_eq!(env.redacted_count, 0);
+    }
+
+    // ---- Env capture: non-safe non-sensitive vars are silently dropped ----
+
+    #[test]
+    fn env_drops_unknown_vars_without_counting_as_redacted() {
+        let vars = vec![
+            ("COMPLETELY_CUSTOM".to_string(), "value".to_string()),
+            ("MY_APP_FLAG".to_string(), "true".to_string()),
+        ];
+        let env = capture_env_from_iter(vars.into_iter());
+        assert!(env.vars.is_empty());
+        assert_eq!(env.redacted_count, 0);
+    }
+
+    // ---- with_env_from_iter via builder ----
+
+    #[test]
+    fn with_env_from_iter_captures_safe_vars() {
+        let vars = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("TERM".to_string(), "xterm".to_string()),
+            ("NOT_SAFE".to_string(), "ignored".to_string()),
+        ];
+        let snapshot =
+            PaneStateSnapshot::new(0, 0, make_terminal()).with_env_from_iter(vars.into_iter());
+        let env = snapshot.env.unwrap();
+        assert_eq!(env.vars.len(), 2);
+        assert_eq!(env.vars.get("PATH"), Some(&"/usr/bin".to_string()));
+        assert_eq!(env.vars.get("TERM"), Some(&"xterm".to_string()));
+    }
+
+    // ---- to_json_budgeted: large argv truncated when env already removed ----
+
+    #[test]
+    fn size_budget_large_argv_truncated() {
+        let mut snapshot =
+            PaneStateSnapshot::new(0, 1000, make_terminal()).with_process(ProcessInfo {
+                name: "test".to_string(),
+                pid: Some(1),
+                argv: Some(vec!["x".repeat(80_000)]),
+            });
+        // Also add large env so we trigger the two-stage truncation
+        let mut vars = std::collections::HashMap::new();
+        for i in 0..500 {
+            vars.insert(format!("VAR_{i}"), "x".repeat(100));
+        }
+        snapshot.env = Some(CapturedEnv {
+            vars,
+            redacted_count: 0,
+        });
+
+        let (json, truncated) = snapshot.to_json_budgeted().unwrap();
+        assert!(truncated);
+        // After truncation, env removed; if still too big, argv removed too
+        let restored: PaneStateSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(restored.env.is_none());
+    }
+
+    // ---- ProcessInfo fields ----
+
+    #[test]
+    fn process_info_minimal() {
+        let p = ProcessInfo {
+            name: "bash".to_string(),
+            pid: None,
+            argv: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let restored: ProcessInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.name, "bash");
+        assert!(restored.pid.is_none());
+        assert!(restored.argv.is_none());
+    }
+
+    // ---- TerminalState defaults ----
+
+    #[test]
+    fn terminal_state_serde_defaults_on_missing_fields() {
+        let json = r#"{"rows":24,"cols":80}"#;
+        let terminal: TerminalState = serde_json::from_str(json).unwrap();
+        assert_eq!(terminal.rows, 24);
+        assert_eq!(terminal.cols, 80);
+        assert_eq!(terminal.cursor_row, 0);
+        assert_eq!(terminal.cursor_col, 0);
+        assert!(!terminal.is_alt_screen);
+        assert!(terminal.title.is_empty());
+    }
+
+    // ---- Constants ----
+
+    #[test]
+    fn pane_state_size_budget_is_64kb() {
+        assert_eq!(PANE_STATE_SIZE_BUDGET, 65_536);
+    }
+
+    #[test]
+    fn safe_env_vars_contains_expected_entries() {
+        assert!(SAFE_ENV_VARS.contains(&"PATH"));
+        assert!(SAFE_ENV_VARS.contains(&"HOME"));
+        assert!(SAFE_ENV_VARS.contains(&"SHELL"));
+        assert!(SAFE_ENV_VARS.contains(&"TERM"));
+        assert!(SAFE_ENV_VARS.contains(&"EDITOR"));
+        assert!(SAFE_ENV_VARS.contains(&"FT_WORKSPACE"));
+    }
+
+    #[test]
+    fn sensitive_patterns_contains_expected_entries() {
+        assert!(SENSITIVE_VAR_PATTERNS.contains(&"SECRET"));
+        assert!(SENSITIVE_VAR_PATTERNS.contains(&"TOKEN"));
+        assert!(SENSITIVE_VAR_PATTERNS.contains(&"PASSWORD"));
+        assert!(SENSITIVE_VAR_PATTERNS.contains(&"API_KEY"));
+    }
 }

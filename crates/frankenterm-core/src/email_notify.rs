@@ -201,4 +201,335 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(err.contains("from"));
     }
+
+    // -----------------------------------------------------------------------
+    // Batch 14 — PearlHeron wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    // ---- looks_like_email ----
+
+    #[test]
+    fn looks_like_email_valid_address() {
+        assert!(looks_like_email("user@example.com"));
+        assert!(looks_like_email("a@b.c"));
+        assert!(looks_like_email("complex+tag@sub.domain.org"));
+    }
+
+    #[test]
+    fn looks_like_email_empty_string() {
+        assert!(!looks_like_email(""));
+    }
+
+    #[test]
+    fn looks_like_email_whitespace_only() {
+        assert!(!looks_like_email("   "));
+        assert!(!looks_like_email("\t\n"));
+    }
+
+    #[test]
+    fn looks_like_email_no_at_sign() {
+        assert!(!looks_like_email("userexample.com"));
+    }
+
+    #[test]
+    fn looks_like_email_multiple_at_signs() {
+        assert!(!looks_like_email("user@@example.com"));
+        assert!(!looks_like_email("a@b@c.com"));
+    }
+
+    #[test]
+    fn looks_like_email_no_local_part() {
+        assert!(!looks_like_email("@example.com"));
+    }
+
+    #[test]
+    fn looks_like_email_no_domain() {
+        assert!(!looks_like_email("user@"));
+    }
+
+    #[test]
+    fn looks_like_email_domain_without_dot() {
+        assert!(!looks_like_email("user@localhost"));
+    }
+
+    #[test]
+    fn looks_like_email_leading_trailing_whitespace_tolerated() {
+        // The function trims, so padded valid addresses pass
+        assert!(looks_like_email("  user@example.com  "));
+    }
+
+    // ---- validate: valid full config ----
+
+    #[test]
+    fn email_config_valid_full_passes() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: Some("user@example.com".to_string()),
+            password: Some("app-password".to_string()),
+            from: "wa@example.com".to_string(),
+            to: vec!["ops@example.com".to_string()],
+            subject_prefix: "[wa]".to_string(),
+            tls: EmailTlsMode::StartTls,
+            timeout_secs: 10,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    // ---- validate: port zero ----
+
+    #[test]
+    fn email_config_rejects_port_zero() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 0,
+            username: Some("user@example.com".to_string()),
+            password: Some("pass".to_string()),
+            from: "wa@example.com".to_string(),
+            to: vec!["ops@example.com".to_string()],
+            ..EmailNotifyConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("smtp_port"));
+    }
+
+    // ---- validate: empty to list ----
+
+    #[test]
+    fn email_config_rejects_empty_to_list() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: Some("user@example.com".to_string()),
+            password: Some("pass".to_string()),
+            from: "wa@example.com".to_string(),
+            to: vec![],
+            ..EmailNotifyConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("to"));
+    }
+
+    // ---- validate: invalid recipient in to list ----
+
+    #[test]
+    fn email_config_rejects_invalid_recipient() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: Some("user@example.com".to_string()),
+            password: Some("pass".to_string()),
+            from: "wa@example.com".to_string(),
+            to: vec!["valid@example.com".to_string(), "not-an-email".to_string()],
+            ..EmailNotifyConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("to[1]"));
+    }
+
+    // ---- validate: empty string in to list ----
+
+    #[test]
+    fn email_config_rejects_empty_string_in_to() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: Some("user@example.com".to_string()),
+            password: Some("pass".to_string()),
+            from: "wa@example.com".to_string(),
+            to: vec!["".to_string()],
+            ..EmailNotifyConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("to[0]"));
+    }
+
+    // ---- validate: username without password ----
+
+    #[test]
+    fn email_config_rejects_username_without_password() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: Some("user@example.com".to_string()),
+            password: None,
+            from: "wa@example.com".to_string(),
+            to: vec!["ops@example.com".to_string()],
+            ..EmailNotifyConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("username") || err.contains("password"));
+    }
+
+    // ---- validate: password without username ----
+
+    #[test]
+    fn email_config_rejects_password_without_username() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: None,
+            password: Some("pass".to_string()),
+            from: "wa@example.com".to_string(),
+            to: vec!["ops@example.com".to_string()],
+            ..EmailNotifyConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("username") || err.contains("password"));
+    }
+
+    // ---- validate: empty username string ----
+
+    #[test]
+    fn email_config_rejects_empty_username() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: Some("  ".to_string()),
+            password: Some("pass".to_string()),
+            from: "wa@example.com".to_string(),
+            to: vec!["ops@example.com".to_string()],
+            ..EmailNotifyConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("username"));
+    }
+
+    // ---- validate: empty password string ----
+
+    #[test]
+    fn email_config_rejects_empty_password() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: Some("user@example.com".to_string()),
+            password: Some("  ".to_string()),
+            from: "wa@example.com".to_string(),
+            to: vec!["ops@example.com".to_string()],
+            ..EmailNotifyConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("password"));
+    }
+
+    // ---- validate: no credentials is valid (anonymous SMTP) ----
+
+    #[test]
+    fn email_config_no_credentials_is_valid() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 25,
+            username: None,
+            password: None,
+            from: "wa@example.com".to_string(),
+            to: vec!["ops@example.com".to_string()],
+            ..EmailNotifyConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    // ---- TLS mode default ----
+
+    #[test]
+    fn email_tls_mode_default_is_starttls() {
+        assert_eq!(EmailTlsMode::default(), EmailTlsMode::StartTls);
+    }
+
+    // ---- Default config values ----
+
+    #[test]
+    fn email_config_default_values() {
+        let config = EmailNotifyConfig::default();
+        assert!(!config.enabled);
+        assert!(config.smtp_host.is_empty());
+        assert_eq!(config.smtp_port, 587);
+        assert!(config.username.is_none());
+        assert!(config.password.is_none());
+        assert!(config.from.is_empty());
+        assert!(config.to.is_empty());
+        assert_eq!(config.subject_prefix, "[wa]");
+        assert_eq!(config.tls, EmailTlsMode::StartTls);
+        assert_eq!(config.timeout_secs, 10);
+    }
+
+    // ---- Serde roundtrip ----
+
+    #[test]
+    fn email_tls_mode_serde_roundtrip() {
+        for mode in [
+            EmailTlsMode::None,
+            EmailTlsMode::StartTls,
+            EmailTlsMode::Tls,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let restored: EmailTlsMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, restored);
+        }
+    }
+
+    #[test]
+    fn email_config_serde_roundtrip() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 465,
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            from: "wa@example.com".to_string(),
+            to: vec!["a@b.com".to_string(), "c@d.com".to_string()],
+            subject_prefix: "[test]".to_string(),
+            tls: EmailTlsMode::Tls,
+            timeout_secs: 30,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: EmailNotifyConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.smtp_host, "smtp.example.com");
+        assert_eq!(restored.smtp_port, 465);
+        assert_eq!(restored.to.len(), 2);
+        assert_eq!(restored.timeout_secs, 30);
+    }
+
+    // ---- validate: whitespace-only smtp_host ----
+
+    #[test]
+    fn email_config_rejects_whitespace_only_host() {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "   ".to_string(),
+            smtp_port: 587,
+            from: "wa@example.com".to_string(),
+            to: vec!["ops@example.com".to_string()],
+            ..EmailNotifyConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("smtp_host"));
+    }
+
+    // ---- TLS mode serde values ----
+
+    #[test]
+    fn email_tls_mode_serde_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&EmailTlsMode::None).unwrap(),
+            "\"none\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EmailTlsMode::StartTls).unwrap(),
+            "\"start_tls\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EmailTlsMode::Tls).unwrap(),
+            "\"tls\""
+        );
+    }
 }

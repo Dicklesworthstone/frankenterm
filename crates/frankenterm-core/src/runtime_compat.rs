@@ -684,4 +684,252 @@ mod tests {
         let value = rt.block_on(async { "hello" });
         assert_eq!(value, "hello");
     }
+
+    // ========================================================================
+    // Mutex tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn mutex_lock_and_read() {
+        let m = Mutex::new(42);
+        let guard = m.lock().await;
+        assert_eq!(*guard, 42);
+    }
+
+    #[tokio::test]
+    async fn mutex_lock_and_mutate() {
+        let m = Mutex::new(0);
+        {
+            let mut guard = m.lock().await;
+            *guard = 99;
+        }
+        let guard = m.lock().await;
+        assert_eq!(*guard, 99);
+    }
+
+    #[tokio::test]
+    async fn mutex_sequential_locks() {
+        let m = Mutex::new(vec![1, 2, 3]);
+        {
+            let mut guard = m.lock().await;
+            guard.push(4);
+        }
+        let guard = m.lock().await;
+        assert_eq!(*guard, vec![1, 2, 3, 4]);
+    }
+
+    // ========================================================================
+    // RwLock tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn rwlock_read() {
+        let rw = RwLock::new("hello".to_string());
+        let guard = rw.read().await;
+        assert_eq!(&*guard, "hello");
+    }
+
+    #[tokio::test]
+    async fn rwlock_write() {
+        let rw = RwLock::new(0);
+        {
+            let mut guard = rw.write().await;
+            *guard = 42;
+        }
+        let guard = rw.read().await;
+        assert_eq!(*guard, 42);
+    }
+
+    #[tokio::test]
+    async fn rwlock_multiple_sequential_readers() {
+        let rw = RwLock::new(100);
+        let r1 = rw.read().await;
+        assert_eq!(*r1, 100);
+        drop(r1);
+        let r2 = rw.read().await;
+        assert_eq!(*r2, 100);
+    }
+
+    // ========================================================================
+    // Semaphore tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn semaphore_available_permits() {
+        let sem = Semaphore::new(3);
+        assert_eq!(sem.available_permits(), 3);
+    }
+
+    #[tokio::test]
+    async fn semaphore_acquire_decrements_permits() {
+        let sem = Semaphore::new(2);
+        let _p1 = sem.acquire().await.expect("acquire 1");
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn semaphore_release_on_drop() {
+        let sem = Semaphore::new(1);
+        {
+            let _p = sem.acquire().await.expect("acquire");
+            assert_eq!(sem.available_permits(), 0);
+        }
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn semaphore_try_acquire_success() {
+        let sem = Semaphore::new(1);
+        let p = sem.try_acquire();
+        assert!(p.is_ok());
+    }
+
+    #[tokio::test]
+    async fn semaphore_try_acquire_no_permits() {
+        let sem = Semaphore::new(1);
+        let _held = sem.acquire().await.expect("acquire");
+        let err = sem.try_acquire();
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn semaphore_try_acquire_owned_success() {
+        let sem = std::sync::Arc::new(Semaphore::new(2));
+        let p = sem.clone().try_acquire_owned();
+        assert!(p.is_ok());
+    }
+
+    #[tokio::test]
+    async fn semaphore_try_acquire_owned_no_permits() {
+        let sem = std::sync::Arc::new(Semaphore::new(1));
+        let _held = sem.clone().acquire_owned().await.expect("acquire");
+        let err = sem.clone().try_acquire_owned();
+        assert!(err.is_err());
+    }
+
+    // ========================================================================
+    // MPSC channel tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn mpsc_send_recv() {
+        let (tx, mut rx) = mpsc::channel(10);
+        tx.send(42).await.expect("send");
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = asupersync::Cx::for_testing();
+            let val = rx.recv(&cx).await.expect("recv");
+            assert_eq!(val, 42);
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let val = rx.recv().await.expect("recv");
+            assert_eq!(val, 42);
+        }
+    }
+
+    #[tokio::test]
+    async fn mpsc_multiple_messages_fifo() {
+        let (tx, mut rx) = mpsc::channel(10);
+        for i in 0..5 {
+            tx.send(i).await.expect("send");
+        }
+        for i in 0..5 {
+            #[cfg(feature = "asupersync-runtime")]
+            {
+                let cx = asupersync::Cx::for_testing();
+                let val = rx.recv(&cx).await.expect("recv");
+                assert_eq!(val, i);
+            }
+            #[cfg(not(feature = "asupersync-runtime"))]
+            {
+                let val = rx.recv().await.expect("recv");
+                assert_eq!(val, i);
+            }
+        }
+    }
+
+    // ========================================================================
+    // Watch channel tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn watch_initial_value() {
+        let (_, rx) = watch::channel(42);
+        assert_eq!(*rx.borrow(), 42);
+    }
+
+    #[tokio::test]
+    async fn watch_send_updates_value() {
+        let (tx, rx) = watch::channel(0);
+        tx.send(99).expect("send");
+        assert_eq!(*rx.borrow(), 99);
+    }
+
+    // ========================================================================
+    // Broadcast channel tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn broadcast_send_recv() {
+        let (tx, mut rx) = broadcast::channel(16);
+        tx.send(42).expect("send");
+        let val = rx.recv().await.expect("recv");
+        assert_eq!(val, 42);
+    }
+
+    #[tokio::test]
+    async fn broadcast_multiple_receivers() {
+        let (tx, mut rx1) = broadcast::channel(16);
+        let mut rx2 = tx.subscribe();
+        tx.send(7).expect("send");
+        assert_eq!(rx1.recv().await.expect("r1"), 7);
+        assert_eq!(rx2.recv().await.expect("r2"), 7);
+    }
+
+    // ========================================================================
+    // Sleep and timeout edge cases
+    // ========================================================================
+
+    #[tokio::test]
+    async fn sleep_zero_duration_completes_immediately() {
+        let start = std::time::Instant::now();
+        sleep(Duration::ZERO).await;
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn timeout_with_immediate_future() {
+        let result = timeout(Duration::from_millis(100), async { "fast" }).await;
+        assert_eq!(result.unwrap(), "fast");
+    }
+
+    #[tokio::test]
+    async fn timeout_error_is_string() {
+        let result = timeout(Duration::from_millis(1), async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    // ========================================================================
+    // CompatRuntime trait tests
+    // ========================================================================
+
+    #[test]
+    fn block_on_returns_complex_type() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let result: Vec<i32> = rt.block_on(async { vec![1, 2, 3] });
+        assert_eq!(result, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn spawn_detached_accepts_send_future() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {});
+        rt.spawn_detached(async {});
+    }
 }

@@ -373,4 +373,86 @@ mod tests {
         assert_eq!(config.orphan_reap_interval_seconds, 60);
         assert_eq!(config.orphan_max_age_seconds, 30);
     }
+
+    // -----------------------------------------------------------------------
+    // Batch 14 — PearlHeron wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    // ---- split_first_token ----
+
+    #[test]
+    fn split_first_token_normal() {
+        let (first, rest) = split_first_token("hello world foo").unwrap();
+        assert_eq!(first, "hello");
+        assert_eq!(rest.trim(), "world foo");
+    }
+
+    #[test]
+    fn split_first_token_single_word() {
+        let (first, rest) = split_first_token("hello").unwrap();
+        assert_eq!(first, "hello");
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn split_first_token_empty() {
+        assert!(split_first_token("").is_none());
+    }
+
+    #[test]
+    fn split_first_token_whitespace_only() {
+        assert!(split_first_token("   ").is_none());
+    }
+
+    #[test]
+    fn split_first_token_leading_whitespace() {
+        let (first, rest) = split_first_token("   hello world").unwrap();
+        assert_eq!(first, "hello");
+        assert_eq!(rest.trim(), "world");
+    }
+
+    #[test]
+    fn split_first_token_tab_separator() {
+        let (first, rest) = split_first_token("abc\tdef").unwrap();
+        assert_eq!(first, "abc");
+        assert_eq!(rest.trim(), "def");
+    }
+
+    // ---- parse_etime edge cases ----
+
+    #[test]
+    fn parse_etime_zero() {
+        assert_eq!(parse_etime("0").unwrap(), 0);
+        assert_eq!(parse_etime("00:00").unwrap(), 0);
+        assert_eq!(parse_etime("00:00:00").unwrap(), 0);
+        assert_eq!(parse_etime("0-00:00:00").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_etime_days_only() {
+        assert_eq!(parse_etime("1-00:00:00").unwrap(), 86400);
+        assert_eq!(parse_etime("7-00:00:00").unwrap(), 7 * 86400);
+    }
+
+    #[test]
+    fn parse_etime_too_many_colons() {
+        assert!(parse_etime("1:2:3:4").is_err());
+    }
+
+    // ---- ReapReport ----
+
+    #[test]
+    fn reap_report_serde_json_fields() {
+        let report = ReapReport {
+            scanned: 10,
+            killed: 0,
+            killed_pids: vec![],
+            errors: vec!["test error".to_string()],
+        };
+        let json = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(json["scanned"], 10);
+        assert_eq!(json["killed"], 0);
+        assert!(json["killed_pids"].as_array().unwrap().is_empty());
+        assert_eq!(json["errors"][0], "test error");
+    }
 }

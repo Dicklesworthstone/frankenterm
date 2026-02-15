@@ -616,4 +616,227 @@ mod tests {
         assert_eq!(AlertPeriod::Week.duration_ms(), 604_800_000);
         assert_eq!(AlertPeriod::Month.duration_ms(), 2_592_000_000);
     }
+
+    // -----------------------------------------------------------------------
+    // Batch 14 — PearlHeron wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    // ---- AlertPeriod / AlertMetric parse errors ----
+
+    #[test]
+    fn alert_period_parse_unknown_errors() {
+        let err: Result<AlertPeriod, _> = "hourly".parse();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("hourly"));
+    }
+
+    #[test]
+    fn alert_metric_parse_unknown_errors() {
+        let err: Result<AlertMetric, _> = "latency".parse();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("latency"));
+    }
+
+    // ---- AlertLevel display ----
+
+    #[test]
+    fn alert_level_as_str_display_consistency() {
+        for level in [
+            AlertLevel::Info,
+            AlertLevel::Warning,
+            AlertLevel::Critical,
+            AlertLevel::Exceeded,
+        ] {
+            assert_eq!(level.as_str(), level.to_string());
+        }
+    }
+
+    // ---- AlertLevel from_percent boundaries ----
+
+    #[test]
+    fn alert_level_from_percent_negative() {
+        assert_eq!(AlertLevel::from_percent(-0.1), None);
+    }
+
+    // ---- TriggeredAlert summary: rate limit ----
+
+    #[test]
+    fn triggered_alert_summary_rate_limit() {
+        let alert = TriggeredAlert {
+            rule_id: "rl-daily".to_string(),
+            metric: AlertMetric::RateLimitFrequency,
+            level: AlertLevel::Exceeded,
+            current_value: 15.0,
+            threshold: 10.0,
+            percent_of_threshold: 1.5,
+            period: AlertPeriod::Day,
+            evaluated_at: 0,
+        };
+        let summary = alert.summary();
+        assert!(summary.contains("exceeded"));
+        assert!(summary.contains("rate limits"));
+        assert!(summary.contains("15"));
+        assert!(summary.contains("150%"));
+    }
+
+    // ---- TriggeredAlert summary: account balance ----
+
+    #[test]
+    fn triggered_alert_summary_account_balance() {
+        let alert = TriggeredAlert {
+            rule_id: "bal-low".to_string(),
+            metric: AlertMetric::AccountBalance,
+            level: AlertLevel::Critical,
+            current_value: 5.0,
+            threshold: 20.0,
+            percent_of_threshold: 0.75,
+            period: AlertPeriod::Day,
+            evaluated_at: 0,
+        };
+        let summary = alert.summary();
+        assert!(summary.contains("critical"));
+        assert!(summary.contains("balance"));
+        assert!(summary.contains("5.0%"));
+        assert!(summary.contains("20.0%"));
+    }
+
+    // ---- AlertRule constructors set expected fields ----
+
+    #[test]
+    fn alert_rule_cost_constructor() {
+        let rule = AlertRule::cost("c1", 100.0, AlertPeriod::Week);
+        assert_eq!(rule.id, "c1");
+        assert_eq!(rule.metric, AlertMetric::Cost);
+        assert!((rule.threshold - 100.0).abs() < f64::EPSILON);
+        assert_eq!(rule.period, AlertPeriod::Week);
+        assert!(rule.agent_type.is_none());
+        assert!(rule.account_id.is_none());
+        assert!(rule.enabled);
+    }
+
+    #[test]
+    fn alert_rule_token_usage_constructor() {
+        let rule = AlertRule::token_usage("t1", 50_000.0, AlertPeriod::Month);
+        assert_eq!(rule.metric, AlertMetric::TokenUsage);
+        assert_eq!(rule.period, AlertPeriod::Month);
+    }
+
+    #[test]
+    fn alert_rule_rate_limit_constructor() {
+        let rule = AlertRule::rate_limit("r1", 20.0, AlertPeriod::Day);
+        assert_eq!(rule.metric, AlertMetric::RateLimitFrequency);
+        assert!((rule.threshold - 20.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn alert_rule_account_balance_constructor() {
+        let rule = AlertRule::account_balance("b1", 10.0, Some("acct-1".to_string()));
+        assert_eq!(rule.metric, AlertMetric::AccountBalance);
+        assert_eq!(rule.account_id.as_deref(), Some("acct-1"));
+    }
+
+    // ---- AlertMetric / AlertPeriod serde roundtrip ----
+
+    #[test]
+    fn alert_metric_serde_roundtrip() {
+        for metric in [
+            AlertMetric::Cost,
+            AlertMetric::TokenUsage,
+            AlertMetric::RateLimitFrequency,
+            AlertMetric::AccountBalance,
+        ] {
+            let json = serde_json::to_string(&metric).unwrap();
+            let restored: AlertMetric = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, metric);
+        }
+    }
+
+    #[test]
+    fn alert_period_serde_roundtrip() {
+        for period in [AlertPeriod::Day, AlertPeriod::Week, AlertPeriod::Month] {
+            let json = serde_json::to_string(&period).unwrap();
+            let restored: AlertPeriod = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, period);
+        }
+    }
+
+    // ---- AlertLevel serde roundtrip ----
+
+    #[test]
+    fn alert_level_serde_roundtrip() {
+        for level in [
+            AlertLevel::Info,
+            AlertLevel::Warning,
+            AlertLevel::Critical,
+            AlertLevel::Exceeded,
+        ] {
+            let json = serde_json::to_string(&level).unwrap();
+            let restored: AlertLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, level);
+        }
+    }
+
+    // ---- Negative threshold ----
+
+    #[test]
+    fn negative_threshold_never_triggers() {
+        let rule = AlertRule::cost("neg", -10.0, AlertPeriod::Day);
+        assert_eq!(rule.check(100.0), None);
+    }
+
+    // ---- sum helpers ----
+
+    #[test]
+    fn sum_amounts_empty() {
+        assert!((sum_amounts(&[]) - 0.0).abs() < f64::EPSILON);
+    }
+
+    fn make_usage_record(
+        id: i64,
+        metric_type: MetricType,
+        amount: Option<f64>,
+        tokens: Option<i64>,
+    ) -> UsageMetricRecord {
+        UsageMetricRecord {
+            id,
+            timestamp: 0,
+            metric_type,
+            pane_id: None,
+            agent_type: None,
+            account_id: None,
+            workflow_id: None,
+            count: None,
+            amount,
+            tokens,
+            metadata: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn sum_amounts_with_nones() {
+        let records = vec![
+            make_usage_record(0, MetricType::ApiCost, Some(1.5), None),
+            make_usage_record(1, MetricType::ApiCost, None, None),
+            make_usage_record(2, MetricType::ApiCost, Some(2.5), None),
+        ];
+        assert!((sum_amounts(&records) - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sum_tokens_with_nones() {
+        let records = vec![
+            make_usage_record(0, MetricType::TokenUsage, None, Some(100)),
+            make_usage_record(1, MetricType::TokenUsage, None, None),
+            make_usage_record(2, MetricType::TokenUsage, None, Some(250)),
+        ];
+        assert_eq!(sum_tokens(&records), 350);
+    }
+
+    // ---- now_ms sanity ----
+
+    #[test]
+    fn now_ms_is_positive() {
+        assert!(now_ms() > 0);
+    }
 }
