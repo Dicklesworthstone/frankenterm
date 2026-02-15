@@ -1036,7 +1036,8 @@ mod tests {
         let final_val = counter.load(Ordering::SeqCst);
         assert!(
             final_val >= 7,
-            "final counter value {final_val} should be >= 7"
+            "final counter value {} should be >= 7",
+            final_val
         );
         incrementer.await.unwrap();
     }
@@ -1175,8 +1176,8 @@ mod tests {
         assert_eq!(snap.gauges.len(), 1);
         assert_eq!(snap.gauges[0], ("ingest_q".to_owned(), 2));
         let desc = snap.describe(Instant::now());
-        assert!(desc.contains("ingest_q=2"), "desc: {desc}");
-        assert!(desc.contains("total_pending=2"), "desc: {desc}");
+        assert!(desc.contains("ingest_q=2"), "desc: {}", desc);
+        assert!(desc.contains("total_pending=2"), "desc: {}", desc);
     }
 
     #[test]
@@ -1288,5 +1289,978 @@ mod tests {
         slow_gauge.decrement();
 
         assert!(detector.is_quiet(Instant::now()));
+    }
+
+    // =========================================================================
+    // NEW TESTS: Backoff edge cases
+    // =========================================================================
+
+    #[test]
+    fn backoff_factor_one_stays_constant() {
+        let backoff = Backoff {
+            initial: Duration::from_millis(50),
+            max: Duration::from_millis(200),
+            factor: 1,
+            max_retries: None,
+        };
+        let mut delay = backoff.initial;
+        for _ in 0..10 {
+            delay = backoff.next_delay(delay);
+            assert_eq!(delay, Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn backoff_factor_zero_always_zero() {
+        let backoff = Backoff {
+            initial: Duration::from_millis(100),
+            max: Duration::from_millis(200),
+            factor: 0,
+            max_retries: None,
+        };
+        let delay = backoff.next_delay(backoff.initial);
+        assert_eq!(delay, Duration::ZERO);
+    }
+
+    #[test]
+    fn backoff_zero_initial_stays_zero() {
+        let backoff = Backoff {
+            initial: Duration::ZERO,
+            max: Duration::from_secs(1),
+            factor: 2,
+            max_retries: None,
+        };
+        let delay = backoff.next_delay(backoff.initial);
+        assert_eq!(delay, Duration::ZERO);
+    }
+
+    #[test]
+    fn backoff_max_equals_initial() {
+        let backoff = Backoff {
+            initial: Duration::from_millis(100),
+            max: Duration::from_millis(100),
+            factor: 5,
+            max_retries: None,
+        };
+        let delay = backoff.next_delay(backoff.initial);
+        assert_eq!(delay, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn backoff_very_large_factor_caps_at_max() {
+        let backoff = Backoff {
+            initial: Duration::from_millis(1),
+            max: Duration::from_millis(50),
+            factor: 1000,
+            max_retries: None,
+        };
+        let delay = backoff.next_delay(backoff.initial);
+        assert_eq!(delay, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn backoff_saturating_mul_does_not_panic() {
+        // Very large duration * large factor should saturate, not overflow
+        let backoff = Backoff {
+            initial: Duration::from_secs(u64::MAX / 2),
+            max: Duration::from_secs(u64::MAX / 2),
+            factor: u32::MAX,
+            max_retries: None,
+        };
+        // Should not panic
+        let delay = backoff.next_delay(backoff.initial);
+        // Result is either capped at max or saturated
+        assert!(delay <= Duration::MAX);
+    }
+
+    #[test]
+    fn backoff_clone_is_independent() {
+        let b1 = Backoff {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(100),
+            factor: 2,
+            max_retries: Some(5),
+        };
+        let b2 = b1.clone();
+        assert_eq!(b2.initial, b1.initial);
+        assert_eq!(b2.max, b1.max);
+        assert_eq!(b2.factor, b1.factor);
+        assert_eq!(b2.max_retries, b1.max_retries);
+    }
+
+    #[test]
+    fn backoff_debug_format() {
+        let b = Backoff::default();
+        let debug = format!("{:?}", b);
+        assert!(debug.contains("Backoff"), "debug: {}", debug);
+        assert!(debug.contains("initial"), "debug: {}", debug);
+        assert!(debug.contains("max"), "debug: {}", debug);
+        assert!(debug.contains("factor"), "debug: {}", debug);
+    }
+
+    #[test]
+    fn backoff_max_retries_some_zero() {
+        let b = Backoff {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(100),
+            factor: 2,
+            max_retries: Some(0),
+        };
+        assert_eq!(b.max_retries, Some(0));
+    }
+
+    #[test]
+    fn backoff_max_retries_some_usize_max() {
+        let b = Backoff {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(100),
+            factor: 2,
+            max_retries: Some(usize::MAX),
+        };
+        assert_eq!(b.max_retries, Some(usize::MAX));
+    }
+
+    // =========================================================================
+    // NEW TESTS: WaitFor enum
+    // =========================================================================
+
+    #[test]
+    fn wait_for_ready_with_string() {
+        let wf: WaitFor<String> = WaitFor::ready("hello".to_string());
+        match wf {
+            WaitFor::Ready(v) => assert_eq!(v, "hello"),
+            WaitFor::NotReady { .. } => panic!("expected Ready"),
+        }
+    }
+
+    #[test]
+    fn wait_for_not_ready_with_none_string() {
+        let wf: WaitFor<u64> = WaitFor::not_ready(None::<String>);
+        match wf {
+            WaitFor::NotReady { last_observed } => assert!(last_observed.is_none()),
+            WaitFor::Ready(_) => panic!("expected NotReady"),
+        }
+    }
+
+    #[test]
+    fn wait_for_clone() {
+        let wf: WaitFor<u32> = WaitFor::ready(99);
+        let cloned = wf.clone();
+        assert!(matches!(cloned, WaitFor::Ready(99)));
+
+        let wf2: WaitFor<u32> = WaitFor::not_ready(Some("waiting".to_string()));
+        let cloned2 = wf2.clone();
+        match cloned2 {
+            WaitFor::NotReady { last_observed } => {
+                assert_eq!(last_observed.as_deref(), Some("waiting"));
+            }
+            _ => panic!("expected NotReady"),
+        }
+    }
+
+    #[test]
+    fn wait_for_debug_format() {
+        let ready: WaitFor<i32> = WaitFor::ready(42);
+        let debug = format!("{:?}", ready);
+        assert!(debug.contains("Ready"), "debug: {}", debug);
+        assert!(debug.contains("42"), "debug: {}", debug);
+
+        let not_ready: WaitFor<i32> = WaitFor::not_ready(Some("msg".to_string()));
+        let debug2 = format!("{:?}", not_ready);
+        assert!(debug2.contains("NotReady"), "debug: {}", debug2);
+        assert!(debug2.contains("msg"), "debug: {}", debug2);
+    }
+
+    #[test]
+    fn wait_for_ready_zero_value() {
+        let wf: WaitFor<u64> = WaitFor::ready(0);
+        assert!(matches!(wf, WaitFor::Ready(0)));
+    }
+
+    #[test]
+    fn wait_for_ready_u64_max() {
+        let wf: WaitFor<u64> = WaitFor::ready(u64::MAX);
+        match wf {
+            WaitFor::Ready(v) => assert_eq!(v, u64::MAX),
+            _ => panic!("expected Ready"),
+        }
+    }
+
+    #[test]
+    fn wait_for_not_ready_empty_string_observation() {
+        let wf: WaitFor<()> = WaitFor::not_ready(Some(String::new()));
+        match wf {
+            WaitFor::NotReady { last_observed } => {
+                assert_eq!(last_observed, Some(String::new()));
+            }
+            _ => panic!("expected NotReady"),
+        }
+    }
+
+    // =========================================================================
+    // NEW TESTS: WaitCondition
+    // =========================================================================
+
+    #[test]
+    fn wait_condition_describe_returns_description() {
+        let cond = WaitCondition::new("my condition", || async { WaitFor::<()>::ready(()) });
+        assert_eq!(cond.description, "my condition");
+    }
+
+    #[test]
+    fn wait_condition_new_with_empty_description() {
+        let cond = WaitCondition::new("", || async { WaitFor::<()>::ready(()) });
+        assert_eq!(cond.description, "");
+    }
+
+    #[test]
+    fn wait_condition_new_with_string_owned() {
+        let desc = String::from("owned description");
+        let cond = WaitCondition::new(desc, || async { WaitFor::<()>::ready(()) });
+        assert_eq!(cond.description, "owned description");
+    }
+
+    #[test]
+    fn wait_condition_describe_via_trait() {
+        let cond = WaitCondition::new("via trait", || async { WaitFor::<i32>::ready(1) });
+        // Test through the WaitPredicate trait
+        let desc = WaitPredicate::describe(&cond);
+        assert_eq!(desc, "via trait");
+    }
+
+    // =========================================================================
+    // NEW TESTS: WaitError
+    // =========================================================================
+
+    #[test]
+    fn wait_error_debug_format() {
+        let err = WaitError {
+            expected: "ready".to_string(),
+            last_observed: Some("pending".to_string()),
+            retries: 3,
+            elapsed: Duration::from_millis(500),
+        };
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("WaitError"), "debug: {}", debug);
+        assert!(debug.contains("ready"), "debug: {}", debug);
+        assert!(debug.contains("pending"), "debug: {}", debug);
+    }
+
+    #[test]
+    fn wait_error_clone() {
+        let err = WaitError {
+            expected: "ready".to_string(),
+            last_observed: Some("connecting".to_string()),
+            retries: 7,
+            elapsed: Duration::from_secs(2),
+        };
+        let cloned = err.clone();
+        assert_eq!(cloned.expected, "ready");
+        assert_eq!(cloned.last_observed.as_deref(), Some("connecting"));
+        assert_eq!(cloned.retries, 7);
+        assert_eq!(cloned.elapsed, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn wait_error_is_std_error() {
+        let err = WaitError {
+            expected: "test".to_string(),
+            last_observed: None,
+            retries: 0,
+            elapsed: Duration::ZERO,
+        };
+        // Verify it implements std::error::Error
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn wait_error_display_zero_elapsed() {
+        let err = WaitError {
+            expected: "test".to_string(),
+            last_observed: None,
+            retries: 0,
+            elapsed: Duration::ZERO,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("0ms"), "should show 0ms: {}", msg);
+        assert!(msg.contains("retries=0"), "should show 0 retries: {}", msg);
+    }
+
+    #[test]
+    fn wait_error_display_large_elapsed() {
+        let err = WaitError {
+            expected: "test".to_string(),
+            last_observed: Some("still waiting".to_string()),
+            retries: 1000,
+            elapsed: Duration::from_secs(3600),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("3600000"), "should show elapsed ms: {}", msg);
+        assert!(msg.contains("retries=1000"), "msg: {}", msg);
+        assert!(msg.contains("still waiting"), "msg: {}", msg);
+    }
+
+    #[test]
+    fn wait_error_display_with_special_characters_in_expected() {
+        let err = WaitError {
+            expected: "value == \"hello world\"".to_string(),
+            last_observed: Some("<error: timeout>".to_string()),
+            retries: 1,
+            elapsed: Duration::from_millis(10),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("value == \"hello world\""), "msg: {}", msg);
+        assert!(msg.contains("<error: timeout>"), "msg: {}", msg);
+    }
+
+    // =========================================================================
+    // NEW TESTS: QueueDepthGauge extended
+    // =========================================================================
+
+    #[test]
+    fn gauge_empty_name() {
+        let g = QueueDepthGauge::new("");
+        assert_eq!(g.name(), "");
+        assert_eq!(g.depth(), 0);
+    }
+
+    #[test]
+    fn gauge_long_name() {
+        let name = "a".repeat(1000);
+        let g = QueueDepthGauge::new(name.clone());
+        assert_eq!(g.name(), name);
+    }
+
+    #[test]
+    fn gauge_debug_format() {
+        let g = QueueDepthGauge::new("test_gauge");
+        let debug = format!("{:?}", g);
+        assert!(debug.contains("QueueDepthGauge"), "debug: {}", debug);
+        assert!(debug.contains("test_gauge"), "debug: {}", debug);
+    }
+
+    #[test]
+    fn gauge_many_increments() {
+        let g = QueueDepthGauge::new("big");
+        for _ in 0..1000 {
+            g.increment();
+        }
+        assert_eq!(g.depth(), 1000);
+        for _ in 0..1000 {
+            g.decrement();
+        }
+        assert_eq!(g.depth(), 0);
+    }
+
+    #[test]
+    fn gauge_increment_after_underflow_recovery() {
+        let g = QueueDepthGauge::new("q");
+        // Underflow then increment
+        g.decrement();
+        assert_eq!(g.depth(), 0);
+        g.increment();
+        assert_eq!(g.depth(), 1);
+    }
+
+    #[test]
+    fn gauge_multiple_underflow_attempts() {
+        let g = QueueDepthGauge::new("q");
+        for _ in 0..10 {
+            g.decrement();
+        }
+        assert_eq!(g.depth(), 0);
+    }
+
+    #[test]
+    fn gauge_name_with_special_chars() {
+        let g = QueueDepthGauge::new("queue/capture:v2 (main)");
+        assert_eq!(g.name(), "queue/capture:v2 (main)");
+    }
+
+    // =========================================================================
+    // NEW TESTS: ActivityTracker extended
+    // =========================================================================
+
+    #[test]
+    fn tracker_default_is_idle() {
+        let t = ActivityTracker::default();
+        assert!(t.is_idle());
+        assert!(t.last_activity().is_none());
+    }
+
+    #[test]
+    fn tracker_debug_format() {
+        let t = ActivityTracker::new();
+        let debug = format!("{:?}", t);
+        assert!(debug.contains("ActivityTracker"), "debug: {}", debug);
+        assert!(debug.contains("epoch"), "debug: {}", debug);
+    }
+
+    #[test]
+    fn tracker_record_then_not_idle() {
+        let t = ActivityTracker::new();
+        assert!(t.is_idle());
+        t.record();
+        assert!(!t.is_idle());
+    }
+
+    #[test]
+    fn tracker_multiple_records() {
+        let t = ActivityTracker::new();
+        t.record();
+        t.record();
+        t.record();
+        assert!(!t.is_idle());
+        // last_activity should return Some
+        assert!(t.last_activity().is_some());
+    }
+
+    #[test]
+    fn tracker_last_activity_is_after_epoch() {
+        let t = ActivityTracker::new();
+        let epoch = t.epoch;
+        t.record();
+        let last = t.last_activity().unwrap();
+        assert!(last >= epoch, "last_activity should be >= epoch");
+    }
+
+    #[test]
+    fn tracker_offset_encoding_minimum_value() {
+        // Encoded 1 maps to epoch (offset 0 after decoding)
+        let t = ActivityTracker::new();
+        t.last_offset_nanos.store(1, Ordering::SeqCst);
+        let activity = t.last_activity();
+        assert!(activity.is_some());
+        assert_eq!(activity.unwrap(), t.epoch);
+    }
+
+    #[test]
+    fn tracker_offset_encoding_large_value() {
+        let t = ActivityTracker::new();
+        // Store a large offset (simulating far future activity)
+        let large_offset: u64 = 1_000_000_000; // 1 second in nanos
+        t.last_offset_nanos.store(large_offset, Ordering::SeqCst);
+        let activity = t.last_activity().unwrap();
+        let expected = t.epoch + Duration::from_nanos(large_offset - 1);
+        assert_eq!(activity, expected);
+    }
+
+    // =========================================================================
+    // NEW TESTS: QuiescenceState extended
+    // =========================================================================
+
+    #[test]
+    fn quiescence_state_quiet_zero_pending_no_activity_zero_window() {
+        let state = QuiescenceState {
+            pending: 0,
+            last_activity: None,
+            quiet_window: Duration::ZERO,
+        };
+        assert!(state.is_quiet_at(Instant::now()));
+    }
+
+    #[test]
+    fn quiescence_state_not_quiet_large_pending() {
+        let state = QuiescenceState {
+            pending: usize::MAX,
+            last_activity: None,
+            quiet_window: Duration::ZERO,
+        };
+        assert!(!state.is_quiet_at(Instant::now()));
+    }
+
+    #[test]
+    fn quiescence_state_describe_no_activity() {
+        let state = QuiescenceState {
+            pending: 0,
+            last_activity: None,
+            quiet_window: Duration::from_millis(100),
+        };
+        let desc = state.describe_at(Instant::now());
+        assert!(desc.contains("pending=0"), "desc: {}", desc);
+        assert!(desc.contains("quiet_window_ms=100"), "desc: {}", desc);
+        assert!(desc.contains("since_last_ms=0"), "desc: {}", desc);
+    }
+
+    #[test]
+    fn quiescence_state_clone() {
+        let state = QuiescenceState {
+            pending: 5,
+            last_activity: Some(Instant::now()),
+            quiet_window: Duration::from_secs(1),
+        };
+        let cloned = state.clone();
+        assert_eq!(cloned.pending, 5);
+        assert!(cloned.last_activity.is_some());
+        assert_eq!(cloned.quiet_window, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn quiescence_state_debug_format() {
+        let state = QuiescenceState {
+            pending: 2,
+            last_activity: None,
+            quiet_window: Duration::from_millis(200),
+        };
+        let debug = format!("{:?}", state);
+        assert!(debug.contains("QuiescenceState"), "debug: {}", debug);
+        assert!(debug.contains("pending"), "debug: {}", debug);
+    }
+
+    #[test]
+    fn quiescence_state_signals_trait_is_quiet() {
+        let state = QuiescenceState {
+            pending: 0,
+            last_activity: None,
+            quiet_window: Duration::ZERO,
+        };
+        // Use via trait
+        let signals: &dyn QuiescenceSignals = &state;
+        assert!(signals.is_quiet(Instant::now()));
+    }
+
+    #[test]
+    fn quiescence_state_signals_trait_describe() {
+        let state = QuiescenceState {
+            pending: 1,
+            last_activity: None,
+            quiet_window: Duration::from_millis(50),
+        };
+        let signals: &dyn QuiescenceSignals = &state;
+        let desc = signals.describe(Instant::now());
+        assert!(desc.contains("pending=1"), "desc: {}", desc);
+    }
+
+    // =========================================================================
+    // NEW TESTS: QuiescenceDetector extended
+    // =========================================================================
+
+    #[test]
+    fn detector_debug_format() {
+        let d = QuiescenceDetector::new(Duration::from_millis(100));
+        let debug = format!("{:?}", d);
+        assert!(debug.contains("QuiescenceDetector"), "debug: {}", debug);
+        assert!(debug.contains("gauges"), "debug: {}", debug);
+        assert!(debug.contains("quiet_window"), "debug: {}", debug);
+    }
+
+    #[test]
+    fn detector_clone_shares_gauges() {
+        let g = Arc::new(QueueDepthGauge::new("shared"));
+        g.increment();
+        let d1 = QuiescenceDetector::new(Duration::from_millis(0)).with_gauge(g.clone());
+        let d2 = d1.clone();
+        assert_eq!(d2.total_pending(), 1);
+        // Modifying the gauge should be visible through both detectors
+        g.increment();
+        assert_eq!(d1.total_pending(), 2);
+        assert_eq!(d2.total_pending(), 2);
+    }
+
+    #[test]
+    fn detector_add_gauge_method() {
+        let mut d = QuiescenceDetector::new(Duration::from_millis(0));
+        let g1 = Arc::new(QueueDepthGauge::new("g1"));
+        let g2 = Arc::new(QueueDepthGauge::new("g2"));
+        g1.increment();
+        g2.increment();
+        g2.increment();
+        d.add_gauge(g1);
+        d.add_gauge(g2);
+        assert_eq!(d.total_pending(), 3);
+    }
+
+    #[test]
+    fn detector_zero_quiet_window_with_activity() {
+        let activity = Arc::new(ActivityTracker::new());
+        activity.record();
+        let d = QuiescenceDetector::new(Duration::ZERO).with_activity(activity);
+        // Zero quiet window means no waiting required after activity
+        assert!(d.is_quiet(Instant::now()));
+    }
+
+    #[test]
+    fn detector_snapshot_no_gauges() {
+        let d = QuiescenceDetector::new(Duration::from_millis(50));
+        let snap = d.snapshot();
+        assert_eq!(snap.total_pending, 0);
+        assert!(snap.gauges.is_empty());
+        assert!(snap.last_activity.is_none());
+        assert_eq!(snap.quiet_window, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn detector_describe_no_gauges() {
+        let d = QuiescenceDetector::new(Duration::from_millis(50));
+        let desc = d.describe(Instant::now());
+        assert!(desc.contains("no gauges"), "desc: {}", desc);
+        assert!(desc.contains("total_pending=0"), "desc: {}", desc);
+    }
+
+    #[test]
+    fn detector_describe_with_activity() {
+        let activity = Arc::new(ActivityTracker::new());
+        activity.record();
+        let g = Arc::new(QueueDepthGauge::new("q1"));
+        g.increment();
+        let d = QuiescenceDetector::new(Duration::from_millis(100))
+            .with_activity(activity)
+            .with_gauge(g);
+        let desc = d.describe(Instant::now());
+        assert!(desc.contains("q1=1"), "desc: {}", desc);
+        assert!(desc.contains("total_pending=1"), "desc: {}", desc);
+        assert!(desc.contains("quiet_window_ms=100"), "desc: {}", desc);
+    }
+
+    // =========================================================================
+    // NEW TESTS: QuiescenceSnapshot extended
+    // =========================================================================
+
+    #[test]
+    fn snapshot_not_quiet_with_pending() {
+        let snap = QuiescenceSnapshot {
+            total_pending: 1,
+            gauges: vec![("q".to_owned(), 1)],
+            last_activity: None,
+            quiet_window: Duration::ZERO,
+        };
+        assert!(!snap.is_quiet(Instant::now()));
+    }
+
+    #[test]
+    fn snapshot_quiet_no_activity_no_pending() {
+        let snap = QuiescenceSnapshot {
+            total_pending: 0,
+            gauges: vec![("q".to_owned(), 0)],
+            last_activity: None,
+            quiet_window: Duration::from_secs(60),
+        };
+        assert!(snap.is_quiet(Instant::now()));
+    }
+
+    #[test]
+    fn snapshot_clone() {
+        let snap = QuiescenceSnapshot {
+            total_pending: 5,
+            gauges: vec![("a".to_owned(), 3), ("b".to_owned(), 2)],
+            last_activity: Some(Instant::now()),
+            quiet_window: Duration::from_millis(200),
+        };
+        let cloned = snap.clone();
+        assert_eq!(cloned.total_pending, 5);
+        assert_eq!(cloned.gauges.len(), 2);
+        assert_eq!(cloned.quiet_window, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn snapshot_debug_format() {
+        let snap = QuiescenceSnapshot {
+            total_pending: 0,
+            gauges: vec![],
+            last_activity: None,
+            quiet_window: Duration::ZERO,
+        };
+        let debug = format!("{:?}", snap);
+        assert!(debug.contains("QuiescenceSnapshot"), "debug: {}", debug);
+    }
+
+    #[test]
+    fn snapshot_describe_multiple_gauges() {
+        let snap = QuiescenceSnapshot {
+            total_pending: 7,
+            gauges: vec![
+                ("capture".to_owned(), 3),
+                ("writer".to_owned(), 2),
+                ("export".to_owned(), 2),
+            ],
+            last_activity: None,
+            quiet_window: Duration::from_millis(50),
+        };
+        let desc = snap.describe(Instant::now());
+        assert!(desc.contains("capture=3"), "desc: {}", desc);
+        assert!(desc.contains("writer=2"), "desc: {}", desc);
+        assert!(desc.contains("export=2"), "desc: {}", desc);
+        assert!(desc.contains("total_pending=7"), "desc: {}", desc);
+    }
+
+    #[test]
+    fn snapshot_describe_empty_gauges() {
+        let snap = QuiescenceSnapshot {
+            total_pending: 0,
+            gauges: vec![],
+            last_activity: None,
+            quiet_window: Duration::ZERO,
+        };
+        let desc = snap.describe(Instant::now());
+        assert!(desc.contains("no gauges"), "desc: {}", desc);
+    }
+
+    #[test]
+    fn snapshot_signals_trait_describe() {
+        let snap = QuiescenceSnapshot {
+            total_pending: 1,
+            gauges: vec![("q".to_owned(), 1)],
+            last_activity: None,
+            quiet_window: Duration::from_millis(10),
+        };
+        let signals: &dyn QuiescenceSignals = &snap;
+        let desc = signals.describe(Instant::now());
+        assert!(desc.contains("q=1"), "desc: {}", desc);
+    }
+
+    // =========================================================================
+    // NEW TESTS: Async wait functions extended
+    // =========================================================================
+
+    #[tokio::test]
+    async fn wait_for_value_string_type() {
+        let result = wait_for_value(
+            || async { "hello".to_string() },
+            "hello".to_string(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(result.unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn wait_for_value_mismatch_shows_observed() {
+        let result = wait_for_value(
+            || async { "actual".to_string() },
+            "expected".to_string(),
+            Duration::from_millis(0),
+        )
+        .await;
+        let err = result.expect_err("should timeout");
+        assert!(
+            err.last_observed.as_ref().unwrap().contains("actual"),
+            "observed: {:?}",
+            err.last_observed
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_succeeds_on_first_try() {
+        let condition = WaitCondition::new("always ready", || async { WaitFor::Ready(true) });
+        let backoff = Backoff {
+            initial: Duration::from_millis(1),
+            max: Duration::from_millis(10),
+            factor: 2,
+            max_retries: Some(1),
+        };
+        let result = wait_for(condition, Duration::from_secs(1), backoff).await;
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn wait_for_max_retries_one_means_single_attempt() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter2 = counter.clone();
+        let condition = WaitCondition::new("never", move || {
+            counter2.fetch_add(1, Ordering::SeqCst);
+            async { WaitFor::<()>::not_ready(None::<String>) }
+        });
+        let backoff = Backoff {
+            initial: Duration::from_millis(1),
+            max: Duration::from_millis(10),
+            factor: 2,
+            max_retries: Some(1),
+        };
+        let result = wait_for(condition, Duration::from_secs(10), backoff).await;
+        let err = result.expect_err("should exhaust after 1 retry");
+        assert_eq!(err.retries, 1);
+    }
+
+    #[tokio::test]
+    async fn wait_for_condition_with_backoff_succeeds() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter2 = counter.clone();
+        let backoff = Backoff {
+            initial: Duration::from_millis(1),
+            max: Duration::from_millis(5),
+            factor: 2,
+            max_retries: None,
+        };
+        let result = wait_for_condition_with_backoff(
+            "counter reaches 2",
+            move || {
+                let n = counter2.fetch_add(1, Ordering::SeqCst);
+                async move { n >= 1 }
+            },
+            Duration::from_secs(1),
+            backoff,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn wait_for_condition_with_backoff_times_out() {
+        let backoff = Backoff {
+            initial: Duration::from_millis(1),
+            max: Duration::from_millis(5),
+            factor: 2,
+            max_retries: Some(3),
+        };
+        let result = wait_for_condition_with_backoff(
+            "never true",
+            || async { false },
+            Duration::from_secs(10),
+            backoff,
+        )
+        .await;
+        let err = result.expect_err("should exhaust retries");
+        assert!(err.expected.contains("never true"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_quiescence_with_backoff_custom() {
+        let signals = QuiescenceState {
+            pending: 0,
+            last_activity: None,
+            quiet_window: Duration::ZERO,
+        };
+        let backoff = Backoff {
+            initial: Duration::from_millis(1),
+            max: Duration::from_millis(5),
+            factor: 2,
+            max_retries: None,
+        };
+        let result =
+            wait_for_quiescence_with_backoff(signals, Duration::from_millis(100), backoff).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn wait_for_zero_timeout_immediate_fail() {
+        let condition = WaitCondition::new("never", || async {
+            WaitFor::<()>::not_ready(Some("still not".to_string()))
+        });
+        let backoff = Backoff {
+            initial: Duration::from_millis(100),
+            max: Duration::from_millis(100),
+            factor: 2,
+            max_retries: None,
+        };
+        let result = wait_for(condition, Duration::ZERO, backoff).await;
+        let err = result.expect_err("zero timeout should fail quickly");
+        assert_eq!(err.retries, 1);
+        assert_eq!(err.last_observed.as_deref(), Some("still not"));
+    }
+
+    // =========================================================================
+    // NEW TESTS: Cross-component and edge cases
+    // =========================================================================
+
+    #[test]
+    fn detector_with_activity_replaces_default() {
+        let custom_activity = Arc::new(ActivityTracker::new());
+        custom_activity.record();
+        let d =
+            QuiescenceDetector::new(Duration::from_secs(60)).with_activity(custom_activity.clone());
+        // Should not be quiet because custom tracker has activity and window is 60s
+        assert!(!d.is_quiet(Instant::now()));
+    }
+
+    #[test]
+    fn detector_snapshot_reflects_gauge_changes() {
+        let g = Arc::new(QueueDepthGauge::new("dynamic"));
+        let d = QuiescenceDetector::new(Duration::ZERO).with_gauge(g.clone());
+
+        let snap1 = d.snapshot();
+        assert_eq!(snap1.total_pending, 0);
+
+        g.increment();
+        g.increment();
+        let snap2 = d.snapshot();
+        assert_eq!(snap2.total_pending, 2);
+
+        g.decrement();
+        let snap3 = d.snapshot();
+        assert_eq!(snap3.total_pending, 1);
+    }
+
+    #[test]
+    fn snapshot_not_quiet_recent_activity_large_window() {
+        let snap = QuiescenceSnapshot {
+            total_pending: 0,
+            gauges: vec![],
+            last_activity: Some(Instant::now()),
+            quiet_window: Duration::from_secs(3600),
+        };
+        // Activity just happened and window is 1 hour - not quiet
+        assert!(!snap.is_quiet(Instant::now()));
+    }
+
+    #[test]
+    fn gauge_shared_across_threads() {
+        // Verify gauge works with Arc for thread sharing
+        let g = Arc::new(QueueDepthGauge::new("shared"));
+        let g2 = g.clone();
+
+        g.increment();
+        g2.increment();
+        assert_eq!(g.depth(), 2);
+        assert_eq!(g2.depth(), 2);
+
+        g2.decrement();
+        assert_eq!(g.depth(), 1);
+    }
+
+    #[test]
+    fn activity_tracker_shared_via_arc() {
+        let t = Arc::new(ActivityTracker::new());
+        let t2 = t.clone();
+
+        assert!(t.is_idle());
+        t2.record();
+        assert!(!t.is_idle());
+        assert!(t.last_activity().is_some());
+    }
+
+    #[test]
+    fn quiescence_state_pending_one_not_quiet_even_with_zero_window() {
+        let state = QuiescenceState {
+            pending: 1,
+            last_activity: None,
+            quiet_window: Duration::ZERO,
+        };
+        assert!(!state.is_quiet_at(Instant::now()));
+    }
+
+    #[test]
+    fn detector_chained_builder_pattern() {
+        let g1 = Arc::new(QueueDepthGauge::new("a"));
+        let g2 = Arc::new(QueueDepthGauge::new("b"));
+        let g3 = Arc::new(QueueDepthGauge::new("c"));
+        let activity = Arc::new(ActivityTracker::new());
+
+        let d = QuiescenceDetector::new(Duration::from_millis(50))
+            .with_gauge(g1)
+            .with_gauge(g2)
+            .with_gauge(g3)
+            .with_activity(activity);
+
+        assert_eq!(d.total_pending(), 0);
+        assert!(d.is_quiet(Instant::now()));
+    }
+
+    #[test]
+    fn detector_total_pending_sums_all_gauges() {
+        let g1 = Arc::new(QueueDepthGauge::new("a"));
+        let g2 = Arc::new(QueueDepthGauge::new("b"));
+        let g3 = Arc::new(QueueDepthGauge::new("c"));
+
+        g1.increment();
+        g1.increment();
+        g2.increment();
+        // g3 stays at 0
+
+        let d = QuiescenceDetector::new(Duration::ZERO)
+            .with_gauge(g1)
+            .with_gauge(g2)
+            .with_gauge(g3);
+
+        assert_eq!(d.total_pending(), 3);
     }
 }
