@@ -643,4 +643,333 @@ mod tests {
         let results = tree.query(&Rect::new(0.0, 0.0, 10.0, 10.0));
         assert!(results.is_empty());
     }
+
+    // ── Expanded test coverage ──────────────────────────────────────
+
+    #[test]
+    fn rect_new_swapped_coords() {
+        // Rect::new auto-corrects swapped coordinates
+        let r = Rect::new(10.0, 10.0, 0.0, 0.0);
+        assert!(r.x_min < r.x_max || r.x_min == r.x_max);
+        assert_eq!(r.x_min, 0.0);
+        assert_eq!(r.x_max, 10.0);
+        assert_eq!(r.y_min, 0.0);
+        assert_eq!(r.y_max, 10.0);
+    }
+
+    #[test]
+    fn rect_point_is_zero_area() {
+        let p = Rect::point(5.0, 3.0);
+        assert!((p.area() - 0.0).abs() < 1e-10);
+        assert!(p.contains_point(5.0, 3.0));
+        assert!(!p.contains_point(5.1, 3.0));
+    }
+
+    #[test]
+    fn rect_union_basic() {
+        let a = Rect::new(0.0, 0.0, 5.0, 5.0);
+        let b = Rect::new(3.0, 3.0, 10.0, 10.0);
+        let u = a.union(&b);
+        assert!((u.x_min - 0.0).abs() < 1e-10);
+        assert!((u.y_min - 0.0).abs() < 1e-10);
+        assert!((u.x_max - 10.0).abs() < 1e-10);
+        assert!((u.y_max - 10.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rect_union_with_self() {
+        let a = Rect::new(1.0, 2.0, 3.0, 4.0);
+        let u = a.union(&a);
+        assert_eq!(u, a);
+    }
+
+    #[test]
+    fn rect_enlargement() {
+        let a = Rect::new(0.0, 0.0, 5.0, 5.0);
+        let b = Rect::new(0.0, 0.0, 5.0, 5.0); // same rect
+        assert!((a.enlargement(&b) - 0.0).abs() < 1e-10);
+
+        let c = Rect::new(5.0, 5.0, 10.0, 10.0);
+        // union would be [0,10]x[0,10] = 100, original = 25, enlargement = 75
+        assert!((a.enlargement(&c) - 75.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rect_overlaps_symmetric() {
+        let a = Rect::new(0.0, 0.0, 5.0, 5.0);
+        let b = Rect::new(3.0, 3.0, 8.0, 8.0);
+        assert_eq!(a.overlaps(&b), b.overlaps(&a));
+    }
+
+    #[test]
+    fn rect_overlaps_touching_edges() {
+        // Rects sharing an edge should overlap (>=/<= check)
+        let a = Rect::new(0.0, 0.0, 5.0, 5.0);
+        let b = Rect::new(5.0, 0.0, 10.0, 5.0);
+        assert!(a.overlaps(&b));
+    }
+
+    #[test]
+    fn rect_overlaps_touching_corner() {
+        let a = Rect::new(0.0, 0.0, 5.0, 5.0);
+        let b = Rect::new(5.0, 5.0, 10.0, 10.0);
+        assert!(a.overlaps(&b));
+    }
+
+    #[test]
+    fn rect_no_overlap_separated() {
+        let a = Rect::new(0.0, 0.0, 1.0, 1.0);
+        let b = Rect::new(2.0, 2.0, 3.0, 3.0);
+        assert!(!a.overlaps(&b));
+        assert!(!b.overlaps(&a));
+    }
+
+    #[test]
+    fn rect_min_distance_corners() {
+        let r = Rect::new(0.0, 0.0, 5.0, 5.0);
+        // Upper-right diagonal
+        let dist = r.min_distance(8.0, 8.0);
+        let expected = ((3.0f64).powi(2) + (3.0f64).powi(2)).sqrt();
+        assert!((dist - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rect_min_distance_on_boundary() {
+        let r = Rect::new(0.0, 0.0, 5.0, 5.0);
+        assert!((r.min_distance(5.0, 3.0) - 0.0).abs() < 1e-10);
+        assert!((r.min_distance(0.0, 0.0) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rect_contains_point_on_boundary() {
+        let r = Rect::new(0.0, 0.0, 10.0, 10.0);
+        assert!(r.contains_point(0.0, 0.0));
+        assert!(r.contains_point(10.0, 10.0));
+        assert!(r.contains_point(5.0, 0.0));
+        assert!(r.contains_point(0.0, 5.0));
+    }
+
+    #[test]
+    fn point_query_empty_tree() {
+        let tree: RTree<i32> = RTree::new();
+        let results = tree.query_point(5.0, 5.0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn point_query_outside_all_rects() {
+        let mut tree = RTree::new();
+        tree.insert(Rect::new(0.0, 0.0, 5.0, 5.0), 1);
+        tree.insert(Rect::new(10.0, 10.0, 15.0, 15.0), 2);
+
+        let results = tree.query_point(7.0, 7.0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn point_query_on_boundary() {
+        let mut tree = RTree::new();
+        tree.insert(Rect::new(0.0, 0.0, 10.0, 10.0), 1);
+
+        let results = tree.query_point(10.0, 10.0);
+        assert_eq!(results.len(), 1);
+        assert_eq!(*results[0].1, 1);
+    }
+
+    #[test]
+    fn insert_triggers_split() {
+        // Insert more than MAX_ENTRIES to force splits
+        let mut tree = RTree::new();
+        for i in 0..20 {
+            tree.insert(
+                Rect::new(i as f64, 0.0, i as f64 + 1.0, 1.0),
+                i,
+            );
+        }
+        assert_eq!(tree.len(), 20);
+
+        // All entries should still be retrievable
+        let entries = tree.entries();
+        assert_eq!(entries.len(), 20);
+    }
+
+    #[test]
+    fn query_after_many_splits() {
+        let mut tree = RTree::new();
+        for i in 0..50 {
+            let x = (i % 10) as f64 * 10.0;
+            let y = (i / 10) as f64 * 10.0;
+            tree.insert(Rect::new(x, y, x + 5.0, y + 5.0), i);
+        }
+        assert_eq!(tree.len(), 50);
+
+        // Query a region that should contain specific entries
+        let results = tree.query(&Rect::new(0.0, 0.0, 15.0, 5.0));
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn nearest_single_entry() {
+        let mut tree = RTree::new();
+        tree.insert(Rect::new(10.0, 10.0, 20.0, 20.0), 42);
+
+        let (_, val, _) = tree.nearest(0.0, 0.0).unwrap();
+        assert_eq!(*val, 42);
+    }
+
+    #[test]
+    fn nearest_prefers_closest() {
+        let mut tree = RTree::new();
+        tree.insert(Rect::new(0.0, 0.0, 1.0, 1.0), "near");
+        tree.insert(Rect::new(100.0, 100.0, 101.0, 101.0), "far");
+        tree.insert(Rect::new(50.0, 50.0, 51.0, 51.0), "mid");
+
+        let (_, val, _) = tree.nearest(0.5, 0.5).unwrap();
+        assert_eq!(*val, "near");
+    }
+
+    #[test]
+    fn entries_empty_tree() {
+        let tree: RTree<i32> = RTree::new();
+        assert!(tree.entries().is_empty());
+    }
+
+    #[test]
+    fn entries_count_matches_len() {
+        let mut tree = RTree::new();
+        for i in 0..15 {
+            tree.insert(Rect::new(i as f64, 0.0, i as f64 + 1.0, 1.0), i);
+        }
+        assert_eq!(tree.entries().len(), tree.len());
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_queries() {
+        let mut tree = RTree::new();
+        tree.insert(Rect::new(0.0, 0.0, 5.0, 5.0), "a");
+        tree.insert(Rect::new(10.0, 10.0, 15.0, 15.0), "b");
+
+        let json = serde_json::to_string(&tree).unwrap();
+        let restored: RTree<&str> = serde_json::from_str(&json).unwrap();
+
+        let orig_results = tree.query_point(3.0, 3.0);
+        let rest_results = restored.query_point(3.0, 3.0);
+        assert_eq!(orig_results.len(), rest_results.len());
+    }
+
+    #[test]
+    fn clone_independence() {
+        let mut tree = RTree::new();
+        tree.insert(Rect::new(0.0, 0.0, 5.0, 5.0), 1);
+
+        let mut cloned = tree.clone();
+        cloned.insert(Rect::new(10.0, 10.0, 15.0, 15.0), 2);
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(cloned.len(), 2);
+    }
+
+    #[test]
+    fn display_empty() {
+        let tree: RTree<i32> = RTree::new();
+        assert_eq!(format!("{}", tree), "RTree(0 entries)");
+    }
+
+    #[test]
+    fn display_many() {
+        let mut tree = RTree::new();
+        for i in 0..25 {
+            tree.insert(Rect::new(0.0, 0.0, 1.0, 1.0), i);
+        }
+        assert_eq!(format!("{}", tree), "RTree(25 entries)");
+    }
+
+    #[test]
+    fn overlapping_rects_query() {
+        // Multiple overlapping rects, query should find all overlapping ones
+        let mut tree = RTree::new();
+        tree.insert(Rect::new(0.0, 0.0, 10.0, 10.0), 1);
+        tree.insert(Rect::new(2.0, 2.0, 12.0, 12.0), 2);
+        tree.insert(Rect::new(4.0, 4.0, 14.0, 14.0), 3);
+        tree.insert(Rect::new(50.0, 50.0, 60.0, 60.0), 4);
+
+        let results = tree.query(&Rect::new(3.0, 3.0, 5.0, 5.0));
+        assert_eq!(results.len(), 3); // All except rect 4
+    }
+
+    #[test]
+    fn point_rects_in_tree() {
+        // Insert zero-area point rects
+        let mut tree = RTree::new();
+        tree.insert(Rect::point(1.0, 1.0), "p1");
+        tree.insert(Rect::point(2.0, 2.0), "p2");
+        tree.insert(Rect::point(3.0, 3.0), "p3");
+        assert_eq!(tree.len(), 3);
+
+        let results = tree.query_point(2.0, 2.0);
+        assert_eq!(results.len(), 1);
+        assert_eq!(*results[0].1, "p2");
+    }
+
+    #[test]
+    fn nearest_large_dataset_brute_force() {
+        let mut tree = RTree::new();
+        let mut rects = Vec::new();
+        for i in 0..30 {
+            let x = (i * 7 % 20) as f64;
+            let y = (i * 11 % 20) as f64;
+            let r = Rect::new(x, y, x + 2.0, y + 2.0);
+            rects.push((r, i));
+            tree.insert(r, i);
+        }
+
+        let qx = 5.5;
+        let qy = 7.3;
+
+        let (_, tree_val, tree_dist) = tree.nearest(qx, qy).unwrap();
+
+        // Brute force
+        let mut best_dist = f64::INFINITY;
+        let mut best_val = 0;
+        for (r, v) in &rects {
+            let d = r.min_distance(qx, qy);
+            if d < best_dist {
+                best_dist = d;
+                best_val = *v;
+            }
+        }
+
+        assert_eq!(*tree_val, best_val);
+        assert!((tree_dist - best_dist).abs() < 1e-10);
+    }
+
+    #[test]
+    fn query_with_negative_coordinates() {
+        let mut tree = RTree::new();
+        tree.insert(Rect::new(-10.0, -10.0, -5.0, -5.0), "neg");
+        tree.insert(Rect::new(5.0, 5.0, 10.0, 10.0), "pos");
+
+        let results = tree.query_point(-7.0, -7.0);
+        assert_eq!(results.len(), 1);
+        assert_eq!(*results[0].1, "neg");
+
+        let results = tree.query(&Rect::new(-11.0, -11.0, -4.0, -4.0));
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn range_query_no_overlap() {
+        let mut tree = RTree::new();
+        tree.insert(Rect::new(0.0, 0.0, 5.0, 5.0), 1);
+        tree.insert(Rect::new(10.0, 10.0, 15.0, 15.0), 2);
+
+        let results = tree.query(&Rect::new(6.0, 6.0, 9.0, 9.0));
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn rect_area_zero_width() {
+        let r = Rect::new(5.0, 0.0, 5.0, 10.0);
+        assert!((r.area() - 0.0).abs() < 1e-10);
+    }
 }
