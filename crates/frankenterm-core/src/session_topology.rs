@@ -931,7 +931,7 @@ mod tests {
     // ── Constants ──────────────────────────────────────────────────────
 
     #[test]
-    fn topology_schema_version_is_one() {
+    fn topology_schema_version_is_one_batch2() {
         assert_eq!(TOPOLOGY_SCHEMA_VERSION, 1);
     }
 
@@ -1133,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_node_hsplit_serde_roundtrip() {
+    fn pane_node_hsplit_serde_roundtrip_batch2() {
         let node = PaneNode::HSplit {
             children: vec![(
                 1.0,

@@ -1958,7 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_report_serde_roundtrip() {
+    fn readiness_report_serde_roundtrip_batch2() {
         let mut config = DistributedConfig::default();
         config.enabled = true;
         config.auth_mode = DistributedAuthMode::Token;
@@ -2441,7 +2441,7 @@ mod tests {
     // =====================================================================
 
     #[test]
-    fn token_source_kind_debug_clone_copy_eq() {
+    fn token_source_kind_debug_clone_copy_eq_batch2() {
         let k = DistributedTokenSourceKind::File;
         let k2 = k; // Copy
         assert_eq!(k, k2);
@@ -2845,7 +2845,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_item_serde_roundtrip() {
+    fn readiness_item_serde_roundtrip_batch2() {
         let item = ReadinessItem {
             id: "test.check".to_string(),
             category: "Test".to_string(),

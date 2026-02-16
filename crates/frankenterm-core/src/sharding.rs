@@ -1119,13 +1119,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn shard_id_display() {
+    fn shard_id_display_batch2() {
         assert_eq!(ShardId(0).to_string(), "0");
         assert_eq!(ShardId(42).to_string(), "42");
     }
 
     #[test]
-    fn shard_id_serde_roundtrip() {
+    fn shard_id_serde_roundtrip_batch2() {
         let id = ShardId(7);
         let json = serde_json::to_string(&id).unwrap();
         let back: ShardId = serde_json::from_str(&json).unwrap();
@@ -1143,7 +1143,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn assignment_strategy_default_is_round_robin() {
+    fn assignment_strategy_default_is_round_robin_batch2() {
         assert_eq!(
             AssignmentStrategy::default(),
             AssignmentStrategy::RoundRobin

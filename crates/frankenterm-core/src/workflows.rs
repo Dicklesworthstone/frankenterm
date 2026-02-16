@@ -18102,7 +18102,7 @@ Try again at 3:00 PM UTC.
         }
 
         #[test]
-        fn outcome_failed_serde() {
+        fn outcome_failed_serde_batch2() {
             let outcome = DeviceAuthStepOutcome::Failed {
                 error: "Playwright crashed".into(),
                 error_kind: Some("PlaywrightError".into()),

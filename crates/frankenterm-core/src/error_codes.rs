@@ -1328,7 +1328,7 @@ mod tests {
     // --- format_plain detail tests ---
 
     #[test]
-    fn format_plain_includes_causes() {
+    fn format_plain_includes_causes_batch2() {
         let def = get_error_code("FT-1001").unwrap();
         let formatted = def.format_plain();
         assert!(formatted.contains("Common causes:"));

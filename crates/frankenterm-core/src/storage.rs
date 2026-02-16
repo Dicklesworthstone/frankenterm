@@ -18782,7 +18782,7 @@ mod timeline_tests {
     }
 
     #[test]
-    fn correlation_type_display() {
+    fn correlation_type_display_batch2() {
         assert_eq!(CorrelationType::Failover.to_string(), "failover");
         assert_eq!(CorrelationType::Temporal.to_string(), "temporal");
         assert_eq!(CorrelationType::WorkflowGroup.to_string(), "workflow_group");

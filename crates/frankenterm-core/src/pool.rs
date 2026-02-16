@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_try_acquire_when_full() {
+    async fn pool_try_acquire_when_full_batch2() {
         let pool: Pool<String> = Pool::new(test_config(1));
         let _held = pool.acquire().await.expect("acquire");
 
@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_config_serde_roundtrip() {
+    fn pool_config_serde_roundtrip_batch2() {
         let config = PoolConfig {
             max_size: 8,
             idle_timeout: Duration::from_secs(120),
@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_stats_serde_roundtrip() {
+    fn pool_stats_serde_roundtrip_batch2() {
         let stats = PoolStats {
             max_size: 4,
             idle_count: 2,
@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_config_debug() {
+    fn pool_config_debug_batch2() {
         let config = PoolConfig::default();
         let dbg = format!("{config:?}");
         assert!(dbg.contains("max_size"));
@@ -616,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_stats_debug() {
+    fn pool_stats_debug_batch2() {
         let stats = PoolStats {
             max_size: 1,
             idle_count: 0,
@@ -632,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_stats_clone() {
+    fn pool_stats_clone_batch2() {
         let stats = PoolStats {
             max_size: 8,
             idle_count: 3,
@@ -783,7 +783,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_acquire_result_debug() {
+    async fn pool_acquire_result_debug_batch2() {
         let pool: Pool<String> = Pool::new(test_config(2));
         pool.put("test-conn".to_string()).await;
         let result = pool.acquire().await.expect("acquire");

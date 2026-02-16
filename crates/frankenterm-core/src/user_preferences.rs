@@ -1253,7 +1253,7 @@ mod tests {
     }
 
     #[test]
-    fn cosine_similarity_zero_vector() {
+    fn cosine_similarity_zero_vector_batch2() {
         let a = [0.0, 0.0];
         let b = [1.0, 2.0];
         assert_eq!(cosine_similarity(&a, &b), 0.0);
@@ -1358,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn reward_function_serde_roundtrip() {
+    fn reward_function_serde_roundtrip_batch2() {
         let mut rf = RewardFunction::new();
         rf.theta = [1.0, -2.0, 3.0, 0.0, 0.5, -0.5, 0.1, 0.0];
         rf.observation_count = 42;
@@ -1391,7 +1391,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn irl_config_default_values() {
+    fn irl_config_default_values_batch2() {
         let c = IrlConfig::default();
         assert!((c.learning_rate - 0.01).abs() < 1e-10);
         assert_eq!(c.max_iterations, 100);
@@ -1482,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn observation_debug_clone_serde() {
+    fn observation_debug_clone_serde_batch2() {
         let obs = Observation {
             pane_states: make_test_panes(&[1, 2], 42),
             current_pane_id: 1,
@@ -1555,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn rank_correlation_single_element() {
+    fn rank_correlation_single_element_batch2() {
         let a = [1.0];
         let b = [2.0];
         let r = rank_correlation(&a, &b);
@@ -1571,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn cosine_similarity_opposite_vectors() {
+    fn cosine_similarity_opposite_vectors_batch2() {
         let a = [1.0, 0.0];
         let b = [-1.0, 0.0];
         assert!((cosine_similarity(&a, &b) + 1.0).abs() < 1e-10);

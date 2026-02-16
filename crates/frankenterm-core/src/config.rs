@@ -5263,13 +5263,13 @@ retention_tiers = []
     }
 
     #[test]
-    fn log_format_from_str_invalid() {
+    fn log_format_from_str_invalid_batch2() {
         assert!("xml".parse::<LogFormat>().is_err());
         assert!("".parse::<LogFormat>().is_err());
     }
 
     #[test]
-    fn log_format_default_is_pretty() {
+    fn log_format_default_is_pretty_batch2() {
         assert_eq!(LogFormat::default(), LogFormat::Pretty);
     }
 
@@ -5665,7 +5665,7 @@ retention_tiers = []
     }
 
     #[test]
-    fn sync_direction_serde_roundtrip() {
+    fn sync_direction_serde_roundtrip_batch2() {
         // Default is Push
         assert_eq!(SyncDirection::default(), SyncDirection::Push);
 

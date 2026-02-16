@@ -793,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn circuit_breaker_status_default() {
+    fn circuit_breaker_status_default_batch2() {
         let status = CircuitBreakerStatus::default();
         assert_eq!(status.state, CircuitStateKind::Closed);
         assert_eq!(status.consecutive_failures, 0);
@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn circuit_breaker_status_serde_roundtrip() {
+    fn circuit_breaker_status_serde_roundtrip_batch2() {
         let s = CircuitBreakerStatus::default();
         let json = serde_json::to_string(&s).unwrap();
         let back: CircuitBreakerStatus = serde_json::from_str(&json).unwrap();
@@ -1059,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn circuit_breaker_snapshot_serde_roundtrip() {
+    fn circuit_breaker_snapshot_serde_roundtrip_batch2() {
         let snap = CircuitBreakerSnapshot {
             name: "test_circuit".into(),
             status: CircuitBreakerStatus::default(),

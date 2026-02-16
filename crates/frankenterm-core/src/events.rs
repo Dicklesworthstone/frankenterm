@@ -2500,7 +2500,7 @@ mod tests {
     // ---- severity_level / parse tests ----
 
     #[test]
-    fn severity_level_ordering() {
+    fn severity_level_ordering_batch2() {
         assert!(
             severity_level(crate::patterns::Severity::Info)
                 < severity_level(crate::patterns::Severity::Warning)
