@@ -625,6 +625,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("failed to build runtime for wait tests");
+        runtime.block_on(future);
+    }
 
     #[test]
     fn backoff_schedule_increases_and_caps() {
@@ -712,128 +723,145 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn wait_for_value_timeout_includes_debug_info() {
-        let result = wait_for_value(|| async { 1u32 }, 2u32, Duration::from_millis(0)).await;
-        let err = result.expect_err("should timeout");
-        assert!(err.expected.contains("value == 2"));
-        assert_eq!(err.last_observed.as_deref(), Some("1"));
-        assert_eq!(err.retries, 1);
-    }
-
-    #[tokio::test]
-    async fn wait_for_value_succeeds_immediately() {
-        let result = wait_for_value(|| async { 42u32 }, 42u32, Duration::from_secs(1)).await;
-        assert_eq!(result.unwrap(), 42);
-    }
-
-    #[tokio::test]
-    async fn wait_for_predicate_succeeds_after_n_attempts() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter2 = counter.clone();
-
-        let condition = WaitCondition::new("counter reaches 3", move || {
-            let n = counter2.fetch_add(1, Ordering::SeqCst);
-            async move {
-                if n >= 2 {
-                    WaitFor::Ready(n)
-                } else {
-                    WaitFor::not_ready(Some(format!("count={n}")))
-                }
-            }
+    #[test]
+    fn wait_for_value_timeout_includes_debug_info() {
+        run_async_test(async {
+            let result = wait_for_value(|| async { 1u32 }, 2u32, Duration::from_millis(0)).await;
+            let err = result.expect_err("should timeout");
+            assert!(err.expected.contains("value == 2"));
+            assert_eq!(err.last_observed.as_deref(), Some("1"));
+            assert_eq!(err.retries, 1);
         });
-
-        let backoff = Backoff {
-            initial: Duration::from_millis(1),
-            max: Duration::from_millis(5),
-            factor: 2,
-            max_retries: None,
-        };
-
-        let result = wait_for(condition, Duration::from_secs(1), backoff).await;
-        let value = result.unwrap();
-        assert!(value >= 2, "should have succeeded after attempts");
     }
 
-    #[tokio::test]
-    async fn wait_for_max_retries_exhausted() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter2 = counter.clone();
-
-        let condition = WaitCondition::new("never ready", move || {
-            let n = counter2.fetch_add(1, Ordering::SeqCst);
-            async move { WaitFor::<()>::not_ready(Some(format!("attempt={n}"))) }
+    #[test]
+    fn wait_for_value_succeeds_immediately() {
+        run_async_test(async {
+            let result = wait_for_value(|| async { 42u32 }, 42u32, Duration::from_secs(1)).await;
+            assert_eq!(result.unwrap(), 42);
         });
-
-        let backoff = Backoff {
-            initial: Duration::from_millis(1),
-            max: Duration::from_millis(5),
-            factor: 2,
-            max_retries: Some(3),
-        };
-
-        let result = wait_for(condition, Duration::from_secs(10), backoff).await;
-        let err = result.expect_err("should exhaust retries");
-        assert!(err.retries <= 3, "retries={} should be <= 3", err.retries);
-        assert!(err.expected.contains("never ready"));
-        assert!(err.last_observed.is_some());
     }
 
-    #[tokio::test]
-    async fn wait_for_condition_succeeds() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter2 = counter.clone();
+    #[test]
+    fn wait_for_predicate_succeeds_after_n_attempts() {
+        run_async_test(async {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let counter2 = counter.clone();
 
-        let result = wait_for_condition(
-            "counter reaches 2",
-            move || {
+            let condition = WaitCondition::new("counter reaches 3", move || {
                 let n = counter2.fetch_add(1, Ordering::SeqCst);
-                async move { n >= 1 }
-            },
-            Duration::from_secs(1),
-        )
-        .await;
-        assert!(result.is_ok());
+                async move {
+                    if n >= 2 {
+                        WaitFor::Ready(n)
+                    } else {
+                        WaitFor::not_ready(Some(format!("count={n}")))
+                    }
+                }
+            });
+
+            let backoff = Backoff {
+                initial: Duration::from_millis(1),
+                max: Duration::from_millis(5),
+                factor: 2,
+                max_retries: None,
+            };
+
+            let result = wait_for(condition, Duration::from_secs(1), backoff).await;
+            let value = result.unwrap();
+            assert!(value >= 2, "should have succeeded after attempts");
+        });
     }
 
-    #[tokio::test]
-    async fn wait_for_condition_times_out() {
-        let result =
-            wait_for_condition("impossible", || async { false }, Duration::from_millis(10)).await;
-        let err = result.expect_err("should timeout");
-        assert!(err.expected.contains("impossible"));
-        assert!(err.retries >= 1);
+    #[test]
+    fn wait_for_max_retries_exhausted() {
+        run_async_test(async {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let counter2 = counter.clone();
+
+            let condition = WaitCondition::new("never ready", move || {
+                let n = counter2.fetch_add(1, Ordering::SeqCst);
+                async move { WaitFor::<()>::not_ready(Some(format!("attempt={n}"))) }
+            });
+
+            let backoff = Backoff {
+                initial: Duration::from_millis(1),
+                max: Duration::from_millis(5),
+                factor: 2,
+                max_retries: Some(3),
+            };
+
+            let result = wait_for(condition, Duration::from_secs(10), backoff).await;
+            let err = result.expect_err("should exhaust retries");
+            assert!(err.retries <= 3, "retries={} should be <= 3", err.retries);
+            assert!(err.expected.contains("never ready"));
+            assert!(err.last_observed.is_some());
+        });
     }
 
-    #[tokio::test]
-    async fn wait_for_quiescence_succeeds_when_quiet() {
-        let signals = QuiescenceState {
-            pending: 0,
-            last_activity: None,
-            quiet_window: Duration::from_millis(0),
-        };
+    #[test]
+    fn wait_for_condition_succeeds() {
+        run_async_test(async {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let counter2 = counter.clone();
 
-        let result = wait_for_quiescence(signals, Duration::from_millis(0)).await;
-        assert!(result.is_ok());
+            let result = wait_for_condition(
+                "counter reaches 2",
+                move || {
+                    let n = counter2.fetch_add(1, Ordering::SeqCst);
+                    async move { n >= 1 }
+                },
+                Duration::from_secs(1),
+            )
+            .await;
+            assert!(result.is_ok());
+        });
     }
 
-    #[tokio::test]
-    async fn wait_for_quiescence_timeout_with_pending_work() {
-        let signals = QuiescenceState {
-            pending: 5,
-            last_activity: Some(Instant::now()),
-            quiet_window: Duration::from_millis(100),
-        };
+    #[test]
+    fn wait_for_condition_times_out() {
+        run_async_test(async {
+            let result =
+                wait_for_condition("impossible", || async { false }, Duration::from_millis(10))
+                    .await;
+            let err = result.expect_err("should timeout");
+            assert!(err.expected.contains("impossible"));
+            assert!(err.retries >= 1);
+        });
+    }
 
-        let result = wait_for_quiescence(signals, Duration::from_millis(10)).await;
-        let err = result.expect_err("should timeout with pending work");
-        assert!(err.expected.contains("quiescence"));
-        assert!(err.last_observed.is_some());
-        let obs = err.last_observed.unwrap();
-        assert!(
-            obs.contains("pending=5"),
-            "should report pending count: {obs}"
-        );
+    #[test]
+    fn wait_for_quiescence_succeeds_when_quiet() {
+        run_async_test(async {
+            let signals = QuiescenceState {
+                pending: 0,
+                last_activity: None,
+                quiet_window: Duration::from_millis(0),
+            };
+
+            let result = wait_for_quiescence(signals, Duration::from_millis(0)).await;
+            assert!(result.is_ok());
+        });
+    }
+
+    #[test]
+    fn wait_for_quiescence_timeout_with_pending_work() {
+        run_async_test(async {
+            let signals = QuiescenceState {
+                pending: 5,
+                last_activity: Some(Instant::now()),
+                quiet_window: Duration::from_millis(100),
+            };
+
+            let result = wait_for_quiescence(signals, Duration::from_millis(10)).await;
+            let err = result.expect_err("should timeout with pending work");
+            assert!(err.expected.contains("quiescence"));
+            assert!(err.last_observed.is_some());
+            let obs = err.last_observed.unwrap();
+            assert!(
+                obs.contains("pending=5"),
+                "should report pending count: {obs}"
+            );
+        });
     }
 
     #[test]
@@ -905,141 +933,147 @@ mod tests {
     // Integration tests: synthetic producer/consumer quiescence
     // =========================================================================
 
-    #[tokio::test]
-    async fn quiescence_producer_consumer_eventually_quiet() {
-        // Simulate a producer/consumer where the consumer drains work
-        // and quiescence is achieved once the queue is empty and quiet window elapses.
-        let pending = Arc::new(AtomicUsize::new(5));
-        let pending2 = pending.clone();
+    #[test]
+    fn quiescence_producer_consumer_eventually_quiet() {
+        run_async_test(async {
+            // Simulate a producer/consumer where the consumer drains work
+            // and quiescence is achieved once the queue is empty and quiet window elapses.
+            let pending = Arc::new(AtomicUsize::new(5));
+            let pending2 = pending.clone();
 
-        // Spawn a "consumer" task that drains one item every 5ms
-        let consumer = tokio::spawn(async move {
-            loop {
-                let current = pending2.load(Ordering::SeqCst);
-                if current == 0 {
-                    break;
+            // Spawn a "consumer" task that drains one item every 5ms
+            let consumer = crate::runtime_compat::task::spawn(async move {
+                loop {
+                    let current = pending2.load(Ordering::SeqCst);
+                    if current == 0 {
+                        break;
+                    }
+                    pending2.fetch_sub(1, Ordering::SeqCst);
+                    sleep(Duration::from_millis(5)).await;
                 }
-                pending2.fetch_sub(1, Ordering::SeqCst);
-                sleep(Duration::from_millis(5)).await;
-            }
-        });
+            });
 
-        // Wait for quiescence: pending must reach 0
-        let pending_check = pending.clone();
-        let condition = WaitCondition::new("queue drained", move || {
-            let count = pending_check.load(Ordering::SeqCst);
-            async move {
-                if count == 0 {
-                    WaitFor::Ready(())
-                } else {
-                    WaitFor::not_ready(Some(format!("pending={count}")))
+            // Wait for quiescence: pending must reach 0
+            let pending_check = pending.clone();
+            let condition = WaitCondition::new("queue drained", move || {
+                let count = pending_check.load(Ordering::SeqCst);
+                async move {
+                    if count == 0 {
+                        WaitFor::Ready(())
+                    } else {
+                        WaitFor::not_ready(Some(format!("pending={count}")))
+                    }
                 }
-            }
+            });
+
+            let backoff = Backoff {
+                initial: Duration::from_millis(2),
+                max: Duration::from_millis(20),
+                factor: 2,
+                max_retries: None,
+            };
+
+            let result = wait_for(condition, Duration::from_secs(2), backoff).await;
+            assert!(
+                result.is_ok(),
+                "should achieve quiescence after consumer drains"
+            );
+
+            consumer.await.unwrap();
+            assert_eq!(pending.load(Ordering::SeqCst), 0);
         });
-
-        let backoff = Backoff {
-            initial: Duration::from_millis(2),
-            max: Duration::from_millis(20),
-            factor: 2,
-            max_retries: None,
-        };
-
-        let result = wait_for(condition, Duration::from_secs(2), backoff).await;
-        assert!(
-            result.is_ok(),
-            "should achieve quiescence after consumer drains"
-        );
-
-        consumer.await.unwrap();
-        assert_eq!(pending.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
-    async fn quiescence_with_shared_state_and_quiet_window() {
-        // Test QuiescenceState with a shared atomic that simulates
-        // work draining and then a quiet window.
-        use std::sync::Mutex;
+    #[test]
+    fn quiescence_with_shared_state_and_quiet_window() {
+        run_async_test(async {
+            // Test QuiescenceState with a shared atomic that simulates
+            // work draining and then a quiet window.
+            use std::sync::Mutex;
 
-        let shared = Arc::new(Mutex::new(QuiescenceState {
-            pending: 3,
-            last_activity: Some(Instant::now()),
-            quiet_window: Duration::from_millis(10),
-        }));
-        let shared2 = shared.clone();
+            let shared = Arc::new(Mutex::new(QuiescenceState {
+                pending: 3,
+                last_activity: Some(Instant::now()),
+                quiet_window: Duration::from_millis(10),
+            }));
+            let shared2 = shared.clone();
 
-        // Spawn a task that reduces pending and then goes quiet
-        let worker = tokio::spawn(async move {
-            for _ in 0..3 {
-                sleep(Duration::from_millis(3)).await;
-                let mut s = shared2.lock().unwrap();
-                s.pending = s.pending.saturating_sub(1);
-                s.last_activity = Some(Instant::now());
-            }
-        });
-
-        // Poll the shared state for quiescence
-        let shared_check = shared.clone();
-        let condition = WaitCondition::new("shared state quiescent", move || {
-            let state = shared_check.lock().unwrap().clone();
-            let now = Instant::now();
-            async move {
-                if state.is_quiet_at(now) {
-                    WaitFor::Ready(())
-                } else {
-                    WaitFor::not_ready(Some(state.describe_at(now)))
+            // Spawn a task that reduces pending and then goes quiet
+            let worker = crate::runtime_compat::task::spawn(async move {
+                for _ in 0..3 {
+                    sleep(Duration::from_millis(3)).await;
+                    let mut s = shared2.lock().unwrap();
+                    s.pending = s.pending.saturating_sub(1);
+                    s.last_activity = Some(Instant::now());
                 }
-            }
+            });
+
+            // Poll the shared state for quiescence
+            let shared_check = shared.clone();
+            let condition = WaitCondition::new("shared state quiescent", move || {
+                let state = shared_check.lock().unwrap().clone();
+                let now = Instant::now();
+                async move {
+                    if state.is_quiet_at(now) {
+                        WaitFor::Ready(())
+                    } else {
+                        WaitFor::not_ready(Some(state.describe_at(now)))
+                    }
+                }
+            });
+
+            let backoff = Backoff {
+                initial: Duration::from_millis(2),
+                max: Duration::from_millis(20),
+                factor: 2,
+                max_retries: None,
+            };
+
+            let result = wait_for(condition, Duration::from_secs(2), backoff).await;
+            assert!(result.is_ok(), "should detect quiescence after work drains");
+
+            worker.await.unwrap();
         });
-
-        let backoff = Backoff {
-            initial: Duration::from_millis(2),
-            max: Duration::from_millis(20),
-            factor: 2,
-            max_retries: None,
-        };
-
-        let result = wait_for(condition, Duration::from_secs(2), backoff).await;
-        assert!(result.is_ok(), "should detect quiescence after work drains");
-
-        worker.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn wait_for_condition_on_changing_source() {
-        // Simulate a monotonically increasing counter and wait for it to
-        // reach a threshold. Uses wait_for_condition (>= check) rather than
-        // wait_for_value (exact equality) because the counter may overshoot
-        // between polls.
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter2 = counter.clone();
+    #[test]
+    fn wait_for_condition_on_changing_source() {
+        run_async_test(async {
+            // Simulate a monotonically increasing counter and wait for it to
+            // reach a threshold. Uses wait_for_condition (>= check) rather than
+            // wait_for_value (exact equality) because the counter may overshoot
+            // between polls.
+            let counter = Arc::new(AtomicUsize::new(0));
+            let counter2 = counter.clone();
 
-        // Spawn an incrementer that ticks every 3ms up to 10
-        let incrementer = tokio::spawn(async move {
-            for _ in 0..10 {
-                sleep(Duration::from_millis(3)).await;
-                counter2.fetch_add(1, Ordering::SeqCst);
-            }
+            // Spawn an incrementer that ticks every 3ms up to 10
+            let incrementer = crate::runtime_compat::task::spawn(async move {
+                for _ in 0..10 {
+                    sleep(Duration::from_millis(3)).await;
+                    counter2.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            let counter_read = counter.clone();
+            let result = wait_for_condition(
+                "counter >= 7",
+                move || {
+                    let val = counter_read.load(Ordering::SeqCst);
+                    async move { val >= 7 }
+                },
+                Duration::from_secs(2),
+            )
+            .await;
+
+            assert!(result.is_ok(), "counter should reach >= 7 within timeout");
+            let final_val = counter.load(Ordering::SeqCst);
+            assert!(
+                final_val >= 7,
+                "final counter value {} should be >= 7",
+                final_val
+            );
+            incrementer.await.unwrap();
         });
-
-        let counter_read = counter.clone();
-        let result = wait_for_condition(
-            "counter >= 7",
-            move || {
-                let val = counter_read.load(Ordering::SeqCst);
-                async move { val >= 7 }
-            },
-            Duration::from_secs(2),
-        )
-        .await;
-
-        assert!(result.is_ok(), "counter should reach >= 7 within timeout");
-        let final_val = counter.load(Ordering::SeqCst);
-        assert!(
-            final_val >= 7,
-            "final counter value {} should be >= 7",
-            final_val
-        );
-        incrementer.await.unwrap();
     }
 
     // =========================================================================
@@ -1103,15 +1137,17 @@ mod tests {
         assert!(t.last_activity().is_some());
     }
 
-    #[tokio::test]
-    async fn tracker_activity_monotonic() {
-        let t = ActivityTracker::new();
-        t.record();
-        let first = t.last_activity().unwrap();
-        sleep(Duration::from_millis(5)).await;
-        t.record();
-        let second = t.last_activity().unwrap();
-        assert!(second >= first, "activity timestamps should be monotonic");
+    #[test]
+    fn tracker_activity_monotonic() {
+        run_async_test(async {
+            let t = ActivityTracker::new();
+            t.record();
+            let first = t.last_activity().unwrap();
+            sleep(Duration::from_millis(5)).await;
+            t.record();
+            let second = t.last_activity().unwrap();
+            assert!(second >= first, "activity timestamps should be monotonic");
+        });
     }
 
     // =========================================================================
@@ -1195,100 +1231,104 @@ mod tests {
     // Integration: multi-queue quiescence detection via detector
     // =========================================================================
 
-    #[tokio::test]
-    async fn detector_integration_multi_queue_drain() {
-        // Simulate two queues being drained by independent consumers.
-        // The detector should report quiescence only after both drain.
-        let capture_gauge = Arc::new(QueueDepthGauge::new("capture"));
-        let writer_gauge = Arc::new(QueueDepthGauge::new("writer"));
-        let activity = Arc::new(ActivityTracker::new());
+    #[test]
+    fn detector_integration_multi_queue_drain() {
+        run_async_test(async {
+            // Simulate two queues being drained by independent consumers.
+            // The detector should report quiescence only after both drain.
+            let capture_gauge = Arc::new(QueueDepthGauge::new("capture"));
+            let writer_gauge = Arc::new(QueueDepthGauge::new("writer"));
+            let activity = Arc::new(ActivityTracker::new());
 
-        // Enqueue work
-        for _ in 0..5 {
-            capture_gauge.increment();
-        }
-        for _ in 0..3 {
-            writer_gauge.increment();
-        }
-        activity.record();
-
-        let detector = QuiescenceDetector::new(Duration::from_millis(10))
-            .with_gauge(capture_gauge.clone())
-            .with_gauge(writer_gauge.clone())
-            .with_activity(activity.clone());
-
-        assert!(!detector.is_quiet(Instant::now()));
-
-        // Spawn consumers
-        let cg = capture_gauge.clone();
-        let act1 = activity.clone();
-        let consumer1 = tokio::spawn(async move {
+            // Enqueue work
             for _ in 0..5 {
-                sleep(Duration::from_millis(2)).await;
-                cg.decrement();
-                act1.record();
+                capture_gauge.increment();
             }
-        });
-
-        let wg = writer_gauge.clone();
-        let act2 = activity.clone();
-        let consumer2 = tokio::spawn(async move {
             for _ in 0..3 {
-                sleep(Duration::from_millis(3)).await;
-                wg.decrement();
-                act2.record();
+                writer_gauge.increment();
             }
+            activity.record();
+
+            let detector = QuiescenceDetector::new(Duration::from_millis(10))
+                .with_gauge(capture_gauge.clone())
+                .with_gauge(writer_gauge.clone())
+                .with_activity(activity.clone());
+
+            assert!(!detector.is_quiet(Instant::now()));
+
+            // Spawn consumers
+            let cg = capture_gauge.clone();
+            let act1 = activity.clone();
+            let consumer1 = crate::runtime_compat::task::spawn(async move {
+                for _ in 0..5 {
+                    sleep(Duration::from_millis(2)).await;
+                    cg.decrement();
+                    act1.record();
+                }
+            });
+
+            let wg = writer_gauge.clone();
+            let act2 = activity.clone();
+            let consumer2 = crate::runtime_compat::task::spawn(async move {
+                for _ in 0..3 {
+                    sleep(Duration::from_millis(3)).await;
+                    wg.decrement();
+                    act2.record();
+                }
+            });
+
+            // Wait for quiescence using the detector with wait_for_quiescence
+            let backoff = Backoff {
+                initial: Duration::from_millis(2),
+                max: Duration::from_millis(20),
+                factor: 2,
+                max_retries: None,
+            };
+
+            let result =
+                wait_for_quiescence_with_backoff(detector.clone(), Duration::from_secs(2), backoff)
+                    .await;
+
+            assert!(
+                result.is_ok(),
+                "detector should report quiescence after both queues drain"
+            );
+            assert_eq!(detector.total_pending(), 0);
+
+            consumer1.await.unwrap();
+            consumer2.await.unwrap();
         });
-
-        // Wait for quiescence using the detector with wait_for_quiescence
-        let backoff = Backoff {
-            initial: Duration::from_millis(2),
-            max: Duration::from_millis(20),
-            factor: 2,
-            max_retries: None,
-        };
-
-        let result =
-            wait_for_quiescence_with_backoff(detector.clone(), Duration::from_secs(2), backoff)
-                .await;
-
-        assert!(
-            result.is_ok(),
-            "detector should report quiescence after both queues drain"
-        );
-        assert_eq!(detector.total_pending(), 0);
-
-        consumer1.await.unwrap();
-        consumer2.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn detector_not_quiet_while_one_queue_still_draining() {
-        let fast_gauge = Arc::new(QueueDepthGauge::new("fast"));
-        let slow_gauge = Arc::new(QueueDepthGauge::new("slow"));
+    #[test]
+    fn detector_not_quiet_while_one_queue_still_draining() {
+        run_async_test(async {
+            let fast_gauge = Arc::new(QueueDepthGauge::new("fast"));
+            let slow_gauge = Arc::new(QueueDepthGauge::new("slow"));
 
-        fast_gauge.increment();
-        slow_gauge.increment();
-        slow_gauge.increment();
-        slow_gauge.increment();
+            fast_gauge.increment();
+            slow_gauge.increment();
+            slow_gauge.increment();
+            slow_gauge.increment();
 
-        let detector = QuiescenceDetector::new(Duration::from_millis(0))
-            .with_gauge(fast_gauge.clone())
-            .with_gauge(slow_gauge.clone());
+            let detector = QuiescenceDetector::new(Duration::from_millis(0))
+                .with_gauge(fast_gauge.clone())
+                .with_gauge(slow_gauge.clone());
 
-        // Drain the fast queue immediately
-        fast_gauge.decrement();
+            // Drain the fast queue immediately
+            fast_gauge.decrement();
 
-        // Still not quiet because slow_gauge has 3 pending
-        assert!(!detector.is_quiet(Instant::now()));
-        assert_eq!(detector.total_pending(), 3);
+            // Still not quiet because slow_gauge has 3 pending
+            assert!(!detector.is_quiet(Instant::now()));
+            assert_eq!(detector.total_pending(), 3);
 
-        // Drain slow queue
-        slow_gauge.decrement();
-        slow_gauge.decrement();
-        slow_gauge.decrement();
+            // Drain slow queue
+            slow_gauge.decrement();
+            slow_gauge.decrement();
+            slow_gauge.decrement();
 
-        assert!(detector.is_quiet(Instant::now()));
+            assert!(detector.is_quiet(Instant::now()));
+        });
     }
 
     // =========================================================================
@@ -2012,140 +2052,157 @@ mod tests {
     // NEW TESTS: Async wait functions extended
     // =========================================================================
 
-    #[tokio::test]
-    async fn wait_for_value_string_type() {
-        let result = wait_for_value(
-            || async { "hello".to_string() },
-            "hello".to_string(),
-            Duration::from_secs(1),
-        )
-        .await;
-        assert_eq!(result.unwrap(), "hello");
-    }
-
-    #[tokio::test]
-    async fn wait_for_value_mismatch_shows_observed() {
-        let result = wait_for_value(
-            || async { "actual".to_string() },
-            "expected".to_string(),
-            Duration::from_millis(0),
-        )
-        .await;
-        let err = result.expect_err("should timeout");
-        assert!(
-            err.last_observed.as_ref().unwrap().contains("actual"),
-            "observed: {:?}",
-            err.last_observed
-        );
-    }
-
-    #[tokio::test]
-    async fn wait_for_succeeds_on_first_try() {
-        let condition = WaitCondition::new("always ready", || async { WaitFor::Ready(true) });
-        let backoff = Backoff {
-            initial: Duration::from_millis(1),
-            max: Duration::from_millis(10),
-            factor: 2,
-            max_retries: Some(1),
-        };
-        let result = wait_for(condition, Duration::from_secs(1), backoff).await;
-        assert!(result.unwrap());
-    }
-
-    #[tokio::test]
-    async fn wait_for_max_retries_one_means_single_attempt() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter2 = counter.clone();
-        let condition = WaitCondition::new("never", move || {
-            counter2.fetch_add(1, Ordering::SeqCst);
-            async { WaitFor::<()>::not_ready(None::<String>) }
+    #[test]
+    fn wait_for_value_string_type() {
+        run_async_test(async {
+            let result = wait_for_value(
+                || async { "hello".to_string() },
+                "hello".to_string(),
+                Duration::from_secs(1),
+            )
+            .await;
+            assert_eq!(result.unwrap(), "hello");
         });
-        let backoff = Backoff {
-            initial: Duration::from_millis(1),
-            max: Duration::from_millis(10),
-            factor: 2,
-            max_retries: Some(1),
-        };
-        let result = wait_for(condition, Duration::from_secs(10), backoff).await;
-        let err = result.expect_err("should exhaust after 1 retry");
-        assert_eq!(err.retries, 1);
     }
 
-    #[tokio::test]
-    async fn wait_for_condition_with_backoff_succeeds() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter2 = counter.clone();
-        let backoff = Backoff {
-            initial: Duration::from_millis(1),
-            max: Duration::from_millis(5),
-            factor: 2,
-            max_retries: None,
-        };
-        let result = wait_for_condition_with_backoff(
-            "counter reaches 2",
-            move || {
-                let n = counter2.fetch_add(1, Ordering::SeqCst);
-                async move { n >= 1 }
-            },
-            Duration::from_secs(1),
-            backoff,
-        )
-        .await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn wait_for_condition_with_backoff_times_out() {
-        let backoff = Backoff {
-            initial: Duration::from_millis(1),
-            max: Duration::from_millis(5),
-            factor: 2,
-            max_retries: Some(3),
-        };
-        let result = wait_for_condition_with_backoff(
-            "never true",
-            || async { false },
-            Duration::from_secs(10),
-            backoff,
-        )
-        .await;
-        let err = result.expect_err("should exhaust retries");
-        assert!(err.expected.contains("never true"));
-    }
-
-    #[tokio::test]
-    async fn wait_for_quiescence_with_backoff_custom() {
-        let signals = QuiescenceState {
-            pending: 0,
-            last_activity: None,
-            quiet_window: Duration::ZERO,
-        };
-        let backoff = Backoff {
-            initial: Duration::from_millis(1),
-            max: Duration::from_millis(5),
-            factor: 2,
-            max_retries: None,
-        };
-        let result =
-            wait_for_quiescence_with_backoff(signals, Duration::from_millis(100), backoff).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn wait_for_zero_timeout_immediate_fail() {
-        let condition = WaitCondition::new("never", || async {
-            WaitFor::<()>::not_ready(Some("still not".to_string()))
+    #[test]
+    fn wait_for_value_mismatch_shows_observed() {
+        run_async_test(async {
+            let result = wait_for_value(
+                || async { "actual".to_string() },
+                "expected".to_string(),
+                Duration::from_millis(0),
+            )
+            .await;
+            let err = result.expect_err("should timeout");
+            assert!(
+                err.last_observed.as_ref().unwrap().contains("actual"),
+                "observed: {:?}",
+                err.last_observed
+            );
         });
-        let backoff = Backoff {
-            initial: Duration::from_millis(100),
-            max: Duration::from_millis(100),
-            factor: 2,
-            max_retries: None,
-        };
-        let result = wait_for(condition, Duration::ZERO, backoff).await;
-        let err = result.expect_err("zero timeout should fail quickly");
-        assert_eq!(err.retries, 1);
-        assert_eq!(err.last_observed.as_deref(), Some("still not"));
+    }
+
+    #[test]
+    fn wait_for_succeeds_on_first_try() {
+        run_async_test(async {
+            let condition = WaitCondition::new("always ready", || async { WaitFor::Ready(true) });
+            let backoff = Backoff {
+                initial: Duration::from_millis(1),
+                max: Duration::from_millis(10),
+                factor: 2,
+                max_retries: Some(1),
+            };
+            let result = wait_for(condition, Duration::from_secs(1), backoff).await;
+            assert!(result.unwrap());
+        });
+    }
+
+    #[test]
+    fn wait_for_max_retries_one_means_single_attempt() {
+        run_async_test(async {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let counter2 = counter.clone();
+            let condition = WaitCondition::new("never", move || {
+                counter2.fetch_add(1, Ordering::SeqCst);
+                async { WaitFor::<()>::not_ready(None::<String>) }
+            });
+            let backoff = Backoff {
+                initial: Duration::from_millis(1),
+                max: Duration::from_millis(10),
+                factor: 2,
+                max_retries: Some(1),
+            };
+            let result = wait_for(condition, Duration::from_secs(10), backoff).await;
+            let err = result.expect_err("should exhaust after 1 retry");
+            assert_eq!(err.retries, 1);
+        });
+    }
+
+    #[test]
+    fn wait_for_condition_with_backoff_succeeds() {
+        run_async_test(async {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let counter2 = counter.clone();
+            let backoff = Backoff {
+                initial: Duration::from_millis(1),
+                max: Duration::from_millis(5),
+                factor: 2,
+                max_retries: None,
+            };
+            let result = wait_for_condition_with_backoff(
+                "counter reaches 2",
+                move || {
+                    let n = counter2.fetch_add(1, Ordering::SeqCst);
+                    async move { n >= 1 }
+                },
+                Duration::from_secs(1),
+                backoff,
+            )
+            .await;
+            assert!(result.is_ok());
+        });
+    }
+
+    #[test]
+    fn wait_for_condition_with_backoff_times_out() {
+        run_async_test(async {
+            let backoff = Backoff {
+                initial: Duration::from_millis(1),
+                max: Duration::from_millis(5),
+                factor: 2,
+                max_retries: Some(3),
+            };
+            let result = wait_for_condition_with_backoff(
+                "never true",
+                || async { false },
+                Duration::from_secs(10),
+                backoff,
+            )
+            .await;
+            let err = result.expect_err("should exhaust retries");
+            assert!(err.expected.contains("never true"));
+        });
+    }
+
+    #[test]
+    fn wait_for_quiescence_with_backoff_custom() {
+        run_async_test(async {
+            let signals = QuiescenceState {
+                pending: 0,
+                last_activity: None,
+                quiet_window: Duration::ZERO,
+            };
+            let backoff = Backoff {
+                initial: Duration::from_millis(1),
+                max: Duration::from_millis(5),
+                factor: 2,
+                max_retries: None,
+            };
+            let result =
+                wait_for_quiescence_with_backoff(signals, Duration::from_millis(100), backoff)
+                    .await;
+            assert!(result.is_ok());
+        });
+    }
+
+    #[test]
+    fn wait_for_zero_timeout_immediate_fail() {
+        run_async_test(async {
+            let condition = WaitCondition::new("never", || async {
+                WaitFor::<()>::not_ready(Some("still not".to_string()))
+            });
+            let backoff = Backoff {
+                initial: Duration::from_millis(100),
+                max: Duration::from_millis(100),
+                factor: 2,
+                max_retries: None,
+            };
+            let result = wait_for(condition, Duration::ZERO, backoff).await;
+            let err = result.expect_err("zero timeout should fail quickly");
+            assert_eq!(err.retries, 1);
+            assert_eq!(err.last_observed.as_deref(), Some("still not"));
+        });
     }
 
     // =========================================================================
