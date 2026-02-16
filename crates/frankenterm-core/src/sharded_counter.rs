@@ -704,4 +704,71 @@ mod tests {
         assert_eq!(counter.get(), 8 * 49_995_000);
         assert_eq!(max.get(), 7 * 10_000 + 9999);
     }
+
+    // -----------------------------------------------------------------------
+    // AtomicU64-compatible shims
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn counter_load_shim() {
+        let c = ShardedCounter::with_shards(4);
+        c.add(42);
+        assert_eq!(c.load(Ordering::SeqCst), 42);
+    }
+
+    #[test]
+    fn counter_fetch_add_shim() {
+        let c = ShardedCounter::with_shards(4);
+        c.add(10);
+        let prev = c.fetch_add(5, Ordering::Relaxed);
+        assert_eq!(prev, 10);
+        assert_eq!(c.get(), 15);
+    }
+
+    #[test]
+    fn gauge_store_load_shims() {
+        let g = ShardedGauge::with_shards(1);
+        g.store(77, Ordering::SeqCst);
+        assert_eq!(g.load(Ordering::SeqCst), 77);
+    }
+
+    #[test]
+    fn gauge_default() {
+        let g = ShardedGauge::default();
+        assert_eq!(g.get_max(), 0);
+    }
+
+    #[test]
+    fn max_shard_count_accessor() {
+        let m = ShardedMax::with_shards(7);
+        assert_eq!(m.shard_count(), 7);
+    }
+
+    #[test]
+    fn counter_debug_format() {
+        let c = ShardedCounter::with_shards(2);
+        c.add(100);
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("ShardedCounter"));
+    }
+
+    #[test]
+    fn max_observe_same_value_twice() {
+        let m = ShardedMax::with_shards(1);
+        m.observe(42);
+        m.observe(42);
+        assert_eq!(m.get(), 42);
+    }
+
+    #[test]
+    fn snapshot_empty() {
+        let snap = ShardedSnapshot {
+            counters: vec![],
+            maxes: vec![],
+            gauges: vec![],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ShardedSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
 }
