@@ -487,6 +487,8 @@ fn domain_budget_disabled_allows_single_domain_to_consume_all() {
         frame_budget_units: 10,
         domain_budget_enabled: false,
         allow_single_oversubscription: false,
+        // Disable storm throttling — this test focuses on domain budget behavior
+        storm_threshold_intents: 100,
         ..ResizeSchedulerConfig::default()
     });
 
