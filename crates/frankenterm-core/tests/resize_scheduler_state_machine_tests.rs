@@ -848,11 +848,18 @@ fn oversubscription_blocked_when_disabled() {
 #[test]
 fn schedule_frame_result_serialization_round_trip() {
     let result = ScheduleFrameResult {
+        requested_frame_budget_units: 10,
         frame_budget_units: 8,
+        pacing_budget_units: 8,
+        vsync_adjusted_budget_units: 7,
+        vsync_refresh_hz: Some(120),
+        vsync_interval_us: Some(8_333),
         effective_resize_budget_units: 6,
         input_reserved_units: 2,
         pending_input_events: 10,
         budget_spent_units: 5,
+        hitch_detected: false,
+        hitch_overrun_units: 0,
         scheduled: vec![],
         pending_after: 3,
     };

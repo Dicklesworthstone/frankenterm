@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc b3c1fc05c61a2f0183d84dd26fb28289ea05b04a2765ff87e26808fab884191d # shrinks to n = 49
 cc 54923db13763e087cdd56086b687c09071b086771488ef159fddcfe26007cb81 # shrinks to pairs = [([], 0), ([], 1)]
+cc 9bc0d8b2bbb7754b59e102aef027feff5cbfa4e7ac1e5d583368c43b6f810fb1 # shrinks to pairs = [([0], 0)]
