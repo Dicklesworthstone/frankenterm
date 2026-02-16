@@ -9,7 +9,7 @@ use crate::{Domain, Mux, MuxNotification};
 use anyhow::Error;
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
-use config::{configuration, ExitBehavior, ExitBehaviorMessaging};
+use config::{ExitBehavior, ExitBehaviorMessaging, configuration};
 use fancy_regex::Regex;
 use frankenterm_dynamic::Value;
 use frankenterm_term::color::ColorPalette;
@@ -21,7 +21,7 @@ use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
 use procinfo::LocalProcessInfo;
 use rangeset::RangeSet;
-use smol::channel::{bounded, Receiver, TryRecvError};
+use smol::channel::{Receiver, TryRecvError, bounded};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
@@ -29,7 +29,7 @@ use std::io::{Result as IoResult, Write};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use termwiz::escape::csi::{Sgr, CSI};
+use termwiz::escape::csi::{CSI, Sgr};
 use termwiz::escape::{Action, DeviceControlMode};
 use termwiz::input::KeyboardEncoding;
 use termwiz::surface::{Line, SequenceNo};
@@ -2040,6 +2040,61 @@ mod tests {
             replay.presented_size.map(|size| (size.cols, size.rows)),
             Some((100, 35))
         );
+    }
+
+    #[test]
+    fn replay_fallback_paths_preserve_identical_presented_outcome() {
+        let mut boundary_cancel = ResizeReplayHarness::default();
+        boundary_cancel.enqueue(80, 24);
+        boundary_cancel
+            .start_next()
+            .expect("first intent should start");
+        boundary_cancel.enqueue(120, 40);
+        assert!(boundary_cancel.boundary_cancel_current_if_superseded());
+        boundary_cancel
+            .start_next()
+            .expect("latest intent should start after boundary cancellation");
+        assert_eq!(
+            boundary_cancel.commit_current_with_present_barrier(),
+            Some(true)
+        );
+
+        let mut present_reject = ResizeReplayHarness::default();
+        present_reject.enqueue(80, 24);
+        present_reject
+            .start_next()
+            .expect("first intent should start");
+        present_reject.enqueue(120, 40);
+        assert_eq!(
+            present_reject.commit_current_with_present_barrier(),
+            Some(false),
+            "superseded in-flight should reject at present barrier"
+        );
+        present_reject
+            .start_next()
+            .expect("latest intent should start after reject");
+        assert_eq!(
+            present_reject.commit_current_with_present_barrier(),
+            Some(true)
+        );
+
+        assert_eq!(
+            boundary_cancel.presented_seq, present_reject.presented_seq,
+            "presented sequence should be deterministic across fallback paths"
+        );
+        assert_eq!(
+            boundary_cancel.presented_size.map(|s| (s.cols, s.rows)),
+            present_reject.presented_size.map(|s| (s.cols, s.rows)),
+            "presented geometry should be deterministic across fallback paths"
+        );
+        assert_eq!(
+            boundary_cancel.completed, present_reject.completed,
+            "completed commit ids should match across fallback paths"
+        );
+        assert_eq!(boundary_cancel.cancelled.len(), 1);
+        assert_eq!(present_reject.cancelled.len(), 1);
+        assert!(boundary_cancel.rejected_frames.is_empty());
+        assert_eq!(present_reject.rejected_frames, vec![1]);
     }
 
     // =========================================================================

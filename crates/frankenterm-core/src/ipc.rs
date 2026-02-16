@@ -791,6 +791,9 @@ async fn handle_request_with_context(
                     payload["runtime_lock_memory"] = runtime_lock_memory;
                 }
             }
+            payload["streaming_health"] = crate::tailer::StreamingHealth::get_global()
+                .and_then(|snapshot| serde_json::to_value(snapshot).ok())
+                .unwrap_or(serde_json::Value::Null);
             payload["health"] = health;
             if let Some(snapshot) =
                 crate::resize_scheduler::ResizeSchedulerDebugSnapshot::get_global()
@@ -1669,6 +1672,15 @@ mod tests {
                     avg_cursor_snapshot_bytes: 3072.0,
                 },
             );
+            crate::tailer::StreamingHealth::update_global(crate::tailer::StreamingHealth {
+                mode: crate::tailer::TailerMode::Streaming,
+                events_processed: 42,
+                dirty_ranges_total: 10,
+                dirty_rows_total: 80,
+                gaps_emitted: 1,
+                fallback_count: 2,
+                active_panes: 3,
+            });
 
             let server = IpcServer::bind(&socket_path).await.unwrap();
             let event_bus = Arc::new(EventBus::new(100));
@@ -1704,6 +1716,18 @@ mod tests {
             assert_eq!(
                 runtime_lock_memory.get("p95_cursor_snapshot_bytes"),
                 Some(&serde_json::json!(3900))
+            );
+            let streaming_health = data
+                .get("streaming_health")
+                .and_then(serde_json::Value::as_object)
+                .expect("streaming_health should be present in status payload");
+            assert_eq!(
+                streaming_health.get("events_processed"),
+                Some(&serde_json::json!(42))
+            );
+            assert_eq!(
+                streaming_health.get("dirty_rows_total"),
+                Some(&serde_json::json!(80))
             );
 
             send_shutdown(&shutdown_tx).await;

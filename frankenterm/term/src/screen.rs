@@ -2,12 +2,12 @@
 use super::*;
 use crate::config::BidiMode;
 use crossbeam::thread;
+use frankenterm_surface::SequenceNo;
 use frankenterm_surface::line::{
     LineWrapScorecard as MonospaceLineWrapScorecard, MonospaceKpCostModel, MonospaceWrapMode,
 };
-use frankenterm_surface::SequenceNo;
 use log::{debug, warn};
-use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
@@ -2529,11 +2529,7 @@ impl Screen {
 fn phys_intersection(r1: &Range<PhysRowIndex>, r2: &Range<PhysRowIndex>) -> Range<PhysRowIndex> {
     let start = r1.start.max(r2.start);
     let end = r1.end.min(r2.end);
-    if end > start {
-        start..end
-    } else {
-        0..0
-    }
+    if end > start { start..end } else { 0..0 }
 }
 
 #[cfg(test)]
@@ -2891,10 +2887,11 @@ mod tests {
         );
 
         assert!(plan.covers_each_logical_line_once(logical_count));
-        assert!(plan
-            .batches
-            .iter()
-            .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES));
+        assert!(
+            plan.batches
+                .iter()
+                .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES)
+        );
         assert_eq!(
             plan.batches
                 .first()
@@ -3074,10 +3071,75 @@ mod tests {
     }
 
     #[test]
+    fn forced_rollback_retry_matches_direct_resize_semantics() {
+        let attrs = CellAttributes::blank();
+        let seed_lines = VecDeque::from(vec![
+            Line::from_text("abcd", &attrs, 0, None),
+            Line::from_text("efgh", &attrs, 0, None),
+            Line::from_text("ijkl", &attrs, 0, None),
+        ]);
+        let cursor = test_cursor(1, 1, 10);
+        let target = test_size(4, 3, 144);
+
+        let mut direct = test_screen(3, 4, 96);
+        direct.lines = seed_lines.clone();
+        let direct_cursor = direct.resize(target, cursor, 11, false);
+
+        let mut fallback_then_retry = test_screen(3, 4, 96);
+        fallback_then_retry.lines = seed_lines;
+        fallback_then_retry
+            .force_resize_commit_rollback(LastGoodFrameRollbackCause::ForcedFailureInjection);
+        let fallback_cursor = fallback_then_retry.resize(target, cursor, 11, false);
+        assert_eq!(
+            fallback_cursor, cursor,
+            "forced rollback path should preserve pre-resize cursor on rejected commit"
+        );
+        let retry_cursor = fallback_then_retry.resize(target, cursor, 12, false);
+
+        let direct_lines: Vec<String> = direct
+            .visible_lines()
+            .into_iter()
+            .map(|line| line.as_str().to_string())
+            .collect();
+        let retry_lines: Vec<String> = fallback_then_retry
+            .visible_lines()
+            .into_iter()
+            .map(|line| line.as_str().to_string())
+            .collect();
+
+        assert_eq!(retry_cursor, direct_cursor);
+        assert_eq!(
+            (
+                fallback_then_retry.physical_cols,
+                fallback_then_retry.physical_rows,
+                fallback_then_retry.dpi
+            ),
+            (direct.physical_cols, direct.physical_rows, direct.dpi),
+            "final geometry should converge after fallback retry"
+        );
+        assert_eq!(
+            retry_lines, direct_lines,
+            "final visible frame should match direct resize after fallback retry"
+        );
+        assert_eq!(
+            fallback_then_retry.last_good_frame_lifecycle.rollback_count,
+            1
+        );
+        assert_eq!(
+            fallback_then_retry
+                .last_good_frame_lifecycle
+                .rollback_missing_snapshot_count,
+            0
+        );
+    }
+
+    #[test]
     fn last_good_frame_rollback_tracks_missing_snapshot_failures() {
         let mut screen = test_screen(2, 2, 96);
-        assert!(!screen
-            .rollback_to_last_good_frame(2, LastGoodFrameRollbackCause::ResizeCommitValidation));
+        assert!(
+            !screen
+                .rollback_to_last_good_frame(2, LastGoodFrameRollbackCause::ResizeCommitValidation)
+        );
         assert_eq!(screen.last_good_frame_lifecycle.rollback_count, 0);
         assert_eq!(
             screen
