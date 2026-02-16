@@ -26,33 +26,26 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// ── Node ──────────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BinomialNode<K, V> {
     key: K,
     value: V,
-    order: usize,           // degree/order of this tree
-    child: Option<usize>,   // first child
-    sibling: Option<usize>, // next sibling (for root list or child list)
+    order: usize,
+    child: Option<usize>,
+    sibling: Option<usize>,
 }
 
-// ── BinomialHeap ──────────────────────────────────────────────────────
-
 /// Min-binomial heap with arena allocation.
-///
-/// Elements with the smallest key are at the top.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BinomialHeap<K, V> {
     nodes: Vec<BinomialNode<K, V>>,
-    head: Option<usize>, // head of root list
+    head: Option<usize>,
     count: usize,
-    min_root: Option<usize>, // cached minimum
+    min_root: Option<usize>,
     free: Vec<usize>,
 }
 
 impl<K: Ord + Clone, V: Clone> BinomialHeap<K, V> {
-    /// Creates an empty binomial heap.
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
@@ -63,17 +56,14 @@ impl<K: Ord + Clone, V: Clone> BinomialHeap<K, V> {
         }
     }
 
-    /// Returns the number of elements.
     pub fn len(&self) -> usize {
         self.count
     }
 
-    /// Returns true if the heap is empty.
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
-    /// Returns a reference to the minimum element.
     pub fn peek(&self) -> Option<(&K, &V)> {
         self.min_root
             .map(|m| (&self.nodes[m].key, &self.nodes[m].value))
@@ -102,172 +92,39 @@ impl<K: Ord + Clone, V: Clone> BinomialHeap<K, V> {
         }
     }
 
-    /// Inserts a key-value pair.
-    pub fn insert(&mut self, key: K, value: V) {
-        let idx = self.alloc_node(key, value);
-        // Create a singleton heap and merge
-        let prev_head = self.head;
-        self.head = Some(idx);
-        self.nodes[idx].sibling = None;
-        self.count += 1;
-
-        // Merge singleton into existing root list
-        if let Some(prev) = prev_head {
-            self.head = Some(idx);
-            self.nodes[idx].sibling = None;
-            self.head = self.merge_root_lists(Some(idx), Some(prev));
-            self.consolidate();
+    fn collect_roots(&self) -> Vec<usize> {
+        let mut roots = Vec::new();
+        let mut cur = self.head;
+        while let Some(idx) = cur {
+            roots.push(idx);
+            cur = self.nodes[idx].sibling;
         }
-
-        self.update_min();
+        roots
     }
 
-    /// Removes and returns the minimum element.
-    pub fn extract_min(&mut self) -> Option<(K, V)> {
-        let min_root = self.min_root?;
-
-        let result = (
-            self.nodes[min_root].key.clone(),
-            self.nodes[min_root].value.clone(),
-        );
-
-        // Remove min_root from root list
-        self.head = self.remove_from_root_list(min_root);
-
-        // Reverse the child list of min_root and merge with remaining roots
-        let children = self.reverse_children(min_root);
-        self.head = self.merge_root_lists(self.head, children);
-        self.consolidate();
-
-        self.free.push(min_root);
-        self.count -= 1;
-
-        if self.count == 0 {
+    fn rebuild_root_list(&mut self, roots: &[usize]) {
+        if roots.is_empty() {
             self.head = None;
             self.min_root = None;
-        } else {
-            self.update_min();
-        }
-
-        Some(result)
-    }
-
-    /// Alias for `extract_min`.
-    pub fn pop(&mut self) -> Option<(K, V)> {
-        self.extract_min()
-    }
-
-    /// Merges another heap into this one. The other heap is left empty.
-    pub fn merge(&mut self, other: &mut BinomialHeap<K, V>) {
-        if other.is_empty() {
             return;
         }
-        if self.is_empty() {
-            std::mem::swap(self, other);
-            return;
+        self.head = Some(roots[0]);
+        for i in 0..roots.len() {
+            self.nodes[roots[i]].sibling = if i + 1 < roots.len() {
+                Some(roots[i + 1])
+            } else {
+                None
+            };
         }
-
-        let offset = self.nodes.len();
-        for node in &other.nodes {
-            let mut copied = node.clone();
-            copied.child = copied.child.map(|c| c + offset);
-            copied.sibling = copied.sibling.map(|s| s + offset);
-            self.nodes.push(copied);
-        }
-
-        let other_head = other.head.map(|h| h + offset);
-        self.head = self.merge_root_lists(self.head, other_head);
-        self.consolidate();
-        self.count += other.count;
-        self.free.extend(other.free.iter().map(|&f| f + offset));
-
-        other.nodes.clear();
-        other.head = None;
-        other.count = 0;
-        other.min_root = None;
-        other.free.clear();
-
         self.update_min();
     }
 
-    /// Returns all elements sorted.
-    pub fn into_sorted(mut self) -> Vec<(K, V)> {
-        let mut result = Vec::with_capacity(self.count);
-        while let Some(item) = self.extract_min() {
-            result.push(item);
-        }
-        result
-    }
-
-    /// Returns sorted elements without consuming.
-    pub fn sorted(&self) -> Vec<(K, V)> {
-        self.clone().into_sorted()
-    }
-
-    // ── Internal helpers ──────────────────────────────────────────
-
-    /// Merge two sorted root lists into one sorted by order.
-    fn merge_root_lists(
-        &self,
-        mut a: Option<usize>,
-        mut b: Option<usize>,
-    ) -> Option<usize> {
-        let mut result: Vec<usize> = Vec::new();
-
-        while let (Some(ai), Some(bi)) = (a, b) {
-            if self.nodes[ai].order <= self.nodes[bi].order {
-                result.push(ai);
-                a = self.nodes[ai].sibling;
-            } else {
-                result.push(bi);
-                b = self.nodes[bi].sibling;
-            }
-        }
-
-        while let Some(ai) = a {
-            result.push(ai);
-            a = self.nodes[ai].sibling;
-        }
-        while let Some(bi) = b {
-            result.push(bi);
-            b = self.nodes[bi].sibling;
-        }
-
-        // Link them
-        if result.is_empty() {
-            return None;
-        }
-        for i in 0..result.len() - 1 {
-            self.nodes[result[i]].sibling; // read-only
-        }
-
-        // We need to return connected list
-        Some(result[0])
-    }
-
-    /// Consolidates the root list: combine trees of the same order.
-    fn consolidate(&mut self) {
-        // Collect all roots
-        let mut roots = Vec::new();
-        let mut current = self.head;
-        while let Some(idx) = current {
-            roots.push(idx);
-            current = self.nodes[idx].sibling;
-        }
-
-        if roots.is_empty() {
-            return;
-        }
-
-        // Clear all siblings
+    fn consolidate_roots(&mut self, roots: Vec<usize>) {
         for &r in &roots {
             self.nodes[r].sibling = None;
         }
-
-        // Merge trees of same order
-        let max_order = 64; // more than enough for any practical size
+        let max_order = 64;
         let mut by_order: Vec<Option<usize>> = vec![None; max_order];
-
         for root in roots {
             let mut curr = root;
             loop {
@@ -287,87 +144,26 @@ impl<K: Ord + Clone, V: Clone> BinomialHeap<K, V> {
                 }
             }
         }
-
-        // Rebuild root list sorted by order
-        self.head = None;
-        let mut prev: Option<usize> = None;
-
-        for entry in &by_order {
-            if let Some(idx) = entry {
-                self.nodes[*idx].sibling = None;
-                match prev {
-                    None => self.head = Some(*idx),
-                    Some(p) => self.nodes[p].sibling = Some(*idx),
-                }
-                prev = Some(*idx);
-            }
-        }
+        let final_roots: Vec<usize> = by_order.into_iter().flatten().collect();
+        self.rebuild_root_list(&final_roots);
     }
 
-    /// Links two trees of the same order, making the larger-key tree
-    /// a child of the smaller-key tree.
     fn link_trees(&mut self, a: usize, b: usize) -> usize {
         let (winner, loser) = if self.nodes[a].key <= self.nodes[b].key {
             (a, b)
         } else {
             (b, a)
         };
-
         self.nodes[loser].sibling = self.nodes[winner].child;
         self.nodes[winner].child = Some(loser);
         self.nodes[winner].order += 1;
         winner
     }
 
-    fn remove_from_root_list(&mut self, target: usize) -> Option<usize> {
-        let mut roots = Vec::new();
-        let mut current = self.head;
-        while let Some(idx) = current {
-            if idx != target {
-                roots.push(idx);
-            }
-            current = self.nodes[idx].sibling;
-        }
-
-        if roots.is_empty() {
-            return None;
-        }
-
-        for &r in &roots {
-            self.nodes[r].sibling = None;
-        }
-        for i in 0..roots.len() - 1 {
-            self.nodes[roots[i]].sibling = Some(roots[i + 1]);
-        }
-        Some(roots[0])
-    }
-
-    fn reverse_children(&mut self, parent: usize) -> Option<usize> {
-        let mut children = Vec::new();
-        let mut current = self.nodes[parent].child;
-        while let Some(idx) = current {
-            children.push(idx);
-            current = self.nodes[idx].sibling;
-        }
-
-        if children.is_empty() {
-            return None;
-        }
-
-        children.reverse();
-        for &c in &children {
-            self.nodes[c].sibling = None;
-        }
-        for i in 0..children.len() - 1 {
-            self.nodes[children[i]].sibling = Some(children[i + 1]);
-        }
-        Some(children[0])
-    }
-
     fn update_min(&mut self) {
         self.min_root = None;
-        let mut current = self.head;
-        while let Some(idx) = current {
+        let mut cur = self.head;
+        while let Some(idx) = cur {
             match self.min_root {
                 None => self.min_root = Some(idx),
                 Some(m) => {
@@ -376,8 +172,92 @@ impl<K: Ord + Clone, V: Clone> BinomialHeap<K, V> {
                     }
                 }
             }
-            current = self.nodes[idx].sibling;
+            cur = self.nodes[idx].sibling;
         }
+    }
+
+    pub fn insert(&mut self, key: K, value: V) {
+        let idx = self.alloc_node(key, value);
+        self.count += 1;
+        let mut roots = self.collect_roots();
+        roots.push(idx);
+        self.consolidate_roots(roots);
+    }
+
+    pub fn extract_min(&mut self) -> Option<(K, V)> {
+        let min_root = self.min_root?;
+        let result = (
+            self.nodes[min_root].key.clone(),
+            self.nodes[min_root].value.clone(),
+        );
+        let mut roots: Vec<usize> = self
+            .collect_roots()
+            .into_iter()
+            .filter(|&r| r != min_root)
+            .collect();
+        let mut child = self.nodes[min_root].child;
+        while let Some(c) = child {
+            let next = self.nodes[c].sibling;
+            self.nodes[c].sibling = None;
+            roots.push(c);
+            child = next;
+        }
+        self.free.push(min_root);
+        self.count -= 1;
+        if self.count == 0 {
+            self.head = None;
+            self.min_root = None;
+        } else {
+            self.consolidate_roots(roots);
+        }
+        Some(result)
+    }
+
+    pub fn pop(&mut self) -> Option<(K, V)> {
+        self.extract_min()
+    }
+
+    pub fn merge(&mut self, other: &mut BinomialHeap<K, V>) {
+        if other.is_empty() {
+            return;
+        }
+        if self.is_empty() {
+            std::mem::swap(self, other);
+            return;
+        }
+        let offset = self.nodes.len();
+        for node in &other.nodes {
+            let mut copied = node.clone();
+            copied.child = copied.child.map(|c| c + offset);
+            copied.sibling = copied.sibling.map(|s| s + offset);
+            self.nodes.push(copied);
+        }
+        let mut roots = self.collect_roots();
+        let mut other_cur = other.head;
+        while let Some(idx) = other_cur {
+            roots.push(idx + offset);
+            other_cur = other.nodes[idx].sibling;
+        }
+        self.count += other.count;
+        self.free.extend(other.free.iter().map(|&f| f + offset));
+        self.consolidate_roots(roots);
+        other.nodes.clear();
+        other.head = None;
+        other.count = 0;
+        other.min_root = None;
+        other.free.clear();
+    }
+
+    pub fn into_sorted(mut self) -> Vec<(K, V)> {
+        let mut result = Vec::with_capacity(self.count);
+        while let Some(item) = self.extract_min() {
+            result.push(item);
+        }
+        result
+    }
+
+    pub fn sorted(&self) -> Vec<(K, V)> {
+        self.clone().into_sorted()
     }
 }
 
@@ -392,8 +272,6 @@ impl<K: Ord + Clone + fmt::Display, V: Clone> fmt::Display for BinomialHeap<K, V
         write!(f, "BinomialHeap({} elements)", self.count)
     }
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -438,7 +316,6 @@ mod tests {
         heap.insert(7, 70);
         heap.insert(1, 10);
         heap.insert(9, 90);
-
         assert_eq!(heap.extract_min(), Some((1, 10)));
         assert_eq!(heap.extract_min(), Some((3, 30)));
         assert_eq!(heap.extract_min(), Some((5, 50)));
@@ -461,15 +338,12 @@ mod tests {
         h1.insert(1, 10);
         h1.insert(3, 30);
         h1.insert(5, 50);
-
         let mut h2 = BinomialHeap::new();
         h2.insert(2, 20);
         h2.insert(4, 40);
-
         h1.merge(&mut h2);
         assert_eq!(h1.len(), 5);
         assert!(h2.is_empty());
-
         let sorted = h1.into_sorted();
         let keys: Vec<i32> = sorted.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, vec![1, 2, 3, 4, 5]);
@@ -481,7 +355,6 @@ mod tests {
         let mut h2 = BinomialHeap::new();
         h2.insert(1, 10);
         h2.insert(2, 20);
-
         h1.merge(&mut h2);
         assert_eq!(h1.len(), 2);
         assert_eq!(h1.peek(), Some((&1, &10)));
@@ -491,7 +364,6 @@ mod tests {
     fn merge_empty_into_nonempty() {
         let mut h1 = BinomialHeap::new();
         h1.insert(1, 10);
-
         let mut h2: BinomialHeap<i32, i32> = BinomialHeap::new();
         h1.merge(&mut h2);
         assert_eq!(h1.len(), 1);

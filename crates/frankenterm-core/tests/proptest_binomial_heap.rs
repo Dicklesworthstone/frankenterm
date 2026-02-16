@@ -2,10 +2,17 @@
 //!
 //! Verifies correctness invariants:
 //! - Pop order matches sorted BinaryHeap reference
-//! - Peek returns minimum
+//! - Peek always returns minimum key
 //! - Merge preserves all elements
-//! - Length tracking
-//! - Serde roundtrip
+//! - Merge commutativity (same elements regardless of direction)
+//! - Length tracking across insert/extract/merge
+//! - No element loss (every insert is extractable)
+//! - Serde roundtrip preserves elements
+//! - Sorted output is monotonically non-decreasing
+//! - Clone preserves heap contents
+//! - Duplicate key handling
+//! - Interleaved insert/extract sequences
+//! - Multi-heap merge chains
 
 use frankenterm_core::binomial_heap::BinomialHeap;
 use proptest::prelude::*;
@@ -206,6 +213,265 @@ proptest! {
             let (k, v) = heap.extract_min().unwrap();
             prop_assert_eq!(k, e);
             prop_assert_eq!(v, e * 10);
+        }
+    }
+
+    // ── Merge commutativity ─────────────────────────────────────
+
+    #[test]
+    fn merge_produces_same_elements(
+        vals_a in values_strategy(25),
+        vals_b in values_strategy(25)
+    ) {
+        let mut h1a = BinomialHeap::new();
+        let mut h1b = BinomialHeap::new();
+        let mut h2a = BinomialHeap::new();
+        let mut h2b = BinomialHeap::new();
+
+        for &v in &vals_a {
+            h1a.insert(v, v);
+            h2a.insert(v, v);
+        }
+        for &v in &vals_b {
+            h1b.insert(v, v);
+            h2b.insert(v, v);
+        }
+
+        h1a.merge(&mut h1b);
+        h2b.merge(&mut h2a);
+
+        let sorted1 = h1a.into_sorted();
+        let sorted2 = h2b.into_sorted();
+        let keys1: Vec<i32> = sorted1.iter().map(|&(k, _)| k).collect();
+        let keys2: Vec<i32> = sorted2.iter().map(|&(k, _)| k).collect();
+        prop_assert_eq!(keys1, keys2);
+    }
+
+    // ── Merge with empty is identity ────────────────────────────
+
+    #[test]
+    fn merge_with_empty_is_identity(vals in values_strategy(30)) {
+        let mut heap = BinomialHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+        let original_sorted = heap.sorted();
+
+        let mut empty: BinomialHeap<i32, i32> = BinomialHeap::new();
+        heap.merge(&mut empty);
+
+        prop_assert_eq!(heap.len(), vals.len());
+        let after_sorted = heap.sorted();
+        prop_assert_eq!(original_sorted, after_sorted);
+    }
+
+    // ── Merge multiple heaps ────────────────────────────────────
+
+    #[test]
+    fn merge_multiple_heaps(
+        vals_a in values_strategy(15),
+        vals_b in values_strategy(15),
+        vals_c in values_strategy(15)
+    ) {
+        let mut h1 = BinomialHeap::new();
+        let mut h2 = BinomialHeap::new();
+        let mut h3 = BinomialHeap::new();
+
+        for &v in &vals_a { h1.insert(v, v); }
+        for &v in &vals_b { h2.insert(v, v); }
+        for &v in &vals_c { h3.insert(v, v); }
+
+        h1.merge(&mut h2);
+        h1.merge(&mut h3);
+
+        let total = vals_a.len() + vals_b.len() + vals_c.len();
+        prop_assert_eq!(h1.len(), total);
+
+        let mut all: Vec<i32> = vals_a
+            .iter()
+            .chain(vals_b.iter())
+            .chain(vals_c.iter())
+            .copied()
+            .collect();
+        all.sort();
+
+        let extracted: Vec<i32> = h1.into_sorted().into_iter().map(|(k, _)| k).collect();
+        prop_assert_eq!(extracted, all);
+    }
+
+    // ── Clone preserves contents ────────────────────────────────
+
+    #[test]
+    fn clone_preserves_contents(vals in values_strategy(40)) {
+        let mut heap = BinomialHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+
+        let cloned = heap.clone();
+        let original_sorted = heap.into_sorted();
+        let cloned_sorted = cloned.into_sorted();
+        prop_assert_eq!(original_sorted, cloned_sorted);
+    }
+
+    // ── Duplicate keys all preserved ────────────────────────────
+
+    #[test]
+    fn duplicate_keys_all_preserved(
+        key in -100..100i32,
+        count in 1..20usize
+    ) {
+        let mut heap = BinomialHeap::new();
+        for i in 0..count {
+            heap.insert(key, i as i32);
+        }
+
+        prop_assert_eq!(heap.len(), count);
+
+        let mut extracted = 0usize;
+        while let Some((k, _)) = heap.extract_min() {
+            prop_assert_eq!(k, key);
+            extracted += 1;
+        }
+        prop_assert_eq!(extracted, count);
+    }
+
+    // ── Interleaved insert/extract ──────────────────────────────
+
+    #[test]
+    fn interleaved_insert_extract(
+        ops in prop::collection::vec(
+            prop_oneof![
+                (-1000..1000i32).prop_map(|v| (true, v)),
+                Just((false, 0i32)),
+            ],
+            0..80
+        )
+    ) {
+        let mut heap = BinomialHeap::new();
+        let mut reference: BinaryHeap<Reverse<i32>> = BinaryHeap::new();
+
+        for (is_insert, val) in ops {
+            if is_insert {
+                heap.insert(val, val);
+                reference.push(Reverse(val));
+            } else if !heap.is_empty() {
+                let (hk, _) = heap.extract_min().unwrap();
+                let Reverse(rk) = reference.pop().unwrap();
+                prop_assert_eq!(hk, rk);
+            }
+        }
+
+        while let Some((hk, _)) = heap.extract_min() {
+            let Reverse(rk) = reference.pop().unwrap();
+            prop_assert_eq!(hk, rk);
+        }
+        prop_assert!(reference.is_empty());
+    }
+
+    // ── Pop alias consistency ───────────────────────────────────
+
+    #[test]
+    fn pop_alias_same_as_extract_min(vals in values_strategy(30)) {
+        let mut heap1 = BinomialHeap::new();
+        let mut heap2 = BinomialHeap::new();
+        for &v in &vals {
+            heap1.insert(v, v);
+            heap2.insert(v, v);
+        }
+
+        for _ in 0..vals.len() {
+            let a = heap1.extract_min();
+            let b = heap2.pop();
+            prop_assert_eq!(a, b);
+        }
+    }
+
+    // ── Peek correct after each extract ─────────────────────────
+
+    #[test]
+    fn peek_correct_after_each_extract(vals in values_strategy(40)) {
+        let mut heap = BinomialHeap::new();
+        let mut sorted_vals: Vec<i32> = vals.clone();
+        sorted_vals.sort();
+
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+
+        for &expected_min in &sorted_vals {
+            if let Some((pk, _)) = heap.peek() {
+                prop_assert_eq!(*pk, expected_min);
+            }
+            let (ek, _) = heap.extract_min().unwrap();
+            prop_assert_eq!(ek, expected_min);
+        }
+    }
+
+    // ── Merge peek returns global minimum ───────────────────────
+
+    #[test]
+    fn merge_peek_returns_global_min(
+        vals_a in values_strategy(20),
+        vals_b in values_strategy(20)
+    ) {
+        if vals_a.is_empty() && vals_b.is_empty() {
+            return Ok(());
+        }
+
+        let mut h1 = BinomialHeap::new();
+        let mut h2 = BinomialHeap::new();
+        for &v in &vals_a { h1.insert(v, v); }
+        for &v in &vals_b { h2.insert(v, v); }
+
+        h1.merge(&mut h2);
+
+        if let Some((pk, _)) = h1.peek() {
+            let global_min = vals_a
+                .iter()
+                .chain(vals_b.iter())
+                .copied()
+                .min()
+                .unwrap();
+            prop_assert_eq!(*pk, global_min);
+        }
+    }
+
+    // ── Large heap stress ───────────────────────────────────────
+
+    #[test]
+    fn large_heap_ordering(seed in 0..100u64) {
+        let mut heap = BinomialHeap::new();
+        let mut reference: BinaryHeap<Reverse<i32>> = BinaryHeap::new();
+
+        let mut state = seed;
+        for _ in 0..200 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let val = (state >> 33) as i32 % 10000;
+            heap.insert(val, val);
+            reference.push(Reverse(val));
+        }
+
+        while let Some((hk, _)) = heap.extract_min() {
+            let Reverse(rk) = reference.pop().unwrap();
+            prop_assert_eq!(hk, rk);
+        }
+    }
+
+    // ── Peek tracks minimum during inserts ──────────────────────
+
+    #[test]
+    fn peek_tracks_minimum_during_inserts(vals in values_strategy(50)) {
+        let mut heap = BinomialHeap::new();
+        let mut min_so_far: Option<i32> = None;
+
+        for &v in &vals {
+            heap.insert(v, v);
+            min_so_far = Some(min_so_far.map_or(v, |m| m.min(v)));
+            let (pk, _) = heap.peek().unwrap();
+            prop_assert_eq!(*pk, min_so_far.unwrap());
         }
     }
 }
