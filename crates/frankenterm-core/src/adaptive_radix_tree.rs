@@ -676,15 +676,16 @@ impl<V> AdaptiveRadixTree<V> {
         results: &mut Vec<(Vec<u8>, &'a V)>,
     ) {
         let node = &self.nodes[node_idx];
+        let mut current_key = key_so_far;
+        current_key.extend_from_slice(&node.prefix);
 
         if let Some(ref val) = node.value {
-            results.push((key_so_far.clone(), val));
+            results.push((current_key.clone(), val));
         }
 
         for (byte, child_idx) in node.inner.children_sorted() {
-            let mut child_key = key_so_far.clone();
+            let mut child_key = current_key.clone();
             child_key.push(byte);
-            child_key.extend_from_slice(&self.nodes[child_idx].prefix);
             self.collect_all(child_idx, child_key, results);
         }
     }
@@ -1010,5 +1011,251 @@ mod tests {
         assert_eq!(tree.len(), 3);
         assert_eq!(*tree.get(&[0, 0, 0]).unwrap(), 1);
         assert_eq!(*tree.get(&[255, 255, 255]).unwrap(), 3);
+    }
+
+    // ── Additional tests ──────────────────────────────────────────────
+
+    #[test]
+    fn get_nonexistent_from_empty() {
+        let tree: AdaptiveRadixTree<i32> = AdaptiveRadixTree::new();
+        assert!(tree.get(b"anything").is_none());
+    }
+
+    #[test]
+    fn contains_key_basic() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert(b"hello", 1);
+        assert!(tree.contains_key(b"hello"));
+        assert!(!tree.contains_key(b"hell"));
+        assert!(!tree.contains_key(b"helloo"));
+    }
+
+    #[test]
+    fn remove_from_empty() {
+        let mut tree: AdaptiveRadixTree<i32> = AdaptiveRadixTree::new();
+        assert!(tree.remove(b"anything").is_none());
+    }
+
+    #[test]
+    fn remove_all_keys() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert(b"a", 1);
+        tree.insert(b"b", 2);
+        tree.insert(b"c", 3);
+        assert_eq!(tree.remove(b"a"), Some(1));
+        assert_eq!(tree.remove(b"b"), Some(2));
+        assert_eq!(tree.remove(b"c"), Some(3));
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn remove_then_reinsert() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert(b"hello", 1);
+        tree.remove(b"hello");
+        assert!(tree.get(b"hello").is_none());
+        tree.insert(b"hello", 2);
+        assert_eq!(*tree.get(b"hello").unwrap(), 2);
+    }
+
+    #[test]
+    fn insert_returns_old_on_overwrite() {
+        let mut tree = AdaptiveRadixTree::new();
+        assert!(tree.insert(b"key", 1).is_none());
+        assert_eq!(tree.insert(b"key", 2), Some(1));
+        assert_eq!(tree.insert(b"key", 3), Some(2));
+        assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn prefix_search_empty_tree() {
+        let tree: AdaptiveRadixTree<i32> = AdaptiveRadixTree::new();
+        assert!(tree.prefix_search(b"hello").is_empty());
+    }
+
+    #[test]
+    fn prefix_search_no_match() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert(b"hello", 1);
+        assert!(tree.prefix_search(b"world").is_empty());
+    }
+
+    #[test]
+    fn prefix_search_empty_prefix_returns_all() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert(b"a", 1);
+        tree.insert(b"b", 2);
+        tree.insert(b"c", 3);
+        let results = tree.prefix_search(b"");
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn prefix_search_str_helper() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert_str("git commit", 1);
+        tree.insert_str("git push", 2);
+        tree.insert_str("grep", 3);
+        let results = tree.prefix_search_str("git");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn iter_empty() {
+        let tree: AdaptiveRadixTree<i32> = AdaptiveRadixTree::new();
+        assert!(tree.iter().is_empty());
+    }
+
+    #[test]
+    fn iter_single() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert(b"only", 42);
+        let items = tree.iter();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, b"only");
+        assert_eq!(*items[0].1, 42);
+    }
+
+    #[test]
+    fn iter_sorted_with_shared_prefix() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert(b"abc", 1);
+        tree.insert(b"abd", 2);
+        tree.insert(b"abe", 3);
+        let items = tree.iter();
+        assert_eq!(items.len(), 3);
+        // Verify sorted
+        for w in items.windows(2) {
+            assert!(w[0].0 <= w[1].0);
+        }
+    }
+
+    #[test]
+    fn node_count_grows() {
+        let mut tree = AdaptiveRadixTree::new();
+        assert_eq!(tree.node_count(), 0);
+        tree.insert(b"a", 1);
+        assert!(tree.node_count() > 0);
+        tree.insert(b"b", 2);
+        assert!(tree.node_count() >= 2);
+    }
+
+    #[test]
+    fn remove_leaf_node_cleans_up() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert(b"abc", 1);
+        tree.insert(b"abd", 2);
+        assert_eq!(tree.remove(b"abc"), Some(1));
+        assert!(tree.get(b"abc").is_none());
+        assert_eq!(*tree.get(b"abd").unwrap(), 2);
+        assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn remove_middle_node() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert(b"a", 1);
+        tree.insert(b"ab", 2);
+        tree.insert(b"abc", 3);
+        assert_eq!(tree.remove(b"ab"), Some(2));
+        assert_eq!(*tree.get(b"a").unwrap(), 1);
+        assert_eq!(*tree.get(b"abc").unwrap(), 3);
+    }
+
+    #[test]
+    fn serde_roundtrip_empty() {
+        let tree: AdaptiveRadixTree<i32> = AdaptiveRadixTree::new();
+        let json = serde_json::to_string(&tree).unwrap();
+        let restored: AdaptiveRadixTree<i32> = serde_json::from_str(&json).unwrap();
+        assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn display_empty() {
+        let tree: AdaptiveRadixTree<i32> = AdaptiveRadixTree::new();
+        let s = format!("{}", tree);
+        assert!(s.contains("0 entries"));
+    }
+
+    #[test]
+    fn clone_independence() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert(b"hello", 1);
+        let mut clone = tree.clone();
+        clone.insert(b"world", 2);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(clone.len(), 2);
+    }
+
+    #[test]
+    fn many_keys_with_shared_prefix() {
+        let mut tree = AdaptiveRadixTree::new();
+        for i in 0..50u8 {
+            let key = format!("prefix_{}", i);
+            tree.insert(key.as_bytes(), i as i32);
+        }
+        assert_eq!(tree.len(), 50);
+        for i in 0..50u8 {
+            let key = format!("prefix_{}", i);
+            assert_eq!(*tree.get(key.as_bytes()).unwrap(), i as i32);
+        }
+    }
+
+    #[test]
+    fn stress_insert_remove() {
+        let mut tree = AdaptiveRadixTree::new();
+        for i in 0..100u32 {
+            tree.insert(&i.to_be_bytes(), i);
+        }
+        assert_eq!(tree.len(), 100);
+        for i in 0..50u32 {
+            assert_eq!(tree.remove(&i.to_be_bytes()), Some(i));
+        }
+        assert_eq!(tree.len(), 50);
+        for i in 50..100u32 {
+            assert_eq!(*tree.get(&i.to_be_bytes()).unwrap(), i);
+        }
+    }
+
+    #[test]
+    fn contains_str_helper() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert_str("hello", 1);
+        assert!(tree.contains_str("hello"));
+        assert!(!tree.contains_str("world"));
+    }
+
+    #[test]
+    fn remove_str_helper() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert_str("hello", 1);
+        assert_eq!(tree.remove_str("hello"), Some(1));
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn get_str_helper() {
+        let mut tree = AdaptiveRadixTree::new();
+        tree.insert_str("key", 42);
+        assert_eq!(*tree.get_str("key").unwrap(), 42);
+        assert!(tree.get_str("other").is_none());
+    }
+
+    #[test]
+    fn single_byte_keys_all_256() {
+        let mut tree = AdaptiveRadixTree::new();
+        for b in 0..=255u8 {
+            tree.insert(&[b], b as i32);
+        }
+        assert_eq!(tree.len(), 256);
+        // Verify all retrievable
+        for b in 0..=255u8 {
+            assert_eq!(*tree.get(&[b]).unwrap(), b as i32);
+        }
+        // Remove half
+        for b in 0..128u8 {
+            assert_eq!(tree.remove(&[b]), Some(b as i32));
+        }
+        assert_eq!(tree.len(), 128);
     }
 }

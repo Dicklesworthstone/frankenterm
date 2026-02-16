@@ -521,4 +521,204 @@ mod tests {
             assert_eq!(lcp[i], common, "LCP[{}] mismatch", i);
         }
     }
+
+    // ── Additional tests ──────────────────────────────────────────────
+
+    #[test]
+    fn search_empty_pattern() {
+        let sa = SuffixArray::from_str("hello");
+        assert!(sa.search(b"").is_empty());
+        assert_eq!(sa.count(b""), 0);
+    }
+
+    #[test]
+    fn search_on_empty_text() {
+        let sa = SuffixArray::new(b"");
+        assert!(sa.search(b"a").is_empty());
+        assert_eq!(sa.count(b"a"), 0);
+    }
+
+    #[test]
+    fn search_str_and_search_consistent() {
+        let sa = SuffixArray::from_str("abcabc");
+        assert_eq!(sa.search_str("abc"), sa.search(b"abc"));
+    }
+
+    #[test]
+    fn count_str_and_count_consistent() {
+        let sa = SuffixArray::from_str("abcabc");
+        assert_eq!(sa.count_str("abc"), sa.count(b"abc"));
+    }
+
+    #[test]
+    fn search_suffix() {
+        let sa = SuffixArray::from_str("hello world");
+        assert_eq!(sa.search_str("world"), vec![6]);
+    }
+
+    #[test]
+    fn search_prefix() {
+        let sa = SuffixArray::from_str("hello world");
+        assert_eq!(sa.search_str("hello"), vec![0]);
+    }
+
+    #[test]
+    fn search_middle() {
+        let sa = SuffixArray::from_str("hello world");
+        assert_eq!(sa.search_str("lo w"), vec![3]);
+    }
+
+    #[test]
+    fn search_pattern_longer_than_text() {
+        let sa = SuffixArray::from_str("hi");
+        assert!(sa.search_str("hello").is_empty());
+    }
+
+    #[test]
+    fn search_overlapping_occurrences() {
+        let sa = SuffixArray::from_str("aaaa");
+        // "aa" appears at 0, 1, 2
+        assert_eq!(sa.search_str("aa"), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn longest_repeated_empty_text() {
+        let sa = SuffixArray::new(b"");
+        assert_eq!(sa.longest_repeated_substring(), (0, 0));
+    }
+
+    #[test]
+    fn longest_repeated_single_char() {
+        let sa = SuffixArray::from_str("a");
+        assert_eq!(sa.longest_repeated_substring(), (0, 0));
+    }
+
+    #[test]
+    fn longest_repeated_all_same() {
+        let sa = SuffixArray::from_str("aaaa");
+        let (_, len) = sa.longest_repeated_substring();
+        assert_eq!(len, 3); // "aaa" is repeated
+    }
+
+    #[test]
+    fn longest_repeated_substring_str() {
+        let sa = SuffixArray::from_str("abcabc");
+        let substr = sa.longest_repeated_substring_str();
+        assert_eq!(substr, b"abc");
+    }
+
+    #[test]
+    fn longest_repeated_substring_str_empty() {
+        let sa = SuffixArray::new(b"");
+        assert!(sa.longest_repeated_substring_str().is_empty());
+    }
+
+    #[test]
+    fn distinct_substrings_empty() {
+        let sa = SuffixArray::new(b"");
+        assert_eq!(sa.distinct_substring_count(), 0);
+    }
+
+    #[test]
+    fn distinct_substrings_single_char() {
+        let sa = SuffixArray::from_str("a");
+        assert_eq!(sa.distinct_substring_count(), 1);
+    }
+
+    #[test]
+    fn distinct_substrings_all_unique() {
+        let sa = SuffixArray::from_str("abcd");
+        // a,ab,abc,abcd,b,bc,bcd,c,cd,d = 10
+        assert_eq!(sa.distinct_substring_count(), 10);
+    }
+
+    #[test]
+    fn text_accessor() {
+        let sa = SuffixArray::from_str("hello");
+        assert_eq!(sa.text(), b"hello");
+    }
+
+    #[test]
+    fn suffix_array_len_matches_text() {
+        let sa = SuffixArray::from_str("hello");
+        assert_eq!(sa.suffix_array().len(), 5);
+        assert_eq!(sa.lcp_array().len(), 5);
+    }
+
+    #[test]
+    fn serde_roundtrip_empty() {
+        let sa = SuffixArray::new(b"");
+        let json = serde_json::to_string(&sa).unwrap();
+        let restored: SuffixArray = serde_json::from_str(&json).unwrap();
+        assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn display_empty() {
+        let sa = SuffixArray::new(b"");
+        let s = format!("{}", sa);
+        assert!(s.contains("0 bytes"));
+    }
+
+    #[test]
+    fn display_includes_distinct_count() {
+        let sa = SuffixArray::from_str("abc");
+        let s = format!("{}", sa);
+        assert!(s.contains("6 distinct"));
+    }
+
+    #[test]
+    fn clone_independence() {
+        let sa = SuffixArray::from_str("hello");
+        let clone = sa.clone();
+        assert_eq!(sa.search_str("llo"), clone.search_str("llo"));
+    }
+
+    #[test]
+    fn mississippi_detailed() {
+        let sa = SuffixArray::from_str("mississippi");
+        assert_eq!(sa.search_str("issi"), vec![1, 4]);
+        assert_eq!(sa.search_str("ss"), vec![2, 5]);
+        assert_eq!(sa.search_str("p"), vec![8, 9]);
+        assert_eq!(sa.search_str("mississippi"), vec![0]);
+    }
+
+    #[test]
+    fn two_char_text() {
+        let sa = SuffixArray::from_str("ab");
+        assert_eq!(sa.suffix_array(), &[0, 1]);
+        assert_eq!(sa.search_str("a"), vec![0]);
+        assert_eq!(sa.search_str("b"), vec![1]);
+        assert_eq!(sa.search_str("ab"), vec![0]);
+    }
+
+    #[test]
+    fn repeated_pattern() {
+        let sa = SuffixArray::from_str("xyzxyzxyz");
+        assert_eq!(sa.search_str("xyz"), vec![0, 3, 6]);
+        assert_eq!(sa.count_str("xyz"), 3);
+    }
+
+    #[test]
+    fn binary_data_with_zero_bytes() {
+        let data = vec![0u8, 0, 1, 0, 0, 1];
+        let sa = SuffixArray::new(&data);
+        let results = sa.search(&[0, 0, 1]);
+        assert_eq!(results, vec![0, 3]);
+    }
+
+    #[test]
+    fn suffixes_sorted_invariant_mississippi() {
+        let sa = SuffixArray::from_str("mississippi");
+        let arr = sa.suffix_array();
+        let text = sa.text();
+        for w in arr.windows(2) {
+            assert!(
+                &text[w[0]..] <= &text[w[1]..],
+                "suffix at {} not <= suffix at {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
 }
