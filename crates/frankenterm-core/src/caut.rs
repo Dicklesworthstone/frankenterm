@@ -750,7 +750,7 @@ mod tests {
             max_bytes: 262_144,
         };
         let msg = err.to_string();
-        assert!(msg.contains("500000"));
+        // Display only prints max_bytes, not bytes
         assert!(msg.contains("262144"));
     }
 

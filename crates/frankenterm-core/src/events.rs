@@ -3456,6 +3456,9 @@ mod tests {
     #[test]
     fn match_rule_glob_question_mark() {
         assert!(match_rule_glob("codex.err?r", "codex.error"));
-        assert!(!match_rule_glob("codex.err?r", "codex.errrr"));
+        // `?` matches any single char, so codex.err?r matches codex.errrr
+        assert!(match_rule_glob("codex.err?r", "codex.errrr"));
+        // But it should NOT match a longer string
+        assert!(!match_rule_glob("codex.err?r", "codex.errror"));
     }
 }

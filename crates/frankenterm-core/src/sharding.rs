@@ -59,6 +59,40 @@ pub fn is_sharded_pane_id(pane_id: u64) -> bool {
     (pane_id >> (64 - SHARD_ID_BITS)) != 0
 }
 
+/// Serialize HashMap<u64, V> as a map with string keys for JSON compatibility.
+fn serialize_u64_map<S, V: Serialize>(
+    map: &HashMap<u64, V>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut ser_map = serializer.serialize_map(Some(map.len()))?;
+    for (k, v) in map {
+        ser_map.serialize_entry(&k.to_string(), v)?;
+    }
+    ser_map.end()
+}
+
+/// Deserialize HashMap<u64, V> from a map with string keys.
+fn deserialize_u64_map<'de, D, V: Deserialize<'de>>(
+    deserializer: D,
+) -> std::result::Result<HashMap<u64, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let string_map: HashMap<String, V> = HashMap::deserialize(deserializer)?;
+    string_map
+        .into_iter()
+        .map(|(k, v)| {
+            k.parse::<u64>()
+                .map(|k| (k, v))
+                .map_err(serde::de::Error::custom)
+        })
+        .collect()
+}
+
 /// How panes should be assigned to shards.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "strategy")]
@@ -78,6 +112,10 @@ pub enum AssignmentStrategy {
     },
     /// Explicit pane-id map with optional fallback shard.
     Manual {
+        #[serde(
+            serialize_with = "serialize_u64_map",
+            deserialize_with = "deserialize_u64_map"
+        )]
         pane_to_shard: HashMap<u64, ShardId>,
         default_shard: Option<ShardId>,
     },

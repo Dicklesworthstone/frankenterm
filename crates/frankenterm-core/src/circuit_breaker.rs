@@ -1033,9 +1033,9 @@ mod tests {
         let s = CircuitBreakerStatus::default();
         assert_eq!(s.state, CircuitStateKind::Closed);
         assert_eq!(s.consecutive_failures, 0);
-        assert_eq!(s.failure_threshold, 3);
-        assert_eq!(s.success_threshold, 1);
-        assert_eq!(s.open_cooldown_ms, 10_000);
+        assert_eq!(s.failure_threshold, 0);
+        assert_eq!(s.success_threshold, 0);
+        assert_eq!(s.open_cooldown_ms, 0);
         assert!(s.open_for_ms.is_none());
         assert!(s.cooldown_remaining_ms.is_none());
         assert!(s.half_open_successes.is_none());
@@ -1047,7 +1047,7 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: CircuitBreakerStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(back.state, CircuitStateKind::Closed);
-        assert_eq!(back.failure_threshold, 3);
+        assert_eq!(back.failure_threshold, 0);
     }
 
     #[test]

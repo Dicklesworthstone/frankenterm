@@ -196,10 +196,7 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
             stack.push(idx);
             current = self.nodes[idx].left;
         }
-        IntervalTreeIter {
-            tree: self,
-            stack,
-        }
+        IntervalTreeIter { tree: self, stack }
     }
 
     /// Return the minimum low endpoint across all intervals, if any.
@@ -368,7 +365,9 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
                     Some(self.balance(idx))
                 }
             }
-        } else if target < self.nodes.len() && self.nodes[target].interval.low <= self.nodes[idx].interval.low {
+        } else if target < self.nodes.len()
+            && self.nodes[target].interval.low <= self.nodes[idx].interval.low
+        {
             let left = self.nodes[idx].left;
             self.nodes[idx].left = self.remove_at(left, target);
             self.update_augment(idx);
@@ -448,7 +447,9 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
     }
 
     fn rotate_left(&mut self, idx: usize) -> usize {
-        let right = self.nodes[idx].right.expect("rotate_left requires right child");
+        let right = self.nodes[idx]
+            .right
+            .expect("rotate_left requires right child");
         let right_left = self.nodes[right].left;
 
         self.nodes[right].left = Some(idx);
@@ -461,7 +462,9 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
     }
 
     fn rotate_right(&mut self, idx: usize) -> usize {
-        let left = self.nodes[idx].left.expect("rotate_right requires left child");
+        let left = self.nodes[idx]
+            .left
+            .expect("rotate_right requires left child");
         let left_right = self.nodes[left].right;
 
         self.nodes[left].right = Some(idx);
@@ -681,7 +684,7 @@ mod tests {
 
         // Query overlapping [4, 13)
         let results = tree.query_overlap(&iv(4, 13));
-        assert_eq!(results.len(), 3); // a=[1,5), b=[3,8), c=[10,15)
+        assert_eq!(results.len(), 4); // a=[1,5), b=[3,8), c=[10,15), d=[12,20)
 
         // Query overlapping [20, 25) — should only get nothing (d is [12,20))
         let results = tree.query_overlap(&iv(20, 25));
@@ -751,13 +754,10 @@ mod tests {
 
     #[test]
     fn from_iterator() {
-        let tree: IntervalTree<i32, &str> = vec![
-            (iv(1, 5), "a"),
-            (iv(3, 8), "b"),
-            (iv(10, 15), "c"),
-        ]
-        .into_iter()
-        .collect();
+        let tree: IntervalTree<i32, &str> =
+            vec![(iv(1, 5), "a"), (iv(3, 8), "b"), (iv(10, 15), "c")]
+                .into_iter()
+                .collect();
 
         assert_eq!(tree.len(), 3);
         assert_eq!(tree.query_overlap(&iv(4, 9)).len(), 2);
@@ -927,14 +927,8 @@ mod tests {
     #[test]
     fn string_endpoints() {
         let mut tree = IntervalTree::new();
-        tree.insert(
-            Interval::new("aaa".to_string(), "mmm".to_string()),
-            1,
-        );
-        tree.insert(
-            Interval::new("ggg".to_string(), "zzz".to_string()),
-            2,
-        );
+        tree.insert(Interval::new("aaa".to_string(), "mmm".to_string()), 1);
+        tree.insert(Interval::new("ggg".to_string(), "zzz".to_string()), 2);
 
         let results = tree.query_point(&"hello".to_string());
         assert_eq!(results.len(), 2); // both intervals contain "hello"

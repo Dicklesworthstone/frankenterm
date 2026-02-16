@@ -1297,7 +1297,8 @@ mod tests {
         let mut wd = AdaptiveWatchdog::new(AdaptiveWatchdogConfig::default());
         wd.observe(Component::Capture, 1000);
         assert!(wd.tracker(Component::Capture).is_some());
-        assert!(wd.tracker(Component::Discovery).is_none());
+        // All component trackers are pre-created in new()
+        assert!(wd.tracker(Component::Discovery).is_some());
     }
 
     // ── AdaptiveHealthReport additional coverage ────────────

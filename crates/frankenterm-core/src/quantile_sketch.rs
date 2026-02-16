@@ -462,17 +462,16 @@ impl TDigest {
             let last = merged.last().unwrap();
             let proposed_weight = last.weight + centroid.weight;
 
-            // Scale function k(q) = (δ/2) * sin⁻¹(2q - 1) / π + 1/2
-            // The constraint is that the merged centroid's weight must not exceed
-            // the capacity at its quantile position.
+            // Scale function k₁(q) = (δ/2π) · arcsin(2q - 1).
+            // The constraint is that a merged centroid must span at most 1 unit
+            // in k-space: k(q_right) - k(q_left) <= 1.
             let q_left = (cumulative - last.weight) / total_weight;
             let q_right = (cumulative + centroid.weight) / total_weight;
 
             let k_left = self.scale_fn(q_left, delta);
             let k_right = self.scale_fn(q_right, delta);
-            let max_weight = total_weight * (k_right - k_left);
 
-            if proposed_weight <= max_weight {
+            if k_right - k_left <= 1.0 {
                 // Safe to merge
                 let last_mut = merged.last_mut().unwrap();
                 last_mut.merge(centroid);

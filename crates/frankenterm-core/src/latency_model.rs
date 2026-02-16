@@ -1053,10 +1053,10 @@ mod tests {
         let delay = multiplexed_delay_bound(&panes, &svc);
         // D = (50*10000)/(100M - 50*1000) + 0.005
         //   = 500000/99950000 + 0.005
-        //   ≈ 0.005005 seconds ≈ 5.005 ms
+        //   ≈ 0.010005 seconds ≈ 10.005 ms
         let expected = 500_000.0 / (100_000_000.0 - 50_000.0) + 0.005;
         assert!(approx_eq(delay, expected));
-        assert!(delay < 0.006); // < 6ms total delay
+        assert!(delay < 0.011); // < 11ms total delay
     }
 
     // ── FrankenTerm analysis tests ──

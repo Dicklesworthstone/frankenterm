@@ -132,7 +132,7 @@ pub fn cleanup_sessions(
 ///
 /// Active sessions (shutdown_clean = 0 with recent checkpoints) are preserved.
 fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize, rusqlite::Error> {
-    let cutoff_ms = epoch_ms().saturating_sub(max_age_days * 86_400_000);
+    let cutoff_ms = epoch_ms().saturating_sub(max_age_days.saturating_mul(86_400_000));
 
     let deleted = conn.execute(
         "DELETE FROM mux_sessions
@@ -166,7 +166,7 @@ fn delete_excess_closed_sessions(
 
 /// Delete oldest closed sessions until total session data size is under budget.
 fn delete_sessions_by_size(conn: &Connection, max_total_mb: u64) -> Result<usize, rusqlite::Error> {
-    let max_bytes = max_total_mb * 1_024 * 1_024;
+    let max_bytes = max_total_mb.saturating_mul(1_024).saturating_mul(1_024);
 
     // Get total size of session data
     let total_bytes: i64 = conn
