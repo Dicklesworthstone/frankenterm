@@ -176,6 +176,7 @@ pub mod scrollback_eviction;
 pub mod search;
 pub mod search_explain;
 pub mod secrets;
+pub mod segment_tree;
 pub mod self_stabilize;
 pub mod semantic_quality;
 pub mod sequence_model;
