@@ -720,4 +720,527 @@ mod tests {
         assert_eq!(heap.extract_min().unwrap().0, "banana");
         assert_eq!(heap.extract_min().unwrap().0, "cherry");
     }
+
+    // ── Additional tests ──────────────────────────────────────────────
+
+    #[test]
+    fn extract_min_from_empty() {
+        let mut heap: FibonacciHeap<i32, i32> = FibonacciHeap::new();
+        assert_eq!(heap.extract_min(), None);
+        assert_eq!(heap.extract_min(), None); // idempotent
+    }
+
+    #[test]
+    fn pop_from_empty() {
+        let mut heap: FibonacciHeap<i32, i32> = FibonacciHeap::new();
+        assert_eq!(heap.pop(), None);
+    }
+
+    #[test]
+    fn extract_single_element() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(42, 420);
+        assert_eq!(heap.extract_min(), Some((42, 420)));
+        assert!(heap.is_empty());
+        assert_eq!(heap.peek(), None);
+    }
+
+    #[test]
+    fn extract_two_elements_ordered() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(1, 10);
+        heap.insert(2, 20);
+        assert_eq!(heap.extract_min(), Some((1, 10)));
+        assert_eq!(heap.extract_min(), Some((2, 20)));
+        assert!(heap.is_empty());
+    }
+
+    #[test]
+    fn extract_two_elements_reverse() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(2, 20);
+        heap.insert(1, 10);
+        assert_eq!(heap.extract_min(), Some((1, 10)));
+        assert_eq!(heap.extract_min(), Some((2, 20)));
+    }
+
+    #[test]
+    fn peek_is_idempotent() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(5, 50);
+        heap.insert(3, 30);
+        assert_eq!(heap.peek(), Some((&3, &30)));
+        assert_eq!(heap.peek(), Some((&3, &30)));
+        assert_eq!(heap.len(), 2);
+    }
+
+    #[test]
+    fn peek_updates_after_extract() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(1, 10);
+        heap.insert(5, 50);
+        heap.insert(3, 30);
+        assert_eq!(heap.peek(), Some((&1, &10)));
+        heap.extract_min();
+        assert_eq!(heap.peek(), Some((&3, &30)));
+    }
+
+    #[test]
+    fn decrease_key_to_same_value() {
+        let mut heap = FibonacciHeap::new();
+        let h = heap.insert(5, 50);
+        heap.decrease_key(h, 5); // no-op, same key
+        assert_eq!(heap.peek(), Some((&5, &50)));
+    }
+
+    #[test]
+    fn decrease_key_makes_new_min() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(3, 30);
+        let h = heap.insert(10, 100);
+        heap.insert(5, 50);
+        // Force consolidation
+        heap.extract_min(); // removes 3
+        heap.decrease_key(h, 1);
+        assert_eq!(heap.peek(), Some((&1, &100)));
+    }
+
+    #[test]
+    fn decrease_key_multiple_times() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(1, 10);
+        let h = heap.insert(100, 1000);
+        heap.extract_min(); // consolidate
+        heap.decrease_key(h, 50);
+        heap.decrease_key(h, 25);
+        heap.decrease_key(h, 10);
+        assert_eq!(heap.extract_min(), Some((10, 1000)));
+    }
+
+    #[test]
+    fn get_key_value_after_extract() {
+        let mut heap = FibonacciHeap::new();
+        let h = heap.insert(5, 50);
+        heap.extract_min();
+        // Handle is now in the free list
+        assert!(heap.get_key(h).is_none());
+        assert!(heap.get_value(h).is_none());
+    }
+
+    #[test]
+    fn get_key_value_out_of_bounds() {
+        let heap: FibonacciHeap<i32, i32> = FibonacciHeap::new();
+        assert!(heap.get_key(100).is_none());
+        assert!(heap.get_value(100).is_none());
+    }
+
+    #[test]
+    fn node_reuse_after_extract() {
+        let mut heap = FibonacciHeap::new();
+        let h1 = heap.insert(10, 100);
+        heap.extract_min();
+        // New insert should reuse freed slot
+        let h2 = heap.insert(20, 200);
+        assert_eq!(h2, h1); // reuses same index
+        assert_eq!(heap.get_key(h2), Some(&20));
+    }
+
+    #[test]
+    fn interleaved_insert_extract() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(5, 50);
+        heap.insert(3, 30);
+        assert_eq!(heap.extract_min(), Some((3, 30)));
+        heap.insert(1, 10);
+        heap.insert(4, 40);
+        assert_eq!(heap.extract_min(), Some((1, 10)));
+        assert_eq!(heap.extract_min(), Some((4, 40)));
+        assert_eq!(heap.extract_min(), Some((5, 50)));
+        assert!(heap.is_empty());
+    }
+
+    #[test]
+    fn reverse_sorted_input() {
+        let mut heap = FibonacciHeap::new();
+        for i in (0..20).rev() {
+            heap.insert(i, i * 10);
+        }
+        for i in 0..20 {
+            assert_eq!(heap.extract_min(), Some((i, i * 10)));
+        }
+    }
+
+    #[test]
+    fn already_sorted_input() {
+        let mut heap = FibonacciHeap::new();
+        for i in 0..20 {
+            heap.insert(i, i * 10);
+        }
+        for i in 0..20 {
+            assert_eq!(heap.extract_min(), Some((i, i * 10)));
+        }
+    }
+
+    #[test]
+    fn zigzag_input() {
+        let mut heap = FibonacciHeap::new();
+        // Insert in zigzag: 0, 19, 1, 18, 2, 17, ...
+        for i in 0..10 {
+            heap.insert(i, i);
+            heap.insert(19 - i, 19 - i);
+        }
+        for i in 0..20 {
+            assert_eq!(heap.extract_min().unwrap().0, i);
+        }
+    }
+
+    #[test]
+    fn negative_keys() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(-5, 50);
+        heap.insert(-10, 100);
+        heap.insert(0, 0);
+        heap.insert(5, 50);
+        assert_eq!(heap.extract_min(), Some((-10, 100)));
+        assert_eq!(heap.extract_min(), Some((-5, 50)));
+        assert_eq!(heap.extract_min(), Some((0, 0)));
+    }
+
+    #[test]
+    fn duplicate_keys_preserve_all_values() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(1, 100);
+        heap.insert(1, 200);
+        heap.insert(1, 300);
+        let mut values = Vec::new();
+        while let Some((_, v)) = heap.extract_min() {
+            values.push(v);
+        }
+        values.sort();
+        assert_eq!(values, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn merge_both_empty() {
+        let mut h1: FibonacciHeap<i32, i32> = FibonacciHeap::new();
+        let mut h2: FibonacciHeap<i32, i32> = FibonacciHeap::new();
+        h1.merge(&mut h2);
+        assert!(h1.is_empty());
+        assert!(h2.is_empty());
+    }
+
+    #[test]
+    fn merge_large_into_small() {
+        let mut h1 = FibonacciHeap::new();
+        h1.insert(100, 100);
+
+        let mut h2 = FibonacciHeap::new();
+        for i in 0..10 {
+            h2.insert(i, i);
+        }
+
+        h1.merge(&mut h2);
+        assert_eq!(h1.len(), 11);
+        assert_eq!(h1.peek().unwrap().0, &0);
+    }
+
+    #[test]
+    fn chained_merges() {
+        let mut h1 = FibonacciHeap::new();
+        h1.insert(5, 50);
+
+        let mut h2 = FibonacciHeap::new();
+        h2.insert(3, 30);
+
+        let mut h3 = FibonacciHeap::new();
+        h3.insert(1, 10);
+
+        h1.merge(&mut h2);
+        h1.merge(&mut h3);
+        assert_eq!(h1.len(), 3);
+        assert_eq!(h1.extract_min(), Some((1, 10)));
+        assert_eq!(h1.extract_min(), Some((3, 30)));
+        assert_eq!(h1.extract_min(), Some((5, 50)));
+    }
+
+    #[test]
+    fn merge_preserves_decrease_key() {
+        let mut h1 = FibonacciHeap::new();
+        h1.insert(10, 100);
+        let h = h1.insert(20, 200);
+
+        let mut h2 = FibonacciHeap::new();
+        h2.insert(5, 50);
+
+        // Extract+consolidate before merge so we have structured trees
+        h1.extract_min();
+        h1.insert(15, 150);
+
+        h1.merge(&mut h2);
+        // decrease_key on handle from h1
+        h1.decrease_key(h, 1);
+        assert_eq!(h1.peek(), Some((&1, &200)));
+    }
+
+    #[test]
+    fn merge_overlapping_key_ranges() {
+        let mut h1 = FibonacciHeap::new();
+        for i in [1, 3, 5, 7, 9] {
+            h1.insert(i, i);
+        }
+        let mut h2 = FibonacciHeap::new();
+        for i in [2, 4, 6, 8, 10] {
+            h2.insert(i, i);
+        }
+        h1.merge(&mut h2);
+        let sorted = h1.into_sorted();
+        let keys: Vec<i32> = sorted.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, (1..=10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn clone_independence() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(1, 10);
+        heap.insert(2, 20);
+        let mut clone = heap.clone();
+        clone.insert(0, 0);
+        assert_eq!(heap.len(), 2);
+        assert_eq!(clone.len(), 3);
+        assert_eq!(clone.extract_min(), Some((0, 0)));
+    }
+
+    #[test]
+    fn into_sorted_empty() {
+        let heap: FibonacciHeap<i32, i32> = FibonacciHeap::new();
+        let sorted = heap.into_sorted();
+        assert!(sorted.is_empty());
+    }
+
+    #[test]
+    fn into_sorted_single() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(42, 420);
+        let sorted = heap.into_sorted();
+        assert_eq!(sorted, vec![(42, 420)]);
+    }
+
+    #[test]
+    fn sorted_preserves_heap() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(3, 30);
+        heap.insert(1, 10);
+        let _ = heap.sorted();
+        assert_eq!(heap.len(), 2); // original not consumed
+    }
+
+    #[test]
+    fn display_empty() {
+        let heap: FibonacciHeap<i32, i32> = FibonacciHeap::new();
+        assert_eq!(format!("{}", heap), "FibonacciHeap(0 elements)");
+    }
+
+    #[test]
+    fn display_single() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(1, 10);
+        assert_eq!(format!("{}", heap), "FibonacciHeap(1 elements)");
+    }
+
+    #[test]
+    fn serde_roundtrip_empty() {
+        let heap: FibonacciHeap<i32, i32> = FibonacciHeap::new();
+        let json = serde_json::to_string(&heap).unwrap();
+        let restored: FibonacciHeap<i32, i32> = serde_json::from_str(&json).unwrap();
+        assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn serde_roundtrip_after_pops() {
+        let mut heap = FibonacciHeap::new();
+        for i in 0..5 {
+            heap.insert(i, i * 10);
+        }
+        heap.extract_min();
+        heap.extract_min();
+        let json = serde_json::to_string(&heap).unwrap();
+        let restored: FibonacciHeap<i32, i32> = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.len(), 3);
+    }
+
+    #[test]
+    fn len_tracks_insert_and_extract() {
+        let mut heap = FibonacciHeap::new();
+        assert_eq!(heap.len(), 0);
+        heap.insert(1, 10);
+        assert_eq!(heap.len(), 1);
+        heap.insert(2, 20);
+        assert_eq!(heap.len(), 2);
+        heap.extract_min();
+        assert_eq!(heap.len(), 1);
+        heap.extract_min();
+        assert_eq!(heap.len(), 0);
+    }
+
+    #[test]
+    fn len_tracks_merge() {
+        let mut h1 = FibonacciHeap::new();
+        h1.insert(1, 10);
+        let mut h2 = FibonacciHeap::new();
+        h2.insert(2, 20);
+        h2.insert(3, 30);
+        h1.merge(&mut h2);
+        assert_eq!(h1.len(), 3);
+        assert_eq!(h2.len(), 0);
+    }
+
+    #[test]
+    fn u8_keys() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(255u8, "max");
+        heap.insert(0u8, "min");
+        heap.insert(128u8, "mid");
+        assert_eq!(heap.extract_min(), Some((0u8, "min")));
+        assert_eq!(heap.extract_min(), Some((128u8, "mid")));
+        assert_eq!(heap.extract_min(), Some((255u8, "max")));
+    }
+
+    #[test]
+    fn tuple_values() {
+        let mut heap = FibonacciHeap::new();
+        heap.insert(2, ("b", 2));
+        heap.insert(1, ("a", 1));
+        heap.insert(3, ("c", 3));
+        assert_eq!(heap.extract_min(), Some((1, ("a", 1))));
+    }
+
+    #[test]
+    fn stress_insert_extract_mixed() {
+        let mut heap = FibonacciHeap::new();
+        // Insert 100 items, extract every 5th
+        for i in 0..100 {
+            heap.insert(i, i);
+            if i % 5 == 4 {
+                heap.extract_min();
+            }
+        }
+        // Now extract all remaining in order
+        let mut prev = i32::MIN;
+        while let Some((k, _)) = heap.extract_min() {
+            assert!(k >= prev);
+            prev = k;
+        }
+    }
+
+    #[test]
+    fn decrease_key_chain_deep_structure() {
+        let mut heap = FibonacciHeap::new();
+        let handles: Vec<usize> = (0..20).map(|i| heap.insert(i * 10, i)).collect();
+
+        // Multiple extractions to build deep trees
+        for _ in 0..5 {
+            heap.extract_min();
+        }
+
+        // Decrease remaining keys to trigger cascading cuts
+        for i in (5..20).rev() {
+            heap.decrease_key(handles[i], i as i32 - 100);
+        }
+
+        let mut prev = i32::MIN;
+        while let Some((k, _)) = heap.extract_min() {
+            assert!(k >= prev);
+            prev = k;
+        }
+    }
+
+    #[test]
+    fn free_list_grows_with_extractions() {
+        let mut heap = FibonacciHeap::new();
+        for i in 0..10 {
+            heap.insert(i, i);
+        }
+        for _ in 0..10 {
+            heap.extract_min();
+        }
+        assert_eq!(heap.free.len(), 10);
+        // Re-insert should reuse freed slots
+        for i in 0..5 {
+            heap.insert(i + 100, i);
+        }
+        assert_eq!(heap.free.len(), 5); // 5 reused
+    }
+
+    #[test]
+    fn insert_after_drain() {
+        let mut heap = FibonacciHeap::new();
+        for i in 0..10 {
+            heap.insert(i, i);
+        }
+        while heap.extract_min().is_some() {}
+        assert!(heap.is_empty());
+        // Should work fine after full drain
+        heap.insert(42, 420);
+        assert_eq!(heap.len(), 1);
+        assert_eq!(heap.peek(), Some((&42, &420)));
+    }
+
+    #[test]
+    fn many_small_merges() {
+        let mut main = FibonacciHeap::new();
+        for i in 0..20 {
+            let mut small = FibonacciHeap::new();
+            small.insert(i, i * 10);
+            main.merge(&mut small);
+        }
+        assert_eq!(main.len(), 20);
+        let sorted = main.into_sorted();
+        let keys: Vec<i32> = sorted.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, (0..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn merge_donor_becomes_empty() {
+        let mut h1 = FibonacciHeap::new();
+        h1.insert(1, 10);
+        let mut h2 = FibonacciHeap::new();
+        h2.insert(2, 20);
+        h2.insert(3, 30);
+        h1.merge(&mut h2);
+        assert!(h2.is_empty());
+        assert_eq!(h2.len(), 0);
+        assert!(h2.peek().is_none());
+        assert!(h2.extract_min().is_none());
+    }
+
+    #[test]
+    fn consolidation_produces_correct_order() {
+        // Insert many elements, extract to force consolidation, verify order
+        let mut heap = FibonacciHeap::new();
+        let vals = [50, 20, 80, 10, 40, 70, 30, 90, 60];
+        for v in vals {
+            heap.insert(v, v);
+        }
+        // First extract triggers consolidation
+        assert_eq!(heap.extract_min(), Some((10, 10)));
+        assert_eq!(heap.extract_min(), Some((20, 20)));
+        assert_eq!(heap.extract_min(), Some((30, 30)));
+    }
+
+    #[test]
+    fn handle_validity_across_operations() {
+        let mut heap = FibonacciHeap::new();
+        let h0 = heap.insert(10, 100);
+        let h1 = heap.insert(20, 200);
+        let h2 = heap.insert(30, 300);
+
+        assert_eq!(heap.get_key(h0), Some(&10));
+        assert_eq!(heap.get_key(h1), Some(&20));
+        assert_eq!(heap.get_key(h2), Some(&30));
+
+        heap.extract_min(); // removes h0 (key=10)
+        assert!(heap.get_key(h0).is_none()); // freed
+        assert_eq!(heap.get_key(h1), Some(&20));
+        assert_eq!(heap.get_key(h2), Some(&30));
+    }
 }

@@ -716,4 +716,307 @@ mod tests {
         assert!(cache.contains_key(&"a"));
         assert!(!cache.contains_key(&"b"));
     }
+
+    // ── Additional tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_default_cache() {
+        let cache: LfuCache<String, i32> = LfuCache::default();
+        assert!(cache.is_empty());
+        assert_eq!(cache.capacity(), 128);
+    }
+
+    #[test]
+    fn test_get_miss_increments() {
+        let mut cache: LfuCache<&str, i32> = LfuCache::new(5);
+        cache.get(&"x");
+        cache.get(&"y");
+        cache.get(&"z");
+        let stats = cache.stats();
+        assert_eq!(stats.misses, 3);
+        assert_eq!(stats.hits, 0);
+    }
+
+    #[test]
+    fn test_multiple_evictions() {
+        let mut cache = LfuCache::new(2);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        let ev1 = cache.insert("c", 3); // evicts a
+        assert_eq!(ev1, Some(("a", 1)));
+        let ev2 = cache.insert("d", 4); // evicts b or c (both freq=1, b is older)
+        assert_eq!(ev2, Some(("b", 2)));
+    }
+
+    #[test]
+    fn test_frequency_increases_on_get() {
+        let mut cache = LfuCache::new(5);
+        cache.insert("a", 1);
+        assert_eq!(cache.frequency(&"a"), Some(1));
+        cache.get(&"a");
+        assert_eq!(cache.frequency(&"a"), Some(2));
+        cache.get(&"a");
+        cache.get(&"a");
+        assert_eq!(cache.frequency(&"a"), Some(4));
+    }
+
+    #[test]
+    fn test_frequency_increases_on_update() {
+        let mut cache = LfuCache::new(5);
+        cache.insert("a", 1);
+        assert_eq!(cache.frequency(&"a"), Some(1));
+        cache.insert("a", 10); // update increments frequency
+        assert_eq!(cache.frequency(&"a"), Some(2));
+        assert_eq!(cache.peek(&"a"), Some(&10));
+    }
+
+    #[test]
+    fn test_frequency_nonexistent() {
+        let cache: LfuCache<&str, i32> = LfuCache::new(5);
+        assert_eq!(cache.frequency(&"x"), None);
+    }
+
+    #[test]
+    fn test_min_frequency_tracking() {
+        let mut cache = LfuCache::new(5);
+        let stats = cache.stats();
+        assert_eq!(stats.min_frequency, 0); // empty cache
+        cache.insert("a", 1);
+        let stats = cache.stats();
+        assert_eq!(stats.min_frequency, 1); // just inserted
+        cache.get(&"a"); // freq=2
+        cache.insert("b", 2); // min_frequency resets to 1
+        let stats = cache.stats();
+        assert_eq!(stats.min_frequency, 1);
+    }
+
+    #[test]
+    fn test_eviction_all_same_frequency() {
+        let mut cache = LfuCache::new(3);
+        cache.insert("a", 1); // freq=1, oldest
+        cache.insert("b", 2); // freq=1
+        cache.insert("c", 3); // freq=1, newest
+        // All same frequency — evicts by LRU (oldest = "a")
+        let evicted = cache.insert("d", 4);
+        assert_eq!(evicted, Some(("a", 1)));
+    }
+
+    #[test]
+    fn test_eviction_respects_frequency_over_recency() {
+        let mut cache = LfuCache::new(3);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        cache.insert("c", 3);
+        // Boost a and b
+        cache.get(&"a"); // freq=2
+        cache.get(&"b"); // freq=2
+        // c has freq=1, should be evicted
+        let evicted = cache.insert("d", 4);
+        assert_eq!(evicted, Some(("c", 3)));
+    }
+
+    #[test]
+    fn test_remove_from_full_then_insert() {
+        let mut cache = LfuCache::new(2);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        assert!(cache.is_full());
+        cache.remove(&"a");
+        assert!(!cache.is_full());
+        let evicted = cache.insert("c", 3);
+        assert_eq!(evicted, None); // no eviction needed
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_contains_key_after_eviction() {
+        let mut cache = LfuCache::new(2);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        cache.insert("c", 3); // evicts a
+        assert!(!cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"b"));
+        assert!(cache.contains_key(&"c"));
+    }
+
+    #[test]
+    fn test_is_full_after_eviction() {
+        let mut cache = LfuCache::new(2);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        assert!(cache.is_full());
+        cache.insert("c", 3); // evicts one, inserts one — still full
+        assert!(cache.is_full());
+    }
+
+    #[test]
+    fn test_peek_nonexistent() {
+        let cache: LfuCache<&str, i32> = LfuCache::new(5);
+        assert_eq!(cache.peek(&"x"), None);
+    }
+
+    #[test]
+    fn test_peek_doesnt_count_stats() {
+        let mut cache = LfuCache::new(5);
+        cache.insert("a", 1);
+        let _ = cache.peek(&"a");
+        let _ = cache.peek(&"b");
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+    }
+
+    #[test]
+    fn test_clear_then_reinsert() {
+        let mut cache = LfuCache::new(3);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        cache.get(&"a");
+        cache.clear();
+        assert!(cache.is_empty());
+        cache.insert("c", 3);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&"c"), Some(&3));
+    }
+
+    #[test]
+    fn test_keys_unordered() {
+        let mut cache = LfuCache::new(5);
+        cache.insert("z", 26);
+        cache.insert("a", 1);
+        cache.insert("m", 13);
+        let mut keys = cache.keys();
+        keys.sort();
+        assert_eq!(keys, vec!["a", "m", "z"]);
+    }
+
+    #[test]
+    fn test_integer_keys() {
+        let mut cache = LfuCache::new(3);
+        cache.insert(1, "one");
+        cache.insert(2, "two");
+        cache.insert(3, "three");
+        assert_eq!(cache.get(&1), Some(&"one"));
+        cache.insert(4, "four"); // evicts least freq
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn test_string_owned_keys() {
+        let mut cache = LfuCache::new(2);
+        cache.insert("hello".to_string(), 1);
+        cache.insert("world".to_string(), 2);
+        assert_eq!(cache.get(&"hello".to_string()), Some(&1));
+    }
+
+    #[test]
+    fn test_update_same_key_many_times() {
+        let mut cache = LfuCache::new(3);
+        for i in 0..10 {
+            cache.insert("a", i);
+        }
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.peek(&"a"), Some(&9));
+        assert_eq!(cache.frequency(&"a"), Some(10));
+    }
+
+    #[test]
+    fn test_eviction_counter() {
+        let mut cache = LfuCache::new(1);
+        cache.insert("a", 1);
+        cache.insert("b", 2); // evicts a
+        cache.insert("c", 3); // evicts b
+        let stats = cache.stats();
+        assert_eq!(stats.evictions, 2);
+    }
+
+    #[test]
+    fn test_remove_does_not_count_eviction() {
+        let mut cache = LfuCache::new(5);
+        cache.insert("a", 1);
+        cache.remove(&"a");
+        let stats = cache.stats();
+        assert_eq!(stats.evictions, 0);
+    }
+
+    #[test]
+    fn test_capacity_one_repeated_insert() {
+        let mut cache = LfuCache::new(1);
+        for i in 0..10 {
+            cache.insert(i, i * 10);
+        }
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&9), Some(&90));
+    }
+
+    #[test]
+    fn test_large_cache_stress() {
+        let mut cache = LfuCache::new(100);
+        for i in 0..200 {
+            cache.insert(i, i * 10);
+        }
+        assert_eq!(cache.len(), 100);
+        let stats = cache.stats();
+        assert_eq!(stats.evictions, 100);
+    }
+
+    #[test]
+    fn test_frequency_promotion_chain() {
+        let mut cache = LfuCache::new(3);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        cache.insert("c", 3);
+        // Promote a to freq=3
+        cache.get(&"a");
+        cache.get(&"a");
+        // Promote b to freq=2
+        cache.get(&"b");
+        // c stays at freq=1 — should be evicted
+        let evicted = cache.insert("d", 4);
+        assert_eq!(evicted, Some(("c", 3)));
+        // Now d(freq=1) is lowest, should be next eviction
+        let evicted2 = cache.insert("e", 5);
+        assert_eq!(evicted2, Some(("d", 4)));
+    }
+
+    #[test]
+    fn test_stats_comprehensive() {
+        let mut cache = LfuCache::new(2);
+        cache.insert("a", 1); // insert
+        cache.insert("b", 2); // insert
+        cache.get(&"a"); // hit
+        cache.get(&"c"); // miss
+        cache.insert("c", 3); // evict + insert
+
+        let stats = cache.stats();
+        assert_eq!(stats.entry_count, 2);
+        assert_eq!(stats.capacity, 2);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.evictions, 1);
+    }
+
+    #[test]
+    fn test_config_default() {
+        let config = LfuCacheConfig::default();
+        assert_eq!(config.capacity, 128);
+    }
+
+    #[test]
+    fn test_config_equality() {
+        let c1 = LfuCacheConfig { capacity: 42 };
+        let c2 = LfuCacheConfig { capacity: 42 };
+        let c3 = LfuCacheConfig { capacity: 100 };
+        assert_eq!(c1, c2);
+        assert_ne!(c1, c3);
+    }
+
+    #[test]
+    fn test_stats_equality() {
+        let mut cache = LfuCache::new(5);
+        cache.insert("a", 1);
+        let s1 = cache.stats();
+        let s2 = cache.stats();
+        assert_eq!(s1, s2);
+    }
 }

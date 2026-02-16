@@ -622,4 +622,324 @@ mod tests {
         keys.sort();
         assert_eq!(keys, vec!["hello", "world"]);
     }
+
+    // ── Additional tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_default_is_empty() {
+        let t = Trie::default();
+        assert!(t.is_empty());
+        assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn test_insert_bytes_duplicate() {
+        let mut t = Trie::new();
+        assert!(t.insert_bytes(b"abc"));
+        assert!(!t.insert_bytes(b"abc"));
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn test_contains_nonexistent() {
+        let mut t = Trie::new();
+        t.insert("hello");
+        assert!(!t.contains("goodbye"));
+        assert!(!t.contains("h"));
+        assert!(!t.contains("helloworld"));
+    }
+
+    #[test]
+    fn test_remove_all_keys() {
+        let mut t = Trie::new();
+        t.insert("a");
+        t.insert("b");
+        t.insert("c");
+        assert!(t.remove("a"));
+        assert!(t.remove("b"));
+        assert!(t.remove("c"));
+        assert!(t.is_empty());
+        assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn test_remove_then_reinsert() {
+        let mut t = Trie::new();
+        t.insert("hello");
+        t.remove("hello");
+        assert!(!t.contains("hello"));
+        assert!(t.insert("hello")); // should be treated as new
+        assert!(t.contains("hello"));
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_partial_key_doesnt_exist() {
+        let mut t = Trie::new();
+        t.insert("hello");
+        assert!(!t.remove("hel")); // "hel" not inserted as a complete key
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn test_starts_with_empty_trie() {
+        let t = Trie::new();
+        assert!(!t.starts_with("anything"));
+    }
+
+    #[test]
+    fn test_starts_with_empty_prefix_empty_trie() {
+        let t = Trie::new();
+        // Empty prefix on empty trie — root is not terminal
+        assert!(!t.starts_with(""));
+    }
+
+    #[test]
+    fn test_starts_with_empty_prefix_nonempty_trie() {
+        let mut t = Trie::new();
+        t.insert("hello");
+        assert!(t.starts_with(""));
+    }
+
+    #[test]
+    fn test_keys_with_prefix_no_matches() {
+        let mut t = Trie::new();
+        t.insert("hello");
+        t.insert("world");
+        let keys = t.keys_with_prefix("xyz");
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_keys_with_prefix_exact_match_only() {
+        let mut t = Trie::new();
+        t.insert("hello");
+        let keys = t.keys_with_prefix("hello");
+        assert_eq!(keys, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_keys_with_prefix_bytes() {
+        let mut t = Trie::new();
+        t.insert_bytes(b"abc");
+        t.insert_bytes(b"abd");
+        t.insert_bytes(b"xyz");
+        let keys = t.keys_with_prefix_bytes(b"ab");
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn test_longest_common_prefix_no_match() {
+        let mut t = Trie::new();
+        t.insert("hello");
+        assert_eq!(t.longest_common_prefix("world"), "");
+    }
+
+    #[test]
+    fn test_longest_common_prefix_empty_key() {
+        let mut t = Trie::new();
+        t.insert("");
+        assert_eq!(t.longest_common_prefix("anything"), "");
+    }
+
+    #[test]
+    fn test_longest_common_prefix_full_match() {
+        let mut t = Trie::new();
+        t.insert("hello");
+        assert_eq!(t.longest_common_prefix("hello"), "hello");
+    }
+
+    #[test]
+    fn test_longest_shared_prefix_no_overlap() {
+        let mut t = Trie::new();
+        t.insert("abc");
+        assert_eq!(t.longest_shared_prefix("xyz"), "");
+    }
+
+    #[test]
+    fn test_longest_shared_prefix_partial() {
+        let mut t = Trie::new();
+        t.insert("abcdef");
+        assert_eq!(t.longest_shared_prefix("abcxyz"), "abc");
+    }
+
+    #[test]
+    fn test_longest_shared_prefix_empty_key() {
+        let mut t = Trie::new();
+        t.insert("hello");
+        assert_eq!(t.longest_shared_prefix(""), "");
+    }
+
+    #[test]
+    fn test_all_keys_empty() {
+        let t = Trie::new();
+        assert!(t.all_keys().is_empty());
+    }
+
+    #[test]
+    fn test_all_keys_after_removals() {
+        let mut t = Trie::new();
+        t.insert("apple");
+        t.insert("banana");
+        t.insert("cherry");
+        t.remove("banana");
+        assert_eq!(t.all_keys(), vec!["apple", "cherry"]);
+    }
+
+    #[test]
+    fn test_clear_then_reuse() {
+        let mut t = Trie::new();
+        t.insert("hello");
+        t.insert("world");
+        t.clear();
+        assert!(t.is_empty());
+        t.insert("new");
+        assert_eq!(t.len(), 1);
+        assert!(t.contains("new"));
+        assert!(!t.contains("hello"));
+    }
+
+    #[test]
+    fn test_stats_insert_count() {
+        let mut t = Trie::new();
+        t.insert("a");
+        t.insert("b");
+        t.insert("a"); // duplicate
+        let stats = t.stats();
+        assert_eq!(stats.insert_count, 3); // all insert calls counted
+        assert_eq!(stats.key_count, 2); // only 2 distinct keys
+    }
+
+    #[test]
+    fn test_stats_lookup_count() {
+        let mut t = Trie::new();
+        t.insert("hello");
+        t.contains("hello");
+        t.contains("world");
+        t.longest_common_prefix("test");
+        let stats = t.stats();
+        assert_eq!(stats.lookup_count, 3);
+    }
+
+    #[test]
+    fn test_stats_node_count_chain() {
+        let mut t = Trie::new();
+        t.insert("abcde");
+        let stats = t.stats();
+        // root + a + b + c + d + e = 6 nodes
+        assert_eq!(stats.node_count, 6);
+    }
+
+    #[test]
+    fn test_memory_bytes_nonzero() {
+        let t = Trie::new();
+        assert!(t.memory_bytes() > 0); // at least the root
+    }
+
+    #[test]
+    fn test_large_key_set() {
+        let mut t = Trie::new();
+        for i in 0..500 {
+            t.insert(&format!("key_{:04}", i));
+        }
+        assert_eq!(t.len(), 500);
+        for i in 0..500 {
+            assert!(t.contains(&format!("key_{:04}", i)));
+        }
+    }
+
+    #[test]
+    fn test_deeply_nested_keys() {
+        let mut t = Trie::new();
+        let long_key = "a".repeat(200);
+        t.insert(&long_key);
+        assert!(t.contains(&long_key));
+        assert!(!t.contains(&"a".repeat(199)));
+    }
+
+    #[test]
+    fn test_binary_keys_non_utf8() {
+        let mut t = Trie::new();
+        let key = vec![0u8, 255, 128, 64];
+        assert!(t.insert_bytes(&key));
+        assert!(t.contains_bytes(&key));
+        assert!(!t.contains_bytes(&[0, 255]));
+    }
+
+    #[test]
+    fn test_remove_chain_prunes_nodes() {
+        let mut t = Trie::new();
+        t.insert("abcde");
+        assert_eq!(t.stats().node_count, 6); // root + 5 chars
+        t.remove("abcde");
+        // After removing the only key, nodes should be pruned
+        assert_eq!(t.stats().node_count, 1); // only root remains
+    }
+
+    #[test]
+    fn test_remove_doesnt_prune_shared_nodes() {
+        let mut t = Trie::new();
+        t.insert("abc");
+        t.insert("abd");
+        t.remove("abc");
+        assert!(t.contains("abd"));
+        assert!(t.starts_with("ab"));
+    }
+
+    #[test]
+    fn test_clone_preserves_stats() {
+        let mut t = Trie::new();
+        t.insert("hello");
+        t.contains("hello");
+        let clone = t.clone();
+        let stats = clone.stats();
+        assert_eq!(stats.key_count, 1);
+        assert_eq!(stats.insert_count, 1);
+        assert_eq!(stats.lookup_count, 1);
+    }
+
+    #[test]
+    fn test_special_characters() {
+        let mut t = Trie::new();
+        t.insert("hello world");
+        t.insert("hello\tworld");
+        t.insert("hello\nworld");
+        assert_eq!(t.len(), 3);
+        assert!(t.contains("hello world"));
+        assert!(t.contains("hello\tworld"));
+    }
+
+    #[test]
+    fn test_unicode_keys() {
+        let mut t = Trie::new();
+        t.insert("cafe\u{0301}"); // café with combining accent
+        t.insert("日本語");
+        t.insert("🎉");
+        assert_eq!(t.len(), 3);
+        assert!(t.contains("日本語"));
+    }
+
+    #[test]
+    fn test_config_default() {
+        let config = TrieConfig::default();
+        assert_eq!(config.expected_keys, 256);
+    }
+
+    #[test]
+    fn test_config_equality() {
+        let c1 = TrieConfig { expected_keys: 100 };
+        let c2 = TrieConfig { expected_keys: 100 };
+        let c3 = TrieConfig { expected_keys: 200 };
+        assert_eq!(c1, c2);
+        assert_ne!(c1, c3);
+    }
+
+    #[test]
+    fn test_stats_equality() {
+        let mut t = Trie::new();
+        t.insert("a");
+        let s1 = t.stats();
+        let s2 = t.stats();
+        assert_eq!(s1, s2);
+    }
 }
