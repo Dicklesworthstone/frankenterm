@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)]
 //! Property-based tests for persistent_ds.rs — immutable data structures.
 //!
 //! Bead: ft-283h4.7.1
@@ -168,7 +169,7 @@ proptest! {
         for &item in &items {
             v = v.push(item);
         }
-        let collected: Vec<_> = v.iter().cloned().collect();
+        let collected: Vec<_> = v.iter().copied().collect();
         prop_assert_eq!(collected, items);
     }
 

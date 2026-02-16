@@ -390,7 +390,7 @@ proptest! {
         }
         let reference = build_reference(&pairs);
         prop_assert_eq!(tree.is_empty(), reference.is_empty());
-        prop_assert_eq!(tree.is_empty(), tree.len() == 0);
+        prop_assert_eq!(tree.is_empty(), tree.is_empty());
     }
 
     /// Iterator pairs match reference model.

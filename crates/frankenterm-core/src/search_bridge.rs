@@ -619,7 +619,7 @@ mod tests {
             .await
             .map_err(|message| SearchBridgeError::Runtime { message })?;
 
-            return joined.map_err(SearchBridgeError::Search);
+            joined.map_err(SearchBridgeError::Search)
         }
     }
 

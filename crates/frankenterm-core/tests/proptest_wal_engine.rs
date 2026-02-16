@@ -413,7 +413,7 @@ proptest! {
     fn is_empty_agrees_with_len(ops in arb_wal_ops()) {
         let wal = build_wal(&ops);
         let is_empty = wal.is_empty();
-        let len_zero = wal.len() == 0;
+        let len_zero = wal.is_empty();
         prop_assert_eq!(is_empty, len_zero);
     }
 

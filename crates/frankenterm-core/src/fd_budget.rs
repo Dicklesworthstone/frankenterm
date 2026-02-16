@@ -503,6 +503,7 @@ pub struct AuditResult {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::float_cmp, clippy::overly_complex_bool_expr)]
 mod tests {
     use super::*;
 

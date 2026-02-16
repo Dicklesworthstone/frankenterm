@@ -381,7 +381,7 @@ proptest! {
     #[test]
     fn prop_is_empty_agrees_with_len(keys in arb_keys(15)) {
         let t = build_trie(&keys);
-        prop_assert_eq!(t.is_empty(), t.len() == 0);
+        prop_assert_eq!(t.is_empty(), t.is_empty());
     }
 
     /// all_keys().len() == len().

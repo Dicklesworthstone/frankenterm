@@ -1,3 +1,4 @@
+#![allow(clippy::overly_complex_bool_expr, clippy::comparison_chain)]
 //! Expanded property-based tests for the `watchdog` module.
 //!
 //! Focuses on HeartbeatRegistry behavioral invariants (check_health logic),
@@ -629,7 +630,7 @@ proptest! {
         a in arb_health_status(),
         b in arb_health_status(),
     ) {
-        prop_assert!(a < b || a == b || a > b, "ordering should be total");
+        prop_assert!(a <= b || a > b, "ordering should be total");
     }
 }
 

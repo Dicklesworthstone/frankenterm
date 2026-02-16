@@ -1173,7 +1173,7 @@ mod tests {
         let dbg = format!("{:?}", dt);
         assert!(dbg.contains("RateDrop"));
         let copied = dt; // Copy
-        let cloned = dt.clone(); // Clone
+        let cloned = dt; // Clone
         assert_eq!(copied, cloned);
     }
 

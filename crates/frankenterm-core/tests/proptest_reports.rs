@@ -143,14 +143,14 @@ proptest! {
     #[test]
     fn days_to_ymd_month_range(days in arb_days()) {
         let (_, m, _) = days_to_ymd(days);
-        prop_assert!(m >= 1 && m <= 12, "month {} out of range for day {}", m, days);
+        prop_assert!((1..=12).contains(&m), "month {} out of range for day {}", m, days);
     }
 
     /// Day is always in [1, 31].
     #[test]
     fn days_to_ymd_day_range(days in arb_days()) {
         let (_, _, d) = days_to_ymd(days);
-        prop_assert!(d >= 1 && d <= 31, "day {} out of range for day-count {}", d, days);
+        prop_assert!((1..=31).contains(&d), "day {} out of range for day-count {}", d, days);
     }
 
     /// Day never exceeds the maximum for its month/year.
@@ -277,8 +277,8 @@ proptest! {
         let s = format_ts(ms);
         let month: u32 = s[5..7].parse().unwrap_or(0);
         let day: u32 = s[8..10].parse().unwrap_or(0);
-        prop_assert!(month >= 1 && month <= 12, "month {} invalid in '{}'", month, s);
-        prop_assert!(day >= 1 && day <= 31, "day {} invalid in '{}'", day, s);
+        prop_assert!((1..=12).contains(&month), "month {} invalid in '{}'", month, s);
+        prop_assert!((1..=31).contains(&day), "day {} invalid in '{}'", day, s);
     }
 
     /// Monotonicity: later timestamps produce lexicographically >= output.
@@ -410,7 +410,7 @@ proptest! {
         let num_str = &s[..s.len() - 1];
         let val: f64 = num_str.parse().unwrap_or(f64::NAN);
         prop_assert!(!val.is_nan(), "tier2 '{}' not parseable as float", s);
-        prop_assert!(val >= 1.0 && val <= 60.0, "tier2 value {} out of expected range", val);
+        prop_assert!((1.0..=60.0).contains(&val), "tier2 value {} out of expected range", val);
     }
 
     /// Tier 3 minutes and seconds are consistent.
@@ -424,7 +424,7 @@ proptest! {
         let secs_str = parts[1].trim().trim_end_matches('s').trim();
         let secs: i64 = secs_str.parse().unwrap_or(-1);
         prop_assert!(mins >= 1, "minutes should be >= 1: '{}'", s);
-        prop_assert!(secs >= 0 && secs < 60, "seconds {} out of range in '{}'", secs, s);
+        prop_assert!((0..60).contains(&secs), "seconds {} out of range in '{}'", secs, s);
         // Verify: mins * 60 + secs == ms / 1000 (integer division)
         let expected_total_secs = ms / 1000;
         let actual_total_secs = mins * 60 + secs;

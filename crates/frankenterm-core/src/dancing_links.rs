@@ -504,7 +504,7 @@ mod tests {
         let solution = dlx.solve().unwrap();
 
         // Verify it's a valid exact cover
-        let mut covered = vec![false; 7];
+        let mut covered = [false; 7];
         for &row in &solution {
             let cols = match row {
                 0 => vec![2, 4, 5],
@@ -576,7 +576,7 @@ mod tests {
         assert!(solution.is_some());
         let sol = solution.unwrap();
 
-        let mut covered = vec![false; 3];
+        let mut covered = [false; 3];
         for &row in &sol {
             for (col, &val) in matrix[row].iter().enumerate() {
                 if val {
@@ -653,7 +653,7 @@ mod tests {
 
         let solutions = dlx.solve_all();
         for solution in &solutions {
-            let mut covered = vec![false; 4];
+            let mut covered = [false; 4];
             for &row in solution {
                 let cols = match row {
                     0 => vec![0, 1],
@@ -927,7 +927,7 @@ mod tests {
         assert!(!solutions.is_empty());
 
         for solution in &solutions {
-            let mut covered = vec![false; 6];
+            let mut covered = [false; 6];
             for &row in solution {
                 for &col in &row_cols[row] {
                     assert!(!covered[col], "column {} double-covered", col);

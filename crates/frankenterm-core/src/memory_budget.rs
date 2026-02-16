@@ -1002,7 +1002,7 @@ mod tests {
         let a = BudgetLevel::Throttled;
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, c);
     }
 

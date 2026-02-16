@@ -603,7 +603,7 @@ proptest! {
         let mut heap: PairingHeap<i32, i32> = PairingHeap::new();
 
         // Empty state
-        let len_zero = heap.len() == 0;
+        let len_zero = heap.is_empty();
         let empty = heap.is_empty();
         prop_assert_eq!(empty, len_zero, "is_empty disagrees with len on empty heap");
 

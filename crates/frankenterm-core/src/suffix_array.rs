@@ -715,7 +715,7 @@ mod tests {
         let text = sa.text();
         for w in arr.windows(2) {
             assert!(
-                &text[w[0]..] <= &text[w[1]..],
+                text[w[0]..] <= text[w[1]..],
                 "suffix at {} not <= suffix at {}",
                 w[0],
                 w[1]

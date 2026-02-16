@@ -838,7 +838,7 @@ mod tests {
     fn caut_service_clone_copy_eq() {
         let s1 = CautService::OpenAI;
         let s2 = s1; // Copy
-        let s3 = s1.clone();
+        let s3 = s1;
         assert_eq!(s1, s2);
         assert_eq!(s1, s3);
     }

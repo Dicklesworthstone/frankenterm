@@ -3784,7 +3784,7 @@ mod tests {
                 1,
                 ResizeWorkClass::Interactive,
                 4,
-                100 + i as u64,
+                100 + i,
                 ResizeDomain::Ssh {
                     host: "remote1".into(),
                 },

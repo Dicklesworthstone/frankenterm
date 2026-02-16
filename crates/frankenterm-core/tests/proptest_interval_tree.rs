@@ -1,3 +1,4 @@
+#![allow(clippy::trivially_copy_pass_by_ref, clippy::needless_collect)]
 //! Property-based tests for `interval_tree` module.
 //!
 //! Verifies correctness invariants of the augmented interval tree using proptest:
@@ -23,6 +24,7 @@ fn intervals_strategy(max_len: usize) -> impl Strategy<Value = Vec<(Interval<i32
     prop::collection::vec((interval_strategy(), 0..1000u32), 0..max_len)
 }
 
+#[allow(dead_code)]
 fn tree_strategy(max_len: usize) -> impl Strategy<Value = IntervalTree<i32, u32>> {
     intervals_strategy(max_len).prop_map(|intervals| {
         let mut tree = IntervalTree::new();
@@ -328,8 +330,8 @@ proptest! {
         let json = serde_json::to_string(&tree).unwrap();
         let restored: IntervalTree<i32, u32> = serde_json::from_str(&json).unwrap();
 
-        let orig_max = tree.max_high().cloned();
-        let rest_max = restored.max_high().cloned();
+        let orig_max = tree.max_high().copied();
+        let rest_max = restored.max_high().copied();
         prop_assert_eq!(orig_max, rest_max);
     }
 
@@ -437,7 +439,7 @@ proptest! {
 
         for (iv, val) in &intervals {
             tree.insert(iv.clone(), *val);
-            let current_max = tree.max_high().cloned().unwrap();
+            let current_max = tree.max_high().copied().unwrap();
 
             if let Some(pm) = prev_max {
                 prop_assert!(

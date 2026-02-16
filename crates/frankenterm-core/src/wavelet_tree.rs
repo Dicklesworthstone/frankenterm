@@ -548,7 +548,7 @@ mod tests {
         // select(symbol, n) returns pos such that rank(symbol, pos+1) == n
         let data = b"abracadabra";
         let wt = WaveletTree::new(data);
-        for &symbol in &[b'a', b'b', b'c', b'd', b'r'] {
+        for &symbol in b"abcdr" {
             let total = wt.rank(symbol, data.len());
             for n in 1..=total {
                 let pos = wt.select(symbol, n).unwrap();
@@ -588,7 +588,7 @@ mod tests {
     fn range_count_full_range_equals_rank() {
         let data = b"abracadabra";
         let wt = WaveletTree::new(data);
-        for &symbol in &[b'a', b'b', b'c', b'd', b'r'] {
+        for &symbol in b"abcdr" {
             assert_eq!(
                 wt.range_count(symbol, 0, data.len()),
                 wt.rank(symbol, data.len()),
@@ -602,7 +602,7 @@ mod tests {
         let data = b"abracadabra";
         let wt = WaveletTree::new(data);
         let mid = 5;
-        for &symbol in &[b'a', b'b', b'r'] {
+        for &symbol in b"abr" {
             let full = wt.range_count(symbol, 0, data.len());
             let left = wt.range_count(symbol, 0, mid);
             let right = wt.range_count(symbol, mid, data.len());
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn alphabet_size_all_same() {
-        let wt = WaveletTree::new(&vec![100u8; 50]);
+        let wt = WaveletTree::new(&[100u8; 50]);
         assert_eq!(wt.alphabet_size(), 1);
     }
 
@@ -692,7 +692,7 @@ mod tests {
         let restored: WaveletTree = serde_json::from_str(&json).unwrap();
 
         // Verify all queries match
-        for &sym in &[b't', b'h', b'e', b' ', b'o'] {
+        for &sym in b"the o" {
             assert_eq!(restored.rank(sym, data.len()), wt.rank(sym, data.len()));
         }
         assert_eq!(restored.alphabet_size(), wt.alphabet_size());

@@ -432,6 +432,7 @@ impl<K: Ord, V> SkipList<K, V> {
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop, clippy::needless_collect)]
 mod tests {
     use super::*;
 

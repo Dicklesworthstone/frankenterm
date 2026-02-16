@@ -1,3 +1,4 @@
+#![allow(clippy::no_effect_underscore_binding)]
 //! Property-based tests for pane_typestate.rs — compile-time pane lifecycle.
 //!
 //! Bead: ft-283h4.10
@@ -63,6 +64,7 @@ fn arb_snapshot_data() -> impl Strategy<Value = SnapshotData> {
 
 /// Transition operation in the state machine.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 enum TransitionOp {
     Activate,
     BeginSnapshot,
@@ -93,7 +95,7 @@ fn arb_transition_ops() -> impl Strategy<Value = Vec<TransitionOp>> {
 /// Returns the final state label and transition count.
 fn execute_ops(config: PaneConfig, ops: &[TransitionOp]) -> (StateLabel, u32) {
     let mut state = StateLabel::Creating;
-    let mut pane_id = config.pane_id;
+    let pane_id = config.pane_id;
 
     // We simulate with runtime state tracking since we can't
     // generically hold TypedPane<S> across different S types.
@@ -432,8 +434,8 @@ proptest! {
         prop_assert_eq!(log.len(), len);
 
         // Sum of per-pane counts equals total
-        let mut total = 0usize;
-        for &pid in &pane_ids[..len] {
+        let _total = 0usize;
+        for &_pid in &pane_ids[..len] {
             // Count unique appearances (may double-count, use set)
         }
         // Simpler check: records_for_pane returns subset
@@ -487,7 +489,7 @@ proptest! {
     /// Once closed, state never changes.
     #[test]
     fn closed_is_absorbing(
-        config in arb_pane_config(),
+        _config in arb_pane_config(),
         ops in arb_transition_ops()
     ) {
         let mut current = StateLabel::Creating;

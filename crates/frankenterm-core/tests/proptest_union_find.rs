@@ -366,7 +366,7 @@ proptest! {
     fn prop_clone_independence(
         (n, ops) in arb_union_find(15),
     ) {
-        let mut uf = build_uf(n, &ops);
+        let uf = build_uf(n, &ops);
         let original_count = uf.component_count();
         let mut clone = uf.clone();
         // Union everything in clone

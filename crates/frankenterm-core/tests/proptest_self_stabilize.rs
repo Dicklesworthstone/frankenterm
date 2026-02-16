@@ -1,3 +1,4 @@
+#![allow(clippy::comparison_chain)]
 //! Property-based tests for self_stabilize.rs — convergent reconciliation protocol.
 //!
 //! Bead: ft-283h4.13.1
@@ -22,12 +23,12 @@ fn arb_entry() -> impl Strategy<Value = (Vec<u8>, Vec<u8>)> {
 
 fn arb_tree(max_entries: usize) -> impl Strategy<Value = MerkleTree> {
     prop::collection::vec(arb_entry(), 0..max_entries)
-        .prop_map(|entries| MerkleTree::from_entries(entries))
+        .prop_map(MerkleTree::from_entries)
 }
 
 fn arb_nonempty_tree(max_entries: usize) -> impl Strategy<Value = MerkleTree> {
     prop::collection::vec(arb_entry(), 1..max_entries)
-        .prop_map(|entries| MerkleTree::from_entries(entries))
+        .prop_map(MerkleTree::from_entries)
 }
 
 fn arb_config() -> impl Strategy<Value = ReconcileConfig> {

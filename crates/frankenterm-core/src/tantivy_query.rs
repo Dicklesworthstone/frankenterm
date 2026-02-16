@@ -1645,7 +1645,7 @@ mod tests {
     #[test]
     fn sort_field_debug_clone_copy() {
         let f = SortField::Sequence;
-        let cloned = f.clone();
+        let cloned = f;
         let copied = f;
         assert_eq!(cloned, copied);
         let dbg = format!("{:?}", f);
@@ -1935,7 +1935,7 @@ mod tests {
     #[test]
     fn event_direction_debug_clone_copy() {
         let d = EventDirection::Ingress;
-        let cloned = d.clone();
+        let cloned = d;
         let copied = d;
         assert_eq!(cloned, copied);
         let dbg = format!("{:?}", d);

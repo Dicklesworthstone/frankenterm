@@ -532,6 +532,7 @@ impl<P: Point + fmt::Debug, V: Clone> fmt::Display for KdTree<P, V> {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 

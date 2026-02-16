@@ -485,6 +485,7 @@ impl<V: Clone + fmt::Debug> fmt::Display for RTree<V> {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -651,7 +652,7 @@ mod tests {
     fn rect_new_swapped_coords() {
         // Rect::new auto-corrects swapped coordinates
         let r = Rect::new(10.0, 10.0, 0.0, 0.0);
-        assert!(r.x_min < r.x_max || r.x_min == r.x_max);
+        assert!(r.x_min <= r.x_max);
         assert_eq!(r.x_min, 0.0);
         assert_eq!(r.x_max, 10.0);
         assert_eq!(r.y_min, 0.0);
@@ -730,7 +731,7 @@ mod tests {
         let r = Rect::new(0.0, 0.0, 5.0, 5.0);
         // Upper-right diagonal
         let dist = r.min_distance(8.0, 8.0);
-        let expected = ((3.0f64).powi(2) + (3.0f64).powi(2)).sqrt();
+        let expected = (3.0f64).hypot(3.0f64);
         assert!((dist - expected).abs() < 1e-10);
     }
 

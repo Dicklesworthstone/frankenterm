@@ -1263,7 +1263,7 @@ mod tests {
         let qa = QuotaAvailability::Available;
         let dbg = format!("{:?}", qa);
         assert!(dbg.contains("Available"));
-        let cloned = qa.clone();
+        let cloned = qa;
         let copied = qa;
         assert_eq!(cloned, copied);
     }

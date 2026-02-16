@@ -214,9 +214,9 @@ proptest! {
 
         // No longer repeated substring should exist
         // Check all substrings of length max_len + 1
-        if max_len + 1 <= text.len() {
+        if max_len < text.len() {
             for i in 0..=text.len() - (max_len + 1) {
-                let pattern = &text[i..i + max_len + 1];
+                let pattern = &text[i..=(i + max_len)];
                 let count = brute_force_count(&text, pattern);
                 prop_assert!(
                     count < 2,
@@ -378,9 +378,9 @@ proptest! {
     fn absent_pattern_empty(text in prop::collection::vec(b'a'..=b'c', 1..50)) {
         // Use only a-c in text, search for 'd' to guarantee absence
         let sa = SuffixArray::new(&text);
-        let results = sa.search(&[b'd']);
+        let results = sa.search(b"d");
         prop_assert!(results.is_empty(), "should not find 'd' in text of a-c only");
-        prop_assert_eq!(sa.count(&[b'd']), 0);
+        prop_assert_eq!(sa.count(b"d"), 0);
     }
 
     // ── Uniform text (all same character) ────────────────────────

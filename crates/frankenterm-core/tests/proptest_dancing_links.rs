@@ -148,7 +148,7 @@ proptest! {
         }
 
         // If all columns are covered exactly once, it should be solvable
-        let mut seen = vec![false; 6];
+        let mut seen = [false; 6];
         let mut all_unique = true;
         for &c in &cols {
             if seen[c] {

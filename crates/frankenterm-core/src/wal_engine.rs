@@ -394,6 +394,7 @@ impl<T: Clone> WalEngine<T> {
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::needless_collect)]
 mod tests {
     use super::*;
 

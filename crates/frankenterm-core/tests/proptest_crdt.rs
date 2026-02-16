@@ -172,7 +172,7 @@ proptest! {
         let before = a.value();
         let mut c = a.clone();
         c.increment();
-        prop_assert!(c.value() >= before + 1);
+        prop_assert!(c.value() > before);
     }
 
     #[test]

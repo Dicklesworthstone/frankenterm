@@ -422,7 +422,7 @@ proptest! {
         match result {
             WorkflowStartResult::Started { .. } => prop_assert_eq!(ty, "started"),
             WorkflowStartResult::NoMatchingWorkflow { .. } => {
-                prop_assert_eq!(ty, "no_matching_workflow")
+                prop_assert_eq!(ty, "no_matching_workflow");
             }
             WorkflowStartResult::PaneLocked { .. } => prop_assert_eq!(ty, "pane_locked"),
             WorkflowStartResult::Error { .. } => prop_assert_eq!(ty, "error"),

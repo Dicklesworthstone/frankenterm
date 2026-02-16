@@ -1044,6 +1044,7 @@ fn html_escape(text: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
     use crate::recording::{FrameHeader, FrameType, RecordingFrame};
@@ -2059,7 +2060,7 @@ mod tests {
     fn player_state_debug_clone_copy() {
         let s = PlayerState::Playing;
         let c = s; // Copy
-        let cl = s.clone();
+        let cl = s;
         assert_eq!(s, c);
         assert_eq!(s, cl);
         let dbg = format!("{:?}", s);
@@ -2100,7 +2101,7 @@ mod tests {
             timestamp_ms: 1000,
         };
         let c = p; // Copy
-        let cl = p.clone();
+        let cl = p;
         assert_eq!(c.frame_index, 42);
         assert_eq!(cl.timestamp_ms, 1000);
         let dbg = format!("{:?}", p);
@@ -2113,7 +2114,7 @@ mod tests {
     fn playback_speed_debug_clone_copy() {
         let s = PlaybackSpeed::NORMAL;
         let c = s; // Copy
-        let cl = s.clone();
+        let cl = s;
         assert_eq!(s, c);
         assert_eq!(s, cl);
         let dbg = format!("{:?}", s);
@@ -2151,7 +2152,7 @@ mod tests {
     fn player_control_debug_clone_copy() {
         let c = PlayerControl::Play;
         let b = c; // Copy
-        let d = c.clone();
+        let d = c;
         assert_eq!(c, b);
         assert_eq!(c, d);
         let dbg = format!("{:?}", c);
@@ -2194,7 +2195,7 @@ mod tests {
     fn export_format_debug_clone_copy_eq() {
         let f = ExportFormat::Asciinema;
         let c = f; // Copy
-        let cl = f.clone();
+        let cl = f;
         assert_eq!(f, c);
         assert_eq!(f, cl);
         assert_ne!(ExportFormat::Asciinema, ExportFormat::Html);

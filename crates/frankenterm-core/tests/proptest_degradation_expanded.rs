@@ -1,3 +1,4 @@
+#![allow(clippy::comparison_chain, clippy::overly_complex_bool_expr)]
 //! Expanded property-based tests for degradation.rs.
 //!
 //! Focuses on `evaluate_resize_degradation_ladder` classifier invariants:
@@ -591,7 +592,7 @@ proptest! {
     /// Tier ordering is total.
     #[test]
     fn tier_ordering_total(a in arb_tier(), b in arb_tier()) {
-        prop_assert!(a < b || a == b || a > b, "tier ordering should be total");
+        prop_assert!(a <= b || a > b, "tier ordering should be total");
     }
 }
 

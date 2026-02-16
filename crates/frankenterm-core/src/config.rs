@@ -5741,7 +5741,7 @@ mode = "periodic"
         let a = LogFormat::Pretty;
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, c);
         assert_ne!(LogFormat::Pretty, LogFormat::Json);
         let _ = format!("{:?}", a);
@@ -5794,7 +5794,7 @@ mode = "periodic"
         let a = SyncDirection::Push;
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, c);
         assert_ne!(SyncDirection::Push, SyncDirection::Pull);
         let _ = format!("{:?}", a);
@@ -5827,7 +5827,7 @@ mode = "periodic"
         let a = DistributedAuthMode::Token;
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, c);
         let _ = format!("{:?}", a);
     }
@@ -5875,7 +5875,7 @@ mode = "periodic"
         let a = DcgMode::Native;
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, c);
         let _ = format!("{:?}", a);
     }

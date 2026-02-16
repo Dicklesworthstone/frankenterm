@@ -1,3 +1,4 @@
+#![allow(clippy::naive_bytecount, clippy::needless_range_loop)]
 //! Property-based tests for `wavelet_tree` module.
 //!
 //! Verifies correctness invariants:
@@ -451,9 +452,9 @@ proptest! {
         middle in prop::collection::vec(1u8..=254, 0..20)
     ) {
         let mut data = Vec::new();
-        data.extend(std::iter::repeat(0u8).take(count_zero));
+        data.extend(std::iter::repeat_n(0u8, count_zero));
         data.extend(&middle);
-        data.extend(std::iter::repeat(255u8).take(count_ff));
+        data.extend(std::iter::repeat_n(255u8, count_ff));
 
         if data.is_empty() {
             return Ok(());
@@ -498,7 +499,7 @@ proptest! {
                 "rank step must be 0 or 1, got {} at pos {}", step, pos
             );
             // Step is 1 iff data[pos] == symbol
-            let expected_step = if data[pos] == symbol { 1 } else { 0 };
+            let expected_step = usize::from(data[pos] == symbol);
             prop_assert_eq!(step, expected_step, "rank step mismatch at pos {}", pos);
         }
     }

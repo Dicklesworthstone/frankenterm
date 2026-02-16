@@ -2218,7 +2218,7 @@ mod tests {
         };
         let dbg = format!("{:?}", tr);
         assert!(dbg.contains("TimeRange"));
-        let cloned = tr.clone();
+        let cloned = tr;
         let copied = tr;
         assert_eq!(cloned.start_ms, copied.start_ms);
     }
@@ -2263,7 +2263,7 @@ mod tests {
         let kind = QueryEventKind::IngressText;
         let dbg = format!("{:?}", kind);
         assert!(dbg.contains("IngressText"));
-        let cloned = kind.clone();
+        let cloned = kind;
         let copied = kind;
         assert_eq!(cloned, copied);
     }

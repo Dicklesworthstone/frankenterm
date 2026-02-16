@@ -1,3 +1,4 @@
+#![allow(clippy::needless_continue)]
 //! Property-based tests for work_stealing_deque.
 //!
 //! Verifies the work-stealing deque invariants:
@@ -277,7 +278,7 @@ proptest! {
 
         let mut total_retrieved = 0usize;
         for i in 0..n {
-            while let Some(_) = pool.pop_or_steal(i) {
+            while pool.pop_or_steal(i).is_some() {
                 total_retrieved += 1;
             }
         }

@@ -318,7 +318,7 @@ proptest! {
         prop_assert_eq!(art_rev.len(), reference.len());
 
         // Both should have same key set
-        for (k, _) in &reference {
+        for k in reference.keys() {
             prop_assert!(art_fwd.contains_key(k));
             prop_assert!(art_rev.contains_key(k));
         }
@@ -409,7 +409,7 @@ proptest! {
 
         // Each insert creates at most 2 nodes (split + new leaf)
         // Plus existing nodes. Total should be bounded.
-        if art.len() > 0 {
+        if !art.is_empty() {
             // Very generous bound: each key creates at most key_len nodes
             // In practice, path compression keeps it much lower
             let total_key_bytes: usize = pairs.iter().map(|(k, _)| k.len() + 1).sum();

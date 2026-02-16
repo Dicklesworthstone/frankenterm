@@ -371,7 +371,7 @@ mod tests {
             ansi_byte_count: 10,
         };
         let m2 = m;
-        let m3 = m.clone();
+        let m3 = m;
         assert_eq!(m, m2);
         assert_eq!(m, m3);
     }

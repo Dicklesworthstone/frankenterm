@@ -614,14 +614,14 @@ proptest! {
         let mut heap = FibonacciHeap::new();
 
         // Initially empty
-        let len_zero = heap.len() == 0;
+        let len_zero = heap.is_empty();
         let empty = heap.is_empty();
         prop_assert_eq!(empty, len_zero, "initial: is_empty={}, len==0={}", empty, len_zero);
 
         // After each insert
         for &v in &vals {
             heap.insert(v, v);
-            let len_zero = heap.len() == 0;
+            let len_zero = heap.is_empty();
             let empty = heap.is_empty();
             prop_assert_eq!(empty, len_zero,
                 "after insert: is_empty={}, len==0={}, len={}", empty, len_zero, heap.len());
@@ -629,7 +629,7 @@ proptest! {
 
         // After each extract
         while heap.extract_min().is_some() {
-            let len_zero = heap.len() == 0;
+            let len_zero = heap.is_empty();
             let empty = heap.is_empty();
             prop_assert_eq!(empty, len_zero,
                 "after extract: is_empty={}, len==0={}, len={}", empty, len_zero, heap.len());

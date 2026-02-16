@@ -279,6 +279,7 @@ fn emergency_disable_returns_legacy_fallback_hint_for_remote_submissions() {
 // ── DarkBadger wa-1u90p.7.1 ──────────────────────────────────────
 
 #[test]
+#[allow(clippy::similar_names)]
 fn multi_ssh_domain_fair_budget_partitioning() {
     let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
         frame_budget_units: 8,
@@ -350,7 +351,7 @@ fn local_domain_gets_higher_share_than_remote() {
             1,
             ResizeWorkClass::Interactive,
             2,
-            100 + i as u64,
+            100 + i,
             ResizeDomain::Local,
             1,
         ));
@@ -362,7 +363,7 @@ fn local_domain_gets_higher_share_than_remote() {
             1,
             ResizeWorkClass::Interactive,
             2,
-            100 + i as u64,
+            100 + i,
             ResizeDomain::Ssh {
                 host: "remote".into(),
             },
@@ -407,7 +408,7 @@ fn storm_tab_rotation_allows_different_tabs_per_frame() {
             1,
             ResizeWorkClass::Interactive,
             2,
-            100 + i as u64,
+            100 + i,
             ResizeDomain::Local,
             1,
         ));
@@ -419,7 +420,7 @@ fn storm_tab_rotation_allows_different_tabs_per_frame() {
             1,
             ResizeWorkClass::Interactive,
             2,
-            100 + i as u64,
+            100 + i,
             ResizeDomain::Local,
             2,
         ));
@@ -496,7 +497,7 @@ fn domain_budget_disabled_allows_single_domain_to_consume_all() {
             1,
             ResizeWorkClass::Interactive,
             2,
-            100 + i as u64,
+            100 + i,
             ResizeDomain::Ssh {
                 host: "single".into(),
             },

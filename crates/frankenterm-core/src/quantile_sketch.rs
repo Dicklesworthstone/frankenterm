@@ -513,6 +513,7 @@ impl FromIterator<f64> for TDigest {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -760,7 +761,7 @@ mod tests {
 
     #[test]
     fn centroid_debug_clone_serde() {
-        let c = Centroid::new(3.14, 2.0);
+        let c = Centroid::new(std::f64::consts::PI, 2.0);
         let dbg = format!("{:?}", c);
         assert!(dbg.contains("Centroid"));
         let c2 = c.clone();

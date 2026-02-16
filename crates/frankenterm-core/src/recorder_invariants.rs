@@ -1377,7 +1377,7 @@ mod tests {
         let a = ViolationSeverity::Warning;
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, c);
         assert_ne!(ViolationSeverity::Warning, ViolationSeverity::Error);
         assert_ne!(ViolationSeverity::Error, ViolationSeverity::Critical);
@@ -1447,7 +1447,7 @@ mod tests {
         let a = ViolationKind::MergeOrderViolation;
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, c);
         let dbg = format!("{:?}", a);
         assert!(dbg.contains("MergeOrderViolation"));

@@ -1120,7 +1120,7 @@ mod tests {
         let s = PaneState::Active;
         let dbg = format!("{:?}", s);
         assert!(dbg.contains("Active"));
-        let cloned = s.clone();
+        let cloned = s;
         let copied = s;
         assert_eq!(cloned, copied);
     }
@@ -1269,7 +1269,7 @@ mod tests {
         let s = EvidenceStrength::Strong;
         let dbg = format!("{:?}", s);
         assert!(dbg.contains("Strong"));
-        let cloned = s.clone();
+        let cloned = s;
         let copied = s;
         assert_eq!(cloned, copied);
     }

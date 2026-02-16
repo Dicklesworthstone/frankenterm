@@ -1347,7 +1347,7 @@ mod tests {
         let a = SensitivityTier::T1Standard;
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, c);
         assert_ne!(SensitivityTier::T1Standard, SensitivityTier::T2Sensitive);
         let _ = format!("{:?}", a);

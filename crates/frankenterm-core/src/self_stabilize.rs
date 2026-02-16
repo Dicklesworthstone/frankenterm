@@ -721,7 +721,7 @@ mod tests {
     #[test]
     fn phase_clone_copy() {
         let phase = Phase::Init;
-        let cloned = phase.clone();
+        let cloned = phase;
         let copied = phase;
         assert_eq!(cloned, copied);
     }

@@ -1006,7 +1006,7 @@ mod tests {
         let a = CircuitStateKind::Closed;
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, c);
         assert_ne!(CircuitStateKind::Closed, CircuitStateKind::Open);
         assert_ne!(CircuitStateKind::Open, CircuitStateKind::HalfOpen);

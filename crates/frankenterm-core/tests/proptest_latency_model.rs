@@ -123,7 +123,7 @@ proptest! {
         t in arb_positive_time()
     ) {
         let curve = PiecewiseLinear::linear(intercept, slope);
-        let expected = intercept + slope * t;
+        let expected = slope.mul_add(t, intercept);
         let actual = curve.eval(t);
         prop_assert!(
             (actual - expected).abs() < 1e-4,
@@ -540,7 +540,7 @@ proptest! {
         let arr = ArrivalCurve::leaky_bucket(sigma, rho);
         let svc = ServiceCurve::rate_latency(rate, latency);
         let b = backlog_bound(&arr, &svc);
-        let expected = sigma + rho * latency;
+        let expected = rho.mul_add(latency, sigma);
         prop_assert!(
             (b - expected).abs() < 1e-6,
             "closed form: expected {}, got {}", expected, b
@@ -767,7 +767,7 @@ proptest! {
         let b = backlog_bound(&arr, &svc);
         // backlog = σ + ρ·T, delay = σ/(R-ρ) + T
         // backlog ≤ arrival_at_delay_bound: α(D) = σ + ρ·D ≥ B
-        let alpha_d = sigma + rho * d;
+        let alpha_d = rho.mul_add(d, sigma);
         prop_assert!(
             alpha_d >= b - 1e-6,
             "α(D) = {} < B = {}", alpha_d, b

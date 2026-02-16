@@ -870,7 +870,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "start")]
     fn interval_invalid_panics() {
-        Interval::new(10, 5);
+        let _discard = Interval::new(10, 5);
     }
 
     #[test]

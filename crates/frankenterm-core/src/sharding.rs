@@ -2122,7 +2122,7 @@ mod tests {
         let a = ShardId(5);
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, c);
         let dbg = format!("{:?}", a);
         assert!(dbg.contains("ShardId"));

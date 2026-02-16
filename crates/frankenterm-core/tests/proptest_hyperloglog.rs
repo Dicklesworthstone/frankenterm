@@ -336,7 +336,7 @@ proptest! {
         for item in &items1 { hll1.insert(item); }
         for item in &items2 { hll2.insert(item); }
         let j = hll1.jaccard(&hll2).unwrap();
-        prop_assert!(j >= 0.0 && j <= 1.0, "jaccard {} out of [0,1]", j);
+        prop_assert!((0.0..=1.0).contains(&j), "jaccard {} out of [0,1]", j);
     }
 
     /// Jaccard precision mismatch returns None.

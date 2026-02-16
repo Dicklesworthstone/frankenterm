@@ -2,6 +2,8 @@
 //!
 //! Bead: ft-283h4.20
 
+#![allow(clippy::float_cmp)]
+
 use frankenterm_core::quantile_sketch::*;
 use proptest::prelude::*;
 
@@ -66,7 +68,7 @@ proptest! {
         for &v in &values {
             td.insert(v);
         }
-        let expected_min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let expected_min = values.iter().copied().fold(f64::INFINITY, f64::min);
         prop_assert_eq!(td.min(), Some(expected_min));
     }
 
@@ -77,7 +79,7 @@ proptest! {
         for &v in &values {
             td.insert(v);
         }
-        let expected_max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let expected_max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         prop_assert_eq!(td.max(), Some(expected_max));
     }
 
@@ -207,7 +209,7 @@ proptest! {
             td.insert(v);
         }
         let cdf = td.cdf(x);
-        prop_assert!(cdf >= 0.0 && cdf <= 1.0, "cdf({})={} out of [0,1]", x, cdf);
+        prop_assert!((0.0..=1.0).contains(&cdf), "cdf({})={} out of [0,1]", x, cdf);
     }
 
     /// CDF is monotonically non-decreasing.
@@ -222,7 +224,7 @@ proptest! {
         let span = max - min;
         if span > 0.0 {
             let cdfs: Vec<f64> = (0..=20)
-                .map(|i| td.cdf(min + (i as f64 / 20.0) * span))
+                .map(|i| td.cdf((i as f64 / 20.0).mul_add(span, min)))
                 .collect();
             for i in 1..cdfs.len() {
                 prop_assert!(
@@ -262,8 +264,8 @@ proptest! {
         }
         let td_mean = td.mean();
         let true_mean: f64 = values.iter().sum::<f64>() / values.len() as f64;
-        let tolerance = (values.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
-            - values.iter().cloned().fold(f64::INFINITY, f64::min))
+        let tolerance = (values.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+            - values.iter().copied().fold(f64::INFINITY, f64::min))
             * 0.05;
         prop_assert!(
             (td_mean - true_mean).abs() < tolerance.max(1.0),
@@ -408,7 +410,7 @@ proptest! {
         let _ = td.quantile(0.5); // force compress
         // T-digest centroid count is roughly proportional to compression
         // Upper bound is approximately π * δ / 2 + some overhead
-        let upper_bound = (std::f64::consts::PI * comp + 100.0) as usize;
+        let upper_bound = std::f64::consts::PI.mul_add(comp, 100.0) as usize;
         prop_assert!(
             td.centroid_count() <= upper_bound,
             "centroid count {} exceeds bound {} for compression {}", td.centroid_count(), upper_bound, comp
@@ -489,8 +491,8 @@ proptest! {
         for &v in &v2 { td.insert(v); }
 
         prop_assert_eq!(td.count(), v2.len() as f64);
-        let min = v2.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = v2.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let min = v2.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = v2.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         prop_assert_eq!(td.min(), Some(min));
         prop_assert_eq!(td.max(), Some(max));
     }
@@ -502,7 +504,7 @@ proptest! {
         for &v in &values {
             td1.insert(v);
         }
-        let td2: TDigest = values.iter().cloned().collect();
+        let td2: TDigest = values.iter().copied().collect();
 
         prop_assert_eq!(td1.count(), td2.count());
         prop_assert_eq!(td1.min(), td2.min());

@@ -1253,7 +1253,7 @@ mod tests {
     #[test]
     fn component_debug_clone_copy() {
         let c = Component::Capture;
-        let cloned = c.clone();
+        let cloned = c;
         let copied = c;
         assert_eq!(cloned, copied);
     }
@@ -1280,7 +1280,7 @@ mod tests {
     #[test]
     fn health_status_debug_clone_copy() {
         let s = HealthStatus::Degraded;
-        let cloned = s.clone();
+        let cloned = s;
         let copied = s;
         assert_eq!(cloned, copied);
     }

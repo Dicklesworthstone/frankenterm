@@ -1210,9 +1210,8 @@ mod tests {
             ..Default::default()
         };
         let result = exporter.export(&human(), &req, NOW).unwrap();
-        let lines: Vec<&str> = result.data.lines().collect();
         // Header + 4 data rows
-        assert_eq!(lines.len(), 5);
+        assert_eq!(result.data.lines().count(), 5);
         assert_eq!(result.event_count, 4);
     }
 

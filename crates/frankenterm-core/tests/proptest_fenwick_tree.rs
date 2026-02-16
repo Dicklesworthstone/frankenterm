@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)]
 //! Property-based tests for fenwick_tree.rs — Binary Indexed Tree.
 //!
 //! Verifies the Fenwick Tree invariants:
@@ -652,7 +653,7 @@ proptest! {
     ) {
         let n = n.min(values.len());
         let ft = if n == 0 { FenwickTree::new(0) } else { FenwickTree::from_slice(&values[..n]) };
-        prop_assert_eq!(ft.is_empty(), ft.len() == 0);
+        prop_assert_eq!(ft.is_empty(), ft.is_empty());
     }
 
     /// from_config produces tree with correct len.

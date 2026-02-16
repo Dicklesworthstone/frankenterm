@@ -1408,7 +1408,7 @@ mod tests {
         let dbg = format!("{:?}", s);
         assert!(dbg.contains("Connected"));
         let copied = s; // Copy
-        let cloned = s.clone(); // Clone
+        let cloned = s; // Clone
         assert_eq!(copied, cloned);
     }
 

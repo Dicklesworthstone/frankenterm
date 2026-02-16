@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)]
 //! Property-based tests for `sparse_table` module.
 //!
 //! Verifies correctness invariants:

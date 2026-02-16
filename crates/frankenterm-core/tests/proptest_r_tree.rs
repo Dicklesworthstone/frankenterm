@@ -1,3 +1,4 @@
+#![allow(clippy::needless_collect)]
 //! Property-based tests for `r_tree` module.
 //!
 //! Verifies correctness invariants:
@@ -233,8 +234,8 @@ proptest! {
 
     #[test]
     fn rect_min_distance_inside(r in rect_strategy()) {
-        let cx = (r.x_min + r.x_max) / 2.0;
-        let cy = (r.y_min + r.y_max) / 2.0;
+        let cx = f64::midpoint(r.x_min, r.x_max);
+        let cy = f64::midpoint(r.y_min, r.y_max);
         prop_assert!((r.min_distance(cx, cy) - 0.0).abs() < 1e-10);
     }
 
@@ -302,8 +303,8 @@ proptest! {
         t_y in 0.0f64..1.0
     ) {
         // Interpolate a point guaranteed to be inside the rect
-        let px = rect.x_min + t_x * (rect.x_max - rect.x_min);
-        let py = rect.y_min + t_y * (rect.y_max - rect.y_min);
+        let px = t_x.mul_add(rect.x_max - rect.x_min, rect.x_min);
+        let py = t_y.mul_add(rect.y_max - rect.y_min, rect.y_min);
 
         let mut tree = RTree::new();
         tree.insert(rect, val);
@@ -389,8 +390,8 @@ proptest! {
         rect in rect_strategy(),
         val in any::<i32>()
     ) {
-        let cx = (rect.x_min + rect.x_max) / 2.0;
-        let cy = (rect.y_min + rect.y_max) / 2.0;
+        let cx = f64::midpoint(rect.x_min, rect.x_max);
+        let cy = f64::midpoint(rect.y_min, rect.y_max);
 
         let mut tree = RTree::new();
         tree.insert(rect, val);

@@ -517,7 +517,7 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
 
         // Check AVL balance
         let bf = self.balance_factor(idx);
-        if bf < -1 || bf > 1 {
+        if !(-1..=1).contains(&bf) {
             return false;
         }
 

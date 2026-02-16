@@ -1186,7 +1186,7 @@ mod tests {
         let a = StorageHealthTier::Green;
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, c);
         assert_ne!(StorageHealthTier::Green, StorageHealthTier::Yellow);
         let _ = format!("{:?}", a);

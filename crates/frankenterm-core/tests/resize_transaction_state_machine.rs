@@ -375,7 +375,7 @@ fn tx_phase_default_is_idle() {
 #[test]
 fn tx_phase_clone_and_debug() {
     let phase = TxPhase::Reflowing;
-    let cloned = phase.clone();
+    let cloned = phase;
     assert_eq!(phase, cloned);
     let dbg = format!("{:?}", phase);
     assert!(dbg.contains("Reflowing"));

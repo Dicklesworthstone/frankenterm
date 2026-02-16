@@ -2776,7 +2776,7 @@ mod tests {
         let a = DistributedTokenSourceKind::Inline;
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, c);
         assert_ne!(
             DistributedTokenSourceKind::Inline,

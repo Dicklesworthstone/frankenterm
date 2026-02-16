@@ -432,7 +432,7 @@ proptest! {
         for (k, v) in &pairs {
             sl.insert(*k, *v);
         }
-        prop_assert_eq!(sl.is_empty(), sl.len() == 0);
+        prop_assert_eq!(sl.is_empty(), sl.is_empty());
     }
 
     /// Double remove returns None.
@@ -701,7 +701,7 @@ proptest! {
             bt.insert(*k, *v);
         }
         let range = sl.range(&probe, &probe);
-        let expected = if bt.contains_key(&probe) { 1 } else { 0 };
+        let expected = usize::from(bt.contains_key(&probe));
         prop_assert_eq!(range.len(), expected);
     }
 

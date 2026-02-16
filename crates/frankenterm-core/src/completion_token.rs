@@ -1210,7 +1210,7 @@ mod tests {
         let dbg = format!("{:?}", s);
         assert!(dbg.contains("InProgress"));
         let copied = s; // Copy
-        let cloned = s.clone(); // Clone
+        let cloned = s; // Clone
         assert_eq!(copied, cloned);
     }
 
@@ -1243,7 +1243,7 @@ mod tests {
         let dbg = format!("{:?}", o);
         assert!(dbg.contains("Ok"));
         let copied = o; // Copy
-        let cloned = o.clone(); // Clone
+        let cloned = o; // Clone
         assert_eq!(copied, cloned);
         assert_ne!(StepOutcome::Ok, StepOutcome::Error);
         assert_ne!(StepOutcome::Skipped, StepOutcome::Cancelled);

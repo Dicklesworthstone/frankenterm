@@ -315,6 +315,7 @@ fn splitmix64(mut x: u64) -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -333,7 +334,7 @@ mod tests {
         assert!(!hll.is_empty());
         assert_eq!(hll.total_inserts(), 1);
         let card = hll.cardinality();
-        assert!(card >= 1 && card <= 3, "cardinality {} should be ~1", card);
+        assert!((1..=3).contains(&card), "cardinality {} should be ~1", card);
     }
 
     #[test]
@@ -344,7 +345,7 @@ mod tests {
         }
         assert_eq!(hll.total_inserts(), 1000);
         let card = hll.cardinality();
-        assert!(card >= 1 && card <= 3, "cardinality {} should be ~1", card);
+        assert!((1..=3).contains(&card), "cardinality {} should be ~1", card);
     }
 
     #[test]
@@ -905,7 +906,7 @@ mod tests {
         hll.insert(&true); // duplicate
         assert_eq!(hll.total_inserts(), 3);
         let card = hll.cardinality();
-        assert!(card >= 1 && card <= 5, "cardinality {} should be ~2", card);
+        assert!((1..=5).contains(&card), "cardinality {} should be ~2", card);
     }
 
     #[test]

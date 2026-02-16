@@ -311,6 +311,7 @@ impl<T: Ord + Clone> IndexSparseTable<T> {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
 

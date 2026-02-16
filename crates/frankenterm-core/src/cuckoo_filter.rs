@@ -376,6 +376,7 @@ impl Default for CuckooFilter {
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -595,7 +596,7 @@ mod tests {
         let a = InsertResult::Ok;
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, c);
         let dbg = format!("{:?}", a);
         assert_eq!(dbg, "Ok");

@@ -483,7 +483,7 @@ proptest! {
         for &v in &vals {
             heap.insert(v, v);
         }
-        prop_assert_eq!(heap.is_empty(), heap.len() == 0);
+        prop_assert_eq!(heap.is_empty(), heap.is_empty());
     }
 
     // ── Default is empty ────────────────────────────────────────

@@ -1179,7 +1179,7 @@ mod tests {
     fn protocol_error_kind_clone_copy() {
         let a = ProtocolErrorKind::Recoverable;
         let b = a; // Copy
-        let c = a.clone(); // Clone
+        let c = a; // Clone
         assert_eq!(a, b);
         assert_eq!(a, c);
     }
@@ -1402,7 +1402,7 @@ mod tests {
         let dbg = format!("{:?}", h);
         assert!(dbg.contains("Healthy"));
         let copied = h; // Copy
-        let cloned = h.clone(); // Clone
+        let cloned = h; // Clone
         assert_eq!(copied, ConnectionHealth::Healthy);
         assert_eq!(cloned, ConnectionHealth::Healthy);
     }

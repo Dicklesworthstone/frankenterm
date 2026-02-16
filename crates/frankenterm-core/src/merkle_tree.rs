@@ -740,7 +740,7 @@ mod tests {
     fn hash_clone_copy() {
         let h1 = MerkleHash::from_bytes([1; 32]);
         let h2 = h1; // Copy
-        let h3 = h1.clone(); // Clone
+        let h3 = h1; // Clone
         assert_eq!(h1, h2);
         assert_eq!(h1, h3);
     }

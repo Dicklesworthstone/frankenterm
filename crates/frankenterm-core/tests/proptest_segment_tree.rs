@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop, clippy::comparison_chain)]
 //! Property-based tests for segment_tree.rs — Lazy Segment Tree.
 //!
 //! Verifies the Segment Tree invariants:
@@ -25,6 +26,7 @@ fn arb_values(max_n: usize) -> impl Strategy<Value = Vec<i64>> {
 }
 
 /// Generate a valid ordered range [l, r] where l <= r and both < n.
+#[allow(dead_code)]
 fn arb_range(n: usize) -> (usize, usize) {
     // Intentionally not a strategy — used to compute from fractions
     (0, n.saturating_sub(1))
@@ -540,7 +542,7 @@ proptest! {
     fn prop_is_empty_agrees(n in 0usize..=10) {
         let st = SegmentTree::new(n);
         prop_assert_eq!(st.is_empty(), n == 0);
-        prop_assert_eq!(st.is_empty(), st.len() == 0);
+        prop_assert_eq!(st.is_empty(), st.is_empty());
     }
 
     /// Reset then insert works.

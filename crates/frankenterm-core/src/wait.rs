@@ -623,6 +623,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::match_wildcard_for_single_variants)]
 mod tests {
     use super::*;
     use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};

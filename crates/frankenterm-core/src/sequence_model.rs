@@ -1148,7 +1148,7 @@ mod tests {
     #[test]
     fn replay_order_debug_clone() {
         let o = ReplayOrder::new(10, 20, 30);
-        let cloned = o.clone();
+        let cloned = o;
         assert_eq!(o, cloned);
         let dbg = format!("{:?}", o);
         assert!(dbg.contains("ReplayOrder"));

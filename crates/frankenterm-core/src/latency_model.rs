@@ -1197,7 +1197,7 @@ mod tests {
     fn curve_point_clone_copy_eq() {
         let p = CurvePoint { t: 3.0, y: 7.0 };
         let p2 = p; // Copy
-        let p3 = p.clone();
+        let p3 = p;
         assert_eq!(p, p2);
         assert_eq!(p, p3);
     }

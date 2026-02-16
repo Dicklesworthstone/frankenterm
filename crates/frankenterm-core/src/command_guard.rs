@@ -1552,7 +1552,7 @@ mod tests {
     #[test]
     fn trust_level_clone_copy() {
         let t = TrustLevel::Permissive;
-        let cloned = t.clone();
+        let cloned = t;
         let copied = t;
         assert_eq!(cloned, copied);
     }

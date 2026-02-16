@@ -2,6 +2,8 @@
 //!
 //! Bead: ft-283h4.18
 
+#![allow(clippy::float_cmp)]
+
 use frankenterm_core::cuckoo_filter::*;
 use proptest::prelude::*;
 use std::collections::HashSet;
@@ -408,7 +410,7 @@ proptest! {
             filter.insert(item);
         }
         let lf = filter.load_factor();
-        prop_assert!(lf >= 0.0 && lf <= 1.0, "load factor out of range: {}", lf);
+        prop_assert!((0.0..=1.0).contains(&lf), "load factor out of range: {}", lf);
     }
 
     /// Clone produces independent filter with same state.

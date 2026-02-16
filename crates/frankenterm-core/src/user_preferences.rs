@@ -1695,7 +1695,7 @@ mod tests {
         let ps = PaneState {
             has_new_output: true,
             time_since_focus_s: 42.0,
-            output_rate: 3.14,
+            output_rate: std::f64::consts::PI,
             error_count: 2,
             process_active: false,
             scroll_depth: 0.75,
@@ -1735,7 +1735,7 @@ mod tests {
     fn user_action_debug_clone_copy() {
         let a = UserAction::FocusPane(42);
         let b = a; // Copy
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, b);
         assert_eq!(a, c);
         let dbg = format!("{:?}", a);
