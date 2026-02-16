@@ -642,8 +642,8 @@ proptest! {
         // Count overlaps after removal
         let after_count = tree.query_overlap(target).len();
 
-        // After removing exact matches, overlap count should decrease by at least exact_matches
-        // (the removed intervals were themselves overlapping the query)
+        // remove() removes ALL exact-match intervals, so the overlap count
+        // should decrease by at least the number of exact matches removed.
         prop_assert!(
             after_count <= before_count.saturating_sub(exact_matches),
             "after removal: before={}, after={}, exact_matches={}",

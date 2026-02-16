@@ -367,10 +367,25 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
                 }
             }
         } else if target < self.nodes.len()
-            && self.nodes[target].interval.low <= self.nodes[idx].interval.low
+            && self.nodes[target].interval.low < self.nodes[idx].interval.low
         {
+            // Strictly less — must be in left subtree
             let left = self.nodes[idx].left;
             self.nodes[idx].left = self.remove_at(left, target);
+            self.update_augment(idx);
+            Some(self.balance(idx))
+        } else if target < self.nodes.len()
+            && self.nodes[target].interval.low == self.nodes[idx].interval.low
+        {
+            // Equal keys — target could be in either subtree after AVL rotations.
+            // Check left first (insertion uses <= for left), fall back to right.
+            if self.subtree_contains(self.nodes[idx].left, target) {
+                let left = self.nodes[idx].left;
+                self.nodes[idx].left = self.remove_at(left, target);
+            } else {
+                let right = self.nodes[idx].right;
+                self.nodes[idx].right = self.remove_at(right, target);
+            }
             self.update_augment(idx);
             Some(self.balance(idx))
         } else {
@@ -379,6 +394,16 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
             self.update_augment(idx);
             Some(self.balance(idx))
         }
+    }
+
+    /// Check whether `target` index is reachable from `node` in the tree.
+    fn subtree_contains(&self, node: Option<usize>, target: usize) -> bool {
+        let Some(idx) = node else { return false };
+        if idx == target {
+            return true;
+        }
+        self.subtree_contains(self.nodes[idx].left, target)
+            || self.subtree_contains(self.nodes[idx].right, target)
     }
 
     fn find_min(&self, mut idx: usize) -> usize {

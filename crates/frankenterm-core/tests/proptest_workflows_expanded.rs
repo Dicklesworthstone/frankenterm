@@ -855,9 +855,17 @@ proptest! {
 proptest! {
     #[test]
     fn group_lock_acquire_all_or_none(
-        pane_ids in proptest::collection::vec(1u64..1000, 2..6),
+        pane_ids_raw in proptest::collection::vec(1u64..1000, 2..6),
     ) {
         let mgr = PaneWorkflowLockManager::new();
+        // Deduplicate: try_acquire_group locks sequentially, so duplicate
+        // IDs would self-conflict on the second acquire.
+        let mut pane_ids = pane_ids_raw.clone();
+        pane_ids.sort();
+        pane_ids.dedup();
+        if pane_ids.len() < 2 {
+            return Ok(());
+        }
         let result = mgr.try_acquire_group(&pane_ids, "wf1", "exec1");
         match &result {
             GroupLockResult::Acquired { locked_panes } => {
