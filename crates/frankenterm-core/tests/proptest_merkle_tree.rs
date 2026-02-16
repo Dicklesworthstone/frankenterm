@@ -98,8 +98,16 @@ proptest! {
     /// Insertion order doesn't affect root hash (deterministic).
     #[test]
     fn insertion_order_independent(entries in arb_entries(20)) {
-        let tree1 = MerkleTree::from_entries(entries.clone());
-        let mut reversed = entries;
+        // Deduplicate: with duplicate keys, last-writer-wins means insertion
+        // order DOES matter for the final value. Use BTreeMap to get a
+        // deterministic set of unique keys.
+        let unique: std::collections::BTreeMap<_, _> = entries.into_iter().collect();
+        let deduped: Vec<_> = unique.into_iter().collect();
+        if deduped.is_empty() {
+            return Ok(());
+        }
+        let tree1 = MerkleTree::from_entries(deduped.clone());
+        let mut reversed = deduped;
         reversed.reverse();
         let tree2 = MerkleTree::from_entries(reversed);
         prop_assert_eq!(
