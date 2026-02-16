@@ -653,3 +653,111 @@ fn report_with_failing_assertion() {
     assert_eq!(report.assertions_failed, 1);
     assert!(!report.all_passed);
 }
+
+// ─── Global injector singleton ──────────────────────────────────────
+
+#[test]
+fn init_global_returns_arc() {
+    // reset first to avoid interference
+    FaultInjector::reset_global();
+    let injector = FaultInjector::init_global();
+    assert_eq!(injector.total_fired(), 0);
+    FaultInjector::reset_global();
+}
+
+#[test]
+fn global_returns_none_after_reset() {
+    FaultInjector::reset_global();
+    assert!(FaultInjector::global().is_none());
+}
+
+#[test]
+fn global_returns_some_after_init() {
+    FaultInjector::reset_global();
+    let _arc = FaultInjector::init_global();
+    assert!(FaultInjector::global().is_some());
+    FaultInjector::reset_global();
+}
+
+#[test]
+fn check_succeeds_without_global() {
+    FaultInjector::reset_global();
+    // When no global injector is set, check should succeed (no fault configured)
+    let result = FaultInjector::check(FaultPoint::DbWrite);
+    assert!(result.is_ok());
+}
+
+// ─── ChaosAssertion property tests ──────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn total_in_range_with_zero_to_max_always_passes(
+        point in arb_fault_point(),
+    ) {
+        let injector = FaultInjector::new();
+        let scenario = ChaosScenario::new("test", "test")
+            .with_assertion(ChaosAssertion::TotalFaultsInRange(0, usize::MAX));
+        let results = injector.check_assertions(&scenario);
+        // On a clean injector with max range, should always pass
+        let _ = point; // unused but part of strategy
+        prop_assert!(results[0].passed);
+    }
+
+    #[test]
+    fn multiple_assertions_count_correctly(
+        n_passing in 1usize..5,
+        n_failing in 1usize..5,
+    ) {
+        let injector = FaultInjector::new();
+        let mut scenario = ChaosScenario::new("test", "test");
+
+        // FaultNeverFired always passes on clean injector
+        for _ in 0..n_passing {
+            scenario = scenario.with_assertion(ChaosAssertion::FaultNeverFired(FaultPoint::DbWrite));
+        }
+        // FaultFiredAtLeast(_, 1) always fails on clean injector
+        for _ in 0..n_failing {
+            scenario = scenario.with_assertion(ChaosAssertion::FaultFiredAtLeast(FaultPoint::DbRead, 1));
+        }
+
+        let report = ChaosReport::from_scenario(&injector, &scenario);
+        prop_assert_eq!(report.assertions_passed, n_passing);
+        prop_assert_eq!(report.assertions_failed, n_failing);
+        prop_assert!(!report.all_passed);
+    }
+}
+
+// ─── AssertionResult structural tests ───────────────────────────────
+
+#[test]
+fn assertion_result_has_description() {
+    let injector = FaultInjector::new();
+    let scenario = ChaosScenario::new("test", "test")
+        .with_assertion(ChaosAssertion::FaultNeverFired(FaultPoint::DbWrite));
+    let results = injector.check_assertions(&scenario);
+    assert!(!results[0].detail.is_empty(), "AssertionResult should have detail text");
+}
+
+// ─── FaultMode serde roundtrip ──────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn fault_mode_always_fail_debug(msg in "[a-z]{1,20}") {
+        let mode = FaultMode::always_fail(msg);
+        let debug = format!("{:?}", mode);
+        prop_assert!(!debug.is_empty(), "Debug should produce non-empty string");
+        prop_assert!(debug.contains("AlwaysFail"), "Debug should show variant name");
+    }
+
+    #[test]
+    fn fault_mode_delay_debug(ms in 0u64..100_000) {
+        let mode = FaultMode::delay(ms);
+        let debug = format!("{:?}", mode);
+        prop_assert!(!debug.is_empty(), "Debug should produce non-empty string");
+        prop_assert!(debug.contains("Delay"), "Debug should show variant name");
+    }
+}

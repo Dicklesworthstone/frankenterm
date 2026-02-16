@@ -775,3 +775,187 @@ fn endpoint_category_all_variants_have_unique_titles() {
     titles.dedup();
     assert_eq!(titles.len(), before, "category titles must be unique");
 }
+
+// =========================================================================
+// Additional property tests for coverage
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Type string is never empty for properties with explicit type.
+    #[test]
+    fn prop_parse_schema_type_string_nonempty(schema in arb_json_schema()) {
+        let doc = parse_schema(&schema);
+        for prop in &doc.properties {
+            // Properties with $ref may have type from the ref target name
+            prop_assert!(
+                !prop.type_str.is_empty(),
+                "type_str should be non-empty for property '{}'", prop.name
+            );
+        }
+    }
+
+    /// Property descriptions are extracted from the schema.
+    #[test]
+    fn prop_parse_schema_description_preserved(schema in arb_json_schema()) {
+        let doc = parse_schema(&schema);
+        if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+            for prop in &doc.properties {
+                if let Some(schema_prop) = props.get(&prop.name) {
+                    if let Some(desc) = schema_prop.get("description").and_then(Value::as_str) {
+                        prop_assert_eq!(
+                            &prop.description, desc,
+                            "description mismatch for property '{}'", prop.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Within required group and optional group, names are alphabetically sorted.
+    #[test]
+    fn prop_parse_schema_alphabetical_within_groups(schema in arb_json_schema()) {
+        let doc = parse_schema(&schema);
+        let required: Vec<&str> = doc.properties.iter()
+            .filter(|p| p.required)
+            .map(|p| p.name.as_str())
+            .collect();
+        let optional: Vec<&str> = doc.properties.iter()
+            .filter(|p| !p.required)
+            .map(|p| p.name.as_str())
+            .collect();
+
+        for w in required.windows(2) {
+            prop_assert!(w[0] <= w[1], "required: '{}' should come before '{}'", w[0], w[1]);
+        }
+        for w in optional.windows(2) {
+            prop_assert!(w[0] <= w[1], "optional: '{}' should come before '{}'", w[0], w[1]);
+        }
+    }
+
+    /// categorize_endpoint always returns a valid category variant.
+    #[test]
+    fn prop_categorize_returns_valid_variant(ep in arb_endpoint_meta()) {
+        let cat = categorize_endpoint(&ep);
+        let all = EndpointCategory::all();
+        let is_valid = all.contains(&cat);
+        prop_assert!(is_valid, "category {:?} should be in all()", cat);
+    }
+
+    /// DocGenConfig with all booleans set can roundtrip through JSON.
+    #[test]
+    fn prop_doc_gen_config_all_true_roundtrip(
+        envelope in any::<bool>(),
+        experimental in any::<bool>(),
+        error_codes in any::<bool>(),
+    ) {
+        let config = DocGenConfig {
+            include_envelope: envelope,
+            include_experimental: experimental,
+            include_error_codes: error_codes,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: DocGenConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(config.include_envelope, parsed.include_envelope);
+        prop_assert_eq!(config.include_experimental, parsed.include_experimental);
+        prop_assert_eq!(config.include_error_codes, parsed.include_error_codes);
+    }
+}
+
+// =========================================================================
+// parse_schema: type extraction edge cases
+// =========================================================================
+
+#[test]
+fn parse_schema_nested_object_type() {
+    let schema = json!({
+        "properties": {
+            "config": {
+                "type": "object",
+                "description": "Nested object"
+            }
+        }
+    });
+    let doc = parse_schema(&schema);
+    assert_eq!(doc.properties.len(), 1);
+    assert_eq!(doc.properties[0].type_str, "object");
+}
+
+#[test]
+fn parse_schema_boolean_type() {
+    let schema = json!({
+        "properties": {
+            "enabled": {
+                "type": "boolean",
+                "description": "A toggle"
+            }
+        }
+    });
+    let doc = parse_schema(&schema);
+    assert_eq!(doc.properties[0].type_str, "boolean");
+}
+
+#[test]
+fn parse_schema_multiple_required_sorted() {
+    let schema = json!({
+        "properties": {
+            "zeta": { "type": "string", "description": "z" },
+            "alpha": { "type": "string", "description": "a" },
+            "beta": { "type": "string", "description": "b" },
+        },
+        "required": ["zeta", "alpha", "beta"]
+    });
+    let doc = parse_schema(&schema);
+    let names: Vec<&str> = doc.properties.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["alpha", "beta", "zeta"]);
+}
+
+#[test]
+fn parse_schema_mixed_required_optional_sorted() {
+    let schema = json!({
+        "properties": {
+            "zeta": { "type": "string", "description": "z" },
+            "alpha": { "type": "string", "description": "a" },
+            "beta": { "type": "string", "description": "b" },
+        },
+        "required": ["beta"]
+    });
+    let doc = parse_schema(&schema);
+    // Required first, then optional, each alphabetical
+    assert!(doc.properties[0].name == "beta", "required 'beta' should be first");
+    assert!(doc.properties[0].required);
+    assert!(!doc.properties[1].required);
+    assert!(!doc.properties[2].required);
+}
+
+#[test]
+fn categorize_meta_for_help() {
+    let ep = EndpointMeta {
+        id: "help".to_string(),
+        title: String::new(),
+        description: String::new(),
+        robot_command: None,
+        mcp_tool: None,
+        schema_file: String::new(),
+        stable: true,
+        since: String::new(),
+    };
+    assert_eq!(categorize_endpoint(&ep), EndpointCategory::Meta);
+}
+
+#[test]
+fn categorize_meta_for_approve() {
+    let ep = EndpointMeta {
+        id: "approve".to_string(),
+        title: String::new(),
+        description: String::new(),
+        robot_command: None,
+        mcp_tool: None,
+        schema_file: String::new(),
+        stable: true,
+        since: String::new(),
+    };
+    assert_eq!(categorize_endpoint(&ep), EndpointCategory::Meta);
+}
