@@ -315,6 +315,33 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # Resize/reflow SLO gates: deterministic scenario + timeline threshold checks
+  # for M1/M2/M3 mid-tier budgets with machine-readable reports.
+  # Implements: ft-1u90p.7.4
+  resize-performance-gates:
+    name: Resize Performance Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: resize-performance-gates
+
+      - name: Run resize performance regression gates
+        run: scripts/check_resize_performance_gates.sh
+
+      - name: Upload resize gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resize-performance-gates
+          path: |
+            target/resize-performance-gates/
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Recorder validation gates: wire load/invariant/quality/recovery harnesses
   # into CI with explicit thresholds and artifact retention.
   # Implements: wa-oegrb.7.5

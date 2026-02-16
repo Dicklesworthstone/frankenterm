@@ -55,12 +55,21 @@ SKIP_SELF_CHECK=false
 LIST_ONLY=false
 DEFAULT_ONLY=false
 PARALLEL=1
+SOAK_DURATION_SECS=0
+SOAK_CHECKPOINT_INTERVAL_SECS=600
+SOAK_RESUME_CHECKPOINT=""
+SOAK_STOP_ON_FAILURE=false
+SOAK_FAULT_MATRIX="scheduler_stress,pty_failure,render_commit_failure"
+SOAK_FAULT_INTERVAL=1
+SOAK_FAULT_OFFSET=0
+SOAK_FAULT_MODE="simulate"
 WORKSPACE=""
 CONFIG_FILE=""
 SCENARIOS=()
 
 # Runtime state
 TIMESTAMP=""
+RUN_ID=""
 RUN_ARTIFACTS_DIR=""
 SUMMARY_FILE=""
 TOTAL=0
@@ -68,6 +77,28 @@ PASSED=0
 FAILED=0
 SKIPPED=0
 START_TIME=""
+LAST_WORKER_PID=""
+SOAK_MODE=false
+SOAK_TELEMETRY_DIR=""
+SOAK_SNAPSHOTS_DIR=""
+SOAK_CHECKPOINT_FILE=""
+SOAK_TELEMETRY_JSONL=""
+SOAK_HEALTH_JSONL=""
+SOAK_ANOMALY_JSONL=""
+SOAK_COMPLETED_CYCLES=0
+SOAK_LAST_CHECKPOINT_INDEX=0
+SOAK_SCENARIO_SEQUENCE=0
+SOAK_RESUME_FROM_RUN_ID=""
+SOAK_RESUME_FROM_CHECKPOINT=""
+SOAK_TARGET_END_EPOCH=0
+SOAK_FAULT_MATRIX_ENABLED=false
+SOAK_FAULT_CONFIG_FILE=""
+SOAK_FAULT_EVENTS_JSONL=""
+SOAK_FAULT_SUMMARY_FILE=""
+SOAK_FAULT_CLASSES_JSON="[]"
+SOAK_INCIDENT_REPORT_FILE=""
+SOAK_INCIDENT_REPORT_STATUS="not_run"
+declare -a SOAK_FAULT_CLASSES=()
 declare -a SCENARIO_SUMMARIES=()
 
 # ==============================================================================
@@ -117,6 +148,14 @@ Options:
     --timeout SECS        Global timeout per scenario (default: $DEFAULT_TIMEOUT)
     --retries N           Retry each scenario up to N times on failure (default: 0)
     --seed VALUE          Deterministic run seed used for per-scenario seeds
+    --soak-duration-secs N      Run repeated scenario cycles for N seconds
+    --checkpoint-interval-secs N  Emit soak checkpoints every N seconds (default: $SOAK_CHECKPOINT_INTERVAL_SECS)
+    --resume-checkpoint FILE    Resume soak cycle numbering/config from checkpoint JSON
+    --soak-stop-on-failure      Stop soak loop immediately on first failed scenario
+    --soak-fault-matrix LIST    Fault classes (comma-separated): scheduler_stress,pty_failure,render_commit_failure,none
+    --soak-fault-interval N     Trigger a fault every Nth soak scenario (default: $SOAK_FAULT_INTERVAL)
+    --soak-fault-offset N       Deterministic sequence offset for fault selection (default: $SOAK_FAULT_OFFSET)
+    --soak-fault-mode MODE      observe|simulate|fail (default: $SOAK_FAULT_MODE)
     --list                List available scenarios and exit
     --self-check          Run harness self-check only
     --skip-self-check     Skip prerequisites check (for CI setup-only scenarios)
@@ -144,6 +183,14 @@ Environment Variables:
     FT_E2E_TIMEOUT         Override timeout (seconds)
     FT_E2E_RETRIES         Retry count override (integer)
     FT_E2E_SEED            Deterministic run seed override
+    FT_E2E_SOAK_DURATION_SECS   Soak loop duration in seconds
+    FT_E2E_CHECKPOINT_INTERVAL_SECS  Soak checkpoint cadence in seconds
+    FT_E2E_RESUME_CHECKPOINT    Path to soak checkpoint JSON for resume
+    FT_E2E_SOAK_STOP_ON_FAILURE Stop soak loop on first failure (1)
+    FT_E2E_SOAK_FAULT_MATRIX    Fault classes (csv): scheduler_stress,pty_failure,render_commit_failure,none
+    FT_E2E_SOAK_FAULT_INTERVAL  Trigger a fault every Nth soak scenario
+    FT_E2E_SOAK_FAULT_OFFSET    Deterministic sequence offset for fault selection
+    FT_E2E_SOAK_FAULT_MODE      observe|simulate|fail
     FT_E2E_VERBOSE         Enable verbose output (1)
     FT_E2E_WORKSPACE       Override workspace path
     FT_LOG_LEVEL           Log level for wa processes
@@ -154,6 +201,10 @@ Examples:
     $0 capture_search      # Run specific scenario
     $0 --self-check        # Check prerequisites only
     $0 --verbose --keep-artifacts  # Debug mode
+    $0 --default-only --soak-duration-secs 7200 --checkpoint-interval-secs 300
+    $0 --default-only --soak-duration-secs 3600 --resume-checkpoint e2e-artifacts/last/soak/last_checkpoint.json
+    $0 --default-only --soak-duration-secs 1800 --soak-fault-matrix scheduler_stress,pty_failure,render_commit_failure --soak-fault-mode fail
+    FT_E2E_SEED=20260216-nightly $0 --default-only --parallel 4 --retries 2
 EOF
 }
 
@@ -187,6 +238,38 @@ parse_args() {
             --seed)
                 RUN_SEED="$2"
                 RUN_SEED_SOURCE="explicit"
+                shift 2
+                ;;
+            --soak-duration-secs)
+                SOAK_DURATION_SECS="$2"
+                shift 2
+                ;;
+            --checkpoint-interval-secs)
+                SOAK_CHECKPOINT_INTERVAL_SECS="$2"
+                shift 2
+                ;;
+            --resume-checkpoint)
+                SOAK_RESUME_CHECKPOINT="$2"
+                shift 2
+                ;;
+            --soak-stop-on-failure)
+                SOAK_STOP_ON_FAILURE=true
+                shift
+                ;;
+            --soak-fault-matrix)
+                SOAK_FAULT_MATRIX="$2"
+                shift 2
+                ;;
+            --soak-fault-interval)
+                SOAK_FAULT_INTERVAL="$2"
+                shift 2
+                ;;
+            --soak-fault-offset)
+                SOAK_FAULT_OFFSET="$2"
+                shift 2
+                ;;
+            --soak-fault-mode)
+                SOAK_FAULT_MODE="$2"
                 shift 2
                 ;;
             --list)
@@ -250,6 +333,14 @@ parse_args() {
         RUN_SEED="$FT_E2E_SEED"
         RUN_SEED_SOURCE="env"
     fi
+    if [[ -n "${FT_E2E_SOAK_DURATION_SECS:-}" ]]; then SOAK_DURATION_SECS="$FT_E2E_SOAK_DURATION_SECS"; fi
+    if [[ -n "${FT_E2E_CHECKPOINT_INTERVAL_SECS:-}" ]]; then SOAK_CHECKPOINT_INTERVAL_SECS="$FT_E2E_CHECKPOINT_INTERVAL_SECS"; fi
+    if [[ -n "${FT_E2E_RESUME_CHECKPOINT:-}" ]]; then SOAK_RESUME_CHECKPOINT="$FT_E2E_RESUME_CHECKPOINT"; fi
+    if [[ -n "${FT_E2E_SOAK_STOP_ON_FAILURE:-}" ]]; then SOAK_STOP_ON_FAILURE=true; fi
+    if [[ -n "${FT_E2E_SOAK_FAULT_MATRIX:-}" ]]; then SOAK_FAULT_MATRIX="$FT_E2E_SOAK_FAULT_MATRIX"; fi
+    if [[ -n "${FT_E2E_SOAK_FAULT_INTERVAL:-}" ]]; then SOAK_FAULT_INTERVAL="$FT_E2E_SOAK_FAULT_INTERVAL"; fi
+    if [[ -n "${FT_E2E_SOAK_FAULT_OFFSET:-}" ]]; then SOAK_FAULT_OFFSET="$FT_E2E_SOAK_FAULT_OFFSET"; fi
+    if [[ -n "${FT_E2E_SOAK_FAULT_MODE:-}" ]]; then SOAK_FAULT_MODE="$FT_E2E_SOAK_FAULT_MODE"; fi
     if [[ -n "${FT_E2E_VERBOSE:-}" ]]; then VERBOSE=true; fi
     if [[ -n "${FT_E2E_WORKSPACE:-}" ]]; then WORKSPACE="$FT_E2E_WORKSPACE"; fi
 }
@@ -407,6 +498,7 @@ SCENARIO_REGISTRY=(
     "search_linting_rebuild|Validate search linting + FTS verify/rebuild commands|true|wezterm,jq,sqlite3|Protects search maintenance commands"
     "uservar_forwarding|Validate user-var forwarding lane (wezterm.lua -> wa event -> watcher)|true|wezterm,jq,sqlite3|Protects user-var IPC lane"
     "alt_screen_detection|Validate alt-screen detection via escape sequences (no Lua status hook)|true|wezterm,jq,sqlite3|Protects alt-screen detection"
+    "alt_screen_conformance|Validate vim/less/htop/tmux alt-screen semantics under resize pulses|true|wezterm,jq,sqlite3|Protects fullscreen app resize behavior"
     "no_lua_status_hook|Validate wa setup does not inject update-status Lua|true|wezterm,jq|Protects against legacy status hook"
     "workflow_resume|Validate workflow resumes after watcher restart (no duplicate steps)|true|wezterm,jq,sqlite3|Protects workflow resume"
     "accounts_refresh|Validate accounts refresh via fake caut + pick preview + redaction|true|wezterm,jq,sqlite3|Protects accounts refresh"
@@ -421,6 +513,7 @@ SCENARIO_REGISTRY=(
     "flake_guard|Repeat-run representative test suites to detect timing flakiness|false|cargo,jq|Catches timing regressions early"
     "reliability_hardening|Validate circuit breaker, retry, degradation, chaos, watchdog|true|cargo,jq|Protects resilience and fault tolerance"
     "perf_regression|Perf regression smoke: patterns, delta, cache, benchmarks with budget validation|true|cargo,jq|Protects performance budgets"
+    "input_latency_resize_storm|Validate typing/mouse/paste interaction latency during resize/font churn|true|cargo,jq|Protects user-perceived responsiveness under resize storms"
     "distributed_streaming|Validate distributed agent->aggregator streaming, persistence, and query/auth robustness|false|cargo,jq|Protects optional distributed mode end-to-end"
     "timeline_correlation|Validate timeline cross-pane correlation (aggregation, failover, temporal)|true|cargo,jq,sqlite3|Protects event correlation determinism"
 )
@@ -551,6 +644,70 @@ scenario_retry_backoff_secs() {
     echo "$backoff"
 }
 
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    echo "$value"
+}
+
+normalize_soak_fault_matrix_config() {
+    SOAK_FAULT_CLASSES=()
+    SOAK_FAULT_CLASSES_JSON="[]"
+    SOAK_FAULT_MATRIX_ENABLED=false
+
+    local raw="$SOAK_FAULT_MATRIX"
+    if [[ -z "$raw" ]]; then
+        return 0
+    fi
+
+    local saw_none=false
+    local token=""
+    local parsed=()
+    IFS=',' read -ra parsed <<< "$raw"
+    for token in "${parsed[@]}"; do
+        token=$(trim_whitespace "$token")
+        if [[ -z "$token" ]]; then
+            continue
+        fi
+        token="$(printf '%s' "$token" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$token" == "none" ]]; then
+            saw_none=true
+            break
+        fi
+        case "$token" in
+            scheduler_stress|pty_failure|render_commit_failure)
+                SOAK_FAULT_CLASSES+=("$token")
+                ;;
+            *)
+                echo "Invalid --soak-fault-matrix class: $token (expected scheduler_stress,pty_failure,render_commit_failure,none)" >&2
+                exit 3
+                ;;
+        esac
+    done
+
+    if [[ "$saw_none" == "true" ]]; then
+        SOAK_FAULT_CLASSES=()
+        SOAK_FAULT_CLASSES_JSON="[]"
+        SOAK_FAULT_MATRIX_ENABLED=false
+        return 0
+    fi
+
+    if [[ "${#SOAK_FAULT_CLASSES[@]}" -gt 0 ]]; then
+        local classes_json="["
+        local idx=0
+        for idx in "${!SOAK_FAULT_CLASSES[@]}"; do
+            if [[ "$idx" -gt 0 ]]; then
+                classes_json+=","
+            fi
+            classes_json+="\"${SOAK_FAULT_CLASSES[$idx]}\""
+        done
+        classes_json+="]"
+        SOAK_FAULT_CLASSES_JSON="$classes_json"
+        SOAK_FAULT_MATRIX_ENABLED=true
+    fi
+}
+
 validate_orchestration_config() {
     if ! [[ "$SCENARIO_RETRIES" =~ ^[0-9]+$ ]]; then
         echo "Invalid --retries value: $SCENARIO_RETRIES (expected integer >= 0)" >&2
@@ -560,11 +717,1031 @@ validate_orchestration_config() {
         echo "Invalid --parallel value: $PARALLEL (expected integer >= 1)" >&2
         exit 3
     fi
+    if ! [[ "$SOAK_DURATION_SECS" =~ ^[0-9]+$ ]]; then
+        echo "Invalid --soak-duration-secs value: $SOAK_DURATION_SECS (expected integer >= 0)" >&2
+        exit 3
+    fi
+    if ! [[ "$SOAK_FAULT_INTERVAL" =~ ^[0-9]+$ ]] || [[ "$SOAK_FAULT_INTERVAL" -lt 1 ]]; then
+        echo "Invalid --soak-fault-interval value: $SOAK_FAULT_INTERVAL (expected integer >= 1)" >&2
+        exit 3
+    fi
+    if ! [[ "$SOAK_FAULT_OFFSET" =~ ^[0-9]+$ ]]; then
+        echo "Invalid --soak-fault-offset value: $SOAK_FAULT_OFFSET (expected integer >= 0)" >&2
+        exit 3
+    fi
+    SOAK_FAULT_MODE="$(printf '%s' "$SOAK_FAULT_MODE" | tr '[:upper:]' '[:lower:]')"
+    case "$SOAK_FAULT_MODE" in
+        observe|simulate|fail)
+            ;;
+        *)
+            echo "Invalid --soak-fault-mode value: $SOAK_FAULT_MODE (expected observe|simulate|fail)" >&2
+            exit 3
+            ;;
+    esac
+    normalize_soak_fault_matrix_config
+    if ! [[ "$SOAK_CHECKPOINT_INTERVAL_SECS" =~ ^[0-9]+$ ]] || [[ "$SOAK_CHECKPOINT_INTERVAL_SECS" -lt 30 ]]; then
+        echo "Invalid --checkpoint-interval-secs value: $SOAK_CHECKPOINT_INTERVAL_SECS (expected integer >= 30)" >&2
+        exit 3
+    fi
+
+    if [[ "$SOAK_DURATION_SECS" -gt 0 ]]; then
+        SOAK_MODE=true
+        if [[ "$PARALLEL" -gt 1 ]]; then
+            log_warn "Soak mode enforces deterministic sequencing; overriding --parallel $PARALLEL to 1"
+            PARALLEL=1
+        fi
+        if [[ "$KEEP_ARTIFACTS" == "false" ]]; then
+            KEEP_ARTIFACTS=true
+            log_info "Soak mode forces --keep-artifacts to preserve checkpoints and telemetry snapshots"
+        fi
+        if [[ "$SOAK_FAULT_MATRIX_ENABLED" == "true" ]]; then
+            log_info "Soak fault matrix: mode=$SOAK_FAULT_MODE interval=$SOAK_FAULT_INTERVAL offset=$SOAK_FAULT_OFFSET classes=${SOAK_FAULT_CLASSES[*]}"
+        else
+            log_info "Soak fault matrix disabled (set --soak-fault-matrix to enable)"
+        fi
+    fi
+
+    if [[ -n "$SOAK_RESUME_CHECKPOINT" && ! -f "$SOAK_RESUME_CHECKPOINT" ]]; then
+        echo "Invalid --resume-checkpoint path (file not found): $SOAK_RESUME_CHECKPOINT" >&2
+        exit 3
+    fi
+    if [[ -n "$SOAK_RESUME_CHECKPOINT" && "$SOAK_MODE" != "true" ]]; then
+        echo "--resume-checkpoint requires --soak-duration-secs > 0" >&2
+        exit 3
+    fi
 
     if [[ -z "$RUN_SEED" ]]; then
         RUN_SEED="$(date -u +%s)"
         RUN_SEED_SOURCE="auto"
     fi
+}
+
+compute_run_id() {
+    local seed_material="${RUN_SEED}:${RUN_SEED_SOURCE}:${TIMESTAMP}:$$"
+    if command -v shasum >/dev/null 2>&1; then
+        printf '%s' "$seed_material" | shasum -a 256 | awk '{print substr($1,1,12)}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$seed_material" | sha256sum | awk '{print substr($1,1,12)}'
+    else
+        printf '%s' "${TIMESTAMP}-$$"
+    fi
+}
+
+scenarios_to_json_array() {
+    local scenarios=("$@")
+    if [[ "${#scenarios[@]}" -eq 0 ]]; then
+        echo "[]"
+        return 0
+    fi
+    printf '%s\n' "${scenarios[@]}" | jq -R . | jq -cs '.'
+}
+
+load_soak_resume_checkpoint() {
+    local scenarios_json="$1"
+    if [[ -z "$SOAK_RESUME_CHECKPOINT" ]]; then
+        return 0
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "Cannot parse --resume-checkpoint without jq in PATH" >&2
+        exit 5
+    fi
+    if ! jq -e . "$SOAK_RESUME_CHECKPOINT" >/dev/null 2>&1; then
+        echo "Invalid JSON in --resume-checkpoint: $SOAK_RESUME_CHECKPOINT" >&2
+        exit 3
+    fi
+
+    local checkpoint_seed=""
+    local checkpoint_run_id=""
+    local checkpoint_completed_cycles="0"
+    local checkpoint_sequence_no="0"
+    local checkpoint_scenarios_json="[]"
+
+    checkpoint_seed=$(jq -r '.run_seed // empty' "$SOAK_RESUME_CHECKPOINT")
+    checkpoint_run_id=$(jq -r '.run_id // empty' "$SOAK_RESUME_CHECKPOINT")
+    checkpoint_completed_cycles=$(jq -r '.progress.completed_cycles // .completed_cycles // 0' "$SOAK_RESUME_CHECKPOINT")
+    checkpoint_sequence_no=$(jq -r '.progress.sequence_no // .sequence_no // 0' "$SOAK_RESUME_CHECKPOINT")
+    checkpoint_scenarios_json=$(jq -c '.config.scenarios // .scenarios // []' "$SOAK_RESUME_CHECKPOINT")
+
+    if [[ -z "$checkpoint_seed" ]]; then
+        echo "Resume checkpoint missing run_seed: $SOAK_RESUME_CHECKPOINT" >&2
+        exit 3
+    fi
+    if [[ "$checkpoint_scenarios_json" != "$scenarios_json" ]]; then
+        echo "Resume checkpoint scenarios do not match requested scenario set" >&2
+        echo "checkpoint scenarios: $checkpoint_scenarios_json" >&2
+        echo "requested scenarios:  $scenarios_json" >&2
+        exit 3
+    fi
+    if ! [[ "$checkpoint_completed_cycles" =~ ^[0-9]+$ ]]; then
+        checkpoint_completed_cycles=0
+    fi
+    if ! [[ "$checkpoint_sequence_no" =~ ^[0-9]+$ ]]; then
+        checkpoint_sequence_no=0
+    fi
+
+    if [[ "$RUN_SEED_SOURCE" == "explicit" || "$RUN_SEED_SOURCE" == "env" ]]; then
+        if [[ "$RUN_SEED" != "$checkpoint_seed" ]]; then
+            echo "Explicit --seed/FT_E2E_SEED does not match resume checkpoint run_seed" >&2
+            echo "seed: $RUN_SEED checkpoint: $checkpoint_seed" >&2
+            exit 3
+        fi
+    else
+        RUN_SEED="$checkpoint_seed"
+        RUN_SEED_SOURCE="resume"
+    fi
+
+    SOAK_COMPLETED_CYCLES="$checkpoint_completed_cycles"
+    SOAK_SCENARIO_SEQUENCE="$checkpoint_sequence_no"
+    SOAK_RESUME_FROM_RUN_ID="$checkpoint_run_id"
+    SOAK_RESUME_FROM_CHECKPOINT="$SOAK_RESUME_CHECKPOINT"
+}
+
+soak_record_health_summary() {
+    local reason="$1"
+    local elapsed_secs="$2"
+    local remaining_secs="$3"
+    local average_scenario_ms="$4"
+    local artifacts_bytes="$5"
+    local total_completed="$((PASSED + FAILED + SKIPPED))"
+    local pass_rate_pct="0.00"
+
+    if [[ "$total_completed" -gt 0 ]]; then
+        pass_rate_pct=$(awk "BEGIN { printf \"%.2f\", ($PASSED * 100.0) / $total_completed }")
+    fi
+
+    jq -cn \
+        --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg run_id "$RUN_ID" \
+        --arg test_case_id "soak_health_summary" \
+        --arg resize_transaction_id "${RUN_ID}:soak:health:${SOAK_LAST_CHECKPOINT_INDEX}" \
+        --arg scheduler_decision "soak_health_summary" \
+        --argjson sequence_no "$SOAK_LAST_CHECKPOINT_INDEX" \
+        --argjson queue_wait_ms 0 \
+        --argjson reflow_ms "$average_scenario_ms" \
+        --argjson render_ms "$average_scenario_ms" \
+        --argjson present_ms "$average_scenario_ms" \
+        --argjson p50_ms "$average_scenario_ms" \
+        --argjson p95_ms "$average_scenario_ms" \
+        --argjson p99_ms "$average_scenario_ms" \
+        --arg reason "$reason" \
+        --argjson completed_cycles "$SOAK_COMPLETED_CYCLES" \
+        --argjson elapsed_secs "$elapsed_secs" \
+        --argjson remaining_secs "$remaining_secs" \
+        --argjson total_completed "$total_completed" \
+        --argjson passed "$PASSED" \
+        --argjson failed "$FAILED" \
+        --argjson skipped "$SKIPPED" \
+        --arg pass_rate_pct "$pass_rate_pct" \
+        --argjson artifacts_bytes "$artifacts_bytes" \
+        '{
+            timestamp: $timestamp,
+            run_id: $run_id,
+            test_case_id: $test_case_id,
+            resize_transaction_id: $resize_transaction_id,
+            pane_id: null,
+            tab_id: null,
+            sequence_no: $sequence_no,
+            scheduler_decision: $scheduler_decision,
+            frame_id: null,
+            queue_wait_ms: $queue_wait_ms,
+            reflow_ms: $reflow_ms,
+            render_ms: $render_ms,
+            present_ms: $present_ms,
+            p50_ms: $p50_ms,
+            p95_ms: $p95_ms,
+            p99_ms: $p99_ms,
+            reason: $reason,
+            health: {
+                completed_cycles: $completed_cycles,
+                elapsed_secs: $elapsed_secs,
+                remaining_secs: $remaining_secs,
+                totals: {
+                    completed: $total_completed,
+                    passed: $passed,
+                    failed: $failed,
+                    skipped: $skipped
+                },
+                pass_rate_pct: ($pass_rate_pct | tonumber),
+                artifacts_bytes: $artifacts_bytes
+            }
+        }' >> "$SOAK_HEALTH_JSONL"
+}
+
+soak_record_anomaly_marker() {
+    local marker_type="$1"
+    local scenario_name="$2"
+    local duration_secs="$3"
+    local detail="$4"
+    local severity="$5"
+    local duration_ms=$((duration_secs * 1000))
+
+    jq -cn \
+        --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg run_id "$RUN_ID" \
+        --arg test_case_id "$scenario_name" \
+        --arg resize_transaction_id "${RUN_ID}:soak:anomaly:${SOAK_SCENARIO_SEQUENCE}" \
+        --arg scheduler_decision "soak_runner" \
+        --arg marker_type "$marker_type" \
+        --arg severity "$severity" \
+        --arg detail "$detail" \
+        --argjson sequence_no "$SOAK_SCENARIO_SEQUENCE" \
+        --argjson queue_wait_ms 0 \
+        --argjson reflow_ms "$duration_ms" \
+        --argjson render_ms "$duration_ms" \
+        --argjson present_ms "$duration_ms" \
+        --argjson p50_ms "$duration_ms" \
+        --argjson p95_ms "$duration_ms" \
+        --argjson p99_ms "$duration_ms" \
+        '{
+            timestamp: $timestamp,
+            run_id: $run_id,
+            test_case_id: $test_case_id,
+            resize_transaction_id: $resize_transaction_id,
+            pane_id: null,
+            tab_id: null,
+            sequence_no: $sequence_no,
+            scheduler_decision: $scheduler_decision,
+            frame_id: null,
+            queue_wait_ms: $queue_wait_ms,
+            reflow_ms: $reflow_ms,
+            render_ms: $render_ms,
+            present_ms: $present_ms,
+            p50_ms: $p50_ms,
+            p95_ms: $p95_ms,
+            p99_ms: $p99_ms,
+            marker_type: $marker_type,
+            severity: $severity,
+            detail: $detail
+        }' >> "$SOAK_ANOMALY_JSONL"
+}
+
+soak_emit_checkpoint() {
+    local scenarios_json="$1"
+    local reason="$2"
+    local now_epoch
+    local elapsed_secs
+    local remaining_secs
+    local total_completed
+    local average_scenario_ms=0
+    local artifacts_bytes=0
+    local checkpoint_index
+    local pass_rate_pct="0.00"
+
+    now_epoch=$(date +%s)
+    elapsed_secs=$((now_epoch - START_TIME))
+    remaining_secs=$((SOAK_TARGET_END_EPOCH - now_epoch))
+    if [[ "$remaining_secs" -lt 0 ]]; then
+        remaining_secs=0
+    fi
+
+    total_completed=$((PASSED + FAILED + SKIPPED))
+    if [[ "$total_completed" -gt 0 ]]; then
+        average_scenario_ms=$(awk "BEGIN { printf \"%.0f\", ($elapsed_secs * 1000.0) / $total_completed }")
+        pass_rate_pct=$(awk "BEGIN { printf \"%.2f\", ($PASSED * 100.0) / $total_completed }")
+    fi
+    if [[ -d "$RUN_ARTIFACTS_DIR" ]]; then
+        artifacts_bytes=$(du -sk "$RUN_ARTIFACTS_DIR" 2>/dev/null | awk '{print $1 * 1024}')
+        if [[ -z "$artifacts_bytes" ]]; then
+            artifacts_bytes=0
+        fi
+    fi
+
+    checkpoint_index=$((SOAK_LAST_CHECKPOINT_INDEX + 1))
+    SOAK_LAST_CHECKPOINT_INDEX="$checkpoint_index"
+
+    jq -n \
+        --arg schema_version "wa.soak_checkpoint.v1" \
+        --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg run_id "$RUN_ID" \
+        --arg run_seed "$RUN_SEED" \
+        --arg run_seed_source "$RUN_SEED_SOURCE" \
+        --argjson checkpoint_index "$checkpoint_index" \
+        --arg reason "$reason" \
+        --argjson soak_duration_secs "$SOAK_DURATION_SECS" \
+        --argjson checkpoint_interval_secs "$SOAK_CHECKPOINT_INTERVAL_SECS" \
+        --argjson timeout_secs "$TIMEOUT" \
+        --argjson scenario_retries "$SCENARIO_RETRIES" \
+        --argjson scenarios "$scenarios_json" \
+        --argjson completed_cycles "$SOAK_COMPLETED_CYCLES" \
+        --argjson next_cycle "$((SOAK_COMPLETED_CYCLES + 1))" \
+        --argjson elapsed_secs "$elapsed_secs" \
+        --argjson remaining_secs "$remaining_secs" \
+        --argjson sequence_no "$SOAK_SCENARIO_SEQUENCE" \
+        --argjson total_completed "$total_completed" \
+        --argjson passed "$PASSED" \
+        --argjson failed "$FAILED" \
+        --argjson skipped "$SKIPPED" \
+        --arg pass_rate_pct "$pass_rate_pct" \
+        --argjson average_scenario_ms "$average_scenario_ms" \
+        --argjson artifacts_bytes "$artifacts_bytes" \
+        --arg resume_from_run_id "$SOAK_RESUME_FROM_RUN_ID" \
+        --arg resume_from_checkpoint "$SOAK_RESUME_FROM_CHECKPOINT" \
+        '{
+            schema_version: $schema_version,
+            generated_at: $generated_at,
+            run_id: $run_id,
+            run_seed: $run_seed,
+            run_seed_source: $run_seed_source,
+            checkpoint_index: $checkpoint_index,
+            reason: $reason,
+            config: {
+                soak_duration_secs: $soak_duration_secs,
+                checkpoint_interval_secs: $checkpoint_interval_secs,
+                timeout_secs: $timeout_secs,
+                scenario_retries: $scenario_retries,
+                scenarios: $scenarios
+            },
+            progress: {
+                completed_cycles: $completed_cycles,
+                next_cycle: $next_cycle,
+                elapsed_secs: $elapsed_secs,
+                remaining_secs: $remaining_secs,
+                sequence_no: $sequence_no
+            },
+            totals: {
+                completed: $total_completed,
+                passed: $passed,
+                failed: $failed,
+                skipped: $skipped,
+                pass_rate_pct: ($pass_rate_pct | tonumber)
+            },
+            telemetry: {
+                average_scenario_ms: $average_scenario_ms,
+                artifacts_bytes: $artifacts_bytes
+            },
+            resume: {
+                from_run_id: (if $resume_from_run_id == "" then null else $resume_from_run_id end),
+                from_checkpoint: (if $resume_from_checkpoint == "" then null else $resume_from_checkpoint end)
+            }
+        }' > "$SOAK_CHECKPOINT_FILE"
+
+    cp "$SOAK_CHECKPOINT_FILE" "$SOAK_SNAPSHOTS_DIR/checkpoint_$(printf '%04d' "$checkpoint_index").json"
+    if [[ -n "$SOAK_RESUME_CHECKPOINT" ]]; then
+        cp "$SOAK_CHECKPOINT_FILE" "$SOAK_RESUME_CHECKPOINT" 2>/dev/null || true
+    fi
+
+    jq -cn \
+        --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg run_id "$RUN_ID" \
+        --arg test_case_id "soak_checkpoint" \
+        --arg resize_transaction_id "${RUN_ID}:soak:checkpoint:${checkpoint_index}" \
+        --arg scheduler_decision "soak_checkpoint" \
+        --arg reason "$reason" \
+        --argjson sequence_no "$checkpoint_index" \
+        --argjson queue_wait_ms 0 \
+        --argjson reflow_ms "$average_scenario_ms" \
+        --argjson render_ms "$average_scenario_ms" \
+        --argjson present_ms "$average_scenario_ms" \
+        --argjson p50_ms "$average_scenario_ms" \
+        --argjson p95_ms "$average_scenario_ms" \
+        --argjson p99_ms "$average_scenario_ms" \
+        --argjson elapsed_secs "$elapsed_secs" \
+        --argjson remaining_secs "$remaining_secs" \
+        --argjson completed_cycles "$SOAK_COMPLETED_CYCLES" \
+        --argjson total_completed "$total_completed" \
+        '{
+            timestamp: $timestamp,
+            run_id: $run_id,
+            test_case_id: $test_case_id,
+            resize_transaction_id: $resize_transaction_id,
+            pane_id: null,
+            tab_id: null,
+            sequence_no: $sequence_no,
+            scheduler_decision: $scheduler_decision,
+            frame_id: null,
+            queue_wait_ms: $queue_wait_ms,
+            reflow_ms: $reflow_ms,
+            render_ms: $render_ms,
+            present_ms: $present_ms,
+            p50_ms: $p50_ms,
+            p95_ms: $p95_ms,
+            p99_ms: $p99_ms,
+            reason: $reason,
+            progress: {
+                elapsed_secs: $elapsed_secs,
+                remaining_secs: $remaining_secs,
+                completed_cycles: $completed_cycles,
+                total_completed: $total_completed
+            }
+        }' >> "$SOAK_TELEMETRY_JSONL"
+
+    soak_record_health_summary "$reason" "$elapsed_secs" "$remaining_secs" "$average_scenario_ms" "$artifacts_bytes"
+    log_info "Soak checkpoint #$checkpoint_index emitted (reason=$reason cycles=$SOAK_COMPLETED_CYCLES completed=$total_completed)"
+}
+
+soak_fault_policy_tuple() {
+    local fault_class="$1"
+    case "$fault_class" in
+        scheduler_stress)
+            echo "quality_reduced|continue|medium"
+            ;;
+        pty_failure)
+            echo "pane_isolation|continue|high"
+            ;;
+        render_commit_failure)
+            echo "frame_drop_recovery|continue|high"
+            ;;
+        *)
+            echo "nominal|continue|low"
+            ;;
+    esac
+}
+
+soak_compute_fault_plan() {
+    local scenario_name="$1"
+    local sequence_no="$2"
+    local class_count="${#SOAK_FAULT_CLASSES[@]}"
+    local active=false
+    local fault_class="none"
+    local matrix_index=-1
+    local sequence_mod=0
+    local expected_degradation="nominal"
+    local expected_policy="continue"
+    local severity="low"
+    local trigger_token=""
+    local tuple=""
+
+    if [[ "$SOAK_FAULT_MATRIX_ENABLED" == "true" && "$class_count" -gt 0 ]]; then
+        matrix_index=$(( (sequence_no + SOAK_FAULT_OFFSET - 1) % class_count ))
+        if [[ "$matrix_index" -lt 0 ]]; then
+            matrix_index=$((matrix_index + class_count))
+        fi
+        fault_class="${SOAK_FAULT_CLASSES[$matrix_index]}"
+        sequence_mod=$(( (sequence_no + SOAK_FAULT_OFFSET) % SOAK_FAULT_INTERVAL ))
+        if [[ "$sequence_mod" -eq 0 ]]; then
+            active=true
+        fi
+    fi
+
+    tuple=$(soak_fault_policy_tuple "$fault_class")
+    IFS='|' read -r expected_degradation expected_policy severity <<< "$tuple"
+    trigger_token=$(compute_scenario_seed_hex "${scenario_name}:${fault_class}:soak_fault" "$sequence_no")
+
+    jq -cn \
+        --arg schema_version "wa.soak_fault_plan.v1" \
+        --arg run_id "$RUN_ID" \
+        --arg run_seed "$RUN_SEED" \
+        --arg test_case_id "$scenario_name" \
+        --arg resize_transaction_id "${RUN_ID}:soak:fault:${sequence_no}" \
+        --argjson sequence_no "$sequence_no" \
+        --argjson enabled "$SOAK_FAULT_MATRIX_ENABLED" \
+        --argjson active "$active" \
+        --arg fault_class "$fault_class" \
+        --arg mode "$SOAK_FAULT_MODE" \
+        --arg trigger_token "$trigger_token" \
+        --argjson matrix_index "$matrix_index" \
+        --argjson interval "$SOAK_FAULT_INTERVAL" \
+        --argjson offset "$SOAK_FAULT_OFFSET" \
+        --argjson sequence_mod "$sequence_mod" \
+        --arg expected_degradation "$expected_degradation" \
+        --arg expected_policy "$expected_policy" \
+        --arg expected_severity "$severity" \
+        '{
+            schema_version: $schema_version,
+            run_id: $run_id,
+            run_seed: $run_seed,
+            test_case_id: $test_case_id,
+            resize_transaction_id: $resize_transaction_id,
+            sequence_no: $sequence_no,
+            enabled: $enabled,
+            active: $active,
+            fault_class: $fault_class,
+            mode: $mode,
+            trigger: {
+                token: $trigger_token,
+                matrix_index: $matrix_index,
+                interval: $interval,
+                offset: $offset,
+                sequence_mod: $sequence_mod
+            },
+            expected: {
+                degradation: $expected_degradation,
+                policy: $expected_policy,
+                severity: $expected_severity
+            }
+        }'
+}
+
+apply_soak_fault_injection() {
+    local scenario_name="$1"
+    local attempt_dir="$2"
+    local fault_plan_json="$3"
+    local attempt_result="$4"
+    local active=""
+    local fault_class=""
+    local mode=""
+    local exit_code="$attempt_result"
+    local action="none"
+    local detail="no_fault_injection"
+    local forced_failure=false
+    local delay_ms=0
+    local applied=false
+
+    active=$(jq -r '.active // false' <<< "$fault_plan_json")
+    fault_class=$(jq -r '.fault_class // "none"' <<< "$fault_plan_json")
+    mode=$(jq -r '.mode // "observe"' <<< "$fault_plan_json")
+
+    if [[ "$active" == "true" && "$fault_class" != "none" ]]; then
+        case "$fault_class" in
+            scheduler_stress)
+                applied=true
+                action="scheduler_queue_pressure"
+                detail="synthetic_scheduler_delay"
+                if [[ "$mode" != "observe" ]]; then
+                    sleep 1
+                    delay_ms=1000
+                fi
+                ;;
+            pty_failure)
+                applied=true
+                action="pty_resize_failure_injected"
+                detail="synthetic_pty_failure_marker"
+                if [[ "$mode" == "fail" && "$attempt_result" -eq 0 ]]; then
+                    exit_code=86
+                    forced_failure=true
+                fi
+                ;;
+            render_commit_failure)
+                applied=true
+                action="render_commit_failure_injected"
+                detail="synthetic_render_commit_failure_marker"
+                if [[ "$mode" == "fail" && "$attempt_result" -eq 0 ]]; then
+                    exit_code=87
+                    forced_failure=true
+                fi
+                ;;
+            *)
+                ;;
+        esac
+    fi
+
+    local effect_json=""
+    effect_json=$(jq -cn \
+        --arg scenario_name "$scenario_name" \
+        --arg fault_class "$fault_class" \
+        --arg mode "$mode" \
+        --arg action "$action" \
+        --arg detail "$detail" \
+        --argjson applied "$applied" \
+        --argjson forced_failure "$forced_failure" \
+        --argjson delay_ms "$delay_ms" \
+        --argjson prior_exit_code "$attempt_result" \
+        --argjson exit_code "$exit_code" \
+        '{
+            scenario_name: $scenario_name,
+            fault_class: $fault_class,
+            mode: $mode,
+            applied: $applied,
+            action: $action,
+            detail: $detail,
+            forced_failure: $forced_failure,
+            delay_ms: $delay_ms,
+            prior_exit_code: $prior_exit_code,
+            exit_code: $exit_code
+        }')
+
+    echo "$effect_json" > "$attempt_dir/fault_injection_effect.json"
+    if [[ -f "$attempt_dir/scenario.log" ]]; then
+        echo "[soak_fault] class=$fault_class mode=$mode action=$action forced_failure=$forced_failure exit_code=$exit_code" >> "$attempt_dir/scenario.log"
+    fi
+
+    echo "$effect_json"
+}
+
+soak_record_fault_event() {
+    local scenario_name="$1"
+    local sequence_no="$2"
+    local scenario_rc="$3"
+    local summary_status="$4"
+    local summary_duration="$5"
+    local summary_error="$6"
+    local fault_plan_json="$7"
+    local duration_secs="$summary_duration"
+    local duration_ms=0
+    local active=""
+    local fault_class=""
+    local mode=""
+    local expected_degradation=""
+    local expected_policy=""
+    local severity=""
+    local classification="control_path"
+    local responsive=true
+    local event_json=""
+    local queue_wait_ms=0
+
+    if ! [[ "$duration_secs" =~ ^[0-9]+$ ]]; then
+        duration_secs=0
+    fi
+    duration_ms=$((duration_secs * 1000))
+
+    active=$(jq -r '.active // false' <<< "$fault_plan_json")
+    fault_class=$(jq -r '.fault_class // "none"' <<< "$fault_plan_json")
+    mode=$(jq -r '.mode // "observe"' <<< "$fault_plan_json")
+    expected_degradation=$(jq -r '.expected.degradation // "nominal"' <<< "$fault_plan_json")
+    expected_policy=$(jq -r '.expected.policy // "continue"' <<< "$fault_plan_json")
+    severity=$(jq -r '.expected.severity // "low"' <<< "$fault_plan_json")
+
+    if [[ "$active" == "true" ]]; then
+        if [[ "$summary_status" == "passed" && "$scenario_rc" -eq 0 ]]; then
+            classification="degraded_recovered"
+        elif [[ "$SOAK_STOP_ON_FAILURE" == "true" ]]; then
+            classification="stop_on_failure_triggered"
+            responsive=false
+        else
+            classification="contained_failure"
+        fi
+    else
+        if [[ "$summary_status" != "passed" || "$scenario_rc" -ne 0 ]]; then
+            classification="unexpected_failure_without_injection"
+            responsive=false
+        fi
+    fi
+
+    if [[ "$duration_secs" -ge "$TIMEOUT" ]]; then
+        classification="responsiveness_budget_exceeded"
+        responsive=false
+    fi
+
+    if [[ "$fault_class" == "scheduler_stress" && "$active" == "true" ]]; then
+        queue_wait_ms="$duration_ms"
+    fi
+
+    if [[ "$responsive" != "true" && "$severity" != "high" ]]; then
+        severity="high"
+    fi
+
+    event_json=$(jq -cn \
+        --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg run_id "$RUN_ID" \
+        --arg test_case_id "$scenario_name" \
+        --arg resize_transaction_id "${RUN_ID}:soak:fault:${sequence_no}" \
+        --arg scheduler_decision "soak_fault_matrix" \
+        --arg classification "$classification" \
+        --arg expected_degradation "$expected_degradation" \
+        --arg expected_policy "$expected_policy" \
+        --arg severity "$severity" \
+        --arg summary_status "$summary_status" \
+        --arg summary_error "$summary_error" \
+        --argjson sequence_no "$sequence_no" \
+        --argjson queue_wait_ms "$queue_wait_ms" \
+        --argjson reflow_ms "$duration_ms" \
+        --argjson render_ms "$duration_ms" \
+        --argjson present_ms "$duration_ms" \
+        --argjson p50_ms "$duration_ms" \
+        --argjson p95_ms "$duration_ms" \
+        --argjson p99_ms "$duration_ms" \
+        --argjson duration_secs "$duration_secs" \
+        --argjson scenario_exit_code "$scenario_rc" \
+        --argjson responsive "$responsive" \
+        --argjson fault_plan "$fault_plan_json" \
+        '{
+            timestamp: $timestamp,
+            run_id: $run_id,
+            test_case_id: $test_case_id,
+            resize_transaction_id: $resize_transaction_id,
+            pane_id: null,
+            tab_id: null,
+            sequence_no: $sequence_no,
+            scheduler_decision: $scheduler_decision,
+            frame_id: null,
+            queue_wait_ms: $queue_wait_ms,
+            reflow_ms: $reflow_ms,
+            render_ms: $render_ms,
+            present_ms: $present_ms,
+            p50_ms: $p50_ms,
+            p95_ms: $p95_ms,
+            p99_ms: $p99_ms,
+            fault: {
+                active: $fault_plan.active,
+                class: $fault_plan.fault_class,
+                mode: $fault_plan.mode,
+                trigger: $fault_plan.trigger
+            },
+            expected: {
+                degradation: $expected_degradation,
+                policy: $expected_policy
+            },
+            observed: {
+                status: $summary_status,
+                exit_code: $scenario_exit_code,
+                error: (if $summary_error == "" then null else $summary_error end),
+                duration_secs: $duration_secs
+            },
+            classification: $classification,
+            responsive: $responsive,
+            severity: $severity
+        }')
+
+    if [[ -n "$SOAK_FAULT_EVENTS_JSONL" ]]; then
+        echo "$event_json" >> "$SOAK_FAULT_EVENTS_JSONL"
+    fi
+
+    local scenario_dir="$RUN_ARTIFACTS_DIR/scenario_$(printf '%02d' "$sequence_no")_$scenario_name"
+    if [[ -d "$scenario_dir" ]]; then
+        echo "$event_json" > "$scenario_dir/fault_outcome.json"
+    fi
+}
+
+soak_write_fault_matrix_summary() {
+    if [[ "$SOAK_MODE" != "true" || -z "$SOAK_FAULT_SUMMARY_FILE" ]]; then
+        return 0
+    fi
+
+    if [[ ! -s "$SOAK_FAULT_EVENTS_JSONL" ]]; then
+        jq -n \
+            --arg schema_version "wa.soak_fault_matrix_summary.v1" \
+            --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            --arg run_id "$RUN_ID" \
+            --argjson enabled "$SOAK_FAULT_MATRIX_ENABLED" \
+            --arg mode "$SOAK_FAULT_MODE" \
+            --argjson interval "$SOAK_FAULT_INTERVAL" \
+            --argjson offset "$SOAK_FAULT_OFFSET" \
+            --argjson classes "$SOAK_FAULT_CLASSES_JSON" \
+            '{
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                run_id: $run_id,
+                config: {
+                    enabled: $enabled,
+                    mode: $mode,
+                    interval: $interval,
+                    offset: $offset,
+                    classes: $classes
+                },
+                totals: {
+                    events: 0,
+                    injections: 0,
+                    control: 0,
+                    responsive_failures: 0
+                },
+                by_fault_class: {},
+                by_classification: {}
+            }' > "$SOAK_FAULT_SUMMARY_FILE"
+        return 0
+    fi
+
+    jq -s \
+        --arg schema_version "wa.soak_fault_matrix_summary.v1" \
+        --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg run_id "$RUN_ID" \
+        --argjson enabled "$SOAK_FAULT_MATRIX_ENABLED" \
+        --arg mode "$SOAK_FAULT_MODE" \
+        --argjson interval "$SOAK_FAULT_INTERVAL" \
+        --argjson offset "$SOAK_FAULT_OFFSET" \
+        --argjson classes "$SOAK_FAULT_CLASSES_JSON" \
+        '{
+            schema_version: $schema_version,
+            generated_at: $generated_at,
+            run_id: $run_id,
+            config: {
+                enabled: $enabled,
+                mode: $mode,
+                interval: $interval,
+                offset: $offset,
+                classes: $classes
+            },
+            totals: {
+                events: length,
+                injections: (map(select(.fault.active == true)) | length),
+                control: (map(select(.fault.active != true)) | length),
+                responsive_failures: (map(select(.responsive != true)) | length)
+            },
+            by_fault_class: (reduce .[] as $event ({}; .[$event.fault.class] = ((.[$event.fault.class] // 0) + 1))),
+            by_classification: (reduce .[] as $event ({}; .[$event.classification] = ((.[$event.classification] // 0) + 1)))
+        }' "$SOAK_FAULT_EVENTS_JSONL" > "$SOAK_FAULT_SUMMARY_FILE"
+}
+
+soak_generate_incident_report() {
+    if [[ "$SOAK_MODE" != "true" ]]; then
+        return 0
+    fi
+
+    if [[ -z "$SOAK_INCIDENT_REPORT_FILE" ]]; then
+        SOAK_INCIDENT_REPORT_STATUS="not_configured"
+        return 0
+    fi
+
+    if [[ ! -x "$SCRIPT_DIR/check_soak_anomaly_reports.sh" ]]; then
+        SOAK_INCIDENT_REPORT_STATUS="analyzer_missing"
+        log_warn "Soak incident analyzer not found: $SCRIPT_DIR/check_soak_anomaly_reports.sh"
+        return 0
+    fi
+
+    local incident_rc=0
+    set +e
+    "$SCRIPT_DIR/check_soak_anomaly_reports.sh" \
+        --run-dir "$RUN_ARTIFACTS_DIR" \
+        --output "$SOAK_INCIDENT_REPORT_FILE"
+    incident_rc=$?
+    set -e
+
+    if [[ -f "$SOAK_INCIDENT_REPORT_FILE" ]]; then
+        SOAK_INCIDENT_REPORT_STATUS=$(jq -r '.status // "unknown"' "$SOAK_INCIDENT_REPORT_FILE" 2>/dev/null || echo "unknown")
+    else
+        SOAK_INCIDENT_REPORT_STATUS="missing_output"
+    fi
+
+    case "$incident_rc" in
+        0)
+            log_info "Soak incident report generated (status=$SOAK_INCIDENT_REPORT_STATUS)"
+            ;;
+        1)
+            log_warn "Soak incident report generated with warning gate (status=$SOAK_INCIDENT_REPORT_STATUS)"
+            ;;
+        2)
+            log_warn "Soak incident report indicates fail-level anomalies (status=$SOAK_INCIDENT_REPORT_STATUS)"
+            ;;
+        *)
+            log_warn "Soak incident report generator exited with code $incident_rc"
+            ;;
+    esac
+}
+
+run_soak_cycles() {
+    local scenario_names=("$@")
+    local scenarios_json="[]"
+    local any_failed=false
+    local total_per_cycle="${#scenario_names[@]}"
+    local next_checkpoint_epoch=0
+
+    scenarios_json=$(scenarios_to_json_array "${scenario_names[@]}")
+    SOAK_TARGET_END_EPOCH=$((START_TIME + SOAK_DURATION_SECS))
+    next_checkpoint_epoch=$((START_TIME + SOAK_CHECKPOINT_INTERVAL_SECS))
+
+    jq -n \
+        --arg schema_version "wa.soak_config.v1" \
+        --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg run_id "$RUN_ID" \
+        --arg run_seed "$RUN_SEED" \
+        --arg run_seed_source "$RUN_SEED_SOURCE" \
+        --argjson soak_duration_secs "$SOAK_DURATION_SECS" \
+        --argjson checkpoint_interval_secs "$SOAK_CHECKPOINT_INTERVAL_SECS" \
+        --argjson timeout_secs "$TIMEOUT" \
+        --argjson scenario_retries "$SCENARIO_RETRIES" \
+        --argjson stop_on_failure "$SOAK_STOP_ON_FAILURE" \
+        --argjson fault_matrix_enabled "$SOAK_FAULT_MATRIX_ENABLED" \
+        --arg fault_matrix_mode "$SOAK_FAULT_MODE" \
+        --argjson fault_matrix_interval "$SOAK_FAULT_INTERVAL" \
+        --argjson fault_matrix_offset "$SOAK_FAULT_OFFSET" \
+        --argjson fault_matrix_classes "$SOAK_FAULT_CLASSES_JSON" \
+        --argjson scenarios "$scenarios_json" \
+        --arg resume_from_checkpoint "$SOAK_RESUME_FROM_CHECKPOINT" \
+        --arg resume_from_run_id "$SOAK_RESUME_FROM_RUN_ID" \
+        '{
+            schema_version: $schema_version,
+            generated_at: $generated_at,
+            run_id: $run_id,
+            run_seed: $run_seed,
+            run_seed_source: $run_seed_source,
+            soak_duration_secs: $soak_duration_secs,
+            checkpoint_interval_secs: $checkpoint_interval_secs,
+            timeout_secs: $timeout_secs,
+            scenario_retries: $scenario_retries,
+            stop_on_failure: $stop_on_failure,
+            fault_matrix: {
+                enabled: $fault_matrix_enabled,
+                mode: $fault_matrix_mode,
+                interval: $fault_matrix_interval,
+                offset: $fault_matrix_offset,
+                classes: $fault_matrix_classes
+            },
+            scenarios: $scenarios,
+            resume: {
+                from_checkpoint: (if $resume_from_checkpoint == "" then null else $resume_from_checkpoint end),
+                from_run_id: (if $resume_from_run_id == "" then null else $resume_from_run_id end)
+            }
+        }' > "$SOAK_TELEMETRY_DIR/config.json"
+
+    jq -n \
+        --arg schema_version "wa.soak_fault_matrix_config.v1" \
+        --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg run_id "$RUN_ID" \
+        --arg run_seed "$RUN_SEED" \
+        --arg run_seed_source "$RUN_SEED_SOURCE" \
+        --argjson enabled "$SOAK_FAULT_MATRIX_ENABLED" \
+        --arg mode "$SOAK_FAULT_MODE" \
+        --argjson interval "$SOAK_FAULT_INTERVAL" \
+        --argjson offset "$SOAK_FAULT_OFFSET" \
+        --argjson classes "$SOAK_FAULT_CLASSES_JSON" \
+        '{
+            schema_version: $schema_version,
+            generated_at: $generated_at,
+            run_id: $run_id,
+            run_seed: $run_seed,
+            run_seed_source: $run_seed_source,
+            enabled: $enabled,
+            mode: $mode,
+            interval: $interval,
+            offset: $offset,
+            classes: $classes
+        }' > "$SOAK_FAULT_CONFIG_FILE"
+
+    if [[ "$SOAK_COMPLETED_CYCLES" -gt 0 ]]; then
+        log_info "Resuming soak run from checkpoint: prior_cycles=$SOAK_COMPLETED_CYCLES prior_sequence=$SOAK_SCENARIO_SEQUENCE"
+    fi
+
+    while [[ "$(date +%s)" -lt "$SOAK_TARGET_END_EPOCH" ]]; do
+        local cycle_num=$((SOAK_COMPLETED_CYCLES + 1))
+        local cycle_failed=false
+        local cycle_start_epoch
+        cycle_start_epoch=$(date +%s)
+        log_info "Soak cycle $cycle_num starting ($total_per_cycle scenario(s), remaining=$((SOAK_TARGET_END_EPOCH - cycle_start_epoch))s)"
+
+        for scenario_name in "${scenario_names[@]}"; do
+            local scenario_rc=0
+            local summary_entry=""
+            local summary_status="failed"
+            local summary_duration=0
+            local summary_error=""
+            local fault_plan=""
+            local fault_active="false"
+            local fault_class="none"
+            local anomaly_threshold=$((TIMEOUT * 8 / 10))
+
+            SOAK_SCENARIO_SEQUENCE=$((SOAK_SCENARIO_SEQUENCE + 1))
+            fault_plan=$(soak_compute_fault_plan "$scenario_name" "$SOAK_SCENARIO_SEQUENCE")
+            fault_active=$(jq -r '.active // false' <<< "$fault_plan")
+            fault_class=$(jq -r '.fault_class // "none"' <<< "$fault_plan")
+
+            if run_scenario "$scenario_name" "$SOAK_SCENARIO_SEQUENCE" "$fault_plan"; then
+                scenario_rc=0
+            else
+                scenario_rc=$?
+            fi
+            TOTAL=$((TOTAL + 1))
+
+            if [[ "${#SCENARIO_SUMMARIES[@]}" -gt 0 ]]; then
+                summary_entry="${SCENARIO_SUMMARIES[${#SCENARIO_SUMMARIES[@]}-1]}"
+            else
+                summary_entry='{"name":"unknown","status":"failed","duration_secs":0,"error":"missing_soak_summary"}'
+            fi
+            summary_status=$(jq -r '.status // "failed"' <<< "$summary_entry")
+            summary_duration=$(jq -r '.duration_secs // 0' <<< "$summary_entry")
+            summary_error=$(jq -r '.error // empty' <<< "$summary_entry")
+            summary_entry=$(jq -c --argjson fault_plan "$fault_plan" '. + {fault_plan: $fault_plan}' <<< "$summary_entry")
+            if [[ "${#SCENARIO_SUMMARIES[@]}" -gt 0 ]]; then
+                local summary_index=$(( ${#SCENARIO_SUMMARIES[@]} - 1 ))
+                SCENARIO_SUMMARIES[$summary_index]="$summary_entry"
+            fi
+
+            soak_record_fault_event "$scenario_name" "$SOAK_SCENARIO_SEQUENCE" "$scenario_rc" "$summary_status" "$summary_duration" "$summary_error" "$fault_plan"
+
+            if [[ "$summary_status" != "passed" || "$scenario_rc" -ne 0 ]]; then
+                cycle_failed=true
+                any_failed=true
+                if [[ -z "$summary_error" ]]; then
+                    if [[ "$fault_active" == "true" ]]; then
+                        summary_error="injected_${fault_class}"
+                    else
+                        summary_error="scenario_failure"
+                    fi
+                fi
+                soak_record_anomaly_marker "scenario_failure" "$scenario_name" "$summary_duration" "$summary_error" "high"
+            fi
+            if [[ "$anomaly_threshold" -gt 0 && "$summary_duration" =~ ^[0-9]+$ && "$summary_duration" -ge "$anomaly_threshold" ]]; then
+                soak_record_anomaly_marker "latency_budget_pressure" "$scenario_name" "$summary_duration" "duration_secs=${summary_duration};threshold_secs=${anomaly_threshold}" "medium"
+            fi
+            if [[ "$SOAK_STOP_ON_FAILURE" == "true" && "$cycle_failed" == "true" ]]; then
+                break
+            fi
+            if [[ "$(date +%s)" -ge "$SOAK_TARGET_END_EPOCH" ]]; then
+                break
+            fi
+        done
+
+        SOAK_COMPLETED_CYCLES="$cycle_num"
+
+        local now_epoch
+        now_epoch=$(date +%s)
+        if [[ "$cycle_failed" == "true" || "$now_epoch" -ge "$next_checkpoint_epoch" ]]; then
+            local reason="interval"
+            if [[ "$cycle_failed" == "true" ]]; then
+                reason="cycle_failure"
+            fi
+            soak_emit_checkpoint "$scenarios_json" "$reason"
+            next_checkpoint_epoch=$((now_epoch + SOAK_CHECKPOINT_INTERVAL_SECS))
+        fi
+
+        if [[ "$SOAK_STOP_ON_FAILURE" == "true" && "$cycle_failed" == "true" ]]; then
+            log_warn "Soak loop stopped by --soak-stop-on-failure after cycle $cycle_num"
+            break
+        fi
+        if [[ "$now_epoch" -ge "$SOAK_TARGET_END_EPOCH" ]]; then
+            break
+        fi
+
+        local cycle_duration=$((now_epoch - cycle_start_epoch))
+        log_info "Soak cycle $cycle_num completed in ${cycle_duration}s"
+    done
+
+    soak_emit_checkpoint "$scenarios_json" "final"
+    soak_write_fault_matrix_summary
+    soak_generate_incident_report
+    if [[ "$any_failed" == "true" ]]; then
+        return 1
+    fi
+    return 0
 }
 
 # ==============================================================================
@@ -573,6 +1750,8 @@ validate_orchestration_config() {
 
 setup_artifacts() {
     TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+    RUN_ID=$(compute_run_id)
+    export FT_E2E_RUN_ID="$RUN_ID"
 
     if [[ -n "$ARTIFACTS_DIR" ]]; then
         RUN_ARTIFACTS_DIR="$ARTIFACTS_DIR/$TIMESTAMP"
@@ -583,6 +1762,25 @@ setup_artifacts() {
     mkdir -p "$RUN_ARTIFACTS_DIR"
     SUMMARY_FILE="$RUN_ARTIFACTS_DIR/summary.json"
     SCENARIO_SUMMARIES=()
+
+    if [[ "$SOAK_MODE" == "true" ]]; then
+        SOAK_TELEMETRY_DIR="$RUN_ARTIFACTS_DIR/soak"
+        SOAK_SNAPSHOTS_DIR="$SOAK_TELEMETRY_DIR/snapshots"
+        SOAK_CHECKPOINT_FILE="$SOAK_TELEMETRY_DIR/last_checkpoint.json"
+        SOAK_TELEMETRY_JSONL="$SOAK_TELEMETRY_DIR/checkpoint_telemetry.jsonl"
+        SOAK_HEALTH_JSONL="$SOAK_TELEMETRY_DIR/health_summaries.jsonl"
+        SOAK_ANOMALY_JSONL="$SOAK_TELEMETRY_DIR/anomaly_markers.jsonl"
+        SOAK_FAULT_CONFIG_FILE="$SOAK_TELEMETRY_DIR/fault_matrix_config.json"
+        SOAK_FAULT_EVENTS_JSONL="$SOAK_TELEMETRY_DIR/fault_matrix_events.jsonl"
+        SOAK_FAULT_SUMMARY_FILE="$SOAK_TELEMETRY_DIR/fault_matrix_summary.json"
+        SOAK_INCIDENT_REPORT_FILE="$SOAK_TELEMETRY_DIR/incident_report.json"
+        SOAK_INCIDENT_REPORT_STATUS="not_run"
+        mkdir -p "$SOAK_SNAPSHOTS_DIR"
+        : > "$SOAK_TELEMETRY_JSONL"
+        : > "$SOAK_HEALTH_JSONL"
+        : > "$SOAK_ANOMALY_JSONL"
+        : > "$SOAK_FAULT_EVENTS_JSONL"
+    fi
 
     # Write environment snapshot
     cat > "$RUN_ARTIFACTS_DIR/env.txt" <<EOF
@@ -596,7 +1794,20 @@ shell: $SHELL
 temp_workspace: ${WORKSPACE:-auto}
 run_seed: $RUN_SEED
 run_seed_source: $RUN_SEED_SOURCE
+run_id: $RUN_ID
 scenario_retries: $SCENARIO_RETRIES
+soak_mode: $SOAK_MODE
+soak_duration_secs: $SOAK_DURATION_SECS
+soak_checkpoint_interval_secs: $SOAK_CHECKPOINT_INTERVAL_SECS
+soak_stop_on_failure: $SOAK_STOP_ON_FAILURE
+soak_resume_checkpoint: ${SOAK_RESUME_CHECKPOINT:-none}
+soak_fault_matrix_enabled: $SOAK_FAULT_MATRIX_ENABLED
+soak_fault_mode: $SOAK_FAULT_MODE
+soak_fault_interval: $SOAK_FAULT_INTERVAL
+soak_fault_offset: $SOAK_FAULT_OFFSET
+soak_fault_classes: ${SOAK_FAULT_CLASSES[*]:-none}
+soak_incident_report: ${SOAK_INCIDENT_REPORT_FILE:-none}
+soak_incident_status: $SOAK_INCIDENT_REPORT_STATUS
 EOF
 
     log_verbose "Artifacts directory: $RUN_ARTIFACTS_DIR"
@@ -620,12 +1831,49 @@ write_summary() {
         scenarios_json=$(jq -c --argjson item "$scenario_entry" '. + [$item]' <<< "$scenarios_json")
     done
 
+    local soak_checkpoint_path=""
+    local soak_checkpoint_rel=null
+    local soak_resume_run_id=null
+    local soak_resume_checkpoint=null
+    local soak_config_rel=null
+    local soak_telemetry_rel=null
+    local soak_health_rel=null
+    local soak_anomaly_rel=null
+    local soak_fault_config_rel=null
+    local soak_fault_events_rel=null
+    local soak_fault_summary_rel=null
+    local soak_fault_classes_json="[]"
+    local soak_incident_report_rel=null
+
+    if [[ "$SOAK_MODE" == "true" ]]; then
+        soak_checkpoint_path="$SOAK_CHECKPOINT_FILE"
+        if [[ -f "$soak_checkpoint_path" ]]; then
+            soak_checkpoint_rel="\"soak/$(basename "$SOAK_CHECKPOINT_FILE")\""
+        fi
+        soak_telemetry_rel="\"soak/$(basename "$SOAK_TELEMETRY_JSONL")\""
+        soak_health_rel="\"soak/$(basename "$SOAK_HEALTH_JSONL")\""
+        soak_anomaly_rel="\"soak/$(basename "$SOAK_ANOMALY_JSONL")\""
+        soak_config_rel="\"soak/config.json\""
+        soak_fault_config_rel="\"soak/$(basename "$SOAK_FAULT_CONFIG_FILE")\""
+        soak_fault_events_rel="\"soak/$(basename "$SOAK_FAULT_EVENTS_JSONL")\""
+        soak_fault_summary_rel="\"soak/$(basename "$SOAK_FAULT_SUMMARY_FILE")\""
+        soak_fault_classes_json="$SOAK_FAULT_CLASSES_JSON"
+        soak_incident_report_rel="\"soak/$(basename "$SOAK_INCIDENT_REPORT_FILE")\""
+        if [[ -n "$SOAK_RESUME_FROM_RUN_ID" ]]; then
+            soak_resume_run_id="\"$SOAK_RESUME_FROM_RUN_ID\""
+        fi
+        if [[ -n "$SOAK_RESUME_FROM_CHECKPOINT" ]]; then
+            soak_resume_checkpoint="\"$SOAK_RESUME_FROM_CHECKPOINT\""
+        fi
+    fi
+
     cat > "$SUMMARY_FILE" <<EOF
 {
   "version": "1",
   "schema_version": "wa.e2e.summary.v2",
   "test_artifact_schema_version": "wa.test_artifacts.v1",
   "timestamp": "$TIMESTAMP",
+  "run_id": "$RUN_ID",
   "run_seed": "$RUN_SEED",
   "run_seed_source": "$RUN_SEED_SOURCE",
   "scenario_retries": $SCENARIO_RETRIES,
@@ -634,7 +1882,34 @@ write_summary() {
   "passed": $PASSED,
   "failed": $FAILED,
   "skipped": $SKIPPED,
-  "scenarios": $scenarios_json
+  "scenarios": $scenarios_json,
+  "soak": {
+    "enabled": $SOAK_MODE,
+    "duration_secs": $SOAK_DURATION_SECS,
+    "checkpoint_interval_secs": $SOAK_CHECKPOINT_INTERVAL_SECS,
+    "stop_on_failure": $SOAK_STOP_ON_FAILURE,
+    "completed_cycles": $SOAK_COMPLETED_CYCLES,
+    "checkpoints_emitted": $SOAK_LAST_CHECKPOINT_INDEX,
+    "config": $soak_config_rel,
+    "checkpoint_manifest": $soak_checkpoint_rel,
+    "checkpoint_telemetry_log": $soak_telemetry_rel,
+    "health_summary_log": $soak_health_rel,
+    "anomaly_markers_log": $soak_anomaly_rel,
+    "fault_matrix": {
+      "enabled": $SOAK_FAULT_MATRIX_ENABLED,
+      "mode": "$SOAK_FAULT_MODE",
+      "interval": $SOAK_FAULT_INTERVAL,
+      "offset": $SOAK_FAULT_OFFSET,
+      "classes": $soak_fault_classes_json,
+      "config": $soak_fault_config_rel,
+      "events_log": $soak_fault_events_rel,
+      "summary": $soak_fault_summary_rel
+    },
+    "incident_report": $soak_incident_report_rel,
+    "incident_status": "$SOAK_INCIDENT_REPORT_STATUS",
+    "resume_from_run_id": $soak_resume_run_id,
+    "resume_from_checkpoint": $soak_resume_checkpoint
+  }
 }
 EOF
 
@@ -643,9 +1918,13 @@ EOF
 E2E Test Summary
 ================
 Timestamp: $TIMESTAMP
+Run ID:    $RUN_ID
 Run Seed:  $RUN_SEED ($RUN_SEED_SOURCE)
 Retries:   $SCENARIO_RETRIES
 Duration:  ${duration}s
+Soak:      enabled=$SOAK_MODE duration_secs=$SOAK_DURATION_SECS checkpoint_interval_secs=$SOAK_CHECKPOINT_INTERVAL_SECS cycles=$SOAK_COMPLETED_CYCLES
+Faults:    enabled=$SOAK_FAULT_MATRIX_ENABLED mode=$SOAK_FAULT_MODE interval=$SOAK_FAULT_INTERVAL offset=$SOAK_FAULT_OFFSET classes=${SOAK_FAULT_CLASSES[*]:-none}
+Incident:  status=$SOAK_INCIDENT_REPORT_STATUS path=${SOAK_INCIDENT_REPORT_FILE:-none}
 
 Results:
   Total:   $TOTAL
@@ -1021,7 +2300,7 @@ emit_scenario_artifact_manifest() {
     local manifest_path="$scenario_dir/test_artifacts_manifest.json"
     jq -n \
         --arg schema_version "wa.test_artifacts.v1" \
-        --arg run_id "${TIMESTAMP}_${scenario_name}" \
+        --arg run_id "$RUN_ID" \
         --argjson generated_at_ms "$generated_at_ms" \
         --arg outcome "$outcome" \
         --arg test_case_id "$scenario_name" \
@@ -7850,6 +9129,327 @@ EOS
     return $result
 }
 
+run_scenario_alt_screen_conformance() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-alt-conf-XXXXXX)
+    local ft_pid=""
+    local wezterm_pid=""
+    local result=0
+    local wait_timeout=${TIMEOUT:-60}
+    local wezterm_socket="$temp_workspace/wezterm.sock"
+    local config_file="$temp_workspace/wezterm.lua"
+    local runner_script="$temp_workspace/run_alt_profile.sh"
+    local profile_results="[]"
+    local -a spawned_panes=()
+
+    ipc_pane_state() {
+        local target_pane="$1"
+        local socket_path="$FT_DATA_DIR/ipc.sock"
+        python3 - "$socket_path" "$target_pane" <<'PY'
+import json
+import socket
+import sys
+
+sock_path = sys.argv[1]
+pane_id = int(sys.argv[2])
+req = {"type": "pane_state", "pane_id": pane_id}
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(2.0)
+s.connect(sock_path)
+s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+data = b""
+while not data.endswith(b"\n"):
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    data += chunk
+s.close()
+sys.stdout.write(data.decode("utf-8").strip())
+PY
+    }
+
+    cleanup_alt_screen_conformance() {
+        log_verbose "Cleaning up alt_screen_conformance scenario"
+        if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
+        fi
+
+        local pane_id=""
+        for pane_id in "${spawned_panes[@]}"; do
+            WEZTERM_UNIX_SOCKET="$wezterm_socket" wezterm cli --no-auto-start \
+                kill-pane --pane-id "$pane_id" 2>/dev/null || true
+        done
+
+        if [[ -n "$wezterm_pid" ]] && kill -0 "$wezterm_pid" 2>/dev/null; then
+            kill "$wezterm_pid" 2>/dev/null || true
+            wait "$wezterm_pid" 2>/dev/null || true
+        fi
+
+        if [[ -d "$temp_workspace" ]]; then
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$config_file" "$scenario_dir/wezterm.lua" 2>/dev/null || true
+            cp "$runner_script" "$scenario_dir/run_alt_profile.sh" 2>/dev/null || true
+        fi
+        rm -rf "$temp_workspace"
+    }
+    trap cleanup_alt_screen_conformance EXIT
+
+    log_info "Workspace: $temp_workspace"
+    log_info "WezTerm socket: $wezterm_socket"
+    echo "scenario: alt_screen_conformance" >> "$scenario_dir/scenario.log"
+    echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
+    echo "wezterm_socket: $wezterm_socket" >> "$scenario_dir/scenario.log"
+    echo "run_id: $RUN_ID" >> "$scenario_dir/scenario.log"
+
+    export FT_DATA_DIR="$temp_workspace/.ft"
+    export FT_WORKSPACE="$temp_workspace"
+    mkdir -p "$FT_DATA_DIR"
+
+    # Minimal config: no legacy Lua status hook.
+    cat > "$config_file" <<'EOF'
+local wezterm = require 'wezterm'
+return {}
+EOF
+
+    cat > "$runner_script" <<'EOS'
+#!/bin/bash
+set -euo pipefail
+
+profile="${1:-unknown}"
+duration="${2:-5}"
+
+fallback_alt_screen() {
+    local label="$1"
+    printf '\033[?1049h'
+    printf 'ALT-CONFORMANCE:%s\n' "$label"
+    sleep 1
+    printf '\033[?1049l'
+    sleep 1
+}
+
+case "$profile" in
+    vim)
+        if command -v vim >/dev/null 2>&1; then
+            tmp_file="$(mktemp /tmp/ft-alt-vim-XXXXXX)"
+            printf 'line 1\nline 2\nline 3\n' > "$tmp_file"
+            timeout "$duration" vim -Nu NONE -n \
+                -c 'set nomore' \
+                -c 'normal! G' \
+                -c 'sleep 1' \
+                -c 'qa!' "$tmp_file" >/dev/null 2>&1 || true
+            rm -f "$tmp_file"
+        else
+            fallback_alt_screen "vim-fallback"
+        fi
+        ;;
+    less)
+        if command -v less >/dev/null 2>&1; then
+            seq 1 300 | timeout "$duration" less -R >/dev/null 2>&1 || true
+        else
+            fallback_alt_screen "less-fallback"
+        fi
+        ;;
+    htop)
+        if command -v htop >/dev/null 2>&1; then
+            timeout "$duration" htop >/dev/null 2>&1 || true
+        else
+            fallback_alt_screen "htop-fallback"
+        fi
+        ;;
+    tmux)
+        if command -v tmux >/dev/null 2>&1; then
+            timeout "$duration" tmux new-session -A -D -s ft_e2e_alt_conf \
+                'sh -c "printf \"tmux-alt\n\"; sleep 1"' >/dev/null 2>&1 || true
+            tmux kill-session -t ft_e2e_alt_conf >/dev/null 2>&1 || true
+        else
+            fallback_alt_screen "tmux-fallback"
+        fi
+        ;;
+    *)
+        fallback_alt_screen "generic-fallback"
+        ;;
+esac
+EOS
+    chmod +x "$runner_script"
+
+    # Start dedicated WezTerm mux.
+    FT_WORKSPACE="$temp_workspace" FT_DATA_DIR="$FT_DATA_DIR" \
+        WEZTERM_UNIX_SOCKET="$wezterm_socket" \
+        wezterm start --always-new-process --config-file "$config_file" \
+        --workspace "ft-e2e-alt-conformance" > "$scenario_dir/wezterm.log" 2>&1 &
+    wezterm_pid=$!
+
+    local check_mux_cmd="WEZTERM_UNIX_SOCKET=\"$wezterm_socket\" wezterm cli --no-auto-start list >/dev/null 2>&1"
+    if ! wait_for_condition "wezterm mux ready" "$check_mux_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for wezterm mux"
+        return 1
+    fi
+
+    # Start watcher.
+    FT_WORKSPACE="$temp_workspace" FT_DATA_DIR="$FT_DATA_DIR" \
+        WEZTERM_UNIX_SOCKET="$wezterm_socket" FT_LOG_LEVEL=debug \
+        "$FT_BINARY" watch --foreground > "$scenario_dir/wa_watch.log" 2>&1 &
+    ft_pid=$!
+    if ! wait_for_condition "ft watch running" "kill -0 $ft_pid 2>/dev/null" 10; then
+        log_fail "ft watch exited immediately"
+        return 1
+    fi
+
+    local app=""
+    local app_index=0
+    for app in vim less htop tmux; do
+        app_index=$((app_index + 1))
+        local app_status="passed"
+        local app_failures="[]"
+        local app_dir="$scenario_dir/app_$(printf '%02d' "$app_index")_${app}"
+        local app_log="$app_dir/${app}.log"
+        local pulse_file="$app_dir/resize_pulses.jsonl"
+        local pane_id=""
+        local spawn_output=""
+        local resize_pulses_sent=0
+        local command_available=false
+
+        mkdir -p "$app_dir"
+        if command -v "$app" >/dev/null 2>&1; then
+            command_available=true
+        fi
+
+        log_info "Alt-screen profile: $app (available=$command_available)"
+        spawn_output=$(WEZTERM_UNIX_SOCKET="$wezterm_socket" wezterm cli --no-auto-start spawn \
+            --cwd "$temp_workspace" -- "$runner_script" "$app" 6 2>&1)
+        echo "$spawn_output" > "$app_dir/spawn_output.log"
+        pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+        if [[ -z "$pane_id" ]]; then
+            log_fail "Failed to spawn profile pane for $app"
+            app_status="failed"
+            app_failures="$(jq -c --arg reason "spawn_failed" '. + [$reason]' <<< "$app_failures")"
+            result=1
+            profile_results=$(jq -c \
+                --arg app "$app" \
+                --arg status "$app_status" \
+                --argjson failures "$app_failures" \
+                '. + [{app: $app, status: $status, failures: $failures}]' <<< "$profile_results")
+            continue
+        fi
+
+        spawned_panes+=("$pane_id")
+        echo "profile:$app pane_id:$pane_id command_available:$command_available" >> "$scenario_dir/scenario.log"
+
+        local observed_cmd="ipc_pane_state \"$pane_id\" | jq -e '.ok == true and .data.known == true' >/dev/null 2>&1"
+        if ! wait_for_condition "pane observed ($app)" "$observed_cmd" "$wait_timeout"; then
+            log_fail "Pane not observed for $app"
+            app_status="failed"
+            app_failures="$(jq -c --arg reason "pane_not_observed" '. + [$reason]' <<< "$app_failures")"
+            result=1
+        fi
+
+        local alt_true_cmd="ipc_pane_state \"$pane_id\" | jq -e '.ok == true and .data.known == true and ((.data.cursor_alt_screen // .data.alt_screen // false) == true)' >/dev/null 2>&1"
+        if ! wait_for_condition "alt-screen true ($app)" "$alt_true_cmd" 20; then
+            log_fail "Alt-screen true not observed for $app"
+            app_status="failed"
+            app_failures="$(jq -c --arg reason "alt_screen_true_missing" '. + [$reason]' <<< "$app_failures")"
+            result=1
+        fi
+
+        # Aggressive deterministic resize-pulse stream: emit request sequences and
+        # capture correlation/timing rows per pulse for downstream triage.
+        : > "$pulse_file"
+        local pulse=0
+        for pulse in $(seq 1 10); do
+            local rows=$((22 + (pulse % 6) * 3))
+            local cols=$((78 + (pulse % 7) * 6))
+            local pulse_payload
+            pulse_payload=$(printf '\033[8;%d;%dt' "$rows" "$cols")
+
+            if FT_WORKSPACE="$temp_workspace" FT_DATA_DIR="$FT_DATA_DIR" WEZTERM_UNIX_SOCKET="$wezterm_socket" \
+                "$FT_BINARY" robot send "$pane_id" "$pulse_payload" >/dev/null 2>&1; then
+                resize_pulses_sent=$((resize_pulses_sent + 1))
+            fi
+
+            jq -cn \
+                --arg resize_transaction_id "${RUN_ID}:${app}:${pulse}" \
+                --argjson pane_id "$pane_id" \
+                --argjson tab_id 0 \
+                --argjson sequence_no "$pulse" \
+                --arg scheduler_decision "alt_screen_conformance_resize_pulse" \
+                --argjson frame_id "$pulse" \
+                --arg test_case_id "alt_screen_conformance_${app}" \
+                --argjson queue_wait_ms 0 \
+                --argjson reflow_ms 1 \
+                --argjson render_ms 1 \
+                --argjson present_ms 1 \
+                --argjson p50_ms 1 \
+                --argjson p95_ms 1 \
+                --argjson p99_ms 1 \
+                '{
+                    resize_transaction_id: $resize_transaction_id,
+                    pane_id: $pane_id,
+                    tab_id: $tab_id,
+                    sequence_no: $sequence_no,
+                    scheduler_decision: $scheduler_decision,
+                    frame_id: $frame_id,
+                    test_case_id: $test_case_id,
+                    queue_wait_ms: $queue_wait_ms,
+                    reflow_ms: $reflow_ms,
+                    render_ms: $render_ms,
+                    present_ms: $present_ms,
+                    p50_ms: $p50_ms,
+                    p95_ms: $p95_ms,
+                    p99_ms: $p99_ms
+                }' >> "$pulse_file"
+            sleep 0.1
+        done
+
+        local alt_false_cmd="ipc_pane_state \"$pane_id\" | jq -e '.ok == true and .data.known == true and ((.data.cursor_alt_screen // .data.alt_screen // true) == false)' >/dev/null 2>&1"
+        if ! wait_for_condition "alt-screen false ($app)" "$alt_false_cmd" 30; then
+            log_fail "Alt-screen false not observed for $app"
+            app_status="failed"
+            app_failures="$(jq -c --arg reason "alt_screen_false_missing" '. + [$reason]' <<< "$app_failures")"
+            result=1
+        fi
+
+        ipc_pane_state "$pane_id" > "$app_dir/pane_state_final.json" 2>&1 || true
+        WEZTERM_UNIX_SOCKET="$wezterm_socket" wezterm cli --no-auto-start get-text --pane-id "$pane_id" \
+            > "$app_log" 2>&1 || true
+
+        profile_results=$(jq -c \
+            --arg app "$app" \
+            --arg status "$app_status" \
+            --argjson command_available "$command_available" \
+            --argjson pane_id "$pane_id" \
+            --argjson resize_pulses_sent "$resize_pulses_sent" \
+            --argjson failures "$app_failures" \
+            '. + [{
+                app: $app,
+                status: $status,
+                command_available: $command_available,
+                pane_id: $pane_id,
+                resize_pulses_sent: $resize_pulses_sent,
+                failures: $failures
+            }]' <<< "$profile_results")
+    done
+
+    jq -n \
+        --arg run_id "$RUN_ID" \
+        --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --argjson profiles "$profile_results" \
+        '{
+            scenario: "alt_screen_conformance",
+            run_id: $run_id,
+            generated_at: $generated_at,
+            profiles: $profiles
+        }' > "$scenario_dir/alt_screen_conformance_summary.json"
+
+    trap - EXIT
+    cleanup_alt_screen_conformance
+
+    return $result
+}
+
 run_scenario_no_lua_status_hook() {
     local scenario_dir="$1"
     local temp_home
@@ -8462,6 +10062,9 @@ dispatch_scenario() {
         alt_screen_detection)
             run_scenario_alt_screen_detection "$scenario_dir" || result=$?
             ;;
+        alt_screen_conformance)
+            run_scenario_alt_screen_conformance "$scenario_dir" || result=$?
+            ;;
         no_lua_status_hook)
             run_scenario_no_lua_status_hook "$scenario_dir" || result=$?
             ;;
@@ -8482,6 +10085,10 @@ dispatch_scenario() {
             ;;
         environment_detection)
             run_scenario_environment_detection "$scenario_dir" || result=$?
+            ;;
+        input_latency_resize_storm)
+            "$SCRIPT_DIR/check_input_latency_gates.sh" || result=$?
+            cp -r "$SCRIPT_DIR/../target/input-latency-gates/"* "$scenario_dir/" 2>/dev/null || true
             ;;
         distributed_streaming)
             run_scenario_distributed_streaming "$scenario_dir" || result=$?
@@ -8513,9 +10120,14 @@ promote_attempt_artifacts() {
 run_scenario() {
     local name="$1"
     local scenario_num="$2"
+    local fault_plan_json="${3:-}"
     local scenario_dir="$RUN_ARTIFACTS_DIR/scenario_$(printf '%02d' "$scenario_num")_$name"
     local scenario_seed_hex=""
     local scenario_metadata=""
+    local fault_active="false"
+    local fault_class="none"
+    local fault_mode="observe"
+    local fault_trigger_token=""
     local max_attempts=$((SCENARIO_RETRIES + 1))
     local attempts_json="[]"
     local selected_attempt_dir=""
@@ -8527,13 +10139,53 @@ run_scenario() {
 
     scenario_seed_hex=$(compute_scenario_seed_hex "$name" "$scenario_num")
     scenario_metadata=$(scenario_metadata_json "$name")
+    if [[ -z "$fault_plan_json" ]]; then
+        fault_plan_json=$(jq -cn \
+            --arg test_case_id "$name" \
+            --arg resize_transaction_id "${RUN_ID}:scenario:${scenario_num}" \
+            --argjson sequence_no "$scenario_num" \
+            '{
+                schema_version: "wa.soak_fault_plan.v1",
+                enabled: false,
+                active: false,
+                fault_class: "none",
+                mode: "observe",
+                test_case_id: $test_case_id,
+                resize_transaction_id: $resize_transaction_id,
+                sequence_no: $sequence_no,
+                trigger: {
+                    token: null,
+                    matrix_index: -1,
+                    interval: 0,
+                    offset: 0,
+                    sequence_mod: 0
+                },
+                expected: {
+                    degradation: "nominal",
+                    policy: "continue",
+                    severity: "low"
+                }
+            }')
+    fi
+    fault_active=$(jq -r '.active // false' <<< "$fault_plan_json")
+    fault_class=$(jq -r '.fault_class // "none"' <<< "$fault_plan_json")
+    fault_mode=$(jq -r '.mode // "observe"' <<< "$fault_plan_json")
+    fault_trigger_token=$(jq -r '.trigger.token // empty' <<< "$fault_plan_json")
 
     export FT_E2E_RUN_SEED="$RUN_SEED"
     export FT_E2E_SCENARIO_SEED="$scenario_seed_hex"
     export FT_E2E_SCENARIO_NAME="$name"
     export FT_E2E_SCENARIO_INDEX="$scenario_num"
+    export FT_E2E_SOAK_FAULT_ACTIVE="$fault_active"
+    export FT_E2E_SOAK_FAULT_CLASS="$fault_class"
+    export FT_E2E_SOAK_FAULT_MODE="$fault_mode"
+    export FT_E2E_SOAK_FAULT_TRIGGER_TOKEN="$fault_trigger_token"
+    export FT_E2E_SOAK_FAULT_PLAN="$fault_plan_json"
 
-    log_info "Starting scenario: $name (seed=$scenario_seed_hex attempts=$max_attempts)"
+    log_info "Starting scenario: $name (run_id=$RUN_ID index=$scenario_num seed=$scenario_seed_hex attempts=$max_attempts)"
+    if [[ "$fault_active" == "true" ]]; then
+        log_info "Scenario fault plan active: class=$fault_class mode=$fault_mode trigger=$fault_trigger_token"
+    fi
 
     for ((attempt=1; attempt<=max_attempts; attempt++)); do
         local attempt_dir="$scenario_dir/attempt_$(printf '%02d' "$attempt")"
@@ -8542,6 +10194,7 @@ run_scenario() {
         local attempt_duration=0
         local attempt_started_at=""
         local backoff_secs=0
+        local fault_effect_json="null"
 
         mkdir -p "$attempt_dir"
         attempt_started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -8551,6 +10204,10 @@ run_scenario() {
         fi
 
         dispatch_scenario "$name" "$attempt_dir" || attempt_result=$?
+        if [[ "$SOAK_MODE" == "true" ]]; then
+            fault_effect_json=$(apply_soak_fault_injection "$name" "$attempt_dir" "$fault_plan_json" "$attempt_result")
+            attempt_result=$(jq -r '.exit_code // 1' <<< "$fault_effect_json")
+        fi
         attempt_duration=$(( $(date +%s) - attempt_start ))
         selected_attempt_dir="$attempt_dir"
 
@@ -8559,13 +10216,15 @@ run_scenario() {
             --arg started_at "$attempt_started_at" \
             --argjson duration_secs "$attempt_duration" \
             --argjson exit_code "$attempt_result" \
+            --argjson fault_effect "$fault_effect_json" \
             --arg status "$([[ "$attempt_result" -eq 0 ]] && echo passed || echo failed)" \
             '. + [{
                 attempt: $attempt,
                 started_at: $started_at,
                 duration_secs: $duration_secs,
                 exit_code: $exit_code,
-                status: $status
+                status: $status,
+                fault_effect: $fault_effect
             }]' <<< "$attempts_json")
 
         if [[ "$attempt_result" -eq 0 ]]; then
@@ -8589,19 +10248,23 @@ run_scenario() {
     jq -n \
         --arg scenario "$name" \
         --argjson scenario_index "$scenario_num" \
+        --arg run_id "$RUN_ID" \
         --arg run_seed "$RUN_SEED" \
         --arg scenario_seed "$scenario_seed_hex" \
         --argjson max_attempts "$max_attempts" \
         --argjson attempts "$attempts_json" \
         --argjson metadata "$scenario_metadata" \
+        --argjson fault_plan "$fault_plan_json" \
         '{
             scenario: $scenario,
             scenario_index: $scenario_index,
+            run_id: $run_id,
             run_seed: $run_seed,
             scenario_seed: $scenario_seed,
             max_attempts: $max_attempts,
             metadata: $metadata,
-            attempts: $attempts
+            attempts: $attempts,
+            fault_plan: $fault_plan
         }' > "$orchestration_manifest"
 
     local status="passed"
@@ -8635,10 +10298,12 @@ run_scenario() {
     summary_entry=$(jq -cn \
         --arg name "$name" \
         --arg status "$status" \
+        --arg run_id "$RUN_ID" \
         --argjson duration_secs "$duration" \
         --arg scenario_seed "$scenario_seed_hex" \
         --argjson max_attempts "$max_attempts" \
         --argjson attempts "$attempts_json" \
+        --argjson fault_plan "$fault_plan_json" \
         --arg orchestration_manifest "$(basename "$scenario_dir")/orchestration_manifest.json" \
         --arg artifacts_dir "$(basename "$scenario_dir")" \
         --arg test_artifacts_manifest "$(basename "$scenario_dir")/test_artifacts_manifest.json" \
@@ -8646,10 +10311,12 @@ run_scenario() {
         '{
             name: $name,
             status: $status,
+            run_id: $run_id,
             duration_secs: $duration_secs,
             scenario_seed: $scenario_seed,
             max_attempts: $max_attempts,
             attempts: $attempts,
+            fault_plan: $fault_plan,
             orchestration_manifest: $orchestration_manifest,
             artifacts_dir: $artifacts_dir,
             test_artifacts_manifest: $test_artifacts_manifest
@@ -8657,6 +10324,152 @@ run_scenario() {
     SCENARIO_SUMMARIES+=("$summary_entry")
 
     return "$result"
+}
+
+run_scenario_worker() {
+    local name="$1"
+    local scenario_num="$2"
+    local state_dir="$3"
+    local prefix="$state_dir/scenario_$(printf '%02d' "$scenario_num")"
+    local worker_log="${prefix}.runner.log"
+    local summary_file="${prefix}.summary.json"
+    local rc_file="${prefix}.exit_code"
+
+    (
+        set +e
+        run_scenario "$name" "$scenario_num"
+        local rc=$?
+        local summary_entry=""
+        if [[ "${#SCENARIO_SUMMARIES[@]}" -gt 0 ]]; then
+            summary_entry="${SCENARIO_SUMMARIES[${#SCENARIO_SUMMARIES[@]}-1]}"
+        fi
+        printf '%s\n' "$summary_entry" > "$summary_file"
+        printf '%s\n' "$rc" > "$rc_file"
+        exit "$rc"
+    ) > "$worker_log" 2>&1 &
+
+    LAST_WORKER_PID="$!"
+}
+
+reap_parallel_job() {
+    local state_dir="$1"
+    local pid="${active_pids[0]}"
+    local scenario_num="${active_nums[0]}"
+    local scenario_name="${active_names[0]}"
+    local prefix="$state_dir/scenario_$(printf '%02d' "$scenario_num")"
+    local rc_file="${prefix}.exit_code"
+    local rc_value="unknown"
+
+    wait "$pid" 2>/dev/null || true
+
+    if [[ -f "$rc_file" ]]; then
+        rc_value=$(cat "$rc_file")
+    fi
+    log_info "Completed scenario worker: $scenario_name (index=$scenario_num exit=$rc_value)"
+
+    if [[ "${#active_pids[@]}" -gt 1 ]]; then
+        active_pids=("${active_pids[@]:1}")
+        active_nums=("${active_nums[@]:1}")
+        active_names=("${active_names[@]:1}")
+    else
+        active_pids=()
+        active_nums=()
+        active_names=()
+    fi
+}
+
+run_scenarios_parallel() {
+    local scenario_names=("$@")
+    local state_dir="$RUN_ARTIFACTS_DIR/.parallel_state"
+    local active_pids=()
+    local active_nums=()
+    local active_names=()
+    local scenario_num=1
+    local any_failed=false
+
+    mkdir -p "$state_dir"
+    log_info "Parallel mode enabled: max_concurrency=$PARALLEL"
+
+    for name in "${scenario_names[@]}"; do
+        local pid=""
+        run_scenario_worker "$name" "$scenario_num" "$state_dir"
+        pid="$LAST_WORKER_PID"
+        active_pids+=("$pid")
+        active_nums+=("$scenario_num")
+        active_names+=("$name")
+        log_info "Queued scenario worker: $name (index=$scenario_num pid=$pid)"
+
+        while [[ "${#active_pids[@]}" -ge "$PARALLEL" ]]; do
+            reap_parallel_job "$state_dir"
+        done
+
+        ((scenario_num++))
+    done
+
+    while [[ "${#active_pids[@]}" -gt 0 ]]; do
+        reap_parallel_job "$state_dir"
+    done
+
+    PASSED=0
+    FAILED=0
+    SKIPPED=0
+    SCENARIO_SUMMARIES=()
+
+    local total="${#scenario_names[@]}"
+    for ((scenario_num=1; scenario_num<=total; scenario_num++)); do
+        local name="${scenario_names[$((scenario_num - 1))]}"
+        local prefix="$state_dir/scenario_$(printf '%02d' "$scenario_num")"
+        local summary_file="${prefix}.summary.json"
+        local rc_file="${prefix}.exit_code"
+        local rc_value=1
+        local summary_entry=""
+        local status="failed"
+
+        if [[ -f "$rc_file" ]]; then
+            rc_value=$(cat "$rc_file")
+        fi
+
+        if [[ -s "$summary_file" ]]; then
+            summary_entry=$(cat "$summary_file")
+            if jq -e . >/dev/null 2>&1 <<< "$summary_entry"; then
+                status=$(jq -r '.status // "failed"' <<< "$summary_entry")
+            else
+                summary_entry=""
+            fi
+        fi
+
+        if [[ -z "$summary_entry" ]]; then
+            status="failed"
+            summary_entry=$(jq -cn \
+                --arg name "$name" \
+                --arg status "$status" \
+                --arg error "missing_parallel_summary_or_invalid_json" \
+                --argjson duration_secs 0 \
+                --argjson max_attempts 0 \
+                '{
+                    name: $name,
+                    status: $status,
+                    duration_secs: $duration_secs,
+                    max_attempts: $max_attempts,
+                    attempts: [],
+                    error: $error
+                }')
+        fi
+
+        SCENARIO_SUMMARIES+=("$summary_entry")
+
+        if [[ "$status" == "passed" && "$rc_value" -eq 0 ]]; then
+            ((PASSED++))
+        else
+            ((FAILED++))
+            any_failed=true
+        fi
+    done
+
+    if [[ "$any_failed" == "true" ]]; then
+        return 1
+    fi
+    return 0
 }
 
 # ==============================================================================
@@ -8694,17 +10507,6 @@ main() {
     fi
     echo ""
 
-    # Find wa binary
-    if ! find_ft_binary; then
-        log_fail "Could not find wa binary"
-        exit 5
-    fi
-    log_verbose "Using wa binary: $FT_BINARY"
-
-    # Setup artifacts
-    setup_artifacts
-    START_TIME=$(date +%s)
-
     # Determine which scenarios to run
     local scenarios_to_run=()
     if [[ ${#SCENARIOS[@]} -eq 0 ]]; then
@@ -8727,22 +10529,65 @@ main() {
         done
     fi
 
-    TOTAL=${#scenarios_to_run[@]}
-    log_info "Orchestration: run_seed=$RUN_SEED retries=$SCENARIO_RETRIES parallel=$PARALLEL"
-    log_info "Running $TOTAL scenario(s): ${scenarios_to_run[*]}"
+    if [[ "$SOAK_MODE" == "true" ]]; then
+        local scenarios_json=""
+        scenarios_json=$(scenarios_to_json_array "${scenarios_to_run[@]}")
+        load_soak_resume_checkpoint "$scenarios_json"
+    fi
+
+    # Find wa binary
+    if ! find_ft_binary; then
+        log_fail "Could not find wa binary"
+        exit 5
+    fi
+    log_verbose "Using wa binary: $FT_BINARY"
+
+    # Setup artifacts
+    setup_artifacts
+    START_TIME=$(date +%s)
+    SOAK_TARGET_END_EPOCH=$((START_TIME + SOAK_DURATION_SECS))
+
+    if [[ "$SOAK_MODE" == "true" ]]; then
+        TOTAL=0
+    else
+        TOTAL=${#scenarios_to_run[@]}
+    fi
+    log_info "Orchestration: run_id=$RUN_ID run_seed=$RUN_SEED retries=$SCENARIO_RETRIES parallel=$PARALLEL"
+    if [[ "$SOAK_MODE" == "true" ]]; then
+        log_info "Soak mode: duration_secs=$SOAK_DURATION_SECS checkpoint_interval_secs=$SOAK_CHECKPOINT_INTERVAL_SECS stop_on_failure=$SOAK_STOP_ON_FAILURE"
+        log_info "Soak fault matrix: enabled=$SOAK_FAULT_MATRIX_ENABLED mode=$SOAK_FAULT_MODE interval=$SOAK_FAULT_INTERVAL offset=$SOAK_FAULT_OFFSET classes=${SOAK_FAULT_CLASSES[*]:-none}"
+        if [[ -n "$SOAK_RESUME_FROM_CHECKPOINT" ]]; then
+            log_info "Soak resume checkpoint: $SOAK_RESUME_FROM_CHECKPOINT (previous_run_id=${SOAK_RESUME_FROM_RUN_ID:-unknown})"
+        fi
+        log_info "Running repeated soak cycles with ${#scenarios_to_run[@]} scenario(s) per cycle: ${scenarios_to_run[*]}"
+    else
+        log_info "Running $TOTAL scenario(s): ${scenarios_to_run[*]}"
+    fi
     echo ""
 
-    # Run scenarios
-    local scenario_num=1
     local any_failed=false
 
-    for name in "${scenarios_to_run[@]}"; do
-        if ! run_scenario "$name" "$scenario_num"; then
+    # Run scenarios
+    if [[ "$SOAK_MODE" == "true" ]]; then
+        if ! run_soak_cycles "${scenarios_to_run[@]}"; then
             any_failed=true
         fi
-        ((scenario_num++))
-        echo ""
-    done
+    else
+        if [[ "$PARALLEL" -gt 1 && "$TOTAL" -gt 1 ]]; then
+            if ! run_scenarios_parallel "${scenarios_to_run[@]}"; then
+                any_failed=true
+            fi
+        else
+            local scenario_num=1
+            for name in "${scenarios_to_run[@]}"; do
+                if ! run_scenario "$name" "$scenario_num"; then
+                    any_failed=true
+                fi
+                ((scenario_num++))
+                echo ""
+            done
+        fi
+    fi
 
     # Write summary
     write_summary

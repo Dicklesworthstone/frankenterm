@@ -135,6 +135,23 @@ Artifacts are counted per resize-class event.
 - Run runtime warning-threshold tests for lock wait/hold and cursor snapshot memory.
 - Enforce numeric M1/M2/M3 thresholds from generated baseline artifacts (mid tier minimum).
 - Fail build on any critical artifact or threshold breach.
+- Canonical command: `scripts/check_resize_performance_gates.sh`
+
+## Baseline Refresh Workflow (Audit Required)
+
+`scripts/check_resize_performance_gates.sh` supports threshold checks plus controlled baseline refresh.
+
+Rules:
+- Baseline updates require an explicit reason in `FT_RESIZE_GATE_BASELINE_REASON`.
+- Refresh writes baseline metrics to `evidence/wa-1u90p.7.4/resize_perf_mid_baseline.json`.
+- Refresh appends an audit trail row to `evidence/wa-1u90p.7.4/resize_perf_mid_baseline.audit.jsonl` with timestamp, user, commit, reason, and source report path.
+
+Example:
+
+```bash
+FT_RESIZE_GATE_BASELINE_REASON="Recalibrate after approved scheduler optimization" \
+scripts/check_resize_performance_gates.sh --write-baseline
+```
 
 ## Nightly/Soak Gate
 

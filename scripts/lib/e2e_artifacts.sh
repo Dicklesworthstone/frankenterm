@@ -168,6 +168,9 @@ _e2e_infer_artifact_kind() {
         *frame_histogram*.json)
             echo "frame_histogram"
             ;;
+        *visual_artifact_report*.json|*visual_artifact_summary*.json)
+            echo "visual_artifact_report"
+            ;;
         *failure_signature*.json|*failure_signature*.txt)
             echo "failure_signature"
             ;;
@@ -345,6 +348,166 @@ _e2e_ensure_failure_artifacts() {
     fi
 }
 
+_e2e_emit_visual_artifact_report() {
+    local scenario_name="$1"
+    local scenario_dir="$2"
+    local duration_ms="$3"
+    local generated_at
+    generated_at=$(_e2e_timestamp)
+
+    local histogram_file="$scenario_dir/frame_histogram.json"
+    local correlation_file="$scenario_dir/correlation.jsonl"
+    local report_file="$scenario_dir/visual_artifact_report.json"
+
+    local warn_threshold="${VISUAL_ARTIFACT_WARN_THRESHOLD:-0.35}"
+    local fail_threshold="${VISUAL_ARTIFACT_FAIL_THRESHOLD:-0.65}"
+
+    local frame_count=0
+    local dropped_frame_count=0
+    local long_frame_count=0
+    local max_bucket_ms=0
+
+    if [[ -f "$histogram_file" ]]; then
+        frame_count=$(jq -r '.histogram.frame_count // 0' "$histogram_file" 2>/dev/null || echo 0)
+        dropped_frame_count=$(jq -r '.histogram.dropped_frame_count // 0' "$histogram_file" 2>/dev/null || echo 0)
+        long_frame_count=$(jq -r '
+            (.histogram.bucket_ms // [])
+            | map(
+                if type == "object" then
+                    ((.ms // .bucket_ms // .bucket // 0) | tonumber? // 0) as $ms
+                    | ((.count // .frames // 1) | tonumber? // 1) as $count
+                    | (if $ms >= 33 then $count else 0 end)
+                elif type == "number" then
+                    (if . >= 33 then 1 else 0 end)
+                else
+                    0
+                end
+            )
+            | add // 0
+        ' "$histogram_file" 2>/dev/null || echo 0)
+        max_bucket_ms=$(jq -r '
+            (.histogram.bucket_ms // [])
+            | map(
+                if type == "object" then
+                    ((.ms // .bucket_ms // .bucket // 0) | tonumber? // 0)
+                elif type == "number" then
+                    .
+                else
+                    0
+                end
+            )
+            | max // 0
+        ' "$histogram_file" 2>/dev/null || echo 0)
+    fi
+
+    local p50_ms=0
+    local p95_ms=0
+    local p99_ms=0
+    if [[ -f "$correlation_file" ]]; then
+        p50_ms=$(jq -sr 'map(.p50_ms // empty) | if length > 0 then (add / length) else 0 end' "$correlation_file" 2>/dev/null || echo 0)
+        p95_ms=$(jq -sr 'map(.p95_ms // empty) | if length > 0 then (add / length) else 0 end' "$correlation_file" 2>/dev/null || echo 0)
+        p99_ms=$(jq -sr 'map(.p99_ms // empty) | if length > 0 then (add / length) else 0 end' "$correlation_file" 2>/dev/null || echo 0)
+    fi
+
+    local keyword_count=0
+    if compgen -G "$scenario_dir/*.log" > /dev/null 2>&1; then
+        keyword_count=$(grep -Eio 'flicker|tearing|tear|artifact|jitter|ghost|smear|stretch|shimmy' "$scenario_dir"/*.log 2>/dev/null | wc -l | tr -d ' ')
+    fi
+
+    local metrics_json
+    metrics_json=$(jq -n \
+        --argjson frame_count "$frame_count" \
+        --argjson dropped_frame_count "$dropped_frame_count" \
+        --argjson long_frame_count "$long_frame_count" \
+        --argjson max_bucket_ms "$max_bucket_ms" \
+        --argjson p50_ms "$p50_ms" \
+        --argjson p95_ms "$p95_ms" \
+        --argjson p99_ms "$p99_ms" \
+        --argjson keyword_count "$keyword_count" \
+        '
+            def clamp01:
+                if . < 0 then 0
+                elif . > 1 then 1
+                else .
+                end;
+
+            ($frame_count | if . <= 0 then 0 else . end) as $fc
+            | ($dropped_frame_count / (if $fc == 0 then 1 else $fc end)) as $drop_ratio
+            | ($long_frame_count / (if $fc == 0 then 1 else $fc end)) as $long_ratio
+            | (if $p50_ms <= 0 then 0 else (($p99_ms - $p50_ms) / $p50_ms) end) as $jitter_ratio
+            | (($keyword_count / 8) | clamp01) as $keyword_signal
+            | (($drop_ratio / 0.10) | clamp01) as $drop_norm
+            | (($long_ratio / 0.20) | clamp01) as $long_norm
+            | (($jitter_ratio / 1.50) | clamp01) as $jitter_norm
+            | {
+                frame_count: $fc,
+                dropped_frame_count: $dropped_frame_count,
+                dropped_ratio: $drop_ratio,
+                long_frame_count: $long_frame_count,
+                long_frame_ratio: $long_ratio,
+                max_bucket_ms: $max_bucket_ms,
+                p50_ms: $p50_ms,
+                p95_ms: $p95_ms,
+                p99_ms: $p99_ms,
+                jitter_ratio: $jitter_ratio,
+                keyword_count: $keyword_count,
+                keyword_signal: $keyword_signal,
+                score: (0.45 * $drop_norm + 0.30 * $long_norm + 0.20 * $jitter_norm + 0.05 * $keyword_signal)
+            }
+        ')
+
+    local logs_json="[]"
+    for log_name in combined.log stdout.log stderr.log; do
+        if [[ -f "$scenario_dir/$log_name" ]]; then
+            logs_json=$(jq -c --arg log_name "$log_name" '. + [$log_name]' <<< "$logs_json")
+        fi
+    done
+
+    jq -n \
+        --arg schema_version "wa.visual_artifact_report.v1" \
+        --arg generated_at "$generated_at" \
+        --arg test_case_id "$scenario_name" \
+        --argjson duration_ms "$duration_ms" \
+        --arg warn_threshold "$warn_threshold" \
+        --arg fail_threshold "$fail_threshold" \
+        --argjson metrics "$metrics_json" \
+        --arg histogram_exists "$([[ -f "$histogram_file" ]] && echo true || echo false)" \
+        --arg failure_signature_exists "$([[ -f "$scenario_dir/failure_signature.json" ]] && echo true || echo false)" \
+        --arg correlation_exists "$([[ -f "$correlation_file" ]] && echo true || echo false)" \
+        --argjson logs "$logs_json" \
+        '
+            ($warn_threshold | tonumber? // 0.35) as $warn
+            | ($fail_threshold | tonumber? // 0.65) as $fail
+            | ($metrics.score // 0) as $score
+            | {
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                test_case_id: $test_case_id,
+                duration_ms: $duration_ms,
+                severity: {
+                    score: $score,
+                    class: (
+                        if $score >= $fail then "fail"
+                        elif $score >= $warn then "warn"
+                        else "pass"
+                        end
+                    ),
+                    thresholds: {
+                        warn: $warn,
+                        fail: $fail
+                    }
+                },
+                metrics: $metrics,
+                evidence: {
+                    frame_histogram: (if $histogram_exists == "true" then "frame_histogram.json" else null end),
+                    failure_signature: (if $failure_signature_exists == "true" then "failure_signature.json" else null end),
+                    correlation_stream: (if $correlation_exists == "true" then "correlation.jsonl" else null end),
+                    logs: $logs
+                }
+            }
+        ' > "$report_file"
+}
+
 _e2e_build_scenario_artifacts_json() {
     local scenario_dir="$1"
     local entries="[]"
@@ -404,6 +567,7 @@ _e2e_emit_scenario_manifest() {
         failure_signature=$(_e2e_derive_failure_signature "$scenario_dir")
         _e2e_ensure_failure_artifacts "$scenario_name" "$scenario_dir" "$duration_ms" "$failure_signature"
     fi
+    _e2e_emit_visual_artifact_report "$scenario_name" "$scenario_dir" "$duration_ms"
 
     local correlation_jsonl="$scenario_dir/correlation.jsonl"
     jq -cn \
