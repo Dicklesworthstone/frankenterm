@@ -135,6 +135,7 @@ pub mod orphan_reaper;
 pub mod outcome;
 pub mod output;
 pub mod output_compression;
+pub mod pairing_heap;
 pub mod pane_lifecycle;
 pub mod pane_tiers;
 pub mod pane_typestate;
