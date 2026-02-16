@@ -694,4 +694,325 @@ mod tests {
         });
         assert!(filter.num_buckets() >= 2);
     }
+
+    // ── Expanded coverage (DarkMill ft-353k0) ────────────────────────
+
+    #[test]
+    fn is_empty_after_insert_then_delete() {
+        let mut filter = CuckooFilter::new();
+        filter.insert(&99);
+        assert!(!filter.is_empty());
+        filter.delete(&99);
+        assert!(filter.is_empty());
+        assert_eq!(filter.count(), 0);
+    }
+
+    #[test]
+    fn count_after_multiple_deletes() {
+        let mut filter = CuckooFilter::new();
+        for i in 0..5 {
+            filter.insert(&i);
+        }
+        assert_eq!(filter.count(), 5);
+        filter.delete(&0);
+        filter.delete(&2);
+        filter.delete(&4);
+        assert_eq!(filter.count(), 2);
+        assert!(filter.lookup(&1));
+        assert!(filter.lookup(&3));
+    }
+
+    #[test]
+    fn load_factor_increases_with_inserts() {
+        let mut filter = CuckooFilter::with_config(CuckooConfig {
+            num_buckets: 8,
+            bucket_size: 4,
+            max_kicks: 100,
+        });
+        let lf0 = filter.load_factor();
+        assert_eq!(lf0, 0.0);
+        filter.insert(&1);
+        let lf1 = filter.load_factor();
+        assert!(lf1 > lf0, "load_factor should increase after insert");
+        filter.insert(&2);
+        let lf2 = filter.load_factor();
+        assert!(lf2 > lf1, "load_factor should increase further");
+    }
+
+    #[test]
+    fn load_factor_bounded_by_one() {
+        let mut filter = CuckooFilter::with_config(CuckooConfig {
+            num_buckets: 4,
+            bucket_size: 2,
+            max_kicks: 50,
+        });
+        for i in 0..100 {
+            filter.insert(&i);
+        }
+        assert!(filter.load_factor() <= 1.0, "load_factor should not exceed 1.0");
+    }
+
+    #[test]
+    fn stats_count_matches_count_method() {
+        let mut filter = CuckooFilter::new();
+        for i in 0..10 {
+            filter.insert(&i);
+        }
+        assert_eq!(filter.stats().count, filter.count());
+    }
+
+    #[test]
+    fn stats_capacity_matches_capacity_method() {
+        let filter = CuckooFilter::new();
+        assert_eq!(filter.stats().capacity, filter.capacity());
+    }
+
+    #[test]
+    fn stats_occupied_buckets_bounded() {
+        let mut filter = CuckooFilter::new();
+        for i in 0..50 {
+            filter.insert(&i);
+        }
+        let stats = filter.stats();
+        assert!(stats.occupied_buckets <= stats.num_buckets,
+            "occupied {} > num_buckets {}", stats.occupied_buckets, stats.num_buckets);
+    }
+
+    #[test]
+    fn stats_load_percent_bounded() {
+        let mut filter = CuckooFilter::with_config(CuckooConfig {
+            num_buckets: 4,
+            bucket_size: 2,
+            max_kicks: 50,
+        });
+        for i in 0..100 {
+            filter.insert(&i);
+        }
+        assert!(filter.stats().load_percent <= 100);
+    }
+
+    #[test]
+    fn with_capacity_holds_expected_items() {
+        let expected = 500;
+        let mut filter = CuckooFilter::with_capacity(expected);
+        let mut inserted = 0;
+        for i in 0..expected {
+            if filter.insert(&i) == InsertResult::Ok {
+                inserted += 1;
+            }
+        }
+        // Should hold at least 90% of expected
+        assert!(inserted >= expected * 9 / 10,
+            "only inserted {} out of {} expected", inserted, expected);
+    }
+
+    #[test]
+    fn with_config_custom_bucket_size() {
+        let filter = CuckooFilter::with_config(CuckooConfig {
+            num_buckets: 16,
+            bucket_size: 8,
+            max_kicks: 100,
+        });
+        assert_eq!(filter.bucket_size(), 8);
+        assert_eq!(filter.capacity(), 16 * 8);
+    }
+
+    #[test]
+    fn clear_resets_load_factor() {
+        let mut filter = CuckooFilter::new();
+        for i in 0..50 {
+            filter.insert(&i);
+        }
+        assert!(filter.load_factor() > 0.0);
+        filter.clear();
+        assert_eq!(filter.load_factor(), 0.0);
+    }
+
+    #[test]
+    fn lookup_no_false_negatives() {
+        let mut filter = CuckooFilter::new();
+        let items: Vec<i32> = (0..200).collect();
+        for &item in &items {
+            filter.insert(&item);
+        }
+        for &item in &items {
+            assert!(filter.lookup(&item), "false negative for item {}", item);
+        }
+    }
+
+    #[test]
+    fn delete_all_leaves_empty() {
+        let mut filter = CuckooFilter::new();
+        let n = 30;
+        for i in 0..n {
+            filter.insert(&i);
+        }
+        assert_eq!(filter.count(), n);
+        for i in 0..n {
+            assert!(filter.delete(&i), "should delete item {}", i);
+        }
+        assert!(filter.is_empty());
+        assert_eq!(filter.count(), 0);
+    }
+
+    #[test]
+    fn clone_independence() {
+        let mut filter = CuckooFilter::new();
+        filter.insert(&1);
+        filter.insert(&2);
+        let mut clone = filter.clone();
+        clone.insert(&3);
+        clone.delete(&1);
+        // Original unchanged
+        assert_eq!(filter.count(), 2);
+        assert!(filter.lookup(&1));
+        // Clone modified
+        assert_eq!(clone.count(), 2);
+        assert!(!clone.lookup(&1));
+        assert!(clone.lookup(&3));
+    }
+
+    #[test]
+    fn insert_various_hashable_types() {
+        let mut filter = CuckooFilter::new();
+        assert_eq!(filter.insert(&42i32), InsertResult::Ok);
+        assert_eq!(filter.insert(&"hello"), InsertResult::Ok);
+        assert_eq!(filter.insert(&true), InsertResult::Ok);
+        assert_eq!(filter.insert(&(1u8, 2u8)), InsertResult::Ok);
+        assert_eq!(filter.insert(&vec![1, 2, 3]), InsertResult::Ok);
+        assert_eq!(filter.count(), 5);
+    }
+
+    #[test]
+    fn double_delete_second_returns_false() {
+        let mut filter = CuckooFilter::new();
+        filter.insert(&42);
+        assert!(filter.delete(&42));
+        assert!(!filter.delete(&42), "second delete of same item should return false");
+    }
+
+    #[test]
+    fn stats_after_clear_shows_zero() {
+        let mut filter = CuckooFilter::new();
+        for i in 0..20 {
+            filter.insert(&i);
+        }
+        filter.clear();
+        let stats = filter.stats();
+        assert_eq!(stats.count, 0);
+        assert_eq!(stats.load_percent, 0);
+        assert_eq!(stats.occupied_buckets, 0);
+    }
+
+    #[test]
+    fn small_max_kicks_fills_sooner() {
+        let mut small_kicks = CuckooFilter::with_config(CuckooConfig {
+            num_buckets: 4,
+            bucket_size: 2,
+            max_kicks: 1,
+        });
+        let mut large_kicks = CuckooFilter::with_config(CuckooConfig {
+            num_buckets: 4,
+            bucket_size: 2,
+            max_kicks: 500,
+        });
+        let mut small_inserted = 0;
+        let mut large_inserted = 0;
+        for i in 0..100 {
+            if small_kicks.insert(&i) == InsertResult::Ok {
+                small_inserted += 1;
+            }
+            if large_kicks.insert(&i) == InsertResult::Ok {
+                large_inserted += 1;
+            }
+        }
+        assert!(large_inserted >= small_inserted,
+            "more kicks should allow more inserts: large={}, small={}", large_inserted, small_inserted);
+    }
+
+    #[test]
+    fn large_scale_insert_lookup() {
+        let mut filter = CuckooFilter::with_capacity(2000);
+        for i in 0..1000 {
+            assert_eq!(filter.insert(&i), InsertResult::Ok);
+        }
+        assert_eq!(filter.count(), 1000);
+        for i in 0..1000 {
+            assert!(filter.lookup(&i));
+        }
+    }
+
+    #[test]
+    fn stress_interleaved_insert_delete() {
+        let mut filter = CuckooFilter::new();
+        // Insert 0..50
+        for i in 0..50 {
+            filter.insert(&i);
+        }
+        // Delete even numbers
+        for i in (0..50).step_by(2) {
+            assert!(filter.delete(&i));
+        }
+        assert_eq!(filter.count(), 25);
+        // Odd numbers still present
+        for i in (1..50).step_by(2) {
+            assert!(filter.lookup(&i), "odd number {} should still be present", i);
+        }
+        // Insert more
+        for i in 50..75 {
+            filter.insert(&i);
+        }
+        assert_eq!(filter.count(), 50);
+    }
+
+    #[test]
+    fn alt_index_always_within_bounds() {
+        for n in [2, 4, 8, 16, 32, 64, 128, 256] {
+            for i in 0..n {
+                for fp in [1u32, 42, 255, 1000, u32::MAX] {
+                    let j = alt_index(i, fp, n);
+                    assert!(j < n, "alt_index({}, {}, {}) = {} out of bounds", i, fp, n, j);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn insert_after_full_returns_full() {
+        let mut filter = CuckooFilter::with_config(CuckooConfig {
+            num_buckets: 2,
+            bucket_size: 1,
+            max_kicks: 0,
+        });
+        // With 2 buckets, 1 slot each, and 0 kicks, capacity is 2
+        let mut full_seen = false;
+        for i in 0..100 {
+            if filter.insert(&i) == InsertResult::Full {
+                full_seen = true;
+                break;
+            }
+        }
+        assert!(full_seen, "should see InsertResult::Full on tiny filter");
+    }
+
+    #[test]
+    fn occupied_buckets_zero_when_empty() {
+        let filter = CuckooFilter::new();
+        assert_eq!(filter.stats().occupied_buckets, 0);
+    }
+
+    #[test]
+    fn occupied_buckets_increases_with_inserts() {
+        let mut filter = CuckooFilter::with_config(CuckooConfig {
+            num_buckets: 32,
+            bucket_size: 4,
+            max_kicks: 100,
+        });
+        let before = filter.stats().occupied_buckets;
+        for i in 0..20 {
+            filter.insert(&i);
+        }
+        let after = filter.stats().occupied_buckets;
+        assert!(after > before, "occupied should increase after inserts");
+    }
 }
