@@ -31,6 +31,11 @@ fn brute_argmin(data: &[i32], left: usize, right: usize) -> usize {
     (left..=right).find(|&i| data[i] == min_val).unwrap()
 }
 
+fn brute_argmax(data: &[i32], left: usize, right: usize) -> usize {
+    let max_val = brute_max(data, left, right);
+    (left..=right).find(|&i| data[i] == max_val).unwrap()
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 proptest! {
@@ -228,5 +233,295 @@ proptest! {
             prop_assert!(full_min <= right_min);
             prop_assert!(full_min == left_min || full_min == right_min);
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  NEW TESTS (13 additional properties)
+    // ══════════════════════════════════════════════════════════════
+
+    // ── Exhaustive small min ─────────────────────────────────────
+
+    #[test]
+    fn exhaustive_small_min(data in prop::collection::vec(-100..100i32, 1..10usize)) {
+        let st = SparseTable::min_table(&data);
+        let n = data.len();
+
+        for l in 0..n {
+            for r in l..n {
+                let got = st.query(l, r);
+                let expected = brute_min(&data, l, r);
+                prop_assert_eq!(got, expected, "exhaustive min mismatch at [{}, {}]", l, r);
+            }
+        }
+    }
+
+    // ── Exhaustive small max ─────────────────────────────────────
+
+    #[test]
+    fn exhaustive_small_max(data in prop::collection::vec(-100..100i32, 1..10usize)) {
+        let st = SparseTable::max_table(&data);
+        let n = data.len();
+
+        for l in 0..n {
+            for r in l..n {
+                let got = st.query(l, r);
+                let expected = brute_max(&data, l, r);
+                prop_assert_eq!(got, expected, "exhaustive max mismatch at [{}, {}]", l, r);
+            }
+        }
+    }
+
+    // ── Index max matches ────────────────────────────────────────
+
+    #[test]
+    fn index_max_matches(data in values_strategy(50)) {
+        let ist = IndexSparseTable::build(&data, QueryOp::Max);
+        let n = data.len();
+
+        for l in 0..n.min(15) {
+            for step in [0, 1, n / 3, n - 1] {
+                let r = (l + step).min(n - 1);
+                let idx = ist.query_index(l, r);
+                let expected_idx = brute_argmax(&data, l, r);
+
+                // Index might differ for ties, but value must match
+                prop_assert_eq!(
+                    data[idx], data[expected_idx],
+                    "max index value mismatch for [{}, {}]", l, r
+                );
+                prop_assert!(idx >= l && idx <= r, "max index out of range");
+            }
+        }
+    }
+
+    // ── Index always in range ────────────────────────────────────
+
+    #[test]
+    fn index_always_in_range(data in values_strategy(50)) {
+        let ist_min = IndexSparseTable::build(&data, QueryOp::Min);
+        let ist_max = IndexSparseTable::build(&data, QueryOp::Max);
+        let n = data.len();
+
+        for l in 0..n.min(15) {
+            for step in [0, 1, n / 4, n / 2, n - 1] {
+                let r = (l + step).min(n - 1);
+                let idx_min = ist_min.query_index(l, r);
+                let idx_max = ist_max.query_index(l, r);
+
+                prop_assert!(
+                    idx_min >= l && idx_min <= r,
+                    "min index {} not in [{}, {}]", idx_min, l, r
+                );
+                prop_assert!(
+                    idx_max >= l && idx_max <= r,
+                    "max index {} not in [{}, {}]", idx_max, l, r
+                );
+            }
+        }
+    }
+
+    // ── Index serde roundtrip ────────────────────────────────────
+
+    #[test]
+    fn index_serde_roundtrip(data in values_strategy(30)) {
+        let ist = IndexSparseTable::build(&data, QueryOp::Min);
+        let json = serde_json::to_string(&ist).unwrap();
+        let restored: IndexSparseTable<i32> = serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(restored.len(), ist.len());
+        let n = data.len();
+
+        // Verify full-range query matches
+        let (orig_idx, orig_val) = ist.query(0, n - 1);
+        let (rest_idx, rest_val) = restored.query(0, n - 1);
+        prop_assert_eq!(*rest_val, *orig_val, "index serde value mismatch");
+        prop_assert_eq!(
+            data[rest_idx], data[orig_idx],
+            "index serde index-value mismatch"
+        );
+
+        // Verify a mid-range query if possible
+        if n >= 3 {
+            let (oi, ov) = ist.query(1, n - 2);
+            let (ri, rv) = restored.query(1, n - 2);
+            prop_assert_eq!(*rv, *ov, "index serde mid-range value mismatch");
+            prop_assert_eq!(
+                data[ri], data[oi],
+                "index serde mid-range index-value mismatch"
+            );
+        }
+    }
+
+    // ── Clone equivalence ────────────────────────────────────────
+
+    #[test]
+    fn clone_equivalence(data in values_strategy(50)) {
+        let st = SparseTable::min_table(&data);
+        let cloned = st.clone();
+        let n = data.len();
+
+        prop_assert_eq!(cloned.len(), st.len());
+        prop_assert_eq!(cloned.operation(), st.operation());
+
+        // Verify queries match on several ranges
+        for l in 0..n.min(10) {
+            for step in [0, 1, n / 3, n - 1] {
+                let r = (l + step).min(n - 1);
+                prop_assert_eq!(
+                    cloned.query(l, r), st.query(l, r),
+                    "clone mismatch at [{}, {}]", l, r
+                );
+            }
+        }
+    }
+
+    // ── Operation preserved ──────────────────────────────────────
+
+    #[test]
+    fn operation_preserved(data in values_strategy(50)) {
+        let st_min = SparseTable::min_table(&data);
+        let st_max = SparseTable::max_table(&data);
+
+        prop_assert_eq!(st_min.operation(), QueryOp::Min, "min_table should have Min op");
+        prop_assert_eq!(st_max.operation(), QueryOp::Max, "max_table should have Max op");
+
+        // Also verify build() with explicit op
+        let st_build_min = SparseTable::build(&data, QueryOp::Min);
+        let st_build_max = SparseTable::build(&data, QueryOp::Max);
+        prop_assert_eq!(st_build_min.operation(), QueryOp::Min, "build Min op");
+        prop_assert_eq!(st_build_max.operation(), QueryOp::Max, "build Max op");
+    }
+
+    // ── Constant data all same ───────────────────────────────────
+
+    #[test]
+    fn constant_data_all_same(
+        val in -1000..1000i32,
+        len in 1..50usize,
+    ) {
+        let data: Vec<i32> = vec![val; len];
+        let st_min = SparseTable::min_table(&data);
+        let st_max = SparseTable::max_table(&data);
+
+        for l in 0..len.min(15) {
+            for step in [0, 1, len / 3, len - 1] {
+                let r = (l + step).min(len - 1);
+                prop_assert_eq!(
+                    st_min.query(l, r), val,
+                    "constant min mismatch at [{}, {}]", l, r
+                );
+                prop_assert_eq!(
+                    st_max.query(l, r), val,
+                    "constant max mismatch at [{}, {}]", l, r
+                );
+            }
+        }
+    }
+
+    // ── Min <= max for same data ─────────────────────────────────
+
+    #[test]
+    fn min_leq_max(data in values_strategy(50)) {
+        let st_min = SparseTable::min_table(&data);
+        let st_max = SparseTable::max_table(&data);
+        let n = data.len();
+
+        for l in 0..n.min(15) {
+            for step in [0, 1, n / 4, n / 2, n - 1] {
+                let r = (l + step).min(n - 1);
+                let min_val = st_min.query(l, r);
+                let max_val = st_max.query(l, r);
+                prop_assert!(
+                    min_val <= max_val,
+                    "min {} > max {} at [{}, {}]", min_val, max_val, l, r
+                );
+            }
+        }
+    }
+
+    // ── Overlapping ranges ───────────────────────────────────────
+
+    #[test]
+    fn overlapping_ranges(data in values_strategy(50)) {
+        let st = SparseTable::min_table(&data);
+        let n = data.len();
+
+        if n >= 3 {
+            for mid in 1..(n - 1).min(15) {
+                let full = st.query(0, n - 1);
+                let left_part = st.query(0, mid);
+                let right_part = st.query(mid, n - 1);
+
+                // The min of each half must be >= the overall min
+                prop_assert!(
+                    left_part >= full,
+                    "left part min {} < full min {} at mid {}", left_part, full, mid
+                );
+                prop_assert!(
+                    right_part >= full,
+                    "right part min {} < full min {} at mid {}", right_part, full, mid
+                );
+            }
+        }
+    }
+
+    // ── Prefix suffix min ────────────────────────────────────────
+
+    #[test]
+    fn prefix_suffix_min(data in values_strategy(50)) {
+        let st = SparseTable::min_table(&data);
+        let n = data.len();
+
+        // min(0, k) for increasing k is non-increasing
+        let mut prev_min = data[0];
+        for k in 0..n {
+            let current_min = st.query(0, k);
+            prop_assert!(
+                current_min <= prev_min,
+                "prefix min increased at k={}: {} > {}", k, current_min, prev_min
+            );
+            prev_min = current_min;
+        }
+    }
+
+    // ── Index value matches direct ───────────────────────────────
+
+    #[test]
+    fn index_value_matches_direct(data in values_strategy(50)) {
+        let st = SparseTable::min_table(&data);
+        let ist = IndexSparseTable::build(&data, QueryOp::Min);
+        let n = data.len();
+
+        for l in 0..n.min(15) {
+            for step in [0, 1, n / 3, n - 1] {
+                let r = (l + step).min(n - 1);
+                let direct_val = st.query(l, r);
+                let (idx, idx_val) = ist.query(l, r);
+                prop_assert_eq!(
+                    *idx_val, direct_val,
+                    "index query value {} != direct {} at [{}, {}]", idx_val, direct_val, l, r
+                );
+                prop_assert_eq!(
+                    data[idx], direct_val,
+                    "data at index {} != direct {} at [{}, {}]", data[idx], direct_val, l, r
+                );
+            }
+        }
+    }
+
+    // ── Get matches original data ────────────────────────────────
+
+    #[test]
+    fn get_matches_original_data(data in values_strategy(50)) {
+        let st = SparseTable::min_table(&data);
+
+        for (i, val) in data.iter().enumerate() {
+            let got = st.get(i);
+            prop_assert_eq!(got, Some(val), "get({}) mismatch", i);
+        }
+
+        // Out-of-bounds returns None
+        prop_assert!(st.get(data.len()).is_none(), "get(len) should be None");
+        prop_assert!(st.get(data.len() + 100).is_none(), "get(len+100) should be None");
     }
 }
