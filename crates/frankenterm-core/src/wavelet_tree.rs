@@ -514,4 +514,215 @@ mod tests {
         // rank at pos > len should be clamped to len
         assert_eq!(wt.rank(b'a', 100), 1);
     }
+
+    // ── Expanded test coverage ──────────────────────────────────────
+
+    #[test]
+    fn rank_all_symbols_sum_to_pos() {
+        let data = b"abracadabra";
+        let wt = WaveletTree::new(data);
+        // Sum of rank(symbol, pos) for all symbols should equal pos
+        for pos in 0..=data.len() {
+            let total: usize = (0u8..=255).map(|s| wt.rank(s, pos)).sum();
+            assert_eq!(total, pos, "ranks don't sum to {} at pos {}", pos, pos);
+        }
+    }
+
+    #[test]
+    fn rank_monotonically_increasing() {
+        let data = b"abracadabra";
+        let wt = WaveletTree::new(data);
+        for symbol in [b'a', b'b', b'c', b'd', b'r'] {
+            let mut prev = 0;
+            for pos in 0..=data.len() {
+                let r = wt.rank(symbol, pos);
+                assert!(r >= prev, "rank({}, {}) = {} < prev {}", symbol, pos, r, prev);
+                prev = r;
+            }
+        }
+    }
+
+    #[test]
+    fn select_rank_consistency() {
+        // select(symbol, n) returns pos such that rank(symbol, pos+1) == n
+        let data = b"abracadabra";
+        let wt = WaveletTree::new(data);
+        for &symbol in &[b'a', b'b', b'c', b'd', b'r'] {
+            let total = wt.rank(symbol, data.len());
+            for n in 1..=total {
+                let pos = wt.select(symbol, n).unwrap();
+                assert_eq!(
+                    wt.rank(symbol, pos + 1),
+                    n,
+                    "select({}, {}) = {}, but rank at pos+1 != {}",
+                    symbol as char, n, pos, n,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn select_nonexistent_symbol() {
+        let wt = WaveletTree::new(b"aaa");
+        assert!(wt.select(b'b', 1).is_none());
+        assert!(wt.select(b'z', 1).is_none());
+    }
+
+    #[test]
+    fn select_beyond_count() {
+        let wt = WaveletTree::new(b"aab");
+        assert_eq!(wt.select(b'a', 1), Some(0));
+        assert_eq!(wt.select(b'a', 2), Some(1));
+        assert!(wt.select(b'a', 3).is_none());
+    }
+
+    #[test]
+    fn range_count_empty_range() {
+        let wt = WaveletTree::new(b"abcdef");
+        assert_eq!(wt.range_count(b'a', 3, 3), 0); // lo == hi
+        assert_eq!(wt.range_count(b'a', 5, 2), 0); // lo > hi
+    }
+
+    #[test]
+    fn range_count_full_range_equals_rank() {
+        let data = b"abracadabra";
+        let wt = WaveletTree::new(data);
+        for &symbol in &[b'a', b'b', b'c', b'd', b'r'] {
+            assert_eq!(
+                wt.range_count(symbol, 0, data.len()),
+                wt.rank(symbol, data.len()),
+            );
+        }
+    }
+
+    #[test]
+    fn range_count_additivity() {
+        // range_count(s, lo, hi) = range_count(s, lo, mid) + range_count(s, mid, hi)
+        let data = b"abracadabra";
+        let wt = WaveletTree::new(data);
+        let mid = 5;
+        for &symbol in &[b'a', b'b', b'r'] {
+            let full = wt.range_count(symbol, 0, data.len());
+            let left = wt.range_count(symbol, 0, mid);
+            let right = wt.range_count(symbol, mid, data.len());
+            assert_eq!(full, left + right);
+        }
+    }
+
+    #[test]
+    fn quantile_empty_range() {
+        let wt = WaveletTree::new(b"abc");
+        assert!(wt.quantile(2, 2, 0).is_none());
+        assert!(wt.quantile(5, 3, 0).is_none());
+    }
+
+    #[test]
+    fn quantile_on_empty_tree() {
+        let wt = WaveletTree::new(&[]);
+        assert!(wt.quantile(0, 1, 0).is_none());
+    }
+
+    #[test]
+    fn quantile_full_range_sorted() {
+        let data = vec![50, 30, 10, 40, 20];
+        let wt = WaveletTree::new(&data);
+        let sorted: Vec<u8> = (0..5).map(|k| wt.quantile(0, 5, k).unwrap()).collect();
+        assert_eq!(sorted, vec![10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn range_frequencies_empty_range() {
+        let wt = WaveletTree::new(b"abc");
+        assert!(wt.range_frequencies(3, 3).is_empty());
+        assert!(wt.range_frequencies(5, 2).is_empty());
+    }
+
+    #[test]
+    fn range_frequencies_subrange() {
+        let data = b"aabbccdd";
+        let wt = WaveletTree::new(data);
+        let freqs = wt.range_frequencies(2, 6); // "bbcc"
+        let b_count = freqs.iter().find(|&&(b, _)| b == b'b').map(|&(_, c)| c).unwrap_or(0);
+        let c_count = freqs.iter().find(|&&(b, _)| b == b'c').map(|&(_, c)| c).unwrap_or(0);
+        assert_eq!(b_count, 2);
+        assert_eq!(c_count, 2);
+        assert_eq!(freqs.len(), 2); // only 'b' and 'c'
+    }
+
+    #[test]
+    fn alphabet_size_empty() {
+        let wt = WaveletTree::new(&[]);
+        assert_eq!(wt.alphabet_size(), 0);
+    }
+
+    #[test]
+    fn alphabet_size_single() {
+        let wt = WaveletTree::new(&[42]);
+        assert_eq!(wt.alphabet_size(), 1);
+    }
+
+    #[test]
+    fn alphabet_size_all_same() {
+        let wt = WaveletTree::new(&vec![100u8; 50]);
+        assert_eq!(wt.alphabet_size(), 1);
+    }
+
+    #[test]
+    fn access_out_of_bounds() {
+        let wt = WaveletTree::new(b"hello");
+        assert!(wt.access(5).is_none());
+        assert!(wt.access(100).is_none());
+    }
+
+    #[test]
+    fn clone_independence() {
+        let wt = WaveletTree::new(b"test");
+        let cloned = wt.clone();
+        assert_eq!(wt.len(), cloned.len());
+        assert_eq!(wt.rank(b't', 4), cloned.rank(b't', 4));
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_queries() {
+        let data = b"the quick brown fox";
+        let wt = WaveletTree::new(data);
+
+        let json = serde_json::to_string(&wt).unwrap();
+        let restored: WaveletTree = serde_json::from_str(&json).unwrap();
+
+        // Verify all queries match
+        for &sym in &[b't', b'h', b'e', b' ', b'o'] {
+            assert_eq!(restored.rank(sym, data.len()), wt.rank(sym, data.len()));
+        }
+        assert_eq!(restored.alphabet_size(), wt.alphabet_size());
+        assert_eq!(restored.quantile(0, 5, 2), wt.quantile(0, 5, 2));
+    }
+
+    #[test]
+    fn display_empty() {
+        let wt = WaveletTree::new(&[]);
+        assert_eq!(format!("{}", wt), "WaveletTree(len=0, alphabet=0)");
+    }
+
+    #[test]
+    fn rank_nonexistent_symbol() {
+        let wt = WaveletTree::new(b"abc");
+        assert_eq!(wt.rank(b'z', 3), 0);
+        assert_eq!(wt.rank(0, 3), 0);
+        assert_eq!(wt.rank(255, 3), 0);
+    }
+
+    #[test]
+    fn full_byte_range() {
+        // Test with all 256 byte values
+        let data: Vec<u8> = (0..=255).collect();
+        let wt = WaveletTree::new(&data);
+        assert_eq!(wt.len(), 256);
+        assert_eq!(wt.alphabet_size(), 256);
+
+        for byte in 0..=255u8 {
+            assert_eq!(wt.rank(byte, 256), 1);
+            assert_eq!(wt.select(byte, 1), Some(byte as usize));
+        }
+    }
 }
