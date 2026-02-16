@@ -8,6 +8,9 @@
 //! - Insert/remove semantics
 //! - Splay-to-root property
 //! - Serde roundtrip
+//! - Clone equivalence and independence
+//! - Display formatting
+//! - Iterator correctness
 
 use frankenterm_core::splay_tree::SplayTree;
 use proptest::prelude::*;
@@ -325,5 +328,247 @@ proptest! {
             }
         }
         prop_assert_eq!(tree.len(), reference.len());
+    }
+}
+
+// ── Clone equivalence ─────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Clone produces identical content.
+    #[test]
+    fn clone_equivalence(pairs in kv_pairs_strategy(30)) {
+        let mut tree = SplayTree::new();
+        for &(k, v) in &pairs {
+            tree.insert(k, v);
+        }
+        let cloned = tree.clone();
+
+        prop_assert_eq!(cloned.len(), tree.len());
+        let reference = build_reference(&pairs);
+        for (k, v) in &reference {
+            prop_assert_eq!(cloned.peek(k), Some(v));
+        }
+    }
+
+    /// Clone is independent — mutating clone doesn't affect original.
+    #[test]
+    fn clone_independence(pairs in kv_pairs_strategy(30)) {
+        let mut tree = SplayTree::new();
+        for &(k, v) in &pairs {
+            tree.insert(k, v);
+        }
+        let original_len = tree.len();
+
+        let mut cloned = tree.clone();
+        cloned.insert(9999, 1);
+
+        prop_assert_eq!(tree.len(), original_len);
+        prop_assert!(tree.peek(&9999).is_none());
+        prop_assert_eq!(cloned.len(), original_len + 1);
+    }
+
+    /// Display format is non-empty.
+    #[test]
+    fn display_format(pairs in kv_pairs_strategy(20)) {
+        let mut tree = SplayTree::new();
+        for &(k, v) in &pairs {
+            tree.insert(k, v);
+        }
+        let display = format!("{}", tree);
+        prop_assert!(!display.is_empty());
+        prop_assert!(display.contains("SplayTree"));
+    }
+
+    /// is_empty agrees with len == 0.
+    #[test]
+    fn is_empty_agrees_with_len(pairs in kv_pairs_strategy(30)) {
+        let mut tree = SplayTree::new();
+        for &(k, v) in &pairs {
+            tree.insert(k, v);
+        }
+        let reference = build_reference(&pairs);
+        prop_assert_eq!(tree.is_empty(), reference.is_empty());
+        prop_assert_eq!(tree.is_empty(), tree.len() == 0);
+    }
+
+    /// Iterator pairs match reference model.
+    #[test]
+    fn iter_matches_reference(pairs in kv_pairs_strategy(30)) {
+        let reference = build_reference(&pairs);
+        let mut tree = SplayTree::new();
+        for &(k, v) in &pairs {
+            tree.insert(k, v);
+        }
+
+        let iter_pairs: Vec<(i32, u32)> = tree.iter().into_iter().map(|(&k, &v)| (k, v)).collect();
+        let ref_pairs: Vec<(i32, u32)> = reference.iter().map(|(&k, &v)| (k, v)).collect();
+        prop_assert_eq!(iter_pairs, ref_pairs);
+    }
+
+    /// Double remove returns None.
+    #[test]
+    fn double_remove_returns_none(pairs in kv_pairs_strategy(30)) {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        let mut tree = SplayTree::new();
+        for &(k, v) in &pairs {
+            tree.insert(k, v);
+        }
+
+        let key = pairs[0].0;
+        let _ = tree.remove(&key);
+        let second = tree.remove(&key);
+        prop_assert!(second.is_none());
+    }
+
+    /// Overwrite preserves length.
+    #[test]
+    fn overwrite_preserves_len(pairs in kv_pairs_strategy(30)) {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        let mut tree = SplayTree::new();
+        for &(k, v) in &pairs {
+            tree.insert(k, v);
+        }
+        let len_before = tree.len();
+
+        // Overwrite first key
+        let key = pairs[0].0;
+        tree.insert(key, 99999);
+        prop_assert_eq!(tree.len(), len_before);
+        prop_assert_eq!(tree.get(&key), Some(&99999));
+    }
+
+    /// After removing first key, min/max still correct.
+    #[test]
+    fn min_max_after_remove(pairs in kv_pairs_strategy(30)) {
+        let mut reference = build_reference(&pairs);
+        let mut tree = SplayTree::new();
+        for &(k, v) in &pairs {
+            tree.insert(k, v);
+        }
+
+        if reference.len() < 2 {
+            return Ok(());
+        }
+
+        let first_key = *reference.keys().next().unwrap();
+        tree.remove(&first_key);
+        reference.remove(&first_key);
+
+        let tree_min = tree.min().map(|(k, v)| (*k, *v));
+        let ref_min = reference.iter().next().map(|(&k, &v)| (k, v));
+        prop_assert_eq!(tree_min, ref_min);
+    }
+
+    /// Remove all entries yields empty tree.
+    #[test]
+    fn remove_all_yields_empty(pairs in kv_pairs_strategy(20)) {
+        let reference = build_reference(&pairs);
+        let mut tree = SplayTree::new();
+        for &(k, v) in &pairs {
+            tree.insert(k, v);
+        }
+
+        for key in reference.keys() {
+            tree.remove(key);
+        }
+
+        prop_assert!(tree.is_empty());
+        prop_assert_eq!(tree.len(), 0);
+        prop_assert!(tree.min().is_none());
+        prop_assert!(tree.max().is_none());
+    }
+
+    /// Insert-remove-insert cycle: reinserting works correctly.
+    #[test]
+    fn insert_remove_reinsert(pairs in kv_pairs_strategy(20)) {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        let mut tree = SplayTree::new();
+        for &(k, v) in &pairs {
+            tree.insert(k, v);
+        }
+
+        let key = pairs[0].0;
+        tree.remove(&key);
+        prop_assert!(tree.get(&key).is_none());
+
+        tree.insert(key, 77777);
+        prop_assert_eq!(tree.get(&key), Some(&77777));
+    }
+
+    /// Default produces same as new.
+    #[test]
+    fn default_same_as_new(_dummy in 0..10u8) {
+        let d: SplayTree<i32, u32> = SplayTree::default();
+        let n: SplayTree<i32, u32> = SplayTree::new();
+        prop_assert!(d.is_empty());
+        prop_assert!(n.is_empty());
+        prop_assert_eq!(d.len(), n.len());
+    }
+
+    /// Peek does not affect subsequent get results.
+    #[test]
+    fn peek_does_not_affect_get(pairs in kv_pairs_strategy(30)) {
+        let reference = build_reference(&pairs);
+        let mut tree = SplayTree::new();
+        for &(k, v) in &pairs {
+            tree.insert(k, v);
+        }
+
+        // Peek all keys (non-mutating)
+        for k in reference.keys() {
+            let _ = tree.peek(k);
+        }
+
+        // Get should still return correct results
+        for (k, v) in &reference {
+            prop_assert_eq!(tree.get(k), Some(v));
+        }
+    }
+
+    /// Keys length matches len().
+    #[test]
+    fn keys_len_matches_len(pairs in kv_pairs_strategy(30)) {
+        let mut tree = SplayTree::new();
+        for &(k, v) in &pairs {
+            tree.insert(k, v);
+        }
+        prop_assert_eq!(tree.keys().len(), tree.len());
+    }
+
+    /// Serde roundtrip after removals preserves remaining entries.
+    #[test]
+    fn serde_roundtrip_after_remove(pairs in kv_pairs_strategy(30)) {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        let mut tree = SplayTree::new();
+        let mut reference = build_reference(&pairs);
+        for &(k, v) in &pairs {
+            tree.insert(k, v);
+        }
+
+        let key = pairs[0].0;
+        tree.remove(&key);
+        reference.remove(&key);
+
+        let json = serde_json::to_string(&tree).unwrap();
+        let restored: SplayTree<i32, u32> = serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(restored.len(), reference.len());
+        for (k, v) in &reference {
+            prop_assert_eq!(restored.peek(k), Some(v));
+        }
     }
 }

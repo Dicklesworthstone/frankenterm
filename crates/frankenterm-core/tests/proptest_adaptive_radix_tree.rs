@@ -420,4 +420,190 @@ proptest! {
             );
         }
     }
+
+    // ── String API consistency ───────────────────────────────────
+
+    #[test]
+    fn insert_str_matches_insert_bytes(
+        pairs in prop::collection::vec(("[a-z]{1,15}", any::<u32>()), 0..30)
+    ) {
+        let mut art_bytes = AdaptiveRadixTree::new();
+        let mut art_str = AdaptiveRadixTree::new();
+        for (k, v) in &pairs {
+            art_bytes.insert(k.as_bytes(), *v);
+            art_str.insert_str(k, *v);
+        }
+        prop_assert_eq!(art_bytes.len(), art_str.len());
+        for (k, _) in &pairs {
+            prop_assert_eq!(art_bytes.get(k.as_bytes()), art_str.get_str(k));
+        }
+    }
+
+    #[test]
+    fn contains_str_matches_contains_key(
+        pairs in prop::collection::vec(("[a-z]{1,15}", any::<u32>()), 0..30),
+        probe in "[a-z]{1,15}"
+    ) {
+        let mut art = AdaptiveRadixTree::new();
+        for (k, v) in &pairs {
+            art.insert_str(k, *v);
+        }
+        prop_assert_eq!(art.contains_str(&probe), art.contains_key(probe.as_bytes()));
+    }
+
+    #[test]
+    fn remove_str_matches_remove_bytes(
+        pairs in prop::collection::vec(("[a-z]{1,10}", any::<u32>()), 1..20)
+    ) {
+        let mut art_bytes = AdaptiveRadixTree::new();
+        let mut art_str = AdaptiveRadixTree::new();
+        for (k, v) in &pairs {
+            art_bytes.insert(k.as_bytes(), *v);
+            art_str.insert_str(k, *v);
+        }
+
+        let key = &pairs[0].0;
+        let removed_bytes = art_bytes.remove(key.as_bytes());
+        let removed_str = art_str.remove_str(key);
+        prop_assert_eq!(removed_bytes, removed_str);
+        prop_assert_eq!(art_bytes.len(), art_str.len());
+    }
+
+    #[test]
+    fn prefix_search_str_matches_bytes(
+        pairs in prop::collection::vec(("[a-z]{1,8}", any::<u32>()), 0..20),
+        prefix in "[a-z]{1,4}"
+    ) {
+        let mut art = AdaptiveRadixTree::new();
+        for (k, v) in &pairs {
+            art.insert_str(k, *v);
+        }
+
+        let bytes_results = art.prefix_search(prefix.as_bytes());
+        let str_results = art.prefix_search_str(&prefix);
+        prop_assert_eq!(bytes_results.len(), str_results.len());
+    }
+
+    // ── Multiple removes ────────────────────────────────────────
+
+    #[test]
+    fn multiple_removes_consistent(pairs in kv_pairs_strategy(30)) {
+        let mut art = AdaptiveRadixTree::new();
+        let mut reference = build_reference(&pairs);
+        for (k, v) in &pairs {
+            art.insert(k, *v);
+        }
+
+        // Remove half the keys
+        let keys_to_remove: Vec<Vec<u8>> = reference.keys().take(reference.len() / 2).cloned().collect();
+        for k in &keys_to_remove {
+            art.remove(k);
+            reference.remove(k);
+        }
+
+        prop_assert_eq!(art.len(), reference.len());
+        for (k, v) in &reference {
+            prop_assert_eq!(art.get(k), Some(v));
+        }
+    }
+
+    // ── Double remove returns None ──────────────────────────────
+
+    #[test]
+    fn double_remove_returns_none(pairs in kv_pairs_strategy(20)) {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        let mut art = AdaptiveRadixTree::new();
+        for (k, v) in &pairs {
+            art.insert(k, *v);
+        }
+
+        let key = &pairs[0].0;
+        let _ = art.remove(key);
+        let second = art.remove(key);
+        prop_assert!(second.is_none());
+    }
+
+    // ── Display format ──────────────────────────────────────────
+
+    #[test]
+    fn display_format(pairs in kv_pairs_strategy(20)) {
+        let mut art = AdaptiveRadixTree::new();
+        for (k, v) in &pairs {
+            art.insert(k, *v);
+        }
+        let display = format!("{}", art);
+        prop_assert!(!display.is_empty());
+        prop_assert!(display.contains("AdaptiveRadixTree"));
+    }
+
+    // ── Default is empty ────────────────────────────────────────
+
+    #[test]
+    fn default_is_empty(_dummy in 0..10u8) {
+        let art: AdaptiveRadixTree<u32> = AdaptiveRadixTree::default();
+        prop_assert!(art.is_empty());
+        prop_assert_eq!(art.len(), 0);
+        prop_assert_eq!(art.node_count(), 0);
+    }
+
+    // ── Overwrite updates value ─────────────────────────────────
+
+    #[test]
+    fn overwrite_updates_value(pairs in kv_pairs_strategy(20)) {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        let mut art = AdaptiveRadixTree::new();
+        for (k, v) in &pairs {
+            art.insert(k, *v);
+        }
+
+        let key = &pairs[0].0;
+        let len_before = art.len();
+        art.insert(key, 99999);
+        prop_assert_eq!(art.len(), len_before);
+        prop_assert_eq!(art.get(key), Some(&99999));
+    }
+
+    // ── Remove all yields empty ─────────────────────────────────
+
+    #[test]
+    fn remove_all_yields_empty(pairs in kv_pairs_strategy(20)) {
+        let reference = build_reference(&pairs);
+        let mut art = AdaptiveRadixTree::new();
+        for (k, v) in &pairs {
+            art.insert(k, *v);
+        }
+
+        for k in reference.keys() {
+            art.remove(k);
+        }
+
+        prop_assert!(art.is_empty());
+        prop_assert_eq!(art.len(), 0);
+    }
+
+    // ── Serde preserves all values ─────────────────────────────
+
+    #[test]
+    fn serde_preserves_all_values(pairs in kv_pairs_strategy(30)) {
+        let reference = build_reference(&pairs);
+        let mut art = AdaptiveRadixTree::new();
+        for (k, v) in &pairs {
+            art.insert(k, *v);
+        }
+
+        let json = serde_json::to_string(&art).unwrap();
+        let restored: AdaptiveRadixTree<u32> = serde_json::from_str(&json).unwrap();
+
+        // Verify every reference key is present with correct value
+        for (k, v) in &reference {
+            prop_assert_eq!(restored.get(k), Some(v), "key {:?} missing after serde", k);
+        }
+        prop_assert_eq!(restored.len(), reference.len());
+    }
 }

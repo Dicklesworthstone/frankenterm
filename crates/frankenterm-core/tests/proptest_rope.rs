@@ -310,4 +310,151 @@ proptest! {
         let full = rope.substring(0, rope.len());
         prop_assert_eq!(full, text);
     }
+
+    // ── Concat method ───────────────────────────────────────────
+
+    #[test]
+    fn concat_preserves_content(
+        a in text_strategy(),
+        b in text_strategy()
+    ) {
+        let mut rope_a = Rope::from_str(&a);
+        let rope_b = Rope::from_str(&b);
+        rope_a.concat(&rope_b);
+        let expected = format!("{}{}", a, b);
+        prop_assert_eq!(rope_a.to_string_full(), expected);
+    }
+
+    #[test]
+    fn concat_len_is_sum(
+        a in text_strategy(),
+        b in text_strategy()
+    ) {
+        let mut rope_a = Rope::from_str(&a);
+        let rope_b = Rope::from_str(&b);
+        rope_a.concat(&rope_b);
+        prop_assert_eq!(rope_a.len(), a.len() + b.len());
+    }
+
+    // ── Clone independence ──────────────────────────────────────
+
+    #[test]
+    fn clone_independence(text in text_strategy()) {
+        let text_len = text.len();
+        let rope = Rope::from_str(&text);
+        let mut cloned = rope.clone();
+        cloned.append("EXTRA");
+
+        prop_assert_eq!(rope.to_string_full(), text);
+        prop_assert_eq!(rope.len(), text_len);
+        prop_assert_eq!(cloned.len(), text_len + 5);
+    }
+
+    #[test]
+    fn clone_preserves_content(text in text_strategy()) {
+        let rope = Rope::from_str(&text);
+        let cloned = rope.clone();
+        prop_assert_eq!(cloned.to_string_full(), rope.to_string_full());
+        prop_assert_eq!(cloned.len(), rope.len());
+    }
+
+    // ── Split + concat roundtrip ────────────────────────────────
+
+    #[test]
+    fn split_concat_roundtrip(
+        text in "[a-zA-Z0-9]{2,100}",
+        split_frac in 0.1..0.9f64
+    ) {
+        let rope = Rope::from_str(&text);
+        let split_pos = (split_frac * text.len() as f64) as usize;
+        let split_pos = split_pos.min(text.len());
+
+        let (left, right) = rope.split(split_pos);
+        let mut combined = left;
+        combined.concat(&right);
+
+        prop_assert_eq!(combined.to_string_full(), text);
+    }
+
+    // ── Node count is positive for non-empty ────────────────────
+
+    #[test]
+    fn node_count_positive_for_nonempty(text in "[a-zA-Z]{1,100}") {
+        let rope = Rope::from_str(&text);
+        prop_assert!(rope.node_count() >= 1, "non-empty rope should have at least 1 node");
+    }
+
+    // ── Display format ──────────────────────────────────────────
+
+    #[test]
+    fn display_format(text in text_strategy()) {
+        let rope = Rope::from_str(&text);
+        let display = format!("{}", rope);
+        prop_assert!(!display.is_empty());
+        prop_assert!(display.contains("Rope"));
+    }
+
+    // ── Default is empty ────────────────────────────────────────
+
+    #[test]
+    fn default_is_empty(_dummy in 0..10u8) {
+        let rope: Rope = Rope::default();
+        prop_assert!(rope.is_empty());
+        prop_assert_eq!(rope.len(), 0);
+        prop_assert_eq!(rope.to_string_full(), "");
+    }
+
+    // ── From String trait ───────────────────────────────────────
+
+    #[test]
+    fn from_string_matches_from_str(text in text_strategy()) {
+        let from_str = Rope::from_str(&text);
+        let from_string: Rope = text.clone().into();
+        prop_assert_eq!(from_str.to_string_full(), from_string.to_string_full());
+        prop_assert_eq!(from_str.len(), from_string.len());
+    }
+
+    // ── Insert at boundaries ────────────────────────────────────
+
+    #[test]
+    fn insert_at_start_same_as_prepend(
+        base in "[a-zA-Z]{1,50}",
+        prefix in "[0-9]{1,10}"
+    ) {
+        let mut rope_insert = Rope::from_str(&base);
+        rope_insert.insert(0, &prefix);
+
+        let mut rope_prepend = Rope::from_str(&base);
+        rope_prepend.prepend(&prefix);
+
+        prop_assert_eq!(rope_insert.to_string_full(), rope_prepend.to_string_full());
+    }
+
+    #[test]
+    fn insert_at_end_same_as_append(
+        base in "[a-zA-Z]{1,50}",
+        suffix in "[0-9]{1,10}"
+    ) {
+        let base_len = base.len();
+        let mut rope_insert = Rope::from_str(&base);
+        rope_insert.insert(base_len, &suffix);
+
+        let mut rope_append = Rope::from_str(&base);
+        rope_append.append(&suffix);
+
+        prop_assert_eq!(rope_insert.to_string_full(), rope_append.to_string_full());
+    }
+
+    // ── Line content matches reference ──────────────────────────
+
+    #[test]
+    fn line_content_matches_split(text in "[a-zA-Z0-9]{1,30}(\\n[a-zA-Z0-9]{0,30}){0,5}") {
+        let rope = Rope::from_str(&text);
+        let reference_lines: Vec<&str> = text.split('\n').collect();
+
+        for (i, expected) in reference_lines.iter().enumerate() {
+            let rope_line = rope.line(i);
+            prop_assert_eq!(rope_line.as_deref(), Some(*expected), "line {} mismatch", i);
+        }
+    }
 }
