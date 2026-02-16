@@ -200,6 +200,7 @@ pub mod storage;
 pub mod storage_targets;
 pub mod storage_telemetry;
 pub mod stream_hash;
+pub mod suffix_array;
 pub mod suggestions;
 pub mod survival;
 pub mod tailer;
