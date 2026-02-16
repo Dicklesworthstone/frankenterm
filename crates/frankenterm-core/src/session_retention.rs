@@ -936,13 +936,14 @@ mod tests {
     fn age_cleanup_boundary_exactly_at_cutoff() {
         let conn = make_test_db();
         let now = epoch_ms() as i64;
-        // Exactly 30 days ago
-        let exactly_30_days = now - 30 * 86_400_000;
+        // Slightly newer than 30 days ago (+100ms) to account for time elapsed
+        // between this epoch_ms() call and the one inside delete_sessions_by_age.
+        // The query uses `created_at < cutoff`, so anything at or after the cutoff
+        // should NOT be deleted.
+        let just_inside_30_days = now - 30 * 86_400_000 + 100;
 
-        insert_session(&conn, "boundary", exactly_30_days, true);
+        insert_session(&conn, "boundary", just_inside_30_days, true);
 
-        // cutoff = now - 30 days = exactly_30_days. Query: created_at < cutoff
-        // Since created_at == cutoff, it should NOT be deleted (< not <=)
         let deleted = delete_sessions_by_age(&conn, 30).unwrap();
         assert_eq!(deleted, 0);
     }
