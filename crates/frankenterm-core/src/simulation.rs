@@ -4,7 +4,7 @@
 //! [`MockWezterm`](crate::wezterm::MockWezterm) for reproducible testing
 //! and interactive demonstrations.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -208,6 +208,37 @@ pub struct ResizeQueueMetrics {
     pub depth_after: u64,
 }
 
+/// Atlas invalidation policy selected for a font-size transition.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FontAtlasCachePolicy {
+    /// Reuse existing atlas entries where possible; minimal invalidation.
+    ReuseHotAtlas,
+    /// Invalidate only affected regions and keep hot glyph coverage.
+    SelectiveInvalidate,
+    /// Full atlas rebuild required for correctness.
+    FullRebuild,
+}
+
+/// Structured render-prep metrics for font-size transitions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FontRenderPrepMetrics {
+    /// Atlas policy selected for this transition.
+    pub atlas_cache_policy: FontAtlasCachePolicy,
+    /// Whether shader warmup was performed before commit.
+    pub shader_warmup: bool,
+    /// Glyphs served from cache for this event.
+    pub cache_hit_glyphs: u32,
+    /// Glyphs rebuilt synchronously in the current frame.
+    pub glyphs_rebuilt_now: u32,
+    /// Glyphs deferred to follow-up staging batches.
+    pub deferred_glyphs: u32,
+    /// Total staging batches implied by this transition.
+    pub staged_batches_total: u32,
+    /// Number of batches deferred after the current frame.
+    pub staged_batches_deferred: u32,
+}
+
 /// One stage timing sample for a single resize timeline event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResizeTimelineStageSample {
@@ -220,6 +251,9 @@ pub struct ResizeTimelineStageSample {
     /// Queue depth attribution (present for scheduler stage).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_metrics: Option<ResizeQueueMetrics>,
+    /// Structured render-prep metrics (present for font-size transitions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub render_prep_metrics: Option<FontRenderPrepMetrics>,
 }
 
 /// Per-event timeline attribution for resize-class actions.
@@ -619,6 +653,7 @@ impl Scenario {
             .count();
         let mut resize_seen = 0usize;
         let mut timeline_events = Vec::new();
+        let mut font_pipeline_state: HashMap<u64, FontRenderPipelineState> = HashMap::new();
 
         for (index, event) in self.events.iter().enumerate() {
             if event.at > elapsed {
@@ -647,6 +682,7 @@ impl Scenario {
                 start_offset_ns: offset_ns,
                 duration_ns: input_intent_duration_ns,
                 queue_metrics: None,
+                render_prep_metrics: None,
             });
             offset_ns = offset_ns.saturating_add(input_intent_duration_ns);
 
@@ -666,6 +702,7 @@ impl Scenario {
                     depth_before,
                     depth_after,
                 }),
+                render_prep_metrics: None,
             });
             offset_ns = offset_ns.saturating_add(scheduler_queue_duration_ns);
 
@@ -678,23 +715,28 @@ impl Scenario {
                 start_offset_ns: offset_ns,
                 duration_ns: logical_reflow_duration_ns,
                 queue_metrics: None,
+                render_prep_metrics: None,
             });
             offset_ns = offset_ns.saturating_add(logical_reflow_duration_ns);
 
             // Stage 4: render prep
             let stage_started = Instant::now();
-            let _render_hint = match &mock_event {
-                MockEvent::AppendOutput(text) => text.len(),
-                MockEvent::SetTitle(text) => text.len(),
-                MockEvent::Resize(cols, rows) => (*cols as usize) + (*rows as usize),
-                MockEvent::ClearScreen => 0,
-            };
-            let render_prep_duration_ns = duration_ns_u64(stage_started.elapsed());
+            let (planned_render_prep_ns, render_prep_metrics) = plan_render_prep(
+                &event.action,
+                event.pane,
+                &event.content,
+                &mock_event,
+                &mut font_pipeline_state,
+            );
+            let render_prep_duration_ns = planned_render_prep_ns
+                .max(duration_ns_u64(stage_started.elapsed()))
+                .max(1);
             stages.push(ResizeTimelineStageSample {
                 stage: ResizeTimelineStage::RenderPrep,
                 start_offset_ns: offset_ns,
                 duration_ns: render_prep_duration_ns,
                 queue_metrics: None,
+                render_prep_metrics,
             });
             offset_ns = offset_ns.saturating_add(render_prep_duration_ns);
 
@@ -707,6 +749,7 @@ impl Scenario {
                 start_offset_ns: offset_ns,
                 duration_ns: presentation_duration_ns,
                 queue_metrics: None,
+                render_prep_metrics: None,
             });
 
             let total_duration_ns = duration_ns_u64(event_started.elapsed());
@@ -1145,6 +1188,127 @@ fn generate_scrollback(lines: usize, width: usize) -> String {
     out
 }
 
+#[derive(Debug, Clone, Default)]
+struct FontRenderPipelineState {
+    last_font_scale: Option<f64>,
+    cached_glyphs: u32,
+    shader_warmed: bool,
+}
+
+fn plan_render_prep(
+    action: &EventAction,
+    pane_id: u64,
+    content: &str,
+    mock_event: &MockEvent,
+    state: &mut HashMap<u64, FontRenderPipelineState>,
+) -> (u64, Option<FontRenderPrepMetrics>) {
+    if *action != EventAction::SetFontSize {
+        let render_hint = match mock_event {
+            MockEvent::AppendOutput(text) => text.len(),
+            MockEvent::SetTitle(text) => text.len(),
+            MockEvent::Resize(cols, rows) => (*cols as usize) + (*rows as usize),
+            MockEvent::ClearScreen => 0,
+        };
+        let hint_u64 = u64::try_from(render_hint).unwrap_or(u64::MAX);
+        let duration_ns = 20_000u64.saturating_add(hint_u64.saturating_mul(75));
+        return (duration_ns, None);
+    }
+
+    let target_font_scale = parse_font_scale(content);
+    let target_glyph_budget = target_glyph_budget(target_font_scale);
+    let pane_state = state.entry(pane_id).or_default();
+
+    let atlas_cache_policy =
+        pane_state
+            .last_font_scale
+            .map_or(FontAtlasCachePolicy::FullRebuild, |last| {
+                let delta = (target_font_scale - last).abs();
+                if delta <= 0.03 {
+                    FontAtlasCachePolicy::ReuseHotAtlas
+                } else if delta <= 0.20 {
+                    FontAtlasCachePolicy::SelectiveInvalidate
+                } else {
+                    FontAtlasCachePolicy::FullRebuild
+                }
+            });
+
+    let cache_hit_glyphs = match atlas_cache_policy {
+        FontAtlasCachePolicy::ReuseHotAtlas => pane_state.cached_glyphs.min(target_glyph_budget),
+        FontAtlasCachePolicy::SelectiveInvalidate => {
+            (pane_state.cached_glyphs / 2).min(target_glyph_budget)
+        }
+        FontAtlasCachePolicy::FullRebuild => 0,
+    };
+
+    let glyphs_to_rebuild = target_glyph_budget.saturating_sub(cache_hit_glyphs);
+    let staged_batch_size = 256u32;
+    let staged_batches_total = if glyphs_to_rebuild == 0 {
+        0
+    } else {
+        div_ceil_u32(glyphs_to_rebuild, staged_batch_size)
+    };
+    let glyphs_rebuilt_now = glyphs_to_rebuild.min(staged_batch_size);
+    let deferred_glyphs = glyphs_to_rebuild.saturating_sub(glyphs_rebuilt_now);
+    let staged_batches_deferred = staged_batches_total.saturating_sub(1);
+
+    let shader_warmup = !pane_state.shader_warmed
+        || matches!(atlas_cache_policy, FontAtlasCachePolicy::FullRebuild);
+
+    // Stage expensive font-switch work into bounded chunks to avoid single-frame stalls.
+    let cache_probe_ns = 20_000u64;
+    let atlas_rebuild_ns = u64::from(glyphs_rebuilt_now).saturating_mul(700);
+    let shader_warmup_ns = if shader_warmup { 120_000 } else { 0 };
+    let cache_commit_ns = 30_000u64;
+    let duration_ns = cache_probe_ns
+        .saturating_add(atlas_rebuild_ns)
+        .saturating_add(shader_warmup_ns)
+        .saturating_add(cache_commit_ns)
+        .max(1);
+
+    pane_state.last_font_scale = Some(target_font_scale);
+    pane_state.cached_glyphs = target_glyph_budget;
+    pane_state.shader_warmed = true;
+
+    (
+        duration_ns,
+        Some(FontRenderPrepMetrics {
+            atlas_cache_policy,
+            shader_warmup,
+            cache_hit_glyphs,
+            glyphs_rebuilt_now,
+            deferred_glyphs,
+            staged_batches_total,
+            staged_batches_deferred,
+        }),
+    )
+}
+
+fn parse_font_scale(content: &str) -> f64 {
+    content
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0)
+}
+
+fn target_glyph_budget(font_scale: f64) -> u32 {
+    let scaled = (font_scale * 1024.0).round();
+    if !scaled.is_finite() || scaled <= 0.0 {
+        return 1024;
+    }
+    let clamped = scaled.clamp(256.0, 4096.0);
+    clamped as u32
+}
+
+fn div_ceil_u32(numerator: u32, denominator: u32) -> u32 {
+    if denominator == 0 {
+        numerator
+    } else {
+        numerator.saturating_add(denominator.saturating_sub(1)) / denominator
+    }
+}
+
 fn duration_ns_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
@@ -1517,6 +1681,18 @@ events:
             assert_eq!(event.reflow_ms, ns_to_ms_u64(event.stages[2].duration_ns));
             assert_eq!(event.render_ms, ns_to_ms_u64(event.stages[3].duration_ns));
             assert_eq!(event.present_ms, ns_to_ms_u64(event.stages[4].duration_ns));
+            let render_prep_metrics = event.stages[3].render_prep_metrics.as_ref();
+            if event.action == EventAction::SetFontSize {
+                let metrics = render_prep_metrics
+                    .expect("set_font_size events should emit render-prep metrics");
+                assert!(metrics.staged_batches_total >= 1);
+                assert!(metrics.glyphs_rebuilt_now > 0 || metrics.cache_hit_glyphs > 0);
+            } else {
+                assert!(
+                    render_prep_metrics.is_none(),
+                    "non-font resize events should not emit font render-prep metrics"
+                );
+            }
             let queue = event.stages[1].queue_metrics.as_ref().unwrap();
             assert!(
                 queue.depth_before >= queue.depth_after,
@@ -1577,6 +1753,65 @@ events:
         for stage in ResizeTimelineStage::ALL {
             assert!(stage_suffixes.contains(stage.as_str()));
         }
+    }
+
+    #[tokio::test]
+    async fn set_font_size_render_prep_uses_staged_atlas_and_shader_warmup_policy() {
+        let yaml = r#"
+name: font_pipeline_policy
+duration: "8s"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: set_font_size
+    content: "1.00"
+  - at: "2s"
+    pane: 0
+    action: set_font_size
+    content: "1.02"
+  - at: "3s"
+    pane: 0
+    action: set_font_size
+    content: "1.60"
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+
+        let (_executed, timeline) = scenario
+            .execute_all_with_resize_timeline(&mock)
+            .await
+            .unwrap();
+        assert_eq!(timeline.events.len(), 3);
+
+        let first = timeline.events[0].stages[3]
+            .render_prep_metrics
+            .as_ref()
+            .unwrap();
+        assert_eq!(first.atlas_cache_policy, FontAtlasCachePolicy::FullRebuild);
+        assert!(first.shader_warmup);
+        assert!(first.staged_batches_total >= 1);
+
+        let second = timeline.events[1].stages[3]
+            .render_prep_metrics
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            second.atlas_cache_policy,
+            FontAtlasCachePolicy::ReuseHotAtlas
+        );
+        assert!(!second.shader_warmup);
+        assert!(second.cache_hit_glyphs > 0);
+
+        let third = timeline.events[2].stages[3]
+            .render_prep_metrics
+            .as_ref()
+            .unwrap();
+        assert_eq!(third.atlas_cache_policy, FontAtlasCachePolicy::FullRebuild);
+        assert!(third.shader_warmup);
+        assert!(third.deferred_glyphs > 0);
     }
 
     #[tokio::test]
@@ -2557,6 +2792,35 @@ events: []
     }
 
     #[test]
+    fn font_atlas_cache_policy_serde_roundtrip() {
+        for policy in [
+            FontAtlasCachePolicy::ReuseHotAtlas,
+            FontAtlasCachePolicy::SelectiveInvalidate,
+            FontAtlasCachePolicy::FullRebuild,
+        ] {
+            let json = serde_json::to_string(&policy).unwrap();
+            let back: FontAtlasCachePolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(policy, back);
+        }
+    }
+
+    #[test]
+    fn font_render_prep_metrics_serde_roundtrip() {
+        let metrics = FontRenderPrepMetrics {
+            atlas_cache_policy: FontAtlasCachePolicy::SelectiveInvalidate,
+            shader_warmup: true,
+            cache_hit_glyphs: 120,
+            glyphs_rebuilt_now: 64,
+            deferred_glyphs: 32,
+            staged_batches_total: 2,
+            staged_batches_deferred: 1,
+        };
+        let json = serde_json::to_string(&metrics).unwrap();
+        let back: FontRenderPrepMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(metrics, back);
+    }
+
+    #[test]
     fn resize_timeline_stage_sample_serde_with_queue_metrics() {
         let sample = ResizeTimelineStageSample {
             stage: ResizeTimelineStage::SchedulerQueueing,
@@ -2566,6 +2830,7 @@ events: []
                 depth_before: 3,
                 depth_after: 2,
             }),
+            render_prep_metrics: None,
         };
         let json = serde_json::to_string(&sample).unwrap();
         assert!(json.contains("queue_metrics"));
@@ -2580,10 +2845,35 @@ events: []
             start_offset_ns: 0,
             duration_ns: 42,
             queue_metrics: None,
+            render_prep_metrics: None,
         };
         let json = serde_json::to_string(&sample).unwrap();
         // skip_serializing_if means queue_metrics should not appear
         assert!(!json.contains("queue_metrics"));
+        assert!(!json.contains("render_prep_metrics"));
+        let back: ResizeTimelineStageSample = serde_json::from_str(&json).unwrap();
+        assert_eq!(sample, back);
+    }
+
+    #[test]
+    fn resize_timeline_stage_sample_serde_with_render_prep_metrics() {
+        let sample = ResizeTimelineStageSample {
+            stage: ResizeTimelineStage::RenderPrep,
+            start_offset_ns: 250,
+            duration_ns: 900,
+            queue_metrics: None,
+            render_prep_metrics: Some(FontRenderPrepMetrics {
+                atlas_cache_policy: FontAtlasCachePolicy::ReuseHotAtlas,
+                shader_warmup: false,
+                cache_hit_glyphs: 400,
+                glyphs_rebuilt_now: 120,
+                deferred_glyphs: 30,
+                staged_batches_total: 2,
+                staged_batches_deferred: 1,
+            }),
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert!(json.contains("render_prep_metrics"));
         let back: ResizeTimelineStageSample = serde_json::from_str(&json).unwrap();
         assert_eq!(sample, back);
     }
@@ -2863,6 +3153,7 @@ events: []
                         start_offset_ns: 0,
                         duration_ns: 100,
                         queue_metrics: None,
+                        render_prep_metrics: None,
                     },
                     ResizeTimelineStageSample {
                         stage: ResizeTimelineStage::SchedulerQueueing,
@@ -2872,24 +3163,28 @@ events: []
                             depth_before: 1,
                             depth_after: 0,
                         }),
+                        render_prep_metrics: None,
                     },
                     ResizeTimelineStageSample {
                         stage: ResizeTimelineStage::LogicalReflow,
                         start_offset_ns: 300,
                         duration_ns: 300,
                         queue_metrics: None,
+                        render_prep_metrics: None,
                     },
                     ResizeTimelineStageSample {
                         stage: ResizeTimelineStage::RenderPrep,
                         start_offset_ns: 600,
                         duration_ns: 150,
                         queue_metrics: None,
+                        render_prep_metrics: None,
                     },
                     ResizeTimelineStageSample {
                         stage: ResizeTimelineStage::Presentation,
                         start_offset_ns: 750,
                         duration_ns: 250,
                         queue_metrics: None,
+                        render_prep_metrics: None,
                     },
                 ],
             }],
@@ -2939,6 +3234,7 @@ events: []
                     start_offset_ns: 0,
                     duration_ns: 100,
                     queue_metrics: None,
+                    render_prep_metrics: None,
                 }],
             }],
         };
