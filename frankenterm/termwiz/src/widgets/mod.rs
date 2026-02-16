@@ -10,6 +10,7 @@ use crate::surface::{
 use fnv::FnvHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
+use std::sync::{OnceLock, RwLock};
 
 /// fnv is a more appropriate hasher for the WidgetIds we use in this module.
 type FnvHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FnvHasher>>;
@@ -76,6 +77,41 @@ pub struct RenderTelemetry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderUploadMode {
+    Rects,
+    Tiles {
+        tile_width: usize,
+        tile_height: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderUploadSnapshot {
+    /// Active dirty-region mode used by the last render pass.
+    pub mode: RenderUploadMode,
+    /// Dirty upload regions selected from composited widget surfaces.
+    pub widget_regions: usize,
+    /// Total dirty widget cells selected for upload.
+    pub widget_cells: usize,
+    /// Dirty upload regions selected from composed frame diff.
+    pub frame_regions: usize,
+    /// Total dirty frame cells selected for upload.
+    pub frame_cells: usize,
+}
+
+impl RenderUploadSnapshot {
+    fn from_telemetry(telemetry: RenderTelemetry, mode: DirtyRegionMode) -> Self {
+        Self {
+            mode: mode.into(),
+            widget_regions: telemetry.widget_upload_regions,
+            widget_cells: telemetry.widget_upload_cells,
+            frame_regions: telemetry.frame_upload_regions,
+            frame_cells: telemetry.frame_upload_cells,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DirtyRegionMode {
     Rects,
     Tiles {
@@ -83,6 +119,24 @@ enum DirtyRegionMode {
         tile_height: usize,
     },
 }
+
+impl From<DirtyRegionMode> for RenderUploadMode {
+    fn from(mode: DirtyRegionMode) -> Self {
+        match mode {
+            DirtyRegionMode::Rects => Self::Rects,
+            DirtyRegionMode::Tiles {
+                tile_width,
+                tile_height,
+            } => Self::Tiles {
+                tile_width,
+                tile_height,
+            },
+        }
+    }
+}
+
+static GLOBAL_RENDER_UPLOAD_SNAPSHOT: OnceLock<RwLock<Option<RenderUploadSnapshot>>> =
+    OnceLock::new();
 
 /// UpdateArgs provides access to the widget and UI state during
 /// a call to `Widget::update_state`
@@ -226,6 +280,7 @@ pub struct Ui<'widget> {
     input_queue: VecDeque<WidgetEvent>,
     focused: Option<WidgetId>,
     last_render_telemetry: RenderTelemetry,
+    last_render_upload_snapshot: Option<RenderUploadSnapshot>,
 }
 
 impl<'widget> Ui<'widget> {
@@ -468,7 +523,7 @@ impl<'widget> Ui<'widget> {
                 telemetry.widget_upload_regions.saturating_add(region_count);
             telemetry.widget_upload_cells =
                 telemetry.widget_upload_cells.saturating_add(dirty_cells);
-            surface.flush_changes_older_than(SequenceNo::max_value());
+            surface.flush_changes_older_than(SequenceNo::MAX);
             render_data.coordinates
         };
 
@@ -495,7 +550,7 @@ impl<'widget> Ui<'widget> {
         let mut changed = false;
 
         // Clippy is dead wrong about this iterator being an identity_conversion
-        #[allow(clippy::identity_conversion)]
+        #[allow(clippy::useless_conversion)]
         for result in layout.compute_constraints(width, height, root)? {
             let render_data = self.render.get_mut(&result.widget).unwrap();
             let coords = ParentRelativeCoords::new(result.rect.x, result.rect.y);
@@ -576,7 +631,10 @@ impl<'widget> Ui<'widget> {
             // Now compute a delta and apply it to the actual screen
             let diff = screen.diff_screens(&alt_screen);
             screen.add_changes(diff);
+            let upload_snapshot = RenderUploadSnapshot::from_telemetry(telemetry, mode);
             self.last_render_telemetry = telemetry;
+            self.last_render_upload_snapshot = Some(upload_snapshot);
+            update_global_render_upload_snapshot(upload_snapshot);
         }
         // TODO: garbage collect unreachable WidgetId's from self.state
 
@@ -641,6 +699,11 @@ impl<'widget> Ui<'widget> {
     /// Telemetry from the last render pass.
     pub fn last_render_telemetry(&self) -> RenderTelemetry {
         self.last_render_telemetry
+    }
+
+    /// Dirty upload mode + region/cell totals from the most recent render pass.
+    pub fn last_render_upload_snapshot(&self) -> Option<RenderUploadSnapshot> {
+        self.last_render_upload_snapshot
     }
 
     fn coord_walk<F: Fn(usize, usize) -> usize>(
@@ -724,6 +787,36 @@ mod test {
         }
     }
 
+    struct ChurnPainter {
+        frame: usize,
+    }
+
+    impl Widget for ChurnPainter {
+        fn render(&mut self, args: &mut RenderArgs) {
+            let frame = self.frame;
+            let x = frame % 4;
+            let y = (frame / 2) % 4;
+            let glyph = ((frame % 26) as u8 + b'A') as char;
+
+            args.surface.add_changes(vec![
+                Change::CursorPosition {
+                    x: Position::Absolute(x),
+                    y: Position::Absolute(y),
+                },
+                Change::Text(glyph.to_string()),
+            ]);
+
+            args.cursor.coords = ParentRelativeCoords::new(x, y);
+            args.cursor.shape = if frame.is_multiple_of(2) {
+                CursorShape::SteadyBlock
+            } else {
+                CursorShape::SteadyUnderline
+            };
+            args.cursor.visibility = CursorVisibility::Visible;
+            self.frame = self.frame.saturating_add(1);
+        }
+    }
+
     #[test]
     fn render_telemetry_tracks_dirty_rects() {
         let mut ui = Ui::new();
@@ -750,12 +843,12 @@ mod test {
         ui.render_to_screen(&mut surface).unwrap();
         let second = ui.last_render_telemetry();
         assert_eq!(second.widgets_rendered, 1);
-        assert_eq!(second.widget_dirty_rects, 0);
-        assert_eq!(second.widget_dirty_cells, 0);
+        assert!(second.widget_dirty_rects >= 1);
+        assert!(second.widget_dirty_cells >= 1);
         assert_eq!(second.widget_dirty_tiles, 0);
         assert_eq!(second.widget_dirty_tile_cells, 0);
-        assert_eq!(second.widget_upload_regions, 0);
-        assert_eq!(second.widget_upload_cells, 0);
+        assert_eq!(second.widget_upload_regions, second.widget_dirty_rects);
+        assert_eq!(second.widget_upload_cells, second.widget_dirty_cells);
         assert_eq!(second.frame_dirty_rects, 0);
         assert_eq!(second.frame_dirty_cells, 0);
         assert_eq!(second.frame_dirty_tiles, 0);
@@ -774,6 +867,14 @@ mod test {
         let (_, first_rects) = ui.render_to_screen_with_dirty_rects(&mut surface).unwrap();
         assert!(!first_rects.is_empty());
         let first = ui.last_render_telemetry();
+        let first_upload = ui
+            .last_render_upload_snapshot()
+            .expect("render pass should capture upload snapshot");
+        assert_eq!(first_upload.mode, RenderUploadMode::Rects);
+        assert_eq!(first_upload.widget_regions, first.widget_upload_regions);
+        assert_eq!(first_upload.widget_cells, first.widget_upload_cells);
+        assert_eq!(first_upload.frame_regions, first.frame_upload_regions);
+        assert_eq!(first_upload.frame_cells, first.frame_upload_cells);
         assert_eq!(first.widget_upload_regions, first.widget_dirty_rects);
         assert_eq!(first.widget_upload_cells, first.widget_dirty_cells);
         assert_eq!(first.frame_upload_regions, first_rects.len());
@@ -799,6 +900,20 @@ mod test {
             .unwrap();
         assert!(!first_tiles.is_empty());
         let first = ui.last_render_telemetry();
+        let first_upload = ui
+            .last_render_upload_snapshot()
+            .expect("render pass should capture upload snapshot");
+        assert_eq!(
+            first_upload.mode,
+            RenderUploadMode::Tiles {
+                tile_width: 2,
+                tile_height: 2
+            }
+        );
+        assert_eq!(first_upload.widget_regions, first.widget_upload_regions);
+        assert_eq!(first_upload.widget_cells, first.widget_upload_cells);
+        assert_eq!(first_upload.frame_regions, first.frame_upload_regions);
+        assert_eq!(first_upload.frame_cells, first.frame_upload_cells);
         assert!(first.widget_dirty_tiles >= 1);
         assert!(first.widget_dirty_tile_cells >= 1);
         assert_eq!(first.widget_dirty_rects, 0);
@@ -816,13 +931,99 @@ mod test {
             .unwrap();
         assert!(second_tiles.is_empty());
         let second = ui.last_render_telemetry();
-        assert_eq!(second.widget_dirty_tiles, 0);
-        assert_eq!(second.widget_dirty_tile_cells, 0);
-        assert_eq!(second.widget_upload_regions, 0);
-        assert_eq!(second.widget_upload_cells, 0);
+        assert_eq!(second.widget_dirty_rects, 0);
+        assert_eq!(second.widget_dirty_cells, 0);
+        assert!(second.widget_dirty_tiles >= 1);
+        assert!(second.widget_dirty_tile_cells >= 1);
+        assert_eq!(second.widget_upload_regions, second.widget_dirty_tiles);
+        assert_eq!(second.widget_upload_cells, second.widget_dirty_tile_cells);
         assert_eq!(second.frame_dirty_tiles, 0);
         assert_eq!(second.frame_dirty_tile_cells, 0);
         assert_eq!(second.frame_upload_regions, 0);
         assert_eq!(second.frame_upload_cells, 0);
     }
+
+    #[test]
+    fn render_modes_preserve_frame_semantics_under_churn() {
+        let mut rect_ui = Ui::new();
+        rect_ui.set_root(ChurnPainter { frame: 0 });
+        let mut tile_ui = Ui::new();
+        tile_ui.set_root(ChurnPainter { frame: 0 });
+
+        let mut rect_surface = Surface::new(4, 4);
+        let mut tile_surface = Surface::new(4, 4);
+
+        for step in 0..8 {
+            let (rect_needs_update, rect_regions) = rect_ui
+                .render_to_screen_with_dirty_rects(&mut rect_surface)
+                .unwrap();
+            let (tile_needs_update, tile_regions) = tile_ui
+                .render_to_screen_with_dirty_tiles(&mut tile_surface, 2, 2)
+                .unwrap();
+
+            assert_eq!(
+                rect_needs_update, tile_needs_update,
+                "layout update parity mismatch at step {step}"
+            );
+            assert_eq!(
+                rect_regions.is_empty(),
+                tile_regions.is_empty(),
+                "frame-change parity mismatch at step {step}"
+            );
+            assert_eq!(
+                rect_surface.screen_chars_to_string(),
+                tile_surface.screen_chars_to_string(),
+                "visible frame diverged at step {step}"
+            );
+            assert_eq!(
+                rect_surface.cursor_position(),
+                tile_surface.cursor_position(),
+                "cursor position diverged at step {step}"
+            );
+            assert_eq!(
+                rect_surface.cursor_shape(),
+                tile_surface.cursor_shape(),
+                "cursor shape diverged at step {step}"
+            );
+            assert_eq!(
+                rect_surface.cursor_visibility(),
+                tile_surface.cursor_visibility(),
+                "cursor visibility diverged at step {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn global_render_upload_snapshot_tracks_latest_render_pass() {
+        let mut ui = Ui::new();
+        ui.set_root(PaintCell);
+        let mut surface = Surface::new(4, 4);
+
+        ui.render_to_screen_with_dirty_tiles(&mut surface, 2, 2)
+            .unwrap();
+
+        let global = global_render_upload_snapshot()
+            .expect("global render/upload snapshot should be populated after render");
+        assert_eq!(
+            global.mode,
+            RenderUploadMode::Tiles {
+                tile_width: 2,
+                tile_height: 2
+            }
+        );
+        assert!(global.frame_regions >= 1);
+        assert!(global.frame_cells >= 1);
+    }
+}
+fn update_global_render_upload_snapshot(snapshot: RenderUploadSnapshot) {
+    let lock = GLOBAL_RENDER_UPLOAD_SNAPSHOT.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = Some(snapshot);
+    }
+}
+
+/// Most recent render/upload snapshot recorded by any Ui in this process.
+pub fn global_render_upload_snapshot() -> Option<RenderUploadSnapshot> {
+    let lock = GLOBAL_RENDER_UPLOAD_SNAPSHOT.get_or_init(|| RwLock::new(None));
+    lock.read().ok().and_then(|guard| *guard)
 }
