@@ -45,6 +45,7 @@
 #![feature(stmt_expr_attributes)]
 
 pub mod accounts;
+pub mod adaptive_radix_tree;
 pub mod agent_correlator;
 pub mod alerts;
 pub mod api_schema;
@@ -105,6 +106,7 @@ pub mod export;
 pub mod extensions;
 #[cfg(unix)]
 pub mod fd_budget;
+pub mod fenwick_tree;
 pub mod gc;
 pub mod hyperloglog;
 pub mod incident_bundle;
