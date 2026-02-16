@@ -523,4 +523,430 @@ mod tests {
             card
         );
     }
+
+    // ── Default impl ────────────────────────────────────────────────
+
+    #[test]
+    fn default_creates_p14() {
+        let hll = HyperLogLog::default();
+        assert_eq!(hll.precision(), 14);
+        assert_eq!(hll.register_count(), 1 << 14);
+        assert!(hll.is_empty());
+    }
+
+    // ── Insert/cardinality edge cases ───────────────────────────────
+
+    #[test]
+    fn insert_after_clear() {
+        let mut hll = HyperLogLog::new();
+        for i in 0..100u64 {
+            hll.insert(&i);
+        }
+        hll.clear();
+        for i in 0..50u64 {
+            hll.insert(&i);
+        }
+        assert_eq!(hll.total_inserts(), 50);
+        let card = hll.cardinality();
+        assert!(
+            (card as f64 - 50.0).abs() < 20.0,
+            "cardinality {} should be ~50",
+            card
+        );
+    }
+
+    #[test]
+    fn multiple_clears() {
+        let mut hll = HyperLogLog::new();
+        hll.insert(&1u64);
+        hll.clear();
+        hll.clear();
+        assert!(hll.is_empty());
+        assert_eq!(hll.cardinality(), 0);
+    }
+
+    #[test]
+    fn cardinality_f64_matches_integer() {
+        let mut hll = HyperLogLog::new();
+        for i in 0..500u64 {
+            hll.insert(&i);
+        }
+        assert_eq!(hll.cardinality_f64(), hll.cardinality() as f64);
+    }
+
+    #[test]
+    fn is_empty_tracks_inserts() {
+        let mut hll = HyperLogLog::new();
+        assert!(hll.is_empty());
+        hll.insert(&1u64);
+        assert!(!hll.is_empty());
+        hll.clear();
+        assert!(hll.is_empty());
+    }
+
+    // ── Monotonicity ────────────────────────────────────────────────
+
+    #[test]
+    fn more_distinct_elements_higher_cardinality() {
+        let mut hll_small = HyperLogLog::with_precision(10);
+        let mut hll_large = HyperLogLog::with_precision(10);
+        for i in 0..100u64 {
+            hll_small.insert(&i);
+        }
+        for i in 0..1000u64 {
+            hll_large.insert(&i);
+        }
+        assert!(
+            hll_large.cardinality() > hll_small.cardinality(),
+            "1000 distinct should give higher cardinality than 100"
+        );
+    }
+
+    #[test]
+    fn nonzero_registers_grow_with_elements() {
+        let mut hll = HyperLogLog::with_precision(10);
+        assert_eq!(hll.nonzero_registers(), 0);
+        hll.insert(&1u64);
+        let nz1 = hll.nonzero_registers();
+        assert!(nz1 > 0);
+        for i in 2..100u64 {
+            hll.insert(&i);
+        }
+        assert!(hll.nonzero_registers() >= nz1);
+    }
+
+    // ── Accuracy at different scales ────────────────────────────────
+
+    #[test]
+    fn accuracy_at_100() {
+        let mut hll = HyperLogLog::with_precision(12);
+        for i in 0..100u64 {
+            hll.insert(&i);
+        }
+        let card = hll.cardinality();
+        assert!(
+            (card as f64 - 100.0).abs() < 30.0,
+            "cardinality {} should be ~100",
+            card
+        );
+    }
+
+    #[test]
+    fn accuracy_at_50000() {
+        let mut hll = HyperLogLog::new(); // p=14
+        for i in 0..50000u64 {
+            hll.insert(&i);
+        }
+        let card = hll.cardinality();
+        let error_pct = ((card as f64 - 50000.0) / 50000.0).abs();
+        assert!(
+            error_pct < 0.05,
+            "cardinality {} should be within 5% of 50000 (error: {:.1}%)",
+            card,
+            error_pct * 100.0
+        );
+    }
+
+    // ── Precision and alpha ─────────────────────────────────────────
+
+    #[test]
+    fn alpha_varies_by_register_count() {
+        // Alpha is internal, but standard_error depends on it
+        let p4 = HyperLogLog::with_precision(4);
+        let p5 = HyperLogLog::with_precision(5);
+        let p6 = HyperLogLog::with_precision(6);
+        // More registers → lower standard error
+        assert!(p4.standard_error() > p5.standard_error());
+        assert!(p5.standard_error() > p6.standard_error());
+    }
+
+    #[test]
+    fn standard_error_formula() {
+        let hll = HyperLogLog::with_precision(10);
+        let expected = 1.04 / (1024.0f64).sqrt();
+        assert!((hll.standard_error() - expected).abs() < 1e-10);
+    }
+
+    // ── Merge edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn merge_with_empty() {
+        let mut hll = HyperLogLog::new();
+        for i in 0..100u64 {
+            hll.insert(&i);
+        }
+        let card_before = hll.cardinality();
+        let empty = HyperLogLog::new();
+        hll.merge(&empty).unwrap();
+        assert_eq!(hll.cardinality(), card_before);
+    }
+
+    #[test]
+    fn merge_into_empty() {
+        let mut empty = HyperLogLog::new();
+        let mut full = HyperLogLog::new();
+        for i in 0..100u64 {
+            full.insert(&i);
+        }
+        let expected = full.cardinality();
+        empty.merge(&full).unwrap();
+        assert_eq!(empty.cardinality(), expected);
+    }
+
+    #[test]
+    fn merge_overlapping_sets() {
+        let mut hll1 = HyperLogLog::with_precision(12);
+        let mut hll2 = HyperLogLog::with_precision(12);
+        // hll1: 0..1000, hll2: 500..1500 → union: 0..1500
+        for i in 0..1000u64 {
+            hll1.insert(&i);
+        }
+        for i in 500..1500u64 {
+            hll2.insert(&i);
+        }
+        hll1.merge(&hll2).unwrap();
+        let card = hll1.cardinality();
+        assert!(
+            (card as f64 - 1500.0).abs() < 300.0,
+            "merged cardinality {} should be ~1500",
+            card
+        );
+    }
+
+    #[test]
+    fn merge_same_data_idempotent() {
+        let mut hll1 = HyperLogLog::with_precision(10);
+        let mut hll2 = HyperLogLog::with_precision(10);
+        for i in 0..500u64 {
+            hll1.insert(&i);
+            hll2.insert(&i);
+        }
+        let card_before = hll1.cardinality();
+        hll1.merge(&hll2).unwrap();
+        // Merging same data shouldn't significantly change cardinality
+        let card_after = hll1.cardinality();
+        assert_eq!(card_before, card_after);
+    }
+
+    #[test]
+    fn merge_preserves_count() {
+        let mut hll1 = HyperLogLog::new();
+        let mut hll2 = HyperLogLog::new();
+        for i in 0..100u64 {
+            hll1.insert(&i);
+        }
+        for i in 0..50u64 {
+            hll2.insert(&i);
+        }
+        hll1.merge(&hll2).unwrap();
+        assert_eq!(hll1.total_inserts(), 150);
+    }
+
+    // ── Clone independence ──────────────────────────────────────────
+
+    #[test]
+    fn clone_independence() {
+        let mut hll = HyperLogLog::new();
+        for i in 0..100u64 {
+            hll.insert(&i);
+        }
+        let mut cloned = hll.clone();
+        cloned.insert(&999u64);
+
+        // Original should not change
+        assert_eq!(hll.total_inserts(), 100);
+        assert_eq!(cloned.total_inserts(), 101);
+    }
+
+    // ── insert_hash edge cases ──────────────────────────────────────
+
+    #[test]
+    fn insert_hash_zero() {
+        let mut hll = HyperLogLog::new();
+        hll.insert_hash(0);
+        assert_eq!(hll.total_inserts(), 1);
+        assert!(hll.cardinality() >= 1);
+    }
+
+    #[test]
+    fn insert_hash_max() {
+        let mut hll = HyperLogLog::new();
+        hll.insert_hash(u64::MAX);
+        assert_eq!(hll.total_inserts(), 1);
+        assert!(hll.cardinality() >= 1);
+    }
+
+    #[test]
+    fn insert_hash_many_distinct() {
+        let mut hll = HyperLogLog::with_precision(12);
+        for i in 0..5000u64 {
+            hll.insert_hash(splitmix64(i));
+        }
+        let card = hll.cardinality();
+        assert!(
+            (card as f64 - 5000.0).abs() < 1000.0,
+            "cardinality {} should be ~5000",
+            card
+        );
+    }
+
+    // ── Jaccard edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn jaccard_both_empty() {
+        let hll1 = HyperLogLog::with_precision(10);
+        let hll2 = HyperLogLog::with_precision(10);
+        let j = hll1.jaccard(&hll2).unwrap();
+        assert_eq!(j, 0.0);
+    }
+
+    #[test]
+    fn jaccard_partial_overlap() {
+        let mut hll1 = HyperLogLog::with_precision(12);
+        let mut hll2 = HyperLogLog::with_precision(12);
+        // 50% overlap: hll1=0..100, hll2=50..150
+        for i in 0..100u64 {
+            hll1.insert(&i);
+        }
+        for i in 50..150u64 {
+            hll2.insert(&i);
+        }
+        let j = hll1.jaccard(&hll2).unwrap();
+        // Expected ~50/150 = 0.33
+        assert!(
+            j > 0.1 && j < 0.6,
+            "jaccard {} should be ~0.33",
+            j
+        );
+    }
+
+    #[test]
+    fn jaccard_symmetric() {
+        let mut hll1 = HyperLogLog::with_precision(10);
+        let mut hll2 = HyperLogLog::with_precision(10);
+        for i in 0..500u64 {
+            hll1.insert(&i);
+        }
+        for i in 250..750u64 {
+            hll2.insert(&i);
+        }
+        let j12 = hll1.jaccard(&hll2).unwrap();
+        let j21 = hll2.jaccard(&hll1).unwrap();
+        assert!(
+            (j12 - j21).abs() < 0.05,
+            "jaccard should be symmetric: {} vs {}",
+            j12,
+            j21
+        );
+    }
+
+    // ── Stats edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn stats_on_empty() {
+        let hll = HyperLogLog::new();
+        let stats = hll.stats();
+        assert_eq!(stats.precision, 14);
+        assert_eq!(stats.nonzero_registers, 0);
+        assert_eq!(stats.estimated_cardinality, 0);
+    }
+
+    #[test]
+    fn stats_after_merge() {
+        let mut hll1 = HyperLogLog::with_precision(10);
+        let mut hll2 = HyperLogLog::with_precision(10);
+        for i in 0..100u64 {
+            hll1.insert(&i);
+        }
+        for i in 50..150u64 {
+            hll2.insert(&i);
+        }
+        hll1.merge(&hll2).unwrap();
+        let stats = hll1.stats();
+        assert!(stats.nonzero_registers > 0);
+        assert!(stats.estimated_cardinality > 100);
+    }
+
+    #[test]
+    fn stats_after_clear() {
+        let mut hll = HyperLogLog::new();
+        for i in 0..100u64 {
+            hll.insert(&i);
+        }
+        hll.clear();
+        let stats = hll.stats();
+        assert_eq!(stats.nonzero_registers, 0);
+        assert_eq!(stats.estimated_cardinality, 0);
+    }
+
+    // ── Type-specific tests ─────────────────────────────────────────
+
+    #[test]
+    fn u8_elements() {
+        let mut hll = HyperLogLog::with_precision(10);
+        for i in 0..=255u8 {
+            hll.insert(&i);
+        }
+        let card = hll.cardinality();
+        assert!(
+            (card as f64 - 256.0).abs() < 80.0,
+            "cardinality {} should be ~256",
+            card
+        );
+    }
+
+    #[test]
+    fn bool_elements() {
+        let mut hll = HyperLogLog::with_precision(8);
+        hll.insert(&true);
+        hll.insert(&false);
+        hll.insert(&true); // duplicate
+        assert_eq!(hll.total_inserts(), 3);
+        let card = hll.cardinality();
+        assert!(card >= 1 && card <= 5, "cardinality {} should be ~2", card);
+    }
+
+    #[test]
+    fn i32_negative_and_positive() {
+        let mut hll = HyperLogLog::with_precision(10);
+        for i in -50..50i32 {
+            hll.insert(&i);
+        }
+        let card = hll.cardinality();
+        assert!(
+            (card as f64 - 100.0).abs() < 40.0,
+            "cardinality {} should be ~100",
+            card
+        );
+    }
+
+    // ── Config tests ────────────────────────────────────────────────
+
+    #[test]
+    fn config_default_precision() {
+        let config = HllConfig::default();
+        assert_eq!(config.precision, 14);
+    }
+
+    #[test]
+    fn config_equality() {
+        let c1 = HllConfig { precision: 12 };
+        let c2 = HllConfig { precision: 12 };
+        let c3 = HllConfig { precision: 10 };
+        assert_eq!(c1, c2);
+        assert_ne!(c1, c3);
+    }
+
+    #[test]
+    fn stats_equality() {
+        let s1 = HllStats {
+            precision: 14,
+            register_count: 16384,
+            nonzero_registers: 100,
+            estimated_cardinality: 150,
+            memory_bytes: 16384,
+        };
+        let s2 = s1.clone();
+        assert_eq!(s1, s2);
+    }
 }

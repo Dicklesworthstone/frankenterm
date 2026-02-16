@@ -641,4 +641,424 @@ mod tests {
         // But pop works
         assert_eq!(pool.pop(0), Some(42));
     }
+
+    // ── Steal batch edge cases ──────────────────────────────────────
+
+    #[test]
+    fn steal_batch_empty_deque() {
+        let (_worker, stealer) = new_deque::<i32>(16);
+        let batch = stealer.steal_batch(5);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn steal_batch_zero_max() {
+        let (worker, stealer) = new_deque(16);
+        worker.push(1);
+        worker.push(2);
+        let batch = stealer.steal_batch(0);
+        assert!(batch.is_empty());
+        assert_eq!(worker.len(), 2); // nothing stolen
+    }
+
+    #[test]
+    fn steal_batch_exact_count() {
+        let (worker, stealer) = new_deque(16);
+        worker.push(10);
+        worker.push(20);
+        worker.push(30);
+        let batch = stealer.steal_batch(3);
+        assert_eq!(batch, vec![10, 20, 30]);
+        assert!(worker.is_empty());
+    }
+
+    #[test]
+    fn steal_batch_preserves_fifo_order() {
+        let (worker, stealer) = new_deque(16);
+        for i in 0..10 {
+            worker.push(i);
+        }
+        let batch = stealer.steal_batch(5);
+        assert_eq!(batch, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn steal_batch_then_steal_single() {
+        let (worker, stealer) = new_deque(16);
+        for i in 0..6 {
+            worker.push(i);
+        }
+        let batch = stealer.steal_batch(3);
+        assert_eq!(batch, vec![0, 1, 2]);
+        assert_eq!(stealer.steal().unwrap(), 3);
+        assert_eq!(stealer.steal().unwrap(), 4);
+        assert_eq!(stealer.steal().unwrap(), 5);
+        assert!(stealer.steal().is_empty());
+    }
+
+    // ── Stealer.is_empty ────────────────────────────────────────────
+
+    #[test]
+    fn stealer_is_empty_reflects_state() {
+        let (worker, stealer) = new_deque(16);
+        assert!(stealer.is_empty());
+        worker.push(1);
+        assert!(!stealer.is_empty());
+        stealer.steal();
+        assert!(stealer.is_empty());
+    }
+
+    // ── Pop edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn pop_from_empty_is_idempotent() {
+        let (worker, _) = new_deque::<i32>(16);
+        assert_eq!(worker.pop(), None);
+        assert_eq!(worker.pop(), None);
+        assert_eq!(worker.pop(), None);
+    }
+
+    #[test]
+    fn push_single_pop_single() {
+        let (worker, _) = new_deque(16);
+        worker.push(42);
+        assert_eq!(worker.len(), 1);
+        assert!(!worker.is_empty());
+        assert_eq!(worker.pop(), Some(42));
+        assert!(worker.is_empty());
+    }
+
+    // ── Clone behavior ──────────────────────────────────────────────
+
+    #[test]
+    fn worker_clone_shares_state() {
+        let (worker, _stealer) = new_deque(16);
+        let worker2 = worker.clone();
+        worker.push(1);
+        worker.push(2);
+        // Clone sees the same items
+        assert_eq!(worker2.len(), 2);
+        assert_eq!(worker2.pop(), Some(2));
+        assert_eq!(worker.len(), 1);
+    }
+
+    #[test]
+    fn stealer_clone_shares_state() {
+        let (worker, stealer) = new_deque(16);
+        let stealer2 = stealer.clone();
+        worker.push(10);
+        worker.push(20);
+
+        assert_eq!(stealer.steal().unwrap(), 10);
+        assert_eq!(stealer2.steal().unwrap(), 20);
+        assert!(stealer.steal().is_empty());
+        assert!(stealer2.steal().is_empty());
+    }
+
+    // ── Stats verification ──────────────────────────────────────────
+
+    #[test]
+    fn stats_on_empty_deque() {
+        let (worker, _) = new_deque::<i32>(16);
+        let stats = worker.stats();
+        assert_eq!(stats.len, 0);
+        assert_eq!(stats.total_pushed, 0);
+        assert_eq!(stats.total_popped, 0);
+        assert_eq!(stats.total_stolen, 0);
+        assert_eq!(stats.steal_failures, 0);
+    }
+
+    #[test]
+    fn stats_count_batch_steals() {
+        let (worker, stealer) = new_deque(16);
+        for i in 0..10 {
+            worker.push(i);
+        }
+        stealer.steal_batch(4);
+        let stats = worker.stats();
+        assert_eq!(stats.total_pushed, 10);
+        assert_eq!(stats.total_stolen, 4);
+        assert_eq!(stats.len, 6);
+    }
+
+    #[test]
+    fn stats_after_many_operations() {
+        let (worker, stealer) = new_deque(16);
+        for i in 0..20 {
+            worker.push(i);
+        }
+        for _ in 0..5 {
+            worker.pop();
+        }
+        for _ in 0..3 {
+            stealer.steal();
+        }
+        let stats = worker.stats();
+        assert_eq!(stats.total_pushed, 20);
+        assert_eq!(stats.total_popped, 5);
+        assert_eq!(stats.total_stolen, 3);
+        assert_eq!(stats.len, 12);
+    }
+
+    // ── StealResult panics ──────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "called unwrap on Empty")]
+    fn steal_result_unwrap_empty_panics() {
+        let r: StealResult<i32> = StealResult::Empty;
+        r.unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "called unwrap on Retry")]
+    fn steal_result_unwrap_retry_panics() {
+        let r: StealResult<i32> = StealResult::Retry;
+        r.unwrap();
+    }
+
+    #[test]
+    fn steal_result_into_option_variants() {
+        assert_eq!(StealResult::Success(42).into_option(), Some(42));
+        assert_eq!(StealResult::<i32>::Empty.into_option(), None);
+        assert_eq!(StealResult::<i32>::Retry.into_option(), None);
+    }
+
+    // ── Len tracking ────────────────────────────────────────────────
+
+    #[test]
+    fn len_tracks_push_pop_steal() {
+        let (worker, stealer) = new_deque(16);
+        assert_eq!(worker.len(), 0);
+
+        worker.push(1);
+        assert_eq!(worker.len(), 1);
+
+        worker.push(2);
+        worker.push(3);
+        assert_eq!(worker.len(), 3);
+
+        worker.pop();
+        assert_eq!(worker.len(), 2);
+
+        stealer.steal();
+        assert_eq!(worker.len(), 1);
+
+        stealer.steal();
+        assert_eq!(worker.len(), 0);
+    }
+
+    // ── Capacity growth ─────────────────────────────────────────────
+
+    #[test]
+    fn deque_grows_beyond_initial_capacity() {
+        let (worker, stealer) = new_deque(4);
+        // Push well beyond initial capacity of 4
+        for i in 0..100 {
+            worker.push(i);
+        }
+        assert_eq!(worker.len(), 100);
+
+        // Steal all in FIFO order
+        for i in 0..100 {
+            assert_eq!(stealer.steal().unwrap(), i);
+        }
+    }
+
+    // ── Pool extended tests ─────────────────────────────────────────
+
+    #[test]
+    fn pool_many_workers() {
+        let pool = WorkStealingPool::new(8);
+        assert_eq!(pool.num_workers(), 8);
+        for w in 0..8 {
+            pool.push(w, w as i32 * 10);
+        }
+        for w in 0..8 {
+            assert_eq!(pool.pop(w), Some(w as i32 * 10));
+        }
+    }
+
+    #[test]
+    fn pool_steal_round_robin() {
+        let pool = WorkStealingPool::new(3);
+        pool.push(0, 10);
+        pool.push(1, 20);
+        pool.push(2, 30);
+
+        // Worker 0 steals — should find something from worker 1 or 2
+        let stolen = pool.steal(0);
+        assert!(stolen.is_success());
+    }
+
+    #[test]
+    fn pool_pop_or_steal_prefers_own() {
+        let pool = WorkStealingPool::new(2);
+        pool.push(0, 10);
+        pool.push(1, 20);
+
+        // Worker 0 should pop its own (10) first
+        assert_eq!(pool.pop_or_steal(0), Some(10));
+        // Now worker 0's deque is empty, steals from worker 1
+        assert_eq!(pool.pop_or_steal(0), Some(20));
+        // All empty
+        assert_eq!(pool.pop_or_steal(0), None);
+    }
+
+    #[test]
+    fn pool_pop_or_steal_all_empty() {
+        let pool = WorkStealingPool::<i32>::new(3);
+        assert_eq!(pool.pop_or_steal(0), None);
+        assert_eq!(pool.pop_or_steal(1), None);
+        assert_eq!(pool.pop_or_steal(2), None);
+    }
+
+    #[test]
+    fn pool_stats_comprehensive() {
+        let pool = WorkStealingPool::new(3);
+        pool.push(0, 1);
+        pool.push(0, 2);
+        pool.push(1, 3);
+        pool.push(2, 4);
+        pool.push(2, 5);
+        pool.pop(0); // pop from worker 0
+        pool.steal(1); // worker 1 steals (from 0 or 2)
+
+        let stats = pool.stats();
+        assert_eq!(stats.total_pushed, 5);
+        assert_eq!(stats.total_popped, 1);
+        assert_eq!(stats.total_stolen, 1);
+        assert_eq!(stats.len, 3);
+    }
+
+    #[test]
+    fn pool_multiple_push_steal_rounds() {
+        let pool = WorkStealingPool::new(2);
+        for round in 0..5 {
+            let base = round * 10;
+            pool.push(0, base);
+            pool.push(0, base + 1);
+            pool.push(1, base + 2);
+
+            pool.pop(0);
+            pool.steal(1);
+        }
+        let stats = pool.stats();
+        assert_eq!(stats.total_pushed, 15); // 3 per round * 5
+        assert_eq!(stats.total_popped, 5);  // 1 pop per round
+        assert_eq!(stats.total_stolen, 5);  // 1 steal per round
+    }
+
+    #[test]
+    fn pool_with_string_type() {
+        let pool = WorkStealingPool::new(2);
+        pool.push(0, "hello".to_string());
+        pool.push(1, "world".to_string());
+        assert_eq!(pool.pop(0), Some("hello".to_string()));
+        assert_eq!(pool.pop_or_steal(0), Some("world".to_string()));
+    }
+
+    // ── Type-specific tests ─────────────────────────────────────────
+
+    #[test]
+    fn deque_with_string_type() {
+        let (worker, stealer) = new_deque(8);
+        worker.push("alpha".to_string());
+        worker.push("beta".to_string());
+        assert_eq!(stealer.steal().unwrap(), "alpha");
+        assert_eq!(worker.pop(), Some("beta".to_string()));
+    }
+
+    #[test]
+    fn deque_with_vec_type() {
+        let (worker, stealer) = new_deque(8);
+        worker.push(vec![1, 2, 3]);
+        worker.push(vec![4, 5]);
+        assert_eq!(stealer.steal().unwrap(), vec![1, 2, 3]);
+        assert_eq!(worker.pop(), Some(vec![4, 5]));
+    }
+
+    // ── Interleaved operations ──────────────────────────────────────
+
+    #[test]
+    fn push_steal_pop_interleaved_stress() {
+        let (worker, stealer) = new_deque(16);
+        let mut stolen = Vec::new();
+        let mut popped = Vec::new();
+
+        for i in 0..50 {
+            worker.push(i);
+            if i % 3 == 0 {
+                if let StealResult::Success(v) = stealer.steal() {
+                    stolen.push(v);
+                }
+            }
+            if i % 5 == 0 {
+                if let Some(v) = worker.pop() {
+                    popped.push(v);
+                }
+            }
+        }
+        // Drain remainder
+        while let Some(v) = worker.pop() {
+            popped.push(v);
+        }
+        while let StealResult::Success(v) = stealer.steal() {
+            stolen.push(v);
+        }
+
+        // Total stolen + popped should equal total pushed (50)
+        assert_eq!(stolen.len() + popped.len(), 50);
+    }
+
+    #[test]
+    fn steal_batch_multiple_rounds() {
+        let (worker, stealer) = new_deque(16);
+        for i in 0..20 {
+            worker.push(i);
+        }
+        let b1 = stealer.steal_batch(5);
+        let b2 = stealer.steal_batch(5);
+        let b3 = stealer.steal_batch(5);
+        let b4 = stealer.steal_batch(5);
+        assert_eq!(b1, vec![0, 1, 2, 3, 4]);
+        assert_eq!(b2, vec![5, 6, 7, 8, 9]);
+        assert_eq!(b3, vec![10, 11, 12, 13, 14]);
+        assert_eq!(b4, vec![15, 16, 17, 18, 19]);
+        assert!(stealer.steal().is_empty());
+    }
+
+    // ── WsDequeConfig / WsDequeStats equality ───────────────────────
+
+    #[test]
+    fn config_equality() {
+        let c1 = WsDequeConfig { initial_capacity: 32 };
+        let c2 = WsDequeConfig { initial_capacity: 32 };
+        let c3 = WsDequeConfig { initial_capacity: 64 };
+        assert_eq!(c1, c2);
+        assert_ne!(c1, c3);
+    }
+
+    #[test]
+    fn stats_equality() {
+        let s1 = WsDequeStats { len: 1, total_pushed: 2, total_popped: 3, total_stolen: 4, steal_failures: 5 };
+        let s2 = WsDequeStats { len: 1, total_pushed: 2, total_popped: 3, total_stolen: 4, steal_failures: 5 };
+        let s3 = WsDequeStats { len: 0, total_pushed: 2, total_popped: 3, total_stolen: 4, steal_failures: 5 };
+        assert_eq!(s1, s2);
+        assert_ne!(s1, s3);
+    }
+
+    #[test]
+    fn config_debug_format() {
+        let config = WsDequeConfig { initial_capacity: 64 };
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("64"));
+    }
+
+    #[test]
+    fn stats_debug_format() {
+        let stats = WsDequeStats { len: 5, total_pushed: 10, total_popped: 3, total_stolen: 2, steal_failures: 0 };
+        let debug = format!("{:?}", stats);
+        assert!(debug.contains("total_pushed"));
+        assert!(debug.contains("10"));
+    }
 }
