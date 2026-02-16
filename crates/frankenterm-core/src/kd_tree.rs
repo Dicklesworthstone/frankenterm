@@ -747,4 +747,422 @@ mod tests {
         assert_eq!(restored.len(), tree.len());
         assert_eq!(restored.dims(), tree.dims());
     }
+
+    // ── Expanded test coverage ──────────────────────────────────────
+
+    #[test]
+    fn build_empty_produces_empty_tree() {
+        let tree: KdTree<VecPoint, i32> = KdTree::build(vec![], 2);
+        assert!(tree.is_empty());
+        assert_eq!(tree.len(), 0);
+        assert!(tree.nearest(&pt(0.0, 0.0)).is_none());
+    }
+
+    #[test]
+    fn build_single_point() {
+        let tree = KdTree::build(vec![(pt(3.0, 4.0), 42)], 2);
+        assert_eq!(tree.len(), 1);
+        assert!(!tree.is_empty());
+
+        let (p, v, dist) = tree.nearest(&pt(3.0, 4.0)).unwrap();
+        assert_eq!(*v, 42);
+        assert!(dist < 1e-10);
+        assert_eq!(p.coords, vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn k_nearest_zero_returns_empty() {
+        let tree = KdTree::build(vec![(pt(0.0, 0.0), 1)], 2);
+        let results = tree.k_nearest(&pt(0.0, 0.0), 0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn k_nearest_on_empty_tree() {
+        let tree: KdTree<VecPoint, i32> = KdTree::new(2);
+        let results = tree.k_nearest(&pt(0.0, 0.0), 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn range_query_on_empty_tree() {
+        let tree: KdTree<VecPoint, i32> = KdTree::new(2);
+        let results = tree.range_query(&[0.0, 0.0], &[10.0, 10.0]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn radius_query_on_empty_tree() {
+        let tree: KdTree<VecPoint, i32> = KdTree::new(2);
+        let results = tree.radius_query(&pt(0.0, 0.0), 10.0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn radius_query_zero_radius_exact_match() {
+        let items = vec![
+            (pt(0.0, 0.0), 1),
+            (pt(1.0, 0.0), 2),
+            (pt(0.0, 1.0), 3),
+        ];
+        let tree = KdTree::build(items, 2);
+        let results = tree.radius_query(&pt(0.0, 0.0), 0.0);
+        assert_eq!(results.len(), 1);
+        assert_eq!(*results[0].1, 1);
+    }
+
+    #[test]
+    fn range_query_exact_boundary_inclusion() {
+        // Points exactly on the boundary should be included (<=)
+        let items = vec![
+            (pt(0.0, 0.0), 1),
+            (pt(5.0, 5.0), 2),
+            (pt(10.0, 10.0), 3),
+        ];
+        let tree = KdTree::build(items, 2);
+        let results = tree.range_query(&[0.0, 0.0], &[5.0, 5.0]);
+        assert_eq!(results.len(), 2);
+        let values: Vec<&i32> = results.iter().map(|(_, v)| *v).collect();
+        assert!(values.contains(&&1));
+        assert!(values.contains(&&2));
+    }
+
+    #[test]
+    fn k_nearest_sorted_by_distance() {
+        let items = vec![
+            (pt(0.0, 0.0), 1),
+            (pt(3.0, 0.0), 2),
+            (pt(1.0, 0.0), 3),
+            (pt(2.0, 0.0), 4),
+        ];
+        let tree = KdTree::build(items, 2);
+        let results = tree.k_nearest(&pt(0.0, 0.0), 4);
+        assert_eq!(results.len(), 4);
+
+        // Verify sorted by distance (ascending)
+        for i in 1..results.len() {
+            assert!(
+                results[i].2 >= results[i - 1].2,
+                "k_nearest not sorted: {} >= {}",
+                results[i].2,
+                results[i - 1].2,
+            );
+        }
+
+        // First should be origin (dist=0)
+        assert!(*results[0].1 == 1);
+    }
+
+    #[test]
+    fn insert_updates_nearest() {
+        let mut tree: KdTree<VecPoint, &str> = KdTree::new(2);
+        tree.insert(pt(10.0, 10.0), "far");
+        tree.insert(pt(0.1, 0.1), "close");
+
+        let (_, v, _) = tree.nearest(&pt(0.0, 0.0)).unwrap();
+        assert_eq!(*v, "close");
+
+        // Insert an even closer point
+        tree.insert(pt(0.01, 0.01), "closest");
+        let (_, v, _) = tree.nearest(&pt(0.0, 0.0)).unwrap();
+        assert_eq!(*v, "closest");
+    }
+
+    #[test]
+    fn collinear_points() {
+        // All points on x-axis
+        let items = vec![
+            (pt(1.0, 0.0), 1),
+            (pt(3.0, 0.0), 3),
+            (pt(5.0, 0.0), 5),
+            (pt(7.0, 0.0), 7),
+            (pt(9.0, 0.0), 9),
+        ];
+        let tree = KdTree::build(items, 2);
+        assert_eq!(tree.len(), 5);
+
+        let (_, v, _) = tree.nearest(&pt(4.0, 0.0)).unwrap();
+        assert!(*v == 3 || *v == 5); // either neighbor is acceptable
+
+        let results = tree.k_nearest(&pt(5.0, 0.0), 3);
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn negative_coordinates() {
+        let items = vec![
+            (pt(-5.0, -5.0), 1),
+            (pt(-1.0, -1.0), 2),
+            (pt(0.0, 0.0), 3),
+            (pt(1.0, 1.0), 4),
+        ];
+        let tree = KdTree::build(items, 2);
+
+        let (_, v, _) = tree.nearest(&pt(-4.0, -4.0)).unwrap();
+        assert_eq!(*v, 1);
+
+        let results = tree.range_query(&[-6.0, -6.0], &[-0.5, -0.5]);
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_queries() {
+        let items = vec![
+            (pt(0.0, 0.0), "a"),
+            (pt(1.0, 0.0), "b"),
+            (pt(0.0, 1.0), "c"),
+            (pt(5.0, 5.0), "d"),
+        ];
+        let tree = KdTree::build(items, 2);
+
+        let json = serde_json::to_string(&tree).unwrap();
+        let restored: KdTree<VecPoint, &str> = serde_json::from_str(&json).unwrap();
+
+        // Same nearest result
+        let (_, v_orig, _) = tree.nearest(&pt(0.1, 0.1)).unwrap();
+        let (_, v_rest, _) = restored.nearest(&pt(0.1, 0.1)).unwrap();
+        assert_eq!(v_orig, v_rest);
+
+        // Same range result count
+        let range_orig = tree.range_query(&[-1.0, -1.0], &[2.0, 2.0]);
+        let range_rest = restored.range_query(&[-1.0, -1.0], &[2.0, 2.0]);
+        assert_eq!(range_orig.len(), range_rest.len());
+    }
+
+    #[test]
+    fn large_tree_nearest_correctness() {
+        // Build grid of 100 points and verify nearest neighbor brute force
+        let mut items: Vec<(VecPoint, (i32, i32))> = Vec::new();
+        for x in 0..10 {
+            for y in 0..10 {
+                items.push((pt(x as f64, y as f64), (x, y)));
+            }
+        }
+        let tree = KdTree::build(items.clone(), 2);
+        assert_eq!(tree.len(), 100);
+
+        // Query a point and verify nearest is correct
+        let query = pt(3.7, 6.2);
+        let (_, v, dist_sq) = tree.nearest(&query).unwrap();
+
+        // Brute force check
+        let mut best_dist_sq = f64::INFINITY;
+        let mut best_val = (0, 0);
+        for (p, val) in &items {
+            let d = p.dist_sq(&query);
+            if d < best_dist_sq {
+                best_dist_sq = d;
+                best_val = *val;
+            }
+        }
+        assert_eq!(*v, best_val);
+        assert!((dist_sq - best_dist_sq).abs() < 1e-10);
+    }
+
+    #[test]
+    fn five_dimensional_tree() {
+        let items = vec![
+            (VecPoint::new(vec![1.0, 0.0, 0.0, 0.0, 0.0]), "a"),
+            (VecPoint::new(vec![0.0, 1.0, 0.0, 0.0, 0.0]), "b"),
+            (VecPoint::new(vec![0.0, 0.0, 1.0, 0.0, 0.0]), "c"),
+            (VecPoint::new(vec![0.0, 0.0, 0.0, 1.0, 0.0]), "d"),
+            (VecPoint::new(vec![0.0, 0.0, 0.0, 0.0, 1.0]), "e"),
+            (VecPoint::new(vec![0.0, 0.0, 0.0, 0.0, 0.0]), "origin"),
+        ];
+        let tree = KdTree::build(items, 5);
+        assert_eq!(tree.dims(), 5);
+        assert_eq!(tree.len(), 6);
+
+        let query = VecPoint::new(vec![0.0, 0.0, 0.0, 0.0, 0.0]);
+        let (_, v, dist) = tree.nearest(&query).unwrap();
+        assert_eq!(*v, "origin");
+        assert!(dist < 1e-10);
+    }
+
+    #[test]
+    fn one_dimensional_tree() {
+        let items = vec![
+            (VecPoint::new(vec![5.0]), 5),
+            (VecPoint::new(vec![2.0]), 2),
+            (VecPoint::new(vec![8.0]), 8),
+            (VecPoint::new(vec![1.0]), 1),
+        ];
+        let tree = KdTree::build(items, 1);
+        assert_eq!(tree.dims(), 1);
+
+        let query = VecPoint::new(vec![3.0]);
+        let (_, v, _) = tree.nearest(&query).unwrap();
+        assert_eq!(*v, 2); // closest to 3.0 is 2.0
+
+        let results = tree.range_query(&[1.5], &[5.5]);
+        assert_eq!(results.len(), 2); // points 2.0 and 5.0
+    }
+
+    #[test]
+    fn clone_independence() {
+        let items = vec![
+            (pt(0.0, 0.0), 1),
+            (pt(5.0, 5.0), 2),
+        ];
+        let tree = KdTree::build(items, 2);
+        let mut cloned = tree.clone();
+        cloned.insert(pt(10.0, 10.0), 3);
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(cloned.len(), 3);
+    }
+
+    #[test]
+    fn dist_sq_correctness() {
+        let a = pt(3.0, 4.0);
+        let b = pt(0.0, 0.0);
+        assert!((a.dist_sq(&b) - 25.0).abs() < 1e-10); // 3² + 4² = 25
+
+        let c = VecPoint::new3d(1.0, 2.0, 3.0);
+        let d = VecPoint::new3d(4.0, 6.0, 3.0);
+        assert!((c.dist_sq(&d) - 25.0).abs() < 1e-10); // 3² + 4² + 0² = 25
+    }
+
+    #[test]
+    fn dist_sq_symmetric() {
+        let a = pt(1.0, 7.0);
+        let b = pt(4.0, 3.0);
+        assert!((a.dist_sq(&b) - b.dist_sq(&a)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn dist_sq_zero_for_same_point() {
+        let a = pt(42.0, 17.0);
+        assert!(a.dist_sq(&a) < 1e-10);
+    }
+
+    #[test]
+    fn radius_query_includes_boundary() {
+        // Point at exactly radius distance should be included (<=)
+        let items = vec![
+            (pt(0.0, 0.0), 1),
+            (pt(1.0, 0.0), 2),
+        ];
+        let tree = KdTree::build(items, 2);
+        let results = tree.radius_query(&pt(0.0, 0.0), 1.0);
+        assert_eq!(results.len(), 2); // both points: 0 dist and 1.0 dist
+    }
+
+    #[test]
+    fn k_nearest_single_point_tree() {
+        let tree = KdTree::build(vec![(pt(5.0, 5.0), 99)], 2);
+        let results = tree.k_nearest(&pt(0.0, 0.0), 3);
+        assert_eq!(results.len(), 1);
+        assert_eq!(*results[0].1, 99);
+    }
+
+    #[test]
+    fn range_query_single_point_in_range() {
+        let tree = KdTree::build(vec![(pt(5.0, 5.0), 1)], 2);
+        let results = tree.range_query(&[4.0, 4.0], &[6.0, 6.0]);
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn range_query_single_point_out_of_range() {
+        let tree = KdTree::build(vec![(pt(5.0, 5.0), 1)], 2);
+        let results = tree.range_query(&[0.0, 0.0], &[1.0, 1.0]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn insert_many_then_nearest() {
+        let mut tree: KdTree<VecPoint, i32> = KdTree::new(2);
+        for i in 0..50 {
+            tree.insert(pt(i as f64, i as f64), i);
+        }
+        assert_eq!(tree.len(), 50);
+
+        let (_, v, _) = tree.nearest(&pt(25.3, 25.3)).unwrap();
+        assert_eq!(*v, 25);
+    }
+
+    #[test]
+    fn points_returns_all_after_insert() {
+        let mut tree: KdTree<VecPoint, i32> = KdTree::new(2);
+        tree.insert(pt(1.0, 2.0), 10);
+        tree.insert(pt(3.0, 4.0), 20);
+        tree.insert(pt(5.0, 6.0), 30);
+
+        let points = tree.points();
+        assert_eq!(points.len(), 3);
+        let values: Vec<&i32> = points.iter().map(|(_, v)| *v).collect();
+        assert!(values.contains(&&10));
+        assert!(values.contains(&&20));
+        assert!(values.contains(&&30));
+    }
+
+    #[test]
+    fn display_empty_tree() {
+        let tree: KdTree<VecPoint, i32> = KdTree::new(3);
+        assert_eq!(format!("{}", tree), "KdTree(0 points, 3D)");
+    }
+
+    #[test]
+    fn vec_point_constructors() {
+        let p2 = VecPoint::new2d(1.0, 2.0);
+        assert_eq!(p2.dims(), 2);
+        assert_eq!(p2.coord(0), 1.0);
+        assert_eq!(p2.coord(1), 2.0);
+
+        let p3 = VecPoint::new3d(3.0, 4.0, 5.0);
+        assert_eq!(p3.dims(), 3);
+        assert_eq!(p3.coord(2), 5.0);
+
+        let pn = VecPoint::new(vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(pn.dims(), 4);
+    }
+
+    #[test]
+    fn radius_query_returns_sorted_candidate_distances() {
+        // The results should have correct distance values
+        let items = vec![
+            (pt(0.0, 0.0), 1),
+            (pt(1.0, 0.0), 2),
+            (pt(2.0, 0.0), 3),
+        ];
+        let tree = KdTree::build(items, 2);
+        let results = tree.radius_query(&pt(0.0, 0.0), 3.0);
+        assert_eq!(results.len(), 3);
+
+        for (point, _, dist_sq) in &results {
+            let expected = point.dist_sq(&pt(0.0, 0.0));
+            assert!((dist_sq - expected).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn large_tree_range_query_correctness() {
+        // Grid of points, verify range query matches brute force
+        let mut items: Vec<(VecPoint, (i32, i32))> = Vec::new();
+        for x in 0..10 {
+            for y in 0..10 {
+                items.push((pt(x as f64, y as f64), (x, y)));
+            }
+        }
+        let tree = KdTree::build(items.clone(), 2);
+
+        let min = [3.0, 3.0];
+        let max = [7.0, 7.0];
+        let results = tree.range_query(&min, &max);
+
+        // Brute force count
+        let expected: usize = items
+            .iter()
+            .filter(|(p, _)| {
+                p.coord(0) >= 3.0
+                    && p.coord(0) <= 7.0
+                    && p.coord(1) >= 3.0
+                    && p.coord(1) <= 7.0
+            })
+            .count();
+
+        assert_eq!(results.len(), expected);
+        assert_eq!(results.len(), 25); // 5x5 grid from 3..=7
+    }
 }
