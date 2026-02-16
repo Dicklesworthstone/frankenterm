@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 base64 = {workspace = true, default-features=false, features=["alloc"]}
-bitflags = "2.0"
+bitflags = "2.10"
 hex = {workspace = true, default-features=false, features=["alloc"]}
 image = {workspace =true, optional=true }
 log.workspace = true
