@@ -95,3 +95,16 @@ docs/formal/*.tlc.log
 
 # WezTerm Automata runtime state (backups, locks)
 .wa/
+
+# Per-agent Cargo caches (concurrent agent builds use isolated registries)
+.cargo_*/
+
+# Remote compilation helper cache
+.rch/
+
+# Agent mail SQLite databases (runtime state, not project data)
+storage.sqlite3
+storage.sqlite3-*
+
+# Beads backup files (auto-generated during sync/migration)
+.beads/*.bak*
