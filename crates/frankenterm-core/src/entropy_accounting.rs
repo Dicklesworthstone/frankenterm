@@ -727,4 +727,18 @@ mod tests {
         let order = eviction_order(&scores);
         assert_eq!(order[0], 0, "low-entropy pane A should be evicted first");
     }
+
+    #[test]
+    fn compute_entropy_single_byte_repeated() {
+        let data = vec![42u8; 1000];
+        let h = compute_entropy(&data);
+        assert!(h < 0.01, "constant data should have near-zero entropy, got {}", h);
+    }
+
+    #[test]
+    fn estimator_fill_ratio_starts_at_zero() {
+        let est = EntropyEstimator::new(256);
+        assert!(est.fill_ratio() < f64::EPSILON);
+        assert_eq!(est.total_bytes(), 0);
+    }
 }

@@ -653,4 +653,22 @@ mod tests {
             assert_eq!(unique.len(), 3, "Replicas should be distinct for key-{}", i);
         }
     }
+
+    #[test]
+    fn is_empty_on_new_ring() {
+        let ring: HashRing<&str> = HashRing::new(10);
+        assert!(ring.is_empty());
+        assert_eq!(ring.node_count(), 0);
+        assert_eq!(ring.vnode_count(), 0);
+    }
+
+    #[test]
+    fn clone_independence() {
+        let mut ring = HashRing::new(10);
+        ring.add_node("A");
+        let ring2 = ring.clone();
+        ring.add_node("B");
+        assert_eq!(ring.node_count(), 2);
+        assert_eq!(ring2.node_count(), 1);
+    }
 }

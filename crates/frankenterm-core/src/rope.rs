@@ -621,4 +621,19 @@ mod tests {
         rope.delete(3, 5);
         assert_eq!(rope.to_string_full(), "abcdef");
     }
+
+    #[test]
+    fn clone_independence() {
+        let rope = Rope::from_str("hello");
+        let rope2 = rope.clone();
+        assert_eq!(rope.to_string_full(), rope2.to_string_full());
+    }
+
+    #[test]
+    fn char_at_out_of_bounds() {
+        let rope = Rope::from_str("abc");
+        assert_eq!(rope.char_at(0), Some('a'));
+        assert_eq!(rope.char_at(2), Some('c'));
+        assert_eq!(rope.char_at(3), None);
+    }
 }

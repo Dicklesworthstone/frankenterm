@@ -946,4 +946,25 @@ mod tests {
         assert!(sorted[0].low <= sorted[1].low);
         assert!(sorted[1].low <= sorted[2].low);
     }
+
+    #[test]
+    fn clone_independence() {
+        let mut tree = IntervalTree::new();
+        tree.insert(iv(1, 10), "a".to_string());
+        let tree2 = tree.clone();
+        tree.insert(iv(20, 30), "b".to_string());
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree2.len(), 1);
+    }
+
+    #[test]
+    fn query_point_on_boundary() {
+        let mut tree = IntervalTree::new();
+        tree.insert(iv(5, 10), ());
+        // Low boundary included, high boundary excluded (half-open [low, high))
+        assert_eq!(tree.query_point(&5).len(), 1);
+        assert_eq!(tree.query_point(&9).len(), 1);
+        assert_eq!(tree.query_point(&4).len(), 0);
+        assert_eq!(tree.query_point(&10).len(), 0); // exclusive upper bound
+    }
 }

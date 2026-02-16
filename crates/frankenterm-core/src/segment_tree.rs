@@ -557,4 +557,22 @@ mod tests {
         let mut st = SegmentTree::new(3);
         st.point_update(3, 1);
     }
+
+    #[test]
+    fn stats_counts_operations() {
+        let mut st = SegmentTree::from_slice(&[1, 2, 3, 4]);
+        st.query(0, 3);
+        st.query(1, 2);
+        st.point_update(0, 5);
+        let stats = st.stats();
+        assert_eq!(stats.query_count, 2);
+        assert_eq!(stats.update_count, 1);
+        assert_eq!(stats.element_count, 4);
+    }
+
+    #[test]
+    fn config_default() {
+        let config = SegmentTreeConfig::default();
+        assert_eq!(config.capacity, 64);
+    }
 }
