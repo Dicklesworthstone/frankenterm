@@ -23421,6 +23421,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             frankenterm_core::simulation::EventAction::GenerateScrollback => {
                                 "generate_scrollback"
                             }
+                            frankenterm_core::simulation::EventAction::Typing => "typing",
+                            frankenterm_core::simulation::EventAction::Paste => "paste",
+                            frankenterm_core::simulation::EventAction::Mouse => "mouse",
                             frankenterm_core::simulation::EventAction::Marker => "marker",
                         };
                         println!(

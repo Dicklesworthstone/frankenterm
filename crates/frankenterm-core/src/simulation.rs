@@ -132,6 +132,12 @@ pub enum EventAction {
     SetFontSize,
     /// Deterministically synthesize scrollback text. Uses `content` as "LINES" or "LINESxWIDTH".
     GenerateScrollback,
+    /// Simulate interactive typing input. Uses `content` as typed payload.
+    Typing,
+    /// Simulate bracketed paste input. Uses `content` as pasted payload.
+    Paste,
+    /// Simulate mouse interaction. Uses `name` or `content` as interaction token.
+    Mouse,
     /// Insert a named marker (for expectations).
     Marker,
 }
@@ -147,16 +153,24 @@ impl EventAction {
             Self::Resize => "resize",
             Self::SetFontSize => "set_font_size",
             Self::GenerateScrollback => "generate_scrollback",
+            Self::Typing => "typing",
+            Self::Paste => "paste",
+            Self::Mouse => "mouse",
             Self::Marker => "marker",
         }
     }
 
-    /// Whether this action participates in resize/reflow baseline attribution.
+    /// Whether this action participates in timeline attribution.
     #[must_use]
     pub const fn is_resize_timeline_action(&self) -> bool {
         matches!(
             self,
-            Self::Resize | Self::SetFontSize | Self::GenerateScrollback
+            Self::Resize
+                | Self::SetFontSize
+                | Self::GenerateScrollback
+                | Self::Typing
+                | Self::Paste
+                | Self::Mouse
         )
     }
 }
@@ -513,6 +527,22 @@ impl Scenario {
                 EventAction::GenerateScrollback => {
                     let _ = parse_scrollback_spec(&event.content)?;
                 }
+                EventAction::Typing | EventAction::Paste => {
+                    if event.content.trim().is_empty() {
+                        return Err(crate::Error::Runtime(format!(
+                            "{:?} requires non-empty content in scenario '{}'",
+                            event.action, self.name
+                        )));
+                    }
+                }
+                EventAction::Mouse => {
+                    if event.name.trim().is_empty() && event.content.trim().is_empty() {
+                        return Err(crate::Error::Runtime(format!(
+                            "Mouse requires non-empty name or content in scenario '{}'",
+                            self.name
+                        )));
+                    }
+                }
                 EventAction::Append
                 | EventAction::Clear
                 | EventAction::SetTitle
@@ -603,6 +633,19 @@ impl Scenario {
             EventAction::GenerateScrollback => {
                 let (lines, width) = parse_scrollback_spec(&event.content)?;
                 Ok(MockEvent::AppendOutput(generate_scrollback(lines, width)))
+            }
+            EventAction::Typing => Ok(MockEvent::AppendOutput(format!(
+                "[TYPING:{}]",
+                event.content
+            ))),
+            EventAction::Paste => Ok(MockEvent::AppendOutput(format!("[PASTE:{}]", event.content))),
+            EventAction::Mouse => {
+                let token = if event.name.trim().is_empty() {
+                    event.content.trim()
+                } else {
+                    event.name.trim()
+                };
+                Ok(MockEvent::AppendOutput(format!("[MOUSE:{token}]")))
             }
             EventAction::Marker => {
                 // Markers don't produce a MockEvent; they're used for expectations.
@@ -1493,18 +1536,33 @@ events:
     content: "8x64"
   - at: "7s"
     pane: 0
+    action: typing
+    content: "hello"
+  - at: "8s"
+    pane: 0
+    action: paste
+    content: "multi-line payload"
+  - at: "9s"
+    pane: 0
+    action: mouse
+    name: left_click
+  - at: "10s"
+    pane: 0
     action: marker
     name: checkpoint
 "#;
         let scenario = Scenario::from_yaml(yaml).unwrap();
-        assert_eq!(scenario.events.len(), 7);
+        assert_eq!(scenario.events.len(), 10);
         assert_eq!(scenario.events[0].action, EventAction::Append);
         assert_eq!(scenario.events[1].action, EventAction::Clear);
         assert_eq!(scenario.events[2].action, EventAction::SetTitle);
         assert_eq!(scenario.events[3].action, EventAction::Resize);
         assert_eq!(scenario.events[4].action, EventAction::SetFontSize);
         assert_eq!(scenario.events[5].action, EventAction::GenerateScrollback);
-        assert_eq!(scenario.events[6].action, EventAction::Marker);
+        assert_eq!(scenario.events[6].action, EventAction::Typing);
+        assert_eq!(scenario.events[7].action, EventAction::Paste);
+        assert_eq!(scenario.events[8].action, EventAction::Mouse);
+        assert_eq!(scenario.events[9].action, EventAction::Marker);
     }
 
     #[test]
@@ -1515,10 +1573,16 @@ events:
             EventAction::GenerateScrollback.as_str(),
             "generate_scrollback"
         );
+        assert_eq!(EventAction::Typing.as_str(), "typing");
+        assert_eq!(EventAction::Paste.as_str(), "paste");
+        assert_eq!(EventAction::Mouse.as_str(), "mouse");
         assert!(!EventAction::Append.is_resize_timeline_action());
         assert!(EventAction::Resize.is_resize_timeline_action());
         assert!(EventAction::SetFontSize.is_resize_timeline_action());
         assert!(EventAction::GenerateScrollback.is_resize_timeline_action());
+        assert!(EventAction::Typing.is_resize_timeline_action());
+        assert!(EventAction::Paste.is_resize_timeline_action());
+        assert!(EventAction::Mouse.is_resize_timeline_action());
     }
 
     #[test]
@@ -2655,6 +2719,9 @@ events: []
             EventAction::GenerateScrollback.as_str(),
             "generate_scrollback"
         );
+        assert_eq!(EventAction::Typing.as_str(), "typing");
+        assert_eq!(EventAction::Paste.as_str(), "paste");
+        assert_eq!(EventAction::Mouse.as_str(), "mouse");
         assert_eq!(EventAction::Marker.as_str(), "marker");
     }
 
@@ -2666,6 +2733,9 @@ events: []
         assert!(EventAction::Resize.is_resize_timeline_action());
         assert!(EventAction::SetFontSize.is_resize_timeline_action());
         assert!(EventAction::GenerateScrollback.is_resize_timeline_action());
+        assert!(EventAction::Typing.is_resize_timeline_action());
+        assert!(EventAction::Paste.is_resize_timeline_action());
+        assert!(EventAction::Mouse.is_resize_timeline_action());
         assert!(!EventAction::Marker.is_resize_timeline_action());
     }
 
@@ -2749,6 +2819,9 @@ events: []
             EventAction::Resize,
             EventAction::SetFontSize,
             EventAction::GenerateScrollback,
+            EventAction::Typing,
+            EventAction::Paste,
+            EventAction::Mouse,
             EventAction::Marker,
         ] {
             let json = serde_json::to_string(&action).unwrap();
@@ -2763,6 +2836,12 @@ events: []
         assert_eq!(json, "\"set_font_size\"");
         let json = serde_json::to_string(&EventAction::GenerateScrollback).unwrap();
         assert_eq!(json, "\"generate_scrollback\"");
+        let json = serde_json::to_string(&EventAction::Typing).unwrap();
+        assert_eq!(json, "\"typing\"");
+        let json = serde_json::to_string(&EventAction::Paste).unwrap();
+        assert_eq!(json, "\"paste\"");
+        let json = serde_json::to_string(&EventAction::Mouse).unwrap();
+        assert_eq!(json, "\"mouse\"");
     }
 
     #[test]
@@ -3411,6 +3490,54 @@ contains:
         };
         let mock_event = Scenario::to_mock_event(&event).unwrap();
         assert!(matches!(mock_event, MockEvent::AppendOutput(ref s) if s == "[FONT_SIZE:1.50]"));
+    }
+
+    #[test]
+    fn to_mock_event_typing_and_paste_emit_marked_output() {
+        let typing = ScenarioEvent {
+            at: Duration::from_secs(0),
+            pane: 0,
+            action: EventAction::Typing,
+            content: "hello".to_string(),
+            name: String::new(),
+            comment: None,
+        };
+        let paste = ScenarioEvent {
+            at: Duration::from_secs(0),
+            pane: 0,
+            action: EventAction::Paste,
+            content: "world".to_string(),
+            name: String::new(),
+            comment: None,
+        };
+        let typing_event = Scenario::to_mock_event(&typing).unwrap();
+        let paste_event = Scenario::to_mock_event(&paste).unwrap();
+        assert!(matches!(typing_event, MockEvent::AppendOutput(ref s) if s == "[TYPING:hello]"));
+        assert!(matches!(paste_event, MockEvent::AppendOutput(ref s) if s == "[PASTE:world]"));
+    }
+
+    #[test]
+    fn to_mock_event_mouse_prefers_name_then_content() {
+        let by_name = ScenarioEvent {
+            at: Duration::from_secs(0),
+            pane: 0,
+            action: EventAction::Mouse,
+            content: "ignored".to_string(),
+            name: "right_click".to_string(),
+            comment: None,
+        };
+        let by_content = ScenarioEvent {
+            at: Duration::from_secs(0),
+            pane: 0,
+            action: EventAction::Mouse,
+            content: "wheel_up".to_string(),
+            name: String::new(),
+            comment: None,
+        };
+        let event_name = Scenario::to_mock_event(&by_name).unwrap();
+        let event_content = Scenario::to_mock_event(&by_content).unwrap();
+        assert!(matches!(event_name, MockEvent::AppendOutput(ref s) if s == "[MOUSE:right_click]"));
+        assert!(matches!(event_content, MockEvent::AppendOutput(ref s) if s == "[MOUSE:wheel_up]"));
     }
 
     #[test]

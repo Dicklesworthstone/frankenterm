@@ -25,6 +25,9 @@ fn arb_event_action() -> impl Strategy<Value = EventAction> {
         Just(EventAction::Resize),
         Just(EventAction::SetFontSize),
         Just(EventAction::GenerateScrollback),
+        Just(EventAction::Typing),
+        Just(EventAction::Paste),
+        Just(EventAction::Mouse),
         Just(EventAction::Marker),
     ]
 }
@@ -211,6 +214,9 @@ proptest! {
             EventAction::Resize => "\"resize\"",
             EventAction::SetFontSize => "\"set_font_size\"",
             EventAction::GenerateScrollback => "\"generate_scrollback\"",
+            EventAction::Typing => "\"typing\"",
+            EventAction::Paste => "\"paste\"",
+            EventAction::Mouse => "\"mouse\"",
             EventAction::Marker => "\"marker\"",
         };
         prop_assert_eq!(json.as_str(), expected);
@@ -240,12 +246,17 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(30))]
 
-    /// is_resize_timeline_action returns true only for Resize, SetFontSize, GenerateScrollback.
+    /// is_resize_timeline_action returns true for timeline-attributed actions.
     #[test]
     fn prop_is_resize_timeline_correct(action in arb_event_action()) {
         let expected = matches!(
             action,
-            EventAction::Resize | EventAction::SetFontSize | EventAction::GenerateScrollback
+            EventAction::Resize
+                | EventAction::SetFontSize
+                | EventAction::GenerateScrollback
+                | EventAction::Typing
+                | EventAction::Paste
+                | EventAction::Mouse
         );
         prop_assert_eq!(action.is_resize_timeline_action(), expected);
     }
@@ -608,6 +619,9 @@ fn event_action_variants_distinct() {
         EventAction::Resize,
         EventAction::SetFontSize,
         EventAction::GenerateScrollback,
+        EventAction::Typing,
+        EventAction::Paste,
+        EventAction::Mouse,
         EventAction::Marker,
     ];
     for (i, a) in actions.iter().enumerate() {
