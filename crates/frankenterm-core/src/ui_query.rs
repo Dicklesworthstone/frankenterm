@@ -626,4 +626,103 @@ mod tests {
         let state = resolve_ruleset_profile_state(None).expect("resolve state");
         assert_eq!(state.active_profile, "default");
     }
+
+    #[test]
+    fn pane_bookmark_view_from_record_with_none_tags() {
+        let record = PaneBookmarkRecord {
+            id: 1,
+            pane_id: 10,
+            alias: "alias".to_string(),
+            tags: None,
+            description: Some("desc".to_string()),
+            created_at: 100,
+            updated_at: 200,
+        };
+        let view = PaneBookmarkView::from(record);
+        assert!(view.tags.is_empty()); // None becomes empty vec
+        assert_eq!(view.description.as_deref(), Some("desc"));
+        assert_eq!(view.created_at, 100);
+        assert_eq!(view.updated_at, 200);
+    }
+
+    #[test]
+    fn pane_bookmark_view_from_record_with_many_tags() {
+        let record = PaneBookmarkRecord {
+            id: 2,
+            pane_id: 20,
+            alias: "multi".to_string(),
+            tags: Some(vec!["a".into(), "b".into(), "c".into()]),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let view = PaneBookmarkView::from(record);
+        assert_eq!(view.tags.len(), 3);
+    }
+
+    #[test]
+    fn saved_search_view_from_record_defaults() {
+        let record = SavedSearchRecord::new(
+            "minimal".to_string(),
+            "query".to_string(),
+            None,
+            10,
+            "absolute".to_string(),
+            None,
+        );
+        let view = SavedSearchView::from(record);
+        assert_eq!(view.name, "minimal");
+        assert_eq!(view.pane_id, None);
+        assert!(!view.enabled); // default is false
+        assert!(view.last_run_at.is_none());
+        assert!(view.last_error.is_none());
+    }
+
+    #[test]
+    fn ruleset_profile_state_default_has_one_profile() {
+        let state = RulesetProfileState::default();
+        assert_eq!(state.profiles.len(), 1);
+        assert_eq!(state.profiles[0].name, "default");
+        assert!(state.profiles[0].path.is_none());
+        assert!(state.profiles[0].last_applied_at.is_none());
+    }
+
+    #[test]
+    fn saved_search_view_json_null_optional_fields() {
+        let view = SavedSearchView {
+            id: "s2".to_string(),
+            name: "nulls".to_string(),
+            query: "q".to_string(),
+            pane_id: None,
+            limit: 5,
+            since_mode: "last_run".to_string(),
+            since_ms: None,
+            schedule_interval_ms: None,
+            enabled: false,
+            last_run_at: None,
+            last_result_count: None,
+            last_error: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json["pane_id"].is_null());
+        assert!(json["since_ms"].is_null());
+        assert!(json["schedule_interval_ms"].is_null());
+        assert!(json["last_run_at"].is_null());
+    }
+
+    #[test]
+    fn pane_bookmark_view_empty_alias() {
+        let view = PaneBookmarkView {
+            pane_id: 0,
+            alias: String::new(),
+            tags: vec![],
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["alias"], "");
+    }
 }
