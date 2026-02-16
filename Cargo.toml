@@ -399,13 +399,13 @@ fastmcp-server = { version = "0.2.0", git = "https://github.com/Dicklesworthston
 fastmcp-client = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
 fastmcp-macros = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
 fastmcp-console = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastapi = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", package = "fastapi-rust" }
-fastapi-core = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust" }
-fastapi-http = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust" }
-fastapi-router = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust" }
-fastapi-macros = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust" }
-fastapi-openapi = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust" }
-fastapi-output = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust" }
+fastapi = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec", package = "fastapi-rust" }
+fastapi-core = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
+fastapi-http = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
+fastapi-router = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
+fastapi-macros = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
+fastapi-openapi = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
+fastapi-output = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
 
 # Internal crates
 frankenterm-core = { path = "crates/frankenterm-core" }
@@ -424,11 +424,11 @@ strip = true        # Remove debug symbols
 [patch.crates-io]
 # Pin git revs to avoid branch drift and to keep the dependency graph single-sourced.
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "f58a4e5e437aa564286729c0e2ec50b1e62c1f0e" }
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "f9098d74f3dfa4bd141356ada9daa5d9c0f3bdc1" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "c7c15f630caf9bd2c6b9f39feed6212d64986dfa" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "f9098d74f3dfa4bd141356ada9daa5d9c0f3bdc1" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "c7c15f630caf9bd2c6b9f39feed6212d64986dfa" }
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "f58a4e5e437aa564286729c0e2ec50b1e62c1f0e" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "f9098d74f3dfa4bd141356ada9daa5d9c0f3bdc1" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "c7c15f630caf9bd2c6b9f39feed6212d64986dfa" }
