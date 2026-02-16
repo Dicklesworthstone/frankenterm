@@ -72,6 +72,7 @@ pub mod conformal;
 pub mod consistent_hash;
 pub mod content_dedup;
 pub mod continuous_backpressure;
+pub mod count_min_sketch;
 pub mod cpu_pressure;
 pub mod cuckoo_filter;
 pub mod crash;
