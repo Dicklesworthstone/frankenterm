@@ -20,10 +20,6 @@ use proptest::prelude::*;
 
 // ── Strategies ──────────────────────────────────────────────────────
 
-fn arb_size() -> impl Strategy<Value = usize> {
-    1usize..=50
-}
-
 fn arb_values(max_n: usize) -> impl Strategy<Value = Vec<i64>> {
     prop::collection::vec(-1000i64..=1000, 1..=max_n)
 }

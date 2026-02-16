@@ -26,18 +26,6 @@ fn arb_size() -> impl Strategy<Value = usize> {
     1usize..=50
 }
 
-fn arb_values(n: usize) -> impl Strategy<Value = Vec<i64>> {
-    prop::collection::vec(-1000i64..=1000, n..=n)
-}
-
-fn arb_nonneg_values(n: usize) -> impl Strategy<Value = Vec<i64>> {
-    prop::collection::vec(0i64..=100, n..=n)
-}
-
-fn arb_updates(n: usize) -> impl Strategy<Value = Vec<(usize, i64)>> {
-    prop::collection::vec((0usize..n, -500i64..=500), 0..n * 2)
-}
-
 // ── Prefix sum correctness ──────────────────────────────────────────
 
 proptest! {
@@ -130,7 +118,8 @@ proptest! {
 
         prop_assert_eq!(
             ft.range_sum(i, i), ft.point_query(i),
-            "range_sum({0}, {0}) != point_query({0})", i
+            "range_sum({i}, {i}) != point_query({i})",
+            i = i
         );
     }
 

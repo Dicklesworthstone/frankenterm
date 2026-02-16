@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(sa.search_str("aa"), vec![0, 1, 2]);
         assert_eq!(sa.search_str("aaa"), vec![0, 1]);
         assert_eq!(sa.search_str("aaaa"), vec![0]);
-        assert_eq!(sa.search_str("aaaaa"), vec![]);
+        assert_eq!(sa.search_str("aaaaa"), Vec::<usize>::new());
     }
 
     #[test]

@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_clone_independence() {
-        let mut ft = FenwickTree::from_slice(&[1, 2, 3]);
+        let ft = FenwickTree::from_slice(&[1, 2, 3]);
         let original_sum = ft.total_sum();
         let mut clone = ft.clone();
         clone.update(0, 100);
@@ -643,14 +643,14 @@ mod tests {
     #[should_panic(expected = "out of bounds")]
     fn test_prefix_sum_out_of_bounds() {
         let ft = FenwickTree::new(3);
-        ft.prefix_sum(3);
+        let _ = ft.prefix_sum(3);
     }
 
     #[test]
     #[should_panic(expected = "left")]
     fn test_range_sum_invalid() {
         let ft = FenwickTree::new(5);
-        ft.range_sum(3, 1);
+        let _ = ft.range_sum(3, 1);
     }
 
     #[test]

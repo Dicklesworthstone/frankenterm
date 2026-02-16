@@ -891,6 +891,7 @@ mod tests {
         // PaneMap::insert overwrites, but total_allocated gets double-incremented
         // This is a known trade-off in the lock-free design
         let snap = budget.snapshot();
+        assert_eq!(snap.total_allocated, 50);
         // The pane_breakdown should have only one entry
         let breakdown = budget.pane_breakdown();
         assert_eq!(breakdown.len(), 1);
