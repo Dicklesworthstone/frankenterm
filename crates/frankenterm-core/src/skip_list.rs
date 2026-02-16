@@ -717,4 +717,415 @@ mod tests {
         assert_eq!(list.get(&1), Some(&300));
         assert_eq!(list.len(), 1);
     }
+
+    // -- Batch: DarkMill ft-283h4.53 ----------------------------------------
+
+    #[test]
+    fn remove_first_element() {
+        let mut list = SkipList::new(42);
+        list.insert(1, "a");
+        list.insert(2, "b");
+        list.insert(3, "c");
+        assert_eq!(list.remove(&1), Some("a"));
+        assert_eq!(list.min(), Some((&2, &"b")));
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn remove_last_element() {
+        let mut list = SkipList::new(42);
+        list.insert(1, "a");
+        list.insert(2, "b");
+        list.insert(3, "c");
+        assert_eq!(list.remove(&3), Some("c"));
+        assert_eq!(list.max(), Some((&2, &"b")));
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn remove_only_element() {
+        let mut list = SkipList::new(42);
+        list.insert(42, "only");
+        assert_eq!(list.remove(&42), Some("only"));
+        assert!(list.is_empty());
+        assert!(list.min().is_none());
+        assert!(list.max().is_none());
+    }
+
+    #[test]
+    fn double_remove_same_key() {
+        let mut list = SkipList::new(42);
+        list.insert(5, "five");
+        assert_eq!(list.remove(&5), Some("five"));
+        assert!(list.remove(&5).is_none());
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn remove_all_one_by_one() {
+        let mut list = SkipList::new(42);
+        let keys: Vec<i32> = (0..20).collect();
+        for &k in &keys {
+            list.insert(k, k * 10);
+        }
+        for &k in &keys {
+            assert!(list.remove(&k).is_some());
+        }
+        assert!(list.is_empty());
+        assert_eq!(list.len(), 0);
+        assert!(list.min().is_none());
+    }
+
+    #[test]
+    fn remove_all_reverse_order() {
+        let mut list = SkipList::new(42);
+        for i in 0..30 {
+            list.insert(i, i);
+        }
+        for i in (0..30).rev() {
+            assert_eq!(list.remove(&i), Some(i));
+        }
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn negative_keys() {
+        let mut list = SkipList::new(42);
+        list.insert(-10, "neg10");
+        list.insert(0, "zero");
+        list.insert(10, "pos10");
+        assert_eq!(list.min(), Some((&-10, &"neg10")));
+        assert_eq!(list.max(), Some((&10, &"pos10")));
+        assert_eq!(list.get(&0), Some(&"zero"));
+    }
+
+    #[test]
+    fn string_keys() {
+        let mut list = SkipList::new(42);
+        list.insert("banana".to_string(), 2);
+        list.insert("apple".to_string(), 1);
+        list.insert("cherry".to_string(), 3);
+        let items: Vec<_> = list.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(items, vec!["apple", "banana", "cherry"]);
+    }
+
+    #[test]
+    fn range_from_gt_to_is_empty() {
+        let mut list = SkipList::new(42);
+        for i in 0..10 {
+            list.insert(i, i);
+        }
+        let result = list.range(&8, &3);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn range_covers_entire_list() {
+        let mut list = SkipList::new(42);
+        for i in 0..10 {
+            list.insert(i, i);
+        }
+        let result = list.range(&0, &9);
+        assert_eq!(result.len(), 10);
+    }
+
+    #[test]
+    fn range_no_keys_in_interval() {
+        let mut list = SkipList::new(42);
+        list.insert(10, "a");
+        list.insert(50, "b");
+        let result = list.range(&20, &40);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn range_bounds_exceed_list() {
+        let mut list = SkipList::new(42);
+        list.insert(10, 1);
+        list.insert(20, 2);
+        list.insert(30, 3);
+        let result = list.range(&0, &100);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn range_on_empty_list() {
+        let list: SkipList<i32, i32> = SkipList::new(42);
+        let result = list.range(&0, &100);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn iter_sorted_after_random_inserts() {
+        let mut list = SkipList::new(99);
+        let vals = [37, 12, 85, 3, 56, 91, 24, 68, 7, 43];
+        for &v in &vals {
+            list.insert(v, v);
+        }
+        let keys: Vec<i32> = list.iter().map(|(k, _)| *k).collect();
+        let mut sorted = vals.to_vec();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+    }
+
+    #[test]
+    fn iter_count_matches_len() {
+        let mut list = SkipList::new(42);
+        for i in 0..50 {
+            list.insert(i, i);
+        }
+        // Remove some
+        for i in (0..50).step_by(3) {
+            list.remove(&i);
+        }
+        assert_eq!(list.iter().count(), list.len());
+    }
+
+    #[test]
+    fn min_max_after_removals() {
+        let mut list = SkipList::new(42);
+        for i in 0..10 {
+            list.insert(i, i);
+        }
+        list.remove(&0); // remove min
+        assert_eq!(list.min(), Some((&1, &1)));
+        list.remove(&9); // remove max
+        assert_eq!(list.max(), Some((&8, &8)));
+    }
+
+    #[test]
+    fn min_max_updates_with_new_extremes() {
+        let mut list = SkipList::new(42);
+        list.insert(50, "fifty");
+        assert_eq!(list.min(), Some((&50, &"fifty")));
+        list.insert(10, "ten");
+        assert_eq!(list.min(), Some((&10, &"ten")));
+        list.insert(90, "ninety");
+        assert_eq!(list.max(), Some((&90, &"ninety")));
+    }
+
+    #[test]
+    fn stats_after_clear() {
+        let mut list = SkipList::new(42);
+        for i in 0..20 {
+            list.insert(i, i);
+        }
+        list.clear();
+        let stats = list.stats();
+        assert_eq!(stats.len, 0);
+        assert_eq!(stats.current_level, 0);
+        assert_eq!(stats.free_slots, 0);
+    }
+
+    #[test]
+    fn stats_free_slots_accumulate() {
+        let mut list = SkipList::new(42);
+        for i in 0..10 {
+            list.insert(i, i);
+        }
+        list.remove(&3);
+        list.remove(&7);
+        list.remove(&1);
+        let stats = list.stats();
+        assert_eq!(stats.free_slots, 3);
+        assert_eq!(stats.len, 7);
+    }
+
+    #[test]
+    fn free_slot_reuse() {
+        let mut list = SkipList::new(42);
+        for i in 0..10 {
+            list.insert(i, i);
+        }
+        let nodes_before = list.stats().total_nodes;
+        // Remove 5 elements to create free slots
+        for i in 0..5 {
+            list.remove(&i);
+        }
+        assert_eq!(list.stats().free_slots, 5);
+        // Reinsert — should reuse free slots, not grow arena
+        for i in 0..5 {
+            list.insert(i, i * 100);
+        }
+        assert_eq!(list.stats().free_slots, 0);
+        assert_eq!(list.stats().total_nodes, nodes_before);
+    }
+
+    #[test]
+    fn different_seeds_different_levels() {
+        // Same data, different seeds should have same content but may differ in structure
+        let mut list1 = SkipList::new(1);
+        let mut list2 = SkipList::new(999_999);
+        for i in 0..100 {
+            list1.insert(i, i);
+            list2.insert(i, i);
+        }
+        assert_eq!(list1.len(), list2.len());
+        // Content should be identical
+        let items1: Vec<_> = list1.iter().map(|(k, v)| (*k, *v)).collect();
+        let items2: Vec<_> = list2.iter().map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(items1, items2);
+    }
+
+    #[test]
+    fn large_scale_insert_verify() {
+        let mut list = SkipList::new(42);
+        for i in 0..1000 {
+            list.insert(i, i * 3);
+        }
+        assert_eq!(list.len(), 1000);
+        for i in 0..1000 {
+            assert_eq!(list.get(&i), Some(&(i * 3)), "missing key {}", i);
+        }
+        assert_eq!(list.min(), Some((&0, &0)));
+        assert_eq!(list.max(), Some((&999, &2997)));
+    }
+
+    #[test]
+    fn large_scale_insert_remove_all() {
+        let mut list = SkipList::new(42);
+        for i in 0..500 {
+            list.insert(i, i);
+        }
+        for i in 0..500 {
+            assert!(list.remove(&i).is_some());
+        }
+        assert!(list.is_empty());
+        assert!(list.min().is_none());
+        assert!(list.max().is_none());
+    }
+
+    #[test]
+    fn interleaved_insert_remove() {
+        let mut list = SkipList::new(42);
+        // Insert 0..10, remove evens, insert 10..20, remove odds from first batch
+        for i in 0..10 {
+            list.insert(i, i);
+        }
+        for i in (0..10).step_by(2) {
+            list.remove(&i);
+        }
+        for i in 10..20 {
+            list.insert(i, i);
+        }
+        for i in (1..10).step_by(2) {
+            list.remove(&i);
+        }
+        // Only 10..20 should remain
+        assert_eq!(list.len(), 10);
+        for i in 10..20 {
+            assert!(list.contains_key(&i));
+        }
+        for i in 0..10 {
+            assert!(!list.contains_key(&i));
+        }
+    }
+
+    #[test]
+    fn contains_key_after_removal() {
+        let mut list = SkipList::new(42);
+        list.insert(1, "one");
+        list.insert(2, "two");
+        assert!(list.contains_key(&1));
+        list.remove(&1);
+        assert!(!list.contains_key(&1));
+        assert!(list.contains_key(&2));
+    }
+
+    #[test]
+    fn get_returns_none_for_removed() {
+        let mut list = SkipList::new(42);
+        list.insert(10, 100);
+        list.insert(20, 200);
+        list.remove(&10);
+        assert!(list.get(&10).is_none());
+        assert_eq!(list.get(&20), Some(&200));
+    }
+
+    #[test]
+    fn overwrite_returns_previous_value() {
+        let mut list = SkipList::new(42);
+        assert!(list.insert(1, "first").is_none());
+        assert_eq!(list.insert(1, "second"), Some("first"));
+        assert_eq!(list.insert(1, "third"), Some("second"));
+    }
+
+    #[test]
+    fn insert_remove_reinsert_cycles() {
+        let mut list = SkipList::new(42);
+        for cycle in 0..5 {
+            for i in 0..20 {
+                list.insert(i, cycle * 100 + i);
+            }
+            for i in 0..20 {
+                list.remove(&i);
+            }
+            assert!(list.is_empty());
+        }
+        // Final insert to verify structure still works
+        list.insert(42, 999);
+        assert_eq!(list.get(&42), Some(&999));
+    }
+
+    #[test]
+    fn range_boundary_precision() {
+        let mut list = SkipList::new(42);
+        for i in [10, 20, 30, 40, 50] {
+            list.insert(i, i);
+        }
+        // Exact boundaries
+        assert_eq!(list.range(&20, &40).len(), 3); // 20, 30, 40
+        // Just inside
+        assert_eq!(list.range(&21, &39).len(), 1); // 30 only
+        // Just outside
+        assert_eq!(list.range(&11, &19).len(), 0); // nothing between 10 and 20
+    }
+
+    #[test]
+    fn stats_total_nodes_includes_head() {
+        let list: SkipList<i32, i32> = SkipList::new(42);
+        let stats = list.stats();
+        assert_eq!(stats.total_nodes, 1); // just head
+        assert_eq!(stats.len, 0);
+    }
+
+    #[test]
+    fn clone_is_independent() {
+        let mut list = SkipList::new(42);
+        list.insert(1, "a");
+        list.insert(2, "b");
+        let mut cloned = list.clone();
+        cloned.insert(3, "c");
+        cloned.remove(&1);
+        // Original unchanged
+        assert_eq!(list.len(), 2);
+        assert!(list.contains_key(&1));
+        assert!(!list.contains_key(&3));
+        // Clone has changes
+        assert_eq!(cloned.len(), 2);
+        assert!(!cloned.contains_key(&1));
+        assert!(cloned.contains_key(&3));
+    }
+
+    #[test]
+    fn remove_from_empty() {
+        let mut list: SkipList<i32, i32> = SkipList::new(42);
+        assert!(list.remove(&1).is_none());
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn current_level_decreases_after_removals() {
+        let mut list = SkipList::new(42);
+        for i in 0..200 {
+            list.insert(i, i);
+        }
+        let level_high = list.current_level();
+        assert!(level_high > 0);
+        // Remove all — level should go back to 0
+        for i in 0..200 {
+            list.remove(&i);
+        }
+        assert_eq!(list.current_level(), 0);
+    }
 }
