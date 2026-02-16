@@ -524,4 +524,157 @@ proptest! {
         prop_assert!(st.get(data.len()).is_none(), "get(len) should be None");
         prop_assert!(st.get(data.len() + 100).is_none(), "get(len+100) should be None");
     }
+
+    // ══════════════════════════════════════════════════════════════
+    //  ROUND 2: 6 additional property tests (26→31)
+    // ══════════════════════════════════════════════════════════════
+
+    // ── is_empty agrees with len ─────────────────────────────────
+
+    #[test]
+    fn is_empty_agrees_with_len(data in values_strategy(50)) {
+        let st = SparseTable::min_table(&data);
+        let ist = IndexSparseTable::build(&data, QueryOp::Min);
+
+        // Non-empty data => not empty, len > 0
+        let st_len = st.len();
+        let st_empty = st.is_empty();
+        prop_assert!(st_len > 0, "len should be > 0 for non-empty data");
+        prop_assert!(!st_empty, "is_empty should be false for non-empty data");
+        // is_empty <=> len == 0
+        prop_assert_eq!(st_empty, st_len == 0, "is_empty must agree with len");
+
+        let ist_len = ist.len();
+        let ist_empty = ist.is_empty();
+        prop_assert!(ist_len > 0, "IndexSparseTable len should be > 0");
+        prop_assert!(!ist_empty, "IndexSparseTable is_empty should be false");
+        prop_assert_eq!(ist_empty, ist_len == 0, "IndexSparseTable is_empty must agree with len");
+    }
+
+    // ── Debug format does not panic ──────────────────────────────
+
+    #[test]
+    fn debug_format_non_empty(data in values_strategy(30)) {
+        let st_min = SparseTable::min_table(&data);
+        let st_max = SparseTable::max_table(&data);
+        let ist = IndexSparseTable::build(&data, QueryOp::Min);
+
+        // Debug format should not panic and should produce non-empty output
+        let dbg_min = format!("{:?}", st_min);
+        let dbg_max = format!("{:?}", st_max);
+        let dbg_ist = format!("{:?}", ist);
+
+        prop_assert!(!dbg_min.is_empty(), "Debug for min table should not be empty");
+        prop_assert!(!dbg_max.is_empty(), "Debug for max table should not be empty");
+        prop_assert!(!dbg_ist.is_empty(), "Debug for index table should not be empty");
+
+        // Debug should contain type name
+        prop_assert!(
+            dbg_min.contains("SparseTable"),
+            "Debug should contain SparseTable, got: {}", dbg_min
+        );
+        prop_assert!(
+            dbg_ist.contains("IndexSparseTable"),
+            "Debug should contain IndexSparseTable, got: {}", dbg_ist
+        );
+    }
+
+    // ── Display format consistency ───────────────────────────────
+
+    #[test]
+    fn display_format_consistency(data in values_strategy(30)) {
+        let st_min = SparseTable::min_table(&data);
+        let st_max = SparseTable::max_table(&data);
+
+        let disp_min = format!("{}", st_min);
+        let disp_max = format!("{}", st_max);
+        let expected_len = data.len();
+
+        // Display should show correct count and operation
+        let expected_min = format!("SparseTable({} elements, Min)", expected_len);
+        let expected_max = format!("SparseTable({} elements, Max)", expected_len);
+        prop_assert_eq!(disp_min, expected_min, "Display min mismatch");
+        prop_assert_eq!(disp_max, expected_max, "Display max mismatch");
+    }
+
+    // ── build() vs min_table()/max_table() equivalence ──────────
+
+    #[test]
+    fn build_vs_convenience_constructors(data in values_strategy(50)) {
+        let st_min = SparseTable::min_table(&data);
+        let st_build_min = SparseTable::build(&data, QueryOp::Min);
+        let st_max = SparseTable::max_table(&data);
+        let st_build_max = SparseTable::build(&data, QueryOp::Max);
+        let n = data.len();
+
+        // Same length and operation
+        prop_assert_eq!(st_min.len(), st_build_min.len());
+        prop_assert_eq!(st_min.operation(), st_build_min.operation());
+        prop_assert_eq!(st_max.len(), st_build_max.len());
+        prop_assert_eq!(st_max.operation(), st_build_max.operation());
+
+        // Same query results across several ranges
+        for l in 0..n.min(15) {
+            for step in [0, 1, n / 3, n - 1] {
+                let r = (l + step).min(n - 1);
+                let min_conv = st_min.query(l, r);
+                let min_build = st_build_min.query(l, r);
+                prop_assert_eq!(min_conv, min_build, "build vs min_table at [{}, {}]", l, r);
+
+                let max_conv = st_max.query(l, r);
+                let max_build = st_build_max.query(l, r);
+                prop_assert_eq!(max_conv, max_build, "build vs max_table at [{}, {}]", l, r);
+            }
+        }
+    }
+
+    // ── Suffix max is non-decreasing ─────────────────────────────
+
+    #[test]
+    fn suffix_max_non_decreasing(data in values_strategy(50)) {
+        let st = SparseTable::max_table(&data);
+        let n = data.len();
+
+        // max(k, n-1) for decreasing k is non-decreasing
+        let mut prev_max = data[n - 1];
+        for k in (0..n).rev() {
+            let current_max = st.query(k, n - 1);
+            prop_assert!(
+                current_max >= prev_max,
+                "suffix max decreased at k={}: {} < {}", k, current_max, prev_max
+            );
+            prev_max = current_max;
+        }
+    }
+
+    // ── IndexSparseTable clone independence ──────────────────────
+
+    #[test]
+    fn index_clone_independence(data in values_strategy(50)) {
+        let ist = IndexSparseTable::build(&data, QueryOp::Min);
+        let cloned = ist.clone();
+        let n = data.len();
+
+        // Cloned table has same length
+        prop_assert_eq!(cloned.len(), ist.len());
+
+        // Verify queries produce identical results
+        for l in 0..n.min(10) {
+            for step in [0, 1, n / 3, n - 1] {
+                let r = (l + step).min(n - 1);
+                let (orig_idx, orig_val) = ist.query(l, r);
+                let (clone_idx, clone_val) = cloned.query(l, r);
+
+                // Values must match (indices may differ for ties)
+                prop_assert_eq!(
+                    *clone_val, *orig_val,
+                    "clone value mismatch at [{}, {}]", l, r
+                );
+                prop_assert_eq!(
+                    data[clone_idx], data[orig_idx],
+                    "clone index-value mismatch at [{}, {}]", l, r
+                );
+            }
+        }
+    }
 }

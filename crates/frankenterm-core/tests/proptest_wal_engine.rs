@@ -404,3 +404,107 @@ proptest! {
         );
     }
 }
+
+// ── Additional invariant properties ─────────────────────────────
+
+proptest! {
+    /// is_empty agrees with len: empty iff len == 0.
+    #[test]
+    fn is_empty_agrees_with_len(ops in arb_wal_ops()) {
+        let wal = build_wal(&ops);
+        let is_empty = wal.is_empty();
+        let len_zero = wal.len() == 0;
+        prop_assert_eq!(is_empty, len_zero);
+    }
+
+    /// A freshly constructed WAL is always empty regardless of config.
+    #[test]
+    fn new_wal_is_empty(config in arb_config()) {
+        let wal = WalEngine::<String>::new(config);
+        prop_assert!(wal.is_empty());
+        prop_assert_eq!(wal.len(), 0);
+        prop_assert_eq!(wal.next_seq(), 1);
+        prop_assert!(wal.last_checkpoint().is_none());
+        prop_assert_eq!(wal.compacted_through(), 0);
+    }
+
+    /// Clone produces an independent copy: mutating one does not affect the other.
+    #[test]
+    fn clone_independence(ops in arb_wal_ops()) {
+        let wal = build_wal(&ops);
+        let mut cloned = wal.clone();
+        cloned.append("extra_clone_entry".to_string(), 99999);
+
+        let orig_len = wal.len();
+        let cloned_len = cloned.len();
+        prop_assert_eq!(cloned_len, orig_len + 1);
+        // Original is unmodified
+        prop_assert_eq!(wal.len(), orig_len);
+    }
+
+    /// Stats fields are consistent with direct WAL queries.
+    #[test]
+    fn stats_consistent_with_queries(ops in arb_wal_ops()) {
+        let wal = build_wal(&ops);
+        let stats = wal.stats();
+
+        let total = wal.len();
+        let first = wal.first_seq();
+        let last = wal.last_seq();
+        let cp = wal.last_checkpoint();
+        let ct = wal.compacted_through();
+        let nc = wal.needs_compaction();
+
+        prop_assert_eq!(stats.total_entries, total);
+        prop_assert_eq!(stats.first_seq, first);
+        prop_assert_eq!(stats.last_seq, last);
+        prop_assert_eq!(stats.last_checkpoint_seq, cp);
+        prop_assert_eq!(stats.compacted_through, ct);
+        prop_assert_eq!(stats.needs_compaction, nc);
+    }
+
+    /// WalEntry serde roundtrip preserves equality for all entry kinds.
+    #[test]
+    fn wal_entry_serde_roundtrip(ops in arb_wal_ops()) {
+        let wal = build_wal(&ops);
+        for entry in wal.iter() {
+            let json = serde_json::to_string(entry).unwrap();
+            let back: WalEntry<String> = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(entry.seq, back.seq);
+            prop_assert_eq!(entry.timestamp_ms, back.timestamp_ms);
+            prop_assert_eq!(entry.kind.clone(), back.kind);
+        }
+    }
+
+    /// compacted_through never decreases across successive compact calls.
+    #[test]
+    fn compacted_through_monotonic(ops in arb_wal_ops()) {
+        let mut wal = build_wal(&ops);
+        let ct0 = wal.compacted_through();
+        wal.compact();
+        let ct1 = wal.compacted_through();
+        // Append more entries then compact again
+        wal.append("post_compact_a".to_string(), 50000);
+        wal.checkpoint(50001);
+        wal.append("post_compact_b".to_string(), 50002);
+        wal.compact();
+        let ct2 = wal.compacted_through();
+        prop_assert!(ct1 >= ct0, "compacted_through should not decrease: {} < {}", ct1, ct0);
+        prop_assert!(ct2 >= ct1, "compacted_through should not decrease: {} < {}", ct2, ct1);
+    }
+
+    /// Truncate then append: new entry gets the correct next sequence number.
+    #[test]
+    fn truncate_then_append_seq_correct(ops in arb_wal_ops()) {
+        let mut wal = build_wal(&ops);
+        if wal.len() >= 2 {
+            let mid = wal.first_seq() + (wal.last_seq() - wal.first_seq()) / 2;
+            wal.truncate_after(mid);
+            let expected_next = mid + 1;
+            let next = wal.next_seq();
+            prop_assert_eq!(next, expected_next);
+            let new_seq = wal.append("after_truncate".to_string(), 77777);
+            prop_assert_eq!(new_seq, expected_next);
+        }
+    }
+}

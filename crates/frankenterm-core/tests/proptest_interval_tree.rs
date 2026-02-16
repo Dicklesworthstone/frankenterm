@@ -529,4 +529,177 @@ proptest! {
         let results = tree.query_overlap(&query);
         prop_assert!(results.len() <= n);
     }
+
+    // ── is_empty agrees with len ────────────────────────────────────
+
+    #[test]
+    fn is_empty_agrees_with_len(intervals in intervals_strategy(50)) {
+        let mut tree = IntervalTree::new();
+        for (iv, val) in &intervals {
+            tree.insert(iv.clone(), *val);
+        }
+
+        let len = tree.len();
+        let empty = tree.is_empty();
+
+        if len == 0 {
+            prop_assert!(empty, "len is 0 but is_empty returned false");
+        } else {
+            prop_assert!(!empty, "len is {} but is_empty returned true", len);
+        }
+    }
+
+    // ── Clone independence ──────────────────────────────────────────
+
+    #[test]
+    fn clone_is_independent(
+        intervals in intervals_strategy(30),
+        extra in interval_strategy()
+    ) {
+        let mut tree = IntervalTree::new();
+        for (iv, val) in &intervals {
+            tree.insert(iv.clone(), *val);
+        }
+
+        let original_len = tree.len();
+        let mut cloned = tree.clone();
+
+        // Mutate the clone by inserting an extra interval
+        cloned.insert(extra.clone(), 9999u32);
+
+        // Original must be unchanged
+        prop_assert_eq!(tree.len(), original_len,
+            "original tree length changed after mutating clone");
+        prop_assert_eq!(cloned.len(), original_len + 1,
+            "cloned tree length not incremented after insert");
+    }
+
+    // ── Display format consistency ──────────────────────────────────
+
+    #[test]
+    fn display_format_contains_len(intervals in intervals_strategy(30)) {
+        let mut tree = IntervalTree::new();
+        for (iv, val) in &intervals {
+            tree.insert(iv.clone(), *val);
+        }
+
+        let display = format!("{}", tree);
+        let len = tree.len();
+        let expected_fragment = format!("{} intervals", len);
+
+        prop_assert!(
+            display.contains(&expected_fragment),
+            "Display '{}' should contain '{}'", display, expected_fragment
+        );
+    }
+
+    // ── Debug format is non-empty ───────────────────────────────────
+
+    #[test]
+    fn debug_format_is_nonempty(intervals in intervals_strategy(20)) {
+        let mut tree = IntervalTree::new();
+        for (iv, val) in &intervals {
+            tree.insert(iv.clone(), *val);
+        }
+
+        let debug = format!("{:?}", tree);
+        prop_assert!(!debug.is_empty(), "Debug output should not be empty");
+
+        // Debug should contain "IntervalTree" struct name
+        prop_assert!(
+            debug.contains("IntervalTree"),
+            "Debug output should contain 'IntervalTree', got: {}", debug
+        );
+    }
+
+    // ── Remove then query returns fewer results ─────────────────────
+
+    #[test]
+    fn remove_then_query_consistent(intervals in intervals_strategy(20)) {
+        if intervals.is_empty() {
+            return Ok(());
+        }
+
+        let mut tree = IntervalTree::new();
+        for (iv, val) in &intervals {
+            tree.insert(iv.clone(), *val);
+        }
+
+        let target = &intervals[0].0;
+
+        // Count overlaps before removal
+        let before_count = tree.query_overlap(target).len();
+
+        // Count how many intervals are exact matches
+        let exact_matches = intervals.iter()
+            .filter(|(iv, _)| iv.low == target.low && iv.high == target.high)
+            .count();
+
+        tree.remove(target);
+
+        // Count overlaps after removal
+        let after_count = tree.query_overlap(target).len();
+
+        // After removing exact matches, overlap count should decrease by at least exact_matches
+        // (the removed intervals were themselves overlapping the query)
+        prop_assert!(
+            after_count <= before_count.saturating_sub(exact_matches),
+            "after removal: before={}, after={}, exact_matches={}",
+            before_count, after_count, exact_matches
+        );
+    }
+
+    // ── Serde roundtrip preserves iterator ordering ─────────────────
+
+    #[test]
+    fn serde_roundtrip_preserves_sorted_order(intervals in intervals_strategy(30)) {
+        let mut tree = IntervalTree::new();
+        for (iv, val) in &intervals {
+            tree.insert(iv.clone(), *val);
+        }
+
+        let json = serde_json::to_string(&tree).unwrap();
+        let restored: IntervalTree<i32, u32> = serde_json::from_str(&json).unwrap();
+
+        let orig_lows: Vec<i32> = tree.iter().map(|(iv, _)| iv.low).collect();
+        let rest_lows: Vec<i32> = restored.iter().map(|(iv, _)| iv.low).collect();
+
+        prop_assert_eq!(orig_lows.len(), rest_lows.len(),
+            "iterator lengths differ after serde roundtrip");
+
+        // Both should be sorted
+        for w in rest_lows.windows(2) {
+            prop_assert!(w[0] <= w[1],
+                "restored iterator not sorted: {} > {}", w[0], w[1]);
+        }
+    }
+
+    // ── intervals_sorted agrees with iter ───────────────────────────
+
+    #[test]
+    fn intervals_sorted_matches_iter(intervals in intervals_strategy(50)) {
+        let mut tree = IntervalTree::new();
+        for (iv, val) in &intervals {
+            tree.insert(iv.clone(), *val);
+        }
+
+        let from_sorted: Vec<(i32, i32)> = tree.intervals_sorted()
+            .iter()
+            .map(|iv| (iv.low, iv.high))
+            .collect();
+
+        let from_iter: Vec<(i32, i32)> = tree.iter()
+            .map(|(iv, _)| (iv.low, iv.high))
+            .collect();
+
+        prop_assert_eq!(from_sorted.len(), from_iter.len(),
+            "intervals_sorted and iter have different lengths");
+
+        for i in 0..from_sorted.len() {
+            let s = from_sorted[i];
+            let it = from_iter[i];
+            prop_assert_eq!(s, it,
+                "mismatch at index {}: sorted={:?} iter={:?}", i, s, it);
+        }
+    }
 }

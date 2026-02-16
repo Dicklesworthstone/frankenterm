@@ -605,4 +605,216 @@ proptest! {
         prop_assert_eq!(extracted_keys, reference_keys,
             "after decrease_key, extraction order is wrong");
     }
+
+    // ── 26. is_empty agrees with len throughout lifecycle ────────
+    // At every step of insert/extract, is_empty() == (len() == 0).
+
+    #[test]
+    fn is_empty_agrees_with_len(vals in values_strategy(40)) {
+        let mut heap = FibonacciHeap::new();
+
+        // Initially empty
+        let len_zero = heap.len() == 0;
+        let empty = heap.is_empty();
+        prop_assert_eq!(empty, len_zero, "initial: is_empty={}, len==0={}", empty, len_zero);
+
+        // After each insert
+        for &v in &vals {
+            heap.insert(v, v);
+            let len_zero = heap.len() == 0;
+            let empty = heap.is_empty();
+            prop_assert_eq!(empty, len_zero,
+                "after insert: is_empty={}, len==0={}, len={}", empty, len_zero, heap.len());
+        }
+
+        // After each extract
+        while heap.extract_min().is_some() {
+            let len_zero = heap.len() == 0;
+            let empty = heap.is_empty();
+            prop_assert_eq!(empty, len_zero,
+                "after extract: is_empty={}, len==0={}, len={}", empty, len_zero, heap.len());
+        }
+
+        // Final state
+        prop_assert!(heap.is_empty());
+        prop_assert_eq!(heap.len(), 0);
+    }
+
+    // ── 27. Default produces same state as new ──────────────────
+    // FibonacciHeap::default() should behave identically to FibonacciHeap::new().
+
+    #[test]
+    fn default_equivalent_to_new(vals in values_strategy(30)) {
+        let mut heap_new: FibonacciHeap<i32, i32> = FibonacciHeap::new();
+        let mut heap_default: FibonacciHeap<i32, i32> = FibonacciHeap::default();
+
+        // Both start empty
+        prop_assert_eq!(heap_new.len(), heap_default.len());
+        prop_assert_eq!(heap_new.is_empty(), heap_default.is_empty());
+
+        // Insert same values into both
+        for &v in &vals {
+            heap_new.insert(v, v);
+            heap_default.insert(v, v);
+        }
+
+        // Same sorted output
+        let sorted_new = heap_new.into_sorted();
+        let sorted_default = heap_default.into_sorted();
+        prop_assert_eq!(sorted_new, sorted_default);
+    }
+
+    // ── 28. Clone independence — mutations don't cross ──────────
+    // Modifying a clone does not affect the original and vice versa.
+
+    #[test]
+    fn clone_independence(vals in values_strategy(30)) {
+        prop_assume!(vals.len() >= 2);
+
+        let mut heap = FibonacciHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+
+        let mut cloned = heap.clone();
+
+        // Extract from original
+        let original_min = heap.extract_min();
+        prop_assert!(original_min.is_some());
+
+        // Clone should still have all elements
+        let cloned_len = cloned.len();
+        let original_len = heap.len();
+        prop_assert_eq!(cloned_len, vals.len(),
+            "clone len should be {} but is {}", vals.len(), cloned_len);
+        prop_assert_eq!(original_len, vals.len() - 1,
+            "original len should be {} but is {}", vals.len() - 1, original_len);
+
+        // Insert into clone
+        cloned.insert(-9999, -9999);
+        let cloned_len_after = cloned.len();
+        let original_len_after = heap.len();
+        prop_assert_eq!(cloned_len_after, vals.len() + 1);
+        prop_assert_eq!(original_len_after, vals.len() - 1,
+            "original affected by clone insert: len={}", original_len_after);
+
+        // Clone's min should now be -9999
+        let (peek_key, _) = cloned.peek().unwrap();
+        prop_assert_eq!(*peek_key, -9999);
+    }
+
+    // ── 29. Display format tracks count correctly ───────────────
+    // Display output should always reflect current element count.
+
+    #[test]
+    fn display_tracks_count(vals in values_strategy(30)) {
+        let mut heap = FibonacciHeap::new();
+
+        // Empty
+        let display_str = format!("{}", heap);
+        let expected = format!("FibonacciHeap({} elements)", 0);
+        prop_assert_eq!(display_str, expected);
+
+        // After insertions
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+        let display_str = format!("{}", heap);
+        let expected = format!("FibonacciHeap({} elements)", vals.len());
+        prop_assert_eq!(display_str, expected);
+
+        // After some extractions
+        let extract_count = vals.len() / 2;
+        for _ in 0..extract_count {
+            heap.extract_min();
+        }
+        let remaining = vals.len() - extract_count;
+        let display_str = format!("{}", heap);
+        let expected = format!("FibonacciHeap({} elements)", remaining);
+        prop_assert_eq!(display_str, expected);
+    }
+
+    // ── 30. Serde roundtrip preserves state after decrease_key ──
+    // Serialize/deserialize after decrease_key operations still yields
+    // correct extraction order.
+
+    #[test]
+    fn serde_roundtrip_after_decrease_key(vals in values_strategy(20)) {
+        prop_assume!(vals.len() >= 3);
+
+        let mut heap = FibonacciHeap::new();
+        let handles: Vec<usize> = vals.iter().map(|&v| heap.insert(v, v)).collect();
+
+        // Force consolidation so decrease_key triggers cuts
+        heap.extract_min();
+
+        // Decrease the last valid handle to a very small key
+        let last_handle = *handles.last().unwrap();
+        if heap.get_key(last_handle).is_some() {
+            heap.decrease_key(last_handle, -5000);
+        }
+
+        // Serialize and restore
+        let json = serde_json::to_string(&heap).unwrap();
+        let restored: FibonacciHeap<i32, i32> = serde_json::from_str(&json).unwrap();
+
+        let heap_len = heap.len();
+        let restored_len = restored.len();
+        prop_assert_eq!(restored_len, heap_len,
+            "restored len {} != original len {}", restored_len, heap_len);
+
+        // Both should produce the same sorted order
+        let original_sorted = heap.into_sorted();
+        let restored_sorted = restored.into_sorted();
+        prop_assert_eq!(original_sorted, restored_sorted,
+            "sorted mismatch after serde roundtrip with decrease_key");
+    }
+
+    // ── 31. Pop alias matches extract_min exactly ───────────────
+    // pop() and extract_min() should behave identically on equal heaps.
+
+    #[test]
+    fn pop_matches_extract_min(vals in values_strategy(40)) {
+        let mut heap_pop = FibonacciHeap::new();
+        let mut heap_extract = FibonacciHeap::new();
+
+        for &v in &vals {
+            heap_pop.insert(v, v);
+            heap_extract.insert(v, v);
+        }
+
+        loop {
+            let from_pop = heap_pop.pop();
+            let from_extract = heap_extract.extract_min();
+            prop_assert_eq!(from_pop, from_extract,
+                "pop and extract_min diverged");
+            if from_pop.is_none() {
+                break;
+            }
+        }
+    }
+
+    // ── 32. Debug format is non-empty and doesn't panic ─────────
+    // The Debug impl should produce a non-empty string for any heap state.
+
+    #[test]
+    fn debug_format_valid(vals in values_strategy(30)) {
+        let mut heap = FibonacciHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+
+        let debug_str = format!("{:?}", heap);
+        prop_assert!(!debug_str.is_empty(), "Debug output should not be empty");
+
+        // Should contain "FibonacciHeap" since it derives Debug on the struct
+        let contains_name = debug_str.contains("FibonacciHeap");
+        prop_assert!(contains_name,
+            "Debug output should contain 'FibonacciHeap', got: {}", debug_str);
+
+        // After extraction, Debug should still work
+        while heap.extract_min().is_some() {}
+        let debug_empty = format!("{:?}", heap);
+        prop_assert!(!debug_empty.is_empty(), "Debug on empty heap should not be empty");
+    }
 }

@@ -362,3 +362,122 @@ proptest! {
         prop_assert!(stats.converged);
     }
 }
+
+// ── Additional property tests ───────────────────────────────────────
+
+proptest! {
+    /// Reconciled result contains no keys absent from authority.
+    #[test]
+    fn result_has_no_extra_keys(
+        authority in arb_tree(15),
+        replica in arb_tree(15),
+        config in arb_config()
+    ) {
+        let (result, _) = reconcile_trees(&authority, &replica, &config);
+        for (k, _) in result.iter() {
+            prop_assert!(
+                authority.contains_key(k),
+                "result contains key not in authority"
+            );
+        }
+    }
+
+    /// Stats total matches diff total_changes.
+    #[test]
+    fn stats_total_matches_diff_total(
+        authority in arb_tree(15),
+        replica in arb_tree(15),
+        config in arb_config()
+    ) {
+        let diff = replica.diff(&authority);
+        let (_, stats) = reconcile_with_stats(&authority, &replica, &config);
+        let stats_total = stats.added + stats.removed + stats.changed;
+        let diff_total = diff.total_changes();
+        prop_assert_eq!(stats_total, diff_total);
+    }
+
+    /// ReconcileConfig default always has max_probe_depth == 6.
+    #[test]
+    fn config_default_probe_depth(_dummy in 0..1u8) {
+        let config = ReconcileConfig::default();
+        prop_assert_eq!(config.max_probe_depth, 6);
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// Session update_local reflects new tree state.
+    #[test]
+    fn session_update_local_reflects_new_tree(
+        tree1 in arb_tree(10),
+        tree2 in arb_tree(10),
+        config in arb_config()
+    ) {
+        let mut session = ReconcileSession::new(tree1.clone(), true, config);
+        let old_hash = session.local_tree().root_hash();
+        session.update_local(tree2.clone());
+        let new_hash = session.local_tree().root_hash();
+        prop_assert_eq!(new_hash, tree2.root_hash());
+        // Phase should still be Init after update_local
+        prop_assert_eq!(session.phase(), Phase::Init);
+        // Old hash should only match if trees happen to be identical
+        if tree1.root_hash() != tree2.root_hash() {
+            prop_assert_ne!(old_hash, new_hash);
+        }
+    }
+
+    /// Fingerprint from empty tree has zero entry_count and zero root hash.
+    #[test]
+    fn fingerprint_empty_tree_properties(version in any::<u64>()) {
+        let tree = MerkleTree::new();
+        let fp = StateFingerprint::from_tree(&tree, version);
+        prop_assert_eq!(fp.entry_count, 0);
+        prop_assert_eq!(fp.version, version);
+        prop_assert!(fp.root_hash.is_zero(), "empty tree should have zero root hash");
+    }
+
+    /// ReconcileMessage::LevelHashes serde roundtrip preserves depth and hashes.
+    #[test]
+    fn msg_level_hashes_serde(
+        depth in 0..10usize,
+        hash_bytes in prop::collection::vec(prop::array::uniform32(any::<u8>()), 0..8)
+    ) {
+        let hashes: Vec<MerkleHash> = hash_bytes.into_iter().map(MerkleHash::from_bytes).collect();
+        let msg = ReconcileMessage::LevelHashes { depth, hashes };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ReconcileMessage = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(msg, back);
+    }
+
+    /// ReconcileMessage::Patch serde roundtrip preserves entries.
+    #[test]
+    fn msg_patch_serde(
+        entries in prop::collection::vec(arb_entry(), 0..10)
+    ) {
+        let msg = ReconcileMessage::Patch(entries);
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ReconcileMessage = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(msg, back);
+    }
+
+    /// When authority is a strict subset of replica, surplus keys are removed.
+    #[test]
+    fn reconcile_removes_surplus_keys(
+        base_entries in prop::collection::vec(arb_entry(), 1..10),
+        extra_entries in prop::collection::vec(arb_entry(), 1..5),
+        config in arb_config()
+    ) {
+        let authority = MerkleTree::from_entries(base_entries.clone());
+        let mut all_entries = base_entries;
+        all_entries.extend(extra_entries);
+        let replica = MerkleTree::from_entries(all_entries);
+        let (result, _) = reconcile_trees(&authority, &replica, &config);
+        prop_assert_eq!(result.root_hash(), authority.root_hash());
+        prop_assert_eq!(result.len(), authority.len());
+        // Every key in result must exist in authority
+        for (k, v) in result.iter() {
+            let auth_val = authority.get(k);
+            prop_assert!(auth_val.is_some(), "result key not in authority");
+            prop_assert_eq!(auth_val.unwrap(), v, "result value differs from authority");
+        }
+    }
+}

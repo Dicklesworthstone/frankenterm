@@ -584,4 +584,132 @@ proptest! {
             }
         }
     }
+
+    // ══════════════════════════════════════════════════════════════
+    // ADDITIONAL TESTS (8 more properties — tests 26-33)
+    // ══════════════════════════════════════════════════════════════
+
+    // ── 14. is_empty_agrees_with_len ─────────────────────────────
+
+    #[test]
+    fn is_empty_agrees_with_len(entries in prop::collection::vec(
+        (rect_strategy(), any::<i32>()), 0..50
+    )) {
+        let mut tree = RTree::new();
+        for &(rect, val) in &entries {
+            tree.insert(rect, val);
+        }
+
+        let len = tree.len();
+        let empty = tree.is_empty();
+        prop_assert_eq!(empty, len == 0,
+            "is_empty()={} but len()={}", empty, len);
+    }
+
+    // ── 15. default_is_empty ─────────────────────────────────────
+
+    #[test]
+    fn default_is_empty(_dummy in 0..1u8) {
+        let tree: RTree<i32> = RTree::default();
+        prop_assert!(tree.is_empty());
+        prop_assert_eq!(tree.len(), 0);
+        prop_assert!(tree.entries().is_empty());
+    }
+
+    // ── 16. clone_independence_after_insert ───────────────────────
+
+    #[test]
+    fn clone_independence_after_insert(
+        entries in rects_with_values(20),
+        extra_rect in rect_strategy(),
+        extra_val in any::<i32>()
+    ) {
+        let mut tree = RTree::new();
+        for &(rect, val) in &entries {
+            tree.insert(rect, val);
+        }
+
+        let original_len = tree.len();
+        let mut cloned = tree.clone();
+        cloned.insert(extra_rect, extra_val);
+
+        // Original must be unaffected
+        prop_assert_eq!(tree.len(), original_len,
+            "original len changed from {} to {} after inserting into clone",
+            original_len, tree.len());
+        prop_assert_eq!(cloned.len(), original_len + 1);
+    }
+
+    // ── 17. debug_format_does_not_panic ──────────────────────────
+
+    #[test]
+    fn debug_format_does_not_panic(entries in rects_with_values(30)) {
+        let mut tree = RTree::new();
+        for &(rect, val) in &entries {
+            tree.insert(rect, val);
+        }
+
+        // Debug should produce non-empty output without panicking
+        let debug_str = format!("{:?}", tree);
+        prop_assert!(!debug_str.is_empty());
+    }
+
+    // ── 18. display_shows_correct_count ──────────────────────────
+
+    #[test]
+    fn display_shows_correct_count(entries in rects_with_values(30)) {
+        let mut tree = RTree::new();
+        for &(rect, val) in &entries {
+            tree.insert(rect, val);
+        }
+
+        let display_str = format!("{}", tree);
+        let expected = format!("RTree({} entries)", entries.len());
+        prop_assert_eq!(display_str, expected);
+    }
+
+    // ── 19. rect_point_zero_area ─────────────────────────────────
+
+    #[test]
+    fn rect_point_zero_area(x in -1000.0f64..1000.0, y in -1000.0f64..1000.0) {
+        let p = Rect::point(x, y);
+        let area = p.area();
+        prop_assert!(
+            area.abs() < 1e-10,
+            "Rect::point({}, {}) should have zero area, got {}",
+            x, y, area
+        );
+        prop_assert!(p.contains_point(x, y),
+            "Rect::point({}, {}) should contain its own coordinates", x, y);
+    }
+
+    // ── 20. rect_union_commutative ───────────────────────────────
+
+    #[test]
+    fn rect_union_commutative(a in rect_strategy(), b in rect_strategy()) {
+        let ab = a.union(&b);
+        let ba = b.union(&a);
+        prop_assert!(
+            (ab.x_min - ba.x_min).abs() < 1e-10
+                && (ab.y_min - ba.y_min).abs() < 1e-10
+                && (ab.x_max - ba.x_max).abs() < 1e-10
+                && (ab.y_max - ba.y_max).abs() < 1e-10,
+            "union should be commutative: a.union(b)={:?} vs b.union(a)={:?}",
+            ab, ba
+        );
+    }
+
+    // ── 21. rect_serde_roundtrip ─────────────────────────────────
+
+    #[test]
+    fn rect_serde_roundtrip(r in rect_strategy()) {
+        let json = serde_json::to_string(&r).unwrap();
+        let restored: Rect = serde_json::from_str(&json).unwrap();
+        // f64 JSON roundtrip can lose precision in last few ULPs
+        let eps = 1e-10;
+        prop_assert!((r.x_min - restored.x_min).abs() < eps, "x_min mismatch");
+        prop_assert!((r.y_min - restored.y_min).abs() < eps, "y_min mismatch");
+        prop_assert!((r.x_max - restored.x_max).abs() < eps, "x_max mismatch");
+        prop_assert!((r.y_max - restored.y_max).abs() < eps, "y_max mismatch");
+    }
 }

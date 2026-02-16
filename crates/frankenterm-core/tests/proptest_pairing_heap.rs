@@ -591,4 +591,166 @@ proptest! {
             );
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // ADDITIONAL PROPERTY TESTS (7 more)
+    // ═══════════════════════════════════════════════════════════════
+
+    // ── is_empty agrees with len throughout lifecycle ─────────────
+
+    #[test]
+    fn is_empty_agrees_with_len(vals in values_strategy(40)) {
+        let mut heap: PairingHeap<i32, i32> = PairingHeap::new();
+
+        // Empty state
+        let len_zero = heap.len() == 0;
+        let empty = heap.is_empty();
+        prop_assert_eq!(empty, len_zero, "is_empty disagrees with len on empty heap");
+
+        // After insertions
+        for &v in &vals {
+            heap.insert(v, v);
+            let current_len = heap.len();
+            let current_empty = heap.is_empty();
+            prop_assert_eq!(
+                current_empty, current_len == 0,
+                "is_empty disagrees with len after insert (len={})", current_len
+            );
+        }
+
+        // During pops
+        while heap.pop().is_some() {
+            let current_len = heap.len();
+            let current_empty = heap.is_empty();
+            prop_assert_eq!(
+                current_empty, current_len == 0,
+                "is_empty disagrees with len after pop (len={})", current_len
+            );
+        }
+
+        // Final state
+        prop_assert!(heap.is_empty());
+        prop_assert_eq!(heap.len(), 0);
+    }
+
+    // ── Default produces empty heap ──────────────────────────────
+
+    #[test]
+    fn default_is_empty(_dummy in 0..1i32) {
+        let heap: PairingHeap<i32, i32> = PairingHeap::default();
+        prop_assert!(heap.is_empty());
+        prop_assert_eq!(heap.len(), 0);
+        prop_assert!(heap.peek().is_none());
+
+        let sorted = heap.sorted();
+        prop_assert!(sorted.is_empty());
+    }
+
+    // ── Clone independence: mutating clone doesn't affect original ─
+
+    #[test]
+    fn clone_independence(vals in values_strategy(40)) {
+        let mut heap = PairingHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+
+        let original_sorted = heap.sorted();
+        let original_len = heap.len();
+
+        // Clone and mutate the clone
+        let mut cloned = heap.clone();
+        while cloned.pop().is_some() {}
+        cloned.insert(9999, 9999);
+
+        // Original must be unchanged
+        prop_assert_eq!(heap.len(), original_len, "original len changed after clone mutation");
+        let after_sorted = heap.sorted();
+        prop_assert_eq!(original_sorted, after_sorted, "original contents changed after clone mutation");
+    }
+
+    // ── Debug format is non-empty and doesn't panic ──────────────
+
+    #[test]
+    fn debug_format_nonempty(vals in values_strategy(30)) {
+        let mut heap = PairingHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+
+        let debug_str = format!("{:?}", heap);
+        prop_assert!(!debug_str.is_empty(), "Debug format produced empty string");
+
+        let contains_pairing = debug_str.contains("PairingHeap");
+        prop_assert!(contains_pairing, "Debug format missing 'PairingHeap': {}", debug_str);
+    }
+
+    // ── Display format contains element count ────────────────────
+
+    #[test]
+    fn display_contains_count(vals in values_strategy(30)) {
+        let mut heap = PairingHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+
+        let display_str = format!("{}", heap);
+        let expected = format!("PairingHeap({} elements)", vals.len());
+        prop_assert_eq!(display_str, expected, "Display format mismatch");
+    }
+
+    // ── Serde roundtrip after interleaved ops (exercises free list) ─
+
+    #[test]
+    fn serde_roundtrip_with_free_list(
+        insert_vals in values_strategy(30),
+        pop_count in 0usize..15
+    ) {
+        let mut heap = PairingHeap::new();
+        for &v in &insert_vals {
+            heap.insert(v, v);
+        }
+
+        // Pop some elements to build up the free list
+        let actual_pops = pop_count.min(insert_vals.len());
+        for _ in 0..actual_pops {
+            heap.pop();
+        }
+
+        let before_sorted = heap.sorted();
+        let before_len = heap.len();
+
+        // Serialize + deserialize
+        let json = serde_json::to_string(&heap).unwrap();
+        let restored: PairingHeap<i32, i32> = serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(restored.len(), before_len, "serde roundtrip changed len");
+
+        let restored_sorted = restored.sorted();
+        prop_assert_eq!(before_sorted, restored_sorted, "serde roundtrip changed contents");
+    }
+
+    // ── Sorted output is always monotonically non-decreasing ─────
+
+    #[test]
+    fn sorted_is_monotonic(vals in values_strategy(60)) {
+        let mut heap = PairingHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+
+        let sorted = heap.sorted();
+
+        for window in sorted.windows(2) {
+            let (k1, _) = window[0];
+            let (k2, _) = window[1];
+            prop_assert!(
+                k1 <= k2,
+                "sorted output not monotonic: {} > {}", k1, k2
+            );
+        }
+
+        // Also verify length
+        prop_assert_eq!(sorted.len(), vals.len(), "sorted length mismatch");
+    }
 }

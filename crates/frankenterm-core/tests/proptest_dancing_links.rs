@@ -636,3 +636,152 @@ proptest! {
         prop_assert_eq!(rows_after, rows_before, "add_row(&[]) should not change num_rows");
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// ── ADDITIONAL PROPERTY TESTS (26–31) ──────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    // ── 26. Default DancingLinks is empty: 0 rows, 0 cols ────────
+
+    #[test]
+    fn new_zero_columns_is_empty(num_cols in 0usize..10) {
+        let dlx = DancingLinks::new(num_cols);
+
+        let cols = dlx.num_columns();
+        let rows = dlx.num_rows();
+        prop_assert_eq!(cols, num_cols);
+        prop_assert_eq!(rows, 0usize, "freshly created DLX should have 0 rows");
+
+        // is_empty semantics: num_rows == 0
+        let is_empty = dlx.num_rows() == 0;
+        prop_assert!(is_empty, "new DancingLinks should be empty");
+    }
+
+    // ── 27. Debug format is non-empty and contains struct name ───
+
+    #[test]
+    fn debug_format_nonempty(
+        (num_cols, rows) in sparse_matrix_strategy(6, 5)
+    ) {
+        let mut dlx = DancingLinks::new(num_cols);
+        for row in &rows {
+            dlx.add_row(row);
+        }
+
+        let debug_str = format!("{:?}", dlx);
+        prop_assert!(!debug_str.is_empty(), "Debug output should not be empty");
+        prop_assert!(
+            debug_str.contains("DancingLinks"),
+            "Debug output should contain 'DancingLinks', got: {}",
+            &debug_str[..debug_str.len().min(100)]
+        );
+    }
+
+    // ── 28. Display format includes dimensions ───────────────────
+
+    #[test]
+    fn display_format_includes_dimensions(
+        (num_cols, rows) in sparse_matrix_strategy(6, 5)
+    ) {
+        let mut dlx = DancingLinks::new(num_cols);
+        for row in &rows {
+            dlx.add_row(row);
+        }
+
+        let display_str = format!("{}", dlx);
+        let num_rows = dlx.num_rows();
+        let expected_dim = format!("{}x{}", num_rows, num_cols);
+        prop_assert!(
+            display_str.contains(&expected_dim),
+            "Display should contain '{}', got '{}'",
+            expected_dim,
+            display_str
+        );
+        prop_assert!(
+            display_str.contains("nodes"),
+            "Display should contain 'nodes', got '{}'",
+            display_str
+        );
+    }
+
+    // ── 29. Clone independence: mutating clone doesn't affect original ──
+
+    #[test]
+    fn clone_independence_after_mutation(
+        (num_cols, rows) in sparse_matrix_strategy(6, 5)
+    ) {
+        let mut dlx = DancingLinks::new(num_cols);
+        for row in &rows {
+            dlx.add_row(row);
+        }
+
+        let orig_json = serde_json::to_string(&dlx).unwrap();
+        let mut cloned = dlx.clone();
+
+        // Mutate the clone by solving (which covers/uncovers internally)
+        let _clone_sol = cloned.solve_all();
+
+        // Original should be unchanged
+        let after_json = serde_json::to_string(&dlx).unwrap();
+        prop_assert_eq!(
+            orig_json,
+            after_json,
+            "original DLX state should not change when clone is mutated"
+        );
+    }
+
+    // ── 30. with_names preserves column count and solvability ────
+
+    #[test]
+    fn with_names_preserves_structure(n in 1usize..8) {
+        let names: Vec<String> = (0..n).map(|i| format!("col_{}", i)).collect();
+        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+
+        let mut dlx_named = DancingLinks::with_names(&name_refs);
+        let mut dlx_plain = DancingLinks::new(n);
+
+        prop_assert_eq!(dlx_named.num_columns(), dlx_plain.num_columns());
+        prop_assert_eq!(dlx_named.num_rows(), dlx_plain.num_rows());
+
+        // Add identity rows to both and verify same solvability
+        for i in 0..n {
+            dlx_named.add_row(&[i]);
+            dlx_plain.add_row(&[i]);
+        }
+
+        let named_sol = dlx_named.solve();
+        let plain_sol = dlx_plain.solve();
+        let named_some = named_sol.is_some();
+        let plain_some = plain_sol.is_some();
+        prop_assert_eq!(
+            named_some,
+            plain_some,
+            "with_names and new should produce same solvability"
+        );
+    }
+
+    // ── 31. solve_all restores internal state (serialization stable) ──
+
+    #[test]
+    fn solve_all_restores_state(
+        (num_cols, rows) in sparse_matrix_strategy(6, 5)
+    ) {
+        let mut dlx = DancingLinks::new(num_cols);
+        for row in &rows {
+            dlx.add_row(row);
+        }
+
+        let before = serde_json::to_string(&dlx).unwrap();
+        let _solutions = dlx.solve_all();
+        let after = serde_json::to_string(&dlx).unwrap();
+
+        prop_assert_eq!(
+            before,
+            after,
+            "solve_all should fully restore internal state"
+        );
+    }
+}

@@ -10,8 +10,9 @@
 //! proptest_storage_targets.rs, and proptest_storage_telemetry.rs.
 
 use frankenterm_core::storage::{
-    ActionHistoryRecord, ActionUndoRecord, AuditActionRecord, AuditStreamRecord,
-    NotificationHistoryRecord, NotificationStatus, PaneBookmarkRecord, PreparedPlanRecord,
+    ActionHistoryRecord, ActionUndoRecord, ApprovalTokenRecord, AuditActionRecord,
+    AuditStreamRecord, MaintenanceRecord, MetricType, NotificationHistoryRecord,
+    NotificationStatus, PaneBookmarkRecord, PaneReservation, PreparedPlanRecord,
     SavedSearchRecord, TimelineQuery, WorkflowActionPlanRecord, WorkflowRecord,
     WorkflowStepLogRecord,
 };
@@ -718,5 +719,345 @@ proptest! {
         prop_assert_eq!(&back.result, &result);
         prop_assert_eq!(back.undoable, Some(undoable));
         prop_assert_eq!(&back.undo_strategy, &Some(undo_strategy));
+    }
+}
+
+// ── MetricType enum ─────────────────────────────────────────────────────────
+
+fn arb_metric_type() -> impl Strategy<Value = MetricType> {
+    prop_oneof![
+        Just(MetricType::TokenUsage),
+        Just(MetricType::ApiCost),
+        Just(MetricType::ApiCall),
+        Just(MetricType::RateLimitHit),
+        Just(MetricType::WorkflowCost),
+        Just(MetricType::SessionDuration),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn metric_type_serde_roundtrip(mt in arb_metric_type()) {
+        let json = serde_json::to_string(&mt).unwrap();
+        let back: MetricType = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(mt, back);
+    }
+
+    #[test]
+    fn metric_type_as_str_parse_roundtrip(mt in arb_metric_type()) {
+        let s = mt.as_str();
+        let back: MetricType = s.parse().unwrap();
+        prop_assert_eq!(mt, back);
+    }
+
+    #[test]
+    fn metric_type_display_matches_as_str(mt in arb_metric_type()) {
+        let display = format!("{}", mt);
+        let as_str = mt.as_str();
+        prop_assert_eq!(&display, as_str);
+    }
+}
+
+// ── TimelineQuery builder: severities ───────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn timeline_query_builder_preserves_severities(
+        severities in proptest::collection::vec(arb_severity(), 1..5),
+    ) {
+        let query = TimelineQuery::new().with_severities(severities.clone());
+        prop_assert_eq!(query.severities.as_ref().unwrap(), &severities);
+        // Default fields should be preserved
+        prop_assert_eq!(query.limit, 100);
+        prop_assert!(query.include_correlations);
+    }
+}
+
+// ── WorkflowRecord clone equivalence ────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn workflow_record_clone_produces_identical_json(
+        id in arb_id_string(),
+        workflow_name in arb_short_text(),
+        pane_id in any::<u64>(),
+        current_step in 0usize..50,
+        status in arb_workflow_status(),
+        started_at in arb_timestamp(),
+    ) {
+        let updated_at = started_at + 500;
+        let record = WorkflowRecord {
+            id,
+            workflow_name,
+            pane_id,
+            trigger_event_id: None,
+            current_step,
+            status,
+            wait_condition: None,
+            context: None,
+            result: None,
+            error: None,
+            started_at,
+            updated_at,
+            completed_at: None,
+        };
+        let cloned = record.clone();
+        let json_orig = serde_json::to_string(&record).unwrap();
+        let json_clone = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(json_orig, json_clone);
+    }
+}
+
+// ── ActionUndoRecord undone state consistency ───────────────────────────────
+
+proptest! {
+    #[test]
+    fn action_undo_record_undone_consistency(
+        audit_action_id in any::<i64>(),
+        undo_strategy in arb_undo_strategy(),
+        undone_at in arb_timestamp(),
+    ) {
+        // When undone_at is set, the record represents a completed undo operation.
+        let record = ActionUndoRecord {
+            audit_action_id,
+            undoable: true,
+            undo_strategy: undo_strategy.clone(),
+            undo_hint: Some("revert via workflow".to_string()),
+            undo_payload: Some("{\"cmd\":\"undo\"}".to_string()),
+            undone_at: Some(undone_at),
+            undone_by: Some("admin".to_string()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let back: ActionUndoRecord = serde_json::from_str(&json).unwrap();
+        // Undone records should always be undoable
+        prop_assert!(back.undoable);
+        // undone_at and undone_by must both be present
+        prop_assert!(back.undone_at.is_some());
+        prop_assert!(back.undone_by.is_some());
+        prop_assert_eq!(back.undone_at.unwrap(), undone_at);
+        prop_assert_eq!(&back.undo_strategy, &undo_strategy);
+    }
+}
+
+// ── Debug format non-empty for record types ─────────────────────────────────
+
+proptest! {
+    #[test]
+    fn notification_history_record_debug_is_nonempty(
+        id in any::<i64>(),
+        timestamp in arb_timestamp(),
+        severity in arb_severity(),
+        status in arb_notification_status(),
+    ) {
+        let record = NotificationHistoryRecord {
+            id,
+            timestamp,
+            event_id: None,
+            channel: "desktop".to_string(),
+            title: "Alert".to_string(),
+            body: "Something happened".to_string(),
+            severity,
+            status,
+            error_message: None,
+            acknowledged_at: None,
+            acknowledged_by: None,
+            action_taken: None,
+            retry_count: 0,
+            metadata: None,
+            created_at: timestamp,
+        };
+        let debug = format!("{:?}", record);
+        prop_assert!(!debug.is_empty());
+        // Debug output should contain the struct name
+        let has_name = debug.contains("NotificationHistoryRecord");
+        prop_assert!(has_name);
+    }
+}
+
+// ── PreparedPlanRecord consumed temporal invariant ──────────────────────────
+
+proptest! {
+    #[test]
+    fn prepared_plan_consumed_at_after_created_at(
+        created_at in arb_timestamp(),
+        ttl_ms in 1000i64..3_600_000,
+        consume_offset in 0i64..1_000_000,
+    ) {
+        let expires_at = created_at + ttl_ms;
+        let consumed_at = created_at + consume_offset;
+        let record = PreparedPlanRecord {
+            plan_id: "plan-consumed".to_string(),
+            plan_hash: "deadbeef12345678".to_string(),
+            workspace_id: "ws-1".to_string(),
+            action_kind: "send_text".to_string(),
+            pane_id: Some(99),
+            pane_uuid: None,
+            params_json: None,
+            plan_json: "{}".to_string(),
+            requires_approval: false,
+            created_at,
+            expires_at,
+            consumed_at: Some(consumed_at),
+        };
+        // consumed_at must be >= created_at
+        prop_assert!(record.consumed_at.unwrap() >= record.created_at);
+        // serde roundtrip preserves consumed_at
+        let json = serde_json::to_string(&record).unwrap();
+        let back: PreparedPlanRecord = serde_json::from_str(&json).unwrap();
+        prop_assert!(back.consumed_at.is_some());
+        prop_assert_eq!(back.consumed_at.unwrap(), consumed_at);
+    }
+}
+
+// ── MaintenanceRecord serde roundtrip ───────────────────────────────────────
+
+fn arb_event_type() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("startup".to_string()),
+        Just("shutdown".to_string()),
+        Just("vacuum".to_string()),
+        Just("retention_cleanup".to_string()),
+        Just("error".to_string()),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn maintenance_record_serde_roundtrip(
+        id in any::<i64>(),
+        event_type in arb_event_type(),
+        message in proptest::option::of(arb_short_text()),
+        timestamp in arb_timestamp(),
+    ) {
+        let record = MaintenanceRecord {
+            id,
+            event_type: event_type.clone(),
+            message: message.clone(),
+            metadata: None,
+            timestamp,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let back: MaintenanceRecord = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.id, id);
+        prop_assert_eq!(&back.event_type, &event_type);
+        prop_assert_eq!(&back.message, &message);
+        prop_assert_eq!(back.timestamp, timestamp);
+    }
+}
+
+// ── ApprovalTokenRecord is_active ───────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn approval_token_active_when_unused_and_unexpired(
+        created_at in arb_timestamp(),
+        ttl_ms in 1000i64..3_600_000,
+        query_offset in 0i64..500,
+    ) {
+        let expires_at = created_at + ttl_ms;
+        let record = ApprovalTokenRecord {
+            id: 1,
+            code_hash: "abc123def456".to_string(),
+            created_at,
+            expires_at,
+            used_at: None,
+            workspace_id: "ws-test".to_string(),
+            action_kind: "send_text".to_string(),
+            pane_id: Some(42),
+            action_fingerprint: "fp-001".to_string(),
+            plan_hash: None,
+            plan_version: None,
+            risk_summary: None,
+        };
+        // Querying before expiry: should be active
+        let before_expiry = created_at + query_offset;
+        prop_assert!(record.is_active(before_expiry));
+        // Querying after expiry: should be inactive
+        let after_expiry = expires_at + 1;
+        prop_assert!(!record.is_active(after_expiry));
+    }
+
+    #[test]
+    fn approval_token_inactive_when_used(
+        created_at in arb_timestamp(),
+        ttl_ms in 1000i64..3_600_000,
+        use_offset in 0i64..500,
+    ) {
+        let expires_at = created_at + ttl_ms;
+        let used_at = created_at + use_offset;
+        let record = ApprovalTokenRecord {
+            id: 2,
+            code_hash: "used_hash".to_string(),
+            created_at,
+            expires_at,
+            used_at: Some(used_at),
+            workspace_id: "ws-test".to_string(),
+            action_kind: "workflow_run".to_string(),
+            pane_id: None,
+            action_fingerprint: "fp-002".to_string(),
+            plan_hash: None,
+            plan_version: None,
+            risk_summary: None,
+        };
+        // Should always be inactive once used, regardless of time
+        let now = created_at + 100;
+        prop_assert!(!record.is_active(now));
+    }
+}
+
+// ── PaneReservation is_active ───────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn pane_reservation_active_before_expiry(
+        pane_id in any::<u64>(),
+        created_at in arb_timestamp(),
+        ttl_ms in 1000i64..3_600_000,
+    ) {
+        let expires_at = created_at + ttl_ms;
+        let record = PaneReservation {
+            id: 1,
+            pane_id,
+            owner_kind: "workflow".to_string(),
+            owner_id: "wf-123".to_string(),
+            reason: Some("running step 3".to_string()),
+            created_at,
+            expires_at,
+            released_at: None,
+            status: "active".to_string(),
+        };
+        // Should be active when queried before expiry
+        let now_before = created_at + 1;
+        prop_assert!(record.is_active(now_before));
+        // Should be inactive when queried at or after expiry
+        let now_at_expiry = expires_at;
+        prop_assert!(!record.is_active(now_at_expiry));
+        let now_after = expires_at + 1;
+        prop_assert!(!record.is_active(now_after));
+    }
+
+    #[test]
+    fn pane_reservation_inactive_when_released(
+        pane_id in any::<u64>(),
+        created_at in arb_timestamp(),
+        ttl_ms in 1000i64..3_600_000,
+        release_offset in 0i64..500,
+    ) {
+        let expires_at = created_at + ttl_ms;
+        let released_at = created_at + release_offset;
+        let record = PaneReservation {
+            id: 2,
+            pane_id,
+            owner_kind: "agent".to_string(),
+            owner_id: "agent-abc".to_string(),
+            reason: None,
+            created_at,
+            expires_at,
+            released_at: Some(released_at),
+            status: "released".to_string(),
+        };
+        // Should always be inactive once released
+        let now = created_at + 100;
+        prop_assert!(!record.is_active(now));
     }
 }

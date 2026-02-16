@@ -442,3 +442,189 @@ proptest! {
         prop_assert!(is_none2, "max_end should be None for empty");
     }
 }
+
+// ── is_empty / count / default agreement ────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// is_empty() agrees with count() == 0 for any interval set.
+    #[test]
+    fn prop_is_empty_agrees_with_count(intervals in arb_intervals(15)) {
+        let di = build_di(&intervals);
+        let empty = di.is_empty();
+        let count_zero = di.count() == 0;
+        prop_assert_eq!(empty, count_zero,
+            "is_empty()={} but count()==0 is {}", empty, count_zero);
+    }
+
+    /// Default::default() produces an identical empty set to new().
+    #[test]
+    fn prop_default_is_empty(_dummy in 0..1u8) {
+        let di: DisjointIntervals = Default::default();
+        prop_assert!(di.is_empty());
+        prop_assert_eq!(di.count(), 0);
+        prop_assert_eq!(di.span(), 0);
+        let ivs = di.intervals();
+        prop_assert!(ivs.is_empty(), "default should have no intervals");
+    }
+}
+
+// ── min_start / max_end consistency ─────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// min_start and max_end agree with the first and last intervals.
+    #[test]
+    fn prop_min_max_consistent(intervals in arb_intervals(15)) {
+        let di = build_di(&intervals);
+        let ivs = di.intervals();
+        if ivs.is_empty() {
+            let min_none = di.min_start().is_none();
+            let max_none = di.max_end().is_none();
+            prop_assert!(min_none, "min_start should be None when empty");
+            prop_assert!(max_none, "max_end should be None when empty");
+        } else {
+            let min_s = di.min_start().unwrap();
+            let max_e = di.max_end().unwrap();
+            prop_assert_eq!(min_s, ivs[0].start,
+                "min_start {} != first interval start {}", min_s, ivs[0].start);
+            prop_assert_eq!(max_e, ivs[ivs.len() - 1].end,
+                "max_end {} != last interval end {}", max_e, ivs[ivs.len() - 1].end);
+            prop_assert!(min_s < max_e,
+                "min_start {} should be < max_end {}", min_s, max_e);
+        }
+    }
+}
+
+// ── Interval serde roundtrip ────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Interval survives JSON roundtrip.
+    #[test]
+    fn prop_interval_serde_roundtrip(
+        start in -100i64..=100,
+        len in 0i64..=50,
+    ) {
+        let iv = Interval::new(start, start + len);
+        let json = serde_json::to_string(&iv).unwrap();
+        let back: Interval = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(iv, back);
+    }
+}
+
+// ── Double remove idempotency ───────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Removing the same range twice is idempotent (second remove is a no-op).
+    #[test]
+    fn prop_double_remove_idempotent(
+        intervals in arb_intervals(10),
+        s in -30i64..=30,
+        len in 1i64..=20,
+    ) {
+        let e = s + len;
+        let mut di1 = build_di(&intervals);
+        di1.remove(s, e);
+        let after_first = di1.intervals().to_vec();
+
+        di1.remove(s, e);
+        let after_second = di1.intervals().to_vec();
+
+        prop_assert_eq!(after_first, after_second,
+            "second remove changed intervals");
+    }
+}
+
+// ── Gaps disjoint and sorted ────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Gaps are disjoint, sorted, and non-empty.
+    #[test]
+    fn prop_gaps_disjoint_sorted(
+        intervals in arb_intervals(10),
+        lo in -50i64..=0,
+        hi_offset in 1i64..=100,
+    ) {
+        let hi = lo + hi_offset;
+        let di = build_di(&intervals);
+        let gaps = di.gaps(lo, hi);
+
+        // All gap intervals are non-empty
+        for g in &gaps {
+            prop_assert!(g.start < g.end,
+                "gap [{}, {}) is empty", g.start, g.end);
+        }
+
+        // Gaps are sorted and disjoint
+        for pair in gaps.windows(2) {
+            prop_assert!(pair[0].end <= pair[1].start,
+                "gaps overlap or unsorted: [{}, {}) and [{}, {})",
+                pair[0].start, pair[0].end, pair[1].start, pair[1].end);
+        }
+
+        // All gaps are within [lo, hi)
+        for g in &gaps {
+            prop_assert!(g.start >= lo && g.end <= hi,
+                "gap [{}, {}) outside bounds [{}, {})", g.start, g.end, lo, hi);
+        }
+    }
+
+    /// Gap points are not contained in any interval.
+    #[test]
+    fn prop_gap_points_not_contained(
+        intervals in arb_intervals(8),
+        lo in -20i64..=0,
+        hi_offset in 1i64..=40,
+    ) {
+        let hi = lo + hi_offset;
+        let di = build_di(&intervals);
+        let gaps = di.gaps(lo, hi);
+
+        for g in &gaps {
+            // Sample up to 10 points from each gap
+            let sample_count = (g.end - g.start).min(10);
+            for i in 0..sample_count {
+                let p = g.start + i;
+                prop_assert!(!di.contains(p),
+                    "gap point {} is contained but shouldn't be", p);
+            }
+        }
+    }
+}
+
+// ── from_config with merge_adjacent=false ───────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// With merge_adjacent=false, adjacent (touching) intervals stay separate.
+    #[test]
+    fn prop_no_merge_adjacent_keeps_touching(
+        base in 0i64..=50,
+        len1 in 1i64..=20,
+        len2 in 1i64..=20,
+    ) {
+        let config = DisjointIntervalsConfig { merge_adjacent: false };
+        let mut di = DisjointIntervals::from_config(&config);
+        di.insert(base, base + len1);
+        di.insert(base + len1, base + len1 + len2);  // adjacent, not overlapping
+
+        // With merge_adjacent=false, these should remain as two separate intervals
+        prop_assert_eq!(di.count(), 2,
+            "adjacent intervals should stay separate when merge_adjacent=false, \
+             got count={}", di.count());
+
+        // Total span should equal the sum of both lengths
+        let expected_span = len1 + len2;
+        prop_assert_eq!(di.span(), expected_span,
+            "span {} != expected {}", di.span(), expected_span);
+    }
+}
