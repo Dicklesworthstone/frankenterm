@@ -2,7 +2,7 @@
 //!
 //! Uses a HashMap for key→index lookup and an arena-based doubly-linked list
 //! for recency ordering. All get/put/remove operations are O(1) amortized.
-//! No unsafe code — uses Vec<Node> with index-based links instead of raw pointers.
+//! No unsafe code — uses `Vec<Node>` with index-based links instead of raw pointers.
 //!
 //! # Features
 //! - O(1) get, put, remove, peek

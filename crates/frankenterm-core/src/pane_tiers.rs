@@ -15,7 +15,7 @@
 //! | Background | 10s      | Minimized/hidden tab                 |
 //! | Dormant    | 30s      | Rate-limited or paused > 5 min       |
 //!
-//! Tiers interact with [`BackpressureTier`](crate::backpressure::BackpressureTier)
+//! Tiers interact with [`BackpressureTier`]
 //! via multipliers: under system pressure, all intervals are scaled up.
 
 use std::collections::HashMap;

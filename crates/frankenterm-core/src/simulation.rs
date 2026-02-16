@@ -1,7 +1,7 @@
 //! Simulation scenario system for testing and demos.
 //!
 //! Defines declarative YAML scenarios that can be applied to a
-//! [`MockWezterm`](crate::wezterm::MockWezterm) for reproducible testing
+//! [`MockWezterm`] for reproducible testing
 //! and interactive demonstrations.
 
 use std::collections::{BTreeMap, HashMap, HashSet};

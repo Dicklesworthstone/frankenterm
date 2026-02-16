@@ -102,9 +102,9 @@ impl ThrottleActions {
 
 /// Continuous backpressure severity model with EMA smoothing.
 ///
-/// Call [`observe`] with each queue depth sample to update the smoothed
-/// ratio and severity. Read the current state with [`severity`],
-/// [`throttle_actions`], or [`equivalent_tier`].
+/// Call `observe` with each queue depth sample to update the smoothed
+/// ratio and severity. Read the current state with `severity`,
+/// `throttle_actions`, or `equivalent_tier`.
 #[derive(Debug, Clone)]
 pub struct ContinuousBackpressure {
     config: SeverityConfig,

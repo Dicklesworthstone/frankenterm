@@ -470,7 +470,7 @@ impl std::fmt::Debug for StorageTelemetry {
 // InstrumentedStorage — decorator wrapper
 // =============================================================================
 
-/// Decorator that wraps any [`RecorderStorage`] implementation with automatic
+/// Decorator that wraps any `RecorderStorage` implementation with automatic
 /// telemetry recording. Each trait method is timed and its outcome is recorded
 /// to the [`StorageTelemetry`] collector.
 pub struct InstrumentedStorage<S> {

@@ -7,7 +7,7 @@
 //!
 //! The pool manages a fixed set of connection slots. Each slot holds either
 //! an idle connection or is empty (available for a new connection). Callers
-//! acquire a [`PoolGuard`] which provides access to a connection and
+//! acquire a `PoolGuard` which provides access to a connection and
 //! automatically returns it to the pool on drop.
 //!
 //! For CLI mode, pooling acts as a concurrency limiter — the underlying

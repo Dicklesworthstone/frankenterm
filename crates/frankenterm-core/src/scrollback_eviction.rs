@@ -251,7 +251,7 @@ impl LineImportanceScorer {
         &self.config
     }
 
-    /// Compute [0,1] importance for one line.
+    /// Compute `[0,1]` importance for one line.
     #[must_use]
     pub fn score_line(&self, line: &str, previous_line: Option<&str>) -> f64 {
         let mut score = self.config.baseline;

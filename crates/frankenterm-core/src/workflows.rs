@@ -4114,7 +4114,7 @@ impl CoordinationResult {
 /// Evaluate which panes in a group pass preconditions and return per-pane outcomes.
 ///
 /// This is the core "filter before broadcast" logic that prevents spraying actions
-/// to panes that aren't ready. Returns a vec of (pane_id, Option<outcome>) where
+/// to panes that aren't ready. Returns a vec of (pane_id, `Option<outcome>`) where
 /// `None` means the pane passed all preconditions.
 #[must_use]
 pub fn evaluate_pane_preconditions<S: ::std::hash::BuildHasher>(
@@ -7981,7 +7981,7 @@ impl Workflow for HandleUsageLimits {
 ///
 /// Supported agents: Codex, Claude Code, Gemini.
 /// Extracts available fields (session_id, tokens, cost, end_reason) from the
-/// detection trigger and upserts an [`AgentSessionRecord`].
+/// detection trigger and upserts an `AgentSessionRecord`.
 pub struct HandleSessionEnd;
 
 impl HandleSessionEnd {

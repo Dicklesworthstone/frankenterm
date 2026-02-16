@@ -211,7 +211,7 @@ struct PaneState {
 }
 
 /// The pane lifecycle engine — classifies pane health, recommends actions,
-/// and delegates process classification to [`process_triage`].
+/// and delegates process classification to `process_triage`.
 pub struct PaneLifecycleEngine {
     config: LifecycleConfig,
     pane_states: Vec<PaneState>,
@@ -319,7 +319,7 @@ impl PaneLifecycleEngine {
 
     /// Build a triage plan from the current pane states and their process trees.
     ///
-    /// Delegates to [`process_triage::build_plan`] with pane-aware context.
+    /// Delegates to `process_triage::build_plan` with pane-aware context.
     #[must_use]
     pub fn build_triage_plan(
         &self,

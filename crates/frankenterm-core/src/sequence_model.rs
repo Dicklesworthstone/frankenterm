@@ -2,8 +2,8 @@
 //!
 //! This module defines the ordering and correlation rules that make flight-recorder
 //! replay deterministic across panes. It bridges the per-pane sequence counters
-//! (from [`IngressSequence`] / [`EgressEvent::sequence`]) with the process-wide
-//! [`GlobalSequence`] and adds correlation metadata for causal reconstruction.
+//! (from `IngressSequence` / `EgressEvent::sequence`) with the process-wide
+//! `GlobalSequence` and adds correlation metadata for causal reconstruction.
 //!
 //! # Ordering Contract
 //!
@@ -322,7 +322,7 @@ impl CorrelationTracker {
     }
 
     /// Start a named batch for a pane. Events on this pane will carry the
-    /// batch ID until [`end_batch`] is called.
+    /// batch ID until `end_batch` is called.
     pub fn start_batch(&self, pane_id: u64, batch_id: String) {
         self.active_batches
             .lock()

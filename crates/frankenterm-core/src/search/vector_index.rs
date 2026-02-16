@@ -162,7 +162,7 @@ impl<W: Write> FtviWriter<W> {
     }
 }
 
-/// Write an FTVI index to a Vec<u8> with correct count header.
+/// Write an FTVI index to a `Vec<u8>` with correct count header.
 pub fn write_ftvi_vec(dimension: u16, records: &[(u64, &[f32])]) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     buf.extend_from_slice(MAGIC);

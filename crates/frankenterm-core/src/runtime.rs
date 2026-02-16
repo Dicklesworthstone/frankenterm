@@ -2392,7 +2392,7 @@ impl ObservationRuntime {
 
     /// Take ownership of the storage handle for external shutdown.
     ///
-    /// Returns the storage handle wrapped in Arc<Mutex>. The caller is
+    /// Returns the storage handle wrapped in `Arc<Mutex>`. The caller is
     /// responsible for shutdown. This invalidates the runtime.
     #[must_use]
     pub fn take_storage(self) -> Arc<tokio::sync::Mutex<StorageHandle>> {

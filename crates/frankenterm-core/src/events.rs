@@ -1177,7 +1177,7 @@ impl Default for EventFilter {
 ///
 /// Typical usage in the runtime persistence task:
 ///
-/// ```ignore
+/// ```text
 /// if gate.should_notify(&detection, pane_id, None) == NotifyDecision::Send { … }
 /// ```
 #[derive(Debug)]

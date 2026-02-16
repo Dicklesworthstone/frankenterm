@@ -1175,7 +1175,7 @@ impl DistributedConfig {
 #[serde(default)]
 pub struct PatternsConfig {
     /// Enabled pattern packs (order matters for overrides)
-    /// Format: "builtin:<name>" or "file:<path>"
+    /// Format: `builtin:<name>` or `file:<path>`
     pub packs: Vec<String>,
 
     /// Per-pack configuration overrides

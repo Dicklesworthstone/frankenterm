@@ -251,7 +251,7 @@ impl ResizeCrashContextBuilder {
     }
 
     /// Record a policy decision.  Oldest decisions are evicted when
-    /// the buffer exceeds [`MAX_POLICY_DECISIONS`].
+    /// the buffer exceeds `MAX_POLICY_DECISIONS`.
     #[must_use]
     pub fn add_policy_decision(mut self, decision: PolicyDecision) -> Self {
         if self.policy_decisions.len() >= MAX_POLICY_DECISIONS {

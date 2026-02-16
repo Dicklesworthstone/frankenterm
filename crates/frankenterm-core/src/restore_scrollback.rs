@@ -10,7 +10,7 @@
 //! output_segments (DB) → ScrollbackData → ScrollbackInjector → send_text → pane
 //! ```
 //!
-//! Uses [`WeztermInterface::send_text`] for injection. Content is chunked to
+//! Uses `WeztermInterface::send_text` for injection. Content is chunked to
 //! avoid overwhelming the terminal parser and injected concurrently across
 //! multiple panes via a semaphore.
 //!

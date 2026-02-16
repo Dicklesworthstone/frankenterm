@@ -438,7 +438,7 @@ pub struct DecisionEvidence {
 /// Snapshot of rate limit state when a decision is made.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimitSnapshot {
-    /// Scope string (per_pane:<id> or global)
+    /// Scope string (`per_pane:<id>` or `global`)
     pub scope: String,
     /// Action kind
     pub action: String,

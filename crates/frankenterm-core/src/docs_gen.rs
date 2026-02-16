@@ -1,7 +1,7 @@
 //! Schema-driven API reference documentation generator.
 //!
 //! Consumes JSON Schema files from `docs/json-schema/` and
-//! [`SchemaRegistry`](crate::api_schema::SchemaRegistry) metadata to produce
+//! [`SchemaRegistry`] metadata to produce
 //! deterministic Markdown reference pages.
 //!
 //! # Design

@@ -11,7 +11,7 @@
 //! - **Frame corruption detection**: heuristics to detect when a PDU stream
 //!   is corrupted vs a transient I/O hiccup.
 //! - **Degradation integration**: reports sustained failures to the
-//!   [`DegradationManager`] so the system can adapt.
+//!   `DegradationManager` so the system can adapt.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

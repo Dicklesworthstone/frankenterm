@@ -14,7 +14,7 @@
 //! [`ShardedMax`] tracks a running maximum using the same sharding, with
 //! per-shard CAS loops and a cross-shard max on read.
 //!
-//! [`ShardedMetrics`] bundles multiple named counters and maxes into a
+//! `ShardedMetrics` bundles multiple named counters and maxes into a
 //! single cache-friendly struct.
 //!
 //! # Cache Line Padding

@@ -1537,7 +1537,7 @@ pub struct PaneCaptureState {
 /// The checkpoint is versioned so future changes can be detected and handled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureCheckpoint {
-    /// Format version (always [`CHECKPOINT_FORMAT_VERSION`]).
+    /// Format version (always `CHECKPOINT_FORMAT_VERSION`).
     pub version: u32,
     /// Epoch seconds when the checkpoint was created.
     pub created_at: u64,

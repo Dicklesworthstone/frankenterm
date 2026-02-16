@@ -3,7 +3,7 @@
 //! Given a [`TopologySnapshot`] captured by the session persistence system,
 //! this module recreates the exact window/tab/pane arrangement using
 //! `wezterm cli spawn` and `wezterm cli split-pane` commands via the
-//! [`WeztermInterface`] trait.
+//! `WeztermInterface` trait.
 //!
 //! # Data flow
 //!
