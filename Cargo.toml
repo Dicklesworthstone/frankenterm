@@ -422,14 +422,13 @@ strip = true        # Remove debug symbols
 # Without these patches, cargo cannot resolve those transitive path deps when fetching
 # the upstream repos as git dependencies.
 [patch.crates-io]
-rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", branch = "master" }
-# Track upstream asupersync to pick up runtime/reactor fixes (including
-# macOS kqueue compatibility) faster than crates.io releases.
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", branch = "master" }
+# Pin git revs to avoid branch drift and to keep the dependency graph single-sourced.
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "f58a4e5e437aa564286729c0e2ec50b1e62c1f0e" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "f9098d74f3dfa4bd141356ada9daa5d9c0f3bdc1" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
-rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", branch = "master" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "f9098d74f3dfa4bd141356ada9daa5d9c0f3bdc1" }
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "f58a4e5e437aa564286729c0e2ec50b1e62c1f0e" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "f9098d74f3dfa4bd141356ada9daa5d9c0f3bdc1" }

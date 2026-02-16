@@ -31,10 +31,7 @@ fn arb_depth() -> impl Strategy<Value = usize> {
 }
 
 fn arb_config() -> impl Strategy<Value = CmsConfig> {
-    (arb_width(), arb_depth()).prop_map(|(w, d)| CmsConfig {
-        width: w,
-        depth: d,
-    })
+    (arb_width(), arb_depth()).prop_map(|(w, d)| CmsConfig { width: w, depth: d })
 }
 
 fn arb_items(max_len: usize) -> impl Strategy<Value = Vec<u64>> {
