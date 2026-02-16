@@ -28442,6 +28442,7 @@ const PRAGMASEVKA_BUNDLED_ZST_SHA256: &str =
 const PRAGMASEVKA_BUNDLED_PAYLOAD_ZST: &[u8] = include_bytes!("../assets/Pragmasevka_NF.zip.zst");
 const PRAGMASEVKA_FONT_FILES: &[&str] = &["pragmasevka-nf-regular.ttf"];
 const PRAGMASEVKA_MARKER_FILE: &str = ".ft-pragmasevka-nf-v1.7.0.sha256";
+const FT_SKIP_BUNDLED_FONT_INSTALL_ENV: &str = "FT_SKIP_BUNDLED_FONT_INSTALL";
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -28625,7 +28626,20 @@ fn refresh_linux_font_cache(_font_dir: &Path, _verbose: u8) -> Option<String> {
     None
 }
 
+fn bundled_font_auto_install_disabled(raw_value: Option<std::ffi::OsString>) -> bool {
+    let Some(value) = raw_value else {
+        return false;
+    };
+
+    let normalized = value.to_string_lossy().trim().to_ascii_lowercase();
+    matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+}
+
 fn should_auto_install_bundled_font(command: Option<&Commands>) -> bool {
+    if bundled_font_auto_install_disabled(std::env::var_os(FT_SKIP_BUNDLED_FONT_INSTALL_ENV)) {
+        return false;
+    }
+
     !matches!(
         command,
         Some(
@@ -36173,6 +36187,27 @@ log_level = "debug"
     }
 
     #[test]
+    fn bundled_font_auto_install_opt_out_parses_truthy_values() {
+        for truthy in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(
+                bundled_font_auto_install_disabled(Some(std::ffi::OsString::from(truthy))),
+                "expected truthy value to disable auto install: {truthy}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_font_auto_install_opt_out_parses_falsey_values() {
+        for falsey in ["0", "false", "off", "no", "random"] {
+            assert!(
+                !bundled_font_auto_install_disabled(Some(std::ffi::OsString::from(falsey))),
+                "expected falsey value to keep auto install enabled: {falsey}"
+            );
+        }
+        assert!(!bundled_font_auto_install_disabled(None));
+    }
+
+    #[test]
     fn bundled_pragmasevka_payload_hashes_match_manifest() {
         assert_eq!(
             sha256_hex(PRAGMASEVKA_BUNDLED_PAYLOAD_ZST),
@@ -36231,6 +36266,47 @@ log_level = "debug"
         assert!(
             bundled_pragmasevka_installed(&temp_dir),
             "all expected files should count as installed"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn bundled_pragmasevka_install_is_idempotent_and_writes_marker_metadata() {
+        let temp_dir = unique_temp_dir("font_install_idempotent");
+
+        let first = install_bundled_pragmasevka(&temp_dir)
+            .expect("first bundled font install should succeed");
+        assert_eq!(
+            first.len(),
+            PRAGMASEVKA_FONT_FILES.len(),
+            "installer should write expected number of font files"
+        );
+        assert!(
+            bundled_pragmasevka_installed(&temp_dir),
+            "first install should satisfy installed detector"
+        );
+
+        let marker_path = temp_dir.join(PRAGMASEVKA_MARKER_FILE);
+        let marker =
+            std::fs::read_to_string(&marker_path).expect("font install marker should be readable");
+        assert!(marker.contains("font=Pragmasevka NF"));
+        assert!(marker.contains(&format!("version={}", PRAGMASEVKA_BUNDLED_VERSION)));
+        assert!(marker.contains(&format!("source={}", PRAGMASEVKA_BUNDLED_SOURCE_URL)));
+        assert!(marker.contains(&format!("zip_sha256={}", PRAGMASEVKA_BUNDLED_ZIP_SHA256)));
+        assert!(marker.contains(&format!("zst_sha256={}", PRAGMASEVKA_BUNDLED_ZST_SHA256)));
+        assert!(marker.contains("installed_at_utc="));
+
+        let second = install_bundled_pragmasevka(&temp_dir)
+            .expect("second bundled font install should succeed");
+        assert_eq!(
+            second.len(),
+            first.len(),
+            "reinstall should write same set of bundled font files"
+        );
+        assert!(
+            bundled_pragmasevka_installed(&temp_dir),
+            "reinstall should remain idempotently installed"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

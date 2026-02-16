@@ -207,6 +207,12 @@ ft setup
 # Bundled Pragmasevka Nerd Font auto-installs on normal ft usage
 # (no `ft setup font --apply` required), and generated wezterm config
 # defaults to it automatically.
+
+# Manual install / reinstall path:
+ft setup font --apply
+
+# Opt out of automatic font install for this invocation:
+FT_SKIP_BUNDLED_FONT_INSTALL=1 ft status
 ```
 
 ### 2. Verify Terminal Backend Connectivity
