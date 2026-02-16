@@ -492,4 +492,240 @@ mod tests {
         assert_eq!(veb.min(), Some(50));
         assert_eq!(veb.max(), Some(99));
     }
+
+    // ── Expanded test coverage ──────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "universe size must be positive")]
+    fn zero_universe_panics() {
+        VanEmdeBoas::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "universe size must be <= 2^20")]
+    fn too_large_universe_panics() {
+        VanEmdeBoas::new(2_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of universe")]
+    fn insert_out_of_bounds_panics() {
+        let mut veb = VanEmdeBoas::new(100);
+        veb.insert(100);
+    }
+
+    #[test]
+    fn contains_out_of_bounds() {
+        let veb = VanEmdeBoas::new(100);
+        assert!(!veb.contains(100));
+        assert!(!veb.contains(1000));
+    }
+
+    #[test]
+    fn remove_out_of_bounds() {
+        let mut veb = VanEmdeBoas::new(100);
+        assert!(!veb.remove(100));
+        assert!(!veb.remove(1000));
+    }
+
+    #[test]
+    fn universe_size_accessor() {
+        let veb = VanEmdeBoas::new(500);
+        assert_eq!(veb.universe_size(), 500);
+    }
+
+    #[test]
+    fn successor_on_empty() {
+        let veb = VanEmdeBoas::new(256);
+        assert!(veb.successor(0).is_none());
+        assert!(veb.successor(100).is_none());
+    }
+
+    #[test]
+    fn predecessor_on_empty() {
+        let veb = VanEmdeBoas::new(256);
+        assert!(veb.predecessor(100).is_none());
+        assert!(veb.predecessor(0).is_none());
+    }
+
+    #[test]
+    fn successor_of_max() {
+        let mut veb = VanEmdeBoas::new(256);
+        veb.insert(200);
+        assert!(veb.successor(200).is_none());
+    }
+
+    #[test]
+    fn predecessor_of_min() {
+        let mut veb = VanEmdeBoas::new(256);
+        veb.insert(0);
+        assert!(veb.predecessor(0).is_none());
+    }
+
+    #[test]
+    fn iter_empty() {
+        let veb = VanEmdeBoas::new(256);
+        assert!(veb.iter().is_empty());
+    }
+
+    #[test]
+    fn iter_single() {
+        let mut veb = VanEmdeBoas::new(256);
+        veb.insert(42);
+        assert_eq!(veb.iter(), vec![42]);
+    }
+
+    #[test]
+    fn clear_then_reinsert() {
+        let mut veb = VanEmdeBoas::new(256);
+        veb.insert(10);
+        veb.insert(20);
+        veb.clear();
+
+        assert!(!veb.contains(10));
+        assert!(!veb.contains(20));
+
+        veb.insert(30);
+        assert_eq!(veb.len(), 1);
+        assert_eq!(veb.min(), Some(30));
+        assert_eq!(veb.max(), Some(30));
+    }
+
+    #[test]
+    fn remove_all_individually() {
+        let mut veb = VanEmdeBoas::new(256);
+        for i in [5, 10, 15, 20, 25] {
+            veb.insert(i);
+        }
+        for i in [5, 10, 15, 20, 25] {
+            assert!(veb.remove(i));
+        }
+        assert!(veb.is_empty());
+        assert!(veb.min().is_none());
+        assert!(veb.max().is_none());
+    }
+
+    #[test]
+    fn remove_in_reverse_order() {
+        let mut veb = VanEmdeBoas::new(256);
+        for i in 0..10u32 {
+            veb.insert(i);
+        }
+        for i in (0..10u32).rev() {
+            assert!(veb.remove(i));
+            if i > 0 {
+                assert_eq!(veb.max(), Some(i - 1));
+            }
+        }
+        assert!(veb.is_empty());
+    }
+
+    #[test]
+    fn min_max_after_remove_middle() {
+        let mut veb = VanEmdeBoas::new(256);
+        veb.insert(10);
+        veb.insert(50);
+        veb.insert(100);
+        veb.remove(50);
+        assert_eq!(veb.min(), Some(10));
+        assert_eq!(veb.max(), Some(100));
+    }
+
+    #[test]
+    fn successor_predecessor_chain() {
+        let mut veb = VanEmdeBoas::new(256);
+        for val in [10, 30, 50, 70, 90] {
+            veb.insert(val);
+        }
+        // Walk forward via successor
+        let mut forward = Vec::new();
+        let mut current = veb.min();
+        while let Some(val) = current {
+            forward.push(val);
+            current = veb.successor(val);
+        }
+        assert_eq!(forward, vec![10, 30, 50, 70, 90]);
+
+        // Walk backward via predecessor
+        let mut backward = Vec::new();
+        let mut current = veb.max();
+        while let Some(val) = current {
+            backward.push(val);
+            current = veb.predecessor(val);
+        }
+        assert_eq!(backward, vec![90, 70, 50, 30, 10]);
+    }
+
+    #[test]
+    fn dense_fill() {
+        let mut veb = VanEmdeBoas::new(128);
+        for i in 0..128u32 {
+            veb.insert(i);
+        }
+        assert_eq!(veb.len(), 128);
+        assert_eq!(veb.min(), Some(0));
+        assert_eq!(veb.max(), Some(127));
+
+        for i in 0..127u32 {
+            assert_eq!(veb.successor(i), Some(i + 1));
+        }
+    }
+
+    #[test]
+    fn clone_independence() {
+        let mut veb = VanEmdeBoas::new(256);
+        veb.insert(10);
+        veb.insert(20);
+
+        let mut cloned = veb.clone();
+        cloned.insert(30);
+        cloned.remove(10);
+
+        assert_eq!(veb.len(), 2);
+        assert_eq!(cloned.len(), 2);
+        assert!(veb.contains(10));
+        assert!(!cloned.contains(10));
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_all_queries() {
+        let mut veb = VanEmdeBoas::new(256);
+        for val in [0, 42, 100, 200, 255] {
+            veb.insert(val);
+        }
+
+        let json = serde_json::to_string(&veb).unwrap();
+        let restored: VanEmdeBoas = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.iter(), veb.iter());
+        assert_eq!(restored.successor(42), veb.successor(42));
+        assert_eq!(restored.predecessor(200), veb.predecessor(200));
+        assert!(restored.contains(100));
+    }
+
+    #[test]
+    fn display_empty() {
+        let veb = VanEmdeBoas::new(256);
+        assert_eq!(format!("{}", veb), "VanEmdeBoas(universe=256, count=0)");
+    }
+
+    #[test]
+    fn small_universe() {
+        let mut veb = VanEmdeBoas::new(1);
+        assert!(veb.insert(0));
+        assert_eq!(veb.len(), 1);
+        assert_eq!(veb.min(), Some(0));
+        assert_eq!(veb.max(), Some(0));
+        assert!(veb.successor(0).is_none());
+        assert!(veb.predecessor(0).is_none());
+    }
+
+    #[test]
+    fn universe_size_two() {
+        let mut veb = VanEmdeBoas::new(2);
+        veb.insert(0);
+        veb.insert(1);
+        assert_eq!(veb.successor(0), Some(1));
+        assert_eq!(veb.predecessor(1), Some(0));
+    }
 }
