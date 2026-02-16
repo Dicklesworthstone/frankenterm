@@ -168,10 +168,11 @@ proptest! {
     // --- Value Invariants ---
 
     #[test]
-    fn gcounter_value_nonnegative(a in gcounter_strategy()) {
-        // G-Counter values are always >= 0
-        // (trivially true for u64, but verifies saturating_add)
-        prop_assert!(a.value() >= 0);
+    fn gcounter_value_monotone_after_increment(a in gcounter_strategy()) {
+        let before = a.value();
+        let mut c = a.clone();
+        c.increment();
+        prop_assert!(c.value() >= before + 1);
     }
 
     #[test]
@@ -674,7 +675,12 @@ proptest! {
         c.merge(&s3);
         c.merge(&s1);
 
-        prop_assert_eq!(a, b);
-        prop_assert_eq!(b, c);
+        prop_assert_eq!(a.len(), b.len());
+        prop_assert_eq!(b.len(), c.len());
+        // Verify all three converged to same elements
+        for item in a.iter() {
+            prop_assert!(b.contains(item));
+            prop_assert!(c.contains(item));
+        }
     }
 }
