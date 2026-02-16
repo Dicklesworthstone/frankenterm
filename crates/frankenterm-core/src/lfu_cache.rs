@@ -59,9 +59,22 @@ pub struct LfuCacheStats {
 
 /// Internal entry storing value and metadata.
 #[derive(Debug, Clone)]
-struct CacheEntry<V> {
+struct CacheEntry<K, V> {
     value: V,
     frequency: u64,
+    prev: Option<K>,
+    next: Option<K>,
+}
+
+/// Keys in each frequency bucket are maintained in insertion/access order so
+/// ties can be evicted by LRU policy within the same frequency.
+#[derive(Debug, Clone)]
+struct FrequencyBucket<K> {
+    head: Option<K>,
+    tail: Option<K>,
+    len: usize,
+    prev_frequency: Option<u64>,
+    next_frequency: Option<u64>,
 }
 
 /// O(1) Least Frequently Used cache.
@@ -84,9 +97,9 @@ struct CacheEntry<V> {
 #[derive(Debug, Clone)]
 pub struct LfuCache<K, V> {
     /// Key -> entry mapping.
-    entries: HashMap<K, CacheEntry<V>>,
-    /// Frequency -> ordered list of keys (oldest first = eviction candidate).
-    frequency_buckets: HashMap<u64, Vec<K>>,
+    entries: HashMap<K, CacheEntry<K, V>>,
+    /// Frequency -> linked bucket of keys for O(1) promote/evict operations.
+    frequency_buckets: HashMap<u64, FrequencyBucket<K>>,
     /// Maximum capacity.
     capacity: usize,
     /// Minimum frequency in the cache.
@@ -150,38 +163,15 @@ impl<K: Hash + Eq + Clone, V> LfuCache<K, V> {
     ///
     /// Increments the access frequency of the entry.
     pub fn get(&mut self, key: &K) -> Option<&V> {
-        if !self.entries.contains_key(key) {
+        let old_frequency = if let Some(entry) = self.entries.get(key) {
+            entry.frequency
+        } else {
             self.misses += 1;
             return None;
-        }
+        };
         self.hits += 1;
 
-        // Increment frequency
-        let old_freq;
-        {
-            let entry = self.entries.get_mut(key).unwrap();
-            old_freq = entry.frequency;
-            entry.frequency += 1;
-        }
-        let new_freq = old_freq + 1;
-
-        // Move key from old frequency bucket to new
-        self.remove_from_bucket(old_freq, key);
-        self.frequency_buckets
-            .entry(new_freq)
-            .or_default()
-            .push(key.clone());
-
-        // Update min_frequency if we emptied the min bucket
-        if old_freq == self.min_frequency {
-            if let Some(bucket) = self.frequency_buckets.get(&old_freq) {
-                if bucket.is_empty() {
-                    self.min_frequency = new_freq;
-                }
-            } else {
-                self.min_frequency = new_freq;
-            }
-        }
+        self.bump_frequency(key.clone(), old_frequency);
 
         self.entries.get(key).map(|e| &e.value)
     }
@@ -209,38 +199,17 @@ impl<K: Hash + Eq + Clone, V> LfuCache<K, V> {
         }
 
         // If key exists, update in place and increment frequency
-        if self.entries.contains_key(&key) {
-            let old_freq;
-            {
-                let entry = self.entries.get_mut(&key).unwrap();
-                old_freq = entry.frequency;
-                entry.frequency += 1;
+        if let Some(old_frequency) = self.entries.get(&key).map(|entry| entry.frequency) {
+            if let Some(entry) = self.entries.get_mut(&key) {
                 entry.value = value;
             }
-            let new_freq = old_freq + 1;
-
-            self.remove_from_bucket(old_freq, &key);
-            self.frequency_buckets
-                .entry(new_freq)
-                .or_default()
-                .push(key);
-
-            if old_freq == self.min_frequency {
-                if let Some(bucket) = self.frequency_buckets.get(&old_freq) {
-                    if bucket.is_empty() {
-                        self.min_frequency = new_freq;
-                    }
-                } else {
-                    self.min_frequency = new_freq;
-                }
-            }
-
+            self.bump_frequency(key, old_frequency);
             return None;
         }
 
         // Evict if at capacity
         let evicted = if self.entries.len() >= self.capacity {
-            self.evict()
+            self.evict_lfu()
         } else {
             None
         };
@@ -251,9 +220,12 @@ impl<K: Hash + Eq + Clone, V> LfuCache<K, V> {
             CacheEntry {
                 value,
                 frequency: 1,
+                prev: None,
+                next: None,
             },
         );
-        self.frequency_buckets.entry(1).or_default().push(key);
+        self.ensure_frequency_bucket_as_min(1);
+        self.link_key_to_bucket_tail(&key, 1);
         self.min_frequency = 1;
 
         evicted
@@ -261,25 +233,7 @@ impl<K: Hash + Eq + Clone, V> LfuCache<K, V> {
 
     /// Remove a key explicitly. Returns the value if it existed.
     pub fn remove(&mut self, key: &K) -> Option<V> {
-        if let Some(entry) = self.entries.remove(key) {
-            self.remove_from_bucket(entry.frequency, key);
-
-            // Update min_frequency if needed
-            if !self.entries.is_empty()
-                && entry.frequency == self.min_frequency
-            {
-                if let Some(bucket) = self.frequency_buckets.get(&self.min_frequency) {
-                    if bucket.is_empty() {
-                        // Find next non-empty bucket
-                        self.recompute_min_frequency();
-                    }
-                }
-            }
-
-            Some(entry.value)
-        } else {
-            None
-        }
+        self.remove_internal(key, false).map(|(_, value)| value)
     }
 
     /// Get the frequency of a key, or None if not present.
@@ -319,38 +273,210 @@ impl<K: Hash + Eq + Clone, V> LfuCache<K, V> {
 
     // ── Internal helpers ────────────────────────────────────────────
 
-    fn remove_from_bucket(&mut self, freq: u64, key: &K) {
-        if let Some(bucket) = self.frequency_buckets.get_mut(&freq) {
-            if let Some(pos) = bucket.iter().position(|k| k == key) {
-                bucket.remove(pos);
+    fn bump_frequency(&mut self, key: K, old_frequency: u64) {
+        let new_frequency = old_frequency.saturating_add(1);
+        self.ensure_frequency_bucket_after(new_frequency, old_frequency);
+
+        let (prev, next) = if let Some(entry) = self.entries.get(&key) {
+            (entry.prev.clone(), entry.next.clone())
+        } else {
+            return;
+        };
+        self.unlink_from_bucket(&key, old_frequency, prev, next);
+
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.frequency = new_frequency;
+        }
+        self.link_key_to_bucket_tail(&key, new_frequency);
+    }
+
+    fn remove_internal(&mut self, key: &K, count_eviction: bool) -> Option<(K, V)> {
+        let (frequency, prev, next) = if let Some(entry) = self.entries.get(key) {
+            (entry.frequency, entry.prev.clone(), entry.next.clone())
+        } else {
+            return None;
+        };
+
+        self.unlink_from_bucket(key, frequency, prev, next);
+        let removed = self.entries.remove(key)?;
+
+        if self.entries.is_empty() {
+            self.min_frequency = 0;
+        }
+        if count_eviction {
+            self.evictions = self.evictions.saturating_add(1);
+        }
+
+        Some((key.clone(), removed.value))
+    }
+
+    fn unlink_from_bucket(&mut self, key: &K, frequency: u64, prev: Option<K>, next: Option<K>) {
+        if let Some(prev_key) = prev.as_ref()
+            && let Some(prev_entry) = self.entries.get_mut(prev_key)
+        {
+            prev_entry.next.clone_from(&next);
+        }
+        if let Some(next_key) = next.as_ref()
+            && let Some(next_entry) = self.entries.get_mut(next_key)
+        {
+            next_entry.prev.clone_from(&prev);
+        }
+
+        let mut remove_bucket = false;
+        let mut bucket_prev_frequency = None;
+        let mut bucket_next_frequency = None;
+
+        if let Some(bucket) = self.frequency_buckets.get_mut(&frequency) {
+            if bucket
+                .head
+                .as_ref()
+                .is_some_and(|bucket_head| bucket_head == key)
+            {
+                bucket.head.clone_from(&next);
+            }
+            if bucket
+                .tail
+                .as_ref()
+                .is_some_and(|bucket_tail| bucket_tail == key)
+            {
+                bucket.tail.clone_from(&prev);
+            }
+            bucket.len = bucket.len.saturating_sub(1);
+
+            if bucket.len == 0 {
+                remove_bucket = true;
+                bucket_prev_frequency = bucket.prev_frequency;
+                bucket_next_frequency = bucket.next_frequency;
+            }
+        }
+
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.prev = None;
+            entry.next = None;
+        }
+
+        if remove_bucket {
+            self.frequency_buckets.remove(&frequency);
+
+            if let Some(prev_frequency) = bucket_prev_frequency
+                && let Some(prev_bucket) = self.frequency_buckets.get_mut(&prev_frequency)
+            {
+                prev_bucket.next_frequency = bucket_next_frequency;
+            }
+            if let Some(next_frequency) = bucket_next_frequency
+                && let Some(next_bucket) = self.frequency_buckets.get_mut(&next_frequency)
+            {
+                next_bucket.prev_frequency = bucket_prev_frequency;
+            }
+
+            if self.min_frequency == frequency {
+                self.min_frequency = bucket_next_frequency.or(bucket_prev_frequency).unwrap_or(0);
             }
         }
     }
 
-    fn evict(&mut self) -> Option<(K, V)> {
-        // Find the LFU bucket (min_frequency)
-        if let Some(bucket) = self.frequency_buckets.get_mut(&self.min_frequency) {
-            if let Some(evict_key) = bucket.first().cloned() {
-                bucket.remove(0);
-                if let Some(entry) = self.entries.remove(&evict_key) {
-                    self.evictions += 1;
+    fn link_key_to_bucket_tail(&mut self, key: &K, frequency: u64) {
+        let current_tail = self
+            .frequency_buckets
+            .get(&frequency)
+            .and_then(|bucket| bucket.tail.clone());
 
-                    // If bucket is now empty, we'll set min_frequency when inserting new entry
-                    return Some((evict_key, entry.value));
-                }
-            }
+        if let Some(tail_key) = current_tail.as_ref()
+            && let Some(tail_entry) = self.entries.get_mut(tail_key)
+        {
+            tail_entry.next = Some(key.clone());
         }
-        None
+
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.prev = current_tail;
+            entry.next = None;
+            entry.frequency = frequency;
+        }
+
+        if let Some(bucket) = self.frequency_buckets.get_mut(&frequency) {
+            if bucket.head.is_none() {
+                bucket.head = Some(key.clone());
+            }
+            bucket.tail = Some(key.clone());
+            bucket.len += 1;
+        }
     }
 
-    fn recompute_min_frequency(&mut self) {
-        // Simple: find minimum frequency among all entries
-        self.min_frequency = self
-            .entries
-            .values()
-            .map(|e| e.frequency)
-            .min()
-            .unwrap_or(0);
+    fn ensure_frequency_bucket_as_min(&mut self, frequency: u64) {
+        if self.frequency_buckets.contains_key(&frequency) {
+            return;
+        }
+
+        if self.min_frequency == 0 {
+            self.frequency_buckets.insert(
+                frequency,
+                FrequencyBucket {
+                    head: None,
+                    tail: None,
+                    len: 0,
+                    prev_frequency: None,
+                    next_frequency: None,
+                },
+            );
+            self.min_frequency = frequency;
+            return;
+        }
+
+        let current_min_frequency = self.min_frequency;
+        self.frequency_buckets.insert(
+            frequency,
+            FrequencyBucket {
+                head: None,
+                tail: None,
+                len: 0,
+                prev_frequency: None,
+                next_frequency: Some(current_min_frequency),
+            },
+        );
+
+        if let Some(current_min_bucket) = self.frequency_buckets.get_mut(&current_min_frequency) {
+            current_min_bucket.prev_frequency = Some(frequency);
+        }
+        self.min_frequency = frequency;
+    }
+
+    fn ensure_frequency_bucket_after(&mut self, frequency: u64, previous_frequency: u64) {
+        if self.frequency_buckets.contains_key(&frequency) {
+            return;
+        }
+        let Some(previous_bucket) = self.frequency_buckets.get(&previous_frequency) else {
+            self.ensure_frequency_bucket_as_min(frequency);
+            return;
+        };
+        let next_frequency = previous_bucket.next_frequency;
+
+        self.frequency_buckets.insert(
+            frequency,
+            FrequencyBucket {
+                head: None,
+                tail: None,
+                len: 0,
+                prev_frequency: Some(previous_frequency),
+                next_frequency,
+            },
+        );
+
+        if let Some(previous_bucket_mut) = self.frequency_buckets.get_mut(&previous_frequency) {
+            previous_bucket_mut.next_frequency = Some(frequency);
+        }
+        if let Some(next_frequency) = next_frequency
+            && let Some(next_bucket) = self.frequency_buckets.get_mut(&next_frequency)
+        {
+            next_bucket.prev_frequency = Some(frequency);
+        }
+    }
+
+    fn evict_lfu(&mut self) -> Option<(K, V)> {
+        let evict_key = self
+            .frequency_buckets
+            .get(&self.min_frequency)
+            .and_then(|bucket| bucket.head.clone())?;
+        self.remove_internal(&evict_key, true)
     }
 }
 
@@ -437,7 +563,7 @@ mod tests {
         let mut cache = LfuCache::new(3);
         cache.insert("a", 1);
         assert_eq!(cache.frequency(&"a"), Some(1));
-        cache.peek(&"a");
+        let _ = cache.peek(&"a");
         assert_eq!(cache.frequency(&"a"), Some(1)); // unchanged
     }
 

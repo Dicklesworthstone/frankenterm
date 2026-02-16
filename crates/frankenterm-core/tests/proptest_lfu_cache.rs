@@ -84,7 +84,7 @@ proptest! {
         prop_assert_eq!(cache.get(&key), Some(&value));
     }
 
-    /// contains_key agrees with get.
+    /// contains_key agrees with peek.
     #[test]
     fn prop_contains_agrees_with_get(
         cap in arb_capacity(),
@@ -95,11 +95,6 @@ proptest! {
         for &(k, v) in &ops {
             cache.insert(k, v);
         }
-        let has = cache.contains_key(&probe);
-        let got = cache.get(&probe).is_some();
-        // Note: get modifies frequency, but the existence should be the same
-        // We can only check this if we do contains first
-        // So let's use peek instead
         let mut cache2: LfuCache<u8, u8> = LfuCache::new(cap);
         for &(k, v) in &ops {
             cache2.insert(k, v);
@@ -194,7 +189,7 @@ proptest! {
         let initial_freq = cache.frequency(&0);
 
         for _ in 0..n_peeks {
-            cache.peek(&0);
+            let _ = cache.peek(&0);
         }
 
         prop_assert_eq!(cache.frequency(&0), initial_freq, "peek changed frequency");
