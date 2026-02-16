@@ -45,6 +45,7 @@ impl BitVec {
         self.bits[word] |= 1u64 << bit;
     }
 
+    #[allow(dead_code)]
     fn get(&self, pos: usize) -> bool {
         let word = pos / 64;
         let bit = pos % 64;

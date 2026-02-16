@@ -460,7 +460,7 @@ impl TDigest {
             }
 
             let last = merged.last().unwrap();
-            let proposed_weight = last.weight + centroid.weight;
+            let _proposed_weight = last.weight + centroid.weight;
 
             // Scale function k₁(q) = (δ/2π) · arcsin(2q - 1).
             // The constraint is that a merged centroid must span at most 1 unit

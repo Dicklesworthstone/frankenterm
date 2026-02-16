@@ -318,7 +318,7 @@ impl<P: Point, V: Clone> KdTree<P, V> {
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
         self.knn_recursive(self.root.unwrap(), query, k, &mut heap);
 
-        let mut results: Vec<(&P, &V, f64)> = heap
+        let results: Vec<(&P, &V, f64)> = heap
             .into_sorted_vec()
             .into_iter()
             .map(|e| {
