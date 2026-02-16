@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c4deeb63a052aad5562af34576d06572c3d204d482fa3bb3263812203b01c1cf # shrinks to accounts = [AccountRecord { id: 0, account_id: "_", service: "a", name: None, percent_remaining: 0.0, reset_at: None, tokens_used: None, tokens_remaining: None, tokens_limit: None, last_refreshed_at: 1000000013, last_used_at: Some(563601042865), created_at: 1603187447306, updated_at: 800002150857 }, AccountRecord { id: 0, account_id: "_", service: "mA-n-F_na_3_3", name: Some("mhO"), percent_remaining: 98.52, reset_at: None, tokens_used: None, tokens_remaining: Some(339780), tokens_limit: None, last_refreshed_at: 1113354435609, last_used_at: None, created_at: 586461112711, updated_at: 376939174687 }], config = AccountSelectionConfig { threshold_percent: 84.74 }
