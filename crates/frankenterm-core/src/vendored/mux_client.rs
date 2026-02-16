@@ -922,6 +922,17 @@ mod tests {
         decode_u64_leb128_prefix(bytes).map(|length| (length & COMPRESSED_MASK) != 0)
     }
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build runtime for mux_client tests");
+        runtime.block_on(future);
+    }
+
     #[test]
     fn decode_from_buffer_roundtrip() {
         let mut buf = Vec::new();
@@ -949,65 +960,67 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn list_panes_roundtrip() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = temp_dir.path().join("mux.sock");
-        let listener = compat_unix::bind(&socket_path)
-            .await
-            .expect("bind listener");
+    #[test]
+    fn list_panes_roundtrip() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("mux.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
 
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
-            let mut responses: HashMap<u64, Pdu> = HashMap::new();
-            loop {
-                let mut temp = vec![0u8; 4096];
-                let read = unix_stream_read(&mut stream, &mut temp)
-                    .await
-                    .expect("read");
-                if read == 0 {
-                    break;
-                }
-                read_buf.extend_from_slice(&temp[..read]);
-                while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
-                    let response = match decoded.pdu {
-                        Pdu::GetCodecVersion(_) => {
-                            let payload = GetCodecVersionResponse {
-                                codec_vers: CODEC_VERSION,
-                                version_string: "wezterm-test".to_string(),
-                                executable_path: PathBuf::from("/bin/wezterm"),
-                                config_file_path: None,
-                            };
-                            Pdu::GetCodecVersionResponse(payload)
-                        }
-                        Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                        Pdu::ListPanes(_) => {
-                            let payload = ListPanesResponse {
-                                tabs: Vec::new(),
-                                tab_titles: Vec::new(),
-                                window_titles: HashMap::new(),
-                            };
-                            Pdu::ListPanesResponse(payload)
-                        }
-                        _ => continue,
-                    };
-                    responses.insert(decoded.serial, response);
-                }
+            task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut responses: HashMap<u64, Pdu> = HashMap::new();
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let payload = GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "wezterm-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                };
+                                Pdu::GetCodecVersionResponse(payload)
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::ListPanes(_) => {
+                                let payload = ListPanesResponse {
+                                    tabs: Vec::new(),
+                                    tab_titles: Vec::new(),
+                                    window_titles: HashMap::new(),
+                                };
+                                Pdu::ListPanesResponse(payload)
+                            }
+                            _ => continue,
+                        };
+                        responses.insert(decoded.serial, response);
+                    }
 
-                for (serial, pdu) in responses.drain() {
-                    let mut out = Vec::new();
-                    pdu.encode(&mut out, serial).expect("encode response");
-                    stream.write_all(&out).await.expect("write response");
+                    for (serial, pdu) in responses.drain() {
+                        let mut out = Vec::new();
+                        pdu.encode(&mut out, serial).expect("encode response");
+                        stream.write_all(&out).await.expect("write response");
+                    }
                 }
-            }
+            });
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            let panes = client.list_panes().await.expect("list panes");
+            assert!(panes.tabs.is_empty());
         });
-
-        let mut config = DirectMuxClientConfig::default();
-        config.socket_path = Some(socket_path);
-        let mut client = DirectMuxClient::connect(config).await.expect("connect");
-        let panes = client.list_panes().await.expect("list panes");
-        assert!(panes.tabs.is_empty());
     }
 
     #[test]
@@ -1337,77 +1350,80 @@ mod tests {
         assert!(!is_local_unix_socket(tmp.path()));
     }
 
-    #[tokio::test]
-    async fn fallback_via_always_override_when_server_rejects_uncompressed() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = temp_dir.path().join("compression-fallback.sock");
-        let listener = compat_unix::bind(&socket_path)
-            .await
-            .expect("bind listener");
+    #[test]
+    fn fallback_via_always_override_when_server_rejects_uncompressed() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("compression-fallback.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
 
-        let server = tokio::spawn(async move {
-            for attempt in 0..2 {
-                let (mut stream, _) = listener.accept().await.expect("accept");
-                let reject_uncompressed = attempt == 0;
-                let mut read_buf = Vec::new();
-                let mut first_frame_checked = false;
+            let server = task::spawn(async move {
+                for attempt in 0..2 {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let reject_uncompressed = attempt == 0;
+                    let mut read_buf = Vec::new();
+                    let mut first_frame_checked = false;
 
-                loop {
-                    let mut temp = vec![0u8; 4096];
-                    let read = unix_stream_read(&mut stream, &mut temp)
-                        .await
-                        .expect("read");
-                    if read == 0 {
-                        break;
-                    }
-                    read_buf.extend_from_slice(&temp[..read]);
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
 
-                    if !first_frame_checked {
-                        if let Some(is_compressed) = frame_marked_compressed(&read_buf) {
-                            first_frame_checked = true;
-                            if reject_uncompressed && !is_compressed {
-                                break;
+                        if !first_frame_checked {
+                            if let Some(is_compressed) = frame_marked_compressed(&read_buf) {
+                                first_frame_checked = true;
+                                if reject_uncompressed && !is_compressed {
+                                    break;
+                                }
                             }
                         }
-                    }
 
-                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
-                        let response = match decoded.pdu {
-                            Pdu::GetCodecVersion(_) => {
-                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                                    codec_vers: CODEC_VERSION,
-                                    version_string: "compression-fallback-test".to_string(),
-                                    executable_path: PathBuf::from("/bin/wezterm"),
-                                    config_file_path: None,
-                                })
-                            }
-                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                            _ => continue,
-                        };
-                        let mut out = Vec::new();
-                        response
-                            .encode(&mut out, decoded.serial)
-                            .expect("encode response");
-                        stream.write_all(&out).await.expect("write response");
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            let response = match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "compression-fallback-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    })
+                                }
+                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                                _ => continue,
+                            };
+                            let mut out = Vec::new();
+                            response
+                                .encode(&mut out, decoded.serial)
+                                .expect("encode response");
+                            stream.write_all(&out).await.expect("write response");
+                        }
                     }
                 }
-            }
+            });
+
+            let auto_config =
+                DirectMuxClientConfig::default().with_socket_path(socket_path.clone());
+            let err = DirectMuxClient::connect(auto_config)
+                .await
+                .expect_err("auto mode should fail when uncompressed PDUs are rejected");
+            assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable);
+
+            let mut fallback = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            fallback.compression_mode = crate::config::VendoredCompressionMode::Always;
+            let client = DirectMuxClient::connect(fallback)
+                .await
+                .expect("explicit always mode should recover compatibility");
+            drop(client);
+
+            server.await.expect("server task");
         });
-
-        let auto_config = DirectMuxClientConfig::default().with_socket_path(socket_path.clone());
-        let err = DirectMuxClient::connect(auto_config)
-            .await
-            .expect_err("auto mode should fail when uncompressed PDUs are rejected");
-        assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable);
-
-        let mut fallback = DirectMuxClientConfig::default().with_socket_path(socket_path);
-        fallback.compression_mode = crate::config::VendoredCompressionMode::Always;
-        let client = DirectMuxClient::connect(fallback)
-            .await
-            .expect("explicit always mode should recover compatibility");
-        drop(client);
-
-        server.await.expect("server task");
     }
 
     #[test]
@@ -1474,15 +1490,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn connect_to_missing_socket_returns_error() {
-        let config = DirectMuxClientConfig::default()
-            .with_socket_path("/tmp/wa-test-nonexistent-socket-12345.sock");
-        let err = DirectMuxClient::connect(config).await.unwrap_err();
-        match err {
-            DirectMuxError::SocketNotFound(_) => {}
-            other => panic!("expected SocketNotFound, got: {other}"),
-        }
+    #[test]
+    fn connect_to_missing_socket_returns_error() {
+        run_async_test(async {
+            let config = DirectMuxClientConfig::default()
+                .with_socket_path("/tmp/wa-test-nonexistent-socket-12345.sock");
+            let err = DirectMuxClient::connect(config).await.unwrap_err();
+            match err {
+                DirectMuxError::SocketNotFound(_) => {}
+                other => panic!("expected SocketNotFound, got: {other}"),
+            }
+        });
     }
 
     #[test]
@@ -1549,43 +1567,45 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn incompatible_codec_version_rejected() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = temp_dir.path().join("mux-incompat.sock");
-        let listener = compat_unix::bind(&socket_path).await.expect("bind");
+    #[test]
+    fn incompatible_codec_version_rejected() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("mux-incompat.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
 
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
-            let mut temp = vec![0u8; 4096];
-            let read = unix_stream_read(&mut stream, &mut temp)
-                .await
-                .expect("read");
-            read_buf.extend_from_slice(&temp[..read]);
-            if let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
-                // Respond with wrong codec version
-                let response = Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                    codec_vers: CODEC_VERSION + 999,
-                    version_string: "incompatible-wezterm".to_string(),
-                    executable_path: PathBuf::from("/bin/wezterm"),
-                    config_file_path: None,
-                });
-                let mut out = Vec::new();
-                response.encode(&mut out, decoded.serial).expect("encode");
-                stream.write_all(&out).await.expect("write");
+            task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut temp = vec![0u8; 4096];
+                let read = unix_stream_read(&mut stream, &mut temp)
+                    .await
+                    .expect("read");
+                read_buf.extend_from_slice(&temp[..read]);
+                if let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                    // Respond with wrong codec version
+                    let response = Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                        codec_vers: CODEC_VERSION + 999,
+                        version_string: "incompatible-wezterm".to_string(),
+                        executable_path: PathBuf::from("/bin/wezterm"),
+                        config_file_path: None,
+                    });
+                    let mut out = Vec::new();
+                    response.encode(&mut out, decoded.serial).expect("encode");
+                    stream.write_all(&out).await.expect("write");
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let err = DirectMuxClient::connect(config).await.unwrap_err();
+            match err {
+                DirectMuxError::IncompatibleCodec { local, remote, .. } => {
+                    assert_eq!(local, CODEC_VERSION);
+                    assert_eq!(remote, CODEC_VERSION + 999);
+                }
+                other => panic!("expected IncompatibleCodec, got: {other}"),
             }
         });
-
-        let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-        let err = DirectMuxClient::connect(config).await.unwrap_err();
-        match err {
-            DirectMuxError::IncompatibleCodec { local, remote, .. } => {
-                assert_eq!(local, CODEC_VERSION);
-                assert_eq!(remote, CODEC_VERSION + 999);
-            }
-            other => panic!("expected IncompatibleCodec, got: {other}"),
-        }
     }
 
     // --- subscribe_pane_output / PaneDelta / SubscriptionConfig tests ---
@@ -1662,222 +1682,228 @@ mod tests {
         assert_eq!(format!("{delta:?}"), format!("{cloned:?}"));
     }
 
-    #[tokio::test]
-    async fn subscription_output_delta_reports_dirty_counts() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = temp_dir.path().join("dirty-counts.sock");
-        let listener = compat_unix::bind(&socket_path).await.expect("bind");
+    #[test]
+    fn subscription_output_delta_reports_dirty_counts() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("dirty-counts.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
 
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
-            let mut emitted_output = false;
+            task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut emitted_output = false;
 
-            loop {
-                let mut temp = vec![0u8; 4096];
-                let read = match unix_stream_read(&mut stream, &mut temp).await {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                read_buf.extend_from_slice(&temp[..read]);
-                while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
-                    let response = match decoded.pdu {
-                        Pdu::GetCodecVersion(_) => {
-                            Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                                codec_vers: CODEC_VERSION,
-                                version_string: "test".to_string(),
-                                executable_path: PathBuf::from("/bin/wezterm"),
-                                config_file_path: None,
-                            })
-                        }
-                        Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                        Pdu::GetPaneRenderChanges(_) => {
-                            let (dirty_lines, seqno) = if emitted_output {
-                                (Vec::new(), 2)
-                            } else {
-                                emitted_output = true;
-                                (vec![0isize..2isize, 4isize..7isize], 1)
-                            };
-
-                            Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
-                                pane_id: 7,
-                                mouse_grabbed: false,
-                                cursor_position: mux::renderable::StableCursorPosition::default(),
-                                dimensions: mux::renderable::RenderableDimensions {
-                                    cols: 80,
-                                    viewport_rows: 24,
-                                    scrollback_rows: 0,
-                                    physical_top: 0,
-                                    scrollback_top: 0,
-                                    dpi: 96,
-                                    pixel_width: 0,
-                                    pixel_height: 0,
-                                    reverse_video: false,
-                                },
-                                dirty_lines,
-                                title: "test".to_string(),
-                                working_dir: None,
-                                bonus_lines: Vec::new().into(),
-                                input_serial: None,
-                                seqno,
-                            })
-                        }
-                        _ => continue,
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = match unix_stream_read(&mut stream, &mut temp).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
                     };
-                    let mut out = Vec::new();
-                    response.encode(&mut out, decoded.serial).expect("encode");
-                    stream.write_all(&out).await.expect("write");
-                }
-            }
-        });
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(_) => {
+                                let (dirty_lines, seqno) = if emitted_output {
+                                    (Vec::new(), 2)
+                                } else {
+                                    emitted_output = true;
+                                    (vec![0isize..2isize, 4isize..7isize], 1)
+                                };
 
-        let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-        let client = DirectMuxClient::connect(config).await.expect("connect");
-        let mut sub = subscribe_pane_output(
-            client,
-            7,
-            SubscriptionConfig {
-                poll_interval: Duration::from_millis(10),
-                min_poll_interval: Duration::from_millis(5),
-                channel_capacity: 8,
-            },
-        );
-
-        let mut observed = None;
-        for _ in 0..20 {
-            match timeout(Duration::from_millis(200), sub.next()).await {
-                Ok(Some(PaneDelta::Output {
-                    pane_id,
-                    dirty_range_count,
-                    dirty_row_count,
-                    ..
-                })) => {
-                    observed = Some((pane_id, dirty_range_count, dirty_row_count));
-                    break;
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => {}
-            }
-        }
-
-        let (pane_id, dirty_range_count, dirty_row_count) =
-            observed.expect("expected output delta with dirty counts");
-        assert_eq!(pane_id, 7);
-        assert_eq!(dirty_range_count, 2);
-        assert_eq!(dirty_row_count, 5);
-        sub.cancel();
-    }
-
-    #[tokio::test]
-    async fn subscription_cancel_stops_poller() {
-        // Create a subscription with a mock socket that never responds.
-        // The poller should shut down when cancelled via the handle.
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = temp_dir.path().join("cancel-test.sock");
-        let listener = compat_unix::bind(&socket_path).await.expect("bind");
-
-        // Server: accept, do codec handshake, then respond to GetPaneRenderChanges
-        // with empty dirty_lines (no deltas to emit).
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
-            loop {
-                let mut temp = vec![0u8; 4096];
-                let read = match unix_stream_read(&mut stream, &mut temp).await {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                read_buf.extend_from_slice(&temp[..read]);
-                while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
-                    let response = match decoded.pdu {
-                        Pdu::GetCodecVersion(_) => {
-                            Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                                codec_vers: CODEC_VERSION,
-                                version_string: "test".to_string(),
-                                executable_path: PathBuf::from("/bin/wezterm"),
-                                config_file_path: None,
-                            })
-                        }
-                        Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                        Pdu::GetPaneRenderChanges(_) => {
-                            // Return empty changes (seqno 0, no dirty lines)
-                            Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
-                                pane_id: 0,
-                                mouse_grabbed: false,
-                                cursor_position: mux::renderable::StableCursorPosition::default(),
-                                dimensions: mux::renderable::RenderableDimensions {
-                                    cols: 80,
-                                    viewport_rows: 24,
-                                    scrollback_rows: 0,
-                                    physical_top: 0,
-                                    scrollback_top: 0,
-                                    dpi: 96,
-                                    pixel_width: 0,
-                                    pixel_height: 0,
-                                    reverse_video: false,
-                                },
-                                dirty_lines: Vec::new(),
-                                title: "test".to_string(),
-                                working_dir: None,
-                                bonus_lines: Vec::new().into(),
-                                input_serial: None,
-                                seqno: 0,
-                            })
-                        }
-                        _ => continue,
-                    };
-                    let mut out = Vec::new();
-                    response.encode(&mut out, decoded.serial).expect("encode");
-                    stream.write_all(&out).await.expect("write");
-                }
-            }
-        });
-
-        let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-        let client = DirectMuxClient::connect(config).await.expect("connect");
-
-        let mut sub = subscribe_pane_output(
-            client,
-            0,
-            SubscriptionConfig {
-                poll_interval: Duration::from_millis(10),
-                min_poll_interval: Duration::from_millis(5),
-                channel_capacity: 8,
-            },
-        );
-
-        // Give the poller time to start
-        sleep(Duration::from_millis(50)).await;
-
-        // Cancel and verify it terminates
-        sub.cancel();
-
-        // next() should return an Ended delta or None eventually
-        let timeout = timeout(Duration::from_secs(2), sub.next()).await;
-        match timeout {
-            Ok(Some(PaneDelta::Ended { reason, .. })) => {
-                assert!(reason.contains("cancelled"));
-            }
-            Ok(None) => {} // channel closed — also fine
-            Ok(Some(other)) => {
-                // Could get a stale delta before Ended; drain until Ended or None
-                let mut found_end = false;
-                let _ = other; // consume
-                for _ in 0..10 {
-                    match sub.next().await {
-                        Some(PaneDelta::Ended { .. }) | None => {
-                            found_end = true;
-                            break;
-                        }
-                        _ => {}
+                                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                    pane_id: 7,
+                                    mouse_grabbed: false,
+                                    cursor_position: mux::renderable::StableCursorPosition::default(
+                                    ),
+                                    dimensions: mux::renderable::RenderableDimensions {
+                                        cols: 80,
+                                        viewport_rows: 24,
+                                        scrollback_rows: 0,
+                                        physical_top: 0,
+                                        scrollback_top: 0,
+                                        dpi: 96,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                        reverse_video: false,
+                                    },
+                                    dirty_lines,
+                                    title: "test".to_string(),
+                                    working_dir: None,
+                                    bonus_lines: Vec::new().into(),
+                                    input_serial: None,
+                                    seqno,
+                                })
+                            }
+                            _ => continue,
+                        };
+                        let mut out = Vec::new();
+                        response.encode(&mut out, decoded.serial).expect("encode");
+                        stream.write_all(&out).await.expect("write");
                     }
                 }
-                assert!(found_end, "should eventually see Ended or channel close");
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let client = DirectMuxClient::connect(config).await.expect("connect");
+            let mut sub = subscribe_pane_output(
+                client,
+                7,
+                SubscriptionConfig {
+                    poll_interval: Duration::from_millis(10),
+                    min_poll_interval: Duration::from_millis(5),
+                    channel_capacity: 8,
+                },
+            );
+
+            let mut observed = None;
+            for _ in 0..20 {
+                match timeout(Duration::from_millis(200), sub.next()).await {
+                    Ok(Some(PaneDelta::Output {
+                        pane_id,
+                        dirty_range_count,
+                        dirty_row_count,
+                        ..
+                    })) => {
+                        observed = Some((pane_id, dirty_range_count, dirty_row_count));
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
             }
-            Err(_) => panic!("subscription did not terminate within timeout"),
-        }
+
+            let (pane_id, dirty_range_count, dirty_row_count) =
+                observed.expect("expected output delta with dirty counts");
+            assert_eq!(pane_id, 7);
+            assert_eq!(dirty_range_count, 2);
+            assert_eq!(dirty_row_count, 5);
+            sub.cancel();
+        });
+    }
+
+    #[test]
+    fn subscription_cancel_stops_poller() {
+        run_async_test(async {
+            // Create a subscription with a mock socket that never responds.
+            // The poller should shut down when cancelled via the handle.
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("cancel-test.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+
+            // Server: accept, do codec handshake, then respond to GetPaneRenderChanges
+            // with empty dirty_lines (no deltas to emit).
+            task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = match unix_stream_read(&mut stream, &mut temp).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(_) => {
+                                // Return empty changes (seqno 0, no dirty lines)
+                                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                    pane_id: 0,
+                                    mouse_grabbed: false,
+                                    cursor_position: mux::renderable::StableCursorPosition::default(
+                                    ),
+                                    dimensions: mux::renderable::RenderableDimensions {
+                                        cols: 80,
+                                        viewport_rows: 24,
+                                        scrollback_rows: 0,
+                                        physical_top: 0,
+                                        scrollback_top: 0,
+                                        dpi: 96,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                        reverse_video: false,
+                                    },
+                                    dirty_lines: Vec::new(),
+                                    title: "test".to_string(),
+                                    working_dir: None,
+                                    bonus_lines: Vec::new().into(),
+                                    input_serial: None,
+                                    seqno: 0,
+                                })
+                            }
+                            _ => continue,
+                        };
+                        let mut out = Vec::new();
+                        response.encode(&mut out, decoded.serial).expect("encode");
+                        stream.write_all(&out).await.expect("write");
+                    }
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let client = DirectMuxClient::connect(config).await.expect("connect");
+
+            let mut sub = subscribe_pane_output(
+                client,
+                0,
+                SubscriptionConfig {
+                    poll_interval: Duration::from_millis(10),
+                    min_poll_interval: Duration::from_millis(5),
+                    channel_capacity: 8,
+                },
+            );
+
+            // Give the poller time to start
+            sleep(Duration::from_millis(50)).await;
+
+            // Cancel and verify it terminates
+            sub.cancel();
+
+            // next() should return an Ended delta or None eventually
+            let timeout = timeout(Duration::from_secs(2), sub.next()).await;
+            match timeout {
+                Ok(Some(PaneDelta::Ended { reason, .. })) => {
+                    assert!(reason.contains("cancelled"));
+                }
+                Ok(None) => {} // channel closed — also fine
+                Ok(Some(other)) => {
+                    // Could get a stale delta before Ended; drain until Ended or None
+                    let mut found_end = false;
+                    let _ = other; // consume
+                    for _ in 0..10 {
+                        match sub.next().await {
+                            Some(PaneDelta::Ended { .. }) | None => {
+                                found_end = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    assert!(found_end, "should eventually see Ended or channel close");
+                }
+                Err(_) => panic!("subscription did not terminate within timeout"),
+            }
+        });
     }
 }
