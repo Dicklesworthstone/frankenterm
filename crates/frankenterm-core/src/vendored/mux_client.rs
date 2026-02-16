@@ -1024,6 +1024,103 @@ mod tests {
     }
 
     #[test]
+    fn list_panes_wire_frame_matches_codec_encoding() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("wire-frame.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut captured_frame: Option<(u64, Vec<u8>)> = None;
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+
+                    loop {
+                        let before_decode = read_buf.clone();
+                        let decoded = match codec::Pdu::stream_decode(&mut read_buf) {
+                            Ok(Some(decoded)) => decoded,
+                            Ok(None) => break,
+                            Err(err) => panic!("failed to decode request frame: {err}"),
+                        };
+                        let consumed = before_decode.len().saturating_sub(read_buf.len());
+                        let raw_frame = before_decode[..consumed].to_vec();
+
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let payload = GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "wezterm-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                };
+                                Pdu::GetCodecVersionResponse(payload)
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::ListPanes(_) => {
+                                captured_frame = Some((decoded.serial, raw_frame));
+                                let payload = ListPanesResponse {
+                                    tabs: Vec::new(),
+                                    tab_titles: Vec::new(),
+                                    window_titles: HashMap::new(),
+                                };
+                                Pdu::ListPanesResponse(payload)
+                            }
+                            _ => continue,
+                        };
+
+                        let mut out = Vec::new();
+                        response
+                            .encode(&mut out, decoded.serial)
+                            .expect("encode response");
+                        stream.write_all(&out).await.expect("write response");
+
+                        if captured_frame.is_some() {
+                            break;
+                        }
+                    }
+
+                    if captured_frame.is_some() {
+                        break;
+                    }
+                }
+
+                captured_frame.expect("captured ListPanes request frame")
+            });
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.compression_mode = crate::config::VendoredCompressionMode::Never;
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            let _ = client.list_panes().await.expect("list panes");
+            drop(client);
+
+            let (serial, observed_frame) = server.await.expect("server task");
+
+            let mut expected_frame = Vec::new();
+            Pdu::ListPanes(ListPanes {})
+                .encode_with_mode(&mut expected_frame, serial, CompressionMode::Never)
+                .expect("encode expected frame");
+
+            assert_eq!(
+                observed_frame, expected_frame,
+                "ListPanes request frame must remain bit-for-bit stable"
+            );
+        });
+    }
+
+    #[test]
     fn next_request_serial_rejects_overflow() {
         let mut serial = u64::MAX;
         let err = next_request_serial(&mut serial).expect_err("overflow should be rejected");
