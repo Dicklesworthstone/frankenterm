@@ -7,8 +7,9 @@
 //! `flame_samples`/`stage_summary` structural invariants.
 
 use frankenterm_core::simulation::{
-    EventAction, ResizeQueueMetrics, ResizeTimeline, ResizeTimelineEvent,
-    ResizeTimelineFlameSample, ResizeTimelineStage, ResizeTimelineStageSample,
+    EventAction, FontAtlasCachePolicy, FontRenderPrepMetrics, ResizeQueueMetrics,
+    ResizeTimeline, ResizeTimelineEvent, ResizeTimelineFlameSample, ResizeTimelineStage,
+    ResizeTimelineStageSample,
 };
 use proptest::prelude::*;
 
@@ -45,21 +46,64 @@ fn arb_queue_metrics() -> impl Strategy<Value = ResizeQueueMetrics> {
     })
 }
 
+fn arb_atlas_cache_policy() -> impl Strategy<Value = FontAtlasCachePolicy> {
+    prop_oneof![
+        Just(FontAtlasCachePolicy::ReuseHotAtlas),
+        Just(FontAtlasCachePolicy::SelectiveInvalidate),
+        Just(FontAtlasCachePolicy::FullRebuild),
+    ]
+}
+
+fn arb_render_prep_metrics() -> impl Strategy<Value = FontRenderPrepMetrics> {
+    (
+        arb_atlas_cache_policy(),
+        any::<bool>(),
+        0_u32..10_000,
+        0_u32..10_000,
+        0_u32..10_000,
+        0_u32..100,
+        0_u32..100,
+    )
+        .prop_map(
+            |(
+                atlas_cache_policy,
+                shader_warmup,
+                cache_hit_glyphs,
+                glyphs_rebuilt_now,
+                deferred_glyphs,
+                staged_batches_total,
+                staged_batches_deferred,
+            )| FontRenderPrepMetrics {
+                atlas_cache_policy,
+                shader_warmup,
+                cache_hit_glyphs,
+                glyphs_rebuilt_now,
+                deferred_glyphs,
+                staged_batches_total,
+                staged_batches_deferred,
+            },
+        )
+}
+
 fn arb_stage_sample() -> impl Strategy<Value = ResizeTimelineStageSample> {
     (
         arb_resize_timeline_stage(),
         0_u64..1_000_000,
         0_u64..1_000_000,
         proptest::option::of(arb_queue_metrics()),
+        proptest::option::of(arb_render_prep_metrics()),
     )
-        .prop_map(|(stage, start_offset_ns, duration_ns, queue_metrics)| {
-            ResizeTimelineStageSample {
-                stage,
-                start_offset_ns,
-                duration_ns,
-                queue_metrics,
-            }
-        })
+        .prop_map(
+            |(stage, start_offset_ns, duration_ns, queue_metrics, render_prep_metrics)| {
+                ResizeTimelineStageSample {
+                    stage,
+                    start_offset_ns,
+                    duration_ns,
+                    queue_metrics,
+                    render_prep_metrics,
+                }
+            },
+        )
 }
 
 fn arb_timeline_event() -> impl Strategy<Value = ResizeTimelineEvent> {
@@ -326,6 +370,7 @@ proptest! {
             start_offset_ns: start,
             duration_ns: dur,
             queue_metrics: None,
+            render_prep_metrics: None,
         };
         let json = serde_json::to_string(&sample).unwrap();
         // skip_serializing_if means "queue_metrics" shouldn't appear
@@ -615,12 +660,14 @@ fn flame_sample_with_known_timeline() {
                     start_offset_ns: 0,
                     duration_ns: 100,
                     queue_metrics: None,
+                    render_prep_metrics: None,
                 },
                 ResizeTimelineStageSample {
                     stage: ResizeTimelineStage::Presentation,
                     start_offset_ns: 100,
                     duration_ns: 400,
                     queue_metrics: None,
+                    render_prep_metrics: None,
                 },
             ],
         }],
