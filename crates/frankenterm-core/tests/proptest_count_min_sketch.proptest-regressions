@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d41ddf7f1bd320fd5a8f4e2eb28b520aa511bde9c6a2a1b93e8fa76f1e282d99 # shrinks to (config, entries) = (CmsConfig { width: 141, depth: 1 }, [])

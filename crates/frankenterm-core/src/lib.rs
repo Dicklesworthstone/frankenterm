@@ -76,6 +76,7 @@ pub mod count_min_sketch;
 pub mod cpu_pressure;
 pub mod cuckoo_filter;
 pub mod crash;
+pub mod crdt;
 pub mod cross_pane_correlation;
 #[cfg(feature = "asupersync-runtime")]
 pub mod cx;
@@ -205,6 +206,7 @@ pub mod telemetry;
 pub mod test_artifacts;
 pub mod token_bucket;
 pub mod undo;
+pub mod union_find;
 pub mod user_preferences;
 pub mod viewport_reflow_planner;
 pub mod voi;
