@@ -636,7 +636,7 @@ impl<V> AdaptiveRadixTree<V> {
         node_idx: usize,
         prefix: &[u8],
         depth: usize,
-        mut key_so_far: Vec<u8>,
+        key_so_far: Vec<u8>,
         results: &mut Vec<(Vec<u8>, &'a V)>,
     ) {
         let node = &self.nodes[node_idx];
@@ -648,19 +648,16 @@ impl<V> AdaptiveRadixTree<V> {
             return; // Mismatch
         }
 
-        key_so_far.extend_from_slice(&node.prefix);
-
         if prefix_remaining.len() <= node.prefix.len() {
-            // The search prefix is fully consumed — collect everything under this node
-            self.collect_all(node_idx, key_so_far.clone(), results);
-            // We already added the current node's value in collect_all,
-            // but we extended key_so_far. Actually, collect_all starts from
-            // this node. We need to skip the prefix extension since collect_all
-            // does it itself. Let me fix this.
+            // The search prefix is fully consumed — collect everything under this node.
+            // collect_all extends key_so_far with node.prefix, so don't extend here.
+            self.collect_all(node_idx, key_so_far, results);
             return;
         }
 
         // Prefix extends beyond this node — follow the child
+        let mut key_so_far = key_so_far;
+        key_so_far.extend_from_slice(&node.prefix);
         let next_depth = depth + node.prefix.len();
         let byte = prefix[next_depth];
         key_so_far.push(byte);
