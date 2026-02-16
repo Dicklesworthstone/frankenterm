@@ -370,4 +370,82 @@ mod tests {
         assert_eq!(info.name, "info-test");
         assert_eq!(info.dimension, 100);
     }
+
+    #[test]
+    fn mock_embedder_as_trait_object() {
+        let emb: Box<dyn Embedder> = Box::new(MockEmbedder {
+            info: EmbedderInfo {
+                name: "boxed".into(),
+                dimension: 8,
+                tier: EmbedderTier::Hash,
+            },
+        });
+        assert_eq!(emb.dimension(), 8);
+        assert_eq!(emb.tier(), EmbedderTier::Hash);
+        let v = emb.embed("test").unwrap();
+        assert_eq!(v.len(), 8);
+    }
+
+    #[test]
+    fn embed_error_debug_all_variants() {
+        let variants: Vec<EmbedError> = vec![
+            EmbedError::ModelNotFound("path".into()),
+            EmbedError::TokenizationFailed("tok".into()),
+            EmbedError::InferenceFailed("inf".into()),
+            EmbedError::DimensionMismatch {
+                expected: 1,
+                actual: 2,
+            },
+            EmbedError::Io(std::io::Error::other("io")),
+        ];
+        for e in variants {
+            let dbg = format!("{:?}", e);
+            assert!(!dbg.is_empty());
+        }
+    }
+
+    #[test]
+    fn embed_error_from_io_preserves_kind() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout");
+        let e = EmbedError::from(io_err);
+        if let EmbedError::Io(inner) = e {
+            assert_eq!(inner.kind(), std::io::ErrorKind::TimedOut);
+        } else {
+            panic!("expected Io variant");
+        }
+    }
+
+    #[test]
+    fn embedder_info_zero_dimension() {
+        let info = EmbedderInfo {
+            name: "zero-dim".into(),
+            dimension: 0,
+            tier: EmbedderTier::Hash,
+        };
+        assert_eq!(info.dimension, 0);
+    }
+
+    #[test]
+    fn embedder_info_large_dimension() {
+        let info = EmbedderInfo {
+            name: "large".into(),
+            dimension: 4096,
+            tier: EmbedderTier::Quality,
+        };
+        assert_eq!(info.dimension, 4096);
+    }
+
+    #[test]
+    fn mock_embedder_embed_batch_single_item() {
+        let emb = MockEmbedder {
+            info: EmbedderInfo {
+                name: "batch1".into(),
+                dimension: 10,
+                tier: EmbedderTier::Fast,
+            },
+        };
+        let results = emb.embed_batch(&["only one"]).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].len(), 10);
+    }
 }
