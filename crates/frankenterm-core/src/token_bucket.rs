@@ -599,4 +599,190 @@ mod tests {
     fn zero_rate_panics() {
         let _ = TokenBucket::new(10.0, 0.0);
     }
+
+    #[test]
+    #[should_panic(expected = "capacity must be positive")]
+    fn negative_capacity_panics() {
+        let _ = TokenBucket::new(-1.0, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "refill_rate must be positive")]
+    fn negative_rate_panics() {
+        let _ = TokenBucket::new(10.0, -5.0);
+    }
+
+    #[test]
+    fn new_bucket_available_equals_capacity() {
+        let mut b = TokenBucket::with_time(7.5, 3.0, 100);
+        let avail = b.available(100);
+        assert!((avail - 7.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn empty_bucket_available_is_zero() {
+        let mut b = TokenBucket::new_empty(10.0, 5.0);
+        b.last_refill_ms = 100;
+        let avail = b.available(100);
+        assert!(avail.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn wait_time_after_partial_refill() {
+        let mut b = TokenBucket::with_time(10.0, 2.0, 0);
+        b.try_acquire(10, 0); // empty
+        // After 1s at 2/sec → 2 tokens. Need 5 → deficit 3, wait 1500ms.
+        let wait = b.wait_time_ms(5, 1000);
+        assert_eq!(wait, 1500);
+    }
+
+    #[test]
+    fn stats_fill_ratio_half() {
+        let mut b = TokenBucket::with_time(10.0, 1.0, 0);
+        b.try_acquire(5, 0);
+        let s = b.stats();
+        assert!((s.fill_ratio - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn stats_fill_ratio_zero_when_empty() {
+        let b = TokenBucket::new_empty(10.0, 1.0);
+        let s = b.stats();
+        assert!(s.fill_ratio.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn config_serde_default_start_empty() {
+        let json = r#"{"capacity":10.0,"refill_rate":5.0}"#;
+        let config: BucketConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.start_empty); // default is false
+    }
+
+    #[test]
+    fn hierarchical_local_accessor() {
+        let local = TokenBucket::with_time(5.0, 2.0, 0);
+        let global = TokenBucket::with_time(50.0, 20.0, 0);
+        let hb = HierarchicalBucket::new(local, global);
+        assert!((hb.local().capacity() - 5.0).abs() < f64::EPSILON);
+        assert!((hb.local().refill_rate() - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn hierarchical_global_accessor() {
+        let local = TokenBucket::with_time(5.0, 2.0, 0);
+        let global = TokenBucket::with_time(50.0, 20.0, 0);
+        let hb = HierarchicalBucket::new(local, global);
+        assert!((hb.global().capacity() - 50.0).abs() < f64::EPSILON);
+        assert!((hb.global().refill_rate() - 20.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn hierarchical_result_is_allowed_variants() {
+        assert!(HierarchicalResult::Allowed.is_allowed());
+        assert!(!HierarchicalResult::DeniedLocal { wait_ms: 100 }.is_allowed());
+        assert!(!HierarchicalResult::DeniedGlobal { wait_ms: 200 }.is_allowed());
+    }
+
+    #[test]
+    fn clone_independence() {
+        let mut b1 = TokenBucket::with_time(10.0, 5.0, 0);
+        let mut b2 = b1.clone();
+        b1.try_acquire(5, 0);
+        // b2 should still be full
+        assert!(b2.try_acquire(10, 0));
+        assert_eq!(b1.total_consumed(), 5);
+        assert_eq!(b2.total_consumed(), 10);
+    }
+
+    #[test]
+    fn sequential_acquires_with_time() {
+        let mut b = TokenBucket::with_time(5.0, 5.0, 0); // 5/sec
+        // Drain all 5 at t=0
+        assert!(b.try_acquire(5, 0));
+        assert!(!b.try_acquire_one(0));
+        // At t=200ms → 1 token refilled
+        assert!(b.try_acquire_one(200));
+        // At t=400ms → another 1 token
+        assert!(b.try_acquire_one(400));
+        assert_eq!(b.total_consumed(), 7);
+    }
+
+    #[test]
+    fn reset_clears_to_full_but_preserves_counters() {
+        let mut b = TokenBucket::with_time(10.0, 1.0, 0);
+        b.try_acquire(8, 0);
+        b.try_acquire(5, 0); // denied
+        assert_eq!(b.total_consumed(), 8);
+        assert_eq!(b.total_denied(), 1);
+        b.reset(1000);
+        // After reset: full tokens, but counters preserved
+        assert!(b.try_acquire(10, 1000));
+        assert_eq!(b.total_consumed(), 18);
+        assert_eq!(b.total_denied(), 1);
+    }
+
+    #[test]
+    fn refill_ignores_backward_time() {
+        let mut b = TokenBucket::with_time(10.0, 10.0, 1000);
+        b.try_acquire(5, 1000); // 5 remaining
+        // Call with earlier timestamp — should NOT refill
+        let avail = b.available(500);
+        assert!((avail - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn try_acquire_zero_cost() {
+        let mut b = TokenBucket::with_time(10.0, 5.0, 0);
+        assert!(b.try_acquire(0, 0));
+        assert_eq!(b.total_consumed(), 0);
+    }
+
+    #[test]
+    fn hierarchical_both_deny_prefers_local() {
+        let local = TokenBucket::new_empty(5.0, 1.0);
+        let global = TokenBucket::new_empty(50.0, 10.0);
+        let mut hb = HierarchicalBucket::new(local, global);
+        let result = hb.try_acquire(1, 0);
+        // When both empty, local is checked first → DeniedLocal
+        assert!(matches!(result, HierarchicalResult::DeniedLocal { .. }));
+    }
+
+    #[test]
+    fn hierarchical_consumes_from_both() {
+        let local = TokenBucket::with_time(5.0, 2.0, 0);
+        let global = TokenBucket::with_time(50.0, 20.0, 0);
+        let mut hb = HierarchicalBucket::new(local, global);
+        hb.try_acquire(3, 0);
+        assert_eq!(hb.local().total_consumed(), 3);
+        assert_eq!(hb.global().total_consumed(), 3);
+    }
+
+    #[test]
+    fn debug_format_contains_capacity() {
+        let b = TokenBucket::new(42.0, 7.0);
+        let dbg = format!("{:?}", b);
+        assert!(dbg.contains("42"));
+        assert!(dbg.contains("7"));
+    }
+
+    #[test]
+    fn bucket_stats_debug_and_clone() {
+        let b = TokenBucket::new(10.0, 5.0);
+        let s = b.stats();
+        let s2 = s.clone();
+        assert!((s.capacity - s2.capacity).abs() < f64::EPSILON);
+        let _ = format!("{:?}", s);
+    }
+
+    #[test]
+    fn hierarchical_clone_independence() {
+        let local = TokenBucket::with_time(5.0, 2.0, 0);
+        let global = TokenBucket::with_time(50.0, 20.0, 0);
+        let mut hb1 = HierarchicalBucket::new(local, global);
+        let mut hb2 = hb1.clone();
+        hb1.try_acquire(3, 0);
+        // hb2 should be unaffected
+        assert_eq!(hb2.local().total_consumed(), 0);
+        assert!(hb2.try_acquire(5, 0).is_allowed());
+    }
 }
