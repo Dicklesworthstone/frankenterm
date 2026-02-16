@@ -644,6 +644,26 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
+    /// is_empty agrees with len == 0.
+    #[test]
+    fn prop_is_empty_agrees(
+        n in 0usize..=30,
+        values in prop::collection::vec(-100i64..=100, 0..=30),
+    ) {
+        let n = n.min(values.len());
+        let ft = if n == 0 { FenwickTree::new(0) } else { FenwickTree::from_slice(&values[..n]) };
+        prop_assert_eq!(ft.is_empty(), ft.len() == 0);
+    }
+
+    /// from_config produces tree with correct len.
+    #[test]
+    fn prop_from_config_len(cap in 0usize..=100) {
+        let config = FenwickConfig { capacity: cap };
+        let ft = FenwickTree::from_config(&config);
+        prop_assert_eq!(ft.len(), cap);
+        prop_assert_eq!(ft.total_sum(), 0);
+    }
+
     /// Memory scales linearly with n.
     #[test]
     fn prop_memory_scales(

@@ -557,4 +557,24 @@ proptest! {
         prop_assert!(cms.is_empty());
         prop_assert_eq!(cms.total_count(), 0);
     }
+
+    /// Default sketch is empty.
+    #[test]
+    fn prop_default_is_empty(_dummy in 0..1u8) {
+        let cms = CountMinSketch::new();
+        prop_assert!(cms.is_empty());
+        prop_assert_eq!(cms.total_count(), 0);
+    }
+
+    /// is_empty agrees with total_count == 0.
+    #[test]
+    fn prop_is_empty_agrees_with_total(
+        entries in prop::collection::vec((0u64..500, arb_count()), 0..30),
+    ) {
+        let mut cms = CountMinSketch::new();
+        for &(ref item, count) in &entries {
+            cms.add(item, count);
+        }
+        prop_assert_eq!(cms.is_empty(), cms.total_count() == 0);
+    }
 }

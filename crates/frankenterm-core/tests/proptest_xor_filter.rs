@@ -423,6 +423,19 @@ proptest! {
         );
     }
 
+    // ── Theoretical FP rates are distinct ──────────────────────
+
+    #[test]
+    fn theoretical_fp_rates_differ(_dummy in 0..1u8) {
+        let fp8 = XorFilter::theoretical_fp_rate();
+        let fp16 = XorFilter16::theoretical_fp_rate();
+        prop_assert!(fp8 > fp16, "8-bit fp rate {} should exceed 16-bit {}", fp8, fp16);
+        prop_assert!(fp8 > 0.0);
+        prop_assert!(fp16 > 0.0);
+        prop_assert!(fp8 < 1.0);
+        prop_assert!(fp16 < 1.0);
+    }
+
     // ── try_build consistency (8-bit) ────────────────────────────
 
     #[test]

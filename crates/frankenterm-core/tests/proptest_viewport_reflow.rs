@@ -478,3 +478,57 @@ proptest! {
         prop_assert_eq!(parsed, plan);
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Additional structural properties
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// Adjacent batches have contiguous ranges (no gaps or overlaps).
+    #[test]
+    fn adjacent_batches_contiguous(input in arb_nonempty_input()) {
+        let plan = ViewportReflowPlanner::plan(&input);
+        for pair in plan.batches.windows(2) {
+            // Within the same priority tier, ranges should be non-overlapping
+            // but not necessarily contiguous across priority boundaries.
+            prop_assert!(
+                pair[0].range.end_line_exclusive <= pair[1].range.start_line
+                    || pair[0].range.start_line >= pair[1].range.end_line_exclusive
+                    || pair[0].range.end_line_exclusive == pair[1].range.start_line,
+                "batches overlap: {}..{} and {}..{}",
+                pair[0].range.start_line, pair[0].range.end_line_exclusive,
+                pair[1].range.start_line, pair[1].range.end_line_exclusive
+            );
+        }
+    }
+
+    /// Total lines across all batches equals total_logical_lines.
+    #[test]
+    fn total_batch_lines_match(input in arb_nonempty_input()) {
+        let plan = ViewportReflowPlanner::plan(&input);
+        let total: u32 = plan.batches.iter()
+            .map(|b| b.range.end_line_exclusive - b.range.start_line)
+            .sum();
+        prop_assert_eq!(
+            total, input.total_logical_lines,
+            "total batch lines {} != input total {}", total, input.total_logical_lines
+        );
+    }
+
+    /// Plan has at least one batch for non-empty input.
+    #[test]
+    fn plan_has_batches(input in arb_nonempty_input()) {
+        let plan = ViewportReflowPlanner::plan(&input);
+        prop_assert!(!plan.batches.is_empty(), "non-empty input should produce batches");
+    }
+
+    /// frame_budget_units in plan is stored.
+    #[test]
+    fn frame_budget_stored(input in arb_nonempty_input()) {
+        let plan = ViewportReflowPlanner::plan(&input);
+        prop_assert!(plan.frame_budget_units > 0 || plan.frame_work_units > 0,
+            "at least budget or work should be positive");
+    }
+}

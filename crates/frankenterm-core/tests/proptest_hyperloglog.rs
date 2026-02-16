@@ -379,4 +379,44 @@ proptest! {
         prop_assert_eq!(hll1.precision(), hll2.precision());
         prop_assert_eq!(hll1.register_count(), hll2.register_count());
     }
+
+    /// Clone independence: mutation of clone doesn't affect original.
+    #[test]
+    fn clone_independence(p in arb_precision(), items in arb_small_items()) {
+        let mut hll = HyperLogLog::with_precision(p);
+        for item in &items { hll.insert(item); }
+        let card_before = hll.cardinality();
+        let inserts_before = hll.total_inserts();
+
+        let mut clone = hll.clone();
+        for i in 200_000u64..200_100 {
+            clone.insert(&i);
+        }
+
+        prop_assert_eq!(hll.cardinality(), card_before);
+        prop_assert_eq!(hll.total_inserts(), inserts_before);
+    }
+
+    /// cardinality_f64 is non-negative and close to cardinality.
+    #[test]
+    fn cardinality_f64_consistent(p in arb_precision(), items in arb_small_items()) {
+        let mut hll = HyperLogLog::with_precision(p);
+        for item in &items { hll.insert(item); }
+        let card = hll.cardinality() as f64;
+        let card_f64 = hll.cardinality_f64();
+        prop_assert!(card_f64 >= 0.0);
+        // Integer cardinality should be the floor of the f64 version
+        let diff = (card - card_f64).abs();
+        prop_assert!(diff < 1.5, "cardinality {} and cardinality_f64 {} differ too much", card, card_f64);
+    }
+
+    /// Default HLL has standard precision and is empty.
+    #[test]
+    fn default_is_empty(_dummy in 0..1u8) {
+        let hll = HyperLogLog::new();
+        prop_assert!(hll.is_empty());
+        prop_assert_eq!(hll.cardinality(), 0);
+        prop_assert_eq!(hll.total_inserts(), 0);
+        prop_assert_eq!(hll.nonzero_registers(), 0);
+    }
 }
