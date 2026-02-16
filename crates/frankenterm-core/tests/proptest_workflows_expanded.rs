@@ -14,9 +14,8 @@
 use frankenterm_core::workflows::{
     DescriptorControlKey, DescriptorLimits, DescriptorMatcher, DescriptorStep, DescriptorTrigger,
     ExecutionStatus, GroupLockConflict, GroupLockResult, PaneWorkflowLockManager, UnstickConfig,
-    UnstickFinding, UnstickFindingKind, UnstickReport, WaitConditionOptions,
-    WaitConditionResult, WorkflowExecution, WorkflowExecutionResult, WorkflowStartResult,
-    WorkflowStep,
+    UnstickFinding, UnstickFindingKind, UnstickReport, WaitConditionOptions, WaitConditionResult,
+    WorkflowExecution, WorkflowExecutionResult, WorkflowStartResult, WorkflowStep,
 };
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -75,7 +74,11 @@ fn arb_descriptor_matcher() -> impl Strategy<Value = DescriptorMatcher> {
 /// from recursive Conditional/Loop nesting.
 fn arb_descriptor_step_flat() -> impl Strategy<Value = DescriptorStep> {
     prop_oneof![
-        (arb_step_id(), arb_descriptor_matcher(), proptest::option::of(1u64..120_000))
+        (
+            arb_step_id(),
+            arb_descriptor_matcher(),
+            proptest::option::of(1u64..120_000)
+        )
             .prop_map(|(id, matcher, timeout_ms)| DescriptorStep::WaitFor {
                 id,
                 description: None,
@@ -94,12 +97,13 @@ fn arb_descriptor_step_flat() -> impl Strategy<Value = DescriptorStep> {
             wait_for: None,
             wait_timeout_ms: None,
         }),
-        (arb_step_id(), arb_descriptor_control_key())
-            .prop_map(|(id, key)| DescriptorStep::SendCtrl {
+        (arb_step_id(), arb_descriptor_control_key()).prop_map(|(id, key)| {
+            DescriptorStep::SendCtrl {
                 id,
                 description: None,
                 key,
-            }),
+            }
+        }),
         (arb_step_id(), arb_short_text()).prop_map(|(id, message)| DescriptorStep::Notify {
             id,
             description: None,
@@ -157,15 +161,16 @@ fn arb_workflow_start_result() -> impl Strategy<Value = WorkflowStartResult> {
 
 fn arb_workflow_execution_result() -> impl Strategy<Value = WorkflowExecutionResult> {
     prop_oneof![
-        (arb_step_id(), any::<u64>(), 0usize..100)
-            .prop_map(|(execution_id, elapsed_ms, steps_executed)| {
+        (arb_step_id(), any::<u64>(), 0usize..100).prop_map(
+            |(execution_id, elapsed_ms, steps_executed)| {
                 WorkflowExecutionResult::Completed {
                     execution_id,
                     result: serde_json::json!({"status": "ok"}),
                     elapsed_ms,
                     steps_executed,
                 }
-            }),
+            }
+        ),
         (arb_step_id(), arb_short_text(), 0usize..100, any::<u64>()).prop_map(
             |(execution_id, reason, step_index, elapsed_ms)| WorkflowExecutionResult::Aborted {
                 execution_id,
@@ -192,20 +197,30 @@ fn arb_workflow_execution_result() -> impl Strategy<Value = WorkflowExecutionRes
 
 fn arb_wait_condition_result() -> impl Strategy<Value = WaitConditionResult> {
     prop_oneof![
-        (any::<u64>(), 1usize..1000, proptest::option::of(arb_short_text())).prop_map(
-            |(elapsed_ms, polls, context)| WaitConditionResult::Satisfied {
-                elapsed_ms,
-                polls,
-                context,
-            }
-        ),
-        (any::<u64>(), 1usize..1000, proptest::option::of(arb_short_text())).prop_map(
-            |(elapsed_ms, polls, last_observed)| WaitConditionResult::TimedOut {
-                elapsed_ms,
-                polls,
-                last_observed,
-            }
-        ),
+        (
+            any::<u64>(),
+            1usize..1000,
+            proptest::option::of(arb_short_text())
+        )
+            .prop_map(
+                |(elapsed_ms, polls, context)| WaitConditionResult::Satisfied {
+                    elapsed_ms,
+                    polls,
+                    context,
+                }
+            ),
+        (
+            any::<u64>(),
+            1usize..1000,
+            proptest::option::of(arb_short_text())
+        )
+            .prop_map(
+                |(elapsed_ms, polls, last_observed)| WaitConditionResult::TimedOut {
+                    elapsed_ms,
+                    polls,
+                    last_observed,
+                }
+            ),
         arb_short_text().prop_map(|reason| WaitConditionResult::Unsupported { reason }),
     ]
 }
@@ -655,7 +670,10 @@ fn unstick_config_default_values() {
     let config = UnstickConfig::default();
     assert_eq!(config.max_findings_per_kind, 10);
     assert_eq!(config.max_total_findings, 25);
-    assert!(!config.extensions.is_empty(), "default extensions should not be empty");
+    assert!(
+        !config.extensions.is_empty(),
+        "default extensions should not be empty"
+    );
     assert!(config.extensions.contains(&"rs".to_string()));
 }
 
@@ -742,7 +760,10 @@ fn wait_condition_options_defaults_valid() {
         "poll_initial should be <= poll_max"
     );
     assert!(opts.max_polls > 0, "max_polls should be positive");
-    assert!(opts.allow_idle_heuristics, "default should allow idle heuristics");
+    assert!(
+        opts.allow_idle_heuristics,
+        "default should allow idle heuristics"
+    );
 }
 
 // ── WorkflowStep serde ──────────────────────────────────────────────────────

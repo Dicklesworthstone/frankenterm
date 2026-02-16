@@ -2772,7 +2772,7 @@ mod tests {
     }
 
     #[test]
-    fn token_source_kind_debug_clone_copy_eq() {
+    fn token_source_kind_debug_clone_copy_eq_v2() {
         let a = DistributedTokenSourceKind::Inline;
         let b = a; // Copy
         assert_eq!(a, b);
@@ -2860,7 +2860,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_report_serde_roundtrip() {
+    fn readiness_report_serde_roundtrip_v2() {
         let config = DistributedConfig::default();
         let report = evaluate_readiness(&config);
         let json = serde_json::to_string(&report).unwrap();

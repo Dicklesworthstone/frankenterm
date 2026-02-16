@@ -845,6 +845,10 @@ mod tests {
     };
     use crate::tantivy_ingest::map_event_to_document;
 
+    fn make_doc(pane: u64, text: &str, seq: u64) -> IndexDocumentFields {
+        make_ingress(&format!("doc-{pane}-{seq}"), pane, seq, text)
+    }
+
     fn make_ingress(id: &str, pane: u64, seq: u64, text: &str) -> IndexDocumentFields {
         let event = RecorderEvent {
             schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),

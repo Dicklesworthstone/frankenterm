@@ -1529,7 +1529,7 @@ mod tests {
         let mut store = SessionStore::new(SessionDnaConfig::default());
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
-        store.add_session("s1", SessionDna::default(), true);
+        store.add_session("s1".to_string(), SessionDna::default(), true);
         assert!(!store.is_empty());
         assert_eq!(store.len(), 1);
     }
@@ -1545,10 +1545,16 @@ mod tests {
 
     #[test]
     fn pca_debug_clone() {
-        let data = vec![
-            vec![1.0, 2.0, 3.0],
-            vec![4.0, 5.0, 6.0],
-            vec![7.0, 8.0, 9.0],
+        let data: Vec<[f64; RAW_FEATURE_DIM]> = vec![
+            [
+                1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            [
+                4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            [
+                7.0, 8.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
         ];
         if let Some(model) = PcaModel::fit(&data, 2) {
             let dbg = format!("{:?}", model);
@@ -1560,15 +1566,26 @@ mod tests {
 
     #[test]
     fn pca_embedding_dim_accessor() {
-        let data = vec![
-            vec![1.0, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0],
-            vec![0.0, 0.0, 1.0],
-            vec![1.0, 1.0, 0.0],
+        let data: Vec<[f64; RAW_FEATURE_DIM]> = vec![
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            [
+                0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            [
+                0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            [
+                1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
         ];
         if let Some(model) = PcaModel::fit(&data, 2) {
             assert_eq!(model.embedding_dim(), 2);
-            let projected = model.project(&[1.0, 0.5, 0.5]);
+            let input = [
+                1.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ];
+            let projected = model.project(&input);
             assert_eq!(projected.len(), 2);
         }
     }

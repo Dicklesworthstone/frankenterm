@@ -1984,7 +1984,7 @@ mod tests {
     }
 
     #[test]
-    fn format_plain_includes_causes() {
+    fn format_plain_includes_causes_v2() {
         let formatted = FT_1001.format_plain();
         assert!(formatted.contains("Common causes:"));
     }

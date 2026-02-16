@@ -1057,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_config_serde_roundtrip() {
+    fn pool_config_serde_roundtrip_v2() {
         let cfg = PoolConfig {
             max_size: 8,
             idle_timeout: Duration::from_secs(120),
@@ -1071,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_config_debug() {
+    fn pool_config_debug_v2() {
         let cfg = PoolConfig::default();
         let debug = format!("{cfg:?}");
         assert!(debug.contains("PoolConfig"));
@@ -1079,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_stats_serde_roundtrip() {
+    fn pool_stats_serde_roundtrip_v2() {
         let stats = PoolStats {
             max_size: 4,
             idle_count: 2,
@@ -1101,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_stats_debug() {
+    fn pool_stats_debug_v2() {
         let stats = PoolStats {
             max_size: 2,
             idle_count: 0,
@@ -1117,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_stats_clone() {
+    fn pool_stats_clone_v2() {
         let stats = PoolStats {
             max_size: 3,
             idle_count: 1,
@@ -1174,7 +1174,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_acquire_result_debug() {
+    async fn pool_acquire_result_debug_v2() {
         let pool: Pool<String> = Pool::new(test_config(2));
         pool.put("debug-test".to_string()).await;
 
@@ -1186,7 +1186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_try_acquire_when_full() {
+    async fn pool_try_acquire_when_full_v2() {
         let pool: Pool<String> = Pool::new(test_config(1));
         let _held = pool.acquire().await.unwrap();
 

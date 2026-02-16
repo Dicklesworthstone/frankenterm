@@ -1029,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn circuit_breaker_status_default() {
+    fn circuit_breaker_status_default_v2() {
         let s = CircuitBreakerStatus::default();
         assert_eq!(s.state, CircuitStateKind::Closed);
         assert_eq!(s.consecutive_failures, 0);

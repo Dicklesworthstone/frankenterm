@@ -3407,7 +3407,7 @@ mod tests {
     // --- severity_level ordering ---
 
     #[test]
-    fn severity_level_ordering() {
+    fn severity_level_ordering_v2() {
         use crate::patterns::Severity;
         assert!(severity_level(Severity::Info) < severity_level(Severity::Warning));
         assert!(severity_level(Severity::Warning) < severity_level(Severity::Critical));

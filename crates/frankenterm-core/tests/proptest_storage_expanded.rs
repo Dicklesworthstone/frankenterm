@@ -92,10 +92,7 @@ fn arb_undo_strategy() -> impl Strategy<Value = String> {
 }
 
 fn arb_since_mode() -> impl Strategy<Value = String> {
-    prop_oneof![
-        Just("last_run".to_string()),
-        Just("fixed".to_string()),
-    ]
+    prop_oneof![Just("last_run".to_string()), Just("fixed".to_string()),]
 }
 
 fn arb_severity() -> impl Strategy<Value = String> {

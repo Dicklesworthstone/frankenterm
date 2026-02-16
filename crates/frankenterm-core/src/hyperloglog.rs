@@ -61,8 +61,8 @@ pub struct HllStats {
 pub struct HyperLogLog {
     registers: Vec<u8>,
     precision: u8,
-    m: usize,       // 2^precision
-    count: u64,      // total inserts (not distinct)
+    m: usize,   // 2^precision
+    count: u64, // total inserts (not distinct)
 }
 
 impl HyperLogLog {
@@ -129,7 +129,11 @@ impl HyperLogLog {
         let alpha = self.alpha();
 
         // Raw harmonic mean estimate
-        let sum: f64 = self.registers.iter().map(|&r| 2.0f64.powi(-(r as i32))).sum();
+        let sum: f64 = self
+            .registers
+            .iter()
+            .map(|&r| 2.0f64.powi(-(r as i32)))
+            .sum();
         let raw_estimate = alpha * m * m / sum;
 
         // Small range correction (linear counting)

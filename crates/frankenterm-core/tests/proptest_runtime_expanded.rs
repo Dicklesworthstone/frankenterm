@@ -39,11 +39,11 @@ fn arb_degradation_tier() -> impl Strategy<Value = ResizeDegradationTier> {
 
 fn arb_degradation_signals() -> impl Strategy<Value = ResizeDegradationSignals> {
     (
-        0usize..50,   // stalled_total
-        0usize..50,   // stalled_critical
-        1u64..10_000, // warning_threshold_ms
-        1u64..30_000, // critical_threshold_ms
-        1usize..10,   // critical_stalled_limit
+        0usize..50,    // stalled_total
+        0usize..50,    // stalled_critical
+        1u64..10_000,  // warning_threshold_ms
+        1u64..30_000,  // critical_threshold_ms
+        1usize..10,    // critical_stalled_limit
         any::<bool>(), // safe_mode_recommended
         any::<bool>(), // safe_mode_active
         any::<bool>(), // legacy_fallback_enabled
@@ -52,11 +52,8 @@ fn arb_degradation_signals() -> impl Strategy<Value = ResizeDegradationSignals> 
             |(total, crit, wt, ct, limit, recommended, active, legacy)| {
                 // Ensure critical <= total and warning_threshold <= critical_threshold
                 let stalled_critical = crit.min(total);
-                let (warning_threshold_ms, critical_threshold_ms) = if wt <= ct {
-                    (wt, ct)
-                } else {
-                    (ct, wt)
-                };
+                let (warning_threshold_ms, critical_threshold_ms) =
+                    if wt <= ct { (wt, ct) } else { (ct, wt) };
                 ResizeDegradationSignals {
                     stalled_total: total,
                     stalled_critical,

@@ -1525,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_node_hsplit_serde_roundtrip() {
+    fn pane_node_hsplit_serde_roundtrip_v2() {
         let node = PaneNode::HSplit {
             children: vec![
                 (
@@ -1585,7 +1585,8 @@ mod tests {
                 ),
             ],
         };
-        let ids = node.collect_pane_ids();
+        let mut ids = Vec::new();
+        node.collect_pane_ids(&mut ids);
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&10));
         assert!(ids.contains(&20));
@@ -1726,7 +1727,7 @@ mod tests {
     // -- TOPOLOGY_SCHEMA_VERSION --
 
     #[test]
-    fn topology_schema_version_is_one() {
+    fn topology_schema_version_is_one_v2() {
         assert_eq!(TOPOLOGY_SCHEMA_VERSION, 1);
     }
 

@@ -39,12 +39,12 @@ fn arb_health_status() -> impl Strategy<Value = HealthStatus> {
 /// Arbitrary WatchdogConfig with sensible but varied thresholds.
 fn arb_watchdog_config() -> impl Strategy<Value = WatchdogConfig> {
     (
-        1_u64..60_000,   // check_interval_ms
+        1_u64..60_000,    // check_interval_ms
         100_u64..120_000, // discovery_stale_ms
         100_u64..120_000, // capture_stale_ms
         100_u64..120_000, // persistence_stale_ms
         100_u64..120_000, // maintenance_stale_ms
-        0_u64..120_000,  // grace_period_ms
+        0_u64..120_000,   // grace_period_ms
     )
         .prop_map(
             |(
@@ -77,14 +77,7 @@ fn arb_mux_watchdog_config() -> impl Strategy<Value = MuxWatchdogConfig> {
         1_usize..5000, // history_capacity
     )
         .prop_map(
-            |(
-                check_ms,
-                ping_ms,
-                failure_threshold,
-                mem_a,
-                mem_b,
-                history_capacity,
-            )| {
+            |(check_ms, ping_ms, failure_threshold, mem_a, mem_b, history_capacity)| {
                 let (warning, critical) = if mem_a <= mem_b {
                     (mem_a, mem_a + mem_b)
                 } else {
@@ -692,5 +685,8 @@ fn heartbeat_registry_default_same_as_new() {
 fn mux_watchdog_config_default_memory_ratio() {
     let config = MuxWatchdogConfig::default();
     // Critical should be exactly 2x warning
-    assert_eq!(config.memory_critical_bytes, config.memory_warning_bytes * 2);
+    assert_eq!(
+        config.memory_critical_bytes,
+        config.memory_warning_bytes * 2
+    );
 }

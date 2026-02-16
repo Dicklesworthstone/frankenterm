@@ -4924,9 +4924,10 @@ mod tests {
             segment: Segment {
                 id: 0,
                 pane_id: 1,
-                pane_uuid: None,
                 seq: 0,
                 content: "data".into(),
+                content_len: 4,
+                content_hash: None,
                 captured_at: 100,
             },
             gap: None,

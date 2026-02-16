@@ -26,7 +26,7 @@ use proptest::prelude::*;
 use std::time::Duration;
 
 use frankenterm_core::runtime_compat::{
-    self, broadcast, mpsc, watch, CompatRuntime, Mutex, RuntimeBuilder, RwLock, Semaphore,
+    self, CompatRuntime, Mutex, RuntimeBuilder, RwLock, Semaphore, broadcast, mpsc, watch,
 };
 
 // ────────────────────────────────────────────────────────────────────

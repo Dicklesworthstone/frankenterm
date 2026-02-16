@@ -1783,7 +1783,7 @@ mod tests {
     // --- Observation ---
 
     #[test]
-    fn observation_debug_clone_serde() {
+    fn observation_debug_clone_serde_v2() {
         let obs = Observation {
             pane_states: vec![PaneState {
                 has_new_output: true,
@@ -1821,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn irl_config_default_values() {
+    fn irl_config_default_values_v2() {
         let cfg = IrlConfig::default();
         assert_eq!(cfg.learning_rate, 0.01);
         assert_eq!(cfg.max_iterations, 100);
@@ -1861,7 +1861,7 @@ mod tests {
     }
 
     #[test]
-    fn reward_function_serde_roundtrip() {
+    fn reward_function_serde_roundtrip_v2() {
         let mut rf = RewardFunction::new();
         rf.theta[0] = 1.5;
         rf.theta[7] = -0.3;
@@ -1996,7 +1996,7 @@ mod tests {
     }
 
     #[test]
-    fn cosine_similarity_zero_vector() {
+    fn cosine_similarity_zero_vector_v2() {
         let v = [1.0, 2.0];
         let z = [0.0, 0.0];
         assert_eq!(cosine_similarity(&v, &z), 0.0);
@@ -2004,7 +2004,7 @@ mod tests {
     }
 
     #[test]
-    fn cosine_similarity_opposite_vectors() {
+    fn cosine_similarity_opposite_vectors_v2() {
         let a = [1.0, 0.0];
         let b = [-1.0, 0.0];
         let sim = cosine_similarity(&a, &b);
@@ -2022,7 +2022,7 @@ mod tests {
     }
 
     #[test]
-    fn rank_correlation_single_element() {
+    fn rank_correlation_single_element_v2() {
         let a = [5.0];
         let b = [10.0];
         assert_eq!(rank_correlation(&a, &b), 0.0);

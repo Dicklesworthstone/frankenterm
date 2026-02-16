@@ -23,13 +23,13 @@ use frankenterm_core::viewport_reflow_planner::{
 
 fn arb_planner_input() -> impl Strategy<Value = ReflowPlannerInput> {
     (
-        0u32..10_000,  // total_logical_lines
-        0u32..10_000,  // viewport_top
-        0u32..500,     // viewport_height
-        0u32..200,     // overscan_lines
-        0u32..256,     // max_batch_lines
-        0u32..64,      // lines_per_work_unit
-        0u32..100,     // frame_budget_units
+        0u32..10_000, // total_logical_lines
+        0u32..10_000, // viewport_top
+        0u32..500,    // viewport_height
+        0u32..200,    // overscan_lines
+        0u32..256,    // max_batch_lines
+        0u32..64,     // lines_per_work_unit
+        0u32..100,    // frame_budget_units
     )
         .prop_map(
             |(total, top, height, overscan, batch, lpwu, budget)| ReflowPlannerInput {
@@ -47,13 +47,13 @@ fn arb_planner_input() -> impl Strategy<Value = ReflowPlannerInput> {
 /// Non-degenerate inputs where a plan will have batches.
 fn arb_nonempty_input() -> impl Strategy<Value = ReflowPlannerInput> {
     (
-        1u32..5_000,   // total_logical_lines (at least 1)
-        0u32..5_000,   // viewport_top
-        1u32..200,     // viewport_height (at least 1)
-        0u32..100,     // overscan_lines
-        1u32..128,     // max_batch_lines (at least 1)
-        1u32..32,      // lines_per_work_unit (at least 1)
-        0u32..50,      // frame_budget_units
+        1u32..5_000, // total_logical_lines (at least 1)
+        0u32..5_000, // viewport_top
+        1u32..200,   // viewport_height (at least 1)
+        0u32..100,   // overscan_lines
+        1u32..128,   // max_batch_lines (at least 1)
+        1u32..32,    // lines_per_work_unit (at least 1)
+        0u32..50,    // frame_budget_units
     )
         .prop_map(
             |(total, top, height, overscan, batch, lpwu, budget)| ReflowPlannerInput {

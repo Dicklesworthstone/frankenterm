@@ -3171,14 +3171,14 @@ mod tests {
     }
 
     #[test]
-    fn wait_matcher_substring_matches() {
+    fn wait_matcher_substring_matches_v2() {
         let m = WaitMatcher::substring("hello");
         assert!(m.matches("say hello world").unwrap());
         assert!(!m.matches("goodbye").unwrap());
     }
 
     #[test]
-    fn wait_matcher_regex_matches() {
+    fn wait_matcher_regex_matches_v2() {
         let re = fancy_regex::Regex::new(r"\d+\.\d+").unwrap();
         let m = WaitMatcher::regex(re);
         assert!(m.matches("version 1.2").unwrap());

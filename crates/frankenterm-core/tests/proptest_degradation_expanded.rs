@@ -30,14 +30,14 @@ fn arb_tier() -> impl Strategy<Value = ResizeDegradationTier> {
 /// Arbitrary signals with reasonable ranges.
 fn arb_signals() -> impl Strategy<Value = ResizeDegradationSignals> {
     (
-        0_usize..20,   // stalled_total
-        0_usize..10,   // stalled_critical
+        0_usize..20,      // stalled_total
+        0_usize..10,      // stalled_critical
         1000_u64..30_000, // warning_threshold_ms
         5000_u64..60_000, // critical_threshold_ms
-        1_usize..10,   // critical_stalled_limit
-        any::<bool>(), // safe_mode_recommended
-        any::<bool>(), // safe_mode_active
-        any::<bool>(), // legacy_fallback_enabled
+        1_usize..10,      // critical_stalled_limit
+        any::<bool>(),    // safe_mode_recommended
+        any::<bool>(),    // safe_mode_active
+        any::<bool>(),    // legacy_fallback_enabled
     )
         .prop_map(
             |(
@@ -89,14 +89,14 @@ fn signals_full_quality() -> impl Strategy<Value = ResizeDegradationSignals> {
 /// Signals known to produce QualityReduced tier.
 fn signals_quality_reduced() -> impl Strategy<Value = ResizeDegradationSignals> {
     (
-        1_usize..20,    // stalled_total > 0
+        1_usize..20, // stalled_total > 0
         1000_u64..30_000,
         5000_u64..60_000,
         1_usize..10,
         any::<bool>(),
     )
-        .prop_map(
-            |(stalled, warning_ms, critical_ms, limit, legacy)| ResizeDegradationSignals {
+        .prop_map(|(stalled, warning_ms, critical_ms, limit, legacy)| {
+            ResizeDegradationSignals {
                 stalled_total: stalled,
                 stalled_critical: 0,
                 warning_threshold_ms: warning_ms,
@@ -105,15 +105,15 @@ fn signals_quality_reduced() -> impl Strategy<Value = ResizeDegradationSignals> 
                 safe_mode_recommended: false,
                 safe_mode_active: false,
                 legacy_fallback_enabled: legacy,
-            },
-        )
+            }
+        })
 }
 
 /// Signals known to produce CorrectnessGuarded tier.
 fn signals_correctness_guarded() -> impl Strategy<Value = ResizeDegradationSignals> {
     (
-        0_usize..20,    // stalled_total
-        1_usize..10,    // stalled_critical > 0
+        0_usize..20, // stalled_total
+        1_usize..10, // stalled_critical > 0
         1000_u64..30_000,
         5000_u64..60_000,
         1_usize..10,
@@ -147,7 +147,15 @@ fn signals_emergency() -> impl Strategy<Value = ResizeDegradationSignals> {
         any::<bool>(),
     )
         .prop_map(
-            |(stalled_total, stalled_critical, warning_ms, critical_ms, limit, recommended, legacy)| {
+            |(
+                stalled_total,
+                stalled_critical,
+                warning_ms,
+                critical_ms,
+                limit,
+                recommended,
+                legacy,
+            )| {
                 ResizeDegradationSignals {
                     stalled_total,
                     stalled_critical,
@@ -622,7 +630,10 @@ fn safe_mode_active_trumps_everything() {
         legacy_fallback_enabled: false,
     };
     let assessment = evaluate_resize_degradation_ladder(signals);
-    assert_eq!(assessment.tier, ResizeDegradationTier::EmergencyCompatibility);
+    assert_eq!(
+        assessment.tier,
+        ResizeDegradationTier::EmergencyCompatibility
+    );
 }
 
 #[test]

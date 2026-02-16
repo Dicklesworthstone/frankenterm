@@ -5748,7 +5748,7 @@ mode = "periodic"
     }
 
     #[test]
-    fn log_format_default_is_pretty() {
+    fn log_format_default_is_pretty_v2() {
         assert_eq!(LogFormat::default(), LogFormat::Pretty);
     }
 
@@ -5776,7 +5776,7 @@ mode = "periodic"
     }
 
     #[test]
-    fn log_format_from_str_invalid() {
+    fn log_format_from_str_invalid_v2() {
         let err = "xml".parse::<LogFormat>();
         assert!(err.is_err());
     }
@@ -5806,7 +5806,7 @@ mode = "periodic"
     }
 
     #[test]
-    fn sync_direction_serde_roundtrip() {
+    fn sync_direction_serde_roundtrip_v2() {
         for dir in [SyncDirection::Push, SyncDirection::Pull] {
             let json = serde_json::to_string(&dir).unwrap();
             let back: SyncDirection = serde_json::from_str(&json).unwrap();

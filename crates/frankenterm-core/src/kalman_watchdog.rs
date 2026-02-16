@@ -1311,10 +1311,10 @@ mod tests {
         let dbg = format!("{:?}", report);
         assert!(dbg.contains("AdaptiveHealthReport"));
         let r2 = report.clone();
-        assert_eq!(r2.overall_status, report.overall_status);
+        assert_eq!(r2.overall, report.overall);
         let json = serde_json::to_string(&report).unwrap();
         let back: AdaptiveHealthReport = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.overall_status, report.overall_status);
+        assert_eq!(back.overall, report.overall);
     }
 
     // ── ComponentClassification additional coverage ─────────
