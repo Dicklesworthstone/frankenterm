@@ -424,4 +424,328 @@ proptest! {
             prop_assert!(min_k <= max_k);
         }
     }
+
+    /// is_empty agrees with len == 0.
+    #[test]
+    fn is_empty_agrees_with_len(seed in arb_seed(), pairs in arb_insert_ops()) {
+        let mut sl = SkipList::new(seed);
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+        }
+        prop_assert_eq!(sl.is_empty(), sl.len() == 0);
+    }
+
+    /// Double remove returns None.
+    #[test]
+    fn double_remove_none(seed in arb_seed(), key in 0..1000i64, val in any::<i64>()) {
+        let mut sl = SkipList::new(seed);
+        sl.insert(key, val);
+        let _ = sl.remove(&key);
+        prop_assert!(sl.remove(&key).is_none());
+    }
+
+    /// After clear, insertions work normally.
+    #[test]
+    fn insert_after_clear(seed in arb_seed(), pairs in arb_insert_ops()) {
+        let mut sl = SkipList::new(seed);
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+        }
+        sl.clear();
+        sl.insert(42, 100);
+        prop_assert_eq!(sl.len(), 1);
+        prop_assert_eq!(sl.get(&42), Some(&100));
+    }
+
+    /// Range with inverted bounds returns empty.
+    #[test]
+    fn range_inverted_empty(seed in arb_seed(), pairs in arb_insert_ops()) {
+        let mut sl = SkipList::new(seed);
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+        }
+        let range = sl.range(&500, &100);
+        prop_assert!(range.is_empty());
+    }
+
+    /// min/max after single insert.
+    #[test]
+    fn min_max_single(seed in arb_seed(), key in 0..1000i64, val in any::<i64>()) {
+        let mut sl = SkipList::new(seed);
+        sl.insert(key, val);
+        let (min_k, min_v) = sl.min().unwrap();
+        let (max_k, max_v) = sl.max().unwrap();
+        prop_assert_eq!(*min_k, key);
+        prop_assert_eq!(*min_v, val);
+        prop_assert_eq!(*max_k, key);
+        prop_assert_eq!(*max_v, val);
+    }
+
+    /// Stats total_nodes >= len.
+    #[test]
+    fn stats_nodes_ge_len(seed in arb_seed(), pairs in arb_insert_ops()) {
+        let mut sl = SkipList::new(seed);
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+        }
+        let stats = sl.stats();
+        prop_assert!(stats.total_nodes >= stats.len, "nodes {} < len {}", stats.total_nodes, stats.len);
+    }
+
+    /// Remove all then verify empty.
+    #[test]
+    fn remove_all_yields_empty(seed in arb_seed(), pairs in arb_insert_ops()) {
+        let mut sl = SkipList::new(seed);
+        let mut bt = BTreeMap::new();
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+            bt.insert(*k, *v);
+        }
+        for key in bt.keys() {
+            sl.remove(key);
+        }
+        prop_assert!(sl.is_empty());
+        prop_assert_eq!(sl.len(), 0);
+    }
+
+    /// current_level grows with insertions.
+    #[test]
+    fn current_level_grows(seed in arb_seed(), pairs in arb_insert_ops()) {
+        let mut sl = SkipList::new(seed);
+        let empty_level = sl.current_level();
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+        }
+        if !pairs.is_empty() {
+            prop_assert!(sl.current_level() >= empty_level);
+        }
+    }
+
+    /// Different seeds produce same logical content.
+    #[test]
+    fn different_seeds_same_content(
+        seed1 in arb_seed(),
+        seed2 in arb_seed(),
+        pairs in arb_insert_ops()
+    ) {
+        let mut sl1 = SkipList::new(seed1);
+        let mut sl2 = SkipList::new(seed2);
+        for (k, v) in &pairs {
+            sl1.insert(*k, *v);
+            sl2.insert(*k, *v);
+        }
+        let items1: Vec<_> = sl1.iter().map(|(k, v)| (*k, *v)).collect();
+        let items2: Vec<_> = sl2.iter().map(|(k, v)| (*k, *v)).collect();
+        prop_assert_eq!(items1, items2);
+    }
+}
+
+// ── Additional invariants (DarkMill ft-283h4.54) ────────────────────
+
+proptest! {
+    /// current_level is always < MAX_LEVEL (16).
+    #[test]
+    fn level_bounded(seed in arb_seed(), pairs in arb_insert_ops()) {
+        let mut sl = SkipList::new(seed);
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+        }
+        prop_assert!(sl.current_level() < 16, "level {} >= 16", sl.current_level());
+    }
+
+    /// min() == iter().next() for non-empty lists.
+    #[test]
+    fn min_matches_iter_first(seed in arb_seed(), pairs in arb_insert_ops()) {
+        let mut sl = SkipList::new(seed);
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+        }
+        let min_pair = sl.min().map(|(k, v)| (*k, *v));
+        let iter_first = sl.iter().next().map(|(k, v)| (*k, *v));
+        prop_assert_eq!(min_pair, iter_first);
+    }
+
+    /// max() == iter().last() for non-empty lists.
+    #[test]
+    fn max_matches_iter_last(seed in arb_seed(), pairs in arb_insert_ops()) {
+        let mut sl = SkipList::new(seed);
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+        }
+        let max_pair = sl.max().map(|(k, v)| (*k, *v));
+        let iter_last = sl.iter().last().map(|(k, v)| (*k, *v));
+        prop_assert_eq!(max_pair, iter_last);
+    }
+
+    /// range(min, max) returns all elements.
+    #[test]
+    fn range_min_max_returns_all(seed in arb_seed(), pairs in arb_insert_ops()) {
+        let mut sl = SkipList::new(seed);
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+        }
+        if let (Some((min_k, _)), Some((max_k, _))) = (sl.min(), sl.max()) {
+            let range = sl.range(min_k, max_k);
+            prop_assert_eq!(range.len(), sl.len());
+        }
+    }
+
+    /// Inserting same key N times keeps len at 1.
+    #[test]
+    fn insert_same_key_idempotent_len(
+        seed in arb_seed(),
+        key in 0..1000i64,
+        values in prop::collection::vec(any::<i64>(), 2..10)
+    ) {
+        let mut sl = SkipList::new(seed);
+        for v in &values {
+            sl.insert(key, *v);
+        }
+        prop_assert_eq!(sl.len(), 1);
+        prop_assert_eq!(sl.get(&key), Some(values.last().unwrap()));
+    }
+
+    /// Remove then reinsert works correctly.
+    #[test]
+    fn remove_then_reinsert(
+        seed in arb_seed(),
+        key in 0..1000i64,
+        v1 in any::<i64>(),
+        v2 in any::<i64>()
+    ) {
+        let mut sl = SkipList::new(seed);
+        sl.insert(key, v1);
+        sl.remove(&key);
+        prop_assert!(sl.get(&key).is_none());
+        sl.insert(key, v2);
+        prop_assert_eq!(sl.get(&key), Some(&v2));
+        prop_assert_eq!(sl.len(), 1);
+    }
+
+    /// Every key in iter() is retrievable via get().
+    #[test]
+    fn iter_keys_all_gettable(seed in arb_seed(), pairs in arb_insert_ops()) {
+        let mut sl = SkipList::new(seed);
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+        }
+        for (k, v) in sl.iter() {
+            let got = sl.get(k);
+            prop_assert_eq!(got, Some(v));
+        }
+    }
+
+    /// Range completeness: all keys in bounds appear in range result.
+    #[test]
+    fn range_complete(
+        seed in arb_seed(),
+        pairs in arb_insert_ops(),
+        from in 0..500i64,
+        span in 0..500i64
+    ) {
+        let to = from + span;
+        let mut sl = SkipList::new(seed);
+        let mut bt = BTreeMap::new();
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+            bt.insert(*k, *v);
+        }
+        let range = sl.range(&from, &to);
+        let range_keys: std::collections::HashSet<i64> = range.iter().map(|(k, _)| **k).collect();
+        for k in bt.keys() {
+            if *k >= from && *k <= to {
+                prop_assert!(range_keys.contains(k), "key {} missing from range", k);
+            }
+        }
+    }
+
+    /// Clone produces an independent copy with identical content.
+    #[test]
+    fn clone_equivalence(seed in arb_seed(), pairs in arb_insert_ops()) {
+        let mut sl = SkipList::new(seed);
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+        }
+        let cloned = sl.clone();
+        prop_assert_eq!(sl.len(), cloned.len());
+        let items1: Vec<_> = sl.iter().map(|(k, v)| (*k, *v)).collect();
+        let items2: Vec<_> = cloned.iter().map(|(k, v)| (*k, *v)).collect();
+        prop_assert_eq!(items1, items2);
+    }
+
+    /// After clear, stats show zero length and zero level.
+    #[test]
+    fn clear_resets_stats(seed in arb_seed(), pairs in arb_insert_ops()) {
+        let mut sl = SkipList::new(seed);
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+        }
+        sl.clear();
+        let stats = sl.stats();
+        prop_assert_eq!(stats.len, 0);
+        prop_assert_eq!(stats.current_level, 0);
+        prop_assert_eq!(stats.free_slots, 0);
+    }
+
+    /// Range on single point returns 1 if key exists, 0 otherwise.
+    #[test]
+    fn range_single_point(
+        seed in arb_seed(),
+        pairs in arb_insert_ops(),
+        probe in 0..10000i64
+    ) {
+        let mut sl = SkipList::new(seed);
+        let mut bt = BTreeMap::new();
+        for (k, v) in &pairs {
+            sl.insert(*k, *v);
+            bt.insert(*k, *v);
+        }
+        let range = sl.range(&probe, &probe);
+        let expected = if bt.contains_key(&probe) { 1 } else { 0 };
+        prop_assert_eq!(range.len(), expected);
+    }
+
+    /// Interleaved model: every intermediate state matches BTreeMap.
+    #[test]
+    fn interleaved_model_every_step(seed in arb_seed(), ops in arb_ops()) {
+        let mut sl = SkipList::new(seed);
+        let mut bt = BTreeMap::new();
+
+        for op in &ops {
+            match op {
+                ListOp::Insert(k, v) => {
+                    sl.insert(*k, *v);
+                    bt.insert(*k, *v);
+                }
+                ListOp::Remove(k) => {
+                    sl.remove(k);
+                    bt.remove(k);
+                }
+                ListOp::Get(k) => {
+                    prop_assert_eq!(sl.get(k), bt.get(k));
+                }
+            }
+            prop_assert_eq!(sl.len(), bt.len());
+        }
+    }
+
+    /// Stats total_nodes = 1 (head) + len + free_slots.
+    #[test]
+    fn stats_node_accounting(seed in arb_seed(), ops in arb_ops()) {
+        let mut sl = SkipList::new(seed);
+        for op in &ops {
+            match op {
+                ListOp::Insert(k, v) => { sl.insert(*k, *v); }
+                ListOp::Remove(k) => { sl.remove(k); }
+                ListOp::Get(_) => {}
+            }
+        }
+        let stats = sl.stats();
+        prop_assert_eq!(
+            stats.total_nodes,
+            1 + stats.len + stats.free_slots,
+            "node accounting: total {} != 1 + {} + {}",
+            stats.total_nodes, stats.len, stats.free_slots
+        );
+    }
 }

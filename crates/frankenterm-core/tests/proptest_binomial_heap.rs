@@ -474,4 +474,120 @@ proptest! {
             prop_assert_eq!(*pk, min_so_far.unwrap());
         }
     }
+
+    // ── is_empty agrees with len ────────────────────────────────
+
+    #[test]
+    fn is_empty_agrees_with_len(vals in values_strategy(30)) {
+        let mut heap = BinomialHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+        prop_assert_eq!(heap.is_empty(), heap.len() == 0);
+    }
+
+    // ── Default is empty ────────────────────────────────────────
+
+    #[test]
+    fn default_is_empty(_dummy in 0..10u8) {
+        let heap: BinomialHeap<i32, i32> = BinomialHeap::new();
+        prop_assert!(heap.is_empty());
+        prop_assert_eq!(heap.len(), 0);
+        prop_assert!(heap.peek().is_none());
+    }
+
+    // ── Clone independence ──────────────────────────────────────
+
+    #[test]
+    fn clone_independence(vals in values_strategy(30)) {
+        let mut heap = BinomialHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+        let original_len = heap.len();
+        let mut cloned = heap.clone();
+        cloned.insert(99999, 99999);
+        prop_assert_eq!(heap.len(), original_len);
+    }
+
+    // ── Serde roundtrip after extractions ────────────────────────
+
+    #[test]
+    fn serde_after_extractions(vals in values_strategy(30)) {
+        let mut heap = BinomialHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+        // Extract half
+        let extract_count = heap.len() / 2;
+        for _ in 0..extract_count {
+            heap.extract_min();
+        }
+
+        let json = serde_json::to_string(&heap).unwrap();
+        let restored: BinomialHeap<i32, i32> = serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(restored.len(), heap.len());
+        let orig = heap.sorted();
+        let rest = restored.sorted();
+        prop_assert_eq!(orig, rest);
+    }
+
+    // ── into_sorted consumes all ────────────────────────────────
+
+    #[test]
+    fn into_sorted_length(vals in values_strategy(40)) {
+        let mut heap = BinomialHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+        let sorted = heap.into_sorted();
+        prop_assert_eq!(sorted.len(), vals.len());
+    }
+
+    // ── sorted is non-decreasing ────────────────────────────────
+
+    #[test]
+    fn sorted_is_non_decreasing(vals in values_strategy(50)) {
+        let mut heap = BinomialHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+        let sorted = heap.sorted();
+        for w in sorted.windows(2) {
+            prop_assert!(w[0].0 <= w[1].0, "not sorted: {} > {}", w[0].0, w[1].0);
+        }
+    }
+
+    // ── Extract min returns minimum each time ───────────────────
+
+    #[test]
+    fn extract_min_monotone(vals in values_strategy(40)) {
+        let mut heap = BinomialHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+        let mut prev: Option<i32> = None;
+        while let Some((k, _)) = heap.extract_min() {
+            if let Some(p) = prev {
+                prop_assert!(k >= p, "extract not monotone: {} < {}", k, p);
+            }
+            prev = Some(k);
+        }
+    }
+
+    // ── Merge self with empty preserves ─────────────────────────
+
+    #[test]
+    fn merge_empty_into_full(vals in values_strategy(30)) {
+        let mut heap = BinomialHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+        let sorted_before = heap.sorted();
+        let mut empty: BinomialHeap<i32, i32> = BinomialHeap::new();
+        empty.merge(&mut heap);
+        let sorted_after = empty.sorted();
+        prop_assert_eq!(sorted_before, sorted_after);
+    }
 }

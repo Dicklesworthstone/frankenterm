@@ -371,3 +371,89 @@ proptest! {
         prop_assert!(!t.starts_with("a"));
     }
 }
+
+// ── Additional properties ──────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// is_empty agrees with len == 0.
+    #[test]
+    fn prop_is_empty_agrees_with_len(keys in arb_keys(15)) {
+        let t = build_trie(&keys);
+        prop_assert_eq!(t.is_empty(), t.len() == 0);
+    }
+
+    /// all_keys().len() == len().
+    #[test]
+    fn prop_all_keys_len_matches(keys in arb_keys(15)) {
+        let t = build_trie(&keys);
+        prop_assert_eq!(t.all_keys().len(), t.len());
+    }
+
+    /// Insert after remove works.
+    #[test]
+    fn prop_insert_after_remove(keys in arb_keys(10)) {
+        let unique = unique_keys(&keys);
+        prop_assume!(!unique.is_empty());
+        let mut t = build_trie(&keys);
+
+        let target = &unique[0];
+        t.remove(target);
+        prop_assert!(!t.contains(target));
+
+        t.insert(target);
+        prop_assert!(t.contains(target));
+    }
+
+    /// Remove all yields empty trie.
+    #[test]
+    fn prop_remove_all_empty(keys in arb_keys(15)) {
+        let unique = unique_keys(&keys);
+        let mut t = build_trie(&keys);
+        for key in &unique {
+            t.remove(key);
+        }
+        prop_assert!(t.is_empty());
+        prop_assert_eq!(t.len(), 0);
+    }
+
+    /// Clear then insert works.
+    #[test]
+    fn prop_clear_then_insert(keys in arb_keys(10)) {
+        let mut t = build_trie(&keys);
+        t.clear();
+        t.insert("hello");
+        prop_assert_eq!(t.len(), 1);
+        prop_assert!(t.contains("hello"));
+    }
+
+    /// Debug format is non-empty.
+    #[test]
+    fn prop_debug_format(keys in arb_keys(10)) {
+        let t = build_trie(&keys);
+        let debug = format!("{:?}", t);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// longest_common_prefix of exact key returns the key.
+    #[test]
+    fn prop_lcp_exact_key(keys in arb_keys(10)) {
+        let unique = unique_keys(&keys);
+        prop_assume!(!unique.is_empty());
+        let mut t = build_trie(&keys);
+        let target = &unique[0];
+        let lcp = t.longest_common_prefix(target);
+        prop_assert_eq!(lcp, target.clone(), "LCP of exact key should be the key itself");
+    }
+
+    /// memory_bytes > 0 for non-empty trie.
+    #[test]
+    fn prop_memory_positive(keys in arb_keys(10)) {
+        prop_assume!(!keys.is_empty());
+        let t = build_trie(&keys);
+        if !t.is_empty() {
+            prop_assert!(t.memory_bytes() > 0);
+        }
+    }
+}

@@ -432,3 +432,87 @@ proptest! {
         prop_assert_eq!(uf.len(), 0);
     }
 }
+
+// ── Additional properties ──────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// is_empty agrees with len == 0.
+    #[test]
+    fn prop_is_empty_agrees(n in 0usize..=20) {
+        let uf = UnionFind::new(n);
+        prop_assert_eq!(uf.is_empty(), n == 0);
+    }
+
+    /// Union with self is a no-op (returns false).
+    #[test]
+    fn prop_self_union_noop(
+        n in 1usize..=20,
+        x_frac in 0.0f64..1.0,
+    ) {
+        let x = (x_frac * n as f64) as usize % n;
+        let mut uf = UnionFind::new(n);
+        let merged = uf.union(x, x);
+        prop_assert!(!merged, "union(x, x) should return false");
+        prop_assert_eq!(uf.component_count(), n);
+    }
+
+    /// Component members all have the same root.
+    #[test]
+    fn prop_members_share_root(
+        (n, ops) in arb_union_find(15),
+        x_frac in 0.0f64..1.0,
+    ) {
+        let x = frac_to_idx(x_frac, n);
+        let mut uf = build_uf(n, &ops);
+        let root = uf.find(x);
+        let members = uf.component_members(x);
+        for &m in &members {
+            prop_assert_eq!(uf.find(m), root, "member {} has different root", m);
+        }
+    }
+
+    /// Largest component <= n.
+    #[test]
+    fn prop_largest_component_bounded(
+        (n, ops) in arb_union_find(20),
+    ) {
+        let mut uf = build_uf(n, &ops);
+        let stats = uf.stats();
+        prop_assert!(stats.largest_component <= n);
+        prop_assert!(stats.largest_component >= 1 || n == 0);
+    }
+
+    /// memory_bytes > 0 for non-empty UF.
+    #[test]
+    fn prop_memory_positive(n in 1usize..=20) {
+        let uf = UnionFind::new(n);
+        prop_assert!(uf.memory_bytes() > 0);
+    }
+
+    /// make_set then union with existing works.
+    #[test]
+    fn prop_make_set_then_union(
+        (n, ops) in arb_union_find(15),
+    ) {
+        prop_assume!(n > 0);
+        let mut uf = build_uf(n, &ops);
+        let new_idx = uf.make_set();
+        prop_assert!(!uf.connected(0, new_idx));
+        uf.union(0, new_idx);
+        prop_assert!(uf.connected(0, new_idx));
+    }
+
+    /// find is idempotent after make_set.
+    #[test]
+    fn prop_find_after_make_set(
+        (n, ops) in arb_union_find(15),
+    ) {
+        let mut uf = build_uf(n, &ops);
+        let idx = uf.make_set();
+        let root = uf.find(idx);
+        prop_assert_eq!(root, idx, "new element should be its own root");
+        prop_assert_eq!(uf.find(root), root);
+    }
+}

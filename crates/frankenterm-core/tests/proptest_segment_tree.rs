@@ -517,4 +517,82 @@ proptest! {
             prop_assert!(st2.memory_bytes() > st1.memory_bytes(), "memory should scale with n");
         }
     }
+
+    /// new(n) creates all-zero tree.
+    #[test]
+    fn prop_new_all_zeros(n in 1usize..=30) {
+        let mut st = SegmentTree::new(n);
+        for i in 0..n {
+            prop_assert_eq!(st.query(i, i), 0, "new tree not zero at {}", i);
+        }
+        prop_assert_eq!(st.total_sum(), 0);
+    }
+
+    /// len() returns the size.
+    #[test]
+    fn prop_len_correct(values in arb_values(30)) {
+        let st = SegmentTree::from_slice(&values);
+        prop_assert_eq!(st.len(), values.len());
+    }
+
+    /// is_empty agrees with len.
+    #[test]
+    fn prop_is_empty_agrees(n in 0usize..=10) {
+        let st = SegmentTree::new(n);
+        prop_assert_eq!(st.is_empty(), n == 0);
+        prop_assert_eq!(st.is_empty(), st.len() == 0);
+    }
+
+    /// Reset then insert works.
+    #[test]
+    fn prop_reset_then_update(
+        values in arb_values(15),
+        i_frac in 0.0f64..1.0,
+        delta in -500i64..=500,
+    ) {
+        let n = values.len();
+        let i = (i_frac * n as f64) as usize % n;
+        let mut st = SegmentTree::from_slice(&values);
+        st.reset();
+        st.point_update(i, delta);
+        prop_assert_eq!(st.query(i, i), delta);
+        prop_assert_eq!(st.total_sum(), delta);
+    }
+
+    /// point_set then point_update combines correctly.
+    #[test]
+    fn prop_set_then_update(
+        n in 1usize..=15,
+        i_frac in 0.0f64..1.0,
+        val in -500i64..=500,
+        delta in -500i64..=500,
+    ) {
+        let i = (i_frac * n as f64) as usize % n;
+        let mut st = SegmentTree::new(n);
+        st.point_set(i, val);
+        st.point_update(i, delta);
+        prop_assert_eq!(st.query(i, i), val.wrapping_add(delta));
+    }
+
+    /// to_vec length matches len().
+    #[test]
+    fn prop_to_vec_len(values in arb_values(30)) {
+        let mut st = SegmentTree::from_slice(&values);
+        prop_assert_eq!(st.to_vec().len(), st.len());
+    }
+
+    /// Clone after updates still correct.
+    #[test]
+    fn prop_clone_after_updates(
+        values in arb_values(15),
+        delta in -100i64..=100,
+    ) {
+        let n = values.len();
+        let mut st = SegmentTree::from_slice(&values);
+        st.range_update(0, n - 1, delta);
+        let mut clone = st.clone();
+        for i in 0..n {
+            prop_assert_eq!(st.query(i, i), clone.query(i, i));
+        }
+    }
 }
