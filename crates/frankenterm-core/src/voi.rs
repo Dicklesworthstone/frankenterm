@@ -1040,4 +1040,116 @@ mod tests {
         assert!((mult2.yellow - 2.0).abs() < 1e-10);
         assert!((mult2.red - 5.0).abs() < 1e-10);
     }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──
+
+    #[test]
+    fn voi_config_debug_clone_serde() {
+        let cfg = VoiConfig::default();
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("VoiConfig"));
+        let c = cfg.clone();
+        assert!((c.min_voi_threshold - cfg.min_voi_threshold).abs() < 1e-10);
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: VoiConfig = serde_json::from_str(&json).unwrap();
+        assert!((back.entropy_drift_rate - 0.1).abs() < 1e-10);
+    }
+
+    #[test]
+    fn voi_config_default_values() {
+        let cfg = VoiConfig::default();
+        assert!((cfg.min_voi_threshold - 0.01).abs() < 1e-10);
+        assert_eq!(cfg.min_poll_interval_ms, 50);
+        assert_eq!(cfg.max_poll_interval_ms, 30_000);
+        assert!((cfg.default_cost_ms - 2.0).abs() < 1e-10);
+        assert!((cfg.default_importance - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scheduling_decision_debug_clone_serde() {
+        let d = SchedulingDecision {
+            pane_id: 42,
+            voi: 1.5,
+            entropy: 2.0,
+            importance: 1.0,
+            effective_cost: 2.0,
+            map_state: PaneState::Active,
+            staleness_ms: 5000,
+        };
+        let dbg = format!("{:?}", d);
+        assert!(dbg.contains("SchedulingDecision"));
+        let c = d.clone();
+        assert_eq!(c.pane_id, 42);
+        let json = serde_json::to_string(&d).unwrap();
+        let back: SchedulingDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pane_id, 42);
+        assert!((back.voi - 1.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn voi_snapshot_debug_clone() {
+        let mut sched = VoiScheduler::new(VoiConfig::default());
+        sched.register_pane(1, 1000);
+        let snap = sched.snapshot(2000);
+        let dbg = format!("{:?}", snap);
+        assert!(dbg.contains("VoiSnapshot"));
+        let c = snap.clone();
+        assert_eq!(c.pane_count, 1);
+    }
+
+    #[test]
+    fn pane_snapshot_entry_debug_clone_serde() {
+        let entry = PaneSnapshotEntry {
+            pane_id: 1,
+            entropy: 2.0,
+            map_state: PaneState::Idle,
+            staleness_ms: 1000,
+            observations: 5,
+            importance: 1.0,
+        };
+        let dbg = format!("{:?}", entry);
+        assert!(dbg.contains("PaneSnapshotEntry"));
+        let c = entry.clone();
+        assert_eq!(c.pane_id, 1);
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: PaneSnapshotEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.observations, 5);
+    }
+
+    #[test]
+    fn backpressure_tier_input_copy_eq() {
+        let a = BackpressureTierInput::Yellow;
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn backpressure_tier_input_debug() {
+        let dbg = format!("{:?}", BackpressureTierInput::Red);
+        assert!(dbg.contains("Red"));
+    }
+
+    #[test]
+    fn backpressure_multipliers_debug_clone() {
+        let m = BackpressureMultipliers::default();
+        let dbg = format!("{:?}", m);
+        assert!(dbg.contains("BackpressureMultipliers"));
+        let c = m.clone();
+        assert!((c.green - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn compute_voi_unknown_pane_returns_none() {
+        let sched = VoiScheduler::new(VoiConfig::default());
+        assert!(sched.compute_voi(999, 1000).is_none());
+    }
+
+    #[test]
+    fn register_pane_then_unregister() {
+        let mut sched = VoiScheduler::new(VoiConfig::default());
+        sched.register_pane(1, 1000);
+        assert!(sched.compute_voi(1, 2000).is_some());
+        sched.unregister_pane(1);
+        assert!(sched.compute_voi(1, 2000).is_none());
+    }
 }

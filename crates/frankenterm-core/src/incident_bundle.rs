@@ -1106,6 +1106,179 @@ mod tests {
         assert!(readme.contains("No secrets detected"));
     }
 
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──
+
+    #[test]
+    fn bundle_format_version_display() {
+        let v = BundleFormatVersion { major: 1, minor: 0 };
+        assert_eq!(format!("{}", v), "1.0");
+    }
+
+    #[test]
+    fn bundle_format_version_serde_roundtrip() {
+        let v = BundleFormatVersion { major: 2, minor: 3 };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: BundleFormatVersion = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn bundle_version_error_display_incompatible() {
+        let err = BundleVersionError::IncompatibleMajor {
+            reader_major: 1,
+            bundle_major: 2,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("incompatible"));
+        assert!(msg.contains("1"));
+        assert!(msg.contains("2"));
+    }
+
+    #[test]
+    fn bundle_version_error_display_newer_minor() {
+        let err = BundleVersionError::NewerMinor {
+            reader_minor: 0,
+            bundle_minor: 5,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("newer"));
+        assert!(msg.contains("5"));
+    }
+
+    #[test]
+    fn bundle_file_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(BundleFile::Manifest);
+        set.insert(BundleFile::Readme);
+        set.insert(BundleFile::Manifest);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn bundle_file_copy_semantics() {
+        let a = BundleFile::CrashReport;
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn bundle_file_serde_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&BundleFile::Manifest).unwrap(),
+            "\"manifest\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BundleFile::HealthSnapshot).unwrap(),
+            "\"health_snapshot\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BundleFile::DbMetadata).unwrap(),
+            "\"db_metadata\""
+        );
+    }
+
+    #[test]
+    fn bundle_file_all_returns_nine() {
+        assert_eq!(BundleFile::all().len(), 9);
+    }
+
+    #[test]
+    fn privacy_budget_validate_file_exceeds_total() {
+        let budget = PrivacyBudget {
+            max_bytes_per_file: 2_000_000,
+            max_total_bytes: 1_000_000,
+            ..PrivacyBudget::default()
+        };
+        match budget.validate() {
+            Err(PrivacyBudgetError::FileExceedsTotal { .. }) => {}
+            other => panic!("expected FileExceedsTotal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn privacy_budget_validate_zero_total() {
+        let budget = PrivacyBudget {
+            max_total_bytes: 0,
+            max_bytes_per_file: 0,
+            ..PrivacyBudget::default()
+        };
+        match budget.validate() {
+            Err(PrivacyBudgetError::ZeroLimit { field }) => {
+                assert!(field.contains("total") || field.contains("file"));
+            }
+            other => panic!("expected ZeroLimit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn privacy_budget_would_exceed_total_boundary() {
+        let budget = PrivacyBudget::default();
+        let limit = budget.max_total_bytes;
+        assert!(!budget.would_exceed_total(0, limit));
+        assert!(budget.would_exceed_total(1, limit));
+        assert!(budget.would_exceed_total(limit, 1));
+    }
+
+    #[test]
+    fn privacy_budget_truncate_excerpt_within_limit() {
+        let budget = PrivacyBudget::default();
+        let short = "hello";
+        assert_eq!(budget.truncate_excerpt(short), "hello");
+    }
+
+    #[test]
+    fn privacy_budget_truncate_excerpt_over_limit() {
+        let budget = PrivacyBudget {
+            max_output_excerpt_len: 5,
+            ..PrivacyBudget::default()
+        };
+        let long = "hello world this is a long string";
+        let truncated = budget.truncate_excerpt(long);
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.len() < long.len());
+    }
+
+    #[test]
+    fn bundle_replay_mode_copy_semantics() {
+        let a = BundleReplayMode::Policy;
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn redaction_summary_debug_clone_serde() {
+        let rs = RedactionSummary {
+            total_redactions: 7,
+            files_with_redactions: 2,
+        };
+        let dbg = format!("{:?}", rs);
+        assert!(dbg.contains("RedactionSummary"));
+        let c = rs.clone();
+        assert_eq!(c.total_redactions, 7);
+        let json = serde_json::to_string(&rs).unwrap();
+        let back: RedactionSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total_redactions, 7);
+        assert_eq!(back.files_with_redactions, 2);
+    }
+
+    #[test]
+    fn bundle_file_entry_debug_clone_serde() {
+        let entry = BundleFileEntry {
+            name: "test.json".to_string(),
+            size_bytes: 1024,
+            redacted: true,
+        };
+        let dbg = format!("{:?}", entry);
+        assert!(dbg.contains("BundleFileEntry"));
+        let c = entry.clone();
+        assert_eq!(c.name, "test.json");
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: BundleFileEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.size_bytes, 1024);
+        assert!(back.redacted);
+    }
+
     // --- Helpers ---
 
     fn sample_manifest() -> IncidentManifest {
