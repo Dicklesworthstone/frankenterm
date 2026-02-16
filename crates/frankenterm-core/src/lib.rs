@@ -229,6 +229,7 @@ pub mod watcher_client;
 pub mod webhook;
 pub mod wezterm;
 pub mod workflows;
+pub mod xor_filter;
 
 #[cfg(feature = "vendored")]
 pub mod vendored;
