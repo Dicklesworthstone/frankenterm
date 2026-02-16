@@ -621,7 +621,7 @@ where
 {
     #[cfg(feature = "asupersync-runtime")]
     {
-        asupersync::runtime::spawn_blocking(work).await
+        Ok(asupersync::runtime::spawn_blocking(work).await)
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]
@@ -1414,6 +1414,16 @@ mod tests {
         assert!(err.is_err());
         // The SendError should contain the value that could not be sent
         let send_err = err.unwrap_err();
+        #[cfg(feature = "asupersync-runtime")]
+        assert!(
+            matches!(
+                send_err,
+                mpsc::SendError::Disconnected(value) if value == "lost"
+            ),
+            "expected disconnected send error carrying original value",
+        );
+
+        #[cfg(not(feature = "asupersync-runtime"))]
         assert_eq!(send_err.0, "lost");
     }
 
