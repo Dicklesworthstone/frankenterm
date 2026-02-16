@@ -81,6 +81,7 @@ pub mod cross_pane_correlation;
 pub mod cuckoo_filter;
 #[cfg(feature = "asupersync-runtime")]
 pub mod cx;
+pub mod dancing_links;
 pub mod dataflow;
 pub mod degradation;
 pub mod desktop_notify;
