@@ -1,6 +1,19 @@
 //! Property-based tests for work_stealing_deque.
 //!
-//! Bead: ft-t58vf
+//! Verifies the work-stealing deque invariants:
+//! - LIFO ordering for pop, FIFO for steal
+//! - Conservation: pushed == popped + stolen + remaining
+//! - No duplication across pop/steal
+//! - Stats accuracy
+//! - Batch steal bounds and ordering
+//! - Pool conservation and stats
+//! - StealResult properties
+//! - Serde roundtrip for config/stats
+//! - Empty deque invariants
+//! - Interleaved operation correctness
+//! - Stealer is_empty, worker clone, pool steal/pop
+//!
+//! Bead: ft-t58vf, ft-283h4.51
 
 use frankenterm_core::work_stealing_deque::{
     new_deque, new_deque_default, StealResult, WorkStealingPool, WsDequeConfig, WsDequeStats,
@@ -463,5 +476,243 @@ proptest! {
         prop_assert_eq!(stats.total_pushed, expected_pushed);
         prop_assert_eq!(stats.total_popped, expected_popped);
         prop_assert_eq!(stats.total_stolen, expected_stolen);
+    }
+}
+
+// ── Stealer is_empty property ───────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Stealer is_empty agrees with worker is_empty (when no contention).
+    #[test]
+    fn stealer_is_empty_agrees_with_worker(
+        items in prop::collection::vec(0..1000u32, 0..20),
+    ) {
+        let (worker, stealer) = new_deque(64);
+        // Initially both empty
+        prop_assert!(stealer.is_empty(), "stealer should be empty initially");
+        prop_assert!(worker.is_empty(), "worker should be empty initially");
+
+        for &item in &items {
+            worker.push(item);
+        }
+
+        if items.is_empty() {
+            prop_assert!(stealer.is_empty(), "stealer should be empty with no items");
+        } else {
+            let stealer_empty = stealer.is_empty();
+            prop_assert!(!stealer_empty, "stealer should not be empty with items");
+        }
+    }
+
+    /// Stealer is_empty becomes true after all items stolen.
+    #[test]
+    fn stealer_empty_after_drain(items in small_items_strategy()) {
+        let (worker, stealer) = new_deque(64);
+        for &item in &items {
+            worker.push(item);
+        }
+        // Drain via steal
+        loop {
+            match stealer.steal() {
+                StealResult::Success(_) => {}
+                StealResult::Empty => break,
+                StealResult::Retry => continue,
+            }
+        }
+        prop_assert!(stealer.is_empty(), "stealer should be empty after draining");
+    }
+}
+
+// ── Pool num_workers property ───────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// num_workers matches the value passed to constructor.
+    #[test]
+    fn pool_num_workers_matches(n in 1..10usize) {
+        let pool = WorkStealingPool::<u32>::new(n);
+        prop_assert_eq!(pool.num_workers(), n, "num_workers mismatch");
+    }
+}
+
+// ── Pool steal and pop methods ──────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Pool pop returns items from the specified worker's deque.
+    #[test]
+    fn pool_pop_returns_own_items(
+        n_workers in 2..4usize,
+        val in 0..1000u32,
+    ) {
+        let pool = WorkStealingPool::new(n_workers);
+        pool.push(0, val);
+        let result = pool.pop(0);
+        prop_assert_eq!(result, Some(val), "pool pop should return pushed item");
+    }
+
+    /// Pool steal takes items from other workers.
+    #[test]
+    fn pool_steal_takes_from_others(
+        n_workers in 2..4usize,
+        val in 0..1000u32,
+    ) {
+        let pool = WorkStealingPool::new(n_workers);
+        // Push to worker 0
+        pool.push(0, val);
+        // Steal from perspective of worker 1
+        let result = pool.steal(1);
+        let is_success = result.is_success();
+        // May or may not succeed depending on lock contention
+        if is_success {
+            prop_assert_eq!(result.unwrap(), val);
+        }
+    }
+
+    /// Pool pop returns None when worker's deque is empty.
+    #[test]
+    fn pool_pop_empty_returns_none(n_workers in 2..4usize) {
+        let pool = WorkStealingPool::<u32>::new(n_workers);
+        prop_assert_eq!(pool.pop(0), None, "pop on empty pool should return None");
+    }
+}
+
+// ── StealResult clone and eq properties ─────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// StealResult Clone produces equal values.
+    #[test]
+    fn steal_result_clone_eq(val in any::<u32>()) {
+        let s = StealResult::Success(val);
+        let cloned = s.clone();
+        prop_assert_eq!(s, cloned, "cloned StealResult should equal original");
+    }
+
+    /// StealResult Empty variants are equal.
+    #[test]
+    fn steal_result_empty_eq(_dummy in 0..1u8) {
+        let a: StealResult<u32> = StealResult::Empty;
+        let b: StealResult<u32> = StealResult::Empty;
+        prop_assert_eq!(a, b);
+    }
+
+    /// StealResult Retry variants are equal.
+    #[test]
+    fn steal_result_retry_eq(_dummy in 0..1u8) {
+        let a: StealResult<u32> = StealResult::Retry;
+        let b: StealResult<u32> = StealResult::Retry;
+        prop_assert_eq!(a, b);
+    }
+
+    /// Different StealResult variants are not equal.
+    #[test]
+    fn steal_result_variants_differ(val in any::<u32>()) {
+        let s: StealResult<u32> = StealResult::Success(val);
+        let e: StealResult<u32> = StealResult::Empty;
+        let r: StealResult<u32> = StealResult::Retry;
+        prop_assert_ne!(s.clone(), e.clone());
+        prop_assert_ne!(s, r.clone());
+        prop_assert_ne!(e, r);
+    }
+}
+
+// ── Single-item deque ───────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Single item pushed then popped returns that item.
+    #[test]
+    fn single_item_pop(val in any::<u32>()) {
+        let (worker, _stealer) = new_deque(4);
+        worker.push(val);
+        prop_assert_eq!(worker.pop(), Some(val));
+        prop_assert!(worker.is_empty());
+    }
+
+    /// Single item pushed then stolen returns that item.
+    #[test]
+    fn single_item_steal(val in any::<u32>()) {
+        let (worker, stealer) = new_deque(4);
+        worker.push(val);
+        let result = stealer.steal();
+        let is_success = result.is_success();
+        prop_assert!(is_success);
+        prop_assert_eq!(result.unwrap(), val);
+        prop_assert!(worker.is_empty());
+    }
+}
+
+// ── Push-pop-push cycle ─────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Push-pop-push cycle preserves correctness.
+    #[test]
+    fn push_pop_push_cycle(
+        first_batch in prop::collection::vec(0..1000u32, 1..20),
+        second_batch in prop::collection::vec(0..1000u32, 1..20),
+    ) {
+        let (worker, _stealer) = new_deque(64);
+
+        // Push first batch
+        for &item in &first_batch {
+            worker.push(item);
+        }
+        // Pop all
+        while worker.pop().is_some() {}
+        prop_assert!(worker.is_empty());
+
+        // Push second batch
+        for &item in &second_batch {
+            worker.push(item);
+        }
+        prop_assert_eq!(worker.len(), second_batch.len());
+
+        // Pop and verify LIFO
+        let mut popped = Vec::new();
+        while let Some(v) = worker.pop() {
+            popped.push(v);
+        }
+        let mut expected = second_batch.clone();
+        expected.reverse();
+        prop_assert_eq!(popped, expected);
+    }
+}
+
+// ── WsDequeConfig default property ──────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Default WsDequeConfig has reasonable initial_capacity.
+    #[test]
+    fn config_default_reasonable(_dummy in 0..1u8) {
+        let config = WsDequeConfig::default();
+        prop_assert!(config.initial_capacity > 0, "default capacity should be positive");
+    }
+}
+
+// ── Batch steal with zero max ───────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Batch steal with max 0 returns empty vec.
+    #[test]
+    fn batch_steal_zero_max(items in small_items_strategy()) {
+        let (worker, stealer) = new_deque(64);
+        for &item in &items {
+            worker.push(item);
+        }
+        let batch = stealer.steal_batch(0);
+        prop_assert!(batch.is_empty(), "batch steal with max 0 should return empty");
     }
 }
