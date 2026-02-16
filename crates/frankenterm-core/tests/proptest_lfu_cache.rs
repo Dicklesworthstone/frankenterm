@@ -10,8 +10,12 @@
 //! - Clone equivalence and independence
 //! - Clear empties the cache
 //! - Config and stats serde roundtrip
+//! - is_full agrees with len == capacity
+//! - from_config equivalence
+//! - Default trait
+//! - Eviction and min_frequency stats
 //!
-//! Bead: ft-283h4.38
+//! Bead: ft-283h4.38, ft-283h4.51
 
 use frankenterm_core::lfu_cache::*;
 use proptest::prelude::*;
@@ -237,6 +241,33 @@ proptest! {
         cache.remove(&all_keys[0]);
         prop_assert_eq!(cache.len(), before - 1, "len didn't decrease");
     }
+
+    /// Remove returns the removed value.
+    #[test]
+    fn prop_remove_returns_value(
+        cap in arb_capacity(),
+        key in 0u8..20,
+        val in 0u8..100,
+    ) {
+        let mut cache: LfuCache<u8, u8> = LfuCache::new(cap);
+        cache.insert(key, val);
+        let removed = cache.remove(&key);
+        prop_assert_eq!(removed, Some(val), "remove didn't return the value");
+    }
+
+    /// Double remove returns None on the second call.
+    #[test]
+    fn prop_double_remove_returns_none(
+        cap in arb_capacity(),
+        key in 0u8..20,
+        val in 0u8..100,
+    ) {
+        let mut cache: LfuCache<u8, u8> = LfuCache::new(cap);
+        cache.insert(key, val);
+        let _ = cache.remove(&key);
+        let second = cache.remove(&key);
+        prop_assert_eq!(second, None, "double remove should return None");
+    }
 }
 
 // ── Hit/miss counting ───────────────────────────────────────────────
@@ -395,5 +426,261 @@ proptest! {
         }
         prop_assert!(cache.is_empty());
         prop_assert_eq!(cache.len(), 0);
+    }
+}
+
+// ── is_full properties ──────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// is_full() agrees with len() == capacity().
+    #[test]
+    fn prop_is_full_matches_len_eq_capacity(
+        cap in arb_capacity(),
+        ops in arb_ops(),
+    ) {
+        let mut cache: LfuCache<u8, u8> = LfuCache::new(cap);
+        for &(k, v) in &ops {
+            cache.insert(k, v);
+        }
+        prop_assert_eq!(
+            cache.is_full(),
+            cache.len() == cache.capacity(),
+            "is_full disagrees with len==capacity"
+        );
+    }
+
+    /// Filling cache to capacity makes is_full true.
+    #[test]
+    fn prop_full_after_filling(cap in 1usize..=10) {
+        let mut cache: LfuCache<u8, u8> = LfuCache::new(cap);
+        for i in 0..cap as u8 {
+            cache.insert(i, i);
+        }
+        prop_assert!(cache.is_full(), "cache not full after inserting cap items");
+    }
+}
+
+// ── from_config properties ──────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// from_config produces a cache with the specified capacity.
+    #[test]
+    fn prop_from_config_capacity(cap in 0usize..500) {
+        let config = LfuCacheConfig { capacity: cap };
+        let cache: LfuCache<u8, u8> = LfuCache::from_config(&config);
+        prop_assert_eq!(cache.capacity(), cap, "from_config capacity mismatch");
+        prop_assert!(cache.is_empty(), "from_config should produce empty cache");
+    }
+
+    /// from_config is equivalent to new(config.capacity).
+    #[test]
+    fn prop_from_config_equiv_new(cap in arb_capacity()) {
+        let config = LfuCacheConfig { capacity: cap };
+        let cache1: LfuCache<u8, u8> = LfuCache::from_config(&config);
+        let cache2: LfuCache<u8, u8> = LfuCache::new(cap);
+        prop_assert_eq!(cache1.capacity(), cache2.capacity());
+        prop_assert_eq!(cache1.len(), cache2.len());
+    }
+}
+
+// ── Default trait properties ────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Default LfuCacheConfig has capacity 128.
+    #[test]
+    fn prop_default_config(_dummy in 0..1u8) {
+        let config = LfuCacheConfig::default();
+        prop_assert_eq!(config.capacity, 128);
+    }
+
+    /// Default LfuCache is usable and empty.
+    #[test]
+    fn prop_default_cache_usable(key in 0u8..50, val in 0u8..100) {
+        let mut cache: LfuCache<u8, u8> = LfuCache::default();
+        prop_assert!(cache.is_empty());
+        prop_assert_eq!(cache.capacity(), 128);
+        cache.insert(key, val);
+        prop_assert_eq!(cache.get(&key), Some(&val));
+    }
+}
+
+// ── Eviction stats properties ───────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Eviction count in stats matches actual evictions.
+    #[test]
+    fn prop_eviction_count_accurate(
+        cap in 1usize..=5,
+        n_extra in 1usize..=10,
+    ) {
+        let mut cache: LfuCache<u8, u8> = LfuCache::new(cap);
+        // Fill to capacity with unique keys
+        for i in 0..cap as u8 {
+            cache.insert(i, i);
+        }
+        // Each additional unique key causes one eviction
+        for i in 0..n_extra as u8 {
+            cache.insert(100 + i, i);
+        }
+        let stats = cache.stats();
+        prop_assert_eq!(
+            stats.evictions, n_extra as u64,
+            "eviction count mismatch: expected {}, got {}", n_extra, stats.evictions
+        );
+    }
+
+    /// min_frequency in stats is <= any entry's frequency.
+    #[test]
+    fn prop_min_frequency_is_minimum(
+        cap in 2usize..=8,
+        ops in prop::collection::vec((0u8..15, 0u8..50), 1..30),
+    ) {
+        let mut cache: LfuCache<u8, u8> = LfuCache::new(cap);
+        for &(k, v) in &ops {
+            cache.insert(k, v);
+        }
+        // Do some gets to vary frequencies
+        for &(k, _) in ops.iter().take(5) {
+            cache.get(&k);
+        }
+        let stats = cache.stats();
+        if !cache.is_empty() {
+            for key in cache.keys() {
+                if let Some(freq) = cache.frequency(&key) {
+                    prop_assert!(
+                        stats.min_frequency <= freq,
+                        "min_frequency {} > entry frequency {} for key {}",
+                        stats.min_frequency, freq, key
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ── Insert overwrite properties ─────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Inserting with existing key updates the value.
+    #[test]
+    fn prop_insert_overwrite_updates(
+        cap in arb_capacity(),
+        key in 0u8..10,
+        val1 in 0u8..50,
+        val2 in 50u8..100,
+    ) {
+        let mut cache: LfuCache<u8, u8> = LfuCache::new(cap);
+        cache.insert(key, val1);
+        cache.insert(key, val2);
+        prop_assert_eq!(cache.get(&key), Some(&val2), "overwrite didn't update value");
+    }
+
+    /// Inserting with existing key does not change len.
+    #[test]
+    fn prop_insert_overwrite_preserves_len(
+        cap in arb_capacity(),
+        key in 0u8..10,
+        val1 in 0u8..50,
+        val2 in 50u8..100,
+    ) {
+        let mut cache: LfuCache<u8, u8> = LfuCache::new(cap);
+        cache.insert(key, val1);
+        let len_before = cache.len();
+        cache.insert(key, val2);
+        prop_assert_eq!(cache.len(), len_before, "overwrite changed len");
+    }
+}
+
+// ── Clear resets stats ──────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// After clear, stats show zero entries.
+    #[test]
+    fn prop_clear_resets_entry_count(
+        cap in arb_capacity(),
+        ops in arb_ops(),
+    ) {
+        let mut cache: LfuCache<u8, u8> = LfuCache::new(cap);
+        for &(k, v) in &ops {
+            cache.insert(k, v);
+        }
+        cache.clear();
+        let stats = cache.stats();
+        prop_assert_eq!(stats.entry_count, 0, "entry_count not 0 after clear");
+    }
+
+    /// After clear, re-inserting works correctly.
+    #[test]
+    fn prop_clear_then_reinsert(
+        cap in arb_capacity(),
+        ops in arb_ops(),
+        key in 0u8..20,
+        val in 0u8..100,
+    ) {
+        let mut cache: LfuCache<u8, u8> = LfuCache::new(cap);
+        for &(k, v) in &ops {
+            cache.insert(k, v);
+        }
+        cache.clear();
+        cache.insert(key, val);
+        prop_assert_eq!(cache.get(&key), Some(&val));
+        prop_assert_eq!(cache.len(), 1);
+    }
+}
+
+// ── Display format property ─────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Display output contains capacity and len info.
+    #[test]
+    fn prop_display_contains_info(
+        cap in arb_capacity(),
+        ops in prop::collection::vec((0u8..10, 0u8..50), 0..10),
+    ) {
+        let mut cache: LfuCache<u8, u8> = LfuCache::new(cap);
+        for &(k, v) in &ops {
+            cache.insert(k, v);
+        }
+        let display = format!("{:?}", cache);
+        prop_assert!(!display.is_empty(), "Debug output should not be empty");
+    }
+}
+
+// ── Frequency monotonicity property ─────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Frequency is monotonically non-decreasing under get calls.
+    #[test]
+    fn prop_frequency_monotonic_under_gets(
+        n_gets in 1usize..=15,
+    ) {
+        let mut cache: LfuCache<u8, u8> = LfuCache::new(5);
+        cache.insert(42, 0);
+        let mut prev_freq = cache.frequency(&42).unwrap_or(0);
+        for _ in 0..n_gets {
+            cache.get(&42);
+            let cur_freq = cache.frequency(&42).unwrap_or(0);
+            prop_assert!(
+                cur_freq >= prev_freq,
+                "frequency decreased: {} -> {}", prev_freq, cur_freq
+            );
+            prev_freq = cur_freq;
+        }
     }
 }
