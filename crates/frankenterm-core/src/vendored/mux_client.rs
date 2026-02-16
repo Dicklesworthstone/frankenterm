@@ -1121,6 +1121,117 @@ mod tests {
     }
 
     #[test]
+    fn batch_render_changes_preserves_request_order_with_out_of_order_responses() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("batch-order.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut batch_requests: Vec<(u64, usize)> = Vec::new();
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let response =
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "wezterm-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    });
+                                let mut out = Vec::new();
+                                response
+                                    .encode(&mut out, decoded.serial)
+                                    .expect("encode response");
+                                stream.write_all(&out).await.expect("write response");
+                            }
+                            Pdu::SetClientId(_) => {
+                                let mut out = Vec::new();
+                                Pdu::UnitResponse(UnitResponse {})
+                                    .encode(&mut out, decoded.serial)
+                                    .expect("encode response");
+                                stream.write_all(&out).await.expect("write response");
+                            }
+                            Pdu::GetPaneRenderChanges(request) => {
+                                batch_requests.push((decoded.serial, request.pane_id));
+                                if batch_requests.len() == 3 {
+                                    for (idx, (serial, pane_id)) in
+                                        batch_requests.iter().rev().enumerate()
+                                    {
+                                        let response = Pdu::GetPaneRenderChangesResponse(
+                                            GetPaneRenderChangesResponse {
+                                                pane_id: *pane_id,
+                                                mouse_grabbed: false,
+                                                cursor_position:
+                                                    mux::renderable::StableCursorPosition::default(),
+                                                dimensions: mux::renderable::RenderableDimensions {
+                                                    cols: 80,
+                                                    viewport_rows: 24,
+                                                    scrollback_rows: 0,
+                                                    physical_top: 0,
+                                                    scrollback_top: 0,
+                                                    dpi: 96,
+                                                    pixel_width: 0,
+                                                    pixel_height: 0,
+                                                    reverse_video: false,
+                                                },
+                                                dirty_lines: Vec::new(),
+                                                title: format!("pane-{pane_id}"),
+                                                working_dir: None,
+                                                bonus_lines: Vec::new().into(),
+                                                input_serial: None,
+                                                seqno: idx + 1,
+                                            },
+                                        );
+                                        let mut out = Vec::new();
+                                        response
+                                            .encode(&mut out, *serial)
+                                            .expect("encode response");
+                                        stream.write_all(&out).await.expect("write response");
+                                    }
+                                    return;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            let responses = client
+                .get_pane_render_changes_batch(&[10, 20, 30], 3, Duration::from_secs(1))
+                .await
+                .expect("batch request");
+
+            assert_eq!(responses.len(), 3);
+            assert_eq!(responses[0].pane_id, 10);
+            assert_eq!(responses[1].pane_id, 20);
+            assert_eq!(responses[2].pane_id, 30);
+
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[test]
     fn next_request_serial_rejects_overflow() {
         let mut serial = u64::MAX;
         let err = next_request_serial(&mut serial).expect_err("overflow should be rejected");
