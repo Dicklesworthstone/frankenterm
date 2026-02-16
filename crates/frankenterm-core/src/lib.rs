@@ -86,6 +86,7 @@ pub mod degradation;
 pub mod desktop_notify;
 pub mod diagnostic;
 pub mod differential_snapshot;
+pub mod disjoint_intervals;
 pub mod docs_gen;
 pub mod drift;
 pub mod dry_run;
