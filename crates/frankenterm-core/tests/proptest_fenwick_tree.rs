@@ -109,12 +109,11 @@ proptest! {
     /// range_sum(i, i) == point_query(i) for all i.
     #[test]
     fn prop_range_sum_single_equals_point(
-        n in 1usize..=30,
         values in prop::collection::vec(-1000i64..=1000, 1..=30),
-        i in 0usize..30,
+        i_frac in 0.0f64..1.0,
     ) {
-        let n = n.min(values.len());
-        prop_assume!(i < n);
+        let n = values.len();
+        let i = (i_frac * n as f64) as usize % n;
         let ft = FenwickTree::from_slice(&values[..n]);
 
         prop_assert_eq!(
@@ -145,11 +144,11 @@ proptest! {
     #[test]
     fn prop_update_additivity(
         n in 1usize..=30,
-        i in 0usize..30,
+        i_frac in 0.0f64..1.0,
         a in -500i64..=500,
         b in -500i64..=500,
     ) {
-        prop_assume!(i < n);
+        let i = (i_frac * n as f64) as usize % n;
 
         // Two separate updates
         let mut ft1 = FenwickTree::new(n);
@@ -474,13 +473,12 @@ proptest! {
     /// set(i, v) makes point_query(i) == v.
     #[test]
     fn prop_set_then_query(
-        n in 1usize..=20,
-        i in 0usize..20,
         initial in prop::collection::vec(-100i64..=100, 1..=20),
+        i_frac in 0.0f64..1.0,
         new_val in -500i64..=500,
     ) {
-        let n = n.min(initial.len());
-        prop_assume!(i < n);
+        let n = initial.len();
+        let i = (i_frac * n as f64) as usize % n;
 
         let mut ft = FenwickTree::from_slice(&initial[..n]);
         ft.set(i, new_val);
@@ -490,13 +488,12 @@ proptest! {
     /// set doesn't affect other elements.
     #[test]
     fn prop_set_isolated(
-        n in 2usize..=15,
         values in prop::collection::vec(-100i64..=100, 2..=15),
-        i in 0usize..15,
+        i_frac in 0.0f64..1.0,
         new_val in -500i64..=500,
     ) {
-        let n = n.min(values.len());
-        prop_assume!(i < n);
+        let n = values.len();
+        let i = (i_frac * n as f64) as usize % n;
 
         let mut ft = FenwickTree::from_slice(&values[..n]);
         ft.set(i, new_val);

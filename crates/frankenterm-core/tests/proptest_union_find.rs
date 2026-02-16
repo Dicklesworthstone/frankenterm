@@ -44,6 +44,11 @@ fn build_uf(n: usize, ops: &[(usize, usize)]) -> UnionFind {
     uf
 }
 
+/// Map a fraction [0.0, 1.0) to an index in [0, n).
+fn frac_to_idx(frac: f64, n: usize) -> usize {
+    (frac * n as f64) as usize % n
+}
+
 // ── Find idempotence ────────────────────────────────────────────────
 
 proptest! {
@@ -96,10 +101,11 @@ proptest! {
     #[test]
     fn prop_connected_symmetric(
         (n, ops) in arb_union_find(20),
-        x in 0usize..20,
-        y in 0usize..20,
+        x_frac in 0.0f64..1.0,
+        y_frac in 0.0f64..1.0,
     ) {
-        prop_assume!(x < n && y < n);
+        let x = frac_to_idx(x_frac, n);
+        let y = frac_to_idx(y_frac, n);
         let mut uf = build_uf(n, &ops);
         let xy = uf.connected(x, y);
         let yx = uf.connected(y, x);
@@ -110,11 +116,13 @@ proptest! {
     #[test]
     fn prop_connected_transitive(
         (n, ops) in arb_union_find(20),
-        a in 0usize..20,
-        b in 0usize..20,
-        c in 0usize..20,
+        a_frac in 0.0f64..1.0,
+        b_frac in 0.0f64..1.0,
+        c_frac in 0.0f64..1.0,
     ) {
-        prop_assume!(a < n && b < n && c < n);
+        let a = frac_to_idx(a_frac, n);
+        let b = frac_to_idx(b_frac, n);
+        let c = frac_to_idx(c_frac, n);
         let mut uf = build_uf(n, &ops);
         if uf.connected(a, b) && uf.connected(b, c) {
             prop_assert!(uf.connected(a, c), "transitivity violated: connected({},{}) && connected({},{}) but not connected({},{})", a, b, b, c, a, c);
@@ -131,10 +139,11 @@ proptest! {
     #[test]
     fn prop_union_connects(
         n in arb_size(),
-        x in 0usize..50,
-        y in 0usize..50,
+        x_frac in 0.0f64..1.0,
+        y_frac in 0.0f64..1.0,
     ) {
-        prop_assume!(x < n && y < n);
+        let x = frac_to_idx(x_frac, n);
+        let y = frac_to_idx(y_frac, n);
         let mut uf = UnionFind::new(n);
         uf.union(x, y);
         prop_assert!(uf.connected(x, y));
@@ -145,10 +154,11 @@ proptest! {
     fn prop_union_commutative(
         n in 2usize..=30,
         ops in prop::collection::vec((0usize..30, 0usize..30), 0..20),
-        query_x in 0usize..30,
-        query_y in 0usize..30,
+        qx_frac in 0.0f64..1.0,
+        qy_frac in 0.0f64..1.0,
     ) {
-        prop_assume!(query_x < n && query_y < n);
+        let query_x = frac_to_idx(qx_frac, n);
+        let query_y = frac_to_idx(qy_frac, n);
         let valid_ops: Vec<(usize, usize)> = ops.iter()
             .filter(|&&(a, b)| a < n && b < n)
             .copied()
@@ -205,10 +215,12 @@ proptest! {
     #[test]
     fn prop_successful_union_decrements(
         n in 3usize..=30,
-        x in 0usize..30,
-        y in 0usize..30,
+        x_frac in 0.0f64..1.0,
+        y_frac in 0.0f64..1.0,
     ) {
-        prop_assume!(x < n && y < n && x != y);
+        let x = frac_to_idx(x_frac, n);
+        let y = frac_to_idx(y_frac, n);
+        prop_assume!(x != y);
         let mut uf = UnionFind::new(n);
         let before = uf.component_count();
         let merged = uf.union(x, y);
@@ -251,9 +263,9 @@ proptest! {
     #[test]
     fn prop_component_size_matches_members(
         (n, ops) in arb_union_find(20),
-        x in 0usize..20,
+        x_frac in 0.0f64..1.0,
     ) {
-        prop_assume!(x < n);
+        let x = frac_to_idx(x_frac, n);
         let mut uf = build_uf(n, &ops);
         let size = uf.component_size(x);
         let members = uf.component_members(x);
@@ -313,10 +325,12 @@ proptest! {
     #[test]
     fn prop_reset_disconnects_all(
         (n, ops) in arb_union_find(15),
-        x in 0usize..15,
-        y in 0usize..15,
+        x_frac in 0.0f64..1.0,
+        y_frac in 0.0f64..1.0,
     ) {
-        prop_assume!(x < n && y < n && x != y);
+        let x = frac_to_idx(x_frac, n);
+        let y = frac_to_idx(y_frac, n);
+        prop_assume!(x != y);
         let mut uf = build_uf(n, &ops);
         uf.reset();
         prop_assert!(!uf.connected(x, y), "elements {} and {} should be disconnected after reset", x, y);
