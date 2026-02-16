@@ -571,4 +571,222 @@ mod tests {
         rb.push(20);
         assert_eq!(rb.to_vec(), vec![&10, &20]);
     }
+
+    // ── Expanded coverage (DarkMill ft-26e06) ────────────────────────
+
+    #[test]
+    fn drain_empty_buffer() {
+        let mut rb: RingBuffer<i32> = RingBuffer::new(5);
+        let drained = rb.drain();
+        assert!(drained.is_empty());
+        assert!(rb.is_empty());
+    }
+
+    #[test]
+    fn drain_partial_fill() {
+        let mut rb = RingBuffer::new(5);
+        rb.push(10);
+        rb.push(20);
+        let drained = rb.drain();
+        assert_eq!(drained, vec![10, 20]);
+        assert!(rb.is_empty());
+    }
+
+    #[test]
+    fn push_after_drain() {
+        let mut rb = RingBuffer::new(3);
+        rb.push(1);
+        rb.push(2);
+        rb.push(3);
+        let _ = rb.drain();
+        rb.push(100);
+        rb.push(200);
+        assert_eq!(rb.len(), 2);
+        assert_eq!(rb.front(), Some(&100));
+        assert_eq!(rb.back(), Some(&200));
+    }
+
+    #[test]
+    fn into_iter_for_ref() {
+        let mut rb = RingBuffer::new(3);
+        rb.push(1);
+        rb.push(2);
+        rb.push(3);
+        let v: Vec<&i32> = (&rb).into_iter().collect();
+        assert_eq!(v, vec![&1, &2, &3]);
+    }
+
+    #[test]
+    fn get_out_of_bounds_empty() {
+        let rb: RingBuffer<i32> = RingBuffer::new(5);
+        assert_eq!(rb.get(0), None);
+        assert_eq!(rb.get(100), None);
+    }
+
+    #[test]
+    fn front_back_after_clear() {
+        let mut rb = RingBuffer::new(3);
+        rb.push(1);
+        rb.push(2);
+        rb.clear();
+        assert_eq!(rb.front(), None);
+        assert_eq!(rb.back(), None);
+    }
+
+    #[test]
+    fn total_evicted_when_not_full() {
+        let mut rb = RingBuffer::new(10);
+        rb.push(1);
+        rb.push(2);
+        assert_eq!(rb.total_evicted(), 0);
+        assert_eq!(rb.total_pushed(), 2);
+    }
+
+    #[test]
+    fn clear_preserves_nothing_about_total() {
+        let mut rb = RingBuffer::new(3);
+        rb.push(1);
+        rb.push(2);
+        rb.push(3);
+        rb.push(4);
+        let total_before = rb.total_pushed();
+        assert_eq!(total_before, 4);
+        rb.clear();
+        // total is not cleared
+        assert_eq!(rb.total_pushed(), 4);
+        assert_eq!(rb.total_evicted(), 1);
+    }
+
+    #[test]
+    fn stats_empty_buffer() {
+        let rb: RingBuffer<i32> = RingBuffer::new(5);
+        let s = rb.stats();
+        assert_eq!(s.capacity, 5);
+        assert_eq!(s.len, 0);
+        assert_eq!(s.total_pushed, 0);
+        assert_eq!(s.total_evicted, 0);
+        assert!((s.fill_ratio - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn stats_partial_fill() {
+        let mut rb = RingBuffer::new(4);
+        rb.push(1);
+        rb.push(2);
+        let s = rb.stats();
+        assert_eq!(s.len, 2);
+        assert!((s.fill_ratio - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn to_owned_vec_empty() {
+        let rb: RingBuffer<String> = RingBuffer::new(3);
+        let v = rb.to_owned_vec();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn to_owned_vec_after_wrap() {
+        let mut rb = RingBuffer::new(2);
+        rb.push("a".to_string());
+        rb.push("b".to_string());
+        rb.push("c".to_string()); // evicts "a"
+        let v = rb.to_owned_vec();
+        assert_eq!(v, vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn capacity_accessor_matches_constructor() {
+        for cap in [1, 2, 5, 10, 100] {
+            let rb: RingBuffer<u8> = RingBuffer::new(cap);
+            assert_eq!(rb.capacity(), cap);
+        }
+    }
+
+    #[test]
+    fn is_full_transitions() {
+        let mut rb = RingBuffer::new(3);
+        assert!(!rb.is_full());
+        rb.push(1);
+        assert!(!rb.is_full());
+        rb.push(2);
+        assert!(!rb.is_full());
+        rb.push(3);
+        assert!(rb.is_full());
+        rb.push(4); // still full after overwrite
+        assert!(rb.is_full());
+    }
+
+    #[test]
+    fn get_after_multiple_wraps() {
+        let mut rb = RingBuffer::new(3);
+        for i in 0..100 {
+            rb.push(i);
+        }
+        // Last 3 items: 97, 98, 99
+        assert_eq!(rb.get(0), Some(&97));
+        assert_eq!(rb.get(1), Some(&98));
+        assert_eq!(rb.get(2), Some(&99));
+    }
+
+    #[test]
+    fn push_string_ownership() {
+        let mut rb = RingBuffer::new(2);
+        let s = String::from("hello");
+        rb.push(s); // ownership transferred
+        assert_eq!(rb.back(), Some(&String::from("hello")));
+    }
+
+    #[test]
+    fn iter_size_hint() {
+        let mut rb = RingBuffer::new(5);
+        rb.push(1);
+        rb.push(2);
+        rb.push(3);
+        let iter = rb.iter();
+        assert_eq!(iter.size_hint(), (3, Some(3)));
+    }
+
+    #[test]
+    fn iter_exact_size_after_wrap() {
+        let mut rb = RingBuffer::new(3);
+        for i in 0..10 {
+            rb.push(i);
+        }
+        assert_eq!(rb.iter().len(), 3);
+    }
+
+    #[test]
+    fn drain_after_wrap() {
+        let mut rb = RingBuffer::new(3);
+        rb.push(1);
+        rb.push(2);
+        rb.push(3);
+        rb.push(4);
+        rb.push(5);
+        let drained = rb.drain();
+        assert_eq!(drained, vec![3, 4, 5]); // oldest to newest
+        assert!(rb.is_empty());
+    }
+
+    #[test]
+    fn evicted_count_accurate() {
+        let mut rb = RingBuffer::new(3);
+        for i in 0..10 {
+            rb.push(i);
+        }
+        assert_eq!(rb.total_pushed(), 10);
+        assert_eq!(rb.total_evicted(), 7); // 10 - 3
+    }
+
+    #[test]
+    fn front_back_capacity_one_after_push() {
+        let mut rb = RingBuffer::new(1);
+        rb.push(42);
+        assert_eq!(rb.front(), Some(&42));
+        assert_eq!(rb.back(), Some(&42));
+        rb.push(99);
+        assert_eq!(rb.front(), Some(&99));
+        assert_eq!(rb.back(), Some(&99));
+    }
 }
