@@ -644,4 +644,321 @@ mod tests {
 
         assert_eq!(di1.intervals(), di2.intervals());
     }
+
+    // ── Expanded coverage ──────────────────────────────────────────
+
+    #[test]
+    fn default_is_empty() {
+        let di = DisjointIntervals::default();
+        assert!(di.is_empty());
+        assert_eq!(di.count(), 0);
+        assert_eq!(di.span(), 0);
+    }
+
+    #[test]
+    fn from_config_merge_adjacent_false() {
+        let config = DisjointIntervalsConfig { merge_adjacent: false };
+        let mut di = DisjointIntervals::from_config(&config);
+        di.insert(1, 5);
+        di.insert(5, 8); // adjacent but shouldn't merge
+        assert_eq!(di.count(), 2);
+        assert_eq!(di.intervals()[0], Interval::new(1, 5));
+        assert_eq!(di.intervals()[1], Interval::new(5, 8));
+    }
+
+    #[test]
+    fn from_config_merge_adjacent_false_overlapping_still_merges() {
+        let config = DisjointIntervalsConfig { merge_adjacent: false };
+        let mut di = DisjointIntervals::from_config(&config);
+        di.insert(1, 6);
+        di.insert(5, 8); // overlapping should still merge
+        assert_eq!(di.count(), 1);
+        assert_eq!(di.intervals()[0], Interval::new(1, 8));
+    }
+
+    #[test]
+    fn insert_duplicate_same_interval() {
+        let mut di = DisjointIntervals::new();
+        di.insert(1, 5);
+        di.insert(1, 5);
+        assert_eq!(di.count(), 1);
+        assert_eq!(di.span(), 4);
+    }
+
+    #[test]
+    fn insert_subset_no_change() {
+        let mut di = DisjointIntervals::new();
+        di.insert(0, 10);
+        di.insert(3, 7); // subset
+        assert_eq!(di.count(), 1);
+        assert_eq!(di.intervals()[0], Interval::new(0, 10));
+    }
+
+    #[test]
+    fn insert_reverse_order() {
+        let mut di = DisjointIntervals::new();
+        di.insert(10, 15);
+        di.insert(5, 8);
+        di.insert(0, 3);
+        assert_eq!(di.count(), 3);
+        assert_eq!(di.intervals()[0], Interval::new(0, 3));
+        assert_eq!(di.intervals()[1], Interval::new(5, 8));
+        assert_eq!(di.intervals()[2], Interval::new(10, 15));
+    }
+
+    #[test]
+    #[should_panic(expected = "start")]
+    fn insert_start_greater_than_end_panics() {
+        let mut di = DisjointIntervals::new();
+        di.insert(10, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "start")]
+    fn remove_start_greater_than_end_panics() {
+        let mut di = DisjointIntervals::new();
+        di.remove(10, 5);
+    }
+
+    #[test]
+    fn remove_empty_interval_noop() {
+        let mut di = DisjointIntervals::new();
+        di.insert(0, 10);
+        di.remove(5, 5);
+        assert_eq!(di.count(), 1);
+        assert_eq!(di.intervals()[0], Interval::new(0, 10));
+    }
+
+    #[test]
+    fn remove_spanning_multiple_intervals() {
+        let mut di = DisjointIntervals::new();
+        di.insert(0, 3);
+        di.insert(5, 8);
+        di.insert(10, 13);
+        di.remove(2, 11); // spans all three
+        assert_eq!(di.count(), 2);
+        assert_eq!(di.intervals()[0], Interval::new(0, 2));
+        assert_eq!(di.intervals()[1], Interval::new(11, 13));
+    }
+
+    #[test]
+    fn remove_superset_of_all() {
+        let mut di = DisjointIntervals::new();
+        di.insert(5, 10);
+        di.insert(15, 20);
+        di.remove(0, 100);
+        assert!(di.is_empty());
+    }
+
+    #[test]
+    fn gaps_empty_set() {
+        let di = DisjointIntervals::new();
+        let gaps = di.gaps(0, 10);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0], Interval::new(0, 10));
+    }
+
+    #[test]
+    fn gaps_invalid_range() {
+        let mut di = DisjointIntervals::new();
+        di.insert(0, 10);
+        let gaps = di.gaps(10, 5); // lo >= hi
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn gaps_intervals_extend_beyond_query() {
+        let mut di = DisjointIntervals::new();
+        di.insert(0, 20); // extends beyond [5, 15)
+        let gaps = di.gaps(5, 15);
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn gaps_partial_overlap_left() {
+        let mut di = DisjointIntervals::new();
+        di.insert(3, 8); // partially inside [0, 10)
+        let gaps = di.gaps(0, 10);
+        assert_eq!(gaps.len(), 2);
+        assert_eq!(gaps[0], Interval::new(0, 3));
+        assert_eq!(gaps[1], Interval::new(8, 10));
+    }
+
+    #[test]
+    fn contains_boundary_points() {
+        let mut di = DisjointIntervals::new();
+        di.insert(10, 20);
+        assert!(di.contains(10)); // start inclusive
+        assert!(di.contains(19)); // end - 1
+        assert!(!di.contains(20)); // end exclusive
+        assert!(!di.contains(9));
+    }
+
+    #[test]
+    fn contains_empty_set() {
+        let di = DisjointIntervals::new();
+        assert!(!di.contains(0));
+        assert!(!di.contains(100));
+    }
+
+    #[test]
+    fn intersects_empty_range() {
+        let mut di = DisjointIntervals::new();
+        di.insert(0, 10);
+        assert!(!di.intersects(5, 5)); // empty query
+    }
+
+    #[test]
+    fn intersects_empty_set() {
+        let di = DisjointIntervals::new();
+        assert!(!di.intersects(0, 10));
+    }
+
+    #[test]
+    fn min_max_after_removal() {
+        let mut di = DisjointIntervals::new();
+        di.insert(0, 5);
+        di.insert(10, 20);
+        di.insert(30, 40);
+        di.remove(0, 5); // remove first
+        assert_eq!(di.min_start(), Some(10));
+        di.remove(30, 40); // remove last
+        assert_eq!(di.max_end(), Some(20));
+    }
+
+    #[test]
+    fn interval_overlaps_vs_overlaps_or_adjacent() {
+        let a = Interval::new(0, 5);
+        let b = Interval::new(5, 10); // adjacent
+        assert!(!a.overlaps(&b), "adjacent should not strictly overlap");
+        assert!(a.overlaps_or_adjacent(&b), "adjacent should overlap-or-adjacent");
+
+        let c = Interval::new(4, 10); // overlapping
+        assert!(a.overlaps(&c));
+        assert!(a.overlaps_or_adjacent(&c));
+
+        let d = Interval::new(6, 10); // disjoint
+        assert!(!a.overlaps(&d));
+        assert!(!a.overlaps_or_adjacent(&d));
+    }
+
+    #[test]
+    fn interval_merge() {
+        let a = Interval::new(0, 5);
+        let b = Interval::new(3, 10);
+        let merged = a.merge(&b);
+        assert_eq!(merged, Interval::new(0, 10));
+    }
+
+    #[test]
+    fn interval_serde() {
+        let iv = Interval::new(42, 100);
+        let json = serde_json::to_string(&iv).unwrap();
+        let back: Interval = serde_json::from_str(&json).unwrap();
+        assert_eq!(iv, back);
+    }
+
+    #[test]
+    fn interval_ord() {
+        let a = Interval::new(0, 5);
+        let b = Interval::new(1, 3);
+        let c = Interval::new(0, 10);
+        assert!(a < b);
+        assert!(a < c);
+    }
+
+    #[test]
+    #[should_panic(expected = "start")]
+    fn interval_invalid_panics() {
+        Interval::new(10, 5);
+    }
+
+    #[test]
+    fn stats_memory_bytes_positive() {
+        let mut di = DisjointIntervals::new();
+        di.insert(0, 10);
+        let stats = di.stats();
+        assert!(stats.memory_bytes > 0);
+    }
+
+    #[test]
+    fn config_default_merge_adjacent_true() {
+        let config = DisjointIntervalsConfig::default();
+        assert!(config.merge_adjacent);
+    }
+
+    #[test]
+    fn stress_many_inserts() {
+        let mut di = DisjointIntervals::new();
+        for i in (0..100).step_by(3) {
+            di.insert(i, i + 2);
+        }
+        // Each [i, i+2) is separated by a gap of 1
+        assert_eq!(di.count(), 34);
+        assert_eq!(di.span(), 68); // 34 * 2
+    }
+
+    #[test]
+    fn stress_merge_all() {
+        let mut di = DisjointIntervals::new();
+        for i in 0..50 {
+            di.insert(i * 2, i * 2 + 2); // [0,2), [2,4), [4,6)...
+        }
+        // All adjacent, should merge into one
+        assert_eq!(di.count(), 1);
+        assert_eq!(di.intervals()[0], Interval::new(0, 100));
+    }
+
+    #[test]
+    fn clear_resets_intervals_not_stats() {
+        let mut di = DisjointIntervals::new();
+        di.insert(0, 10);
+        di.remove(3, 7);
+        di.clear();
+        assert!(di.is_empty());
+        assert_eq!(di.span(), 0);
+        let stats = di.stats();
+        // insert and remove ops are still tracked
+        assert_eq!(stats.insert_count, 1);
+        assert_eq!(stats.remove_count, 1);
+    }
+
+    #[test]
+    fn insert_after_clear() {
+        let mut di = DisjointIntervals::new();
+        di.insert(0, 10);
+        di.clear();
+        di.insert(20, 30);
+        assert_eq!(di.count(), 1);
+        assert_eq!(di.intervals()[0], Interval::new(20, 30));
+    }
+
+    #[test]
+    fn debug_format() {
+        let di = DisjointIntervals::new();
+        let dbg = format!("{:?}", di);
+        assert!(dbg.contains("DisjointIntervals"));
+    }
+
+    #[test]
+    fn intervals_accessor_sorted() {
+        let mut di = DisjointIntervals::new();
+        di.insert(20, 30);
+        di.insert(0, 5);
+        di.insert(10, 15);
+        let ivs = di.intervals();
+        for w in ivs.windows(2) {
+            assert!(w[0].start < w[1].start);
+        }
+    }
+
+    #[test]
+    fn remove_then_reinsert() {
+        let mut di = DisjointIntervals::new();
+        di.insert(0, 10);
+        di.remove(0, 10);
+        assert!(di.is_empty());
+        di.insert(0, 10);
+        assert_eq!(di.count(), 1);
+    }
 }

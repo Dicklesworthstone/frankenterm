@@ -522,6 +522,55 @@ mod tests {
     }
 
     #[test]
+    fn stats_empty_structure_reports_zero_largest_component() {
+        let mut uf = UnionFind::new(0);
+        let stats = uf.stats();
+        assert_eq!(stats.element_count, 0);
+        assert_eq!(stats.component_count, 0);
+        assert_eq!(stats.largest_component, 0);
+        assert_eq!(stats.union_count, 0);
+        assert_eq!(stats.find_count, 0);
+    }
+
+    #[test]
+    fn union_same_element_is_noop() {
+        let mut uf = UnionFind::new(3);
+        assert!(!uf.union(1, 1));
+        assert_eq!(uf.component_count(), 3);
+    }
+
+    #[test]
+    fn all_components_are_sorted_by_first_member() {
+        let mut uf = UnionFind::new(6);
+        uf.union(2, 4);
+        uf.union(0, 1);
+        let components = uf.all_components();
+        assert_eq!(
+            components,
+            vec![vec![0, 1], vec![2, 4], vec![3], vec![5]]
+        );
+    }
+
+    #[test]
+    fn reset_clears_counters_and_connectivity() {
+        let mut uf = UnionFind::new(4);
+        uf.union(0, 1);
+        uf.union(2, 3);
+        assert!(uf.connected(0, 1));
+        assert!(uf.connected(2, 3));
+
+        uf.reset();
+
+        let stats = uf.stats();
+        assert_eq!(stats.union_count, 0);
+        // stats() performs one find per element when computing largest_component.
+        assert_eq!(stats.find_count, uf.len() as u64);
+        assert_eq!(stats.component_count, uf.len());
+        assert!(!uf.connected(0, 1));
+        assert!(!uf.connected(2, 3));
+    }
+
+    #[test]
     #[should_panic(expected = "out of range")]
     fn find_out_of_bounds() {
         let mut uf = UnionFind::new(3);
