@@ -10,6 +10,7 @@
 //! - CompatRuntime trait methods (block_on, spawn_detached) execute properly
 //! - sleep() and timeout() wrappers behave as expected
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -18,253 +19,307 @@ use frankenterm_core::runtime_compat::{
     self, CompatRuntime, Mutex, RuntimeBuilder, RwLock, Semaphore,
 };
 
+fn run_async_test<F>(future: F)
+where
+    F: Future<Output = ()>,
+{
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("failed to build runtime_compat current-thread runtime");
+    CompatRuntime::block_on(&runtime, future);
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Mutex
 // ────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn mutex_lock_and_read() {
-    let m = Mutex::new(42u64);
-    let guard = m.lock().await;
-    assert_eq!(*guard, 42);
+#[test]
+fn mutex_lock_and_read() {
+    run_async_test(async {
+        let m = Mutex::new(42u64);
+        let guard = m.lock().await;
+        assert_eq!(*guard, 42);
+    });
 }
 
-#[tokio::test]
-async fn mutex_lock_and_mutate() {
-    let m = Mutex::new(0u64);
-    {
-        let mut guard = m.lock().await;
-        *guard = 99;
-    }
-    let guard = m.lock().await;
-    assert_eq!(*guard, 99);
+#[test]
+fn mutex_lock_and_mutate() {
+    run_async_test(async {
+        let m = Mutex::new(0u64);
+        {
+            let mut guard = m.lock().await;
+            *guard = 99;
+        }
+        let guard = m.lock().await;
+        assert_eq!(*guard, 99);
+    });
 }
 
-#[tokio::test]
-async fn mutex_sequential_locks_preserve_state() {
-    let m = Arc::new(Mutex::new(0u64));
-    for i in 1..=10 {
-        let mut guard = m.lock().await;
-        *guard += 1;
-        assert_eq!(*guard, i);
-    }
-}
-
-#[tokio::test]
-async fn mutex_concurrent_tasks() {
-    let m = Arc::new(Mutex::new(0u64));
-    let mut handles = Vec::new();
-    for _ in 0..10 {
-        let m = Arc::clone(&m);
-        handles.push(tokio::spawn(async move {
+#[test]
+fn mutex_sequential_locks_preserve_state() {
+    run_async_test(async {
+        let m = Arc::new(Mutex::new(0u64));
+        for i in 1..=10 {
             let mut guard = m.lock().await;
             *guard += 1;
-        }));
-    }
-    for h in handles {
-        h.await.unwrap();
-    }
-    assert_eq!(*m.lock().await, 10);
+            assert_eq!(*guard, i);
+        }
+    });
+}
+
+#[test]
+fn mutex_concurrent_tasks() {
+    run_async_test(async {
+        let m = Arc::new(Mutex::new(0u64));
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let m = Arc::clone(&m);
+            handles.push(runtime_compat::task::spawn(async move {
+                let mut guard = m.lock().await;
+                *guard += 1;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(*m.lock().await, 10);
+    });
 }
 
 // ────────────────────────────────────────────────────────────────────
 // RwLock
 // ────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn rwlock_read_access() {
-    let rw = RwLock::new(42u64);
-    let guard = rw.read().await;
-    assert_eq!(*guard, 42);
+#[test]
+fn rwlock_read_access() {
+    run_async_test(async {
+        let rw = RwLock::new(42u64);
+        let guard = rw.read().await;
+        assert_eq!(*guard, 42);
+    });
 }
 
-#[tokio::test]
-async fn rwlock_write_access() {
-    let rw = RwLock::new(0u64);
-    {
-        let mut guard = rw.write().await;
-        *guard = 77;
-    }
-    let guard = rw.read().await;
-    assert_eq!(*guard, 77);
+#[test]
+fn rwlock_write_access() {
+    run_async_test(async {
+        let rw = RwLock::new(0u64);
+        {
+            let mut guard = rw.write().await;
+            *guard = 77;
+        }
+        let guard = rw.read().await;
+        assert_eq!(*guard, 77);
+    });
 }
 
-#[tokio::test]
-async fn rwlock_concurrent_reads() {
-    let rw = Arc::new(RwLock::new(42u64));
-    let mut handles = Vec::new();
-    for _ in 0..10 {
-        let rw = Arc::clone(&rw);
-        handles.push(tokio::spawn(async move {
-            let guard = rw.read().await;
-            assert_eq!(*guard, 42);
-        }));
-    }
-    for h in handles {
-        h.await.unwrap();
-    }
+#[test]
+fn rwlock_concurrent_reads() {
+    run_async_test(async {
+        let rw = Arc::new(RwLock::new(42u64));
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let rw = Arc::clone(&rw);
+            handles.push(runtime_compat::task::spawn(async move {
+                let guard = rw.read().await;
+                assert_eq!(*guard, 42);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    });
 }
 
-#[tokio::test]
-async fn rwlock_write_then_read() {
-    let rw = Arc::new(RwLock::new(String::from("hello")));
-    {
-        let mut guard = rw.write().await;
-        guard.push_str(" world");
-    }
-    let guard = rw.read().await;
-    assert_eq!(&*guard, "hello world");
+#[test]
+fn rwlock_write_then_read() {
+    run_async_test(async {
+        let rw = Arc::new(RwLock::new(String::from("hello")));
+        {
+            let mut guard = rw.write().await;
+            guard.push_str(" world");
+        }
+        let guard = rw.read().await;
+        assert_eq!(&*guard, "hello world");
+    });
 }
 
 // ────────────────────────────────────────────────────────────────────
 // Semaphore
 // ────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn semaphore_acquire_and_release() {
-    let sem = Semaphore::new(2);
-    assert_eq!(sem.available_permits(), 2);
+#[test]
+fn semaphore_acquire_and_release() {
+    run_async_test(async {
+        let sem = Semaphore::new(2);
+        assert_eq!(sem.available_permits(), 2);
 
-    let p1 = sem.acquire().await.unwrap();
-    assert_eq!(sem.available_permits(), 1);
+        let p1 = sem.acquire().await.unwrap();
+        assert_eq!(sem.available_permits(), 1);
 
-    let _p2 = sem.acquire().await.unwrap();
-    assert_eq!(sem.available_permits(), 0);
+        let _p2 = sem.acquire().await.unwrap();
+        assert_eq!(sem.available_permits(), 0);
 
-    drop(p1);
-    assert_eq!(sem.available_permits(), 1);
+        drop(p1);
+        assert_eq!(sem.available_permits(), 1);
+    });
 }
 
-#[tokio::test]
-async fn semaphore_try_acquire_succeeds() {
-    let sem = Semaphore::new(1);
-    let permit = sem.try_acquire().unwrap();
-    assert_eq!(sem.available_permits(), 0);
-    drop(permit);
-    assert_eq!(sem.available_permits(), 1);
+#[test]
+fn semaphore_try_acquire_succeeds() {
+    run_async_test(async {
+        let sem = Semaphore::new(1);
+        let permit = sem.try_acquire().unwrap();
+        assert_eq!(sem.available_permits(), 0);
+        drop(permit);
+        assert_eq!(sem.available_permits(), 1);
+    });
 }
 
-#[tokio::test]
-async fn semaphore_try_acquire_no_permits() {
-    let sem = Semaphore::new(0);
-    let err = sem.try_acquire().unwrap_err();
-    // tokio's TryAcquireError::NoPermits
-    assert!(format!("{}", err).contains("no permits"));
+#[test]
+fn semaphore_try_acquire_no_permits() {
+    run_async_test(async {
+        let sem = Semaphore::new(0);
+        let err = sem.try_acquire().unwrap_err();
+        // tokio's TryAcquireError::NoPermits
+        assert!(format!("{}", err).contains("no permits"));
+    });
 }
 
-#[tokio::test]
-async fn semaphore_close_blocks_acquire() {
-    let sem = Semaphore::new(5);
-    sem.close();
-    let result = sem.try_acquire();
-    assert!(result.is_err());
+#[test]
+fn semaphore_close_blocks_acquire() {
+    run_async_test(async {
+        let sem = Semaphore::new(5);
+        sem.close();
+        let result = sem.try_acquire();
+        assert!(result.is_err());
+    });
 }
 
-#[tokio::test]
-async fn semaphore_available_permits_tracks() {
-    let sem = Semaphore::new(3);
-    assert_eq!(sem.available_permits(), 3);
+#[test]
+fn semaphore_available_permits_tracks() {
+    run_async_test(async {
+        let sem = Semaphore::new(3);
+        assert_eq!(sem.available_permits(), 3);
 
-    let _p1 = sem.try_acquire().unwrap();
-    assert_eq!(sem.available_permits(), 2);
+        let _p1 = sem.try_acquire().unwrap();
+        assert_eq!(sem.available_permits(), 2);
 
-    let _p2 = sem.try_acquire().unwrap();
-    assert_eq!(sem.available_permits(), 1);
+        let _p2 = sem.try_acquire().unwrap();
+        assert_eq!(sem.available_permits(), 1);
 
-    let _p3 = sem.try_acquire().unwrap();
-    assert_eq!(sem.available_permits(), 0);
+        let _p3 = sem.try_acquire().unwrap();
+        assert_eq!(sem.available_permits(), 0);
+    });
 }
 
-#[tokio::test]
-async fn semaphore_acquire_owned() {
-    let sem = Arc::new(Semaphore::new(1));
-    let permit = Semaphore::acquire_owned(Arc::clone(&sem)).await.unwrap();
-    assert_eq!(sem.available_permits(), 0);
-    drop(permit);
-    assert_eq!(sem.available_permits(), 1);
+#[test]
+fn semaphore_acquire_owned() {
+    run_async_test(async {
+        let sem = Arc::new(Semaphore::new(1));
+        let permit = Semaphore::acquire_owned(Arc::clone(&sem)).await.unwrap();
+        assert_eq!(sem.available_permits(), 0);
+        drop(permit);
+        assert_eq!(sem.available_permits(), 1);
+    });
 }
 
-#[tokio::test]
-async fn semaphore_try_acquire_owned_succeeds() {
-    let sem = Arc::new(Semaphore::new(1));
-    let permit = Semaphore::try_acquire_owned(Arc::clone(&sem)).unwrap();
-    assert_eq!(sem.available_permits(), 0);
-    drop(permit);
-    assert_eq!(sem.available_permits(), 1);
+#[test]
+fn semaphore_try_acquire_owned_succeeds() {
+    run_async_test(async {
+        let sem = Arc::new(Semaphore::new(1));
+        let permit = Semaphore::try_acquire_owned(Arc::clone(&sem)).unwrap();
+        assert_eq!(sem.available_permits(), 0);
+        drop(permit);
+        assert_eq!(sem.available_permits(), 1);
+    });
 }
 
-#[tokio::test]
-async fn semaphore_try_acquire_owned_no_permits() {
-    let sem = Arc::new(Semaphore::new(0));
-    let result = Semaphore::try_acquire_owned(Arc::clone(&sem));
-    assert!(result.is_err());
+#[test]
+fn semaphore_try_acquire_owned_no_permits() {
+    run_async_test(async {
+        let sem = Arc::new(Semaphore::new(0));
+        let result = Semaphore::try_acquire_owned(Arc::clone(&sem));
+        assert!(result.is_err());
+    });
 }
 
 // ────────────────────────────────────────────────────────────────────
 // mpsc channel
 // ────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn mpsc_send_and_recv() {
-    let (tx, mut rx) = runtime_compat::mpsc::channel::<u64>(8);
-    tx.send(42).await.unwrap();
-    tx.send(43).await.unwrap();
-    assert_eq!(rx.recv().await, Some(42));
-    assert_eq!(rx.recv().await, Some(43));
+#[test]
+fn mpsc_send_and_recv() {
+    run_async_test(async {
+        let (tx, mut rx) = runtime_compat::mpsc::channel::<u64>(8);
+        tx.send(42).await.unwrap();
+        tx.send(43).await.unwrap();
+        assert_eq!(rx.recv().await, Some(42));
+        assert_eq!(rx.recv().await, Some(43));
+    });
 }
 
-#[tokio::test]
-async fn mpsc_closed_on_sender_drop() {
-    let (tx, mut rx) = runtime_compat::mpsc::channel::<u64>(8);
-    tx.send(1).await.unwrap();
-    drop(tx);
-    assert_eq!(rx.recv().await, Some(1));
-    assert_eq!(rx.recv().await, None); // channel closed
+#[test]
+fn mpsc_closed_on_sender_drop() {
+    run_async_test(async {
+        let (tx, mut rx) = runtime_compat::mpsc::channel::<u64>(8);
+        tx.send(1).await.unwrap();
+        drop(tx);
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(rx.recv().await, None); // channel closed
+    });
 }
 
-#[tokio::test]
-async fn mpsc_multiple_senders() {
-    let (tx, mut rx) = runtime_compat::mpsc::channel::<u64>(16);
-    let tx2 = tx.clone();
+#[test]
+fn mpsc_multiple_senders() {
+    run_async_test(async {
+        let (tx, mut rx) = runtime_compat::mpsc::channel::<u64>(16);
+        let tx2 = tx.clone();
 
-    tx.send(1).await.unwrap();
-    tx2.send(2).await.unwrap();
+        tx.send(1).await.unwrap();
+        tx2.send(2).await.unwrap();
 
-    let mut values = vec![rx.recv().await.unwrap(), rx.recv().await.unwrap()];
-    values.sort();
-    assert_eq!(values, vec![1, 2]);
+        let mut values = vec![rx.recv().await.unwrap(), rx.recv().await.unwrap()];
+        values.sort();
+        assert_eq!(values, vec![1, 2]);
+    });
 }
 
 // ────────────────────────────────────────────────────────────────────
 // watch channel
 // ────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn watch_send_and_borrow() {
-    let (tx, rx) = runtime_compat::watch::channel(0u64);
-    assert_eq!(*rx.borrow(), 0);
+#[test]
+fn watch_send_and_borrow() {
+    run_async_test(async {
+        let (tx, rx) = runtime_compat::watch::channel(0u64);
+        assert_eq!(*rx.borrow(), 0);
 
-    tx.send(42).unwrap();
-    assert_eq!(*rx.borrow(), 42);
+        tx.send(42).unwrap();
+        assert_eq!(*rx.borrow(), 42);
+    });
 }
 
-#[tokio::test]
-async fn watch_changed_notification() {
-    let (tx, mut rx) = runtime_compat::watch::channel(0u64);
-    tx.send(1).unwrap();
+#[test]
+fn watch_changed_notification() {
+    run_async_test(async {
+        let (tx, mut rx) = runtime_compat::watch::channel(0u64);
+        tx.send(1).unwrap();
 
-    rx.changed().await.unwrap();
-    assert_eq!(*rx.borrow_and_update(), 1);
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow_and_update(), 1);
+    });
 }
 
-#[tokio::test]
-async fn watch_multiple_receivers() {
-    let (tx, rx1) = runtime_compat::watch::channel(0u64);
-    let rx2 = rx1.clone();
+#[test]
+fn watch_multiple_receivers() {
+    run_async_test(async {
+        let (tx, rx1) = runtime_compat::watch::channel(0u64);
+        let rx2 = rx1.clone();
 
-    tx.send(99).unwrap();
-    assert_eq!(*rx1.borrow(), 99);
-    assert_eq!(*rx2.borrow(), 99);
+        tx.send(99).unwrap();
+        assert_eq!(*rx1.borrow(), 99);
+        assert_eq!(*rx2.borrow(), 99);
+    });
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -351,9 +406,9 @@ fn compat_runtime_spawn_detached_runs() {
 
 fn rt2_spawn_helper(flag: &Arc<AtomicUsize>) {
     // We can't call spawn_detached from within block_on easily without a handle,
-    // so test using tokio::spawn directly (which is what the tokio CompatRuntime delegates to)
+    // so test using runtime_compat::task::spawn (which delegates to tokio in this cfg).
     let f = Arc::clone(flag);
-    tokio::spawn(async move {
+    runtime_compat::task::spawn(async move {
         f.store(1, Ordering::SeqCst);
     });
 }
@@ -362,108 +417,126 @@ fn rt2_spawn_helper(flag: &Arc<AtomicUsize>) {
 // sleep
 // ────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn sleep_completes_after_duration() {
-    let start = Instant::now();
-    runtime_compat::sleep(Duration::from_millis(10)).await;
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed >= Duration::from_millis(5),
-        "sleep should wait at least ~10ms, got {}ms",
-        elapsed.as_millis()
-    );
+#[test]
+fn sleep_completes_after_duration() {
+    run_async_test(async {
+        let start = Instant::now();
+        runtime_compat::sleep(Duration::from_millis(10)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(5),
+            "sleep should wait at least ~10ms, got {}ms",
+            elapsed.as_millis()
+        );
+    });
 }
 
-#[tokio::test]
-async fn sleep_zero_duration_returns_immediately() {
-    let start = Instant::now();
-    runtime_compat::sleep(Duration::ZERO).await;
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_millis(50),
-        "zero sleep should be near-instant, got {}ms",
-        elapsed.as_millis()
-    );
+#[test]
+fn sleep_zero_duration_returns_immediately() {
+    run_async_test(async {
+        let start = Instant::now();
+        runtime_compat::sleep(Duration::ZERO).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "zero sleep should be near-instant, got {}ms",
+            elapsed.as_millis()
+        );
+    });
 }
 
 // ────────────────────────────────────────────────────────────────────
 // timeout
 // ────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn timeout_ok_when_future_completes_in_time() {
-    let result = runtime_compat::timeout(Duration::from_secs(1), async { 42 }).await;
-    assert_eq!(result.unwrap(), 42);
+#[test]
+fn timeout_ok_when_future_completes_in_time() {
+    run_async_test(async {
+        let result = runtime_compat::timeout(Duration::from_secs(1), async { 42 }).await;
+        assert_eq!(result.unwrap(), 42);
+    });
 }
 
-#[tokio::test]
-async fn timeout_err_when_future_exceeds_deadline() {
-    let result = runtime_compat::timeout(
-        Duration::from_millis(5),
-        runtime_compat::sleep(Duration::from_secs(60)),
-    )
-    .await;
-    assert!(result.is_err());
-    let err_msg = result.unwrap_err();
-    assert!(
-        err_msg.contains("elapsed") || err_msg.contains("timeout") || err_msg.contains("time"),
-        "timeout error should mention time, got: {}",
-        err_msg
-    );
+#[test]
+fn timeout_err_when_future_exceeds_deadline() {
+    run_async_test(async {
+        let result = runtime_compat::timeout(
+            Duration::from_millis(5),
+            runtime_compat::sleep(Duration::from_secs(60)),
+        )
+        .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("elapsed") || err_msg.contains("timeout") || err_msg.contains("time"),
+            "timeout error should mention time, got: {}",
+            err_msg
+        );
+    });
 }
 
-#[tokio::test]
-async fn timeout_returns_future_output_type() {
-    let result =
-        runtime_compat::timeout(Duration::from_secs(1), async { String::from("hello") }).await;
-    assert_eq!(result.unwrap(), "hello");
+#[test]
+fn timeout_returns_future_output_type() {
+    run_async_test(async {
+        let result =
+            runtime_compat::timeout(Duration::from_secs(1), async { String::from("hello") }).await;
+        assert_eq!(result.unwrap(), "hello");
+    });
 }
 
-#[tokio::test]
-async fn timeout_zero_duration_on_ready_future() {
-    // A future that's immediately ready should still succeed with zero timeout
-    // (tokio may or may not allow this — test documents actual behavior)
-    let result = runtime_compat::timeout(Duration::ZERO, async { 1 }).await;
-    // Either Ok(1) or Err — both are valid depending on scheduler
-    match result {
-        Ok(v) => assert_eq!(v, 1),
-        Err(_) => {} // acceptable: zero timeout may expire first
-    }
+#[test]
+fn timeout_zero_duration_on_ready_future() {
+    run_async_test(async {
+        // A future that's immediately ready should still succeed with zero timeout
+        // (tokio may or may not allow this — test documents actual behavior)
+        let result = runtime_compat::timeout(Duration::ZERO, async { 1 }).await;
+        // Either Ok(1) or Err — both are valid depending on scheduler
+        match result {
+            Ok(v) => assert_eq!(v, 1),
+            Err(_) => {} // acceptable: zero timeout may expire first
+        }
+    });
 }
 
 // ────────────────────────────────────────────────────────────────────
 // Error type Display
 // ────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn try_acquire_error_display_no_permits() {
-    let sem = Semaphore::new(0);
-    let err = sem.try_acquire().unwrap_err();
-    let msg = format!("{}", err);
-    assert!(
-        !msg.is_empty(),
-        "TryAcquireError should have a display message"
-    );
+#[test]
+fn try_acquire_error_display_no_permits() {
+    run_async_test(async {
+        let sem = Semaphore::new(0);
+        let err = sem.try_acquire().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            !msg.is_empty(),
+            "TryAcquireError should have a display message"
+        );
+    });
 }
 
-#[tokio::test]
-async fn try_acquire_error_display_closed() {
-    let sem = Semaphore::new(5);
-    sem.close();
-    let err = sem.try_acquire().unwrap_err();
-    let msg = format!("{}", err);
-    assert!(
-        !msg.is_empty(),
-        "TryAcquireError::Closed should have a display message"
-    );
+#[test]
+fn try_acquire_error_display_closed() {
+    run_async_test(async {
+        let sem = Semaphore::new(5);
+        sem.close();
+        let err = sem.try_acquire().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            !msg.is_empty(),
+            "TryAcquireError::Closed should have a display message"
+        );
+    });
 }
 
-#[tokio::test]
-async fn acquire_error_on_closed_semaphore() {
-    let sem = Semaphore::new(1);
-    sem.close();
-    let result = sem.acquire().await;
-    assert!(result.is_err(), "acquire on closed semaphore should fail");
+#[test]
+fn acquire_error_on_closed_semaphore() {
+    run_async_test(async {
+        let sem = Semaphore::new(1);
+        sem.close();
+        let result = sem.acquire().await;
+        assert!(result.is_err(), "acquire on closed semaphore should fail");
+    });
 }
 
 // ────────────────────────────────────────────────────────────────────

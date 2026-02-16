@@ -1,9 +1,11 @@
 //! Integration tests for cass CLI wrapper + correlation + accounting.
 
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use frankenterm_core::cass::{CassAgent, CassClient, CassError};
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::session_correlation::{
     CassCorrelationOptions, CassSummaryRefreshOptions, correlate_with_cass,
     refresh_cass_summary_for_session,
@@ -66,24 +68,37 @@ esac
     script_path
 }
 
-#[tokio::test]
-async fn missing_cass_binary_returns_not_installed() {
-    let cass = CassClient::new().with_binary("cass-missing-xyz");
-    let tmp = TempDir::new().expect("temp dir");
-    let err = cass
-        .search_sessions(tmp.path(), Some(CassAgent::ClaudeCode))
-        .await
-        .expect_err("missing binary should error");
-
-    assert!(matches!(err, CassError::NotInstalled));
+fn run_async_test<F>(future: F)
+where
+    F: Future<Output = ()>,
+{
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("failed to build runtime_compat current-thread runtime");
+    CompatRuntime::block_on(&runtime, future);
 }
 
-#[tokio::test]
-async fn stub_cass_search_drives_deterministic_correlation() {
-    let tmp = TempDir::new().expect("temp dir");
-    let log_path = tmp.path().join("cass.log");
+#[test]
+fn missing_cass_binary_returns_not_installed() {
+    run_async_test(async {
+        let cass = CassClient::new().with_binary("cass-missing-xyz");
+        let tmp = TempDir::new().expect("temp dir");
+        let err = cass
+            .search_sessions(tmp.path(), Some(CassAgent::ClaudeCode))
+            .await
+            .expect_err("missing binary should error");
 
-    let search_json = r#"[
+        assert!(matches!(err, CassError::NotInstalled));
+    });
+}
+
+#[test]
+fn stub_cass_search_drives_deterministic_correlation() {
+    run_async_test(async {
+        let tmp = TempDir::new().expect("temp dir");
+        let log_path = tmp.path().join("cass.log");
+
+        let search_json = r#"[
   {
     "session_id": "cass-old",
     "agent": "claude_code",
@@ -97,40 +112,43 @@ async fn stub_cass_search_drives_deterministic_correlation() {
     "started_at": "2026-01-29T10:01:00Z"
   }
 ]"#;
-    let query_json = r#"{
+        let query_json = r#"{
   "session_id": "cass-new",
   "agent": "claude_code",
   "project_path": "/repo",
-  "started_at": "2026-01-29T10:01:00Z",
-  "messages": []
+    "started_at": "2026-01-29T10:01:00Z",
+    "messages": []
 }"#;
 
-    let stub = write_cass_stub(tmp.path(), search_json, query_json, Some(&log_path));
-    let cass = CassClient::new().with_binary(stub.to_string_lossy().to_string());
+        let stub = write_cass_stub(tmp.path(), search_json, query_json, Some(&log_path));
+        let cass = CassClient::new().with_binary(stub.to_string_lossy().to_string());
 
-    let options = CassCorrelationOptions::default();
-    let start_ms = frankenterm_core::cass::parse_cass_timestamp_ms("2026-01-29T10:00:00Z").unwrap();
-    let result = correlate_with_cass(
-        &cass,
-        Path::new("/repo"),
-        CassAgent::ClaudeCode,
-        start_ms,
-        &options,
-    )
-    .await;
+        let options = CassCorrelationOptions::default();
+        let start_ms =
+            frankenterm_core::cass::parse_cass_timestamp_ms("2026-01-29T10:00:00Z").unwrap();
+        let result = correlate_with_cass(
+            &cass,
+            Path::new("/repo"),
+            CassAgent::ClaudeCode,
+            start_ms,
+            &options,
+        )
+        .await;
 
-    let log = fs::read_to_string(&log_path).expect("log stub");
-    assert!(log.contains("search"), "stub should log search invocation");
-    assert_eq!(result.external_id.as_deref(), Some("cass-new"));
-    assert!(result.reasons.iter().any(|r| r == "ambiguous_candidates"));
+        let log = fs::read_to_string(&log_path).expect("log stub");
+        assert!(log.contains("search"), "stub should log search invocation");
+        assert_eq!(result.external_id.as_deref(), Some("cass-new"));
+        assert!(result.reasons.iter().any(|r| r == "ambiguous_candidates"));
+    });
 }
 
-#[tokio::test]
-async fn refresh_cass_summary_updates_agent_session() {
-    let tmp = TempDir::new().expect("temp dir");
-    let log_path = tmp.path().join("cass.log");
+#[test]
+fn refresh_cass_summary_updates_agent_session() {
+    run_async_test(async {
+        let tmp = TempDir::new().expect("temp dir");
+        let log_path = tmp.path().join("cass.log");
 
-    let search_json = r#"[
+        let search_json = r#"[
   {
     "session_id": "cass-session-1",
     "agent": "claude_code",
@@ -138,7 +156,7 @@ async fn refresh_cass_summary_updates_agent_session() {
     "started_at": "2026-01-29T10:00:00Z"
   }
 ]"#;
-    let query_json = r#"{
+        let query_json = r#"{
   "session_id": "cass-session-1",
   "agent": "claude_code",
   "project_path": "/repo",
@@ -150,55 +168,57 @@ async fn refresh_cass_summary_updates_agent_session() {
   ]
 }"#;
 
-    let stub = write_cass_stub(tmp.path(), search_json, query_json, Some(&log_path));
-    let cass = CassClient::new().with_binary(stub.to_string_lossy().to_string());
+        let stub = write_cass_stub(tmp.path(), search_json, query_json, Some(&log_path));
+        let cass = CassClient::new().with_binary(stub.to_string_lossy().to_string());
 
-    let db_path = tmp.path().join("ft.db");
-    let db_path_str = db_path.to_string_lossy().to_string();
-    let storage = StorageHandle::new(&db_path_str).await.unwrap();
+        let db_path = tmp.path().join("ft.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db_path_str).await.unwrap();
 
-    let now_ms = frankenterm_core::cass::parse_cass_timestamp_ms("2026-01-29T10:00:00Z").unwrap();
+        let now_ms =
+            frankenterm_core::cass::parse_cass_timestamp_ms("2026-01-29T10:00:00Z").unwrap();
 
-    let pane = PaneRecord {
-        pane_id: 1,
-        pane_uuid: None,
-        domain: "local".to_string(),
-        window_id: None,
-        tab_id: None,
-        title: None,
-        cwd: Some("/repo".to_string()),
-        tty_name: None,
-        first_seen_at: now_ms,
-        last_seen_at: now_ms,
-        observed: true,
-        ignore_reason: None,
-        last_decision_at: None,
-    };
-    storage.upsert_pane(pane).await.unwrap();
+        let pane = PaneRecord {
+            pane_id: 1,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: None,
+            cwd: Some("/repo".to_string()),
+            tty_name: None,
+            first_seen_at: now_ms,
+            last_seen_at: now_ms,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane(pane).await.unwrap();
 
-    let mut session = AgentSessionRecord::new_start(1, "claude_code");
-    session.started_at = now_ms;
-    session.external_id = Some("cass-session-1".to_string());
-    let session_id = storage.upsert_agent_session(session).await.unwrap();
+        let mut session = AgentSessionRecord::new_start(1, "claude_code");
+        session.started_at = now_ms;
+        session.external_id = Some("cass-session-1".to_string());
+        let session_id = storage.upsert_agent_session(session).await.unwrap();
 
-    let summary = refresh_cass_summary_for_session(
-        &storage,
-        &cass,
-        session_id,
-        &CassSummaryRefreshOptions::default(),
-    )
-    .await
-    .expect("refresh summary");
-
-    let updated = storage
-        .get_agent_session(session_id)
+        let summary = refresh_cass_summary_for_session(
+            &storage,
+            &cass,
+            session_id,
+            &CassSummaryRefreshOptions::default(),
+        )
         .await
-        .unwrap()
-        .unwrap();
+        .expect("refresh summary");
 
-    let log = fs::read_to_string(&log_path).expect("log stub");
-    assert!(log.contains("query"), "stub should log query invocation");
-    assert_eq!(summary.total_tokens, Some(33));
-    assert_eq!(updated.total_tokens, Some(33));
-    assert!(updated.external_meta.is_some());
+        let updated = storage
+            .get_agent_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let log = fs::read_to_string(&log_path).expect("log stub");
+        assert!(log.contains("query"), "stub should log query invocation");
+        assert_eq!(summary.total_tokens, Some(33));
+        assert_eq!(updated.total_tokens, Some(33));
+        assert!(updated.external_meta.is_some());
+    });
 }

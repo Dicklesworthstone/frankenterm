@@ -15,7 +15,8 @@ use frankenterm_core::recording::{
     EgressEvent, EgressNoopTap, EgressTap, RecorderSegmentKind, SharedEgressTap,
     captured_kind_to_segment,
 };
-use frankenterm_core::runtime_compat::{RwLock, mpsc, sleep};
+use frankenterm_core::runtime_compat::task as runtime_task;
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder, RwLock, mpsc, sleep};
 use frankenterm_core::tailer::{CaptureEvent, TailerConfig, TailerSupervisor};
 use frankenterm_core::wezterm::{PaneInfo, PaneTextSource};
 
@@ -115,262 +116,282 @@ fn pane_map(ids: &[u64]) -> HashMap<u64, PaneInfo> {
     ids.iter().map(|&id| (id, test_pane_info(id))).collect()
 }
 
-#[tokio::test]
-async fn egress_tap_fires_on_delta_capture() {
-    let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
-    let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
-    let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let source = Arc::new(FakePaneSource::new());
+fn run_async_test<F>(future: F)
+where
+    F: Future<Output = ()>,
+{
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("failed to build runtime_compat current-thread runtime");
+    CompatRuntime::block_on(&runtime, future);
+}
 
-    source.set_text(1, "$ prompt\nline1\nline2\n").await;
-    {
-        cursors.write().await.insert(1, PaneCursor::new(1));
-    }
+#[test]
+fn egress_tap_fires_on_delta_capture() {
+    run_async_test(async {
+        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
+        let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
+        let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(FakePaneSource::new());
 
-    let tap = Arc::new(TestEgressTap::new());
-    let mut tailer = TailerSupervisor::new(
-        fast_config(),
-        tx,
-        Arc::clone(&cursors),
-        Arc::clone(&registry),
-        shutdown.clone(),
-        Arc::clone(&source),
-    );
-    tailer.set_egress_tap(tap.clone());
-    tailer.sync_tailers(&pane_map(&[1]));
+        source.set_text(1, "$ prompt\nline1\nline2\n").await;
+        {
+            cursors.write().await.insert(1, PaneCursor::new(1));
+        }
 
-    let mut js = tokio::task::JoinSet::new();
-    tailer.spawn_ready(&mut js);
-    while let Some(r) = js.join_next().await {
-        let (pid, out) = r.unwrap();
-        tailer.handle_poll_result(pid, out);
-    }
-    while rx.try_recv().is_ok() {}
-
-    if tap.len() >= 1 {
-        let e = &tap.events()[0];
-        assert_eq!(e.pane_id, 1);
-        assert!(!e.text.is_empty());
-        assert!(e.occurred_at_ms > 0);
-    }
-
-    source
-        .set_text(1, "$ prompt\nline1\nline2\nnew output\n")
-        .await;
-    sleep(Duration::from_millis(20)).await;
-
-    let mut js = tokio::task::JoinSet::new();
-    tailer.spawn_ready(&mut js);
-    while let Some(r) = js.join_next().await {
-        let (pid, out) = r.unwrap();
-        tailer.handle_poll_result(pid, out);
-    }
-    while rx.try_recv().is_ok() {}
-
-    let all = tap.events();
-    if all.len() >= 2 {
-        let last = &all[all.len() - 1];
-        assert_eq!(last.pane_id, 1);
-        assert!(
-            last.segment_kind == RecorderSegmentKind::Delta
-                || last.segment_kind == RecorderSegmentKind::Gap
+        let tap = Arc::new(TestEgressTap::new());
+        let mut tailer = TailerSupervisor::new(
+            fast_config(),
+            tx,
+            Arc::clone(&cursors),
+            Arc::clone(&registry),
+            shutdown.clone(),
+            Arc::clone(&source),
         );
-    }
-}
+        tailer.set_egress_tap(tap.clone());
+        tailer.sync_tailers(&pane_map(&[1]));
 
-#[tokio::test]
-async fn egress_tap_captures_gap_segments() {
-    let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
-    let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
-    let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let source = Arc::new(FakePaneSource::new());
-
-    source.set_text(1, "initial content").await;
-    {
-        cursors.write().await.insert(1, PaneCursor::new(1));
-    }
-
-    let tap = Arc::new(TestEgressTap::new());
-    let mut tailer = TailerSupervisor::new(
-        fast_config(),
-        tx,
-        Arc::clone(&cursors),
-        Arc::clone(&registry),
-        shutdown.clone(),
-        Arc::clone(&source),
-    );
-    tailer.set_egress_tap(tap.clone());
-    tailer.sync_tailers(&pane_map(&[1]));
-
-    let mut js = tokio::task::JoinSet::new();
-    tailer.spawn_ready(&mut js);
-    while let Some(r) = js.join_next().await {
-        let (pid, out) = r.unwrap();
-        tailer.handle_poll_result(pid, out);
-    }
-    while rx.try_recv().is_ok() {}
-
-    source
-        .set_text(1, "completely different text that shares no overlap")
-        .await;
-    sleep(Duration::from_millis(20)).await;
-
-    let mut js = tokio::task::JoinSet::new();
-    tailer.spawn_ready(&mut js);
-    while let Some(r) = js.join_next().await {
-        let (pid, out) = r.unwrap();
-        tailer.handle_poll_result(pid, out);
-    }
-    while rx.try_recv().is_ok() {}
-
-    for gap in tap.events().iter().filter(|e| e.is_gap) {
-        assert_eq!(gap.pane_id, 1);
-        assert!(gap.gap_reason.is_some());
-        assert_eq!(gap.segment_kind, RecorderSegmentKind::Gap);
-    }
-}
-
-#[tokio::test]
-async fn egress_noop_tap_compiles_as_shared() {
-    let _tap: SharedEgressTap = Arc::new(EgressNoopTap);
-}
-
-#[tokio::test]
-async fn egress_tap_multi_pane() {
-    let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
-    let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
-    let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let source = Arc::new(FakePaneSource::new());
-
-    source.set_text(10, "pane ten content").await;
-    source.set_text(20, "pane twenty content").await;
-    {
-        let mut g = cursors.write().await;
-        g.insert(10, PaneCursor::new(10));
-        g.insert(20, PaneCursor::new(20));
-    }
-
-    let tap = Arc::new(TestEgressTap::new());
-    let mut tailer = TailerSupervisor::new(
-        fast_config(),
-        tx,
-        Arc::clone(&cursors),
-        Arc::clone(&registry),
-        shutdown.clone(),
-        Arc::clone(&source),
-    );
-    tailer.set_egress_tap(tap.clone());
-    tailer.sync_tailers(&pane_map(&[10, 20]));
-
-    let mut js = tokio::task::JoinSet::new();
-    tailer.spawn_ready(&mut js);
-    while let Some(r) = js.join_next().await {
-        let (pid, out) = r.unwrap();
-        tailer.handle_poll_result(pid, out);
-    }
-    while rx.try_recv().is_ok() {}
-
-    for ev in &tap.events() {
-        assert!(ev.pane_id == 10 || ev.pane_id == 20);
-    }
-}
-
-#[tokio::test]
-async fn egress_tap_not_set_still_works() {
-    let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
-    let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
-    let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let source = Arc::new(FakePaneSource::new());
-
-    source.set_text(1, "some text").await;
-    {
-        cursors.write().await.insert(1, PaneCursor::new(1));
-    }
-
-    let mut tailer = TailerSupervisor::new(
-        fast_config(),
-        tx,
-        Arc::clone(&cursors),
-        Arc::clone(&registry),
-        shutdown.clone(),
-        Arc::clone(&source),
-    );
-    tailer.sync_tailers(&pane_map(&[1]));
-
-    let mut js = tokio::task::JoinSet::new();
-    tailer.spawn_ready(&mut js);
-    while let Some(r) = js.join_next().await {
-        let (pid, out) = r.unwrap();
-        tailer.handle_poll_result(pid, out);
-    }
-
-    let mut count = 0;
-    while rx.try_recv().is_ok() {
-        count += 1;
-    }
-    // Primary assertion: no panic without a tap set.
-    // Capture may or may not produce events depending on scheduler state.
-    let _ = count;
-}
-
-#[tokio::test]
-async fn egress_monotonic_sequence() {
-    let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
-    let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
-    let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let source = Arc::new(FakePaneSource::new());
-
-    source.set_text(1, "aaaa\nbbbb\ncccc\ndddd\neeee\n").await;
-    {
-        cursors.write().await.insert(1, PaneCursor::new(1));
-    }
-
-    let tap = Arc::new(TestEgressTap::new());
-    let mut tailer = TailerSupervisor::new(
-        fast_config(),
-        tx,
-        Arc::clone(&cursors),
-        Arc::clone(&registry),
-        shutdown.clone(),
-        Arc::clone(&source),
-    );
-    tailer.set_egress_tap(tap.clone());
-    tailer.sync_tailers(&pane_map(&[1]));
-
-    for i in 0..3 {
-        source
-            .set_text(1, &format!("aaaa\nbbbb\ncccc\ndddd\neeee\nout-{i}\n"))
-            .await;
-        sleep(Duration::from_millis(20)).await;
-        let mut js = tokio::task::JoinSet::new();
+        let mut js = runtime_task::JoinSet::new();
         tailer.spawn_ready(&mut js);
         while let Some(r) = js.join_next().await {
             let (pid, out) = r.unwrap();
             tailer.handle_poll_result(pid, out);
         }
         while rx.try_recv().is_ok() {}
-    }
 
-    let all = tap.events();
-    if all.len() >= 2 {
-        for w in all.windows(2) {
+        if tap.len() >= 1 {
+            let e = &tap.events()[0];
+            assert_eq!(e.pane_id, 1);
+            assert!(!e.text.is_empty());
+            assert!(e.occurred_at_ms > 0);
+        }
+
+        source
+            .set_text(1, "$ prompt\nline1\nline2\nnew output\n")
+            .await;
+        sleep(Duration::from_millis(20)).await;
+
+        let mut js = runtime_task::JoinSet::new();
+        tailer.spawn_ready(&mut js);
+        while let Some(r) = js.join_next().await {
+            let (pid, out) = r.unwrap();
+            tailer.handle_poll_result(pid, out);
+        }
+        while rx.try_recv().is_ok() {}
+
+        let all = tap.events();
+        if all.len() >= 2 {
+            let last = &all[all.len() - 1];
+            assert_eq!(last.pane_id, 1);
             assert!(
-                w[1].sequence >= w[0].sequence,
-                "monotonic: {} >= {}",
-                w[1].sequence,
-                w[0].sequence
+                last.segment_kind == RecorderSegmentKind::Delta
+                    || last.segment_kind == RecorderSegmentKind::Gap
             );
         }
-    }
+    });
 }
 
-#[tokio::test]
-async fn captured_kind_maps_correctly() {
+#[test]
+fn egress_tap_captures_gap_segments() {
+    run_async_test(async {
+        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
+        let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
+        let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(FakePaneSource::new());
+
+        source.set_text(1, "initial content").await;
+        {
+            cursors.write().await.insert(1, PaneCursor::new(1));
+        }
+
+        let tap = Arc::new(TestEgressTap::new());
+        let mut tailer = TailerSupervisor::new(
+            fast_config(),
+            tx,
+            Arc::clone(&cursors),
+            Arc::clone(&registry),
+            shutdown.clone(),
+            Arc::clone(&source),
+        );
+        tailer.set_egress_tap(tap.clone());
+        tailer.sync_tailers(&pane_map(&[1]));
+
+        let mut js = runtime_task::JoinSet::new();
+        tailer.spawn_ready(&mut js);
+        while let Some(r) = js.join_next().await {
+            let (pid, out) = r.unwrap();
+            tailer.handle_poll_result(pid, out);
+        }
+        while rx.try_recv().is_ok() {}
+
+        source
+            .set_text(1, "completely different text that shares no overlap")
+            .await;
+        sleep(Duration::from_millis(20)).await;
+
+        let mut js = runtime_task::JoinSet::new();
+        tailer.spawn_ready(&mut js);
+        while let Some(r) = js.join_next().await {
+            let (pid, out) = r.unwrap();
+            tailer.handle_poll_result(pid, out);
+        }
+        while rx.try_recv().is_ok() {}
+
+        for gap in tap.events().iter().filter(|e| e.is_gap) {
+            assert_eq!(gap.pane_id, 1);
+            assert!(gap.gap_reason.is_some());
+            assert_eq!(gap.segment_kind, RecorderSegmentKind::Gap);
+        }
+    });
+}
+
+#[test]
+fn egress_noop_tap_compiles_as_shared() {
+    let _tap: SharedEgressTap = Arc::new(EgressNoopTap);
+}
+
+#[test]
+fn egress_tap_multi_pane() {
+    run_async_test(async {
+        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
+        let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
+        let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(FakePaneSource::new());
+
+        source.set_text(10, "pane ten content").await;
+        source.set_text(20, "pane twenty content").await;
+        {
+            let mut g = cursors.write().await;
+            g.insert(10, PaneCursor::new(10));
+            g.insert(20, PaneCursor::new(20));
+        }
+
+        let tap = Arc::new(TestEgressTap::new());
+        let mut tailer = TailerSupervisor::new(
+            fast_config(),
+            tx,
+            Arc::clone(&cursors),
+            Arc::clone(&registry),
+            shutdown.clone(),
+            Arc::clone(&source),
+        );
+        tailer.set_egress_tap(tap.clone());
+        tailer.sync_tailers(&pane_map(&[10, 20]));
+
+        let mut js = runtime_task::JoinSet::new();
+        tailer.spawn_ready(&mut js);
+        while let Some(r) = js.join_next().await {
+            let (pid, out) = r.unwrap();
+            tailer.handle_poll_result(pid, out);
+        }
+        while rx.try_recv().is_ok() {}
+
+        for ev in &tap.events() {
+            assert!(ev.pane_id == 10 || ev.pane_id == 20);
+        }
+    });
+}
+
+#[test]
+fn egress_tap_not_set_still_works() {
+    run_async_test(async {
+        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
+        let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
+        let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(FakePaneSource::new());
+
+        source.set_text(1, "some text").await;
+        {
+            cursors.write().await.insert(1, PaneCursor::new(1));
+        }
+
+        let mut tailer = TailerSupervisor::new(
+            fast_config(),
+            tx,
+            Arc::clone(&cursors),
+            Arc::clone(&registry),
+            shutdown.clone(),
+            Arc::clone(&source),
+        );
+        tailer.sync_tailers(&pane_map(&[1]));
+
+        let mut js = runtime_task::JoinSet::new();
+        tailer.spawn_ready(&mut js);
+        while let Some(r) = js.join_next().await {
+            let (pid, out) = r.unwrap();
+            tailer.handle_poll_result(pid, out);
+        }
+
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        // Primary assertion: no panic without a tap set.
+        // Capture may or may not produce events depending on scheduler state.
+        let _ = count;
+    });
+}
+
+#[test]
+fn egress_monotonic_sequence() {
+    run_async_test(async {
+        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
+        let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
+        let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(FakePaneSource::new());
+
+        source.set_text(1, "aaaa\nbbbb\ncccc\ndddd\neeee\n").await;
+        {
+            cursors.write().await.insert(1, PaneCursor::new(1));
+        }
+
+        let tap = Arc::new(TestEgressTap::new());
+        let mut tailer = TailerSupervisor::new(
+            fast_config(),
+            tx,
+            Arc::clone(&cursors),
+            Arc::clone(&registry),
+            shutdown.clone(),
+            Arc::clone(&source),
+        );
+        tailer.set_egress_tap(tap.clone());
+        tailer.sync_tailers(&pane_map(&[1]));
+
+        for i in 0..3 {
+            source
+                .set_text(1, &format!("aaaa\nbbbb\ncccc\ndddd\neeee\nout-{i}\n"))
+                .await;
+            sleep(Duration::from_millis(20)).await;
+            let mut js = runtime_task::JoinSet::new();
+            tailer.spawn_ready(&mut js);
+            while let Some(r) = js.join_next().await {
+                let (pid, out) = r.unwrap();
+                tailer.handle_poll_result(pid, out);
+            }
+            while rx.try_recv().is_ok() {}
+        }
+
+        let all = tap.events();
+        if all.len() >= 2 {
+            for w in all.windows(2) {
+                assert!(
+                    w[1].sequence >= w[0].sequence,
+                    "monotonic: {} >= {}",
+                    w[1].sequence,
+                    w[0].sequence
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn captured_kind_maps_correctly() {
     let (kind, is_gap) = captured_kind_to_segment(&CapturedSegmentKind::Delta);
     assert_eq!(kind, RecorderSegmentKind::Delta);
     assert!(!is_gap);

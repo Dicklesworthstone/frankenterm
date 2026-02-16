@@ -4,6 +4,8 @@ use frankenterm_core::resize_scheduler::{
     SubmitOutcome,
 };
 use frankenterm_core::runtime::{ResizeWatchdogSeverity, evaluate_resize_watchdog};
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use std::future::Future;
 
 fn intent(pane_id: u64, intent_seq: u64, submitted_at_ms: u64) -> ResizeIntent {
     ResizeIntent {
@@ -15,6 +17,16 @@ fn intent(pane_id: u64, intent_seq: u64, submitted_at_ms: u64) -> ResizeIntent {
         domain: ResizeDomain::Local,
         tab_id: Some(1),
     }
+}
+
+fn run_async_test<F>(future: F)
+where
+    F: Future<Output = ()>,
+{
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("failed to build runtime_compat current-thread runtime");
+    CompatRuntime::block_on(&runtime, future);
 }
 
 #[test]
@@ -44,76 +56,78 @@ fn watchdog_escalates_to_critical_when_multiple_resize_transactions_stall() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn ipc_status_includes_resize_watchdog_assessment() {
+#[test]
+fn ipc_status_includes_resize_watchdog_assessment() {
     use std::sync::Arc;
     use std::time::Duration;
 
     use frankenterm_core::events::EventBus;
     use frankenterm_core::ipc::{IpcClient, IpcServer};
-    use frankenterm_core::runtime_compat::{mpsc, mpsc_send, sleep};
+    use frankenterm_core::runtime_compat::{mpsc, mpsc_send, sleep, task};
     use tempfile::TempDir;
 
-    // Create stale active transactions so watchdog emits a critical assessment.
-    let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
-        frame_budget_units: 2,
-        allow_single_oversubscription: false,
-        ..ResizeSchedulerConfig::default()
+    run_async_test(async {
+        // Create stale active transactions so watchdog emits a critical assessment.
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 2,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+        let _ = scheduler.submit_intent(intent(10, 1, 0));
+        let _ = scheduler.submit_intent(intent(11, 1, 0));
+        let frame = scheduler.schedule_frame();
+        assert_eq!(frame.scheduled.len(), 2);
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let socket_path = temp_dir.path().join("ipc-watchdog.sock");
+
+        let server = IpcServer::bind(&socket_path)
+            .await
+            .expect("bind ipc server");
+        let event_bus = Arc::new(EventBus::new(100));
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+        let server_bus = Arc::clone(&event_bus);
+        let server_handle = task::spawn(async move {
+            server.run(server_bus, shutdown_rx).await;
+        });
+
+        sleep(Duration::from_millis(10)).await;
+
+        let client = IpcClient::new(&socket_path);
+        let response = client.status().await.expect("ipc status response");
+        assert!(response.ok);
+
+        let data = response.data.expect("status payload data");
+        let watchdog = data
+            .get("resize_control_plane_watchdog")
+            .expect("watchdog field should be present");
+        assert!(
+            watchdog.is_object(),
+            "watchdog payload should be structured"
+        );
+        assert_eq!(
+            watchdog.get("severity"),
+            Some(&serde_json::json!("critical"))
+        );
+        assert_eq!(
+            watchdog.get("safe_mode_recommended"),
+            Some(&serde_json::json!(true))
+        );
+        let ladder = data
+            .get("resize_degradation_ladder")
+            .expect("resize_degradation_ladder field should be present");
+        assert!(ladder.is_object(), "ladder payload should be structured");
+        assert_eq!(
+            ladder.get("tier"),
+            Some(&serde_json::json!(
+                ResizeDegradationTier::CorrectnessGuarded
+            ))
+        );
+
+        let _ = mpsc_send(&shutdown_tx, ()).await;
+        let _ = server_handle.await;
     });
-    let _ = scheduler.submit_intent(intent(10, 1, 0));
-    let _ = scheduler.submit_intent(intent(11, 1, 0));
-    let frame = scheduler.schedule_frame();
-    assert_eq!(frame.scheduled.len(), 2);
-
-    let temp_dir = TempDir::new().expect("temp dir");
-    let socket_path = temp_dir.path().join("ipc-watchdog.sock");
-
-    let server = IpcServer::bind(&socket_path)
-        .await
-        .expect("bind ipc server");
-    let event_bus = Arc::new(EventBus::new(100));
-    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-
-    let server_bus = Arc::clone(&event_bus);
-    let server_handle = tokio::spawn(async move {
-        server.run(server_bus, shutdown_rx).await;
-    });
-
-    sleep(Duration::from_millis(10)).await;
-
-    let client = IpcClient::new(&socket_path);
-    let response = client.status().await.expect("ipc status response");
-    assert!(response.ok);
-
-    let data = response.data.expect("status payload data");
-    let watchdog = data
-        .get("resize_control_plane_watchdog")
-        .expect("watchdog field should be present");
-    assert!(
-        watchdog.is_object(),
-        "watchdog payload should be structured"
-    );
-    assert_eq!(
-        watchdog.get("severity"),
-        Some(&serde_json::json!("critical"))
-    );
-    assert_eq!(
-        watchdog.get("safe_mode_recommended"),
-        Some(&serde_json::json!(true))
-    );
-    let ladder = data
-        .get("resize_degradation_ladder")
-        .expect("resize_degradation_ladder field should be present");
-    assert!(ladder.is_object(), "ladder payload should be structured");
-    assert_eq!(
-        ladder.get("tier"),
-        Some(&serde_json::json!(
-            ResizeDegradationTier::CorrectnessGuarded
-        ))
-    );
-
-    let _ = mpsc_send(&shutdown_tx, ()).await;
-    let _ = server_handle.await;
 }
 
 // ── DarkBadger wa-1u90p.7.1 ──────────────────────────────────────

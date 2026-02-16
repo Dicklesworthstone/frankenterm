@@ -53,9 +53,6 @@ fn arb_semaphore_permits() -> impl Strategy<Value = usize> {
     1usize..=50
 }
 
-fn arb_acquire_count(max_permits: usize) -> impl Strategy<Value = usize> {
-    1..=max_permits
-}
 
 fn arb_worker_threads() -> impl Strategy<Value = usize> {
     1usize..=8

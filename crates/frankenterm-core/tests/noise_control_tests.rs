@@ -13,7 +13,9 @@ use frankenterm_core::events::{
     NotificationGate, NotifyDecision,
 };
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{EventMuteRecord, StorageHandle};
+use std::future::Future;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -71,321 +73,358 @@ fn cleanup(db_path: &str) {
     let _ = std::fs::remove_file(format!("{db_path}-shm"));
 }
 
+fn run_async_test<F>(future: F)
+where
+    F: Future<Output = ()>,
+{
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("failed to build runtime_compat current-thread runtime");
+    CompatRuntime::block_on(&runtime, future);
+}
+
 // ===========================================================================
 // 1. Mute storage CRUD
 // ===========================================================================
 
-#[tokio::test]
-async fn mute_add_and_query_active() {
-    let (storage, db_path) = temp_storage("add_query").await;
+#[test]
+fn mute_add_and_query_active() {
+    run_async_test(async {
+        let (storage, db_path) = temp_storage("add_query").await;
 
-    let record = EventMuteRecord {
-        identity_key: "evt:abc123".to_string(),
-        scope: "workspace".to_string(),
-        created_at: now_ms(),
-        expires_at: None, // permanent
-        created_by: Some("test".to_string()),
-        reason: Some("noisy".to_string()),
-    };
-    storage.add_event_mute(record).await.unwrap();
+        let record = EventMuteRecord {
+            identity_key: "evt:abc123".to_string(),
+            scope: "workspace".to_string(),
+            created_at: now_ms(),
+            expires_at: None, // permanent
+            created_by: Some("test".to_string()),
+            reason: Some("noisy".to_string()),
+        };
+        storage.add_event_mute(record).await.unwrap();
 
-    let muted = storage
-        .is_event_muted("evt:abc123", now_ms())
-        .await
-        .unwrap();
-    assert!(muted, "permanent mute should be active");
-
-    cleanup(&db_path);
-}
-
-#[tokio::test]
-async fn mute_query_nonexistent_returns_false() {
-    let (storage, db_path) = temp_storage("nonexistent").await;
-
-    let muted = storage
-        .is_event_muted("evt:nonexistent", now_ms())
-        .await
-        .unwrap();
-    assert!(!muted, "nonexistent key should not be muted");
-
-    cleanup(&db_path);
-}
-
-#[tokio::test]
-async fn mute_remove_existing() {
-    let (storage, db_path) = temp_storage("remove").await;
-
-    let record = EventMuteRecord {
-        identity_key: "evt:removable".to_string(),
-        scope: "workspace".to_string(),
-        created_at: now_ms(),
-        expires_at: None,
-        created_by: None,
-        reason: None,
-    };
-    storage.add_event_mute(record).await.unwrap();
-
-    // Confirm muted
-    assert!(
-        storage
-            .is_event_muted("evt:removable", now_ms())
+        let muted = storage
+            .is_event_muted("evt:abc123", now_ms())
             .await
-            .unwrap()
-    );
+            .unwrap();
+        assert!(muted, "permanent mute should be active");
 
-    // Remove
-    let removed = storage.remove_event_mute("evt:removable").await.unwrap();
-    assert!(removed, "should return true when a row was deleted");
+        cleanup(&db_path);
+    });
+}
 
-    // Confirm no longer muted
-    assert!(
-        !storage
-            .is_event_muted("evt:removable", now_ms())
+#[test]
+fn mute_query_nonexistent_returns_false() {
+    run_async_test(async {
+        let (storage, db_path) = temp_storage("nonexistent").await;
+
+        let muted = storage
+            .is_event_muted("evt:nonexistent", now_ms())
             .await
-            .unwrap()
-    );
+            .unwrap();
+        assert!(!muted, "nonexistent key should not be muted");
 
-    cleanup(&db_path);
+        cleanup(&db_path);
+    });
 }
 
-#[tokio::test]
-async fn mute_remove_nonexistent_returns_false() {
-    let (storage, db_path) = temp_storage("remove_none").await;
+#[test]
+fn mute_remove_existing() {
+    run_async_test(async {
+        let (storage, db_path) = temp_storage("remove").await;
 
-    let removed = storage.remove_event_mute("evt:ghost").await.unwrap();
-    assert!(!removed, "removing nonexistent key should return false");
+        let record = EventMuteRecord {
+            identity_key: "evt:removable".to_string(),
+            scope: "workspace".to_string(),
+            created_at: now_ms(),
+            expires_at: None,
+            created_by: None,
+            reason: None,
+        };
+        storage.add_event_mute(record).await.unwrap();
 
-    cleanup(&db_path);
+        // Confirm muted
+        assert!(
+            storage
+                .is_event_muted("evt:removable", now_ms())
+                .await
+                .unwrap()
+        );
+
+        // Remove
+        let removed = storage.remove_event_mute("evt:removable").await.unwrap();
+        assert!(removed, "should return true when a row was deleted");
+
+        // Confirm no longer muted
+        assert!(
+            !storage
+                .is_event_muted("evt:removable", now_ms())
+                .await
+                .unwrap()
+        );
+
+        cleanup(&db_path);
+    });
 }
 
-#[tokio::test]
-async fn mute_expiry_past_timestamp() {
-    let (storage, db_path) = temp_storage("expiry_past").await;
+#[test]
+fn mute_remove_nonexistent_returns_false() {
+    run_async_test(async {
+        let (storage, db_path) = temp_storage("remove_none").await;
 
-    let now = now_ms();
-    let record = EventMuteRecord {
-        identity_key: "evt:expired".to_string(),
-        scope: "workspace".to_string(),
-        created_at: now - 60_000,
-        expires_at: Some(now - 1_000), // expired 1 second ago
-        created_by: None,
-        reason: None,
-    };
-    storage.add_event_mute(record).await.unwrap();
+        let removed = storage.remove_event_mute("evt:ghost").await.unwrap();
+        assert!(!removed, "removing nonexistent key should return false");
 
-    let muted = storage.is_event_muted("evt:expired", now).await.unwrap();
-    assert!(!muted, "expired mute should not be active");
-
-    cleanup(&db_path);
+        cleanup(&db_path);
+    });
 }
 
-#[tokio::test]
-async fn mute_expiry_future_timestamp() {
-    let (storage, db_path) = temp_storage("expiry_future").await;
+#[test]
+fn mute_expiry_past_timestamp() {
+    run_async_test(async {
+        let (storage, db_path) = temp_storage("expiry_past").await;
 
-    let now = now_ms();
-    let record = EventMuteRecord {
-        identity_key: "evt:future".to_string(),
-        scope: "workspace".to_string(),
-        created_at: now,
-        expires_at: Some(now + 60_000), // expires in 1 minute
-        created_by: None,
-        reason: None,
-    };
-    storage.add_event_mute(record).await.unwrap();
+        let now = now_ms();
+        let record = EventMuteRecord {
+            identity_key: "evt:expired".to_string(),
+            scope: "workspace".to_string(),
+            created_at: now - 60_000,
+            expires_at: Some(now - 1_000), // expired 1 second ago
+            created_by: None,
+            reason: None,
+        };
+        storage.add_event_mute(record).await.unwrap();
 
-    let muted = storage.is_event_muted("evt:future", now).await.unwrap();
-    assert!(muted, "future-expiry mute should still be active");
+        let muted = storage.is_event_muted("evt:expired", now).await.unwrap();
+        assert!(!muted, "expired mute should not be active");
 
-    cleanup(&db_path);
+        cleanup(&db_path);
+    });
 }
 
-#[tokio::test]
-async fn mute_expiry_exact_boundary() {
-    let (storage, db_path) = temp_storage("expiry_boundary").await;
+#[test]
+fn mute_expiry_future_timestamp() {
+    run_async_test(async {
+        let (storage, db_path) = temp_storage("expiry_future").await;
 
-    let now = now_ms();
-    let record = EventMuteRecord {
-        identity_key: "evt:boundary".to_string(),
-        scope: "workspace".to_string(),
-        created_at: now - 1000,
-        expires_at: Some(now), // expires exactly now
-        created_by: None,
-        reason: None,
-    };
-    storage.add_event_mute(record).await.unwrap();
+        let now = now_ms();
+        let record = EventMuteRecord {
+            identity_key: "evt:future".to_string(),
+            scope: "workspace".to_string(),
+            created_at: now,
+            expires_at: Some(now + 60_000), // expires in 1 minute
+            created_by: None,
+            reason: None,
+        };
+        storage.add_event_mute(record).await.unwrap();
 
-    // Query says "expires_at > now_ms" — at exact boundary, it should NOT be muted
-    let muted = storage.is_event_muted("evt:boundary", now).await.unwrap();
-    assert!(!muted, "mute at exact expiry boundary should not be active");
+        let muted = storage.is_event_muted("evt:future", now).await.unwrap();
+        assert!(muted, "future-expiry mute should still be active");
 
-    cleanup(&db_path);
+        cleanup(&db_path);
+    });
+}
+
+#[test]
+fn mute_expiry_exact_boundary() {
+    run_async_test(async {
+        let (storage, db_path) = temp_storage("expiry_boundary").await;
+
+        let now = now_ms();
+        let record = EventMuteRecord {
+            identity_key: "evt:boundary".to_string(),
+            scope: "workspace".to_string(),
+            created_at: now - 1000,
+            expires_at: Some(now), // expires exactly now
+            created_by: None,
+            reason: None,
+        };
+        storage.add_event_mute(record).await.unwrap();
+
+        // Query says "expires_at > now_ms" — at exact boundary, it should NOT be muted
+        let muted = storage.is_event_muted("evt:boundary", now).await.unwrap();
+        assert!(!muted, "mute at exact expiry boundary should not be active");
+
+        cleanup(&db_path);
+    });
 }
 
 // ===========================================================================
 // 2. Mute determinism — upsert semantics, scope handling
 // ===========================================================================
 
-#[tokio::test]
-async fn mute_upsert_overwrites_fields() {
-    let (storage, db_path) = temp_storage("upsert").await;
+#[test]
+fn mute_upsert_overwrites_fields() {
+    run_async_test(async {
+        let (storage, db_path) = temp_storage("upsert").await;
 
-    let now = now_ms();
-    let record1 = EventMuteRecord {
-        identity_key: "evt:upsert_key".to_string(),
-        scope: "workspace".to_string(),
-        created_at: now,
-        expires_at: Some(now + 60_000),
-        created_by: Some("agent_a".to_string()),
-        reason: Some("first mute".to_string()),
-    };
-    storage.add_event_mute(record1).await.unwrap();
-
-    // Upsert with different scope and reason
-    let record2 = EventMuteRecord {
-        identity_key: "evt:upsert_key".to_string(),
-        scope: "global".to_string(),
-        created_at: now + 1000,
-        expires_at: None, // now permanent
-        created_by: Some("agent_b".to_string()),
-        reason: Some("upgraded to permanent".to_string()),
-    };
-    storage.add_event_mute(record2).await.unwrap();
-
-    // Should still be muted (permanent now)
-    let muted = storage
-        .is_event_muted("evt:upsert_key", now + 120_000)
-        .await
-        .unwrap();
-    assert!(
-        muted,
-        "upserted permanent mute should be active beyond original expiry"
-    );
-
-    cleanup(&db_path);
-}
-
-#[tokio::test]
-async fn mute_upsert_idempotent() {
-    let (storage, db_path) = temp_storage("upsert_idem").await;
-
-    let now = now_ms();
-    let record = EventMuteRecord {
-        identity_key: "evt:idem".to_string(),
-        scope: "workspace".to_string(),
-        created_at: now,
-        expires_at: None,
-        created_by: None,
-        reason: None,
-    };
-    // Insert twice — should not error
-    storage.add_event_mute(record.clone()).await.unwrap();
-    storage.add_event_mute(record).await.unwrap();
-
-    let muted = storage.is_event_muted("evt:idem", now).await.unwrap();
-    assert!(muted);
-
-    // Remove once — should succeed
-    let removed = storage.remove_event_mute("evt:idem").await.unwrap();
-    assert!(removed);
-
-    // Second remove — should be no-op
-    let removed2 = storage.remove_event_mute("evt:idem").await.unwrap();
-    assert!(!removed2);
-
-    cleanup(&db_path);
-}
-
-#[tokio::test]
-async fn mute_multiple_keys_independent() {
-    let (storage, db_path) = temp_storage("multi_key").await;
-
-    let now = now_ms();
-    for i in 0..5 {
-        let record = EventMuteRecord {
-            identity_key: format!("evt:key_{i}"),
+        let now = now_ms();
+        let record1 = EventMuteRecord {
+            identity_key: "evt:upsert_key".to_string(),
             scope: "workspace".to_string(),
             created_at: now,
-            expires_at: if i % 2 == 0 { None } else { Some(now - 1000) },
+            expires_at: Some(now + 60_000),
+            created_by: Some("agent_a".to_string()),
+            reason: Some("first mute".to_string()),
+        };
+        storage.add_event_mute(record1).await.unwrap();
+
+        // Upsert with different scope and reason
+        let record2 = EventMuteRecord {
+            identity_key: "evt:upsert_key".to_string(),
+            scope: "global".to_string(),
+            created_at: now + 1000,
+            expires_at: None, // now permanent
+            created_by: Some("agent_b".to_string()),
+            reason: Some("upgraded to permanent".to_string()),
+        };
+        storage.add_event_mute(record2).await.unwrap();
+
+        // Should still be muted (permanent now)
+        let muted = storage
+            .is_event_muted("evt:upsert_key", now + 120_000)
+            .await
+            .unwrap();
+        assert!(
+            muted,
+            "upserted permanent mute should be active beyond original expiry"
+        );
+
+        cleanup(&db_path);
+    });
+}
+
+#[test]
+fn mute_upsert_idempotent() {
+    run_async_test(async {
+        let (storage, db_path) = temp_storage("upsert_idem").await;
+
+        let now = now_ms();
+        let record = EventMuteRecord {
+            identity_key: "evt:idem".to_string(),
+            scope: "workspace".to_string(),
+            created_at: now,
+            expires_at: None,
             created_by: None,
             reason: None,
         };
+        // Insert twice — should not error
+        storage.add_event_mute(record.clone()).await.unwrap();
         storage.add_event_mute(record).await.unwrap();
-    }
 
-    // Even keys (0,2,4) are permanent, odd keys (1,3) are expired
-    for i in 0..5 {
-        let muted = storage
-            .is_event_muted(&format!("evt:key_{i}"), now)
-            .await
-            .unwrap();
-        if i % 2 == 0 {
-            assert!(muted, "key_{i} should be muted (permanent)");
-        } else {
-            assert!(!muted, "key_{i} should not be muted (expired)");
+        let muted = storage.is_event_muted("evt:idem", now).await.unwrap();
+        assert!(muted);
+
+        // Remove once — should succeed
+        let removed = storage.remove_event_mute("evt:idem").await.unwrap();
+        assert!(removed);
+
+        // Second remove — should be no-op
+        let removed2 = storage.remove_event_mute("evt:idem").await.unwrap();
+        assert!(!removed2);
+
+        cleanup(&db_path);
+    });
+}
+
+#[test]
+fn mute_multiple_keys_independent() {
+    run_async_test(async {
+        let (storage, db_path) = temp_storage("multi_key").await;
+
+        let now = now_ms();
+        for i in 0..5 {
+            let record = EventMuteRecord {
+                identity_key: format!("evt:key_{i}"),
+                scope: "workspace".to_string(),
+                created_at: now,
+                expires_at: if i % 2 == 0 { None } else { Some(now - 1000) },
+                created_by: None,
+                reason: None,
+            };
+            storage.add_event_mute(record).await.unwrap();
         }
-    }
 
-    cleanup(&db_path);
+        // Even keys (0,2,4) are permanent, odd keys (1,3) are expired
+        for i in 0..5 {
+            let muted = storage
+                .is_event_muted(&format!("evt:key_{i}"), now)
+                .await
+                .unwrap();
+            if i % 2 == 0 {
+                assert!(muted, "key_{i} should be muted (permanent)");
+            } else {
+                assert!(!muted, "key_{i} should not be muted (expired)");
+            }
+        }
+
+        cleanup(&db_path);
+    });
 }
 
 // ===========================================================================
 // 3. Event identity key + mute integration
 // ===========================================================================
 
-#[tokio::test]
-async fn mute_via_identity_key_round_trip() {
-    let (storage, db_path) = temp_storage("identity_key_rt").await;
+#[test]
+fn mute_via_identity_key_round_trip() {
+    run_async_test(async {
+        let (storage, db_path) = temp_storage("identity_key_rt").await;
 
-    // Compute identity key the same way the pipeline does
-    let detection = make_detection("core.codex:usage_reached");
-    let identity_key = frankenterm_core::events::event_identity_key(&detection, 42, None);
+        // Compute identity key the same way the pipeline does
+        let detection = make_detection("core.codex:usage_reached");
+        let identity_key = frankenterm_core::events::event_identity_key(&detection, 42, None);
 
-    // Mute that identity key
-    let now = now_ms();
-    let record = EventMuteRecord {
-        identity_key: identity_key.clone(),
-        scope: "workspace".to_string(),
-        created_at: now,
-        expires_at: None,
-        created_by: Some("test".to_string()),
-        reason: Some("mute usage reached for pane 42".to_string()),
-    };
-    storage.add_event_mute(record).await.unwrap();
+        // Mute that identity key
+        let now = now_ms();
+        let record = EventMuteRecord {
+            identity_key: identity_key.clone(),
+            scope: "workspace".to_string(),
+            created_at: now,
+            expires_at: None,
+            created_by: Some("test".to_string()),
+            reason: Some("mute usage reached for pane 42".to_string()),
+        };
+        storage.add_event_mute(record).await.unwrap();
 
-    // Same detection + pane should produce the same key and be muted
-    let check_key = frankenterm_core::events::event_identity_key(&detection, 42, None);
-    assert_eq!(
-        identity_key, check_key,
-        "identity key should be deterministic"
-    );
+        // Same detection + pane should produce the same key and be muted
+        let check_key = frankenterm_core::events::event_identity_key(&detection, 42, None);
+        assert_eq!(
+            identity_key, check_key,
+            "identity key should be deterministic"
+        );
 
-    let muted = storage.is_event_muted(&check_key, now).await.unwrap();
-    assert!(muted, "detection with muted identity key should be muted");
+        let muted = storage.is_event_muted(&check_key, now).await.unwrap();
+        assert!(muted, "detection with muted identity key should be muted");
 
-    // Different pane_id produces a different key
-    let other_key = frankenterm_core::events::event_identity_key(&detection, 99, None);
-    assert_ne!(
-        identity_key, other_key,
-        "different pane should produce different key"
-    );
+        // Different pane_id produces a different key
+        let other_key = frankenterm_core::events::event_identity_key(&detection, 99, None);
+        assert_ne!(
+            identity_key, other_key,
+            "different pane should produce different key"
+        );
 
-    let other_muted = storage.is_event_muted(&other_key, now).await.unwrap();
-    assert!(!other_muted, "different pane's key should not be muted");
+        let other_muted = storage.is_event_muted(&other_key, now).await.unwrap();
+        assert!(!other_muted, "different pane's key should not be muted");
 
-    cleanup(&db_path);
+        cleanup(&db_path);
+    });
 }
 
-#[tokio::test]
-async fn identity_key_deterministic_with_uuid() {
-    let detection = make_detection("core.claude_code:compaction");
-    let key1 = frankenterm_core::events::event_identity_key(&detection, 7, Some("uuid-abc-123"));
-    let key2 = frankenterm_core::events::event_identity_key(&detection, 7, Some("uuid-abc-123"));
-    assert_eq!(key1, key2, "same inputs should produce same identity key");
+#[test]
+fn identity_key_deterministic_with_uuid() {
+    run_async_test(async {
+        let detection = make_detection("core.claude_code:compaction");
+        let key1 =
+            frankenterm_core::events::event_identity_key(&detection, 7, Some("uuid-abc-123"));
+        let key2 =
+            frankenterm_core::events::event_identity_key(&detection, 7, Some("uuid-abc-123"));
+        assert_eq!(key1, key2, "same inputs should produce same identity key");
 
-    // Different UUID = different key
-    let key3 = frankenterm_core::events::event_identity_key(&detection, 7, Some("uuid-xyz-999"));
-    assert_ne!(key1, key3, "different UUID should produce different key");
+        // Different UUID = different key
+        let key3 =
+            frankenterm_core::events::event_identity_key(&detection, 7, Some("uuid-xyz-999"));
+        assert_ne!(key1, key3, "different UUID should produce different key");
+    });
 }
 
 // ===========================================================================
