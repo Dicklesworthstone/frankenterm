@@ -1,12 +1,12 @@
 // Ideally this would be scoped to WidgetId, but I can't seem to find the
 // right place for it to take effect
 #![allow(clippy::new_without_default)]
+use crate::Result;
 use crate::color::ColorAttribute;
 use crate::input::InputEvent;
 use crate::surface::{
     Change, CursorShape, CursorVisibility, DirtyRect, Position, SequenceNo, Surface,
 };
-use crate::Result;
 use fnv::FnvHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
@@ -53,6 +53,14 @@ pub struct RenderTelemetry {
     pub widget_dirty_rects: usize,
     /// Total dirty cells emitted while compositing widget surfaces.
     pub widget_dirty_cells: usize,
+    /// Number of tile-aligned dirty regions emitted while compositing widget surfaces.
+    pub widget_dirty_tiles: usize,
+    /// Total dirty cells emitted in tile-aligned widget regions.
+    pub widget_dirty_tile_cells: usize,
+    /// Number of dirty widget regions selected for upload in the active render mode.
+    pub widget_upload_regions: usize,
+    /// Total dirty widget cells selected for upload in the active render mode.
+    pub widget_upload_cells: usize,
     /// Number of dirty rectangles between the previous and current composed frame.
     pub frame_dirty_rects: usize,
     /// Total dirty cells between the previous and current composed frame.
@@ -399,6 +407,7 @@ impl<'widget> Ui<'widget> {
         id: WidgetId,
         screen: &mut Surface,
         abs_coords: &ScreenRelativeCoords,
+        mode: DirtyRegionMode,
         telemetry: &mut RenderTelemetry,
     ) -> Result<()> {
         let coords = {
@@ -413,15 +422,52 @@ impl<'widget> Ui<'widget> {
                 };
                 render_data.widget.render(&mut args);
             }
-            let (_, dirty_rects) = screen.draw_from_screen_with_dirty_rects(
-                surface,
-                abs_coords.x + render_data.coordinates.x,
-                abs_coords.y + render_data.coordinates.y,
-            );
-            let (rect_count, dirty_cells) = Self::accumulate_dirty_rects(&dirty_rects);
+            let dirty_regions = match mode {
+                DirtyRegionMode::Rects => {
+                    screen
+                        .draw_from_screen_with_dirty_rects(
+                            surface,
+                            abs_coords.x + render_data.coordinates.x,
+                            abs_coords.y + render_data.coordinates.y,
+                        )
+                        .1
+                }
+                DirtyRegionMode::Tiles {
+                    tile_width,
+                    tile_height,
+                } => {
+                    screen
+                        .draw_from_screen_with_dirty_tiles(
+                            surface,
+                            abs_coords.x + render_data.coordinates.x,
+                            abs_coords.y + render_data.coordinates.y,
+                            tile_width,
+                            tile_height,
+                        )
+                        .1
+                }
+            };
+            let (region_count, dirty_cells) = Self::accumulate_dirty_rects(&dirty_regions);
             telemetry.widgets_rendered = telemetry.widgets_rendered.saturating_add(1);
-            telemetry.widget_dirty_rects = telemetry.widget_dirty_rects.saturating_add(rect_count);
-            telemetry.widget_dirty_cells = telemetry.widget_dirty_cells.saturating_add(dirty_cells);
+            match mode {
+                DirtyRegionMode::Rects => {
+                    telemetry.widget_dirty_rects =
+                        telemetry.widget_dirty_rects.saturating_add(region_count);
+                    telemetry.widget_dirty_cells =
+                        telemetry.widget_dirty_cells.saturating_add(dirty_cells);
+                }
+                DirtyRegionMode::Tiles { .. } => {
+                    telemetry.widget_dirty_tiles =
+                        telemetry.widget_dirty_tiles.saturating_add(region_count);
+                    telemetry.widget_dirty_tile_cells = telemetry
+                        .widget_dirty_tile_cells
+                        .saturating_add(dirty_cells);
+                }
+            }
+            telemetry.widget_upload_regions =
+                telemetry.widget_upload_regions.saturating_add(region_count);
+            telemetry.widget_upload_cells =
+                telemetry.widget_upload_cells.saturating_add(dirty_cells);
             surface.flush_changes_older_than(SequenceNo::max_value());
             render_data.coordinates
         };
@@ -431,6 +477,7 @@ impl<'widget> Ui<'widget> {
                 child,
                 screen,
                 &ScreenRelativeCoords::new(coords.x + abs_coords.x, coords.y + abs_coords.y),
+                mode,
                 telemetry,
             )?;
         }
@@ -499,6 +546,7 @@ impl<'widget> Ui<'widget> {
                 root,
                 &mut alt_screen,
                 &ScreenRelativeCoords::new(0, 0),
+                mode,
                 &mut telemetry,
             )?;
             let frame_dirty_rects = screen.dirty_rects(&alt_screen);
@@ -688,6 +736,10 @@ mod test {
         assert_eq!(first.widgets_rendered, 1);
         assert!(first.widget_dirty_rects >= 1);
         assert!(first.widget_dirty_cells >= 1);
+        assert_eq!(first.widget_dirty_tiles, 0);
+        assert_eq!(first.widget_dirty_tile_cells, 0);
+        assert_eq!(first.widget_upload_regions, first.widget_dirty_rects);
+        assert_eq!(first.widget_upload_cells, first.widget_dirty_cells);
         assert!(first.frame_dirty_rects >= 1);
         assert!(first.frame_dirty_cells >= 1);
         assert_eq!(first.frame_dirty_tiles, 0);
@@ -698,6 +750,12 @@ mod test {
         ui.render_to_screen(&mut surface).unwrap();
         let second = ui.last_render_telemetry();
         assert_eq!(second.widgets_rendered, 1);
+        assert_eq!(second.widget_dirty_rects, 0);
+        assert_eq!(second.widget_dirty_cells, 0);
+        assert_eq!(second.widget_dirty_tiles, 0);
+        assert_eq!(second.widget_dirty_tile_cells, 0);
+        assert_eq!(second.widget_upload_regions, 0);
+        assert_eq!(second.widget_upload_cells, 0);
         assert_eq!(second.frame_dirty_rects, 0);
         assert_eq!(second.frame_dirty_cells, 0);
         assert_eq!(second.frame_dirty_tiles, 0);
@@ -716,6 +774,8 @@ mod test {
         let (_, first_rects) = ui.render_to_screen_with_dirty_rects(&mut surface).unwrap();
         assert!(!first_rects.is_empty());
         let first = ui.last_render_telemetry();
+        assert_eq!(first.widget_upload_regions, first.widget_dirty_rects);
+        assert_eq!(first.widget_upload_cells, first.widget_dirty_cells);
         assert_eq!(first.frame_upload_regions, first_rects.len());
         assert_eq!(first.frame_upload_regions, first.frame_dirty_rects);
         assert_eq!(first.frame_upload_cells, first.frame_dirty_cells);
@@ -739,6 +799,12 @@ mod test {
             .unwrap();
         assert!(!first_tiles.is_empty());
         let first = ui.last_render_telemetry();
+        assert!(first.widget_dirty_tiles >= 1);
+        assert!(first.widget_dirty_tile_cells >= 1);
+        assert_eq!(first.widget_dirty_rects, 0);
+        assert_eq!(first.widget_dirty_cells, 0);
+        assert_eq!(first.widget_upload_regions, first.widget_dirty_tiles);
+        assert_eq!(first.widget_upload_cells, first.widget_dirty_tile_cells);
         assert!(first.frame_dirty_tiles >= 1);
         assert!(first.frame_dirty_tile_cells >= 1);
         assert_eq!(first.frame_upload_regions, first_tiles.len());
@@ -750,6 +816,10 @@ mod test {
             .unwrap();
         assert!(second_tiles.is_empty());
         let second = ui.last_render_telemetry();
+        assert_eq!(second.widget_dirty_tiles, 0);
+        assert_eq!(second.widget_dirty_tile_cells, 0);
+        assert_eq!(second.widget_upload_regions, 0);
+        assert_eq!(second.widget_upload_cells, 0);
         assert_eq!(second.frame_dirty_tiles, 0);
         assert_eq!(second.frame_dirty_tile_cells, 0);
         assert_eq!(second.frame_upload_regions, 0);
