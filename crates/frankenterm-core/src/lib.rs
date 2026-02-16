@@ -218,6 +218,7 @@ pub mod treap;
 pub mod trie;
 pub mod undo;
 pub mod union_find;
+pub mod van_emde_boas;
 pub mod user_preferences;
 pub mod viewport_reflow_planner;
 pub mod voi;
