@@ -1,0 +1,91 @@
+name: input_latency_happy_path
+description: "Deterministic typing/paste/mouse interactions during moderate resize and font churn"
+duration: "5s"
+metadata:
+  suite: input_latency_resize_storm
+  suite_version: "2026-02-16"
+  seed: "2001"
+  profile: happy_path
+  regression_fixture: "none"
+  pane_count: "2"
+  tab_count: "1"
+  stress_level: "low"
+panes:
+  - id: 50
+    title: "editor"
+    window_id: 0
+    tab_id: 0
+    cols: 120
+    rows: 34
+    initial_content: "$ "
+  - id: 51
+    title: "control"
+    window_id: 0
+    tab_id: 0
+    cols: 120
+    rows: 34
+    initial_content: "$ "
+events:
+  - at: "200ms"
+    pane: 50
+    action: typing
+    content: "open README"
+  - at: "260ms"
+    pane: 50
+    action: resize
+    content: "140x40"
+  - at: "320ms"
+    pane: 50
+    action: paste
+    content: "fn demo() { println!(\"ok\"); }"
+  - at: "380ms"
+    pane: 50
+    action: set_font_size
+    content: "1.08"
+  - at: "440ms"
+    pane: 50
+    action: mouse
+    name: left_click
+  - at: "620ms"
+    pane: 51
+    action: resize
+    content: "132x38"
+  - at: "700ms"
+    pane: 51
+    action: typing
+    content: "cargo test -q"
+  - at: "780ms"
+    pane: 51
+    action: paste
+    content: "--nocapture"
+  - at: "860ms"
+    pane: 51
+    action: mouse
+    name: wheel_down
+  - at: "940ms"
+    pane: 51
+    action: set_font_size
+    content: "0.96"
+  - at: "1100ms"
+    pane: 51
+    action: marker
+    name: happy_done
+expectations:
+  - contains:
+      pane: 50
+      text: "[TYPING:open README]"
+  - contains:
+      pane: 50
+      text: "[PASTE:fn demo()"
+  - contains:
+      pane: 50
+      text: "[MOUSE:left_click]"
+  - contains:
+      pane: 51
+      text: "[TYPING:cargo test -q]"
+  - contains:
+      pane: 51
+      text: "[PASTE:--nocapture]"
+  - contains:
+      pane: 51
+      text: "[MARKER:happy_done]"

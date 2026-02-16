@@ -1,0 +1,106 @@
+name: input_latency_regression_resize_wrap_jitter_2026_02
+description: "Regression fixture for previously observed input lag during resize wrap jitter"
+duration: "4s"
+metadata:
+  suite: input_latency_resize_storm
+  suite_version: "2026-02-16"
+  seed: "2003"
+  profile: regression
+  regression_fixture: "resize_wrap_jitter_2026_02"
+  pane_count: "2"
+  tab_count: "1"
+  stress_level: "medium"
+panes:
+  - id: 70
+    title: "regression-editor"
+    window_id: 0
+    tab_id: 0
+    cols: 110
+    rows: 30
+  - id: 71
+    title: "regression-control"
+    window_id: 0
+    tab_id: 0
+    cols: 110
+    rows: 30
+events:
+  - at: "1ms"
+    pane: 70
+    action: typing
+    content: "insert mode"
+  - at: "2ms"
+    pane: 70
+    action: resize
+    content: "150x46"
+  - at: "3ms"
+    pane: 71
+    action: paste
+    content: "tail -f runtime.log"
+  - at: "4ms"
+    pane: 70
+    action: set_font_size
+    content: "1.16"
+  - at: "5ms"
+    pane: 71
+    action: mouse
+    name: left_click
+  - at: "6ms"
+    pane: 70
+    action: resize
+    content: "84x24"
+  - at: "7ms"
+    pane: 71
+    action: set_font_size
+    content: "0.90"
+  - at: "8ms"
+    pane: 70
+    action: paste
+    content: "let wrapped = true;"
+  - at: "9ms"
+    pane: 71
+    action: typing
+    content: "/retry"
+  - at: "10ms"
+    pane: 70
+    action: mouse
+    name: wheel_down
+  - at: "11ms"
+    pane: 71
+    action: resize
+    content: "126x36"
+  - at: "12ms"
+    pane: 70
+    action: set_font_size
+    content: "1.03"
+  - at: "13ms"
+    pane: 71
+    action: paste
+    content: "cargo run -p frankenterm -- watch"
+  - at: "14ms"
+    pane: 70
+    action: typing
+    content: "<esc>:w"
+  - at: "15ms"
+    pane: 71
+    action: mouse
+    name: drag_select
+  - at: "16ms"
+    pane: 70
+    action: marker
+    name: regression_done
+expectations:
+  - contains:
+      pane: 70
+      text: "[TYPING:insert mode]"
+  - contains:
+      pane: 70
+      text: "[PASTE:let wrapped = true;]"
+  - contains:
+      pane: 70
+      text: "[MOUSE:wheel_down]"
+  - contains:
+      pane: 71
+      text: "[PASTE:cargo run -p frankenterm -- watch]"
+  - contains:
+      pane: 70
+      text: "[MARKER:regression_done]"

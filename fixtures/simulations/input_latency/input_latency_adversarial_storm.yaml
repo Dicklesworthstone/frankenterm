@@ -1,0 +1,168 @@
+name: input_latency_adversarial_storm
+description: "High-frequency typing/paste/mouse bursts under resize and font storms"
+duration: "3s"
+metadata:
+  suite: input_latency_resize_storm
+  suite_version: "2026-02-16"
+  seed: "2002"
+  profile: adversarial_storm
+  regression_fixture: "none"
+  pane_count: "3"
+  tab_count: "2"
+  stress_level: "high"
+panes:
+  - id: 60
+    title: "editor-a"
+    window_id: 0
+    tab_id: 0
+    cols: 120
+    rows: 34
+  - id: 61
+    title: "editor-b"
+    window_id: 0
+    tab_id: 0
+    cols: 120
+    rows: 34
+  - id: 62
+    title: "ops"
+    window_id: 0
+    tab_id: 1
+    cols: 120
+    rows: 34
+events:
+  - at: "1ms"
+    pane: 60
+    action: typing
+    content: "i"
+  - at: "2ms"
+    pane: 61
+    action: paste
+    content: "kubectl get pods"
+  - at: "3ms"
+    pane: 62
+    action: mouse
+    name: left_click
+  - at: "4ms"
+    pane: 60
+    action: resize
+    content: "160x48"
+  - at: "5ms"
+    pane: 61
+    action: set_font_size
+    content: "1.12"
+  - at: "6ms"
+    pane: 62
+    action: resize
+    content: "160x48"
+  - at: "7ms"
+    pane: 60
+    action: paste
+    content: "fn storm() {}"
+  - at: "8ms"
+    pane: 61
+    action: typing
+    content: ":wq"
+  - at: "9ms"
+    pane: 62
+    action: mouse
+    name: drag_start
+  - at: "10ms"
+    pane: 60
+    action: set_font_size
+    content: "0.88"
+  - at: "11ms"
+    pane: 61
+    action: resize
+    content: "92x26"
+  - at: "12ms"
+    pane: 62
+    action: set_font_size
+    content: "1.18"
+  - at: "13ms"
+    pane: 60
+    action: typing
+    content: "cargo"
+  - at: "14ms"
+    pane: 61
+    action: paste
+    content: "cargo check --workspace"
+  - at: "15ms"
+    pane: 62
+    action: mouse
+    name: drag_end
+  - at: "16ms"
+    pane: 60
+    action: resize
+    content: "148x44"
+  - at: "17ms"
+    pane: 61
+    action: set_font_size
+    content: "1.04"
+  - at: "18ms"
+    pane: 62
+    action: resize
+    content: "98x28"
+  - at: "19ms"
+    pane: 60
+    action: paste
+    content: "let a = 42;"
+  - at: "20ms"
+    pane: 61
+    action: typing
+    content: "/compact"
+  - at: "21ms"
+    pane: 62
+    action: mouse
+    name: wheel_up
+  - at: "22ms"
+    pane: 60
+    action: set_font_size
+    content: "1.20"
+  - at: "23ms"
+    pane: 61
+    action: resize
+    content: "104x32"
+  - at: "24ms"
+    pane: 62
+    action: set_font_size
+    content: "0.92"
+  - at: "25ms"
+    pane: 60
+    action: typing
+    content: ":q"
+  - at: "26ms"
+    pane: 61
+    action: paste
+    content: "tail -f app.log"
+  - at: "27ms"
+    pane: 62
+    action: mouse
+    name: middle_click
+  - at: "28ms"
+    pane: 60
+    action: resize
+    content: "120x34"
+  - at: "29ms"
+    pane: 61
+    action: set_font_size
+    content: "1.00"
+  - at: "30ms"
+    pane: 62
+    action: marker
+    name: adversarial_done
+expectations:
+  - contains:
+      pane: 60
+      text: "[TYPING:i]"
+  - contains:
+      pane: 60
+      text: "[PASTE:fn storm() {}]"
+  - contains:
+      pane: 61
+      text: "[PASTE:cargo check --workspace]"
+  - contains:
+      pane: 62
+      text: "[MOUSE:middle_click]"
+  - contains:
+      pane: 62
+      text: "[MARKER:adversarial_done]"
