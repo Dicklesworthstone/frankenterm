@@ -117,6 +117,7 @@ pub mod interval_tree;
 #[cfg(unix)]
 pub mod ipc;
 pub mod kalman_watchdog;
+pub mod kd_tree;
 pub mod latency_model;
 pub mod learn;
 pub mod lfu_cache;
