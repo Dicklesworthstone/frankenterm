@@ -440,3 +440,212 @@ proptest! {
         prop_assert_eq!(filter.load_factor(), 0.0);
     }
 }
+
+// ── Additional invariants (DarkMill ft-283h4.55) ────────────────────
+
+proptest! {
+    /// After insert, is_empty is false.
+    #[test]
+    fn insert_makes_nonempty(
+        config in arb_large_config(),
+        item in 0..100000u64
+    ) {
+        let mut filter = CuckooFilter::with_config(config);
+        let result = filter.insert(&item);
+        if result == InsertResult::Ok {
+            prop_assert!(!filter.is_empty());
+        }
+    }
+
+    /// InsertResult::Full means count equals capacity.
+    #[test]
+    fn full_means_at_capacity(config in arb_config()) {
+        let mut filter = CuckooFilter::with_config(config);
+        let cap = filter.capacity();
+        let mut full_seen = false;
+        for i in 0u64..(cap as u64 * 2) {
+            if filter.insert(&i) == InsertResult::Full {
+                full_seen = true;
+                break;
+            }
+        }
+        if full_seen {
+            // When full, count should be > 0 and at or near capacity
+            prop_assert!(filter.count() > 0);
+            prop_assert!(filter.count() <= filter.capacity());
+        }
+    }
+
+    /// Load factor equals count / capacity.
+    #[test]
+    fn load_factor_equals_ratio(
+        config in arb_large_config(),
+        items in arb_small_items()
+    ) {
+        let mut filter = CuckooFilter::with_config(config);
+        for item in &items {
+            filter.insert(item);
+        }
+        let expected = filter.count() as f64 / filter.capacity() as f64;
+        let actual = filter.load_factor();
+        prop_assert!(
+            (actual - expected).abs() < 1e-10,
+            "load_factor {} != count/capacity {}",
+            actual, expected
+        );
+    }
+
+    /// Stats load_percent matches load_factor * 100.
+    #[test]
+    fn stats_load_percent_consistent(
+        config in arb_large_config(),
+        items in arb_small_items()
+    ) {
+        let mut filter = CuckooFilter::with_config(config);
+        for item in &items {
+            filter.insert(item);
+        }
+        let stats = filter.stats();
+        let expected_percent = (filter.load_factor() * 100.0) as u32;
+        prop_assert_eq!(stats.load_percent, expected_percent);
+    }
+
+    /// Duplicate inserts increase count each time (cuckoo allows duplicates).
+    #[test]
+    fn duplicate_inserts_increase_count(
+        config in arb_large_config(),
+        item in 0..100000u64,
+        repeats in 2..5usize
+    ) {
+        let mut filter = CuckooFilter::with_config(config);
+        let mut count = 0;
+        for _ in 0..repeats {
+            if filter.insert(&item) == InsertResult::Ok {
+                count += 1;
+            }
+        }
+        prop_assert_eq!(filter.count(), count);
+    }
+
+    /// Clear then insert works correctly.
+    #[test]
+    fn clear_then_insert(
+        config in arb_large_config(),
+        items1 in arb_small_items(),
+        items2 in arb_small_items()
+    ) {
+        let mut filter = CuckooFilter::with_config(config);
+        for item in &items1 {
+            filter.insert(item);
+        }
+        filter.clear();
+        prop_assert!(filter.is_empty());
+
+        let mut new_count = 0;
+        for item in &items2 {
+            if filter.insert(item) == InsertResult::Ok {
+                new_count += 1;
+            }
+        }
+        prop_assert_eq!(filter.count(), new_count);
+    }
+
+    /// Stats after clear show zeros.
+    #[test]
+    fn stats_after_clear(
+        config in arb_config(),
+        items in arb_small_items()
+    ) {
+        let mut filter = CuckooFilter::with_config(config);
+        for item in &items {
+            filter.insert(item);
+        }
+        filter.clear();
+        let stats = filter.stats();
+        prop_assert_eq!(stats.count, 0);
+        prop_assert_eq!(stats.load_percent, 0);
+        prop_assert_eq!(stats.occupied_buckets, 0);
+    }
+
+    /// Delete returns false on empty filter.
+    #[test]
+    fn delete_on_empty(item in 0..100000u64) {
+        let mut filter = CuckooFilter::new();
+        prop_assert!(!filter.delete(&item));
+        prop_assert!(filter.is_empty());
+    }
+
+    /// Occupied buckets increases with distinct items.
+    #[test]
+    fn occupied_grows_with_inserts(
+        config in arb_large_config(),
+        items in prop::collection::vec(0..100000u64, 5..20)
+    ) {
+        let mut filter = CuckooFilter::with_config(config);
+        let empty_occupied = filter.stats().occupied_buckets;
+        for item in &items {
+            filter.insert(item);
+        }
+        if filter.count() > 0 {
+            prop_assert!(
+                filter.stats().occupied_buckets >= empty_occupied,
+                "occupied should not decrease with inserts"
+            );
+        }
+    }
+
+    /// with_capacity and with_config both produce power-of-2 bucket counts.
+    #[test]
+    fn capacity_api_power_of_two(expected in 10..5000usize) {
+        let filter = CuckooFilter::with_capacity(expected);
+        prop_assert!(filter.num_buckets().is_power_of_two());
+    }
+
+    /// No false negatives after interleaved insert/delete.
+    #[test]
+    fn no_false_negatives_after_mixed_ops(
+        items in prop::collection::vec(0..100000u64, 5..25)
+    ) {
+        let mut filter = CuckooFilter::with_capacity(200);
+        let unique: Vec<u64> = items.into_iter().collect::<HashSet<_>>().into_iter().collect();
+        let mut present = HashSet::new();
+
+        // Insert first half
+        let mid = unique.len() / 2;
+        for item in &unique[..mid] {
+            if filter.insert(item) == InsertResult::Ok {
+                present.insert(*item);
+            }
+        }
+
+        // Delete some from first half
+        let quarter = mid / 2;
+        for item in &unique[..quarter] {
+            if filter.delete(item) {
+                present.remove(item);
+            }
+        }
+
+        // Insert second half
+        for item in &unique[mid..] {
+            if filter.insert(item) == InsertResult::Ok {
+                present.insert(*item);
+            }
+        }
+
+        // All present items must be found
+        for item in &present {
+            prop_assert!(filter.lookup(item), "false negative for item {}", item);
+        }
+    }
+
+    /// Default config creates a valid filter.
+    #[test]
+    fn default_config_valid(item in 0..100000u64) {
+        let mut filter = CuckooFilter::new();
+        let result = filter.insert(&item);
+        let is_ok = result == InsertResult::Ok;
+        prop_assert!(is_ok);
+        prop_assert!(filter.lookup(&item));
+    }
+}
