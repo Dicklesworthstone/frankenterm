@@ -1311,7 +1311,10 @@ impl ResizeScheduler {
 
         let hitch_overrun_units = spent_units.saturating_sub(effective_budget_units);
         let hitch_detected = hitch_overrun_units > 0;
-        self.update_pacing_state_after_frame(hitch_detected, pacing_plan.vsync_adjusted_budget_units);
+        self.update_pacing_state_after_frame(
+            hitch_detected,
+            pacing_plan.vsync_adjusted_budget_units,
+        );
 
         self.metrics.last_frame_budget_units = budget_units;
         self.metrics.last_requested_frame_budget_units = pacing_plan.requested_budget_units;
@@ -1463,6 +1466,155 @@ impl ResizeScheduler {
         let mut telemetry = ResizeInvariantTelemetry::default();
         telemetry.absorb(&report);
         (report, telemetry)
+    }
+
+    fn pacing_budget_bounds(&self) -> (u32, u32) {
+        let min_budget = self.config.pacing_min_budget_units.max(1);
+        let max_budget = self.config.pacing_max_budget_units.max(min_budget);
+        (min_budget, max_budget)
+    }
+
+    fn normalize_vsync_refresh_hz(&self, vsync_refresh_hz: Option<u32>) -> Option<u32> {
+        let min_refresh_hz = self.config.pacing_min_refresh_hz.max(1);
+        let max_refresh_hz = self.config.pacing_max_refresh_hz.max(min_refresh_hz);
+        match vsync_refresh_hz {
+            Some(0) => None,
+            Some(hz) => Some(hz.clamp(min_refresh_hz, max_refresh_hz)),
+            None => None,
+        }
+    }
+
+    fn frame_interval_us_for_refresh(refresh_hz: u32) -> u32 {
+        let hz = refresh_hz.max(1);
+        let interval = (1_000_000_u64 + (u64::from(hz) / 2)) / u64::from(hz);
+        u32::try_from(interval).unwrap_or(u32::MAX)
+    }
+
+    fn nominal_frame_interval_us(&self) -> u32 {
+        let min_refresh_hz = self.config.pacing_min_refresh_hz.max(1);
+        let max_refresh_hz = self.config.pacing_max_refresh_hz.max(min_refresh_hz);
+        let nominal_hz = self
+            .config
+            .pacing_nominal_refresh_hz
+            .clamp(min_refresh_hz, max_refresh_hz);
+        Self::frame_interval_us_for_refresh(nominal_hz)
+    }
+
+    fn scale_budget_by_vsync(
+        &self,
+        requested_budget_units: u32,
+        vsync_interval_us: Option<u32>,
+    ) -> u32 {
+        let nominal_interval_us = self.nominal_frame_interval_us();
+        let nominal_interval = u64::from(nominal_interval_us);
+        let frame_interval = u64::from(vsync_interval_us.unwrap_or(nominal_interval_us));
+        let scaled = (u64::from(requested_budget_units) * frame_interval + (nominal_interval / 2))
+            / nominal_interval;
+        u32::try_from(scaled).unwrap_or(u32::MAX).max(1)
+    }
+
+    fn plan_frame_pacing(
+        &mut self,
+        requested_budget_units: u32,
+        vsync_refresh_hz: Option<u32>,
+    ) -> FramePacingPlan {
+        let requested_budget_units = requested_budget_units.max(1);
+        let vsync_refresh_hz = self.normalize_vsync_refresh_hz(vsync_refresh_hz);
+        let vsync_interval_us = vsync_refresh_hz.map(Self::frame_interval_us_for_refresh);
+        let (min_budget, max_budget) = self.pacing_budget_bounds();
+        let vsync_adjusted_budget_units = self
+            .scale_budget_by_vsync(requested_budget_units, vsync_interval_us)
+            .clamp(min_budget, max_budget);
+
+        let pacing_budget_units = if self.config.pacing_governor_enabled {
+            if self.pacing_budget_units == 0 {
+                self.pacing_budget_units = vsync_adjusted_budget_units;
+            } else {
+                self.pacing_budget_units = self.pacing_budget_units.clamp(min_budget, max_budget);
+            }
+            if self.pacing_budget_units > vsync_adjusted_budget_units {
+                self.pacing_budget_units = vsync_adjusted_budget_units;
+                self.metrics.pacing_budget_decrease_events =
+                    self.metrics.pacing_budget_decrease_events.saturating_add(1);
+            }
+            self.pacing_budget_units
+        } else {
+            requested_budget_units
+        };
+
+        if pacing_budget_units != requested_budget_units {
+            self.metrics.pacing_adjusted_frames =
+                self.metrics.pacing_adjusted_frames.saturating_add(1);
+        }
+
+        FramePacingPlan {
+            requested_budget_units,
+            pacing_budget_units,
+            vsync_adjusted_budget_units,
+            vsync_refresh_hz,
+            vsync_interval_us,
+        }
+    }
+
+    fn update_pacing_state_after_frame(
+        &mut self,
+        hitch_detected: bool,
+        vsync_adjusted_budget_units: u32,
+    ) {
+        if !self.config.pacing_governor_enabled {
+            self.hitch_streak = 0;
+            self.hitch_free_streak = 0;
+            self.metrics.current_hitch_streak = 0;
+            return;
+        }
+
+        let (min_budget, max_budget) = self.pacing_budget_bounds();
+        if self.pacing_budget_units == 0 {
+            self.pacing_budget_units = vsync_adjusted_budget_units.clamp(min_budget, max_budget);
+        }
+
+        if hitch_detected {
+            self.hitch_streak = self.hitch_streak.saturating_add(1);
+            self.hitch_free_streak = 0;
+            let penalty_step = self.config.pacing_hitch_penalty_units.max(1);
+            let escalation = self.hitch_streak.min(4);
+            let penalty = penalty_step.saturating_mul(escalation);
+            let next_budget = self
+                .pacing_budget_units
+                .saturating_sub(penalty)
+                .clamp(min_budget, max_budget);
+            if next_budget < self.pacing_budget_units {
+                self.metrics.pacing_budget_decrease_events =
+                    self.metrics.pacing_budget_decrease_events.saturating_add(1);
+            }
+            self.pacing_budget_units = next_budget;
+        } else {
+            self.hitch_streak = 0;
+            self.hitch_free_streak = self.hitch_free_streak.saturating_add(1);
+            let target_budget = vsync_adjusted_budget_units.clamp(min_budget, max_budget);
+            if self.pacing_budget_units > target_budget {
+                self.pacing_budget_units = target_budget;
+                self.metrics.pacing_budget_decrease_events =
+                    self.metrics.pacing_budget_decrease_events.saturating_add(1);
+            } else if self.pacing_budget_units < target_budget
+                && self.hitch_free_streak >= self.config.pacing_recovery_frames.max(1)
+            {
+                let recovery_step = self.config.pacing_recovery_step_units.max(1);
+                let next_budget = self
+                    .pacing_budget_units
+                    .saturating_add(recovery_step)
+                    .min(target_budget);
+                if next_budget > self.pacing_budget_units {
+                    self.metrics.pacing_budget_increase_events =
+                        self.metrics.pacing_budget_increase_events.saturating_add(1);
+                }
+                self.pacing_budget_units = next_budget;
+                self.hitch_free_streak = 0;
+            }
+        }
+
+        self.metrics.current_hitch_streak = self.hitch_streak;
+        self.metrics.max_hitch_streak = self.metrics.max_hitch_streak.max(self.hitch_streak);
     }
 
     fn collect_candidates(&self) -> Vec<Candidate> {
@@ -3598,15 +3750,16 @@ mod tests {
         let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
             frame_budget_units: 0, // force everything to defer
             max_deferrals_before_drop: 3,
+            max_deferrals_before_force: 100,
             allow_single_oversubscription: false,
             ..ResizeSchedulerConfig::default()
         });
         let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Background, 5, 100));
-        // Run 3 frames — each defers the pending intent
-        for _ in 0..3 {
+        // Run 4 frames: first 3 accrue deferrals, 4th drops at frame-start.
+        for _ in 0..4 {
             scheduler.schedule_frame();
         }
-        // After 3 deferrals (>= max_deferrals_before_drop=3), pending should be dropped
+        // After exceeding deferral threshold, pending work should be dropped.
         assert_eq!(
             scheduler.pending_total(),
             0,
