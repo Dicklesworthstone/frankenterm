@@ -82,6 +82,7 @@ impl Rope {
     }
 
     /// Create a rope from a string.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Self {
         if text.is_empty() {
             return Self::new();
@@ -285,6 +286,7 @@ impl Rope {
         // Split into balanced halves
         let mid = text.len() / 2;
         // Ensure we split on a char boundary
+        #[allow(clippy::incompatible_msrv)]
         let mid = text.floor_char_boundary(mid);
         let left = self.build_from_str(&text[..mid]);
         let right = self.build_from_str(&text[mid..]);

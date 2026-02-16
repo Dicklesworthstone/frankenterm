@@ -31,7 +31,7 @@ struct BitVec {
 
 impl BitVec {
     fn new(len: usize) -> Self {
-        let num_words = (len + 63) / 64;
+        let num_words = len.div_ceil(64);
         Self {
             bits: vec![0u64; num_words],
             len,

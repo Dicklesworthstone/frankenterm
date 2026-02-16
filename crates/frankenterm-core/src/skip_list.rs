@@ -180,6 +180,7 @@ impl<K: Ord, V> SkipList<K, V> {
 
         // If new level exceeds current, update head pointers
         if new_level > self.current_level {
+            #[allow(clippy::needless_range_loop)]
             for level in (self.current_level + 1)..=new_level {
                 update[level] = 0; // head
             }
@@ -197,6 +198,7 @@ impl<K: Ord, V> SkipList<K, V> {
         };
 
         // Wire in forward pointers
+        #[allow(clippy::needless_range_loop)]
         for level in 0..=new_level {
             self.nodes[new_idx].forward[level] = self.nodes[update[level]].forward[level];
             self.nodes[update[level]].forward[level] = Some(new_idx);
@@ -270,6 +272,7 @@ impl<K: Ord, V> SkipList<K, V> {
 
             // Unwire from all levels
             let target_level = self.nodes[target_idx].level();
+            #[allow(clippy::needless_range_loop)]
             for level in 0..=target_level {
                 if self.nodes[update[level]].forward[level] == Some(target_idx) {
                     self.nodes[update[level]].forward[level] =
@@ -324,6 +327,7 @@ impl<K: Ord, V> SkipList<K, V> {
     }
 
     /// Iterate over all key-value pairs in order.
+    #[allow(clippy::iter_without_into_iter)]
     pub fn iter(&self) -> SkipListIter<'_, K, V> {
         SkipListIter {
             list: self,

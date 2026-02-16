@@ -114,7 +114,7 @@ impl PiecewiseLinear {
                     return p1.y;
                 }
                 let frac = (t - p0.t) / dt;
-                return p0.y + frac * (p1.y - p0.y);
+                return frac.mul_add(p1.y - p0.y, p0.y);
             }
         }
 
@@ -128,7 +128,7 @@ impl PiecewiseLinear {
                 return p1.y;
             }
             let slope = (p1.y - p0.y) / dt;
-            p1.y + slope * (t - p1.t)
+            slope.mul_add(t - p1.t, p1.y)
         } else {
             self.points[n - 1].y
         }
@@ -483,7 +483,7 @@ pub fn delay_bound(arrival: &ArrivalCurve, service: &ServiceCurve) -> f64 {
                 let mut lo = 0.0f64;
                 let mut hi = horizon;
                 for _ in 0..64 {
-                    let mid = (lo + hi) / 2.0;
+                    let mid = f64::midpoint(lo, hi);
                     if service.eval(t + mid) >= a_t {
                         hi = mid;
                     } else {

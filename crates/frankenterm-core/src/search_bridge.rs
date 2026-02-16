@@ -409,12 +409,12 @@ fn map_search_error(
 fn update_best_results(best_results: &mut Vec<ScoredResult>, phase: &SearchPhase) {
     match phase {
         SearchPhase::Initial { results, .. } | SearchPhase::Refined { results, .. } => {
-            *best_results = results.clone();
+            best_results.clone_from(results);
         }
         SearchPhase::RefinementFailed {
             initial_results, ..
         } => {
-            *best_results = initial_results.clone();
+            best_results.clone_from(initial_results);
         }
     }
 }

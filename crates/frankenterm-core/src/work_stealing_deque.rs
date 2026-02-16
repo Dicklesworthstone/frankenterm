@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 // ── Configuration ─────────────────────────────────────────────────────
 
 /// Configuration for a work-stealing deque.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WsDequeConfig {
     /// Initial capacity hint. Default: 64.
     pub initial_capacity: usize,
@@ -356,8 +356,7 @@ impl<T> WorkStealingPool<T> {
         for stealer in &self.stealers[worker_id] {
             match stealer.steal() {
                 StealResult::Success(item) => return StealResult::Success(item),
-                StealResult::Retry => continue,
-                StealResult::Empty => continue,
+                StealResult::Retry | StealResult::Empty => {},
             }
         }
         StealResult::Empty

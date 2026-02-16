@@ -189,6 +189,7 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
     }
 
     /// Iterate over all intervals in sorted order by low endpoint.
+    #[allow(clippy::iter_without_into_iter)]
     pub fn iter(&self) -> IntervalTreeIter<'_, T, V> {
         let mut stack = Vec::new();
         let mut current = self.root;

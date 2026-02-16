@@ -290,24 +290,28 @@ impl TypedPane<Creating> {
     }
 
     /// Set the shell command.
+    #[must_use]
     pub fn with_shell(mut self, shell: impl Into<String>) -> Self {
         self.inner.shell = Some(shell.into());
         self
     }
 
     /// Set the working directory.
+    #[must_use]
     pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
         self.inner.cwd = Some(cwd.into());
         self
     }
 
     /// Set the title.
+    #[must_use]
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
         self.inner.title = Some(title.into());
         self
     }
 
     /// Add an environment variable.
+    #[must_use]
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.inner.env.insert(key.into(), value.into());
         self
@@ -531,12 +535,9 @@ impl TransitionLog {
 pub fn is_valid_transition(from: StateLabel, to: StateLabel) -> bool {
     matches!(
         (from, to),
-        (StateLabel::Creating, StateLabel::Active)
-            | (StateLabel::Active, StateLabel::Snapshotting)
-            | (StateLabel::Active, StateLabel::Closed)
-            | (StateLabel::Snapshotting, StateLabel::Active)
-            | (StateLabel::Restoring, StateLabel::Active)
-            | (StateLabel::Restoring, StateLabel::Closed)
+        (StateLabel::Creating | StateLabel::Snapshotting, StateLabel::Active)
+            | (StateLabel::Active, StateLabel::Snapshotting | StateLabel::Closed)
+            | (StateLabel::Restoring, StateLabel::Active | StateLabel::Closed)
     )
 }
 

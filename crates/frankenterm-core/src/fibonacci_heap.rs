@@ -251,8 +251,8 @@ impl<K: Ord + Clone, V: Clone> FibonacciHeap<K, V> {
         let offset = self.nodes.len();
         for node in &other.nodes {
             let mut copied = node.clone();
-            copied.prev = copied.prev + offset;
-            copied.next = copied.next + offset;
+            copied.prev += offset;
+            copied.next += offset;
             copied.parent = copied.parent.map(|p| p + offset);
             copied.child = copied.child.map(|c| c + offset);
             self.nodes.push(copied);
@@ -409,27 +409,25 @@ impl<K: Ord + Clone, V: Clone> FibonacciHeap<K, V> {
 
         // Rebuild root list and find new min
         self.min = None;
-        for entry in degree_table {
-            if let Some(idx) = entry {
-                self.nodes[idx].parent = None;
-                self.nodes[idx].prev = idx;
-                self.nodes[idx].next = idx;
+        for idx in degree_table.into_iter().flatten() {
+            self.nodes[idx].parent = None;
+            self.nodes[idx].prev = idx;
+            self.nodes[idx].next = idx;
 
-                match self.min {
-                    None => {
+            match self.min {
+                None => {
+                    self.min = Some(idx);
+                }
+                Some(m) => {
+                    // Add to root list
+                    let m_next = self.nodes[m].next;
+                    self.nodes[idx].prev = m;
+                    self.nodes[idx].next = m_next;
+                    self.nodes[m].next = idx;
+                    self.nodes[m_next].prev = idx;
+
+                    if self.nodes[idx].key < self.nodes[m].key {
                         self.min = Some(idx);
-                    }
-                    Some(m) => {
-                        // Add to root list
-                        let m_next = self.nodes[m].next;
-                        self.nodes[idx].prev = m;
-                        self.nodes[idx].next = m_next;
-                        self.nodes[m].next = idx;
-                        self.nodes[m_next].prev = idx;
-
-                        if self.nodes[idx].key < self.nodes[m].key {
-                            self.min = Some(idx);
-                        }
                     }
                 }
             }

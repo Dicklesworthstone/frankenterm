@@ -79,6 +79,7 @@ impl SuffixArray {
     }
 
     /// Build from a string.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Self {
         Self::new(text.as_bytes())
     }
@@ -233,7 +234,7 @@ impl SuffixArray {
                 let curr_second = if curr + k < n { rank[curr + k] } else { -1 };
                 let same_second = prev_second == curr_second;
 
-                new_rank[curr] = new_rank[prev] + if same_first && same_second { 0 } else { 1 };
+                new_rank[curr] = new_rank[prev] + i64::from(!(same_first && same_second));
             }
 
             rank.copy_from_slice(&new_rank);

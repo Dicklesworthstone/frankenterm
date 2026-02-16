@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 
 /// Configuration for Count-Min Sketch.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CmsConfig {
     /// Width of each row. Higher = less error. Default: 2048.
     pub width: usize,
@@ -179,7 +179,7 @@ impl CountMinSketch {
 
     /// Failure probability δ = e^(-depth).
     pub fn delta(&self) -> f64 {
-        (-1.0 * self.depth as f64).exp()
+        (-(self.depth as f64)).exp()
     }
 
     /// Get statistics.

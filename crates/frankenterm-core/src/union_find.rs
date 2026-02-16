@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Configuration for Union-Find.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnionFindConfig {
     /// Initial capacity (number of elements).
     pub capacity: usize,
@@ -29,7 +29,7 @@ impl Default for UnionFindConfig {
 }
 
 /// Statistics about the Union-Find structure.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnionFindStats {
     /// Total number of elements.
     pub element_count: usize,
@@ -552,6 +552,20 @@ mod tests {
     }
 
     #[test]
+    fn all_components_empty_is_empty_vec() {
+        let mut uf = UnionFind::new(0);
+        assert!(uf.all_components().is_empty());
+    }
+
+    #[test]
+    fn component_members_singleton_contains_only_self() {
+        let mut uf = UnionFind::new(4);
+        uf.union(0, 1);
+        let members = uf.component_members(3);
+        assert_eq!(members, vec![3]);
+    }
+
+    #[test]
     fn reset_clears_counters_and_connectivity() {
         let mut uf = UnionFind::new(4);
         uf.union(0, 1);
@@ -575,6 +589,13 @@ mod tests {
     fn find_out_of_bounds() {
         let mut uf = UnionFind::new(3);
         uf.find(3);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn find_immutable_out_of_bounds() {
+        let uf = UnionFind::new(3);
+        uf.find_immutable(3);
     }
 
     #[test]

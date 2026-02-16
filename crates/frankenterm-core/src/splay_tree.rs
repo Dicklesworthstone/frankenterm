@@ -289,11 +289,7 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
 
     /// Looks up a key, splaying it to the root if found.
     pub fn get(&mut self, key: &K) -> Option<&V> {
-        if self.root.is_none() {
-            return None;
-        }
-
-        let root = self.root.unwrap();
+        let root = self.root?;
         let root = self.splay(root, key);
         self.root = Some(root);
 
@@ -324,11 +320,7 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
 
     /// Removes a key, returning its value if found.
     pub fn remove(&mut self, key: &K) -> Option<V> {
-        if self.root.is_none() {
-            return None;
-        }
-
-        let root = self.root.unwrap();
+        let root = self.root?;
         let root = self.splay(root, key);
         self.root = Some(root);
 
@@ -364,11 +356,8 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
         // Find a key larger than anything in the tree to splay max to root
         // We go right until we can't, that's our max
         let mut rightmost = root;
-        loop {
-            match self.nodes[rightmost].right {
-                Some(r) => rightmost = r,
-                None => break,
-            }
+        while let Some(r) = self.nodes[rightmost].right {
+            rightmost = r;
         }
         let max_key = self.nodes[rightmost].key.clone();
         self.splay(root, &max_key)
@@ -455,6 +444,7 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
     }
 
     /// Iterates over key-value pairs in sorted order.
+    #[allow(clippy::iter_not_returning_iterator)]
     pub fn iter(&self) -> Vec<(&K, &V)> {
         let mut result = Vec::with_capacity(self.len());
         self.collect_pairs(self.root, &mut result);

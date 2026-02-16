@@ -362,7 +362,7 @@ pub fn reconcile_trees(
     }
 
     // Verify convergence
-    let rounds = if diff.total_changes() == 0 { 0 } else { 1 };
+    let rounds = usize::from(diff.total_changes() != 0);
     (result, rounds)
 }
 

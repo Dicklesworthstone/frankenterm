@@ -434,7 +434,7 @@ impl<T: Clone + Eq> LwwRegister<T> {
         {
             self.value = other.value.clone();
             self.timestamp = other.timestamp;
-            self.writer_id = other.writer_id.clone();
+            self.writer_id.clone_from(&other.writer_id);
         }
     }
 

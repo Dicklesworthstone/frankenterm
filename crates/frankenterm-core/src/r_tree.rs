@@ -70,6 +70,7 @@ impl Rect {
     }
 
     /// Returns the minimum bounding rectangle of two rectangles.
+    #[must_use]
     pub fn union(&self, other: &Rect) -> Rect {
         Rect {
             x_min: self.x_min.min(other.x_min),
@@ -100,7 +101,7 @@ impl Rect {
         } else {
             0.0
         };
-        (dx * dx + dy * dy).sqrt()
+        dx.hypot(dy)
     }
 }
 
@@ -246,7 +247,7 @@ impl<V: Clone> RTree<V> {
             let enlargement = self.nodes[child].mbr.enlargement(rect);
             let area = self.nodes[child].mbr.area();
             if enlargement < best_enlargement
-                || (enlargement == best_enlargement && area < best_area)
+                || ((enlargement - best_enlargement).abs() < f64::EPSILON && area < best_area)
             {
                 best_idx = child;
                 best_enlargement = enlargement;
@@ -272,11 +273,12 @@ impl<V: Clone> RTree<V> {
         (new_node, new_mbr)
     }
 
+    #[allow(clippy::unused_self, clippy::type_complexity)]
     fn split_entries(&self, mut entries: Vec<(Rect, V)>) -> (Vec<(Rect, V)>, Vec<(Rect, V)>) {
         // Simple split: sort by x center, split in half
         entries.sort_by(|a, b| {
-            let ca = (a.0.x_min + a.0.x_max) / 2.0;
-            let cb = (b.0.x_min + b.0.x_max) / 2.0;
+            let ca = f64::midpoint(a.0.x_min, a.0.x_max);
+            let cb = f64::midpoint(b.0.x_min, b.0.x_max);
             ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -294,7 +296,7 @@ impl<V: Clone> RTree<V> {
             .iter()
             .map(|&c| {
                 let mbr = &self.nodes[c].mbr;
-                (c, (mbr.x_min + mbr.x_max) / 2.0)
+                (c, f64::midpoint(mbr.x_min, mbr.x_max))
             })
             .collect();
         indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -360,6 +362,7 @@ impl<V: Clone> RTree<V> {
         results
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn query_point_recursive<'a>(
         &'a self,
         node_idx: usize,
@@ -390,13 +393,11 @@ impl<V: Clone> RTree<V> {
     /// Finds the nearest entry to the given point.
     /// Returns (rectangle, value, distance).
     pub fn nearest(&self, x: f64, y: f64) -> Option<(&Rect, &V, f64)> {
-        if self.root.is_none() {
-            return None;
-        }
+        let root_idx = self.root?;
 
         let mut best_dist = f64::INFINITY;
         let mut best: Option<(&Rect, &V)> = None;
-        self.nearest_recursive(self.root.unwrap(), x, y, &mut best_dist, &mut best);
+        self.nearest_recursive(root_idx, x, y, &mut best_dist, &mut best);
         best.map(|(r, v)| (r, v, best_dist))
     }
 

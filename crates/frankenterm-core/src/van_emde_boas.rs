@@ -47,7 +47,7 @@ impl VanEmdeBoas {
             universe_size <= 1_048_576,
             "universe size must be <= 2^20"
         );
-        let num_words = (universe_size + 63) / 64;
+        let num_words = universe_size.div_ceil(64);
         Self {
             universe: universe_size,
             min: None,
@@ -263,6 +263,7 @@ impl VanEmdeBoas {
     }
 
     /// Returns all elements in sorted order.
+    #[allow(clippy::iter_not_returning_iterator)]
     pub fn iter(&self) -> Vec<u32> {
         let mut result = Vec::with_capacity(self.count);
         let mut current = self.min;

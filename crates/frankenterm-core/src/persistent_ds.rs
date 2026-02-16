@@ -102,6 +102,7 @@ impl<T: Clone> PersistentVec<T> {
     }
 
     /// Return a new vector with `value` appended at the end.
+    #[must_use]
     pub fn push(&self, value: T) -> Self {
         let new_len = self.len + 1;
         // Check if we need to grow the tree depth
@@ -153,6 +154,7 @@ impl<T: Clone> PersistentVec<T> {
     }
 
     /// Iterate over all elements.
+    #[allow(clippy::iter_without_into_iter)]
     pub fn iter(&self) -> PersistentVecIter<'_, T> {
         PersistentVecIter {
             vec: self,
@@ -161,6 +163,7 @@ impl<T: Clone> PersistentVec<T> {
     }
 
     /// Create from an iterator.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_iter(iter: impl IntoIterator<Item = T>) -> Self {
         let mut v = Self::new();
         for item in iter {
@@ -216,7 +219,7 @@ impl<'a, T: Clone> Iterator for PersistentVecIter<'a, T> {
     }
 }
 
-impl<'a, T: Clone> ExactSizeIterator for PersistentVecIter<'a, T> {}
+impl<T: Clone> ExactSizeIterator for PersistentVecIter<'_, T> {}
 
 // ── PersistentVec internals ───────────────────────────────────────
 
@@ -394,6 +397,7 @@ impl<K: Clone + Eq + Hash, V: Clone> PersistentMap<K, V> {
     }
 
     /// Return a new map with the key-value pair inserted (or updated).
+    #[must_use]
     pub fn insert(&self, key: K, value: V) -> Self {
         let hash = hash_key(&key);
         let (new_root, added) = map_insert(&self.root, key, value, hash, 0);
@@ -404,6 +408,7 @@ impl<K: Clone + Eq + Hash, V: Clone> PersistentMap<K, V> {
     }
 
     /// Return a new map with the key removed.
+    #[must_use]
     pub fn remove(&self, key: &K) -> Self {
         let hash = hash_key(key);
         let (new_root, removed) = map_remove(&self.root, key, hash, 0);
@@ -827,7 +832,7 @@ impl<T: Clone> VersionedStore<T> {
             .versions
             .iter()
             .position(|(ts, _)| *ts >= timestamp_ms)
-            .unwrap_or(self.versions.len().saturating_sub(1));
+            .unwrap_or_else(|| self.versions.len().saturating_sub(1));
         // Don't evict current version
         let keep_from = keep_from.min(self.current);
         if keep_from > 0 {
@@ -846,7 +851,7 @@ impl<T: Clone> VersionedStore<T> {
 
 /// Changes between two PersistentMap versions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MapDiff<K: Eq + Hash + Serialize, V: Serialize> {
+pub struct MapDiff<K: Eq + Hash, V> {
     /// Keys added in the newer version.
     pub added: Vec<(K, V)>,
     /// Keys removed from the older version.

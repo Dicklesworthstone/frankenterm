@@ -431,6 +431,7 @@ impl<V> AdaptiveRadixTree<V> {
     }
 
     /// Iterate over all key-value pairs in lexicographic order.
+    #[allow(clippy::iter_not_returning_iterator)]
     pub fn iter(&self) -> Vec<(Vec<u8>, &V)> {
         let mut results = Vec::new();
         if let Some(root) = self.root {

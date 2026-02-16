@@ -35,7 +35,7 @@ impl Centroid {
     fn merge(&mut self, other: &Centroid) {
         let total = self.weight + other.weight;
         if total > 0.0 {
-            self.mean = (self.mean * self.weight + other.mean * other.weight) / total;
+            self.mean = self.mean.mul_add(self.weight, other.mean * other.weight) / total;
             self.weight = total;
         }
     }
@@ -460,8 +460,6 @@ impl TDigest {
             }
 
             let last = merged.last().unwrap();
-            let _proposed_weight = last.weight + centroid.weight;
-
             // Scale function k₁(q) = (δ/2π) · arcsin(2q - 1).
             // The constraint is that a merged centroid must span at most 1 unit
             // in k-space: k(q_right) - k(q_left) <= 1.
@@ -488,9 +486,10 @@ impl TDigest {
 
     /// Scale function k₁(q) = δ/2π · arcsin(2q - 1).
     /// Maps quantile [0,1] → index space, with steep slopes at tails.
+    #[allow(clippy::unused_self)]
     fn scale_fn(&self, q: f64, delta: f64) -> f64 {
         let q = q.clamp(0.0, 1.0);
-        (delta / (2.0 * std::f64::consts::PI)) * ((2.0 * q - 1.0).asin())
+        (delta / (2.0 * std::f64::consts::PI)) * (2.0f64.mul_add(q, -1.0).asin())
     }
 }
 

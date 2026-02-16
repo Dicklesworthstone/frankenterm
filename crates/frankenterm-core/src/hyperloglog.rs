@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 
 /// Configuration for HyperLogLog.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HllConfig {
     /// Precision parameter p. Register count = 2^p.
     /// Valid range: 4..=18. Default: 14.
@@ -34,7 +34,7 @@ impl Default for HllConfig {
 }
 
 /// Statistics about the HyperLogLog state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HllStats {
     pub precision: u8,
     pub register_count: usize,
@@ -137,6 +137,7 @@ impl HyperLogLog {
         let raw_estimate = alpha * m * m / sum;
 
         // Small range correction (linear counting)
+        #[allow(clippy::naive_bytecount)]
         let zeros = self.registers.iter().filter(|&&r| r == 0).count();
         if raw_estimate <= 2.5 * m && zeros > 0 {
             // Linear counting
@@ -263,6 +264,7 @@ impl HyperLogLog {
     }
 
     /// Hash an item using a fast 64-bit hash (SplitMix64-based).
+    #[allow(clippy::unused_self)]
     fn hash_item<T: Hash>(&self, item: &T) -> u64 {
         let mut hasher = FnvHasher::new();
         item.hash(&mut hasher);

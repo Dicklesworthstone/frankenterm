@@ -71,7 +71,7 @@ impl DancingLinks {
         // Root header node (index 0)
         nodes.push(DlxNode {
             left: num_columns,
-            right: if num_columns > 0 { 1 } else { 0 },
+            right: usize::from(num_columns > 0),
             up: 0,
             down: 0,
             column: 0,
