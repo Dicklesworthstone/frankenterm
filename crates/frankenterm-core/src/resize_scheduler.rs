@@ -160,6 +160,24 @@ pub struct ResizeSchedulerConfig {
     pub max_storm_picks_per_tab: u32,
     /// Enable per-domain budget partitioning for fair cross-domain scheduling.
     pub domain_budget_enabled: bool,
+    /// Enable adaptive frame pacing governor.
+    pub pacing_governor_enabled: bool,
+    /// Minimum governor-selected frame budget.
+    pub pacing_min_budget_units: u32,
+    /// Maximum governor-selected frame budget.
+    pub pacing_max_budget_units: u32,
+    /// Budget units removed after each detected hitch.
+    pub pacing_hitch_penalty_units: u32,
+    /// Budget units added when recovering after hitch-free frames.
+    pub pacing_recovery_step_units: u32,
+    /// Hitch-free frames required before recovery adds budget.
+    pub pacing_recovery_frames: u32,
+    /// Nominal refresh rate used as the vsync scaling baseline.
+    pub pacing_nominal_refresh_hz: u32,
+    /// Minimum accepted vsync refresh hint.
+    pub pacing_min_refresh_hz: u32,
+    /// Maximum accepted vsync refresh hint.
+    pub pacing_max_refresh_hz: u32,
 }
 
 impl Default for ResizeSchedulerConfig {
@@ -183,6 +201,15 @@ impl Default for ResizeSchedulerConfig {
             storm_threshold_intents: 4,
             max_storm_picks_per_tab: 2,
             domain_budget_enabled: false,
+            pacing_governor_enabled: true,
+            pacing_min_budget_units: 1,
+            pacing_max_budget_units: 32,
+            pacing_hitch_penalty_units: 1,
+            pacing_recovery_step_units: 1,
+            pacing_recovery_frames: 2,
+            pacing_nominal_refresh_hz: 60,
+            pacing_min_refresh_hz: 24,
+            pacing_max_refresh_hz: 240,
         }
     }
 }
@@ -235,8 +262,18 @@ pub struct ScheduledResizeWork {
 /// Result of a single frame scheduling round.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ScheduleFrameResult {
+    /// Requested frame budget before pacing governor adjustments.
+    pub requested_frame_budget_units: u32,
     /// Frame budget used for this round.
     pub frame_budget_units: u32,
+    /// Governor-selected pacing budget for this round.
+    pub pacing_budget_units: u32,
+    /// Vsync-adjusted target budget before hitch governor penalties/recovery.
+    pub vsync_adjusted_budget_units: u32,
+    /// Vsync refresh hint used for this frame, if available.
+    pub vsync_refresh_hz: Option<u32>,
+    /// Derived vsync frame interval in microseconds, if available.
+    pub vsync_interval_us: Option<u32>,
     /// Effective resize budget after input-reserve guardrails are applied.
     pub effective_resize_budget_units: u32,
     /// Work units reserved for input handling in this frame.
@@ -245,6 +282,10 @@ pub struct ScheduleFrameResult {
     pub pending_input_events: u32,
     /// Work units spent by scheduled picks.
     pub budget_spent_units: u32,
+    /// Whether this frame exceeded the effective resize budget.
+    pub hitch_detected: bool,
+    /// Amount by which this frame exceeded the effective resize budget.
+    pub hitch_overrun_units: u32,
     /// Picks in scheduling order.
     pub scheduled: Vec<ScheduledResizeWork>,
     /// Pending intents still queued after this frame.
@@ -300,6 +341,32 @@ pub struct ResizeSchedulerMetrics {
     pub storm_picks_throttled: u64,
     /// Count of candidate picks throttled by domain budget cap.
     pub domain_budget_throttled: u64,
+    /// Count of frames where pacing governor changed budget vs caller request.
+    pub pacing_adjusted_frames: u64,
+    /// Count of frames identified as hitches (budget overrun).
+    pub hitch_frames: u64,
+    /// Current consecutive hitch streak.
+    pub current_hitch_streak: u32,
+    /// Maximum consecutive hitch streak observed.
+    pub max_hitch_streak: u32,
+    /// Count of pacing governor recovery increases.
+    pub pacing_budget_increase_events: u64,
+    /// Count of pacing governor budget decreases.
+    pub pacing_budget_decrease_events: u64,
+    /// Last requested frame budget before governor adjustments.
+    pub last_requested_frame_budget_units: u32,
+    /// Last pacing governor budget before input guardrails.
+    pub last_pacing_budget_units: u32,
+    /// Last vsync refresh hint used by scheduler.
+    pub last_vsync_refresh_hz: Option<u32>,
+    /// Last vsync frame interval in microseconds.
+    pub last_vsync_interval_us: Option<u32>,
+    /// Last computed vsync-adjusted target budget.
+    pub last_vsync_adjusted_budget_units: u32,
+    /// Whether last frame was classified as hitch.
+    pub last_hitch_detected: bool,
+    /// Last frame hitch overrun units.
+    pub last_hitch_overrun_units: u32,
 }
 
 /// Overload drop reason for pending/intent admission controls.
@@ -608,6 +675,15 @@ struct Candidate {
     tab_id: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FramePacingPlan {
+    requested_budget_units: u32,
+    pacing_budget_units: u32,
+    vsync_adjusted_budget_units: u32,
+    vsync_refresh_hz: Option<u32>,
+    vsync_interval_us: Option<u32>,
+}
+
 /// Global resize scheduler.
 #[derive(Debug)]
 pub struct ResizeScheduler {
@@ -618,6 +694,12 @@ pub struct ResizeScheduler {
     next_lifecycle_event_seq: u64,
     /// Per-tab submission timestamps for storm detection.
     tab_submit_history: HashMap<u64, VecDeque<u64>>,
+    /// Governor state: current pacing budget before input guardrails.
+    pacing_budget_units: u32,
+    /// Consecutive hitch count used for penalty escalation.
+    hitch_streak: u32,
+    /// Consecutive hitch-free frames used for recovery pacing.
+    hitch_free_streak: u32,
 }
 
 impl ResizeScheduler {
@@ -631,6 +713,9 @@ impl ResizeScheduler {
             lifecycle_events: VecDeque::new(),
             next_lifecycle_event_seq: 0,
             tab_submit_history: HashMap::new(),
+            pacing_budget_units: 0,
+            hitch_streak: 0,
+            hitch_free_streak: 0,
         };
         scheduler.publish_debug_snapshot();
         scheduler
@@ -1002,16 +1087,52 @@ impl ResizeScheduler {
         frame_budget_units: u32,
         pending_input_events: u32,
     ) -> ScheduleFrameResult {
+        self.schedule_frame_with_input_backlog_and_vsync(
+            frame_budget_units,
+            pending_input_events,
+            None,
+        )
+    }
+
+    /// Schedule one frame with input backlog pressure and optional vsync hints.
+    ///
+    /// `vsync_refresh_hz` should be set to the display refresh hint when known.
+    /// The scheduler will normalize and clamp it, then adjust pacing budget
+    /// relative to the configured nominal refresh target.
+    pub fn schedule_frame_with_input_backlog_and_vsync(
+        &mut self,
+        frame_budget_units: u32,
+        pending_input_events: u32,
+        vsync_refresh_hz: Option<u32>,
+    ) -> ScheduleFrameResult {
+        let requested_budget_units = frame_budget_units.max(1);
+        let pacing_plan = self.plan_frame_pacing(requested_budget_units, vsync_refresh_hz);
+
         if !self.control_plane_active() {
             self.metrics.suppressed_frames = self.metrics.suppressed_frames.saturating_add(1);
             self.metrics.last_input_backlog = pending_input_events;
+            self.metrics.last_requested_frame_budget_units = pacing_plan.requested_budget_units;
+            self.metrics.last_frame_budget_units = pacing_plan.pacing_budget_units;
+            self.metrics.last_pacing_budget_units = pacing_plan.pacing_budget_units;
+            self.metrics.last_vsync_adjusted_budget_units = pacing_plan.vsync_adjusted_budget_units;
+            self.metrics.last_vsync_refresh_hz = pacing_plan.vsync_refresh_hz;
+            self.metrics.last_vsync_interval_us = pacing_plan.vsync_interval_us;
+            self.metrics.last_hitch_detected = false;
+            self.metrics.last_hitch_overrun_units = 0;
             self.publish_debug_snapshot();
             return ScheduleFrameResult {
-                frame_budget_units: frame_budget_units.max(1),
-                effective_resize_budget_units: frame_budget_units.max(1),
+                requested_frame_budget_units: pacing_plan.requested_budget_units,
+                frame_budget_units: pacing_plan.pacing_budget_units,
+                pacing_budget_units: pacing_plan.pacing_budget_units,
+                vsync_adjusted_budget_units: pacing_plan.vsync_adjusted_budget_units,
+                vsync_refresh_hz: pacing_plan.vsync_refresh_hz,
+                vsync_interval_us: pacing_plan.vsync_interval_us,
+                effective_resize_budget_units: pacing_plan.pacing_budget_units,
                 input_reserved_units: 0,
                 pending_input_events,
                 budget_spent_units: 0,
+                hitch_detected: false,
+                hitch_overrun_units: 0,
                 scheduled: Vec::new(),
                 pending_after: self.pending_total(),
             };
@@ -1033,7 +1154,7 @@ impl ResizeScheduler {
         let mut spent_units = 0u32;
         let mut scheduled = Vec::new();
         let mut deferred_panes = Vec::new();
-        let budget_units = frame_budget_units.max(1);
+        let budget_units = pacing_plan.pacing_budget_units.max(1);
         let (effective_budget_units, input_reserved_units) =
             self.resolve_resize_budget_with_input_guardrail(budget_units, pending_input_events);
         if input_reserved_units > 0 {
@@ -1188,19 +1309,40 @@ impl ResizeScheduler {
 
         self.apply_deferral_aging(&deferred_panes);
 
+        let hitch_overrun_units = spent_units.saturating_sub(effective_budget_units);
+        let hitch_detected = hitch_overrun_units > 0;
+        self.update_pacing_state_after_frame(hitch_detected, pacing_plan.vsync_adjusted_budget_units);
+
         self.metrics.last_frame_budget_units = budget_units;
+        self.metrics.last_requested_frame_budget_units = pacing_plan.requested_budget_units;
+        self.metrics.last_pacing_budget_units = pacing_plan.pacing_budget_units;
+        self.metrics.last_vsync_adjusted_budget_units = pacing_plan.vsync_adjusted_budget_units;
+        self.metrics.last_vsync_refresh_hz = pacing_plan.vsync_refresh_hz;
+        self.metrics.last_vsync_interval_us = pacing_plan.vsync_interval_us;
         self.metrics.last_effective_resize_budget_units = effective_budget_units;
         self.metrics.last_input_backlog = pending_input_events;
         self.metrics.last_frame_spent_units = spent_units;
         self.metrics.last_frame_scheduled = u32::try_from(scheduled.len()).unwrap_or(u32::MAX);
+        self.metrics.last_hitch_detected = hitch_detected;
+        self.metrics.last_hitch_overrun_units = hitch_overrun_units;
+        if hitch_detected {
+            self.metrics.hitch_frames = self.metrics.hitch_frames.saturating_add(1);
+        }
         self.publish_debug_snapshot();
 
         ScheduleFrameResult {
+            requested_frame_budget_units: pacing_plan.requested_budget_units,
             frame_budget_units: budget_units,
+            pacing_budget_units: pacing_plan.pacing_budget_units,
+            vsync_adjusted_budget_units: pacing_plan.vsync_adjusted_budget_units,
+            vsync_refresh_hz: pacing_plan.vsync_refresh_hz,
+            vsync_interval_us: pacing_plan.vsync_interval_us,
             effective_resize_budget_units: effective_budget_units,
             input_reserved_units,
             pending_input_events,
             budget_spent_units: spent_units,
+            hitch_detected,
+            hitch_overrun_units,
             scheduled,
             pending_after: self.pending_total(),
         }

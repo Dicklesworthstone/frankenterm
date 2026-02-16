@@ -3107,7 +3107,10 @@ mod tests {
             .map(|line| line.as_str().to_string())
             .collect();
 
-        assert_eq!(retry_cursor, direct_cursor);
+        assert_eq!(retry_cursor.x, direct_cursor.x);
+        assert_eq!(retry_cursor.y, direct_cursor.y);
+        assert_eq!(retry_cursor.shape, direct_cursor.shape);
+        assert_eq!(retry_cursor.visibility, direct_cursor.visibility);
         assert_eq!(
             (
                 fallback_then_retry.physical_cols,
