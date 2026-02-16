@@ -282,4 +282,200 @@ mod tests {
         let result = reranker.rerank("q", docs).unwrap();
         assert_eq!(result[0].text, "special chars: !@#$%^&*()");
     }
+
+    // =====================================================================
+    // Trait object usage
+    // =====================================================================
+
+    #[test]
+    fn passthrough_as_trait_object() {
+        let reranker: Box<dyn Reranker> = Box::new(PassthroughReranker);
+        let docs = vec![ScoredDoc {
+            id: 1,
+            text: "via trait".into(),
+            score: 0.7,
+        }];
+        let result = reranker.rerank("q", docs).unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn passthrough_as_arc_trait_object() {
+        let reranker: std::sync::Arc<dyn Reranker> = std::sync::Arc::new(PassthroughReranker);
+        let docs = vec![ScoredDoc {
+            id: 1,
+            text: "arc".into(),
+            score: 0.5,
+        }];
+        let result = reranker.rerank("q", docs).unwrap();
+        assert_eq!(result[0].text, "arc");
+    }
+
+    // =====================================================================
+    // Passthrough edge cases
+    // =====================================================================
+
+    #[test]
+    fn passthrough_different_queries_same_docs() {
+        let reranker = PassthroughReranker;
+        let make_docs = || {
+            vec![ScoredDoc {
+                id: 1,
+                text: "doc".into(),
+                score: 1.0,
+            }]
+        };
+        let r1 = reranker.rerank("query A", make_docs()).unwrap();
+        let r2 = reranker.rerank("query B", make_docs()).unwrap();
+        // Passthrough ignores query, results should be identical
+        assert_eq!(r1[0].id, r2[0].id);
+        assert!((r1[0].score - r2[0].score).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn passthrough_empty_query_string() {
+        let reranker = PassthroughReranker;
+        let docs = vec![ScoredDoc {
+            id: 1,
+            text: "doc".into(),
+            score: 0.5,
+        }];
+        let result = reranker.rerank("", docs).unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn passthrough_zero_score() {
+        let reranker = PassthroughReranker;
+        let docs = vec![ScoredDoc {
+            id: 1,
+            text: "zero".into(),
+            score: 0.0,
+        }];
+        let result = reranker.rerank("q", docs).unwrap();
+        assert!(result[0].score.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn passthrough_negative_score() {
+        let reranker = PassthroughReranker;
+        let docs = vec![ScoredDoc {
+            id: 1,
+            text: "neg".into(),
+            score: -1.5,
+        }];
+        let result = reranker.rerank("q", docs).unwrap();
+        assert!((result[0].score - (-1.5)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn passthrough_unicode_text_and_query() {
+        let reranker = PassthroughReranker;
+        let docs = vec![ScoredDoc {
+            id: 1,
+            text: "日本語テスト 🎉".into(),
+            score: 0.9,
+        }];
+        let result = reranker.rerank("検索クエリ", docs).unwrap();
+        assert_eq!(result[0].text, "日本語テスト 🎉");
+    }
+
+    #[test]
+    fn passthrough_empty_text() {
+        let reranker = PassthroughReranker;
+        let docs = vec![ScoredDoc {
+            id: 1,
+            text: String::new(),
+            score: 0.5,
+        }];
+        let result = reranker.rerank("q", docs).unwrap();
+        assert!(result[0].text.is_empty());
+    }
+
+    #[test]
+    fn passthrough_duplicate_ids() {
+        let reranker = PassthroughReranker;
+        let docs = vec![
+            ScoredDoc {
+                id: 1,
+                text: "a".into(),
+                score: 0.5,
+            },
+            ScoredDoc {
+                id: 1,
+                text: "b".into(),
+                score: 0.6,
+            },
+        ];
+        let result = reranker.rerank("q", docs).unwrap();
+        assert_eq!(result.len(), 2);
+        // Both keep their own text despite same id
+        assert_eq!(result[0].text, "a");
+        assert_eq!(result[1].text, "b");
+    }
+
+    // =====================================================================
+    // RerankError additional edge cases
+    // =====================================================================
+
+    #[test]
+    fn rerank_error_model_error_empty_message() {
+        let e = RerankError::ModelError(String::new());
+        let msg = e.to_string();
+        assert!(msg.contains("rerank model error"));
+    }
+
+    #[test]
+    fn rerank_error_model_error_long_message() {
+        let long_msg = "x".repeat(1000);
+        let e = RerankError::ModelError(long_msg.clone());
+        let msg = e.to_string();
+        assert!(msg.contains(&long_msg));
+    }
+
+    // =====================================================================
+    // ScoredDoc additional tests
+    // =====================================================================
+
+    #[test]
+    fn scored_doc_max_id() {
+        let doc = ScoredDoc {
+            id: u64::MAX,
+            text: "max".into(),
+            score: 0.0,
+        };
+        assert_eq!(doc.id, u64::MAX);
+    }
+
+    #[test]
+    fn scored_doc_large_text() {
+        let large = "x".repeat(10_000);
+        let doc = ScoredDoc {
+            id: 1,
+            text: large.clone(),
+            score: 0.5,
+        };
+        let doc2 = doc.clone();
+        assert_eq!(doc2.text.len(), 10_000);
+    }
+
+    #[test]
+    fn scored_doc_nan_score() {
+        let doc = ScoredDoc {
+            id: 1,
+            text: "nan".into(),
+            score: f32::NAN,
+        };
+        assert!(doc.score.is_nan());
+    }
+
+    #[test]
+    fn scored_doc_infinity_score() {
+        let doc = ScoredDoc {
+            id: 1,
+            text: "inf".into(),
+            score: f32::INFINITY,
+        };
+        assert!(doc.score.is_infinite());
+    }
 }
