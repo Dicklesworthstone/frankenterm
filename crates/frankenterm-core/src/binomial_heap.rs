@@ -448,4 +448,403 @@ mod tests {
         assert_eq!(heap.extract_min().unwrap().0, "banana");
         assert_eq!(heap.extract_min().unwrap().0, "cherry");
     }
+
+    #[test]
+    fn extract_min_from_empty() {
+        let mut heap: BinomialHeap<i32, i32> = BinomialHeap::new();
+        assert_eq!(heap.extract_min(), None);
+    }
+
+    #[test]
+    fn pop_from_empty() {
+        let mut heap: BinomialHeap<i32, i32> = BinomialHeap::new();
+        assert_eq!(heap.pop(), None);
+    }
+
+    #[test]
+    fn into_sorted_empty() {
+        let heap: BinomialHeap<i32, i32> = BinomialHeap::new();
+        assert!(heap.into_sorted().is_empty());
+    }
+
+    #[test]
+    fn sorted_single_element() {
+        let mut heap = BinomialHeap::new();
+        heap.insert(42, "answer");
+        let s = heap.sorted();
+        assert_eq!(s, vec![(42, "answer")]);
+        // original heap unchanged
+        assert_eq!(heap.len(), 1);
+    }
+
+    #[test]
+    fn extract_single_then_empty() {
+        let mut heap = BinomialHeap::new();
+        heap.insert(10, 100);
+        assert_eq!(heap.extract_min(), Some((10, 100)));
+        assert!(heap.is_empty());
+        assert_eq!(heap.len(), 0);
+        assert!(heap.peek().is_none());
+    }
+
+    #[test]
+    fn ascending_insertion() {
+        let mut heap = BinomialHeap::new();
+        for i in 0..20 {
+            heap.insert(i, i);
+        }
+        for i in 0..20 {
+            assert_eq!(heap.extract_min(), Some((i, i)));
+        }
+    }
+
+    #[test]
+    fn descending_insertion() {
+        let mut heap = BinomialHeap::new();
+        for i in (0..20).rev() {
+            heap.insert(i, i);
+        }
+        for i in 0..20 {
+            assert_eq!(heap.extract_min(), Some((i, i)));
+        }
+    }
+
+    #[test]
+    fn two_element_heap() {
+        let mut heap = BinomialHeap::new();
+        heap.insert(2, 20);
+        heap.insert(1, 10);
+        assert_eq!(heap.peek(), Some((&1, &10)));
+        assert_eq!(heap.extract_min(), Some((1, 10)));
+        assert_eq!(heap.peek(), Some((&2, &20)));
+        assert_eq!(heap.extract_min(), Some((2, 20)));
+        assert!(heap.is_empty());
+    }
+
+    #[test]
+    fn negative_keys() {
+        let mut heap = BinomialHeap::new();
+        heap.insert(-3, 30);
+        heap.insert(5, 50);
+        heap.insert(-10, 100);
+        heap.insert(0, 0);
+        assert_eq!(heap.extract_min(), Some((-10, 100)));
+        assert_eq!(heap.extract_min(), Some((-3, 30)));
+        assert_eq!(heap.extract_min(), Some((0, 0)));
+        assert_eq!(heap.extract_min(), Some((5, 50)));
+    }
+
+    #[test]
+    fn interleaved_insert_extract() {
+        let mut heap = BinomialHeap::new();
+        heap.insert(5, 50);
+        heap.insert(3, 30);
+        assert_eq!(heap.extract_min(), Some((3, 30)));
+        heap.insert(1, 10);
+        heap.insert(4, 40);
+        assert_eq!(heap.extract_min(), Some((1, 10)));
+        assert_eq!(heap.extract_min(), Some((4, 40)));
+        assert_eq!(heap.extract_min(), Some((5, 50)));
+        assert!(heap.is_empty());
+    }
+
+    #[test]
+    fn peek_does_not_remove() {
+        let mut heap = BinomialHeap::new();
+        heap.insert(1, 10);
+        heap.insert(2, 20);
+        assert_eq!(heap.peek(), Some((&1, &10)));
+        assert_eq!(heap.peek(), Some((&1, &10)));
+        assert_eq!(heap.len(), 2);
+    }
+
+    #[test]
+    fn extract_min_updates_peek() {
+        let mut heap = BinomialHeap::new();
+        heap.insert(1, 10);
+        heap.insert(2, 20);
+        heap.insert(3, 30);
+        assert_eq!(heap.peek(), Some((&1, &10)));
+        heap.extract_min();
+        assert_eq!(heap.peek(), Some((&2, &20)));
+        heap.extract_min();
+        assert_eq!(heap.peek(), Some((&3, &30)));
+    }
+
+    #[test]
+    fn power_of_two_sizes() {
+        // Insert exactly 2^k elements — should produce a single binomial tree
+        for &n in &[1, 2, 4, 8, 16] {
+            let mut heap = BinomialHeap::new();
+            for i in 0..n {
+                heap.insert(i, i);
+            }
+            assert_eq!(heap.len(), n as usize);
+            for i in 0..n {
+                assert_eq!(heap.extract_min(), Some((i, i)));
+            }
+        }
+    }
+
+    #[test]
+    fn extract_half_then_check_remaining() {
+        let mut heap = BinomialHeap::new();
+        for i in 0..10 {
+            heap.insert(i, i * 10);
+        }
+        // extract first 5
+        for i in 0..5 {
+            assert_eq!(heap.extract_min(), Some((i, i * 10)));
+        }
+        assert_eq!(heap.len(), 5);
+        // remaining 5 still sorted
+        let sorted = heap.into_sorted();
+        let keys: Vec<i32> = sorted.iter().map(|&(k, _)| k).collect();
+        assert_eq!(keys, vec![5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn free_list_reuse() {
+        let mut heap = BinomialHeap::new();
+        for i in 0..10 {
+            heap.insert(i, i);
+        }
+        // extract all — fills free list
+        for _ in 0..10 {
+            heap.extract_min();
+        }
+        let arena_size = heap.nodes.len();
+        // reinsert — should reuse arena slots
+        for i in 100..110 {
+            heap.insert(i, i);
+        }
+        // arena should not grow (slots reused from free list)
+        assert_eq!(heap.nodes.len(), arena_size);
+        // verify correctness
+        for i in 100..110 {
+            assert_eq!(heap.extract_min(), Some((i, i)));
+        }
+    }
+
+    #[test]
+    fn clone_independence() {
+        let mut heap = BinomialHeap::new();
+        heap.insert(1, 10);
+        heap.insert(2, 20);
+        heap.insert(3, 30);
+        let mut cloned = heap.clone();
+        // modify original
+        heap.extract_min();
+        heap.insert(0, 0);
+        // clone should be unaffected
+        assert_eq!(cloned.len(), 3);
+        assert_eq!(cloned.extract_min(), Some((1, 10)));
+        assert_eq!(cloned.extract_min(), Some((2, 20)));
+        assert_eq!(cloned.extract_min(), Some((3, 30)));
+    }
+
+    #[test]
+    fn merge_two_large_heaps() {
+        let mut h1 = BinomialHeap::new();
+        let mut h2 = BinomialHeap::new();
+        for i in (0..100).step_by(2) {
+            h1.insert(i, i);
+        }
+        for i in (1..100).step_by(2) {
+            h2.insert(i, i);
+        }
+        h1.merge(&mut h2);
+        assert_eq!(h1.len(), 100);
+        assert!(h2.is_empty());
+        for i in 0..100 {
+            assert_eq!(h1.extract_min(), Some((i, i)));
+        }
+    }
+
+    #[test]
+    fn merge_three_heaps_sequentially() {
+        let mut h1 = BinomialHeap::new();
+        let mut h2 = BinomialHeap::new();
+        let mut h3 = BinomialHeap::new();
+        h1.insert(3, 30);
+        h2.insert(1, 10);
+        h3.insert(2, 20);
+        h1.merge(&mut h2);
+        h1.merge(&mut h3);
+        assert_eq!(h1.len(), 3);
+        assert_eq!(h1.extract_min(), Some((1, 10)));
+        assert_eq!(h1.extract_min(), Some((2, 20)));
+        assert_eq!(h1.extract_min(), Some((3, 30)));
+    }
+
+    #[test]
+    fn merge_after_partial_extraction() {
+        let mut h1 = BinomialHeap::new();
+        h1.insert(1, 10);
+        h1.insert(3, 30);
+        h1.insert(5, 50);
+        h1.extract_min(); // remove 1
+        let mut h2 = BinomialHeap::new();
+        h2.insert(2, 20);
+        h2.insert(4, 40);
+        h1.merge(&mut h2);
+        assert_eq!(h1.len(), 4);
+        let sorted = h1.into_sorted();
+        let keys: Vec<i32> = sorted.iter().map(|&(k, _)| k).collect();
+        assert_eq!(keys, vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn all_same_keys_extract_all() {
+        let mut heap = BinomialHeap::new();
+        for i in 0..10 {
+            heap.insert(5, i);
+        }
+        assert_eq!(heap.len(), 10);
+        let mut values = Vec::new();
+        while let Some((k, v)) = heap.extract_min() {
+            assert_eq!(k, 5);
+            values.push(v);
+        }
+        // all 10 values extracted
+        values.sort();
+        assert_eq!(values, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn serde_roundtrip_after_extract() {
+        let mut heap = BinomialHeap::new();
+        for i in [5, 3, 7, 1, 9] {
+            heap.insert(i, i * 10);
+        }
+        heap.extract_min(); // remove 1
+        let json = serde_json::to_string(&heap).unwrap();
+        let mut restored: BinomialHeap<i32, i32> = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.len(), 4);
+        assert_eq!(restored.extract_min(), Some((3, 30)));
+        assert_eq!(restored.extract_min(), Some((5, 50)));
+        assert_eq!(restored.extract_min(), Some((7, 70)));
+        assert_eq!(restored.extract_min(), Some((9, 90)));
+    }
+
+    #[test]
+    fn serde_empty_roundtrip() {
+        let heap: BinomialHeap<i32, i32> = BinomialHeap::new();
+        let json = serde_json::to_string(&heap).unwrap();
+        let restored: BinomialHeap<i32, i32> = serde_json::from_str(&json).unwrap();
+        assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn display_empty() {
+        let heap: BinomialHeap<i32, i32> = BinomialHeap::new();
+        assert_eq!(format!("{}", heap), "BinomialHeap(0 elements)");
+    }
+
+    #[test]
+    fn insert_extract_insert_cycle() {
+        let mut heap = BinomialHeap::new();
+        // first batch
+        for i in 0..5 {
+            heap.insert(i, i);
+        }
+        // drain all
+        while heap.extract_min().is_some() {}
+        assert!(heap.is_empty());
+        // second batch
+        for i in 10..15 {
+            heap.insert(i, i);
+        }
+        assert_eq!(heap.len(), 5);
+        for i in 10..15 {
+            assert_eq!(heap.extract_min(), Some((i, i)));
+        }
+    }
+
+    #[test]
+    fn len_consistency_through_operations() {
+        let mut heap = BinomialHeap::new();
+        for i in 0..20 {
+            heap.insert(i, i);
+            assert_eq!(heap.len(), i as usize + 1);
+        }
+        for i in (0..20).rev() {
+            heap.extract_min();
+            assert_eq!(heap.len(), i as usize);
+        }
+    }
+
+    #[test]
+    fn merge_both_empty() {
+        let mut h1: BinomialHeap<i32, i32> = BinomialHeap::new();
+        let mut h2: BinomialHeap<i32, i32> = BinomialHeap::new();
+        h1.merge(&mut h2);
+        assert!(h1.is_empty());
+        assert!(h2.is_empty());
+    }
+
+    #[test]
+    fn merge_reuses_donor_free_slots() {
+        let mut receiver = BinomialHeap::new();
+        receiver.insert(0, 0);
+
+        let mut donor = BinomialHeap::new();
+        for i in 1..=10 {
+            donor.insert(i, i);
+        }
+        for i in 1..=5 {
+            assert_eq!(donor.extract_min(), Some((i, i)));
+        }
+
+        let receiver_nodes_before = receiver.nodes.len();
+        let donor_nodes_before = donor.nodes.len();
+        let donor_free_before = donor.free.len();
+
+        receiver.merge(&mut donor);
+        assert_eq!(receiver.len(), 6);
+        assert_eq!(
+            receiver.nodes.len(),
+            receiver_nodes_before + donor_nodes_before
+        );
+        assert_eq!(receiver.free.len(), donor_free_before);
+
+        let nodes_after_merge = receiver.nodes.len();
+        for i in 100..105 {
+            receiver.insert(i, i);
+        }
+        assert_eq!(receiver.nodes.len(), nodes_after_merge);
+    }
+
+    #[test]
+    fn merge_donor_can_be_reused_after_clear() {
+        let mut receiver = BinomialHeap::new();
+        receiver.insert(10, 10);
+
+        let mut donor = BinomialHeap::new();
+        donor.insert(1, 1);
+        donor.insert(2, 2);
+
+        receiver.merge(&mut donor);
+        assert!(donor.is_empty());
+        assert!(donor.nodes.is_empty());
+        assert!(donor.free.is_empty());
+        assert!(donor.head.is_none());
+        assert!(donor.min_root.is_none());
+
+        donor.insert(5, 50);
+        donor.insert(3, 30);
+        assert_eq!(donor.extract_min(), Some((3, 30)));
+        assert_eq!(donor.extract_min(), Some((5, 50)));
+    }
+
+    #[test]
+    fn tuple_keys() {
+        let mut heap = BinomialHeap::new();
+        heap.insert((1, 2), "a");
+        heap.insert((1, 1), "b");
+        heap.insert((0, 9), "c");
+        assert_eq!(heap.extract_min(), Some(((0, 9), "c")));
+        assert_eq!(heap.extract_min(), Some(((1, 1), "b")));
+        assert_eq!(heap.extract_min(), Some(((1, 2), "a")));
+    }
 }
