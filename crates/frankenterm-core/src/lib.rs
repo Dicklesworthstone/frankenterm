@@ -167,6 +167,7 @@ pub mod resize_scheduler;
 pub mod restore_layout;
 pub mod restore_process;
 pub mod restore_scrollback;
+pub mod r_tree;
 pub mod retry;
 pub mod ring_buffer;
 pub mod robot_types;
