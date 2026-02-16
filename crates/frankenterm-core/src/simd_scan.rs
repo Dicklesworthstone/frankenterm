@@ -363,4 +363,103 @@ mod tests {
         assert_eq!(m.newline_count, 0);
         assert_eq!(m.ansi_byte_count, 0);
     }
+
+    #[test]
+    fn metrics_clone_and_copy() {
+        let m = OutputScanMetrics {
+            newline_count: 5,
+            ansi_byte_count: 10,
+        };
+        let m2 = m;
+        let m3 = m.clone();
+        assert_eq!(m, m2);
+        assert_eq!(m, m3);
+    }
+
+    #[test]
+    fn metrics_debug_format() {
+        let m = OutputScanMetrics {
+            newline_count: 3,
+            ansi_byte_count: 7,
+        };
+        let dbg = format!("{:?}", m);
+        assert!(dbg.contains("3"));
+        assert!(dbg.contains("7"));
+    }
+
+    #[test]
+    fn crlf_counted_as_single_newline() {
+        let data = b"line1\r\nline2\r\n";
+        let scan = scan_newlines_and_ansi(data);
+        assert_eq!(scan.newline_count, 2);
+    }
+
+    #[test]
+    fn osc_sequence_esc_bracket_stays_in_escape() {
+        // ESC ] is OSC opener — '[' not involved so final byte check triggers on ']'.
+        // Actually ESC ] starts OSC but ']' has value 0x5D which is in 0x40..=0x7E
+        // and is not '[', so this terminates immediately.
+        let data = b"\x1b]";
+        let scan = scan_newlines_and_ansi(data);
+        assert_eq!(scan.ansi_byte_count, 2);
+    }
+
+    #[test]
+    fn large_plain_text_no_ansi() {
+        let data = "hello world\n".repeat(1000);
+        let scan = scan_newlines_and_ansi(data.as_bytes());
+        assert_eq!(scan.newline_count, 1000);
+        assert_eq!(scan.ansi_byte_count, 0);
+        assert!(scan.ansi_density(data.len()).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn mixed_esc_and_newlines_interleaved() {
+        // Pattern: ESC[Am\n repeated — each CSI is 4 bytes
+        let mut data = Vec::new();
+        for _ in 0..50 {
+            data.extend_from_slice(b"\x1b[Am\n");
+        }
+        let scan = scan_newlines_and_ansi(&data);
+        assert_eq!(scan.newline_count, 50);
+        // Each \x1b[Am is: ESC(1) + [(1, stays in escape since '[' excluded) + A(1, terminates) = wait
+        // Actually: ESC starts escape. '[' is next — 0x5B is in 0x40..0x7E but IS '[' so excluded from termination.
+        // Then 'A' is 0x41, in range and not '[', terminates. So 3 bytes per sequence.
+        // But 'm' is not in escape anymore. Wait let me re-check.
+        // \x1b[Am: ESC=0x1b, [=0x5b, A=0x41, m=0x6d
+        // ESC -> in_escape=true, ansi_byte_count=1
+        // [ -> in_escape, 0x5B in 0x40..=0x7E but == '[', so no termination. ansi_byte_count=2
+        // A -> in_escape, 0x41 in 0x40..=0x7E and != '[', terminates. ansi_byte_count=3
+        // m -> not in escape, not ESC. Not counted.
+        // So 3 ANSI bytes per sequence, 50 sequences = 150.
+        assert_eq!(scan.ansi_byte_count, 150);
+    }
+
+    #[test]
+    fn ansi_density_half() {
+        // 4 ANSI bytes + 4 plain bytes = density 0.5
+        let data = b"abcd\x1b[0m";
+        let scan = scan_newlines_and_ansi(data);
+        assert_eq!(scan.ansi_byte_count, 4);
+        assert!((scan.ansi_density(data.len()) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn logical_line_count_single_char_no_newline() {
+        let data = b"x";
+        let scan = scan_newlines_and_ansi(data);
+        assert_eq!(scan.logical_line_count(data), 1);
+    }
+
+    #[test]
+    fn newline_in_middle_of_csi_params() {
+        // Newline inside CSI parameters: ESC[1\n0m
+        let data = b"\x1b[1\n0m";
+        let scan = scan_newlines_and_ansi(data);
+        assert_eq!(scan.newline_count, 1);
+        // ESC, [, 1 are ANSI (3 bytes). Then \n is 0x0A, not in 0x40..=0x7E, stays in escape.
+        // 0 is 0x30, not in range, stays. m is 0x6D, in range, terminates.
+        // So ANSI bytes: ESC, [, 1, \n, 0, m = 6
+        assert_eq!(scan.ansi_byte_count, 6);
+    }
 }
