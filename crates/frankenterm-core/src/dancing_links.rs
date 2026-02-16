@@ -246,6 +246,7 @@ impl DancingLinks {
 
         self.cover(col);
 
+        let mut found = false;
         let mut row_node = self.nodes[col].down;
         while row_node != col {
             let row_id = self.nodes[row_node].row - 1; // 0-based
@@ -259,29 +260,31 @@ impl DancingLinks {
             }
 
             if self.search(solution) {
-                return true;
+                found = true;
             }
 
-            // Undo: uncover columns in reverse
-            solution.pop();
+            // Undo: uncover columns in reverse (always, even on success)
+            if !found {
+                solution.pop();
+            }
             let mut j = self.nodes[row_node].left;
             while j != row_node {
                 self.uncover(self.nodes[j].column);
                 j = self.nodes[j].left;
             }
 
+            if found {
+                break;
+            }
+
             row_node = self.nodes[row_node].down;
         }
 
         self.uncover(col);
-        false
+        found
     }
 
-    fn search_all(
-        &mut self,
-        partial: &mut Vec<usize>,
-        solutions: &mut Vec<Vec<usize>>,
-    ) {
+    fn search_all(&mut self, partial: &mut Vec<usize>, solutions: &mut Vec<Vec<usize>>) {
         if self.nodes[self.root].right == self.root {
             solutions.push(partial.clone());
             return;
@@ -491,12 +494,12 @@ mod tests {
         // Row 5: 0 0 0 1 1 0 1
         // Solution: rows {0, 3, 4} or similar
         let mut dlx = DancingLinks::new(7);
-        dlx.add_row(&[2, 4, 5]);    // row 0
-        dlx.add_row(&[0, 3, 6]);    // row 1
-        dlx.add_row(&[1, 2, 5]);    // row 2
-        dlx.add_row(&[0, 3]);       // row 3
-        dlx.add_row(&[1, 6]);       // row 4
-        dlx.add_row(&[3, 4, 6]);    // row 5
+        dlx.add_row(&[2, 4, 5]); // row 0
+        dlx.add_row(&[0, 3, 6]); // row 1
+        dlx.add_row(&[1, 2, 5]); // row 2
+        dlx.add_row(&[0, 3]); // row 3
+        dlx.add_row(&[1, 6]); // row 4
+        dlx.add_row(&[3, 4, 6]); // row 5
 
         let solution = dlx.solve().unwrap();
 
@@ -666,5 +669,651 @@ mod tests {
             }
             assert!(covered.iter().all(|&c| c), "incomplete cover");
         }
+    }
+
+    // ── New expanded tests ──────────────────────────────────────────
+
+    #[test]
+    fn zero_columns_trivial_cover() {
+        // Zero-column matrix: trivially solved (empty set covers nothing)
+        let mut dlx = DancingLinks::new(0);
+        assert_eq!(dlx.num_columns(), 0);
+        assert_eq!(dlx.num_rows(), 0);
+        let solution = dlx.solve().unwrap();
+        assert!(solution.is_empty());
+    }
+
+    #[test]
+    fn zero_columns_solve_all() {
+        let mut dlx = DancingLinks::new(0);
+        let solutions = dlx.solve_all();
+        assert_eq!(solutions.len(), 1);
+        assert!(solutions[0].is_empty());
+    }
+
+    #[test]
+    fn solve_limited_zero() {
+        // limit=0 should return no solutions
+        let mut dlx = DancingLinks::new(2);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1]);
+        let solutions = dlx.solve_limited(0);
+        assert!(solutions.is_empty());
+    }
+
+    #[test]
+    fn solve_limited_one() {
+        // limit=1 should return exactly one solution
+        let mut dlx = DancingLinks::new(2);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1]);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1]);
+        // 4 possible solutions but we only want 1
+        let solutions = dlx.solve_limited(1);
+        assert_eq!(solutions.len(), 1);
+    }
+
+    #[test]
+    fn add_row_returns_sequential_indices() {
+        let mut dlx = DancingLinks::new(3);
+        assert_eq!(dlx.add_row(&[0, 1]), 0);
+        assert_eq!(dlx.add_row(&[2]), 1);
+        assert_eq!(dlx.add_row(&[0, 2]), 2);
+        assert_eq!(dlx.num_rows(), 3);
+    }
+
+    #[test]
+    fn add_empty_row_noop() {
+        // Empty column list should be a no-op (no nodes added)
+        let mut dlx = DancingLinks::new(3);
+        let before_nodes = dlx.nodes.len();
+        let idx = dlx.add_row(&[]);
+        assert_eq!(idx, 0); // returns num_rows (0)
+        assert_eq!(dlx.num_rows(), 0); // not incremented
+        assert_eq!(dlx.nodes.len(), before_nodes); // no nodes added
+    }
+
+    #[test]
+    fn solve_on_clone_same_result() {
+        // solve() leaves internal state modified (columns covered).
+        // Verify that cloning before solve gives consistent results.
+        let mut dlx = DancingLinks::new(3);
+        dlx.add_row(&[0, 1]);
+        dlx.add_row(&[2]);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1, 2]);
+
+        let mut clone1 = dlx.clone();
+        let mut clone2 = dlx.clone();
+        let sol1 = clone1.solve();
+        let sol2 = clone2.solve();
+        assert_eq!(sol1, sol2);
+    }
+
+    #[test]
+    fn solve_all_twice_same_result() {
+        let mut dlx = DancingLinks::new(3);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1]);
+        dlx.add_row(&[2]);
+        dlx.add_row(&[0, 1]);
+        dlx.add_row(&[1, 2]);
+
+        let all1 = dlx.solve_all();
+        let all2 = dlx.solve_all();
+        assert_eq!(all1.len(), all2.len());
+        assert_eq!(all1, all2);
+    }
+
+    #[test]
+    fn solve_all_no_duplicates() {
+        let mut dlx = DancingLinks::new(3);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1]);
+        dlx.add_row(&[2]);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1]);
+        dlx.add_row(&[2]);
+
+        let solutions = dlx.solve_all();
+        // Normalize: sort each solution so order doesn't matter
+        let normalized: Vec<Vec<usize>> = solutions
+            .iter()
+            .map(|s| {
+                let mut sorted = s.clone();
+                sorted.sort();
+                sorted
+            })
+            .collect();
+        // Check no two normalized solutions are identical
+        for i in 0..normalized.len() {
+            for j in (i + 1)..normalized.len() {
+                assert_ne!(normalized[i], normalized[j], "duplicate solution found");
+            }
+        }
+    }
+
+    #[test]
+    fn from_matrix_empty() {
+        let mut dlx = DancingLinks::from_matrix(&[]);
+        assert_eq!(dlx.num_columns(), 0);
+        assert_eq!(dlx.num_rows(), 0);
+        let solution = dlx.solve().unwrap();
+        assert!(solution.is_empty());
+    }
+
+    #[test]
+    fn from_matrix_all_false_rows_skipped() {
+        // Rows with no 1s should be skipped
+        let matrix = vec![
+            vec![false, false, false],
+            vec![true, false, false],
+            vec![false, false, false],
+            vec![false, true, true],
+        ];
+        let mut dlx = DancingLinks::from_matrix(&matrix);
+        // Only rows 1 and 3 have 1s
+        assert_eq!(dlx.num_rows(), 2);
+        let solution = dlx.solve().unwrap();
+        // Solution covers all 3 columns with 2 rows
+        assert_eq!(solution.len(), 2);
+    }
+
+    #[test]
+    fn from_matrix_single_cell_true() {
+        let matrix = vec![vec![true]];
+        let mut dlx = DancingLinks::from_matrix(&matrix);
+        assert_eq!(dlx.num_columns(), 1);
+        assert_eq!(dlx.num_rows(), 1);
+        let solution = dlx.solve().unwrap();
+        assert_eq!(solution, vec![0]);
+    }
+
+    #[test]
+    fn from_matrix_single_cell_false() {
+        let matrix = vec![vec![false]];
+        let mut dlx = DancingLinks::from_matrix(&matrix);
+        assert_eq!(dlx.num_columns(), 1);
+        assert_eq!(dlx.num_rows(), 0);
+        // No rows to cover column 0
+        assert!(dlx.solve().is_none());
+    }
+
+    #[test]
+    fn all_ones_row_wins() {
+        // Single row covering all columns should be the only solution
+        let mut dlx = DancingLinks::new(4);
+        dlx.add_row(&[0, 1, 2, 3]); // covers everything
+        dlx.add_row(&[0, 1]); // partial
+        dlx.add_row(&[2, 3]); // partial
+
+        let solutions = dlx.solve_all();
+        // {0} and {1,2} are both valid
+        assert_eq!(solutions.len(), 2);
+    }
+
+    #[test]
+    fn all_ones_row_sole_solution() {
+        // When partial rows overlap, only the full row works
+        let mut dlx = DancingLinks::new(3);
+        dlx.add_row(&[0, 1, 2]); // covers everything
+        dlx.add_row(&[0, 1]); // partial, overlaps
+        dlx.add_row(&[1, 2]); // partial, overlaps
+
+        let solutions = dlx.solve_all();
+        assert_eq!(solutions.len(), 1);
+        assert_eq!(solutions[0], vec![0]);
+    }
+
+    #[test]
+    fn large_identity_matrix() {
+        // 20x20 identity: exactly one solution (all rows)
+        let n = 20;
+        let mut dlx = DancingLinks::new(n);
+        for i in 0..n {
+            dlx.add_row(&[i]);
+        }
+
+        let solution = dlx.solve().unwrap();
+        assert_eq!(solution.len(), n);
+        let mut sorted = solution.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn large_sparse_block_diagonal() {
+        // 4 independent 2x2 blocks = 1 solution per block = 1 total
+        let mut dlx = DancingLinks::new(8);
+        // Block 0: cols 0,1
+        dlx.add_row(&[0, 1]);
+        // Block 1: cols 2,3
+        dlx.add_row(&[2, 3]);
+        // Block 2: cols 4,5
+        dlx.add_row(&[4, 5]);
+        // Block 3: cols 6,7
+        dlx.add_row(&[6, 7]);
+
+        let solution = dlx.solve().unwrap();
+        assert_eq!(solution.len(), 4);
+    }
+
+    #[test]
+    fn pentomino_style_competing_rows() {
+        // 6 columns, multiple overlapping rows, verify all solutions valid
+        let mut dlx = DancingLinks::new(6);
+        dlx.add_row(&[0, 1, 2]); // 0
+        dlx.add_row(&[3, 4, 5]); // 1
+        dlx.add_row(&[0, 3]); // 2
+        dlx.add_row(&[1, 4]); // 3
+        dlx.add_row(&[2, 5]); // 4
+        dlx.add_row(&[0, 1]); // 5
+        dlx.add_row(&[2, 3]); // 6
+        dlx.add_row(&[4, 5]); // 7
+
+        let row_cols: Vec<Vec<usize>> = vec![
+            vec![0, 1, 2],
+            vec![3, 4, 5],
+            vec![0, 3],
+            vec![1, 4],
+            vec![2, 5],
+            vec![0, 1],
+            vec![2, 3],
+            vec![4, 5],
+        ];
+
+        let solutions = dlx.solve_all();
+        assert!(!solutions.is_empty());
+
+        for solution in &solutions {
+            let mut covered = vec![false; 6];
+            for &row in solution {
+                for &col in &row_cols[row] {
+                    assert!(!covered[col], "column {} double-covered", col);
+                    covered[col] = true;
+                }
+            }
+            assert!(covered.iter().all(|&c| c), "not all columns covered");
+        }
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_solutions() {
+        let mut dlx = DancingLinks::new(4);
+        dlx.add_row(&[0, 1]);
+        dlx.add_row(&[2, 3]);
+        dlx.add_row(&[0, 2]);
+        dlx.add_row(&[1, 3]);
+        dlx.add_row(&[0, 3]);
+        dlx.add_row(&[1, 2]);
+
+        let orig_solutions = dlx.solve_all();
+
+        let json = serde_json::to_string(&dlx).unwrap();
+        let mut restored: DancingLinks = serde_json::from_str(&json).unwrap();
+        let rest_solutions = restored.solve_all();
+
+        // Normalize and compare
+        let mut orig_norm: Vec<Vec<usize>> = orig_solutions
+            .iter()
+            .map(|s| {
+                let mut sorted = s.clone();
+                sorted.sort();
+                sorted
+            })
+            .collect();
+        let mut rest_norm: Vec<Vec<usize>> = rest_solutions
+            .iter()
+            .map(|s| {
+                let mut sorted = s.clone();
+                sorted.sort();
+                sorted
+            })
+            .collect();
+        orig_norm.sort();
+        rest_norm.sort();
+        assert_eq!(orig_norm, rest_norm);
+    }
+
+    #[test]
+    fn serde_roundtrip_before_solve() {
+        // Serde roundtrip on pristine (unsolved) DLX preserves solvability.
+        let mut dlx = DancingLinks::new(3);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1]);
+        dlx.add_row(&[2]);
+
+        let json = serde_json::to_string(&dlx).unwrap();
+        let mut restored: DancingLinks = serde_json::from_str(&json).unwrap();
+        let sol = restored.solve().unwrap();
+        assert_eq!(sol.len(), 3);
+    }
+
+    #[test]
+    fn solve_all_restores_state() {
+        // solve_all() fully backtracks, so state should be restored
+        let mut dlx = DancingLinks::new(3);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1]);
+        dlx.add_row(&[2]);
+
+        let before = serde_json::to_string(&dlx).unwrap();
+        let _solutions = dlx.solve_all();
+        let after = serde_json::to_string(&dlx).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn display_various_sizes() {
+        let dlx0 = DancingLinks::new(0);
+        assert_eq!(format!("{}", dlx0), "DancingLinks(0x0, 1 nodes)");
+
+        let dlx1 = DancingLinks::new(1);
+        assert!(format!("{}", dlx1).contains("0x1"));
+
+        let mut dlx5 = DancingLinks::new(5);
+        dlx5.add_row(&[0, 1, 2, 3, 4]);
+        let display = format!("{}", dlx5);
+        assert!(display.contains("1x5"));
+        assert!(display.contains("nodes"));
+    }
+
+    #[test]
+    fn with_names_default_names() {
+        let dlx = DancingLinks::new(3);
+        assert_eq!(dlx.columns[0].name, "C0");
+        assert_eq!(dlx.columns[1].name, "C1");
+        assert_eq!(dlx.columns[2].name, "C2");
+    }
+
+    #[test]
+    fn single_column_many_rows() {
+        // One column, multiple rows — each row alone is a solution
+        let mut dlx = DancingLinks::new(1);
+        for _ in 0..5 {
+            dlx.add_row(&[0]);
+        }
+        assert_eq!(dlx.num_rows(), 5);
+
+        let solutions = dlx.solve_all();
+        // Each row individually is a valid solution
+        assert_eq!(solutions.len(), 5);
+        for sol in &solutions {
+            assert_eq!(sol.len(), 1);
+        }
+    }
+
+    #[test]
+    fn solve_limited_exceeds_total() {
+        // limit > total solutions → returns all
+        let mut dlx = DancingLinks::new(2);
+        dlx.add_row(&[0, 1]);
+        // Only 1 solution
+        let solutions = dlx.solve_limited(100);
+        assert_eq!(solutions.len(), 1);
+    }
+
+    #[test]
+    fn column_count_after_add_row() {
+        let mut dlx = DancingLinks::new(5);
+        dlx.add_row(&[0, 4]);
+        dlx.add_row(&[1, 2, 3]);
+        // Adding rows doesn't change column count
+        assert_eq!(dlx.num_columns(), 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "column index out of bounds")]
+    fn add_row_out_of_bounds_panics() {
+        let mut dlx = DancingLinks::new(3);
+        dlx.add_row(&[3]); // column 3 doesn't exist (0..2)
+    }
+
+    #[test]
+    fn four_queens_as_exact_cover() {
+        // Encode 4-queens as exact cover:
+        // 4 rows + 4 cols + diagonals
+        // Columns: R0..R3 (row constraints), C0..C3 (col constraints)
+        //   + diag constraints (optional, we'll use mandatory row+col only)
+        // Each queen placement (r, c) covers row-r and col-c
+        let mut dlx = DancingLinks::new(8); // R0..R3, C0..C3
+
+        // All 16 possible placements
+        for r in 0..4 {
+            for c in 0..4 {
+                dlx.add_row(&[r, 4 + c]); // covers row r, col c
+            }
+        }
+        assert_eq!(dlx.num_rows(), 16);
+
+        let solutions = dlx.solve_all();
+        // Without diagonal constraints, this is just "one queen per row, one per col"
+        // = number of permutations of {0,1,2,3} = 4! = 24
+        assert_eq!(solutions.len(), 24);
+
+        // Verify each solution has exactly 4 rows
+        for sol in &solutions {
+            assert_eq!(sol.len(), 4);
+        }
+    }
+
+    #[test]
+    fn clone_independence() {
+        let mut dlx = DancingLinks::new(3);
+        dlx.add_row(&[0, 1]);
+        dlx.add_row(&[2]);
+
+        let mut cloned = dlx.clone();
+        // Solving clone doesn't affect original
+        let sol_clone = cloned.solve().unwrap();
+        let sol_orig = dlx.solve().unwrap();
+        assert_eq!(sol_clone, sol_orig);
+    }
+
+    #[test]
+    fn from_matrix_correctness() {
+        // Build via from_matrix and via add_row, compare solutions
+        let matrix = vec![
+            vec![true, false, true, false],
+            vec![false, true, false, true],
+            vec![true, true, false, false],
+            vec![false, false, true, true],
+        ];
+        let mut dlx_matrix = DancingLinks::from_matrix(&matrix);
+
+        let mut dlx_manual = DancingLinks::new(4);
+        dlx_manual.add_row(&[0, 2]);
+        dlx_manual.add_row(&[1, 3]);
+        dlx_manual.add_row(&[0, 1]);
+        dlx_manual.add_row(&[2, 3]);
+
+        let mut sols_matrix = dlx_matrix.solve_all();
+        let mut sols_manual = dlx_manual.solve_all();
+
+        // Normalize
+        for s in &mut sols_matrix {
+            s.sort();
+        }
+        for s in &mut sols_manual {
+            s.sort();
+        }
+        sols_matrix.sort();
+        sols_manual.sort();
+
+        assert_eq!(sols_matrix, sols_manual);
+    }
+
+    #[test]
+    fn unsolvable_column_unreachable() {
+        // Column 2 has no rows → unsolvable
+        let mut dlx = DancingLinks::new(3);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1]);
+        // No row covers column 2
+
+        assert!(dlx.solve().is_none());
+        assert!(dlx.solve_all().is_empty());
+    }
+
+    #[test]
+    fn solve_limited_respects_exact_limit() {
+        // Create problem with many solutions
+        let mut dlx = DancingLinks::new(1);
+        for _ in 0..10 {
+            dlx.add_row(&[0]);
+        }
+        // 10 solutions total
+        assert_eq!(dlx.solve_all().len(), 10);
+
+        // Request exactly 5
+        let mut dlx2 = dlx.clone();
+        let limited = dlx2.solve_limited(5);
+        assert_eq!(limited.len(), 5);
+    }
+
+    #[test]
+    fn solve_after_solve_all_consistent() {
+        let mut dlx = DancingLinks::new(3);
+        dlx.add_row(&[0, 1]);
+        dlx.add_row(&[2]);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1, 2]);
+
+        let all_solutions = dlx.solve_all();
+        let first = dlx.solve();
+
+        // First solution from solve() should be one of the solve_all() solutions
+        assert!(first.is_some());
+        let first = first.unwrap();
+        let mut first_sorted = first.clone();
+        first_sorted.sort();
+
+        let is_in_all = all_solutions.iter().any(|s| {
+            let mut sorted = s.clone();
+            sorted.sort();
+            sorted == first_sorted
+        });
+        assert!(is_in_all, "solve() result not found in solve_all()");
+    }
+
+    #[test]
+    fn choose_column_uses_minimum_size_heuristic() {
+        let mut dlx = DancingLinks::new(4);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[0, 1]);
+        dlx.add_row(&[2, 3]);
+
+        // Column sizes are [2, 1, 1, 1], so the first minimum is column 1 (header index 2).
+        assert_eq!(dlx.choose_column(), 2);
+    }
+
+    #[test]
+    fn cover_then_uncover_restores_serialized_state() {
+        let mut dlx = DancingLinks::new(3);
+        dlx.add_row(&[0, 1]);
+        dlx.add_row(&[1, 2]);
+        dlx.add_row(&[0, 2]);
+
+        let before = serde_json::to_string(&dlx).unwrap();
+        let chosen = dlx.choose_column();
+        dlx.cover(chosen);
+        dlx.uncover(chosen);
+        let after = serde_json::to_string(&dlx).unwrap();
+
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn single_column_without_rows_is_unsolvable() {
+        let mut dlx = DancingLinks::new(1);
+        assert!(dlx.solve().is_none());
+        assert!(dlx.solve_all().is_empty());
+    }
+
+    #[test]
+    fn single_row_partial_cover_is_unsolvable() {
+        let mut dlx = DancingLinks::new(3);
+        dlx.add_row(&[1]);
+
+        assert!(dlx.solve().is_none());
+        assert!(dlx.solve_all().is_empty());
+    }
+
+    #[test]
+    fn duplicate_full_rows_yield_distinct_single_row_solutions() {
+        let mut dlx = DancingLinks::new(3);
+        dlx.add_row(&[0, 1, 2]);
+        dlx.add_row(&[0, 1, 2]);
+        dlx.add_row(&[0, 1, 2]);
+
+        let mut solutions = dlx.solve_all();
+        for solution in &solutions {
+            assert_eq!(solution.len(), 1);
+        }
+        for solution in &mut solutions {
+            solution.sort();
+        }
+        solutions.sort();
+        assert_eq!(solutions, vec![vec![0], vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn solve_limited_then_solve_all_returns_full_solution_set() {
+        let mut dlx = DancingLinks::new(2);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1]);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1]);
+
+        let limited = dlx.solve_limited(2);
+        assert_eq!(limited.len(), 2);
+
+        let all = dlx.solve_all();
+        assert_eq!(all.len(), 4);
+    }
+
+    #[test]
+    fn with_names_empty_has_trivial_solution() {
+        let mut dlx = DancingLinks::with_names(&[]);
+        assert_eq!(dlx.num_columns(), 0);
+        assert_eq!(dlx.num_rows(), 0);
+        let solution = dlx.solve().unwrap();
+        assert!(solution.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "column index out of bounds")]
+    fn from_matrix_jagged_longer_row_panics() {
+        let matrix = vec![vec![true, false], vec![false, true, true]];
+        let _ = DancingLinks::from_matrix(&matrix);
+    }
+
+    #[test]
+    fn from_matrix_jagged_shorter_rows_treated_as_missing_false() {
+        let matrix = vec![
+            vec![true, false, false],
+            vec![false], // shorter row: no true values, should be skipped
+            vec![false, true, true],
+        ];
+        let mut dlx = DancingLinks::from_matrix(&matrix);
+        assert_eq!(dlx.num_columns(), 3);
+        assert_eq!(dlx.num_rows(), 2);
+
+        let solution = dlx.solve().unwrap();
+        assert_eq!(solution.len(), 2);
+    }
+
+    #[test]
+    fn column_sizes_track_add_row_counts() {
+        let mut dlx = DancingLinks::new(4);
+        dlx.add_row(&[0, 2]);
+        dlx.add_row(&[2, 3]);
+        dlx.add_row(&[1]);
+
+        assert_eq!(dlx.columns[0].size, 1);
+        assert_eq!(dlx.columns[1].size, 1);
+        assert_eq!(dlx.columns[2].size, 2);
+        assert_eq!(dlx.columns[3].size, 1);
     }
 }
