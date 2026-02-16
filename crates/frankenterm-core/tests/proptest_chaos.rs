@@ -512,3 +512,144 @@ fn drain_log_returns_empty_on_fresh_injector() {
     let drained = injector.drain_log();
     assert!(drained.is_empty());
 }
+
+// ─── FaultMode construction: additional property tests ───────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn always_fail_preserves_error_message(msg in "[a-zA-Z0-9_ ]{1,50}") {
+        let mode = FaultMode::always_fail(msg.clone());
+        match mode {
+            FaultMode::AlwaysFail { error } => prop_assert_eq!(error, msg),
+            _ => prop_assert!(false, "expected AlwaysFail variant"),
+        }
+    }
+
+    #[test]
+    fn fail_n_times_preserves_count(n in 0u32..10_000) {
+        let mode = FaultMode::fail_n_times(n, "err");
+        match mode {
+            FaultMode::FailNTimes { remaining, .. } => prop_assert_eq!(remaining, n),
+            _ => prop_assert!(false, "expected FailNTimes variant"),
+        }
+    }
+
+    #[test]
+    fn fail_with_probability_clamps_high(raw in 1.01f64..1000.0) {
+        let mode = FaultMode::fail_with_probability(raw, "err");
+        match mode {
+            FaultMode::FailWithProbability { probability, .. } => {
+                prop_assert!(probability <= 1.0, "should clamp to 1.0, got {}", probability);
+            }
+            _ => prop_assert!(false, "expected FailWithProbability variant"),
+        }
+    }
+
+    #[test]
+    fn fail_with_probability_clamps_low(raw in -1000.0f64..0.0) {
+        let mode = FaultMode::fail_with_probability(raw, "err");
+        match mode {
+            FaultMode::FailWithProbability { probability, .. } => {
+                prop_assert!(probability >= 0.0, "should clamp to 0.0, got {}", probability);
+            }
+            _ => prop_assert!(false, "expected FailWithProbability variant"),
+        }
+    }
+
+    #[test]
+    fn delay_then_fail_preserves_fields(
+        ms in 0u64..100_000,
+        msg in "[a-z]{1,20}",
+    ) {
+        let mode = FaultMode::delay_then_fail(ms, msg.clone());
+        match mode {
+            FaultMode::DelayThenFail { delay_ms, error } => {
+                prop_assert_eq!(delay_ms, ms);
+                prop_assert_eq!(error, msg);
+            }
+            _ => prop_assert!(false, "expected DelayThenFail variant"),
+        }
+    }
+
+    #[test]
+    fn delay_preserves_ms(ms in 0u64..100_000) {
+        let mode = FaultMode::delay(ms);
+        match mode {
+            FaultMode::Delay { delay_ms } => prop_assert_eq!(delay_ms, ms),
+            _ => prop_assert!(false, "expected Delay variant"),
+        }
+    }
+}
+
+// ─── ChaosAssertion evaluation property tests ───────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn fired_at_least_zero_always_passes_for_any_point(
+        point in arb_fault_point(),
+    ) {
+        let injector = FaultInjector::new();
+        let scenario = ChaosScenario::new("test", "test")
+            .with_assertion(ChaosAssertion::FaultFiredAtLeast(point, 0));
+        let results = injector.check_assertions(&scenario);
+        prop_assert!(results[0].passed, "FaultFiredAtLeast(_, 0) should always pass");
+    }
+
+    #[test]
+    fn fault_never_fired_passes_on_clean_for_any_point(
+        point in arb_fault_point(),
+    ) {
+        let injector = FaultInjector::new();
+        let scenario = ChaosScenario::new("test", "test")
+            .with_assertion(ChaosAssertion::FaultNeverFired(point));
+        let results = injector.check_assertions(&scenario);
+        prop_assert!(results[0].passed, "FaultNeverFired should pass on clean injector");
+    }
+}
+
+// ─── FaultInjector: set_fault + remove_fault ─────────────────────────
+
+#[test]
+fn set_fault_then_remove_fault_clears_it() {
+    let injector = FaultInjector::new();
+    injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("err"));
+    injector.remove_fault(FaultPoint::DbWrite);
+    // After removal, no fault should be configured for DbWrite
+    assert_eq!(injector.fired_count(FaultPoint::DbWrite), 0);
+}
+
+#[test]
+fn remove_fault_on_unset_is_noop() {
+    let injector = FaultInjector::new();
+    // Removing a fault that was never set shouldn't panic
+    injector.remove_fault(FaultPoint::PatternDetect);
+    assert_eq!(injector.fired_count(FaultPoint::PatternDetect), 0);
+}
+
+// ─── ChaosReport: from_scenario with assertions ─────────────────────
+
+#[test]
+fn report_with_passing_assertion() {
+    let injector = FaultInjector::new();
+    let scenario = ChaosScenario::new("test", "test")
+        .with_assertion(ChaosAssertion::FaultNeverFired(FaultPoint::DbWrite));
+    let report = ChaosReport::from_scenario(&injector, &scenario);
+    assert_eq!(report.assertions_passed, 1);
+    assert_eq!(report.assertions_failed, 0);
+    assert!(report.all_passed);
+}
+
+#[test]
+fn report_with_failing_assertion() {
+    let injector = FaultInjector::new();
+    let scenario = ChaosScenario::new("test", "test")
+        .with_assertion(ChaosAssertion::FaultFiredAtLeast(FaultPoint::DbWrite, 1));
+    let report = ChaosReport::from_scenario(&injector, &scenario);
+    assert_eq!(report.assertions_passed, 0);
+    assert_eq!(report.assertions_failed, 1);
+    assert!(!report.all_passed);
+}

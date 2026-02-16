@@ -670,3 +670,108 @@ proptest! {
         prop_assert!(!debug.is_empty());
     }
 }
+
+// =========================================================================
+// Additional parse_schema property tests
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Parsing the same schema twice yields identical results.
+    #[test]
+    fn prop_parse_schema_deterministic(schema in arb_json_schema()) {
+        let doc1 = parse_schema(&schema);
+        let doc2 = parse_schema(&schema);
+        prop_assert_eq!(doc1.title, doc2.title);
+        prop_assert_eq!(doc1.description, doc2.description);
+        prop_assert_eq!(doc1.properties.len(), doc2.properties.len());
+        prop_assert_eq!(doc1.definitions.len(), doc2.definitions.len());
+        for (a, b) in doc1.properties.iter().zip(doc2.properties.iter()) {
+            prop_assert_eq!(&a.name, &b.name);
+            prop_assert_eq!(&a.type_str, &b.type_str);
+            prop_assert_eq!(a.required, b.required);
+        }
+    }
+
+    /// All required properties appear before optional properties.
+    #[test]
+    fn prop_parse_schema_required_before_optional(schema in arb_json_schema()) {
+        let doc = parse_schema(&schema);
+        let mut seen_optional = false;
+        for prop in &doc.properties {
+            if !prop.required {
+                seen_optional = true;
+            }
+            if prop.required && seen_optional {
+                prop_assert!(false,
+                    "required property '{}' appeared after optional", prop.name);
+            }
+        }
+    }
+
+    /// categorize_endpoint on a cloned EndpointMeta yields same category.
+    #[test]
+    fn prop_categorize_clone_invariant(ep in arb_endpoint_meta()) {
+        let cat1 = categorize_endpoint(&ep);
+        let cat2 = categorize_endpoint(&ep.clone());
+        prop_assert_eq!(cat1, cat2);
+    }
+
+    /// EndpointCategory title is non-empty for any variant.
+    #[test]
+    fn prop_endpoint_category_title_nonempty(cat in arb_endpoint_category()) {
+        prop_assert!(!cat.title().is_empty());
+    }
+
+    /// EndpointCategory Debug is non-empty for any variant.
+    #[test]
+    fn prop_endpoint_category_debug_nonempty(cat in arb_endpoint_category()) {
+        let debug = format!("{:?}", cat);
+        prop_assert!(!debug.is_empty());
+    }
+}
+
+// =========================================================================
+// Additional edge case tests
+// =========================================================================
+
+#[test]
+fn parse_schema_no_properties_key() {
+    let schema = json!({
+        "title": "Empty",
+        "description": "No properties key at all"
+    });
+    let doc = parse_schema(&schema);
+    assert_eq!(doc.title, "Empty");
+    assert!(doc.properties.is_empty());
+}
+
+#[test]
+fn parse_schema_empty_properties_object() {
+    let schema = json!({
+        "title": "EmptyProps",
+        "properties": {}
+    });
+    let doc = parse_schema(&schema);
+    assert!(doc.properties.is_empty());
+}
+
+#[test]
+fn doc_gen_config_default_values() {
+    let config = DocGenConfig::default();
+    // Default should be constructible
+    let json = serde_json::to_string(&config).unwrap();
+    let parsed: DocGenConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(config.include_envelope, parsed.include_envelope);
+}
+
+#[test]
+fn endpoint_category_all_variants_have_unique_titles() {
+    let cats = EndpointCategory::all();
+    let mut titles: Vec<&str> = cats.iter().map(|c| c.title()).collect();
+    let before = titles.len();
+    titles.sort();
+    titles.dedup();
+    assert_eq!(titles.len(), before, "category titles must be unique");
+}
