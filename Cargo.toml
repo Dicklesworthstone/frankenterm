@@ -199,7 +199,7 @@ implicit_clone = "allow"
 # Core dependencies
 serde = { version = "1.0.228", default-features = false, features = ["derive"] }
 serde_json = "1.0.149"
-tantivy = "0.25"
+tantivy = "0.22"
 tokio = { version = "1.49.0", features = ["full"] }
 thiserror = "2.0.18"
 anyhow = "1.0.100"
@@ -407,6 +407,11 @@ fastapi-macros = { version = "0.2.0", git = "https://github.com/Dicklesworthston
 fastapi-openapi = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
 fastapi-output = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
 
+# FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
+frankensearch = { version = "0.1.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3ad4326fd63a3f53d0d90d48f0e5ea1c74c2a4da", default-features = false, features = ["hybrid"] }
+# Agent detection (optional integration, enabled via frankenterm-core feature flag)
+franken-agent-detection = "0.1.0"
+
 # Internal crates
 frankenterm-core = { path = "crates/frankenterm-core" }
 
@@ -431,4 +436,7 @@ asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "c
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "f58a4e5e437aa564286729c0e2ec50b1e62c1f0e" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "c7c15f630caf9bd2c6b9f39feed6212d64986dfa" }
+
+[patch."https://github.com/Dicklesworthstone/frankensearch"]
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "c7c15f630caf9bd2c6b9f39feed6212d64986dfa" }

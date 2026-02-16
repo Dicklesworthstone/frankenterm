@@ -78,6 +78,10 @@ rustls-pemfile = { workspace = true, optional = true }
 x509-parser = { workspace = true, optional = true }
 # Lexical search (optional, behind feature)
 tantivy = { workspace = true, optional = true }
+# FrankenSearch integration (optional, behind feature)
+frankensearch = { workspace = true, optional = true }
+# Agent detection integration (optional, behind feature)
+franken-agent-detection = { workspace = true, optional = true }
 
 # Semantic search (optional, behind feature)
 tokenizers = { version = "0.21", optional = true }
@@ -267,7 +271,9 @@ name = "fork_hardening"
 harness = false
 
 [features]
-default = []
+# Default-on so workspace builds include FrankenSearch + agent-detection integration.
+# Use `--no-default-features` to compile without these dependencies.
+default = ["agent-detection", "frankensearch"]
 # Public feature flags (stable surface)
 frankenterm = ["frankenterm-deps"]
 vendored = ["frankenterm"]  # backward compat alias
@@ -290,6 +296,10 @@ sync = ["dep:asupersync"]
 asupersync-runtime = ["dep:asupersync"]
 recorder-lexical = ["dep:tantivy"]
 semantic-search = ["dep:tokenizers", "dep:safetensors", "dep:half", "dep:fastembed", "dep:rmp-serde"]
+# Feature gate for FrankenSearch integration.
+frankensearch = ["dep:frankensearch"]
+# Feature gate for filesystem-based coding-agent installation probes.
+agent-detection = ["dep:franken-agent-detection"]
 
 # Optional heavy integrations - feature-gated (internal)
 frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-term"]

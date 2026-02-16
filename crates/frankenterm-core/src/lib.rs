@@ -46,6 +46,8 @@
 
 pub mod accounts;
 pub mod adaptive_radix_tree;
+#[cfg(feature = "agent-detection")]
+pub mod agent_detection;
 pub mod agent_correlator;
 pub mod alerts;
 pub mod api_schema;
@@ -184,6 +186,8 @@ pub mod screen_state;
 pub mod scrollback_eviction;
 pub mod search;
 pub mod search_explain;
+#[cfg(feature = "frankensearch")]
+pub mod search_bridge;
 pub mod secrets;
 pub mod segment_tree;
 pub mod self_stabilize;
