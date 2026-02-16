@@ -224,6 +224,7 @@ pub mod voi;
 pub mod wait;
 pub mod wal_engine;
 pub mod watchdog;
+pub mod wavelet_tree;
 pub mod watcher_client;
 pub mod webhook;
 pub mod wezterm;
