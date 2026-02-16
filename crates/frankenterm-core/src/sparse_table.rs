@@ -479,4 +479,371 @@ mod tests {
         assert_eq!(st.query(500, 999), 0);
         assert_eq!(st.query(0, 499), 500);
     }
+
+    // ── Expanded test coverage ──────────────────────────────────────
+
+    #[test]
+    fn index_sparse_table_empty() {
+        let ist = IndexSparseTable::<i32>::build(&[], QueryOp::Min);
+        assert!(ist.is_empty());
+        assert_eq!(ist.len(), 0);
+    }
+
+    #[test]
+    fn index_sparse_table_single() {
+        let ist = IndexSparseTable::build(&[99], QueryOp::Min);
+        assert_eq!(ist.query_index(0, 0), 0);
+        let (idx, val) = ist.query(0, 0);
+        assert_eq!(idx, 0);
+        assert_eq!(*val, 99);
+    }
+
+    #[test]
+    fn index_sparse_table_len_is_empty() {
+        let ist = IndexSparseTable::build(&[1, 2, 3], QueryOp::Max);
+        assert_eq!(ist.len(), 3);
+        assert!(!ist.is_empty());
+    }
+
+    #[test]
+    fn index_sparse_table_serde_roundtrip() {
+        let data = [5, 2, 8, 1, 4];
+        let ist = IndexSparseTable::build(&data, QueryOp::Min);
+        let json = serde_json::to_string(&ist).unwrap();
+        let restored: IndexSparseTable<i32> = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.len(), ist.len());
+        assert_eq!(restored.query_index(0, 4), ist.query_index(0, 4));
+        assert_eq!(restored.query_index(1, 3), ist.query_index(1, 3));
+    }
+
+    #[test]
+    fn single_point_queries_return_data_value() {
+        let data = [10, 20, 30, 40, 50];
+        let st = SparseTable::min_table(&data);
+        for i in 0..data.len() {
+            assert_eq!(st.query(i, i), data[i]);
+        }
+    }
+
+    #[test]
+    fn adjacent_pair_queries() {
+        let data = [5, 2, 8, 1, 4, 7];
+        let st = SparseTable::min_table(&data);
+        assert_eq!(st.query(0, 1), 2);
+        assert_eq!(st.query(1, 2), 2);
+        assert_eq!(st.query(2, 3), 1);
+        assert_eq!(st.query(3, 4), 1);
+        assert_eq!(st.query(4, 5), 4);
+    }
+
+    #[test]
+    fn negative_values() {
+        let data = [-5, -2, -8, -1, -4];
+        let st_min = SparseTable::min_table(&data);
+        assert_eq!(st_min.query(0, 4), -8);
+        assert_eq!(st_min.query(0, 1), -5);
+
+        let st_max = SparseTable::max_table(&data);
+        assert_eq!(st_max.query(0, 4), -1);
+    }
+
+    #[test]
+    fn mixed_positive_negative_zero() {
+        let data = [-3, 0, 5, -1, 2, 0, -7, 4];
+        let st_min = SparseTable::min_table(&data);
+        assert_eq!(st_min.query(0, 7), -7);
+        assert_eq!(st_min.query(0, 3), -3);
+        assert_eq!(st_min.query(4, 7), -7);
+
+        let st_max = SparseTable::max_table(&data);
+        assert_eq!(st_max.query(0, 7), 5);
+    }
+
+    #[test]
+    fn v_shape_data() {
+        let data = [5, 4, 3, 2, 1, 2, 3, 4, 5];
+        let st = SparseTable::min_table(&data);
+        assert_eq!(st.query(0, 8), 1);
+        assert_eq!(st.query(0, 3), 2);
+        assert_eq!(st.query(5, 8), 2);
+        assert_eq!(st.query(3, 5), 1);
+
+        let st_max = SparseTable::max_table(&data);
+        assert_eq!(st_max.query(0, 8), 5);
+    }
+
+    #[test]
+    fn mountain_shape_data() {
+        let data = [1, 2, 3, 4, 5, 4, 3, 2, 1];
+        let st_max = SparseTable::max_table(&data);
+        assert_eq!(st_max.query(0, 8), 5);
+        assert_eq!(st_max.query(0, 3), 4);
+        assert_eq!(st_max.query(5, 8), 4);
+
+        let st_min = SparseTable::min_table(&data);
+        assert_eq!(st_min.query(0, 8), 1);
+    }
+
+    #[test]
+    fn plateau_data() {
+        let data = [1, 1, 5, 5, 5, 1, 1];
+        let st = SparseTable::min_table(&data);
+        assert_eq!(st.query(0, 6), 1);
+        assert_eq!(st.query(2, 4), 5);
+
+        let st_max = SparseTable::max_table(&data);
+        assert_eq!(st_max.query(0, 6), 5);
+        assert_eq!(st_max.query(0, 1), 1);
+    }
+
+    #[test]
+    fn alternating_pattern() {
+        let data = [1, 100, 1, 100, 1, 100];
+        let st_min = SparseTable::min_table(&data);
+        assert_eq!(st_min.query(0, 5), 1);
+        assert_eq!(st_min.query(1, 3), 1);
+
+        let st_max = SparseTable::max_table(&data);
+        assert_eq!(st_max.query(0, 5), 100);
+        assert_eq!(st_max.query(0, 0), 1);
+    }
+
+    #[test]
+    fn three_elements_all_orderings() {
+        // min at start
+        let st = SparseTable::min_table(&[1, 2, 3]);
+        assert_eq!(st.query(0, 2), 1);
+        // min at middle
+        let st = SparseTable::min_table(&[2, 1, 3]);
+        assert_eq!(st.query(0, 2), 1);
+        // min at end
+        let st = SparseTable::min_table(&[3, 2, 1]);
+        assert_eq!(st.query(0, 2), 1);
+    }
+
+    #[test]
+    fn odd_length_array() {
+        let data = [7, 3, 9, 1, 5];
+        let st = SparseTable::min_table(&data);
+        assert_eq!(st.query(0, 4), 1);
+        assert_eq!(st.query(0, 2), 3);
+        assert_eq!(st.query(2, 4), 1);
+    }
+
+    #[test]
+    fn non_power_of_two_lengths() {
+        for n in [3, 5, 6, 7, 9, 10, 15, 17] {
+            let data: Vec<i32> = (0..n).collect();
+            let st = SparseTable::min_table(&data);
+            assert_eq!(st.len(), n as usize);
+            assert_eq!(st.query(0, n as usize - 1), 0);
+        }
+    }
+
+    #[test]
+    fn brute_force_correctness_small() {
+        let data = [5, 2, 8, 1, 4, 7, 3, 6];
+        let st = SparseTable::min_table(&data);
+        let n = data.len();
+        for left in 0..n {
+            for right in left..n {
+                let expected = *data[left..=right].iter().min().unwrap();
+                assert_eq!(
+                    st.query(left, right),
+                    expected,
+                    "min query [{}, {}] failed",
+                    left,
+                    right
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn brute_force_max_correctness() {
+        let data = [5, 2, 8, 1, 4, 7, 3, 6];
+        let st = SparseTable::max_table(&data);
+        let n = data.len();
+        for left in 0..n {
+            for right in left..n {
+                let expected = *data[left..=right].iter().max().unwrap();
+                assert_eq!(
+                    st.query(left, right),
+                    expected,
+                    "max query [{}, {}] failed",
+                    left,
+                    right
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn index_sparse_table_correctness_all_subranges() {
+        let data = [5, 2, 8, 1, 4, 7];
+        let ist = IndexSparseTable::build(&data, QueryOp::Min);
+        let n = data.len();
+        for left in 0..n {
+            for right in left..n {
+                let idx = ist.query_index(left, right);
+                assert!(idx >= left && idx <= right);
+                assert_eq!(data[idx], *data[left..=right].iter().min().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn index_sparse_table_max_correctness() {
+        let data = [5, 2, 8, 1, 4, 7];
+        let ist = IndexSparseTable::build(&data, QueryOp::Max);
+        let n = data.len();
+        for left in 0..n {
+            for right in left..n {
+                let (idx, val) = ist.query(left, right);
+                assert!(idx >= left && idx <= right);
+                assert_eq!(*val, *data[left..=right].iter().max().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_min_values() {
+        let data = [3, 1, 5, 1, 4, 1, 2];
+        let st = SparseTable::min_table(&data);
+        assert_eq!(st.query(0, 6), 1);
+        assert_eq!(st.query(0, 1), 1);
+        assert_eq!(st.query(2, 5), 1);
+    }
+
+    #[test]
+    fn min_max_consistency() {
+        let data = [10, 20, 30, 40, 50, 15, 25, 35];
+        let st_min = SparseTable::min_table(&data);
+        let st_max = SparseTable::max_table(&data);
+        let n = data.len();
+        for left in 0..n {
+            for right in left..n {
+                assert!(st_min.query(left, right) <= st_max.query(left, right));
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_first_and_last() {
+        let data = [100, 50, 30, 70, 200];
+        let st = SparseTable::min_table(&data);
+        assert_eq!(st.query(0, 0), 100); // first only
+        assert_eq!(st.query(4, 4), 200); // last only
+        assert_eq!(st.query(0, 4), 30); // full range
+
+        let st_max = SparseTable::max_table(&data);
+        assert_eq!(st_max.query(0, 0), 100);
+        assert_eq!(st_max.query(4, 4), 200);
+        assert_eq!(st_max.query(0, 4), 200);
+    }
+
+    #[test]
+    fn serde_roundtrip_max_table() {
+        let data = [5, 2, 8, 1, 4];
+        let st = SparseTable::max_table(&data);
+        let json = serde_json::to_string(&st).unwrap();
+        let restored: SparseTable<i32> = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.query(0, 4), 8);
+        assert_eq!(restored.operation(), QueryOp::Max);
+    }
+
+    #[test]
+    fn build_with_explicit_op() {
+        let data = [5, 2, 8];
+        let st = SparseTable::build(&data, QueryOp::Min);
+        assert_eq!(st.query(0, 2), 2);
+        assert_eq!(st.operation(), QueryOp::Min);
+
+        let st = SparseTable::build(&data, QueryOp::Max);
+        assert_eq!(st.query(0, 2), 8);
+        assert_eq!(st.operation(), QueryOp::Max);
+    }
+
+    #[test]
+    fn index_table_ties_prefer_leftmost() {
+        let data = [3, 1, 5, 1, 7];
+        let ist = IndexSparseTable::build(&data, QueryOp::Min);
+        // When ties exist, the implementation picks left (<=)
+        let idx = ist.query_index(0, 4);
+        assert_eq!(data[idx], 1);
+        assert!(idx == 1 || idx == 3);
+    }
+
+    #[test]
+    fn large_index_sparse_table() {
+        let data: Vec<i32> = (0..500).rev().collect();
+        let ist = IndexSparseTable::build(&data, QueryOp::Min);
+        assert_eq!(ist.len(), 500);
+        let (idx, val) = ist.query(0, 499);
+        assert_eq!(idx, 499); // min is at the end (reversed)
+        assert_eq!(*val, 0);
+    }
+
+    #[test]
+    fn query_op_serde() {
+        let op = QueryOp::Min;
+        let json = serde_json::to_string(&op).unwrap();
+        let restored: QueryOp = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, QueryOp::Min);
+
+        let op = QueryOp::Max;
+        let json = serde_json::to_string(&op).unwrap();
+        let restored: QueryOp = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, QueryOp::Max);
+    }
+
+    #[test]
+    fn range_size_one_through_n() {
+        let data = [10, 3, 7, 1, 5, 9, 2, 8];
+        let st = SparseTable::min_table(&data);
+        // Range size 1
+        assert_eq!(st.query(3, 3), 1);
+        // Range size 2
+        assert_eq!(st.query(3, 4), 1);
+        // Range size 4
+        assert_eq!(st.query(2, 5), 1);
+        // Range size 8 (full)
+        assert_eq!(st.query(0, 7), 1);
+    }
+
+    #[test]
+    fn get_out_of_bounds() {
+        let st = SparseTable::min_table(&[10, 20]);
+        assert_eq!(st.get(0), Some(&10));
+        assert_eq!(st.get(1), Some(&20));
+        assert!(st.get(2).is_none());
+        assert!(st.get(100).is_none());
+    }
+
+    #[test]
+    fn empty_table_is_empty() {
+        let st = SparseTable::<i32>::min_table(&[]);
+        assert!(st.is_empty());
+        assert_eq!(st.len(), 0);
+        assert_eq!(st.operation(), QueryOp::Min);
+        assert!(st.get(0).is_none());
+    }
+
+    #[test]
+    fn index_sparse_table_query_value_matches_index() {
+        let data = [7, 3, 9, 1, 5, 8, 2, 6];
+        let ist = IndexSparseTable::build(&data, QueryOp::Min);
+        for left in 0..data.len() {
+            for right in left..data.len() {
+                let (idx, val) = ist.query(left, right);
+                assert_eq!(*val, data[idx], "value at index should match data");
+            }
+        }
+    }
+
+    #[test]
+    fn display_max_table() {
+        let st = SparseTable::max_table(&[1, 2, 3, 4, 5]);
+        assert_eq!(format!("{}", st), "SparseTable(5 elements, Max)");
+    }
 }
