@@ -423,6 +423,9 @@ strip = true        # Remove debug symbols
 # the upstream repos as git dependencies.
 [patch.crates-io]
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", branch = "master" }
+# Track upstream asupersync to pick up runtime/reactor fixes (including
+# macOS kqueue compatibility) faster than crates.io releases.
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", branch = "master" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
