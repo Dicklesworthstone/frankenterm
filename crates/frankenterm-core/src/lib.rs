@@ -109,6 +109,7 @@ pub mod gc;
 pub mod hyperloglog;
 pub mod incident_bundle;
 pub mod ingest;
+pub mod interval_tree;
 #[cfg(unix)]
 pub mod ipc;
 pub mod kalman_watchdog;
