@@ -87,13 +87,14 @@ proptest! {
     /// range_sum(l, r) == prefix_sum(r) - prefix_sum(l-1) when l > 0.
     #[test]
     fn prop_range_sum_decomposition(
-        n in 2usize..=30,
         values in prop::collection::vec(-1000i64..=1000, 2..=30),
-        l in 0usize..30,
-        r in 0usize..30,
+        l_frac in 0.0f64..1.0,
+        r_frac in 0.0f64..1.0,
     ) {
-        let n = n.min(values.len());
-        prop_assume!(l < n && r < n && l <= r);
+        let n = values.len();
+        let a = (l_frac * n as f64) as usize % n;
+        let b = (r_frac * n as f64) as usize % n;
+        let (l, r) = if a <= b { (a, b) } else { (b, a) };
         let ft = FenwickTree::from_slice(&values[..n]);
 
         let range = ft.range_sum(l, r);

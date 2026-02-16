@@ -24,6 +24,12 @@ fn arb_values(max_n: usize) -> impl Strategy<Value = Vec<i64>> {
     prop::collection::vec(-1000i64..=1000, 1..=max_n)
 }
 
+/// Generate a valid ordered range [l, r] where l <= r and both < n.
+fn arb_range(n: usize) -> (usize, usize) {
+    // Intentionally not a strategy — used to compute from fractions
+    (0, n.saturating_sub(1))
+}
+
 // ── Query correctness ───────────────────────────────────────────────
 
 proptest! {
@@ -33,11 +39,13 @@ proptest! {
     #[test]
     fn prop_query_matches_naive(
         values in arb_values(30),
-        l in 0usize..30,
-        r in 0usize..30,
+        l_frac in 0.0f64..1.0,
+        r_frac in 0.0f64..1.0,
     ) {
         let n = values.len();
-        prop_assume!(l < n && r < n && l <= r);
+        let a = (l_frac * n as f64) as usize % n;
+        let b = (r_frac * n as f64) as usize % n;
+        let (l, r) = if a <= b { (a, b) } else { (b, a) };
         let mut st = SegmentTree::from_slice(&values);
 
         let naive: i64 = values[l..=r].iter().copied().fold(0i64, |a, b| a.wrapping_add(b));
@@ -48,10 +56,10 @@ proptest! {
     #[test]
     fn prop_point_query_matches_value(
         values in arb_values(30),
-        i in 0usize..30,
+        i_frac in 0.0f64..1.0,
     ) {
         let n = values.len();
-        prop_assume!(i < n);
+        let i = (i_frac * n as f64) as usize % n;
         let mut st = SegmentTree::from_slice(&values);
         prop_assert_eq!(st.query(i, i), values[i], "point query mismatch at {}", i);
     }
@@ -77,13 +85,20 @@ proptest! {
     #[test]
     fn prop_range_decomposition(
         values in arb_values(30),
-        l in 0usize..30,
-        r in 0usize..30,
-        m_offset in 0usize..30,
+        l_frac in 0.0f64..1.0,
+        r_frac in 0.0f64..1.0,
+        m_frac in 0.0f64..1.0,
     ) {
         let n = values.len();
-        prop_assume!(l < n && r < n && l < r);
-        let m = l + (m_offset % (r - l)); // m in [l, r)
+        prop_assume!(n >= 2);
+        let a = (l_frac * n as f64) as usize % n;
+        let b = (r_frac * n as f64) as usize % n;
+        let (l, r) = if a < b { (a, b) } else if b < a { (b, a) } else {
+            // a == b, need l < r
+            if a + 1 < n { (a, a + 1) } else { (a.saturating_sub(1), a) }
+        };
+        prop_assume!(l < r);
+        let m = l + ((m_frac * (r - l) as f64) as usize % (r - l)); // m in [l, r)
         let mut st = SegmentTree::from_slice(&values);
 
         let full = st.query(l, r);
@@ -107,13 +122,16 @@ proptest! {
     #[test]
     fn prop_point_update_affects_containing_ranges(
         values in arb_values(20),
-        i in 0usize..20,
+        i_frac in 0.0f64..1.0,
         delta in -500i64..=500,
-        l in 0usize..20,
-        r in 0usize..20,
+        l_frac in 0.0f64..1.0,
+        r_frac in 0.0f64..1.0,
     ) {
         let n = values.len();
-        prop_assume!(i < n && l < n && r < n && l <= r);
+        let i = (i_frac * n as f64) as usize % n;
+        let a = (l_frac * n as f64) as usize % n;
+        let b = (r_frac * n as f64) as usize % n;
+        let (l, r) = if a <= b { (a, b) } else { (b, a) };
         let mut st = SegmentTree::from_slice(&values);
         let before = st.query(l, r);
         st.point_update(i, delta);
@@ -132,11 +150,11 @@ proptest! {
     #[test]
     fn prop_point_update_additive(
         n in 1usize..=20,
-        i in 0usize..20,
+        i_frac in 0.0f64..1.0,
         a in -500i64..=500,
         b in -500i64..=500,
     ) {
-        prop_assume!(i < n);
+        let i = (i_frac * n as f64) as usize % n;
 
         let mut st1 = SegmentTree::new(n);
         st1.point_update(i, a);
@@ -163,12 +181,14 @@ proptest! {
     #[test]
     fn prop_range_update_correct(
         values in arb_values(20),
-        l in 0usize..20,
-        r in 0usize..20,
+        l_frac in 0.0f64..1.0,
+        r_frac in 0.0f64..1.0,
         delta in -100i64..=100,
     ) {
         let n = values.len();
-        prop_assume!(l < n && r < n && l <= r);
+        let a = (l_frac * n as f64) as usize % n;
+        let b = (r_frac * n as f64) as usize % n;
+        let (l, r) = if a <= b { (a, b) } else { (b, a) };
 
         let mut st = SegmentTree::from_slice(&values);
         st.range_update(l, r, delta);
@@ -188,11 +208,11 @@ proptest! {
     #[test]
     fn prop_range_update_single_equals_point(
         values in arb_values(20),
-        i in 0usize..20,
+        i_frac in 0.0f64..1.0,
         delta in -500i64..=500,
     ) {
         let n = values.len();
-        prop_assume!(i < n);
+        let i = (i_frac * n as f64) as usize % n;
 
         let mut st_point = SegmentTree::from_slice(&values);
         st_point.point_update(i, delta);
@@ -275,11 +295,11 @@ proptest! {
     #[test]
     fn prop_point_set_correct(
         values in arb_values(20),
-        i in 0usize..20,
+        i_frac in 0.0f64..1.0,
         new_val in -500i64..=500,
     ) {
         let n = values.len();
-        prop_assume!(i < n);
+        let i = (i_frac * n as f64) as usize % n;
 
         let mut st = SegmentTree::from_slice(&values);
         st.point_set(i, new_val);
@@ -290,11 +310,11 @@ proptest! {
     #[test]
     fn prop_point_set_isolated(
         values in arb_values(15),
-        i in 0usize..15,
+        i_frac in 0.0f64..1.0,
         new_val in -500i64..=500,
     ) {
         let n = values.len();
-        prop_assume!(i < n);
+        let i = (i_frac * n as f64) as usize % n;
 
         let mut st = SegmentTree::from_slice(&values);
         st.point_set(i, new_val);
@@ -343,12 +363,14 @@ proptest! {
     #[test]
     fn prop_to_vec_after_range_update(
         values in arb_values(20),
-        l in 0usize..20,
-        r in 0usize..20,
+        l_frac in 0.0f64..1.0,
+        r_frac in 0.0f64..1.0,
         delta in -100i64..=100,
     ) {
         let n = values.len();
-        prop_assume!(l < n && r < n && l <= r);
+        let a = (l_frac * n as f64) as usize % n;
+        let b = (r_frac * n as f64) as usize % n;
+        let (l, r) = if a <= b { (a, b) } else { (b, a) };
 
         let mut st = SegmentTree::from_slice(&values);
         st.range_update(l, r, delta);
