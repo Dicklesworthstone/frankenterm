@@ -30,123 +30,123 @@ panes:
     cols: 120
     rows: 34
 events:
-  - at: "1ms"
+  - at: "0.001s"
     pane: 60
     action: typing
     content: "i"
-  - at: "2ms"
+  - at: "0.002s"
     pane: 61
     action: paste
     content: "kubectl get pods"
-  - at: "3ms"
+  - at: "0.003s"
     pane: 62
     action: mouse
     name: left_click
-  - at: "4ms"
+  - at: "0.004s"
     pane: 60
     action: resize
     content: "160x48"
-  - at: "5ms"
+  - at: "0.005s"
     pane: 61
     action: set_font_size
     content: "1.12"
-  - at: "6ms"
+  - at: "0.006s"
     pane: 62
     action: resize
     content: "160x48"
-  - at: "7ms"
+  - at: "0.007s"
     pane: 60
     action: paste
     content: "fn storm() {}"
-  - at: "8ms"
+  - at: "0.008s"
     pane: 61
     action: typing
     content: ":wq"
-  - at: "9ms"
+  - at: "0.009s"
     pane: 62
     action: mouse
     name: drag_start
-  - at: "10ms"
+  - at: "0.010s"
     pane: 60
     action: set_font_size
     content: "0.88"
-  - at: "11ms"
+  - at: "0.011s"
     pane: 61
     action: resize
     content: "92x26"
-  - at: "12ms"
+  - at: "0.012s"
     pane: 62
     action: set_font_size
     content: "1.18"
-  - at: "13ms"
+  - at: "0.013s"
     pane: 60
     action: typing
     content: "cargo"
-  - at: "14ms"
+  - at: "0.014s"
     pane: 61
     action: paste
     content: "cargo check --workspace"
-  - at: "15ms"
+  - at: "0.015s"
     pane: 62
     action: mouse
     name: drag_end
-  - at: "16ms"
+  - at: "0.016s"
     pane: 60
     action: resize
     content: "148x44"
-  - at: "17ms"
+  - at: "0.017s"
     pane: 61
     action: set_font_size
     content: "1.04"
-  - at: "18ms"
+  - at: "0.018s"
     pane: 62
     action: resize
     content: "98x28"
-  - at: "19ms"
+  - at: "0.019s"
     pane: 60
     action: paste
     content: "let a = 42;"
-  - at: "20ms"
+  - at: "0.020s"
     pane: 61
     action: typing
     content: "/compact"
-  - at: "21ms"
+  - at: "0.021s"
     pane: 62
     action: mouse
     name: wheel_up
-  - at: "22ms"
+  - at: "0.022s"
     pane: 60
     action: set_font_size
     content: "1.20"
-  - at: "23ms"
+  - at: "0.023s"
     pane: 61
     action: resize
     content: "104x32"
-  - at: "24ms"
+  - at: "0.024s"
     pane: 62
     action: set_font_size
     content: "0.92"
-  - at: "25ms"
+  - at: "0.025s"
     pane: 60
     action: typing
     content: ":q"
-  - at: "26ms"
+  - at: "0.026s"
     pane: 61
     action: paste
     content: "tail -f app.log"
-  - at: "27ms"
+  - at: "0.027s"
     pane: 62
     action: mouse
     name: middle_click
-  - at: "28ms"
+  - at: "0.028s"
     pane: 60
     action: resize
     content: "120x34"
-  - at: "29ms"
+  - at: "0.029s"
     pane: 61
     action: set_font_size
     content: "1.00"
-  - at: "30ms"
+  - at: "0.030s"
     pane: 62
     action: marker
     name: adversarial_done

@@ -24,67 +24,67 @@ panes:
     cols: 110
     rows: 30
 events:
-  - at: "1ms"
+  - at: "0.001s"
     pane: 70
     action: typing
     content: "insert mode"
-  - at: "2ms"
+  - at: "0.002s"
     pane: 70
     action: resize
     content: "150x46"
-  - at: "3ms"
+  - at: "0.003s"
     pane: 71
     action: paste
     content: "tail -f runtime.log"
-  - at: "4ms"
+  - at: "0.004s"
     pane: 70
     action: set_font_size
     content: "1.16"
-  - at: "5ms"
+  - at: "0.005s"
     pane: 71
     action: mouse
     name: left_click
-  - at: "6ms"
+  - at: "0.006s"
     pane: 70
     action: resize
     content: "84x24"
-  - at: "7ms"
+  - at: "0.007s"
     pane: 71
     action: set_font_size
     content: "0.90"
-  - at: "8ms"
+  - at: "0.008s"
     pane: 70
     action: paste
     content: "let wrapped = true;"
-  - at: "9ms"
+  - at: "0.009s"
     pane: 71
     action: typing
     content: "/retry"
-  - at: "10ms"
+  - at: "0.010s"
     pane: 70
     action: mouse
     name: wheel_down
-  - at: "11ms"
+  - at: "0.011s"
     pane: 71
     action: resize
     content: "126x36"
-  - at: "12ms"
+  - at: "0.012s"
     pane: 70
     action: set_font_size
     content: "1.03"
-  - at: "13ms"
+  - at: "0.013s"
     pane: 71
     action: paste
     content: "cargo run -p frankenterm -- watch"
-  - at: "14ms"
+  - at: "0.014s"
     pane: 70
     action: typing
     content: "<esc>:w"
-  - at: "15ms"
+  - at: "0.015s"
     pane: 71
     action: mouse
     name: drag_select
-  - at: "16ms"
+  - at: "0.016s"
     pane: 70
     action: marker
     name: regression_done

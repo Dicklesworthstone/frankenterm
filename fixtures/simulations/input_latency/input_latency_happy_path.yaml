@@ -26,47 +26,47 @@ panes:
     rows: 34
     initial_content: "$ "
 events:
-  - at: "200ms"
+  - at: "0.200s"
     pane: 50
     action: typing
     content: "open README"
-  - at: "260ms"
+  - at: "0.260s"
     pane: 50
     action: resize
     content: "140x40"
-  - at: "320ms"
+  - at: "0.320s"
     pane: 50
     action: paste
     content: "fn demo() { println!(\"ok\"); }"
-  - at: "380ms"
+  - at: "0.380s"
     pane: 50
     action: set_font_size
     content: "1.08"
-  - at: "440ms"
+  - at: "0.440s"
     pane: 50
     action: mouse
     name: left_click
-  - at: "620ms"
+  - at: "0.620s"
     pane: 51
     action: resize
     content: "132x38"
-  - at: "700ms"
+  - at: "0.700s"
     pane: 51
     action: typing
     content: "cargo test -q"
-  - at: "780ms"
+  - at: "0.780s"
     pane: 51
     action: paste
     content: "--nocapture"
-  - at: "860ms"
+  - at: "0.860s"
     pane: 51
     action: mouse
     name: wheel_down
-  - at: "940ms"
+  - at: "0.940s"
     pane: 51
     action: set_font_size
     content: "0.96"
-  - at: "1100ms"
+  - at: "1.100s"
     pane: 51
     action: marker
     name: happy_done
