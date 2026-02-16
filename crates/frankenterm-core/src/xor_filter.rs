@@ -754,13 +754,13 @@ mod tests {
 
     #[test]
     fn fp_rate_large_sample() {
-        let n = 5000;
+        let n: u64 = 5000;
         let keys: Vec<u64> = (0..n).collect();
         let filter = XorFilter::build(&keys).unwrap();
 
         let test_count = 50_000u64;
         let mut fp = 0u64;
-        for i in (n as u64)..(n as u64 + test_count) {
+        for i in n..(n + test_count) {
             if filter.contains(i) {
                 fp += 1;
             }
@@ -901,13 +901,13 @@ mod tests {
 
     #[test]
     fn fp_rate_16bit_within_bounds() {
-        let n = 5000;
+        let n: u64 = 5000;
         let keys: Vec<u64> = (0..n).collect();
         let filter = XorFilter16::build(&keys).unwrap();
 
         let test_count = 100_000u64;
         let mut fp = 0u64;
-        for i in (n as u64)..(n as u64 + test_count) {
+        for i in n..(n + test_count) {
             if filter.contains(i) {
                 fp += 1;
             }
