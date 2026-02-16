@@ -686,4 +686,328 @@ mod tests {
         let root = tree.root.unwrap();
         assert_eq!(tree.nodes[root].key, 1);
     }
+
+    // ── Expanded test coverage ──────────────────────────────────────
+
+    #[test]
+    fn get_on_empty() {
+        let mut tree: SplayTree<i32, i32> = SplayTree::new();
+        assert!(tree.get(&42).is_none());
+    }
+
+    #[test]
+    fn remove_from_empty() {
+        let mut tree: SplayTree<i32, i32> = SplayTree::new();
+        assert_eq!(tree.remove(&1), None);
+    }
+
+    #[test]
+    fn contains_key_on_empty() {
+        let mut tree: SplayTree<i32, i32> = SplayTree::new();
+        assert!(!tree.contains_key(&1));
+    }
+
+    #[test]
+    fn peek_on_empty() {
+        let tree: SplayTree<i32, i32> = SplayTree::new();
+        assert!(tree.peek(&1).is_none());
+    }
+
+    #[test]
+    fn rank_on_empty() {
+        let tree: SplayTree<i32, i32> = SplayTree::new();
+        assert_eq!(tree.rank(&42), 0);
+    }
+
+    #[test]
+    fn keys_on_empty() {
+        let tree: SplayTree<i32, i32> = SplayTree::new();
+        assert!(tree.keys().is_empty());
+    }
+
+    #[test]
+    fn iter_on_empty() {
+        let tree: SplayTree<i32, i32> = SplayTree::new();
+        assert!(tree.iter().is_empty());
+    }
+
+    #[test]
+    fn remove_sole_element() {
+        let mut tree = SplayTree::new();
+        tree.insert(42, 100);
+        assert_eq!(tree.remove(&42), Some(100));
+        assert!(tree.is_empty());
+        assert_eq!(tree.len(), 0);
+        assert!(tree.min().is_none());
+    }
+
+    #[test]
+    fn remove_all_elements() {
+        let mut tree = SplayTree::new();
+        for i in 0..10 {
+            tree.insert(i, i * 10);
+        }
+        for i in 0..10 {
+            assert_eq!(tree.remove(&i), Some(i * 10));
+        }
+        assert!(tree.is_empty());
+        assert_eq!(tree.len(), 0);
+    }
+
+    #[test]
+    fn insert_ascending_order() {
+        let mut tree = SplayTree::new();
+        for i in 0..50 {
+            tree.insert(i, i);
+        }
+        assert_eq!(tree.len(), 50);
+        let keys: Vec<i32> = tree.keys().into_iter().copied().collect();
+        let expected: Vec<i32> = (0..50).collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn insert_descending_order() {
+        let mut tree = SplayTree::new();
+        for i in (0..50).rev() {
+            tree.insert(i, i);
+        }
+        assert_eq!(tree.len(), 50);
+        let keys: Vec<i32> = tree.keys().into_iter().copied().collect();
+        let expected: Vec<i32> = (0..50).collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn min_max_single_element() {
+        let mut tree = SplayTree::new();
+        tree.insert(42, 100);
+        assert_eq!(tree.min(), Some((&42, &100)));
+        assert_eq!(tree.max(), Some((&42, &100)));
+    }
+
+    #[test]
+    fn kth_all_elements() {
+        let mut tree = SplayTree::new();
+        for i in [5, 3, 7, 1, 4, 6, 8, 2] {
+            tree.insert(i, i * 10);
+        }
+        let sorted = [1, 2, 3, 4, 5, 6, 7, 8];
+        for (k, &expected_key) in sorted.iter().enumerate() {
+            let (key, val) = tree.kth(k).unwrap();
+            assert_eq!(*key, expected_key);
+            assert_eq!(*val, expected_key * 10);
+        }
+    }
+
+    #[test]
+    fn rank_all_elements() {
+        let mut tree = SplayTree::new();
+        for i in [5, 2, 8, 1, 4, 7, 9, 3, 6] {
+            tree.insert(i, 0);
+        }
+        for i in 1..=9 {
+            assert_eq!(tree.rank(&i), (i - 1) as usize);
+        }
+    }
+
+    #[test]
+    fn rank_missing_keys() {
+        let mut tree = SplayTree::new();
+        tree.insert(10, 0);
+        tree.insert(20, 0);
+        tree.insert(30, 0);
+
+        // Keys less than 10: 0
+        assert_eq!(tree.rank(&5), 0);
+        // Keys less than 15: 1 (just 10)
+        assert_eq!(tree.rank(&15), 1);
+        // Keys less than 25: 2 (10, 20)
+        assert_eq!(tree.rank(&25), 2);
+        // Keys less than 35: 3 (10, 20, 30)
+        assert_eq!(tree.rank(&35), 3);
+    }
+
+    #[test]
+    fn free_list_reuse() {
+        let mut tree = SplayTree::new();
+        tree.insert(1, 10);
+        tree.insert(2, 20);
+        tree.insert(3, 30);
+        let arena_before = tree.nodes.len();
+
+        // Remove and reinsert should reuse arena slots
+        tree.remove(&2);
+        tree.insert(4, 40);
+        // Arena should not grow (free slot reused)
+        assert_eq!(tree.nodes.len(), arena_before);
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree.get(&4), Some(&40));
+    }
+
+    #[test]
+    fn clone_independence() {
+        let mut tree = SplayTree::new();
+        tree.insert(1, 10);
+        tree.insert(2, 20);
+
+        let mut cloned = tree.clone();
+        cloned.insert(3, 30);
+        cloned.remove(&1);
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(cloned.len(), 2);
+        assert!(tree.peek(&1).is_some());
+        assert!(cloned.peek(&1).is_none());
+    }
+
+    #[test]
+    fn interleaved_insert_remove() {
+        let mut tree = SplayTree::new();
+        tree.insert(1, 10);
+        tree.insert(2, 20);
+        tree.remove(&1);
+        tree.insert(3, 30);
+        tree.insert(4, 40);
+        tree.remove(&3);
+
+        assert_eq!(tree.len(), 2);
+        assert!(tree.peek(&1).is_none());
+        assert_eq!(tree.peek(&2), Some(&20));
+        assert!(tree.peek(&3).is_none());
+        assert_eq!(tree.peek(&4), Some(&40));
+    }
+
+    #[test]
+    fn overwrite_preserves_size() {
+        let mut tree = SplayTree::new();
+        tree.insert(1, 10);
+        tree.insert(2, 20);
+        tree.insert(3, 30);
+
+        // Overwrite key 2
+        tree.insert(2, 200);
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree.get(&2), Some(&200));
+    }
+
+    #[test]
+    fn size_consistency_after_operations() {
+        let mut tree = SplayTree::new();
+        for i in 0..20 {
+            tree.insert(i, i);
+            assert_eq!(tree.len(), (i + 1) as usize);
+        }
+        for i in 0..10 {
+            tree.remove(&i);
+            assert_eq!(tree.len(), (19 - i) as usize);
+        }
+        // Remaining: 10..20
+        let keys: Vec<i32> = tree.keys().into_iter().copied().collect();
+        assert_eq!(keys, (10..20).collect::<Vec<i32>>());
+    }
+
+    #[test]
+    fn get_splays_to_root() {
+        let mut tree = SplayTree::new();
+        for i in 0..10 {
+            tree.insert(i, i);
+        }
+        // Access key 5 — should become root
+        tree.get(&5);
+        let root = tree.root.unwrap();
+        assert_eq!(tree.nodes[root].key, 5);
+
+        // Access key 0 — should become root
+        tree.get(&0);
+        let root = tree.root.unwrap();
+        assert_eq!(tree.nodes[root].key, 0);
+    }
+
+    #[test]
+    fn get_nonexistent_still_splays() {
+        let mut tree = SplayTree::new();
+        tree.insert(1, 10);
+        tree.insert(5, 50);
+        tree.insert(10, 100);
+
+        // Get nonexistent key 3 — nearest key splayed to root
+        assert!(tree.get(&3).is_none());
+        // Tree should still be valid
+        assert_eq!(tree.len(), 3);
+    }
+
+    #[test]
+    fn display_empty() {
+        let tree: SplayTree<i32, i32> = SplayTree::new();
+        assert_eq!(format!("{}", tree), "SplayTree(0 elements)");
+    }
+
+    #[test]
+    fn serde_roundtrip_after_removes() {
+        let mut tree = SplayTree::new();
+        for i in 0..10 {
+            tree.insert(i, i * 10);
+        }
+        tree.remove(&3);
+        tree.remove(&7);
+
+        let json = serde_json::to_string(&tree).unwrap();
+        let restored: SplayTree<i32, i32> = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.len(), 8);
+        assert!(restored.peek(&3).is_none());
+        assert!(restored.peek(&7).is_none());
+        assert_eq!(restored.peek(&5), Some(&50));
+    }
+
+    #[test]
+    fn remove_min_and_max() {
+        let mut tree = SplayTree::new();
+        for i in 1..=5 {
+            tree.insert(i, i);
+        }
+        // Remove min
+        let (min_key, _) = tree.min().map(|(&k, &v)| (k, v)).unwrap();
+        tree.remove(&min_key);
+        assert_eq!(tree.min().map(|(&k, _)| k), Some(2));
+
+        // Remove max
+        let (max_key, _) = tree.max().map(|(&k, &v)| (k, v)).unwrap();
+        tree.remove(&max_key);
+        assert_eq!(tree.max().map(|(&k, _)| k), Some(4));
+    }
+
+    #[test]
+    fn remove_root_node() {
+        let mut tree = SplayTree::new();
+        tree.insert(5, 50);
+        tree.insert(3, 30);
+        tree.insert(7, 70);
+
+        // Get 5 to ensure it's root
+        tree.get(&5);
+        let root = tree.root.unwrap();
+        assert_eq!(tree.nodes[root].key, 5);
+
+        // Remove root
+        tree.remove(&5);
+        assert_eq!(tree.len(), 2);
+        assert!(tree.peek(&5).is_none());
+        assert_eq!(tree.peek(&3), Some(&30));
+        assert_eq!(tree.peek(&7), Some(&70));
+    }
+
+    #[test]
+    fn kth_and_rank_inverse() {
+        let mut tree = SplayTree::new();
+        for i in [10, 20, 30, 40, 50] {
+            tree.insert(i, 0);
+        }
+        // kth(rank(k)) == k for all k in tree
+        for &k in &[10, 20, 30, 40, 50] {
+            let r = tree.rank(&k);
+            let (key, _) = tree.kth(r).unwrap();
+            assert_eq!(*key, k);
+        }
+    }
 }
