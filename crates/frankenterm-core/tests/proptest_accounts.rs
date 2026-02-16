@@ -1138,7 +1138,8 @@ proptest! {
         }
     }
 
-    /// select_account: selected account_id never appears in filtered_out.
+    /// select_account: selected account's percent_remaining is always at or above threshold.
+    /// (Cannot compare by account_id alone since duplicate IDs are possible.)
     #[test]
     fn select_winner_not_in_filtered(
         accounts in arb_account_vec(10),
@@ -1146,12 +1147,20 @@ proptest! {
     ) {
         let result = select_account(&accounts, &config);
         if let Some(ref selected) = result.selected {
-            let in_filtered = result.explanation.filtered_out.iter()
-                .any(|f| f.account_id == selected.account_id);
-            prop_assert!(!in_filtered,
-                "selected account '{}' should not appear in filtered_out",
-                selected.account_id
+            // The selected account must be at or above threshold
+            prop_assert!(
+                selected.percent_remaining >= config.threshold_percent,
+                "selected account '{}' has {:.2}% but threshold is {:.2}%",
+                selected.account_id, selected.percent_remaining, config.threshold_percent
             );
+            // Every filtered account must be below threshold
+            for f in &result.explanation.filtered_out {
+                prop_assert!(
+                    f.percent_remaining < config.threshold_percent,
+                    "filtered account '{}' has {:.2}% which is at or above threshold {:.2}%",
+                    f.account_id, f.percent_remaining, config.threshold_percent
+                );
+            }
         }
     }
 }
