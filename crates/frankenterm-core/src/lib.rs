@@ -198,6 +198,7 @@ pub mod sharding;
 pub mod simd_scan;
 pub mod skip_list;
 pub mod snapshot_engine;
+pub mod sparse_table;
 pub mod splay_tree;
 pub mod spectral;
 pub mod spsc_ring_buffer;
@@ -232,6 +233,7 @@ pub mod wavelet_tree;
 pub mod watcher_client;
 pub mod webhook;
 pub mod wezterm;
+pub mod work_stealing_deque;
 pub mod workflows;
 pub mod xor_filter;
 
