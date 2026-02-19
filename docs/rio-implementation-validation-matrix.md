@@ -25,6 +25,20 @@ Scope: convert Rio-derived recommendations into execution-ready implementation/v
 | R6 | Frame pacing policy tiers (latency/balanced/efficiency) | `ft-1u90p.8` (rollout/policy), `ft-1u90p.4` (historical impl) | Open + Closed | Unit: policy selection + fallback; Integration: pacing mode switch under monitor/occlusion transitions | `tests/e2e/rio/test_frame_pacing_policy_tiers.sh` using `fixtures/rio/frame_pacing` | `e2e-artifacts/rio/frame_pacing/<run_id>/pacing_decisions.jsonl`, `missed_frame_report.json` |
 | R7 | Effective-config introspection + strict validation mode | `ft-1u90p.8` (active), `ft-vv3h` (historical impl), `ft-x4bt` (historical impl) | Open + Closed + Closed | Unit: precedence/source attribution; Integration: invalid/unknown/platform-mismatch config handling | `tests/e2e/rio/test_effective_config_resolve.sh` using `fixtures/rio/config_resolve` | `e2e-artifacts/rio/config_resolve/<run_id>/resolved_config.json`, `validation_events.jsonl` |
 
+## Legacy Rio Code Anchors (2026-02-19 Verification Pass)
+
+These anchors were verified directly against `legacy_rio/rio` to make downstream implementation beads less ambiguous.
+
+| Rec | Verified legacy Rio anchors | Why it matters for FrankenTerm implementation beads |
+|---|---|---|
+| R1 | `legacy_rio/rio/rio-backend/src/performer/mod.rs:218` (Wakeup emission after non-sync parse), `legacy_rio/rio/frontends/rioterm/src/application.rs:304` (Wakeup handling + redraw scheduling), `legacy_rio/rio/frontends/rioterm/src/scheduler.rs:61` (timer dispatch) | Defines the concrete wakeup/coalescing path to preserve when implementing ingest->detect->render coalescing contracts. |
+| R2 | `legacy_rio/rio/frontends/rioterm/src/context/renderable.rs:98` (`PendingUpdate` dirty/UI damage merge), `legacy_rio/rio/rio-backend/src/crosswords/mod.rs:559` (`peek_damage_event`), `legacy_rio/rio/frontends/rioterm/src/renderer/mod.rs:884` (terminal+UI damage merge at render) | Confirms two-source damage merge semantics and where full/partial/cursor-only fallback is decided. |
+| R3 | `legacy_rio/rio/rio-backend/src/performer/mod.rs:32` (`READ_BUFFER_SIZE`, `MAX_LOCKED_READ`), `legacy_rio/rio/rio-backend/src/performer/mod.rs:213` (lock-duration guard), `legacy_rio/rio/rio-backend/src/performer/mod.rs:335` (sync timeout handling) | Establishes concrete batching/guardrail knobs and timeout behavior for adaptive sync/update bead work. |
+| R4 | `legacy_rio/rio/rio-backend/src/crosswords/mod.rs:448` (fixed scrollback allocation), `legacy_rio/rio/rio-backend/src/crosswords/mod.rs:588` (damage reset lifecycle) | Shows Rio baseline lacks a unified memory-budget controller; FrankenTerm beads must add explicit budget governance rather than assuming it exists upstream. |
+| R5 | `legacy_rio/rio/frontends/rioterm/src/router/mod.rs:511` (`wait_until` frame timing), `legacy_rio/rio/frontends/rioterm/src/router/mod.rs:569` (`update_vblank_interval`), `legacy_rio/rio/frontends/rioterm/src/application.rs:1420` (redraw continuation rules) | Provides the frame-timing and redraw hot path needed for pane-churn SLO instrumentation and benchmark wiring. |
+| R6 | `legacy_rio/rio/frontends/rioterm/src/screen/mod.rs:140` (performance/backend policy selection), `legacy_rio/rio/frontends/rioterm/src/application.rs:220` (unfocused/occluded render gating), `legacy_rio/rio/frontends/rioterm/src/router/mod.rs:61` (platform-specific redraw scheduling) | Anchors policy-tier behavior to concrete render gating and pacing decisions for rollout/ops beads. |
+| R7 | `legacy_rio/rio/rio-backend/src/config/mod.rs:378` (`try_load` + error surfaces), `legacy_rio/rio/rio-backend/src/config/mod.rs:458` (platform override merge), `legacy_rio/rio/frontends/rioterm/src/watcher.rs:35` (config change events), `legacy_rio/rio/frontends/rioterm/src/application.rs:357` (debounced config reload apply) | Defines effective-config precedence and live reload execution points required for strict validation/introspection contracts. |
+
 ## Deterministic Validation Command Contracts
 
 All implementation beads mapped above must include these command classes in notes/comments:
