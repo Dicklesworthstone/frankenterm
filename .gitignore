@@ -39,6 +39,9 @@ legacy_ghostty/
 # Legacy Zellij source (vendored for reference)
 legacy_zellij/
 
+# Legacy Rio source (vendored for reference)
+legacy_rio/
+
 # SQLite databases (runtime)
 *.db
 *.db-journal
