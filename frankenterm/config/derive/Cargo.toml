@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 repository = "https://github.com/wezterm/wezterm"
 description = "derive config metadata"
-license = "MIT"
+license-file = "../../../LICENSE"
 publish = false
 
 [lib]

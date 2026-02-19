@@ -5,7 +5,7 @@ version = "0.1.0"
 edition = "2024"
 repository = "https://github.com/wezterm/wezterm"
 description = "Model a Cell in a Terminal display"
-license = "MIT"
+license-file = "../../LICENSE"
 documentation = "https://docs.rs/frankenterm-cell"
 keywords = ["terminal", "cell"]
 publish = false
@@ -30,4 +30,3 @@ use_serde = ["dep:serde", "frankenterm-color-types/use_serde"]
 use_image = ["dep:image", "dep:frankenterm-blob-leases", "dep:log", "dep:ordered-float", "dep:sha2", "dep:thiserror"]
 
 [dev-dependencies]
-

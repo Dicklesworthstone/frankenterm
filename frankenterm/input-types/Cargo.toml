@@ -5,7 +5,7 @@ authors = ["Wez Furlong <wez@wezfurlong.org>"]
 edition = "2021"
 repository = "https://github.com/wezterm/wezterm"
 description = "config serialization for wezterm via dynamic json-like data values"
-license = "MIT"
+license-file = "../../LICENSE"
 publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

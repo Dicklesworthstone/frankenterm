@@ -5,7 +5,7 @@ version = "0.1.0"
 edition = "2018"
 repository = "https://github.com/wezterm/wezterm"
 description = "Surface and Line types for terminals"
-license = "MIT"
+license-file = "../../LICENSE"
 documentation = "https://docs.rs/frankenterm-surface"
 keywords = ["terminal", "surface", "line"]
 publish = false
@@ -37,4 +37,3 @@ use_image = ["frankenterm-cell/use_image"] # "image", "dep:image", "frankenterm-
 
 [dev-dependencies]
 k9.workspace = true
-

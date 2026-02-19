@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 repository = "https://github.com/wezterm/wezterm"
 description = "Portable unix domain sockets"
-license = "MIT"
+license-file = "../../LICENSE"
 documentation = "https://docs.rs/frankenterm-uds"
 publish = false
 
