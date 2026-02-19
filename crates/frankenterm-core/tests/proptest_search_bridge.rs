@@ -608,7 +608,7 @@ proptest! {
         prop_assert_eq!(cloned.results.len(), orig.results.len());
         for (a, b) in cloned.results.iter().zip(orig.results.iter()) {
             prop_assert_eq!(&a.doc_id, &b.doc_id);
-            prop_assert_eq!(a.score, b.score);
+            prop_assert_eq!(a.score.to_bits(), b.score.to_bits());
         }
     }
 

@@ -638,7 +638,10 @@ impl Scenario {
                 "[TYPING:{}]",
                 event.content
             ))),
-            EventAction::Paste => Ok(MockEvent::AppendOutput(format!("[PASTE:{}]", event.content))),
+            EventAction::Paste => Ok(MockEvent::AppendOutput(format!(
+                "[PASTE:{}]",
+                event.content
+            ))),
             EventAction::Mouse => {
                 let token = if event.name.trim().is_empty() {
                     event.content.trim()
@@ -1348,7 +1351,7 @@ fn div_ceil_u32(numerator: u32, denominator: u32) -> u32 {
     if denominator == 0 {
         numerator
     } else {
-        numerator.saturating_add(denominator.saturating_sub(1)) / denominator
+        numerator.div_ceil(denominator)
     }
 }
 

@@ -538,7 +538,7 @@ pub fn pressure_renice_candidates(
         .collect();
 
     // Sort by age descending (oldest first).
-    candidates.sort_by(|a, b| b.2.cmp(&a.2));
+    candidates.sort_by_key(|x| std::cmp::Reverse(x.2));
 
     candidates
         .iter()

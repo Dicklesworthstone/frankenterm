@@ -813,7 +813,7 @@ impl<T: Clone + Serialize + for<'de> Deserialize<'de>> DiskWal<T> {
 ///
 /// Each variant captures a specific state transition in the mux server.
 /// These are the `T` parameter for `WalEngine<MuxMutation>`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MuxMutation {
     /// Terminal output captured from a pane.
     PaneOutput { pane_id: u64, data: Vec<u8> },

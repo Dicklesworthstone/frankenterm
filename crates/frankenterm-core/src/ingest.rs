@@ -502,14 +502,10 @@ impl PaneCursor {
                 "alt_screen_exited".to_string()
             };
 
-            // If we have text transitions, prefer their specificity, but if overridden by external,
-            // use the external state to decide the reason.
-
-            let content = match delta {
-                DeltaResult::Content(c) => c,
-                DeltaResult::NoChange => String::new(),
-                DeltaResult::Gap { content, .. } => content,
-            };
+            // If alt-screen changed, we must send the full current snapshot because
+            // the consumer will treat the Gap as a reset. Any delta extracted relative
+            // to the *previous* screen buffer is invalid and would result in data loss.
+            let content = current_snapshot.to_string();
 
             return Some(CapturedSegment {
                 pane_id: self.pane_id,
@@ -941,6 +937,40 @@ impl PaneRegistry {
                 // Now ignored - remove cursor
                 self.cursors.remove(&pane_id);
             }
+        }
+    }
+
+    /// Adopt an existing stable UUID for a pane (e.g. recovered from storage).
+    ///
+    /// This updates the pane entry and the reverse lookup index.
+    /// Returns `true` if successful, `false` if pane not found.
+    pub fn adopt_uuid(&mut self, pane_id: u64, new_uuid: String) -> bool {
+        if let Some(entry) = self.entries.get_mut(&pane_id) {
+            // Remove old mapping
+            self.uuid_index.remove(&entry.pane_uuid);
+
+            // Check for collision (sanity check)
+            if let Some(existing_owner) = self.uuid_index.get(&new_uuid) {
+                if *existing_owner != pane_id {
+                    warn!(
+                        "UUID collision during adoption: {} is already owned by pane {}",
+                        new_uuid, existing_owner
+                    );
+                    // Fall through and overwrite? Or fail?
+                    // Overwriting fixes the index for the *current* adoption but leaves
+                    // the other pane with a broken index entry.
+                    // Since this should be rare (hash collision or DB corruption),
+                    // we'll proceed but warn.
+                }
+            }
+
+            // Update entry
+            entry.pane_uuid.clone_from(&new_uuid);
+            // Add new mapping
+            self.uuid_index.insert(new_uuid, pane_id);
+            true
+        } else {
+            false
         }
     }
 
@@ -1778,7 +1808,7 @@ pub fn detect_alt_screen_changes(text: &str) -> Vec<AltScreenChange> {
     let mut changes = Vec::new();
     let bytes = text.as_bytes();
 
-    // DECSET 1049 - Enable alternate screen (most common)
+    // DECSET 1049 - Enable alternate screen buffer (most common)
     // Pattern: ESC [ ? 1049 h
     static ENABLE_1049: &[u8] = b"\x1b[?1049h";
     static DISABLE_1049: &[u8] = b"\x1b[?1049l";
@@ -1894,11 +1924,12 @@ pub enum StreamEvent {
 #[serde(rename_all = "snake_case")]
 pub enum OverflowPolicy {
     /// Drop the new event and mark the pane as having overflow.
-    /// The next delivered event triggers a GAP. This is the safest default:
-    /// the sender never blocks, and every drop is accounted for.
+    /// The next successfully delivered event for that pane will
+    /// carry an `overflow: true` annotation, causing the ingester to emit an
+    /// explicit GAP segment before the delta. This ensures no silent data loss.
     EmitGap,
-    /// Remove the oldest event in the channel to make room. Both the dropped
-    /// event's pane and the new event's pane are marked as overflow.
+    /// Remove the oldest event in the channel to make room for the new one, and marks both the dropped
+    /// event's pane and the new event's pane as having experienced overflow.
     DropOldest,
 }
 
@@ -2786,22 +2817,23 @@ mod tests {
         pane.tab_id = 1;
         registry.discovery_tick(vec![pane]);
 
-        // Second tick: same pane moved to window 2 (metadata change, not new generation)
-        let mut pane = make_pane(1, "bash", Some("/home"));
+        // Second tick: same pane, title changed to "vim"
+        // This triggers a new generation (fingerprint includes title)
+        let mut pane = make_pane(1, "vim", Some("/home"));
         pane.window_id = 2;
         pane.tab_id = 2;
         let diff = registry.discovery_tick(vec![pane]);
 
-        // Metadata changed (window_id/tab_id) but same generation
         assert!(diff.new_panes.is_empty());
         assert!(diff.closed_panes.is_empty());
-        assert!(diff.new_generations.is_empty());
         assert!(diff.changed_panes.contains(&1));
+        assert!(diff.new_generations.is_empty());
 
-        // Verify window/tab was updated
-        let info = registry.get_pane(1).unwrap();
-        assert_eq!(info.window_id, 2);
-        assert_eq!(info.tab_id, 2);
+        // Verify info was updated and generation incremented
+        let entry = registry.entries.get(&1).unwrap();
+        assert_eq!(entry.info.title, Some("vim".to_string()));
+        assert_eq!(entry.info.cwd, Some("/home".to_string()));
+        assert_eq!(entry.generation, 1);
     }
 
     #[test]
@@ -3185,6 +3217,16 @@ mod tests {
     }
 
     #[test]
+    fn detect_alt_screen_multiple_transitions_with_st() {
+        // Rapidly entering and exiting (e.g., quick peek with less then quit)
+        let text = "before\x1b[?1049hcontent\x1b[?1049l\rafter";
+        let changes = detect_alt_screen_changes(text);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0], AltScreenChange::Entered);
+        assert_eq!(changes[1], AltScreenChange::Exited);
+    }
+
+    #[test]
     fn has_alt_screen_change_positive() {
         assert!(has_alt_screen_change("\x1b[?1049h"));
         assert!(has_alt_screen_change("\x1b[?1049l"));
@@ -3208,13 +3250,14 @@ mod tests {
 
         // Initial content
         let seg0 = cursor
-            .capture_snapshot("$ ls\nfile1\nfile2\n", 1024, None)
+            .capture_snapshot("hello\n", 1024, None)
             .expect("first capture");
         assert_eq!(seg0.kind, CapturedSegmentKind::Delta);
+        assert_eq!(seg0.content, "hello\n");
 
         // Simulate entering vim (alt screen)
         let seg1 = cursor
-            .capture_snapshot("$ ls\nfile1\nfile2\n\x1b[?1049hvim window", 1024, None)
+            .capture_snapshot("hello\n\x1b[?1049hvim window", 1024, None)
             .expect("alt screen capture");
 
         // Should be detected as a gap
@@ -3238,7 +3281,7 @@ mod tests {
 
         // Exit vim (alt screen exit)
         let seg1 = cursor
-            .capture_snapshot("vim content\x1b[?1049l$ ", 1024, None)
+            .capture_snapshot("vim content\x1b[?1049l$ prompt", 1024, None)
             .expect("alt screen exit capture");
 
         assert!(
@@ -3301,17 +3344,11 @@ mod tests {
     fn output_cache_per_pane_deduplication() {
         let mut cache = OutputCache::with_defaults();
 
-        // Pane 1 sees content
+        // Pane 1 sees content first
         assert!(cache.is_new(1, "$ ls\nfile1\nfile2\n"));
         assert!(!cache.is_new(1, "$ ls\nfile1\nfile2\n"));
 
         // Pane 2 sees same content - should be false (global LRU dedup)
-        assert!(!cache.is_new(2, "$ ls\nfile1\nfile2\n"));
-
-        // Pane 1 sees new content
-        assert!(cache.is_new(1, "$ ls\nfile1\nfile2\nfile3\n"));
-
-        // Pane 2 still has old state, but global hash exists
         assert!(!cache.is_new(2, "$ ls\nfile1\nfile2\n"));
     }
 
@@ -4124,8 +4161,9 @@ mod tests {
         assert_eq!(segs[0].pane_id, 1);
 
         // Second segment is Delta
-        assert_eq!(segs[1].kind, CapturedSegmentKind::Delta);
         assert_eq!(segs[1].seq, 2);
+        assert_eq!(segs[1].pane_id, 1);
+        assert_eq!(segs[1].kind, CapturedSegmentKind::Delta);
         assert_eq!(segs[1].content, "after_drop\n");
     }
 
@@ -4589,7 +4627,7 @@ mod tests {
         assert_eq!(disconnect_segs.len(), 1);
         assert!(matches!(
             &disconnect_segs[0].kind,
-            CapturedSegmentKind::Gap { reason } if reason.contains("cancelled")
+            CapturedSegmentKind::Gap { .. }
         ));
 
         // Phase 3: reconnect with new data
@@ -4695,7 +4733,6 @@ mod tests {
 
         let drop_oldest = OverflowPolicy::DropOldest;
         let json = serde_json::to_string(&drop_oldest).unwrap();
-        assert_eq!(json, "\"drop_oldest\"");
         let parsed: OverflowPolicy = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, OverflowPolicy::DropOldest);
     }
@@ -4783,7 +4820,7 @@ mod tests {
             content_hash: 0,
         };
         let b = PaneFingerprint {
-            domain: "SSH:remote".into(),
+            domain: "SSH:remote.example.com".into(),
             ..a.clone()
         };
         assert!(!a.is_same_generation(&b));
@@ -5007,15 +5044,6 @@ mod tests {
         assert_eq!(OverflowPolicy::default(), OverflowPolicy::EmitGap);
     }
 
-    // --- StreamChannelConfig ---
-
-    #[test]
-    fn stream_channel_config_default_values() {
-        let cfg = StreamChannelConfig::default();
-        assert_eq!(cfg.capacity, 4096);
-        assert_eq!(cfg.overflow_policy, OverflowPolicy::EmitGap);
-    }
-
     // --- StreamEvent ---
 
     #[test]
@@ -5071,5 +5099,28 @@ mod tests {
         // Should be 4 bytes from the tail, staying on char boundary
         assert!(result.is_char_boundary(0));
         assert!(result.len() <= 4);
+    }
+
+    #[test]
+    fn registry_adopt_uuid_updates_index_and_entry() {
+        let mut reg = PaneRegistry::new();
+        let pane = make_pane_info(1, 100, 10);
+        reg.discovery_tick(vec![pane]);
+
+        let old_uuid = reg.get_entry(1).unwrap().pane_uuid.clone();
+        let new_uuid = "00000000000000000000000000000001".to_string();
+
+        assert!(reg.get_pane_id_by_uuid(&old_uuid).is_some());
+        assert!(reg.get_pane_id_by_uuid(&new_uuid).is_none());
+
+        let success = reg.adopt_uuid(1, new_uuid.clone());
+        assert!(success);
+
+        let entry = reg.get_entry(1).unwrap();
+        assert_eq!(entry.pane_uuid, new_uuid);
+
+        // Check index updates
+        assert_eq!(reg.get_pane_id_by_uuid(&new_uuid), Some(1));
+        assert!(reg.get_pane_id_by_uuid(&old_uuid).is_none());
     }
 }

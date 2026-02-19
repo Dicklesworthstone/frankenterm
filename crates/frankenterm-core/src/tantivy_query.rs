@@ -739,23 +739,23 @@ impl LexicalSearchService for InMemorySearchService {
             }
             SortField::RecordedAt => {
                 if query.sort.descending {
-                    scored.sort_by(|(_, da), (_, db)| db.recorded_at_ms.cmp(&da.recorded_at_ms));
+                    scored.sort_by_key(|(_, d)| std::cmp::Reverse(d.recorded_at_ms));
                 } else {
-                    scored.sort_by(|(_, da), (_, db)| da.recorded_at_ms.cmp(&db.recorded_at_ms));
+                    scored.sort_by_key(|(_, d)| d.recorded_at_ms);
                 }
             }
             SortField::Sequence => {
                 if query.sort.descending {
-                    scored.sort_by(|(_, da), (_, db)| db.sequence.cmp(&da.sequence));
+                    scored.sort_by_key(|(_, d)| std::cmp::Reverse(d.sequence));
                 } else {
-                    scored.sort_by(|(_, da), (_, db)| da.sequence.cmp(&db.sequence));
+                    scored.sort_by_key(|(_, d)| d.sequence);
                 }
             }
             SortField::LogOffset => {
                 if query.sort.descending {
-                    scored.sort_by(|(_, da), (_, db)| db.log_offset.cmp(&da.log_offset));
+                    scored.sort_by_key(|(_, d)| std::cmp::Reverse(d.log_offset));
                 } else {
-                    scored.sort_by(|(_, da), (_, db)| da.log_offset.cmp(&db.log_offset));
+                    scored.sort_by_key(|(_, d)| d.log_offset);
                 }
             }
         }
