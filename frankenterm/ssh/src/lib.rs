@@ -49,6 +49,12 @@ pub mod runtime {
         pub use smol::channel::{bounded, Receiver, RecvError, Sender, TryRecvError};
     }
 
+    pub mod io {
+        // Transitional shim: keep trait usage behind a crate-local path so
+        // async runtime migration can switch implementations centrally.
+        pub use smol::io::{AsyncRead, AsyncWrite};
+    }
+
     #[cfg(feature = "async-asupersync")]
     static ASUPERSYNC_RUNTIME: std::sync::LazyLock<asupersync::runtime::Runtime> =
         std::sync::LazyLock::new(|| {

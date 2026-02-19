@@ -1,12 +1,13 @@
 use super::{Metadata, SessionRequest, SessionSender, SftpChannelResult, SftpRequest};
 use crate::runtime::channel::{bounded, Sender};
-use smol::future::FutureExt;
+use crate::runtime::io::{AsyncRead, AsyncWrite};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{fmt, io};
 
 pub(crate) type FileId = usize;
+type IoFuture<T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + Sync + 'static>>;
 
 /// A file handle to an SFTP connection.
 pub struct File {
@@ -17,10 +18,10 @@ pub struct File {
 
 #[derive(Default)]
 struct FileState {
-    f_read: Option<Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send + Sync + 'static>>>,
-    f_write: Option<Pin<Box<dyn Future<Output = io::Result<usize>> + Send + Sync + 'static>>>,
-    f_flush: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync + 'static>>>,
-    f_close: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync + 'static>>>,
+    f_read: Option<IoFuture<Vec<u8>>>,
+    f_write: Option<IoFuture<usize>>,
+    f_flush: Option<IoFuture<()>>,
+    f_close: Option<IoFuture<()>>,
 }
 
 #[derive(Debug)]
@@ -143,7 +144,22 @@ impl File {
     }
 }
 
-impl smol::io::AsyncRead for File {
+fn poll_io_future<T, F>(
+    slot: &mut Option<IoFuture<T>>,
+    cx: &mut Context<'_>,
+    init: F,
+) -> Poll<io::Result<T>>
+where
+    F: FnOnce() -> IoFuture<T>,
+{
+    let poll = slot.get_or_insert_with(init).as_mut().poll(cx);
+    if poll.is_ready() {
+        slot.take();
+    }
+    poll
+}
+
+impl AsyncRead for File {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -157,15 +173,9 @@ impl smol::io::AsyncRead for File {
         let tx = self.tx.as_ref().unwrap().clone();
         let file_id = self.file_id;
 
-        let poll = self
-            .state
-            .f_read
-            .get_or_insert_with(|| Box::pin(read(tx, file_id, buf.len())))
-            .poll(cx);
-
-        if poll.is_ready() {
-            self.state.f_read.take();
-        }
+        let poll = poll_io_future(&mut self.state.f_read, cx, || {
+            Box::pin(read(tx, file_id, buf.len()))
+        });
 
         match poll {
             Poll::Pending => Poll::Pending,
@@ -179,7 +189,7 @@ impl smol::io::AsyncRead for File {
     }
 }
 
-impl smol::io::AsyncWrite for File {
+impl AsyncWrite for File {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -196,17 +206,9 @@ impl smol::io::AsyncWrite for File {
         let tx = self.tx.as_ref().unwrap().clone();
         let file_id = self.file_id;
 
-        let poll = self
-            .state
-            .f_write
-            .get_or_insert_with(|| Box::pin(write(tx, file_id, buf.to_vec())))
-            .poll(cx);
-
-        if poll.is_ready() {
-            self.state.f_write.take();
-        }
-
-        poll
+        poll_io_future(&mut self.state.f_write, cx, || {
+            Box::pin(write(tx, file_id, buf.to_vec()))
+        })
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -219,17 +221,7 @@ impl smol::io::AsyncWrite for File {
         let tx = self.tx.as_ref().unwrap().clone();
         let file_id = self.file_id;
 
-        let poll = self
-            .state
-            .f_flush
-            .get_or_insert_with(|| Box::pin(flush(tx, file_id)))
-            .poll(cx);
-
-        if poll.is_ready() {
-            self.state.f_flush.take();
-        }
-
-        poll
+        poll_io_future(&mut self.state.f_flush, cx, || Box::pin(flush(tx, file_id)))
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -242,17 +234,7 @@ impl smol::io::AsyncWrite for File {
         let tx = self.tx.as_ref().unwrap().clone();
         let file_id = self.file_id;
 
-        let poll = self
-            .state
-            .f_close
-            .get_or_insert_with(|| Box::pin(close(tx, file_id)))
-            .poll(cx);
-
-        if poll.is_ready() {
-            self.state.f_close.take();
-        }
-
-        poll
+        poll_io_future(&mut self.state.f_close, cx, || Box::pin(close(tx, file_id)))
     }
 }
 
