@@ -115,6 +115,12 @@ pub struct SearchConfig {
     pub rrf_k: u32,
     /// Two-tier blending weight for quality tier (0.0-1.0).
     pub quality_weight: f64,
+    /// Quality-tier budget in milliseconds.
+    pub quality_timeout_ms: u64,
+    /// Restrict semantic retrieval to fast tier only.
+    pub fast_only: bool,
+    /// Hybrid fusion backend selector.
+    pub fusion_backend: String,
     /// Enable cross-encoder reranking.
     pub reranker_enabled: bool,
     /// Background daemon configuration.
@@ -131,6 +137,9 @@ impl Default for SearchConfig {
             quality_model: "all-MiniLM-L6-v2".into(),
             rrf_k: 60,
             quality_weight: 0.7,
+            quality_timeout_ms: 200,
+            fast_only: false,
+            fusion_backend: "legacy".into(),
             reranker_enabled: false,
             daemon: SearchDaemonConfig::default(),
         }
@@ -5410,6 +5419,9 @@ retention_tiers = []
         assert_eq!(config.mode, "fts5");
         assert_eq!(config.rrf_k, 60);
         assert!((config.quality_weight - 0.7).abs() < 0.001);
+        assert_eq!(config.quality_timeout_ms, 200);
+        assert!(!config.fast_only);
+        assert_eq!(config.fusion_backend, "legacy");
     }
 
     #[test]
@@ -6051,6 +6063,9 @@ mode = "periodic"
         assert_eq!(sc.mode, "fts5");
         assert_eq!(sc.rrf_k, 60);
         assert!((sc.quality_weight - 0.7).abs() < 0.001);
+        assert_eq!(sc.quality_timeout_ms, 200);
+        assert!(!sc.fast_only);
+        assert_eq!(sc.fusion_backend, "legacy");
         assert!(!sc.reranker_enabled);
     }
 

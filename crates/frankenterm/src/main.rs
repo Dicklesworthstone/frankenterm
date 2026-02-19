@@ -3660,6 +3660,12 @@ fn effective_search_fusion_weights(config: &frankenterm_core::config::Config) ->
     (lexical_weight, semantic_weight)
 }
 
+fn effective_search_fusion_backend(
+    config: &frankenterm_core::config::Config,
+) -> frankenterm_core::search::FusionBackend {
+    frankenterm_core::search::FusionBackend::parse(&config.search.fusion_backend)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum NotifyChannel {
     Webhook,
@@ -11910,6 +11916,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let hybrid_rrf_k = effective_search_rrf_k(&config);
                             let (hybrid_lexical_weight, hybrid_semantic_weight) =
                                 effective_search_fusion_weights(&config);
+                            let hybrid_fusion_backend = effective_search_fusion_backend(&config);
                             let search_results: Result<
                                 Vec<frankenterm_core::storage::SearchResult>,
                                 frankenterm_core::Error,
@@ -11951,6 +11958,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             hybrid_rrf_k,
                                             hybrid_lexical_weight,
                                             hybrid_semantic_weight,
+                                            Some(hybrid_fusion_backend),
                                         )
                                         .await
                                     {
@@ -16049,6 +16057,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let hybrid_rrf_k = effective_search_rrf_k(&config);
                     let (hybrid_lexical_weight, hybrid_semantic_weight) =
                         effective_search_fusion_weights(&config);
+                    let hybrid_fusion_backend = effective_search_fusion_backend(&config);
 
                     let search_results = if let Some(candidate_panes) = pane_candidates {
                         if candidate_panes.is_empty() {
@@ -16077,6 +16086,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             hybrid_rrf_k,
                                             hybrid_lexical_weight,
                                             hybrid_semantic_weight,
+                                            Some(hybrid_fusion_backend),
                                         )
                                         .await
                                     {
@@ -16131,6 +16141,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 hybrid_rrf_k,
                                                 hybrid_lexical_weight,
                                                 hybrid_semantic_weight,
+                                                Some(hybrid_fusion_backend),
                                             )
                                             .await
                                         {
@@ -16209,6 +16220,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         hybrid_rrf_k,
                                         hybrid_lexical_weight,
                                         hybrid_semantic_weight,
+                                        Some(hybrid_fusion_backend),
                                     )
                                     .await
                                 {

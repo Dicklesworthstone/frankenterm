@@ -82,6 +82,10 @@ fn effective_search_fusion_weights(config: &Config) -> (f32, f32) {
     (lexical_weight, semantic_weight)
 }
 
+fn effective_search_fusion_backend(config: &Config) -> crate::search::FusionBackend {
+    crate::search::FusionBackend::parse(&config.search.fusion_backend)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum McpOutputFormat {
     #[default]
@@ -2186,6 +2190,7 @@ impl ToolHandler for WaSearchTool {
         let hybrid_rrf_k = effective_search_rrf_k(config.as_ref());
         let (hybrid_lexical_weight, hybrid_semantic_weight) =
             effective_search_fusion_weights(config.as_ref());
+        let hybrid_fusion_backend = effective_search_fusion_backend(config.as_ref());
         let semantic_query = if matches!(
             requested_mode,
             UnifiedSearchMode::Semantic | UnifiedSearchMode::Hybrid
@@ -2307,6 +2312,7 @@ impl ToolHandler for WaSearchTool {
                                 hybrid_rrf_k,
                                 hybrid_lexical_weight,
                                 hybrid_semantic_weight,
+                                Some(hybrid_fusion_backend),
                             )
                             .await
                             .map_err(McpToolError::from_error)?;
@@ -2362,6 +2368,7 @@ impl ToolHandler for WaSearchTool {
                     rrf_k,
                     lexical_weight,
                     semantic_weight,
+                    fusion_backend,
                     lexical_candidates,
                     semantic_candidates,
                     semantic_cache_hit,
@@ -2403,6 +2410,7 @@ impl ToolHandler for WaSearchTool {
                     "rrf_k": rrf_k,
                     "lexical_weight": lexical_weight,
                     "semantic_weight": semantic_weight,
+                    "fusion_backend": fusion_backend,
                     "lexical_candidates": lexical_candidates,
                     "semantic_candidates": semantic_candidates,
                     "semantic_cache_hit": semantic_cache_hit,
@@ -6225,6 +6233,31 @@ mod tests {
         let (lexical_default, semantic_default) = effective_search_fusion_weights(&config);
         assert!((lexical_default - 0.3).abs() < f32::EPSILON);
         assert!((semantic_default - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn effective_search_fusion_backend_uses_config_selector() {
+        let mut config = Config::default();
+        config.search.fusion_backend = "legacy".to_string();
+        assert_eq!(
+            effective_search_fusion_backend(&config),
+            crate::search::FusionBackend::Legacy
+        );
+
+        config.search.fusion_backend = "unknown-backend".to_string();
+        assert_eq!(
+            effective_search_fusion_backend(&config),
+            crate::search::FusionBackend::Legacy
+        );
+
+        #[cfg(feature = "frankensearch")]
+        {
+            config.search.fusion_backend = "frankensearch".to_string();
+            assert_eq!(
+                effective_search_fusion_backend(&config),
+                crate::search::FusionBackend::FrankenSearchRrf
+            );
+        }
     }
 
     // ── parse_mcp_output_format edge cases ───────────────────────────────

@@ -47,7 +47,7 @@ use crate::events::event_identity_key;
 use crate::lru_cache::LruCache;
 use crate::policy::Redactor;
 use crate::runtime_compat::mpsc;
-use crate::search::{HybridSearchService, SearchMode};
+use crate::search::{FusionBackend, HybridSearchService, SearchMode};
 
 // =============================================================================
 // Schema Definition
@@ -1462,6 +1462,9 @@ pub struct HybridSearchBundle {
     pub lexical_weight: f32,
     /// Semantic lane weight used by fusion.
     pub semantic_weight: f32,
+    /// Fusion backend used for ranking.
+    #[serde(default)]
+    pub fusion_backend: String,
     /// Number of lexical candidates considered.
     pub lexical_candidates: usize,
     /// Number of semantic candidates considered.
@@ -6708,6 +6711,7 @@ impl StorageHandle {
         rrf_k: u32,
         lexical_weight: f32,
         semantic_weight: f32,
+        fusion_backend: Option<FusionBackend>,
     ) -> Result<HybridSearchBundle> {
         let db_path = Arc::clone(&self.db_path);
         let semantic_budget_state = Arc::clone(&self.semantic_budget_state);
@@ -6729,6 +6733,7 @@ impl StorageHandle {
                 rrf_k,
                 lexical_weight,
                 semantic_weight,
+                fusion_backend,
                 &semantic_budget_state,
             )
         })
@@ -12044,6 +12049,7 @@ fn hybrid_search_with_results_sync(
     rrf_k: u32,
     lexical_weight: f32,
     semantic_weight: f32,
+    fusion_backend: Option<FusionBackend>,
     semantic_budget_state: &Arc<Mutex<SemanticBudgetState>>,
 ) -> Result<HybridSearchBundle> {
     let top_k = options.limit.unwrap_or(100);
@@ -12064,6 +12070,7 @@ fn hybrid_search_with_results_sync(
     } else {
         (lexical_weight, semantic_weight)
     };
+    let fusion_backend = fusion_backend.unwrap_or_else(FusionBackend::from_env);
 
     let semantic_lane = resolve_semantic_lane(
         conn,
@@ -12125,6 +12132,7 @@ fn hybrid_search_with_results_sync(
         .with_mode(effective_mode)
         .with_rrf_k(rrf_k)
         .with_rrf_weights(lexical_weight, semantic_weight)
+        .with_fusion_backend(fusion_backend)
         .fuse(&lexical_ranked, &semantic_ranked, top_k);
     // Make tie behavior deterministic despite internal HashMap aggregation.
     fused.sort_by(|a, b| {
@@ -12198,6 +12206,7 @@ fn hybrid_search_with_results_sync(
         rrf_k,
         lexical_weight,
         semantic_weight,
+        fusion_backend: fusion_backend.as_str().to_string(),
         lexical_candidates: lexical_ranked.len(),
         semantic_candidates: semantic_ranked.len(),
         semantic_cache_hit: semantic_lane.cache_hit,
@@ -19354,6 +19363,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
+                Some(crate::search::FusionBackend::Legacy),
             )
             .await
             .unwrap();
@@ -19436,6 +19446,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
+                Some(crate::search::FusionBackend::Legacy),
             )
             .await
             .unwrap();
@@ -19493,6 +19504,7 @@ mod storage_handle_tests {
                 60,
                 f32::NAN,
                 -1.0,
+                Some(crate::search::FusionBackend::Legacy),
             )
             .await
             .unwrap();
@@ -19510,6 +19522,7 @@ mod storage_handle_tests {
                 60,
                 0.0,
                 0.0,
+                Some(crate::search::FusionBackend::Legacy),
             )
             .await
             .unwrap();
@@ -19562,6 +19575,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
+                Some(crate::search::FusionBackend::Legacy),
             )
             .await
             .unwrap();
@@ -19579,6 +19593,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
+                Some(crate::search::FusionBackend::Legacy),
             )
             .await
             .unwrap();
@@ -19602,6 +19617,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
+                Some(crate::search::FusionBackend::Legacy),
             )
             .await
             .unwrap();
@@ -19665,6 +19681,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
+                Some(crate::search::FusionBackend::Legacy),
             )
             .await
             .unwrap();
@@ -19686,6 +19703,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
+                Some(crate::search::FusionBackend::Legacy),
             )
             .await
             .unwrap();

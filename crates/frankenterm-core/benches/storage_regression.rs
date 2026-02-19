@@ -17,7 +17,7 @@ use frankenterm_core::recording::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
     RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
-use frankenterm_core::search::SearchMode;
+use frankenterm_core::search::{FusionBackend, SearchMode};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};
 #[cfg(feature = "distributed")]
 use frankenterm_core::wire_protocol::{
@@ -631,6 +631,7 @@ fn bench_recorder_swarm_load_profile(c: &mut Criterion) {
                                 60,
                                 1.0,
                                 1.0,
+                                Some(FusionBackend::Legacy),
                             )
                             .await
                             .expect("hybrid search");

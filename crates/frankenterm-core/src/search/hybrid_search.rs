@@ -24,16 +24,13 @@ pub enum FusionBackend {
 }
 
 impl FusionBackend {
-    /// Resolve backend from `FT_SEARCH_FUSION_BACKEND`.
+    /// Parse a fusion backend selector string.
     ///
     /// Supported values:
-    /// - `legacy` (default)
+    /// - `legacy` (default/fallback)
     /// - `frankensearch`, `frankensearch_rrf`, `frankensearch-rrf` (when enabled)
     #[must_use]
-    pub fn from_env() -> Self {
-        let Ok(raw) = std::env::var("FT_SEARCH_FUSION_BACKEND") else {
-            return Self::Legacy;
-        };
+    pub fn parse(raw: &str) -> Self {
         let normalized = raw.trim().to_ascii_lowercase();
 
         #[cfg(feature = "frankensearch")]
@@ -45,6 +42,29 @@ impl FusionBackend {
         }
 
         Self::Legacy
+    }
+
+    /// Canonical backend selector string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            #[cfg(feature = "frankensearch")]
+            Self::FrankenSearchRrf => "frankensearch_rrf",
+        }
+    }
+
+    /// Resolve backend from `FT_SEARCH_FUSION_BACKEND`.
+    ///
+    /// Supported values:
+    /// - `legacy` (default)
+    /// - `frankensearch`, `frankensearch_rrf`, `frankensearch-rrf` (when enabled)
+    #[must_use]
+    pub fn from_env() -> Self {
+        let Ok(raw) = std::env::var("FT_SEARCH_FUSION_BACKEND") else {
+            return Self::Legacy;
+        };
+        Self::parse(&raw)
     }
 }
 
@@ -990,6 +1010,36 @@ mod tests {
     fn hybrid_service_can_set_fusion_backend() {
         let svc = HybridSearchService::new().with_fusion_backend(FusionBackend::Legacy);
         assert_eq!(svc.fusion_backend(), FusionBackend::Legacy);
+    }
+
+    #[test]
+    fn fusion_backend_parse_defaults_to_legacy() {
+        assert_eq!(FusionBackend::parse("legacy"), FusionBackend::Legacy);
+        assert_eq!(FusionBackend::parse(""), FusionBackend::Legacy);
+        assert_eq!(FusionBackend::parse("unknown"), FusionBackend::Legacy);
+    }
+
+    #[cfg(feature = "frankensearch")]
+    #[test]
+    fn fusion_backend_parse_supports_frankensearch_aliases() {
+        assert_eq!(
+            FusionBackend::parse("frankensearch"),
+            FusionBackend::FrankenSearchRrf
+        );
+        assert_eq!(
+            FusionBackend::parse("frankensearch_rrf"),
+            FusionBackend::FrankenSearchRrf
+        );
+        assert_eq!(
+            FusionBackend::parse("frankensearch-rrf"),
+            FusionBackend::FrankenSearchRrf
+        );
+    }
+
+    #[test]
+    fn fusion_backend_as_str_roundtrip() {
+        let backend = FusionBackend::Legacy;
+        assert_eq!(FusionBackend::parse(backend.as_str()), backend);
     }
 
     #[test]
