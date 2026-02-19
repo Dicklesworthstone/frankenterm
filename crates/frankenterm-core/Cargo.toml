@@ -274,6 +274,10 @@ required-features = ["native-wezterm"]
 name = "fork_hardening"
 harness = false
 
+[[bench]]
+name = "wal_throughput"
+harness = false
+
 [features]
 # Default-on so workspace builds include FrankenSearch + agent-detection integration.
 # Use `--no-default-features` to compile without these dependencies.
