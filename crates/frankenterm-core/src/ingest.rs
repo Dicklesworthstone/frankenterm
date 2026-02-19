@@ -2817,9 +2817,10 @@ mod tests {
         pane.tab_id = 1;
         registry.discovery_tick(vec![pane]);
 
-        // Second tick: same pane, title changed to "vim"
-        // This triggers a new generation (fingerprint includes title)
-        let mut pane = make_pane(1, "vim", Some("/home"));
+        // Second tick: same pane, same title/cwd but window/tab moved.
+        // Title stays "bash" so fingerprint is unchanged — this triggers
+        // changed_panes (metadata change), not new_generations.
+        let mut pane = make_pane(1, "bash", Some("/home"));
         pane.window_id = 2;
         pane.tab_id = 2;
         let diff = registry.discovery_tick(vec![pane]);
@@ -2829,11 +2830,11 @@ mod tests {
         assert!(diff.changed_panes.contains(&1));
         assert!(diff.new_generations.is_empty());
 
-        // Verify info was updated and generation incremented
+        // Verify metadata was updated but generation stayed the same
         let entry = registry.entries.get(&1).unwrap();
-        assert_eq!(entry.info.title, Some("vim".to_string()));
+        assert_eq!(entry.info.title, Some("bash".to_string()));
         assert_eq!(entry.info.cwd, Some("/home".to_string()));
-        assert_eq!(entry.generation, 1);
+        assert_eq!(entry.generation, 0);
     }
 
     #[test]
