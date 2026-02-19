@@ -659,6 +659,13 @@ pub enum PaneDelta {
         pane_id: u64,
         /// Mux-side sequence number from `GetPaneRenderChangesResponse`.
         seqno: u64,
+        /// Best-effort UTF-8 text extracted from render-change bonus lines.
+        ///
+        /// This is the closest available approximation to output deltas using
+        /// `GetPaneRenderChanges` polling. It may be empty when no bonus lines
+        /// are present, in which case downstream can fall back to metadata-only
+        /// handling.
+        delta_text: String,
         /// Title of the pane at the time of the delta.
         title: String,
         /// Number of dirty line ranges reported.
@@ -833,10 +840,12 @@ pub fn subscribe_pane_output(
 
                     // Only emit Output delta if there are dirty lines
                     if has_dirty {
+                        let delta_text = bonus_lines_to_text(changes.bonus_lines);
                         let dirty_row_count = total_dirty_rows(&changes.dirty_lines);
                         let delta = PaneDelta::Output {
                             pane_id,
                             seqno,
+                            delta_text,
                             title: changes.title,
                             dirty_range_count: changes.dirty_lines.len(),
                             dirty_row_count,
@@ -918,6 +927,18 @@ fn total_dirty_rows(ranges: &[std::ops::Range<isize>]) -> usize {
         let span_usize = usize::try_from(span).unwrap_or(usize::MAX);
         acc.saturating_add(span_usize)
     })
+}
+
+fn bonus_lines_to_text(lines: codec::SerializedLines) -> String {
+    let (lines, _images) = lines.extract_data();
+    let mut text = String::new();
+    for (idx, (_row, line)) in lines.into_iter().enumerate() {
+        if idx > 0 {
+            text.push('\n');
+        }
+        text.push_str(line.as_str().as_ref());
+    }
+    text
 }
 
 #[cfg(test)]
@@ -1898,6 +1919,7 @@ mod tests {
         let delta = PaneDelta::Output {
             pane_id: 42,
             seqno: 7,
+            delta_text: "hello world".to_string(),
             title: "bash".to_string(),
             dirty_range_count: 3,
             dirty_row_count: 9,
@@ -1935,6 +1957,7 @@ mod tests {
         let delta = PaneDelta::Output {
             pane_id: 10,
             seqno: 99,
+            delta_text: "delta".to_string(),
             title: "zsh".to_string(),
             dirty_range_count: 1,
             dirty_row_count: 1,

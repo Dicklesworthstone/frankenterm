@@ -1079,8 +1079,8 @@ pub fn detect_tailer_mode(config: &crate::config::Config) -> TailerMode {
 /// pipeline, producing `CapturedSegment`s with monotonic seq.
 ///
 /// The bridge converts each delta kind:
-/// - `Output` → `StreamEvent::OutputData` (data is the title for now —
-///   the actual line content would require `get_lines()` round-trip)
+/// - `Output` → `StreamEvent::OutputData` (`delta_text` when present, otherwise
+///   a metadata fallback string)
 /// - `Gap` → `StreamEvent::OutputData` with overflow flag
 /// - `Ended` → `StreamEvent::PaneClosed`
 pub struct StreamingBridge {
@@ -1127,6 +1127,7 @@ impl StreamingBridge {
             crate::vendored::PaneDelta::Output {
                 pane_id,
                 seqno: _,
+                delta_text,
                 title,
                 dirty_range_count,
                 dirty_row_count,
@@ -1137,11 +1138,16 @@ impl StreamingBridge {
                 self.dirty_row_total = self
                     .dirty_row_total
                     .saturating_add(u64::try_from(dirty_row_count).unwrap_or(u64::MAX));
+                let data = if delta_text.is_empty() {
+                    format!(
+                        "[render_changes: {dirty_range_count} dirty ranges, {dirty_row_count} dirty rows, title={title}]"
+                    )
+                } else {
+                    delta_text
+                };
                 StreamEvent::OutputData {
                     pane_id,
-                    data: format!(
-                        "[render_changes: {dirty_range_count} dirty ranges, {dirty_row_count} dirty rows, title={title}]"
-                    ),
+                    data,
                     received_at: now_ms,
                     overflow: false,
                 }
@@ -2471,6 +2477,7 @@ mod tests {
         let delta = PaneDelta::Output {
             pane_id: 1,
             seqno: 5,
+            delta_text: "hello from pane".to_string(),
             title: "bash".to_string(),
             dirty_range_count: 2,
             dirty_row_count: 8,
@@ -2480,8 +2487,7 @@ mod tests {
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].pane_id, 1);
         assert_eq!(segments[0].seq, 0); // first segment for this pane
-        assert!(segments[0].content.contains("dirty ranges"));
-        assert!(segments[0].content.contains("dirty rows"));
+        assert_eq!(segments[0].content, "hello from pane");
         assert_eq!(bridge.events_processed(), 1);
         assert_eq!(bridge.dirty_range_total(), 2);
         assert_eq!(bridge.dirty_row_total(), 8);
@@ -2498,6 +2504,7 @@ mod tests {
         let output = PaneDelta::Output {
             pane_id: 1,
             seqno: 1,
+            delta_text: "first".to_string(),
             title: "bash".to_string(),
             dirty_range_count: 1,
             dirty_row_count: 4,
@@ -2530,6 +2537,7 @@ mod tests {
         let output = PaneDelta::Output {
             pane_id: 1,
             seqno: 1,
+            delta_text: "first".to_string(),
             title: "bash".to_string(),
             dirty_range_count: 1,
             dirty_row_count: 4,
@@ -2564,6 +2572,7 @@ mod tests {
             let delta = PaneDelta::Output {
                 pane_id,
                 seqno: 1,
+                delta_text: format!("pane-{pane_id}-delta"),
                 title: format!("pane-{pane_id}"),
                 dirty_range_count: 1,
                 dirty_row_count: 4,
