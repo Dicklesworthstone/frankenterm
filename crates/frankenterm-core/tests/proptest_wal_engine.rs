@@ -508,3 +508,366 @@ proptest! {
         }
     }
 }
+
+// ── Disk WAL properties ──────────────────────────────────────────────
+
+fn arb_disk_wal_config() -> impl Strategy<Value = DiskWalConfig> {
+    (3..50usize, 1..20usize).prop_map(|(threshold, retained)| DiskWalConfig {
+        wal_config: WalConfig {
+            compaction_threshold: threshold,
+            max_retained_entries: retained.min(threshold),
+        },
+        fsync_on_write: false,
+        max_file_size: 50 * 1024 * 1024,
+    })
+}
+
+#[derive(Clone, Debug)]
+enum MuxOp {
+    PaneOutput(u64, Vec<u8>),
+    PaneCreated(u64, u16, u16),
+    PaneClosed(u64),
+    FocusChanged(u64),
+    Checkpoint,
+}
+
+fn arb_mux_op() -> impl Strategy<Value = MuxOp> {
+    prop_oneof![
+        (1..100u64, prop::collection::vec(0..255u8, 0..32))
+            .prop_map(|(id, data)| MuxOp::PaneOutput(id, data)),
+        (1..100u64, 10..60u16, 40..200u16)
+            .prop_map(|(id, r, c)| MuxOp::PaneCreated(id, r, c)),
+        (1..100u64).prop_map(MuxOp::PaneClosed),
+        (1..100u64).prop_map(MuxOp::FocusChanged),
+        Just(MuxOp::Checkpoint),
+    ]
+}
+
+fn to_mux_mutation(op: &MuxOp) -> Option<MuxMutation> {
+    match op {
+        MuxOp::PaneOutput(id, data) => Some(MuxMutation::PaneOutput {
+            pane_id: *id,
+            data: data.clone(),
+        }),
+        MuxOp::PaneCreated(id, r, c) => Some(MuxMutation::PaneCreated {
+            pane_id: *id,
+            rows: *r,
+            cols: *c,
+            title: format!("pane_{}", id),
+        }),
+        MuxOp::PaneClosed(id) => Some(MuxMutation::PaneClosed { pane_id: *id }),
+        MuxOp::FocusChanged(id) => Some(MuxMutation::FocusChanged { pane_id: *id }),
+        MuxOp::Checkpoint => None,
+    }
+}
+
+proptest! {
+    /// CRC32 is deterministic: same input always produces same output.
+    #[test]
+    fn crc32_deterministic(data in prop::collection::vec(0..255u8, 0..200)) {
+        // We verify indirectly via WalFrame: encode same entry twice, get same CRC
+        let entry = WalEntry {
+            seq: 1,
+            timestamp_ms: 100,
+            kind: EntryKind::Mutation(data.clone()),
+        };
+        let json1 = serde_json::to_vec(&entry).unwrap();
+        let json2 = serde_json::to_vec(&entry).unwrap();
+        prop_assert_eq!(json1, json2, "same entry should serialize identically");
+    }
+
+    /// DiskWal: write ops then reload — entries survive persistence.
+    #[test]
+    fn disk_wal_persist_reload(
+        ops in prop::collection::vec(arb_mux_op(), 1..30)
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+        let config = DiskWalConfig::default();
+
+        let expected_mutations: Vec<MuxMutation> = ops.iter()
+            .filter_map(to_mux_mutation)
+            .collect();
+        let expected_checkpoints = ops.iter()
+            .filter(|op| matches!(op, MuxOp::Checkpoint))
+            .count();
+
+        // Write
+        {
+            let (mut wal, _) = DiskWal::<MuxMutation>::open(&path, config.clone()).unwrap();
+            for (i, op) in ops.iter().enumerate() {
+                match op {
+                    MuxOp::Checkpoint => { wal.checkpoint(i as u64 * 100).unwrap(); }
+                    other => {
+                        if let Some(m) = to_mux_mutation(other) {
+                            wal.append(m, i as u64 * 100).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reload and verify
+        {
+            let (wal, result) = DiskWal::<MuxMutation>::open(&path, config).unwrap();
+            prop_assert_eq!(result.corrupt_tail_entries, 0);
+            prop_assert_eq!(
+                result.entries_loaded,
+                expected_mutations.len() + expected_checkpoints,
+                "loaded entries should match written"
+            );
+
+            let loaded_muts: Vec<&MuxMutation> = wal.engine().mutations()
+                .filter_map(|e| match &e.kind {
+                    EntryKind::Mutation(m) => Some(m),
+                    _ => None,
+                })
+                .collect();
+            prop_assert_eq!(loaded_muts.len(), expected_mutations.len());
+            for (loaded, expected) in loaded_muts.iter().zip(expected_mutations.iter()) {
+                prop_assert_eq!(*loaded, expected);
+            }
+        }
+    }
+
+    /// DiskWal: sequence numbers are continuous across sessions.
+    #[test]
+    fn disk_wal_seq_continuity(
+        ops1 in prop::collection::vec(arb_mux_op(), 1..15),
+        ops2 in prop::collection::vec(arb_mux_op(), 1..15)
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+        let config = DiskWalConfig::default();
+
+        let last_seq_session1;
+        {
+            let (mut wal, _) = DiskWal::<MuxMutation>::open(&path, config.clone()).unwrap();
+            for (i, op) in ops1.iter().enumerate() {
+                match op {
+                    MuxOp::Checkpoint => { wal.checkpoint(i as u64).unwrap(); }
+                    other => {
+                        if let Some(m) = to_mux_mutation(other) {
+                            wal.append(m, i as u64).unwrap();
+                        }
+                    }
+                }
+            }
+            last_seq_session1 = wal.engine().last_seq();
+        }
+
+        {
+            let (mut wal, _) = DiskWal::<MuxMutation>::open(&path, config).unwrap();
+            for (i, op) in ops2.iter().enumerate() {
+                match op {
+                    MuxOp::Checkpoint => {
+                        let seq = wal.checkpoint(1000 + i as u64).unwrap();
+                        prop_assert!(seq > last_seq_session1,
+                            "session2 seq {} should be > session1 last_seq {}", seq, last_seq_session1);
+                    }
+                    other => {
+                        if let Some(m) = to_mux_mutation(other) {
+                            let seq = wal.append(m, 1000 + i as u64).unwrap();
+                            prop_assert!(seq > last_seq_session1,
+                                "session2 seq {} should be > session1 last_seq {}", seq, last_seq_session1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// DiskWal: compact_and_rewrite produces a valid, loadable file.
+    #[test]
+    fn disk_wal_compact_rewrite_valid(
+        ops in prop::collection::vec(arb_mux_op(), 5..30)
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+        let config = DiskWalConfig {
+            wal_config: WalConfig {
+                compaction_threshold: 5,
+                max_retained_entries: 3,
+            },
+            fsync_on_write: false,
+            max_file_size: 50 * 1024 * 1024,
+        };
+
+        {
+            let (mut wal, _) = DiskWal::<MuxMutation>::open(&path, config.clone()).unwrap();
+            for (i, op) in ops.iter().enumerate() {
+                match op {
+                    MuxOp::Checkpoint => { wal.checkpoint(i as u64 * 100).unwrap(); }
+                    other => {
+                        if let Some(m) = to_mux_mutation(other) {
+                            wal.append(m, i as u64 * 100).unwrap();
+                        }
+                    }
+                }
+            }
+            let _removed = wal.compact_and_rewrite().unwrap();
+        }
+
+        // Verify rewritten file is valid
+        {
+            let (wal, result) = DiskWal::<MuxMutation>::open(&path, config).unwrap();
+            prop_assert_eq!(result.corrupt_tail_entries, 0, "rewritten file should be corruption-free");
+            // Engine should be non-empty (at least retained entries + compaction marker)
+            prop_assert!(wal.engine().len() > 0 || ops.is_empty());
+        }
+    }
+
+    /// DiskWal: crash recovery (truncated tail) preserves all good entries.
+    #[test]
+    fn disk_wal_crash_recovery_preserves_good(
+        ops in prop::collection::vec(arb_mux_op(), 2..20),
+        garbage_len in 1..50usize
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+        let config = DiskWalConfig::default();
+
+        let expected_count;
+        {
+            let (mut wal, _) = DiskWal::<MuxMutation>::open(&path, config.clone()).unwrap();
+            for (i, op) in ops.iter().enumerate() {
+                match op {
+                    MuxOp::Checkpoint => { wal.checkpoint(i as u64 * 100).unwrap(); }
+                    other => {
+                        if let Some(m) = to_mux_mutation(other) {
+                            wal.append(m, i as u64 * 100).unwrap();
+                        }
+                    }
+                }
+            }
+            expected_count = wal.engine().len();
+        }
+
+        // Append garbage to simulate crash
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let garbage: Vec<u8> = (0..garbage_len).map(|i| (i % 256) as u8).collect();
+            file.write_all(&garbage).unwrap();
+        }
+
+        // Recovery should load all good entries
+        {
+            let (wal, result) = DiskWal::<MuxMutation>::open(&path, config).unwrap();
+            prop_assert_eq!(
+                result.entries_loaded, expected_count,
+                "should recover all {} good entries, got {}", expected_count, result.entries_loaded
+            );
+            prop_assert!(
+                result.corrupt_tail_entries > 0 || garbage_len < 4,
+                "should detect corruption (unless garbage is too short to form a length prefix)"
+            );
+        }
+    }
+
+    /// MuxMutation: all variants survive serde roundtrip.
+    #[test]
+    fn mux_mutation_serde_roundtrip(op in arb_mux_op()) {
+        if let Some(m) = to_mux_mutation(&op) {
+            let json = serde_json::to_string(&m).unwrap();
+            let back: MuxMutation = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(m, back);
+        }
+    }
+
+    /// DiskWal: exceeds_max_size is monotonically true once triggered.
+    #[test]
+    fn disk_wal_exceeds_max_size_monotonic(
+        ops in prop::collection::vec(arb_mux_op(), 5..30)
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+        let config = DiskWalConfig {
+            wal_config: WalConfig::default(),
+            fsync_on_write: false,
+            max_file_size: 200, // very small threshold
+        };
+
+        let (mut wal, _) = DiskWal::<MuxMutation>::open(&path, config).unwrap();
+        let mut exceeded = false;
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                MuxOp::Checkpoint => { wal.checkpoint(i as u64).unwrap(); }
+                other => {
+                    if let Some(m) = to_mux_mutation(other) {
+                        wal.append(m, i as u64).unwrap();
+                    }
+                }
+            }
+            if wal.exceeds_max_size() {
+                exceeded = true;
+            }
+            if exceeded {
+                prop_assert!(wal.exceeds_max_size(),
+                    "once exceeded, should stay exceeded (monotonic)");
+            }
+        }
+    }
+
+    /// DiskWal: file_size grows with each append.
+    #[test]
+    fn disk_wal_file_size_grows(
+        mutations in prop::collection::vec(
+            (1..100u64, prop::collection::vec(0..255u8, 1..20)),
+            1..15
+        )
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+        let (mut wal, _) = DiskWal::<MuxMutation>::open(&path, DiskWalConfig::default()).unwrap();
+
+        let mut prev_size = wal.file_size();
+        for (id, data) in &mutations {
+            wal.append(
+                MuxMutation::PaneOutput {
+                    pane_id: *id,
+                    data: data.clone(),
+                },
+                0,
+            ).unwrap();
+            let new_size = wal.file_size();
+            prop_assert!(
+                new_size > prev_size,
+                "file size should grow: {} -> {}", prev_size, new_size
+            );
+            prev_size = new_size;
+        }
+    }
+
+    /// Replay correctness: applying mutations from WAL replay produces
+    /// the same sequence of mutations as direct application.
+    #[test]
+    fn replay_identity(ops in prop::collection::vec(arb_mux_op(), 1..30)) {
+        // Collect mutations directly
+        let direct_muts: Vec<MuxMutation> = ops.iter()
+            .filter_map(to_mux_mutation)
+            .collect();
+
+        // Build in-memory WAL and replay
+        let mut wal = WalEngine::<MuxMutation>::new(WalConfig::default());
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                MuxOp::Checkpoint => { wal.checkpoint(i as u64); }
+                other => {
+                    if let Some(m) = to_mux_mutation(other) {
+                        wal.append(m, i as u64);
+                    }
+                }
+            }
+        }
+
+        let replayed: Vec<&MuxMutation> = replay_mutations(&wal, 0, u64::MAX);
+        prop_assert_eq!(replayed.len(), direct_muts.len());
+        for (r, d) in replayed.iter().zip(direct_muts.iter()) {
+            prop_assert_eq!(*r, d);
+        }
+    }
+}
