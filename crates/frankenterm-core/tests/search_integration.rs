@@ -1,16 +1,18 @@
 //! FrankenSearch Integration Tests (Skeleton)
 //! Spec: ft-dr6zv.1.7
-//! 
+//!
 //! These tests validate the full search pipeline:
 //! Indexing -> Bridge -> Backend -> Results -> API
 
-use frankenterm_core::test_utils; // Assuming this exists or similar
+// test_utils placeholder — will be populated when frankensearch wiring lands
+#[allow(unused_imports)]
+use frankenterm_core as _;
 
 #[tokio::test]
 #[ignore = "Waiting for frankensearch implementation"]
 async fn test_bridge_round_trip() {
     // Goal: spawn_blocking correctly passes query to TwoTierSearcher and returns results
-    
+
     // 1. Setup mock TwoTierSearcher
     // 2. Call search_bridge::search("query")
     // 3. Assert results match expected
@@ -20,7 +22,7 @@ async fn test_bridge_round_trip() {
 #[ignore = "Waiting for frankensearch implementation"]
 async fn test_progressive_delivery_ordering() {
     // Goal: verify Initial results arrive before Refined
-    
+
     // 1. Subscribe to search results stream
     // 2. Emit "Initial" event from mock backend
     // 3. Emit "Refined" event
@@ -31,7 +33,7 @@ async fn test_progressive_delivery_ordering() {
 #[ignore = "Waiting for frankensearch implementation"]
 async fn test_index_size_limit() {
     // Goal: index stays within configured max size via automatic cleanup
-    
+
     // 1. Configure small index limit (e.g., 1MB)
     // 2. Ingest 2MB of data
     // 3. Force compaction/cleanup
@@ -42,7 +44,7 @@ async fn test_index_size_limit() {
 #[ignore = "Waiting for frankensearch implementation"]
 async fn test_scrollback_indexing() {
     // Goal: terminal scrollback lines grouped into logical chunks and indexed
-    
+
     // 1. Create a Pane with mock PTY
     // 2. Write output to PTY
     // 3. Wait for ingestion

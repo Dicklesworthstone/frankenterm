@@ -403,6 +403,81 @@ proptest! {
         prop_assert_eq!(delay, expected,
             "second reconnect delay should match custom backoff formula");
     }
+
+    #[test]
+    fn streamer_reconnect_attempt_state_tracks_backoff_formula(
+        initial_ms in 100..2000u64,
+        max_ms in 2000..30000u64,
+        multiplier in 1.2..3.0f64,
+        attempts in 1..8u32,
+    ) {
+        let backoff = BackoffConfig {
+            initial_ms,
+            max_ms,
+            multiplier,
+        };
+        let mut streamer = AgentStreamer::with_backoff("test", backoff.clone());
+
+        for attempt in 0..attempts {
+            let delay = streamer.mark_reconnecting();
+            prop_assert_eq!(
+                delay,
+                backoff.delay_ms(attempt),
+                "delay should follow configured backoff for attempt={}", attempt
+            );
+            prop_assert_eq!(
+                streamer.state(),
+                ConnectionState::Reconnecting { attempt },
+                "state should expose current reconnect attempt"
+            );
+        }
+    }
+
+    #[test]
+    fn streamer_reconnect_backoff_resets_after_connected_or_disconnected(
+        initial_ms in 100..2000u64,
+        max_ms in 2000..30000u64,
+        multiplier in 1.2..3.0f64,
+        warmup_attempts in 1..8u32,
+    ) {
+        let backoff = BackoffConfig {
+            initial_ms,
+            max_ms,
+            multiplier,
+        };
+
+        let mut streamer = AgentStreamer::with_backoff("test", backoff.clone());
+        for _ in 0..warmup_attempts {
+            streamer.mark_reconnecting();
+        }
+        streamer.mark_connected();
+        let delay_after_connect = streamer.mark_reconnecting();
+        prop_assert_eq!(
+            delay_after_connect,
+            initial_ms,
+            "backoff should restart from initial_ms after mark_connected"
+        );
+        prop_assert_eq!(
+            streamer.state(),
+            ConnectionState::Reconnecting { attempt: 0 }
+        );
+
+        let mut streamer = AgentStreamer::with_backoff("test", backoff);
+        for _ in 0..warmup_attempts {
+            streamer.mark_reconnecting();
+        }
+        streamer.mark_disconnected();
+        let delay_after_disconnect = streamer.mark_reconnecting();
+        prop_assert_eq!(
+            delay_after_disconnect,
+            initial_ms,
+            "backoff should restart from initial_ms after mark_disconnected"
+        );
+        prop_assert_eq!(
+            streamer.state(),
+            ConnectionState::Reconnecting { attempt: 0 }
+        );
+    }
 }
 
 // ============================================================================
