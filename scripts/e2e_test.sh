@@ -9240,33 +9240,212 @@ PY
         printf '%s\n' "$row"
     }
 
+    write_failed_profile_artifacts() {
+        local app="$1"
+        local app_dir="$2"
+        local pane_id="$3"
+        local failures_json="$4"
+        local generated_at=""
+        local signature=""
+        local histogram=""
+
+        generated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        signature=$(jq -r '[.[]? | .reason // empty] | map(select(length > 0)) | unique | join("+")' <<< "$failures_json" 2>/dev/null || true)
+        if [[ -z "$signature" ]]; then
+            signature="alt_screen_conformance_profile_failure"
+        fi
+
+        histogram=$(jq -s '
+            def quantile($arr; $p):
+                if ($arr | length) == 0 then 0
+                else $arr[((((($arr | length) - 1) * $p) | floor))] end;
+            [ .[] | select((.test_case_id // "") == ("alt_screen_conformance_" + $app)) |
+              ((.queue_wait_ms // 0) + (.reflow_ms // 0) + (.render_ms // 0) + (.present_ms // 0)) ] as $latencies
+            | ($latencies | sort) as $sorted
+            | {
+                frame_count: ($latencies | length),
+                dropped_frame_count: (
+                    [ .[] | select((.test_case_id // "") == ("alt_screen_conformance_" + $app) and ((.outcome // "ok") != "ok")) ]
+                    | length
+                ),
+                p50_ms: quantile($sorted; 0.50),
+                p95_ms: quantile($sorted; 0.95),
+                p99_ms: quantile($sorted; 0.99),
+                bucket_ms: $latencies
+            }
+        ' --arg app "$app" "$events_file" 2>/dev/null || echo '{"frame_count":0,"dropped_frame_count":0,"p50_ms":0,"p95_ms":0,"p99_ms":0,"bucket_ms":[]}')
+
+        jq -n \
+            --arg schema_version "wa.trace_bundle.v2" \
+            --arg generated_at "$generated_at" \
+            --arg test_case_id "alt_screen_conformance_${app}" \
+            --arg run_id "$RUN_ID" \
+            --arg app "$app" \
+            --argjson pane_id "$pane_id" \
+            --argjson failures "$failures_json" \
+            --arg events_file "$(basename "$events_file")" \
+            --arg pane_state_file "pane_state_final.json" \
+            --arg pane_text_file "${app}.log" \
+            '{
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                test_case_id: $test_case_id,
+                run_id: $run_id,
+                app: $app,
+                pane_id: $pane_id,
+                failures: $failures,
+                events_file: $events_file,
+                app_context: {
+                    pane_state_file: $pane_state_file,
+                    pane_text_file: $pane_text_file
+                }
+            }' > "$app_dir/trace_bundle.json"
+
+        jq -n \
+            --arg schema_version "wa.frame_histogram.v2" \
+            --arg generated_at "$generated_at" \
+            --arg test_case_id "alt_screen_conformance_${app}" \
+            --arg run_id "$RUN_ID" \
+            --arg app "$app" \
+            --argjson pane_id "$pane_id" \
+            --argjson histogram "$histogram" \
+            '{
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                test_case_id: $test_case_id,
+                run_id: $run_id,
+                app: $app,
+                pane_id: $pane_id,
+                histogram: $histogram
+            }' > "$app_dir/frame_histogram.json"
+
+        jq -n \
+            --arg schema_version "wa.failure_signature.v2" \
+            --arg generated_at "$generated_at" \
+            --arg test_case_id "alt_screen_conformance_${app}" \
+            --arg signature "$signature" \
+            --arg run_id "$RUN_ID" \
+            --arg app "$app" \
+            --argjson pane_id "$pane_id" \
+            --argjson failures "$failures_json" \
+            '{
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                test_case_id: $test_case_id,
+                signature: $signature,
+                run_id: $run_id,
+                app: $app,
+                pane_id: $pane_id,
+                failures: $failures
+            }' > "$app_dir/failure_signature.json"
+    }
+
+    ensure_profile_artifact_completeness() {
+        local missing=0
+        local profile_count=0
+        local index=0
+        local app=""
+        local app_status=""
+        local app_dir=""
+        local idx_formatted=""
+        profile_count=$(jq -r 'length' <<< "$profile_results" 2>/dev/null || echo 0)
+
+        while [[ "$index" -lt "$profile_count" ]]; do
+            app=$(jq -r ".[$index].app // \"\"" <<< "$profile_results")
+            app_status=$(jq -r ".[$index].status // \"\"" <<< "$profile_results")
+            idx_formatted=$(printf '%02d' $((index + 1)))
+            app_dir="$scenario_dir/app_${idx_formatted}_${app}"
+
+            if [[ ! -s "$app_dir/app_context.json" ]]; then
+                log_fail "Missing app context artifact for profile $app"
+                missing=1
+            fi
+            if [[ ! -s "$app_dir/resize_pulses.jsonl" ]]; then
+                log_fail "Missing resize pulse log for profile $app"
+                missing=1
+            fi
+
+            if [[ "$app_status" != "passed" ]]; then
+                if [[ ! -s "$app_dir/pane_state_final.json" ]]; then
+                    log_fail "Missing pane_state_final artifact for failed profile $app"
+                    missing=1
+                fi
+                if [[ ! -f "$app_dir/${app}.log" ]]; then
+                    log_fail "Missing pane text log artifact for failed profile $app"
+                    missing=1
+                fi
+                if [[ ! -s "$app_dir/trace_bundle.json" ]]; then
+                    log_fail "Missing trace_bundle artifact for failed profile $app"
+                    missing=1
+                fi
+                if [[ ! -s "$app_dir/frame_histogram.json" ]]; then
+                    log_fail "Missing frame_histogram artifact for failed profile $app"
+                    missing=1
+                fi
+                if [[ ! -s "$app_dir/failure_signature.json" ]]; then
+                    log_fail "Missing failure_signature artifact for failed profile $app"
+                    missing=1
+                fi
+            fi
+
+            index=$((index + 1))
+        done
+
+        return "$missing"
+    }
+
     cleanup_alt_screen_conformance() {
+        local scenario_dir_safe="${scenario_dir:-}"
+        local ft_pid_safe="${ft_pid:-}"
+        local wezterm_pid_safe="${wezterm_pid:-}"
+        local wezterm_socket_safe="${wezterm_socket:-}"
+        local temp_workspace_safe="${temp_workspace:-}"
+        local config_file_safe="${config_file:-}"
+        local runner_script_safe="${runner_script:-}"
+        local enter_seq_file_safe="${enter_seq_file:-}"
+        local leave_seq_file_safe="${leave_seq_file:-}"
+        local fixture_dummy_script_safe="${fixture_dummy_script:-}"
+        local -a pane_ids=()
         log_verbose "Cleaning up alt_screen_conformance scenario"
-        if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
-            kill "$ft_pid" 2>/dev/null || true
-            wait "$ft_pid" 2>/dev/null || true
+        if declare -p spawned_panes >/dev/null 2>&1; then
+            pane_ids=("${spawned_panes[@]}")
+        fi
+
+        if [[ -n "$ft_pid_safe" ]] && kill -0 "$ft_pid_safe" 2>/dev/null; then
+            kill "$ft_pid_safe" 2>/dev/null || true
+            wait "$ft_pid_safe" 2>/dev/null || true
         fi
 
         local pane_id=""
-        for pane_id in "${spawned_panes[@]}"; do
-            WEZTERM_UNIX_SOCKET="$wezterm_socket" wezterm cli --no-auto-start \
+        for pane_id in "${pane_ids[@]+"${pane_ids[@]}"}"; do
+            WEZTERM_UNIX_SOCKET="$wezterm_socket_safe" wezterm cli --no-auto-start \
                 kill-pane --pane-id "$pane_id" 2>/dev/null || true
         done
 
-        if [[ -n "$wezterm_pid" ]] && kill -0 "$wezterm_pid" 2>/dev/null; then
-            kill "$wezterm_pid" 2>/dev/null || true
-            wait "$wezterm_pid" 2>/dev/null || true
+        if [[ -n "$wezterm_pid_safe" ]] && kill -0 "$wezterm_pid_safe" 2>/dev/null; then
+            kill "$wezterm_pid_safe" 2>/dev/null || true
+            wait "$wezterm_pid_safe" 2>/dev/null || true
         fi
 
-        if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$config_file" "$scenario_dir/wezterm.lua" 2>/dev/null || true
-            cp "$runner_script" "$scenario_dir/run_alt_profile.sh" 2>/dev/null || true
+        if [[ -n "$temp_workspace_safe" && -n "$scenario_dir_safe" && -d "$temp_workspace_safe" ]]; then
+            cp -r "$temp_workspace_safe/.ft"/* "$scenario_dir_safe/" 2>/dev/null || true
+            cp "$config_file_safe" "$scenario_dir_safe/wezterm.lua" 2>/dev/null || true
+            cp "$runner_script_safe" "$scenario_dir_safe/run_alt_profile.sh" 2>/dev/null || true
         fi
-        cp "$enter_seq_file" "$scenario_dir/alt_screen_enter_fixture.txt" 2>/dev/null || true
-        cp "$leave_seq_file" "$scenario_dir/alt_screen_leave_fixture.txt" 2>/dev/null || true
-        cp "$fixture_dummy_script" "$scenario_dir/dummy_alt_screen.sh" 2>/dev/null || true
-        rm -rf "$temp_workspace"
+        if [[ -n "$scenario_dir_safe" ]]; then
+            if [[ -n "$enter_seq_file_safe" ]]; then
+                cp "$enter_seq_file_safe" "$scenario_dir_safe/alt_screen_enter_fixture.txt" 2>/dev/null || true
+            fi
+            if [[ -n "$leave_seq_file_safe" ]]; then
+                cp "$leave_seq_file_safe" "$scenario_dir_safe/alt_screen_leave_fixture.txt" 2>/dev/null || true
+            fi
+            if [[ -n "$fixture_dummy_script_safe" ]]; then
+                cp "$fixture_dummy_script_safe" "$scenario_dir_safe/dummy_alt_screen.sh" 2>/dev/null || true
+            fi
+        fi
+        if [[ -n "$temp_workspace_safe" ]]; then
+            rm -rf "$temp_workspace_safe"
+        fi
     }
     trap cleanup_alt_screen_conformance EXIT
 
@@ -9451,6 +9630,28 @@ EOS
             app_status="failed"
             app_failures="$(jq -c --arg reason "spawn_failed" --arg resize_transaction_id "${RUN_ID}:${app}:0:spawn" '. + [{reason: $reason, resize_transaction_id: $resize_transaction_id}]' <<< "$app_failures")"
             emit_conformance_event "$app" "$pane_id" 0 "alt_screen_conformance_spawn" 0 0 0 0 0 "failed" "spawn_failed" "spawn" >/dev/null
+            jq -n \
+                --arg run_id "$RUN_ID" \
+                --arg app "$app" \
+                --arg reason "spawn_failed" \
+                --argjson pane_id "$pane_id" \
+                '{ok: false, run_id: $run_id, app: $app, pane_id: $pane_id, reason: $reason}' \
+                > "$app_dir/pane_state_final.json"
+            printf '[%s] spawn_failed for profile %s\n' "$RUN_ID" "$app" > "$app_log"
+            jq -n \
+                --arg run_id "$RUN_ID" \
+                --arg app "$app" \
+                --arg status "$app_status" \
+                --argjson command_available "$command_available" \
+                --argjson pane_id "$pane_id" \
+                --argjson resize_pulses_sent "$resize_pulses_sent" \
+                --argjson failures "$app_failures" \
+                --arg pulse_log "$(basename "$app_dir")/resize_pulses.jsonl" \
+                --arg pane_state_file "$(basename "$app_dir")/pane_state_final.json" \
+                --arg pane_text_file "$(basename "$app_dir")/${app}.log" \
+                '{run_id: $run_id, app: $app, status: $status, command_available: $command_available, pane_id: $pane_id, resize_pulses_sent: $resize_pulses_sent, failures: $failures, pulse_log: $pulse_log, pane_state_file: $pane_state_file, pane_text_file: $pane_text_file}' \
+                > "$app_dir/app_context.json"
+            write_failed_profile_artifacts "$app" "$app_dir" "$pane_id" "$app_failures"
             result=1
             profile_results=$(jq -c \
                 --arg app "$app" \
@@ -9461,6 +9662,9 @@ EOS
                 --argjson failures "$app_failures" \
                 --arg context_file "$(basename "$app_dir")/app_context.json" \
                 --arg pulse_log "$(basename "$app_dir")/resize_pulses.jsonl" \
+                --arg trace_bundle "$(basename "$app_dir")/trace_bundle.json" \
+                --arg frame_histogram "$(basename "$app_dir")/frame_histogram.json" \
+                --arg failure_signature "$(basename "$app_dir")/failure_signature.json" \
                 '. + [{
                     app: $app,
                     status: $status,
@@ -9469,7 +9673,10 @@ EOS
                     resize_pulses_sent: $resize_pulses_sent,
                     failures: $failures,
                     context_file: $context_file,
-                    pulse_log: $pulse_log
+                    pulse_log: $pulse_log,
+                    trace_bundle: $trace_bundle,
+                    frame_histogram: $frame_histogram,
+                    failure_signature: $failure_signature
                 }]' <<< "$profile_results")
             continue
         fi
@@ -9567,6 +9774,10 @@ EOS
             '{run_id: $run_id, app: $app, status: $status, command_available: $command_available, pane_id: $pane_id, resize_pulses_sent: $resize_pulses_sent, failures: $failures, pulse_log: $pulse_log, pane_state_file: $pane_state_file, pane_text_file: $pane_text_file}' \
             > "$app_dir/app_context.json"
 
+        if [[ "$app_status" != "passed" ]]; then
+            write_failed_profile_artifacts "$app" "$app_dir" "$pane_id" "$app_failures"
+        fi
+
         profile_results=$(jq -c \
             --arg app "$app" \
             --arg status "$app_status" \
@@ -9576,6 +9787,9 @@ EOS
             --argjson failures "$app_failures" \
             --arg context_file "$(basename "$app_dir")/app_context.json" \
             --arg pulse_log "$(basename "$app_dir")/resize_pulses.jsonl" \
+            --arg trace_bundle "$(basename "$app_dir")/trace_bundle.json" \
+            --arg frame_histogram "$(basename "$app_dir")/frame_histogram.json" \
+            --arg failure_signature "$(basename "$app_dir")/failure_signature.json" \
             '. + [{
                 app: $app,
                 status: $status,
@@ -9584,7 +9798,10 @@ EOS
                 resize_pulses_sent: $resize_pulses_sent,
                 failures: $failures,
                 context_file: $context_file,
-                pulse_log: $pulse_log
+                pulse_log: $pulse_log,
+                trace_bundle: (if $status == "passed" then null else $trace_bundle end),
+                frame_histogram: (if $status == "passed" then null else $frame_histogram end),
+                failure_signature: (if $status == "passed" then null else $failure_signature end)
             }]' <<< "$profile_results")
     done
 
@@ -9615,6 +9832,10 @@ EOS
             profiles: $profiles,
             failed_profiles: $failed_profiles
         }' > "$scenario_dir/alt_screen_conformance_summary.json"
+
+    if ! ensure_profile_artifact_completeness; then
+        result=1
+    fi
 
     if [[ "$failed_count" -gt 0 ]]; then
         local scenario_tail=""
