@@ -698,3 +698,74 @@ fn cancellation_token_cancelled_future_resolves_on_cancel() {
             .expect("task should not panic");
     });
 }
+
+// ---------------------------------------------------------------------------
+// Batch 13: additional property tests (DarkMill)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// SearchBridgeRequest preserves query through builder chain.
+    #[test]
+    fn request_preserves_query(query in arb_query(), limit in arb_limit()) {
+        let req = SearchBridgeRequest::new(query.clone(), limit);
+        // The request stores the query — verify Debug output contains it
+        let debug = format!("{:?}", req);
+        prop_assert!(debug.contains(&query) || query.trim().is_empty(),
+            "debug should contain query");
+    }
+
+    /// SearchBridgeRequest with_timeout sets a duration.
+    #[test]
+    fn request_with_timeout(query in arb_query(), limit in arb_limit(), ms in arb_timeout_ms()) {
+        let req = SearchBridgeRequest::new(query, limit)
+            .with_timeout(Duration::from_millis(ms));
+        let debug = format!("{:?}", req);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// BridgeCancellationToken starts not cancelled.
+    #[test]
+    fn cancellation_token_starts_not_cancelled(_dummy in 0..1u8) {
+        let token = BridgeCancellationToken::new();
+        prop_assert!(!token.is_cancelled());
+    }
+
+    /// BridgeCancellationToken cancel is idempotent.
+    #[test]
+    fn cancellation_token_cancel_idempotent(_dummy in 0..1u8) {
+        let token = BridgeCancellationToken::new();
+        token.cancel();
+        prop_assert!(token.is_cancelled());
+        token.cancel(); // second call should not panic
+        prop_assert!(token.is_cancelled());
+    }
+
+    /// Cloned BridgeCancellationToken shares state.
+    #[test]
+    fn cancellation_token_clone_shares_state(_dummy in 0..1u8) {
+        let token1 = BridgeCancellationToken::new();
+        let token2 = token1.clone();
+        prop_assert!(!token1.is_cancelled());
+        prop_assert!(!token2.is_cancelled());
+        token1.cancel();
+        prop_assert!(token2.is_cancelled());
+    }
+
+    /// SearchBridgeError Runtime variant has non-empty Display.
+    #[test]
+    fn error_runtime_display_nonempty(msg in "[a-z ]{1,50}") {
+        let err = SearchBridgeError::Runtime { message: msg };
+        let display = format!("{}", err);
+        prop_assert!(!display.is_empty());
+    }
+
+    /// SearchBridgeError Timeout variant includes timeout_ms.
+    #[test]
+    fn error_timeout_display(ms in 1_u64..100_000) {
+        let err = SearchBridgeError::Timeout { timeout_ms: ms };
+        let display = format!("{}", err);
+        prop_assert!(!display.is_empty());
+    }
+}

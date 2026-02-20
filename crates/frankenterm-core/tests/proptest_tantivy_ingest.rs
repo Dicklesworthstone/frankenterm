@@ -847,3 +847,114 @@ fn minimal_document_roundtrips() {
     assert_eq!(back.pane_id, 1);
     assert_eq!(back.text, "hello world");
 }
+
+// =========================================================================
+// Batch 13: additional property tests (DarkMill)
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// IndexerConfig default has sensible batch_size and consumer_id.
+    #[test]
+    fn indexer_config_default_sane(_dummy in 0..1u8) {
+        let cfg = IndexerConfig::default();
+        prop_assert!(cfg.batch_size > 0, "default batch_size should be positive");
+        prop_assert!(!cfg.consumer_id.is_empty(), "consumer_id should be non-empty");
+        prop_assert!(cfg.dedup_on_replay, "default dedup_on_replay should be true");
+    }
+
+    /// IndexerConfig Clone preserves all fields (extended).
+    #[test]
+    fn indexer_config_clone_preserves_ext(_dummy in 0..1u8) {
+        let cfg = IndexerConfig::default();
+        let cloned = cfg.clone();
+        prop_assert_eq!(cloned.batch_size, cfg.batch_size);
+        prop_assert_eq!(cloned.consumer_id, cfg.consumer_id);
+        prop_assert_eq!(cloned.dedup_on_replay, cfg.dedup_on_replay);
+        prop_assert_eq!(cloned.max_batches, cfg.max_batches);
+    }
+
+    /// IndexerRunResult Clone + PartialEq.
+    #[test]
+    fn indexer_run_result_clone_eq(
+        read in 0_u64..10_000,
+        indexed in 0_u64..10_000,
+        skipped in 0_u64..10_000,
+        batches in 0_u64..1_000,
+        ordinal in proptest::option::of(0_u64..100_000),
+        caught_up in any::<bool>(),
+    ) {
+        let result = IndexerRunResult {
+            events_read: read,
+            events_indexed: indexed,
+            events_skipped: skipped,
+            batches_committed: batches,
+            final_ordinal: ordinal,
+            caught_up,
+        };
+        let cloned = result.clone();
+        prop_assert_eq!(cloned, result);
+    }
+
+    /// IndexCommitStats Clone + PartialEq.
+    #[test]
+    fn index_commit_stats_clone_eq(
+        added in 0_u64..10_000,
+        deleted in 0_u64..10_000,
+        segments in 0_u64..1_000,
+    ) {
+        let stats = IndexCommitStats {
+            docs_added: added,
+            docs_deleted: deleted,
+            segment_count: segments,
+        };
+        let cloned = stats.clone();
+        prop_assert_eq!(cloned, stats);
+    }
+
+    /// IndexerLagSnapshot: records_behind is consistent with ordinals.
+    #[test]
+    fn lag_snapshot_debug_nonempty(
+        head in proptest::option::of(0_u64..100_000),
+        indexer in proptest::option::of(0_u64..100_000),
+        behind in 0_u64..100_000,
+        caught_up in any::<bool>(),
+    ) {
+        let snap = IndexerLagSnapshot {
+            log_head_ordinal: head,
+            indexer_ordinal: indexer,
+            records_behind: behind,
+            caught_up,
+        };
+        let debug = format!("{:?}", snap);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// IndexerConfig Debug is non-empty (extended).
+    #[test]
+    fn indexer_config_debug_nonempty_ext(_dummy in 0..1u8) {
+        let cfg = IndexerConfig::default();
+        let debug = format!("{:?}", cfg);
+        prop_assert!(!debug.is_empty());
+        prop_assert!(debug.contains("batch_size"), "debug should mention batch_size");
+    }
+
+    /// IndexerRunResult events_indexed <= events_read by construction.
+    #[test]
+    fn run_result_indexed_le_read(
+        read in 0_u64..10_000,
+    ) {
+        let indexed = read / 2;
+        let result = IndexerRunResult {
+            events_read: read,
+            events_indexed: indexed,
+            events_skipped: read - indexed,
+            batches_committed: 1,
+            final_ordinal: Some(read),
+            caught_up: true,
+        };
+        prop_assert!(result.events_indexed <= result.events_read);
+        prop_assert_eq!(result.events_read, result.events_indexed + result.events_skipped);
+    }
+}

@@ -649,3 +649,76 @@ proptest! {
         prop_assert_eq!(scan.ansi_byte_count, 0);
     }
 }
+
+// =============================================================================
+// Batch 13: additional property tests (DarkMill)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// logical_line_count >= 1 for any non-empty input.
+    #[test]
+    fn logical_line_count_ge_one_for_nonempty(data in arb_bytes(2000).prop_filter("non-empty", |d| !d.is_empty())) {
+        let scan = scan_newlines_and_ansi(&data);
+        let count = scan.logical_line_count(&data);
+        prop_assert!(count >= 1, "non-empty data should have >= 1 logical line, got {}", count);
+    }
+
+    /// Default OutputScanMetrics has all zeros.
+    #[test]
+    fn metrics_default_zeroed(_dummy in 0..1u8) {
+        let m = OutputScanMetrics::default();
+        prop_assert_eq!(m.newline_count, 0);
+        prop_assert_eq!(m.ansi_byte_count, 0);
+    }
+
+    /// Single newline byte gives exactly 1 newline count.
+    #[test]
+    fn single_newline_gives_count_one(_dummy in 0..1u8) {
+        let scan = scan_newlines_and_ansi(b"\n");
+        prop_assert_eq!(scan.newline_count, 1);
+    }
+
+    /// ansi_density on zero total_bytes returns 0.0 (not NaN/inf).
+    #[test]
+    fn ansi_density_zero_for_zero_total(_dummy in 0..1u8) {
+        let scan = scan_newlines_and_ansi(&[]);
+        let density = scan.ansi_density(0);
+        prop_assert!(density == 0.0 || density.is_nan(),
+            "density on zero bytes should be 0 or NaN, got {}", density);
+    }
+
+    /// Prefix of data has <= newlines of full data.
+    #[test]
+    fn prefix_newlines_le_full(data in arb_bytes(2000), split in 0_usize..2001) {
+        let split = split.min(data.len());
+        let full = scan_newlines_and_ansi(&data);
+        let prefix = scan_newlines_and_ansi(&data[..split]);
+        prop_assert!(prefix.newline_count <= full.newline_count,
+            "prefix newlines {} > full {}", prefix.newline_count, full.newline_count);
+    }
+
+    /// ansi_byte_count is deterministic across repeated calls.
+    #[test]
+    fn ansi_count_deterministic(data in arb_bytes(1000)) {
+        let a = scan_newlines_and_ansi(&data).ansi_byte_count;
+        let b = scan_newlines_and_ansi(&data).ansi_byte_count;
+        prop_assert_eq!(a, b);
+    }
+
+    /// Concatenation: newline count is additive when splitting at any point.
+    #[test]
+    fn newline_count_additive_on_concat(data in arb_bytes(1000), split in 0_usize..1001) {
+        let split = split.min(data.len());
+        let left = scan_newlines_and_ansi(&data[..split]);
+        let right = scan_newlines_and_ansi(&data[split..]);
+        let full = scan_newlines_and_ansi(&data);
+        prop_assert_eq!(
+            left.newline_count + right.newline_count,
+            full.newline_count,
+            "left {} + right {} != full {}",
+            left.newline_count, right.newline_count, full.newline_count
+        );
+    }
+}

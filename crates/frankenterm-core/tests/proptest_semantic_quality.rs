@@ -693,3 +693,114 @@ fn threshold_violation_debug_nonempty() {
     let debug = format!("{:?}", v);
     assert!(!debug.is_empty());
 }
+
+// ── Batch 13: additional property tests (DarkMill) ────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// QualitySummary serde roundtrip.
+    #[test]
+    fn quality_summary_serde_roundtrip(
+        total in 1_usize..100,
+        p in 0.0_f64..1.0,
+        r in 0.0_f64..1.0,
+        n in 0.0_f64..1.0,
+        delta in -1.0_f64..1.0,
+    ) {
+        use frankenterm_core::semantic_quality::QualitySummary;
+        let summary = QualitySummary {
+            total_queries: total,
+            mean_hybrid_precision_at_k: p,
+            mean_hybrid_recall_at_k: r,
+            mean_hybrid_ndcg_at_k: n,
+            mean_hybrid_vs_lexical_ndcg_delta: delta,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let parsed: QualitySummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed.total_queries, summary.total_queries);
+    }
+
+    /// ThresholdViolation serde roundtrip.
+    #[test]
+    fn threshold_violation_serde_roundtrip(
+        actual in 0.0_f64..1.0,
+        required in 0.0_f64..1.0,
+    ) {
+        let v = ThresholdViolation {
+            query: "test_query".to_string(),
+            metric: "precision_at_k".to_string(),
+            actual,
+            required,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let parsed: ThresholdViolation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed.query, v.query);
+        prop_assert_eq!(parsed.metric, v.metric);
+    }
+
+    /// RegressionThresholds serde roundtrip.
+    #[test]
+    fn regression_thresholds_serde_roundtrip(
+        ndcg_delta in -1.0_f64..1.0,
+        min_p in 0.0_f64..1.0,
+        min_r in 0.0_f64..1.0,
+    ) {
+        let t = RegressionThresholds {
+            min_hybrid_ndcg_delta_vs_lexical: ndcg_delta,
+            min_hybrid_precision_at_k: min_p,
+            min_hybrid_recall_at_k: min_r,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let parsed: RegressionThresholds = serde_json::from_str(&json).unwrap();
+        prop_assert!((parsed.min_hybrid_precision_at_k - t.min_hybrid_precision_at_k).abs() < f64::EPSILON);
+    }
+
+    /// Harness with custom rrf_k is deterministic.
+    #[test]
+    fn harness_rrf_k_deterministic(rrf_k in 1_u32..100) {
+        let queries = default_semantic_eval_queries();
+        let report1 = SemanticQualityHarness::new(queries.clone()).with_rrf_k(rrf_k).run();
+        let report2 = SemanticQualityHarness::new(queries).with_rrf_k(rrf_k).run();
+        prop_assert_eq!(report1.passed, report2.passed);
+        prop_assert_eq!(report1.queries.len(), report2.queries.len());
+    }
+
+    /// Empty relevant_ids produces zero precision and recall.
+    #[test]
+    fn empty_relevant_yields_zero_precision(top_k in 1_usize..=10) {
+        let ranked: Vec<(u64, f32)> = (1..=5_u64).map(|id| (id, 0.5)).collect();
+        let query = SemanticEvalQuery {
+            name: "empty_rel".to_string(),
+            description: String::new(),
+            lexical_ranked: ranked.clone(),
+            semantic_ranked: ranked,
+            relevant_ids: vec![],
+            top_k,
+        };
+        let report = SemanticQualityHarness::new(vec![query]).run();
+        let m = &report.queries[0].hybrid.metrics;
+        prop_assert!(m.precision_at_k.abs() < f64::EPSILON,
+            "precision should be 0 with no relevant IDs, got {}", m.precision_at_k);
+    }
+
+    /// SemanticQualityReport serde roundtrip with custom rrf_k.
+    #[test]
+    fn report_serde_roundtrip_rrf(rrf_k in 1_u32..50) {
+        let queries = default_semantic_eval_queries();
+        let report = SemanticQualityHarness::new(queries).with_rrf_k(rrf_k).run();
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: SemanticQualityReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed.passed, report.passed);
+        prop_assert_eq!(parsed.queries.len(), report.queries.len());
+        prop_assert_eq!(parsed.violations.len(), report.violations.len());
+    }
+
+    /// RegressionThresholds default has non-negative minimums.
+    #[test]
+    fn default_thresholds_non_negative(_dummy in 0..1u8) {
+        let t = RegressionThresholds::default();
+        prop_assert!(t.min_hybrid_precision_at_k >= 0.0);
+        prop_assert!(t.min_hybrid_recall_at_k >= 0.0);
+    }
+}

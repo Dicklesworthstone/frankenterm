@@ -532,3 +532,79 @@ proptest! {
             "at least budget or work should be positive");
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Batch 13: additional property tests (DarkMill)
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// scheduling_hooks() returns one hook per batch.
+    #[test]
+    fn scheduling_hooks_count_matches_batches(input in arb_nonempty_input()) {
+        let plan = ViewportReflowPlanner::plan(&input);
+        let hooks = plan.scheduling_hooks();
+        prop_assert_eq!(
+            hooks.len(), plan.batches.len(),
+            "hooks {} != batches {}", hooks.len(), plan.batches.len()
+        );
+    }
+
+    /// scheduling_hooks() work_units match batch work_units.
+    #[test]
+    fn scheduling_hooks_preserve_work_units(input in arb_nonempty_input()) {
+        let plan = ViewportReflowPlanner::plan(&input);
+        let hooks = plan.scheduling_hooks();
+        for (hook, batch) in hooks.iter().zip(plan.batches.iter()) {
+            prop_assert_eq!(hook.work_units, batch.work_units,
+                "hook work_units {} != batch {}", hook.work_units, batch.work_units);
+            prop_assert_eq!(hook.selected_for_frame, batch.selected_for_frame);
+        }
+    }
+
+    /// log_lines() returns non-empty output for non-empty input.
+    #[test]
+    fn log_lines_nonempty_for_nonempty_input(input in arb_nonempty_input()) {
+        let plan = ViewportReflowPlanner::plan(&input);
+        let lines = plan.log_lines();
+        prop_assert!(!lines.is_empty(), "non-empty plan should produce log lines");
+    }
+
+    /// Default ReflowPlan has no batches and zero budget.
+    #[test]
+    fn plan_default_empty(_dummy in 0..1u8) {
+        let plan = ReflowPlan::default();
+        prop_assert!(plan.batches.is_empty());
+        prop_assert_eq!(plan.frame_budget_units, 0);
+        prop_assert_eq!(plan.frame_work_units, 0);
+    }
+
+    /// ReflowLineRange end_line_exclusive >= start_line for valid ranges.
+    #[test]
+    fn line_range_endpoints_ordered(
+        start in 0_u32..5000,
+        extra in 0_u32..5000,
+    ) {
+        let end = start.saturating_add(extra);
+        let range = ReflowLineRange { start_line: start, end_line_exclusive: end };
+        prop_assert!(range.end_line_exclusive >= range.start_line);
+    }
+
+    /// Every ReflowBatchPriority has a non-empty Debug representation.
+    #[test]
+    fn priority_debug_nonempty(p in arb_priority()) {
+        let debug = format!("{:?}", p);
+        prop_assert!(!debug.is_empty(), "priority debug should be non-empty");
+    }
+
+    /// Default input has valid defaults (overscan=16, max_batch=64).
+    #[test]
+    fn planner_input_default_has_valid_fields(_dummy in 0..1u8) {
+        let input = ReflowPlannerInput::default();
+        prop_assert_eq!(input.overscan_lines, 16);
+        prop_assert_eq!(input.max_batch_lines, 64);
+        prop_assert_eq!(input.lines_per_work_unit, 32);
+        prop_assert_eq!(input.frame_budget_units, 8);
+    }
+}
