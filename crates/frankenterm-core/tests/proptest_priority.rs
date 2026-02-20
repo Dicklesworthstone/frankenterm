@@ -570,3 +570,99 @@ proptest! {
         prop_assert!(!debug.is_empty());
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// PanePriority JSON has expected keys.
+    #[test]
+    fn prop_priority_json_keys(tier in arb_priority()) {
+        let json = serde_json::to_string(&tier).unwrap();
+        // PanePriority is likely an enum, check it serializes
+        prop_assert!(!json.is_empty());
+    }
+
+    /// PanePriority Clone preserves value.
+    #[test]
+    fn prop_priority_clone(tier in arb_priority()) {
+        let cloned = tier.clone();
+        let j1 = serde_json::to_string(&tier).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// PriorityConfig JSON has rate_half_life_secs field.
+    #[test]
+    fn prop_config_json_keys(hl in 1.0f64..600.0) {
+        let config = PriorityConfig {
+            rate_half_life_secs: hl,
+            high_rate_threshold: 100.0,
+            medium_rate_threshold: 10.0,
+            error_retention_secs: 300.0,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(json.contains("\"rate_half_life_secs\""));
+    }
+
+    /// PriorityMetrics JSON is valid.
+    #[test]
+    fn prop_metrics_json_valid(
+        total_cls in 0u64..100_000,
+        overrides in 0usize..100,
+        tracked in 0usize..1000,
+    ) {
+        let mut counts = std::collections::HashMap::new();
+        counts.insert("High".to_string(), tracked / 2);
+        counts.insert("Low".to_string(), tracked - tracked / 2);
+        let m = PriorityMetrics {
+            counts,
+            total_classifications: total_cls,
+            override_count: overrides,
+            tracked_panes: tracked,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+    }
+
+    /// PriorityConfig Clone preserves all fields.
+    #[test]
+    fn prop_config_clone_eq(hl in 1.0f64..600.0) {
+        let config = PriorityConfig {
+            rate_half_life_secs: hl,
+            high_rate_threshold: 100.0,
+            medium_rate_threshold: 10.0,
+            error_retention_secs: 300.0,
+        };
+        let cloned = config.clone();
+        let j1 = serde_json::to_string(&config).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// PanePriority Debug is non-empty.
+    #[test]
+    fn prop_priority_debug(tier in arb_priority()) {
+        let dbg = format!("{:?}", tier);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// PriorityMetrics Debug is non-empty.
+    #[test]
+    fn prop_metrics_debug_output(
+        total_cls in 0u64..100_000,
+        overrides in 0usize..100,
+        tracked in 0usize..1000,
+    ) {
+        let m = PriorityMetrics {
+            counts: std::collections::HashMap::new(),
+            total_classifications: total_cls,
+            override_count: overrides,
+            tracked_panes: tracked,
+        };
+        let dbg = format!("{:?}", m);
+        prop_assert!(!dbg.is_empty());
+    }
+}

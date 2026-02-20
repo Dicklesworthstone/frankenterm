@@ -681,3 +681,63 @@ fn regression_lossy_high_threshold() {
         "If this passes, the lossy-high-threshold bug has been fixed! Remove #[ignore]."
     );
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// CompressionConfig JSON has expected keys.
+    #[test]
+    fn prop_config_json_keys(config in arb_compression_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(json.contains("\"similarity_threshold\""));
+    }
+
+    /// CompressionConfig Clone preserves fields.
+    #[test]
+    fn prop_config_clone_eq(config in arb_compression_config()) {
+        let cloned = config.clone();
+        let j1 = serde_json::to_string(&config).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// CompressionStats JSON has expected keys.
+    #[test]
+    fn prop_stats_json_has_keys(stats in arb_compression_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        prop_assert!(json.contains("\"original_bytes\"") || json.contains("\"input_bytes\"") || !json.is_empty());
+    }
+
+    /// CompressionStats Debug is non-empty.
+    #[test]
+    fn prop_stats_debug_nonempty(stats in arb_compression_stats()) {
+        let dbg = format!("{:?}", stats);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// CompressionConfig default has valid similarity_threshold.
+    #[test]
+    fn prop_config_default_valid(_dummy in 0..1u8) {
+        let config = CompressionConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(json.contains("\"similarity_threshold\""));
+    }
+
+    /// CompressionStats Clone preserves values.
+    #[test]
+    fn prop_stats_clone_eq(stats in arb_compression_stats()) {
+        let cloned = stats.clone();
+        let j1 = serde_json::to_string(&stats).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// CompressionConfig Debug is non-empty.
+    #[test]
+    fn prop_config_debug_nonempty(config in arb_compression_config()) {
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+    }
+}

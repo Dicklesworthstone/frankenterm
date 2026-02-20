@@ -690,3 +690,63 @@ proptest! {
         prop_assert_eq!(dt, back);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// DriftConfig JSON has expected keys.
+    #[test]
+    fn prop_drift_config_json_keys(config in arb_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(json.contains("\"confidence\""));
+    }
+
+    /// DriftConfig Clone preserves fields.
+    #[test]
+    fn prop_drift_config_clone_eq(config in arb_config()) {
+        let cloned = config.clone();
+        let j1 = serde_json::to_string(&config).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// DriftInfo JSON has expected keys.
+    #[test]
+    fn prop_drift_info_json_keys(info in arb_drift_info()) {
+        let json = serde_json::to_string(&info).unwrap();
+        prop_assert!(json.contains("\"mean_diff\""));
+        prop_assert!(json.contains("\"old_mean\""));
+    }
+
+    /// DriftInfo Clone preserves fields.
+    #[test]
+    fn prop_drift_info_clone(info in arb_drift_info()) {
+        let cloned = info.clone();
+        let j1 = serde_json::to_string(&info).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// DriftType Debug is non-empty.
+    #[test]
+    fn prop_drift_type_debug(is_drop in any::<bool>()) {
+        let dt = if is_drop { DriftType::RateDrop } else { DriftType::RateSpike };
+        let dbg = format!("{:?}", dt);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// DriftInfo mean_diff is non-negative.
+    #[test]
+    fn prop_drift_info_mean_diff_nonneg(info in arb_drift_info()) {
+        prop_assert!(info.mean_diff >= 0.0, "mean_diff should be non-negative");
+    }
+
+    /// DriftConfig default has valid confidence.
+    #[test]
+    fn prop_drift_config_default_valid(_dummy in 0..1u8) {
+        let config = DriftConfig::default();
+        prop_assert!(config.confidence > 0.0);
+    }
+}

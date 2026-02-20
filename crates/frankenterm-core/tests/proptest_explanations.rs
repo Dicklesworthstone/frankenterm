@@ -597,3 +597,74 @@ fn category_templates_all_match_prefix() {
         }
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// All template categories produce non-empty lists.
+    #[test]
+    fn prop_all_categories_nonempty(idx in 0usize..4) {
+        let cats = ["deny", "workflow", "event", "risk"];
+        let templates = list_templates_by_category(cats[idx]);
+        prop_assert!(!templates.is_empty(), "category '{}' should have templates", cats[idx]);
+    }
+
+    /// Template IDs are non-empty strings.
+    #[test]
+    fn prop_template_ids_nonempty(idx in 0usize..4) {
+        let cats = ["deny", "workflow", "event", "risk"];
+        let templates = list_templates_by_category(cats[idx]);
+        for tmpl in &templates {
+            prop_assert!(!tmpl.id.is_empty(), "template id should not be empty");
+        }
+    }
+
+    /// Template render with empty context doesn't panic.
+    #[test]
+    fn prop_render_empty_context(idx in 0usize..4) {
+        let cats = ["deny", "workflow", "event", "risk"];
+        let templates = list_templates_by_category(cats[idx]);
+        let context = std::collections::HashMap::new();
+        for tmpl in &templates {
+            let _ = render_explanation(tmpl, &context);
+        }
+    }
+
+    /// Template Debug is non-empty.
+    #[test]
+    fn prop_template_debug(idx in 0usize..4) {
+        let cats = ["deny", "workflow", "event", "risk"];
+        let templates = list_templates_by_category(cats[idx]);
+        if let Some(tmpl) = templates.first() {
+            let dbg = format!("{:?}", tmpl);
+            prop_assert!(!dbg.is_empty());
+        }
+    }
+
+    /// list_template_ids returns non-empty list.
+    #[test]
+    fn prop_list_ids_nonempty(_dummy in 0..1u8) {
+        let ids = list_template_ids();
+        prop_assert!(!ids.is_empty(), "list_template_ids should return IDs");
+    }
+
+    /// get_explanation returns Some for known IDs.
+    #[test]
+    fn prop_get_known_explanation(idx in 0usize..4) {
+        let cats = ["deny", "workflow", "event", "risk"];
+        let templates = list_templates_by_category(cats[idx]);
+        if let Some(tmpl) = templates.first() {
+            let found = get_explanation(&tmpl.id);
+            prop_assert!(found.is_some(), "known template '{}' should be findable", tmpl.id);
+        }
+    }
+
+    /// get_explanation returns None for unknown IDs.
+    #[test]
+    fn prop_get_unknown_explanation(_dummy in 0..1u8) {
+        let found = get_explanation("nonexistent.unknown.template");
+        prop_assert!(found.is_none(), "unknown template should return None");
+    }
+}

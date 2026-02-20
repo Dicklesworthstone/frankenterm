@@ -525,3 +525,84 @@ proptest! {
             "Header kind '{}' should parse back to {:?}", kind_str, kind);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// ExportKind Debug is non-empty.
+    #[test]
+    fn prop_export_kind_debug(kind in arb_export_kind()) {
+        let dbg = format!("{:?}", kind);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// ExportKind as_str is non-empty.
+    #[test]
+    fn prop_export_kind_as_str(kind in arb_export_kind()) {
+        let s = kind.as_str();
+        prop_assert!(!s.is_empty(), "as_str should not be empty");
+    }
+
+    /// ExportHeader JSON has kind field.
+    #[test]
+    fn prop_header_json_has_kind(kind in arb_export_kind()) {
+        let header = arb_header_for_kind(kind);
+        let json = serde_json::to_string(&header).unwrap();
+        prop_assert!(json.contains("\"kind\""));
+    }
+
+    /// ExportHeader Clone preserves kind.
+    #[test]
+    fn prop_header_clone(kind in arb_export_kind()) {
+        let header = arb_header_for_kind(kind);
+        let cloned = header.clone();
+        let j1 = serde_json::to_string(&header).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// ExportKind as_str round-trips through all_kinds.
+    #[test]
+    fn prop_export_kind_as_str_in_all(kind in arb_export_kind()) {
+        let s = kind.as_str();
+        let all = ExportKind::all_names();
+        prop_assert!(all.contains(&s), "as_str '{}' should be in all_names", s);
+    }
+
+    /// ExportHeader record_count is serialized.
+    #[test]
+    fn prop_header_record_count(kind in arb_export_kind(), cnt in 0usize..10_000) {
+        let mut header = arb_header_for_kind(kind);
+        header.record_count = cnt;
+        let json = serde_json::to_string(&header).unwrap();
+        prop_assert!(json.contains("\"record_count\""));
+    }
+
+    /// ExportHeader exported_at_ms appears in JSON as number.
+    #[test]
+    fn prop_header_timestamp_in_json(kind in arb_export_kind(), ts in 0i64..i64::MAX) {
+        let mut header = arb_header_for_kind(kind);
+        header.exported_at_ms = ts;
+        let json = serde_json::to_string(&header).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let got = v["exported_at_ms"].as_i64().unwrap();
+        prop_assert_eq!(got, ts);
+    }
+}
+
+fn arb_header_for_kind(kind: ExportKind) -> ExportHeader {
+    ExportHeader {
+        export: true,
+        version: "1.0".to_string(),
+        kind: kind.as_str().to_string(),
+        redacted: false,
+        exported_at_ms: 1_500_000_000_000,
+        pane_id: None,
+        since: None,
+        until: None,
+        limit: None,
+        record_count: 0,
+    }
+}
