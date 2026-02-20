@@ -98,9 +98,11 @@ proptest! {
         ewma.observe(0.0, 0);
         ewma.observe(100.0, hl.round() as u64); // exactly one half-life
 
-        // After one half-life, alpha = 0.5, so EWMA = 0.5*100 + 0.5*0 = 50
-        // Tolerance accounts for residual f64 rounding in alpha computation.
-        prop_assert!((ewma.value() - 50.0).abs() < 1.0,
+        // After one half-life, alpha = 0.5, so EWMA = 0.5*100 + 0.5*0 = 50.
+        // Tolerance of 2.0 accounts for u64 timestamp rounding: hl.round()
+        // can differ from hl by up to 0.5ms, so dt/hl may be ~1.05 for
+        // small half-lives (~10ms), giving alpha ~0.517 and EWMA ~51.7.
+        prop_assert!((ewma.value() - 50.0).abs() < 2.0,
             "after one half-life, value should be ~50, got {}", ewma.value());
     }
 }
