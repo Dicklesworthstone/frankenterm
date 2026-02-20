@@ -9,7 +9,9 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
-use frankenterm_core::wal_engine::{WalEngine, WalConfig, MuxMutation, replay_mutations, DiskWalConfig, DiskWal};
+use frankenterm_core::wal_engine::{
+    DiskWal, DiskWalConfig, MuxMutation, WalConfig, WalEngine, replay_mutations,
+};
 
 // ── In-Memory WAL Benchmarks ─────────────────────────────────────
 

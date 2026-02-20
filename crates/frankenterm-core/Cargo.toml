@@ -171,6 +171,11 @@ name = "pool_benchmark"
 harness = false
 
 [[bench]]
+name = "mux_pool_scaling"
+harness = false
+required-features = ["vendored"]
+
+[[bench]]
 name = "pdu_pipelining"
 harness = false
 required-features = ["vendored"]
