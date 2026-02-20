@@ -522,3 +522,136 @@ proptest! {
         prop_assert_eq!(obj.len(), 6, "ReadinessItem should have 6 JSON fields");
     }
 }
+
+// =========================================================================
+// DistributedConfig: arb strategy + serde/invariant tests
+// =========================================================================
+
+use frankenterm_core::config::DistributedTlsConfig;
+
+fn arb_auth_mode() -> impl Strategy<Value = DistributedAuthMode> {
+    prop_oneof![
+        Just(DistributedAuthMode::Token),
+        Just(DistributedAuthMode::Mtls),
+        Just(DistributedAuthMode::TokenAndMtls),
+    ]
+}
+
+fn arb_tls_config() -> impl Strategy<Value = DistributedTlsConfig> {
+    (
+        proptest::bool::ANY,
+        proptest::option::of("[a-z/]{5,30}"),
+        proptest::option::of("[a-z/]{5,30}"),
+        proptest::option::of("[a-z/]{5,30}"),
+        prop_oneof![Just("1.2".to_string()), Just("1.3".to_string())],
+    )
+        .prop_map(|(enabled, cert, key, ca, ver)| DistributedTlsConfig {
+            enabled,
+            cert_path: cert,
+            key_path: key,
+            client_ca_path: ca,
+            min_tls_version: ver,
+        })
+}
+
+fn arb_distributed_config() -> impl Strategy<Value = DistributedConfig> {
+    (
+        proptest::bool::ANY,
+        "[0-9.]{7,15}:[0-9]{2,5}",
+        proptest::bool::ANY,
+        proptest::bool::ANY,
+        arb_auth_mode(),
+        proptest::option::of("[a-zA-Z0-9]{8,32}"),
+        proptest::option::of("[A-Z_]{5,20}"),
+        proptest::option::of("[a-z/]{5,30}"),
+        proptest::collection::vec("[a-z0-9-]{3,12}", 0..5),
+        arb_tls_config(),
+    )
+        .prop_map(|(enabled, bind, insecure, require_tls, auth, token, env, path, agents, tls)| {
+            DistributedConfig {
+                enabled,
+                bind_addr: bind,
+                allow_insecure: insecure,
+                require_tls_for_non_loopback: require_tls,
+                auth_mode: auth,
+                token,
+                token_env: env,
+                token_path: path,
+                allow_agent_ids: agents,
+                tls,
+            }
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// DistributedConfig serde roundtrip preserves all fields.
+    #[test]
+    fn prop_distributed_config_serde(config in arb_distributed_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: DistributedConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.enabled, config.enabled);
+        prop_assert_eq!(back.bind_addr, config.bind_addr);
+        prop_assert_eq!(back.allow_insecure, config.allow_insecure);
+        prop_assert_eq!(back.auth_mode, config.auth_mode);
+        prop_assert_eq!(back.token, config.token);
+        prop_assert_eq!(back.token_env, config.token_env);
+        prop_assert_eq!(back.token_path, config.token_path);
+        prop_assert_eq!(back.allow_agent_ids, config.allow_agent_ids);
+    }
+
+    /// DistributedConfig JSON has expected keys.
+    #[test]
+    fn prop_distributed_config_json_keys(config in arb_distributed_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(json.contains("\"enabled\""));
+        prop_assert!(json.contains("\"bind_addr\""));
+        prop_assert!(json.contains("\"auth_mode\""));
+        prop_assert!(json.contains("\"tls\""));
+    }
+
+    /// DistributedConfig Clone preserves fields.
+    #[test]
+    fn prop_distributed_config_clone(config in arb_distributed_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.enabled, config.enabled);
+        prop_assert_eq!(cloned.auth_mode, config.auth_mode);
+        prop_assert_eq!(cloned.allow_agent_ids.len(), config.allow_agent_ids.len());
+    }
+
+    /// DistributedConfig readiness evaluation: disabled config is never ready.
+    #[test]
+    fn prop_disabled_config_not_ready(config in arb_distributed_config()) {
+        let mut cfg = config;
+        cfg.enabled = false;
+        let report = evaluate_readiness(&cfg);
+        prop_assert!(!report.ready, "disabled config should not be ready");
+    }
+
+    /// DistributedConfig Debug is non-empty.
+    #[test]
+    fn prop_distributed_config_debug(config in arb_distributed_config()) {
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// DistributedTlsConfig serde roundtrip.
+    #[test]
+    fn prop_tls_config_serde(tls in arb_tls_config()) {
+        let json = serde_json::to_string(&tls).unwrap();
+        let back: DistributedTlsConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.enabled, tls.enabled);
+        prop_assert_eq!(back.cert_path, tls.cert_path);
+        prop_assert_eq!(back.key_path, tls.key_path);
+        prop_assert_eq!(back.min_tls_version, tls.min_tls_version);
+    }
+
+    /// DistributedAuthMode serde roundtrip.
+    #[test]
+    fn prop_auth_mode_serde(mode in arb_auth_mode()) {
+        let json = serde_json::to_string(&mode).unwrap();
+        let back: DistributedAuthMode = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, mode);
+    }
+}

@@ -578,3 +578,109 @@ proptest! {
         prop_assert_eq!(cms.is_empty(), cms.total_count() == 0);
     }
 }
+
+// =========================================================================
+// CmsStats: arb strategy + serde/invariant tests
+// =========================================================================
+
+fn arb_cms_stats() -> impl Strategy<Value = CmsStats> {
+    (
+        1usize..10_000,
+        1usize..20,
+        0u64..1_000_000,
+        1usize..100_000,
+        0.0001f64..1.0,
+        0.0001f64..1.0,
+    )
+        .prop_map(|(width, depth, total, mem, eps, delta)| CmsStats {
+            width,
+            depth,
+            total_count: total,
+            memory_bytes: mem,
+            epsilon: eps,
+            delta,
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// CmsStats serde roundtrip preserves all fields.
+    #[test]
+    fn prop_cms_stats_arb_serde(stats in arb_cms_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: CmsStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.width, stats.width);
+        prop_assert_eq!(back.depth, stats.depth);
+        prop_assert_eq!(back.total_count, stats.total_count);
+        prop_assert_eq!(back.memory_bytes, stats.memory_bytes);
+        prop_assert!((back.epsilon - stats.epsilon).abs() < 1e-10);
+        prop_assert!((back.delta - stats.delta).abs() < 1e-10);
+    }
+
+    /// CmsStats JSON has expected keys.
+    #[test]
+    fn prop_cms_stats_json_keys(stats in arb_cms_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        prop_assert!(json.contains("\"width\""));
+        prop_assert!(json.contains("\"depth\""));
+        prop_assert!(json.contains("\"total_count\""));
+        prop_assert!(json.contains("\"memory_bytes\""));
+        prop_assert!(json.contains("\"epsilon\""));
+        prop_assert!(json.contains("\"delta\""));
+    }
+
+    /// CmsStats Clone preserves all fields.
+    #[test]
+    fn prop_cms_stats_clone(stats in arb_cms_stats()) {
+        let cloned = stats.clone();
+        prop_assert_eq!(cloned.width, stats.width);
+        prop_assert_eq!(cloned.depth, stats.depth);
+        prop_assert_eq!(cloned.total_count, stats.total_count);
+    }
+
+    /// CmsStats Debug is non-empty.
+    #[test]
+    fn prop_cms_stats_debug(stats in arb_cms_stats()) {
+        let dbg = format!("{:?}", stats);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("CmsStats"));
+    }
+
+    /// CmsStats JSON field count is 6.
+    #[test]
+    fn prop_cms_stats_field_count(stats in arb_cms_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert_eq!(obj.len(), 6, "CmsStats should have 6 JSON fields");
+    }
+
+    /// Real CMS stats have consistent memory_bytes.
+    #[test]
+    fn prop_real_cms_stats_memory(
+        config in arb_config(),
+    ) {
+        let cms = CountMinSketch::with_config(config);
+        let stats = cms.stats();
+        // memory = width * depth * 8 (each cell is u64)
+        prop_assert_eq!(
+            stats.memory_bytes, stats.width * stats.depth * 8,
+            "memory {} != width({}) * depth({}) * 8",
+            stats.memory_bytes, stats.width, stats.depth
+        );
+    }
+
+    /// Real CMS stats epsilon and delta are positive.
+    #[test]
+    fn prop_real_cms_stats_bounds(
+        config in arb_config(),
+    ) {
+        let cms = CountMinSketch::with_config(config);
+        let stats = cms.stats();
+        prop_assert!(stats.epsilon > 0.0, "epsilon should be positive");
+        prop_assert!(stats.delta > 0.0, "delta should be positive");
+        prop_assert!(stats.epsilon <= 1.0, "epsilon should be <= 1");
+        prop_assert!(stats.delta <= 1.0, "delta should be <= 1");
+    }
+}

@@ -453,3 +453,94 @@ proptest! {
         prop_assert!(sr <= 1.0, "smoothed_ratio {} > 1", sr);
     }
 }
+
+// =========================================================================
+// Additional behavioral tests for ThrottleActions + ContinuousBackpressure
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    /// ThrottleActions JSON has expected keys.
+    #[test]
+    fn prop_throttle_actions_json_keys(s in 0.0_f64..1.0) {
+        let actions = ThrottleActions::from_severity(s);
+        let json = serde_json::to_string(&actions).unwrap();
+        prop_assert!(json.contains("\"severity\""));
+        prop_assert!(json.contains("\"poll_backoff_multiplier\""));
+        prop_assert!(json.contains("\"pane_skip_fraction\""));
+        prop_assert!(json.contains("\"buffer_limit_factor\""));
+    }
+
+    /// ThrottleActions Clone preserves fields.
+    #[test]
+    fn prop_throttle_actions_clone(s in 0.0_f64..1.0) {
+        let actions = ThrottleActions::from_severity(s);
+        let cloned = actions;
+        prop_assert!((cloned.severity - actions.severity).abs() < f64::EPSILON);
+        prop_assert!((cloned.poll_backoff_multiplier - actions.poll_backoff_multiplier).abs() < f64::EPSILON);
+    }
+
+    /// ContinuousBackpressure reset clears state.
+    #[test]
+    fn prop_reset_clears_state(
+        config in arb_severity_config(),
+        ratios in proptest::collection::vec(0.0_f64..1.0, 1..20),
+    ) {
+        let mut bp = ContinuousBackpressure::new(config);
+        for r in &ratios {
+            bp.observe_ratio(*r);
+        }
+        bp.reset();
+        prop_assert_eq!(bp.observation_count(), 0, "reset should zero obs count");
+        prop_assert!((bp.smoothed_ratio() - 0.0).abs() < f64::EPSILON, "reset should zero ratio");
+    }
+
+    /// ContinuousBackpressure config accessor returns the same config.
+    #[test]
+    fn prop_config_accessor(config in arb_severity_config()) {
+        let bp = ContinuousBackpressure::new(config.clone());
+        let got = bp.config();
+        prop_assert!((got.center_threshold - config.center_threshold).abs() < f64::EPSILON);
+        prop_assert!((got.steepness - config.steepness).abs() < f64::EPSILON);
+        prop_assert_eq!(got.smoothing_window, config.smoothing_window);
+    }
+
+    /// ContinuousBackpressure observation_count tracks correctly.
+    #[test]
+    fn prop_observation_count_tracks(
+        config in arb_severity_config(),
+        ratios in proptest::collection::vec(0.0_f64..1.0, 1..50),
+    ) {
+        let mut bp = ContinuousBackpressure::new(config);
+        for r in &ratios {
+            bp.observe_ratio(*r);
+        }
+        prop_assert_eq!(bp.observation_count(), ratios.len() as u64,
+            "obs count {} != ratios len {}", bp.observation_count(), ratios.len());
+    }
+
+    /// ContinuousBackpressure equivalent_tier is valid after observations.
+    #[test]
+    fn prop_equivalent_tier_valid(
+        config in arb_severity_config(),
+        ratios in proptest::collection::vec(0.0_f64..1.0, 1..30),
+    ) {
+        let mut bp = ContinuousBackpressure::new(config);
+        for r in &ratios {
+            bp.observe_ratio(*r);
+        }
+        // equivalent_tier should be Debug-formattable
+        let dbg = format!("{:?}", bp.equivalent_tier());
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// SeverityConfig JSON field count is 3.
+    #[test]
+    fn prop_config_json_field_count(config in arb_severity_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert_eq!(obj.len(), 3, "SeverityConfig should have 3 JSON fields");
+    }
+}

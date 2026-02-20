@@ -11,7 +11,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::bloom_filter::{
-    BloomFilter, CountingBloomFilter, optimal_num_bits, optimal_num_hashes, theoretical_fp_rate,
+    BloomFilter, BloomStats, CountingBloomFilter, optimal_num_bits, optimal_num_hashes,
+    theoretical_fp_rate,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -698,5 +699,118 @@ proptest! {
             "stats fill_ratio {} out of [0,1]", fill);
         prop_assert!(stats.num_bits > 0, "stats num_bits should be positive");
         prop_assert!(stats.num_hashes > 0, "stats num_hashes should be positive");
+    }
+}
+
+// =========================================================================
+// BloomStats: arb strategy + serde/invariant tests
+// =========================================================================
+
+fn arb_bloom_stats() -> impl Strategy<Value = BloomStats> {
+    (
+        0usize..10_000,
+        1usize..100_000,
+        1u32..20,
+        1usize..50_000,
+        0.0f64..1.0,
+        0.0f64..1.0,
+    )
+        .prop_map(|(count, num_bits, num_hashes, memory_bytes, fp, fill)| BloomStats {
+            count,
+            num_bits,
+            num_hashes,
+            memory_bytes,
+            estimated_fp_rate: fp,
+            fill_ratio: fill,
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// BloomStats serde roundtrip preserves all fields.
+    #[test]
+    fn prop_bloom_stats_serde(stats in arb_bloom_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: BloomStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.count, stats.count);
+        prop_assert_eq!(back.num_bits, stats.num_bits);
+        prop_assert_eq!(back.num_hashes, stats.num_hashes);
+        prop_assert_eq!(back.memory_bytes, stats.memory_bytes);
+        prop_assert!((back.estimated_fp_rate - stats.estimated_fp_rate).abs() < 1e-10);
+        prop_assert!((back.fill_ratio - stats.fill_ratio).abs() < 1e-10);
+    }
+
+    /// BloomStats JSON has expected keys.
+    #[test]
+    fn prop_bloom_stats_json_keys(stats in arb_bloom_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        prop_assert!(json.contains("\"count\""));
+        prop_assert!(json.contains("\"num_bits\""));
+        prop_assert!(json.contains("\"num_hashes\""));
+        prop_assert!(json.contains("\"memory_bytes\""));
+        prop_assert!(json.contains("\"estimated_fp_rate\""));
+        prop_assert!(json.contains("\"fill_ratio\""));
+    }
+
+    /// BloomStats Clone preserves all fields.
+    #[test]
+    fn prop_bloom_stats_clone(stats in arb_bloom_stats()) {
+        let cloned = stats.clone();
+        prop_assert_eq!(cloned.count, stats.count);
+        prop_assert_eq!(cloned.num_bits, stats.num_bits);
+        prop_assert_eq!(cloned.num_hashes, stats.num_hashes);
+    }
+
+    /// BloomStats from a real filter has consistent fill_ratio.
+    #[test]
+    fn prop_bloom_stats_fill_ratio_consistent(
+        capacity in 10usize..500,
+        fp_rate in 0.001_f64..0.3,
+        items in arb_item_set(50),
+    ) {
+        let mut bf = BloomFilter::with_capacity(capacity, fp_rate);
+        for item in &items {
+            bf.insert(item);
+        }
+        let stats = bf.stats();
+        // fill_ratio should be 0 when no items inserted, else > 0
+        if items.is_empty() {
+            prop_assert!((stats.fill_ratio - 0.0).abs() < 1e-10);
+        } else {
+            prop_assert!(stats.fill_ratio > 0.0, "fill should be > 0 with items");
+        }
+        prop_assert!(stats.fill_ratio <= 1.0);
+    }
+
+    /// BloomStats Debug is non-empty.
+    #[test]
+    fn prop_bloom_stats_debug(stats in arb_bloom_stats()) {
+        let dbg = format!("{:?}", stats);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("BloomStats"));
+    }
+
+    /// BloomStats JSON field count is 6.
+    #[test]
+    fn prop_bloom_stats_field_count(stats in arb_bloom_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert_eq!(obj.len(), 6, "BloomStats should have 6 JSON fields");
+    }
+
+    /// BloomStats from empty filter has zero count and fill_ratio.
+    #[test]
+    fn prop_empty_filter_stats(
+        capacity in 10usize..500,
+        fp_rate in 0.001_f64..0.3,
+    ) {
+        let bf = BloomFilter::with_capacity(capacity, fp_rate);
+        let stats = bf.stats();
+        prop_assert_eq!(stats.count, 0, "empty filter should have count 0");
+        prop_assert!((stats.fill_ratio - 0.0).abs() < f64::EPSILON, "empty filter fill should be 0");
+        prop_assert!(stats.memory_bytes > 0, "memory should be > 0");
+        prop_assert!(stats.num_hashes > 0, "num_hashes should be > 0");
     }
 }

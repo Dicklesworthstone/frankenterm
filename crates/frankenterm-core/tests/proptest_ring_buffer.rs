@@ -712,3 +712,116 @@ proptest! {
         prop_assert_eq!(stats.len, rb.len());
     }
 }
+
+// =========================================================================
+// RingBufferStats: arb strategy + serde/invariant tests
+// =========================================================================
+
+fn arb_ring_buffer_stats() -> impl Strategy<Value = RingBufferStats> {
+    (
+        1usize..10_000,
+        0usize..10_000,
+        0u64..1_000_000,
+        0u64..1_000_000,
+        0.0f64..=1.0,
+    )
+        .prop_map(|(capacity, len, pushed, evicted, fill)| {
+            let len = len.min(capacity);
+            RingBufferStats {
+                capacity,
+                len,
+                total_pushed: pushed,
+                total_evicted: evicted,
+                fill_ratio: fill,
+            }
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// RingBufferStats serde roundtrip preserves all fields.
+    #[test]
+    fn prop_ring_buffer_stats_serde(stats in arb_ring_buffer_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: RingBufferStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.capacity, stats.capacity);
+        prop_assert_eq!(back.len, stats.len);
+        prop_assert_eq!(back.total_pushed, stats.total_pushed);
+        prop_assert_eq!(back.total_evicted, stats.total_evicted);
+        prop_assert!((back.fill_ratio - stats.fill_ratio).abs() < 1e-10);
+    }
+
+    /// RingBufferStats JSON has expected keys.
+    #[test]
+    fn prop_ring_buffer_stats_json_keys(stats in arb_ring_buffer_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        prop_assert!(json.contains("\"capacity\""));
+        prop_assert!(json.contains("\"len\""));
+        prop_assert!(json.contains("\"total_pushed\""));
+        prop_assert!(json.contains("\"total_evicted\""));
+        prop_assert!(json.contains("\"fill_ratio\""));
+    }
+
+    /// RingBufferStats Clone preserves all fields.
+    #[test]
+    fn prop_ring_buffer_stats_clone(stats in arb_ring_buffer_stats()) {
+        let cloned = stats.clone();
+        prop_assert_eq!(cloned.capacity, stats.capacity);
+        prop_assert_eq!(cloned.len, stats.len);
+        prop_assert_eq!(cloned.total_pushed, stats.total_pushed);
+        prop_assert_eq!(cloned.total_evicted, stats.total_evicted);
+    }
+
+    /// RingBufferStats Debug is non-empty.
+    #[test]
+    fn prop_ring_buffer_stats_debug(stats in arb_ring_buffer_stats()) {
+        let dbg = format!("{:?}", stats);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("RingBufferStats"));
+    }
+
+    /// RingBufferStats JSON field count is 5.
+    #[test]
+    fn prop_ring_buffer_stats_field_count(stats in arb_ring_buffer_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert_eq!(obj.len(), 5, "RingBufferStats should have 5 JSON fields");
+    }
+
+    /// Real buffer stats have consistent fill_ratio.
+    #[test]
+    fn prop_real_stats_fill_ratio(
+        capacity in arb_capacity(),
+        items in arb_items(30),
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for &item in &items {
+            rb.push(item);
+        }
+        let stats = rb.stats();
+        let expected_fill = stats.len as f64 / stats.capacity as f64;
+        prop_assert!((stats.fill_ratio - expected_fill).abs() < 1e-10,
+            "fill_ratio {} != expected {}", stats.fill_ratio, expected_fill);
+    }
+
+    /// Real buffer stats evicted + len == total_pushed.
+    #[test]
+    fn prop_real_stats_accounting(
+        capacity in arb_capacity(),
+        items in arb_items(30),
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for &item in &items {
+            rb.push(item);
+        }
+        let stats = rb.stats();
+        prop_assert_eq!(
+            stats.total_evicted + stats.len as u64,
+            stats.total_pushed,
+            "evicted({}) + len({}) != pushed({})",
+            stats.total_evicted, stats.len, stats.total_pushed
+        );
+    }
+}
