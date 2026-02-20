@@ -910,3 +910,72 @@ fn healthy_context_no_reasons() {
         result.reasons.iter().map(|r| r.code).collect::<Vec<_>>(),
     );
 }
+
+// =============================================================================
+// Additional property tests for 37-test coverage
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// PaneIndexingInfo Clone roundtrip preserves all fields.
+    #[test]
+    fn prop_pane_indexing_clone_roundtrip(info in arb_pane_indexing_info(1_700_000_000_000)) {
+        let cloned = info.clone();
+        prop_assert_eq!(cloned.pane_id, info.pane_id);
+        prop_assert_eq!(cloned.segment_count, info.segment_count);
+        prop_assert_eq!(cloned.total_bytes, info.total_bytes);
+        prop_assert_eq!(cloned.last_segment_at, info.last_segment_at);
+        prop_assert_eq!(cloned.fts_row_count, info.fts_row_count);
+        prop_assert_eq!(cloned.fts_consistent, info.fts_consistent);
+    }
+
+    /// GapInfo Clone roundtrip preserves all fields.
+    #[test]
+    fn prop_gap_info_clone_roundtrip(gap in arb_gap_info(1_700_000_000_000)) {
+        let cloned = gap.clone();
+        prop_assert_eq!(cloned.pane_id, gap.pane_id);
+        prop_assert_eq!(cloned.seq_before, gap.seq_before);
+        prop_assert_eq!(cloned.seq_after, gap.seq_after);
+        prop_assert_eq!(cloned.reason, gap.reason);
+        prop_assert_eq!(cloned.detected_at, gap.detected_at);
+    }
+
+    /// PaneExplainInfo Clone roundtrip preserves all fields.
+    #[test]
+    fn prop_pane_explain_clone_roundtrip(info in arb_pane_explain_info(1_700_000_000_000)) {
+        let cloned = info.clone();
+        prop_assert_eq!(cloned.pane_id, info.pane_id);
+        prop_assert_eq!(cloned.observed, info.observed);
+        prop_assert_eq!(cloned.ignore_reason, info.ignore_reason);
+        prop_assert_eq!(cloned.domain, info.domain);
+        prop_assert_eq!(cloned.last_seen_at, info.last_seen_at);
+    }
+
+    /// Ignored panes count = total - observed.
+    #[test]
+    fn prop_ignored_equals_total_minus_observed(ctx in arb_search_context()) {
+        let result = explain_search(&ctx);
+        prop_assert_eq!(result.ignored_panes, result.total_panes - result.observed_panes,
+            "ignored {} should equal total {} - observed {}",
+            result.ignored_panes, result.total_panes, result.observed_panes);
+    }
+
+    /// SearchExplainResult reasons have non-negative confidence.
+    #[test]
+    fn prop_reasons_confidence_non_negative(ctx in arb_search_context()) {
+        let result = explain_search(&ctx);
+        for reason in &result.reasons {
+            prop_assert!(reason.confidence >= 0.0,
+                "confidence {} should be >= 0", reason.confidence);
+        }
+    }
+
+    /// SearchExplainResult total_panes matches input panes length.
+    #[test]
+    fn prop_total_panes_matches_input(ctx in arb_search_context()) {
+        let result = explain_search(&ctx);
+        prop_assert_eq!(result.total_panes, ctx.panes.len(),
+            "total_panes {} should equal input panes len {}", result.total_panes, ctx.panes.len());
+    }
+}

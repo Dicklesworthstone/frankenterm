@@ -1373,3 +1373,114 @@ proptest! {
         );
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// 31. CleanupResult serde roundtrip
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn cleanup_result_clone_fields_match(result in arb_cleanup_result()) {
+        let cloned = result.clone();
+        prop_assert_eq!(cloned.deleted_by_age, result.deleted_by_age);
+        prop_assert_eq!(cloned.deleted_by_count, result.deleted_by_count);
+        prop_assert_eq!(cloned.deleted_by_size, result.deleted_by_size);
+        prop_assert_eq!(cloned.orphaned_checkpoints, result.orphaned_checkpoints);
+        prop_assert_eq!(cloned.orphaned_pane_states, result.orphaned_pane_states);
+        prop_assert_eq!(cloned.vacuumed, result.vacuumed);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 32. CleanupResult Debug is non-empty
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn cleanup_result_debug_nonempty(result in arb_cleanup_result()) {
+        let dbg = format!("{:?}", result);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 33. Config serde deterministic
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn config_serde_deterministic(config in arb_config()) {
+        let j1 = serde_json::to_string(&config).unwrap();
+        let j2 = serde_json::to_string(&config).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 34. Config clone preserves fields
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn config_clone_preserves(config in arb_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.max_age_days, config.max_age_days);
+        prop_assert_eq!(cloned.max_closed_sessions, config.max_closed_sessions);
+        prop_assert_eq!(cloned.max_total_size_mb, config.max_total_size_mb);
+        prop_assert_eq!(cloned.cleanup_interval_hours, config.cleanup_interval_hours);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 35. Config Debug non-empty
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn config_debug_nonempty(config in arb_config()) {
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 36. Total sessions deleted consistency
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn total_sessions_deleted_equals_sum(result in arb_cleanup_result()) {
+        let sum = result.deleted_by_age + result.deleted_by_count + result.deleted_by_size;
+        prop_assert_eq!(result.total_sessions_deleted(), sum,
+            "total_sessions_deleted {} should equal sum of components {}",
+            result.total_sessions_deleted(), sum);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 37. CleanupResult default is no-work
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn cleanup_result_default_no_work(_dummy in 0..1_u8) {
+        let result = CleanupResult::default();
+        prop_assert!(!result.any_work_done());
+        prop_assert_eq!(result.total_sessions_deleted(), 0);
+        prop_assert!(!result.vacuumed);
+    }
+}

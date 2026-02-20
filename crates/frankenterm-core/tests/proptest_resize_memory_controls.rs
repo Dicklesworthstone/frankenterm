@@ -599,3 +599,137 @@ proptest! {
         prop_assert_eq!(json1, json2);
     }
 }
+
+// =============================================================================
+// Property 31: Overscan cap decreases or stays same across tiers
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn overscan_cap_monotonic_with_default(_dummy in 0..1_u8) {
+        let mut policy = ResizeMemoryPolicy::new(ResizeMemoryConfig::default());
+        let green = policy.compute_budget(MemoryPressureTier::Green);
+        let yellow = policy.compute_budget(MemoryPressureTier::Yellow);
+        let orange = policy.compute_budget(MemoryPressureTier::Orange);
+        let red = policy.compute_budget(MemoryPressureTier::Red);
+        prop_assert!(green.overscan_cap >= yellow.overscan_cap,
+            "green overscan {} should be >= yellow {}", green.overscan_cap, yellow.overscan_cap);
+        prop_assert!(yellow.overscan_cap >= orange.overscan_cap,
+            "yellow overscan {} should be >= orange {}", yellow.overscan_cap, orange.overscan_cap);
+        prop_assert!(orange.overscan_cap >= red.overscan_cap,
+            "orange overscan {} should be >= red {}", orange.overscan_cap, red.overscan_cap);
+    }
+}
+
+// =============================================================================
+// Property 32: Backlog cap decreases or stays same across tiers
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn backlog_cap_with_default_monotonic(_dummy in 0..1_u8) {
+        let mut policy = ResizeMemoryPolicy::new(ResizeMemoryConfig::default());
+        let green = policy.compute_budget(MemoryPressureTier::Green);
+        let yellow = policy.compute_budget(MemoryPressureTier::Yellow);
+        let orange = policy.compute_budget(MemoryPressureTier::Orange);
+        let red = policy.compute_budget(MemoryPressureTier::Red);
+        prop_assert!(green.backlog_cap >= yellow.backlog_cap,
+            "green backlog {} should be >= yellow {}", green.backlog_cap, yellow.backlog_cap);
+        prop_assert!(yellow.backlog_cap >= orange.backlog_cap,
+            "yellow backlog {} should be >= orange {}", yellow.backlog_cap, orange.backlog_cap);
+        prop_assert!(orange.backlog_cap >= red.backlog_cap,
+            "orange backlog {} should be >= red {}", orange.backlog_cap, red.backlog_cap);
+    }
+}
+
+// =============================================================================
+// Property 33: Max scratch bytes decreases with pressure
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn max_scratch_monotonic_decrease(config in arb_config()) {
+        let mut policy = ResizeMemoryPolicy::new(config);
+        let green = policy.compute_budget(MemoryPressureTier::Green);
+        let red = policy.compute_budget(MemoryPressureTier::Red);
+        prop_assert!(green.max_scratch_bytes >= red.max_scratch_bytes,
+            "green scratch {} should be >= red {}", green.max_scratch_bytes, red.max_scratch_bytes);
+    }
+}
+
+// =============================================================================
+// Property 34: Budget tier matches requested tier
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn budget_tier_matches_requested(tier in arb_tier()) {
+        let mut policy = ResizeMemoryPolicy::new(ResizeMemoryConfig::default());
+        let budget = policy.compute_budget(tier);
+        prop_assert_eq!(budget.tier, tier,
+            "budget tier {:?} should match requested {:?}", budget.tier, tier);
+    }
+}
+
+// =============================================================================
+// Property 35: Effective cold batch never exceeds budget batch
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn effective_cold_batch_le_budget(
+        remaining in 0_usize..200,
+    ) {
+        let mut policy = ResizeMemoryPolicy::new(ResizeMemoryConfig::default());
+        let budget = policy.compute_budget(MemoryPressureTier::Green);
+        let effective = effective_cold_batch_size(&budget, remaining);
+        prop_assert!(effective <= budget.cold_batch_size,
+            "effective {} should be <= budget batch {}", effective, budget.cold_batch_size);
+    }
+}
+
+// =============================================================================
+// Property 36: Effective overscan respects cap
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn effective_overscan_le_cap(
+        physical_rows in 10_usize..200,
+        scrollback in 0_usize..500,
+    ) {
+        let mut policy = ResizeMemoryPolicy::new(ResizeMemoryConfig::default());
+        let budget = policy.compute_budget(MemoryPressureTier::Green);
+        let effective = effective_overscan_rows(&budget, physical_rows, scrollback);
+        prop_assert!(effective <= budget.overscan_cap,
+            "effective overscan {} should be <= cap {}", effective, budget.overscan_cap);
+    }
+}
+
+// =============================================================================
+// Property 37: Policy config accessor returns construction config
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn policy_config_roundtrip(config in arb_config()) {
+        let policy = ResizeMemoryPolicy::new(config.clone());
+        let retrieved = policy.config();
+        prop_assert_eq!(retrieved.enabled, config.enabled,
+            "config accessor should return construction config");
+    }
+}

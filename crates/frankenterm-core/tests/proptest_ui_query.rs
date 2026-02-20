@@ -635,4 +635,72 @@ proptest! {
         let debug = format!("{:?}", summary);
         prop_assert!(!debug.is_empty());
     }
+
+    /// PaneBookmarkView serializes to valid JSON with pane_id.
+    #[test]
+    fn bookmark_view_serialize_has_pane_id(record in arb_bookmark_record()) {
+        let view = PaneBookmarkView::from(record);
+        let json = serde_json::to_string(&view).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+        prop_assert_eq!(value["pane_id"].as_u64(), Some(view.pane_id));
+    }
+
+    /// SavedSearchView serializes to valid JSON with name/query.
+    #[test]
+    fn saved_search_view_serialize_has_name(record in arb_saved_search_record()) {
+        let view = SavedSearchView::from(record);
+        let json = serde_json::to_string(&view).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+        prop_assert_eq!(value["name"].as_str(), Some(view.name.as_str()));
+    }
+
+    /// PaneBookmarkView Clone preserves fields.
+    #[test]
+    fn bookmark_view_clone_preserves(record in arb_bookmark_record()) {
+        let view = PaneBookmarkView::from(record);
+        let cloned = view.clone();
+        prop_assert_eq!(cloned.pane_id, view.pane_id);
+        prop_assert_eq!(cloned.alias, view.alias);
+        prop_assert_eq!(cloned.description, view.description);
+    }
+
+    /// SavedSearchView Clone preserves fields.
+    #[test]
+    fn saved_search_view_clone_preserves(record in arb_saved_search_record()) {
+        let view = SavedSearchView::from(record);
+        let cloned = view.clone();
+        prop_assert_eq!(cloned.name, view.name);
+        prop_assert_eq!(cloned.query, view.query);
+        prop_assert_eq!(cloned.limit, view.limit);
+    }
+
+    /// RulesetProfileSummary Clone preserves fields.
+    #[test]
+    fn profile_summary_clone_preserves(summary in arb_profile_summary()) {
+        let cloned = summary.clone();
+        prop_assert_eq!(cloned.name, summary.name);
+        prop_assert_eq!(cloned.path, summary.path);
+        prop_assert_eq!(cloned.implicit, summary.implicit);
+    }
+
+    /// RulesetProfileState serializes to valid JSON.
+    #[test]
+    fn profile_state_serialize_valid(_dummy in 0..1u8) {
+        let state = RulesetProfileState::default();
+        let json = serde_json::to_string(&state).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+        prop_assert!(value["active_profile"].is_string());
+    }
+
+    /// PaneBookmarkView deterministic serde.
+    #[test]
+    fn bookmark_view_deterministic_serde(record in arb_bookmark_record()) {
+        let view = PaneBookmarkView::from(record);
+        let j1 = serde_json::to_string(&view).unwrap();
+        let j2 = serde_json::to_string(&view).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
 }

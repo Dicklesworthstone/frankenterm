@@ -979,4 +979,127 @@ proptest! {
         prop_assert_eq!(agent.session_id.as_deref(), Some("sid-123"), "agent session_id mismatch");
         prop_assert_eq!(agent.state.as_deref(), Some("idle"), "agent state mismatch");
     }
+
+    // ================================================================
+    // 31. SessionRestoreConfig Debug is non-empty
+    // ================================================================
+    #[test]
+    fn config_debug_nonempty(_dummy in 0..1_u8) {
+        let config = SessionRestoreConfig::default();
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    // ================================================================
+    // 32. SessionRestoreConfig Clone preserves fields
+    // ================================================================
+    #[test]
+    fn config_clone_preserves_ext(_dummy in 0..1_u8) {
+        let config = SessionRestoreConfig::default();
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.auto_restore, config.auto_restore);
+        prop_assert_eq!(cloned.restore_scrollback, config.restore_scrollback);
+        prop_assert_eq!(cloned.restore_max_lines, config.restore_max_lines);
+    }
+
+    // ================================================================
+    // 33. SessionInfo serializes to valid JSON (Serialize-only)
+    // ================================================================
+    #[test]
+    fn session_info_serialize_valid(
+        clean in proptest::bool::ANY,
+    ) {
+        let info = SessionInfo {
+            session_id: "test-sess".into(),
+            created_at: 1000,
+            last_checkpoint_at: Some(2000),
+            shutdown_clean: clean,
+            ft_version: "0.1.0".into(),
+            host_id: Some("host-1".into()),
+            checkpoint_count: 3,
+            pane_count: Some(5),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+        prop_assert_eq!(value["shutdown_clean"].as_bool(), Some(clean));
+    }
+
+    // ================================================================
+    // 34. CheckpointInfo serializes to valid JSON
+    // ================================================================
+    #[test]
+    fn checkpoint_info_serialize_valid(
+        pane_count in 0_usize..20,
+        total_bytes in 0_usize..100_000,
+    ) {
+        let info = CheckpointInfo {
+            id: 42,
+            checkpoint_at: 5000,
+            checkpoint_type: Some("periodic".into()),
+            pane_count,
+            total_bytes,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+        prop_assert_eq!(value["id"].as_i64(), Some(42));
+    }
+
+    // ================================================================
+    // 35. SessionDoctorReport serializes to valid JSON
+    // ================================================================
+    #[test]
+    fn doctor_report_serialize_valid(
+        total in 0_usize..50,
+        unclean in 0_usize..50,
+    ) {
+        let report = SessionDoctorReport {
+            total_sessions: total,
+            unclean_sessions: unclean.min(total),
+            total_checkpoints: 10,
+            orphaned_pane_states: 0,
+            total_data_bytes: 1024,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+        prop_assert_eq!(value["total_sessions"].as_u64(), Some(total as u64));
+    }
+
+    // ================================================================
+    // 36. SessionRestoreConfig serde deterministic
+    // ================================================================
+    #[test]
+    fn config_serde_deterministic(_dummy in 0..1_u8) {
+        let config = SessionRestoreConfig::default();
+        let j1 = serde_json::to_string(&config).unwrap();
+        let j2 = serde_json::to_string(&config).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    // ================================================================
+    // 37. format_restore_summary non-empty with DB-created summary
+    // ================================================================
+    #[test]
+    fn format_summary_basic_nonempty(
+        session_id in "[a-z]{5,10}",
+    ) {
+        let layout = RestoreResult {
+            pane_id_map: std::collections::HashMap::new(),
+            failed_panes: vec![],
+            windows_created: 0,
+            tabs_created: 0,
+            panes_created: 0,
+        };
+        let summary = RestoreSummary {
+            session_id,
+            checkpoint_id: 1,
+            layout_result: layout,
+            pane_states: vec![],
+            elapsed_ms: 50,
+        };
+        let formatted = format_restore_summary(&summary);
+        prop_assert!(!formatted.is_empty());
+    }
 }
