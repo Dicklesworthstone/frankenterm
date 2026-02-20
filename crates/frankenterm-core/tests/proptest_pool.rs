@@ -11,6 +11,7 @@
 //! - Excess put() beyond max_size drops connections
 //! - try_acquire on empty pool with no slots returns error
 
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use proptest::prelude::*;
 use std::time::Duration;
 
@@ -152,7 +153,7 @@ proptest! {
         max_size in 1usize..=10,
         n_puts in 1usize..=20,
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -178,7 +179,7 @@ proptest! {
         max_size in 1usize..=5,
         excess in 1usize..=10,
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -212,7 +213,7 @@ proptest! {
         n_items in 2usize..=10,
     ) {
         let n = n_items.min(max_size);
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -253,7 +254,7 @@ proptest! {
         n_puts in 1usize..=10,
     ) {
         let n = n_puts.min(max_size);
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -292,7 +293,7 @@ proptest! {
         n_acquires in 1usize..=8,
     ) {
         let effective_puts = n_puts.min(max_size);
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -350,7 +351,7 @@ proptest! {
     fn prop_acquire_drop_restores_slots(
         max_size in 1usize..=5,
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -391,7 +392,7 @@ proptest! {
     fn prop_try_acquire_full_pool_fails(
         max_size in 1usize..=5,
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -428,7 +429,7 @@ proptest! {
     fn prop_into_parts_lifecycle(
         max_size in 1usize..=5,
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -470,7 +471,7 @@ proptest! {
     fn prop_empty_pool_acquire_none_conn(
         max_size in 1usize..=10,
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -501,7 +502,7 @@ proptest! {
         max_size in 1usize..=10,
         value in any::<u32>(),
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -686,7 +687,7 @@ proptest! {
         max_size in 2usize..=5,
         cycles in 2usize..=4,
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -715,7 +716,7 @@ proptest! {
     /// Evict on empty pool is a no-op.
     #[test]
     fn prop_evict_empty_noop(max_size in 1usize..=5) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -732,7 +733,7 @@ proptest! {
     /// Fresh pool has all stats at zero.
     #[test]
     fn prop_fresh_pool_stats_zeroed(max_size in 1usize..=10) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -758,7 +759,7 @@ proptest! {
         max_size in 1usize..=5,
         value in any::<u32>(),
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -797,7 +798,7 @@ proptest! {
         max_size in 1usize..=5,
         value in any::<u32>(),
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,
@@ -818,7 +819,7 @@ proptest! {
         max_size in 1usize..=5,
         value in any::<u32>(),
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let config = PoolConfig {
                 max_size,

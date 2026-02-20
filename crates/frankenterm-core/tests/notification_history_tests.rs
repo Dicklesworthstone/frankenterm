@@ -10,9 +10,10 @@ fn temp_db() -> (TempDir, String) {
     (dir, path)
 }
 
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+
+fn runtime() -> frankenterm_core::runtime_compat::Runtime {
+    RuntimeBuilder::current_thread()
         .build()
         .expect("build runtime")
 }

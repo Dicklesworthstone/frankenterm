@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::restore_layout::{LayoutRestorer, RestoreConfig};
 use frankenterm_core::restore_process::{LaunchAction, LaunchConfig, ProcessLauncher};
 use frankenterm_core::restore_scrollback::{InjectionConfig, ScrollbackData, ScrollbackInjector};
@@ -399,7 +400,7 @@ proptest! {
     #[test]
     fn layout_restore_creates_correct_pane_count(mut topo in arb_topology()) {
         deduplicate_topology(&mut topo);
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let expected_panes = count_leaves(&topo);
             let mock = Arc::new(MockWezterm::new());
@@ -424,7 +425,7 @@ proptest! {
     #[test]
     fn layout_restore_produces_unique_pane_ids(mut topo in arb_topology()) {
         deduplicate_topology(&mut topo);
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let mock = Arc::new(MockWezterm::new());
             let restorer = LayoutRestorer::new(
@@ -460,7 +461,7 @@ proptest! {
     #[test]
     fn layout_structure_is_preserved(mut topo in arb_topology()) {
         deduplicate_topology(&mut topo);
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let mock = Arc::new(MockWezterm::new());
             let restorer = LayoutRestorer::new(
@@ -506,7 +507,7 @@ proptest! {
     #[test]
     fn window_and_tab_counts_match(mut topo in arb_topology()) {
         deduplicate_topology(&mut topo);
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let mock = Arc::new(MockWezterm::new());
             let restorer = LayoutRestorer::new(
@@ -539,7 +540,7 @@ proptest! {
     fn scrollback_injection_preserves_content(
         lines in arb_scrollback_lines()
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(1).await;
@@ -633,7 +634,7 @@ proptest! {
     fn process_plan_is_deterministic(
         pane_ids in prop::collection::vec(1u64..1000, 1..10),
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let mock = Arc::new(MockWezterm::new());
             let launcher = ProcessLauncher::new(
@@ -693,7 +694,7 @@ proptest! {
     fn process_plan_covers_all_mapped_panes(
         pane_count in 1usize..20,
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let mock = Arc::new(MockWezterm::new());
             let launcher = ProcessLauncher::new(mock, LaunchConfig::default());
@@ -944,7 +945,7 @@ proptest! {
     fn shell_process_produces_launch_shell(
         shell in arb_shell(),
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let mock = Arc::new(MockWezterm::new());
             let launcher = ProcessLauncher::new(
@@ -1000,7 +1001,7 @@ proptest! {
     fn disabled_shells_produce_skip(
         shell in arb_shell(),
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
             let mock = Arc::new(MockWezterm::new());
             let launcher = ProcessLauncher::new(
