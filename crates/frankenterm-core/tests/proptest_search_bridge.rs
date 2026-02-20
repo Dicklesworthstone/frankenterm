@@ -4,14 +4,14 @@
 //! chain composition, update_best_results phase selection, map_search_error
 //! priority, and concurrent cancellation safety.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use frankensearch::{ScoredResult, SearchError, SearchPhase};
 use frankenterm_core::search_bridge::{
     BridgeCancellationToken, SearchBridgeError, SearchBridgeRequest, SearchBridgeResult,
 };
-use frankensearch::{ScoredResult, SearchError, SearchPhase};
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------

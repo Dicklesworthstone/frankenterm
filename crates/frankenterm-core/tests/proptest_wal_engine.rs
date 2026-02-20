@@ -535,8 +535,7 @@ fn arb_mux_op() -> impl Strategy<Value = MuxOp> {
     prop_oneof![
         (1..100u64, prop::collection::vec(0..255u8, 0..32))
             .prop_map(|(id, data)| MuxOp::PaneOutput(id, data)),
-        (1..100u64, 10..60u16, 40..200u16)
-            .prop_map(|(id, r, c)| MuxOp::PaneCreated(id, r, c)),
+        (1..100u64, 10..60u16, 40..200u16).prop_map(|(id, r, c)| MuxOp::PaneCreated(id, r, c)),
         (1..100u64).prop_map(MuxOp::PaneClosed),
         (1..100u64).prop_map(MuxOp::FocusChanged),
         Just(MuxOp::Checkpoint),
