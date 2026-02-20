@@ -530,3 +530,96 @@ fn delivery_result_err_basic() {
     assert_eq!(result.error, Some("server error".to_string()));
     assert_eq!(result.status_code, 500);
 }
+
+// =========================================================================
+// Batch 14: additional property tests (DarkMill)
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// WebhookTemplate serde roundtrip for all variants.
+    #[test]
+    fn template_serde_roundtrip(t in arb_webhook_template()) {
+        let json = serde_json::to_string(&t).unwrap();
+        let parsed: WebhookTemplate = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed, t);
+    }
+
+    /// WebhookEndpointConfig serde roundtrip.
+    #[test]
+    fn endpoint_config_serde_roundtrip(
+        name in "[a-z]{3,10}",
+        url in "https://[a-z]{3,10}\\.example\\.com/hook",
+        template in arb_webhook_template(),
+        enabled in any::<bool>(),
+    ) {
+        let config = WebhookEndpointConfig {
+            name: name.clone(),
+            url,
+            template,
+            events: vec!["core.*".to_string()],
+            headers: HashMap::new(),
+            enabled,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: WebhookEndpointConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed.name, name);
+        prop_assert_eq!(parsed.enabled, enabled);
+    }
+
+    /// render_template returns a serde_json::Value for all templates.
+    #[test]
+    fn render_template_valid_json(template in arb_webhook_template()) {
+        let payload = NotificationPayload {
+            event_type: "core.test".to_string(),
+            pane_id: 1,
+            timestamp: "2024-01-01T00:00:00".to_string(),
+            summary: "Test Event".to_string(),
+            description: "A test event occurred".to_string(),
+            severity: "info".to_string(),
+            agent_type: "test".to_string(),
+            confidence: 0.95,
+            quick_fix: None,
+            suppressed_since_last: 0,
+        };
+        let value = render_template(template, &payload);
+        let json = serde_json::to_string(&value).unwrap();
+        prop_assert!(!json.is_empty());
+    }
+
+    /// DeliveryResult ok has accepted=true and no error.
+    #[test]
+    fn delivery_ok_invariants(status in 200_u16..300) {
+        let result = DeliveryResult::ok(status);
+        prop_assert!(result.accepted);
+        prop_assert!(result.error.is_none());
+        prop_assert_eq!(result.status_code, status);
+    }
+
+    /// DeliveryResult err has accepted=false and some error.
+    #[test]
+    fn delivery_err_invariants(status in 400_u16..600, msg in "[a-z ]{3,20}") {
+        let result = DeliveryResult::err(status, &msg);
+        prop_assert!(!result.accepted);
+        prop_assert!(result.error.is_some());
+        prop_assert_eq!(result.status_code, status);
+    }
+
+    /// WebhookTemplate Debug is non-empty for all variants.
+    #[test]
+    fn template_debug_nonempty(t in arb_webhook_template()) {
+        let debug = format!("{:?}", t);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// DeliveryResult Clone preserves all fields.
+    #[test]
+    fn delivery_result_clone_preserves(status in 100_u16..600) {
+        let result = DeliveryResult::ok(status);
+        let cloned = result.clone();
+        prop_assert_eq!(cloned.accepted, result.accepted);
+        prop_assert_eq!(cloned.status_code, result.status_code);
+        prop_assert_eq!(cloned.error, result.error);
+    }
+}

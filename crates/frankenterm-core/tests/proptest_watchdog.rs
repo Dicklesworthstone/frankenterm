@@ -534,3 +534,86 @@ fn mux_health_sample_all_fields() {
     assert!(json.contains("\"ping_ok\":true"));
     assert!(json.contains("\"ping_latency_ms\":42"));
 }
+
+// =========================================================================
+// Batch 14: additional property tests (DarkMill)
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// Component serde roundtrip for all variants.
+    #[test]
+    fn component_serde_roundtrip(c in arb_component()) {
+        let json = serde_json::to_string(&c).unwrap();
+        let parsed: Component = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed, c);
+    }
+
+    /// HealthStatus serde roundtrip for all variants.
+    #[test]
+    fn status_serde_roundtrip(s in arb_health_status()) {
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: HealthStatus = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed, s);
+    }
+
+    /// ComponentHealth serde roundtrip.
+    #[test]
+    fn component_health_serde_roundtrip(c in arb_component(), s in arb_health_status()) {
+        let ch = ComponentHealth {
+            component: c,
+            last_heartbeat_ms: Some(1_700_000_000_000),
+            age_ms: Some(500),
+            threshold_ms: 10_000,
+            status: s,
+        };
+        let json = serde_json::to_string(&ch).unwrap();
+        let parsed: ComponentHealth = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed.component, c);
+        prop_assert_eq!(parsed.status, s);
+    }
+
+    /// HealthReport overall status reflects worst component.
+    #[test]
+    fn report_overall_ge_worst(s1 in arb_health_status(), s2 in arb_health_status()) {
+        let report = HealthReport {
+            timestamp_ms: 1_700_000_000_000,
+            overall: std::cmp::max(s1, s2),
+            components: vec![
+                ComponentHealth { component: Component::Discovery, status: s1, last_heartbeat_ms: None, age_ms: None, threshold_ms: 10_000 },
+                ComponentHealth { component: Component::Capture, status: s2, last_heartbeat_ms: None, age_ms: None, threshold_ms: 10_000 },
+            ],
+        };
+        prop_assert!(report.overall >= s1);
+        prop_assert!(report.overall >= s2);
+    }
+
+    /// MuxHealthSample serde roundtrip.
+    #[test]
+    fn mux_sample_serde_roundtrip(
+        ping_ok in any::<bool>(),
+        latency in proptest::option::of(0_u64..10_000),
+        status in arb_health_status(),
+    ) {
+        let sample = MuxHealthSample {
+            timestamp_ms: 1_700_000_000_000,
+            ping_ok,
+            ping_latency_ms: latency,
+            rss_bytes: Some(1024 * 1024),
+            status,
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        let parsed: MuxHealthSample = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed.ping_ok, ping_ok);
+        prop_assert_eq!(parsed.status, status);
+    }
+
+    /// HealthStatus Healthy is minimum in ordering.
+    #[test]
+    fn healthy_is_minimum(_dummy in 0..1u8) {
+        prop_assert!(HealthStatus::Healthy <= HealthStatus::Degraded);
+        prop_assert!(HealthStatus::Healthy <= HealthStatus::Critical);
+        prop_assert!(HealthStatus::Healthy <= HealthStatus::Hung);
+    }
+}

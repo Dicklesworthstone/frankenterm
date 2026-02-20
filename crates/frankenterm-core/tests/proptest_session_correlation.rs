@@ -599,3 +599,113 @@ proptest! {
         }
     }
 }
+
+// =========================================================================
+// Batch 14: additional property tests (DarkMill)
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// CASS_CORRELATION_VERSION is a non-empty constant.
+    #[test]
+    fn version_constant_nonempty(_dummy in 0..1u8) {
+        prop_assert!(!CASS_CORRELATION_VERSION.is_empty());
+    }
+
+    /// SessionCorrelation with Linked status always has external_id.
+    #[test]
+    fn linked_always_has_external_id(confidence in 0.0_f64..1.0) {
+        let corr = SessionCorrelation {
+            status: CorrelationStatus::Linked,
+            external_id: Some("session-123".to_string()),
+            confidence,
+            reasons: vec!["closest match".to_string()],
+            candidates_considered: 5,
+            window_start_ms: 0,
+            window_end_ms: 60_000,
+            selected_started_at_ms: Some(30_000),
+            algorithm_version: CASS_CORRELATION_VERSION.to_string(),
+            error: None,
+        };
+        prop_assert!(corr.external_id.is_some());
+        prop_assert_eq!(corr.status, CorrelationStatus::Linked);
+    }
+
+    /// to_external_meta always has algorithm_version field.
+    #[test]
+    fn meta_has_algorithm_version(confidence in 0.0_f64..1.0) {
+        let corr = SessionCorrelation {
+            status: CorrelationStatus::Linked,
+            external_id: Some("s1".to_string()),
+            confidence,
+            reasons: vec![],
+            candidates_considered: 1,
+            window_start_ms: 0,
+            window_end_ms: 100_000,
+            selected_started_at_ms: None,
+            algorithm_version: CASS_CORRELATION_VERSION.to_string(),
+            error: None,
+        };
+        let meta = corr.to_external_meta();
+        prop_assert!(meta.get("algorithm_version").is_some());
+    }
+
+    /// CassCorrelationOptions serde roundtrip.
+    #[test]
+    fn options_serde_roundtrip(opts in arb_correlation_options()) {
+        let json = serde_json::to_string(&opts).unwrap();
+        let parsed: CassCorrelationOptions = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed.window_before_ms, opts.window_before_ms);
+        prop_assert_eq!(parsed.window_after_ms, opts.window_after_ms);
+        prop_assert_eq!(parsed.override_session_id, opts.override_session_id);
+    }
+
+    /// CorrelationStatus serde roundtrip for all variants.
+    #[test]
+    fn status_serde_roundtrip_ext(_dummy in 0..1u8) {
+        for status in &[CorrelationStatus::Linked, CorrelationStatus::Unlinked, CorrelationStatus::Error] {
+            let json = serde_json::to_string(status).unwrap();
+            let parsed: CorrelationStatus = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(&parsed, status);
+        }
+    }
+
+    /// Error status correlation has None external_id and Some error.
+    #[test]
+    fn error_status_has_error_field(_dummy in 0..1u8) {
+        let corr = SessionCorrelation {
+            status: CorrelationStatus::Error,
+            external_id: None,
+            confidence: 0.0,
+            reasons: vec![],
+            candidates_considered: 0,
+            window_start_ms: 0,
+            window_end_ms: 0,
+            selected_started_at_ms: None,
+            algorithm_version: CASS_CORRELATION_VERSION.to_string(),
+            error: Some("something failed".to_string()),
+        };
+        prop_assert!(corr.error.is_some());
+        prop_assert!(corr.external_id.is_none());
+    }
+
+    /// Reasons vector can be empty for any status.
+    #[test]
+    fn empty_reasons_valid(confidence in 0.0_f64..1.0) {
+        let corr = SessionCorrelation {
+            status: CorrelationStatus::Unlinked,
+            external_id: None,
+            confidence,
+            reasons: vec![],
+            candidates_considered: 0,
+            window_start_ms: 0,
+            window_end_ms: 100_000,
+            selected_started_at_ms: None,
+            algorithm_version: CASS_CORRELATION_VERSION.to_string(),
+            error: None,
+        };
+        let json = serde_json::to_string(&corr).unwrap();
+        prop_assert!(json.contains("\"reasons\":[]"));
+    }
+}

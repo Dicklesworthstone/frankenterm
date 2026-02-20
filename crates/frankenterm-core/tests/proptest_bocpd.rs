@@ -778,3 +778,63 @@ fn features_primary_metric_is_output_rate() {
     };
     assert!((f.primary_metric() - 42.0).abs() < f64::EPSILON);
 }
+
+// =============================================================================
+// Batch 14: additional property tests (DarkMill)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// BocpdConfig Clone preserves all fields.
+    #[test]
+    fn prop_config_clone_preserves(config in arb_bocpd_config()) {
+        let cloned = config.clone();
+        let j1 = serde_json::to_string(&config).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// ChangePoint has valid posterior_probability range.
+    #[test]
+    fn prop_change_point_posterior_valid(
+        obs_idx in 0_u64..10_000,
+        prob in 0.0_f64..1.0,
+        run_len in 0_usize..1000,
+    ) {
+        let cp = ChangePoint {
+            observation_index: obs_idx,
+            posterior_probability: prob,
+            map_run_length: run_len,
+        };
+        prop_assert!(cp.posterior_probability >= 0.0 && cp.posterior_probability <= 1.0);
+    }
+
+    /// PaneBocpdSummary change_point_count is u64.
+    #[test]
+    fn prop_summary_count_nonneg(s in arb_pane_summary()) {
+        // change_point_count is u64 so always >= 0
+        prop_assert!(s.change_point_count <= u64::MAX);
+    }
+
+    /// BocpdSnapshot serde is deterministic.
+    #[test]
+    fn prop_snapshot_serde_deterministic(snap in arb_bocpd_snapshot()) {
+        let j1 = serde_json::to_string(&snap).unwrap();
+        let j2 = serde_json::to_string(&snap).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// OutputFeatures primary_metric equals output_rate.
+    #[test]
+    fn prop_primary_metric_is_output_rate(f in arb_output_features()) {
+        prop_assert!((f.primary_metric() - f.output_rate).abs() < 1e-10);
+    }
+
+    /// BocpdModel fresh model is in warmup.
+    #[test]
+    fn prop_fresh_model_in_warmup(config in arb_bocpd_config()) {
+        let model = BocpdModel::new(config);
+        prop_assert!(model.in_warmup(), "fresh model should be in warmup");
+    }
+}

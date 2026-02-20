@@ -801,3 +801,74 @@ fn all_outcomes_distinct() {
     assert_ne!(ArtifactRunOutcome::Passed, ArtifactRunOutcome::Aborted);
     assert_ne!(ArtifactRunOutcome::Failed, ArtifactRunOutcome::Aborted);
 }
+
+// =============================================================================
+// Batch 14: additional property tests (DarkMill)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// ArtifactRunOutcome serde roundtrip.
+    #[test]
+    fn outcome_serde_roundtrip(o in arb_outcome()) {
+        let json = serde_json::to_string(&o).unwrap();
+        let parsed: ArtifactRunOutcome = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed, o);
+    }
+
+    /// ArtifactKind serde roundtrip.
+    #[test]
+    fn kind_serde_roundtrip(k in arb_artifact_kind()) {
+        let json = serde_json::to_string(&k).unwrap();
+        let parsed: ArtifactKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed, k);
+    }
+
+    /// ArtifactFormat serde roundtrip.
+    #[test]
+    fn format_serde_roundtrip(f in arb_artifact_format()) {
+        let json = serde_json::to_string(&f).unwrap();
+        let parsed: ArtifactFormat = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed, f);
+    }
+
+    /// StageTimingMetrics default has all None fields.
+    #[test]
+    fn timing_default_all_none(_dummy in 0..1u8) {
+        let t = StageTimingMetrics::default();
+        prop_assert!(t.queue_wait_ms.is_none());
+        prop_assert!(t.reflow_ms.is_none());
+        prop_assert!(t.render_ms.is_none());
+        prop_assert!(t.present_ms.is_none());
+        prop_assert!(t.p50_ms.is_none());
+        prop_assert!(t.p95_ms.is_none());
+        prop_assert!(t.p99_ms.is_none());
+    }
+
+    /// StageTimingMetrics serde roundtrip with populated fields.
+    #[test]
+    fn timing_serde_roundtrip(
+        p50 in proptest::option::of(0.0_f64..1000.0),
+        p95 in proptest::option::of(0.0_f64..1000.0),
+        p99 in proptest::option::of(0.0_f64..1000.0),
+    ) {
+        let t = StageTimingMetrics {
+            queue_wait_ms: Some(1.0),
+            reflow_ms: Some(2.0),
+            render_ms: Some(3.0),
+            present_ms: Some(4.0),
+            p50_ms: p50,
+            p95_ms: p95,
+            p99_ms: p99,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let parsed: StageTimingMetrics = serde_json::from_str(&json).unwrap();
+        // Compare p50_ms values
+        match (parsed.p50_ms, t.p50_ms) {
+            (Some(a), Some(b)) => prop_assert!((a - b).abs() < 1e-10, "p50_ms mismatch"),
+            (None, None) => {}
+            _ => prop_assert!(false, "p50_ms presence mismatch"),
+        }
+    }
+}
