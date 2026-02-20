@@ -1457,4 +1457,660 @@ mod tests {
         assert_eq!(tick.flush_reason, Some(IndexFlushReason::Interval));
         log_phase("test_batch_flush", "assert", started, "pass");
     }
+
+    // -----------------------------------------------------------------------
+    // SearchDocumentSource unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_document_source_as_tag_all_variants() {
+        assert_eq!(SearchDocumentSource::Scrollback.as_tag(), "scrollback");
+        assert_eq!(SearchDocumentSource::Command.as_tag(), "command");
+        assert_eq!(SearchDocumentSource::AgentArtifact.as_tag(), "agent");
+        assert_eq!(SearchDocumentSource::PaneMetadata.as_tag(), "pane_metadata");
+        assert_eq!(SearchDocumentSource::Cass.as_tag(), "cass");
+    }
+
+    #[test]
+    fn test_document_source_serde_roundtrip() {
+        let source = SearchDocumentSource::AgentArtifact;
+        let json = serde_json::to_string(&source).expect("serialize");
+        assert_eq!(json, "\"agent_artifact\"");
+        let parsed: SearchDocumentSource =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, source);
+    }
+
+    #[test]
+    fn test_document_source_equality() {
+        assert_eq!(SearchDocumentSource::Scrollback, SearchDocumentSource::Scrollback);
+        assert_ne!(SearchDocumentSource::Scrollback, SearchDocumentSource::Command);
+    }
+
+    // -----------------------------------------------------------------------
+    // ScrollbackLine unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scrollback_line_new_defaults() {
+        let line = ScrollbackLine::new("hello", 42);
+        assert_eq!(line.text, "hello");
+        assert_eq!(line.captured_at_ms, 42);
+        assert!(line.pane_id.is_none());
+        assert!(line.session_id.is_none());
+    }
+
+    #[test]
+    fn test_scrollback_line_serde_roundtrip() {
+        let line = ScrollbackLine {
+            text: "test line".to_string(),
+            captured_at_ms: 1000,
+            pane_id: Some(5),
+            session_id: Some("sess-1".to_string()),
+        };
+        let json = serde_json::to_string(&line).expect("serialize");
+        let parsed: ScrollbackLine = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, line);
+    }
+
+    // -----------------------------------------------------------------------
+    // IndexableDocument unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_indexable_document_text_constructor() {
+        let doc = IndexableDocument::text(
+            SearchDocumentSource::Command,
+            "ls -la",
+            5000,
+            Some(3),
+            Some("sess-2".to_string()),
+        );
+        assert_eq!(doc.source, SearchDocumentSource::Command);
+        assert_eq!(doc.text, "ls -la");
+        assert_eq!(doc.captured_at_ms, 5000);
+        assert_eq!(doc.pane_id, Some(3));
+        assert_eq!(doc.session_id.as_deref(), Some("sess-2"));
+        assert_eq!(doc.metadata, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_indexable_document_dedupe_basis_text() {
+        let doc = IndexableDocument::text(
+            SearchDocumentSource::Scrollback,
+            "  hello   world  ",
+            1000,
+            None,
+            None,
+        );
+        let basis = doc.dedupe_basis();
+        assert_eq!(basis, "hello world");
+    }
+
+    #[test]
+    fn test_indexable_document_dedupe_basis_pane_metadata() {
+        let mut doc = IndexableDocument::text(
+            SearchDocumentSource::PaneMetadata,
+            "ignored text",
+            1000,
+            None,
+            None,
+        );
+        doc.metadata = serde_json::json!({"key": "value"});
+        let basis = doc.dedupe_basis();
+        // PaneMetadata uses metadata JSON for dedup, not text
+        assert!(basis.contains("key"));
+        assert!(basis.contains("value"));
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_index_text tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_plain_text() {
+        assert_eq!(normalize_index_text("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_normalize_collapses_whitespace() {
+        assert_eq!(normalize_index_text("  foo   bar  "), "foo bar");
+    }
+
+    #[test]
+    fn test_normalize_collapses_consecutive_blank_lines() {
+        let input = "line1\n\n\n\nline2";
+        let result = normalize_index_text(input);
+        assert_eq!(result, "line1\n\nline2");
+    }
+
+    #[test]
+    fn test_normalize_empty_input() {
+        assert_eq!(normalize_index_text(""), "");
+    }
+
+    #[test]
+    fn test_normalize_only_whitespace() {
+        assert_eq!(normalize_index_text("   \n   \n   "), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_ansi_sequences tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_ansi_csi() {
+        let input = "\x1b[31mred\x1b[0m";
+        assert_eq!(strip_ansi_sequences(input), "red");
+    }
+
+    #[test]
+    fn test_strip_ansi_osc_bel() {
+        let input = "\x1b]0;title\x07rest";
+        assert_eq!(strip_ansi_sequences(input), "rest");
+    }
+
+    #[test]
+    fn test_strip_ansi_osc_st() {
+        let input = "\x1b]8;;link\x1b\\visible";
+        assert_eq!(strip_ansi_sequences(input), "visible");
+    }
+
+    #[test]
+    fn test_strip_ansi_no_sequences() {
+        assert_eq!(strip_ansi_sequences("plain text"), "plain text");
+    }
+
+    // -----------------------------------------------------------------------
+    // sha256_hex tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sha256_hex_deterministic() {
+        let a = sha256_hex(b"hello");
+        let b = sha256_hex(b"hello");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64); // SHA-256 hex = 64 chars
+    }
+
+    #[test]
+    fn test_sha256_hex_different_inputs() {
+        assert_ne!(sha256_hex(b"hello"), sha256_hex(b"world"));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_config tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_config_ok() {
+        let dir = tempdir().expect("tempdir");
+        let cfg = make_config(dir.path());
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_zero_flush_threshold() {
+        let dir = tempdir().expect("tempdir");
+        let mut cfg = make_config(dir.path());
+        cfg.flush_docs_threshold = 0;
+        let err = validate_config(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("flush_docs_threshold"));
+    }
+
+    #[test]
+    fn test_validate_config_zero_flush_interval() {
+        let dir = tempdir().expect("tempdir");
+        let mut cfg = make_config(dir.path());
+        cfg.flush_interval_secs = 0;
+        let err = validate_config(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("flush_interval_secs"));
+    }
+
+    #[test]
+    fn test_validate_config_zero_max_docs_per_second() {
+        let dir = tempdir().expect("tempdir");
+        let mut cfg = make_config(dir.path());
+        cfg.max_docs_per_second = 0;
+        let err = validate_config(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("max_docs_per_second"));
+    }
+
+    #[test]
+    fn test_validate_config_empty_index_dir() {
+        let cfg = IndexingConfig {
+            index_dir: PathBuf::from(""),
+            ..make_config(Path::new("/tmp"))
+        };
+        let err = validate_config(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("index_dir"));
+    }
+
+    // -----------------------------------------------------------------------
+    // IndexingConfig default tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_indexing_config_default() {
+        let cfg = IndexingConfig::default();
+        assert_eq!(cfg.max_index_size_bytes, 500 * 1024 * 1024);
+        assert_eq!(cfg.ttl_days, 30);
+        assert_eq!(cfg.flush_interval_secs, 5);
+        assert_eq!(cfg.flush_docs_threshold, 50);
+        assert_eq!(cfg.max_docs_per_second, 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // chunk_scrollback_lines edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chunk_scrollback_empty() {
+        assert!(chunk_scrollback_lines(&[], 5000).is_empty());
+    }
+
+    #[test]
+    fn test_chunk_scrollback_single_line() {
+        let lines = vec![ScrollbackLine::new("one line", 1000)];
+        let chunks = chunk_scrollback_lines(&lines, 5000);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].source, SearchDocumentSource::Scrollback);
+    }
+
+    #[test]
+    fn test_chunk_scrollback_gap_split() {
+        let lines = vec![
+            ScrollbackLine::new("before gap", 1000),
+            ScrollbackLine::new("after gap", 7000),
+        ];
+        let chunks = chunk_scrollback_lines(&lines, 5000);
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn test_chunk_scrollback_blank_line_split() {
+        let lines = vec![
+            ScrollbackLine::new("first block", 1000),
+            ScrollbackLine::new("", 1100),
+            ScrollbackLine::new("second block", 1200),
+        ];
+        let chunks = chunk_scrollback_lines(&lines, 60_000);
+        assert_eq!(chunks.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_command_output_blocks tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_command_blocks_empty() {
+        let config = CommandBlockExtractionConfig::default();
+        assert!(extract_command_output_blocks(&[], &config).is_empty());
+    }
+
+    #[test]
+    fn test_extract_command_blocks_osc133() {
+        let lines = vec![
+            ScrollbackLine::new("\x1b]133;A\x07user@host $", 1000),
+            ScrollbackLine::new("ls output", 1100),
+            ScrollbackLine::new("\x1b]133;A\x07user@host $", 1200),
+            ScrollbackLine::new("pwd output", 1300),
+        ];
+        let config = CommandBlockExtractionConfig::default();
+        let blocks = extract_command_output_blocks(&lines, &config);
+        assert!(blocks.len() >= 2);
+        for block in &blocks {
+            assert_eq!(block.source, SearchDocumentSource::Command);
+        }
+    }
+
+    #[test]
+    fn test_extract_command_blocks_no_prompts_fallback() {
+        let lines = vec![
+            ScrollbackLine::new("output line 1", 1000),
+            ScrollbackLine::new("output line 2", 1100),
+        ];
+        let config = CommandBlockExtractionConfig::default();
+        let blocks = extract_command_output_blocks(&lines, &config);
+        assert_eq!(blocks.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_agent_artifacts tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_artifacts_code_block() {
+        let text = "Some text\n```\nfn main() {}\n```\nMore text";
+        let artifacts = extract_agent_artifacts(text, 1000, Some(1), None);
+        assert!(!artifacts.is_empty());
+        let code_block = artifacts.iter().find(|a| {
+            a.metadata
+                .get("artifact_kind")
+                .and_then(|v| v.as_str())
+                == Some("code_block")
+        });
+        assert!(code_block.is_some());
+    }
+
+    #[test]
+    fn test_extract_artifacts_error_line() {
+        let text = "error: cannot find module `foo`";
+        let artifacts = extract_agent_artifacts(text, 1000, None, None);
+        assert!(!artifacts.is_empty());
+        let err = artifacts.iter().find(|a| {
+            a.metadata.get("artifact_kind").and_then(|v| v.as_str()) == Some("error")
+        });
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn test_extract_artifacts_tool_trace() {
+        let text = "tool call: read_file(\"/foo/bar.rs\")";
+        let artifacts = extract_agent_artifacts(text, 1000, None, None);
+        assert!(!artifacts.is_empty());
+        let tool = artifacts.iter().find(|a| {
+            a.metadata.get("artifact_kind").and_then(|v| v.as_str()) == Some("tool")
+        });
+        assert!(tool.is_some());
+    }
+
+    #[test]
+    fn test_extract_artifacts_empty_text() {
+        let artifacts = extract_agent_artifacts("", 1000, None, None);
+        assert!(artifacts.is_empty());
+    }
+
+    #[test]
+    fn test_extract_artifacts_dedup_identical_lines() {
+        let text = "error: E0425\nerror: E0425";
+        let artifacts = extract_agent_artifacts(text, 1000, None, None);
+        // Dedup by content hash should keep only one
+        assert_eq!(artifacts.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // SearchIndex::search edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_search_empty_query() {
+        let dir = tempdir().expect("tempdir");
+        let mut cfg = make_config(dir.path());
+        cfg.flush_docs_threshold = 1;
+        let mut index = SearchIndex::open(cfg).expect("open");
+
+        let doc = make_doc("findable content", 1000, SearchDocumentSource::Scrollback);
+        let _ = index.ingest_documents(&[doc], 1010, false, None).expect("ingest");
+
+        let hits = index.search("", 10, 1020);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_search_zero_limit() {
+        let dir = tempdir().expect("tempdir");
+        let mut cfg = make_config(dir.path());
+        cfg.flush_docs_threshold = 1;
+        let mut index = SearchIndex::open(cfg).expect("open");
+
+        let doc = make_doc("findable content", 1000, SearchDocumentSource::Scrollback);
+        let _ = index.ingest_documents(&[doc], 1010, false, None).expect("ingest");
+
+        let hits = index.search("findable", 0, 1020);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_search_ranks_by_occurrence_count() {
+        let dir = tempdir().expect("tempdir");
+        let mut cfg = make_config(dir.path());
+        cfg.flush_docs_threshold = 1;
+        let mut index = SearchIndex::open(cfg).expect("open");
+
+        let doc_one = make_doc("rust", 1000, SearchDocumentSource::Scrollback);
+        let doc_many = make_doc("rust rust rust", 1100, SearchDocumentSource::Scrollback);
+        let _ = index
+            .ingest_documents(&[doc_one, doc_many], 1200, false, None)
+            .expect("ingest");
+
+        let hits = index.search("rust", 10, 1300);
+        assert_eq!(hits.len(), 2);
+        // Higher occurrence count should appear first in ranking
+        assert!(hits[0].text.matches("rust").count() >= hits[1].text.matches("rust").count());
+    }
+
+    // -----------------------------------------------------------------------
+    // SearchIndex::stats tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_stats_empty_index() {
+        let dir = tempdir().expect("tempdir");
+        let cfg = make_config(dir.path());
+        let index = SearchIndex::open(cfg).expect("open");
+        let stats = index.stats(1000);
+        assert_eq!(stats.doc_count, 0);
+        assert_eq!(stats.pending_docs, 0);
+        assert!(stats.newest_captured_at_ms.is_none());
+        assert!(stats.oldest_captured_at_ms.is_none());
+        assert!(stats.freshness_age_ms.is_none());
+    }
+
+    #[test]
+    fn test_stats_freshness_calculation() {
+        let dir = tempdir().expect("tempdir");
+        let mut cfg = make_config(dir.path());
+        cfg.flush_docs_threshold = 1;
+        let mut index = SearchIndex::open(cfg).expect("open");
+
+        let doc = make_doc("fresh", 5000, SearchDocumentSource::Scrollback);
+        let _ = index.ingest_documents(&[doc], 5010, false, None).expect("ingest");
+
+        let stats = index.stats(10_000);
+        assert_eq!(stats.freshness_age_ms, Some(5000));
+        assert_eq!(stats.newest_captured_at_ms, Some(5000));
+        assert_eq!(stats.oldest_captured_at_ms, Some(5000));
+    }
+
+    // -----------------------------------------------------------------------
+    // SearchIndex::reindex tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reindex_clears_and_rebuilds() {
+        let dir = tempdir().expect("tempdir");
+        let mut cfg = make_config(dir.path());
+        cfg.flush_docs_threshold = 1;
+        let mut index = SearchIndex::open(cfg).expect("open");
+
+        let old = make_doc("old content", 1000, SearchDocumentSource::Scrollback);
+        let _ = index.ingest_documents(&[old], 1010, false, None).expect("ingest old");
+        assert_eq!(index.documents().len(), 1);
+
+        let new_docs = vec![
+            make_doc("new alpha", 2000, SearchDocumentSource::Scrollback),
+            make_doc("new beta", 2100, SearchDocumentSource::Scrollback),
+        ];
+        let report = index.reindex_documents(&new_docs, 2200, None).expect("reindex");
+        assert_eq!(report.accepted_docs, 2);
+        assert_eq!(index.documents().len(), 2);
+        // Old content should be gone
+        let hits = index.search("old content", 10, 2300);
+        assert!(hits.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate limiting tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rate_limiting() {
+        let dir = tempdir().expect("tempdir");
+        let mut cfg = make_config(dir.path());
+        cfg.flush_docs_threshold = 200;
+        cfg.max_docs_per_second = 5;
+        let mut index = SearchIndex::open(cfg).expect("open");
+
+        let mut docs = Vec::new();
+        for i in 0..10 {
+            docs.push(make_doc(
+                &format!("rate-doc-{i}"),
+                1000,
+                SearchDocumentSource::Scrollback,
+            ));
+        }
+        // All submitted at the same timestamp within one rate window
+        let report = index.ingest_documents(&docs, 1000, false, None).expect("ingest");
+        assert_eq!(report.accepted_docs, 5);
+        assert_eq!(report.deferred_rate_limited_docs, 5);
+    }
+
+    #[test]
+    fn test_rate_window_resets_after_1s() {
+        let dir = tempdir().expect("tempdir");
+        let mut cfg = make_config(dir.path());
+        cfg.flush_docs_threshold = 200;
+        cfg.max_docs_per_second = 2;
+        let mut index = SearchIndex::open(cfg).expect("open");
+
+        let docs_1 = vec![
+            make_doc("a", 1000, SearchDocumentSource::Scrollback),
+            make_doc("b", 1000, SearchDocumentSource::Scrollback),
+            make_doc("c", 1000, SearchDocumentSource::Scrollback),
+        ];
+        let report_1 = index.ingest_documents(&docs_1, 1000, false, None).expect("batch1");
+        assert_eq!(report_1.accepted_docs, 2);
+        assert_eq!(report_1.deferred_rate_limited_docs, 1);
+
+        // After 1000ms, rate window resets
+        let docs_2 = vec![make_doc("d", 2000, SearchDocumentSource::Scrollback)];
+        let report_2 = index.ingest_documents(&docs_2, 2000, false, None).expect("batch2");
+        assert_eq!(report_2.accepted_docs, 1);
+        assert_eq!(report_2.deferred_rate_limited_docs, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // SearchIndexError display tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_error_io_display() {
+        let err = SearchIndexError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file missing",
+        ));
+        let display = format!("{err}");
+        assert!(display.contains("I/O error"));
+    }
+
+    #[test]
+    fn test_error_invalid_config_display() {
+        let err = SearchIndexError::InvalidConfig("bad value".to_string());
+        let display = format!("{err}");
+        assert!(display.contains("invalid indexing config"));
+        assert!(display.contains("bad value"));
+    }
+
+    #[test]
+    fn test_error_unsupported_version_display() {
+        let err = SearchIndexError::UnsupportedStateVersion(99);
+        let display = format!("{err}");
+        assert!(display.contains("unsupported"));
+        assert!(display.contains("99"));
+    }
+
+    // -----------------------------------------------------------------------
+    // IndexingIngestReport / IndexingTickResult defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ingest_report_default() {
+        let report = IndexingIngestReport::default();
+        assert_eq!(report.submitted_docs, 0);
+        assert_eq!(report.accepted_docs, 0);
+        assert_eq!(report.skipped_empty_docs, 0);
+        assert!(report.flush_reason.is_none());
+    }
+
+    #[test]
+    fn test_tick_result_default() {
+        let result = IndexingTickResult::default();
+        assert_eq!(result.flushed_docs, 0);
+        assert_eq!(result.expired_docs, 0);
+        assert_eq!(result.evicted_docs, 0);
+        assert!(result.flush_reason.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // tick yields during resize
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tick_yields_during_resize() {
+        let dir = tempdir().expect("tempdir");
+        let cfg = make_config(dir.path());
+        let mut index = SearchIndex::open(cfg).expect("open");
+        let result = index.tick(1000, true).expect("tick");
+        assert_eq!(result.flushed_docs, 0);
+        assert!(result.flush_reason.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // flush_now with no pending
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_flush_now_no_pending() {
+        let dir = tempdir().expect("tempdir");
+        let cfg = make_config(dir.path());
+        let mut index = SearchIndex::open(cfg).expect("open");
+        let result = index
+            .flush_now(1000, IndexFlushReason::Manual)
+            .expect("flush");
+        assert_eq!(result.flushed_docs, 0);
+        assert!(result.flush_reason.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // CassContentHashProvider trait impl
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cass_hash_provider_hashset() {
+        let mut hashes = HashSet::new();
+        hashes.insert("abc123".to_string());
+        assert!(hashes.contains_content_hash("abc123"));
+        assert!(!hashes.contains_content_hash("xyz789"));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_prompt_boundary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prompt_boundary_osc133_a() {
+        assert!(is_prompt_boundary("\x1b]133;A\x07", "", None));
+    }
+
+    #[test]
+    fn test_prompt_boundary_osc133_b() {
+        assert!(is_prompt_boundary("\x1b]133;B\x07", "", None));
+    }
+
+    #[test]
+    fn test_prompt_boundary_osc133_c() {
+        assert!(is_prompt_boundary("\x1b]133;C\x07", "", None));
+    }
+
+    #[test]
+    fn test_prompt_boundary_regex() {
+        let regex = Regex::new(DEFAULT_PROMPT_PATTERN).unwrap();
+        assert!(is_prompt_boundary("", "user@host $", Some(&regex)));
+        assert!(!is_prompt_boundary("", "just some text", Some(&regex)));
+    }
 }
