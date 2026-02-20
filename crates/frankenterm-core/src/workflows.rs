@@ -11270,8 +11270,20 @@ steps:
         let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
         let mut ctx =
             WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-cond-else");
-        // test_text does NOT contain "error" so else branch runs (notify returns Continue)
-        let result = workflow.execute_step(&mut ctx, 0).await;
+        // test_text does NOT contain "error" so else branch runs (notify returns Continue).
+        // Conditionals compile to multiple executable steps (JumpIfFalse + body + Jump);
+        // simulate the engine loop: Continue advances to the next step, JumpTo jumps,
+        // and Abort/Done/etc. are terminal.
+        let num_steps = workflow.step_count();
+        let mut step = 0usize;
+        let result = loop {
+            let r = workflow.execute_step(&mut ctx, step).await;
+            match r {
+                StepResult::JumpTo { step: target } => step = target,
+                StepResult::Continue if step + 1 < num_steps => step += 1,
+                other => break other,
+            }
+        };
         assert!(result.is_continue());
     }
 
@@ -11303,7 +11315,18 @@ steps:
         let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
         let mut ctx =
             WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-cond-abort");
-        let result = workflow.execute_step(&mut ctx, 0).await;
+        // Conditionals compile to multiple executable steps; simulate the engine loop:
+        // Continue advances to the next step, JumpTo jumps, Abort/Done/etc. are terminal.
+        let num_steps = workflow.step_count();
+        let mut step = 0usize;
+        let result = loop {
+            let r = workflow.execute_step(&mut ctx, step).await;
+            match r {
+                StepResult::JumpTo { step: target } => step = target,
+                StepResult::Continue if step + 1 < num_steps => step += 1,
+                other => break other,
+            }
+        };
         match result {
             StepResult::Abort { reason } => assert_eq!(reason, "fatal error"),
             other => panic!("Expected Abort, got: {other:?}"),

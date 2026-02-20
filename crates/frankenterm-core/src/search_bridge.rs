@@ -1292,7 +1292,10 @@ mod tests {
             text_provider(doc_id)
         });
 
-        let request = SearchBridgeRequest::new("vector retrieval", 6)
+        // Use a negation term so frankensearch invokes text_provider for each
+        // result (exclusion filtering).  Each call sleeps 200 ms, making the
+        // overall search far exceed the 100 ms budget and causing a timeout.
+        let request = SearchBridgeRequest::new("vector retrieval -nonexistent", 6)
             .with_text_provider_arc(slow_provider)
             .with_timeout(Duration::from_millis(100));
 

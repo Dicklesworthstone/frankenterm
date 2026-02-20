@@ -893,7 +893,13 @@ pub fn chunk_scrollback_lines(lines: &[ScrollbackLine], gap_ms: i64) -> Vec<Inde
             current_pane = line.pane_id;
             current_session.clone_from(&line.session_id);
             last_ts = Some(line.captured_at_ms);
-            continue;
+            // For blank-boundary lines the line itself is whitespace/empty and
+            // should not be included in the next chunk.  For gap-boundary lines
+            // the triggering line is real content and must start the new chunk.
+            if blank_boundary {
+                continue;
+            }
+            // Fall through so the gap-triggering line is appended below.
         }
 
         if current_lines.is_empty() {
