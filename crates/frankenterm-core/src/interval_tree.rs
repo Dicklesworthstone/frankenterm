@@ -43,6 +43,7 @@ pub struct Interval<T> {
 
 impl<T: Ord + Clone> Interval<T> {
     /// Create a new interval `[low, high)`.
+    #[must_use]
     pub fn new(low: T, high: T) -> Self {
         Self { low, high }
     }
@@ -50,6 +51,7 @@ impl<T: Ord + Clone> Interval<T> {
     /// Check if this interval overlaps with another.
     /// Two intervals `[a, b)` and `[c, d)` overlap iff `a < d && c < b`.
     /// Empty intervals never overlap anything.
+    #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
         if self.is_empty() || other.is_empty() {
             return false;
@@ -58,11 +60,13 @@ impl<T: Ord + Clone> Interval<T> {
     }
 
     /// Check if this interval contains a point.
+    #[must_use]
     pub fn contains_point(&self, point: &T) -> bool {
         self.low <= *point && *point < self.high
     }
 
     /// Check if this interval is empty (low >= high).
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.low >= self.high
     }
@@ -115,6 +119,7 @@ impl<T: Ord + Clone, V> Default for IntervalTree<T, V> {
 
 impl<T: Ord + Clone, V> IntervalTree<T, V> {
     /// Create an empty interval tree.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
@@ -124,11 +129,13 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
     }
 
     /// Return the number of intervals in the tree.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Check if the tree is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -153,6 +160,7 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
     ///
     /// Returns references to `(interval, value)` pairs.
     /// Time complexity: O(log n + k) where k is the number of results.
+    #[must_use]
     pub fn query_overlap(&self, query: &Interval<T>) -> Vec<(&Interval<T>, &V)> {
         let mut results = Vec::new();
         self.overlap_search(self.root, query, &mut results);
@@ -163,6 +171,7 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
     ///
     /// A stabbing query: returns all intervals `[low, high)` where `low <= point < high`.
     /// Time complexity: O(log n + k) where k is the number of results.
+    #[must_use]
     pub fn query_point(&self, point: &T) -> Vec<(&Interval<T>, &V)> {
         let mut results = Vec::new();
         self.point_search(self.root, point, &mut results);

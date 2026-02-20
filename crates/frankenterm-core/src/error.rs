@@ -4,7 +4,7 @@ use std::fmt::Write;
 use thiserror::Error;
 
 /// Remediation command for resolving an error
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RemediationCommand {
     /// Short label describing the command purpose
     pub label: String,
@@ -15,7 +15,7 @@ pub struct RemediationCommand {
 }
 
 /// Actionable remediation guidance for an error
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Remediation {
     /// One-line summary of how to fix the issue
     pub summary: String,

@@ -41,6 +41,7 @@ impl VanEmdeBoas {
     /// # Panics
     ///
     /// Panics if `universe_size` is 0 or exceeds 1_048_576 (2^20).
+    #[must_use]
     pub fn new(universe_size: usize) -> Self {
         assert!(universe_size > 0, "universe size must be positive");
         assert!(universe_size <= 1_048_576, "universe size must be <= 2^20");
@@ -55,26 +56,31 @@ impl VanEmdeBoas {
     }
 
     /// Returns the universe size.
+    #[must_use]
     pub fn universe_size(&self) -> usize {
         self.universe
     }
 
     /// Returns the number of elements.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.count
     }
 
     /// Returns true if the tree is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     /// Returns the minimum element, or None if empty.
+    #[must_use]
     pub fn min(&self) -> Option<u32> {
         self.min
     }
 
     /// Returns the maximum element, or None if empty.
+    #[must_use]
     pub fn max(&self) -> Option<u32> {
         self.max
     }
@@ -101,6 +107,7 @@ impl VanEmdeBoas {
     }
 
     /// Tests if the tree contains the given key.
+    #[must_use]
     pub fn contains(&self, key: u32) -> bool {
         if key as usize >= self.universe {
             return false;
@@ -177,6 +184,7 @@ impl VanEmdeBoas {
     }
 
     /// Returns the successor of key (smallest element > key), or None.
+    #[must_use]
     pub fn successor(&self, key: u32) -> Option<u32> {
         if key as usize >= self.universe.saturating_sub(1) {
             return None;
@@ -185,6 +193,7 @@ impl VanEmdeBoas {
     }
 
     /// Returns the predecessor of key (largest element < key), or None.
+    #[must_use]
     pub fn predecessor(&self, key: u32) -> Option<u32> {
         if key == 0 {
             return None;

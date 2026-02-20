@@ -86,11 +86,13 @@ impl<K: Ord + Clone, V> Default for Treap<K, V> {
 
 impl<K: Ord + Clone, V> Treap<K, V> {
     /// Create an empty treap.
+    #[must_use]
     pub fn new() -> Self {
         Self::with_seed(0x12345678)
     }
 
     /// Create an empty treap with a specific seed for reproducibility.
+    #[must_use]
     pub fn with_seed(seed: u64) -> Self {
         Self {
             nodes: Vec::new(),
@@ -100,11 +102,13 @@ impl<K: Ord + Clone, V> Treap<K, V> {
     }
 
     /// Return the number of key-value pairs.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.root.map_or(0, |r| self.nodes[r].size)
     }
 
     /// Check if the treap is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.root.is_none()
     }
@@ -135,12 +139,14 @@ impl<K: Ord + Clone, V> Treap<K, V> {
     }
 
     /// Look up a value by key.
+    #[must_use]
     pub fn get(&self, key: &K) -> Option<&V> {
         self.find_node(self.root, key)
             .map(|idx| &self.nodes[idx].value)
     }
 
     /// Check if a key exists.
+    #[must_use]
     pub fn contains_key(&self, key: &K) -> bool {
         self.find_node(self.root, key).is_some()
     }
@@ -159,6 +165,7 @@ impl<K: Ord + Clone, V> Treap<K, V> {
     /// Get the k-th smallest element (0-based).
     ///
     /// Returns `None` if `k >= len()`.
+    #[must_use]
     pub fn kth(&self, k: usize) -> Option<(&K, &V)> {
         self.kth_node(self.root, k)
     }
@@ -166,22 +173,26 @@ impl<K: Ord + Clone, V> Treap<K, V> {
     /// Return the rank (0-based position) of a key in sorted order.
     ///
     /// Returns the number of keys strictly less than the given key.
+    #[must_use]
     pub fn rank(&self, key: &K) -> usize {
         self.rank_of(self.root, key)
     }
 
     /// Get the minimum key-value pair.
+    #[must_use]
     pub fn min(&self) -> Option<(&K, &V)> {
         self.kth(0)
     }
 
     /// Get the maximum key-value pair.
+    #[must_use]
     pub fn max(&self) -> Option<(&K, &V)> {
         let len = self.len();
         if len == 0 { None } else { self.kth(len - 1) }
     }
 
     /// Collect all key-value pairs in sorted order.
+    #[must_use]
     pub fn to_sorted_vec(&self) -> Vec<(&K, &V)> {
         let mut result = Vec::with_capacity(self.len());
         self.inorder(self.root, &mut result);
@@ -189,6 +200,7 @@ impl<K: Ord + Clone, V> Treap<K, V> {
     }
 
     /// Iterate over all keys in sorted order.
+    #[must_use]
     pub fn keys(&self) -> Vec<&K> {
         self.to_sorted_vec().into_iter().map(|(k, _)| k).collect()
     }

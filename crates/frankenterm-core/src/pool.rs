@@ -50,7 +50,7 @@ struct PooledEntry<C> {
 }
 
 /// Statistics about the pool's current state and historical usage.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolStats {
     /// Maximum pool capacity.
     pub max_size: usize,

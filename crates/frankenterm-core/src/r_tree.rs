@@ -32,6 +32,7 @@ pub struct Rect {
 
 impl Rect {
     /// Creates a rectangle from corner coordinates.
+    #[must_use]
     pub fn new(x_min: f64, y_min: f64, x_max: f64, y_max: f64) -> Self {
         Self {
             x_min: x_min.min(x_max),
@@ -42,6 +43,7 @@ impl Rect {
     }
 
     /// Creates a point (zero-area rectangle).
+    #[must_use]
     pub fn point(x: f64, y: f64) -> Self {
         Self {
             x_min: x,
@@ -52,16 +54,19 @@ impl Rect {
     }
 
     /// Area of the rectangle.
+    #[must_use]
     pub fn area(&self) -> f64 {
         (self.x_max - self.x_min) * (self.y_max - self.y_min)
     }
 
     /// Tests if this rectangle contains a point.
+    #[must_use]
     pub fn contains_point(&self, x: f64, y: f64) -> bool {
         x >= self.x_min && x <= self.x_max && y >= self.y_min && y <= self.y_max
     }
 
     /// Tests if this rectangle overlaps another.
+    #[must_use]
     pub fn overlaps(&self, other: &Rect) -> bool {
         self.x_min <= other.x_max
             && self.x_max >= other.x_min
@@ -81,11 +86,13 @@ impl Rect {
     }
 
     /// Area enlargement needed to include another rectangle.
+    #[must_use]
     pub fn enlargement(&self, other: &Rect) -> f64 {
         self.union(other).area() - self.area()
     }
 
     /// Minimum distance from a point to this rectangle.
+    #[must_use]
     pub fn min_distance(&self, x: f64, y: f64) -> f64 {
         let dx = if x < self.x_min {
             self.x_min - x
@@ -131,6 +138,7 @@ pub struct RTree<V> {
 
 impl<V: Clone> RTree<V> {
     /// Creates an empty R-tree.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
@@ -140,11 +148,13 @@ impl<V: Clone> RTree<V> {
     }
 
     /// Returns the number of entries.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.count
     }
 
     /// Returns true if the tree is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }

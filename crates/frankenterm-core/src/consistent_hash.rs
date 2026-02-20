@@ -70,6 +70,7 @@ impl<N: Clone + Eq + Hash + std::fmt::Debug> HashRing<N> {
     ///
     /// # Panics
     /// Panics if `vnodes_per_node` is 0.
+    #[must_use]
     pub fn new(vnodes_per_node: u32) -> Self {
         assert!(vnodes_per_node > 0, "vnodes_per_node must be > 0");
         Self {
@@ -80,6 +81,7 @@ impl<N: Clone + Eq + Hash + std::fmt::Debug> HashRing<N> {
     }
 
     /// Create a hash ring pre-populated with nodes.
+    #[must_use]
     pub fn with_nodes(vnodes_per_node: u32, nodes: impl IntoIterator<Item = N>) -> Self {
         let mut ring = Self::new(vnodes_per_node);
         for node in nodes {
@@ -89,16 +91,19 @@ impl<N: Clone + Eq + Hash + std::fmt::Debug> HashRing<N> {
     }
 
     /// Number of physical nodes on the ring.
+    #[must_use]
     pub fn node_count(&self) -> usize {
         self.node_positions.len()
     }
 
     /// Number of virtual nodes on the ring.
+    #[must_use]
     pub fn vnode_count(&self) -> usize {
         self.ring.len()
     }
 
     /// Returns true if the ring has no nodes.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.node_positions.is_empty()
     }
@@ -131,12 +136,14 @@ impl<N: Clone + Eq + Hash + std::fmt::Debug> HashRing<N> {
     }
 
     /// Returns true if the given physical node is on the ring.
+    #[must_use]
     pub fn contains_node(&self, node: &N) -> bool {
         self.node_positions.contains_key(node)
     }
 
     /// Get the node responsible for the given key.
     /// Returns `None` if the ring is empty.
+    #[must_use]
     pub fn get_node<K: AsRef<[u8]>>(&self, key: K) -> Option<&N> {
         if self.ring.is_empty() {
             return None;
@@ -194,6 +201,7 @@ impl<N: Clone + Eq + Hash + std::fmt::Debug> HashRing<N> {
     }
 
     /// Compute distribution statistics by simulating 10000 key lookups.
+    #[must_use]
     pub fn stats(&self) -> RingStats {
         let node_count = self.node_positions.len();
         let (stddev, min_frac, max_frac) = if node_count == 0 {

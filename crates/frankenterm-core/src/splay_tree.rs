@@ -45,6 +45,7 @@ pub struct SplayTree<K, V> {
 
 impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
     /// Creates an empty splay tree.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
@@ -54,11 +55,13 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
     }
 
     /// Returns the number of elements.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.root.map_or(0, |r| self.nodes[r].size)
     }
 
     /// Returns true if the tree is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.root.is_none()
     }
@@ -288,6 +291,7 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
     }
 
     /// Looks up a key, splaying it to the root if found.
+    #[must_use]
     pub fn get(&mut self, key: &K) -> Option<&V> {
         let root = self.root?;
         let root = self.splay(root, key);
@@ -314,6 +318,7 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
     }
 
     /// Returns true if the key exists (splays it to root).
+    #[must_use]
     pub fn contains_key(&mut self, key: &K) -> bool {
         self.get(key).is_some()
     }
@@ -364,6 +369,7 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
     }
 
     /// Returns the kth smallest element (0-indexed).
+    #[must_use]
     pub fn kth(&self, k: usize) -> Option<(&K, &V)> {
         if k >= self.len() {
             return None;
@@ -390,6 +396,7 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
 
     /// Returns the rank (0-indexed position) of a key in sorted order.
     /// For missing keys, returns the number of keys strictly less than `key`.
+    #[must_use]
     pub fn rank(&self, key: &K) -> usize {
         let mut current = self.root;
         let mut rank = 0;
@@ -411,6 +418,7 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
     }
 
     /// Returns the minimum key-value pair.
+    #[must_use]
     pub fn min(&self) -> Option<(&K, &V)> {
         let mut current = self.root?;
         while let Some(left) = self.nodes[current].left {
@@ -420,6 +428,7 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
     }
 
     /// Returns the maximum key-value pair.
+    #[must_use]
     pub fn max(&self) -> Option<(&K, &V)> {
         let mut current = self.root?;
         while let Some(right) = self.nodes[current].right {
@@ -429,6 +438,7 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
     }
 
     /// Returns all keys in sorted order.
+    #[must_use]
     pub fn keys(&self) -> Vec<&K> {
         let mut result = Vec::with_capacity(self.len());
         self.collect_keys(self.root, &mut result);
@@ -445,6 +455,7 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
 
     /// Iterates over key-value pairs in sorted order.
     #[allow(clippy::iter_not_returning_iterator)]
+    #[must_use]
     pub fn iter(&self) -> Vec<(&K, &V)> {
         let mut result = Vec::with_capacity(self.len());
         self.collect_pairs(self.root, &mut result);

@@ -67,7 +67,7 @@ impl Default for FdBudgetConfig {
 // =============================================================================
 
 /// System resource limits relevant to FD management.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemLimits {
     /// Soft limit on open file descriptors (ulimit -n).
     pub nofile_soft: u64,
@@ -82,7 +82,7 @@ pub struct SystemLimits {
 }
 
 /// Validation result for system limits.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LimitValidation {
     /// Whether all limits are sufficient.
     pub all_ok: bool,
@@ -93,7 +93,7 @@ pub struct LimitValidation {
 }
 
 /// A single limit check result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LimitCheck {
     /// What was checked.
     pub name: String,
