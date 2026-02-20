@@ -16,10 +16,7 @@ pub enum SearchMode {
 /// Fusion backend selector for hybrid ranking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FusionBackend {
-    /// Existing in-tree weighted RRF implementation.
-    Legacy,
-    /// Use `frankensearch` RRF fusion (feature-gated).
-    #[cfg(feature = "frankensearch")]
+    /// Use `frankensearch` RRF fusion.
     FrankenSearchRrf,
 }
 
@@ -27,42 +24,29 @@ impl FusionBackend {
     /// Parse a fusion backend selector string.
     ///
     /// Supported values:
-    /// - `legacy` (default/fallback)
-    /// - `frankensearch`, `frankensearch_rrf`, `frankensearch-rrf` (when enabled)
+    /// - `frankensearch`, `frankensearch_rrf`, `frankensearch-rrf`
+    /// - legacy aliases (`legacy`, empty, unknown) are normalized to FrankenSearch.
     #[must_use]
-    pub fn parse(raw: &str) -> Self {
-        let normalized = raw.trim().to_ascii_lowercase();
-
-        #[cfg(feature = "frankensearch")]
-        if matches!(
-            normalized.as_str(),
-            "frankensearch" | "frankensearch_rrf" | "frankensearch-rrf"
-        ) {
-            return Self::FrankenSearchRrf;
-        }
-
-        Self::Legacy
+    pub fn parse(_raw: &str) -> Self {
+        // All inputs normalize to FrankenSearchRrf (legacy backends removed).
+        Self::FrankenSearchRrf
     }
 
     /// Canonical backend selector string.
     #[must_use]
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Legacy => "legacy",
-            #[cfg(feature = "frankensearch")]
-            Self::FrankenSearchRrf => "frankensearch_rrf",
-        }
+        "frankensearch_rrf"
     }
 
     /// Resolve backend from `FT_SEARCH_FUSION_BACKEND`.
     ///
     /// Supported values:
-    /// - `legacy` (default)
-    /// - `frankensearch`, `frankensearch_rrf`, `frankensearch-rrf` (when enabled)
+    /// - `frankensearch`, `frankensearch_rrf`, `frankensearch-rrf`
+    /// - unset/unknown values default to `frankensearch_rrf`
     #[must_use]
     pub fn from_env() -> Self {
         let Ok(raw) = std::env::var("FT_SEARCH_FUSION_BACKEND") else {
-            return Self::Legacy;
+            return Self::FrankenSearchRrf;
         };
         Self::parse(&raw)
     }
@@ -144,60 +128,67 @@ pub fn rrf_fuse_weighted(
     results
 }
 
-#[cfg(feature = "frankensearch")]
 fn rrf_fuse_with_frankensearch(
     lexical: &[(u64, f32)],
     semantic: &[(u64, f32)],
     k: u32,
 ) -> Vec<FusedResult> {
-    let lexical_hits: Vec<frankensearch::ScoredResult> = lexical
-        .iter()
-        .map(|(id, score)| frankensearch::ScoredResult {
-            doc_id: id.to_string(),
-            score: *score,
-            source: frankensearch::ScoreSource::Lexical,
-            fast_score: None,
-            quality_score: None,
-            lexical_score: Some(*score),
-            rerank_score: None,
-            explanation: None,
-            metadata: None,
-        })
-        .collect();
+    #[cfg(not(feature = "frankensearch"))]
+    {
+        return rrf_fuse_weighted(lexical, semantic, k, 1.0, 1.0);
+    }
 
-    let semantic_hits: Vec<frankensearch::VectorHit> = semantic
-        .iter()
-        .enumerate()
-        .map(|(index, (id, score))| frankensearch::VectorHit {
-            index: u32::try_from(index).unwrap_or(u32::MAX),
-            score: *score,
-            doc_id: id.to_string(),
-        })
-        .collect();
-
-    let config = frankensearch::RrfConfig { k: f64::from(k) };
-    let limit = lexical_hits.len().saturating_add(semantic_hits.len());
-
-    let mut results: Vec<FusedResult> =
-        frankensearch::rrf_fuse(&lexical_hits, &semantic_hits, limit, 0, &config)
-            .into_iter()
-            .filter_map(|hit| {
-                hit.doc_id.parse::<u64>().ok().map(|id| FusedResult {
-                    id,
-                    score: hit.rrf_score as f32,
-                    lexical_rank: hit.lexical_rank,
-                    semantic_rank: hit.semantic_rank,
-                })
+    #[cfg(feature = "frankensearch")]
+    {
+        let lexical_hits: Vec<frankensearch::ScoredResult> = lexical
+            .iter()
+            .map(|(id, score)| frankensearch::ScoredResult {
+                doc_id: id.to_string(),
+                score: *score,
+                source: frankensearch::ScoreSource::Lexical,
+                fast_score: None,
+                quality_score: None,
+                lexical_score: Some(*score),
+                rerank_score: None,
+                explanation: None,
+                metadata: None,
             })
             .collect();
 
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    results
+        let semantic_hits: Vec<frankensearch::VectorHit> = semantic
+            .iter()
+            .enumerate()
+            .map(|(index, (id, score))| frankensearch::VectorHit {
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                score: *score,
+                doc_id: id.to_string(),
+            })
+            .collect();
+
+        let config = frankensearch::RrfConfig { k: f64::from(k) };
+        let limit = lexical_hits.len().saturating_add(semantic_hits.len());
+
+        let mut results: Vec<FusedResult> =
+            frankensearch::rrf_fuse(&lexical_hits, &semantic_hits, limit, 0, &config)
+                .into_iter()
+                .filter_map(|hit| {
+                    hit.doc_id.parse::<u64>().ok().map(|id| FusedResult {
+                        id,
+                        score: hit.rrf_score as f32,
+                        lexical_rank: hit.lexical_rank,
+                        semantic_rank: hit.semantic_rank,
+                    })
+                })
+                .collect();
+
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        results
+    }
 }
 
 /// Two-tier blending: take top-n from tier1 (quality embedder) and fill remaining
@@ -429,29 +420,11 @@ impl HybridSearchService {
                 .collect(),
             SearchMode::Hybrid => {
                 let fused = match self.fusion_backend {
-                    FusionBackend::Legacy => rrf_fuse_weighted(
-                        lexical,
-                        semantic,
-                        self.rrf_k,
-                        self.lexical_weight,
-                        self.semantic_weight,
-                    ),
-                    #[cfg(feature = "frankensearch")]
                     FusionBackend::FrankenSearchRrf => {
-                        let unit_weights = (self.lexical_weight - 1.0).abs() < f32::EPSILON
-                            && (self.semantic_weight - 1.0).abs() < f32::EPSILON;
-                        if unit_weights {
-                            rrf_fuse_with_frankensearch(lexical, semantic, self.rrf_k)
-                        } else {
-                            // frankensearch RRF currently exposes unweighted lexical+semantic fusion.
-                            rrf_fuse_weighted(
-                                lexical,
-                                semantic,
-                                self.rrf_k,
-                                self.lexical_weight,
-                                self.semantic_weight,
-                            )
-                        }
+                        // Force FrankenSearch RRF in all production search paths.
+                        // We keep lexical/semantic weights in config/metrics for forward compatibility,
+                        // but fusion itself is sourced from frankensearch.
+                        rrf_fuse_with_frankensearch(lexical, semantic, self.rrf_k)
                     }
                 };
                 fused.into_iter().take(top_k).collect()
@@ -634,7 +607,7 @@ mod tests {
         assert_eq!(svc.rrf_k(), 60);
         assert!((svc.alpha() - 0.7).abs() < f32::EPSILON);
         assert_eq!(svc.mode(), SearchMode::Hybrid);
-        assert_eq!(svc.fusion_backend(), FusionBackend::Legacy);
+        assert_eq!(svc.fusion_backend(), FusionBackend::FrankenSearchRrf);
         assert!((svc.lexical_weight() - 1.0).abs() < f32::EPSILON);
         assert!((svc.semantic_weight() - 1.0).abs() < f32::EPSILON);
     }
@@ -926,12 +899,12 @@ mod tests {
 
     #[test]
     fn fusion_backend_copy_clone_debug() {
-        let backend = FusionBackend::Legacy;
+        let backend = FusionBackend::FrankenSearchRrf;
         let copied = backend;
         let cloned = backend;
         assert_eq!(backend, copied);
         assert_eq!(backend, cloned);
-        assert_eq!(format!("{backend:?}"), "Legacy");
+        assert_eq!(format!("{backend:?}"), "FrankenSearchRrf");
     }
 
     // ---- FusedResult ----
@@ -1008,20 +981,21 @@ mod tests {
 
     #[test]
     fn hybrid_service_can_set_fusion_backend() {
-        let svc = HybridSearchService::new().with_fusion_backend(FusionBackend::Legacy);
-        assert_eq!(svc.fusion_backend(), FusionBackend::Legacy);
+        let svc = HybridSearchService::new().with_fusion_backend(FusionBackend::FrankenSearchRrf);
+        assert_eq!(svc.fusion_backend(), FusionBackend::FrankenSearchRrf);
     }
 
     #[test]
-    fn fusion_backend_parse_defaults_to_legacy() {
-        assert_eq!(FusionBackend::parse("legacy"), FusionBackend::Legacy);
-        assert_eq!(FusionBackend::parse(""), FusionBackend::Legacy);
-        assert_eq!(FusionBackend::parse("unknown"), FusionBackend::Legacy);
-    }
-
-    #[cfg(feature = "frankensearch")]
-    #[test]
-    fn fusion_backend_parse_supports_frankensearch_aliases() {
+    fn fusion_backend_parse_normalizes_to_frankensearch() {
+        assert_eq!(
+            FusionBackend::parse("legacy"),
+            FusionBackend::FrankenSearchRrf
+        );
+        assert_eq!(FusionBackend::parse(""), FusionBackend::FrankenSearchRrf);
+        assert_eq!(
+            FusionBackend::parse("unknown"),
+            FusionBackend::FrankenSearchRrf
+        );
         assert_eq!(
             FusionBackend::parse("frankensearch"),
             FusionBackend::FrankenSearchRrf
@@ -1038,7 +1012,7 @@ mod tests {
 
     #[test]
     fn fusion_backend_as_str_roundtrip() {
-        let backend = FusionBackend::Legacy;
+        let backend = FusionBackend::FrankenSearchRrf;
         assert_eq!(FusionBackend::parse(backend.as_str()), backend);
     }
 
@@ -1053,40 +1027,27 @@ mod tests {
         assert_eq!(results.len(), 3);
     }
 
-    #[cfg(feature = "frankensearch")]
     #[test]
-    fn frankensearch_rrf_backend_matches_legacy_top_order_for_unit_weights() {
+    fn frankensearch_rrf_backend_is_stable_across_weight_inputs() {
         let lexical = vec![(10, 1.0), (20, 0.8), (30, 0.7), (40, 0.6)];
         let semantic = vec![(20, 0.9), (10, 0.85), (50, 0.8), (30, 0.75)];
 
-        let legacy = HybridSearchService::new()
-            .with_fusion_backend(FusionBackend::Legacy)
-            .with_mode(SearchMode::Hybrid)
-            .with_rrf_weights(1.0, 1.0)
-            .fuse(&lexical, &semantic, 5);
-        let frankensearch = HybridSearchService::new()
+        let unit_weight_results = HybridSearchService::new()
             .with_fusion_backend(FusionBackend::FrankenSearchRrf)
             .with_mode(SearchMode::Hybrid)
             .with_rrf_weights(1.0, 1.0)
             .fuse(&lexical, &semantic, 5);
-
-        let legacy_ids: Vec<u64> = legacy.into_iter().map(|hit| hit.id).collect();
-        let fs_ids: Vec<u64> = frankensearch.into_iter().map(|hit| hit.id).collect();
-        assert_eq!(legacy_ids, fs_ids);
-    }
-
-    #[cfg(feature = "frankensearch")]
-    #[test]
-    fn frankensearch_rrf_backend_falls_back_to_weighted_for_non_unit_weights() {
-        let lexical = vec![(1, 1.0)];
-        let semantic = vec![(2, 1.0)];
-
-        let with_weighted_bias = HybridSearchService::new()
+        let non_unit_weight_results = HybridSearchService::new()
             .with_fusion_backend(FusionBackend::FrankenSearchRrf)
             .with_mode(SearchMode::Hybrid)
             .with_rrf_weights(2.0, 0.5)
-            .fuse(&lexical, &semantic, 10);
+            .fuse(&lexical, &semantic, 5);
 
-        assert_eq!(with_weighted_bias[0].id, 1);
+        let unit_ids: Vec<u64> = unit_weight_results.into_iter().map(|hit| hit.id).collect();
+        let non_unit_ids: Vec<u64> = non_unit_weight_results
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect();
+        assert_eq!(unit_ids, non_unit_ids);
     }
 }
