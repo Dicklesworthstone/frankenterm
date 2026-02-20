@@ -306,23 +306,12 @@ impl IndexingLagThresholds {
 // ───────────────────────────────────────────────────────────────────────────
 
 /// All storage health thresholds in one struct for configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StorageHealthThresholds {
     pub writer_queue: WriterQueueThresholds,
     pub wal: WalThresholds,
     pub fts_consistency: FtsConsistencyThresholds,
     pub indexing_lag: IndexingLagThresholds,
-}
-
-impl Default for StorageHealthThresholds {
-    fn default() -> Self {
-        Self {
-            writer_queue: WriterQueueThresholds::default(),
-            wal: WalThresholds::default(),
-            fts_consistency: FtsConsistencyThresholds::default(),
-            indexing_lag: IndexingLagThresholds::default(),
-        }
-    }
 }
 
 /// Point-in-time storage health assessment.
@@ -400,23 +389,12 @@ fn worst_tier(tiers: &[HealthTier]) -> HealthTier {
 /// Use [`StoragePerfProfile::default()`] for the standard targets.
 /// Custom profiles can be used for resource-constrained or high-performance
 /// environments.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoragePerfProfile {
     pub scale: ScaleTargets,
     pub latency: LatencyBudgets,
     pub throughput: ThroughputBudgets,
     pub health: StorageHealthThresholds,
-}
-
-impl Default for StoragePerfProfile {
-    fn default() -> Self {
-        Self {
-            scale: ScaleTargets::default(),
-            latency: LatencyBudgets::default(),
-            throughput: ThroughputBudgets::default(),
-            health: StorageHealthThresholds::default(),
-        }
-    }
 }
 
 impl StoragePerfProfile {

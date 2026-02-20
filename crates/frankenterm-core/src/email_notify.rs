@@ -3,21 +3,16 @@
 use serde::{Deserialize, Serialize};
 
 /// TLS mode for SMTP delivery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EmailTlsMode {
     /// No TLS (plain SMTP).
     None,
     /// Upgrade to TLS via STARTTLS (recommended).
+    #[default]
     StartTls,
     /// Implicit TLS (SMTPS).
     Tls,
-}
-
-impl Default for EmailTlsMode {
-    fn default() -> Self {
-        Self::StartTls
-    }
 }
 
 /// Email notification configuration.

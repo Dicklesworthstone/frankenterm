@@ -361,11 +361,9 @@ pub fn reconstruct_line(template: &OutputTemplate, variables: &[String]) -> Stri
 
     for (i, part) in parts.iter().enumerate() {
         result.push_str(part);
-        if i < parts.len() - 1 {
-            if var_idx < variables.len() {
-                result.push_str(&variables[var_idx]);
-                var_idx += 1;
-            }
+        if i < parts.len() - 1 && var_idx < variables.len() {
+            result.push_str(&variables[var_idx]);
+            var_idx += 1;
         }
     }
 

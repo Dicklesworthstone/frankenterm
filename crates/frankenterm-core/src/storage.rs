@@ -8400,12 +8400,7 @@ fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
         // Single-command batches skip the transaction wrapper (SQLite
         // auto-commits each statement anyway).
         let use_txn = batch.len() > 1 && !batch.iter().all(is_control_command);
-        let mut txn_open = false;
-        if use_txn {
-            if conn.execute_batch("BEGIN IMMEDIATE").is_ok() {
-                txn_open = true;
-            }
-        }
+        let mut txn_open = use_txn && conn.execute_batch("BEGIN IMMEDIATE").is_ok();
 
         let mut should_break = false;
         for cmd in batch {

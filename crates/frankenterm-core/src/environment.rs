@@ -16,7 +16,7 @@ use crate::setup::{ShellType, has_shell_ft_block, locate_shell_rc};
 use crate::wezterm::{PaneInfo, WeztermHandle, default_wezterm_handle};
 
 /// WezTerm capability flags inferred from local probes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct WeztermCapabilities {
     pub cli_available: bool,
     pub json_output: bool,
@@ -24,19 +24,6 @@ pub struct WeztermCapabilities {
     pub osc_133: bool,
     pub osc_7: bool,
     pub image_protocol: bool,
-}
-
-impl Default for WeztermCapabilities {
-    fn default() -> Self {
-        Self {
-            cli_available: false,
-            json_output: false,
-            multiplexing: false,
-            osc_133: false,
-            osc_7: false,
-            image_protocol: false,
-        }
-    }
 }
 
 /// WezTerm detection summary.

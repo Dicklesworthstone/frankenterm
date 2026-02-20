@@ -761,8 +761,10 @@ impl AuditLog {
     #[must_use]
     pub fn stats(&self) -> AuditStats {
         let inner = self.inner.lock().unwrap();
-        let mut stats = AuditStats::default();
-        stats.total_entries = inner.entries.len() as u64;
+        let mut stats = AuditStats {
+            total_entries: inner.entries.len() as u64,
+            ..Default::default()
+        };
 
         if let (Some(first), Some(last)) = (inner.entries.front(), inner.entries.back()) {
             stats.ordinal_range = Some((first.ordinal, last.ordinal));

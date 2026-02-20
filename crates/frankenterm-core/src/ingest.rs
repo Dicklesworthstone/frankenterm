@@ -1920,23 +1920,18 @@ pub enum StreamEvent {
 }
 
 /// Policy for handling channel overflow when the consumer cannot keep up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OverflowPolicy {
     /// Drop the new event and mark the pane as having overflow.
     /// The next successfully delivered event for that pane will
     /// carry an `overflow: true` annotation, causing the ingester to emit an
     /// explicit GAP segment before the delta. This ensures no silent data loss.
+    #[default]
     EmitGap,
     /// Remove the oldest event in the channel to make room for the new one, and marks both the dropped
     /// event's pane and the new event's pane as having experienced overflow.
     DropOldest,
-}
-
-impl Default for OverflowPolicy {
-    fn default() -> Self {
-        Self::EmitGap
-    }
 }
 
 /// Configuration for the streaming channel between mux source and ingester.

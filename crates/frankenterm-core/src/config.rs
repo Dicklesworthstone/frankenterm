@@ -665,22 +665,13 @@ fn default_pane_priority_value() -> u32 {
 /// Capture budget configuration for ingest throttling.
 ///
 /// A value of 0 disables the budget (unlimited).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct CaptureBudgetConfig {
     /// Maximum capture operations per second across all panes (0 = unlimited)
     pub max_captures_per_sec: u32,
     /// Maximum captured bytes per second across all panes (0 = unlimited)
     pub max_bytes_per_sec: u64,
-}
-
-impl Default for CaptureBudgetConfig {
-    fn default() -> Self {
-        Self {
-            max_captures_per_sec: 0,
-            max_bytes_per_sec: 0,
-        }
-    }
 }
 
 // =============================================================================
@@ -831,19 +822,11 @@ fn tier_matches(tier: &RetentionTier, severity: &str, event_type: &str, handled:
 // =============================================================================
 
 /// Backup configuration
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct BackupConfig {
     /// Scheduled backups configuration
     pub scheduled: ScheduledBackupConfig,
-}
-
-impl Default for BackupConfig {
-    fn default() -> Self {
-        Self {
-            scheduled: ScheduledBackupConfig::default(),
-        }
-    }
 }
 
 /// Scheduled backup configuration
@@ -891,19 +874,14 @@ impl Default for ScheduledBackupConfig {
 // =============================================================================
 
 /// Sync direction for a target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SyncDirection {
     /// Push local data to target (default)
+    #[default]
     Push,
     /// Pull data from target to local
     Pull,
-}
-
-impl Default for SyncDirection {
-    fn default() -> Self {
-        Self::Push
-    }
 }
 
 /// Sync configuration (asupersync).
@@ -1018,9 +996,10 @@ impl Default for SyncTargetConfig {
 // =============================================================================
 
 /// Authentication mode for distributed connections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum DistributedAuthMode {
     /// Shared token authentication
+    #[default]
     #[serde(rename = "token")]
     Token,
     /// Mutual TLS client authentication
@@ -1040,12 +1019,6 @@ impl DistributedAuthMode {
     #[must_use]
     pub const fn requires_mtls(self) -> bool {
         matches!(self, Self::Mtls | Self::TokenAndMtls)
-    }
-}
-
-impl Default for DistributedAuthMode {
-    fn default() -> Self {
-        Self::Token
     }
 }
 
@@ -1306,7 +1279,7 @@ const COMPACTION_PROMPT_TOKENS: [&str; 5] = [
 ];
 
 /// Per-project/pane-matching prompt override.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct CompactionPromptOverride {
     /// Pane-matching rule for selecting this override
@@ -1315,15 +1288,6 @@ pub struct CompactionPromptOverride {
 
     /// Prompt template to use when the rule matches
     pub prompt: String,
-}
-
-impl Default for CompactionPromptOverride {
-    fn default() -> Self {
-        Self {
-            rule: PaneFilterRule::default(),
-            prompt: String::new(),
-        }
-    }
 }
 
 impl CompactionPromptOverride {
@@ -2145,7 +2109,7 @@ impl Default for VendoredShardingConfig {
 }
 
 /// Vendored WezTerm configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct VendoredConfig {
     /// Optional mux socket path override (WEZTERM_UNIX_SOCKET equivalent)
@@ -2154,16 +2118,6 @@ pub struct VendoredConfig {
     pub mux_pool: VendoredMuxPoolConfig,
     /// Optional sharding configuration for multi-socket routing.
     pub sharding: VendoredShardingConfig,
-}
-
-impl Default for VendoredConfig {
-    fn default() -> Self {
-        Self {
-            mux_socket_path: None,
-            mux_pool: VendoredMuxPoolConfig::default(),
-            sharding: VendoredShardingConfig::default(),
-        }
-    }
 }
 
 // =============================================================================
@@ -2212,19 +2166,14 @@ impl Default for CliConfig {
 // =============================================================================
 
 /// Snapshot scheduling mode.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotSchedulingMode {
     /// Legacy fixed-interval scheduling.
     Periodic,
     /// Event/value-driven scheduling with periodic fallback.
+    #[default]
     Intelligent,
-}
-
-impl Default for SnapshotSchedulingMode {
-    fn default() -> Self {
-        Self::Intelligent
-    }
 }
 
 /// Intelligent snapshot scheduling knobs.

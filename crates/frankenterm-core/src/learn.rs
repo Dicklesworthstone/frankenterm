@@ -1149,14 +1149,12 @@ impl TutorialEngine {
         }
 
         // Speed runner — basics complete and total time <= 3 minutes (secret)
-        if !has("speed_runner") && self.is_track_complete_internal("basics") {
-            if self.state.total_time_minutes <= 3 {
-                to_add.push((
-                    "speed_runner".into(),
-                    "Speed Runner".into(),
-                    "Completed the Basics track in under 3 minutes".into(),
-                ));
-            }
+        if !has("speed_runner") && self.is_track_complete_internal("basics") && self.state.total_time_minutes <= 3 {
+            to_add.push((
+                "speed_runner".into(),
+                "Speed Runner".into(),
+                "Completed the Basics track in under 3 minutes".into(),
+            ));
         }
 
         // Night owl — exercise completed after midnight local time (secret)

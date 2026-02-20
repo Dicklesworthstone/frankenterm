@@ -39,21 +39,16 @@ use crate::patterns::Detection;
 // ============================================================================
 
 /// Payload template format for a webhook endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WebhookTemplate {
     /// Generic JSON payload.
+    #[default]
     Generic,
     /// Slack-compatible payload (Block Kit).
     Slack,
     /// Discord-compatible payload (embeds).
     Discord,
-}
-
-impl Default for WebhookTemplate {
-    fn default() -> Self {
-        Self::Generic
-    }
 }
 
 impl fmt::Display for WebhookTemplate {

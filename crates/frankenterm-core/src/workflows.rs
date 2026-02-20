@@ -1231,23 +1231,6 @@ impl WorkflowDescriptor {
         Ok(())
     }
 
-    fn count_steps(&self, steps: &[DescriptorStep]) -> usize {
-        let mut count = 0;
-        for step in steps {
-            count += 1;
-            match step {
-                DescriptorStep::Conditional { then_steps, else_steps, .. } => {
-                    count += self.count_steps(then_steps);
-                    count += self.count_steps(else_steps);
-                }
-                DescriptorStep::Loop { body, .. } => {
-                    count += self.count_steps(body);
-                }
-                _ => {}
-            }
-        }
-        count
-    }
 }
 
 /// Matchers in descriptors (substring or regex).

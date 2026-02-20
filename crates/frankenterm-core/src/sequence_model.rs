@@ -347,18 +347,13 @@ impl CorrelationTracker {
 // ---------------------------------------------------------------------------
 
 /// Policy for handling clock skew between panes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClockSkewPolicy {
     /// Ignore skew — use sequence numbers for ordering (default, recommended).
+    #[default]
     IgnoreUseSequence,
     /// Flag skew exceeding the threshold but don't alter ordering.
     FlagOnly,
-}
-
-impl Default for ClockSkewPolicy {
-    fn default() -> Self {
-        Self::IgnoreUseSequence
-    }
 }
 
 /// Detects clock skew anomalies between events.

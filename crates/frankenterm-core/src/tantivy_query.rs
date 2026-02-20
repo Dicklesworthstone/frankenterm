@@ -589,14 +589,9 @@ pub trait LexicalSearchService: Send + Sync {
 ///
 /// Stores documents in a Vec and performs linear scan with basic text matching.
 /// Not suitable for production but validates the query contract.
+#[derive(Default)]
 pub struct InMemorySearchService {
     docs: Vec<IndexDocumentFields>,
-}
-
-impl Default for InMemorySearchService {
-    fn default() -> Self {
-        Self { docs: Vec::new() }
-    }
 }
 
 impl InMemorySearchService {

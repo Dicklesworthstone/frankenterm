@@ -100,19 +100,14 @@ impl ClientRole {
 // =============================================================================
 
 /// How a client's active-pane focus is determined.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewMode {
     /// Client tracks its own active tab and pane independently.
+    #[default]
     Independent,
     /// Client mirrors the leader client's focus (follows their active tab/pane).
     Mirrored,
-}
-
-impl Default for ViewMode {
-    fn default() -> Self {
-        Self::Independent
-    }
 }
 
 // =============================================================================

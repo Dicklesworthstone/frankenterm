@@ -297,6 +297,19 @@ impl SearchBridge {
         } = request;
 
         let cancellation = cancellation.unwrap_or_default();
+        if cx.is_cancel_requested() {
+            cancellation.cancel();
+            return Err(SearchBridgeError::Cancelled {
+                reason: "capability context already cancelled".to_owned(),
+            });
+        }
+        if cancellation.is_cancelled() {
+            cx.set_cancel_requested(true);
+            return Err(SearchBridgeError::Cancelled {
+                reason: "bridge cancellation requested".to_owned(),
+            });
+        }
+
         let (timeout_done, timeout_fired, timeout_thread) =
             spawn_timeout_thread(timeout, cancellation.clone());
 
@@ -304,8 +317,8 @@ impl SearchBridge {
         let searcher = Arc::clone(&self.searcher);
         let worker_cancellation = cancellation.clone();
 
-        let worker = crate::runtime_compat::spawn_blocking(
-            move || -> Result<SearchBridgeResult, SearchError> {
+        let mut worker =
+            tokio::task::spawn_blocking(move || -> Result<SearchBridgeResult, SearchError> {
                 let (cancel_done, cancel_thread) =
                     spawn_cancellation_thread(cx.clone(), worker_cancellation.clone());
 
@@ -345,22 +358,42 @@ impl SearchBridge {
                 }
 
                 search_result
-            },
-        );
+            });
 
-        let mut worker = Box::pin(worker);
-        let joined = loop {
+        let search_result = loop {
             tokio::select! {
                 maybe_phase = phase_rx.recv() => {
                     if let Some(phase) = maybe_phase {
                         on_phase(phase);
                     }
                 }
+                () = cancellation.cancelled() => {
+                    worker.abort();
+                    let timeout_ms = timeout.map_or(0, |value| value.as_millis() as u64);
+                    if timeout_fired.load(Ordering::Acquire) {
+                        break Err(SearchBridgeError::Timeout { timeout_ms });
+                    }
+                    break Err(SearchBridgeError::Cancelled {
+                        reason: "bridge cancellation requested".to_owned(),
+                    });
+                }
                 worker_result = &mut worker => {
                     while let Ok(phase) = phase_rx.try_recv() {
                         on_phase(phase);
                     }
-                    break worker_result;
+                    let worker_result = worker_result.map_err(|err| SearchBridgeError::Runtime {
+                        message: err.to_string(),
+                    })?;
+
+                    break match worker_result {
+                        Ok(result) => Ok(result),
+                        Err(error) => Err(map_search_error(
+                            error,
+                            &cancellation,
+                            timeout_fired.load(Ordering::Acquire),
+                            timeout,
+                        )),
+                    };
                 }
             }
         };
@@ -370,17 +403,7 @@ impl SearchBridge {
             let _ = handle.join();
         }
 
-        let worker_result = joined.map_err(|message| SearchBridgeError::Runtime { message })?;
-
-        match worker_result {
-            Ok(result) => Ok(result),
-            Err(error) => Err(map_search_error(
-                error,
-                &cancellation,
-                timeout_fired.load(Ordering::Acquire),
-                timeout,
-            )),
-        }
+        search_result
     }
 }
 
@@ -481,6 +504,7 @@ mod tests {
 
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::runtime_compat::CompatRuntime;
@@ -488,6 +512,8 @@ mod tests {
         Embedder, EmbedderStack, HashEmbedder, IndexBuilder, PhaseMetrics, RankChanges,
         ScoreSource, TwoTierConfig, TwoTierIndex,
     };
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn log_test_event(test_name: &str, phase: &str, started_at: Instant, result: &str) {
         tracing::info!(
@@ -544,10 +570,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
+        let nonce = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "frankenterm-search-bridge-{}-{now_nanos}",
-            std::process::id()
+            "frankenterm-search-bridge-{}-{now_nanos}-{nonce}",
+            std::process::id(),
         ));
+        std::fs::create_dir_all(&dir).expect("create test index directory");
 
         let documents = vec![
             (
@@ -746,16 +774,14 @@ mod tests {
 
     #[test]
     fn test_request_with_timeout() {
-        let req = SearchBridgeRequest::new("test", 5)
-            .with_timeout(Duration::from_secs(30));
+        let req = SearchBridgeRequest::new("test", 5).with_timeout(Duration::from_secs(30));
         assert_eq!(req.timeout, Some(Duration::from_secs(30)));
     }
 
     #[test]
     fn test_request_with_cancellation() {
         let token = BridgeCancellationToken::new();
-        let req = SearchBridgeRequest::new("test", 5)
-            .with_cancellation(token.clone());
+        let req = SearchBridgeRequest::new("test", 5).with_cancellation(token.clone());
         assert!(req.cancellation.is_some());
         // Cancelling via the original token is visible through the request
         token.cancel();
@@ -764,14 +790,13 @@ mod tests {
 
     #[test]
     fn test_request_with_text_provider() {
-        let req = SearchBridgeRequest::new("test", 5)
-            .with_text_provider(|doc_id| {
-                if doc_id == "doc-1" {
-                    Some("Document one content".to_string())
-                } else {
-                    None
-                }
-            });
+        let req = SearchBridgeRequest::new("test", 5).with_text_provider(|doc_id| {
+            if doc_id == "doc-1" {
+                Some("Document one content".to_string())
+            } else {
+                None
+            }
+        });
         assert_eq!(
             (req.text_provider)("doc-1"),
             Some("Document one content".to_string())
@@ -782,15 +807,14 @@ mod tests {
     #[test]
     fn test_request_with_text_provider_arc() {
         let provider: TextProvider = Arc::new(|_| Some("shared".to_string()));
-        let req = SearchBridgeRequest::new("test", 5)
-            .with_text_provider_arc(Arc::clone(&provider));
+        let req = SearchBridgeRequest::new("test", 5).with_text_provider_arc(Arc::clone(&provider));
         assert_eq!((req.text_provider)("anything"), Some("shared".to_string()));
     }
 
     #[test]
     fn test_request_debug_format() {
-        let req = SearchBridgeRequest::new("debug query", 3)
-            .with_timeout(Duration::from_millis(500));
+        let req =
+            SearchBridgeRequest::new("debug query", 3).with_timeout(Duration::from_millis(500));
         let debug_str = format!("{:?}", req);
         assert!(debug_str.contains("SearchBridgeRequest"));
         assert!(debug_str.contains("debug query"));
@@ -824,10 +848,7 @@ mod tests {
         assert_eq!(req.limit, 20);
         assert!(req.timeout.is_some());
         assert!(req.cancellation.is_some());
-        assert_eq!(
-            (req.text_provider)("x"),
-            Some("chained-text".to_string())
-        );
+        assert_eq!((req.text_provider)("x"), Some("chained-text".to_string()));
     }
 
     // -----------------------------------------------------------------------
@@ -898,7 +919,10 @@ mod tests {
         let (bridge, _) = build_test_bridge();
         let cloned = bridge.clone();
         // Both should share the same Arc<TwoTierSearcher>
-        assert!(Arc::ptr_eq(&bridge.shared_searcher(), &cloned.shared_searcher()));
+        assert!(Arc::ptr_eq(
+            &bridge.shared_searcher(),
+            &cloned.shared_searcher()
+        ));
     }
 
     #[test]
@@ -916,10 +940,7 @@ mod tests {
     #[test]
     fn test_update_best_results_initial_phase() {
         let mut best = Vec::new();
-        let results = vec![
-            make_scored_result("a", 0.9),
-            make_scored_result("b", 0.8),
-        ];
+        let results = vec![make_scored_result("a", 0.9), make_scored_result("b", 0.8)];
         let phase = SearchPhase::Initial {
             results: results.clone(),
             latency: Duration::from_millis(10),
@@ -1080,7 +1101,11 @@ mod tests {
         // timeout_fired=true but no duration => timeout_ms should be 0
         let mapped = map_search_error(error, &token, true, None);
         let is_timeout_zero = matches!(mapped, SearchBridgeError::Timeout { timeout_ms: 0 });
-        assert!(is_timeout_zero, "expected Timeout with 0ms, got {:?}", mapped);
+        assert!(
+            is_timeout_zero,
+            "expected Timeout with 0ms, got {:?}",
+            mapped
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1216,36 +1241,25 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "searcher does not yet check cancellation; bridge plumbing ready but needs search-engine cooperation"]
     fn test_bridge_cancellation_forward() {
         let started_at = Instant::now();
-        let (bridge, text_provider) = build_test_bridge();
+        let (bridge, _text_provider) = build_test_bridge();
         let token = BridgeCancellationToken::new();
-        let token_for_thread = token.clone();
+        token.cancel();
 
-        let slow_provider: TextProvider = Arc::new(move |doc_id| {
-            std::thread::sleep(Duration::from_millis(200));
-            text_provider(doc_id)
-        });
-
-        let request = SearchBridgeRequest::new("distributed consensus", 5)
-            .with_text_provider_arc(slow_provider)
-            .with_cancellation(token.clone());
-
-        let cancel_thread = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            token_for_thread.cancel();
-        });
+        let request =
+            SearchBridgeRequest::new("distributed consensus", 5).with_cancellation(token.clone());
 
         let result = run_async(bridge.search(request, |_| {}));
-        let _ = cancel_thread.join();
-
-        assert!(matches!(result, Err(SearchBridgeError::Cancelled { .. })));
+        assert!(
+            matches!(result, Err(SearchBridgeError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(token.is_cancelled());
         log_test_event("test_bridge_cancellation_forward", "done", started_at, "ok");
     }
 
     #[test]
-    #[ignore = "searcher does not yet check Cx cancellation; bridge plumbing ready but needs search-engine cooperation"]
     fn test_bridge_cancellation_reverse() {
         let started_at = Instant::now();
         let (bridge, text_provider) = build_test_bridge();
@@ -1270,7 +1284,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "searcher does not yet check timeout/cancellation; bridge plumbing ready but needs search-engine cooperation"]
     fn test_bridge_timeout() {
         let started_at = Instant::now();
         let (bridge, text_provider) = build_test_bridge();
@@ -1369,8 +1382,7 @@ mod tests {
     #[test]
     fn test_bridge_empty_query() {
         let (bridge, text_provider) = build_test_bridge();
-        let request =
-            SearchBridgeRequest::new("", 5).with_text_provider_arc(text_provider);
+        let request = SearchBridgeRequest::new("", 5).with_text_provider_arc(text_provider);
         // Empty query should not panic — it may return empty or all results
         let result = run_async(bridge.search(request, |_| {}));
         assert!(result.is_ok());
@@ -1379,10 +1391,8 @@ mod tests {
     #[test]
     fn test_bridge_search_result_has_metrics() {
         let (bridge, text_provider) = build_test_bridge();
-        let request =
-            SearchBridgeRequest::new("rust", 5).with_text_provider_arc(text_provider);
-        let result = run_async(bridge.search(request, |_| {}))
-            .expect("search should succeed");
+        let request = SearchBridgeRequest::new("rust", 5).with_text_provider_arc(text_provider);
+        let result = run_async(bridge.search(request, |_| {})).expect("search should succeed");
         // TwoTierMetrics should have non-zero phase1_total_ms
         assert!(
             result.metrics.phase1_total_ms >= 0.0,
@@ -1396,8 +1406,8 @@ mod tests {
         let saw_initial = Arc::new(AtomicBool::new(false));
         let saw_initial_clone = Arc::clone(&saw_initial);
 
-        let request = SearchBridgeRequest::new("consensus", 5)
-            .with_text_provider_arc(text_provider);
+        let request =
+            SearchBridgeRequest::new("consensus", 5).with_text_provider_arc(text_provider);
 
         run_async(bridge.search(request, move |phase| {
             if matches!(phase, SearchPhase::Initial { .. }) {
@@ -1406,6 +1416,9 @@ mod tests {
         }))
         .expect("search should succeed");
 
-        assert!(saw_initial.load(Ordering::Acquire), "should have seen Initial phase");
+        assert!(
+            saw_initial.load(Ordering::Acquire),
+            "should have seen Initial phase"
+        );
     }
 }

@@ -116,7 +116,7 @@ impl std::fmt::Display for NotifyBackend {
 /// enabled = true
 /// sound = false
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct DesktopNotifyConfig {
     /// Enable desktop notifications.
@@ -124,15 +124,6 @@ pub struct DesktopNotifyConfig {
 
     /// Play a sound with the notification (platform-dependent).
     pub sound: bool,
-}
-
-impl Default for DesktopNotifyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            sound: false,
-        }
-    }
 }
 
 // ============================================================================

@@ -288,19 +288,20 @@ impl<R: RecorderEventReader> RecorderExporter<R> {
         now_ms: u64,
     ) -> Result<ExportResult, ExportError> {
         // 1. Build a query request from the export request.
-        let mut query = RecorderQueryRequest::default();
-        query.time_range = request.time_range;
-        query.pane_ids.clone_from(&request.pane_ids);
-        query.include_text = request.include_text;
-        query.max_sensitivity = request.max_sensitivity;
-
         // Use the export's max_events or the global limit.
         let limit = if request.max_events > 0 {
             request.max_events
         } else {
             self.max_export_events
         };
-        query.limit = limit;
+        let query = RecorderQueryRequest {
+            time_range: request.time_range,
+            pane_ids: request.pane_ids.clone(),
+            include_text: request.include_text,
+            max_sensitivity: request.max_sensitivity,
+            limit,
+            ..Default::default()
+        };
 
         // 2. Execute the query via the query executor (handles authz + redaction + audit).
         let query_result = self

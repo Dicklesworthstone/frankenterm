@@ -45,10 +45,11 @@ impl ResizeWorkClass {
 /// Each pane belongs to a domain representing its connection context.
 /// Domains enable per-domain throttling and fair budget partitioning
 /// so that remote-domain resize storms don't starve local panes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResizeDomain {
     /// Local panes on the same host.
+    #[default]
     Local,
     /// Remote panes connected via SSH.
     Ssh { host: String },
@@ -77,12 +78,6 @@ impl ResizeDomain {
             Self::Ssh { .. } => 2,
             Self::Mux { .. } => 1,
         }
-    }
-}
-
-impl Default for ResizeDomain {
-    fn default() -> Self {
-        Self::Local
     }
 }
 

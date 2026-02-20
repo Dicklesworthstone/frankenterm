@@ -742,11 +742,9 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
                 let doc = map_event_to_document(&record.event, record.offset.ordinal);
 
                 // Dedup: delete existing doc with same event_id before re-adding
-                if self.config.dedup_on_replay {
-                    if self.writer.delete_by_event_id(&doc.event_id).is_err() {
-                        // Deletion failure on a non-existent doc is fine; only
-                        // propagate genuine failures on commit.
-                    }
+                if self.config.dedup_on_replay && self.writer.delete_by_event_id(&doc.event_id).is_err() {
+                    // Deletion failure on a non-existent doc is fine; only
+                    // propagate genuine failures on commit.
                 }
 
                 match self.writer.add_document(&doc) {

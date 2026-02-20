@@ -333,21 +333,16 @@ pub struct HazardReport {
 // =============================================================================
 
 /// Scheduling mode for automatic mux restart planning.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum RestartMode {
     /// Fully automatic scheduling; execute when score exceeds `min_score`.
     Automatic { min_score: f64 },
     /// Compute recommendations but do not execute.
+    #[default]
     Advisory,
     /// Disable scheduler decisions (manual restart only).
     Manual,
-}
-
-impl Default for RestartMode {
-    fn default() -> Self {
-        Self::Advisory
-    }
 }
 
 /// Configuration for restart window selection.

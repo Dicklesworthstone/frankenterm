@@ -28,7 +28,7 @@ impl Default for ConfigProfileManifest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ConfigProfileManifestEntry {
     pub name: String,
@@ -37,19 +37,6 @@ pub struct ConfigProfileManifestEntry {
     pub created_at: Option<u64>,
     pub updated_at: Option<u64>,
     pub last_applied_at: Option<u64>,
-}
-
-impl Default for ConfigProfileManifestEntry {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            path: String::new(),
-            description: None,
-            created_at: None,
-            updated_at: None,
-            last_applied_at: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]

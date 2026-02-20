@@ -18,7 +18,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -350,7 +350,7 @@ impl ProcessLauncher {
     fn resolve_agent_action(
         &self,
         agent: &AgentMetadata,
-        cwd: &PathBuf,
+        cwd: &Path,
     ) -> (LaunchAction, Option<String>) {
         let agent_type = parse_agent_type(&agent.agent_type);
         let warning = Some(format!(
@@ -379,7 +379,7 @@ impl ProcessLauncher {
             return (
                 LaunchAction::LaunchAgent {
                     command,
-                    cwd: cwd.clone(),
+                    cwd: cwd.to_path_buf(),
                     agent_type: agent.agent_type.clone(),
                 },
                 warning,
@@ -391,7 +391,7 @@ impl ProcessLauncher {
             return (
                 LaunchAction::LaunchAgent {
                     command: cmd,
-                    cwd: cwd.clone(),
+                    cwd: cwd.to_path_buf(),
                     agent_type: agent.agent_type.clone(),
                 },
                 warning,
@@ -415,7 +415,7 @@ impl ProcessLauncher {
     fn resolve_process_action(
         &self,
         process: &ProcessInfo,
-        cwd: &PathBuf,
+        cwd: &Path,
     ) -> (LaunchAction, Option<String>) {
         let name = &process.name;
 
@@ -437,7 +437,7 @@ impl ProcessLauncher {
                 return (
                     LaunchAction::LaunchShell {
                         shell: name.clone(),
-                        cwd: cwd.clone(),
+                        cwd: cwd.to_path_buf(),
                     },
                     None,
                 );
@@ -482,7 +482,7 @@ impl ProcessLauncher {
     // -------------------------------------------------------------------------
 
     /// Send shell launch commands to a pane.
-    async fn launch_shell(&self, pane_id: u64, shell: &str, cwd: &PathBuf) -> Result<(), String> {
+    async fn launch_shell(&self, pane_id: u64, shell: &str, cwd: &Path) -> Result<(), String> {
         // cd to the working directory first
         let cd_cmd = format!("cd {}\r", shell_escape(cwd));
         self.wezterm
@@ -512,7 +512,7 @@ impl ProcessLauncher {
         &self,
         pane_id: u64,
         command: &str,
-        cwd: &PathBuf,
+        cwd: &Path,
         agent_type: &str,
     ) -> Result<(), String> {
         // The command template may include cd, but ensure we're in the right dir
@@ -576,7 +576,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Escape a path for use in a shell command.
-fn shell_escape(path: &PathBuf) -> String {
+fn shell_escape(path: &Path) -> String {
     let s = path.to_string_lossy();
     if s.contains(|c: char| c.is_whitespace() || "\"'$`!#&|;(){}[]<>?*~".contains(c)) {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
@@ -653,7 +653,7 @@ fn parse_agent_type(s: &str) -> AgentType {
 }
 
 /// Get the default launch command for a known agent type.
-fn default_agent_command(agent_type: AgentType, cwd: &PathBuf) -> Option<String> {
+fn default_agent_command(agent_type: AgentType, cwd: &Path) -> Option<String> {
     let cwd_escaped = shell_escape(cwd);
     match agent_type {
         AgentType::ClaudeCode => Some(format!("cd {cwd_escaped} && claude")),

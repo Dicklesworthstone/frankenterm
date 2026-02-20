@@ -94,11 +94,12 @@ where
 }
 
 /// How panes should be assigned to shards.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "strategy")]
 pub enum AssignmentStrategy {
     /// Select shards round-robin for new panes. Existing panes are routed by
     /// observed ownership.
+    #[default]
     RoundRobin,
     /// Route by normalized pane domain.
     ByDomain {
@@ -121,12 +122,6 @@ pub enum AssignmentStrategy {
     },
     /// Route by consistent hashing on pane id.
     ConsistentHash { virtual_nodes: u32 },
-}
-
-impl Default for AssignmentStrategy {
-    fn default() -> Self {
-        Self::RoundRobin
-    }
 }
 
 impl AssignmentStrategy {

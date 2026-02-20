@@ -79,7 +79,7 @@ impl<K: Ord + Clone, V: Clone> FibonacciHeap<K, V> {
     }
 
     fn alloc_node(&mut self, key: K, value: V) -> usize {
-        let idx = if let Some(idx) = self.free.pop() {
+        if let Some(idx) = self.free.pop() {
             self.nodes[idx] = FibNode {
                 key,
                 value,
@@ -104,8 +104,7 @@ impl<K: Ord + Clone, V: Clone> FibonacciHeap<K, V> {
                 next: idx,
             });
             idx
-        };
-        idx
+        }
     }
 
     /// Inserts a key-value pair. Returns a handle (node index) that can

@@ -41,21 +41,16 @@ use std::time::Instant;
 // ============================================================================
 
 /// Per-pane trust level controlling how strictly commands are guarded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustLevel {
     /// Agent panes: block all destructive operations by default.
+    #[default]
     Strict,
     /// Human panes: warn but allow with confirmation.
     Permissive,
     /// Monitoring/read-only panes: no command interception.
     ReadOnly,
-}
-
-impl Default for TrustLevel {
-    fn default() -> Self {
-        Self::Strict
-    }
 }
 
 impl std::fmt::Display for TrustLevel {
