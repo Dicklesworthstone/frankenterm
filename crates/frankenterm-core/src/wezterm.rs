@@ -807,11 +807,14 @@ impl WeztermClient {
     /// Use the constants in the `control` module for common control characters.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
     /// use frankenterm_core::wezterm::{WeztermClient, control};
     ///
+    /// # async fn example() -> frankenterm_core::Result<()> {
     /// let client = WeztermClient::new();
     /// client.send_control(0, control::CTRL_C).await?; // Send interrupt
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn send_control(&self, pane_id: u64, control_char: &str) -> Result<()> {
         // Control characters MUST use no-paste mode

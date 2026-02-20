@@ -19,12 +19,12 @@
 //!
 //! # Usage
 //!
-//! ```ignore
-//! use frankenterm_core::output::{OutputFormat, Renderer, PaneRenderer};
+//! ```no_run
+//! use frankenterm_core::output::{detect_format, Style};
 //!
-//! let format = OutputFormat::detect();
-//! let renderer = PaneRenderer::new(format);
-//! println!("{}", renderer.render(&panes));
+//! let format = detect_format();
+//! let style = Style::from_format(format);
+//! println!("{}", style.bold("FrankenTerm"));
 //! ```
 
 mod error_renderer;

@@ -6,15 +6,17 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```no_run
 //! use frankenterm_core::retry::{RetryPolicy, with_retry};
 //!
+//! # async fn example() -> frankenterm_core::Result<()> {
 //! let policy = RetryPolicy::default();
 //!
-//! let result = with_retry(&policy, || async {
-//!     // Fallible operation
-//!     some_io_operation().await
+//! let result: frankenterm_core::Result<u64> = with_retry(&policy, || async {
+//!     Ok(42) // fallible operation
 //! }).await;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Integration with Circuit Breaker

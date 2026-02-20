@@ -1444,7 +1444,7 @@ pub fn is_command_candidate(text: &str) -> bool {
     // Helper to check if a token matches any known command, handling paths
     let is_match = |token: &str| {
         let lower = token.to_ascii_lowercase();
-        
+
         // Always treat path-like tokens as candidates (e.g. ./script.sh, /bin/destroy)
         // We defer to DCG to determine if the script/binary is actually dangerous.
         if lower.contains('/') || lower.contains('\\') {
@@ -1466,7 +1466,7 @@ pub fn is_command_candidate(text: &str) -> bool {
         if token[..eq_pos].contains('/') || token[..eq_pos].contains('\\') {
             break;
         }
-        
+
         if let Some(next) = parts.next() {
             token = next;
         } else {
@@ -3169,17 +3169,21 @@ impl InjectionResult {
 ///
 /// # Example
 ///
-/// ```ignore
-/// use frankenterm_core::policy::{PolicyGatedInjector, PolicyEngine, ActorKind};
+/// ```no_run
+/// use frankenterm_core::policy::{
+///     PolicyGatedInjector, PolicyEngine, ActorKind,
+///     PaneCapabilities, InjectionResult,
+/// };
 /// use frankenterm_core::wezterm::WeztermClient;
 ///
-/// let engine = PolicyEngine::default();
+/// # async fn example() {
+/// let engine = PolicyEngine::permissive();
 /// let client = WeztermClient::new();
-/// let injector = PolicyGatedInjector::new(engine, client);
+/// let mut injector = PolicyGatedInjector::new(engine, client);
 ///
 /// // Capabilities are derived from current pane state
 /// let caps = PaneCapabilities::prompt();
-/// let result = injector.send_text(1, "ls -la", ActorKind::Robot, &caps).await;
+/// let result = injector.send_text(1, "ls -la", ActorKind::Robot, &caps, None).await;
 ///
 /// match result {
 ///     InjectionResult::Allowed { .. } => println!("Sent successfully"),
@@ -3187,6 +3191,7 @@ impl InjectionResult {
 ///     InjectionResult::RequiresApproval { decision, .. } => println!("Needs approval"),
 ///     InjectionResult::Error { error, .. } => println!("Error: {}", error),
 /// }
+/// # }
 /// ```
 pub struct PolicyGatedInjector<C = crate::wezterm::WeztermClient> {
     engine: PolicyEngine,

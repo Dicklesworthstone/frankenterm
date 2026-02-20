@@ -1230,7 +1230,6 @@ impl WorkflowDescriptor {
 
         Ok(())
     }
-
 }
 
 /// Matchers in descriptors (substring or regex).
@@ -1601,7 +1600,12 @@ impl DescriptorWorkflow {
 
         for step in steps {
             match step {
-                DescriptorStep::Loop { count, body, id: _, description: _ } => {
+                DescriptorStep::Loop {
+                    count,
+                    body,
+                    id: _,
+                    description: _,
+                } => {
                     for _ in 0..*count {
                         Self::compile_recursive(body, exec, meta, depth + 1);
                     }
@@ -1620,7 +1624,10 @@ impl DescriptorWorkflow {
                         matcher: matcher.clone(),
                         jump_to: 0,
                     });
-                    meta.push(WorkflowStep::new(id.clone(), format!("Check: {}", description.as_deref().unwrap_or("condition"))));
+                    meta.push(WorkflowStep::new(
+                        id.clone(),
+                        format!("Check: {}", description.as_deref().unwrap_or("condition")),
+                    ));
 
                     Self::compile_recursive(then_steps, exec, meta, depth + 1);
 
@@ -1632,7 +1639,9 @@ impl DescriptorWorkflow {
                     Self::compile_recursive(else_steps, exec, meta, depth + 1);
                     let end_idx = exec.len();
 
-                    if let ExecutableStep::JumpIfFalse { jump_to, .. } = &mut exec[jump_if_false_idx] {
+                    if let ExecutableStep::JumpIfFalse { jump_to, .. } =
+                        &mut exec[jump_if_false_idx]
+                    {
                         *jump_to = else_start_idx;
                     }
                     if let ExecutableStep::Jump(target) = &mut exec[jump_end_idx] {
@@ -1711,12 +1720,19 @@ impl Workflow for DescriptorWorkflow {
 
             match step {
                 ExecutableStep::Action(desc_step) => {
-                    execute_atomic_descriptor_step(&desc_step, default_wait_timeout_ms, ctx_clone).await
+                    execute_atomic_descriptor_step(&desc_step, default_wait_timeout_ms, ctx_clone)
+                        .await
                 }
                 ExecutableStep::Jump(target) => StepResult::jump_to(target),
-                ExecutableStep::JumpIfFalse { test_text, matcher, jump_to } => {
+                ExecutableStep::JumpIfFalse {
+                    test_text,
+                    matcher,
+                    jump_to,
+                } => {
                     let matches = match matcher {
-                        DescriptorMatcher::Substring { value } => test_text.contains(value.as_str()),
+                        DescriptorMatcher::Substring { value } => {
+                            test_text.contains(value.as_str())
+                        }
                         DescriptorMatcher::Regex { pattern } => fancy_regex::Regex::new(&pattern)
                             .map(|re| re.is_match(&test_text).unwrap_or(false))
                             .unwrap_or(false),
@@ -2191,8 +2207,10 @@ impl WorkflowContext {
 ///
 /// # Example
 ///
-/// ```ignore
-/// use frankenterm_core::workflows::{Workflow, WorkflowContext, WorkflowStep, StepResult, WaitCondition};
+/// ```no_run
+/// use frankenterm_core::workflows::{
+///     Workflow, WorkflowContext, WorkflowStep, StepResult, WaitCondition, BoxFuture,
+/// };
 /// use frankenterm_core::patterns::Detection;
 ///
 /// struct PromptInjectionWorkflow;
@@ -2212,18 +2230,14 @@ impl WorkflowContext {
 ///         ]
 ///     }
 ///
-///     async fn execute_step(&self, ctx: &mut WorkflowContext, step_idx: usize) -> StepResult {
-///         match step_idx {
-///             0 => {
-///                 // Send prompt via WezTerm client
-///                 StepResult::cont()
+///     fn execute_step(&self, _ctx: &mut WorkflowContext, step_idx: usize) -> BoxFuture<'_, StepResult> {
+///         Box::pin(async move {
+///             match step_idx {
+///                 0 => StepResult::cont(),
+///                 1 => StepResult::wait_for(WaitCondition::pattern("response.complete")),
+///                 _ => StepResult::done_empty(),
 ///             }
-///             1 => {
-///                 // Wait for response
-///                 StepResult::wait_for(WaitCondition::pattern("response.complete"))
-///             }
-///             _ => StepResult::done_empty()
-///         }
+///         })
 ///     }
 /// }
 /// ```
@@ -20402,20 +20416,16 @@ You've hit your usage limit. Try again at 5:00 PM.";
             name: "test_loop".to_string(),
             description: None,
             triggers: vec![],
-            steps: vec![
-                DescriptorStep::Loop {
-                    id: "loop".to_string(),
+            steps: vec![DescriptorStep::Loop {
+                id: "loop".to_string(),
+                description: None,
+                count: 3,
+                body: vec![DescriptorStep::Log {
+                    id: "log".to_string(),
                     description: None,
-                    count: 3,
-                    body: vec![
-                        DescriptorStep::Log {
-                            id: "log".to_string(),
-                            description: None,
-                            message: "iteration".to_string(),
-                        }
-                    ],
-                }
-            ],
+                    message: "iteration".to_string(),
+                }],
+            }],
             on_failure: None,
         };
         let _workflow = DescriptorWorkflow::new(descriptor);
