@@ -21195,7 +21195,7 @@ mod proptest_tests {
     use super::*;
     use proptest::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use tokio::runtime::Runtime;
+    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
 
     // Counter for unique temp DB paths
     static PROPTEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -21259,7 +21259,7 @@ mod proptest_tests {
         /// each pane's segments must have strictly increasing seq numbers.
         #[test]
         fn prop_seq_monotonic_per_pane(writes in write_ops_strategy()) {
-            let rt = Runtime::new().expect("create runtime");
+            let rt = RuntimeBuilder::multi_thread().build().expect("create runtime");
             let db_path = temp_db_path();
 
             // Collect results from async block for verification
@@ -21312,7 +21312,7 @@ mod proptest_tests {
         /// FTS search should find it.
         #[test]
         fn prop_fts_finds_inserted_text(content in "[a-zA-Z]{3,20}") {
-            let rt = Runtime::new().expect("create runtime");
+            let rt = RuntimeBuilder::multi_thread().build().expect("create runtime");
             let db_path = temp_db_path();
 
             // Collect search results from async block
@@ -21357,7 +21357,7 @@ mod proptest_tests {
             (content1, content2) in ("[a-zA-Z]{5,15}", "[a-zA-Z]{5,15}")
                 .prop_filter("contents must differ", |(a, b)| a != b)
         ) {
-            let rt = Runtime::new().expect("create runtime");
+            let rt = RuntimeBuilder::multi_thread().build().expect("create runtime");
             let db_path = temp_db_path();
 
             // Collect search results from async block

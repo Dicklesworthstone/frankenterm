@@ -1159,7 +1159,7 @@ impl WeztermClient {
     /// Uses `kill_on_drop(true)` to ensure child processes are killed when the
     /// future is dropped (e.g., on timeout), preventing orphan process accumulation.
     async fn run_cli(&self, args: &[&str]) -> Result<String> {
-        use tokio::process::Command;
+        use crate::runtime_compat::process::Command;
 
         if let Some(ref socket) = self.socket_path {
             if !std::path::Path::new(socket).exists() {

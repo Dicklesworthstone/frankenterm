@@ -12,14 +12,13 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, warn};
-
 use crate::Result;
 use crate::events::EventBus;
 use crate::runtime::RuntimeHandle;
+use crate::runtime_compat::io::{AsyncReadExt, AsyncWriteExt};
+use crate::runtime_compat::net::{TcpListener, TcpStream};
 use crate::runtime_compat::task::JoinHandle;
+use tracing::{debug, warn};
 
 /// Boxed future for async trait-like APIs without additional dependencies.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -1069,7 +1068,7 @@ mod pure_tests {
 #[cfg(all(test, feature = "metrics"))]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use crate::runtime_compat::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn render_prometheus_includes_prefix() {

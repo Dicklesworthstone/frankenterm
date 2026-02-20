@@ -451,6 +451,28 @@ pub mod unix {
     }
 }
 
+/// Async process primitives for the active runtime.
+///
+/// Centralizes tokio::process usage so asupersync can swap it later.
+pub mod process {
+    pub use tokio::process::Command;
+}
+
+/// Async I/O traits for the active runtime.
+///
+/// Re-exports the extension traits needed for TCP stream I/O.
+/// For Unix-specific I/O (BufReader, lines, etc.) see the `unix` module.
+pub mod io {
+    pub use tokio::io::{AsyncReadExt, AsyncWriteExt};
+}
+
+/// Async networking primitives for the active runtime.
+///
+/// For Unix sockets, see the `unix` module.
+pub mod net {
+    pub use tokio::net::{TcpListener, TcpStream};
+}
+
 /// Unified runtime trait used during migration.
 pub trait CompatRuntime {
     /// Runs a future to completion.
@@ -2202,5 +2224,153 @@ mod tests {
         // send() returns the value when receiver is dropped
         let returned = tx.send(42).unwrap_err();
         assert_eq!(returned, 42);
+    }
+
+    // ========================================================================
+    // Process module tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn process_command_echo() {
+        let output = process::Command::new("echo")
+            .arg("hello")
+            .output()
+            .await
+            .expect("echo should succeed");
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn process_command_false_returns_non_zero() {
+        let output = process::Command::new("false")
+            .output()
+            .await
+            .expect("false should execute");
+        assert!(!output.status.success());
+    }
+
+    #[tokio::test]
+    async fn process_command_with_env() {
+        let output = process::Command::new("env")
+            .env("TEST_RC_VAR", "42")
+            .output()
+            .await
+            .expect("env should succeed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("TEST_RC_VAR=42"));
+    }
+
+    #[tokio::test]
+    async fn process_command_stdin_piped() {
+        use std::process::Stdio;
+        let child = process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn();
+        assert!(child.is_ok());
+    }
+
+    #[tokio::test]
+    async fn process_command_nonexistent_binary() {
+        let result = process::Command::new("nonexistent_binary_xyz_123")
+            .output()
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn process_command_args_multiple() {
+        let output = process::Command::new("echo")
+            .args(["a", "b", "c"])
+            .output()
+            .await
+            .expect("echo should succeed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("a b c"));
+    }
+
+    // ========================================================================
+    // IO module tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn io_async_read_ext_available() {
+        use io::AsyncReadExt;
+        let data: &[u8] = b"hello world";
+        let mut cursor = std::io::Cursor::new(data);
+        let mut buf = [0u8; 5];
+        let n = cursor.read(&mut buf).await.expect("read should succeed");
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[tokio::test]
+    async fn io_async_write_ext_available() {
+        use io::AsyncWriteExt;
+        let mut buf = Vec::new();
+        buf.write_all(b"test").await.expect("write should succeed");
+        assert_eq!(&buf, b"test");
+    }
+
+    #[tokio::test]
+    async fn io_read_to_end_via_ext() {
+        use io::AsyncReadExt;
+        let data: &[u8] = b"abcdef";
+        let mut cursor = std::io::Cursor::new(data);
+        let mut buf = Vec::new();
+        cursor
+            .read_to_end(&mut buf)
+            .await
+            .expect("read_to_end should succeed");
+        assert_eq!(&buf, b"abcdef");
+    }
+
+    // ========================================================================
+    // Net module tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn net_tcp_listener_bind() {
+        let listener = net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should succeed");
+        let addr = listener.local_addr().expect("should have local addr");
+        assert!(addr.port() > 0);
+    }
+
+    #[tokio::test]
+    async fn net_tcp_stream_connect_to_listener() {
+        let listener = net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let stream = net::TcpStream::connect(addr).await;
+        assert!(stream.is_ok());
+    }
+
+    #[tokio::test]
+    async fn net_tcp_roundtrip() {
+        use io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = task::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.expect("read");
+            buf
+        });
+
+        let mut client = net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(b"ping").await.expect("write");
+
+        let received = server.await.expect("server task");
+        assert_eq!(&received, b"ping");
     }
 }
