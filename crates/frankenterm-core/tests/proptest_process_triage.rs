@@ -739,3 +739,99 @@ proptest! {
         prop_assert_eq!(json1, json2);
     }
 }
+
+// =============================================================================
+// Additional: TriagePlan serde, ClassifiedProcess JSON keys, TriageAction tagged
+// =============================================================================
+
+fn arb_classified_process() -> impl Strategy<Value = ClassifiedProcess> {
+    (
+        1_u32..100_000,
+        "[a-z]{3,15}",
+        arb_triage_category(),
+        arb_triage_action(),
+        "[a-zA-Z0-9 ]{5,40}",
+        proptest::option::of(1_u64..1000),
+    )
+        .prop_map(|(pid, name, category, action, reason, pane_id)| ClassifiedProcess {
+            pid,
+            name,
+            category,
+            action,
+            reason,
+            pane_id,
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// ClassifiedProcess JSON contains expected keys.
+    #[test]
+    fn classified_process_json_keys(cp in arb_classified_process()) {
+        let json = serde_json::to_string(&cp).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = val.as_object().unwrap();
+        prop_assert!(obj.contains_key("pid"), "missing 'pid'");
+        prop_assert!(obj.contains_key("name"), "missing 'name'");
+        prop_assert!(obj.contains_key("category"), "missing 'category'");
+        prop_assert!(obj.contains_key("reason"), "missing 'reason'");
+    }
+
+    /// ClassifiedProcess pane_id skip_serializing_if None.
+    #[test]
+    fn classified_process_pane_id_skip(
+        pid in 1_u32..100_000,
+        name in "[a-z]{3,10}",
+    ) {
+        let cp = ClassifiedProcess {
+            pid,
+            name,
+            category: TriageCategory::Zombie,
+            action: TriageAction::ForceKill,
+            reason: "test".into(),
+            pane_id: None,
+        };
+        let json = serde_json::to_string(&cp).unwrap();
+        prop_assert!(!json.contains("pane_id"),
+            "pane_id should be skipped when None");
+    }
+
+    /// ClassifiedProcess pane_id present when Some.
+    #[test]
+    fn classified_process_pane_id_present(
+        pid in 1_u32..100_000,
+        pane in 1_u64..1000,
+    ) {
+        let cp = ClassifiedProcess {
+            pid,
+            name: "test".into(),
+            category: TriageCategory::StuckCli,
+            action: TriageAction::ForceKill,
+            reason: "test".into(),
+            pane_id: Some(pane),
+        };
+        let json = serde_json::to_string(&cp).unwrap();
+        let back: ClassifiedProcess = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, Some(pane));
+    }
+
+    /// TriageAction JSON contains "action" tag (tagged enum).
+    #[test]
+    fn triage_action_has_tag(action in arb_triage_action()) {
+        let json = serde_json::to_string(&action).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(val.get("action").is_some(),
+            "TriageAction should have 'action' tag field");
+    }
+
+    /// TriageCategory Display matches serde serialization (without quotes).
+    #[test]
+    fn category_display_matches_serde(cat in arb_triage_category()) {
+        let display = cat.to_string();
+        let json = serde_json::to_string(&cat).unwrap();
+        let serde_str = json.trim_matches('"');
+        prop_assert_eq!(display.as_str(), serde_str,
+            "Display and serde should produce same string");
+    }
+}

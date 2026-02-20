@@ -4,7 +4,9 @@
 //! correctness and complementarity, plus `ReindexProgress` serde roundtrips
 //! and structural invariants.
 
-use frankenterm_core::tantivy_reindex::{BackfillRange, ReindexProgress};
+use frankenterm_core::tantivy_reindex::{
+    BackfillRange, CheckedRange, IntegrityReport, OffsetMismatch, ReindexProgress,
+};
 use proptest::prelude::*;
 
 // =========================================================================
@@ -416,6 +418,51 @@ fn time_range_excludes_outside() {
 }
 
 // =========================================================================
+// Additional strategies: IntegrityReport, OffsetMismatch, CheckedRange
+// =========================================================================
+
+fn arb_checked_range() -> impl Strategy<Value = CheckedRange> {
+    (0_u64..50_000, 50_000_u64..100_000, 0_u64..50_000)
+        .prop_map(|(start, end, checked)| CheckedRange {
+            start_ordinal: start,
+            end_ordinal: end,
+            events_checked: checked,
+        })
+}
+
+fn arb_offset_mismatch() -> impl Strategy<Value = OffsetMismatch> {
+    ("[a-z0-9-]{8,24}", 0_u64..100_000, 0_u64..100_000)
+        .prop_map(|(event_id, expected_offset, actual_offset)| OffsetMismatch {
+            event_id,
+            expected_offset,
+            actual_offset,
+        })
+}
+
+fn arb_integrity_report() -> impl Strategy<Value = IntegrityReport> {
+    (
+        0_u64..100_000,
+        0_u64..100_000,
+        proptest::collection::vec("[a-z0-9-]{8,16}", 0..5),
+        proptest::collection::vec(arb_offset_mismatch(), 0..3),
+        proptest::bool::ANY,
+        proptest::option::of(0_u64..1_000_000),
+        arb_checked_range(),
+    )
+        .prop_map(|(scanned, matches, missing, mismatches, consistent, total_docs, range)| {
+            IntegrityReport {
+                log_events_scanned: scanned,
+                index_matches: matches,
+                missing_from_index: missing,
+                offset_mismatches: mismatches,
+                is_consistent: consistent,
+                total_index_docs: total_docs,
+                checked_range: range,
+            }
+        })
+}
+
+// =========================================================================
 // Additional property tests for coverage
 // =========================================================================
 
@@ -448,5 +495,63 @@ proptest! {
     fn prop_progress_debug_nonempty(progress in arb_reindex_progress()) {
         let dbg = format!("{:?}", progress);
         prop_assert!(!dbg.is_empty());
+    }
+
+    /// CheckedRange serde roundtrip.
+    #[test]
+    fn prop_checked_range_serde(range in arb_checked_range()) {
+        let json = serde_json::to_string(&range).unwrap();
+        let back: CheckedRange = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, range);
+    }
+
+    /// OffsetMismatch serde roundtrip.
+    #[test]
+    fn prop_offset_mismatch_serde(mismatch in arb_offset_mismatch()) {
+        let json = serde_json::to_string(&mismatch).unwrap();
+        let back: OffsetMismatch = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, mismatch);
+    }
+
+    /// IntegrityReport serde roundtrip.
+    #[test]
+    fn prop_integrity_report_serde(report in arb_integrity_report()) {
+        let json = serde_json::to_string(&report).unwrap();
+        let back: IntegrityReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, report);
+    }
+
+    /// IntegrityReport deterministic serialization.
+    #[test]
+    fn prop_integrity_report_deterministic(report in arb_integrity_report()) {
+        let j1 = serde_json::to_string(&report).unwrap();
+        let j2 = serde_json::to_string(&report).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// IntegrityReport JSON has expected keys.
+    #[test]
+    fn prop_integrity_report_json_keys(report in arb_integrity_report()) {
+        let json = serde_json::to_string(&report).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = val.as_object().unwrap();
+        prop_assert!(obj.contains_key("log_events_scanned"), "missing 'log_events_scanned'");
+        prop_assert!(obj.contains_key("index_matches"), "missing 'index_matches'");
+        prop_assert!(obj.contains_key("is_consistent"), "missing 'is_consistent'");
+        prop_assert!(obj.contains_key("checked_range"), "missing 'checked_range'");
+    }
+
+    /// CheckedRange clone preserves fields.
+    #[test]
+    fn prop_checked_range_clone(range in arb_checked_range()) {
+        let cloned = range.clone();
+        prop_assert_eq!(range, cloned);
+    }
+
+    /// OffsetMismatch clone preserves fields.
+    #[test]
+    fn prop_offset_mismatch_clone(mismatch in arb_offset_mismatch()) {
+        let cloned = mismatch.clone();
+        prop_assert_eq!(mismatch, cloned);
     }
 }

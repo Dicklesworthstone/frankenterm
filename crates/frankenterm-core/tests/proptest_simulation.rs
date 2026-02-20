@@ -7,8 +7,9 @@
 //! `flame_samples`/`stage_summary` structural invariants.
 
 use frankenterm_core::simulation::{
-    EventAction, FontAtlasCachePolicy, FontRenderPrepMetrics, ResizeQueueMetrics, ResizeTimeline,
-    ResizeTimelineEvent, ResizeTimelineFlameSample, ResizeTimelineStage, ResizeTimelineStageSample,
+    EventAction, Expectation, ExpectationKind, FontAtlasCachePolicy, FontRenderPrepMetrics,
+    ResizeQueueMetrics, ResizeTimeline, ResizeTimelineEvent, ResizeTimelineFlameSample,
+    ResizeTimelineStage, ResizeTimelineStageSample, ScenarioPane,
 };
 use proptest::prelude::*;
 
@@ -602,6 +603,135 @@ proptest! {
             prop_assert_eq!(entry.max_duration_ns, 0);
             prop_assert_eq!(entry.p95_duration_ns, 0);
         }
+    }
+}
+
+// =========================================================================
+// Additional strategies: ExpectationKind, ScenarioPane
+// =========================================================================
+
+fn arb_expectation_kind() -> impl Strategy<Value = ExpectationKind> {
+    prop_oneof![
+        ("[a-z_]{3,15}", proptest::option::of("[0-9]{1,4}s"))
+            .prop_map(|(event, detected_at)| ExpectationKind::Event { event, detected_at }),
+        ("[a-z_]{3,15}", proptest::option::of("[0-9]{1,4}s"))
+            .prop_map(|(workflow, started_at)| ExpectationKind::Workflow { workflow, started_at }),
+        (1_u64..100, "[a-zA-Z0-9 ]{3,30}")
+            .prop_map(|(pane, text)| ExpectationKind::Contains { pane, text }),
+    ]
+}
+
+fn arb_scenario_pane() -> impl Strategy<Value = ScenarioPane> {
+    (
+        1_u64..1000,
+        "[a-z]{3,15}",
+        prop_oneof![Just("local".to_string()), Just("ssh".to_string())],
+        "[/a-z]{3,20}",
+        0_u64..10,
+        0_u64..10,
+        10_u32..300,
+        5_u32..100,
+        "[a-zA-Z0-9 ]{0,40}",
+    )
+        .prop_map(|(id, title, domain, cwd, window_id, tab_id, cols, rows, initial_content)| {
+            ScenarioPane {
+                id,
+                title,
+                domain,
+                cwd,
+                window_id,
+                tab_id,
+                cols,
+                rows,
+                initial_content,
+            }
+        })
+}
+
+// =========================================================================
+// ExpectationKind and ScenarioPane tests
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    /// ExpectationKind serde roundtrip.
+    #[test]
+    fn prop_expectation_kind_serde(kind in arb_expectation_kind()) {
+        let exp = Expectation { kind: kind.clone() };
+        let json = serde_json::to_string(&exp).unwrap();
+        let back: Expectation = serde_json::from_str(&json).unwrap();
+        let back_json = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(&json, &back_json, "Expectation serde roundtrip failed");
+    }
+
+    /// ExpectationKind deterministic serialization.
+    #[test]
+    fn prop_expectation_kind_deterministic(kind in arb_expectation_kind()) {
+        let exp = Expectation { kind };
+        let j1 = serde_json::to_string(&exp).unwrap();
+        let j2 = serde_json::to_string(&exp).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// ScenarioPane serde roundtrip.
+    #[test]
+    fn prop_scenario_pane_serde(pane in arb_scenario_pane()) {
+        let json = serde_json::to_string(&pane).unwrap();
+        let back: ScenarioPane = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.id, pane.id);
+        prop_assert_eq!(back.title, pane.title);
+        prop_assert_eq!(back.domain, pane.domain);
+        prop_assert_eq!(back.cols, pane.cols);
+        prop_assert_eq!(back.rows, pane.rows);
+    }
+
+    /// ScenarioPane JSON has expected keys.
+    #[test]
+    fn prop_scenario_pane_json_keys(pane in arb_scenario_pane()) {
+        let json = serde_json::to_string(&pane).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = val.as_object().unwrap();
+        prop_assert!(obj.contains_key("id"), "missing 'id'");
+        prop_assert!(obj.contains_key("title"), "missing 'title'");
+        prop_assert!(obj.contains_key("cols"), "missing 'cols'");
+        prop_assert!(obj.contains_key("rows"), "missing 'rows'");
+    }
+
+    /// FontAtlasCachePolicy serde roundtrip.
+    #[test]
+    fn prop_atlas_cache_policy_serde(policy in arb_atlas_cache_policy()) {
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: FontAtlasCachePolicy = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, policy);
+    }
+
+    /// FontAtlasCachePolicy serializes to snake_case.
+    #[test]
+    fn prop_atlas_cache_policy_snake_case(policy in arb_atlas_cache_policy()) {
+        let json = serde_json::to_string(&policy).unwrap();
+        let inner = json.trim_matches('"');
+        prop_assert!(
+            inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "atlas cache policy should be snake_case, got '{}'", inner
+        );
+    }
+
+    /// FontRenderPrepMetrics serde roundtrip.
+    #[test]
+    fn prop_render_prep_metrics_serde(metrics in arb_render_prep_metrics()) {
+        let json = serde_json::to_string(&metrics).unwrap();
+        let back: FontRenderPrepMetrics = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, metrics);
+    }
+
+    /// ResizeQueueMetrics clone and serde are consistent.
+    #[test]
+    fn prop_queue_metrics_clone_serde(qm in arb_queue_metrics()) {
+        let cloned = qm.clone();
+        let j1 = serde_json::to_string(&qm).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(&j1, &j2);
     }
 }
 
