@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use frankensearch::{ScoredResult, SearchError, SearchPhase};
-use frankenterm_core::runtime_compat::task;
+use frankenterm_core::runtime_compat::{self, CompatRuntime, RuntimeBuilder, task};
 use frankenterm_core::search_bridge::{
     BridgeCancellationToken, SearchBridgeError, SearchBridgeRequest, SearchBridgeResult,
 };
@@ -652,14 +652,13 @@ fn cancellation_token_cancelled_future_returns_immediately_when_already_cancelle
     let token = BridgeCancellationToken::new();
     token.cancel();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+    let rt = RuntimeBuilder::current_thread()
         .build()
         .unwrap();
 
     rt.block_on(async {
         // This should return immediately since token is already cancelled
-        tokio::time::timeout(Duration::from_millis(100), token.cancelled())
+        runtime_compat::timeout(Duration::from_millis(100), token.cancelled())
             .await
             .expect("cancelled() should return immediately for already-cancelled token");
     });
@@ -676,8 +675,7 @@ fn cancellation_token_cancelled_future_resolves_on_cancel() {
     let token = BridgeCancellationToken::new();
     let token2 = token.clone();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+    let rt = RuntimeBuilder::current_thread()
         .build()
         .unwrap();
 
@@ -687,12 +685,12 @@ fn cancellation_token_cancelled_future_resolves_on_cancel() {
         });
 
         // Give the task a moment to start waiting
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        runtime_compat::sleep(Duration::from_millis(10)).await;
 
         // Cancel should unblock the waiting task
         token.cancel();
 
-        tokio::time::timeout(Duration::from_millis(200), handle)
+        runtime_compat::timeout(Duration::from_millis(200), handle)
             .await
             .expect("task should complete after cancel")
             .expect("task should not panic");

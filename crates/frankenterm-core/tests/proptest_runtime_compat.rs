@@ -94,8 +94,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+    let rt = RuntimeBuilder::current_thread()
         .build()
         .expect("tokio runtime");
     rt.block_on(f());
