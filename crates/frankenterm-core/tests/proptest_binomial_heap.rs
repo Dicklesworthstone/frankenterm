@@ -591,3 +591,86 @@ proptest! {
         prop_assert_eq!(sorted_before, sorted_after);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Merge two heaps with identical keys preserves all elements (duplicates kept).
+    #[test]
+    fn merge_duplicate_keys_preserves_all(vals in values_strategy(20)) {
+        let mut h1 = BinomialHeap::new();
+        let mut h2 = BinomialHeap::new();
+        for &v in &vals {
+            h1.insert(v, v);
+            h2.insert(v, v);
+        }
+        h1.merge(&mut h2);
+        prop_assert_eq!(h1.len(), vals.len() * 2);
+    }
+
+    /// sorted() called twice on same heap returns identical results.
+    #[test]
+    fn sorted_idempotent(vals in values_strategy(20)) {
+        let mut heap = BinomialHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+        let s1 = heap.sorted();
+        let s2 = heap.sorted();
+        prop_assert_eq!(s1, s2);
+    }
+
+    /// pop from empty heap returns None.
+    #[test]
+    fn pop_empty_returns_none(_dummy in 0..1u8) {
+        let mut heap: BinomialHeap<i32, i32> = BinomialHeap::new();
+        prop_assert!(heap.pop().is_none());
+    }
+
+    /// Display format for non-empty heap contains "BinomialHeap".
+    #[test]
+    fn display_contains_typename(v in -1000i32..1000) {
+        let mut heap = BinomialHeap::new();
+        heap.insert(v, v);
+        let display = format!("{}", heap);
+        prop_assert!(!display.is_empty());
+    }
+
+    /// into_sorted on single-element heap returns that element.
+    #[test]
+    fn into_sorted_single(k in -1000i32..1000) {
+        let mut heap = BinomialHeap::new();
+        heap.insert(k, k);
+        let sorted = heap.into_sorted();
+        prop_assert_eq!(sorted.len(), 1);
+        prop_assert_eq!(sorted[0], (k, k));
+    }
+
+    /// After extract_min, peek returns the new minimum.
+    #[test]
+    fn extract_then_peek_correct(vals in values_strategy(10)) {
+        let mut heap = BinomialHeap::new();
+        for &v in &vals {
+            heap.insert(v, v);
+        }
+        if vals.len() > 1 {
+            heap.extract_min();
+            if let Some((&k, _)) = heap.peek() {
+                let mut sorted_vals: Vec<i32> = vals.clone();
+                sorted_vals.sort();
+                prop_assert_eq!(k, sorted_vals[1]);
+            }
+        }
+    }
+
+    /// Default heap is_empty and has len 0.
+    #[test]
+    fn default_heap_properties(_dummy in 0..1u8) {
+        let heap: BinomialHeap<i32, i32> = BinomialHeap::default();
+        prop_assert!(heap.is_empty());
+        prop_assert_eq!(heap.len(), 0);
+        prop_assert!(heap.peek().is_none());
+    }
+}

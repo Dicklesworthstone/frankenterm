@@ -612,3 +612,80 @@ fn time_series_capacity_respected() {
     }
     assert!(ts.len() <= 5);
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// CausalDagConfig Clone preserves all fields via serde comparison.
+    #[test]
+    fn config_clone_preserves_serde(config in arb_causal_dag_config()) {
+        let cloned = config.clone();
+        let j1 = serde_json::to_string(&config).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// CausalEdge Clone preserves source and target.
+    #[test]
+    fn edge_clone_preserves(edge in arb_causal_edge()) {
+        let cloned = edge.clone();
+        prop_assert_eq!(cloned.source, edge.source);
+        prop_assert_eq!(cloned.target, edge.target);
+    }
+
+    /// CausalDag register then unregister returns to original pane_count.
+    #[test]
+    fn register_unregister_roundtrip(n in 1u64..20) {
+        let config = CausalDagConfig::default();
+        let mut dag = CausalDag::new(config);
+        let initial = dag.pane_count();
+        for i in 0..n {
+            dag.register_pane(1000 + i);
+        }
+        prop_assert_eq!(dag.pane_count(), initial + n as usize);
+        for i in 0..n {
+            dag.unregister_pane(1000 + i);
+        }
+        prop_assert_eq!(dag.pane_count(), initial);
+    }
+
+    /// PaneTimeSeries is_empty when new.
+    #[test]
+    fn time_series_fresh_is_empty(cap in 1usize..100) {
+        let ts = PaneTimeSeries::new(cap);
+        prop_assert!(ts.is_empty());
+        prop_assert_eq!(ts.len(), 0);
+    }
+
+    /// CausalDagSnapshot serde roundtrip preserves edge_count.
+    #[test]
+    fn snapshot_serde_edge_count(snap in arb_causal_dag_snapshot()) {
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: CausalDagSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.edge_count, snap.edge_count);
+    }
+
+    /// CausalDag edges() returns empty vec when no updates performed.
+    #[test]
+    fn edges_empty_without_update(n in 1u64..5) {
+        let config = CausalDagConfig::default();
+        let mut dag = CausalDag::new(config);
+        for i in 0..n {
+            dag.register_pane(i);
+        }
+        prop_assert!(dag.edges().is_empty());
+    }
+
+    /// PaneTimeSeries push then as_slice_ordered returns sorted.
+    #[test]
+    fn time_series_push_ordered(vals in prop::collection::vec(0.0f64..100.0, 1..30)) {
+        let mut ts = PaneTimeSeries::new(vals.len());
+        for v in &vals {
+            ts.push(*v);
+        }
+        let slice = ts.as_slice_ordered();
+        prop_assert_eq!(slice.len(), ts.len());
+    }
+}

@@ -921,3 +921,84 @@ proptest! {
         prop_assert_eq!(matrix.total_windows(), windows.len() as u64);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// CorrelationConfig Clone preserves all fields.
+    #[test]
+    fn config_clone_preserves(config in arb_config()) {
+        let cloned = config.clone();
+        let j1 = serde_json::to_string(&config).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// EventRecord serde roundtrip preserves pane_id and event_type.
+    #[test]
+    fn event_record_serde_pane_id(record in arb_event_record()) {
+        let json = serde_json::to_string(&record).unwrap();
+        let back: EventRecord = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, record.pane_id);
+        prop_assert_eq!(back.event_type, record.event_type);
+    }
+
+    /// CoOccurrenceMatrix new starts empty.
+    #[test]
+    fn matrix_new_is_empty(_dummy in 0..1u8) {
+        let matrix = CoOccurrenceMatrix::new();
+        prop_assert_eq!(matrix.total_windows(), 0);
+        prop_assert_eq!(matrix.event_type_count(), 0);
+    }
+
+    /// CorrelationEngine new starts with zero event_count.
+    #[test]
+    fn engine_new_zero_events(config in arb_config()) {
+        let engine = CorrelationEngine::new(config);
+        prop_assert_eq!(engine.event_count(), 0);
+    }
+
+    /// ChiSquaredResult positive_association preserved in serde.
+    #[test]
+    fn chi_squared_result_serde_positive(
+        chi in 0.0f64..100.0,
+        pval in 0.0f64..1.0,
+    ) {
+        let result = ChiSquaredResult {
+            event_a: "a".to_string(),
+            event_b: "b".to_string(),
+            chi_squared: chi,
+            p_value: pval,
+            observed: 10,
+            expected: 5.0,
+            positive_association: true,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ChiSquaredResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.event_a, "a");
+        prop_assert_eq!(back.positive_association, true);
+    }
+
+    /// Matrix reset clears all state.
+    #[test]
+    fn matrix_reset_clears(
+        windows in prop::collection::vec(arb_window_events(), 1..10),
+    ) {
+        let mut matrix = CoOccurrenceMatrix::new();
+        for w in &windows {
+            matrix.record_window(w);
+        }
+        matrix.reset();
+        prop_assert_eq!(matrix.total_windows(), 0);
+        prop_assert_eq!(matrix.event_type_count(), 0);
+    }
+
+    /// CorrelationConfig Debug is non-empty.
+    #[test]
+    fn config_debug_nonempty(config in arb_config()) {
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+    }
+}

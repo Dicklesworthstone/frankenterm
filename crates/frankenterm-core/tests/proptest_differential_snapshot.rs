@@ -961,3 +961,85 @@ proptest! {
         prop_assert!(!debug.is_empty());
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// DirtyTracker clear resets to clean.
+    #[test]
+    fn tracker_clear_resets(ops in arb_tracker_ops(20)) {
+        let mut tracker = DirtyTracker::new();
+        for op in &ops {
+            match op {
+                TrackerOp::MarkOutput(id) => tracker.mark_output(*id),
+                TrackerOp::MarkMetadata(id) => tracker.mark_metadata(*id),
+                TrackerOp::MarkCreated(id) => tracker.mark_created(*id),
+                TrackerOp::MarkClosed(id) => tracker.mark_closed(*id),
+                TrackerOp::MarkLayoutDirty => tracker.mark_layout_dirty(),
+                TrackerOp::Clear => tracker.clear(),
+            }
+        }
+        tracker.clear();
+        prop_assert!(tracker.is_clean());
+        prop_assert_eq!(tracker.dirty_count(), 0);
+    }
+
+    /// DiffChain new starts with chain_len 0.
+    #[test]
+    fn diff_chain_new_empty(ids in arb_pane_ids()) {
+        let base = make_base(&ids);
+        let chain = DiffChain::new(base);
+        prop_assert_eq!(chain.chain_len(), 0);
+    }
+
+    /// DiffChain push_diff increments chain_len.
+    #[test]
+    fn diff_chain_push_increments(ids in arb_pane_ids(), n in 1usize..10) {
+        let base = make_base(&ids);
+        let mut chain = DiffChain::new(base);
+        for _ in 0..n {
+            let diff = DiffSnapshot { seq: 0, captured_at: 1000, diffs: vec![] };
+            chain.push_diff(diff);
+        }
+        prop_assert_eq!(chain.chain_len(), n);
+    }
+
+    /// DiffChain compact returns chain_len and resets to 0.
+    #[test]
+    fn diff_chain_compact_resets(ids in arb_pane_ids(), n in 1usize..5) {
+        let base = make_base(&ids);
+        let mut chain = DiffChain::new(base);
+        for _ in 0..n {
+            let diff = DiffSnapshot { seq: 0, captured_at: 1000, diffs: vec![] };
+            chain.push_diff(diff);
+        }
+        let compacted = chain.compact();
+        prop_assert_eq!(compacted, n);
+        prop_assert_eq!(chain.chain_len(), 0);
+    }
+
+    /// DiffSnapshotEngine is_initialized false before initialize.
+    #[test]
+    fn engine_not_initialized(_dummy in 0..1u8) {
+        let engine = DiffSnapshotEngine::new(10);
+        prop_assert!(!engine.is_initialized());
+        prop_assert!(engine.restore_latest().is_none());
+    }
+
+    /// SnapshotDiff::PaneClosed pane_id returns Some.
+    #[test]
+    fn snapshot_diff_pane_closed_id(pane_id in 1u64..1000) {
+        let diff = SnapshotDiff::PaneClosed { pane_id };
+        prop_assert_eq!(diff.pane_id(), Some(pane_id));
+    }
+
+    /// DirtyField serde roundtrip preserves variant.
+    #[test]
+    fn dirty_field_serde(field in arb_dirty_field()) {
+        let json = serde_json::to_string(&field).unwrap();
+        let back: DirtyField = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, field);
+    }
+}

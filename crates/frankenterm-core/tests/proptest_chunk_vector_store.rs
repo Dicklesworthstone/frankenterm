@@ -861,3 +861,81 @@ proptest! {
         prop_assert_eq!(hits[0].end_offset.ordinal, end_ord);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    /// SemanticGenerationStatus Clone preserves equality.
+    #[test]
+    fn generation_status_clone(idx in 0usize..3) {
+        let statuses = [
+            SemanticGenerationStatus::Building,
+            SemanticGenerationStatus::Active,
+            SemanticGenerationStatus::Retired,
+        ];
+        let status = statuses[idx];
+        let cloned = status;
+        let is_eq = status == cloned;
+        prop_assert!(is_eq);
+    }
+
+    /// Drift report for non-existent generation returns error.
+    #[test]
+    fn drift_report_nonexistent_generation(_dummy in 0..1u8) {
+        let (store, _dir) = open_store();
+        let result = store.drift_report("p-no", "g-no", "lex-v1", Some(100));
+        prop_assert!(result.is_err());
+    }
+
+    /// Semantic search on non-existent generation returns empty or error.
+    #[test]
+    fn search_nonexistent_generation(dim in 2usize..8) {
+        let (store, _dir) = open_store();
+        let query = make_normalized_vec(dim);
+        let result = store.semantic_search("p-no", "g-no", &query, 10);
+        match result {
+            Ok(hits) => prop_assert_eq!(hits.len(), 0),
+            Err(_) => {} // error is also acceptable
+        }
+    }
+
+    /// Double-registration of same generation id is idempotent.
+    #[test]
+    fn register_generation_idempotent(_dummy in 0..1u8) {
+        let (store, _dir) = open_store();
+        store.register_generation("p1", "g1", "policy-v1", "lex-v1").expect("first reg");
+        let result = store.register_generation("p1", "g1", "policy-v1", "lex-v1");
+        prop_assert!(result.is_ok());
+    }
+
+    /// Empty search returns no hits.
+    #[test]
+    fn empty_search_no_hits(dim in 2usize..8) {
+        let (mut store, _dir) = open_store();
+        store.register_generation("p1", "g1", "policy-v1", "lex-v1").expect("reg");
+        store.activate_generation("p1", "g1").expect("activate");
+        let query = make_normalized_vec(dim);
+        let hits = store.semantic_search("p1", "g1", &query, 10).expect("search");
+        prop_assert_eq!(hits.len(), 0);
+    }
+
+    /// Generation starts as Building status.
+    #[test]
+    fn generation_starts_building(_dummy in 0..1u8) {
+        let (store, _dir) = open_store();
+        store.register_generation("p1", "g1", "policy-v1", "lex-v1").expect("reg");
+        let generation = store.generation("p1", "g1").expect("get").expect("exists");
+        let is_building = generation.status == SemanticGenerationStatus::Building;
+        prop_assert!(is_building);
+    }
+
+    /// ChunkVectorStore open creates a fresh store.
+    #[test]
+    fn fresh_store_no_active_generation(_dummy in 0..1u8) {
+        let (store, _dir) = open_store();
+        let active = store.active_generation("p1").expect("get");
+        prop_assert!(active.is_none());
+    }
+}
