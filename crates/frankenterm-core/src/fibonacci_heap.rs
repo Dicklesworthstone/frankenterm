@@ -54,6 +54,7 @@ pub struct FibonacciHeap<K, V> {
 
 impl<K: Ord + Clone, V: Clone> FibonacciHeap<K, V> {
     /// Creates an empty Fibonacci heap.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
@@ -64,16 +65,19 @@ impl<K: Ord + Clone, V: Clone> FibonacciHeap<K, V> {
     }
 
     /// Returns the number of elements.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.count
     }
 
     /// Returns true if the heap is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     /// Returns a reference to the minimum element, or None if empty.
+    #[must_use]
     pub fn peek(&self) -> Option<(&K, &V)> {
         self.min.map(|m| (&self.nodes[m].key, &self.nodes[m].value))
     }
@@ -219,6 +223,7 @@ impl<K: Ord + Clone, V: Clone> FibonacciHeap<K, V> {
     }
 
     /// Returns the current key for a handle.
+    #[must_use]
     pub fn get_key(&self, handle: usize) -> Option<&K> {
         if self.free.contains(&handle) || handle >= self.nodes.len() {
             None
@@ -228,6 +233,7 @@ impl<K: Ord + Clone, V: Clone> FibonacciHeap<K, V> {
     }
 
     /// Returns the current value for a handle.
+    #[must_use]
     pub fn get_value(&self, handle: usize) -> Option<&V> {
         if self.free.contains(&handle) || handle >= self.nodes.len() {
             None
@@ -285,6 +291,7 @@ impl<K: Ord + Clone, V: Clone> FibonacciHeap<K, V> {
     }
 
     /// Returns all elements in sorted order by consuming the heap.
+    #[must_use]
     pub fn into_sorted(mut self) -> Vec<(K, V)> {
         let mut result = Vec::with_capacity(self.count);
         while let Some(item) = self.extract_min() {
@@ -294,6 +301,7 @@ impl<K: Ord + Clone, V: Clone> FibonacciHeap<K, V> {
     }
 
     /// Returns all elements in sorted order without consuming.
+    #[must_use]
     pub fn sorted(&self) -> Vec<(K, V)> {
         self.clone().into_sorted()
     }

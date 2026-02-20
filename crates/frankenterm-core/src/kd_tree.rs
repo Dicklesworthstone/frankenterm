@@ -58,16 +58,19 @@ pub struct VecPoint {
 
 impl VecPoint {
     /// Creates a new point from coordinates.
+    #[must_use]
     pub fn new(coords: Vec<f64>) -> Self {
         Self { coords }
     }
 
     /// Creates a 2D point.
+    #[must_use]
     pub fn new2d(x: f64, y: f64) -> Self {
         Self { coords: vec![x, y] }
     }
 
     /// Creates a 3D point.
+    #[must_use]
     pub fn new3d(x: f64, y: f64, z: f64) -> Self {
         Self {
             coords: vec![x, y, z],
@@ -111,6 +114,7 @@ pub struct KdTree<P, V> {
 
 impl<P: Point, V: Clone> KdTree<P, V> {
     /// Creates an empty KD-tree with the given dimensionality.
+    #[must_use]
     pub fn new(dims: usize) -> Self {
         Self {
             nodes: Vec::new(),
@@ -120,6 +124,7 @@ impl<P: Point, V: Clone> KdTree<P, V> {
     }
 
     /// Builds a KD-tree from a collection of (point, value) pairs.
+    #[must_use]
     pub fn build(items: Vec<(P, V)>, dims: usize) -> Self {
         if items.is_empty() {
             return Self::new(dims);
@@ -259,6 +264,7 @@ impl<P: Point, V: Clone> KdTree<P, V> {
     /// Finds the nearest neighbor to the query point.
     ///
     /// Returns `Some((point, value, distance_squared))` or None if empty.
+    #[must_use]
     pub fn nearest(&self, query: &P) -> Option<(&P, &V, f64)> {
         let root = self.root?;
         let mut best_dist_sq = f64::INFINITY;
@@ -314,6 +320,7 @@ impl<P: Point, V: Clone> KdTree<P, V> {
     /// Finds the k nearest neighbors to the query point.
     ///
     /// Returns results sorted by distance (closest first).
+    #[must_use]
     pub fn k_nearest(&self, query: &P, k: usize) -> Vec<(&P, &V, f64)> {
         if k == 0 || self.root.is_none() {
             return Vec::new();
@@ -380,6 +387,7 @@ impl<P: Point, V: Clone> KdTree<P, V> {
     /// Range query: finds all points within the given bounding box.
     ///
     /// `min_bounds` and `max_bounds` define an axis-aligned bounding box.
+    #[must_use]
     pub fn range_query(&self, min_bounds: &[f64], max_bounds: &[f64]) -> Vec<(&P, &V)> {
         let mut results = Vec::new();
         if let Some(root) = self.root {
@@ -426,6 +434,7 @@ impl<P: Point, V: Clone> KdTree<P, V> {
     }
 
     /// Finds all points within the given radius of the query point.
+    #[must_use]
     pub fn radius_query(&self, query: &P, radius: f64) -> Vec<(&P, &V, f64)> {
         let radius_sq = radius * radius;
         let mut results = Vec::new();
@@ -471,21 +480,25 @@ impl<P: Point, V: Clone> KdTree<P, V> {
     }
 
     /// Returns the number of points in the tree.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
     /// Returns true if the tree is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
     /// Returns the dimensionality.
+    #[must_use]
     pub fn dims(&self) -> usize {
         self.dims
     }
 
     /// Returns all points in the tree.
+    #[must_use]
     pub fn points(&self) -> Vec<(&P, &V)> {
         self.nodes.iter().map(|n| (&n.point, &n.value)).collect()
     }

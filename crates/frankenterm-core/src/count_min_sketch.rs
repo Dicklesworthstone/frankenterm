@@ -43,6 +43,7 @@ impl Default for CmsConfig {
 impl CmsConfig {
     /// Create config from desired error parameters.
     /// ε = e/width, δ = e^(-depth)
+    #[must_use]
     pub fn from_error_params(epsilon: f64, delta: f64) -> Self {
         let width = (std::f64::consts::E / epsilon).ceil() as usize;
         let depth = (1.0 / delta).ln().ceil() as usize;
@@ -88,11 +89,13 @@ pub struct CountMinSketch {
 
 impl CountMinSketch {
     /// Create with default parameters (w=2048, d=5).
+    #[must_use]
     pub fn new() -> Self {
         Self::with_config(CmsConfig::default())
     }
 
     /// Create with specified width and depth.
+    #[must_use]
     pub fn with_dimensions(width: usize, depth: usize) -> Self {
         Self::with_config(CmsConfig {
             width: width.max(4),
@@ -101,6 +104,7 @@ impl CountMinSketch {
     }
 
     /// Create from config.
+    #[must_use]
     pub fn with_config(config: CmsConfig) -> Self {
         let width = config.width.max(4);
         let depth = config.depth.max(1);
@@ -121,6 +125,7 @@ impl CountMinSketch {
     }
 
     /// Create from desired error parameters.
+    #[must_use]
     pub fn from_error_params(epsilon: f64, delta: f64) -> Self {
         Self::with_config(CmsConfig::from_error_params(epsilon, delta))
     }
@@ -140,6 +145,7 @@ impl CountMinSketch {
     }
 
     /// Estimate frequency of an item (guaranteed upper bound).
+    #[must_use]
     pub fn estimate<T: Hash + ?Sized>(&self, item: &T) -> u64 {
         let mut min = u64::MAX;
         for d in 0..self.depth {
@@ -150,41 +156,49 @@ impl CountMinSketch {
     }
 
     /// Total count of all increments.
+    #[must_use]
     pub fn total_count(&self) -> u64 {
         self.total_count
     }
 
     /// Width (columns per row).
+    #[must_use]
     pub fn width(&self) -> usize {
         self.width
     }
 
     /// Depth (number of hash functions).
+    #[must_use]
     pub fn depth(&self) -> usize {
         self.depth
     }
 
     /// Whether sketch is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.total_count == 0
     }
 
     /// Memory used by table in bytes.
+    #[must_use]
     pub fn memory_bytes(&self) -> usize {
         self.width * self.depth * std::mem::size_of::<u64>()
     }
 
     /// Error bound ε = e/width.
+    #[must_use]
     pub fn epsilon(&self) -> f64 {
         std::f64::consts::E / self.width as f64
     }
 
     /// Failure probability δ = e^(-depth).
+    #[must_use]
     pub fn delta(&self) -> f64 {
         (-(self.depth as f64)).exp()
     }
 
     /// Get statistics.
+    #[must_use]
     pub fn stats(&self) -> CmsStats {
         CmsStats {
             width: self.width,
@@ -212,6 +226,7 @@ impl CountMinSketch {
 
     /// Inner product of two sketches (useful for join size estimation).
     /// Returns minimum inner product across rows.
+    #[must_use]
     pub fn inner_product(&self, other: &CountMinSketch) -> Option<u64> {
         if self.width != other.width || self.depth != other.depth {
             return None;

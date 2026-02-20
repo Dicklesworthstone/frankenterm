@@ -67,12 +67,14 @@ pub struct HyperLogLog {
 
 impl HyperLogLog {
     /// Create with default precision (p=14, ~0.81% standard error).
+    #[must_use]
     pub fn new() -> Self {
         Self::with_precision(14)
     }
 
     /// Create with specified precision p (4..=18).
     /// Higher p = more accuracy, more memory (2^p bytes).
+    #[must_use]
     pub fn with_precision(p: u8) -> Self {
         let p = p.clamp(4, 18);
         let m = 1 << p;
@@ -85,6 +87,7 @@ impl HyperLogLog {
     }
 
     /// Create from config.
+    #[must_use]
     pub fn with_config(config: HllConfig) -> Self {
         Self::with_precision(config.precision)
     }
@@ -124,6 +127,7 @@ impl HyperLogLog {
     }
 
     /// Estimate the number of distinct elements.
+    #[must_use]
     pub fn cardinality(&self) -> u64 {
         let m = self.m as f64;
         let alpha = self.alpha();
@@ -156,46 +160,55 @@ impl HyperLogLog {
     }
 
     /// Estimate cardinality as f64 (more precision for comparisons).
+    #[must_use]
     pub fn cardinality_f64(&self) -> f64 {
         self.cardinality() as f64
     }
 
     /// Total number of insert calls (not distinct count).
+    #[must_use]
     pub fn total_inserts(&self) -> u64 {
         self.count
     }
 
     /// Precision parameter.
+    #[must_use]
     pub fn precision(&self) -> u8 {
         self.precision
     }
 
     /// Number of registers (2^precision).
+    #[must_use]
     pub fn register_count(&self) -> usize {
         self.m
     }
 
     /// Memory used by registers in bytes.
+    #[must_use]
     pub fn memory_bytes(&self) -> usize {
         self.m
     }
 
     /// Standard error of the estimate (~1.04/sqrt(m)).
+    #[must_use]
     pub fn standard_error(&self) -> f64 {
         1.04 / (self.m as f64).sqrt()
     }
 
     /// Number of non-zero registers.
+    #[must_use]
     pub fn nonzero_registers(&self) -> usize {
         self.registers.iter().filter(|&&r| r > 0).count()
     }
 
     /// Whether no elements have been inserted.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     /// Get statistics.
+    #[must_use]
     pub fn stats(&self) -> HllStats {
         HllStats {
             precision: self.precision,
@@ -229,6 +242,7 @@ impl HyperLogLog {
 
     /// Jaccard similarity estimate between two HyperLogLogs.
     /// Returns intersection / union estimate.
+    #[must_use]
     pub fn jaccard(&self, other: &HyperLogLog) -> Option<f64> {
         if self.precision != other.precision {
             return None;

@@ -209,11 +209,13 @@ pub struct CuckooStats {
 
 impl CuckooFilter {
     /// Create a new Cuckoo filter with default configuration.
+    #[must_use]
     pub fn new() -> Self {
         Self::with_config(CuckooConfig::default())
     }
 
     /// Create a new Cuckoo filter with custom configuration.
+    #[must_use]
     pub fn with_config(config: CuckooConfig) -> Self {
         let num_buckets = config.num_buckets.next_power_of_two().max(2);
         let bucket_size = config.bucket_size.max(1);
@@ -230,6 +232,7 @@ impl CuckooFilter {
     /// Create a filter sized for an expected number of items.
     ///
     /// Uses a load factor of ~95% to balance space and insertion success.
+    #[must_use]
     pub fn with_capacity(expected_items: usize) -> Self {
         let bucket_size = 4;
         let num_buckets = ((expected_items as f64 / bucket_size as f64 / 0.95).ceil() as usize)
@@ -283,6 +286,7 @@ impl CuckooFilter {
     ///
     /// Returns `true` if the item is probably present, `false` if definitely absent.
     /// False positives are possible; false negatives are not.
+    #[must_use]
     pub fn lookup<T: Hash + ?Sized>(&self, item: &T) -> bool {
         let (fp, i1) = hash_item(item, self.num_buckets);
         let i2 = alt_index(i1, fp, self.num_buckets);
@@ -311,26 +315,31 @@ impl CuckooFilter {
     }
 
     /// Number of items in the filter.
+    #[must_use]
     pub fn count(&self) -> usize {
         self.count
     }
 
     /// Total capacity of the filter.
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.num_buckets * self.bucket_size
     }
 
     /// Load factor (0.0 to 1.0).
+    #[must_use]
     pub fn load_factor(&self) -> f64 {
         self.count as f64 / self.capacity() as f64
     }
 
     /// Whether the filter is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     /// Get statistics about the filter.
+    #[must_use]
     pub fn stats(&self) -> CuckooStats {
         let occupied = self.buckets.iter().filter(|b| !b.is_empty()).count();
         let capacity = self.capacity();
@@ -357,11 +366,13 @@ impl CuckooFilter {
     }
 
     /// Number of buckets.
+    #[must_use]
     pub fn num_buckets(&self) -> usize {
         self.num_buckets
     }
 
     /// Entries per bucket.
+    #[must_use]
     pub fn bucket_size(&self) -> usize {
         self.bucket_size
     }
