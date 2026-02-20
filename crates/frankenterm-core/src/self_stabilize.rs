@@ -121,6 +121,7 @@ impl ReconcileSession {
     /// `is_authority`: if true, this side's state is considered correct
     /// and it sends patches to the peer. If false, this side applies
     /// patches from the peer.
+    #[must_use]
     pub fn new(local: MerkleTree, is_authority: bool, config: ReconcileConfig) -> Self {
         Self {
             local,
@@ -133,21 +134,25 @@ impl ReconcileSession {
     }
 
     /// Get the current phase.
+    #[must_use]
     pub fn phase(&self) -> Phase {
         self.phase
     }
 
     /// Get the number of rounds completed.
+    #[must_use]
     pub fn rounds(&self) -> usize {
         self.rounds
     }
 
     /// Check if reconciliation is complete.
+    #[must_use]
     pub fn is_converged(&self) -> bool {
         self.phase == Phase::Converged
     }
 
     /// Get a reference to the local state tree.
+    #[must_use]
     pub fn local_tree(&self) -> &MerkleTree {
         &self.local
     }
@@ -328,6 +333,7 @@ impl ReconcileSession {
 ///
 /// This is a convenience wrapper for testing; in production, the
 /// protocol messages would be exchanged over the network.
+#[must_use]
 pub fn reconcile_trees(
     authority: &MerkleTree,
     replica: &MerkleTree,
@@ -382,6 +388,7 @@ pub struct ReconcileStats {
 }
 
 /// Run a full reconciliation and return stats.
+#[must_use]
 pub fn reconcile_with_stats(
     authority: &MerkleTree,
     replica: &MerkleTree,
@@ -419,6 +426,7 @@ pub struct StateFingerprint {
 
 impl StateFingerprint {
     /// Create a fingerprint from a tree and version.
+    #[must_use]
     pub fn from_tree(tree: &MerkleTree, version: u64) -> Self {
         Self {
             root_hash: tree.root_hash(),
@@ -428,11 +436,13 @@ impl StateFingerprint {
     }
 
     /// Check if this fingerprint matches another.
+    #[must_use]
     pub fn matches(&self, other: &StateFingerprint) -> bool {
         self.root_hash == other.root_hash
     }
 
     /// Check if this fingerprint is newer than another.
+    #[must_use]
     pub fn is_newer_than(&self, other: &StateFingerprint) -> bool {
         self.version > other.version
     }

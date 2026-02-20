@@ -60,6 +60,7 @@ pub struct PersistentVec<T: Clone> {
 
 impl<T: Clone> PersistentVec<T> {
     /// Create an empty persistent vector.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             root: Arc::new(VecNode::Leaf(Vec::new())),
@@ -69,16 +70,19 @@ impl<T: Clone> PersistentVec<T> {
     }
 
     /// Number of elements.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the vector is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Get element at index, or None if out of bounds.
+    #[must_use]
     pub fn get(&self, index: usize) -> Option<&T> {
         if index >= self.len {
             return None;
@@ -89,6 +93,7 @@ impl<T: Clone> PersistentVec<T> {
     /// Return a new vector with the element at `index` replaced.
     ///
     /// Returns `None` if index is out of bounds.
+    #[must_use]
     pub fn set(&self, index: usize, value: T) -> Option<Self> {
         if index >= self.len {
             return None;
@@ -130,6 +135,7 @@ impl<T: Clone> PersistentVec<T> {
     /// Return a new vector with the last element removed.
     ///
     /// Returns `None` if the vector is empty.
+    #[must_use]
     pub fn pop(&self) -> Option<(Self, T)> {
         if self.len == 0 {
             return None;
@@ -163,6 +169,7 @@ impl<T: Clone> PersistentVec<T> {
     }
 
     /// Create from an iterator.
+    #[must_use]
     #[allow(clippy::should_implement_trait)]
     pub fn from_iter(iter: impl IntoIterator<Item = T>) -> Self {
         let mut v = Self::new();
@@ -368,6 +375,7 @@ pub struct PersistentMap<K: Clone + Eq + Hash, V: Clone> {
 
 impl<K: Clone + Eq + Hash, V: Clone> PersistentMap<K, V> {
     /// Create an empty map.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             root: Arc::new(MapNode::Empty),
@@ -376,22 +384,26 @@ impl<K: Clone + Eq + Hash, V: Clone> PersistentMap<K, V> {
     }
 
     /// Number of entries.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the map is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Get the value for a key.
+    #[must_use]
     pub fn get(&self, key: &K) -> Option<&V> {
         let hash = hash_key(key);
         map_get(&self.root, key, hash, 0)
     }
 
     /// Check if the map contains a key.
+    #[must_use]
     pub fn contains_key(&self, key: &K) -> bool {
         self.get(key).is_some()
     }
@@ -419,6 +431,7 @@ impl<K: Clone + Eq + Hash, V: Clone> PersistentMap<K, V> {
     }
 
     /// Create from key-value pairs.
+    #[must_use]
     pub fn from_entries(entries: impl IntoIterator<Item = (K, V)>) -> Self {
         let mut map = Self::new();
         for (k, v) in entries {
@@ -430,6 +443,7 @@ impl<K: Clone + Eq + Hash, V: Clone> PersistentMap<K, V> {
     /// Collect all entries into a Vec.
     ///
     /// The order is deterministic but not sorted.
+    #[must_use]
     pub fn entries(&self) -> Vec<(&K, &V)> {
         let mut result = Vec::with_capacity(self.len);
         collect_entries(&self.root, &mut result);
@@ -437,6 +451,7 @@ impl<K: Clone + Eq + Hash, V: Clone> PersistentMap<K, V> {
     }
 
     /// Collect all keys into a Vec.
+    #[must_use]
     pub fn keys(&self) -> Vec<&K> {
         self.entries().into_iter().map(|(k, _)| k).collect()
     }
@@ -759,6 +774,7 @@ pub struct VersionedStore<T: Clone> {
 
 impl<T: Clone> VersionedStore<T> {
     /// Create a versioned store with an initial state.
+    #[must_use]
     pub fn new(initial: T, timestamp_ms: u64) -> Self {
         Self {
             versions: vec![(timestamp_ms, initial)],
@@ -767,16 +783,19 @@ impl<T: Clone> VersionedStore<T> {
     }
 
     /// Get the current state.
+    #[must_use]
     pub fn current(&self) -> &T {
         &self.versions[self.current].1
     }
 
     /// Get the current version number (0-indexed).
+    #[must_use]
     pub fn version_number(&self) -> usize {
         self.current
     }
 
     /// Total number of versions stored.
+    #[must_use]
     pub fn version_count(&self) -> usize {
         self.versions.len()
     }
@@ -788,11 +807,13 @@ impl<T: Clone> VersionedStore<T> {
     }
 
     /// Get state at a specific version number.
+    #[must_use]
     pub fn at_version(&self, version: usize) -> Option<&T> {
         self.versions.get(version).map(|(_, state)| state)
     }
 
     /// Get state at the version closest to the given timestamp.
+    #[must_use]
     pub fn at_timestamp(&self, timestamp_ms: u64) -> Option<&T> {
         if self.versions.is_empty() {
             return None;
@@ -820,6 +841,7 @@ impl<T: Clone> VersionedStore<T> {
     }
 
     /// Get the timestamp for a version.
+    #[must_use]
     pub fn timestamp_at(&self, version: usize) -> Option<u64> {
         self.versions.get(version).map(|(ts, _)| *ts)
     }
@@ -862,6 +884,7 @@ pub struct MapDiff<K: Eq + Hash, V> {
 
 impl<K: Clone + Eq + Hash + Serialize, V: Clone + PartialEq + Serialize> PersistentMap<K, V> {
     /// Compute the diff from `self` (old) to `other` (new).
+    #[must_use]
     pub fn diff(&self, other: &Self) -> MapDiff<K, V>
     where
         K: Serialize + for<'de> Deserialize<'de>,

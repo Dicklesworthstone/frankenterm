@@ -73,6 +73,7 @@ pub struct GCounter {
 
 impl GCounter {
     /// Create a new G-Counter for the given replica.
+    #[must_use]
     pub fn new(replica_id: impl Into<ReplicaId>) -> Self {
         Self {
             replica_id: replica_id.into(),
@@ -92,6 +93,7 @@ impl GCounter {
     }
 
     /// Get the global counter value (sum of all replicas).
+    #[must_use]
     pub fn value(&self) -> u64 {
         self.counts
             .values()
@@ -99,6 +101,7 @@ impl GCounter {
     }
 
     /// Get this replica's local count.
+    #[must_use]
     pub fn local_value(&self) -> u64 {
         self.counts.get(&self.replica_id).copied().unwrap_or(0)
     }
@@ -112,11 +115,13 @@ impl GCounter {
     }
 
     /// Number of replicas that have contributed.
+    #[must_use]
     pub fn replica_count(&self) -> usize {
         self.counts.len()
     }
 
     /// The replica ID of this counter.
+    #[must_use]
     pub fn replica_id(&self) -> &str {
         &self.replica_id
     }
@@ -145,6 +150,7 @@ pub struct PnCounter {
 
 impl PnCounter {
     /// Create a new PN-Counter for the given replica.
+    #[must_use]
     pub fn new(replica_id: impl Into<ReplicaId>) -> Self {
         let id: ReplicaId = replica_id.into();
         Self {
@@ -174,6 +180,7 @@ impl PnCounter {
     }
 
     /// Get the counter value (positive - negative). May be negative.
+    #[must_use]
     pub fn value(&self) -> i128 {
         i128::from(self.positive.value()) - i128::from(self.negative.value())
     }
@@ -185,6 +192,7 @@ impl PnCounter {
     }
 
     /// The replica ID.
+    #[must_use]
     pub fn replica_id(&self) -> &str {
         self.positive.replica_id()
     }
@@ -216,6 +224,7 @@ pub struct GSet<T: Ord + Clone> {
 
 impl<T: Ord + Clone> GSet<T> {
     /// Create an empty G-Set.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             elements: BTreeSet::new(),
@@ -228,16 +237,19 @@ impl<T: Ord + Clone> GSet<T> {
     }
 
     /// Check membership.
+    #[must_use]
     pub fn contains(&self, item: &T) -> bool {
         self.elements.contains(item)
     }
 
     /// Number of elements.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.elements.len()
     }
 
     /// Whether the set is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.elements.is_empty()
     }
@@ -290,6 +302,7 @@ pub struct OrSet<T: Ord + Clone + Hash> {
 
 impl<T: Ord + Clone + Hash> OrSet<T> {
     /// Create a new OR-Set for the given replica.
+    #[must_use]
     pub fn new(replica_id: impl Into<ReplicaId>) -> Self {
         Self {
             replica_id: replica_id.into(),
@@ -311,11 +324,13 @@ impl<T: Ord + Clone + Hash> OrSet<T> {
     }
 
     /// Check if element is in the set (has at least one tag).
+    #[must_use]
     pub fn contains(&self, item: &T) -> bool {
         self.entries.get(item).is_some_and(|tags| !tags.is_empty())
     }
 
     /// Number of distinct elements.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries
             .iter()
@@ -324,11 +339,13 @@ impl<T: Ord + Clone + Hash> OrSet<T> {
     }
 
     /// Whether the set is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Get all elements currently in the set.
+    #[must_use]
     pub fn elements(&self) -> Vec<&T> {
         self.entries
             .iter()
@@ -358,6 +375,7 @@ impl<T: Ord + Clone + Hash> OrSet<T> {
     }
 
     /// The replica ID.
+    #[must_use]
     pub fn replica_id(&self) -> &str {
         &self.replica_id
     }
@@ -389,6 +407,7 @@ pub struct LwwRegister<T: Clone + Eq> {
 
 impl<T: Clone + Eq> LwwRegister<T> {
     /// Create a new LWW-Register with an initial value and timestamp.
+    #[must_use]
     pub fn new(replica_id: impl Into<ReplicaId>, value: T, timestamp: u64) -> Self {
         let rid: ReplicaId = replica_id.into();
         Self {
@@ -412,16 +431,19 @@ impl<T: Clone + Eq> LwwRegister<T> {
     }
 
     /// Get the current value.
+    #[must_use]
     pub fn get(&self) -> &T {
         &self.value
     }
 
     /// Get the current timestamp.
+    #[must_use]
     pub fn timestamp(&self) -> u64 {
         self.timestamp
     }
 
     /// Get the writer ID of the current value.
+    #[must_use]
     pub fn writer_id(&self) -> &str {
         &self.writer_id
     }
@@ -439,6 +461,7 @@ impl<T: Clone + Eq> LwwRegister<T> {
     }
 
     /// The replica ID.
+    #[must_use]
     pub fn replica_id(&self) -> &str {
         &self.replica_id
     }
@@ -485,6 +508,7 @@ struct MvEntry<T: Clone + Eq + Ord> {
 
 impl<T: Clone + Eq + Ord> MvRegister<T> {
     /// Create a new empty MV-Register for the given replica.
+    #[must_use]
     pub fn new(replica_id: impl Into<ReplicaId>) -> Self {
         Self {
             replica_id: replica_id.into(),
@@ -513,11 +537,13 @@ impl<T: Clone + Eq + Ord> MvRegister<T> {
 
     /// Get all concurrent values. If there's exactly one, there are no
     /// conflicts. Multiple values indicate concurrent writes.
+    #[must_use]
     pub fn get_all(&self) -> Vec<&T> {
         self.entries.iter().map(|e| &e.value).collect()
     }
 
     /// Get a single value if there are no conflicts, None if empty or conflicted.
+    #[must_use]
     pub fn get(&self) -> Option<&T> {
         if self.entries.len() == 1 {
             self.entries.iter().next().map(|e| &e.value)
@@ -527,11 +553,13 @@ impl<T: Clone + Eq + Ord> MvRegister<T> {
     }
 
     /// Number of concurrent values (1 = no conflict, >1 = conflict).
+    #[must_use]
     pub fn conflict_count(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether there are concurrent conflicting values.
+    #[must_use]
     pub fn has_conflict(&self) -> bool {
         self.entries.len() > 1
     }
@@ -570,6 +598,7 @@ impl<T: Clone + Eq + Ord> MvRegister<T> {
     }
 
     /// The replica ID.
+    #[must_use]
     pub fn replica_id(&self) -> &str {
         &self.replica_id
     }
@@ -600,6 +629,7 @@ pub struct VersionVector {
 
 impl VersionVector {
     /// Create an empty version vector.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -613,6 +643,7 @@ impl VersionVector {
     }
 
     /// Get the version for a replica.
+    #[must_use]
     pub fn get(&self, replica_id: &str) -> u64 {
         self.entries.get(replica_id).copied().unwrap_or(0)
     }
@@ -626,21 +657,25 @@ impl VersionVector {
     }
 
     /// Check if this VV dominates another (causally after).
+    #[must_use]
     pub fn dominates(&self, other: &VersionVector) -> bool {
         vv_dominates(&self.entries, &other.entries)
     }
 
     /// Check if this VV is concurrent with another (neither dominates).
+    #[must_use]
     pub fn concurrent_with(&self, other: &VersionVector) -> bool {
         !self.dominates(other) && !other.dominates(self)
     }
 
     /// Number of replicas tracked.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -656,6 +691,7 @@ impl Default for VersionVector {
 
 /// Compute a deterministic hash of a CRDT state for convergence checking.
 /// Two replicas with the same convergence hash have identical state.
+#[must_use]
 pub fn convergence_hash(data: &[u8]) -> u64 {
     // FNV-1a hash for deterministic fingerprinting
     let mut hash: u64 = 0xcbf29ce484222325;
