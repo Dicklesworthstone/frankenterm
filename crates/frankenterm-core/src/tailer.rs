@@ -311,11 +311,14 @@ impl CaptureScheduler {
     /// Apply weighted selection: given a priority-sorted list of ready panes,
     /// return those that should be scheduled under the current budget.
     ///
-    /// Under contention (more ready panes than available permits), higher-priority
-    /// panes get a proportionally larger share. The algorithm:
-    /// 1. All panes with priority <= 50 (high) are scheduled first.
-    /// 2. Remaining slots are filled in priority order.
-    /// 3. Global rate limits further restrict the count.
+    /// Uses a tiered anti-starvation algorithm:
+    /// 1. Panes split into High (<= 50) and Low (> 50) priority.
+    /// 2. Low priority gets a reserved 20% floor of available slots.
+    /// 3. High priority gets the remaining 80% (plus any unused Low slots).
+    /// 4. Excess High slots spill back to Low.
+    ///
+    /// This ensures low-priority panes (e.g. SSH) get at least *some* service
+    /// even when high-priority panes (e.g. Codex) are saturating the budget.
     pub fn select_panes(
         &mut self,
         ready_panes: &[(u64, u32)],
@@ -338,13 +341,33 @@ impl CaptureScheduler {
             return Vec::new();
         }
 
-        // Under contention: ensure high-priority panes always get scheduled.
-        // ready_panes is already sorted by (priority, pane_id).
-        let selected: Vec<u64> = ready_panes
-            .iter()
-            .take(effective_limit)
-            .map(|(id, _)| *id)
-            .collect();
+        // Split into high/low priority tiers
+        // High = 0-50 (Critical/High), Low = 51+ (Normal/Low)
+        let (high_prio, low_prio): (Vec<_>, Vec<_>) =
+            ready_panes.iter().partition(|(_, prio)| *prio <= 50);
+
+        // Reserve 20% for low priority to prevent starvation
+        let target_low_count = (effective_limit * 2) / 10; // 20%
+
+        // Calculate allocations allowing spillover
+        let guaranteed_low = low_prio.len().min(target_low_count);
+        let mut slots_remaining = effective_limit - guaranteed_low;
+
+        // High priority takes what it needs from the remaining pool
+        let taken_high = high_prio.len().min(slots_remaining);
+        slots_remaining -= taken_high;
+
+        // Low priority gets the reserved slots + any spillover from high
+        let taken_low = guaranteed_low
+            + low_prio
+                .len()
+                .saturating_sub(guaranteed_low)
+                .min(slots_remaining);
+
+        // Collect results (stable order preserved from input sort)
+        let mut selected = Vec::with_capacity(taken_high + taken_low);
+        selected.extend(high_prio.iter().take(taken_high).map(|(id, _)| *id));
+        selected.extend(low_prio.iter().take(taken_low).map(|(id, _)| *id));
 
         // Debit global capture budget for the count we'll schedule.
         if self.budget.max_captures_per_sec > 0 {

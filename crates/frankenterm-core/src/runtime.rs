@@ -28,11 +28,11 @@ use crate::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax};
 
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::backpressure::BackpressureConfig;
 use crate::config::{
     CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig, PatternsConfig,
     SnapshotConfig, SnapshotSchedulingMode,
 };
-use crate::backpressure::BackpressureConfig;
 use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
 use crate::events::{Event, EventBus, UserVarPayload, event_identity_key};
@@ -1674,7 +1674,36 @@ impl ObservationRuntime {
                         };
 
                         // Handle new panes
-                        for (pane_id, entry) in new_entries {
+                        for (pane_id, mut entry) in new_entries {
+                            // Check if pane exists in storage to recover stable UUID
+                            let stable_uuid = {
+                                let (storage_guard, lock_held_since) =
+                                    lock_storage_with_profile(&storage, &metrics).await;
+                                let result =
+                                    storage_guard.get_pane(pane_id).await.unwrap_or_else(|e| {
+                                        warn!(pane_id, error = %e, "Failed to check storage for existing pane");
+                                        None
+                                    });
+                                drop(storage_guard);
+                                metrics.record_storage_lock_hold(lock_held_since.elapsed());
+                                result.and_then(|r| r.pane_uuid)
+                            };
+
+                            if let Some(uuid) = stable_uuid {
+                                if uuid != entry.pane_uuid {
+                                    debug!(
+                                        pane_id,
+                                        old_uuid = %entry.pane_uuid,
+                                        new_uuid = %uuid,
+                                        "Adopting stable UUID from storage"
+                                    );
+                                    entry.pane_uuid = uuid.clone();
+
+                                    let mut reg = registry.write().await;
+                                    let _ = reg.adopt_uuid(pane_id, uuid);
+                                }
+                            }
+
                             // Upsert pane in storage
                             let record = entry.to_pane_record();
                             let (storage_guard, lock_held_since) =
