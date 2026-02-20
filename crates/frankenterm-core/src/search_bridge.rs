@@ -485,7 +485,8 @@ mod tests {
 
     use crate::runtime_compat::CompatRuntime;
     use frankensearch::{
-        Embedder, EmbedderStack, HashEmbedder, IndexBuilder, TwoTierConfig, TwoTierIndex,
+        Embedder, EmbedderStack, HashEmbedder, IndexBuilder, PhaseMetrics, RankChanges,
+        ScoreSource, TwoTierConfig, TwoTierIndex,
     };
 
     fn log_test_event(test_name: &str, phase: &str, started_at: Instant, result: &str) {
@@ -511,6 +512,32 @@ mod tests {
             .build()
             .expect("build runtime");
         runtime.block_on(future)
+    }
+
+    /// Helper to construct a `ScoredResult` for unit tests (no index needed).
+    fn make_scored_result(doc_id: &str, score: f32) -> ScoredResult {
+        ScoredResult {
+            doc_id: doc_id.to_string(),
+            score,
+            source: ScoreSource::Hybrid,
+            index: None,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: None,
+            rerank_score: None,
+            explanation: None,
+            metadata: None,
+        }
+    }
+
+    /// Helper to construct a `PhaseMetrics` for unit tests.
+    fn make_phase_metrics() -> PhaseMetrics {
+        PhaseMetrics {
+            embedder_id: "test-hash-256".to_string(),
+            vectors_searched: 10,
+            lexical_candidates: 5,
+            fused_count: 8,
+        }
     }
 
     fn build_test_bridge() -> (SearchBridge, TextProvider) {
@@ -622,6 +649,548 @@ mod tests {
             joined.map_err(SearchBridgeError::Search)
         }
     }
+
+    // -----------------------------------------------------------------------
+    // BridgeCancellationToken unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cancellation_token_new_not_cancelled() {
+        let token = BridgeCancellationToken::new();
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancellation_token_cancel_sets_flag() {
+        let token = BridgeCancellationToken::new();
+        token.cancel();
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancellation_token_cancel_idempotent() {
+        let token = BridgeCancellationToken::new();
+        token.cancel();
+        token.cancel();
+        token.cancel();
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancellation_token_clone_shares_state() {
+        let token_a = BridgeCancellationToken::new();
+        let token_b = token_a.clone();
+        assert!(!token_b.is_cancelled());
+        token_a.cancel();
+        assert!(token_b.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancellation_token_default_not_cancelled() {
+        let token = BridgeCancellationToken::default();
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancellation_token_debug_format() {
+        let token = BridgeCancellationToken::new();
+        let debug_str = format!("{:?}", token);
+        assert!(debug_str.contains("BridgeCancellationToken"));
+    }
+
+    #[test]
+    fn test_cancellation_token_cancelled_returns_immediately_if_already_cancelled() {
+        let token = BridgeCancellationToken::new();
+        token.cancel();
+        // cancelled() should return immediately because it's already cancelled
+        run_async(async {
+            tokio::time::timeout(Duration::from_millis(100), token.cancelled())
+                .await
+                .expect("cancelled() should resolve immediately when already cancelled");
+        });
+    }
+
+    #[test]
+    fn test_cancellation_token_cancelled_wakes_on_cancel() {
+        let token = BridgeCancellationToken::new();
+        let token_clone = token.clone();
+        run_async(async {
+            let waiter = tokio::spawn(async move {
+                token_clone.cancelled().await;
+                true
+            });
+            // Give the waiter a moment to register
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            token.cancel();
+            let result = tokio::time::timeout(Duration::from_millis(200), waiter)
+                .await
+                .expect("should not timeout")
+                .expect("task should not panic");
+            assert!(result);
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // SearchBridgeRequest unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_request_new_defaults() {
+        let req = SearchBridgeRequest::new("hello world", 10);
+        assert_eq!(req.query, "hello world");
+        assert_eq!(req.limit, 10);
+        assert!(req.timeout.is_none());
+        assert!(req.cancellation.is_none());
+        // Default text_provider returns None for any doc_id
+        assert!((req.text_provider)("any-doc").is_none());
+    }
+
+    #[test]
+    fn test_request_with_timeout() {
+        let req = SearchBridgeRequest::new("test", 5)
+            .with_timeout(Duration::from_secs(30));
+        assert_eq!(req.timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn test_request_with_cancellation() {
+        let token = BridgeCancellationToken::new();
+        let req = SearchBridgeRequest::new("test", 5)
+            .with_cancellation(token.clone());
+        assert!(req.cancellation.is_some());
+        // Cancelling via the original token is visible through the request
+        token.cancel();
+        assert!(req.cancellation.as_ref().unwrap().is_cancelled());
+    }
+
+    #[test]
+    fn test_request_with_text_provider() {
+        let req = SearchBridgeRequest::new("test", 5)
+            .with_text_provider(|doc_id| {
+                if doc_id == "doc-1" {
+                    Some("Document one content".to_string())
+                } else {
+                    None
+                }
+            });
+        assert_eq!(
+            (req.text_provider)("doc-1"),
+            Some("Document one content".to_string())
+        );
+        assert!((req.text_provider)("doc-2").is_none());
+    }
+
+    #[test]
+    fn test_request_with_text_provider_arc() {
+        let provider: TextProvider = Arc::new(|_| Some("shared".to_string()));
+        let req = SearchBridgeRequest::new("test", 5)
+            .with_text_provider_arc(Arc::clone(&provider));
+        assert_eq!((req.text_provider)("anything"), Some("shared".to_string()));
+    }
+
+    #[test]
+    fn test_request_debug_format() {
+        let req = SearchBridgeRequest::new("debug query", 3)
+            .with_timeout(Duration::from_millis(500));
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("SearchBridgeRequest"));
+        assert!(debug_str.contains("debug query"));
+        assert!(debug_str.contains("3"));
+        assert!(debug_str.contains("<fn>"));
+    }
+
+    #[test]
+    fn test_request_clone() {
+        let token = BridgeCancellationToken::new();
+        let req = SearchBridgeRequest::new("clone me", 7)
+            .with_timeout(Duration::from_secs(5))
+            .with_cancellation(token.clone());
+        let cloned = req.clone();
+        assert_eq!(cloned.query, "clone me");
+        assert_eq!(cloned.limit, 7);
+        assert_eq!(cloned.timeout, Some(Duration::from_secs(5)));
+        // Cancellation token is shared via Arc
+        token.cancel();
+        assert!(cloned.cancellation.as_ref().unwrap().is_cancelled());
+    }
+
+    #[test]
+    fn test_request_builder_chain() {
+        let token = BridgeCancellationToken::new();
+        let req = SearchBridgeRequest::new("chained", 20)
+            .with_timeout(Duration::from_secs(10))
+            .with_cancellation(token)
+            .with_text_provider(|_| Some("chained-text".to_string()));
+        assert_eq!(req.query, "chained");
+        assert_eq!(req.limit, 20);
+        assert!(req.timeout.is_some());
+        assert!(req.cancellation.is_some());
+        assert_eq!(
+            (req.text_provider)("x"),
+            Some("chained-text".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SearchBridgeError unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_error_runtime_display() {
+        let err = SearchBridgeError::Runtime {
+            message: "worker panicked".to_string(),
+        };
+        let display = format!("{err}");
+        assert!(display.contains("runtime failure"));
+        assert!(display.contains("worker panicked"));
+    }
+
+    #[test]
+    fn test_error_timeout_display() {
+        let err = SearchBridgeError::Timeout { timeout_ms: 5000 };
+        let display = format!("{err}");
+        assert!(display.contains("timed out"));
+        assert!(display.contains("5000"));
+    }
+
+    #[test]
+    fn test_error_cancelled_display() {
+        let err = SearchBridgeError::Cancelled {
+            reason: "user requested abort".to_string(),
+        };
+        let display = format!("{err}");
+        assert!(display.contains("cancelled"));
+        assert!(display.contains("user requested abort"));
+    }
+
+    #[test]
+    fn test_error_search_display() {
+        let inner = SearchError::Cancelled {
+            phase: "initial".to_string(),
+            reason: "cx cancelled".to_string(),
+        };
+        let err = SearchBridgeError::Search(inner);
+        let display = format!("{err}");
+        assert!(display.contains("search failed"));
+    }
+
+    #[test]
+    fn test_error_debug_format() {
+        let err = SearchBridgeError::Timeout { timeout_ms: 100 };
+        let debug_str = format!("{:?}", err);
+        assert!(debug_str.contains("Timeout"));
+        assert!(debug_str.contains("100"));
+    }
+
+    // -----------------------------------------------------------------------
+    // SearchBridge construction unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bridge_debug_format() {
+        let (bridge, _) = build_test_bridge();
+        let debug_str = format!("{:?}", bridge);
+        assert!(debug_str.contains("SearchBridge"));
+        assert!(debug_str.contains("<TwoTierSearcher>"));
+    }
+
+    #[test]
+    fn test_bridge_clone_shares_searcher() {
+        let (bridge, _) = build_test_bridge();
+        let cloned = bridge.clone();
+        // Both should share the same Arc<TwoTierSearcher>
+        assert!(Arc::ptr_eq(&bridge.shared_searcher(), &cloned.shared_searcher()));
+    }
+
+    #[test]
+    fn test_bridge_from_shared_preserves_arc() {
+        let (bridge, _) = build_test_bridge();
+        let searcher_arc = bridge.shared_searcher();
+        let bridge2 = SearchBridge::from_shared(Arc::clone(&searcher_arc));
+        assert!(Arc::ptr_eq(&searcher_arc, &bridge2.shared_searcher()));
+    }
+
+    // -----------------------------------------------------------------------
+    // update_best_results unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_best_results_initial_phase() {
+        let mut best = Vec::new();
+        let results = vec![
+            make_scored_result("a", 0.9),
+            make_scored_result("b", 0.8),
+        ];
+        let phase = SearchPhase::Initial {
+            results: results.clone(),
+            latency: Duration::from_millis(10),
+            metrics: make_phase_metrics(),
+        };
+        update_best_results(&mut best, &phase);
+        assert_eq!(best.len(), 2);
+        assert_eq!(best[0].doc_id, "a");
+        assert_eq!(best[1].doc_id, "b");
+    }
+
+    #[test]
+    fn test_update_best_results_refined_replaces_initial() {
+        let mut best = vec![make_scored_result("old", 0.5)];
+        let refined = vec![
+            make_scored_result("x", 0.95),
+            make_scored_result("y", 0.85),
+            make_scored_result("z", 0.75),
+        ];
+        let phase = SearchPhase::Refined {
+            results: refined.clone(),
+            latency: Duration::from_millis(20),
+            metrics: make_phase_metrics(),
+            rank_changes: RankChanges {
+                promoted: 1,
+                demoted: 0,
+                stable: 2,
+            },
+        };
+        update_best_results(&mut best, &phase);
+        assert_eq!(best.len(), 3);
+        assert_eq!(best[0].doc_id, "x");
+    }
+
+    #[test]
+    fn test_update_best_results_refinement_failed_uses_initial() {
+        let mut best = vec![make_scored_result("stale", 0.1)];
+        let initial = vec![
+            make_scored_result("fallback-a", 0.7),
+            make_scored_result("fallback-b", 0.6),
+        ];
+        let phase = SearchPhase::RefinementFailed {
+            initial_results: initial.clone(),
+            error: SearchError::Cancelled {
+                phase: "refined".to_string(),
+                reason: "timeout".to_string(),
+            },
+            latency: Duration::from_millis(500),
+        };
+        update_best_results(&mut best, &phase);
+        assert_eq!(best.len(), 2);
+        assert_eq!(best[0].doc_id, "fallback-a");
+    }
+
+    #[test]
+    fn test_update_best_results_empty_results() {
+        let mut best = vec![make_scored_result("existing", 0.5)];
+        let phase = SearchPhase::Initial {
+            results: Vec::new(),
+            latency: Duration::from_millis(1),
+            metrics: make_phase_metrics(),
+        };
+        update_best_results(&mut best, &phase);
+        assert!(best.is_empty());
+    }
+
+    #[test]
+    fn test_update_best_results_sequential_phases() {
+        let mut best = Vec::new();
+
+        // Phase 1: Initial
+        let initial = vec![make_scored_result("init-1", 0.8)];
+        update_best_results(
+            &mut best,
+            &SearchPhase::Initial {
+                results: initial,
+                latency: Duration::from_millis(5),
+                metrics: make_phase_metrics(),
+            },
+        );
+        assert_eq!(best.len(), 1);
+        assert_eq!(best[0].doc_id, "init-1");
+
+        // Phase 2: Refined replaces
+        let refined = vec![
+            make_scored_result("ref-1", 0.95),
+            make_scored_result("ref-2", 0.85),
+        ];
+        update_best_results(
+            &mut best,
+            &SearchPhase::Refined {
+                results: refined,
+                latency: Duration::from_millis(15),
+                metrics: make_phase_metrics(),
+                rank_changes: RankChanges {
+                    promoted: 1,
+                    demoted: 0,
+                    stable: 1,
+                },
+            },
+        );
+        assert_eq!(best.len(), 2);
+        assert_eq!(best[0].doc_id, "ref-1");
+    }
+
+    // -----------------------------------------------------------------------
+    // map_search_error unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_map_search_error_timeout_takes_priority() {
+        let token = BridgeCancellationToken::new();
+        let error = SearchError::Cancelled {
+            phase: "initial".to_string(),
+            reason: "cx was cancelled".to_string(),
+        };
+        // timeout_fired=true should take priority over Cancelled variant
+        let mapped = map_search_error(error, &token, true, Some(Duration::from_secs(5)));
+        let is_timeout = matches!(mapped, SearchBridgeError::Timeout { timeout_ms: 5000 });
+        assert!(is_timeout, "expected Timeout, got {:?}", mapped);
+    }
+
+    #[test]
+    fn test_map_search_error_cancelled_propagates() {
+        let token = BridgeCancellationToken::new();
+        let error = SearchError::Cancelled {
+            phase: "refined".to_string(),
+            reason: "user abort".to_string(),
+        };
+        let mapped = map_search_error(error, &token, false, None);
+        let is_cancelled = matches!(mapped, SearchBridgeError::Cancelled { .. });
+        assert!(is_cancelled, "expected Cancelled, got {:?}", mapped);
+        // map_search_error also cancels the token on Cancelled errors
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn test_map_search_error_generic_passthrough() {
+        let token = BridgeCancellationToken::new();
+        let error = SearchError::InvalidConfig {
+            field: "limit".to_string(),
+            value: "-1".to_string(),
+            reason: "must be positive".to_string(),
+        };
+        let mapped = map_search_error(error, &token, false, None);
+        let is_search = matches!(mapped, SearchBridgeError::Search(_));
+        assert!(is_search, "expected Search, got {:?}", mapped);
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn test_map_search_error_timeout_zero_when_no_duration() {
+        let token = BridgeCancellationToken::new();
+        let error = SearchError::Cancelled {
+            phase: "test".to_string(),
+            reason: "test".to_string(),
+        };
+        // timeout_fired=true but no duration => timeout_ms should be 0
+        let mapped = map_search_error(error, &token, true, None);
+        let is_timeout_zero = matches!(mapped, SearchBridgeError::Timeout { timeout_ms: 0 });
+        assert!(is_timeout_zero, "expected Timeout with 0ms, got {:?}", mapped);
+    }
+
+    // -----------------------------------------------------------------------
+    // SearchBridgeResult unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_search_bridge_result_debug() {
+        let result = SearchBridgeResult {
+            results: vec![make_scored_result("doc-1", 0.9)],
+            metrics: TwoTierMetrics::default(),
+        };
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("SearchBridgeResult"));
+        assert!(debug_str.contains("doc-1"));
+    }
+
+    #[test]
+    fn test_search_bridge_result_clone() {
+        let result = SearchBridgeResult {
+            results: vec![
+                make_scored_result("doc-a", 0.8),
+                make_scored_result("doc-b", 0.7),
+            ],
+            metrics: TwoTierMetrics::default(),
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned.results.len(), 2);
+        assert_eq!(cloned.results[0].doc_id, "doc-a");
+    }
+
+    // -----------------------------------------------------------------------
+    // spawn_cancellation_thread unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_spawn_cancellation_thread_pre_cancelled() {
+        let cx = Cx::for_testing();
+        let token = BridgeCancellationToken::new();
+        token.cancel();
+
+        let (done, handle) = spawn_cancellation_thread(cx.clone(), token);
+        // When pre-cancelled, no thread is spawned
+        assert!(handle.is_none());
+        // The cx should have cancel requested set
+        assert!(cx.is_cancel_requested());
+        // done flag should still be false (no thread ran)
+        assert!(!done.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_spawn_cancellation_thread_polls_and_stops() {
+        let cx = Cx::for_testing();
+        let token = BridgeCancellationToken::new();
+
+        let (done, handle) = spawn_cancellation_thread(cx.clone(), token);
+        assert!(handle.is_some());
+        // Signal done so thread exits cleanly
+        done.store(true, Ordering::Release);
+        handle.unwrap().join().expect("thread should join");
+        // cx should NOT have cancel_requested since we didn't cancel the token
+        assert!(!cx.is_cancel_requested());
+    }
+
+    // -----------------------------------------------------------------------
+    // spawn_timeout_thread unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_spawn_timeout_thread_none_timeout() {
+        let token = BridgeCancellationToken::new();
+        let (done, fired, handle) = spawn_timeout_thread(None, token.clone());
+        assert!(handle.is_none());
+        assert!(!fired.load(Ordering::Acquire));
+        assert!(!done.load(Ordering::Acquire));
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn test_spawn_timeout_thread_fires_on_expiry() {
+        let token = BridgeCancellationToken::new();
+        let (done, fired, handle) =
+            spawn_timeout_thread(Some(Duration::from_millis(20)), token.clone());
+        assert!(handle.is_some());
+        // Wait for timeout to fire
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(fired.load(Ordering::Acquire));
+        assert!(token.is_cancelled());
+        // Clean up
+        done.store(true, Ordering::Release);
+        handle.unwrap().join().expect("thread should join");
+    }
+
+    #[test]
+    fn test_spawn_timeout_thread_does_not_fire_if_done_early() {
+        let token = BridgeCancellationToken::new();
+        let (done, fired, handle) =
+            spawn_timeout_thread(Some(Duration::from_secs(60)), token.clone());
+        assert!(handle.is_some());
+        // Signal done immediately, before timeout
+        done.store(true, Ordering::Release);
+        handle.unwrap().join().expect("thread should join");
+        assert!(!fired.load(Ordering::Acquire));
+        assert!(!token.is_cancelled());
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests (require building a search index)
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_bridge_round_trip() {
@@ -796,5 +1365,48 @@ mod tests {
         });
 
         log_test_event("test_bridge_overhead", "done", started_at, "ok");
+    }
+
+    #[test]
+    fn test_bridge_empty_query() {
+        let (bridge, text_provider) = build_test_bridge();
+        let request =
+            SearchBridgeRequest::new("", 5).with_text_provider_arc(text_provider);
+        // Empty query should not panic — it may return empty or all results
+        let result = run_async(bridge.search(request, |_| {}));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_bridge_search_result_has_metrics() {
+        let (bridge, text_provider) = build_test_bridge();
+        let request =
+            SearchBridgeRequest::new("rust", 5).with_text_provider_arc(text_provider);
+        let result = run_async(bridge.search(request, |_| {}))
+            .expect("search should succeed");
+        // TwoTierMetrics should have non-zero phase1_total_ms
+        assert!(
+            result.metrics.phase1_total_ms >= 0.0,
+            "phase1_total_ms should be non-negative"
+        );
+    }
+
+    #[test]
+    fn test_bridge_phase_callback_receives_initial() {
+        let (bridge, text_provider) = build_test_bridge();
+        let saw_initial = Arc::new(AtomicBool::new(false));
+        let saw_initial_clone = Arc::clone(&saw_initial);
+
+        let request = SearchBridgeRequest::new("consensus", 5)
+            .with_text_provider_arc(text_provider);
+
+        run_async(bridge.search(request, move |phase| {
+            if matches!(phase, SearchPhase::Initial { .. }) {
+                saw_initial_clone.store(true, Ordering::Release);
+            }
+        }))
+        .expect("search should succeed");
+
+        assert!(saw_initial.load(Ordering::Acquire), "should have seen Initial phase");
     }
 }
