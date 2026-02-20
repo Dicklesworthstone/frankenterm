@@ -682,7 +682,7 @@ mod tests {
         tree.insert(9, 90);
 
         // Access key 1 — it should be splayed to root
-        tree.get(&1);
+        let _ = tree.get(&1);
         // Root should now be 1
         let root = tree.root.unwrap();
         assert_eq!(tree.nodes[root].key, 1);
@@ -915,12 +915,12 @@ mod tests {
             tree.insert(i, i);
         }
         // Access key 5 — should become root
-        tree.get(&5);
+        let _ = tree.get(&5);
         let root = tree.root.unwrap();
         assert_eq!(tree.nodes[root].key, 5);
 
         // Access key 0 — should become root
-        tree.get(&0);
+        let _ = tree.get(&0);
         let root = tree.root.unwrap();
         assert_eq!(tree.nodes[root].key, 0);
     }
@@ -986,7 +986,7 @@ mod tests {
         tree.insert(7, 70);
 
         // Get 5 to ensure it's root
-        tree.get(&5);
+        let _ = tree.get(&5);
         let root = tree.root.unwrap();
         assert_eq!(tree.nodes[root].key, 5);
 

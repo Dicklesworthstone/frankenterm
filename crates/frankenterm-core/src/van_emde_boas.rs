@@ -505,13 +505,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "universe size must be positive")]
     fn zero_universe_panics() {
-        VanEmdeBoas::new(0);
+        let _ = VanEmdeBoas::new(0);
     }
 
     #[test]
     #[should_panic(expected = "universe size must be <= 2^20")]
     fn too_large_universe_panics() {
-        VanEmdeBoas::new(2_000_000);
+        let _ = VanEmdeBoas::new(2_000_000);
     }
 
     #[test]
