@@ -891,3 +891,108 @@ proptest! {
         prop_assert_eq!(json1, json2);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// above_threshold count matches entries with voi >= threshold.
+    #[test]
+    fn above_threshold_count_consistent(
+        pane_ids in arb_pane_ids(5),
+        start_ms in arb_time_ms(),
+    ) {
+        let config = VoiConfig::default();
+        let threshold = config.min_voi_threshold;
+        let mut sched = VoiScheduler::new(config);
+        for &id in &pane_ids { sched.register_pane(id, start_ms); }
+        let result = sched.schedule(start_ms + 5000);
+        let expected = result.schedule.iter().filter(|d| d.voi >= threshold).count();
+        prop_assert_eq!(result.above_threshold, expected,
+            "above_threshold={} should equal count(voi >= threshold)={}", result.above_threshold, expected);
+    }
+
+    /// pane_probabilities returns None for unregistered pane.
+    #[test]
+    fn pane_probabilities_none_for_unknown(pane_id in 1_u64..10_000) {
+        let sched = VoiScheduler::new(VoiConfig::default());
+        prop_assert!(sched.pane_probabilities(pane_id).is_none(),
+            "unknown pane should return None");
+    }
+
+    /// BackpressureMultipliers default ordering: green <= yellow <= red.
+    #[test]
+    fn bp_multipliers_default_ordering(_dummy in 0..1u8) {
+        let bpm = BackpressureMultipliers::default();
+        prop_assert!(bpm.green <= bpm.yellow,
+            "green {} should be <= yellow {}", bpm.green, bpm.yellow);
+        prop_assert!(bpm.yellow <= bpm.red,
+            "yellow {} should be <= red {}", bpm.yellow, bpm.red);
+    }
+
+    /// staleness_ms equals elapsed time for freshly registered pane.
+    #[test]
+    fn staleness_ms_is_elapsed(
+        start_ms in arb_time_ms(),
+        delta_ms in 1_u64..60_000,
+    ) {
+        let mut sched = VoiScheduler::new(VoiConfig::default());
+        sched.register_pane(42, start_ms);
+        let result = sched.schedule(start_ms + delta_ms);
+        if let Some(d) = result.schedule.iter().find(|d| d.pane_id == 42) {
+            prop_assert_eq!(d.staleness_ms, delta_ms,
+                "staleness_ms should equal elapsed time");
+        }
+    }
+
+    /// total_entropy equals sum of decision entropies.
+    #[test]
+    fn total_entropy_is_sum(
+        pane_ids in arb_pane_ids(4),
+        start_ms in arb_time_ms(),
+        delta_ms in 1_u64..30_000,
+    ) {
+        let mut sched = VoiScheduler::new(VoiConfig::default());
+        for &id in &pane_ids { sched.register_pane(id, start_ms); }
+        let result = sched.schedule(start_ms + delta_ms);
+        let sum: f64 = result.schedule.iter().map(|d| d.entropy).sum();
+        prop_assert!((result.total_entropy - sum).abs() < 1e-6,
+            "total_entropy {} should equal sum {}", result.total_entropy, sum);
+    }
+
+    /// next_pane matches first schedule entry above threshold.
+    #[test]
+    fn next_pane_matches_schedule_head(
+        pane_ids in arb_pane_ids(5),
+        start_ms in arb_time_ms(),
+        delta_ms in 1000_u64..10_000,
+    ) {
+        let config = VoiConfig::default();
+        let threshold = config.min_voi_threshold;
+        let mut sched = VoiScheduler::new(config);
+        for &id in &pane_ids { sched.register_pane(id, start_ms); }
+        let result = sched.schedule(start_ms + delta_ms);
+        let next = sched.next_pane(start_ms + delta_ms);
+        let expected = result.schedule.iter().find(|d| d.voi >= threshold);
+        match (next, expected) {
+            (Some(n), Some(e)) => prop_assert_eq!(n.pane_id, e.pane_id),
+            (None, None) => {},
+            (Some(n), None) => prop_assert!(false, "next_pane returned {} but no schedule entry above threshold", n.pane_id),
+            (None, Some(e)) => prop_assert!(false, "next_pane returned None but schedule has entry {} above threshold", e.pane_id),
+        }
+    }
+
+    /// total_observations increments after update_belief.
+    #[test]
+    fn total_observations_increment(
+        start_ms in arb_time_ms(),
+        lls in arb_log_likelihoods(),
+    ) {
+        let mut sched = VoiScheduler::new(VoiConfig::default());
+        sched.register_pane(1, start_ms);
+        prop_assert_eq!(sched.total_observations(), 0);
+        sched.update_belief(1, &lls, start_ms + 1000);
+        prop_assert_eq!(sched.total_observations(), 1);
+    }
+}

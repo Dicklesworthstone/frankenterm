@@ -598,3 +598,94 @@ proptest! {
         prop_assert_eq!(cloned.active_ms, config.active_ms);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// classify and current_tier agree after classify.
+    #[test]
+    fn classify_then_current_tier_consistent(
+        pane_id in arb_pane_id(),
+        is_bg in any::<bool>(),
+        is_rl in any::<bool>(),
+        is_think in any::<bool>(),
+    ) {
+        let clf = PaneTierClassifier::new(TierConfig::default());
+        clf.register_pane(pane_id);
+        clf.set_background(pane_id, is_bg);
+        clf.set_rate_limited(pane_id, is_rl);
+        clf.set_thinking(pane_id, is_think);
+        let classified = clf.classify(pane_id);
+        let current = clf.current_tier(pane_id);
+        prop_assert_eq!(classified, current);
+    }
+
+    /// on_pane_output when already Active does NOT increment total_promotions.
+    #[test]
+    fn output_when_active_no_promotion(pane_id in arb_pane_id()) {
+        let clf = PaneTierClassifier::new(TierConfig::default());
+        clf.register_pane(pane_id);
+        clf.on_pane_output(pane_id);
+        clf.on_pane_output(pane_id);
+        prop_assert_eq!(clf.total_promotions(), 0,
+            "on_pane_output while Active should not count as promotion");
+    }
+
+    /// config() accessor returns the same config passed to new().
+    #[test]
+    fn config_accessor_matches(config in arb_config()) {
+        let clf = PaneTierClassifier::new(config.clone());
+        prop_assert_eq!(clf.config().active_ms, config.active_ms);
+        prop_assert_eq!(clf.config().dormant_ms, config.dormant_ms);
+    }
+
+    /// register_pane is idempotent for pane_count.
+    #[test]
+    fn register_idempotent_count(pane_id in arb_pane_id()) {
+        let clf = PaneTierClassifier::new(TierConfig::default());
+        clf.register_pane(pane_id);
+        clf.register_pane(pane_id);
+        prop_assert_eq!(clf.pane_count(), 1);
+    }
+
+    /// effective_interval is at least as large as the base interval.
+    #[test]
+    fn effective_interval_gte_base_with_bp(
+        config in arb_config(),
+        pane_id in arb_pane_id(),
+        bp in arb_bp_tier(),
+    ) {
+        let clf = PaneTierClassifier::new(config.clone());
+        clf.register_pane(pane_id);
+        let tier = clf.current_tier(pane_id);
+        let base = config.interval_for(tier);
+        let effective = clf.effective_interval(pane_id, bp);
+        prop_assert!(effective >= base,
+            "effective {:?} should be >= base {:?}", effective, base);
+    }
+
+    /// PaneTier Display produces non-empty lowercase string.
+    #[test]
+    fn tier_display_lowercase(tier in arb_tier()) {
+        let display = tier.to_string();
+        prop_assert!(!display.is_empty());
+        prop_assert!(display.chars().all(|c| c.is_lowercase() || !c.is_alphabetic()),
+            "display should be lowercase: {}", display);
+    }
+
+    /// classify_all has entry for every registered pane.
+    #[test]
+    fn classify_all_covers_registered(pane_ids in arb_pane_ids(5)) {
+        let clf = PaneTierClassifier::new(TierConfig::default());
+        for &id in &pane_ids {
+            clf.register_pane(id);
+        }
+        let all = clf.classify_all();
+        for &id in &pane_ids {
+            prop_assert!(all.contains_key(&id),
+                "classify_all should contain pane {}", id);
+        }
+    }
+}

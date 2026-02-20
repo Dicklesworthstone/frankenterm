@@ -420,3 +420,94 @@ proptest! {
         prop_assert_eq!(hll.nonzero_registers(), 0);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// jaccard is symmetric.
+    #[test]
+    fn jaccard_symmetry(
+        p in 8..=12u8,
+        items1 in arb_small_items(),
+        items2 in arb_small_items(),
+    ) {
+        let mut hll1 = HyperLogLog::with_precision(p);
+        let mut hll2 = HyperLogLog::with_precision(p);
+        for item in &items1 { hll1.insert(item); }
+        for item in &items2 { hll2.insert(item); }
+        let j12 = hll1.jaccard(&hll2).unwrap();
+        let j21 = hll2.jaccard(&hll1).unwrap();
+        prop_assert!((j12 - j21).abs() < 1e-10,
+            "jaccard not symmetric: {} vs {}", j12, j21);
+    }
+
+    /// jaccard of two empty HLLs is 0.0.
+    #[test]
+    fn jaccard_empty_empty_zero(p in arb_precision()) {
+        let hll1 = HyperLogLog::with_precision(p);
+        let hll2 = HyperLogLog::with_precision(p);
+        let j = hll1.jaccard(&hll2).unwrap();
+        prop_assert!((j - 0.0).abs() < 1e-10,
+            "jaccard of two empty HLLs should be 0.0, got {}", j);
+    }
+
+    /// nonzero_registers is non-decreasing after inserts.
+    #[test]
+    fn nonzero_registers_nondecreasing(
+        p in arb_precision(),
+        items in prop::collection::vec(any::<u64>(), 2..50),
+    ) {
+        let mut hll = HyperLogLog::with_precision(p);
+        let mut prev_nz = 0;
+        for item in &items {
+            hll.insert(item);
+            let nz = hll.nonzero_registers();
+            prop_assert!(nz >= prev_nz,
+                "nonzero_registers should not decrease: {} -> {}", prev_nz, nz);
+            prev_nz = nz;
+        }
+    }
+
+    /// clear then merge recovers cardinality.
+    #[test]
+    fn clear_then_merge_recovers(p in arb_precision(), items in arb_small_items()) {
+        let mut hll = HyperLogLog::with_precision(p);
+        for item in &items { hll.insert(item); }
+        let card_before = hll.cardinality();
+        let mut cleared = HyperLogLog::with_precision(p);
+        cleared.merge(&hll).unwrap();
+        prop_assert_eq!(cleared.cardinality(), card_before);
+    }
+
+    /// with_config register_count equals 2^p.
+    #[test]
+    fn with_config_register_count(p in arb_precision()) {
+        let hll = HyperLogLog::with_config(HllConfig { precision: p });
+        prop_assert_eq!(hll.register_count(), 1 << p as usize);
+        prop_assert!(hll.is_empty());
+    }
+
+    /// insert_hash increments total_inserts.
+    #[test]
+    fn insert_hash_increments_total(
+        hashes in prop::collection::vec(any::<u64>(), 1..50),
+    ) {
+        let mut hll = HyperLogLog::with_precision(10);
+        for (i, &h) in hashes.iter().enumerate() {
+            hll.insert_hash(h);
+            prop_assert_eq!(hll.total_inserts(), (i + 1) as u64);
+        }
+    }
+
+    /// stats().nonzero_registers matches nonzero_registers().
+    #[test]
+    fn stats_nonzero_consistent(hashes in prop::collection::vec(any::<u64>(), 1..30)) {
+        let mut hll = HyperLogLog::with_precision(10);
+        for &h in &hashes { hll.insert_hash(h); }
+        let stats = hll.stats();
+        prop_assert_eq!(stats.nonzero_registers, hll.nonzero_registers());
+        prop_assert_eq!(stats.estimated_cardinality, hll.cardinality());
+    }
+}

@@ -735,3 +735,81 @@ proptest! {
         prop_assert_eq!(h.retained(), 0);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// quantile(0.0) returns the minimum retained value.
+    #[test]
+    fn quantile_zero_is_min(values in proptest::collection::vec(arb_value(), 2..50)) {
+        let mut h = Histogram::new("test", 1000);
+        for &v in &values { h.record(v); }
+        if let Some(q0) = h.quantile(0.0) {
+            let min_val = values.iter().copied().fold(f64::INFINITY, f64::min);
+            prop_assert!((q0 - min_val).abs() < 1e-10,
+                "quantile(0.0)={} should equal min={}", q0, min_val);
+        }
+    }
+
+    /// quantile(1.0) returns the maximum retained value.
+    #[test]
+    fn quantile_one_is_max(values in proptest::collection::vec(arb_value(), 2..50)) {
+        let mut h = Histogram::new("test", 1000);
+        for &v in &values { h.record(v); }
+        if let Some(q1) = h.quantile(1.0) {
+            let max_val = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            prop_assert!((q1 - max_val).abs() < 1e-10,
+                "quantile(1.0)={} should equal max={}", q1, max_val);
+        }
+    }
+
+    /// summary p95 >= p50.
+    #[test]
+    fn summary_p95_gte_p50(values in proptest::collection::vec(arb_value(), 5..50)) {
+        let mut h = Histogram::new("test", 1000);
+        for &v in &values { h.record(v); }
+        let s = h.summary();
+        if let (Some(p50), Some(p95)) = (s.p50, s.p95) {
+            prop_assert!(p50 <= p95 + 1e-10,
+                "p50={} should be <= p95={}", p50, p95);
+        }
+    }
+
+    /// CircularMetricBuffer capacity accessor returns configured value.
+    #[test]
+    fn buffer_capacity_accessor(capacity in 1_usize..200) {
+        let buf = CircularMetricBuffer::new(capacity);
+        prop_assert_eq!(buf.capacity(), capacity);
+    }
+
+    /// Histogram name accessor returns configured name.
+    #[test]
+    fn histogram_name_accessor(
+        values in proptest::collection::vec(arb_value(), 1..10),
+    ) {
+        let mut h = Histogram::new("my_metric", 50);
+        for &v in &values { h.record(v); }
+        prop_assert_eq!(h.name(), "my_metric");
+    }
+
+    /// aggregate_snapshots with all cpu_percent=None returns mean_cpu_percent=None.
+    #[test]
+    fn aggregate_no_cpu_returns_none(n in 1_usize..10) {
+        let snapshots: Vec<ResourceSnapshot> = (0..n)
+            .map(|i| arb_snapshot_with_resources(1000 + i as u64, 10, None))
+            .collect();
+        let agg = TelemetryStore::aggregate_snapshots(0, &snapshots).unwrap();
+        prop_assert!(agg.mean_cpu_percent.is_none(),
+            "all-None cpu_percent should give mean_cpu_percent=None");
+    }
+
+    /// Histogram quantile returns None for empty histogram.
+    #[test]
+    fn quantile_none_when_empty(_dummy in 0..1u8) {
+        let h = Histogram::new("empty", 50);
+        prop_assert!(h.quantile(0.5).is_none(),
+            "empty histogram quantile should be None");
+    }
+}

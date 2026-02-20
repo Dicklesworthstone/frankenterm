@@ -685,3 +685,86 @@ proptest! {
         prop_assert!((cloned.variance() - tracker.variance()).abs() < 1e-10);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// with_half_life_secs produces half_life_ms = secs * 1000.
+    #[test]
+    fn with_half_life_secs_consistent(secs in 0.001_f64..10_000.0) {
+        let ewma = Ewma::with_half_life_secs(secs);
+        prop_assert!((ewma.half_life_ms() - secs * 1000.0).abs() < 1e-6,
+            "half_life_ms {} should equal secs*1000 {}", ewma.half_life_ms(), secs * 1000.0);
+    }
+
+    /// half_life_ms accessor returns configured value.
+    #[test]
+    fn half_life_ms_accessor(hl in arb_half_life_ms()) {
+        let ewma = Ewma::with_half_life_ms(hl);
+        prop_assert!((ewma.half_life_ms() - hl).abs() < 1e-10);
+    }
+
+    /// is_anomaly consistent with z_score.
+    #[test]
+    fn is_anomaly_consistent_with_z_score(
+        values in proptest::collection::vec(arb_value(), 5..20),
+        test_val in arb_value(),
+        threshold in 0.1_f64..5.0,
+    ) {
+        let mut tracker = EwmaWithVariance::with_half_life_ms(1000.0);
+        for (i, &v) in values.iter().enumerate() {
+            tracker.observe(v, i as u64 * 100);
+        }
+        let is_anom = tracker.is_anomaly(test_val, threshold);
+        let z = tracker.z_score(test_val);
+        prop_assert_eq!(is_anom, z.abs() > threshold,
+            "is_anomaly={} but z_score.abs()={} threshold={}", is_anom, z.abs(), threshold);
+    }
+
+    /// RateEstimator with single event has rate 0.
+    #[test]
+    fn rate_single_event_zero(hl in 100.0_f64..50_000.0, t in 0_u64..1_000_000) {
+        let mut rate = RateEstimator::with_half_life_ms(hl);
+        rate.tick(t);
+        prop_assert!((rate.rate_per_sec() - 0.0).abs() < 1e-10,
+            "single tick should give rate=0, got {}", rate.rate_per_sec());
+        prop_assert_eq!(rate.total_events(), 1);
+    }
+
+    /// stats().half_life_ms equals configured half-life.
+    #[test]
+    fn stats_half_life_ms_correct(hl in arb_half_life_ms()) {
+        let ewma = Ewma::with_half_life_ms(hl);
+        let stats = ewma.stats();
+        prop_assert!((stats.half_life_ms - hl).abs() < 1e-10);
+    }
+
+    /// EwmaWithVariance reset then single observation: z_score is 0.
+    #[test]
+    fn variance_reset_z_score_zero(
+        values in proptest::collection::vec(arb_value(), 2..10),
+        fresh_val in arb_value(),
+    ) {
+        let mut tracker = EwmaWithVariance::with_half_life_ms(1000.0);
+        for (i, &v) in values.iter().enumerate() {
+            tracker.observe(v, i as u64 * 100);
+        }
+        tracker.reset();
+        tracker.observe(fresh_val, 0);
+        let z = tracker.z_score(fresh_val * 2.0);
+        prop_assert!((z - 0.0).abs() < 1e-10,
+            "after reset + 1 obs, z_score should be 0, got {}", z);
+    }
+
+    /// RateEstimator total_events increments with each tick.
+    #[test]
+    fn rate_total_events_increments(n in 1_usize..50) {
+        let mut rate = RateEstimator::with_half_life_ms(1000.0);
+        for i in 0..n {
+            rate.tick(i as u64 * 100);
+        }
+        prop_assert_eq!(rate.total_events(), n as u64);
+    }
+}
