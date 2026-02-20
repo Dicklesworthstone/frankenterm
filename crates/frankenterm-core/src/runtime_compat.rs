@@ -374,6 +374,11 @@ pub mod task {
     {
         tokio::task::spawn_blocking(f)
     }
+
+    /// Yields execution back to the runtime, allowing other tasks to progress.
+    pub async fn yield_now() {
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Re-export `join!` macro for concurrent future evaluation.
@@ -387,6 +392,30 @@ pub use tokio::join;
 /// Wraps `tokio::select!` in the default (non-asupersync) build.
 #[cfg(not(feature = "asupersync-runtime"))]
 pub use tokio::select;
+
+/// Time-control primitives for deterministic test scheduling.
+///
+/// These are primarily used in `#[tokio::test(start_paused = true)]` tests
+/// to drive time manually. Requires tokio's `test-util` feature, which is
+/// only available in test builds.
+#[cfg(test)]
+#[cfg(not(feature = "asupersync-runtime"))]
+pub mod time {
+    use std::time::Duration;
+
+    /// Pauses the runtime's time driver so that `sleep` and `timeout`
+    /// only resolve when time is manually advanced.
+    pub fn pause() {
+        tokio::time::pause();
+    }
+
+    /// Advances the runtime clock by the given duration.
+    ///
+    /// Only effective after `pause()` has been called.
+    pub async fn advance(duration: Duration) {
+        tokio::time::advance(duration).await;
+    }
+}
 
 /// Unix socket aliases/helpers for the active runtime.
 #[cfg(feature = "asupersync-runtime")]
@@ -2588,5 +2617,59 @@ mod tests {
             val = async { "second" } => val,
         };
         assert_eq!(result, "first");
+    }
+
+    // ========================================================================
+    // task::yield_now tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn yield_now_does_not_panic() {
+        task::yield_now().await;
+    }
+
+    #[tokio::test]
+    async fn yield_now_multiple_times() {
+        for _ in 0..5 {
+            task::yield_now().await;
+        }
+    }
+
+    // ========================================================================
+    // time module tests
+    // ========================================================================
+
+    #[tokio::test(start_paused = true)]
+    async fn time_advance_moves_clock() {
+        let start = std::time::Instant::now();
+        time::advance(Duration::from_secs(60)).await;
+        // In paused mode, wall-clock barely moves but tokio's clock advances.
+        // We just verify no panic.
+        let _ = start.elapsed();
+    }
+
+    #[tokio::test]
+    async fn time_pause_enables_deterministic_sleep() {
+        time::pause();
+        // After pausing, sleeps resolve as time is auto-advanced in single-threaded
+        // runtime. Verify a long sleep completes quickly.
+        let start = std::time::Instant::now();
+        sleep(Duration::from_secs(300)).await;
+        let wall_elapsed = start.elapsed();
+        // Wall-clock should be well under 300 seconds.
+        assert!(wall_elapsed < Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn time_advance_then_sleep_resolves() {
+        let (tx, mut rx) = mpsc::channel(1);
+        task::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(42).await;
+        });
+        time::advance(Duration::from_millis(200)).await;
+        task::yield_now().await;
+        let val = rx.recv().await;
+        assert_eq!(val, Some(42));
     }
 }

@@ -2250,7 +2250,7 @@ mod tests {
         let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(5)));
 
         for _ in 0..3 {
-            tokio::select! {
+            crate::runtime_compat::select! {
                 result = &mut fut => {
                     let result = result.expect("wait_for");
                     match result {
@@ -2261,9 +2261,9 @@ mod tests {
                     }
                     return;
                 }
-                () = tokio::time::advance(Duration::from_secs(1)) => {}
+                () = crate::runtime_compat::time::advance(Duration::from_secs(1)) => {}
             }
-            tokio::task::yield_now().await;
+            crate::runtime_compat::task::yield_now().await;
         }
 
         let result = fut.await.expect("wait_for");
@@ -2290,7 +2290,7 @@ mod tests {
         let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(2)));
 
         for _ in 0..4 {
-            tokio::select! {
+            crate::runtime_compat::select! {
                 result = &mut fut => {
                     let result = result.expect("wait_for");
                     match result {
@@ -2306,9 +2306,9 @@ mod tests {
                     }
                     return;
                 }
-                () = tokio::time::advance(Duration::from_secs(1)) => {}
+                () = crate::runtime_compat::time::advance(Duration::from_secs(1)) => {}
             }
-            tokio::task::yield_now().await;
+            crate::runtime_compat::task::yield_now().await;
         }
 
         let result = fut.await.expect("wait_for");
@@ -2989,7 +2989,7 @@ mod tests {
 
         // Advance time enough for polling
         for _ in 0..10 {
-            tokio::select! {
+            crate::runtime_compat::select! {
                 result = &mut fut => {
                     let result = result.unwrap();
                     match result {
@@ -3000,9 +3000,9 @@ mod tests {
                     }
                     return;
                 }
-                () = tokio::time::advance(Duration::from_millis(5)) => {}
+                () = crate::runtime_compat::time::advance(Duration::from_millis(5)) => {}
             }
-            tokio::task::yield_now().await;
+            crate::runtime_compat::task::yield_now().await;
         }
 
         let result = fut.await.unwrap();

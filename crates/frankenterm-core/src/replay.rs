@@ -1297,7 +1297,7 @@ mod tests {
     async fn play_with_stop_control() {
         // Send stop before play starts to deterministically test the pre-loop
         // control-check path. (Spawned-task timing is unreliable with
-        // tokio::time::pause() on a single-threaded runtime.)
+        // crate::runtime_compat::time::pause() on a single-threaded runtime.)
         let data = build_recording(&[
             (0, FrameType::Output, b"A".to_vec()),
             (5000, FrameType::Output, b"B".to_vec()),
@@ -1320,8 +1320,8 @@ mod tests {
 
     #[tokio::test]
     async fn play_deterministic_timing() {
-        // Use tokio::time::pause for deterministic timing tests.
-        tokio::time::pause();
+        // Pause the runtime clock for deterministic timing tests.
+        crate::runtime_compat::time::pause();
 
         let data = build_recording(&[
             (0, FrameType::Output, b"A".to_vec()),
@@ -1342,7 +1342,7 @@ mod tests {
 
     #[tokio::test]
     async fn play_double_speed() {
-        tokio::time::pause();
+        crate::runtime_compat::time::pause();
 
         let data = build_recording(&[
             (0, FrameType::Output, b"A".to_vec()),
@@ -1955,7 +1955,7 @@ mod tests {
 
     #[tokio::test]
     async fn play_with_pause_then_resume() {
-        tokio::time::pause();
+        crate::runtime_compat::time::pause();
 
         let data = build_recording(&[
             (0, FrameType::Output, b"A".to_vec()),
