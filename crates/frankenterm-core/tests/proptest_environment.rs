@@ -884,3 +884,22 @@ fn all_agent_types_get_packs() {
     );
     assert!(auto.pattern_packs.contains(&"builtin:gemini".to_string()));
 }
+
+// =========================================================================
+// Batch 16: additional property tests (DarkMill)
+// =========================================================================
+
+#[test]
+fn auto_config_default_includes_core() {
+    let env = make_env(4, Some(8192), None, vec![], vec![]);
+    let auto = AutoConfig::from_environment(&env);
+    assert!(auto.pattern_packs.contains(&"builtin:core".to_string()));
+}
+
+#[test]
+fn auto_config_max_captures_in_range() {
+    let env = make_env(4, Some(8192), None, vec![], vec![]);
+    let auto = AutoConfig::from_environment(&env);
+    assert!(auto.max_concurrent_captures >= 4);
+    assert!(auto.max_concurrent_captures <= 32);
+}

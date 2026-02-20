@@ -691,3 +691,23 @@ fn mux_watchdog_config_default_memory_ratio() {
         config.memory_warning_bytes * 2
     );
 }
+
+// =========================================================================
+// Batch 16: additional property tests (DarkMill)
+// =========================================================================
+
+#[test]
+fn watchdog_config_all_thresholds_positive() {
+    let config = WatchdogConfig::default();
+    assert!(config.discovery_stale_ms > 0);
+    assert!(config.capture_stale_ms > 0);
+    assert!(config.persistence_stale_ms > 0);
+    assert!(config.maintenance_stale_ms > 0);
+}
+
+#[test]
+fn mux_watchdog_config_memory_critical_ge_warning() {
+    let config = MuxWatchdogConfig::default();
+    assert!(config.memory_critical_bytes >= config.memory_warning_bytes,
+        "critical {} should be >= warning {}", config.memory_critical_bytes, config.memory_warning_bytes);
+}

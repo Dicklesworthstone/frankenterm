@@ -649,3 +649,20 @@ fn text_alias_for_plain() {
     assert_eq!(OutputFormat::parse("TEXT"), Some(OutputFormat::Plain));
     assert_eq!(OutputFormat::parse("Text"), Some(OutputFormat::Plain));
 }
+
+// =============================================================================
+// Batch 16: additional property tests (DarkMill)
+// =============================================================================
+
+#[test]
+fn auto_is_default_variant() {
+    assert_eq!(OutputFormat::default(), OutputFormat::Auto);
+}
+
+#[test]
+fn json_is_json_plain_is_plain() {
+    assert!(OutputFormat::Json.is_json());
+    assert!(!OutputFormat::Json.is_plain());
+    assert!(OutputFormat::Plain.is_plain());
+    assert!(!OutputFormat::Plain.is_json());
+}

@@ -475,3 +475,20 @@ proptest! {
             "'{}' (uppercase) should parse to {:?}", upper, shell);
     }
 }
+
+// =========================================================================
+// Batch 16: additional property tests (DarkMill)
+// =========================================================================
+
+#[test]
+fn shell_type_all_have_names() {
+    for shell in &[ShellType::Bash, ShellType::Zsh, ShellType::Fish] {
+        assert!(!shell.name().is_empty(), "shell {:?} should have a name", shell);
+    }
+}
+
+#[test]
+fn empty_ssh_config_parses_empty() {
+    let hosts = parse_ssh_config("");
+    assert!(hosts.is_empty());
+}
