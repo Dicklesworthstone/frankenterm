@@ -134,4 +134,246 @@ mod tests {
         };
         assert!(err.contains("unsupported embed model"));
     }
+
+    // ── DarkMill test expansion ──────────────────────────────────────
+
+    #[test]
+    fn port_is_stored() {
+        let server = EmbedServer::new(9090);
+        assert_eq!(server.port(), 9090);
+    }
+
+    #[test]
+    fn port_zero() {
+        let server = EmbedServer::new(0);
+        assert_eq!(server.port(), 0);
+    }
+
+    #[test]
+    fn port_max() {
+        let server = EmbedServer::new(u16::MAX);
+        assert_eq!(server.port(), u16::MAX);
+    }
+
+    #[test]
+    fn set_running_false_stops_server() {
+        let server = EmbedServer::new(1000);
+        assert!(server.is_running());
+        server.set_running(false);
+        assert!(!server.is_running());
+    }
+
+    #[test]
+    fn set_running_true_restarts_server() {
+        let server = EmbedServer::new(1000);
+        server.set_running(false);
+        assert!(!server.is_running());
+        server.set_running(true);
+        assert!(server.is_running());
+    }
+
+    #[test]
+    fn set_running_idempotent() {
+        let server = EmbedServer::new(1000);
+        server.set_running(true);
+        assert!(server.is_running());
+        server.set_running(true);
+        assert!(server.is_running());
+    }
+
+    #[test]
+    fn processed_starts_at_zero() {
+        let server = EmbedServer::new(1000);
+        assert_eq!(server.processed(), 0);
+    }
+
+    #[test]
+    fn processed_increments_on_embed() {
+        let server = EmbedServer::new(1000);
+        server.handle(embed_request(1, "a", None));
+        server.handle(embed_request(2, "b", None));
+        assert_eq!(server.processed(), 2);
+    }
+
+    #[test]
+    fn processed_not_incremented_by_ping() {
+        let server = EmbedServer::new(1000);
+        server.handle(DaemonRequest::Ping);
+        assert_eq!(server.processed(), 0);
+    }
+
+    #[test]
+    fn processed_not_incremented_by_shutdown() {
+        let server = EmbedServer::new(1000);
+        server.handle(DaemonRequest::Shutdown);
+        assert_eq!(server.processed(), 0);
+    }
+
+    #[test]
+    fn shutdown_then_embed_fails() {
+        let server = EmbedServer::new(1000);
+        server.handle(DaemonRequest::Shutdown);
+        let response = server.handle(embed_request(1, "test", None));
+        let is_err = matches!(response, DaemonResponse::Error(_));
+        assert!(is_err, "embed after shutdown should fail");
+    }
+
+    #[test]
+    fn multiple_pings_all_return_pong() {
+        let server = EmbedServer::new(1000);
+        for _ in 0..5 {
+            let is_pong = matches!(server.handle(DaemonRequest::Ping), DaemonResponse::Pong);
+            assert!(is_pong);
+        }
+    }
+
+    #[test]
+    fn embed_with_explicit_dimension() {
+        let server = EmbedServer::new(1000);
+        let resp = server.handle(embed_request(1, "test", Some("fnv1a-hash-32")));
+        let embed = match resp {
+            DaemonResponse::Embed(data) => data,
+            other => panic!("expected embed, got {other:?}"),
+        };
+        assert_eq!(embed.vector.len(), 32);
+        assert_eq!(embed.model, "fnv1a-hash-32");
+    }
+
+    #[test]
+    fn embed_default_model_is_128d() {
+        let server = EmbedServer::new(1000);
+        let resp = server.handle(embed_request(1, "test", None));
+        let embed = match resp {
+            DaemonResponse::Embed(data) => data,
+            other => panic!("expected embed, got {other:?}"),
+        };
+        assert_eq!(embed.vector.len(), 128);
+        assert_eq!(embed.model, "fnv1a-hash-128");
+    }
+
+    #[test]
+    fn embed_id_passes_through() {
+        let server = EmbedServer::new(1000);
+        for id in [0, 42, u64::MAX] {
+            let resp = server.handle(embed_request(id, "test", None));
+            let embed = match resp {
+                DaemonResponse::Embed(data) => data,
+                other => panic!("expected embed, got {other:?}"),
+            };
+            assert_eq!(embed.id, id);
+        }
+    }
+
+    #[test]
+    fn embed_invalid_dimension_returns_error() {
+        let server = EmbedServer::new(1000);
+        let resp = server.handle(embed_request(1, "test", Some("fnv1a-hash-0")));
+        let is_err = matches!(resp, DaemonResponse::Error(_));
+        assert!(is_err, "zero dimension should error");
+    }
+
+    #[test]
+    fn embed_non_numeric_dimension_returns_error() {
+        let server = EmbedServer::new(1000);
+        let resp = server.handle(embed_request(1, "test", Some("fnv1a-hash-xyz")));
+        let is_err = matches!(resp, DaemonResponse::Error(_));
+        assert!(is_err, "non-numeric dimension should error");
+    }
+
+    #[test]
+    fn embed_empty_text_succeeds() {
+        let server = EmbedServer::new(1000);
+        let resp = server.handle(embed_request(1, "", None));
+        let is_embed = matches!(resp, DaemonResponse::Embed(_));
+        assert!(is_embed, "empty text should produce embedding");
+    }
+
+    #[test]
+    fn embed_unicode_text_succeeds() {
+        let server = EmbedServer::new(1000);
+        let resp = server.handle(embed_request(1, "日本語 🦀", None));
+        let is_embed = matches!(resp, DaemonResponse::Embed(_));
+        assert!(is_embed, "unicode text should produce embedding");
+    }
+
+    #[test]
+    fn restart_after_shutdown_allows_embeds() {
+        let server = EmbedServer::new(1000);
+        server.handle(DaemonRequest::Shutdown);
+        assert!(!server.is_running());
+        server.set_running(true);
+        let resp = server.handle(embed_request(1, "after restart", None));
+        let is_embed = matches!(resp, DaemonResponse::Embed(_));
+        assert!(is_embed, "embed after restart should succeed");
+    }
+
+    #[test]
+    fn embed_processed_not_incremented_on_stopped() {
+        let server = EmbedServer::new(1000);
+        server.set_running(false);
+        server.handle(embed_request(1, "ignored", None));
+        assert_eq!(server.processed(), 0);
+    }
+
+    #[test]
+    fn embed_processed_not_incremented_on_model_error() {
+        let server = EmbedServer::new(1000);
+        server.handle(embed_request(1, "ignored", Some("bad-model")));
+        assert_eq!(server.processed(), 0);
+    }
+
+    #[test]
+    fn sequential_embed_shutdown_ping_sequence() {
+        let server = EmbedServer::new(1000);
+        // Embed first
+        let r1 = server.handle(embed_request(1, "first", None));
+        let is_embed = matches!(r1, DaemonResponse::Embed(_));
+        assert!(is_embed);
+        // Shutdown
+        let r2 = server.handle(DaemonRequest::Shutdown);
+        let is_pong = matches!(r2, DaemonResponse::Pong);
+        assert!(is_pong);
+        assert!(!server.is_running());
+        // Ping still works after shutdown
+        let r3 = server.handle(DaemonRequest::Ping);
+        let is_pong2 = matches!(r3, DaemonResponse::Pong);
+        assert!(is_pong2);
+        // But embed fails
+        let r4 = server.handle(embed_request(2, "after shutdown", None));
+        let is_err = matches!(r4, DaemonResponse::Error(_));
+        assert!(is_err);
+        assert_eq!(server.processed(), 1);
+    }
+
+    #[test]
+    fn different_texts_produce_different_embeddings() {
+        let server = EmbedServer::new(1000);
+        let r1 = server.handle(embed_request(1, "hello", None));
+        let r2 = server.handle(embed_request(2, "world", None));
+        let v1 = match r1 {
+            DaemonResponse::Embed(data) => data.vector,
+            other => panic!("expected embed, got {other:?}"),
+        };
+        let v2 = match r2 {
+            DaemonResponse::Embed(data) => data.vector,
+            other => panic!("expected embed, got {other:?}"),
+        };
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn same_text_produces_same_embedding() {
+        let server = EmbedServer::new(1000);
+        let r1 = server.handle(embed_request(1, "deterministic", None));
+        let r2 = server.handle(embed_request(2, "deterministic", None));
+        let v1 = match r1 {
+            DaemonResponse::Embed(data) => data.vector,
+            other => panic!("expected embed, got {other:?}"),
+        };
+        let v2 = match r2 {
+            DaemonResponse::Embed(data) => data.vector,
+            other => panic!("expected embed, got {other:?}"),
+        };
+        assert_eq!(v1, v2);
+    }
 }
