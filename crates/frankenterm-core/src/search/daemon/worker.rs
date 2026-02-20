@@ -242,7 +242,11 @@ mod tests {
     fn response_has_nonzero_vector_values() {
         let worker = EmbedWorker::new(1);
         let resp = worker.process(&req(1, "hello world", None)).unwrap();
-        let nonzero = resp.vector.iter().filter(|v| v.abs() > f32::EPSILON).count();
+        let nonzero = resp
+            .vector
+            .iter()
+            .filter(|v| v.abs() > f32::EPSILON)
+            .count();
         assert!(nonzero > 0, "embedding should have nonzero values");
     }
 

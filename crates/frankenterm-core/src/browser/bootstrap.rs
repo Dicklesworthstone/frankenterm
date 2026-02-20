@@ -700,8 +700,7 @@ mod tests {
 
     #[test]
     fn parse_unknown_status_is_error() {
-        let result =
-            InteractiveBootstrap::parse_bootstrap_result(r#"{"status":"unknown_status"}"#);
+        let result = InteractiveBootstrap::parse_bootstrap_result(r#"{"status":"unknown_status"}"#);
         assert!(result.is_err());
     }
 

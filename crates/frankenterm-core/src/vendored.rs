@@ -403,7 +403,12 @@ mod tests {
         let report = compatibility_report_with(meta, Some(&local));
         let json = serde_json::to_value(&report).expect("report should serialize");
         assert_eq!(json["status"], "incompatible");
-        assert!(json["recommendation"].as_str().unwrap().contains("Update WezTerm"));
+        assert!(
+            json["recommendation"]
+                .as_str()
+                .unwrap()
+                .contains("Update WezTerm")
+        );
         assert_eq!(json["local_commit"], "deadbeef");
         assert_eq!(json["vendored_commit"], "abcdef12");
     }

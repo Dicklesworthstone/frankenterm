@@ -976,10 +976,7 @@ mod tests {
             config.interval_for(PaneTier::Thinking),
             Duration::from_secs(2)
         );
-        assert_eq!(
-            config.interval_for(PaneTier::Idle),
-            Duration::from_secs(5)
-        );
+        assert_eq!(config.interval_for(PaneTier::Idle), Duration::from_secs(5));
         assert_eq!(
             config.interval_for(PaneTier::Background),
             Duration::from_secs(10)

@@ -416,21 +416,15 @@ mod tests {
 
     #[test]
     fn with_cx_async_passes_through() {
-        let runtime = CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let result = runtime.block_on(async {
-            with_cx_async(&cx, |_inner| async { 99 }).await
-        });
+        let result = runtime.block_on(async { with_cx_async(&cx, |_inner| async { 99 }).await });
         assert_eq!(result, 99);
     }
 
     #[test]
     fn with_cx_async_can_await_futures() {
-        let runtime = CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let result = runtime.block_on(async {
             with_cx_async(&cx, |_inner| async {
@@ -449,9 +443,7 @@ mod tests {
 
     #[test]
     fn spawn_with_cx_runs_task() {
-        let runtime = CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let handle = runtime.handle();
 
@@ -464,9 +456,7 @@ mod tests {
 
     #[test]
     fn spawn_with_cx_receives_cloned_cx() {
-        let runtime = CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let handle = runtime.handle();
 
@@ -481,18 +471,14 @@ mod tests {
 
     #[test]
     fn spawn_with_cx_multiple_tasks() {
-        let runtime = CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let handle = runtime.handle();
 
         let results = runtime.block_on(async {
             let mut joins = Vec::new();
             for i in 0..5u32 {
-                joins.push(spawn_with_cx(&handle, &cx, move |_cx| async move {
-                    i * 2
-                }));
+                joins.push(spawn_with_cx(&handle, &cx, move |_cx| async move { i * 2 }));
             }
             let mut out = Vec::new();
             for join in joins {
@@ -509,9 +495,7 @@ mod tests {
 
     #[test]
     fn try_spawn_with_cx_success() {
-        let runtime = CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let handle = runtime.handle();
 
@@ -529,70 +513,57 @@ mod tests {
 
     #[test]
     fn spawn_bounded_empty_tasks() {
-        let runtime = CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let handle = runtime.handle();
 
-        let results: Vec<i32> = runtime.block_on(async {
-            spawn_bounded_with_cx(&handle, &cx, 4, Vec::new()).await
-        });
+        let tasks: Vec<
+            Box<dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = i32> + Send>> + Send>,
+        > = Vec::new();
+        let results: Vec<i32> =
+            runtime.block_on(async { spawn_bounded_with_cx(&handle, &cx, 4, tasks).await });
         assert!(results.is_empty());
     }
 
     #[test]
     fn spawn_bounded_preserves_order() {
-        let runtime = CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let handle = runtime.handle();
 
         let tasks: Vec<
-            Box<
-                dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>>
-                    + Send,
-            >,
+            Box<dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>> + Send>,
         > = (0..5u32)
             .map(|i| {
                 let closure: Box<
-                    dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>>
-                        + Send,
+                    dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>> + Send,
                 > = Box::new(move |_cx| Box::pin(async move { i }));
                 closure
             })
             .collect();
 
-        let results = runtime.block_on(async {
-            spawn_bounded_with_cx(&handle, &cx, 2, tasks).await
-        });
+        let results =
+            runtime.block_on(async { spawn_bounded_with_cx(&handle, &cx, 2, tasks).await });
         assert_eq!(results, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
     fn spawn_bounded_concurrency_limit_1() {
-        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
-        let runtime = CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let handle = runtime.handle();
 
         let counter = Arc::new(AtomicU32::new(0));
         let tasks: Vec<
-            Box<
-                dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>>
-                    + Send,
-            >,
+            Box<dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>> + Send>,
         > = (0..3u32)
             .map(|i| {
                 let counter = Arc::clone(&counter);
                 let closure: Box<
-                    dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>>
-                        + Send,
+                    dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>> + Send,
                 > = Box::new(move |_cx| {
                     Box::pin(async move {
                         counter.fetch_add(1, Ordering::SeqCst);
@@ -603,9 +574,8 @@ mod tests {
             })
             .collect();
 
-        let results = runtime.block_on(async {
-            spawn_bounded_with_cx(&handle, &cx, 1, tasks).await
-        });
+        let results =
+            runtime.block_on(async { spawn_bounded_with_cx(&handle, &cx, 1, tasks).await });
         assert_eq!(results.len(), 3);
         assert_eq!(counter.load(Ordering::SeqCst), 3);
     }
@@ -616,39 +586,27 @@ mod tests {
 
     #[test]
     fn spawn_with_timeout_completes_in_time() {
-        let runtime = CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let handle = runtime.handle();
 
         let result = runtime.block_on(async {
-            spawn_with_timeout(&handle, &cx, Duration::from_secs(5), |_cx| async {
-                "fast"
-            })
-            .await
+            spawn_with_timeout(&handle, &cx, Duration::from_secs(5), |_cx| async { "fast" }).await
         });
         assert_eq!(result.unwrap(), "fast");
     }
 
     #[test]
     fn spawn_with_timeout_returns_error_on_timeout() {
-        let runtime = CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let handle = runtime.handle();
 
         let result = runtime.block_on(async {
-            spawn_with_timeout(
-                &handle,
-                &cx,
-                Duration::from_millis(1),
-                |_cx| async {
-                    crate::runtime_compat::sleep(Duration::from_secs(10)).await;
-                    "slow"
-                },
-            )
+            spawn_with_timeout(&handle, &cx, Duration::from_millis(1), |_cx| async {
+                crate::runtime_compat::sleep(Duration::from_secs(10)).await;
+                "slow"
+            })
             .await
         });
         assert!(result.is_err());

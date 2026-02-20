@@ -1044,7 +1044,11 @@ mod tests {
         ];
         for action in &actions {
             let label = action_label(action);
-            assert!(!label.is_empty(), "action_label({:?}) should be non-empty", action);
+            assert!(
+                !label.is_empty(),
+                "action_label({:?}) should be non-empty",
+                action
+            );
         }
     }
 

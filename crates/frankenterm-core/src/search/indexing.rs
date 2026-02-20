@@ -1482,15 +1482,20 @@ mod tests {
         let source = SearchDocumentSource::AgentArtifact;
         let json = serde_json::to_string(&source).expect("serialize");
         assert_eq!(json, "\"agent_artifact\"");
-        let parsed: SearchDocumentSource =
-            serde_json::from_str(&json).expect("deserialize");
+        let parsed: SearchDocumentSource = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, source);
     }
 
     #[test]
     fn test_document_source_equality() {
-        assert_eq!(SearchDocumentSource::Scrollback, SearchDocumentSource::Scrollback);
-        assert_ne!(SearchDocumentSource::Scrollback, SearchDocumentSource::Command);
+        assert_eq!(
+            SearchDocumentSource::Scrollback,
+            SearchDocumentSource::Scrollback
+        );
+        assert_ne!(
+            SearchDocumentSource::Scrollback,
+            SearchDocumentSource::Command
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1795,10 +1800,7 @@ mod tests {
         let artifacts = extract_agent_artifacts(text, 1000, Some(1), None);
         assert!(!artifacts.is_empty());
         let code_block = artifacts.iter().find(|a| {
-            a.metadata
-                .get("artifact_kind")
-                .and_then(|v| v.as_str())
-                == Some("code_block")
+            a.metadata.get("artifact_kind").and_then(|v| v.as_str()) == Some("code_block")
         });
         assert!(code_block.is_some());
     }
@@ -1808,9 +1810,9 @@ mod tests {
         let text = "error: cannot find module `foo`";
         let artifacts = extract_agent_artifacts(text, 1000, None, None);
         assert!(!artifacts.is_empty());
-        let err = artifacts.iter().find(|a| {
-            a.metadata.get("artifact_kind").and_then(|v| v.as_str()) == Some("error")
-        });
+        let err = artifacts
+            .iter()
+            .find(|a| a.metadata.get("artifact_kind").and_then(|v| v.as_str()) == Some("error"));
         assert!(err.is_some());
     }
 
@@ -1819,9 +1821,9 @@ mod tests {
         let text = "tool call: read_file(\"/foo/bar.rs\")";
         let artifacts = extract_agent_artifacts(text, 1000, None, None);
         assert!(!artifacts.is_empty());
-        let tool = artifacts.iter().find(|a| {
-            a.metadata.get("artifact_kind").and_then(|v| v.as_str()) == Some("tool")
-        });
+        let tool = artifacts
+            .iter()
+            .find(|a| a.metadata.get("artifact_kind").and_then(|v| v.as_str()) == Some("tool"));
         assert!(tool.is_some());
     }
 
@@ -1851,7 +1853,9 @@ mod tests {
         let mut index = SearchIndex::open(cfg).expect("open");
 
         let doc = make_doc("findable content", 1000, SearchDocumentSource::Scrollback);
-        let _ = index.ingest_documents(&[doc], 1010, false, None).expect("ingest");
+        let _ = index
+            .ingest_documents(&[doc], 1010, false, None)
+            .expect("ingest");
 
         let hits = index.search("", 10, 1020);
         assert!(hits.is_empty());
@@ -1865,7 +1869,9 @@ mod tests {
         let mut index = SearchIndex::open(cfg).expect("open");
 
         let doc = make_doc("findable content", 1000, SearchDocumentSource::Scrollback);
-        let _ = index.ingest_documents(&[doc], 1010, false, None).expect("ingest");
+        let _ = index
+            .ingest_documents(&[doc], 1010, false, None)
+            .expect("ingest");
 
         let hits = index.search("findable", 0, 1020);
         assert!(hits.is_empty());
@@ -1915,7 +1921,9 @@ mod tests {
         let mut index = SearchIndex::open(cfg).expect("open");
 
         let doc = make_doc("fresh", 5000, SearchDocumentSource::Scrollback);
-        let _ = index.ingest_documents(&[doc], 5010, false, None).expect("ingest");
+        let _ = index
+            .ingest_documents(&[doc], 5010, false, None)
+            .expect("ingest");
 
         let stats = index.stats(10_000);
         assert_eq!(stats.freshness_age_ms, Some(5000));
@@ -1935,14 +1943,18 @@ mod tests {
         let mut index = SearchIndex::open(cfg).expect("open");
 
         let old = make_doc("old content", 1000, SearchDocumentSource::Scrollback);
-        let _ = index.ingest_documents(&[old], 1010, false, None).expect("ingest old");
+        let _ = index
+            .ingest_documents(&[old], 1010, false, None)
+            .expect("ingest old");
         assert_eq!(index.documents().len(), 1);
 
         let new_docs = vec![
             make_doc("new alpha", 2000, SearchDocumentSource::Scrollback),
             make_doc("new beta", 2100, SearchDocumentSource::Scrollback),
         ];
-        let report = index.reindex_documents(&new_docs, 2200, None).expect("reindex");
+        let report = index
+            .reindex_documents(&new_docs, 2200, None)
+            .expect("reindex");
         assert_eq!(report.accepted_docs, 2);
         assert_eq!(index.documents().len(), 2);
         // Old content should be gone
@@ -1971,7 +1983,9 @@ mod tests {
             ));
         }
         // All submitted at the same timestamp within one rate window
-        let report = index.ingest_documents(&docs, 1000, false, None).expect("ingest");
+        let report = index
+            .ingest_documents(&docs, 1000, false, None)
+            .expect("ingest");
         assert_eq!(report.accepted_docs, 5);
         assert_eq!(report.deferred_rate_limited_docs, 5);
     }
@@ -1989,13 +2003,17 @@ mod tests {
             make_doc("b", 1000, SearchDocumentSource::Scrollback),
             make_doc("c", 1000, SearchDocumentSource::Scrollback),
         ];
-        let report_1 = index.ingest_documents(&docs_1, 1000, false, None).expect("batch1");
+        let report_1 = index
+            .ingest_documents(&docs_1, 1000, false, None)
+            .expect("batch1");
         assert_eq!(report_1.accepted_docs, 2);
         assert_eq!(report_1.deferred_rate_limited_docs, 1);
 
         // After 1000ms, rate window resets
         let docs_2 = vec![make_doc("d", 2000, SearchDocumentSource::Scrollback)];
-        let report_2 = index.ingest_documents(&docs_2, 2000, false, None).expect("batch2");
+        let report_2 = index
+            .ingest_documents(&docs_2, 2000, false, None)
+            .expect("batch2");
         assert_eq!(report_2.accepted_docs, 1);
         assert_eq!(report_2.deferred_rate_limited_docs, 0);
     }

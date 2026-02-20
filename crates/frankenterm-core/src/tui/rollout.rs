@@ -303,10 +303,7 @@ mod tests {
     fn parse_backend_similar_but_wrong() {
         assert_eq!(parse_backend(Some("ftui2")), TuiBackend::STAGE_DEFAULT);
         assert_eq!(parse_backend(Some("ratatuis")), TuiBackend::STAGE_DEFAULT);
-        assert_eq!(
-            parse_backend(Some("legacymode")),
-            TuiBackend::STAGE_DEFAULT
-        );
+        assert_eq!(parse_backend(Some("legacymode")), TuiBackend::STAGE_DEFAULT);
         assert_eq!(
             parse_backend(Some("frankentui1")),
             TuiBackend::STAGE_DEFAULT

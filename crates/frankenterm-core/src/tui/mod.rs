@@ -359,7 +359,11 @@ mod import_guardrail_tests {
     #[test]
     fn allowed_files_all_end_with_rs() {
         for f in ALLOWED_FILES {
-            assert!(f.ends_with(".rs"), "allowed file should end with .rs: {}", f);
+            assert!(
+                f.ends_with(".rs"),
+                "allowed file should end with .rs: {}",
+                f
+            );
         }
     }
 
