@@ -829,3 +829,138 @@ fn scheduler_snapshot_json_includes_all_fields() {
     assert!(json.contains("total_throttle_events"));
     assert!(json.contains("tracked_panes"));
 }
+
+// ─── Anti-starvation tiering properties ──────────────────────────────
+
+/// Strategy for mixed-priority pane lists sorted by (priority, pane_id)
+fn arb_mixed_priority_panes() -> impl Strategy<Value = Vec<(u64, u32)>> {
+    prop::collection::vec(
+        (1u64..100, prop_oneof![0u32..51, 51u32..101]),
+        1..30,
+    )
+    .prop_map(|mut panes| {
+        panes.sort_by_key(|&(id, prio)| (prio, id));
+        // Deduplicate by pane_id
+        panes.dedup_by_key(|p| p.0);
+        panes
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Low-priority panes (priority > 50) get at least 20% of slots
+    /// when they exist and there are enough permits.
+    #[test]
+    fn anti_starvation_low_prio_floor(
+        panes in arb_mixed_priority_panes(),
+        permits in 5usize..50,
+    ) {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0, // unlimited
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+        let selected = sched.select_panes(&panes, permits);
+
+        let low_prio_panes: Vec<u64> = panes.iter()
+            .filter(|&&(_, prio)| prio > 50)
+            .map(|&(id, _)| id)
+            .collect();
+
+        if !low_prio_panes.is_empty() {
+            let low_selected: usize = selected.iter()
+                .filter(|id| low_prio_panes.contains(id))
+                .count();
+            let effective = panes.len().min(permits);
+            let expected_floor = (effective * 2) / 10; // 20%
+            let min_expected = low_prio_panes.len().min(expected_floor);
+
+            prop_assert!(
+                low_selected >= min_expected,
+                "low-prio selected ({}) should be >= floor ({}), panes={}, permits={}",
+                low_selected, min_expected, panes.len(), permits
+            );
+        }
+    }
+
+    /// When all panes are high-priority, all slots go to high
+    #[test]
+    fn all_high_prio_gets_all_slots(
+        count in 1usize..30,
+        permits in 1usize..50,
+    ) {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+        let panes: Vec<(u64, u32)> = (1..=count as u64).map(|id| (id, 10)).collect();
+        let selected = sched.select_panes(&panes, permits);
+        prop_assert_eq!(
+            selected.len(),
+            count.min(permits),
+            "all high-prio panes should be selected up to permits"
+        );
+    }
+
+    /// When all panes are low-priority, they get all available slots
+    #[test]
+    fn all_low_prio_gets_all_slots(
+        count in 1usize..30,
+        permits in 1usize..50,
+    ) {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+        let panes: Vec<(u64, u32)> = (1..=count as u64).map(|id| (id, 80)).collect();
+        let selected = sched.select_panes(&panes, permits);
+        prop_assert_eq!(
+            selected.len(),
+            count.min(permits),
+            "all low-prio panes should get slots when no competition"
+        );
+    }
+
+    /// Total selected from mixed tiers never exceeds min(panes, permits)
+    #[test]
+    fn mixed_tier_total_bounded(
+        panes in arb_mixed_priority_panes(),
+        permits in 1usize..50,
+    ) {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+        let selected = sched.select_panes(&panes, permits);
+        prop_assert!(
+            selected.len() <= panes.len().min(permits),
+            "total selected ({}) should be <= min(panes={}, permits={})",
+            selected.len(), panes.len(), permits
+        );
+    }
+
+    /// All selected IDs come from the input pane list
+    #[test]
+    fn mixed_tier_ids_from_input(
+        panes in arb_mixed_priority_panes(),
+        permits in 1usize..50,
+    ) {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+        let selected = sched.select_panes(&panes, permits);
+        let input_ids: std::collections::HashSet<u64> = panes.iter().map(|&(id, _)| id).collect();
+        for &id in &selected {
+            prop_assert!(
+                input_ids.contains(&id),
+                "selected id {} not in input panes", id
+            );
+        }
+    }
+}
