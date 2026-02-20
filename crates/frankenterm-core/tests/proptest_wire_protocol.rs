@@ -704,3 +704,43 @@ fn invalid_json_rejected() {
     let err = WireEnvelope::from_json(b"not json");
     assert!(err.is_err());
 }
+
+// ============================================================================
+// Batch 15: additional property tests (DarkMill)
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// PaneMeta serde is deterministic.
+    #[test]
+    fn pane_meta_serde_deterministic(meta in arb_pane_meta()) {
+        let j1 = serde_json::to_string(&meta).unwrap();
+        let j2 = serde_json::to_string(&meta).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// PaneDelta serde is deterministic.
+    #[test]
+    fn pane_delta_serde_deterministic(delta in arb_pane_delta()) {
+        let j1 = serde_json::to_string(&delta).unwrap();
+        let j2 = serde_json::to_string(&delta).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// ConnectionState serde is deterministic.
+    #[test]
+    fn connection_state_serde_deterministic(state in arb_connection_state()) {
+        let j1 = serde_json::to_string(&state).unwrap();
+        let j2 = serde_json::to_string(&state).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// GapNotice serde is deterministic.
+    #[test]
+    fn gap_notice_serde_deterministic(gap in arb_gap_notice()) {
+        let j1 = serde_json::to_string(&gap).unwrap();
+        let j2 = serde_json::to_string(&gap).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}

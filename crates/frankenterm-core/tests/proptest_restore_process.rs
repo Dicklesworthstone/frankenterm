@@ -581,3 +581,53 @@ proptest! {
         prop_assert_eq!(back.results[1].old_pane_id, r2.old_pane_id);
     }
 }
+
+// =========================================================================
+// Batch 15: additional property tests (DarkMill)
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// LaunchConfig Debug is non-empty (ext).
+    #[test]
+    fn launch_config_debug_nonempty_ext(_dummy in 0..1u8) {
+        let config = LaunchConfig::default();
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// LaunchReport default has zero counts.
+    #[test]
+    fn launch_report_default_zero_counts(_dummy in 0..1u8) {
+        let report = LaunchReport::default();
+        prop_assert_eq!(report.shells_launched, 0);
+        prop_assert_eq!(report.agents_launched, 0);
+        prop_assert!(report.results.is_empty());
+    }
+
+    /// LaunchAction Clone preserves variant (ext).
+    #[test]
+    fn launch_action_clone_preserves_ext(action in arb_launch_action()) {
+        let cloned = action.clone();
+        let j1 = serde_json::to_string(&action).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// ProcessPlan serde is deterministic (ext).
+    #[test]
+    fn process_plan_serde_deterministic_ext(plan in arb_process_plan()) {
+        let j1 = serde_json::to_string(&plan).unwrap();
+        let j2 = serde_json::to_string(&plan).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// LaunchResult old_pane_id preserved through serde.
+    #[test]
+    fn launch_result_pane_id_preserved(result in arb_launch_result()) {
+        let json = serde_json::to_string(&result).unwrap();
+        let back: LaunchResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.old_pane_id, result.old_pane_id);
+    }
+}

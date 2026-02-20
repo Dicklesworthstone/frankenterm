@@ -460,3 +460,41 @@ proptest! {
         prop_assert!(!err_resp.ok);
     }
 }
+
+// =========================================================================
+// Batch 15: additional property tests (DarkMill)
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// IpcResponse serde is deterministic.
+    #[test]
+    fn response_serde_deterministic(response in arb_ipc_response()) {
+        let j1 = serde_json::to_string(&response).unwrap();
+        let j2 = serde_json::to_string(&response).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// IpcRequest Debug output is non-empty.
+    #[test]
+    fn request_debug_nonempty(request in arb_ipc_request()) {
+        let debug = format!("{:?}", request);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// IpcResponse Debug output is non-empty.
+    #[test]
+    fn response_debug_nonempty(response in arb_ipc_response()) {
+        let debug = format!("{:?}", response);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// IpcRequest serde is deterministic.
+    #[test]
+    fn request_serde_deterministic(request in arb_ipc_request()) {
+        let j1 = serde_json::to_string(&request).unwrap();
+        let j2 = serde_json::to_string(&request).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}

@@ -698,3 +698,33 @@ fn policy_input_clone_preserves_action() {
     assert_eq!(input.action.as_str(), c.action.as_str());
     assert_eq!(input.pane_id, c.pane_id);
 }
+
+// =============================================================================
+// Batch 15: additional property tests (DarkMill)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// PolicyInput with_pane sets pane_id.
+    #[test]
+    fn policy_input_with_pane(pane_id in 0_u64..10_000) {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(pane_id);
+        prop_assert_eq!(input.pane_id, Some(pane_id));
+    }
+
+    /// PolicyInput with_domain sets domain.
+    #[test]
+    fn policy_input_with_domain(domain in "[a-z]{3,20}") {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_domain(&domain);
+        prop_assert_eq!(input.domain.as_deref(), Some(domain.as_str()));
+    }
+
+    /// ActionKind as_str is non-empty for all variants (ext).
+    #[test]
+    fn action_kind_as_str_nonempty_ext(kind in arb_action_kind()) {
+        prop_assert!(!kind.as_str().is_empty());
+    }
+}
