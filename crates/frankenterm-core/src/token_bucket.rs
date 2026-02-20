@@ -32,9 +32,11 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use frankenterm_core::token_bucket::TokenBucket;
+///
 /// let mut bucket = TokenBucket::new(10.0, 5.0); // 10 capacity, 5 tokens/sec
-/// let now_ms = current_time_ms();
+/// let now_ms = 1000;
 /// assert!(bucket.try_acquire(1, now_ms));  // succeeds
 /// ```
 #[derive(Debug, Clone)]
@@ -205,12 +207,15 @@ impl TokenBucket {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use frankenterm_core::token_bucket::{TokenBucket, HierarchicalBucket};
+///
 /// let mut hb = HierarchicalBucket::new(
 ///     TokenBucket::new(5.0, 2.0),   // local: 5 capacity, 2/sec
 ///     TokenBucket::new(50.0, 20.0),  // global: 50 capacity, 20/sec
 /// );
-/// assert!(hb.try_acquire(1, now_ms)); // checks both buckets
+/// let now_ms = 1000;
+/// assert!(hb.try_acquire(1, now_ms).is_allowed()); // checks both buckets
 /// ```
 #[derive(Debug, Clone)]
 pub struct HierarchicalBucket {

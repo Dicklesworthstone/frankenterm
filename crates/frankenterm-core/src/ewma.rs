@@ -31,8 +31,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Example
 ///
-/// ```ignore
-/// let mut ewma = Ewma::with_half_life_ms(1000); // 1 second half-life
+/// ```
+/// use frankenterm_core::ewma::Ewma;
+///
+/// let mut ewma = Ewma::with_half_life_ms(1000.0); // 1 second half-life
 /// ewma.observe(100.0, 0);
 /// ewma.observe(200.0, 500);  // alpha ≈ 0.29
 /// ewma.observe(150.0, 1000); // alpha ≈ 0.29
@@ -261,8 +263,10 @@ impl EwmaWithVariance {
 ///
 /// # Example
 ///
-/// ```ignore
-/// let mut rate = RateEstimator::with_half_life_ms(5000);
+/// ```
+/// use frankenterm_core::ewma::RateEstimator;
+///
+/// let mut rate = RateEstimator::with_half_life_ms(5000.0);
 /// rate.tick(1000);
 /// rate.tick(1100);  // 100ms interval → ~10 events/sec
 /// rate.tick(1200);  // 100ms interval → ~10 events/sec
