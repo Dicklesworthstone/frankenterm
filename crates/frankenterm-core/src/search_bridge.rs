@@ -731,7 +731,7 @@ mod tests {
         token.cancel();
         // cancelled() should return immediately because it's already cancelled
         run_async(async {
-            tokio::time::timeout(Duration::from_millis(100), token.cancelled())
+            crate::runtime_compat::timeout(Duration::from_millis(100), token.cancelled())
                 .await
                 .expect("cancelled() should resolve immediately when already cancelled");
         });
@@ -742,14 +742,14 @@ mod tests {
         let token = BridgeCancellationToken::new();
         let token_clone = token.clone();
         run_async(async {
-            let waiter = tokio::spawn(async move {
+            let waiter = crate::runtime_compat::task::spawn(async move {
                 token_clone.cancelled().await;
                 true
             });
             // Give the waiter a moment to register
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            crate::runtime_compat::sleep(Duration::from_millis(10)).await;
             token.cancel();
-            let result = tokio::time::timeout(Duration::from_millis(200), waiter)
+            let result = crate::runtime_compat::timeout(Duration::from_millis(200), waiter)
                 .await
                 .expect("should not timeout")
                 .expect("task should not panic");
