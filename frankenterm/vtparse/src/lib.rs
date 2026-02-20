@@ -478,17 +478,20 @@ impl VTParser {
         self.state == State::Ground
     }
 
-    fn as_integer_params(&self) -> [i64; MAX_PARAMS] {
+    fn as_integer_params(&self) -> ([i64; MAX_PARAMS], usize) {
         let mut res = [0i64; MAX_PARAMS];
-        let mut i = 0;
+        let mut count = 0;
         for src in &self.params[0..self.num_params] {
             if let CsiParam::Integer(value) = src {
-                res[i] = *value;
+                res[count] = *value;
             } else if let CsiParam::P(b';') = src {
-                i += 1;
+                count += 1;
             }
         }
-        res
+        if self.num_params > 0 {
+            count += 1;
+        }
+        (res, count)
     }
 
     fn finish_param(&mut self) {
@@ -582,9 +585,10 @@ impl VTParser {
             }
             Action::Hook => {
                 self.finish_param();
+                let (int_params, int_count) = self.as_integer_params();
                 actor.dcs_hook(
                     param,
-                    &self.as_integer_params()[0..self.num_params],
+                    &int_params[0..int_count],
                     &self.intermediates[0..self.num_intermediates],
                     self.ignored_excess_intermediates,
                 );
@@ -592,8 +596,9 @@ impl VTParser {
             Action::Put => actor.dcs_put(param),
             Action::EscDispatch => {
                 self.finish_param();
+                let (int_params, int_count) = self.as_integer_params();
                 actor.esc_dispatch(
-                    &self.as_integer_params()[0..self.num_params],
+                    &int_params[0..int_count],
                     &self.intermediates[0..self.num_intermediates],
                     self.ignored_excess_intermediates,
                     param,

@@ -221,7 +221,10 @@ impl Display for ShortDeviceControl {
         for b in &self.data {
             f.write_char(*b as char)?;
         }
-        write!(f, "\x1b\\")
+        // Don't include the string terminator here; it is emitted
+        // as a separate StringTerminator action, consistent with
+        // DeviceControlMode::Exit which also relies on the following ST.
+        Ok(())
     }
 }
 
@@ -971,10 +974,8 @@ mod tests {
             data: vec![b'A', b'B'],
         };
         let s = format!("{sdc}");
-        assert!(s.starts_with("\x1bP"));
-        assert!(s.contains("1;2"));
-        assert!(s.contains("q"));
-        assert!(s.ends_with("\x1b\\"));
+        // ST is not included; it comes as a separate StringTerminator action
+        assert_eq!(s, "\x1bP1;2qAB");
     }
 
     #[test]
