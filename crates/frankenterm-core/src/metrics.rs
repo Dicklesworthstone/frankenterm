@@ -452,25 +452,27 @@ impl MetricsServer {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
 
         let join = crate::runtime_compat::task::spawn(async move {
+            let accept_poll_interval = Duration::from_millis(250);
             loop {
-                tokio::select! {
-                    accept = listener.accept() => {
-                        match accept {
-                            Ok((socket, peer)) => {
-                                let collector = Arc::clone(&collector);
-                                let prefix = prefix.clone();
-                                crate::runtime_compat::task::spawn(async move {
-                                    if let Err(err) = handle_connection(socket, &prefix, collector).await {
-                                        debug!(error = %err, peer = %peer, "Metrics connection failed");
-                                    }
-                                });
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                match crate::runtime_compat::timeout(accept_poll_interval, listener.accept()).await
+                {
+                    Ok(Ok((socket, peer))) => {
+                        let collector = Arc::clone(&collector);
+                        let prefix = prefix.clone();
+                        crate::runtime_compat::task::spawn(async move {
+                            if let Err(err) = handle_connection(socket, &prefix, collector).await {
+                                debug!(error = %err, peer = %peer, "Metrics connection failed");
                             }
-                            Err(err) => {
-                                warn!(error = %err, "Metrics listener accept failed");
-                            }
-                        }
+                        });
                     }
-                    () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
+                    Ok(Err(err)) => {
+                        warn!(error = %err, "Metrics listener accept failed");
+                    }
+                    Err(_) => {}
                 }
             }
         });
@@ -550,12 +552,6 @@ fn epoch_ms_u64() -> u64 {
         .ok()
         .and_then(|d| u64::try_from(d.as_millis()).ok())
         .unwrap_or(0)
-}
-
-async fn wait_for_shutdown(flag: Arc<AtomicBool>) {
-    while !flag.load(Ordering::SeqCst) {
-        crate::runtime_compat::sleep(Duration::from_millis(250)).await;
-    }
 }
 
 fn metric_name(prefix: &str, name: &str) -> String {

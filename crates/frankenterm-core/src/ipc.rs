@@ -707,6 +707,9 @@ impl IpcServer {
             }
         }
 
+        // Abort active client handlers so shutdown cannot hang on a client
+        // that connected but never completed a newline-delimited request.
+        connection_tasks.abort_all();
         while let Some(join_result) = connection_tasks.join_next().await {
             if let Err(join_err) = join_result {
                 tracing::debug!(error = %join_err, "IPC client task failed during shutdown");
@@ -1633,6 +1636,42 @@ mod tests {
             send_shutdown(&shutdown_tx).await;
             let _ = server_handle.await;
             assert!(!socket_path.exists());
+        });
+    }
+
+    #[test]
+    fn shutdown_does_not_hang_with_idle_client_connection() {
+        run_async_test(async {
+            use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
+
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
+
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server.run(event_bus, shutdown_rx).await;
+            });
+
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+
+            // Hold a connection open with an incomplete request to simulate an
+            // idle/stuck client handler blocked on line reads.
+            let mut idle_client = compat_unix::connect(&socket_path).await.unwrap();
+            idle_client.write_all(br#"{"type":"ping""#).await.unwrap();
+
+            send_shutdown(&shutdown_tx).await;
+            let shutdown_wait = crate::runtime_compat::timeout(
+                std::time::Duration::from_millis(500),
+                server_handle,
+            )
+            .await;
+            assert!(
+                shutdown_wait.is_ok(),
+                "IPC shutdown timed out with idle client connection"
+            );
         });
     }
 

@@ -1826,6 +1826,7 @@ impl ObservationRuntime {
             max_concurrent: self.config.max_concurrent_captures,
             overlap_size,
             send_timeout: Duration::from_millis(100),
+            capture_timeout: Duration::from_secs(2),
         };
 
         task::spawn(async move {
@@ -1848,109 +1849,117 @@ impl ObservationRuntime {
             // Sync tailers periodically with discovery interval.
             // Keep the first sync immediate to preserve prior interval behavior.
             let mut next_sync_tick = Instant::now();
+            let tick_duration = Duration::from_millis(10);
+            let mut next_spawn_tick = Instant::now() + tick_duration;
             let mut poll_tasks = TailerPollTaskSet::new();
 
             loop {
-                // Determine poll interval dynamically from supervisor config
-                // (Using min_interval for responsiveness)
-                // Actually supervisor manages per-tailer intervals. We just need to wake up often enough to spawn ready tasks.
-                // A fixed tick is fine, supervisor filters ready tasks.
-                let tick_duration = Duration::from_millis(10);
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    debug!("Capture task: shutdown signal received");
+                    break;
+                }
 
-                let sync_wait = next_sync_tick.saturating_duration_since(Instant::now());
+                let now = Instant::now();
+                if now >= next_sync_tick {
+                    next_sync_tick = now + discovery_interval;
+                    heartbeats.record_capture();
 
-                tokio::select! {
-                    () = sleep(sync_wait) => {
-                        next_sync_tick = Instant::now() + discovery_interval;
-                        heartbeats.record_capture();
-
-                        if shutdown_flag.load(Ordering::SeqCst) {
-                            debug!("Capture task: shutdown signal received");
-                            break;
-                        }
-
-                        // Check for config updates
-                        if watch_has_changed(&config_rx) {
-                            let new_config = watch_borrow_and_update_clone(&mut config_rx);
-                            let new_tailer_config = TailerConfig {
-                                min_interval: Duration::from_millis(new_config.min_poll_interval_ms),
-                                max_interval: Duration::from_millis(new_config.poll_interval_ms),
-                                backoff_multiplier: 1.5,
-                                max_concurrent: new_config.max_concurrent_captures as usize,
-                                overlap_size, // Use captured overlap_size
-                                send_timeout: Duration::from_millis(100),
-                            };
-                            supervisor.update_config(new_tailer_config);
-                            supervisor.update_budget(new_config.capture_budgets.clone());
-                            pane_priorities = new_config.pane_priorities.clone();
-                        }
-
-                        // Get current observed panes from registry
-                        let observed_panes: HashMap<u64, PaneInfo> = {
-                            let reg = registry.read().await;
-                            reg.observed_pane_ids()
-                                .into_iter()
-                                .filter_map(|id| reg.get_entry(id).map(|e| (id, e.info.clone())))
-                                .collect()
+                    // Check for config updates
+                    if watch_has_changed(&config_rx) {
+                        let new_config = watch_borrow_and_update_clone(&mut config_rx);
+                        let new_tailer_config = TailerConfig {
+                            min_interval: Duration::from_millis(new_config.min_poll_interval_ms),
+                            max_interval: Duration::from_millis(new_config.poll_interval_ms),
+                            backoff_multiplier: 1.5,
+                            max_concurrent: new_config.max_concurrent_captures as usize,
+                            overlap_size, // Use captured overlap_size
+                            send_timeout: Duration::from_millis(100),
+                            capture_timeout: Duration::from_secs(2),
                         };
-
-                        supervisor.sync_tailers(&observed_panes);
-
-                        // Update effective priorities (config rules + runtime overrides).
-                        //
-                        // This is intentionally computed in the runtime (not the tailer) so:
-                        // - the tailer stays transport/scheduler focused
-                        // - overrides can be set via IPC without restarting
-                        let effective_priorities: HashMap<u64, u32> = {
-                            let now = epoch_ms();
-                            let mut reg = registry.write().await;
-                            reg.purge_expired_priority_overrides(now);
-
-                            reg.observed_pane_ids()
-                                .into_iter()
-                                .filter_map(|id| {
-                                    let entry = reg.get_entry(id)?;
-                                    let domain = entry.info.inferred_domain();
-                                    let title = entry.info.title.as_deref().unwrap_or("");
-                                    let cwd = entry.info.cwd.as_deref().unwrap_or("");
-                                    let base =
-                                        pane_priorities.priority_for_pane(&domain, title, cwd);
-                                    let override_priority = entry
-                                        .priority_override
-                                        .as_ref()
-                                        .and_then(|ov| {
-                                            if ov.expires_at.is_some_and(|exp| exp <= now) {
-                                                None
-                                            } else {
-                                                Some(ov.priority)
-                                            }
-                                        });
-                                    Some((id, override_priority.unwrap_or(base)))
-                                })
-                                .collect()
-                        };
-                        supervisor.update_pane_priorities(effective_priorities);
-
-                        // Publish scheduler snapshot for health reporting.
-                        *scheduler_snapshot.write().await = supervisor.scheduler_snapshot();
-
-                        debug!(
-                            active_tailers = supervisor.active_count(),
-                            observed_panes = observed_panes.len(),
-                            "Tailer sync tick"
-                        );
+                        supervisor.update_config(new_tailer_config);
+                        supervisor.update_budget(new_config.capture_budgets.clone());
+                        pane_priorities = new_config.pane_priorities.clone();
                     }
-                    // Handle completed captures
-                    Some((pane_id, outcome)) = poll_tasks.join_next(), if !poll_tasks.is_empty() => {
-                        supervisor.handle_poll_result(pane_id, outcome);
-                    }
-                    // Spawn new captures if slots available
-                    () = sleep(tick_duration) => {
-                         if shutdown_flag.load(Ordering::SeqCst) {
-                            break;
+
+                    // Get current observed panes from registry
+                    let observed_panes: HashMap<u64, PaneInfo> = {
+                        let reg = registry.read().await;
+                        reg.observed_pane_ids()
+                            .into_iter()
+                            .filter_map(|id| reg.get_entry(id).map(|e| (id, e.info.clone())))
+                            .collect()
+                    };
+
+                    supervisor.sync_tailers(&observed_panes);
+
+                    // Update effective priorities (config rules + runtime overrides).
+                    //
+                    // This is intentionally computed in the runtime (not the tailer) so:
+                    // - the tailer stays transport/scheduler focused
+                    // - overrides can be set via IPC without restarting
+                    let effective_priorities: HashMap<u64, u32> = {
+                        let now = epoch_ms();
+                        let mut reg = registry.write().await;
+                        reg.purge_expired_priority_overrides(now);
+
+                        reg.observed_pane_ids()
+                            .into_iter()
+                            .filter_map(|id| {
+                                let entry = reg.get_entry(id)?;
+                                let domain = entry.info.inferred_domain();
+                                let title = entry.info.title.as_deref().unwrap_or("");
+                                let cwd = entry.info.cwd.as_deref().unwrap_or("");
+                                let base = pane_priorities.priority_for_pane(&domain, title, cwd);
+                                let override_priority =
+                                    entry.priority_override.as_ref().and_then(|ov| {
+                                        if ov.expires_at.is_some_and(|exp| exp <= now) {
+                                            None
+                                        } else {
+                                            Some(ov.priority)
+                                        }
+                                    });
+                                Some((id, override_priority.unwrap_or(base)))
+                            })
+                            .collect()
+                    };
+                    supervisor.update_pane_priorities(effective_priorities);
+
+                    // Publish scheduler snapshot for health reporting.
+                    *scheduler_snapshot.write().await = supervisor.scheduler_snapshot();
+
+                    debug!(
+                        active_tailers = supervisor.active_count(),
+                        observed_panes = observed_panes.len(),
+                        "Tailer sync tick"
+                    );
+                    continue;
+                }
+
+                if now >= next_spawn_tick {
+                    next_spawn_tick = now + tick_duration;
+                    supervisor.spawn_ready(&mut poll_tasks);
+                    continue;
+                }
+
+                let next_deadline = if next_sync_tick <= next_spawn_tick {
+                    next_sync_tick
+                } else {
+                    next_spawn_tick
+                };
+                let wait_duration = next_deadline.saturating_duration_since(Instant::now());
+                if wait_duration.is_zero() {
+                    continue;
+                }
+
+                if !poll_tasks.is_empty() {
+                    match timeout(wait_duration, poll_tasks.join_next()).await {
+                        Ok(Some((pane_id, outcome))) => {
+                            supervisor.handle_poll_result(pane_id, outcome);
                         }
-                        supervisor.spawn_ready(&mut poll_tasks);
+                        Ok(None) | Err(_) => {}
                     }
+                } else {
+                    sleep(wait_duration).await;
                 }
             }
 
