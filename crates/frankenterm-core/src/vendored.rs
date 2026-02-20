@@ -325,33 +325,24 @@ mod tests {
         assert!(!report.allow_vendored);
     }
 
-    // --- Build metadata tests (vendored maintenance plan wa-nu4.4.1.7) ---
-
     #[test]
     fn vendored_metadata_returns_struct() {
         let meta = vendored_metadata();
-        // Whether feature is enabled depends on build flags; struct should always construct
-        assert!(meta.commit.is_some() || meta.commit.is_none()); // non-panic check
+        assert!(meta.commit.is_some() || meta.commit.is_none());
         assert_eq!(meta.enabled, cfg!(feature = "vendored"));
     }
 
     #[test]
     fn commit_prefix_matching_works_both_directions() {
-        // Short local prefix matches long vendored
         assert!(commit_matches("abcdef1234567890", "abcdef12"));
-        // Long local matches short vendored prefix
         assert!(commit_matches("abcdef12", "abcdef1234567890"));
-        // Exact match
         assert!(commit_matches("abcdef12", "abcdef12"));
-        // No match
         assert!(!commit_matches("abcdef12", "deadbeef"));
     }
 
     #[test]
     fn extract_commit_ignores_pure_numeric_tokens() {
-        // Date-like tokens (pure digits) should not be treated as commits
         assert!(extract_commit("20240203-110809").is_none());
-        // But hex-containing tokens should work
         assert_eq!(
             extract_commit("20240203-110809-5046fc22").as_deref(),
             Some("5046fc22")
@@ -398,7 +389,6 @@ mod tests {
         let meta = meta_with(Some("abcdef12"), true);
         let local = WeztermVersion::parse("wezterm 20240101-123456-abcdef12");
         let report = compatibility_report_with(meta, Some(&local));
-
         let json = serde_json::to_value(&report).expect("report should serialize");
         assert_eq!(json["status"], "matched");
         assert_eq!(json["vendored_enabled"], true);
@@ -411,15 +401,9 @@ mod tests {
         let meta = meta_with(Some("abcdef12"), true);
         let local = WeztermVersion::parse("wezterm 20240101-123456-deadbeef");
         let report = compatibility_report_with(meta, Some(&local));
-
         let json = serde_json::to_value(&report).expect("report should serialize");
         assert_eq!(json["status"], "incompatible");
-        assert!(
-            json["recommendation"]
-                .as_str()
-                .unwrap()
-                .contains("Update WezTerm")
-        );
+        assert!(json["recommendation"].as_str().unwrap().contains("Update WezTerm"));
         assert_eq!(json["local_commit"], "deadbeef");
         assert_eq!(json["vendored_commit"], "abcdef12");
     }
@@ -428,7 +412,6 @@ mod tests {
     fn disabled_feature_report_json() {
         let meta = meta_with(Some("abcdef12"), false);
         let report = compatibility_report_with(meta, None);
-
         let json = serde_json::to_value(&report).expect("report should serialize");
         assert_eq!(json["status"], "compatible");
         assert_eq!(json["vendored_enabled"], false);
@@ -437,28 +420,17 @@ mod tests {
 
     #[test]
     fn parse_various_wezterm_formats() {
-        // Standard nightly
         let v = WeztermVersion::parse("wezterm 20240203-110809-5046fc22");
         assert_eq!(v.commit.as_deref(), Some("5046fc22"));
-
-        // With parenthesized suffix
         let v = WeztermVersion::parse("wezterm 20240203-110809-5046fc22 (Ubuntu 24.04)");
         assert_eq!(v.commit.as_deref(), Some("5046fc22"));
-
-        // Development build with long hash
         let v = WeztermVersion::parse("wezterm-gui 0.0.0+05343b387085");
         assert_eq!(v.commit.as_deref(), Some("05343b387085"));
-
-        // Release with no hash
         let v = WeztermVersion::parse("wezterm 20240101");
         assert!(v.commit.is_none());
-
-        // Empty string
         let v = WeztermVersion::parse("");
         assert!(v.commit.is_none());
     }
-
-    // --- Vendored test consolidation (wa-nu4.4.1.5) ---
 
     #[test]
     fn compatibility_all_status_variants_serialize() {
@@ -479,7 +451,6 @@ mod tests {
         let meta = meta_with(Some("abcdef12"), true);
         let local = WeztermVersion::parse("wezterm 20240101-123456-abcdef12");
         let report = compatibility_report_with(meta, Some(&local));
-
         let json_str = serde_json::to_string(&report).expect("serialize report");
         let back: VendoredCompatibilityReport =
             serde_json::from_str(&json_str).expect("deserialize report");
@@ -500,8 +471,83 @@ mod tests {
     #[test]
     fn vendored_metadata_enabled_reflects_feature() {
         let meta = vendored_metadata();
-        // When compiled with vendored feature, enabled should be true; otherwise false.
-        // We can't control build features in test, but we verify consistency.
         assert_eq!(meta.enabled, cfg!(feature = "vendored"));
+    }
+
+    // --- Additional coverage: vendored expanded tests ---
+
+    #[test]
+    fn wezterm_version_parse_preserves_raw() {
+        let raw = "wezterm 20240203-110809-5046fc22";
+        let v = WeztermVersion::parse(raw);
+        assert_eq!(v.raw, raw);
+    }
+
+    #[test]
+    fn wezterm_version_equality() {
+        let v1 = WeztermVersion::parse("wezterm 20240203-110809-5046fc22");
+        let v2 = WeztermVersion::parse("wezterm 20240203-110809-5046fc22");
+        assert_eq!(v1, v2);
+    }
+
+    #[test]
+    fn wezterm_version_inequality() {
+        let v1 = WeztermVersion::parse("wezterm 20240203-110809-5046fc22");
+        let v2 = WeztermVersion::parse("wezterm 20240203-110809-deadbeef");
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn extract_commit_lowercase_normalization() {
+        let commit = extract_commit("wezterm 20240203-110809-ABCDEF12");
+        assert_eq!(commit.as_deref(), Some("abcdef12"));
+    }
+
+    #[test]
+    fn extract_commit_short_tokens_ignored() {
+        assert!(extract_commit("abc12").is_none());
+        assert!(extract_commit("ab1c2d").is_none());
+    }
+
+    #[test]
+    fn vendored_metadata_default_fields() {
+        let meta = VendoredWeztermMetadata::default();
+        assert!(!meta.enabled);
+        assert!(meta.commit.is_none());
+        assert!(meta.version.is_none());
+        assert!(meta.source.is_none());
+    }
+
+    #[test]
+    fn compatibility_incompatible_message_contains_commits() {
+        let meta = meta_with(Some("aabbccdd"), true);
+        // Local commit must contain at least one a-f hex char for extract_commit
+        let local = WeztermVersion::parse("wezterm 20240101-123456-ff223344");
+        let report = compatibility_report_with(meta, Some(&local));
+        assert_eq!(report.status, VendoredCompatibilityStatus::Incompatible);
+        assert!(report.message.contains("ff223344"));
+        assert!(report.message.contains("aabbccdd"));
+    }
+
+    #[test]
+    fn meta_with_helper_sets_version() {
+        let meta = meta_with(Some("abc1234d"), true);
+        assert_eq!(meta.version.as_deref(), Some("0.1.0"));
+        assert_eq!(meta.commit.as_deref(), Some("abc1234d"));
+        assert!(meta.enabled);
+    }
+
+    #[test]
+    fn compatibility_status_clone_and_eq() {
+        let s1 = VendoredCompatibilityStatus::Matched;
+        let s2 = s1;
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn wezterm_version_parse_trims_whitespace() {
+        let v = WeztermVersion::parse("  wezterm 20240203-110809-5046fc22  ");
+        assert_eq!(v.raw, "wezterm 20240203-110809-5046fc22");
+        assert_eq!(v.commit.as_deref(), Some("5046fc22"));
     }
 }

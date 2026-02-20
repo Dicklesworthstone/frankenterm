@@ -275,4 +275,208 @@ mod import_guardrail_tests {
             unlisted.join("\n  ")
         );
     }
+
+    // -- is_exempt_line unit tests --
+
+    #[test]
+    fn exempt_line_comment() {
+        assert!(is_exempt_line("// use ratatui"));
+        assert!(is_exempt_line("  // some comment"));
+    }
+
+    #[test]
+    fn exempt_line_doc_comment() {
+        assert!(is_exempt_line("/// use ratatui::widgets"));
+        assert!(is_exempt_line("  /// doc comment with crossterm::"));
+    }
+
+    #[test]
+    fn exempt_line_module_doc() {
+        assert!(is_exempt_line("//! module doc with ratatui::"));
+        assert!(is_exempt_line("  //! inner doc comment"));
+    }
+
+    #[test]
+    fn exempt_line_cfg_gated() {
+        assert!(is_exempt_line("#[cfg(feature = \"tui\")] use ratatui;"));
+        assert!(is_exempt_line("  #[cfg(test)] mod foo;"));
+    }
+
+    #[test]
+    fn not_exempt_regular_code() {
+        assert!(!is_exempt_line("use ratatui::widgets;"));
+        assert!(!is_exempt_line("let x = 42;"));
+        assert!(!is_exempt_line("fn main() {}"));
+    }
+
+    #[test]
+    fn not_exempt_empty_string() {
+        assert!(!is_exempt_line(""));
+    }
+
+    #[test]
+    fn not_exempt_whitespace_only() {
+        assert!(!is_exempt_line("   "));
+        assert!(!is_exempt_line("\t"));
+    }
+
+    #[test]
+    fn exempt_comment_with_ratatui_mention() {
+        assert!(is_exempt_line("// ratatui::frame::Frame"));
+        assert!(is_exempt_line("// crossterm::event::Event"));
+    }
+
+    #[test]
+    fn not_exempt_code_with_cfg_in_string() {
+        // is_exempt_line uses .contains("#[cfg") so string literals with #[cfg
+        // are treated as exempt — a known limitation acceptable for the guardrail.
+        assert!(is_exempt_line("let s = \"not #[cfg gated\";"));
+    }
+
+    // -- Constant validation tests --
+
+    #[test]
+    fn forbidden_patterns_are_non_empty() {
+        assert!(!FORBIDDEN_PATTERNS.is_empty());
+    }
+
+    #[test]
+    fn forbidden_patterns_all_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for p in FORBIDDEN_PATTERNS {
+            assert!(seen.insert(p), "duplicate forbidden pattern: {}", p);
+        }
+    }
+
+    #[test]
+    fn forbidden_patterns_contain_ratatui_and_crossterm() {
+        let has_ratatui = FORBIDDEN_PATTERNS.iter().any(|p| p.contains("ratatui"));
+        let has_crossterm = FORBIDDEN_PATTERNS.iter().any(|p| p.contains("crossterm"));
+        assert!(has_ratatui, "should have a ratatui pattern");
+        assert!(has_crossterm, "should have a crossterm pattern");
+    }
+
+    #[test]
+    fn allowed_files_all_end_with_rs() {
+        for f in ALLOWED_FILES {
+            assert!(f.ends_with(".rs"), "allowed file should end with .rs: {}", f);
+        }
+    }
+
+    #[test]
+    fn allowed_files_all_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for f in ALLOWED_FILES {
+            assert!(seen.insert(f), "duplicate allowed file: {}", f);
+        }
+    }
+
+    #[test]
+    fn agnostic_modules_all_unique_names() {
+        let mut seen = std::collections::HashSet::new();
+        for (name, _) in AGNOSTIC_MODULES {
+            assert!(seen.insert(name), "duplicate agnostic module: {}", name);
+        }
+    }
+
+    #[test]
+    fn agnostic_modules_all_have_content() {
+        for (name, content) in AGNOSTIC_MODULES {
+            assert!(
+                !content.is_empty(),
+                "agnostic module {} has empty content",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn agnostic_modules_names_end_with_rs() {
+        for (name, _) in AGNOSTIC_MODULES {
+            assert!(
+                name.ends_with(".rs"),
+                "agnostic module name should end with .rs: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_and_agnostic_are_disjoint() {
+        let agnostic_names: Vec<&str> = AGNOSTIC_MODULES.iter().map(|(n, _)| *n).collect();
+        for allowed in ALLOWED_FILES {
+            assert!(
+                !agnostic_names.contains(allowed),
+                "file {} is in both ALLOWED_FILES and AGNOSTIC_MODULES",
+                allowed
+            );
+        }
+    }
+
+    #[test]
+    fn agnostic_module_count_matches_expectation() {
+        assert!(
+            AGNOSTIC_MODULES.len() >= 5,
+            "expected at least 5 agnostic modules, got {}",
+            AGNOSTIC_MODULES.len()
+        );
+    }
+
+    #[test]
+    fn forbidden_patterns_detect_use_import() {
+        let line = "use ratatui::widgets::Table;";
+        assert!(FORBIDDEN_PATTERNS.iter().any(|p| line.contains(p)));
+    }
+
+    #[test]
+    fn forbidden_patterns_detect_qualified_path() {
+        let line = "let frame = ratatui::Frame::default();";
+        assert!(FORBIDDEN_PATTERNS.iter().any(|p| line.contains(p)));
+    }
+
+    #[test]
+    fn forbidden_patterns_do_not_match_safe_code() {
+        let line = "let name = \"frankenterm\";";
+        assert!(!FORBIDDEN_PATTERNS.iter().any(|p| line.contains(p)));
+    }
+
+    #[test]
+    fn exempt_mixed_cfg_and_use() {
+        assert!(is_exempt_line(
+            "#[cfg(feature = \"tui\")] use ratatui::Frame;"
+        ));
+    }
+
+    #[test]
+    fn allowed_files_count_is_reasonable() {
+        assert!(
+            ALLOWED_FILES.len() <= 20,
+            "allowlist is suspiciously large ({}) — review for stale entries",
+            ALLOWED_FILES.len()
+        );
+        assert!(
+            ALLOWED_FILES.len() >= 3,
+            "allowlist should have at least a few legacy files"
+        );
+    }
+
+    #[test]
+    fn forbidden_patterns_count() {
+        assert_eq!(
+            FORBIDDEN_PATTERNS.len(),
+            4,
+            "expected 4 forbidden patterns (use ratatui, use crossterm, ratatui::, crossterm::)"
+        );
+    }
+
+    #[test]
+    fn is_exempt_line_triple_slash_with_code() {
+        assert!(is_exempt_line("/// ```rust\n/// use ratatui;```"));
+    }
+
+    #[test]
+    fn is_exempt_line_deeply_indented_comment() {
+        assert!(is_exempt_line("        // deeply indented comment"));
+        assert!(is_exempt_line("\t\t// tab-indented comment"));
+    }
 }

@@ -429,4 +429,117 @@ mod tests {
         assert!(e2.to_string().contains("suspend"));
         assert!(e3.to_string().contains("resume"));
     }
+
+    // -- Additional coverage: command_handoff expanded tests --
+
+    #[test]
+    fn command_result_debug_format() {
+        let result = CommandResult {
+            command: "ls -la".to_string(),
+            status: None,
+            launch_error: Some("not found".to_string()),
+        };
+        let dbg = format!("{:?}", result);
+        assert!(dbg.contains("ls -la"));
+        assert!(dbg.contains("not found"));
+    }
+
+    #[test]
+    fn command_result_stores_command_string() {
+        let result = CommandResult {
+            command: "echo hello world".to_string(),
+            status: None,
+            launch_error: None,
+        };
+        assert_eq!(result.command, "echo hello world");
+    }
+
+    #[test]
+    fn command_result_no_status_no_error_not_success() {
+        let result = CommandResult {
+            command: "test".to_string(),
+            status: None,
+            launch_error: None,
+        };
+        assert!(!result.success());
+    }
+
+    #[test]
+    fn handoff_error_suspend_failed_display_contains_inner() {
+        let err = HandoffError::SuspendFailed(SessionError::InvalidPhase {
+            expected: &[SessionPhase::Active],
+            actual: SessionPhase::Idle,
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("suspend"));
+        assert!(msg.contains("session"));
+    }
+
+    #[test]
+    fn handoff_error_resume_failed_display_contains_inner() {
+        let err = HandoffError::ResumeFailed(SessionError::InvalidPhase {
+            expected: &[SessionPhase::Suspended],
+            actual: SessionPhase::Active,
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("resume"));
+        assert!(msg.contains("session"));
+    }
+
+    #[test]
+    fn tab_only_command_returns_empty_error() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::default()).unwrap();
+        let err = execute(&mut session, "\t\t").unwrap_err();
+        assert!(matches!(err, HandoffError::EmptyCommand));
+    }
+
+    #[test]
+    fn leave_from_idle_is_noop() {
+        let mut session = MockTerminalSession::new();
+        // Double leave from Idle — should be harmless
+        session.leave();
+        assert_eq!(session.phase(), SessionPhase::Idle);
+        session.leave();
+        assert_eq!(session.phase(), SessionPhase::Idle);
+    }
+
+    #[test]
+    fn draw_during_active_succeeds() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::default()).unwrap();
+        let result = session.draw(&mut |_, _| {});
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn poll_during_idle_fails() {
+        let mut session = MockTerminalSession::new();
+        let err = session.poll_event(std::time::Duration::ZERO).unwrap_err();
+        assert!(matches!(err, SessionError::InvalidPhase { .. }));
+    }
+
+    #[test]
+    fn enter_twice_fails() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::default()).unwrap();
+        let err = session.enter(ScreenMode::AltScreen).unwrap_err();
+        assert!(matches!(err, SessionError::InvalidPhase { .. }));
+        // Original mode preserved
+        assert_eq!(session.phase(), SessionPhase::Active);
+    }
+
+    #[test]
+    fn inline_mode_preserved_across_multiple_handoffs() {
+        let mode = ScreenMode::Inline { ui_height: 12 };
+        let mut session = MockTerminalSession::new();
+        session.enter(mode).unwrap();
+
+        for _ in 0..3 {
+            session.suspend().unwrap();
+            assert_eq!(session.screen_mode(), Some(mode));
+            session.resume().unwrap();
+            assert_eq!(session.screen_mode(), Some(mode));
+        }
+    }
 }

@@ -154,31 +154,18 @@ impl InteractiveBootstrap {
     }
 
     /// Execute the interactive bootstrap flow.
-    ///
-    /// This launches a visible browser window, navigates to the login URL,
-    /// and waits for the operator to complete authentication. On success,
-    /// the browser's storage state is saved and the profile metadata is
-    /// updated.
-    ///
-    /// # Arguments
-    ///
-    /// * `ctx` - Browser context (must be in `Ready` state).
-    /// * `profile` - The browser profile to bootstrap.
-    /// * `service_url` - Optional override for the login URL.
     pub fn execute(
         &self,
         ctx: &BrowserContext,
         profile: &BrowserProfile,
         service_url: Option<&str>,
     ) -> BootstrapResult {
-        // Verify browser context is ready
         if *ctx.status() != BrowserStatus::Ready {
             return BootstrapResult::Failed {
                 error: format!("Browser context not ready: {:?}", ctx.status()),
             };
         }
 
-        // Ensure profile directory exists
         let profile_dir = match profile.ensure_dir() {
             Ok(dir) => dir,
             Err(e) => {
@@ -198,20 +185,15 @@ impl InteractiveBootstrap {
         );
 
         let start = std::time::Instant::now();
-
-        // Run the Playwright script that opens the browser and waits
         let result = self.run_bootstrap_script(&profile_dir, login_url);
-
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         match result {
             Ok(ScriptOutcome::Success { storage_state }) => {
-                // Save storage state
                 if let Err(e) = profile.save_storage_state(&storage_state) {
                     tracing::warn!(error = %e, "Failed to save storage state");
                 }
 
-                // Update metadata
                 let mut metadata =
                     profile.read_metadata().ok().flatten().unwrap_or_else(|| {
                         ProfileMetadata::new(&profile.service, &profile.account)
@@ -251,23 +233,12 @@ impl InteractiveBootstrap {
                 }
             }
             Err(e) => {
-                tracing::error!(
-                    elapsed_ms,
-                    error = %e,
-                    "Interactive bootstrap failed"
-                );
+                tracing::error!(elapsed_ms, error = %e, "Interactive bootstrap failed");
                 BootstrapResult::Failed { error: e }
             }
         }
     }
 
-    /// Run the Playwright script for interactive bootstrap.
-    ///
-    /// The script:
-    /// 1. Launches a visible browser with the profile directory
-    /// 2. Navigates to the login URL
-    /// 3. Polls for success (URL change or page marker)
-    /// 4. Exports storageState on success
     fn run_bootstrap_script(
         &self,
         profile_dir: &Path,
@@ -297,7 +268,6 @@ impl InteractiveBootstrap {
         Self::parse_bootstrap_result(&stdout)
     }
 
-    /// Build the Node.js/Playwright script for interactive bootstrap.
     fn build_bootstrap_script(&self, profile_dir: &Path, login_url: &str) -> String {
         let profile_dir_str = profile_dir.display();
         let timeout = self.config.timeout_ms;
@@ -324,7 +294,6 @@ const {{ chromium }} = require('playwright');
 
   let browser;
   try {{
-    // Launch visible browser for operator interaction
     browser = await chromium.launchPersistentContext(profileDir, {{
       headless: false,
       timeout: TIMEOUT,
@@ -333,10 +302,8 @@ const {{ chromium }} = require('playwright');
     const page = browser.pages()[0] || await browser.newPage();
     page.setDefaultTimeout(TIMEOUT);
 
-    // Navigate to login page
     await page.goto(loginUrl, {{ waitUntil: 'domcontentloaded', timeout: 30000 }});
 
-    // Poll for success indicators
     const startTime = Date.now();
     let success = false;
 
@@ -344,7 +311,6 @@ const {{ chromium }} = require('playwright');
       try {{
         const currentUrl = page.url();
 
-        // Check URL-based success
         for (const prefix of successUrls) {{
           if (currentUrl.startsWith(prefix)) {{
             success = true;
@@ -353,7 +319,6 @@ const {{ chromium }} = require('playwright');
         }}
         if (success) break;
 
-        // Check text-based success
         const bodyText = await page.textContent('body').catch(() => '');
         for (const marker of successTexts) {{
           if (bodyText && bodyText.includes(marker)) {{
@@ -370,7 +335,6 @@ const {{ chromium }} = require('playwright');
     }}
 
     if (success) {{
-      // Export storage state
       const state = await browser.storageState();
       console.log(JSON.stringify({{
         status: 'success',
@@ -398,7 +362,6 @@ const {{ chromium }} = require('playwright');
         )
     }
 
-    /// Parse the result from the bootstrap Playwright script.
     fn parse_bootstrap_result(stdout: &str) -> Result<ScriptOutcome, String> {
         let trimmed = stdout.trim();
         if trimmed.is_empty() {
@@ -459,10 +422,6 @@ enum ScriptOutcome {
 mod tests {
     use super::*;
 
-    // =========================================================================
-    // BootstrapConfig tests
-    // =========================================================================
-
     #[test]
     fn config_defaults() {
         let cfg = BootstrapConfig::default();
@@ -498,10 +457,6 @@ mod tests {
         assert_eq!(cfg.timeout_ms, 60_000);
         assert_eq!(cfg.success_url_prefixes.len(), 1);
     }
-
-    // =========================================================================
-    // BootstrapResult serde tests
-    // =========================================================================
 
     #[test]
     fn result_success_serde() {
@@ -549,10 +504,6 @@ mod tests {
         assert!(json.contains("\"status\":\"failed\""));
     }
 
-    // =========================================================================
-    // InteractiveBootstrap construction tests
-    // =========================================================================
-
     #[test]
     fn bootstrap_with_defaults() {
         let bootstrap = InteractiveBootstrap::with_defaults();
@@ -569,10 +520,6 @@ mod tests {
         assert_eq!(bootstrap.config().timeout_ms, 60_000);
     }
 
-    // =========================================================================
-    // Flow execution guard tests
-    // =========================================================================
-
     #[test]
     fn execute_rejects_not_ready_context() {
         let bootstrap = InteractiveBootstrap::with_defaults();
@@ -580,7 +527,6 @@ mod tests {
         let ctx =
             super::super::BrowserContext::new(super::super::BrowserConfig::default(), &data_dir);
         let profile = ctx.profile("openai", "test-account");
-
         let result = bootstrap.execute(&ctx, &profile, None);
         match result {
             BootstrapResult::Failed { error } => {
@@ -590,10 +536,6 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // Script generation tests
-    // =========================================================================
-
     #[test]
     fn script_contains_login_url() {
         let bootstrap = InteractiveBootstrap::with_defaults();
@@ -602,7 +544,7 @@ mod tests {
             bootstrap.build_bootstrap_script(&profile_dir, "https://auth.openai.com/authorize");
         assert!(script.contains("auth.openai.com/authorize"));
         assert!(script.contains("/tmp/profile"));
-        assert!(script.contains("headless: false")); // Must be visible
+        assert!(script.contains("headless: false"));
     }
 
     #[test]
@@ -621,10 +563,6 @@ mod tests {
         let script = bootstrap.build_bootstrap_script(&profile_dir, "https://example.com/login");
         assert!(script.contains("storageState"));
     }
-
-    // =========================================================================
-    // Result parsing tests
-    // =========================================================================
 
     #[test]
     fn parse_success_with_state() {
@@ -670,5 +608,132 @@ mod tests {
         let stdout = "Debugger attached.\n{\"status\":\"timeout\"}";
         let result = InteractiveBootstrap::parse_bootstrap_result(stdout);
         assert!(matches!(result, Ok(ScriptOutcome::Timeout)));
+    }
+
+    // -- Additional coverage: bootstrap expanded tests --
+
+    #[test]
+    fn config_default_login_url_is_openai() {
+        let cfg = BootstrapConfig::default();
+        assert!(cfg.login_url.contains("openai.com"));
+    }
+
+    #[test]
+    fn config_default_success_prefixes_count() {
+        let cfg = BootstrapConfig::default();
+        assert_eq!(cfg.success_url_prefixes.len(), 2);
+    }
+
+    #[test]
+    fn config_default_text_markers_count() {
+        let cfg = BootstrapConfig::default();
+        assert_eq!(cfg.success_text_markers.len(), 2);
+    }
+
+    #[test]
+    fn result_all_variants_debug() {
+        let variants: Vec<BootstrapResult> = vec![
+            BootstrapResult::Success {
+                elapsed_ms: 1000,
+                profile_dir: PathBuf::from("/tmp/test"),
+            },
+            BootstrapResult::Timeout { waited_ms: 5000 },
+            BootstrapResult::Cancelled {
+                reason: "closed".to_string(),
+            },
+            BootstrapResult::Failed {
+                error: "err".to_string(),
+            },
+        ];
+        for v in &variants {
+            let dbg = format!("{:?}", v);
+            assert!(!dbg.is_empty());
+        }
+    }
+
+    #[test]
+    fn bootstrap_config_accessor_returns_ref() {
+        let cfg = BootstrapConfig {
+            timeout_ms: 42_000,
+            ..Default::default()
+        };
+        let bootstrap = InteractiveBootstrap::new(cfg);
+        assert_eq!(bootstrap.config().timeout_ms, 42_000);
+        assert_eq!(
+            bootstrap.config().login_url,
+            BootstrapConfig::default().login_url
+        );
+    }
+
+    #[test]
+    fn script_escapes_single_quotes_in_url() {
+        let bootstrap = InteractiveBootstrap::with_defaults();
+        let profile_dir = PathBuf::from("/tmp/profile");
+        let script = bootstrap.build_bootstrap_script(&profile_dir, "https://example.com/log'in");
+        assert!(!script.contains("log'in"));
+        assert!(script.contains("log\\'in"));
+    }
+
+    #[test]
+    fn script_contains_timeout_value() {
+        let cfg = BootstrapConfig {
+            timeout_ms: 99_000,
+            ..Default::default()
+        };
+        let bootstrap = InteractiveBootstrap::new(cfg);
+        let script =
+            bootstrap.build_bootstrap_script(&PathBuf::from("/tmp"), "https://example.com");
+        assert!(script.contains("99000"));
+    }
+
+    #[test]
+    fn script_contains_poll_interval() {
+        let cfg = BootstrapConfig {
+            poll_interval_ms: 3_500,
+            ..Default::default()
+        };
+        let bootstrap = InteractiveBootstrap::new(cfg);
+        let script =
+            bootstrap.build_bootstrap_script(&PathBuf::from("/tmp"), "https://example.com");
+        assert!(script.contains("3500"));
+    }
+
+    #[test]
+    fn parse_unknown_status_is_error() {
+        let result =
+            InteractiveBootstrap::parse_bootstrap_result(r#"{"status":"unknown_status"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_whitespace_only_is_error() {
+        let result = InteractiveBootstrap::parse_bootstrap_result("   \n  \n  ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_invalid_json_is_error() {
+        let result = InteractiveBootstrap::parse_bootstrap_result("{not valid json}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn result_success_roundtrip_profile_dir() {
+        let result = BootstrapResult::Success {
+            elapsed_ms: 12345,
+            profile_dir: PathBuf::from("/home/user/.config/profile"),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: BootstrapResult = serde_json::from_str(&json).unwrap();
+        match back {
+            BootstrapResult::Success {
+                elapsed_ms,
+                profile_dir,
+            } => {
+                assert_eq!(elapsed_ms, 12345);
+                assert_eq!(profile_dir, PathBuf::from("/home/user/.config/profile"));
+            }
+            _ => panic!("Expected Success"),
+        }
     }
 }
