@@ -30,7 +30,8 @@ use proptest::prelude::*;
 
 use frankenterm_core::backpressure::BackpressureTier;
 use frankenterm_core::continuous_backpressure::{
-    ContinuousBackpressure, ContinuousBackpressureConfig, EmaSmoother, severity, severity_to_tier,
+    BackpressureSnapshot, ContinuousBackpressure, ContinuousBackpressureConfig, EmaSmoother,
+    ThrottleActions, severity, severity_to_tier,
 };
 
 // =============================================================================
@@ -699,5 +700,154 @@ proptest! {
         let bp = ContinuousBackpressure::new(config);
         prop_assert!(bp.severity().abs() < 1e-10,
             "initial severity should be 0, got {}", bp.severity());
+    }
+}
+
+// =============================================================================
+// Strategies: ThrottleActions and BackpressureSnapshot
+// =============================================================================
+
+fn arb_backpressure_tier() -> impl Strategy<Value = BackpressureTier> {
+    prop_oneof![
+        Just(BackpressureTier::Green),
+        Just(BackpressureTier::Yellow),
+        Just(BackpressureTier::Red),
+        Just(BackpressureTier::Black),
+    ]
+}
+
+fn arb_throttle_actions() -> impl Strategy<Value = ThrottleActions> {
+    (
+        0.0_f64..=1.0,       // severity
+        1.0_f64..5.0,        // poll_multiplier
+        0.0_f64..0.9,        // pane_skip_fraction
+        0.0_f64..0.5,        // detection_skip_fraction
+        0.1_f64..=1.0,       // buffer_limit_fraction
+        arb_backpressure_tier(),
+    )
+        .prop_map(|(sev, poll, pane, detect, buf, tier)| ThrottleActions {
+            severity: sev,
+            poll_multiplier: poll,
+            pane_skip_fraction: pane,
+            detection_skip_fraction: detect,
+            buffer_limit_fraction: buf,
+            equivalent_tier: tier,
+        })
+}
+
+fn arb_backpressure_snapshot() -> impl Strategy<Value = BackpressureSnapshot> {
+    (
+        0.0_f64..=1.0,       // severity
+        0.0_f64..=1.0,       // queue_ratio
+        arb_backpressure_tier(),
+        arb_throttle_actions(),
+        0_u64..1_000_000,    // update_count
+    )
+        .prop_map(|(sev, qr, tier, actions, count)| BackpressureSnapshot {
+            severity: sev,
+            queue_ratio: qr,
+            equivalent_tier: tier,
+            actions,
+            update_count: count,
+        })
+}
+
+// =============================================================================
+// Property: ThrottleActions serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn throttle_actions_serde(actions in arb_throttle_actions()) {
+        let json = serde_json::to_string(&actions).unwrap();
+        let back: ThrottleActions = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.severity - actions.severity).abs() < 1e-9);
+        prop_assert!((back.poll_multiplier - actions.poll_multiplier).abs() < 1e-9);
+        prop_assert!((back.pane_skip_fraction - actions.pane_skip_fraction).abs() < 1e-9);
+        prop_assert!((back.detection_skip_fraction - actions.detection_skip_fraction).abs() < 1e-9);
+        prop_assert!((back.buffer_limit_fraction - actions.buffer_limit_fraction).abs() < 1e-9);
+        prop_assert_eq!(back.equivalent_tier, actions.equivalent_tier);
+    }
+}
+
+// =============================================================================
+// Property: ThrottleActions JSON keys
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn throttle_actions_json_keys(actions in arb_throttle_actions()) {
+        let json = serde_json::to_string(&actions).unwrap();
+        prop_assert!(json.contains("\"severity\""));
+        prop_assert!(json.contains("\"poll_multiplier\""));
+        prop_assert!(json.contains("\"pane_skip_fraction\""));
+        prop_assert!(json.contains("\"detection_skip_fraction\""));
+        prop_assert!(json.contains("\"buffer_limit_fraction\""));
+        prop_assert!(json.contains("\"equivalent_tier\""));
+    }
+}
+
+// =============================================================================
+// Property: BackpressureSnapshot serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn snapshot_direct_serde(snap in arb_backpressure_snapshot()) {
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: BackpressureSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.severity - snap.severity).abs() < 1e-9);
+        prop_assert!((back.queue_ratio - snap.queue_ratio).abs() < 1e-9);
+        prop_assert_eq!(back.equivalent_tier, snap.equivalent_tier);
+        prop_assert_eq!(back.update_count, snap.update_count);
+        prop_assert!((back.actions.severity - snap.actions.severity).abs() < 1e-9);
+    }
+}
+
+// =============================================================================
+// Property: BackpressureSnapshot JSON keys
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn snapshot_json_keys(snap in arb_backpressure_snapshot()) {
+        let json = serde_json::to_string(&snap).unwrap();
+        prop_assert!(json.contains("\"severity\""));
+        prop_assert!(json.contains("\"queue_ratio\""));
+        prop_assert!(json.contains("\"equivalent_tier\""));
+        prop_assert!(json.contains("\"actions\""));
+        prop_assert!(json.contains("\"update_count\""));
+    }
+
+    /// ThrottleActions Clone preserves severity.
+    #[test]
+    fn throttle_actions_clone(actions in arb_throttle_actions()) {
+        let cloned = actions.clone();
+        prop_assert!((cloned.severity - actions.severity).abs() < 1e-12);
+        prop_assert_eq!(cloned.equivalent_tier, actions.equivalent_tier);
+    }
+
+    /// BackpressureSnapshot Clone preserves all fields.
+    #[test]
+    fn snapshot_clone(snap in arb_backpressure_snapshot()) {
+        let cloned = snap.clone();
+        prop_assert!((cloned.severity - snap.severity).abs() < 1e-12);
+        prop_assert_eq!(cloned.update_count, snap.update_count);
+        prop_assert_eq!(cloned.equivalent_tier, snap.equivalent_tier);
+    }
+
+    /// BackpressureSnapshot Debug is non-empty.
+    #[test]
+    fn snapshot_debug_nonempty(snap in arb_backpressure_snapshot()) {
+        let debug = format!("{:?}", snap);
+        prop_assert!(!debug.is_empty());
     }
 }

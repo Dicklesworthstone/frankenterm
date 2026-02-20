@@ -15,7 +15,7 @@ use proptest::prelude::*;
 
 use frankenterm_core::session_dna::{
     DetectionType, FeatureNormalizer, KnnPrediction, PcaModel, RAW_FEATURE_DIM, SessionDna,
-    SessionDnaBuilder, SessionDnaConfig, cosine_similarity, l2_distance,
+    SessionDnaBuilder, SessionDnaConfig, StoredSession, cosine_similarity, l2_distance,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -555,5 +555,172 @@ proptest! {
     fn prop_pca_insufficient_data(dim in 1usize..=8) {
         let data: Vec<[f64; RAW_FEATURE_DIM]> = vec![[1.0; RAW_FEATURE_DIM]];
         prop_assert!(PcaModel::fit(&data, dim).is_none());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// StoredSession: strategy + serde
+// ────────────────────────────────────────────────────────────────────
+
+fn arb_stored_session() -> impl Strategy<Value = StoredSession> {
+    (
+        "[a-z0-9]{8,16}",          // session_id
+        arb_session_dna(),          // dna
+        arb_vec(RAW_FEATURE_DIM),   // embedding
+        0.0f64..100.0,              // duration_hours
+        proptest::bool::ANY,        // successful
+    )
+        .prop_map(|(sid, dna, emb, dur, succ)| StoredSession {
+            session_id: sid,
+            dna,
+            embedding: emb,
+            duration_hours: dur,
+            successful: succ,
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// StoredSession JSON roundtrip preserves session_id and successful.
+    #[test]
+    fn prop_stored_session_serde(ss in arb_stored_session()) {
+        let json = serde_json::to_string(&ss).unwrap();
+        let back: StoredSession = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.session_id, &ss.session_id);
+        prop_assert_eq!(back.successful, ss.successful);
+        prop_assert!((back.duration_hours - ss.duration_hours).abs() < 1e-9);
+        prop_assert_eq!(back.embedding.len(), ss.embedding.len());
+        prop_assert_eq!(back.dna.total_lines, ss.dna.total_lines);
+    }
+
+    /// StoredSession JSON keys include expected fields.
+    #[test]
+    fn prop_stored_session_json_keys(ss in arb_stored_session()) {
+        let json = serde_json::to_string(&ss).unwrap();
+        prop_assert!(json.contains("\"session_id\""));
+        prop_assert!(json.contains("\"dna\""));
+        prop_assert!(json.contains("\"embedding\""));
+        prop_assert!(json.contains("\"duration_hours\""));
+        prop_assert!(json.contains("\"successful\""));
+    }
+
+    /// StoredSession Clone preserves session_id.
+    #[test]
+    fn prop_stored_session_clone(ss in arb_stored_session()) {
+        let cloned = ss.clone();
+        prop_assert_eq!(&cloned.session_id, &ss.session_id);
+        prop_assert_eq!(cloned.successful, ss.successful);
+    }
+
+    /// StoredSession embedding length matches input.
+    #[test]
+    fn prop_stored_session_embedding_dim(ss in arb_stored_session()) {
+        prop_assert_eq!(ss.embedding.len(), RAW_FEATURE_DIM);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// KnnPrediction: additional properties
+// ────────────────────────────────────────────────────────────────────
+
+fn arb_knn_prediction() -> impl Strategy<Value = KnnPrediction> {
+    (
+        0.0f64..100.0,
+        0.0f64..50.0,
+        1usize..=20,
+        proptest::collection::vec(-1.0f64..=1.0, 1..=20),
+    )
+        .prop_map(|(dur, iqr, k, sims)| KnnPrediction {
+            predicted_duration_hours: dur,
+            duration_iqr_hours: iqr,
+            k,
+            neighbor_similarities: sims,
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// KnnPrediction JSON keys are present.
+    #[test]
+    fn prop_knn_prediction_json_keys(pred in arb_knn_prediction()) {
+        let json = serde_json::to_string(&pred).unwrap();
+        prop_assert!(json.contains("\"predicted_duration_hours\""));
+        prop_assert!(json.contains("\"duration_iqr_hours\""));
+        prop_assert!(json.contains("\"k\""));
+        prop_assert!(json.contains("\"neighbor_similarities\""));
+    }
+
+    /// KnnPrediction Clone preserves k.
+    #[test]
+    fn prop_knn_prediction_clone(pred in arb_knn_prediction()) {
+        let cloned = pred.clone();
+        prop_assert_eq!(cloned.k, pred.k);
+        prop_assert_eq!(cloned.neighbor_similarities.len(), pred.neighbor_similarities.len());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// PcaModel: additional properties
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// PCA project output has correct dimensionality.
+    #[test]
+    fn prop_pca_project_dim(n_rows in 5usize..=15) {
+        let mut data: Vec<[f64; RAW_FEATURE_DIM]> = Vec::new();
+        for i in 0..n_rows {
+            let mut row = [0.0; RAW_FEATURE_DIM];
+            row[0] = i as f64;
+            row[1] = 0.5 * i as f64;
+            row[2] = 0.1 * (i as f64).powi(2);
+            data.push(row);
+        }
+        if let Some(model) = PcaModel::fit(&data, 4) {
+            let input = data[0];
+            let projected = model.project(&input);
+            prop_assert_eq!(projected.len(), model.embedding_dim(),
+                "projected len {} != embedding_dim {}", projected.len(), model.embedding_dim());
+        }
+    }
+
+    /// PCA projected values are all finite.
+    #[test]
+    fn prop_pca_project_finite(n_rows in 5usize..=15) {
+        let mut data: Vec<[f64; RAW_FEATURE_DIM]> = Vec::new();
+        for i in 0..n_rows {
+            let mut row = [0.0; RAW_FEATURE_DIM];
+            row[0] = i as f64;
+            row[1] = 0.3 * i as f64;
+            data.push(row);
+        }
+        if let Some(model) = PcaModel::fit(&data, 4) {
+            let projected = model.project(&data[0]);
+            for (i, &v) in projected.iter().enumerate() {
+                prop_assert!(v.is_finite(), "projected[{}] = {} not finite", i, v);
+            }
+        }
+    }
+
+    /// PCA JSON keys include components and feature_means.
+    #[test]
+    fn prop_pca_json_keys(n_rows in 5usize..=12) {
+        let mut data: Vec<[f64; RAW_FEATURE_DIM]> = Vec::new();
+        for i in 0..n_rows {
+            let mut row = [0.0; RAW_FEATURE_DIM];
+            row[0] = i as f64;
+            row[1] = 0.5 * i as f64;
+            data.push(row);
+        }
+        if let Some(model) = PcaModel::fit(&data, 3) {
+            let json = serde_json::to_string(&model).unwrap();
+            prop_assert!(json.contains("\"components\""));
+            prop_assert!(json.contains("\"explained_variance\""));
+            prop_assert!(json.contains("\"feature_means\""));
+            prop_assert!(json.contains("\"fit_count\""));
+        }
     }
 }

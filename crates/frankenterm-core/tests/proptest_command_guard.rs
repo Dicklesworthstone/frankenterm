@@ -796,3 +796,216 @@ proptest! {
         }
     }
 }
+
+// =============================================================================
+// Strategies: GuardDecision, AuditEntry, PaneGuardConfig, GuardPolicy
+// =============================================================================
+
+fn arb_guard_decision() -> impl Strategy<Value = GuardDecision> {
+    prop_oneof![
+        Just(GuardDecision::Allow),
+        (
+            "[a-z.:-]{5,20}",
+            "[a-z._]{3,15}",
+            "[a-zA-Z0-9 ]{5,40}",
+            proptest::collection::vec("[a-zA-Z0-9 ]{3,20}", 0..3),
+        )
+            .prop_map(|(rule_id, pack, reason, suggestions)| GuardDecision::Block {
+                rule_id,
+                pack,
+                reason,
+                suggestions,
+            }),
+        (
+            "[a-z.:-]{5,20}",
+            "[a-z._]{3,15}",
+            "[a-zA-Z0-9 ]{5,40}",
+        )
+            .prop_map(|(rule_id, pack, reason)| GuardDecision::Warn {
+                rule_id,
+                pack,
+                reason,
+            }),
+    ]
+}
+
+fn arb_audit_entry() -> impl Strategy<Value = AuditEntry> {
+    (
+        0u64..10_000,
+        "[a-zA-Z0-9 /_-]{3,50}",
+        prop_oneof![Just("allow"), Just("block"), Just("warn")],
+        proptest::option::of("[a-z.:-]{5,20}"),
+        proptest::option::of("[a-z._]{3,15}"),
+        0u64..1_000_000,
+        1_000_000_000u64..2_000_000_000,
+    )
+        .prop_map(|(pane_id, command, decision, rule_id, pack, eval_us, timestamp_s)| {
+            AuditEntry {
+                pane_id,
+                command,
+                decision: decision.to_string(),
+                rule_id,
+                pack,
+                eval_us,
+                timestamp_s,
+            }
+        })
+}
+
+fn arb_pane_guard_config() -> impl Strategy<Value = PaneGuardConfig> {
+    (
+        arb_trust_level(),
+        proptest::option::of(proptest::collection::vec("[a-z._]{3,15}", 0..5)),
+        proptest::collection::vec("[a-z*?]{3,20}", 0..3),
+        10u64..100_000,
+    )
+        .prop_map(|(trust, packs, patterns, budget)| PaneGuardConfig {
+            trust_level: trust,
+            enabled_packs: packs,
+            allowlist_patterns: patterns,
+            budget_us: budget,
+        })
+}
+
+fn arb_guard_policy() -> impl Strategy<Value = GuardPolicy> {
+    (
+        arb_trust_level(),
+        proptest::collection::vec("[a-z._]{3,15}", 0..5),
+        proptest::collection::vec("[a-z._]{3,15}", 0..3),
+        100usize..50_000,
+    )
+        .prop_map(|(trust, enabled, disabled, capacity)| GuardPolicy {
+            default_trust: trust,
+            enabled_packs: enabled,
+            disabled_packs: disabled,
+            pane_overrides: std::collections::HashMap::new(),
+            audit_capacity: capacity,
+        })
+}
+
+// =============================================================================
+// Property 26: GuardDecision tagged enum format
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn guard_decision_tagged_format(d in arb_guard_decision()) {
+        let json = serde_json::to_string(&d).unwrap();
+        // Tagged enum should contain "decision" field
+        prop_assert!(json.contains("\"decision\""),
+            "tagged enum should contain 'decision' key, got: {}", json);
+        // Verify roundtrip
+        let back: GuardDecision = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.is_allowed(), d.is_allowed());
+        prop_assert_eq!(back.is_blocked(), d.is_blocked());
+        prop_assert_eq!(back.is_warning(), d.is_warning());
+    }
+
+    /// GuardDecision Clone preserves predicates.
+    #[test]
+    fn guard_decision_clone(d in arb_guard_decision()) {
+        let cloned = d.clone();
+        prop_assert_eq!(cloned.is_allowed(), d.is_allowed());
+        prop_assert_eq!(cloned.is_blocked(), d.is_blocked());
+        prop_assert_eq!(cloned.is_warning(), d.is_warning());
+        prop_assert_eq!(cloned.rule_id(), d.rule_id());
+    }
+}
+
+// =============================================================================
+// Property 27: AuditEntry JSON keys
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn audit_entry_json_keys(entry in arb_audit_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        prop_assert!(json.contains("\"pane_id\""));
+        prop_assert!(json.contains("\"command\""));
+        prop_assert!(json.contains("\"decision\""));
+        prop_assert!(json.contains("\"eval_us\""));
+        prop_assert!(json.contains("\"timestamp_s\""));
+    }
+
+    /// AuditEntry optional fields correctly serialize when present/absent.
+    #[test]
+    fn audit_entry_optional_fields(entry in arb_audit_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: AuditEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.rule_id, entry.rule_id);
+        prop_assert_eq!(back.pack, entry.pack);
+    }
+}
+
+// =============================================================================
+// Property 28: PaneGuardConfig with packs serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn pane_config_full_serde(config in arb_pane_guard_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: PaneGuardConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.trust_level, config.trust_level);
+        prop_assert_eq!(back.budget_us, config.budget_us);
+        prop_assert_eq!(back.enabled_packs, config.enabled_packs);
+        prop_assert_eq!(back.allowlist_patterns, config.allowlist_patterns);
+    }
+
+    /// PaneGuardConfig Default serde roundtrip.
+    #[test]
+    fn pane_config_default_serde(_dummy in 0..1u32) {
+        let config = PaneGuardConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: PaneGuardConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.trust_level, TrustLevel::Strict);
+        prop_assert_eq!(back.budget_us, 100);
+        prop_assert!(back.enabled_packs.is_none());
+        prop_assert!(back.allowlist_patterns.is_empty());
+    }
+}
+
+// =============================================================================
+// Property 29: GuardPolicy with full fields serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn guard_policy_full_serde(policy in arb_guard_policy()) {
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: GuardPolicy = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.default_trust, policy.default_trust);
+        prop_assert_eq!(back.audit_capacity, policy.audit_capacity);
+        prop_assert_eq!(back.enabled_packs, policy.enabled_packs);
+        prop_assert_eq!(back.disabled_packs, policy.disabled_packs);
+    }
+
+    /// GuardPolicy with pane_overrides roundtrips.
+    #[test]
+    fn guard_policy_with_overrides(
+        trust in arb_trust_level(),
+        pane_id in 1u64..100,
+        override_config in arb_pane_guard_config(),
+    ) {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(pane_id, override_config.clone());
+        let policy = GuardPolicy {
+            default_trust: trust,
+            pane_overrides: overrides,
+            ..GuardPolicy::default()
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: GuardPolicy = serde_json::from_str(&json).unwrap();
+        let back_override = back.pane_overrides.get(&pane_id);
+        prop_assert!(back_override.is_some(), "pane override should survive roundtrip");
+        prop_assert_eq!(back_override.unwrap().trust_level, override_config.trust_level);
+    }
+}
