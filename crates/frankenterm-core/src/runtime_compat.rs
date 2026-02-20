@@ -2055,4 +2055,152 @@ mod tests {
         assert_eq!(rx1.recv().await.expect("r1"), 7);
         assert_eq!(rx2.recv().await.expect("r2"), 7);
     }
+
+    // ========================================================================
+    // Notify tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn notify_one_wakes_waiter() {
+        let n = notify::Notify::new();
+        let n2 = std::sync::Arc::new(n);
+        let n3 = n2.clone();
+
+        let handle = task::spawn(async move {
+            n3.notified().await;
+            42
+        });
+
+        sleep(Duration::from_millis(5)).await;
+        n2.notify_one();
+
+        let result = handle.await.expect("task");
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn notify_waiters_wakes_all() {
+        let n = std::sync::Arc::new(notify::Notify::new());
+        let n1 = n.clone();
+        let n2 = n.clone();
+
+        let h1 = task::spawn(async move {
+            n1.notified().await;
+            1
+        });
+        let h2 = task::spawn(async move {
+            n2.notified().await;
+            2
+        });
+
+        sleep(Duration::from_millis(5)).await;
+        n.notify_waiters();
+
+        let r1 = h1.await.expect("h1");
+        let r2 = h2.await.expect("h2");
+        assert_eq!(r1 + r2, 3);
+    }
+
+    #[tokio::test]
+    async fn notify_before_notified_does_not_block() {
+        let n = notify::Notify::new();
+        n.notify_one();
+        // Should complete immediately since notification is stored
+        n.notified().await;
+    }
+
+    #[test]
+    fn notify_new_does_not_panic() {
+        let _n = notify::Notify::new();
+    }
+
+    // ========================================================================
+    // Oneshot channel tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn oneshot_send_recv() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(42).expect("send");
+        let val = rx.await.expect("recv");
+        assert_eq!(val, 42);
+    }
+
+    #[tokio::test]
+    async fn oneshot_recv_after_drop_sender_returns_err() {
+        let (tx, rx) = oneshot::channel::<u32>();
+        drop(tx);
+        let result = rx.await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn oneshot_send_after_drop_receiver_returns_err() {
+        let (tx, rx) = oneshot::channel::<u32>();
+        drop(rx);
+        let result = tx.send(42);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn oneshot_with_string_payload() {
+        let (tx, rx) = oneshot::channel();
+        tx.send("hello".to_string()).expect("send");
+        let val = rx.await.expect("recv");
+        assert_eq!(val, "hello");
+    }
+
+    #[tokio::test]
+    async fn oneshot_with_result_payload() {
+        let (tx, rx) = oneshot::channel::<Result<i32, String>>();
+        tx.send(Ok(99)).expect("send");
+        let val = rx.await.expect("recv");
+        assert_eq!(val.unwrap(), 99);
+    }
+
+    #[tokio::test]
+    async fn oneshot_with_result_err_payload() {
+        let (tx, rx) = oneshot::channel::<Result<i32, String>>();
+        tx.send(Err("fail".to_string())).expect("send");
+        let val = rx.await.expect("recv");
+        assert_eq!(val.unwrap_err(), "fail");
+    }
+
+    #[tokio::test]
+    async fn oneshot_with_vec_payload() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(vec![1, 2, 3]).expect("send");
+        let val = rx.await.expect("recv");
+        assert_eq!(val, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn oneshot_with_option_payload() {
+        let (tx, rx) = oneshot::channel::<Option<u32>>();
+        tx.send(Some(7)).expect("send");
+        assert_eq!(rx.await.expect("recv"), Some(7));
+
+        let (tx2, rx2) = oneshot::channel::<Option<u32>>();
+        tx2.send(None).expect("send none");
+        assert_eq!(rx2.await.expect("recv none"), None);
+    }
+
+    #[tokio::test]
+    async fn oneshot_recv_error_is_recv_error() {
+        let (tx, rx) = oneshot::channel::<u32>();
+        drop(tx);
+        let err = rx.await.unwrap_err();
+        // RecvError should display something meaningful
+        let display = format!("{err}");
+        assert!(!display.is_empty());
+    }
+
+    #[tokio::test]
+    async fn oneshot_send_returns_value_on_closed_receiver() {
+        let (tx, rx) = oneshot::channel::<u32>();
+        drop(rx);
+        // send() returns the value when receiver is dropped
+        let returned = tx.send(42).unwrap_err();
+        assert_eq!(returned, 42);
+    }
 }
