@@ -1398,6 +1398,14 @@ const COMMAND_TOKENS: &[&str] = &[
     "xargs",
     "busybox",
     "openssl",
+    // Destructive / System utilities
+    "mkfs",
+    "shred",
+    "wipe",
+    "scrub",
+    "format",
+    "mount",
+    "umount",
 ];
 
 fn first_nonempty_line(text: &str) -> Option<&str> {
@@ -1433,17 +1441,30 @@ pub fn is_command_candidate(text: &str) -> bool {
         break;
     }
 
+    // Helper to check if a token matches any known command, handling paths
+    let is_match = |token: &str| {
+        let lower = token.to_ascii_lowercase();
+        
+        // Always treat path-like tokens as candidates (e.g. ./script.sh, /bin/destroy)
+        // We defer to DCG to determine if the script/binary is actually dangerous.
+        if lower.contains('/') || lower.contains('\\') {
+            return true;
+        }
+
+        // For bare commands, check the known token list
+        COMMAND_TOKENS.contains(&lower.as_str())
+    };
+
     let mut parts = trimmed.split_whitespace();
     let token = parts.next().unwrap_or("");
-    let token_lower = token.to_ascii_lowercase();
-    if COMMAND_TOKENS.contains(&token_lower.as_str()) {
+
+    if is_match(token) {
         return true;
     }
 
-    if token_lower == "sudo" {
+    if token.eq_ignore_ascii_case("sudo") {
         if let Some(next) = parts.next() {
-            let next_lower = next.to_ascii_lowercase();
-            if COMMAND_TOKENS.contains(&next_lower.as_str()) {
+            if is_match(next) {
                 return true;
             }
         }
