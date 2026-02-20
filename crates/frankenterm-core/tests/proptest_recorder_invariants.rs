@@ -673,3 +673,113 @@ proptest! {
         prop_assert_eq!(cloned.check_causality, config.check_causality);
     }
 }
+
+// ============================================================================
+// Additional behavioral invariants
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Duplicate sequence number produces DuplicateSequence violation.
+    #[test]
+    fn prop_duplicate_sequence_is_violation(
+        pane_id in 1u64..100,
+        seq in 1u64..1000,
+        ts in 1000u64..100_000,
+    ) {
+        let e1 = make_event(format!("e1-{}", seq), pane_id, seq, ts);
+        let e2 = make_event(format!("e2-{}", seq), pane_id, seq, ts + 1);
+        let checker = InvariantChecker::with_config(InvariantCheckerConfig::default());
+        let report = checker.check(&[e1, e2]);
+        let has_dup = report.violations.iter()
+            .any(|v| v.kind == ViolationKind::DuplicateSequence);
+        prop_assert!(has_dup, "duplicate seq {} should produce DuplicateSequence", seq);
+    }
+
+    /// Gap of exactly 1 (consecutive) produces no SequenceGap violation.
+    #[test]
+    fn prop_gap_of_one_no_violation(
+        pane_id in 1u64..100,
+        base_seq in 1u64..1000,
+        ts in 1000u64..100_000,
+    ) {
+        let e1 = make_event(format!("e-{}", base_seq), pane_id, base_seq, ts);
+        let e2 = make_event(format!("e-{}", base_seq + 1), pane_id, base_seq + 1, ts + 1);
+        let checker = InvariantChecker::with_config(InvariantCheckerConfig::default());
+        let report = checker.check(&[e1, e2]);
+        let has_gap = report.violations.iter()
+            .any(|v| v.kind == ViolationKind::SequenceGap);
+        prop_assert!(!has_gap, "consecutive sequences should not produce SequenceGap");
+    }
+
+    /// With max_sequence_gap=0, any gap > 0 is a violation.
+    #[test]
+    fn prop_zero_gap_threshold_catches_all(
+        pane_id in 1u64..100,
+        base_seq in 1u64..500,
+        gap in 2u64..20,
+        ts in 1000u64..100_000,
+    ) {
+        let e1 = make_event(format!("e-{}", base_seq), pane_id, base_seq, ts);
+        let e2 = make_event(format!("e-{}", base_seq + gap), pane_id, base_seq + gap, ts + 1);
+        let config = InvariantCheckerConfig {
+            max_sequence_gap: 0,
+            ..InvariantCheckerConfig::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        let report = checker.check(&[e1, e2]);
+        let has_gap = report.violations.iter()
+            .any(|v| v.kind == ViolationKind::SequenceGap);
+        prop_assert!(has_gap, "gap {} with max_gap=0 should produce SequenceGap", gap);
+    }
+
+    /// Replay determinism is reflexive (same events = deterministic).
+    #[test]
+    fn prop_replay_determinism_reflexive_ext(events in arb_well_formed_sequence()) {
+        let result = verify_replay_determinism(&events, &events);
+        prop_assert!(result.deterministic, "same events should be deterministic");
+    }
+
+    /// Report events_checked always equals input length.
+    #[test]
+    fn prop_report_events_checked_eq_len(events in arb_well_formed_sequence()) {
+        let checker = InvariantChecker::with_config(InvariantCheckerConfig::default());
+        let report = checker.check(&events);
+        prop_assert_eq!(report.events_checked, events.len(),
+            "events_checked should equal input length");
+    }
+
+    /// count_by_kind summed across all kinds equals total violations.
+    #[test]
+    fn prop_count_by_kind_exhaustive(events in arb_well_formed_sequence()) {
+        let checker = InvariantChecker::with_config(InvariantCheckerConfig::default());
+        let report = checker.check(&events);
+        let all_kinds = [
+            ViolationKind::SequenceRegression,
+            ViolationKind::SequenceGap,
+            ViolationKind::DuplicateSequence,
+            ViolationKind::DuplicateEventId,
+            ViolationKind::ClockRegression,
+            ViolationKind::ClockFutureSkew,
+            ViolationKind::DanglingParentRef,
+            ViolationKind::DanglingTriggerRef,
+            ViolationKind::DanglingRootRef,
+            ViolationKind::MergeOrderViolation,
+            ViolationKind::EmptyEventId,
+            ViolationKind::SchemaVersionMismatch,
+        ];
+        let sum: usize = all_kinds.iter().map(|k| report.count_by_kind(*k)).sum();
+        prop_assert_eq!(sum, report.violations.len(),
+            "sum of count_by_kind should equal total violations");
+    }
+
+    /// InvariantCheckerConfig default produces a valid checker.
+    #[test]
+    fn prop_default_config_checker_no_panic(_dummy in 0..1u8) {
+        let config = InvariantCheckerConfig::default();
+        let checker = InvariantChecker::with_config(config);
+        let report = checker.check(&[]);
+        prop_assert!(report.passed);
+    }
+}

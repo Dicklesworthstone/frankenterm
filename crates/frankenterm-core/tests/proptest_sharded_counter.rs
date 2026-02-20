@@ -559,3 +559,88 @@ proptest! {
         prop_assert_eq!(counter.get(), 0, "fresh counter should return 0");
     }
 }
+
+// ============================================================================
+// Additional behavioral invariants
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// ShardedGauge with_shards doesn't panic for any value.
+    #[test]
+    fn prop_gauge_with_shards_no_panic(n in 0usize..=128) {
+        let gauge = ShardedGauge::with_shards(n);
+        // Just verify it doesn't panic and get_max returns 0
+        prop_assert_eq!(gauge.get_max(), 0, "fresh gauge should be 0");
+    }
+
+    /// ShardedGauge store then load returns stored value (single shard).
+    #[test]
+    fn prop_gauge_store_load_single_shard(val in 0u64..1_000_000) {
+        let gauge = ShardedGauge::with_shards(1);
+        gauge.store(val, std::sync::atomic::Ordering::SeqCst);
+        let got = gauge.load(std::sync::atomic::Ordering::SeqCst);
+        prop_assert_eq!(got, val);
+    }
+
+    /// ShardedMax::new() starts at 0.
+    #[test]
+    fn prop_max_new_starts_zero(_dummy in 0..1u8) {
+        let max = ShardedMax::new();
+        prop_assert_eq!(max.get(), 0);
+        let sc = max.shard_count();
+        prop_assert!(sc >= 1 && sc <= 64);
+    }
+
+    /// ShardedCounter increment equals add(1).
+    #[test]
+    fn prop_counter_increment_equals_add_one(shards in arb_shard_count()) {
+        let c1 = ShardedCounter::with_shards(shards);
+        c1.increment();
+        let c2 = ShardedCounter::with_shards(shards);
+        c2.add(1);
+        prop_assert_eq!(c1.get(), c2.get(), "increment should equal add(1)");
+    }
+
+    /// ShardedSnapshot serde roundtrip preserves vec lengths.
+    #[test]
+    fn prop_snapshot_vec_lengths_preserved(
+        n_counters in 0usize..10,
+        n_maxes in 0usize..10,
+        n_gauges in 0usize..10,
+    ) {
+        let snap = ShardedSnapshot {
+            counters: (0..n_counters).map(|i| (format!("c{}", i), i as u64)).collect(),
+            maxes: (0..n_maxes).map(|i| (format!("m{}", i), i as u64)).collect(),
+            gauges: (0..n_gauges).map(|i| (format!("g{}", i), i as u64)).collect(),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ShardedSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.counters.len(), n_counters);
+        prop_assert_eq!(back.maxes.len(), n_maxes);
+        prop_assert_eq!(back.gauges.len(), n_gauges);
+    }
+
+    /// ShardedCounter shard_values are all non-negative (trivially true for u64).
+    #[test]
+    fn prop_counter_shard_values_valid(shards in arb_shard_count(), vals in arb_small_values()) {
+        let counter = ShardedCounter::with_shards(shards);
+        for v in &vals {
+            counter.add(*v);
+        }
+        let shard_vals = counter.shard_values();
+        let sum: u64 = shard_vals.iter().sum();
+        prop_assert_eq!(sum, counter.get(),
+            "sum of shard_values should equal get()");
+    }
+
+    /// ShardedGauge reset then get_max returns 0.
+    #[test]
+    fn prop_gauge_reset_clears(val in 1u64..1_000_000) {
+        let gauge = ShardedGauge::with_shards(4);
+        gauge.set(val);
+        gauge.reset();
+        prop_assert_eq!(gauge.get_max(), 0, "gauge should be 0 after reset");
+    }
+}

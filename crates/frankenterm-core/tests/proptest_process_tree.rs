@@ -797,3 +797,98 @@ proptest! {
         prop_assert!(!debug.is_empty());
     }
 }
+
+// =============================================================================
+// Additional behavioral invariants
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// ProcessState serde roundtrip preserves snake_case names.
+    #[test]
+    fn prop_process_state_serde_snake_case(state in arb_process_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let back: ProcessState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(state, back);
+        // snake_case: all lowercase with underscores
+        let inner = json.trim_matches('"');
+        prop_assert!(inner.chars().all(|c| c.is_lowercase() || c == '_'),
+            "state JSON should be snake_case: {}", json);
+    }
+
+    /// PaneActivity serde roundtrip preserves snake_case names.
+    #[test]
+    fn prop_pane_activity_serde_snake_case(
+        activity in prop_oneof![
+            Just(PaneActivity::Idle),
+            Just(PaneActivity::Active),
+            Just(PaneActivity::Editing),
+            Just(PaneActivity::VersionControl),
+            Just(PaneActivity::Testing),
+            Just(PaneActivity::Compiling),
+            Just(PaneActivity::AgentRunning),
+        ],
+    ) {
+        let json = serde_json::to_string(&activity).unwrap();
+        let back: PaneActivity = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(activity, back);
+    }
+
+    /// contains_process always finds the root name.
+    #[test]
+    fn prop_contains_process_root_name(tree in arb_process_tree()) {
+        prop_assert!(tree.contains_process(&tree.root.name),
+            "tree should contain root process '{}'", tree.root.name);
+    }
+
+    /// exe_names always contains the root process name.
+    #[test]
+    fn prop_exe_names_contains_root(tree in arb_process_tree()) {
+        let names = tree.exe_names();
+        prop_assert!(names.contains(&tree.root.name),
+            "exe_names should contain root '{}'", tree.root.name);
+    }
+
+    /// ProcessTreeConfig serde roundtrip preserves fields.
+    #[test]
+    fn prop_config_serde_roundtrip_extended(
+        enabled in any::<bool>(),
+        interval in 1u64..600,
+        depth in 1u32..20,
+    ) {
+        let config = ProcessTreeConfig {
+            enabled,
+            capture_interval_secs: interval,
+            max_depth: depth,
+            include_threads: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ProcessTreeConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.enabled, config.enabled);
+        prop_assert_eq!(back.capture_interval_secs, config.capture_interval_secs);
+        prop_assert_eq!(back.max_depth, config.max_depth);
+    }
+
+    /// ProcessTreeConfig default JSON has expected keys.
+    #[test]
+    fn prop_config_default_json_keys(_dummy in 0..1u8) {
+        let config = ProcessTreeConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(json.contains("\"enabled\""));
+        prop_assert!(json.contains("\"max_depth\""));
+    }
+
+    /// subtree_rss_kb of children sums to total minus root own rss.
+    #[test]
+    fn prop_subtree_rss_children_sum(tree in arb_process_tree()) {
+        let children_sum: u64 = tree.root.children.iter()
+            .map(|c| c.subtree_rss_kb())
+            .sum();
+        prop_assert_eq!(
+            tree.root.subtree_rss_kb(),
+            tree.root.rss_kb + children_sum,
+            "root subtree = own + children subtrees"
+        );
+    }
+}

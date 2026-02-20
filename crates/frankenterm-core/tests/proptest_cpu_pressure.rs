@@ -432,3 +432,94 @@ proptest! {
         prop_assert!((cloned.red_threshold - c.red_threshold).abs() < 1e-12);
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Additional behavioral invariants
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// CpuPressureTier Hash is consistent with Eq.
+    #[test]
+    fn prop_tier_hash_consistent(t1 in arb_tier(), t2 in arb_tier()) {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        map.insert(t1, "first");
+        if t1 == t2 {
+            prop_assert_eq!(map.get(&t2), Some(&"first"));
+        }
+    }
+
+    /// CpuPressureTier Ord is transitive.
+    #[test]
+    fn prop_tier_ord_transitive(t1 in arb_tier(), t2 in arb_tier(), t3 in arb_tier()) {
+        if t1 <= t2 && t2 <= t3 {
+            prop_assert!(t1 <= t3, "Ord should be transitive");
+        }
+    }
+
+    /// CpuPressureConfig partial JSON uses serde defaults.
+    #[test]
+    fn prop_config_partial_json_defaults(_dummy in 0..1u8) {
+        let json = r#"{"enabled": false}"#;
+        let config: CpuPressureConfig = serde_json::from_str(json).unwrap();
+        prop_assert!(!config.enabled);
+        // Other fields should use defaults
+        let default_config = CpuPressureConfig::default();
+        prop_assert_eq!(config.sample_interval_ms, default_config.sample_interval_ms);
+    }
+
+    /// CpuPressureTier as_u8 values form a contiguous range matching Ord.
+    #[test]
+    fn prop_tier_as_u8_matches_ord(_dummy in 0..1u8) {
+        let tiers = [
+            CpuPressureTier::Green,
+            CpuPressureTier::Yellow,
+            CpuPressureTier::Orange,
+            CpuPressureTier::Red,
+        ];
+        for i in 0..tiers.len() {
+            for j in (i+1)..tiers.len() {
+                prop_assert!(tiers[i] < tiers[j],
+                    "tier ordering should match array order");
+                prop_assert!(tiers[i].as_u8() < tiers[j].as_u8(),
+                    "as_u8 ordering should match Ord");
+            }
+        }
+    }
+
+    /// CpuPressureTier capture_interval_multiplier is monotonically non-decreasing.
+    #[test]
+    fn prop_tier_multiplier_monotonic(_dummy in 0..1u8) {
+        let tiers = [
+            CpuPressureTier::Green,
+            CpuPressureTier::Yellow,
+            CpuPressureTier::Orange,
+            CpuPressureTier::Red,
+        ];
+        for i in 0..tiers.len() - 1 {
+            prop_assert!(
+                tiers[i].capture_interval_multiplier() <= tiers[i+1].capture_interval_multiplier(),
+                "multiplier should be non-decreasing across tiers"
+            );
+        }
+    }
+
+    /// CpuPressureConfig Debug contains threshold values.
+    #[test]
+    fn prop_config_debug_has_thresholds(c in arb_config()) {
+        let debug = format!("{:?}", c);
+        prop_assert!(debug.contains("yellow_threshold"));
+        prop_assert!(debug.contains("orange_threshold"));
+        prop_assert!(debug.contains("red_threshold"));
+    }
+
+    /// CpuPressureTier Display is uppercase.
+    #[test]
+    fn prop_tier_display_is_uppercase(tier in arb_tier()) {
+        let display = format!("{}", tier);
+        prop_assert!(display.chars().all(|c| c.is_uppercase() || !c.is_alphabetic()),
+            "Display should be uppercase: {}", display);
+    }
+}

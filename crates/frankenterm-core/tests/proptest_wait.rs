@@ -548,3 +548,101 @@ proptest! {
         prop_assert_eq!(d1, d2);
     }
 }
+
+// =========================================================================
+// Additional behavioral invariants
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// QueueDepthGauge increments accumulate correctly.
+    #[test]
+    fn prop_gauge_depth_matches_increments(n in 1usize..50) {
+        let gauge = QueueDepthGauge::new("test");
+        for _ in 0..n {
+            gauge.increment();
+        }
+        prop_assert_eq!(gauge.depth(), n, "depth should equal {} increments", n);
+    }
+
+    /// QueueDepthGauge name is preserved.
+    #[test]
+    fn prop_gauge_name_preserved_roundtrip(name in "[a-z]{3,10}") {
+        let gauge = QueueDepthGauge::new(&name);
+        prop_assert_eq!(gauge.name(), name.as_str());
+    }
+
+    /// QuiescenceState with pending > 0 is never quiet.
+    #[test]
+    fn prop_quiescence_pending_not_quiet(pending in 1usize..100) {
+        let state = QuiescenceState {
+            pending,
+            last_activity: None,
+            quiet_window: Duration::ZERO,
+        };
+        prop_assert!(!state.is_quiet(Instant::now()),
+            "pending={} should not be quiet", pending);
+    }
+
+    /// QuiescenceState describe is non-empty.
+    #[test]
+    fn prop_quiescence_describe_nonempty(pending in 0usize..10) {
+        let state = QuiescenceState {
+            pending,
+            last_activity: None,
+            quiet_window: Duration::from_millis(100),
+        };
+        let desc = state.describe(Instant::now());
+        prop_assert!(!desc.is_empty(), "describe should be non-empty");
+    }
+
+    /// Backoff sequence is always bounded by max.
+    #[test]
+    fn prop_backoff_sequence_bounded(
+        initial_ms in 1_u64..100,
+        max_ms in 100_u64..10_000,
+        factor in 2_u32..5,
+        steps in 1usize..30,
+    ) {
+        let backoff = Backoff {
+            initial: Duration::from_millis(initial_ms),
+            max: Duration::from_millis(max_ms),
+            factor,
+            max_retries: None,
+        };
+        let max_dur = Duration::from_millis(max_ms);
+        let mut current = Duration::from_millis(initial_ms);
+        for _ in 0..steps {
+            current = backoff.next_delay(current);
+            prop_assert!(current <= max_dur,
+                "delay {:?} should be <= max {:?}", current, max_dur);
+        }
+    }
+
+    /// WaitFor::not_ready contains the observation.
+    #[test]
+    fn prop_wait_for_not_ready_observation(msg in "[a-z]{3,20}") {
+        let w: WaitFor<u64> = WaitFor::not_ready(Some(msg.clone()));
+        match w {
+            WaitFor::NotReady { last_observed } => {
+                prop_assert_eq!(last_observed.as_deref(), Some(msg.as_str()));
+            }
+            WaitFor::Ready(_) => prop_assert!(false, "expected NotReady"),
+        }
+    }
+
+    /// WaitError Display contains the expected string.
+    #[test]
+    fn prop_wait_error_display_contains_expected(expected in "[a-z]{3,10}") {
+        let err = WaitError {
+            expected: expected.clone(),
+            last_observed: None,
+            retries: 0,
+            elapsed: Duration::ZERO,
+        };
+        let display = format!("{}", err);
+        prop_assert!(display.contains(&expected),
+            "display '{}' should contain expected '{}'", display, expected);
+    }
+}
