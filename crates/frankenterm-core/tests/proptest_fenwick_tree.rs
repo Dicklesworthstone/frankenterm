@@ -678,3 +678,86 @@ proptest! {
         }
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Zero update is a no-op.
+    #[test]
+    fn prop_zero_update_noop(
+        values in prop::collection::vec(0i64..=100, 1..=20),
+    ) {
+        let mut ft = FenwickTree::from_slice(&values);
+        let before = ft.total_sum();
+        ft.update(0, 0);
+        prop_assert_eq!(ft.total_sum(), before);
+    }
+
+    /// Reset clears all values.
+    #[test]
+    fn prop_reset_all_zeros(
+        values in prop::collection::vec(0i64..=100, 1..=20),
+    ) {
+        let mut ft = FenwickTree::from_slice(&values);
+        ft.reset();
+        prop_assert_eq!(ft.total_sum(), 0);
+        for i in 0..ft.len() {
+            prop_assert_eq!(ft.point_query(i), 0);
+        }
+    }
+
+    /// Config JSON has capacity key.
+    #[test]
+    fn prop_config_json_key(cap in 1usize..500) {
+        let config = FenwickConfig { capacity: cap };
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(json.contains("\"capacity\""));
+    }
+
+    /// Stats total_sum matches total_sum().
+    #[test]
+    fn prop_stats_total_sum(
+        values in prop::collection::vec(0i64..=100, 1..=20),
+    ) {
+        let mut ft = FenwickTree::from_slice(&values);
+        let stats = ft.stats();
+        prop_assert_eq!(stats.total_sum, ft.total_sum());
+    }
+
+    /// Stats len matches values len.
+    #[test]
+    fn prop_stats_len(
+        values in prop::collection::vec(0i64..=100, 1..=20),
+    ) {
+        let mut ft = FenwickTree::from_slice(&values);
+        let stats = ft.stats();
+        prop_assert_eq!(stats.element_count, values.len());
+    }
+
+    /// Update accumulates across multiple calls.
+    #[test]
+    fn prop_update_accumulates(
+        n in 1usize..=20,
+        deltas in prop::collection::vec(-50i64..=50, 2..=5),
+    ) {
+        let mut ft = FenwickTree::new(n);
+        let mut expected = 0i64;
+        for &d in &deltas {
+            ft.update(0, d);
+            expected += d;
+        }
+        prop_assert_eq!(ft.point_query(0), expected);
+    }
+
+    /// Stats memory_bytes is positive.
+    #[test]
+    fn prop_stats_memory_positive(
+        values in prop::collection::vec(0i64..=100, 1..=20),
+    ) {
+        let mut ft = FenwickTree::from_slice(&values);
+        let stats = ft.stats();
+        prop_assert!(stats.memory_bytes > 0);
+    }
+}

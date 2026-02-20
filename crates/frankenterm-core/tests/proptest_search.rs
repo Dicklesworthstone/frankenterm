@@ -1150,3 +1150,160 @@ proptest! {
         }
     }
 }
+
+// =========================================================================
+// SearchQuery, SearchFilter, Pagination, SnippetConfig serde strategies
+// =========================================================================
+
+fn arb_sort_field() -> impl Strategy<Value = SortField> {
+    prop_oneof![
+        Just(SortField::Relevance),
+        Just(SortField::OccurredAt),
+        Just(SortField::RecordedAt),
+        Just(SortField::Sequence),
+        Just(SortField::LogOffset),
+    ]
+}
+
+fn arb_sort_order() -> impl Strategy<Value = SearchSortOrder> {
+    (arb_sort_field(), proptest::bool::ANY)
+        .prop_map(|(primary, descending)| SearchSortOrder { primary, descending })
+}
+
+fn arb_pagination_cursor() -> impl Strategy<Value = PaginationCursor> {
+    (any::<i64>(), any::<i64>(), any::<u64>(), any::<u64>())
+        .prop_map(|(score, occurred, seq, offset)| PaginationCursor {
+            score_millis: score,
+            occurred_at_ms: occurred,
+            sequence: seq,
+            log_offset: offset,
+        })
+}
+
+fn arb_pagination() -> impl Strategy<Value = Pagination> {
+    (1usize..200, proptest::option::of(arb_pagination_cursor()))
+        .prop_map(|(limit, after)| Pagination { limit, after })
+}
+
+fn arb_snippet_config() -> impl Strategy<Value = SnippetConfig> {
+    (
+        10usize..500,
+        1usize..10,
+        "[<][a-z]+[>]",
+        "[<]/[a-z]+[>]",
+        proptest::bool::ANY,
+    )
+        .prop_map(|(frag_len, frags, pre, post, enabled)| SnippetConfig {
+            max_fragment_len: frag_len,
+            max_fragments: frags,
+            highlight_pre: pre,
+            highlight_post: post,
+            enabled,
+        })
+}
+
+fn arb_search_filter() -> impl Strategy<Value = SearchFilter> {
+    prop_oneof![
+        proptest::collection::vec(0u64..10_000, 1..5)
+            .prop_map(|values| SearchFilter::PaneId { values }),
+        "[a-z0-9-]{5,20}".prop_map(|value| SearchFilter::SessionId { value }),
+        "[a-z0-9-]{5,20}".prop_map(|value| SearchFilter::WorkflowId { value }),
+        "[a-z0-9-]{5,20}".prop_map(|value| SearchFilter::CorrelationId { value }),
+        proptest::collection::vec("[a-z_]{3,15}", 1..4)
+            .prop_map(|values| SearchFilter::Source { values }),
+        proptest::collection::vec("[a-z_]{3,15}", 1..4)
+            .prop_map(|values| SearchFilter::EventType { values }),
+    ]
+}
+
+fn arb_search_query() -> impl Strategy<Value = SearchQuery> {
+    (
+        "[a-zA-Z0-9 ]{1,50}",
+        proptest::collection::vec(arb_search_filter(), 0..3),
+        arb_sort_order(),
+        arb_pagination(),
+        arb_snippet_config(),
+    )
+        .prop_map(|(text, filters, sort, pagination, snippet_config)| SearchQuery {
+            text,
+            filters,
+            sort,
+            pagination,
+            snippet_config,
+            field_boosts: HashMap::new(),
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// SearchQuery serde roundtrip preserves text and filter count.
+    #[test]
+    fn prop_search_query_serde(query in arb_search_query()) {
+        let json = serde_json::to_string(&query).unwrap();
+        let back: SearchQuery = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.text, &query.text);
+        prop_assert_eq!(back.filters.len(), query.filters.len());
+        prop_assert_eq!(back.sort.descending, query.sort.descending);
+        prop_assert_eq!(back.pagination.limit, query.pagination.limit);
+    }
+
+    /// SearchQuery JSON has expected keys.
+    #[test]
+    fn prop_search_query_json_keys(query in arb_search_query()) {
+        let json = serde_json::to_string(&query).unwrap();
+        prop_assert!(json.contains("\"text\""));
+        prop_assert!(json.contains("\"sort\""));
+        prop_assert!(json.contains("\"pagination\""));
+    }
+
+    /// SnippetConfig serde roundtrip preserves all fields.
+    #[test]
+    fn prop_snippet_config_serde(config in arb_snippet_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: SnippetConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.max_fragment_len, config.max_fragment_len);
+        prop_assert_eq!(back.max_fragments, config.max_fragments);
+        prop_assert_eq!(&back.highlight_pre, &config.highlight_pre);
+        prop_assert_eq!(&back.highlight_post, &config.highlight_post);
+        prop_assert_eq!(back.enabled, config.enabled);
+    }
+
+    /// Pagination serde roundtrip preserves limit and cursor presence.
+    #[test]
+    fn prop_pagination_serde(page in arb_pagination()) {
+        let json = serde_json::to_string(&page).unwrap();
+        let back: Pagination = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.limit, page.limit);
+        prop_assert_eq!(back.after.is_some(), page.after.is_some());
+    }
+
+    /// PaginationCursor serde roundtrip preserves all fields.
+    #[test]
+    fn prop_pagination_cursor_serde(cursor in arb_pagination_cursor()) {
+        let json = serde_json::to_string(&cursor).unwrap();
+        let back: PaginationCursor = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.score_millis, cursor.score_millis);
+        prop_assert_eq!(back.occurred_at_ms, cursor.occurred_at_ms);
+        prop_assert_eq!(back.sequence, cursor.sequence);
+        prop_assert_eq!(back.log_offset, cursor.log_offset);
+    }
+
+    /// SearchSortOrder serde roundtrip.
+    #[test]
+    fn prop_sort_order_serde(order in arb_sort_order()) {
+        let json = serde_json::to_string(&order).unwrap();
+        let back: SearchSortOrder = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.descending, order.descending);
+    }
+
+    /// SearchFilter serde roundtrip preserves variant tag.
+    #[test]
+    fn prop_search_filter_serde(filter in arb_search_filter()) {
+        let json = serde_json::to_string(&filter).unwrap();
+        let back: SearchFilter = serde_json::from_str(&json).unwrap();
+        // Check variant matches by re-serializing
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(&json, &json2);
+    }
+}

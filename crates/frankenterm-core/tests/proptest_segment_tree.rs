@@ -598,3 +598,84 @@ proptest! {
         }
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Range update with delta=0 is a no-op.
+    #[test]
+    fn prop_zero_delta_noop(values in arb_values(20)) {
+        let n = values.len();
+        let mut st = SegmentTree::from_slice(&values);
+        let before = st.total_sum();
+        st.range_update(0, n - 1, 0);
+        prop_assert_eq!(st.total_sum(), before);
+    }
+
+    /// point_set followed by point query returns the set value.
+    #[test]
+    fn prop_point_set_get(
+        values in arb_values(20),
+        new_val in -1000i64..=1000,
+        idx_frac in 0.0f64..1.0,
+    ) {
+        let n = values.len();
+        let idx = (idx_frac * (n - 1) as f64) as usize;
+        let mut st = SegmentTree::from_slice(&values);
+        st.point_set(idx, new_val);
+        prop_assert_eq!(st.query(idx, idx), new_val);
+    }
+
+    /// Double range update is additive.
+    #[test]
+    fn prop_double_update_additive(
+        values in arb_values(15),
+        d1 in -50i64..=50,
+        d2 in -50i64..=50,
+    ) {
+        let n = values.len();
+        let mut st = SegmentTree::from_slice(&values);
+        st.range_update(0, n - 1, d1);
+        st.range_update(0, n - 1, d2);
+        let expected: i64 = values.iter().sum::<i64>() + (d1 + d2) * n as i64;
+        prop_assert_eq!(st.total_sum(), expected);
+    }
+
+    /// SegmentTreeConfig serde JSON has expected field.
+    #[test]
+    fn prop_config_json_key(cap in 1usize..1000) {
+        let config = SegmentTreeConfig { capacity: cap };
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(json.contains("\"capacity\""));
+    }
+
+    /// Stats len matches values.len() after construction.
+    #[test]
+    fn prop_stats_len_matches(values in arb_values(30)) {
+        let mut st = SegmentTree::from_slice(&values);
+        let stats = st.stats();
+        prop_assert_eq!(stats.element_count, values.len());
+    }
+
+    /// Stats memory_bytes is positive.
+    #[test]
+    fn prop_stats_memory_positive(values in arb_values(20)) {
+        let mut st = SegmentTree::from_slice(&values);
+        let stats = st.stats();
+        prop_assert!(stats.memory_bytes > 0, "memory should be positive");
+    }
+
+    /// Single-element query equals the element.
+    #[test]
+    fn prop_single_query_element(
+        values in arb_values(20),
+        idx_frac in 0.0f64..1.0,
+    ) {
+        let n = values.len();
+        let idx = (idx_frac * (n - 1) as f64) as usize;
+        let mut st = SegmentTree::from_slice(&values);
+        prop_assert_eq!(st.query(idx, idx), values[idx]);
+    }
+}

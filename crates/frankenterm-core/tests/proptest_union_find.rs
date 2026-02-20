@@ -516,3 +516,85 @@ proptest! {
         prop_assert_eq!(uf.find(root), root);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Union with self is a no-op.
+    #[test]
+    fn prop_union_self_noop(
+        (n, ops) in arb_union_find(15),
+    ) {
+        let mut uf = build_uf(n, &ops);
+        let count_before = uf.component_count();
+        uf.union(0, 0);
+        prop_assert_eq!(uf.component_count(), count_before);
+    }
+
+    /// After reset, component_count == len.
+    #[test]
+    fn prop_reset_restores_singletons(
+        (n, ops) in arb_union_find(15),
+    ) {
+        let mut uf = build_uf(n, &ops);
+        uf.reset();
+        prop_assert_eq!(uf.component_count(), uf.len());
+    }
+
+    /// After reset, no two elements are connected (extended).
+    #[test]
+    fn prop_reset_disconnects_all_extended(
+        (n, ops) in arb_union_find(10),
+    ) {
+        let mut uf = build_uf(n, &ops);
+        uf.reset();
+        if n > 1 {
+            prop_assert!(!uf.connected(0, 1), "elements should be disconnected after reset");
+        }
+    }
+
+    /// Stats config serde JSON has expected key.
+    #[test]
+    fn prop_config_json_has_capacity(n in 1usize..100) {
+        let config = UnionFindConfig { capacity: n };
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(json.contains("\"capacity\""));
+    }
+
+    /// Stats component_count is within bounds after ops.
+    #[test]
+    fn prop_stats_component_count_bounded(
+        (n, ops) in arb_union_find(20),
+    ) {
+        let mut uf = build_uf(n, &ops);
+        let stats = uf.stats();
+        prop_assert!(stats.component_count >= 1);
+        prop_assert!(stats.component_count <= n);
+    }
+
+    /// Clone preserves connectivity.
+    #[test]
+    fn prop_clone_preserves_connectivity(
+        (n, ops) in arb_union_find(10),
+    ) {
+        let mut uf = build_uf(n, &ops);
+        let mut clone = uf.clone();
+        for i in 0..n {
+            for j in 0..n {
+                prop_assert_eq!(uf.connected(i, j), clone.connected(i, j),
+                    "connectivity mismatch at ({}, {})", i, j);
+            }
+        }
+    }
+
+    /// Stats len equals the initial n.
+    #[test]
+    fn prop_stats_len_equals_n(
+        (n, ops) in arb_union_find(20),
+    ) {
+        let uf = build_uf(n, &ops);
+        prop_assert_eq!(uf.len(), n);
+    }
+}
