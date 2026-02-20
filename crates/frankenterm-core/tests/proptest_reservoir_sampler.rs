@@ -664,3 +664,105 @@ proptest! {
         prop_assert_eq!(&j1, &j2);
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// SamplerStats: strategy + serde roundtrip
+// ────────────────────────────────────────────────────────────────────
+
+fn arb_sampler_stats() -> impl Strategy<Value = SamplerStats> {
+    (1usize..1000, 0usize..1000, 0u64..100_000, 0.0f64..=1.0)
+        .prop_map(|(capacity, current_size, total_seen, sampling_rate)| {
+            let current_size = current_size.min(capacity);
+            SamplerStats {
+                capacity,
+                current_size,
+                total_seen,
+                sampling_rate,
+            }
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// SamplerStats serde roundtrip preserves all fields.
+    #[test]
+    fn prop_sampler_stats_serde(stats in arb_sampler_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: SamplerStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.capacity, stats.capacity);
+        prop_assert_eq!(back.current_size, stats.current_size);
+        prop_assert_eq!(back.total_seen, stats.total_seen);
+        prop_assert!((back.sampling_rate - stats.sampling_rate).abs() < 1e-12);
+    }
+
+    /// SamplerStats JSON keys are present.
+    #[test]
+    fn prop_sampler_stats_json_keys(stats in arb_sampler_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        prop_assert!(json.contains("\"capacity\""));
+        prop_assert!(json.contains("\"current_size\""));
+        prop_assert!(json.contains("\"total_seen\""));
+        prop_assert!(json.contains("\"sampling_rate\""));
+    }
+
+    /// SamplerStats from sampler has consistent current_size <= capacity.
+    #[test]
+    fn prop_sampler_stats_size_bounded(
+        capacity in arb_capacity(),
+        items in arb_items(50),
+    ) {
+        let mut rs = ReservoirSampler::new(capacity);
+        for &item in &items {
+            rs.observe(item);
+        }
+        let stats = rs.stats();
+        prop_assert!(stats.current_size <= stats.capacity,
+            "current_size {} > capacity {}", stats.current_size, stats.capacity);
+    }
+
+    /// SamplerStats total_seen equals items observed.
+    #[test]
+    fn prop_sampler_stats_total_seen(
+        capacity in arb_capacity(),
+        items in arb_items(50),
+    ) {
+        let mut rs = ReservoirSampler::new(capacity);
+        for &item in &items {
+            rs.observe(item);
+        }
+        let stats = rs.stats();
+        prop_assert_eq!(stats.total_seen, items.len() as u64,
+            "total_seen {} != items.len() {}", stats.total_seen, items.len());
+    }
+
+    /// SamplerStats sampling_rate is in [0, 1].
+    #[test]
+    fn prop_sampler_stats_rate_bounded(
+        capacity in arb_capacity(),
+        items in arb_items(50),
+    ) {
+        let mut rs = ReservoirSampler::new(capacity);
+        for &item in &items {
+            rs.observe(item);
+        }
+        let stats = rs.stats();
+        prop_assert!(stats.sampling_rate >= 0.0 && stats.sampling_rate <= 1.0 + 1e-10,
+            "sampling_rate {} out of [0, 1]", stats.sampling_rate);
+    }
+
+    /// WeightedReservoir stats has consistent fields.
+    #[test]
+    fn prop_weighted_stats_consistent(
+        capacity in arb_capacity(),
+        items in arb_items(30),
+    ) {
+        let mut wr = WeightedReservoir::new(capacity);
+        for &item in &items {
+            wr.observe(item, 1.0);
+        }
+        let stats = wr.stats();
+        prop_assert!(stats.current_size <= stats.capacity);
+        prop_assert_eq!(stats.total_seen, items.len() as u64);
+    }
+}

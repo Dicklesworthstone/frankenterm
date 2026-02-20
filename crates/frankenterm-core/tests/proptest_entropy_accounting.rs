@@ -17,8 +17,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::entropy_accounting::{
-    EntropyEstimator, EvictionConfig, InformationBudget, compute_entropy, eviction_order,
-    eviction_score, information_cost,
+    EntropyEstimator, EvictionConfig, InformationBudget, PaneEntropySummary, compute_entropy,
+    eviction_order, eviction_score, information_cost,
 };
 
 // =============================================================================
@@ -672,5 +672,128 @@ proptest! {
         let budget = InformationBudget::new(limit);
         prop_assert!((budget.utilization() - 0.0).abs() < 0.001,
             "empty budget utilization should be 0, got {}", budget.utilization());
+    }
+}
+
+// =============================================================================
+// Strategies: PaneEntropySummary, InformationBudget
+// =============================================================================
+
+fn arb_pane_entropy_summary() -> impl Strategy<Value = PaneEntropySummary> {
+    (
+        0u64..100_000,         // pane_id
+        0u64..10_000_000,      // raw_bytes
+        0.0f64..8.0,           // entropy
+        0.0f64..10_000_000.0,  // information_cost
+        0.0f64..8.0,           // compression_ratio_bound
+        0.0f64..100_000.0,     // eviction_score
+    )
+        .prop_map(|(pane_id, raw_bytes, entropy, info_cost, cr_bound, ev_score)| PaneEntropySummary {
+            pane_id,
+            raw_bytes,
+            entropy,
+            information_cost: info_cost,
+            compression_ratio_bound: cr_bound,
+            eviction_score: ev_score,
+        })
+}
+
+fn arb_information_budget() -> impl Strategy<Value = InformationBudget> {
+    (
+        1.0f64..10_000_000.0,  // budget_bytes
+        0.0f64..10_000_000.0,  // current_cost
+        0usize..1000,          // pane_count
+    )
+        .prop_map(|(budget, cost, count)| InformationBudget {
+            budget_bytes: budget,
+            current_cost: cost,
+            pane_count: count,
+        })
+}
+
+// =============================================================================
+// PaneEntropySummary: serde + properties
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// PaneEntropySummary serde roundtrip preserves all fields.
+    #[test]
+    fn prop_pane_entropy_summary_serde(s in arb_pane_entropy_summary()) {
+        let json = serde_json::to_string(&s).unwrap();
+        let back: PaneEntropySummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, s.pane_id);
+        prop_assert_eq!(back.raw_bytes, s.raw_bytes);
+        prop_assert!((back.entropy - s.entropy).abs() < 1e-6);
+        prop_assert!((back.information_cost - s.information_cost).abs() < 1e-6);
+        prop_assert!((back.compression_ratio_bound - s.compression_ratio_bound).abs() < 1e-6);
+    }
+
+    /// PaneEntropySummary JSON keys are present.
+    #[test]
+    fn prop_pane_entropy_summary_json_keys(s in arb_pane_entropy_summary()) {
+        let json = serde_json::to_string(&s).unwrap();
+        prop_assert!(json.contains("\"pane_id\""));
+        prop_assert!(json.contains("\"raw_bytes\""));
+        prop_assert!(json.contains("\"entropy\""));
+        prop_assert!(json.contains("\"information_cost\""));
+        prop_assert!(json.contains("\"compression_ratio_bound\""));
+    }
+
+    /// PaneEntropySummary Clone preserves pane_id.
+    #[test]
+    fn prop_pane_entropy_summary_clone(s in arb_pane_entropy_summary()) {
+        let cloned = s.clone();
+        prop_assert_eq!(cloned.pane_id, s.pane_id);
+        prop_assert_eq!(cloned.raw_bytes, s.raw_bytes);
+    }
+}
+
+// =============================================================================
+// InformationBudget: serde + properties
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// InformationBudget serde roundtrip preserves all fields.
+    #[test]
+    fn prop_information_budget_serde(b in arb_information_budget()) {
+        let json = serde_json::to_string(&b).unwrap();
+        let back: InformationBudget = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.budget_bytes - b.budget_bytes).abs() < 1e-6);
+        prop_assert!((back.current_cost - b.current_cost).abs() < 1e-6);
+        prop_assert_eq!(back.pane_count, b.pane_count);
+    }
+
+    /// InformationBudget JSON keys are present.
+    #[test]
+    fn prop_information_budget_json_keys(b in arb_information_budget()) {
+        let json = serde_json::to_string(&b).unwrap();
+        prop_assert!(json.contains("\"budget_bytes\""));
+        prop_assert!(json.contains("\"current_cost\""));
+        prop_assert!(json.contains("\"pane_count\""));
+    }
+
+    /// InformationBudget utilization is non-negative.
+    #[test]
+    fn prop_information_budget_utilization_nonneg(b in arb_information_budget()) {
+        prop_assert!(b.utilization() >= 0.0,
+            "utilization should be >= 0, got {}", b.utilization());
+    }
+
+    /// InformationBudget is_exceeded consistent with cost vs budget.
+    #[test]
+    fn prop_information_budget_exceeded_consistent(b in arb_information_budget()) {
+        let exceeded = b.is_exceeded();
+        if b.current_cost > b.budget_bytes {
+            prop_assert!(exceeded,
+                "cost {} > budget {} but not exceeded", b.current_cost, b.budget_bytes);
+        }
+        if b.current_cost <= b.budget_bytes {
+            prop_assert!(!exceeded,
+                "cost {} <= budget {} but exceeded", b.current_cost, b.budget_bytes);
+        }
     }
 }

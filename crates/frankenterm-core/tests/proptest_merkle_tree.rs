@@ -468,3 +468,152 @@ proptest! {
         }
     }
 }
+
+// ── Strategies: ProofStep, MerkleProof, TreeDiff ──────────────────
+
+fn arb_merkle_hash() -> impl Strategy<Value = MerkleHash> {
+    prop::array::uniform32(any::<u8>()).prop_map(MerkleHash::from_bytes)
+}
+
+fn arb_proof_step() -> impl Strategy<Value = ProofStep> {
+    prop_oneof![
+        arb_merkle_hash().prop_map(ProofStep::Left),
+        arb_merkle_hash().prop_map(ProofStep::Right),
+    ]
+}
+
+fn arb_merkle_proof() -> impl Strategy<Value = MerkleProof> {
+    (
+        arb_key(),
+        arb_value(),
+        prop::collection::vec(arb_proof_step(), 0..10),
+        arb_merkle_hash(),
+    )
+        .prop_map(|(key, value, path, root_hash)| MerkleProof {
+            key,
+            value,
+            path,
+            root_hash,
+        })
+}
+
+fn arb_tree_diff() -> impl Strategy<Value = TreeDiff> {
+    (
+        prop::collection::vec(arb_key(), 0..10),
+        prop::collection::vec(arb_key(), 0..10),
+        prop::collection::vec(arb_key(), 0..10),
+    )
+        .prop_map(|(added, removed, changed)| TreeDiff {
+            added,
+            removed,
+            changed,
+        })
+}
+
+// ── ProofStep: serde + properties ─────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// ProofStep serde roundtrip.
+    #[test]
+    fn prop_proof_step_serde(step in arb_proof_step()) {
+        let json = serde_json::to_string(&step).unwrap();
+        let back: ProofStep = serde_json::from_str(&json).unwrap();
+        // Compare by re-serialization
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(&json, &json2);
+    }
+
+    /// ProofStep Clone preserves value.
+    #[test]
+    fn prop_proof_step_clone(step in arb_proof_step()) {
+        let cloned = step.clone();
+        let j1 = serde_json::to_string(&step).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}
+
+// ── MerkleProof: serde + properties ───────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// MerkleProof serde roundtrip preserves key, value, path length.
+    #[test]
+    fn prop_merkle_proof_serde(proof in arb_merkle_proof()) {
+        let json = serde_json::to_string(&proof).unwrap();
+        let back: MerkleProof = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.key, &proof.key);
+        prop_assert_eq!(&back.value, &proof.value);
+        prop_assert_eq!(back.path.len(), proof.path.len());
+    }
+
+    /// MerkleProof JSON keys are present.
+    #[test]
+    fn prop_merkle_proof_json_keys(proof in arb_merkle_proof()) {
+        let json = serde_json::to_string(&proof).unwrap();
+        prop_assert!(json.contains("\"key\""));
+        prop_assert!(json.contains("\"value\""));
+        prop_assert!(json.contains("\"path\""));
+        prop_assert!(json.contains("\"root_hash\""));
+    }
+
+    /// MerkleProof from actual tree verifies against root.
+    #[test]
+    fn prop_merkle_proof_from_tree(entries in prop::collection::vec(arb_entry(), 1..8)) {
+        let unique: BTreeMap<Vec<u8>, Vec<u8>> = entries.into_iter().collect();
+        let tree = MerkleTree::from_entries(unique.clone());
+        let root = tree.root_hash();
+        for key in unique.keys() {
+            if let Some(proof) = tree.proof(key) {
+                // Proof should serde roundtrip and still verify
+                let json = serde_json::to_string(&proof).unwrap();
+                let back: MerkleProof = serde_json::from_str(&json).unwrap();
+                prop_assert!(back.verify(&root),
+                    "deserialized proof should verify for key {:?}", key);
+            }
+        }
+    }
+}
+
+// ── TreeDiff: serde + properties ──────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// TreeDiff serde roundtrip.
+    #[test]
+    fn prop_tree_diff_serde(diff in arb_tree_diff()) {
+        let json = serde_json::to_string(&diff).unwrap();
+        let back: TreeDiff = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.added.len(), diff.added.len());
+        prop_assert_eq!(back.removed.len(), diff.removed.len());
+        prop_assert_eq!(back.changed.len(), diff.changed.len());
+    }
+
+    /// TreeDiff JSON keys are present.
+    #[test]
+    fn prop_tree_diff_json_keys(diff in arb_tree_diff()) {
+        let json = serde_json::to_string(&diff).unwrap();
+        prop_assert!(json.contains("\"added\""));
+        prop_assert!(json.contains("\"removed\""));
+        prop_assert!(json.contains("\"changed\""));
+    }
+
+    /// TreeDiff is_empty when all vecs empty.
+    #[test]
+    fn prop_tree_diff_is_empty(diff in arb_tree_diff()) {
+        let expected_empty = diff.added.is_empty() && diff.removed.is_empty() && diff.changed.is_empty();
+        prop_assert_eq!(diff.is_empty(), expected_empty);
+    }
+
+    /// Diff of identical trees is empty.
+    #[test]
+    fn prop_identical_trees_empty_diff(entries in arb_entries(10)) {
+        let tree = MerkleTree::from_entries(entries);
+        let diff = tree.diff(&tree);
+        prop_assert!(diff.is_empty(), "diff of identical tree should be empty");
+    }
+}

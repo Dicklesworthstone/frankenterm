@@ -20,8 +20,8 @@ use frankenterm_core::recorder_storage::{
     CheckpointCommitOutcome, RecorderBackendKind, RecorderStorageErrorClass, RecorderStorageHealth,
 };
 use frankenterm_core::storage_telemetry::{
-    ErrorCounts, SloStatus, StorageHealthTier, StorageTelemetry, StorageTelemetryConfig, diagnose,
-    remediation_for_error,
+    ErrorCounts, SloStatus, StorageDiagnosticSummary, StorageHealthTier, StorageTelemetry,
+    StorageTelemetryConfig, diagnose, remediation_for_error,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -569,5 +569,138 @@ proptest! {
         prop_assert!((cloned.tier_thresholds[0] - cfg.tier_thresholds[0]).abs() < f64::EPSILON);
         prop_assert!((cloned.tier_thresholds[1] - cfg.tier_thresholds[1]).abs() < f64::EPSILON);
         prop_assert!((cloned.tier_thresholds[2] - cfg.tier_thresholds[2]).abs() < f64::EPSILON);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Strategies: StorageTelemetryConfig, StorageDiagnosticSummary
+// ────────────────────────────────────────────────────────────────
+
+fn arb_storage_telemetry_config() -> impl Strategy<Value = StorageTelemetryConfig> {
+    (
+        100usize..10_000,     // histogram_max_samples
+        arb_thresholds(),      // tier_thresholds
+        100.0f64..60_000.0,    // rate_ewma_half_life_ms
+        1_000.0f64..100_000.0, // slo_append_p95_us
+        1_000.0f64..100_000.0, // slo_flush_p95_us
+    )
+        .prop_map(|(max_samples, thresholds, half_life, slo_append, slo_flush)| {
+            StorageTelemetryConfig {
+                histogram_max_samples: max_samples,
+                tier_thresholds: thresholds,
+                rate_ewma_half_life_ms: half_life,
+                slo_append_p95_us: slo_append,
+                slo_flush_p95_us: slo_flush,
+            }
+        })
+}
+
+fn arb_diagnostic_summary() -> impl Strategy<Value = StorageDiagnosticSummary> {
+    (
+        arb_health_tier(),
+        "[a-zA-Z0-9 .]{10,60}",
+        proptest::option::of("[a-zA-Z0-9 .]{10,60}"),
+        arb_error_counts(),
+        arb_slo_status(),
+        arb_slo_status(),
+    )
+        .prop_map(|(tier, status, recommendation, errors, slo_append, slo_flush)| {
+            StorageDiagnosticSummary {
+                tier,
+                status,
+                recommendation,
+                errors,
+                slo_append,
+                slo_flush,
+            }
+        })
+}
+
+// ────────────────────────────────────────────────────────────────
+// StorageTelemetryConfig: serde + properties
+// ────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// StorageTelemetryConfig serde roundtrip preserves all fields.
+    #[test]
+    fn prop_config_serde_roundtrip(cfg in arb_storage_telemetry_config()) {
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: StorageTelemetryConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.histogram_max_samples, cfg.histogram_max_samples);
+        prop_assert!((back.rate_ewma_half_life_ms - cfg.rate_ewma_half_life_ms).abs() < 1e-9);
+        prop_assert!((back.slo_append_p95_us - cfg.slo_append_p95_us).abs() < 1e-9);
+        prop_assert!((back.slo_flush_p95_us - cfg.slo_flush_p95_us).abs() < 1e-9);
+        for i in 0..3 {
+            prop_assert!((back.tier_thresholds[i] - cfg.tier_thresholds[i]).abs() < 1e-9,
+                "threshold[{}] mismatch", i);
+        }
+    }
+
+    /// StorageTelemetryConfig JSON keys are present.
+    #[test]
+    fn prop_config_json_keys(cfg in arb_storage_telemetry_config()) {
+        let json = serde_json::to_string(&cfg).unwrap();
+        prop_assert!(json.contains("\"histogram_max_samples\""));
+        prop_assert!(json.contains("\"tier_thresholds\""));
+        prop_assert!(json.contains("\"rate_ewma_half_life_ms\""));
+        prop_assert!(json.contains("\"slo_append_p95_us\""));
+        prop_assert!(json.contains("\"slo_flush_p95_us\""));
+    }
+
+    /// StorageTelemetryConfig thresholds from arb are ordered.
+    #[test]
+    fn prop_config_thresholds_ordered(cfg in arb_storage_telemetry_config()) {
+        prop_assert!(cfg.tier_thresholds[0] <= cfg.tier_thresholds[1],
+            "yellow {} > red {}", cfg.tier_thresholds[0], cfg.tier_thresholds[1]);
+        prop_assert!(cfg.tier_thresholds[1] <= cfg.tier_thresholds[2],
+            "red {} > black {}", cfg.tier_thresholds[1], cfg.tier_thresholds[2]);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// StorageDiagnosticSummary: serde + properties
+// ────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// StorageDiagnosticSummary serde roundtrip.
+    #[test]
+    fn prop_diagnostic_serde(diag in arb_diagnostic_summary()) {
+        let json = serde_json::to_string(&diag).unwrap();
+        let back: StorageDiagnosticSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.tier, diag.tier);
+        prop_assert_eq!(&back.status, &diag.status);
+        prop_assert_eq!(&back.recommendation, &diag.recommendation);
+        prop_assert_eq!(back.slo_append, diag.slo_append);
+        prop_assert_eq!(back.slo_flush, diag.slo_flush);
+    }
+
+    /// StorageDiagnosticSummary JSON keys are present.
+    #[test]
+    fn prop_diagnostic_json_keys(diag in arb_diagnostic_summary()) {
+        let json = serde_json::to_string(&diag).unwrap();
+        prop_assert!(json.contains("\"tier\""));
+        prop_assert!(json.contains("\"status\""));
+        prop_assert!(json.contains("\"errors\""));
+        prop_assert!(json.contains("\"slo_append\""));
+        prop_assert!(json.contains("\"slo_flush\""));
+    }
+
+    /// diagnose() produces a summary with matching tier.
+    #[test]
+    fn prop_diagnose_tier_consistent(
+        num_appends in 0usize..=10,
+    ) {
+        let telem = StorageTelemetry::with_defaults();
+        for _ in 0..num_appends {
+            telem.record_append(100.0, 1, 256, false);
+        }
+        let snap = telem.snapshot();
+        let summary = diagnose(&snap);
+        prop_assert_eq!(summary.tier, snap.health_tier,
+            "diagnose tier {:?} != snapshot tier {:?}", summary.tier, snap.health_tier);
     }
 }
