@@ -718,11 +718,11 @@ fn arb_backpressure_tier() -> impl Strategy<Value = BackpressureTier> {
 
 fn arb_throttle_actions() -> impl Strategy<Value = ThrottleActions> {
     (
-        0.0_f64..=1.0,       // severity
-        1.0_f64..5.0,        // poll_multiplier
-        0.0_f64..0.9,        // pane_skip_fraction
-        0.0_f64..0.5,        // detection_skip_fraction
-        0.1_f64..=1.0,       // buffer_limit_fraction
+        0.0_f64..=1.0, // severity
+        1.0_f64..5.0,  // poll_multiplier
+        0.0_f64..0.9,  // pane_skip_fraction
+        0.0_f64..0.5,  // detection_skip_fraction
+        0.1_f64..=1.0, // buffer_limit_fraction
         arb_backpressure_tier(),
     )
         .prop_map(|(sev, poll, pane, detect, buf, tier)| ThrottleActions {
@@ -737,11 +737,11 @@ fn arb_throttle_actions() -> impl Strategy<Value = ThrottleActions> {
 
 fn arb_backpressure_snapshot() -> impl Strategy<Value = BackpressureSnapshot> {
     (
-        0.0_f64..=1.0,       // severity
-        0.0_f64..=1.0,       // queue_ratio
+        0.0_f64..=1.0, // severity
+        0.0_f64..=1.0, // queue_ratio
         arb_backpressure_tier(),
         arb_throttle_actions(),
-        0_u64..1_000_000,    // update_count
+        0_u64..1_000_000, // update_count
     )
         .prop_map(|(sev, qr, tier, actions, count)| BackpressureSnapshot {
             severity: sev,

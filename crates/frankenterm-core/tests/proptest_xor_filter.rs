@@ -459,14 +459,14 @@ proptest! {
 
 fn arb_xor_filter_stats() -> impl Strategy<Value = XorFilterStats> {
     (
-        1usize..10_000,      // num_keys
-        1usize..50_000,      // table_len
-        1usize..20_000,      // block_length
+        1usize..10_000,                     // num_keys
+        1usize..50_000,                     // table_len
+        1usize..20_000,                     // block_length
         prop_oneof![Just(8u8), Just(16u8)], // fingerprint_bits
-        1usize..500_000,     // memory_bytes
-        1.0f64..50.0,        // bits_per_key
-        0.0f64..1.0,         // theoretical_fp_rate
-        any::<u64>(),        // seed
+        1usize..500_000,                    // memory_bytes
+        1.0f64..50.0,                       // bits_per_key
+        0.0f64..1.0,                        // theoretical_fp_rate
+        any::<u64>(),                       // seed
     )
         .prop_map(|(nk, tl, bl, fb, mb, bpk, tfp, seed)| XorFilterStats {
             num_keys: nk,

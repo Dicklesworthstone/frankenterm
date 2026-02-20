@@ -11,8 +11,8 @@ use std::time::Duration;
 use proptest::prelude::*;
 
 use frankenterm_core::cx::{
-    for_testing, spawn_bounded_with_cx, spawn_with_cx, spawn_with_timeout, try_spawn_with_cx,
-    with_cx, with_cx_async, Cx, CxRuntimeBuilder, RuntimePreset, RuntimeTuning,
+    Cx, CxRuntimeBuilder, RuntimePreset, RuntimeTuning, for_testing, spawn_bounded_with_cx,
+    spawn_with_cx, spawn_with_timeout, try_spawn_with_cx, with_cx, with_cx_async,
 };
 
 // ── Strategies ──────────────────────────────────────────────────────────
@@ -25,17 +25,15 @@ fn arb_preset() -> impl Strategy<Value = RuntimePreset> {
 }
 
 fn arb_tuning() -> impl Strategy<Value = RuntimeTuning> {
-    (1..=8usize, 1..=256u32, 1..=4usize, 4..=16usize).prop_map(
-        |(workers, budget, bmin, bmax)| {
-            let actual_max = bmin.max(bmax);
-            RuntimeTuning {
-                worker_threads: workers,
-                poll_budget: budget,
-                blocking_min_threads: bmin,
-                blocking_max_threads: actual_max,
-            }
-        },
-    )
+    (1..=8usize, 1..=256u32, 1..=4usize, 4..=16usize).prop_map(|(workers, budget, bmin, bmax)| {
+        let actual_max = bmin.max(bmax);
+        RuntimeTuning {
+            worker_threads: workers,
+            poll_budget: budget,
+            blocking_min_threads: bmin,
+            blocking_max_threads: actual_max,
+        }
+    })
 }
 
 fn make_runtime() -> frankenterm_core::cx::Runtime {

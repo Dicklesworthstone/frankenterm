@@ -1166,18 +1166,21 @@ fn arb_sort_field() -> impl Strategy<Value = SortField> {
 }
 
 fn arb_sort_order() -> impl Strategy<Value = SearchSortOrder> {
-    (arb_sort_field(), proptest::bool::ANY)
-        .prop_map(|(primary, descending)| SearchSortOrder { primary, descending })
+    (arb_sort_field(), proptest::bool::ANY).prop_map(|(primary, descending)| SearchSortOrder {
+        primary,
+        descending,
+    })
 }
 
 fn arb_pagination_cursor() -> impl Strategy<Value = PaginationCursor> {
-    (any::<i64>(), any::<i64>(), any::<u64>(), any::<u64>())
-        .prop_map(|(score, occurred, seq, offset)| PaginationCursor {
+    (any::<i64>(), any::<i64>(), any::<u64>(), any::<u64>()).prop_map(
+        |(score, occurred, seq, offset)| PaginationCursor {
             score_millis: score,
             occurred_at_ms: occurred,
             sequence: seq,
             log_offset: offset,
-        })
+        },
+    )
 }
 
 fn arb_pagination() -> impl Strategy<Value = Pagination> {
@@ -1224,14 +1227,16 @@ fn arb_search_query() -> impl Strategy<Value = SearchQuery> {
         arb_pagination(),
         arb_snippet_config(),
     )
-        .prop_map(|(text, filters, sort, pagination, snippet_config)| SearchQuery {
-            text,
-            filters,
-            sort,
-            pagination,
-            snippet_config,
-            field_boosts: HashMap::new(),
-        })
+        .prop_map(
+            |(text, filters, sort, pagination, snippet_config)| SearchQuery {
+                text,
+                filters,
+                sort,
+                pagination,
+                snippet_config,
+                field_boosts: HashMap::new(),
+            },
+        )
 }
 
 proptest! {

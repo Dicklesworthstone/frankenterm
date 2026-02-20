@@ -567,20 +567,22 @@ fn arb_distributed_config() -> impl Strategy<Value = DistributedConfig> {
         proptest::collection::vec("[a-z0-9-]{3,12}", 0..5),
         arb_tls_config(),
     )
-        .prop_map(|(enabled, bind, insecure, require_tls, auth, token, env, path, agents, tls)| {
-            DistributedConfig {
-                enabled,
-                bind_addr: bind,
-                allow_insecure: insecure,
-                require_tls_for_non_loopback: require_tls,
-                auth_mode: auth,
-                token,
-                token_env: env,
-                token_path: path,
-                allow_agent_ids: agents,
-                tls,
-            }
-        })
+        .prop_map(
+            |(enabled, bind, insecure, require_tls, auth, token, env, path, agents, tls)| {
+                DistributedConfig {
+                    enabled,
+                    bind_addr: bind,
+                    allow_insecure: insecure,
+                    require_tls_for_non_loopback: require_tls,
+                    auth_mode: auth,
+                    token,
+                    token_env: env,
+                    token_path: path,
+                    allow_agent_ids: agents,
+                    tls,
+                }
+            },
+        )
 }
 
 proptest! {

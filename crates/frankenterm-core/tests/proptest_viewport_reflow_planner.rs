@@ -706,11 +706,10 @@ proptest! {
 // ── Strategies: ReflowBatch, ReflowPlan, ReflowLineRange ────────────
 
 fn arb_reflow_line_range() -> impl Strategy<Value = ReflowLineRange> {
-    (0u32..10_000, 1u32..5_000)
-        .prop_map(|(start, len)| ReflowLineRange {
-            start_line: start,
-            end_line_exclusive: start + len,
-        })
+    (0u32..10_000, 1u32..5_000).prop_map(|(start, len)| ReflowLineRange {
+        start_line: start,
+        end_line_exclusive: start + len,
+    })
 }
 
 fn arb_batch_priority() -> impl Strategy<Value = ReflowBatchPriority> {
@@ -737,14 +736,16 @@ fn arb_reflow_batch() -> impl Strategy<Value = ReflowBatch> {
         any::<bool>(),
         "[a-zA-Z0-9 _]{5,30}",
     )
-        .prop_map(|(range, priority, sclass, work_units, selected, rationale)| ReflowBatch {
-            range,
-            priority,
-            scheduler_class: sclass,
-            work_units,
-            selected_for_frame: selected,
-            rationale,
-        })
+        .prop_map(
+            |(range, priority, sclass, work_units, selected, rationale)| ReflowBatch {
+                range,
+                priority,
+                scheduler_class: sclass,
+                work_units,
+                selected_for_frame: selected,
+                rationale,
+            },
+        )
 }
 
 fn arb_reflow_plan() -> impl Strategy<Value = ReflowPlan> {

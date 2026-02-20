@@ -11,7 +11,9 @@
 use proptest::prelude::*;
 
 use frankenterm_core::degradation::{
-    DegradationManager, DegradationReport, DegradationSnapshot, OverallStatus, Subsystem,
+    DegradationManager, DegradationReport, DegradationSnapshot, OverallStatus,
+    ResizeDegradationAssessment, ResizeDegradationSignals, ResizeDegradationTier, Subsystem,
+    evaluate_resize_degradation_ladder,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -516,5 +518,377 @@ proptest! {
         let mut dm = DegradationManager::new();
         dm.record_recovery_attempt(s);
         prop_assert!(!dm.has_degradations());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Strategies: Resize Degradation types
+// ────────────────────────────────────────────────────────────────────
+
+fn arb_resize_degradation_tier() -> impl Strategy<Value = ResizeDegradationTier> {
+    prop_oneof![
+        Just(ResizeDegradationTier::FullQuality),
+        Just(ResizeDegradationTier::QualityReduced),
+        Just(ResizeDegradationTier::CorrectnessGuarded),
+        Just(ResizeDegradationTier::EmergencyCompatibility),
+    ]
+}
+
+fn arb_resize_degradation_signals() -> impl Strategy<Value = ResizeDegradationSignals> {
+    (
+        0usize..=50,
+        0usize..=20,
+        100u64..=30_000,
+        100u64..=60_000,
+        1usize..=10,
+        proptest::bool::ANY,
+        proptest::bool::ANY,
+        proptest::bool::ANY,
+    )
+        .prop_map(
+            |(
+                stalled_total,
+                stalled_critical,
+                warning_threshold_ms,
+                critical_threshold_ms,
+                critical_stalled_limit,
+                safe_mode_recommended,
+                safe_mode_active,
+                legacy_fallback_enabled,
+            )| {
+                ResizeDegradationSignals {
+                    stalled_total,
+                    stalled_critical,
+                    warning_threshold_ms,
+                    critical_threshold_ms,
+                    critical_stalled_limit,
+                    safe_mode_recommended,
+                    safe_mode_active,
+                    legacy_fallback_enabled,
+                }
+            },
+        )
+}
+
+fn arb_resize_degradation_assessment() -> impl Strategy<Value = ResizeDegradationAssessment> {
+    (
+        arb_resize_degradation_tier(),
+        0u8..=3,
+        "[a-z_]{5,40}",
+        "[a-z_]{5,40}",
+        "[a-z_]{5,40}",
+        prop::collection::vec("[a-z_]{3,20}", 0..=3),
+        prop::collection::vec("[a-z_]{3,20}", 0..=3),
+        prop::collection::vec("[a-z_]{3,20}", 0..=3),
+        arb_resize_degradation_signals(),
+    )
+        .prop_map(
+            |(
+                tier,
+                tier_rank,
+                trigger_condition,
+                recovery_rule,
+                recommended_action,
+                quality_reductions,
+                correctness_guards,
+                availability_changes,
+                signals,
+            )| {
+                ResizeDegradationAssessment {
+                    tier,
+                    tier_rank,
+                    trigger_condition,
+                    recovery_rule,
+                    recommended_action,
+                    quality_reductions,
+                    correctness_guards,
+                    availability_changes,
+                    signals,
+                }
+            },
+        )
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ResizeDegradationTier: serde, ordering, Display
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// ResizeDegradationTier serde JSON roundtrip.
+    #[test]
+    fn prop_resize_tier_serde_roundtrip(tier in arb_resize_degradation_tier()) {
+        let json = serde_json::to_string(&tier).unwrap();
+        let back: ResizeDegradationTier = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(tier, back);
+    }
+
+    /// ResizeDegradationTier serializes to snake_case.
+    #[test]
+    fn prop_resize_tier_serde_snake_case(tier in arb_resize_degradation_tier()) {
+        let json = serde_json::to_string(&tier).unwrap();
+        let inner = json.trim_matches('"');
+        prop_assert!(
+            inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "serialized tier should be snake_case, got '{}'", inner
+        );
+    }
+
+    /// ResizeDegradationTier Ord is consistent with PartialOrd.
+    #[test]
+    fn prop_resize_tier_ord_consistent(a in arb_resize_degradation_tier(), b in arb_resize_degradation_tier()) {
+        prop_assert_eq!(a.partial_cmp(&b), Some(a.cmp(&b)));
+    }
+
+    /// ResizeDegradationTier ordering follows severity: FullQuality < QualityReduced < CorrectnessGuarded < EmergencyCompatibility.
+    #[test]
+    fn prop_resize_tier_severity_ordering(_dummy in 0..1u32) {
+        prop_assert!(ResizeDegradationTier::FullQuality < ResizeDegradationTier::QualityReduced);
+        prop_assert!(ResizeDegradationTier::QualityReduced < ResizeDegradationTier::CorrectnessGuarded);
+        prop_assert!(ResizeDegradationTier::CorrectnessGuarded < ResizeDegradationTier::EmergencyCompatibility);
+    }
+
+    /// ResizeDegradationTier rank() increases with severity.
+    #[test]
+    fn prop_resize_tier_rank_monotonic(a in arb_resize_degradation_tier(), b in arb_resize_degradation_tier()) {
+        if a < b {
+            prop_assert!(a.rank() < b.rank(), "rank should increase with severity");
+        } else if a == b {
+            prop_assert_eq!(a.rank(), b.rank());
+        }
+    }
+
+    /// ResizeDegradationTier Display is non-empty snake_case.
+    #[test]
+    fn prop_resize_tier_display_snake_case(tier in arb_resize_degradation_tier()) {
+        let d = tier.to_string();
+        prop_assert!(!d.is_empty());
+        prop_assert!(
+            d.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "Display should be snake_case, got '{}'", d
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ResizeDegradationSignals: serde roundtrip
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// ResizeDegradationSignals JSON roundtrip preserves all fields.
+    #[test]
+    fn prop_resize_signals_serde_roundtrip(signals in arb_resize_degradation_signals()) {
+        let json = serde_json::to_string(&signals).unwrap();
+        let back: ResizeDegradationSignals = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, signals);
+    }
+
+    /// ResizeDegradationSignals serialization is deterministic.
+    #[test]
+    fn prop_resize_signals_serde_deterministic(signals in arb_resize_degradation_signals()) {
+        let json1 = serde_json::to_string(&signals).unwrap();
+        let json2 = serde_json::to_string(&signals).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// ResizeDegradationSignals JSON structure has expected keys.
+    #[test]
+    fn prop_resize_signals_json_keys(signals in arb_resize_degradation_signals()) {
+        let v: serde_json::Value = serde_json::to_value(&signals).unwrap();
+        let obj = v.as_object().unwrap();
+        prop_assert!(obj.contains_key("stalled_total"));
+        prop_assert!(obj.contains_key("stalled_critical"));
+        prop_assert!(obj.contains_key("warning_threshold_ms"));
+        prop_assert!(obj.contains_key("critical_threshold_ms"));
+        prop_assert!(obj.contains_key("safe_mode_recommended"));
+        prop_assert!(obj.contains_key("safe_mode_active"));
+        prop_assert!(obj.contains_key("legacy_fallback_enabled"));
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ResizeDegradationAssessment: serde roundtrip
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// ResizeDegradationAssessment JSON roundtrip preserves all fields.
+    #[test]
+    fn prop_resize_assessment_serde_roundtrip(assessment in arb_resize_degradation_assessment()) {
+        let json = serde_json::to_string(&assessment).unwrap();
+        let back: ResizeDegradationAssessment = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.tier, assessment.tier);
+        prop_assert_eq!(back.tier_rank, assessment.tier_rank);
+        prop_assert_eq!(&back.trigger_condition, &assessment.trigger_condition);
+        prop_assert_eq!(&back.recovery_rule, &assessment.recovery_rule);
+        prop_assert_eq!(&back.recommended_action, &assessment.recommended_action);
+        prop_assert_eq!(back.quality_reductions.len(), assessment.quality_reductions.len());
+        prop_assert_eq!(back.correctness_guards.len(), assessment.correctness_guards.len());
+        prop_assert_eq!(back.availability_changes.len(), assessment.availability_changes.len());
+        prop_assert_eq!(back.signals, assessment.signals);
+    }
+
+    /// ResizeDegradationAssessment serialization is deterministic.
+    #[test]
+    fn prop_resize_assessment_serde_deterministic(assessment in arb_resize_degradation_assessment()) {
+        let json1 = serde_json::to_string(&assessment).unwrap();
+        let json2 = serde_json::to_string(&assessment).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// ResizeDegradationAssessment warning_line is None for FullQuality.
+    #[test]
+    fn prop_resize_assessment_full_quality_no_warning(signals in arb_resize_degradation_signals()) {
+        let mut assessment = evaluate_resize_degradation_ladder(signals);
+        assessment.tier = ResizeDegradationTier::FullQuality;
+        prop_assert!(assessment.warning_line().is_none(),
+                    "FullQuality tier should have no warning");
+    }
+
+    /// ResizeDegradationAssessment warning_line is Some for non-FullQuality tiers.
+    #[test]
+    fn prop_resize_assessment_degraded_has_warning(
+        tier in prop_oneof![
+            Just(ResizeDegradationTier::QualityReduced),
+            Just(ResizeDegradationTier::CorrectnessGuarded),
+            Just(ResizeDegradationTier::EmergencyCompatibility),
+        ],
+        signals in arb_resize_degradation_signals(),
+    ) {
+        let mut assessment = evaluate_resize_degradation_ladder(signals);
+        assessment.tier = tier;
+        prop_assert!(assessment.warning_line().is_some(),
+                    "Non-FullQuality tier should have a warning line");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// evaluate_resize_degradation_ladder: tier selection logic
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// No stalls and no safe-mode produces FullQuality tier.
+    #[test]
+    fn prop_ladder_no_stalls_full_quality(
+        warning_ms in 100u64..=30_000,
+        critical_ms in 100u64..=60_000,
+    ) {
+        let signals = ResizeDegradationSignals {
+            stalled_total: 0,
+            stalled_critical: 0,
+            warning_threshold_ms: warning_ms,
+            critical_threshold_ms: critical_ms,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        };
+        let result = evaluate_resize_degradation_ladder(signals);
+        prop_assert_eq!(result.tier, ResizeDegradationTier::FullQuality);
+    }
+
+    /// Warning stalls (but no critical/safe-mode) produce QualityReduced tier.
+    #[test]
+    fn prop_ladder_warning_stalls_quality_reduced(stalled in 1usize..=50) {
+        let signals = ResizeDegradationSignals {
+            stalled_total: stalled,
+            stalled_critical: 0,
+            warning_threshold_ms: 5000,
+            critical_threshold_ms: 15000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        };
+        let result = evaluate_resize_degradation_ladder(signals);
+        prop_assert_eq!(result.tier, ResizeDegradationTier::QualityReduced);
+    }
+
+    /// Critical stalls produce CorrectnessGuarded tier.
+    #[test]
+    fn prop_ladder_critical_stalls_correctness_guarded(stalled in 1usize..=20) {
+        let signals = ResizeDegradationSignals {
+            stalled_total: stalled + 1,
+            stalled_critical: stalled,
+            warning_threshold_ms: 5000,
+            critical_threshold_ms: 15000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        };
+        let result = evaluate_resize_degradation_ladder(signals);
+        prop_assert_eq!(result.tier, ResizeDegradationTier::CorrectnessGuarded);
+    }
+
+    /// safe_mode_recommended produces CorrectnessGuarded tier.
+    #[test]
+    fn prop_ladder_safe_mode_recommended_correctness(_dummy in 0..1u32) {
+        let signals = ResizeDegradationSignals {
+            stalled_total: 0,
+            stalled_critical: 0,
+            warning_threshold_ms: 5000,
+            critical_threshold_ms: 15000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: true,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        };
+        let result = evaluate_resize_degradation_ladder(signals);
+        prop_assert_eq!(result.tier, ResizeDegradationTier::CorrectnessGuarded);
+    }
+
+    /// safe_mode_active produces EmergencyCompatibility tier.
+    #[test]
+    fn prop_ladder_safe_mode_active_emergency(
+        stalled in 0usize..=50,
+        recommended in proptest::bool::ANY,
+    ) {
+        let signals = ResizeDegradationSignals {
+            stalled_total: stalled,
+            stalled_critical: 0,
+            warning_threshold_ms: 5000,
+            critical_threshold_ms: 15000,
+            critical_stalled_limit: 3,
+            safe_mode_recommended: recommended,
+            safe_mode_active: true,
+            legacy_fallback_enabled: true,
+        };
+        let result = evaluate_resize_degradation_ladder(signals);
+        prop_assert_eq!(result.tier, ResizeDegradationTier::EmergencyCompatibility);
+    }
+
+    /// Ladder result tier_rank matches tier.rank().
+    #[test]
+    fn prop_ladder_rank_matches_tier(signals in arb_resize_degradation_signals()) {
+        let result = evaluate_resize_degradation_ladder(signals);
+        prop_assert_eq!(result.tier_rank, result.tier.rank());
+    }
+
+    /// Ladder result trigger_condition is non-empty.
+    #[test]
+    fn prop_ladder_trigger_condition_non_empty(signals in arb_resize_degradation_signals()) {
+        let result = evaluate_resize_degradation_ladder(signals);
+        prop_assert!(!result.trigger_condition.is_empty());
+    }
+
+    /// Ladder result recovery_rule is non-empty.
+    #[test]
+    fn prop_ladder_recovery_rule_non_empty(signals in arb_resize_degradation_signals()) {
+        let result = evaluate_resize_degradation_ladder(signals);
+        prop_assert!(!result.recovery_rule.is_empty());
+    }
+
+    /// Ladder result signals match input signals.
+    #[test]
+    fn prop_ladder_preserves_input_signals(signals in arb_resize_degradation_signals()) {
+        let result = evaluate_resize_degradation_ladder(signals.clone());
+        prop_assert_eq!(result.signals, signals);
     }
 }

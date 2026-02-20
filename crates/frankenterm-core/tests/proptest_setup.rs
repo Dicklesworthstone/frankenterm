@@ -483,7 +483,11 @@ proptest! {
 #[test]
 fn shell_type_all_have_names() {
     for shell in &[ShellType::Bash, ShellType::Zsh, ShellType::Fish] {
-        assert!(!shell.name().is_empty(), "shell {:?} should have a name", shell);
+        assert!(
+            !shell.name().is_empty(),
+            "shell {:?} should have a name",
+            shell
+        );
     }
 }
 

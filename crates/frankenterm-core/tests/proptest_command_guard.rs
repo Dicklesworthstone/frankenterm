@@ -810,22 +810,21 @@ fn arb_guard_decision() -> impl Strategy<Value = GuardDecision> {
             "[a-zA-Z0-9 ]{5,40}",
             proptest::collection::vec("[a-zA-Z0-9 ]{3,20}", 0..3),
         )
-            .prop_map(|(rule_id, pack, reason, suggestions)| GuardDecision::Block {
+            .prop_map(
+                |(rule_id, pack, reason, suggestions)| GuardDecision::Block {
+                    rule_id,
+                    pack,
+                    reason,
+                    suggestions,
+                }
+            ),
+        ("[a-z.:-]{5,20}", "[a-z._]{3,15}", "[a-zA-Z0-9 ]{5,40}",).prop_map(
+            |(rule_id, pack, reason)| GuardDecision::Warn {
                 rule_id,
                 pack,
                 reason,
-                suggestions,
-            }),
-        (
-            "[a-z.:-]{5,20}",
-            "[a-z._]{3,15}",
-            "[a-zA-Z0-9 ]{5,40}",
-        )
-            .prop_map(|(rule_id, pack, reason)| GuardDecision::Warn {
-                rule_id,
-                pack,
-                reason,
-            }),
+            }
+        ),
     ]
 }
 
@@ -839,8 +838,8 @@ fn arb_audit_entry() -> impl Strategy<Value = AuditEntry> {
         0u64..1_000_000,
         1_000_000_000u64..2_000_000_000,
     )
-        .prop_map(|(pane_id, command, decision, rule_id, pack, eval_us, timestamp_s)| {
-            AuditEntry {
+        .prop_map(
+            |(pane_id, command, decision, rule_id, pack, eval_us, timestamp_s)| AuditEntry {
                 pane_id,
                 command,
                 decision: decision.to_string(),
@@ -848,8 +847,8 @@ fn arb_audit_entry() -> impl Strategy<Value = AuditEntry> {
                 pack,
                 eval_us,
                 timestamp_s,
-            }
-        })
+            },
+        )
 }
 
 fn arb_pane_guard_config() -> impl Strategy<Value = PaneGuardConfig> {

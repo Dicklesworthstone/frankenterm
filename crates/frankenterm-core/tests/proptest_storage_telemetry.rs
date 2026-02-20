@@ -578,21 +578,21 @@ proptest! {
 
 fn arb_storage_telemetry_config() -> impl Strategy<Value = StorageTelemetryConfig> {
     (
-        100usize..10_000,     // histogram_max_samples
+        100usize..10_000,      // histogram_max_samples
         arb_thresholds(),      // tier_thresholds
         100.0f64..60_000.0,    // rate_ewma_half_life_ms
         1_000.0f64..100_000.0, // slo_append_p95_us
         1_000.0f64..100_000.0, // slo_flush_p95_us
     )
-        .prop_map(|(max_samples, thresholds, half_life, slo_append, slo_flush)| {
-            StorageTelemetryConfig {
+        .prop_map(
+            |(max_samples, thresholds, half_life, slo_append, slo_flush)| StorageTelemetryConfig {
                 histogram_max_samples: max_samples,
                 tier_thresholds: thresholds,
                 rate_ewma_half_life_ms: half_life,
                 slo_append_p95_us: slo_append,
                 slo_flush_p95_us: slo_flush,
-            }
-        })
+            },
+        )
 }
 
 fn arb_diagnostic_summary() -> impl Strategy<Value = StorageDiagnosticSummary> {
@@ -604,16 +604,18 @@ fn arb_diagnostic_summary() -> impl Strategy<Value = StorageDiagnosticSummary> {
         arb_slo_status(),
         arb_slo_status(),
     )
-        .prop_map(|(tier, status, recommendation, errors, slo_append, slo_flush)| {
-            StorageDiagnosticSummary {
-                tier,
-                status,
-                recommendation,
-                errors,
-                slo_append,
-                slo_flush,
-            }
-        })
+        .prop_map(
+            |(tier, status, recommendation, errors, slo_append, slo_flush)| {
+                StorageDiagnosticSummary {
+                    tier,
+                    status,
+                    recommendation,
+                    errors,
+                    slo_append,
+                    slo_flush,
+                }
+            },
+        )
 }
 
 // ────────────────────────────────────────────────────────────────

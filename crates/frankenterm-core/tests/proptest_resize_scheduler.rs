@@ -1122,8 +1122,8 @@ fn arb_resize_intent() -> impl Strategy<Value = ResizeIntent> {
         arb_domain(),
         proptest::option::of(0u64..100),
     )
-        .prop_map(|(pane_id, intent_seq, scheduler_class, work_units, submitted_at_ms, domain, tab_id)| {
-            ResizeIntent {
+        .prop_map(
+            |(
                 pane_id,
                 intent_seq,
                 scheduler_class,
@@ -1131,8 +1131,18 @@ fn arb_resize_intent() -> impl Strategy<Value = ResizeIntent> {
                 submitted_at_ms,
                 domain,
                 tab_id,
-            }
-        })
+            )| {
+                ResizeIntent {
+                    pane_id,
+                    intent_seq,
+                    scheduler_class,
+                    work_units,
+                    submitted_at_ms,
+                    domain,
+                    tab_id,
+                }
+            },
+        )
 }
 
 fn arb_scheduler_config() -> impl Strategy<Value = ResizeSchedulerConfig> {
@@ -1167,16 +1177,18 @@ fn arb_scheduled_resize_work() -> impl Strategy<Value = ScheduledResizeWork> {
         proptest::bool::ANY,
         proptest::bool::ANY,
     )
-        .prop_map(|(pane_id, intent_seq, scheduler_class, work_units, over_budget, forced)| {
-            ScheduledResizeWork {
-                pane_id,
-                intent_seq,
-                scheduler_class,
-                work_units,
-                over_budget,
-                forced_by_starvation: forced,
-            }
-        })
+        .prop_map(
+            |(pane_id, intent_seq, scheduler_class, work_units, over_budget, forced)| {
+                ScheduledResizeWork {
+                    pane_id,
+                    intent_seq,
+                    scheduler_class,
+                    work_units,
+                    over_budget,
+                    forced_by_starvation: forced,
+                }
+            },
+        )
 }
 
 fn arb_resize_metrics() -> impl Strategy<Value = ResizeSchedulerMetrics> {
@@ -1189,17 +1201,19 @@ fn arb_resize_metrics() -> impl Strategy<Value = ResizeSchedulerMetrics> {
         0u64..10_000,
         0u64..10_000,
     )
-        .prop_map(|(frames, superseded, rejected, forced, over, overload_rej, overload_ev)| {
-            let mut m = ResizeSchedulerMetrics::default();
-            m.frames = frames;
-            m.superseded_intents = superseded;
-            m.rejected_non_monotonic = rejected;
-            m.forced_background_runs = forced;
-            m.over_budget_runs = over;
-            m.overload_rejected = overload_rej;
-            m.overload_evicted = overload_ev;
-            m
-        })
+        .prop_map(
+            |(frames, superseded, rejected, forced, over, overload_rej, overload_ev)| {
+                let mut m = ResizeSchedulerMetrics::default();
+                m.frames = frames;
+                m.superseded_intents = superseded;
+                m.rejected_non_monotonic = rejected;
+                m.forced_background_runs = forced;
+                m.over_budget_runs = over;
+                m.overload_rejected = overload_rej;
+                m.overload_evicted = overload_ev;
+                m
+            },
+        )
 }
 
 fn arb_gate_state() -> impl Strategy<Value = ResizeControlPlaneGateState> {

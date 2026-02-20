@@ -927,12 +927,12 @@ fn scheduling_config_default_values() {
 
 fn arb_search_indexing_config() -> impl Strategy<Value = SearchIndexingConfig> {
     (
-        "[a-z/.~]{5,40}",  // index_dir
-        0_u64..10_000,      // max_index_mb
-        0_u64..365,         // ttl_days
-        1_u64..3600,        // flush_interval_secs
-        1_usize..10_000,    // flush_docs_threshold
-        1_u32..10_000,      // max_docs_per_second
+        "[a-z/.~]{5,40}", // index_dir
+        0_u64..10_000,    // max_index_mb
+        0_u64..365,       // ttl_days
+        1_u64..3600,      // flush_interval_secs
+        1_usize..10_000,  // flush_docs_threshold
+        1_u32..10_000,    // max_docs_per_second
     )
         .prop_map(
             |(dir, max_mb, ttl, flush_int, flush_docs, max_dps)| SearchIndexingConfig {

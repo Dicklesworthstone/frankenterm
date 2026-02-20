@@ -670,8 +670,8 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 fn arb_sampler_stats() -> impl Strategy<Value = SamplerStats> {
-    (1usize..1000, 0usize..1000, 0u64..100_000, 0.0f64..=1.0)
-        .prop_map(|(capacity, current_size, total_seen, sampling_rate)| {
+    (1usize..1000, 0usize..1000, 0u64..100_000, 0.0f64..=1.0).prop_map(
+        |(capacity, current_size, total_seen, sampling_rate)| {
             let current_size = current_size.min(capacity);
             SamplerStats {
                 capacity,
@@ -679,7 +679,8 @@ fn arb_sampler_stats() -> impl Strategy<Value = SamplerStats> {
                 total_seen,
                 sampling_rate,
             }
-        })
+        },
+    )
 }
 
 proptest! {

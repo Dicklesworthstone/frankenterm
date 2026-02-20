@@ -708,6 +708,10 @@ fn watchdog_config_all_thresholds_positive() {
 #[test]
 fn mux_watchdog_config_memory_critical_ge_warning() {
     let config = MuxWatchdogConfig::default();
-    assert!(config.memory_critical_bytes >= config.memory_warning_bytes,
-        "critical {} should be >= warning {}", config.memory_critical_bytes, config.memory_warning_bytes);
+    assert!(
+        config.memory_critical_bytes >= config.memory_warning_bytes,
+        "critical {} should be >= warning {}",
+        config.memory_critical_bytes,
+        config.memory_warning_bytes
+    );
 }

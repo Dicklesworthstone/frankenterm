@@ -613,11 +613,10 @@ fn latency_budget_debug_nonempty() {
 // =========================================================================
 
 fn arb_latency_budget() -> impl Strategy<Value = LatencyBudget> {
-    (1u64..10_000, arb_query_class())
-        .prop_map(|(ms, class)| LatencyBudget {
-            max_duration: Duration::from_millis(ms),
-            class,
-        })
+    (1u64..10_000, arb_query_class()).prop_map(|(ms, class)| LatencyBudget {
+        max_duration: Duration::from_millis(ms),
+        class,
+    })
 }
 
 fn arb_quality_report() -> impl Strategy<Value = QualityReport> {
@@ -630,8 +629,8 @@ fn arb_quality_report() -> impl Strategy<Value = QualityReport> {
         0usize..100,
         any::<bool>(),
     )
-        .prop_map(|(results, total, passed, failed, latency_v, errors, all_passed)| {
-            QualityReport {
+        .prop_map(
+            |(results, total, passed, failed, latency_v, errors, all_passed)| QualityReport {
                 results,
                 total_queries: total,
                 passed,
@@ -639,8 +638,8 @@ fn arb_quality_report() -> impl Strategy<Value = QualityReport> {
                 latency_violations: latency_v,
                 errors,
                 all_passed,
-            }
-        })
+            },
+        )
 }
 
 // =========================================================================

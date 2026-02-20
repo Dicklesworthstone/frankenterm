@@ -422,21 +422,23 @@ fn time_range_excludes_outside() {
 // =========================================================================
 
 fn arb_checked_range() -> impl Strategy<Value = CheckedRange> {
-    (0_u64..50_000, 50_000_u64..100_000, 0_u64..50_000)
-        .prop_map(|(start, end, checked)| CheckedRange {
+    (0_u64..50_000, 50_000_u64..100_000, 0_u64..50_000).prop_map(|(start, end, checked)| {
+        CheckedRange {
             start_ordinal: start,
             end_ordinal: end,
             events_checked: checked,
-        })
+        }
+    })
 }
 
 fn arb_offset_mismatch() -> impl Strategy<Value = OffsetMismatch> {
-    ("[a-z0-9-]{8,24}", 0_u64..100_000, 0_u64..100_000)
-        .prop_map(|(event_id, expected_offset, actual_offset)| OffsetMismatch {
+    ("[a-z0-9-]{8,24}", 0_u64..100_000, 0_u64..100_000).prop_map(
+        |(event_id, expected_offset, actual_offset)| OffsetMismatch {
             event_id,
             expected_offset,
             actual_offset,
-        })
+        },
+    )
 }
 
 fn arb_integrity_report() -> impl Strategy<Value = IntegrityReport> {
@@ -449,17 +451,19 @@ fn arb_integrity_report() -> impl Strategy<Value = IntegrityReport> {
         proptest::option::of(0_u64..1_000_000),
         arb_checked_range(),
     )
-        .prop_map(|(scanned, matches, missing, mismatches, consistent, total_docs, range)| {
-            IntegrityReport {
-                log_events_scanned: scanned,
-                index_matches: matches,
-                missing_from_index: missing,
-                offset_mismatches: mismatches,
-                is_consistent: consistent,
-                total_index_docs: total_docs,
-                checked_range: range,
-            }
-        })
+        .prop_map(
+            |(scanned, matches, missing, mismatches, consistent, total_docs, range)| {
+                IntegrityReport {
+                    log_events_scanned: scanned,
+                    index_matches: matches,
+                    missing_from_index: missing,
+                    offset_mismatches: mismatches,
+                    is_consistent: consistent,
+                    total_index_docs: total_docs,
+                    checked_range: range,
+                }
+            },
+        )
 }
 
 // =========================================================================

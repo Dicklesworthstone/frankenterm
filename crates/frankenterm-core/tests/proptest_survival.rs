@@ -22,8 +22,8 @@ use proptest::prelude::*;
 
 use frankenterm_core::survival::{
     ActivityProfile, Covariates, HazardAction, HazardForecastPoint, HazardReport, Observation,
-    RestartMode, RestartRecommendation, RestartScoreBreakdown, RestartScheduler,
-    RestartSchedulerConfig, RiskFactor, SurvivalConfig, SurvivalModel, WeibullParams,
+    RestartMode, RestartRecommendation, RestartScheduler, RestartSchedulerConfig,
+    RestartScoreBreakdown, RiskFactor, SurvivalConfig, SurvivalModel, WeibullParams,
 };
 
 // =============================================================================
@@ -908,13 +908,15 @@ fn arb_risk_factor() -> impl Strategy<Value = RiskFactor> {
         -5.0_f64..5.0,
         0.0_f64..1.0,
     )
-        .prop_map(|(name, value, coefficient, contribution, risk_fraction)| RiskFactor {
-            name,
-            value,
-            coefficient,
-            contribution,
-            risk_fraction,
-        })
+        .prop_map(
+            |(name, value, coefficient, contribution, risk_fraction)| RiskFactor {
+                name,
+                value,
+                coefficient,
+                contribution,
+                risk_fraction,
+            },
+        )
 }
 
 fn arb_hazard_action() -> impl Strategy<Value = HazardAction> {
@@ -974,7 +976,17 @@ fn arb_restart_config() -> impl Strategy<Value = RestartSchedulerConfig> {
         5_u32..120,
     )
         .prop_map(
-            |(mode, threshold, steepness, cooldown, horizon, alpha, default_act, snapshot, warning)| {
+            |(
+                mode,
+                threshold,
+                steepness,
+                cooldown,
+                horizon,
+                alpha,
+                default_act,
+                snapshot,
+                warning,
+            )| {
                 RestartSchedulerConfig {
                     mode,
                     hazard_threshold: threshold,
@@ -991,13 +1003,16 @@ fn arb_restart_config() -> impl Strategy<Value = RestartSchedulerConfig> {
 }
 
 fn arb_forecast_point() -> impl Strategy<Value = HazardForecastPoint> {
-    (0_u32..2880, 0.0_f64..10.0, proptest::option::of(0.0_f64..1.0)).prop_map(
-        |(offset, hazard, activity)| HazardForecastPoint {
+    (
+        0_u32..2880,
+        0.0_f64..10.0,
+        proptest::option::of(0.0_f64..1.0),
+    )
+        .prop_map(|(offset, hazard, activity)| HazardForecastPoint {
             offset_minutes: offset,
             hazard_rate: hazard,
             predicted_activity: activity,
-        },
-    )
+        })
 }
 
 fn arb_score_breakdown() -> impl Strategy<Value = RestartScoreBreakdown> {

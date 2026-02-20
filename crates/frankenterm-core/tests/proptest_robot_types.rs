@@ -598,17 +598,17 @@ proptest! {
 fn arb_search_index_stats() -> impl Strategy<Value = SearchIndexStatsData> {
     // Split into two tuples to avoid exceeding proptest's 12-element tuple limit
     let core = (
-        "[a-z/]{5,30}",               // index_dir
-        "[a-z/.]{5,30}",              // state_path
-        1_u32..10,                     // format_version
-        0_usize..100_000,             // document_count
-        0_usize..100,                 // segment_count
-        0_u64..10_000_000,            // index_size_bytes
-        0_usize..1000,               // pending_docs
-        1_000_000_u64..100_000_000,   // max_index_size_bytes
-        1_u64..365,                   // ttl_days
-        1_u64..3600,                  // flush_interval_secs
-        1_usize..10_000,             // flush_docs_threshold
+        "[a-z/]{5,30}",             // index_dir
+        "[a-z/.]{5,30}",            // state_path
+        1_u32..10,                  // format_version
+        0_usize..100_000,           // document_count
+        0_usize..100,               // segment_count
+        0_u64..10_000_000,          // index_size_bytes
+        0_usize..1000,              // pending_docs
+        1_000_000_u64..100_000_000, // max_index_size_bytes
+        1_u64..365,                 // ttl_days
+        1_u64..3600,                // flush_interval_secs
+        1_usize..10_000,            // flush_docs_threshold
     );
     let extra = (
         prop_oneof![
@@ -616,7 +616,7 @@ fn arb_search_index_stats() -> impl Strategy<Value = SearchIndexStatsData> {
             Just("running".to_string()),
             Just("error".to_string()),
         ],
-        0_usize..100,                        // indexing_error_count
+        0_usize..100,                         // indexing_error_count
         proptest::option::of("[a-z ]{5,30}"), // last_error
     );
     (core, extra).prop_map(
@@ -652,20 +652,20 @@ fn arb_search_index_stats() -> impl Strategy<Value = SearchIndexStatsData> {
 
 fn arb_account_info() -> impl Strategy<Value = AccountInfo> {
     (
-        "[a-z0-9-]{5,20}",           // account_id
+        "[a-z0-9-]{5,20}", // account_id
         prop_oneof![
             Just("anthropic".to_string()),
             Just("openai".to_string()),
             Just("google".to_string()),
         ],
         proptest::option::of("[A-Za-z ]{3,20}"), // name
-        0.0_f64..100.0,              // percent_remaining
-        proptest::option::of("[0-9T:-]{10,25}"),  // reset_at
-        proptest::option::of(any::<i64>()),       // tokens_used
-        proptest::option::of(any::<i64>()),       // tokens_remaining
-        proptest::option::of(any::<i64>()),       // tokens_limit
-        any::<i64>(),                             // last_refreshed_at
-        proptest::option::of(any::<i64>()),       // last_used_at
+        0.0_f64..100.0,                          // percent_remaining
+        proptest::option::of("[0-9T:-]{10,25}"), // reset_at
+        proptest::option::of(any::<i64>()),      // tokens_used
+        proptest::option::of(any::<i64>()),      // tokens_remaining
+        proptest::option::of(any::<i64>()),      // tokens_limit
+        any::<i64>(),                            // last_refreshed_at
+        proptest::option::of(any::<i64>()),      // last_used_at
     )
         .prop_map(
             |(id, service, name, pct, reset, used, remaining, limit, refreshed, last_used)| {
@@ -687,19 +687,19 @@ fn arb_account_info() -> impl Strategy<Value = AccountInfo> {
 
 fn arb_event_item() -> impl Strategy<Value = EventItem> {
     (
-        any::<i64>(),     // id
-        any::<u64>(),     // pane_id
-        "[a-z.]{3,20}",  // rule_id
-        "[a-z_]{3,15}",  // pack_id
-        "[a-z_]{3,15}",  // event_type
+        any::<i64>(),   // id
+        any::<u64>(),   // pane_id
+        "[a-z.]{3,20}", // rule_id
+        "[a-z_]{3,15}", // pack_id
+        "[a-z_]{3,15}", // event_type
         prop_oneof![
             Just("info".to_string()),
             Just("warning".to_string()),
             Just("error".to_string()),
             Just("critical".to_string()),
         ],
-        0.5_f64..1.0,     // confidence
-        any::<i64>(),      // captured_at
+        0.5_f64..1.0, // confidence
+        any::<i64>(), // captured_at
     )
         .prop_map(
             |(id, pane_id, rule_id, pack_id, event_type, severity, confidence, captured_at)| {
@@ -723,32 +723,40 @@ fn arb_event_item() -> impl Strategy<Value = EventItem> {
 }
 
 fn arb_send_data() -> impl Strategy<Value = SendData> {
-    (
-        any::<u64>(),
-        proptest::option::of("[a-z ]{5,30}"),
-    )
-        .prop_map(|(pane_id, verification_error)| SendData {
+    (any::<u64>(), proptest::option::of("[a-z ]{5,30}")).prop_map(
+        |(pane_id, verification_error)| SendData {
             pane_id,
             injection: serde_json::json!({"text": "hello"}),
             wait_for: None,
             verification_error,
-        })
+        },
+    )
 }
 
 fn arb_pane_state_data() -> impl Strategy<Value = PaneStateData> {
     (
-        any::<u64>(),                              // pane_id
-        proptest::option::of("[a-z0-9-]{8,16}"),   // pane_uuid
-        any::<u64>(),                              // tab_id
-        any::<u64>(),                              // window_id
-        "[a-z_]{3,15}",                            // domain
-        proptest::option::of("[a-z ]{3,20}"),      // title
-        proptest::option::of("[a-z/]{5,30}"),      // cwd
-        any::<bool>(),                             // observed
-        proptest::option::of("[a-z ]{5,20}"),      // ignore_reason
+        any::<u64>(),                            // pane_id
+        proptest::option::of("[a-z0-9-]{8,16}"), // pane_uuid
+        any::<u64>(),                            // tab_id
+        any::<u64>(),                            // window_id
+        "[a-z_]{3,15}",                          // domain
+        proptest::option::of("[a-z ]{3,20}"),    // title
+        proptest::option::of("[a-z/]{5,30}"),    // cwd
+        any::<bool>(),                           // observed
+        proptest::option::of("[a-z ]{5,20}"),    // ignore_reason
     )
         .prop_map(
-            |(pane_id, pane_uuid, tab_id, window_id, domain, title, cwd, observed, ignore_reason)| {
+            |(
+                pane_id,
+                pane_uuid,
+                tab_id,
+                window_id,
+                domain,
+                title,
+                cwd,
+                observed,
+                ignore_reason,
+            )| {
                 PaneStateData {
                     pane_id,
                     pane_uuid,

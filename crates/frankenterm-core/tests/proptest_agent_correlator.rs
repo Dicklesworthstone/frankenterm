@@ -519,12 +519,14 @@ fn arb_running_entry() -> impl Strategy<Value = RunningAgentInventoryEntry> {
         proptest::option::of("[a-z0-9-]{5,20}"),
         arb_detection_source(),
     )
-        .prop_map(|(slug, state, session_id, source)| RunningAgentInventoryEntry {
-            slug,
-            state,
-            session_id,
-            source,
-        })
+        .prop_map(
+            |(slug, state, session_id, source)| RunningAgentInventoryEntry {
+                slug,
+                state,
+                session_id,
+                source,
+            },
+        )
 }
 
 fn arb_inventory() -> impl Strategy<Value = AgentInventory> {

@@ -753,14 +753,16 @@ fn arb_classified_process() -> impl Strategy<Value = ClassifiedProcess> {
         "[a-zA-Z0-9 ]{5,40}",
         proptest::option::of(1_u64..1000),
     )
-        .prop_map(|(pid, name, category, action, reason, pane_id)| ClassifiedProcess {
-            pid,
-            name,
-            category,
-            action,
-            reason,
-            pane_id,
-        })
+        .prop_map(
+            |(pid, name, category, action, reason, pane_id)| ClassifiedProcess {
+                pid,
+                name,
+                category,
+                action,
+                reason,
+                pane_id,
+            },
+        )
 }
 
 proptest! {

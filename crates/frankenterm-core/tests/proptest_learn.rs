@@ -4,6 +4,7 @@
 //! Track, Exercise, TutorialEngine state machine, TutorialEnvironment,
 //! BUILTIN_ACHIEVEMENTS catalog, and achievement_definition lookup.
 
+use chrono::{TimeZone, Utc};
 use frankenterm_core::learn::*;
 use proptest::prelude::*;
 use std::collections::HashSet;
@@ -29,6 +30,57 @@ fn arb_requirement() -> impl Strategy<Value = Requirement> {
         Just(Requirement::DbHasData),
         Just(Requirement::WaConfigured),
     ]
+}
+
+fn arb_achievement() -> impl Strategy<Value = Achievement> {
+    (
+        "[a-z_]{3,20}",
+        "[A-Z][a-z ]{3,20}",
+        "[a-z ]{5,40}",
+        0i64..=2_000_000_000,
+    )
+        .prop_map(|(id, name, description, ts)| Achievement {
+            id,
+            name,
+            description,
+            unlocked_at: Utc.timestamp_opt(ts, 0).unwrap(),
+        })
+}
+
+fn arb_tutorial_state() -> impl Strategy<Value = TutorialState> {
+    (
+        1u32..=10,
+        proptest::option::of("[a-z]{3,15}"),
+        proptest::option::of("[a-z]{3,10}\\.[0-9]{1,2}"),
+        prop::collection::vec("[a-z]{3,10}\\.[0-9]{1,2}", 0..5),
+        prop::collection::vec(arb_achievement(), 0..4),
+        0i64..=2_000_000_000,
+        0i64..=2_000_000_000,
+        0u32..=10_000,
+    )
+        .prop_map(
+            |(
+                version,
+                current_track,
+                current_exercise,
+                completed,
+                achievements,
+                started,
+                active,
+                minutes,
+            )| {
+                TutorialState {
+                    version,
+                    current_track,
+                    current_exercise,
+                    completed_exercises: completed.into_iter().collect(),
+                    achievements,
+                    started_at: Utc.timestamp_opt(started, 0).unwrap(),
+                    last_active: Utc.timestamp_opt(active, 0).unwrap(),
+                    total_time_minutes: minutes,
+                }
+            },
+        )
 }
 
 fn arb_exercise() -> impl Strategy<Value = Exercise> {
@@ -627,5 +679,128 @@ proptest! {
         };
         prop_assert_eq!(env.can_run_exercise(&exercise), CanRun::Yes,
                        "No requirements should always pass");
+    }
+}
+
+// ============================================================================
+// Property Tests: Achievement serde
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 39: Achievement serde JSON roundtrip preserves all fields
+    #[test]
+    fn prop_achievement_serde_roundtrip(ach in arb_achievement()) {
+        let json = serde_json::to_string(&ach).unwrap();
+        let back: Achievement = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.id, &ach.id);
+        prop_assert_eq!(&back.name, &ach.name);
+        prop_assert_eq!(&back.description, &ach.description);
+        prop_assert_eq!(back.unlocked_at, ach.unlocked_at);
+    }
+
+    /// Property 40: Achievement serde is deterministic
+    #[test]
+    fn prop_achievement_serde_deterministic(ach in arb_achievement()) {
+        let json1 = serde_json::to_string(&ach).unwrap();
+        let json2 = serde_json::to_string(&ach).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// Property 41: Achievement JSON has expected keys
+    #[test]
+    fn prop_achievement_json_keys(ach in arb_achievement()) {
+        let v: serde_json::Value = serde_json::to_value(&ach).unwrap();
+        let obj = v.as_object().unwrap();
+        prop_assert!(obj.contains_key("id"));
+        prop_assert!(obj.contains_key("name"));
+        prop_assert!(obj.contains_key("description"));
+        prop_assert!(obj.contains_key("unlocked_at"));
+    }
+
+    /// Property 42: Achievement equality is reflexive
+    #[test]
+    fn prop_achievement_eq_reflexive(ach in arb_achievement()) {
+        prop_assert_eq!(&ach, &ach);
+    }
+
+    /// Property 43: Achievement clone matches original
+    #[test]
+    fn prop_achievement_clone(ach in arb_achievement()) {
+        let cloned = ach.clone();
+        prop_assert_eq!(&cloned, &ach);
+    }
+}
+
+// ============================================================================
+// Property Tests: TutorialState serde with random data
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Property 44: TutorialState serde roundtrip with random data
+    #[test]
+    fn prop_tutorial_state_random_serde_roundtrip(state in arb_tutorial_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let back: TutorialState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.version, state.version);
+        prop_assert_eq!(back.current_track, state.current_track);
+        prop_assert_eq!(back.current_exercise, state.current_exercise);
+        prop_assert_eq!(back.completed_exercises.len(), state.completed_exercises.len());
+        prop_assert_eq!(back.achievements.len(), state.achievements.len());
+        prop_assert_eq!(back.started_at, state.started_at);
+        prop_assert_eq!(back.last_active, state.last_active);
+        prop_assert_eq!(back.total_time_minutes, state.total_time_minutes);
+    }
+
+    /// Property 45: TutorialState serde is deterministic
+    #[test]
+    fn prop_tutorial_state_random_serde_deterministic(state in arb_tutorial_state()) {
+        let json1 = serde_json::to_string(&state).unwrap();
+        let json2 = serde_json::to_string(&state).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// Property 46: TutorialState JSON has expected keys
+    #[test]
+    fn prop_tutorial_state_json_keys(state in arb_tutorial_state()) {
+        let v: serde_json::Value = serde_json::to_value(&state).unwrap();
+        let obj = v.as_object().unwrap();
+        prop_assert!(obj.contains_key("version"));
+        prop_assert!(obj.contains_key("completed_exercises"));
+        prop_assert!(obj.contains_key("achievements"));
+        prop_assert!(obj.contains_key("started_at"));
+        prop_assert!(obj.contains_key("last_active"));
+        prop_assert!(obj.contains_key("total_time_minutes"));
+    }
+
+    /// Property 47: TutorialState completed_exercises preserved through serde
+    #[test]
+    fn prop_tutorial_state_completed_preserved(state in arb_tutorial_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let back: TutorialState = serde_json::from_str(&json).unwrap();
+        for ex in &state.completed_exercises {
+            prop_assert!(back.completed_exercises.contains(ex),
+                        "Completed exercise '{}' should be preserved", ex);
+        }
+    }
+
+    /// Property 48: TutorialState achievements order preserved through serde
+    #[test]
+    fn prop_tutorial_state_achievements_order(state in arb_tutorial_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let back: TutorialState = serde_json::from_str(&json).unwrap();
+        for (i, ach) in state.achievements.iter().enumerate() {
+            prop_assert_eq!(&back.achievements[i].id, &ach.id,
+                           "Achievement order should be preserved at index {}", i);
+        }
+    }
+
+    /// Property 49: TutorialState version is always positive
+    #[test]
+    fn prop_tutorial_state_version_positive(state in arb_tutorial_state()) {
+        prop_assert!(state.version > 0, "version should be positive");
     }
 }

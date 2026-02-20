@@ -778,14 +778,16 @@ fn arb_client_role() -> impl Strategy<Value = ClientRole> {
 }
 
 fn arb_view_mode() -> impl Strategy<Value = ViewMode> {
-    prop_oneof![
-        Just(ViewMode::Independent),
-        Just(ViewMode::Mirrored),
-    ]
+    prop_oneof![Just(ViewMode::Independent), Just(ViewMode::Mirrored),]
 }
 
 fn arb_client_view_state() -> impl Strategy<Value = ClientViewState> {
-    (0_u64..20, 0_u64..100, arb_view_mode(), 0_u64..2_000_000_000_000)
+    (
+        0_u64..20,
+        0_u64..100,
+        arb_view_mode(),
+        0_u64..2_000_000_000_000,
+    )
         .prop_map(|(tab, pane, mode, ts)| ClientViewState {
             active_tab: tab,
             active_pane: pane,

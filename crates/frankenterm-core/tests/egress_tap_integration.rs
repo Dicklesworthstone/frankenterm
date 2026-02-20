@@ -108,6 +108,7 @@ fn fast_config() -> TailerConfig {
         max_concurrent: 4,
         overlap_size: 50,
         send_timeout: Duration::from_secs(1),
+        capture_timeout: Duration::from_secs(1),
     }
 }
 

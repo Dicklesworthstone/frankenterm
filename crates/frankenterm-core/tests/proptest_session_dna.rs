@@ -564,11 +564,11 @@ proptest! {
 
 fn arb_stored_session() -> impl Strategy<Value = StoredSession> {
     (
-        "[a-z0-9]{8,16}",          // session_id
-        arb_session_dna(),          // dna
-        arb_vec(RAW_FEATURE_DIM),   // embedding
-        0.0f64..100.0,              // duration_hours
-        proptest::bool::ANY,        // successful
+        "[a-z0-9]{8,16}",         // session_id
+        arb_session_dna(),        // dna
+        arb_vec(RAW_FEATURE_DIM), // embedding
+        0.0f64..100.0,            // duration_hours
+        proptest::bool::ANY,      // successful
     )
         .prop_map(|(sid, dna, emb, dur, succ)| StoredSession {
             session_id: sid,

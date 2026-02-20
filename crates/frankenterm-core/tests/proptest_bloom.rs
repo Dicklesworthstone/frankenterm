@@ -715,14 +715,16 @@ fn arb_bloom_stats() -> impl Strategy<Value = BloomStats> {
         0.0f64..1.0,
         0.0f64..1.0,
     )
-        .prop_map(|(count, num_bits, num_hashes, memory_bytes, fp, fill)| BloomStats {
-            count,
-            num_bits,
-            num_hashes,
-            memory_bytes,
-            estimated_fp_rate: fp,
-            fill_ratio: fill,
-        })
+        .prop_map(
+            |(count, num_bits, num_hashes, memory_bytes, fp, fill)| BloomStats {
+                count,
+                num_bits,
+                num_hashes,
+                memory_bytes,
+                estimated_fp_rate: fp,
+                fill_ratio: fill,
+            },
+        )
 }
 
 proptest! {

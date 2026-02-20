@@ -681,28 +681,30 @@ proptest! {
 
 fn arb_pane_entropy_summary() -> impl Strategy<Value = PaneEntropySummary> {
     (
-        0u64..100_000,         // pane_id
-        0u64..10_000_000,      // raw_bytes
-        0.0f64..8.0,           // entropy
-        0.0f64..10_000_000.0,  // information_cost
-        0.0f64..8.0,           // compression_ratio_bound
-        0.0f64..100_000.0,     // eviction_score
+        0u64..100_000,        // pane_id
+        0u64..10_000_000,     // raw_bytes
+        0.0f64..8.0,          // entropy
+        0.0f64..10_000_000.0, // information_cost
+        0.0f64..8.0,          // compression_ratio_bound
+        0.0f64..100_000.0,    // eviction_score
     )
-        .prop_map(|(pane_id, raw_bytes, entropy, info_cost, cr_bound, ev_score)| PaneEntropySummary {
-            pane_id,
-            raw_bytes,
-            entropy,
-            information_cost: info_cost,
-            compression_ratio_bound: cr_bound,
-            eviction_score: ev_score,
-        })
+        .prop_map(
+            |(pane_id, raw_bytes, entropy, info_cost, cr_bound, ev_score)| PaneEntropySummary {
+                pane_id,
+                raw_bytes,
+                entropy,
+                information_cost: info_cost,
+                compression_ratio_bound: cr_bound,
+                eviction_score: ev_score,
+            },
+        )
 }
 
 fn arb_information_budget() -> impl Strategy<Value = InformationBudget> {
     (
-        1.0f64..10_000_000.0,  // budget_bytes
-        0.0f64..10_000_000.0,  // current_cost
-        0usize..1000,          // pane_count
+        1.0f64..10_000_000.0, // budget_bytes
+        0.0f64..10_000_000.0, // current_cost
+        0usize..1000,         // pane_count
     )
         .prop_map(|(budget, cost, count)| InformationBudget {
             budget_bytes: budget,

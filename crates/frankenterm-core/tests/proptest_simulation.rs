@@ -614,8 +614,12 @@ fn arb_expectation_kind() -> impl Strategy<Value = ExpectationKind> {
     prop_oneof![
         ("[a-z_]{3,15}", proptest::option::of("[0-9]{1,4}s"))
             .prop_map(|(event, detected_at)| ExpectationKind::Event { event, detected_at }),
-        ("[a-z_]{3,15}", proptest::option::of("[0-9]{1,4}s"))
-            .prop_map(|(workflow, started_at)| ExpectationKind::Workflow { workflow, started_at }),
+        ("[a-z_]{3,15}", proptest::option::of("[0-9]{1,4}s")).prop_map(|(workflow, started_at)| {
+            ExpectationKind::Workflow {
+                workflow,
+                started_at,
+            }
+        }),
         (1_u64..100, "[a-zA-Z0-9 ]{3,30}")
             .prop_map(|(pane, text)| ExpectationKind::Contains { pane, text }),
     ]
@@ -633,19 +637,21 @@ fn arb_scenario_pane() -> impl Strategy<Value = ScenarioPane> {
         5_u32..100,
         "[a-zA-Z0-9 ]{0,40}",
     )
-        .prop_map(|(id, title, domain, cwd, window_id, tab_id, cols, rows, initial_content)| {
-            ScenarioPane {
-                id,
-                title,
-                domain,
-                cwd,
-                window_id,
-                tab_id,
-                cols,
-                rows,
-                initial_content,
-            }
-        })
+        .prop_map(
+            |(id, title, domain, cwd, window_id, tab_id, cols, rows, initial_content)| {
+                ScenarioPane {
+                    id,
+                    title,
+                    domain,
+                    cwd,
+                    window_id,
+                    tab_id,
+                    cols,
+                    rows,
+                    initial_content,
+                }
+            },
+        )
 }
 
 // =========================================================================
