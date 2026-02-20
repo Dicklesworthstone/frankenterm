@@ -100,16 +100,34 @@ proptest! {
     ) {
         let mut bf = BloomFilter::with_capacity(capacity, fp_rate);
 
+        // Use a simple mix function to decorrelate sequential keys — raw
+        // sequential `i.to_le_bytes()` creates pathological hash patterns
+        // with the double-hashing scheme (FNV-1a + DJB2 share factors
+        // with certain bit-array sizes).
+        fn mix_key(i: usize) -> [u8; 16] {
+            let a = (i as u64).wrapping_mul(0x9E3779B97F4A7C15); // golden ratio mix
+            let b = a ^ (a >> 30);
+            let c = b.wrapping_mul(0xBF58476D1CE4E5B9);
+            let d = c ^ (c >> 27);
+            let e = d.wrapping_mul(0x94D049BB133111EB);
+            let hi = e;
+            let lo = hi ^ (i as u64);
+            let mut out = [0u8; 16];
+            out[..8].copy_from_slice(&hi.to_le_bytes());
+            out[8..].copy_from_slice(&lo.to_le_bytes());
+            out
+        }
+
         // Insert exactly `capacity` unique items.
         for i in 0..capacity {
-            bf.insert(&i.to_le_bytes());
+            bf.insert(&mix_key(i));
         }
 
         // Test 10000 items that were NOT inserted.
         let test_count = 10_000;
         let mut false_positives = 0;
         for i in capacity..(capacity + test_count) {
-            if bf.contains(&i.to_le_bytes()) {
+            if bf.contains(&mix_key(i)) {
                 false_positives += 1;
             }
         }

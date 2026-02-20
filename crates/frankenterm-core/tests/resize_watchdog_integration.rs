@@ -6,6 +6,11 @@ use frankenterm_core::resize_scheduler::{
 use frankenterm_core::runtime::{ResizeWatchdogSeverity, evaluate_resize_watchdog};
 use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use std::future::Future;
+use std::sync::Mutex;
+
+/// Tests in this file share a process-global resize scheduler debug snapshot.
+/// Serialize tests that write+read global state to avoid parallel pollution.
+static GLOBAL_SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
 
 fn intent(pane_id: u64, intent_seq: u64, submitted_at_ms: u64) -> ResizeIntent {
     ResizeIntent {
@@ -31,6 +36,8 @@ where
 
 #[test]
 fn watchdog_escalates_to_critical_when_multiple_resize_transactions_stall() {
+    let _lock = GLOBAL_SNAPSHOT_LOCK.lock().unwrap();
+
     let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
         frame_budget_units: 2,
         allow_single_oversubscription: false,
@@ -58,6 +65,8 @@ fn watchdog_escalates_to_critical_when_multiple_resize_transactions_stall() {
 #[cfg(unix)]
 #[test]
 fn ipc_status_includes_resize_watchdog_assessment() {
+    let _lock = GLOBAL_SNAPSHOT_LOCK.lock().unwrap();
+
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -134,6 +143,8 @@ fn ipc_status_includes_resize_watchdog_assessment() {
 
 #[test]
 fn watchdog_healthy_when_no_stalled_transactions() {
+    let _lock = GLOBAL_SNAPSHOT_LOCK.lock().unwrap();
+
     let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
         frame_budget_units: 4,
         allow_single_oversubscription: false,
@@ -158,6 +169,8 @@ fn watchdog_healthy_when_no_stalled_transactions() {
 
 #[test]
 fn watchdog_warning_line_is_none_for_healthy() {
+    let _lock = GLOBAL_SNAPSHOT_LOCK.lock().unwrap();
+
     // Construct a watchdog assessment at healthy severity to verify warning_line behavior
     let assessment = evaluate_resize_watchdog(0);
     if let Some(ref a) = assessment {
@@ -172,6 +185,8 @@ fn watchdog_warning_line_is_none_for_healthy() {
 
 #[test]
 fn watchdog_assessment_fields_populated() {
+    let _lock = GLOBAL_SNAPSHOT_LOCK.lock().unwrap();
+
     let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
         frame_budget_units: 3,
         allow_single_oversubscription: false,
@@ -209,7 +224,7 @@ fn watchdog_assessment_fields_populated() {
 
 #[test]
 fn watchdog_severity_ordering_healthy_then_warning_then_critical() {
-    // Verify the severity enum variants are distinguishable
+    // No global state access needed — pure enum test
     let healthy = ResizeWatchdogSeverity::Healthy;
     let warning = ResizeWatchdogSeverity::Warning;
     let critical = ResizeWatchdogSeverity::Critical;
@@ -226,6 +241,8 @@ fn watchdog_severity_ordering_healthy_then_warning_then_critical() {
 
 #[test]
 fn scheduler_emergency_disable_affects_watchdog_assessment() {
+    let _lock = GLOBAL_SNAPSHOT_LOCK.lock().unwrap();
+
     let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
         frame_budget_units: 2,
         emergency_disable: true,
