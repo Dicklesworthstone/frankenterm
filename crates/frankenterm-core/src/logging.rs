@@ -14,16 +14,19 @@
 //!
 //! Initialize logging once at startup:
 //!
-//! ```ignore
-//! use frankenterm_core::logging::{init_logging, LogConfig};
+//! ```no_run
+//! use frankenterm_core::logging::{init_logging, LogConfig, LogError};
 //! use frankenterm_core::config::LogFormat;
 //!
-//! let config = LogConfig {
-//!     level: "info".to_string(),
-//!     format: LogFormat::Pretty,
-//!     file: None,
-//! };
-//! init_logging(&config)?;
+//! fn main() -> Result<(), LogError> {
+//!     let config = LogConfig {
+//!         level: "info".to_string(),
+//!         format: LogFormat::Pretty,
+//!         file: None,
+//!     };
+//!     init_logging(&config)?;
+//!     Ok(())
+//! }
 //! ```
 //!
 //! # Correlation Fields

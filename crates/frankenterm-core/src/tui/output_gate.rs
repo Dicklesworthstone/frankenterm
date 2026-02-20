@@ -117,12 +117,12 @@ pub fn is_output_suppressed() -> bool {
 ///
 /// # Usage with tracing
 ///
-/// ```ignore
+/// ```no_run
 /// use frankenterm_core::tui::output_gate::TuiAwareWriter;
+/// use tracing_subscriber::fmt;
+/// use tracing_subscriber::prelude::*;
 ///
-/// fmt::layer()
-///     .with_writer(TuiAwareWriter)
-///     // ...
+/// let layer = fmt::layer().with_writer(TuiAwareWriter);
 /// ```
 #[derive(Clone, Copy)]
 pub struct TuiAwareWriter;
@@ -187,9 +187,9 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TuiAwareWriter {
 ///
 /// # Usage
 ///
-/// ```ignore
+/// ```
 /// use frankenterm_core::tui::output_gate::gated_write_stdout;
-/// gated_write_stdout(format_args!("Running: {}\n", command));
+/// gated_write_stdout(format_args!("Running: {}\n", "cargo build"));
 /// ```
 pub fn gated_write_stdout(args: std::fmt::Arguments<'_>) {
     if is_output_suppressed() {

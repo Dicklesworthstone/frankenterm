@@ -16,18 +16,16 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```
 //! use frankenterm_core::screen_state::ScreenStateTracker;
 //!
 //! let mut tracker = ScreenStateTracker::new();
 //!
-//! // Process captured terminal output
-//! tracker.process_output(pane_id, output_bytes);
+//! // Process captured terminal output containing alt-screen enter sequence
+//! tracker.process_output(0, b"\x1b[?1049h");
 //!
 //! // Query state
-//! if tracker.is_alt_screen(pane_id) {
-//!     // Pane is in alternate screen mode (vim, less, etc.)
-//! }
+//! assert!(tracker.is_alt_screen(0)); // vim, less, etc.
 //! ```
 
 use std::collections::HashMap;
@@ -94,22 +92,31 @@ impl ScreenStateTracker {
 
         let state = self.pane_states.entry(pane_id).or_default();
 
-        // Combine tail buffer with new output to handle split sequences
-        let search_buf: Vec<u8> = if state.tail_buffer.is_empty() {
-            output.to_vec()
-        } else {
-            let mut combined = std::mem::take(&mut state.tail_buffer);
-            combined.extend_from_slice(output);
-            combined
-        };
+        // Optimization: Avoid allocating a new vector for the entire output + tail.
+        // Instead, check the boundary condition (tail + start of output) separately,
+        // then check the main body of the output.
+        // Since sequence detection is idempotent (setting state to true/false),
+        // processing the overlap region twice is safe.
 
-        // Process all escape sequences in order
+        if !state.tail_buffer.is_empty() {
+            // Bridge the gap: tail + prefix of new output
+            let bridge_len = output.len().min(TAIL_BUFFER_SIZE);
+            let mut bridge = Vec::with_capacity(state.tail_buffer.len() + bridge_len);
+            bridge.extend_from_slice(&state.tail_buffer);
+            bridge.extend_from_slice(&output[..bridge_len]);
+
+            state.alt_screen_active =
+                Self::detect_final_alt_screen_state(&bridge, state.alt_screen_active);
+        }
+
+        // Process the full new output
         state.alt_screen_active =
-            Self::detect_final_alt_screen_state(&search_buf, state.alt_screen_active);
+            Self::detect_final_alt_screen_state(output, state.alt_screen_active);
 
-        // Save tail for next capture (in case sequence is split)
-        let tail_start = search_buf.len().saturating_sub(TAIL_BUFFER_SIZE);
-        state.tail_buffer = search_buf[tail_start..].to_vec();
+        // Save tail for next capture
+        let tail_start = output.len().saturating_sub(TAIL_BUFFER_SIZE);
+        state.tail_buffer.clear();
+        state.tail_buffer.extend_from_slice(&output[tail_start..]);
     }
 
     /// Detect the final alt-screen state after processing all sequences in the buffer.

@@ -24,7 +24,7 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```no_run
 //! use frankenterm_core::chaos::{FaultInjector, FaultPoint, FaultMode};
 //!
 //! // Set up fault injection
@@ -32,8 +32,8 @@
 //! injector.set_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(3, "disk full"));
 //!
 //! // Check at injection point (production: no-op)
-//! if let Err(e) = FaultInjector::check(FaultPoint::DbWrite) {
-//!     // Handle injected fault
+//! for _ in 0..3 {
+//!     let _ = FaultInjector::check(FaultPoint::DbWrite);
 //! }
 //!
 //! // Review what happened
