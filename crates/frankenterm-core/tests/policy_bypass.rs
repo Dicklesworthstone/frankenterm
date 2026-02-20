@@ -1,4 +1,4 @@
-use frankenterm_core::policy::{ActionKind, ActorKind, PolicyInput, is_command_candidate};
+use frankenterm_core::policy::is_command_candidate;
 
 #[test]
 fn repro_policy_bypass_absolute_path() {

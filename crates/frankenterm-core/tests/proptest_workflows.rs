@@ -55,6 +55,7 @@ fn arb_step_result() -> impl Strategy<Value = StepResult> {
         "[a-zA-Z0-9 ]{1,64}".prop_map(StepResult::abort),
         arb_wait_condition().prop_map(StepResult::wait_for),
         "[a-zA-Z0-9 ]{1,64}".prop_map(StepResult::send_text),
+        (0usize..100).prop_map(StepResult::jump_to),
     ]
 }
 
