@@ -90,7 +90,7 @@ impl HyperLogLog {
     }
 
     /// Insert a hashable element.
-    pub fn insert<T: Hash>(&mut self, item: &T) {
+    pub fn insert<T: Hash + ?Sized>(&mut self, item: &T) {
         let hash = self.hash_item(item);
         let idx = (hash >> (64 - self.precision)) as usize;
         // Count leading zeros in the remaining bits
@@ -265,7 +265,7 @@ impl HyperLogLog {
 
     /// Hash an item using a fast 64-bit hash (SplitMix64-based).
     #[allow(clippy::unused_self)]
-    fn hash_item<T: Hash>(&self, item: &T) -> u64 {
+    fn hash_item<T: Hash + ?Sized>(&self, item: &T) -> u64 {
         let mut hasher = FnvHasher::new();
         item.hash(&mut hasher);
         let h = hasher.finish();

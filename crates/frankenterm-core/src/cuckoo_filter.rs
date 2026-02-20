@@ -58,7 +58,7 @@ impl Default for CuckooConfig {
 type Fingerprint = u32;
 
 /// Hash an item to produce a fingerprint and primary bucket index.
-fn hash_item<T: Hash>(item: &T, num_buckets: usize) -> (Fingerprint, usize) {
+fn hash_item<T: Hash + ?Sized>(item: &T, num_buckets: usize) -> (Fingerprint, usize) {
     let mut hasher = FnvHasher::new();
     item.hash(&mut hasher);
     let h = hasher.finish();
@@ -243,7 +243,7 @@ impl CuckooFilter {
     }
 
     /// Insert an item into the filter.
-    pub fn insert<T: Hash>(&mut self, item: &T) -> InsertResult {
+    pub fn insert<T: Hash + ?Sized>(&mut self, item: &T) -> InsertResult {
         let (fp, i1) = hash_item(item, self.num_buckets);
         let i2 = alt_index(i1, fp, self.num_buckets);
 
@@ -283,7 +283,7 @@ impl CuckooFilter {
     ///
     /// Returns `true` if the item is probably present, `false` if definitely absent.
     /// False positives are possible; false negatives are not.
-    pub fn lookup<T: Hash>(&self, item: &T) -> bool {
+    pub fn lookup<T: Hash + ?Sized>(&self, item: &T) -> bool {
         let (fp, i1) = hash_item(item, self.num_buckets);
         let i2 = alt_index(i1, fp, self.num_buckets);
         self.buckets[i1].contains(fp) || self.buckets[i2].contains(fp)
@@ -295,7 +295,7 @@ impl CuckooFilter {
     ///
     /// **Important**: Only delete items that were previously inserted.
     /// Deleting items that were never inserted can cause false negatives.
-    pub fn delete<T: Hash>(&mut self, item: &T) -> bool {
+    pub fn delete<T: Hash + ?Sized>(&mut self, item: &T) -> bool {
         let (fp, i1) = hash_item(item, self.num_buckets);
         let i2 = alt_index(i1, fp, self.num_buckets);
 
