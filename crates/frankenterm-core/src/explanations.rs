@@ -6,7 +6,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
+//! ```
 //! use frankenterm_core::explanations::{get_explanation, render_explanation};
 //! use std::collections::HashMap;
 //!
@@ -483,7 +483,7 @@ pub static EXPLANATION_TEMPLATES: LazyLock<HashMap<&'static str, &'static Explan
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```
 /// use frankenterm_core::explanations::get_explanation;
 ///
 /// if let Some(tmpl) = get_explanation("deny.alt_screen") {
@@ -532,7 +532,7 @@ pub fn list_templates_by_category(prefix: &str) -> Vec<&'static ExplanationTempl
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```
 /// use frankenterm_core::explanations::{get_explanation, render_explanation};
 /// use std::collections::HashMap;
 ///

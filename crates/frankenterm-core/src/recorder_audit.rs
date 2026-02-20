@@ -346,7 +346,7 @@ struct AuditLogInner {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use frankenterm_core::recorder_audit::*;
 /// use frankenterm_core::policy::ActorKind;
 ///

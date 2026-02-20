@@ -7,7 +7,7 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```ignore
 //! use frankenterm_core::learn::{TutorialEngine, TutorialEvent};
 //!
 //! let mut engine = TutorialEngine::load_or_create()?;

@@ -16,7 +16,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
+//! ```ignore
 //! use frankenterm_core::screen_state::ScreenStateTracker;
 //!
 //! let mut tracker = ScreenStateTracker::new();

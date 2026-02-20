@@ -6,7 +6,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
+//! ```ignore
 //! use frankenterm_core::retry::{RetryPolicy, with_retry};
 //!
 //! let policy = RetryPolicy::default();

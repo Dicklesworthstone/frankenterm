@@ -269,7 +269,7 @@ pub fn is_logging_initialized() -> bool {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// let span = frankenterm_core::wa_span!(
 ///     "ingest_pane",
 ///     pane_id = 42,

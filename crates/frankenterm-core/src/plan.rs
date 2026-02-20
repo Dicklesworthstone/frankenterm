@@ -15,7 +15,7 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
 //! use frankenterm_core::plan::{ActionPlan, StepPlan, StepAction};
 //!
 //! let plan = ActionPlan::builder("Recover rate-limited agent", "workspace-123")
