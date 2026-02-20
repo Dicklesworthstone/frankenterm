@@ -529,6 +529,54 @@ pub mod net {
     pub use tokio::net::{TcpListener, TcpStream};
 }
 
+/// Signal handling primitives for graceful shutdown.
+///
+/// Wraps `tokio::signal` in the default build for eventual asupersync swap.
+#[cfg(not(feature = "asupersync-runtime"))]
+pub mod signal {
+    /// Completes when a Ctrl+C (SIGINT) signal is received.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signal handler could not be registered.
+    pub async fn ctrl_c() -> std::io::Result<()> {
+        tokio::signal::ctrl_c().await
+    }
+
+    /// Unix-specific signal handling.
+    #[cfg(unix)]
+    pub mod unix {
+        pub use tokio::signal::unix::SignalKind;
+
+        /// A stream of signals of a specific kind.
+        pub struct Signal {
+            inner: tokio::signal::unix::Signal,
+        }
+
+        impl Signal {
+            /// Receives the next signal notification.
+            ///
+            /// Returns `None` if the signal stream is terminated.
+            pub async fn recv(&mut self) -> Option<()> {
+                self.inner.recv().await
+            }
+        }
+
+        /// Creates a new listener for the given signal kind.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the signal handler could not be registered.
+        pub fn signal(kind: SignalKind) -> std::io::Result<Signal> {
+            tokio::signal::unix::signal(kind).map(|inner| Signal { inner })
+        }
+    }
+}
+
+/// Re-export of `tokio::task::JoinError` for task join handle error handling.
+#[cfg(not(feature = "asupersync-runtime"))]
+pub use tokio::task::JoinError;
+
 /// Unified runtime trait used during migration.
 pub trait CompatRuntime {
     /// Runs a future to completion.
@@ -2671,5 +2719,98 @@ mod tests {
         task::yield_now().await;
         let val = rx.recv().await;
         assert_eq!(val, Some(42));
+    }
+
+    // ── Signal module tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn signal_ctrl_c_is_constructible() {
+        // Verify ctrl_c() returns a future that can be selected against.
+        // We cannot actually send SIGINT in a test, so we verify it compiles
+        // and that the select! with an immediate timeout works.
+        let result = timeout(Duration::from_millis(1), signal::ctrl_c()).await;
+        // Should timeout since no SIGINT is sent.
+        assert!(result.is_err(), "ctrl_c should not resolve without signal");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_unix_terminate_is_constructible() {
+        // Verify we can create a SIGTERM listener via the compat layer.
+        let listener = signal::unix::signal(signal::unix::SignalKind::terminate());
+        assert!(listener.is_ok(), "SIGTERM listener creation should succeed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_unix_hangup_is_constructible() {
+        let listener = signal::unix::signal(signal::unix::SignalKind::hangup());
+        assert!(listener.is_ok(), "SIGHUP listener creation should succeed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_unix_recv_times_out_without_signal() {
+        let mut sig = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("create SIGTERM listener");
+        let result = timeout(Duration::from_millis(5), sig.recv()).await;
+        assert!(result.is_err(), "recv should timeout without actual signal");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_unix_usr1_is_constructible() {
+        let listener = signal::unix::signal(signal::unix::SignalKind::user_defined1());
+        assert!(listener.is_ok(), "SIGUSR1 listener creation should succeed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_unix_usr2_is_constructible() {
+        let listener = signal::unix::signal(signal::unix::SignalKind::user_defined2());
+        assert!(listener.is_ok(), "SIGUSR2 listener creation should succeed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_unix_recv_delivers_sent_signal() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut sig = signal::unix::signal(signal::unix::SignalKind::user_defined1())
+            .expect("create SIGUSR1 listener");
+
+        let received = Arc::new(AtomicBool::new(false));
+        let received_clone = received.clone();
+
+        // Spawn a task that waits for the signal.
+        let handle = task::spawn(async move {
+            if let Some(()) = sig.recv().await {
+                received_clone.store(true, Ordering::SeqCst);
+            }
+        });
+
+        // Give the listener a moment to register.
+        task::yield_now().await;
+        sleep(Duration::from_millis(10)).await;
+
+        // Send SIGUSR1 to ourselves via Command (no unsafe).
+        let pid = std::process::id();
+        let _ = std::process::Command::new("kill")
+            .args(["-USR1", &pid.to_string()])
+            .status();
+
+        // Wait for delivery.
+        let _ = timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            received.load(Ordering::SeqCst),
+            "SIGUSR1 should have been received"
+        );
+    }
+
+    #[test]
+    fn join_error_type_is_reexported() {
+        // Verify the JoinError re-export compiles and is usable as a type.
+        fn _accept_join_error(_e: JoinError) {}
     }
 }
