@@ -4,11 +4,14 @@
 //! `AgentCorrelator` lifecycle properties (new, ingest, remove, get_metadata),
 //! title-based detection via `update_from_pane_info`, and state tracking.
 
-use frankenterm_core::agent_correlator::{AgentCorrelator, DetectionSource};
+use frankenterm_core::agent_correlator::{
+    AgentCorrelator, AgentInventory, DetectionSource, InstalledAgentInventoryEntry,
+    RunningAgentInventoryEntry,
+};
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use frankenterm_core::wezterm::PaneInfo;
 use proptest::prelude::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 // =========================================================================
 // Strategies
@@ -454,6 +457,356 @@ proptest! {
 
         let meta = correlator.get_metadata(pane_id).unwrap();
         prop_assert_eq!(meta.state.as_deref(), Some("active"));
+    }
+}
+
+// =========================================================================
+// Inventory type strategies
+// =========================================================================
+
+fn arb_slug() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("claude_code".to_string()),
+        Just("codex".to_string()),
+        Just("gemini".to_string()),
+        Just("aider".to_string()),
+        Just("cursor".to_string()),
+    ]
+}
+
+fn arb_state_str() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("starting".to_string()),
+        Just("working".to_string()),
+        Just("idle".to_string()),
+        Just("rate_limited".to_string()),
+        Just("waiting_approval".to_string()),
+        Just("auth_error".to_string()),
+        Just("active".to_string()),
+        Just("unknown".to_string()),
+    ]
+}
+
+fn arb_installed_entry() -> impl Strategy<Value = InstalledAgentInventoryEntry> {
+    (
+        arb_slug(),
+        any::<bool>(),
+        prop::collection::vec("[a-z_]{3,20}", 0..4),
+        prop::collection::vec("/[a-z/]{3,30}", 0..3),
+        proptest::option::of("[a-z/.]{3,30}"),
+        proptest::option::of("/[a-z/.]{5,40}"),
+        proptest::option::of("[0-9]{1,2}\\.[0-9]{1,2}\\.[0-9]{1,2}"),
+    )
+        .prop_map(
+            |(slug, detected, evidence, root_paths, config_path, binary_path, version)| {
+                InstalledAgentInventoryEntry {
+                    slug,
+                    detected,
+                    evidence,
+                    root_paths,
+                    config_path,
+                    binary_path,
+                    version,
+                }
+            },
+        )
+}
+
+fn arb_running_entry() -> impl Strategy<Value = RunningAgentInventoryEntry> {
+    (
+        arb_slug(),
+        arb_state_str(),
+        proptest::option::of("[a-z0-9-]{5,20}"),
+        arb_detection_source(),
+    )
+        .prop_map(|(slug, state, session_id, source)| RunningAgentInventoryEntry {
+            slug,
+            state,
+            session_id,
+            source,
+        })
+}
+
+fn arb_inventory() -> impl Strategy<Value = AgentInventory> {
+    (
+        prop::collection::vec(arb_installed_entry(), 0..5),
+        prop::collection::vec((1_u64..1000, arb_running_entry()), 0..10),
+    )
+        .prop_map(|(installed, running_pairs)| {
+            let running: BTreeMap<u64, RunningAgentInventoryEntry> =
+                running_pairs.into_iter().collect();
+            AgentInventory { installed, running }
+        })
+}
+
+// =========================================================================
+// InstalledAgentInventoryEntry — serde roundtrip
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// InstalledAgentInventoryEntry survives JSON roundtrip.
+    #[test]
+    fn prop_installed_entry_serde_roundtrip(entry in arb_installed_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: InstalledAgentInventoryEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, entry);
+    }
+
+    /// InstalledAgentInventoryEntry serde is deterministic.
+    #[test]
+    fn prop_installed_entry_serde_deterministic(entry in arb_installed_entry()) {
+        let j1 = serde_json::to_string(&entry).unwrap();
+        let j2 = serde_json::to_string(&entry).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// InstalledAgentInventoryEntry JSON always contains slug field.
+    #[test]
+    fn prop_installed_entry_json_has_slug(entry in arb_installed_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        prop_assert!(json.contains("\"slug\""), "JSON should contain slug field");
+    }
+
+    /// InstalledAgentInventoryEntry JSON always contains detected field.
+    #[test]
+    fn prop_installed_entry_json_has_detected(entry in arb_installed_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        prop_assert!(json.contains("\"detected\""), "JSON should contain detected field");
+    }
+
+    /// InstalledAgentInventoryEntry with detected=true roundtrips correctly.
+    #[test]
+    fn prop_installed_entry_detected_preserved(entry in arb_installed_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: InstalledAgentInventoryEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.detected, entry.detected);
+    }
+}
+
+// =========================================================================
+// RunningAgentInventoryEntry — serde roundtrip
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// RunningAgentInventoryEntry survives JSON roundtrip.
+    #[test]
+    fn prop_running_entry_serde_roundtrip(entry in arb_running_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: RunningAgentInventoryEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, entry);
+    }
+
+    /// RunningAgentInventoryEntry serde is deterministic.
+    #[test]
+    fn prop_running_entry_serde_deterministic(entry in arb_running_entry()) {
+        let j1 = serde_json::to_string(&entry).unwrap();
+        let j2 = serde_json::to_string(&entry).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// RunningAgentInventoryEntry preserves source through serde.
+    #[test]
+    fn prop_running_entry_source_preserved(entry in arb_running_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: RunningAgentInventoryEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.source, entry.source);
+    }
+
+    /// RunningAgentInventoryEntry preserves session_id through serde.
+    #[test]
+    fn prop_running_entry_session_id_preserved(entry in arb_running_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: RunningAgentInventoryEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.session_id, entry.session_id);
+    }
+
+    /// RunningAgentInventoryEntry JSON contains state field.
+    #[test]
+    fn prop_running_entry_json_has_state(entry in arb_running_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        prop_assert!(json.contains("\"state\""), "JSON should contain state field");
+    }
+}
+
+// =========================================================================
+// AgentInventory — serde roundtrip
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// AgentInventory survives JSON roundtrip.
+    #[test]
+    fn prop_inventory_serde_roundtrip(inv in arb_inventory()) {
+        let json = serde_json::to_string(&inv).unwrap();
+        let back: AgentInventory = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.installed.len(), inv.installed.len());
+        prop_assert_eq!(back.running.len(), inv.running.len());
+        // Check installed entries
+        for (a, b) in back.installed.iter().zip(inv.installed.iter()) {
+            prop_assert_eq!(a, b);
+        }
+        // Check running entries
+        for (key, val) in &inv.running {
+            let back_val = back.running.get(key);
+            prop_assert!(back_val.is_some(), "missing key {} in roundtrip", key);
+            prop_assert_eq!(back_val.unwrap(), val);
+        }
+    }
+
+    /// AgentInventory serde is deterministic.
+    #[test]
+    fn prop_inventory_serde_deterministic(inv in arb_inventory()) {
+        let j1 = serde_json::to_string(&inv).unwrap();
+        let j2 = serde_json::to_string(&inv).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// AgentInventory default is empty.
+    #[test]
+    fn prop_inventory_default_empty(_dummy in 0..1u8) {
+        let inv = AgentInventory::default();
+        prop_assert!(inv.installed.is_empty());
+        prop_assert!(inv.running.is_empty());
+    }
+
+    /// AgentInventory JSON contains both top-level fields.
+    #[test]
+    fn prop_inventory_json_structure(inv in arb_inventory()) {
+        let json = serde_json::to_string(&inv).unwrap();
+        prop_assert!(json.contains("\"installed\""), "JSON should contain installed");
+        prop_assert!(json.contains("\"running\""), "JSON should contain running");
+    }
+
+    /// AgentInventory installed count preserved through serde.
+    #[test]
+    fn prop_inventory_installed_count_preserved(inv in arb_inventory()) {
+        let json = serde_json::to_string(&inv).unwrap();
+        let back: AgentInventory = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.installed.len(), inv.installed.len());
+    }
+}
+
+// =========================================================================
+// AgentCorrelator::inventory() — property tests
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// Fresh correlator inventory has empty running map.
+    #[test]
+    fn prop_fresh_inventory_running_empty(_dummy in 0..1u8) {
+        let correlator = AgentCorrelator::new();
+        let inv = correlator.inventory();
+        prop_assert!(inv.running.is_empty());
+    }
+
+    /// Inventory running map matches tracked pane count after ingests.
+    #[test]
+    fn prop_inventory_running_count_matches_tracked(n in 1_u64..15) {
+        let mut correlator = AgentCorrelator::new();
+        for i in 0..n {
+            correlator.ingest_detections(
+                i,
+                &[make_detection("core.claude_code:banner", AgentType::ClaudeCode)],
+            );
+        }
+        let inv = correlator.inventory();
+        prop_assert_eq!(inv.running.len(), n as usize);
+        prop_assert_eq!(inv.running.len(), correlator.tracked_pane_count());
+    }
+
+    /// Inventory running entries have correct slugs.
+    #[test]
+    fn prop_inventory_running_slug_matches_agent(
+        pane_id in 0_u64..10_000,
+        agent in arb_agent_type(),
+    ) {
+        let mut correlator = AgentCorrelator::new();
+        let rule_id = format!("core.test:banner");
+        correlator.ingest_detections(pane_id, &[make_detection(&rule_id, agent)]);
+
+        let inv = correlator.inventory();
+        let entry = inv.running.get(&pane_id);
+        prop_assert!(entry.is_some());
+        let expected_slug = format!("{}", agent);
+        prop_assert_eq!(&entry.unwrap().slug, &expected_slug);
+    }
+
+    /// Inventory running entries have source = PatternEngine when from ingest.
+    #[test]
+    fn prop_inventory_source_from_ingest(pane_id in 0_u64..10_000) {
+        let mut correlator = AgentCorrelator::new();
+        correlator.ingest_detections(
+            pane_id,
+            &[make_detection("core.codex:tool_use", AgentType::Codex)],
+        );
+        let inv = correlator.inventory();
+        let entry = inv.running.get(&pane_id).unwrap();
+        prop_assert_eq!(entry.source, DetectionSource::PatternEngine);
+    }
+
+    /// Inventory running entries from title have source = PaneTitle.
+    #[test]
+    fn prop_inventory_source_from_title(pane_id in 0_u64..10_000) {
+        let mut correlator = AgentCorrelator::new();
+        correlator.update_from_pane_info(&make_pane_info(pane_id, Some("claude-code ~/work")));
+        let inv = correlator.inventory();
+        let entry = inv.running.get(&pane_id).unwrap();
+        prop_assert_eq!(entry.source, DetectionSource::PaneTitle);
+    }
+
+    /// Inventory is serializable (no panics during serde).
+    #[test]
+    fn prop_correlator_inventory_serializable(n in 1_u64..10) {
+        let mut correlator = AgentCorrelator::new();
+        for i in 0..n {
+            correlator.ingest_detections(
+                i,
+                &[make_detection("core.gemini:banner", AgentType::Gemini)],
+            );
+        }
+        let inv = correlator.inventory();
+        let json = serde_json::to_string(&inv);
+        prop_assert!(json.is_ok(), "inventory should be serializable");
+        let back: Result<AgentInventory, _> = serde_json::from_str(&json.unwrap());
+        prop_assert!(back.is_ok(), "inventory should deserialize");
+    }
+
+    /// After remove_pane, inventory running map reflects removal.
+    #[test]
+    fn prop_inventory_after_remove(pane_id in 0_u64..10_000) {
+        let mut correlator = AgentCorrelator::new();
+        correlator.ingest_detections(
+            pane_id,
+            &[make_detection("core.claude_code:banner", AgentType::ClaudeCode)],
+        );
+        prop_assert!(correlator.inventory().running.contains_key(&pane_id));
+
+        correlator.remove_pane(pane_id);
+        prop_assert!(!correlator.inventory().running.contains_key(&pane_id));
+    }
+
+    /// Inventory session_id captured from extracted data.
+    #[test]
+    fn prop_inventory_session_id_captured(pane_id in 0_u64..10_000) {
+        let mut correlator = AgentCorrelator::new();
+        correlator.ingest_detections(
+            pane_id,
+            &[make_detection_with_session(
+                "core.codex:banner",
+                AgentType::Codex,
+                "sess-inv-456",
+            )],
+        );
+        let inv = correlator.inventory();
+        let entry = inv.running.get(&pane_id).unwrap();
+        prop_assert_eq!(entry.session_id.as_deref(), Some("sess-inv-456"));
     }
 }
 
