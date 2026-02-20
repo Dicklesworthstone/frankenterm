@@ -143,13 +143,15 @@ impl Ewma {
 ///
 /// # Example
 ///
-/// ```ignore
-/// let mut tracker = EwmaWithVariance::with_half_life_ms(1000);
-/// // ... observe many normal values ...
-/// let z = tracker.z_score(extreme_value);
-/// if z.abs() > 3.0 { // 3-sigma anomaly
-///     alert("anomaly detected!");
+/// ```
+/// use frankenterm_core::ewma::EwmaWithVariance;
+///
+/// let mut tracker = EwmaWithVariance::with_half_life_ms(1000.0);
+/// for i in 0..20 {
+///     tracker.observe(50.0 + (i as f64 * 0.1), i * 100);
 /// }
+/// let z = tracker.z_score(200.0); // far from mean
+/// assert!(z.abs() > 2.0); // anomaly
 /// ```
 #[derive(Debug, Clone)]
 pub struct EwmaWithVariance {
