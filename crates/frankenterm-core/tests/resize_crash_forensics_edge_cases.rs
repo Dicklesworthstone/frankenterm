@@ -538,7 +538,10 @@ fn global_lifecycle_update_get_clear() {
         .gate(sample_gate_active())
         .build_and_update_global();
     let got = ResizeCrashContext::get_global();
-    assert!(got.is_some(), "get_global should return Some after build_and_update_global");
+    assert!(
+        got.is_some(),
+        "get_global should return Some after build_and_update_global"
+    );
     ResizeCrashContext::clear_global();
 }
 
