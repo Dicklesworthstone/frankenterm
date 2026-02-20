@@ -514,13 +514,12 @@ mod tests {
         runtime.block_on(future)
     }
 
-    /// Helper to construct a `ScoredResult` for unit tests (no index needed).
+    /// Helper to construct a `ScoredResult` for unit tests.
     fn make_scored_result(doc_id: &str, score: f32) -> ScoredResult {
         ScoredResult {
             doc_id: doc_id.to_string(),
             score,
             source: ScoreSource::Hybrid,
-            index: None,
             fast_score: None,
             quality_score: None,
             lexical_score: None,
