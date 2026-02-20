@@ -7,6 +7,8 @@
 //! - Data types: serde roundtrips for GetTextData, TruncationInfo,
 //!   WaitForData, SearchHit, WorkflowInfo, ReservationInfo, etc.
 
+use std::collections::BTreeMap;
+
 use frankenterm_core::error_codes::ErrorCategory;
 use frankenterm_core::robot_types::*;
 use proptest::prelude::*;
@@ -586,5 +588,319 @@ proptest! {
     fn prop_error_code_debug_nonempty(code in arb_known_error_code()) {
         let debug = format!("{:?}", code);
         prop_assert!(!debug.is_empty());
+    }
+}
+
+// ============================================================================
+// Additional strategies for uncovered types
+// ============================================================================
+
+fn arb_search_index_stats() -> impl Strategy<Value = SearchIndexStatsData> {
+    // Split into two tuples to avoid exceeding proptest's 12-element tuple limit
+    let core = (
+        "[a-z/]{5,30}",               // index_dir
+        "[a-z/.]{5,30}",              // state_path
+        1_u32..10,                     // format_version
+        0_usize..100_000,             // document_count
+        0_usize..100,                 // segment_count
+        0_u64..10_000_000,            // index_size_bytes
+        0_usize..1000,               // pending_docs
+        1_000_000_u64..100_000_000,   // max_index_size_bytes
+        1_u64..365,                   // ttl_days
+        1_u64..3600,                  // flush_interval_secs
+        1_usize..10_000,             // flush_docs_threshold
+    );
+    let extra = (
+        prop_oneof![
+            Just("idle".to_string()),
+            Just("running".to_string()),
+            Just("error".to_string()),
+        ],
+        0_usize..100,                        // indexing_error_count
+        proptest::option::of("[a-z ]{5,30}"), // last_error
+    );
+    (core, extra).prop_map(
+        |(
+            (dir, state, ver, docs, segs, size, pending, max_size, ttl, flush_int, flush_docs),
+            (job_status, err_count, last_err),
+        )| {
+            SearchIndexStatsData {
+                index_dir: dir,
+                state_path: state,
+                format_version: ver,
+                document_count: docs,
+                segment_count: segs,
+                index_size_bytes: size,
+                pending_docs: pending,
+                max_index_size_bytes: max_size,
+                ttl_days: ttl,
+                flush_interval_secs: flush_int,
+                flush_docs_threshold: flush_docs,
+                newest_captured_at_ms: None,
+                oldest_captured_at_ms: None,
+                freshness_age_ms: None,
+                last_update_ts: None,
+                source_counts: BTreeMap::new(),
+                embedder_tiers_available: vec![],
+                background_job_status: job_status,
+                indexing_error_count: err_count,
+                last_error: last_err,
+            }
+        },
+    )
+}
+
+fn arb_account_info() -> impl Strategy<Value = AccountInfo> {
+    (
+        "[a-z0-9-]{5,20}",           // account_id
+        prop_oneof![
+            Just("anthropic".to_string()),
+            Just("openai".to_string()),
+            Just("google".to_string()),
+        ],
+        proptest::option::of("[A-Za-z ]{3,20}"), // name
+        0.0_f64..100.0,              // percent_remaining
+        proptest::option::of("[0-9T:-]{10,25}"),  // reset_at
+        proptest::option::of(any::<i64>()),       // tokens_used
+        proptest::option::of(any::<i64>()),       // tokens_remaining
+        proptest::option::of(any::<i64>()),       // tokens_limit
+        any::<i64>(),                             // last_refreshed_at
+        proptest::option::of(any::<i64>()),       // last_used_at
+    )
+        .prop_map(
+            |(id, service, name, pct, reset, used, remaining, limit, refreshed, last_used)| {
+                AccountInfo {
+                    account_id: id,
+                    service,
+                    name,
+                    percent_remaining: pct,
+                    reset_at: reset,
+                    tokens_used: used,
+                    tokens_remaining: remaining,
+                    tokens_limit: limit,
+                    last_refreshed_at: refreshed,
+                    last_used_at: last_used,
+                }
+            },
+        )
+}
+
+fn arb_event_item() -> impl Strategy<Value = EventItem> {
+    (
+        any::<i64>(),     // id
+        any::<u64>(),     // pane_id
+        "[a-z.]{3,20}",  // rule_id
+        "[a-z_]{3,15}",  // pack_id
+        "[a-z_]{3,15}",  // event_type
+        prop_oneof![
+            Just("info".to_string()),
+            Just("warning".to_string()),
+            Just("error".to_string()),
+            Just("critical".to_string()),
+        ],
+        0.5_f64..1.0,     // confidence
+        any::<i64>(),      // captured_at
+    )
+        .prop_map(
+            |(id, pane_id, rule_id, pack_id, event_type, severity, confidence, captured_at)| {
+                EventItem {
+                    id,
+                    pane_id,
+                    rule_id,
+                    pack_id,
+                    event_type,
+                    severity,
+                    confidence,
+                    extracted: None,
+                    annotations: None,
+                    captured_at,
+                    handled_at: None,
+                    workflow_id: None,
+                    would_handle_with: None,
+                }
+            },
+        )
+}
+
+fn arb_send_data() -> impl Strategy<Value = SendData> {
+    (
+        any::<u64>(),
+        proptest::option::of("[a-z ]{5,30}"),
+    )
+        .prop_map(|(pane_id, verification_error)| SendData {
+            pane_id,
+            injection: serde_json::json!({"text": "hello"}),
+            wait_for: None,
+            verification_error,
+        })
+}
+
+fn arb_pane_state_data() -> impl Strategy<Value = PaneStateData> {
+    (
+        any::<u64>(),                              // pane_id
+        proptest::option::of("[a-z0-9-]{8,16}"),   // pane_uuid
+        any::<u64>(),                              // tab_id
+        any::<u64>(),                              // window_id
+        "[a-z_]{3,15}",                            // domain
+        proptest::option::of("[a-z ]{3,20}"),      // title
+        proptest::option::of("[a-z/]{5,30}"),      // cwd
+        any::<bool>(),                             // observed
+        proptest::option::of("[a-z ]{5,20}"),      // ignore_reason
+    )
+        .prop_map(
+            |(pane_id, pane_uuid, tab_id, window_id, domain, title, cwd, observed, ignore_reason)| {
+                PaneStateData {
+                    pane_id,
+                    pane_uuid,
+                    tab_id,
+                    window_id,
+                    domain,
+                    title,
+                    cwd,
+                    observed,
+                    ignore_reason,
+                }
+            },
+        )
+}
+
+// ============================================================================
+// SearchIndexStatsData serde roundtrip
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_search_index_stats_serde_roundtrip(stats in arb_search_index_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: SearchIndexStatsData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.index_dir, &stats.index_dir);
+        prop_assert_eq!(back.document_count, stats.document_count);
+        prop_assert_eq!(back.segment_count, stats.segment_count);
+        prop_assert_eq!(back.index_size_bytes, stats.index_size_bytes);
+        prop_assert_eq!(back.format_version, stats.format_version);
+        prop_assert_eq!(back.indexing_error_count, stats.indexing_error_count);
+        prop_assert_eq!(back.last_error, stats.last_error);
+    }
+
+    #[test]
+    fn prop_search_index_stats_json_structure(stats in arb_search_index_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        prop_assert!(json.contains("\"document_count\""));
+        prop_assert!(json.contains("\"index_size_bytes\""));
+        prop_assert!(json.contains("\"background_job_status\""));
+    }
+
+    #[test]
+    fn prop_search_index_stats_serde_deterministic(stats in arb_search_index_stats()) {
+        let j1 = serde_json::to_string(&stats).unwrap();
+        let j2 = serde_json::to_string(&stats).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}
+
+// ============================================================================
+// AccountInfo serde roundtrip
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_account_info_serde_roundtrip(info in arb_account_info()) {
+        let json = serde_json::to_string(&info).unwrap();
+        let back: AccountInfo = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.account_id, &info.account_id);
+        prop_assert_eq!(&back.service, &info.service);
+        prop_assert_eq!(back.name, info.name);
+        prop_assert!((back.percent_remaining - info.percent_remaining).abs() < 1e-10);
+        prop_assert_eq!(back.last_refreshed_at, info.last_refreshed_at);
+    }
+
+    #[test]
+    fn prop_account_info_json_has_service(info in arb_account_info()) {
+        let json = serde_json::to_string(&info).unwrap();
+        prop_assert!(json.contains("\"service\""));
+        prop_assert!(json.contains("\"account_id\""));
+    }
+}
+
+// ============================================================================
+// EventItem serde roundtrip
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_event_item_serde_roundtrip(item in arb_event_item()) {
+        let json = serde_json::to_string(&item).unwrap();
+        let back: EventItem = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.id, item.id);
+        prop_assert_eq!(&back.rule_id, &item.rule_id);
+        prop_assert_eq!(&back.severity, &item.severity);
+        prop_assert_eq!(back.pane_id, item.pane_id);
+        prop_assert_eq!(&back.event_type, &item.event_type);
+        prop_assert_eq!(back.captured_at, item.captured_at);
+    }
+
+    #[test]
+    fn prop_event_item_json_has_rule_id(item in arb_event_item()) {
+        let json = serde_json::to_string(&item).unwrap();
+        prop_assert!(json.contains("\"rule_id\""));
+        prop_assert!(json.contains("\"severity\""));
+    }
+}
+
+// ============================================================================
+// SendData serde roundtrip
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_send_data_serde_roundtrip(data in arb_send_data()) {
+        let json = serde_json::to_string(&data).unwrap();
+        let back: SendData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, data.pane_id);
+        prop_assert_eq!(back.verification_error, data.verification_error);
+    }
+
+    #[test]
+    fn prop_send_data_json_has_pane_id(data in arb_send_data()) {
+        let json = serde_json::to_string(&data).unwrap();
+        prop_assert!(json.contains("\"pane_id\""));
+    }
+}
+
+// ============================================================================
+// PaneStateData serde roundtrip
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_pane_state_data_serde_roundtrip(data in arb_pane_state_data()) {
+        let json = serde_json::to_string(&data).unwrap();
+        let back: PaneStateData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, data.pane_id);
+        prop_assert_eq!(back.pane_uuid, data.pane_uuid);
+        prop_assert_eq!(back.tab_id, data.tab_id);
+        prop_assert_eq!(back.window_id, data.window_id);
+        prop_assert_eq!(&back.domain, &data.domain);
+        prop_assert_eq!(back.title, data.title);
+        prop_assert_eq!(back.cwd, data.cwd);
+        prop_assert_eq!(back.observed, data.observed);
+        prop_assert_eq!(back.ignore_reason, data.ignore_reason);
+    }
+
+    #[test]
+    fn prop_pane_state_data_json_structure(data in arb_pane_state_data()) {
+        let json = serde_json::to_string(&data).unwrap();
+        prop_assert!(json.contains("\"pane_id\""));
+        prop_assert!(json.contains("\"tab_id\""));
     }
 }
