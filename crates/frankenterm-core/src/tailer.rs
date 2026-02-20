@@ -341,10 +341,11 @@ impl CaptureScheduler {
             return Vec::new();
         }
 
-        // Split into high/low priority tiers
+        // Split into high/low priority tiers (zero-copy)
+        // ready_panes is already sorted by (priority, pane_id).
         // High = 0-50 (Critical/High), Low = 51+ (Normal/Low)
-        let (high_prio, low_prio): (Vec<_>, Vec<_>) =
-            ready_panes.iter().partition(|(_, prio)| *prio <= 50);
+        let split_idx = ready_panes.partition_point(|&(_, prio)| prio <= 50);
+        let (high_prio, low_prio) = ready_panes.split_at(split_idx);
 
         // Reserve 20% for low priority to prevent starvation
         let target_low_count = (effective_limit * 2) / 10; // 20%

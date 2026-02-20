@@ -1456,7 +1456,23 @@ pub fn is_command_candidate(text: &str) -> bool {
     };
 
     let mut parts = trimmed.split_whitespace();
-    let token = parts.next().unwrap_or("");
+    let mut token = parts.next().unwrap_or("");
+
+    // Skip variable assignments (VAR=val) to find the command.
+    // We stop if the token looks like a path (contains / or \ before =),
+    // because that implies it's a command (e.g. ./foo=bar), not an assignment.
+    while let Some(eq_pos) = token.find('=') {
+        // If the part before '=' contains a path separator, it's a command, not an assignment.
+        if token[..eq_pos].contains('/') || token[..eq_pos].contains('\\') {
+            break;
+        }
+        
+        if let Some(next) = parts.next() {
+            token = next;
+        } else {
+            break;
+        }
+    }
 
     if is_match(token) {
         return true;
