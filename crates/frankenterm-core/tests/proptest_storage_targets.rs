@@ -511,3 +511,127 @@ proptest! {
         prop_assert!(!debug.is_empty());
     }
 }
+
+// =========================================================================
+// StorageHealthThresholds serde roundtrip
+// =========================================================================
+
+fn arb_storage_health_thresholds() -> impl Strategy<Value = StorageHealthThresholds> {
+    (
+        arb_writer_queue_thresholds(),
+        arb_wal_thresholds(),
+        arb_fts_consistency_thresholds(),
+        arb_indexing_lag_thresholds(),
+    )
+        .prop_map(|(wq, wal, fts, lag)| StorageHealthThresholds {
+            writer_queue: wq,
+            wal,
+            fts_consistency: fts,
+            indexing_lag: lag,
+        })
+}
+
+fn arb_storage_health_snapshot() -> impl Strategy<Value = StorageHealthSnapshot> {
+    (
+        arb_health_tier(),
+        arb_health_tier(),
+        arb_health_tier(),
+        arb_health_tier(),
+        arb_health_tier(),
+    )
+        .prop_map(|(wq, wal, fts, lag, overall)| StorageHealthSnapshot {
+            writer_queue: wq,
+            wal,
+            fts_consistency: fts,
+            indexing_lag: lag,
+            overall,
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// StorageHealthThresholds serde roundtrip preserves structural fields.
+    #[test]
+    fn prop_health_thresholds_serde(thresholds in arb_storage_health_thresholds()) {
+        let json = serde_json::to_string(&thresholds).unwrap();
+        let back: StorageHealthThresholds = serde_json::from_str(&json).unwrap();
+        // f64 may lose last-digit precision in roundtrip, compare with tolerance
+        prop_assert!((back.writer_queue.yellow_ratio - thresholds.writer_queue.yellow_ratio).abs() < 1e-12);
+        prop_assert!((back.writer_queue.red_ratio - thresholds.writer_queue.red_ratio).abs() < 1e-12);
+        prop_assert_eq!(back.wal.yellow_frames, thresholds.wal.yellow_frames);
+        prop_assert_eq!(back.wal.red_frames, thresholds.wal.red_frames);
+        prop_assert_eq!(back.indexing_lag.yellow, thresholds.indexing_lag.yellow);
+        prop_assert_eq!(back.indexing_lag.red, thresholds.indexing_lag.red);
+    }
+
+    /// StorageHealthSnapshot serde roundtrip.
+    #[test]
+    fn prop_health_snapshot_serde(snap in arb_storage_health_snapshot()) {
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: StorageHealthSnapshot = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(&json, &json2, "StorageHealthSnapshot serde roundtrip");
+    }
+
+    /// StorageHealthSnapshot JSON has all health fields.
+    #[test]
+    fn prop_health_snapshot_json_keys(snap in arb_storage_health_snapshot()) {
+        let json = serde_json::to_string(&snap).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = val.as_object().unwrap();
+        prop_assert!(obj.contains_key("writer_queue"), "missing 'writer_queue'");
+        prop_assert!(obj.contains_key("wal"), "missing 'wal'");
+        prop_assert!(obj.contains_key("fts_consistency"), "missing 'fts_consistency'");
+        prop_assert!(obj.contains_key("indexing_lag"), "missing 'indexing_lag'");
+        prop_assert!(obj.contains_key("overall"), "missing 'overall'");
+    }
+
+    /// StoragePerfProfile default roundtrips.
+    #[test]
+    fn prop_perf_profile_default_serde(_dummy in 0..1_u8) {
+        let profile = StoragePerfProfile::default();
+        let json = serde_json::to_string(&profile).unwrap();
+        let back: StoragePerfProfile = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(&json, &json2, "StoragePerfProfile default serde roundtrip");
+    }
+
+    /// StoragePerfProfile::constrained() roundtrips.
+    #[test]
+    fn prop_perf_profile_constrained_serde(_dummy in 0..1_u8) {
+        let profile = StoragePerfProfile::constrained();
+        let json = serde_json::to_string(&profile).unwrap();
+        let back: StoragePerfProfile = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(&json, &json2, "StoragePerfProfile constrained serde roundtrip");
+    }
+
+    /// StoragePerfProfile::high_performance() roundtrips.
+    #[test]
+    fn prop_perf_profile_high_perf_serde(_dummy in 0..1_u8) {
+        let profile = StoragePerfProfile::high_performance();
+        let json = serde_json::to_string(&profile).unwrap();
+        let back: StoragePerfProfile = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(&json, &json2);
+    }
+
+    /// StorageHealthSnapshot::assess produces correct overall tier.
+    #[test]
+    fn prop_assess_overall_is_worst(metrics in arb_storage_metrics()) {
+        let thresholds = StorageHealthThresholds::default();
+        let snap = StorageHealthSnapshot::assess(&metrics, &thresholds);
+        // overall should be the worst tier
+        let tiers = [snap.writer_queue, snap.wal, snap.fts_consistency, snap.indexing_lag];
+        let has_red = tiers.contains(&HealthTier::Red);
+        let has_yellow = tiers.contains(&HealthTier::Yellow);
+        if has_red {
+            prop_assert_eq!(snap.overall, HealthTier::Red, "overall should be Red when any tier is Red");
+        } else if has_yellow {
+            prop_assert_eq!(snap.overall, HealthTier::Yellow, "overall should be Yellow when any tier is Yellow");
+        } else {
+            prop_assert_eq!(snap.overall, HealthTier::Green, "overall should be Green when all tiers are Green");
+        }
+    }
+}

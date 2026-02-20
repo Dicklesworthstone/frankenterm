@@ -20,9 +20,12 @@
 
 use proptest::prelude::*;
 
+use std::collections::HashMap;
+
 use frankenterm_core::policy::ActionKind;
 use frankenterm_core::watcher_client::{
-    ClientId, ClientPolicyDecision, ClientRegistry, ClientRegistryConfig, ClientRole, ViewMode,
+    ClientId, ClientPolicyDecision, ClientRegistry, ClientRegistryConfig, ClientRole,
+    ClientSession, ClientSummary, ClientViewState, ViewMode,
 };
 
 // =============================================================================
@@ -763,5 +766,163 @@ proptest! {
         let back: ClientRegistryConfig = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.max_clients, max_clients);
         prop_assert_eq!(back.max_watchers, max_watchers);
+    }
+}
+
+// =============================================================================
+// Strategies for ClientViewState, ClientSession, ClientSummary
+// =============================================================================
+
+fn arb_client_role() -> impl Strategy<Value = ClientRole> {
+    prop_oneof![Just(ClientRole::Interactive), Just(ClientRole::Watcher)]
+}
+
+fn arb_view_mode() -> impl Strategy<Value = ViewMode> {
+    prop_oneof![
+        Just(ViewMode::Independent),
+        Just(ViewMode::Mirrored),
+    ]
+}
+
+fn arb_client_view_state() -> impl Strategy<Value = ClientViewState> {
+    (0_u64..20, 0_u64..100, arb_view_mode(), 0_u64..2_000_000_000_000)
+        .prop_map(|(tab, pane, mode, ts)| ClientViewState {
+            active_tab: tab,
+            active_pane: pane,
+            view_mode: mode,
+            updated_at_ms: ts,
+        })
+}
+
+fn arb_client_summary() -> impl Strategy<Value = ClientSummary> {
+    (
+        "[a-z0-9-]{5,20}",
+        "[a-zA-Z0-9 ]{3,20}",
+        arb_client_role(),
+        0_u64..20,
+        0_u64..100,
+        arb_view_mode(),
+        0_u64..2_000_000_000_000,
+    )
+        .prop_map(|(id, name, role, tab, pane, mode, ts)| ClientSummary {
+            id: ClientId(id),
+            name,
+            role,
+            active_tab: tab,
+            active_pane: pane,
+            view_mode: mode,
+            connected_at_ms: ts,
+        })
+}
+
+fn arb_client_session() -> impl Strategy<Value = ClientSession> {
+    (
+        "[a-z0-9-]{5,20}",
+        "[a-zA-Z0-9 ]{3,20}",
+        arb_client_role(),
+        arb_client_view_state(),
+        0_u64..2_000_000_000_000,
+    )
+        .prop_map(|(id, name, role, view_state, connected)| ClientSession {
+            id: ClientId(id),
+            name,
+            role,
+            view_state,
+            connected_at_ms: connected,
+            metadata: HashMap::new(),
+        })
+}
+
+// =============================================================================
+// ClientViewState, ClientSession, ClientSummary serde tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// ClientViewState serde roundtrip.
+    #[test]
+    fn client_view_state_serde(vs in arb_client_view_state()) {
+        let json = serde_json::to_string(&vs).unwrap();
+        let back: ClientViewState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.active_tab, vs.active_tab);
+        prop_assert_eq!(back.active_pane, vs.active_pane);
+        prop_assert_eq!(back.view_mode, vs.view_mode);
+        prop_assert_eq!(back.updated_at_ms, vs.updated_at_ms);
+    }
+
+    /// ClientSummary serde roundtrip.
+    #[test]
+    fn client_summary_serde(cs in arb_client_summary()) {
+        let json = serde_json::to_string(&cs).unwrap();
+        let back: ClientSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.id, cs.id);
+        prop_assert_eq!(back.name, cs.name);
+        prop_assert_eq!(back.role, cs.role);
+        prop_assert_eq!(back.active_tab, cs.active_tab);
+        prop_assert_eq!(back.active_pane, cs.active_pane);
+    }
+
+    /// ClientSession serde roundtrip.
+    #[test]
+    fn client_session_serde(sess in arb_client_session()) {
+        let json = serde_json::to_string(&sess).unwrap();
+        let back: ClientSession = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.id, sess.id);
+        prop_assert_eq!(back.name, sess.name);
+        prop_assert_eq!(back.role, sess.role);
+        prop_assert_eq!(back.connected_at_ms, sess.connected_at_ms);
+    }
+
+    /// ClientSession with empty metadata skips serializing it.
+    #[test]
+    fn client_session_empty_metadata_skip(sess in arb_client_session()) {
+        let json = serde_json::to_string(&sess).unwrap();
+        prop_assert!(!json.contains("metadata"),
+            "empty metadata should be skipped in serialization");
+    }
+
+    /// ClientSession with non-empty metadata includes it.
+    #[test]
+    fn client_session_nonempty_metadata(
+        id in "[a-z0-9-]{5,15}",
+        key in "[a-z]{3,10}",
+        val in "[a-z]{3,10}",
+    ) {
+        let mut meta = HashMap::new();
+        meta.insert(key.clone(), val.clone());
+        let sess = ClientSession {
+            id: ClientId(id),
+            name: "test".to_string(),
+            role: ClientRole::Interactive,
+            view_state: ClientViewState {
+                active_tab: 0,
+                active_pane: 0,
+                view_mode: ViewMode::Independent,
+                updated_at_ms: 0,
+            },
+            connected_at_ms: 0,
+            metadata: meta,
+        };
+        let json = serde_json::to_string(&sess).unwrap();
+        prop_assert!(json.contains("metadata"), "non-empty metadata should be present");
+        let back: ClientSession = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.metadata.get(&key).unwrap(), &val);
+    }
+
+    /// ClientRole serde roundtrip.
+    #[test]
+    fn client_role_serde(role in arb_client_role()) {
+        let json = serde_json::to_string(&role).unwrap();
+        let back: ClientRole = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, role);
+    }
+
+    /// ViewMode serde roundtrip.
+    #[test]
+    fn view_mode_serde(mode in arb_view_mode()) {
+        let json = serde_json::to_string(&mode).unwrap();
+        let back: ViewMode = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, mode);
     }
 }
