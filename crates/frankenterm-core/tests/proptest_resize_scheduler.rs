@@ -20,8 +20,10 @@
 use std::collections::{HashMap, HashSet};
 
 use frankenterm_core::resize_scheduler::{
-    ResizeDomain, ResizeExecutionPhase, ResizeIntent, ResizeLifecycleStage, ResizeScheduler,
-    ResizeSchedulerConfig, ResizeSchedulerDebugSnapshot, ResizeWorkClass, SubmitOutcome,
+    ResizeControlPlaneGateState, ResizeDomain, ResizeExecutionPhase, ResizeIntent,
+    ResizeLifecycleStage, ResizeOverloadReason, ResizeScheduler, ResizeSchedulerConfig,
+    ResizeSchedulerDebugSnapshot, ResizeSchedulerMetrics, ResizeStalledTransaction,
+    ResizeWorkClass, ScheduleFrameResult, ScheduledResizeWork, SubmitOutcome,
 };
 use proptest::prelude::*;
 
@@ -1076,5 +1078,325 @@ proptest! {
     fn prop_work_class_clone(class in arb_work_class()) {
         let cloned = class;
         prop_assert_eq!(class, cloned, "WorkClass Copy should produce equal value");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Strategies: additional resize_scheduler types
+// ---------------------------------------------------------------------------
+
+fn arb_overload_reason() -> impl Strategy<Value = ResizeOverloadReason> {
+    prop_oneof![
+        Just(ResizeOverloadReason::QueueCapacity),
+        Just(ResizeOverloadReason::DeferralTimeout),
+    ]
+}
+
+fn arb_lifecycle_stage() -> impl Strategy<Value = ResizeLifecycleStage> {
+    prop_oneof![
+        Just(ResizeLifecycleStage::Queued),
+        Just(ResizeLifecycleStage::Scheduled),
+        Just(ResizeLifecycleStage::Preparing),
+        Just(ResizeLifecycleStage::Reflowing),
+        Just(ResizeLifecycleStage::Presenting),
+        Just(ResizeLifecycleStage::Cancelled),
+        Just(ResizeLifecycleStage::Committed),
+    ]
+}
+
+fn arb_execution_phase() -> impl Strategy<Value = ResizeExecutionPhase> {
+    prop_oneof![
+        Just(ResizeExecutionPhase::Preparing),
+        Just(ResizeExecutionPhase::Reflowing),
+        Just(ResizeExecutionPhase::Presenting),
+    ]
+}
+
+fn arb_resize_intent() -> impl Strategy<Value = ResizeIntent> {
+    (
+        0u64..10_000,
+        0u64..100_000,
+        arb_work_class(),
+        1u32..100,
+        0u64..10_000_000,
+        arb_domain(),
+        proptest::option::of(0u64..100),
+    )
+        .prop_map(|(pane_id, intent_seq, scheduler_class, work_units, submitted_at_ms, domain, tab_id)| {
+            ResizeIntent {
+                pane_id,
+                intent_seq,
+                scheduler_class,
+                work_units,
+                submitted_at_ms,
+                domain,
+                tab_id,
+            }
+        })
+}
+
+fn arb_scheduler_config() -> impl Strategy<Value = ResizeSchedulerConfig> {
+    (
+        proptest::bool::ANY,
+        proptest::bool::ANY,
+        proptest::bool::ANY,
+        1u32..100,
+        proptest::bool::ANY,
+        0u32..20,
+        0u32..50,
+    )
+        .prop_map(|(cp, ed, lf, fbu, ig, ibt, ibu)| {
+            let mut cfg = ResizeSchedulerConfig::default();
+            cfg.control_plane_enabled = cp;
+            cfg.emergency_disable = ed;
+            cfg.legacy_fallback_enabled = lf;
+            cfg.frame_budget_units = fbu;
+            cfg.input_guardrail_enabled = ig;
+            cfg.input_backlog_threshold = ibt;
+            cfg.input_reserve_units = ibu;
+            cfg
+        })
+}
+
+fn arb_scheduled_resize_work() -> impl Strategy<Value = ScheduledResizeWork> {
+    (
+        0u64..10_000,
+        0u64..100_000,
+        arb_work_class(),
+        1u32..100,
+        proptest::bool::ANY,
+        proptest::bool::ANY,
+    )
+        .prop_map(|(pane_id, intent_seq, scheduler_class, work_units, over_budget, forced)| {
+            ScheduledResizeWork {
+                pane_id,
+                intent_seq,
+                scheduler_class,
+                work_units,
+                over_budget,
+                forced_by_starvation: forced,
+            }
+        })
+}
+
+fn arb_resize_metrics() -> impl Strategy<Value = ResizeSchedulerMetrics> {
+    (
+        0u64..100_000,
+        0u64..10_000,
+        0u64..10_000,
+        0u64..10_000,
+        0u64..10_000,
+        0u64..10_000,
+        0u64..10_000,
+    )
+        .prop_map(|(frames, superseded, rejected, forced, over, overload_rej, overload_ev)| {
+            let mut m = ResizeSchedulerMetrics::default();
+            m.frames = frames;
+            m.superseded_intents = superseded;
+            m.rejected_non_monotonic = rejected;
+            m.forced_background_runs = forced;
+            m.over_budget_runs = over;
+            m.overload_rejected = overload_rej;
+            m.overload_evicted = overload_ev;
+            m
+        })
+}
+
+fn arb_gate_state() -> impl Strategy<Value = ResizeControlPlaneGateState> {
+    (
+        proptest::bool::ANY,
+        proptest::bool::ANY,
+        proptest::bool::ANY,
+    )
+        .prop_map(|(cp, ed, lf)| ResizeControlPlaneGateState {
+            control_plane_enabled: cp,
+            emergency_disable: ed,
+            legacy_fallback_enabled: lf,
+            active: cp && !ed,
+        })
+}
+
+fn arb_stalled_tx() -> impl Strategy<Value = ResizeStalledTransaction> {
+    (
+        0u64..10_000,
+        0u64..100_000,
+        proptest::option::of(arb_execution_phase()),
+        0u64..60_000,
+        proptest::option::of(0u64..100_000),
+    )
+        .prop_map(|(pane_id, intent_seq, active_phase, age_ms, latest_seq)| {
+            ResizeStalledTransaction {
+                pane_id,
+                intent_seq,
+                active_phase,
+                age_ms,
+                latest_seq,
+            }
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Enum serde roundtrips
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// ResizeOverloadReason serde roundtrip.
+    #[test]
+    fn prop_overload_reason_serde(reason in arb_overload_reason()) {
+        let json = serde_json::to_string(&reason).unwrap();
+        let back: ResizeOverloadReason = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, reason);
+    }
+
+    /// ResizeOverloadReason serializes to snake_case.
+    #[test]
+    fn prop_overload_reason_snake_case(reason in arb_overload_reason()) {
+        let json = serde_json::to_string(&reason).unwrap();
+        let inner = json.trim_matches('"');
+        prop_assert!(
+            inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "serialized overload reason should be snake_case, got '{}'", inner
+        );
+    }
+
+    /// ResizeLifecycleStage serde roundtrip.
+    #[test]
+    fn prop_lifecycle_stage_serde(stage in arb_lifecycle_stage()) {
+        let json = serde_json::to_string(&stage).unwrap();
+        let back: ResizeLifecycleStage = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, stage);
+    }
+
+    /// ResizeLifecycleStage serializes to snake_case.
+    #[test]
+    fn prop_lifecycle_stage_snake_case(stage in arb_lifecycle_stage()) {
+        let json = serde_json::to_string(&stage).unwrap();
+        let inner = json.trim_matches('"');
+        prop_assert!(
+            inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "serialized lifecycle stage should be snake_case, got '{}'", inner
+        );
+    }
+
+    /// ResizeExecutionPhase serde roundtrip.
+    #[test]
+    fn prop_execution_phase_serde(phase in arb_execution_phase()) {
+        let json = serde_json::to_string(&phase).unwrap();
+        let back: ResizeExecutionPhase = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, phase);
+    }
+
+    /// ResizeExecutionPhase serializes to snake_case.
+    #[test]
+    fn prop_execution_phase_snake_case(phase in arb_execution_phase()) {
+        let json = serde_json::to_string(&phase).unwrap();
+        let inner = json.trim_matches('"');
+        prop_assert!(
+            inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "serialized execution phase should be snake_case, got '{}'", inner
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Struct serde roundtrips
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// ResizeIntent serde roundtrip.
+    #[test]
+    fn prop_resize_intent_serde(intent in arb_resize_intent()) {
+        let json = serde_json::to_string(&intent).unwrap();
+        let back: ResizeIntent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, intent.pane_id);
+        prop_assert_eq!(back.intent_seq, intent.intent_seq);
+        prop_assert_eq!(back.scheduler_class, intent.scheduler_class);
+        prop_assert_eq!(back.work_units, intent.work_units);
+        prop_assert_eq!(back.submitted_at_ms, intent.submitted_at_ms);
+    }
+
+    /// ResizeSchedulerConfig serde roundtrip.
+    #[test]
+    fn prop_scheduler_config_serde(config in arb_scheduler_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ResizeSchedulerConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.control_plane_enabled, config.control_plane_enabled);
+        prop_assert_eq!(back.emergency_disable, config.emergency_disable);
+        prop_assert_eq!(back.legacy_fallback_enabled, config.legacy_fallback_enabled);
+        prop_assert_eq!(back.frame_budget_units, config.frame_budget_units);
+    }
+
+    /// ScheduledResizeWork serde roundtrip.
+    #[test]
+    fn prop_scheduled_work_serde(work in arb_scheduled_resize_work()) {
+        let json = serde_json::to_string(&work).unwrap();
+        let back: ScheduledResizeWork = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, work);
+    }
+
+    /// ResizeSchedulerMetrics serde roundtrip.
+    #[test]
+    fn prop_scheduler_metrics_serde(metrics in arb_resize_metrics()) {
+        let json = serde_json::to_string(&metrics).unwrap();
+        let back: ResizeSchedulerMetrics = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.frames, metrics.frames);
+        prop_assert_eq!(back.superseded_intents, metrics.superseded_intents);
+        prop_assert_eq!(back.rejected_non_monotonic, metrics.rejected_non_monotonic);
+        prop_assert_eq!(back.forced_background_runs, metrics.forced_background_runs);
+        prop_assert_eq!(back.over_budget_runs, metrics.over_budget_runs);
+    }
+
+    /// ScheduleFrameResult default roundtrip.
+    #[test]
+    fn prop_frame_result_default_serde(_dummy in 0..1_u8) {
+        let result = ScheduleFrameResult::default();
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ScheduleFrameResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, result);
+    }
+
+    /// ResizeControlPlaneGateState serde roundtrip.
+    #[test]
+    fn prop_gate_state_serde(gate in arb_gate_state()) {
+        let json = serde_json::to_string(&gate).unwrap();
+        let back: ResizeControlPlaneGateState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, gate);
+    }
+
+    /// ResizeControlPlaneGateState active field consistency.
+    #[test]
+    fn prop_gate_state_active_consistency(gate in arb_gate_state()) {
+        let expected = gate.control_plane_enabled && !gate.emergency_disable;
+        prop_assert_eq!(gate.active, expected,
+            "active should be control_plane_enabled && !emergency_disable");
+    }
+
+    /// ResizeStalledTransaction serde roundtrip.
+    #[test]
+    fn prop_stalled_tx_serde(tx in arb_stalled_tx()) {
+        let json = serde_json::to_string(&tx).unwrap();
+        let back: ResizeStalledTransaction = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, tx.pane_id);
+        prop_assert_eq!(back.intent_seq, tx.intent_seq);
+        prop_assert_eq!(back.active_phase, tx.active_phase);
+        prop_assert_eq!(back.age_ms, tx.age_ms);
+        prop_assert_eq!(back.latest_seq, tx.latest_seq);
+    }
+
+    /// ResizeSchedulerMetrics default is all zeros.
+    #[test]
+    fn prop_metrics_default_zeros(_dummy in 0..1_u8) {
+        let m = ResizeSchedulerMetrics::default();
+        prop_assert_eq!(m.frames, 0);
+        prop_assert_eq!(m.superseded_intents, 0);
+        prop_assert_eq!(m.rejected_non_monotonic, 0);
+        prop_assert_eq!(m.forced_background_runs, 0);
+        prop_assert_eq!(m.over_budget_runs, 0);
+        prop_assert_eq!(m.overload_rejected, 0);
+        prop_assert_eq!(m.overload_evicted, 0);
     }
 }
