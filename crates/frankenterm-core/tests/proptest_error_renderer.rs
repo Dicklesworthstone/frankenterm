@@ -471,22 +471,19 @@ proptest! {
 }
 
 // =============================================================================
-// 19. Error codes with catalog entries have valid structure
+// 19. All error codes have catalog entries
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
     #[test]
-    fn catalog_entries_have_valid_structure(error in arb_core_error()) {
+    fn all_error_codes_in_catalog(error in arb_core_error()) {
         let code = ErrorRenderer::error_code(&error);
-        // Not all error codes have catalog entries (e.g., FT-9004 Cancelled, FT-9005 Panicked).
-        // When a catalog entry exists, verify its code matches.
-        if let Some(entry) = get_error_code(code) {
-            prop_assert_eq!(
-                entry.code, code,
-                "Catalog entry code should match error_code()"
-            );
-        }
+        let entry = get_error_code(code);
+        prop_assert!(
+            entry.is_some(),
+            "Error code '{}' should have a catalog entry", code
+        );
     }
 }
 

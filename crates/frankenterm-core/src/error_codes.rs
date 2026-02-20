@@ -967,6 +967,44 @@ pub static FT_9003: ErrorCodeDef = ErrorCodeDef {
     doc_link: None,
 };
 
+/// FT-9004: Operation cancelled
+pub static FT_9004: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-9004",
+    category: ErrorCategory::Internal,
+    title: "Operation cancelled",
+    description: "An operation was cancelled before completion, typically due to a timeout, shutdown, or explicit cancellation request.",
+    causes: &[
+        "Timeout exceeded for the operation",
+        "Graceful shutdown triggered while operation was in progress",
+        "Explicit cancellation by user or upstream task",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("Check status", "ft status"),
+        RecoveryStep::text("Retry the operation if the cancellation was unexpected"),
+        RecoveryStep::text("Check whether a timeout or shutdown triggered the cancellation"),
+    ],
+    doc_link: None,
+};
+
+/// FT-9005: Task panicked
+pub static FT_9005: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-9005",
+    category: ErrorCategory::Internal,
+    title: "Task panicked",
+    description: "A background task panicked unexpectedly. The panic has been caught and propagated as an error.",
+    causes: &[
+        "Bug in task logic causing an unexpected state",
+        "Assertion failure in a background task",
+        "Index out of bounds or unwrap on None in task code",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("Run diagnostics", "ft doctor"),
+        RecoveryStep::text("Check logs for the panic backtrace"),
+        RecoveryStep::text("Report the issue with the backtrace if the panic persists"),
+    ],
+    doc_link: None,
+};
+
 // ============================================================================
 // Error Code Registry
 // ============================================================================
@@ -1022,6 +1060,8 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("FT-9001", &FT_9001);
         m.insert("FT-9002", &FT_9002);
         m.insert("FT-9003", &FT_9003);
+        m.insert("FT-9004", &FT_9004);
+        m.insert("FT-9005", &FT_9005);
         m
     });
 
