@@ -1,0 +1,16 @@
+{
+  "description": "Resize sequence fixture for damage merge testing (R2)",
+  "note": "Simulates rapid terminal resizes that produce overlapping damage regions",
+  "sequence": [
+    {"cols": 80, "rows": 24, "delay_ms": 0},
+    {"cols": 120, "rows": 40, "delay_ms": 10},
+    {"cols": 80, "rows": 24, "delay_ms": 5},
+    {"cols": 200, "rows": 60, "delay_ms": 2},
+    {"cols": 100, "rows": 30, "delay_ms": 50}
+  ],
+  "expected_damage": {
+    "full_redraws": ">=2 (resize always triggers full)",
+    "partial_updates": "<=3 (coalesced damage regions)",
+    "cursor_only": "0 (resize invalidates all)"
+  }
+}

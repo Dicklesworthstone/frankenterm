@@ -1,0 +1,41 @@
+{
+  "description": "Frame pacing policy tier fixture for R6",
+  "tiers": [
+    {
+      "name": "latency",
+      "target_fps": 60,
+      "frame_budget_ms": 16.67,
+      "conditions": ["focused", "interactive_input"],
+      "render_priority": "immediate"
+    },
+    {
+      "name": "balanced",
+      "target_fps": 30,
+      "frame_budget_ms": 33.33,
+      "conditions": ["focused", "bulk_output"],
+      "render_priority": "coalesced"
+    },
+    {
+      "name": "efficiency",
+      "target_fps": 10,
+      "frame_budget_ms": 100,
+      "conditions": ["unfocused", "background"],
+      "render_priority": "batched"
+    },
+    {
+      "name": "paused",
+      "target_fps": 0,
+      "frame_budget_ms": null,
+      "conditions": ["occluded", "minimized"],
+      "render_priority": "none"
+    }
+  ],
+  "transitions": [
+    {"from": "paused", "to": "efficiency", "trigger": "window_unminimized"},
+    {"from": "efficiency", "to": "balanced", "trigger": "window_focused"},
+    {"from": "balanced", "to": "latency", "trigger": "keypress_detected"},
+    {"from": "latency", "to": "balanced", "trigger": "idle_timeout_500ms"},
+    {"from": "balanced", "to": "efficiency", "trigger": "window_unfocused"},
+    {"from": "efficiency", "to": "paused", "trigger": "window_minimized"}
+  ]
+}

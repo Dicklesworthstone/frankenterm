@@ -1,0 +1,38 @@
+{
+  "description": "Pane churn workload matrix fixture for R5 SLO testing",
+  "slo_targets": {
+    "p50_ms": 5,
+    "p95_ms": 16,
+    "p99_ms": 33
+  },
+  "workloads": [
+    {
+      "name": "light",
+      "pane_count": 4,
+      "interactive_panes": 1,
+      "bulk_panes": 3,
+      "events_per_second": 100
+    },
+    {
+      "name": "moderate",
+      "pane_count": 20,
+      "interactive_panes": 2,
+      "bulk_panes": 18,
+      "events_per_second": 1000
+    },
+    {
+      "name": "heavy",
+      "pane_count": 50,
+      "interactive_panes": 5,
+      "bulk_panes": 45,
+      "events_per_second": 5000
+    },
+    {
+      "name": "extreme",
+      "pane_count": 200,
+      "interactive_panes": 10,
+      "bulk_panes": 190,
+      "events_per_second": 20000
+    }
+  ]
+}

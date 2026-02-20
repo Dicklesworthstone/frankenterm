@@ -1,0 +1,33 @@
+{
+  "description": "Activity tier fixture for sync update guardrail testing (R3)",
+  "rio_constants": {
+    "READ_BUFFER_SIZE": "0x10_0000 (1MB)",
+    "MAX_LOCKED_READ": "u16::MAX (65535 bytes)"
+  },
+  "tiers": [
+    {
+      "name": "idle",
+      "bytes_per_second": 0,
+      "expected_batch_size": 0,
+      "guardrail": "none"
+    },
+    {
+      "name": "interactive",
+      "bytes_per_second": 1000,
+      "expected_batch_size": 1024,
+      "guardrail": "none"
+    },
+    {
+      "name": "bulk_output",
+      "bytes_per_second": 100000,
+      "expected_batch_size": 65535,
+      "guardrail": "MAX_LOCKED_READ hit, break loop"
+    },
+    {
+      "name": "flood",
+      "bytes_per_second": 10000000,
+      "expected_batch_size": 65535,
+      "guardrail": "MAX_LOCKED_READ + backpressure tier escalation"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+# Simulated burst of PTY output data for wakeup coalescing tests.
+# Each line represents a chunk of output that would trigger a Wakeup event.
+# In Rio, non-sync data triggers RioEvent::Wakeup which coalesces multiple
+# rapid updates into a single render pass.
+#
+# Test expectation: 10 rapid chunks should coalesce into 1-3 render passes,
+# not 10 separate renders.
+
+CHUNK_001 Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+CHUNK_002 Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.
+CHUNK_003 Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.
+CHUNK_004 Duis aute irure dolor in reprehenderit in voluptate velit esse.
+CHUNK_005 Excepteur sint occaecat cupidatat non proident, sunt in culpa.
+CHUNK_006 Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit.
+CHUNK_007 Neque porro quisquam est, qui dolorem ipsum quia dolor sit amet.
+CHUNK_008 Ut enim ad minima veniam, quis nostrum exercitationem ullam corporis.
+CHUNK_009 Quis autem vel eum iure reprehenderit qui in ea voluptate velit.
+CHUNK_010 At vero eos et accusamus et iusto odio dignissimos ducimus qui.

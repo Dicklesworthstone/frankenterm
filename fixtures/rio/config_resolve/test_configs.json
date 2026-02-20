@@ -1,0 +1,56 @@
+{
+  "description": "Config resolution test cases for R7",
+  "precedence_order": [
+    "cli_flags",
+    "environment_variables",
+    "config_file",
+    "platform_defaults",
+    "compiled_defaults"
+  ],
+  "test_cases": [
+    {
+      "name": "default_only",
+      "cli": {},
+      "env": {},
+      "file": {},
+      "expected": {"font_size": 14, "scrollback_lines": 10000, "frame_rate": 60}
+    },
+    {
+      "name": "file_overrides_default",
+      "cli": {},
+      "env": {},
+      "file": {"font_size": 16, "scrollback_lines": 50000},
+      "expected": {"font_size": 16, "scrollback_lines": 50000, "frame_rate": 60}
+    },
+    {
+      "name": "env_overrides_file",
+      "cli": {},
+      "env": {"FRANKENTERM_FONT_SIZE": "18"},
+      "file": {"font_size": 16},
+      "expected": {"font_size": 18, "scrollback_lines": 10000, "frame_rate": 60}
+    },
+    {
+      "name": "cli_overrides_all",
+      "cli": {"--font-size": "20"},
+      "env": {"FRANKENTERM_FONT_SIZE": "18"},
+      "file": {"font_size": 16},
+      "expected": {"font_size": 20, "scrollback_lines": 10000, "frame_rate": 60}
+    },
+    {
+      "name": "invalid_key_strict_mode",
+      "cli": {},
+      "env": {},
+      "file": {"nonexistent_key": "value"},
+      "strict_mode": true,
+      "expected_error": "unknown configuration key: nonexistent_key"
+    },
+    {
+      "name": "platform_mismatch",
+      "cli": {},
+      "env": {},
+      "file": {"linux_only_option": true},
+      "platform": "macos",
+      "expected_warning": "option 'linux_only_option' not applicable on macos"
+    }
+  ]
+}
