@@ -326,6 +326,7 @@ impl<V> Default for AdaptiveRadixTree<V> {
 
 impl<V> AdaptiveRadixTree<V> {
     /// Create an empty ART.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
@@ -335,11 +336,13 @@ impl<V> AdaptiveRadixTree<V> {
     }
 
     /// Return the number of key-value pairs.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Check if the tree is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -361,6 +364,7 @@ impl<V> AdaptiveRadixTree<V> {
     }
 
     /// Look up a value by key.
+    #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<&V> {
         let mut current = self.root?;
         let mut depth = 0;
@@ -395,6 +399,7 @@ impl<V> AdaptiveRadixTree<V> {
     }
 
     /// Check if a key exists.
+    #[must_use]
     pub fn contains_key(&self, key: &[u8]) -> bool {
         self.get(key).is_some()
     }
@@ -413,6 +418,7 @@ impl<V> AdaptiveRadixTree<V> {
     /// Find all key-value pairs whose keys start with the given prefix.
     ///
     /// Returns (key, &value) pairs in sorted order.
+    #[must_use]
     pub fn prefix_search(&self, prefix: &[u8]) -> Vec<(Vec<u8>, &V)> {
         let mut results = Vec::new();
         if let Some(root) = self.root {
@@ -422,6 +428,7 @@ impl<V> AdaptiveRadixTree<V> {
     }
 
     /// Iterate over all key-value pairs in lexicographic order.
+    #[must_use]
     #[allow(clippy::iter_not_returning_iterator)]
     pub fn iter(&self) -> Vec<(Vec<u8>, &V)> {
         let mut results = Vec::new();
@@ -432,6 +439,7 @@ impl<V> AdaptiveRadixTree<V> {
     }
 
     /// Return the number of nodes in the tree (for diagnostics).
+    #[must_use]
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
@@ -699,11 +707,13 @@ impl<V> AdaptiveRadixTree<V> {
     }
 
     /// Look up by string key.
+    #[must_use]
     pub fn get_str(&self, key: &str) -> Option<&V> {
         self.get(key.as_bytes())
     }
 
     /// Check if a string key exists.
+    #[must_use]
     pub fn contains_str(&self, key: &str) -> bool {
         self.contains_key(key.as_bytes())
     }
@@ -714,6 +724,7 @@ impl<V> AdaptiveRadixTree<V> {
     }
 
     /// Prefix search with string prefix.
+    #[must_use]
     pub fn prefix_search_str(&self, prefix: &str) -> Vec<(Vec<u8>, &V)> {
         self.prefix_search(prefix.as_bytes())
     }

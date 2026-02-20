@@ -35,7 +35,7 @@ pub fn content_hash(data: &[u8]) -> String {
 }
 
 /// A reference-counted content block in the store.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentBlock {
     /// SHA-256 hex hash of the content.
     pub hash: String,
