@@ -949,3 +949,152 @@ proptest! {
         assert_eq!(result, vals, "runtime+channel+mutex workflow must preserve values");
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// join! macro properties
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// join! preserves both values from concurrent futures.
+    #[test]
+    fn join_preserves_both_values(a in any::<i64>(), b in any::<i64>()) {
+        with_tokio(move || async move {
+            let (ra, rb) = runtime_compat::join!(async { a }, async { b });
+            assert_eq!(ra, a, "first future value preserved");
+            assert_eq!(rb, b, "second future value preserved");
+        });
+    }
+
+    /// join! preserves ordering of three futures (all values returned).
+    #[test]
+    fn join_three_preserves_all(a in any::<i32>(), b in any::<i32>(), c in any::<i32>()) {
+        with_tokio(move || async move {
+            let (ra, rb, rc) = runtime_compat::join!(
+                async { a },
+                async { b },
+                async { c }
+            );
+            assert_eq!(ra, a, "first value");
+            assert_eq!(rb, b, "second value");
+            assert_eq!(rc, c, "third value");
+        });
+    }
+
+    /// join! with channel operations: send on one side, receive on the other.
+    #[test]
+    fn join_channel_roundtrip(val in any::<u64>()) {
+        with_tokio(move || async move {
+            let (tx, mut rx) = mpsc::channel(1);
+            let ((), recv_result) = runtime_compat::join!(
+                async {
+                    tx.send(val).await.expect("send");
+                },
+                async {
+                    rx.recv().await.expect("recv")
+                }
+            );
+            assert_eq!(recv_result, val, "channel+join must preserve value");
+        });
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// select! macro properties
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// select! returns the value from an immediately-ready branch.
+    #[test]
+    fn select_immediate_branch_returns_value(val in any::<i64>()) {
+        with_tokio(move || async move {
+            let result = runtime_compat::select! {
+                v = async { val } => v,
+                () = runtime_compat::sleep(Duration::from_secs(60)) => -1,
+            };
+            assert_eq!(result, val, "immediate branch should win");
+        });
+    }
+
+    /// select! with channel: ready channel wins over sleep.
+    #[test]
+    fn select_channel_wins_over_sleep(val in any::<u32>()) {
+        with_tokio(move || async move {
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.send(val).await.expect("send");
+            let result = runtime_compat::select! {
+                maybe = rx.recv() => maybe.unwrap_or(0),
+                () = runtime_compat::sleep(Duration::from_secs(60)) => 0,
+            };
+            assert_eq!(result, val, "channel should win over long sleep");
+        });
+    }
+
+    /// select! biased always picks the first ready branch.
+    #[test]
+    fn select_biased_first_wins(a in any::<i32>(), b in any::<i32>()) {
+        with_tokio(move || async move {
+            let result = runtime_compat::select! {
+                biased;
+                v = async { a } => v,
+                v = async { b } => v,
+            };
+            assert_eq!(result, a, "biased select must pick first ready branch");
+        });
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// task::spawn_blocking (JoinHandle) properties
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// task::spawn_blocking preserves the return value through the JoinHandle.
+    #[test]
+    fn task_spawn_blocking_preserves_value(val in any::<i64>()) {
+        with_tokio(move || async move {
+            let handle = runtime_compat::task::spawn_blocking(move || val);
+            let result = handle.await.expect("join");
+            assert_eq!(result, val, "spawn_blocking must preserve closure return");
+        });
+    }
+
+    /// task::spawn_blocking with computation: sum of range preserved.
+    #[test]
+    fn task_spawn_blocking_computation(n in 0u64..1000) {
+        let expected: u64 = (0..n).sum();
+        with_tokio(move || async move {
+            let handle = runtime_compat::task::spawn_blocking(move || {
+                (0..n).sum::<u64>()
+            });
+            let result = handle.await.expect("join");
+            assert_eq!(result, expected, "blocking computation must match");
+        });
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// task::yield_now properties
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// yield_now does not lose values: interleaved yields preserve counter.
+    #[test]
+    fn yield_preserves_counter(n in 1usize..50) {
+        with_tokio(move || async move {
+            let mut counter = 0usize;
+            for _ in 0..n {
+                counter += 1;
+                runtime_compat::task::yield_now().await;
+            }
+            assert_eq!(counter, n, "yield must not lose increments");
+        });
+    }
+}
