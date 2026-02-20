@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8ed1bde7aa9a367a60f60630b680bc4f782e43f4f890e46f9340db81edae7b06 # shrinks to snap = BocpdSnapshot { pane_count: 8, total_change_points: 0, panes: [] }
