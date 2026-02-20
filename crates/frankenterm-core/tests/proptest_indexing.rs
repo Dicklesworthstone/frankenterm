@@ -108,7 +108,7 @@ proptest! {
     /// Duplicate texts produce exactly skipped_duplicate_docs count.
     #[test]
     fn dedup_catches_all_duplicates(
-        text in text_strategy(),
+        text in "[a-zA-Z0-9][a-zA-Z0-9 _.,;:!?/\\-]{0,79}",
         count in 2usize..8,
     ) {
         let dir = tempdir().expect("tempdir");

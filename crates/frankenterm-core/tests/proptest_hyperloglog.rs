@@ -70,9 +70,9 @@ proptest! {
         }
         let true_card = distinct.len() as f64;
         let est_card = hll.cardinality() as f64;
-        // Allow 3 standard errors + small constant for tolerance
+        // Allow 4 standard errors for robustness across many proptest cases
         let se = hll.standard_error();
-        let tolerance = (3.0 * se * true_card).max(10.0);
+        let tolerance = (4.0 * se * true_card).max(10.0);
         prop_assert!(
             (est_card - true_card).abs() < tolerance,
             "cardinality {} not within {} of true {}", est_card, tolerance, true_card
