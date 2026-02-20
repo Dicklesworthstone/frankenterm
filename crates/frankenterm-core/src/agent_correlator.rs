@@ -22,7 +22,9 @@
 //!
 //! If no recent detection exists, the state defaults to "active".
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+#[cfg(feature = "agent-detection")]
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -34,6 +36,38 @@ use crate::wezterm::PaneInfo;
 
 /// Maximum age of a detection to consider for state inference.
 const STATE_DETECTION_MAX_AGE: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Agent installation inventory entry for robot/API consumers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstalledAgentInventoryEntry {
+    pub slug: String,
+    pub detected: bool,
+    pub evidence: Vec<String>,
+    pub root_paths: Vec<String>,
+    pub config_path: Option<String>,
+    pub binary_path: Option<String>,
+    pub version: Option<String>,
+}
+
+/// Running agent inventory entry keyed by pane id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunningAgentInventoryEntry {
+    pub slug: String,
+    pub state: String,
+    pub session_id: Option<String>,
+    pub source: DetectionSource,
+}
+
+/// Unified installed + running inventory snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentInventory {
+    pub installed: Vec<InstalledAgentInventoryEntry>,
+    pub running: BTreeMap<u64, RunningAgentInventoryEntry>,
+}
+
+#[cfg(feature = "agent-detection")]
+static INSTALLED_INVENTORY_CACHE: LazyLock<Mutex<Option<Vec<InstalledAgentInventoryEntry>>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 // =============================================================================
 // AgentCorrelator
@@ -224,6 +258,40 @@ impl AgentCorrelator {
     pub fn tracked_pane_count(&self) -> usize {
         self.pane_agents.len()
     }
+
+    /// Build a unified running/installed inventory snapshot.
+    ///
+    /// Running inventory is always available from correlator state. Installed
+    /// inventory is best-effort and may be empty when filesystem detection is
+    /// disabled or unavailable in the current build.
+    #[must_use]
+    pub fn inventory(&self) -> AgentInventory {
+        let running = self
+            .pane_agents
+            .iter()
+            .map(|(pane_id, state)| {
+                let effective_state = if state.last_state_at.elapsed() > STATE_DETECTION_MAX_AGE {
+                    "unknown".to_string()
+                } else {
+                    state.last_state.clone()
+                };
+                (
+                    *pane_id,
+                    RunningAgentInventoryEntry {
+                        slug: state.agent_type.to_string(),
+                        state: effective_state,
+                        session_id: state.session_id.clone(),
+                        source: state.source,
+                    },
+                )
+            })
+            .collect();
+
+        AgentInventory {
+            installed: installed_inventory_cached().unwrap_or_default(),
+            running,
+        }
+    }
 }
 
 impl Default for AgentCorrelator {
@@ -293,6 +361,100 @@ fn extract_session_id(extracted: &serde_json::Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// Whether filesystem-based installed-agent detection is compiled in.
+#[must_use]
+pub fn filesystem_detection_available() -> bool {
+    cfg!(feature = "agent-detection")
+}
+
+#[cfg(feature = "agent-detection")]
+fn parse_version_from_evidence(evidence: &[String]) -> Option<String> {
+    evidence.iter().find_map(|line| {
+        let (prefix, value) = line.split_once(':')?;
+        if prefix.trim().eq_ignore_ascii_case("version") {
+            let parsed = value.trim();
+            if !parsed.is_empty() {
+                return Some(parsed.to_string());
+            }
+        }
+        None
+    })
+}
+
+#[cfg(feature = "agent-detection")]
+fn convert_detection_entry(
+    entry: crate::agent_detection::InstalledAgentDetectionEntry,
+) -> InstalledAgentInventoryEntry {
+    let config_path = entry.root_paths.first().cloned();
+    let version = parse_version_from_evidence(&entry.evidence);
+    InstalledAgentInventoryEntry {
+        slug: entry.slug,
+        detected: entry.detected,
+        evidence: entry.evidence,
+        root_paths: entry.root_paths,
+        config_path,
+        binary_path: None,
+        version,
+    }
+}
+
+#[cfg(feature = "agent-detection")]
+fn detect_installed_inventory() -> Result<Vec<InstalledAgentInventoryEntry>, String> {
+    let report = crate::agent_detection::detect_installed_agents(
+        &crate::agent_detection::AgentDetectOptions {
+            only_connectors: None,
+            include_undetected: true,
+            root_overrides: Vec::new(),
+        },
+    )
+    .map_err(|err| err.to_string())?;
+
+    Ok(report
+        .installed_agents
+        .into_iter()
+        .map(convert_detection_entry)
+        .collect())
+}
+
+/// Return installed-agent inventory from cache when available.
+///
+/// When the cache is empty, a fresh filesystem probe is performed and stored.
+#[cfg(feature = "agent-detection")]
+pub fn installed_inventory_cached() -> Result<Vec<InstalledAgentInventoryEntry>, String> {
+    let mut cache = INSTALLED_INVENTORY_CACHE
+        .lock()
+        .map_err(|_| "installed agent inventory cache is unavailable".to_string())?;
+    if let Some(entries) = cache.as_ref() {
+        return Ok(entries.clone());
+    }
+    let entries = detect_installed_inventory()?;
+    *cache = Some(entries.clone());
+    Ok(entries)
+}
+
+/// Force-refresh installed-agent inventory from filesystem probes.
+#[cfg(feature = "agent-detection")]
+pub fn installed_inventory_refresh() -> Result<Vec<InstalledAgentInventoryEntry>, String> {
+    let entries = detect_installed_inventory()?;
+    let mut cache = INSTALLED_INVENTORY_CACHE
+        .lock()
+        .map_err(|_| "installed agent inventory cache is unavailable".to_string())?;
+    *cache = Some(entries.clone());
+    Ok(entries)
+}
+
+/// Return installed-agent inventory when agent detection is disabled.
+#[cfg(not(feature = "agent-detection"))]
+pub fn installed_inventory_cached() -> Result<Vec<InstalledAgentInventoryEntry>, String> {
+    Err("filesystem agent detection is not enabled in this build".to_string())
+}
+
+/// Refresh installed-agent inventory when agent detection is disabled.
+#[cfg(not(feature = "agent-detection"))]
+pub fn installed_inventory_refresh() -> Result<Vec<InstalledAgentInventoryEntry>, String> {
+    Err("filesystem agent detection is not enabled in this build".to_string())
 }
 
 // =============================================================================
