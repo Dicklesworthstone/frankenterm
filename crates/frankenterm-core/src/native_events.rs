@@ -924,6 +924,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listener_accepts_reconnect_after_disconnect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("reconnect.sock");
+        let listener = NativeEventListener::bind(socket_path.clone())
+            .await
+            .expect("bind listener");
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+
+        // First connection sends one event and disconnects.
+        let mut stream_one = compat_unix::connect(socket_path.clone())
+            .await
+            .expect("connect first stream");
+        stream_one
+            .write_all(r#"{"type":"pane_destroyed","pane_id":41,"ts":100}"#.as_bytes())
+            .await
+            .expect("write first event");
+        stream_one.write_all(b"\n").await.expect("write newline");
+        drop(stream_one);
+
+        let first = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("first event");
+        assert!(matches!(
+            first,
+            NativeEvent::PaneDestroyed {
+                pane_id: 41,
+                timestamp_ms: 100
+            }
+        ));
+
+        // Second connection should still be accepted and delivered.
+        let mut stream_two = compat_unix::connect(socket_path)
+            .await
+            .expect("connect second stream");
+        stream_two
+            .write_all(
+                r#"{"type":"pane_created","pane_id":42,"domain":"local","ts":200}"#.as_bytes(),
+            )
+            .await
+            .expect("write second event");
+        stream_two.write_all(b"\n").await.expect("write newline");
+
+        let second = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("second event");
+        assert!(matches!(
+            second,
+            NativeEvent::PaneCreated {
+                pane_id: 42,
+                ref domain,
+                timestamp_ms: 200,
+                ..
+            } if domain == "local"
+        ));
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn listener_drops_oversized_line_and_continues() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("oversized.sock");
+        let listener = NativeEventListener::bind(socket_path.clone())
+            .await
+            .expect("bind listener");
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+
+        let mut stream = compat_unix::connect(socket_path).await.expect("connect");
+        let oversized = "x".repeat(MAX_EVENT_LINE_BYTES + 1);
+        stream
+            .write_all(oversized.as_bytes())
+            .await
+            .expect("write oversized line");
+        stream.write_all(b"\n").await.expect("write newline");
+        stream
+            .write_all(r#"{"type":"pane_destroyed","pane_id":9,"ts":777}"#.as_bytes())
+            .await
+            .expect("write valid line");
+        stream.write_all(b"\n").await.expect("write newline");
+
+        let event = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("event");
+        assert!(matches!(
+            event,
+            NativeEvent::PaneDestroyed {
+                pane_id: 9,
+                timestamp_ms: 777
+            }
+        ));
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
     async fn shutdown_flag_stops_listener() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("shutdown.sock");

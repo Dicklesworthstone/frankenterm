@@ -31669,6 +31669,161 @@ mod tests {
     }
 
     #[cfg(feature = "distributed")]
+    #[tokio::test]
+    async fn distributed_persist_payload_maps_sender_scoped_pane_ids_for_query_visibility() {
+        let (storage_handle, db_path) = setup_storage("distributed_persist_payload_map").await;
+        let storage = std::sync::Arc::new(tokio::sync::Mutex::new(storage_handle));
+        let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+        let pane_seq_by_sender =
+            tokio::sync::Mutex::new(std::collections::HashMap::<(String, u64), u64>::new());
+
+        let sender = "agent-mapped";
+        let source_pane_id = 17;
+        let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+        let marker = "DIST_PERSIST_PAYLOAD_MAP_MARKER";
+
+        distributed_persist_payload(
+            sender,
+            frankenterm_core::wire_protocol::WirePayload::PaneMeta(
+                frankenterm_core::wire_protocol::PaneMeta {
+                    pane_id: source_pane_id,
+                    pane_uuid: Some("pane-uuid-17".to_string()),
+                    domain: "prod".to_string(),
+                    title: Some("remote-pane".to_string()),
+                    cwd: Some("/remote/project".to_string()),
+                    rows: Some(24),
+                    cols: Some(120),
+                    observed: true,
+                    timestamp_ms: now_ms(),
+                },
+            ),
+            &storage,
+            &event_bus,
+            &pane_seq_by_sender,
+        )
+        .await
+        .unwrap();
+
+        distributed_persist_payload(
+            sender,
+            frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                frankenterm_core::wire_protocol::PaneDelta {
+                    pane_id: source_pane_id,
+                    seq: 1,
+                    content: marker.to_string(),
+                    content_len: marker.len(),
+                    captured_at_ms: now_ms(),
+                },
+            ),
+            &storage,
+            &event_bus,
+            &pane_seq_by_sender,
+        )
+        .await
+        .unwrap();
+
+        {
+            let storage_guard = storage.lock().await;
+            let remote = storage_guard.get_pane(remote_pane_id).await.unwrap();
+            assert!(remote.is_some());
+            assert!(
+                storage_guard
+                    .get_pane(source_pane_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "raw source pane_id should not be used for persisted remote panes"
+            );
+            let remote = remote.unwrap();
+            assert_eq!(remote.domain, "distributed:agent-mapped:prod");
+
+            let search_hits = storage_guard.search(marker).await.unwrap();
+            assert!(search_hits.iter().any(|seg| seg.pane_id == remote_pane_id));
+        }
+
+        {
+            let storage_guard = storage.lock().await;
+            storage_guard.shutdown().await.unwrap();
+        }
+        drop(storage);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+    }
+
+    #[cfg(feature = "distributed")]
+    #[tokio::test]
+    async fn distributed_persist_payload_out_of_order_records_sender_scoped_gap_and_drops_segment()
+    {
+        let (storage_handle, db_path) = setup_storage("distributed_persist_payload_ordering").await;
+        let storage = std::sync::Arc::new(tokio::sync::Mutex::new(storage_handle));
+        let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+        let pane_seq_by_sender =
+            tokio::sync::Mutex::new(std::collections::HashMap::<(String, u64), u64>::new());
+
+        let sender = "agent-order";
+        let source_pane_id = 23;
+        let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+        let first = "DIST_ORDER_MARKER_FIRST";
+        let gap_jump = "DIST_ORDER_MARKER_GAP_JUMP";
+        let dropped = "DIST_ORDER_MARKER_DROPPED";
+
+        for (seq, content) in [(1_u64, first), (3_u64, gap_jump), (2_u64, dropped)] {
+            distributed_persist_payload(
+                sender,
+                frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                    frankenterm_core::wire_protocol::PaneDelta {
+                        pane_id: source_pane_id,
+                        seq,
+                        content: content.to_string(),
+                        content_len: content.len(),
+                        captured_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+        }
+
+        {
+            let storage_guard = storage.lock().await;
+            let segments = storage_guard
+                .get_segments(remote_pane_id, 16)
+                .await
+                .unwrap();
+            assert_eq!(segments.len(), 2);
+            assert!(segments.iter().any(|seg| seg.content.contains(first)));
+            assert!(segments.iter().any(|seg| seg.content.contains(gap_jump)));
+            assert!(
+                !segments.iter().any(|seg| seg.content.contains(dropped)),
+                "out-of-order pane delta must be dropped from persisted segments"
+            );
+
+            let gaps = storage_guard.get_gaps().await.unwrap();
+            assert!(gaps.iter().any(|gap| {
+                gap.reason
+                    .contains("distributed_seq_gap:sender=agent-order:expected=2:actual=3")
+            }));
+            assert!(gaps.iter().any(|gap| {
+                gap.reason
+                    .contains("distributed_out_of_order:sender=agent-order:expected=4:actual=2")
+            }));
+        }
+
+        {
+            let storage_guard = storage.lock().await;
+            storage_guard.shutdown().await.unwrap();
+        }
+        drop(storage);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+    }
+
+    #[cfg(feature = "distributed")]
     #[test]
     fn distributed_remote_pane_id_is_namespaced_and_stable() {
         let a1 = distributed_remote_pane_id("agent-a", 7);
