@@ -1226,7 +1226,7 @@ proptest! {
         let dir = tempdir().expect("tmpdir");
         let mut cfg = fast_flush_config(dir.path());
         cfg.flush_docs_threshold = threshold;
-        let mut index = SearchIndex::open(&cfg).expect("open");
+        let mut index = SearchIndex::open(cfg).expect("open");
         let docs: Vec<_> = texts
             .iter()
             .enumerate()
