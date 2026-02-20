@@ -607,3 +607,113 @@ fn latency_budget_debug_nonempty() {
         assert!(!debug.is_empty());
     }
 }
+
+// =========================================================================
+// Strategies: LatencyBudget, QualityReport
+// =========================================================================
+
+fn arb_latency_budget() -> impl Strategy<Value = LatencyBudget> {
+    (1u64..10_000, arb_query_class())
+        .prop_map(|(ms, class)| LatencyBudget {
+            max_duration: Duration::from_millis(ms),
+            class,
+        })
+}
+
+fn arb_quality_report() -> impl Strategy<Value = QualityReport> {
+    (
+        proptest::collection::vec(arb_query_test_result(), 0..5),
+        0usize..100,
+        0usize..100,
+        0usize..100,
+        0usize..100,
+        0usize..100,
+        any::<bool>(),
+    )
+        .prop_map(|(results, total, passed, failed, latency_v, errors, all_passed)| {
+            QualityReport {
+                results,
+                total_queries: total,
+                passed,
+                failed,
+                latency_violations: latency_v,
+                errors,
+                all_passed,
+            }
+        })
+}
+
+// =========================================================================
+// LatencyBudget: serde + properties
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// LatencyBudget arb strategy serde roundtrip preserves fields.
+    #[test]
+    fn prop_latency_budget_arb_serde(budget in arb_latency_budget()) {
+        let json = serde_json::to_string(&budget).unwrap();
+        let back: LatencyBudget = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.max_duration, budget.max_duration);
+        prop_assert_eq!(back.class, budget.class);
+    }
+
+    /// LatencyBudget JSON keys are present.
+    #[test]
+    fn prop_latency_budget_json_keys(budget in arb_latency_budget()) {
+        let json = serde_json::to_string(&budget).unwrap();
+        prop_assert!(json.contains("\"max_duration\""));
+        prop_assert!(json.contains("\"class\""));
+    }
+
+    /// LatencyBudget Clone preserves fields.
+    #[test]
+    fn prop_latency_budget_clone(budget in arb_latency_budget()) {
+        let cloned = budget.clone();
+        prop_assert_eq!(cloned.max_duration, budget.max_duration);
+        prop_assert_eq!(cloned.class, budget.class);
+    }
+}
+
+// =========================================================================
+// QualityReport: serde + properties
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// QualityReport arb strategy serde roundtrip preserves fields.
+    #[test]
+    fn prop_quality_report_arb_serde(report in arb_quality_report()) {
+        let json = serde_json::to_string(&report).unwrap();
+        let back: QualityReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_queries, report.total_queries);
+        prop_assert_eq!(back.passed, report.passed);
+        prop_assert_eq!(back.failed, report.failed);
+        prop_assert_eq!(back.latency_violations, report.latency_violations);
+        prop_assert_eq!(back.errors, report.errors);
+        prop_assert_eq!(back.all_passed, report.all_passed);
+        prop_assert_eq!(back.results.len(), report.results.len());
+    }
+
+    /// QualityReport JSON keys are present.
+    #[test]
+    fn prop_quality_report_json_keys(report in arb_quality_report()) {
+        let json = serde_json::to_string(&report).unwrap();
+        prop_assert!(json.contains("\"total_queries\""));
+        prop_assert!(json.contains("\"passed\""));
+        prop_assert!(json.contains("\"failed\""));
+        prop_assert!(json.contains("\"latency_violations\""));
+        prop_assert!(json.contains("\"errors\""));
+        prop_assert!(json.contains("\"all_passed\""));
+    }
+
+    /// QualityReport Clone preserves all_passed.
+    #[test]
+    fn prop_quality_report_clone(report in arb_quality_report()) {
+        let cloned = report.clone();
+        prop_assert_eq!(cloned.all_passed, report.all_passed);
+        prop_assert_eq!(cloned.results.len(), report.results.len());
+    }
+}

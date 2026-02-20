@@ -8,7 +8,8 @@ use proptest::prelude::*;
 
 use frankenterm_core::resize_scheduler::ResizeWorkClass;
 use frankenterm_core::viewport_reflow_planner::{
-    ReflowBatchPriority, ReflowPlan, ReflowPlannerInput, ViewportReflowPlanner,
+    ReflowBatch, ReflowBatchPriority, ReflowLineRange, ReflowPlan, ReflowPlannerInput,
+    ReflowSchedulingHook, ViewportReflowPlanner,
 };
 
 // ── Strategies ────────────────────────────────────────────────────────
@@ -699,5 +700,128 @@ proptest! {
         let cloned = result.clone();
         prop_assert_eq!(cloned.batches.len(), result.batches.len());
         prop_assert_eq!(cloned.frame_work_units, result.frame_work_units);
+    }
+}
+
+// ── Strategies: ReflowBatch, ReflowPlan, ReflowLineRange ────────────
+
+fn arb_reflow_line_range() -> impl Strategy<Value = ReflowLineRange> {
+    (0u32..10_000, 1u32..5_000)
+        .prop_map(|(start, len)| ReflowLineRange {
+            start_line: start,
+            end_line_exclusive: start + len,
+        })
+}
+
+fn arb_batch_priority() -> impl Strategy<Value = ReflowBatchPriority> {
+    prop_oneof![
+        Just(ReflowBatchPriority::ViewportCore),
+        Just(ReflowBatchPriority::ViewportOverscan),
+        Just(ReflowBatchPriority::ColdScrollback),
+    ]
+}
+
+fn arb_resize_work_class() -> impl Strategy<Value = ResizeWorkClass> {
+    prop_oneof![
+        Just(ResizeWorkClass::Interactive),
+        Just(ResizeWorkClass::Background),
+    ]
+}
+
+fn arb_reflow_batch() -> impl Strategy<Value = ReflowBatch> {
+    (
+        arb_reflow_line_range(),
+        arb_batch_priority(),
+        arb_resize_work_class(),
+        0u32..1000,
+        any::<bool>(),
+        "[a-zA-Z0-9 _]{5,30}",
+    )
+        .prop_map(|(range, priority, sclass, work_units, selected, rationale)| ReflowBatch {
+            range,
+            priority,
+            scheduler_class: sclass,
+            work_units,
+            selected_for_frame: selected,
+            rationale,
+        })
+}
+
+fn arb_reflow_plan() -> impl Strategy<Value = ReflowPlan> {
+    (
+        0u32..1000,
+        0u32..1000,
+        proptest::collection::vec(arb_reflow_batch(), 0..10),
+    )
+        .prop_map(|(budget, work, batches)| ReflowPlan {
+            frame_budget_units: budget,
+            frame_work_units: work,
+            batches,
+        })
+}
+
+// ── ReflowPlan: serde roundtrip + properties ────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// ReflowPlan serde roundtrip preserves all fields.
+    #[test]
+    fn prop_reflow_plan_serde(plan in arb_reflow_plan()) {
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: ReflowPlan = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.frame_budget_units, plan.frame_budget_units);
+        prop_assert_eq!(back.frame_work_units, plan.frame_work_units);
+        prop_assert_eq!(back.batches.len(), plan.batches.len());
+    }
+
+    /// ReflowPlan JSON keys are present.
+    #[test]
+    fn prop_reflow_plan_json_keys(plan in arb_reflow_plan()) {
+        let json = serde_json::to_string(&plan).unwrap();
+        prop_assert!(json.contains("\"frame_budget_units\""));
+        prop_assert!(json.contains("\"frame_work_units\""));
+        prop_assert!(json.contains("\"batches\""));
+    }
+
+    /// ReflowBatch serde roundtrip preserves fields.
+    #[test]
+    fn prop_reflow_batch_serde(batch in arb_reflow_batch()) {
+        let json = serde_json::to_string(&batch).unwrap();
+        let back: ReflowBatch = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.range.start_line, batch.range.start_line);
+        prop_assert_eq!(back.range.end_line_exclusive, batch.range.end_line_exclusive);
+        prop_assert_eq!(back.work_units, batch.work_units);
+        prop_assert_eq!(back.selected_for_frame, batch.selected_for_frame);
+    }
+
+    /// ReflowLineRange serde roundtrip.
+    #[test]
+    fn prop_reflow_line_range_serde(range in arb_reflow_line_range()) {
+        let json = serde_json::to_string(&range).unwrap();
+        let back: ReflowLineRange = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.start_line, range.start_line);
+        prop_assert_eq!(back.end_line_exclusive, range.end_line_exclusive);
+    }
+
+    /// ReflowSchedulingHook from plan batches serde roundtrip.
+    #[test]
+    fn prop_scheduling_hook_serde(input in arb_planner_input()) {
+        let result = plan(&input);
+        let hooks = result.scheduling_hooks();
+        for hook in &hooks {
+            let json = serde_json::to_string(hook).unwrap();
+            let back: ReflowSchedulingHook = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(back.work_units, hook.work_units);
+            prop_assert_eq!(back.selected_for_frame, hook.selected_for_frame);
+        }
+    }
+
+    /// ReflowBatchPriority serde roundtrip.
+    #[test]
+    fn prop_batch_priority_serde(p in arb_batch_priority()) {
+        let json = serde_json::to_string(&p).unwrap();
+        let back: ReflowBatchPriority = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, p);
     }
 }

@@ -454,3 +454,97 @@ proptest! {
         }
     }
 }
+
+// ── XorFilterStats: strategy + serde ────────────────────────────────
+
+fn arb_xor_filter_stats() -> impl Strategy<Value = XorFilterStats> {
+    (
+        1usize..10_000,      // num_keys
+        1usize..50_000,      // table_len
+        1usize..20_000,      // block_length
+        prop_oneof![Just(8u8), Just(16u8)], // fingerprint_bits
+        1usize..500_000,     // memory_bytes
+        1.0f64..50.0,        // bits_per_key
+        0.0f64..1.0,         // theoretical_fp_rate
+        any::<u64>(),        // seed
+    )
+        .prop_map(|(nk, tl, bl, fb, mb, bpk, tfp, seed)| XorFilterStats {
+            num_keys: nk,
+            table_len: tl,
+            block_length: bl,
+            fingerprint_bits: fb,
+            memory_bytes: mb,
+            bits_per_key: bpk,
+            theoretical_fp_rate: tfp,
+            seed,
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// XorFilterStats serde roundtrip preserves all fields.
+    #[test]
+    fn prop_stats_serde_roundtrip(stats in arb_xor_filter_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: XorFilterStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.num_keys, stats.num_keys);
+        prop_assert_eq!(back.table_len, stats.table_len);
+        prop_assert_eq!(back.block_length, stats.block_length);
+        prop_assert_eq!(back.fingerprint_bits, stats.fingerprint_bits);
+        prop_assert_eq!(back.memory_bytes, stats.memory_bytes);
+        prop_assert!((back.bits_per_key - stats.bits_per_key).abs() < 1e-9);
+        prop_assert!((back.theoretical_fp_rate - stats.theoretical_fp_rate).abs() < 1e-9);
+        prop_assert_eq!(back.seed, stats.seed);
+    }
+
+    /// XorFilterStats JSON keys are present.
+    #[test]
+    fn prop_stats_json_keys(stats in arb_xor_filter_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        prop_assert!(json.contains("\"num_keys\""));
+        prop_assert!(json.contains("\"table_len\""));
+        prop_assert!(json.contains("\"block_length\""));
+        prop_assert!(json.contains("\"fingerprint_bits\""));
+        prop_assert!(json.contains("\"memory_bytes\""));
+        prop_assert!(json.contains("\"bits_per_key\""));
+        prop_assert!(json.contains("\"theoretical_fp_rate\""));
+        prop_assert!(json.contains("\"seed\""));
+    }
+
+    /// XorFilterStats from built filter has 8-bit fingerprint_bits.
+    #[test]
+    fn prop_stats_from_8bit_filter(keys in key_set_strategy(100)) {
+        let filter = XorFilter::build(&keys).unwrap();
+        let stats = filter.stats();
+        prop_assert_eq!(stats.fingerprint_bits, 8);
+        prop_assert!(stats.bits_per_key > 0.0);
+        prop_assert!(stats.theoretical_fp_rate > 0.0);
+        prop_assert!(stats.theoretical_fp_rate < 1.0);
+    }
+
+    /// XorFilterStats from built filter has 16-bit fingerprint_bits.
+    #[test]
+    fn prop_stats_from_16bit_filter(keys in key_set_strategy(100)) {
+        let filter = XorFilter16::build(&keys).unwrap();
+        let stats = filter.stats();
+        prop_assert_eq!(stats.fingerprint_bits, 16);
+        prop_assert!(stats.bits_per_key > 0.0);
+    }
+
+    /// XorFilterStats Clone preserves all fields.
+    #[test]
+    fn prop_stats_clone(stats in arb_xor_filter_stats()) {
+        let cloned = stats.clone();
+        prop_assert_eq!(cloned.num_keys, stats.num_keys);
+        prop_assert_eq!(cloned.seed, stats.seed);
+        prop_assert_eq!(cloned.fingerprint_bits, stats.fingerprint_bits);
+    }
+
+    /// XorFilterStats Debug is non-empty.
+    #[test]
+    fn prop_stats_debug_nonempty(stats in arb_xor_filter_stats()) {
+        let debug = format!("{:?}", stats);
+        prop_assert!(!debug.is_empty());
+    }
+}
