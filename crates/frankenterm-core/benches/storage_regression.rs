@@ -631,7 +631,7 @@ fn bench_recorder_swarm_load_profile(c: &mut Criterion) {
                                 60,
                                 1.0,
                                 1.0,
-                                Some(FusionBackend::Legacy),
+                                Some(FusionBackend::FrankenSearchRrf),
                             )
                             .await
                             .expect("hybrid search");

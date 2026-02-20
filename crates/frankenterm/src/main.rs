@@ -2213,6 +2213,12 @@ enum RobotCommands {
         pane: Option<u64>,
     },
 
+    /// Search index lifecycle and health commands
+    SearchIndex {
+        #[command(subcommand)]
+        command: RobotSearchIndexCommands,
+    },
+
     /// Search and view coding agent session history via cass
     Cass {
         #[command(subcommand)]
@@ -2640,6 +2646,30 @@ enum RobotCassCommands {
         /// Override cass command timeout (seconds)
         #[arg(long, default_value = "15")]
         timeout_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum RobotSearchIndexCommands {
+    /// Show search index stats and health snapshot
+    Stats,
+    /// Rebuild the search index from captured terminal history and pane metadata
+    Reindex {
+        /// Segment scan batch size (1..=10000)
+        #[arg(long, default_value = "1000")]
+        batch_size: usize,
+
+        /// Restrict reindex to a single pane
+        #[arg(long)]
+        pane: Option<u64>,
+
+        /// Restrict reindex to segments captured at/after this epoch-ms
+        #[arg(long)]
+        since: Option<i64>,
+
+        /// Restrict reindex to segments captured at/before this epoch-ms
+        #[arg(long)]
+        until: Option<i64>,
     },
 }
 
@@ -3666,6 +3696,106 @@ fn effective_search_fusion_backend(
     frankenterm_core::search::FusionBackend::parse(&config.search.fusion_backend)
 }
 
+fn resolve_search_index_dir(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    }
+    if let Some(stripped) = trimmed.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(stripped);
+    }
+    PathBuf::from(trimmed)
+}
+
+fn effective_search_indexing_config(
+    config: &frankenterm_core::config::Config,
+) -> frankenterm_core::search::IndexingConfig {
+    let mut effective = frankenterm_core::search::IndexingConfig::default();
+    let indexing = &config.search.indexing;
+
+    if !indexing.index_dir.trim().is_empty() {
+        effective.index_dir = resolve_search_index_dir(&indexing.index_dir);
+    }
+    effective.max_index_size_bytes = indexing.max_index_mb.saturating_mul(1024 * 1024);
+    effective.ttl_days = indexing.ttl_days;
+    effective.flush_interval_secs = indexing.flush_interval_secs;
+    effective.flush_docs_threshold = indexing.flush_docs_threshold;
+    effective.max_docs_per_second = indexing.max_docs_per_second;
+    effective
+}
+
+fn search_embedder_tiers(config: &frankenterm_core::config::Config) -> Vec<String> {
+    let mut tiers = vec!["hash".to_string()];
+    if cfg!(feature = "semantic-search") && config.search.enabled {
+        tiers.push("model2vec".to_string());
+        tiers.push("fastembed".to_string());
+        if config.search.reranker_enabled {
+            tiers.push("cross-encoder".to_string());
+        }
+    }
+    tiers
+}
+
+fn build_segment_index_documents(
+    segment: &frankenterm_core::storage::Segment,
+) -> Vec<frankenterm_core::search::IndexableDocument> {
+    let lines = segment
+        .content
+        .lines()
+        .map(|line| frankenterm_core::search::ScrollbackLine {
+            text: line.to_string(),
+            captured_at_ms: segment.captured_at,
+            pane_id: Some(segment.pane_id),
+            session_id: None,
+        })
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut docs = frankenterm_core::search::chunk_scrollback_lines(&lines, 30_000);
+    docs.extend(frankenterm_core::search::extract_command_output_blocks(
+        &lines,
+        &frankenterm_core::search::CommandBlockExtractionConfig::default(),
+    ));
+    docs.extend(frankenterm_core::search::extract_agent_artifacts(
+        &segment.content,
+        segment.captured_at,
+        Some(segment.pane_id),
+        None,
+    ));
+    docs
+}
+
+fn build_pane_metadata_index_document(
+    pane: &frankenterm_core::storage::PaneRecord,
+) -> frankenterm_core::search::IndexableDocument {
+    frankenterm_core::search::IndexableDocument {
+        source: frankenterm_core::search::SearchDocumentSource::PaneMetadata,
+        text: String::new(),
+        captured_at_ms: pane.last_seen_at,
+        pane_id: Some(pane.pane_id),
+        session_id: pane.pane_uuid.clone(),
+        metadata: serde_json::json!({
+            "pane_id": pane.pane_id,
+            "pane_uuid": pane.pane_uuid.clone(),
+            "domain": pane.domain.clone(),
+            "window_id": pane.window_id,
+            "tab_id": pane.tab_id,
+            "title": pane.title.clone(),
+            "cwd": pane.cwd.clone(),
+            "tty_name": pane.tty_name.clone(),
+            "observed": pane.observed,
+            "ignore_reason": pane.ignore_reason.clone(),
+            "first_seen_at": pane.first_seen_at,
+            "last_seen_at": pane.last_seen_at,
+        }),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum NotifyChannel {
     Webhook,
@@ -4231,6 +4361,8 @@ struct RobotSearchData {
     #[serde(skip_serializing_if = "Option::is_none")]
     until_filter: Option<i64>,
     mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics: Option<RobotSearchMetrics>,
 }
 
 /// Individual search hit for robot mode
@@ -4245,6 +4377,31 @@ struct RobotSearchHit {
     snippet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fusion_rank: Option<usize>,
+}
+
+/// Optional search pipeline metrics for robot mode.
+#[derive(serde::Serialize)]
+struct RobotSearchMetrics {
+    requested_mode: String,
+    effective_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_reason: Option<String>,
+    rrf_k: u32,
+    lexical_weight: f32,
+    semantic_weight: f32,
+    fusion_backend: String,
+    lexical_candidates: usize,
+    semantic_candidates: usize,
+    semantic_cache_hit: bool,
+    semantic_latency_ms: u64,
+    semantic_rows_scanned: usize,
+    semantic_budget_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_backoff_until_ms: Option<i64>,
 }
 
 /// Robot search-explain response data
@@ -4258,6 +4415,64 @@ struct RobotSearchExplainData {
     ignored_panes: usize,
     total_segments: u64,
     reasons: Vec<frankenterm_core::search_explain::SearchExplainReason>,
+}
+
+/// Robot search-index stats response data
+#[derive(serde::Serialize)]
+struct RobotSearchIndexStatsData {
+    index_dir: String,
+    state_path: String,
+    format_version: u32,
+    document_count: usize,
+    segment_count: usize,
+    index_size_bytes: u64,
+    pending_docs: usize,
+    max_index_size_bytes: u64,
+    ttl_days: u64,
+    flush_interval_secs: u64,
+    flush_docs_threshold: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    newest_captured_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_captured_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness_age_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_update_ts: Option<i64>,
+    source_counts: BTreeMap<String, usize>,
+    embedder_tiers_available: Vec<String>,
+    background_job_status: String,
+    indexing_error_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+}
+
+/// Robot search-index reindex response data
+#[derive(serde::Serialize)]
+struct RobotSearchIndexReindexData {
+    batch_size: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_filter: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since_filter: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    until_filter: Option<i64>,
+    scanned_segments: usize,
+    submitted_docs: usize,
+    accepted_docs: usize,
+    skipped_empty_docs: usize,
+    skipped_duplicate_docs: usize,
+    skipped_cass_docs: usize,
+    skipped_resize_pause_docs: usize,
+    deferred_rate_limited_docs: usize,
+    flushed_docs: usize,
+    expired_docs: usize,
+    evicted_docs: usize,
+    pane_metadata_docs: usize,
+    flush_operations: usize,
+    final_document_count: usize,
+    final_index_size_bytes: u64,
+    source_counts: BTreeMap<String, usize>,
 }
 
 /// Robot events response data
@@ -6711,6 +6926,14 @@ fn build_robot_help() -> RobotHelp {
                 description: "Explain why search results may be missing or incomplete",
             },
             RobotCommandInfo {
+                name: "search-index stats",
+                description: "Show search index size/freshness/health metrics",
+            },
+            RobotCommandInfo {
+                name: "search-index reindex",
+                description: "Rebuild search index from captured segments + pane metadata",
+            },
+            RobotCommandInfo {
                 name: "cass search",
                 description: "Search coding agent session history via cass",
             },
@@ -6880,6 +7103,21 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 examples: vec![
                     "ft robot search-explain \"compilation failed\"",
                     "ft robot search-explain \"error\" --pane 3",
+                ],
+            },
+            QuickStartCommand {
+                name: "search-index stats",
+                args: "",
+                summary: "Show search index health snapshot (size, docs, freshness, tiers)",
+                examples: vec!["ft robot search-index stats"],
+            },
+            QuickStartCommand {
+                name: "search-index reindex",
+                args: "[--batch-size N] [--pane ID] [--since MS] [--until MS]",
+                summary: "Force rebuild of search index from stored capture history",
+                examples: vec![
+                    "ft robot search-index reindex",
+                    "ft robot search-index reindex --pane 3 --batch-size 500",
                 ],
             },
             QuickStartCommand {
@@ -9886,13 +10124,15 @@ async fn run_watcher(
                     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
                     let event_bus = Arc::clone(&event_bus);
                     let registry = Arc::clone(&handle.registry);
+                    let search_config = config.search.clone();
                     let ipc_task = frankenterm_core::runtime_compat::task::spawn(async move {
                         server
-                            .run_with_registry_auth_and_rpc(
+                            .run_with_registry_auth_rpc_and_search_config(
                                 event_bus,
                                 registry,
                                 ipc_auth,
                                 rpc_handler,
+                                Some(search_config),
                                 shutdown_rx,
                             )
                             .await;
@@ -11917,14 +12157,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let (hybrid_lexical_weight, hybrid_semantic_weight) =
                                 effective_search_fusion_weights(&config);
                             let hybrid_fusion_backend = effective_search_fusion_backend(&config);
+                            enum RobotSearchExecution {
+                                Lexical(Vec<frankenterm_core::storage::SearchResult>),
+                                Hybrid(frankenterm_core::storage::HybridSearchBundle),
+                            }
                             let search_results: Result<
-                                Vec<frankenterm_core::storage::SearchResult>,
+                                RobotSearchExecution,
                                 frankenterm_core::Error,
                             > = match canonical.mode {
                                 frankenterm_core::query_contract::UnifiedSearchMode::Lexical => {
                                     storage
                                         .search_with_results(&query_for_storage, options)
                                         .await
+                                        .map(RobotSearchExecution::Lexical)
                                 }
                                 frankenterm_core::query_contract::UnifiedSearchMode::Semantic
                                 | frankenterm_core::query_contract::UnifiedSearchMode::Hybrid => {
@@ -11948,7 +12193,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         }
                                     };
                                     let embedder_id = embedder.info().name;
-                                    match storage
+                                    storage
                                         .hybrid_search_with_results(
                                             &query_for_storage,
                                             options,
@@ -11961,23 +12206,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             Some(hybrid_fusion_backend),
                                         )
                                         .await
-                                    {
-                                        Ok(bundle) => Ok(bundle
-                                            .results
-                                            .into_iter()
-                                            .map(|hit| {
-                                                let mut result = hit.result;
-                                                result.score = hit.fusion_score;
-                                                result
-                                            })
-                                            .collect()),
-                                        Err(err) => Err(err),
-                                    }
+                                        .map(RobotSearchExecution::Hybrid)
                                 }
                             };
 
                             match search_results {
-                                Ok(mut results) => {
+                                Ok(RobotSearchExecution::Lexical(mut results)) => {
                                     redact_search_results_for_output(&mut results);
                                     let total_hits = results.len();
                                     let hits: Vec<RobotSearchHit> = results
@@ -11994,6 +12228,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             } else {
                                                 Some(r.segment.content)
                                             },
+                                            semantic_score: None,
+                                            fusion_rank: None,
                                         })
                                         .collect();
 
@@ -12018,6 +12254,97 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         since_filter: canonical.since,
                                         until_filter: canonical.until,
                                         mode: canonical.mode.as_str().to_string(),
+                                        metrics: None,
+                                    };
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
+                                    print_robot_response(&response, format, stats)?;
+                                }
+                                Ok(RobotSearchExecution::Hybrid(bundle)) => {
+                                    let frankenterm_core::storage::HybridSearchBundle {
+                                        mode: effective_mode,
+                                        requested_mode,
+                                        fallback_reason,
+                                        rrf_k,
+                                        lexical_weight,
+                                        semantic_weight,
+                                        fusion_backend,
+                                        lexical_candidates,
+                                        semantic_candidates,
+                                        semantic_cache_hit,
+                                        semantic_latency_ms,
+                                        semantic_rows_scanned,
+                                        semantic_budget_state,
+                                        semantic_backoff_until_ms,
+                                        mut results,
+                                    } = bundle;
+
+                                    for hit in &mut results {
+                                        hit.result.score = hit.fusion_score;
+                                        redact_search_results_for_output(std::slice::from_mut(
+                                            &mut hit.result,
+                                        ));
+                                    }
+
+                                    let hits: Vec<RobotSearchHit> = results
+                                        .into_iter()
+                                        .map(|hit| {
+                                            let result = hit.result;
+                                            RobotSearchHit {
+                                                segment_id: result.segment.id,
+                                                pane_id: result.segment.pane_id,
+                                                seq: result.segment.seq,
+                                                captured_at: result.segment.captured_at,
+                                                score: hit.fusion_score,
+                                                snippet: result.snippet,
+                                                content: if canonical.snippets {
+                                                    None
+                                                } else {
+                                                    Some(result.segment.content)
+                                                },
+                                                semantic_score: hit.semantic_score,
+                                                fusion_rank: Some(hit.fusion_rank),
+                                            }
+                                        })
+                                        .collect();
+                                    let total_hits = hits.len();
+
+                                    record_read_search_policy_audit(
+                                        Some(&storage),
+                                        frankenterm_core::policy::ActorKind::Robot,
+                                        frankenterm_core::policy::ActionKind::SearchOutput,
+                                        canonical.pane,
+                                        policy_domain.as_deref(),
+                                        &policy_summary,
+                                        &policy_decision,
+                                        "success",
+                                    )
+                                    .await;
+
+                                    let data = RobotSearchData {
+                                        query: redact_for_output(&canonical.query),
+                                        results: hits,
+                                        total_hits,
+                                        limit: canonical.limit,
+                                        pane_filter: canonical.pane,
+                                        since_filter: canonical.since,
+                                        until_filter: canonical.until,
+                                        mode: canonical.mode.as_str().to_string(),
+                                        metrics: Some(RobotSearchMetrics {
+                                            requested_mode,
+                                            effective_mode,
+                                            fallback_reason,
+                                            rrf_k,
+                                            lexical_weight,
+                                            semantic_weight,
+                                            fusion_backend,
+                                            lexical_candidates,
+                                            semantic_candidates,
+                                            semantic_cache_hit,
+                                            semantic_latency_ms,
+                                            semantic_rows_scanned,
+                                            semantic_budget_state,
+                                            semantic_backoff_until_ms,
+                                        }),
                                     };
                                     let response = RobotResponse::success(data, elapsed_ms(start));
                                     print_robot_response(&response, format, stats)?;
@@ -12124,6 +12451,366 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        RobotCommands::SearchIndex { command } => match command {
+                            RobotSearchIndexCommands::Stats => {
+                                let index_cfg =
+                                    effective_search_indexing_config(&ctx.effective.config);
+                                match frankenterm_core::search::SearchIndex::open(index_cfg) {
+                                    Ok(index) => {
+                                        let stats_snapshot = index.stats(now_ms_i64());
+                                        let source_counts = stats_snapshot
+                                            .source_counts
+                                            .into_iter()
+                                            .collect::<BTreeMap<_, _>>();
+                                        let last_update_ts = stats_snapshot
+                                            .newest_captured_at_ms
+                                            .or(stats_snapshot.last_flush_at_ms);
+
+                                        let data = RobotSearchIndexStatsData {
+                                            index_dir: stats_snapshot.index_dir,
+                                            state_path: stats_snapshot.state_path,
+                                            format_version: stats_snapshot.format_version,
+                                            document_count: stats_snapshot.doc_count,
+                                            segment_count: stats_snapshot.segment_count,
+                                            index_size_bytes: stats_snapshot.total_bytes,
+                                            pending_docs: stats_snapshot.pending_docs,
+                                            max_index_size_bytes: stats_snapshot
+                                                .max_index_size_bytes,
+                                            ttl_days: stats_snapshot.ttl_days,
+                                            flush_interval_secs: stats_snapshot.flush_interval_secs,
+                                            flush_docs_threshold: stats_snapshot
+                                                .flush_docs_threshold,
+                                            newest_captured_at_ms: stats_snapshot
+                                                .newest_captured_at_ms,
+                                            oldest_captured_at_ms: stats_snapshot
+                                                .oldest_captured_at_ms,
+                                            freshness_age_ms: stats_snapshot.freshness_age_ms,
+                                            last_update_ts,
+                                            source_counts,
+                                            embedder_tiers_available: search_embedder_tiers(
+                                                &ctx.effective.config,
+                                            ),
+                                            background_job_status: "idle".to_string(),
+                                            indexing_error_count: 0,
+                                            last_error: None,
+                                        };
+                                        let response =
+                                            RobotResponse::success(data, elapsed_ms(start));
+                                        print_robot_response(&response, format, stats)?;
+                                    }
+                                    Err(err) => {
+                                        let response = RobotResponse::<RobotSearchIndexStatsData>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to open search index: {err}"),
+                                            Some("Check [search.indexing] config paths/permissions".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                        print_robot_response(&response, format, stats)?;
+                                    }
+                                }
+                            }
+                            RobotSearchIndexCommands::Reindex {
+                                batch_size,
+                                pane,
+                                since,
+                                until,
+                            } => {
+                                let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                    Ok(layout) => layout,
+                                    Err(e) => {
+                                        let response =
+                                            RobotResponse::<RobotSearchIndexReindexData>::error_with_code(
+                                                ROBOT_ERR_CONFIG,
+                                                format!("Failed to get workspace layout: {e}"),
+                                                Some("Check --workspace or FT_WORKSPACE".to_string()),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
+
+                                let db_path = layout.db_path.to_string_lossy();
+                                let storage = match frankenterm_core::storage::StorageHandle::new(
+                                    &db_path,
+                                )
+                                .await
+                                {
+                                    Ok(storage) => storage,
+                                    Err(e) => {
+                                        let response =
+                                            RobotResponse::<RobotSearchIndexReindexData>::error_with_code(
+                                                ROBOT_ERR_STORAGE,
+                                                format!("Failed to open storage: {e}"),
+                                                Some(
+                                                    "Is the database initialized? Run 'ft watch' first."
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
+
+                                let index_cfg =
+                                    effective_search_indexing_config(&ctx.effective.config);
+                                let mut index = match frankenterm_core::search::SearchIndex::open(
+                                    index_cfg,
+                                ) {
+                                    Ok(index) => index,
+                                    Err(err) => {
+                                        let response = RobotResponse::<RobotSearchIndexReindexData>::error_with_code(
+                                                ROBOT_ERR_STORAGE,
+                                                format!("Failed to open search index: {err}"),
+                                                Some("Check [search.indexing] config paths/permissions".to_string()),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
+
+                                let now_ms = now_ms_i64();
+                                if let Err(err) = index.reindex_documents(&[], now_ms, None) {
+                                    let response = RobotResponse::<RobotSearchIndexReindexData>::error_with_code(
+                                        ROBOT_ERR_STORAGE,
+                                        format!("Failed to reset search index state: {err}"),
+                                        None,
+                                        elapsed_ms(start),
+                                    );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+
+                                let scan_batch_size = batch_size.clamp(1, 10_000);
+                                let mut after_id: Option<i64> = None;
+                                let mut scanned_segments = 0usize;
+                                let mut submitted_docs = 0usize;
+                                let mut accepted_docs = 0usize;
+                                let mut skipped_empty_docs = 0usize;
+                                let mut skipped_duplicate_docs = 0usize;
+                                let mut skipped_cass_docs = 0usize;
+                                let mut skipped_resize_pause_docs = 0usize;
+                                let mut deferred_rate_limited_docs = 0usize;
+                                let mut flushed_docs = 0usize;
+                                let mut expired_docs = 0usize;
+                                let mut evicted_docs = 0usize;
+                                let mut flush_operations = 0usize;
+
+                                loop {
+                                    let query = frankenterm_core::storage::SegmentScanQuery {
+                                        after_id,
+                                        pane_id: pane,
+                                        since,
+                                        until,
+                                        limit: scan_batch_size,
+                                    };
+                                    let segments = match storage.scan_segments(query).await {
+                                        Ok(segments) => segments,
+                                        Err(err) => {
+                                            let response = RobotResponse::<
+                                                RobotSearchIndexReindexData,
+                                            >::error_with_code(
+                                                ROBOT_ERR_STORAGE,
+                                                format!(
+                                                    "Failed to scan segments for reindex: {err}"
+                                                ),
+                                                None,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    if segments.is_empty() {
+                                        break;
+                                    }
+
+                                    scanned_segments =
+                                        scanned_segments.saturating_add(segments.len());
+                                    after_id = segments.last().map(|segment| segment.id);
+
+                                    let mut docs_batch = Vec::new();
+                                    for segment in &segments {
+                                        docs_batch.extend(build_segment_index_documents(segment));
+                                    }
+                                    submitted_docs =
+                                        submitted_docs.saturating_add(docs_batch.len());
+
+                                    if docs_batch.is_empty() {
+                                        continue;
+                                    }
+
+                                    match index.ingest_documents(
+                                        &docs_batch,
+                                        now_ms_i64(),
+                                        false,
+                                        None,
+                                    ) {
+                                        Ok(report) => {
+                                            accepted_docs =
+                                                accepted_docs.saturating_add(report.accepted_docs);
+                                            skipped_empty_docs = skipped_empty_docs
+                                                .saturating_add(report.skipped_empty_docs);
+                                            skipped_duplicate_docs = skipped_duplicate_docs
+                                                .saturating_add(report.skipped_duplicate_docs);
+                                            skipped_cass_docs = skipped_cass_docs
+                                                .saturating_add(report.skipped_cass_docs);
+                                            skipped_resize_pause_docs = skipped_resize_pause_docs
+                                                .saturating_add(report.skipped_resize_pause_docs);
+                                            deferred_rate_limited_docs = deferred_rate_limited_docs
+                                                .saturating_add(report.deferred_rate_limited_docs);
+                                            flushed_docs =
+                                                flushed_docs.saturating_add(report.flushed_docs);
+                                            expired_docs =
+                                                expired_docs.saturating_add(report.expired_docs);
+                                            evicted_docs =
+                                                evicted_docs.saturating_add(report.evicted_docs);
+                                            if report.flushed_docs > 0 {
+                                                flush_operations =
+                                                    flush_operations.saturating_add(1);
+                                            }
+                                        }
+                                        Err(err) => {
+                                            let response = RobotResponse::<
+                                                RobotSearchIndexReindexData,
+                                            >::error_with_code(
+                                                ROBOT_ERR_STORAGE,
+                                                format!("Failed to ingest reindex batch: {err}"),
+                                                None,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+
+                                let panes = match storage.get_panes().await {
+                                    Ok(panes) => panes,
+                                    Err(err) => {
+                                        let response = RobotResponse::<RobotSearchIndexReindexData>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to load pane metadata for reindex: {err}"),
+                                            None,
+                                            elapsed_ms(start),
+                                        );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
+                                let pane_metadata_docs = panes.len();
+                                let pane_docs = panes
+                                    .iter()
+                                    .map(build_pane_metadata_index_document)
+                                    .collect::<Vec<_>>();
+                                submitted_docs = submitted_docs.saturating_add(pane_docs.len());
+
+                                if !pane_docs.is_empty() {
+                                    match index.ingest_documents(
+                                        &pane_docs,
+                                        now_ms_i64(),
+                                        false,
+                                        None,
+                                    ) {
+                                        Ok(report) => {
+                                            accepted_docs =
+                                                accepted_docs.saturating_add(report.accepted_docs);
+                                            skipped_empty_docs = skipped_empty_docs
+                                                .saturating_add(report.skipped_empty_docs);
+                                            skipped_duplicate_docs = skipped_duplicate_docs
+                                                .saturating_add(report.skipped_duplicate_docs);
+                                            skipped_cass_docs = skipped_cass_docs
+                                                .saturating_add(report.skipped_cass_docs);
+                                            skipped_resize_pause_docs = skipped_resize_pause_docs
+                                                .saturating_add(report.skipped_resize_pause_docs);
+                                            deferred_rate_limited_docs = deferred_rate_limited_docs
+                                                .saturating_add(report.deferred_rate_limited_docs);
+                                            flushed_docs =
+                                                flushed_docs.saturating_add(report.flushed_docs);
+                                            expired_docs =
+                                                expired_docs.saturating_add(report.expired_docs);
+                                            evicted_docs =
+                                                evicted_docs.saturating_add(report.evicted_docs);
+                                            if report.flushed_docs > 0 {
+                                                flush_operations =
+                                                    flush_operations.saturating_add(1);
+                                            }
+                                        }
+                                        Err(err) => {
+                                            let response = RobotResponse::<
+                                                RobotSearchIndexReindexData,
+                                            >::error_with_code(
+                                                ROBOT_ERR_STORAGE,
+                                                format!(
+                                                    "Failed to ingest pane metadata during reindex: {err}"
+                                                ),
+                                                None,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+
+                                let flush = match index.flush_now(
+                                    now_ms_i64(),
+                                    frankenterm_core::search::IndexFlushReason::Manual,
+                                ) {
+                                    Ok(flush) => flush,
+                                    Err(err) => {
+                                        let response = RobotResponse::<RobotSearchIndexReindexData>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to flush rebuilt index: {err}"),
+                                            None,
+                                            elapsed_ms(start),
+                                        );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
+                                flushed_docs = flushed_docs.saturating_add(flush.flushed_docs);
+                                expired_docs = expired_docs.saturating_add(flush.expired_docs);
+                                evicted_docs = evicted_docs.saturating_add(flush.evicted_docs);
+                                if flush.flushed_docs > 0 {
+                                    flush_operations = flush_operations.saturating_add(1);
+                                }
+
+                                let index_stats = index.stats(now_ms_i64());
+                                let source_counts = index_stats
+                                    .source_counts
+                                    .into_iter()
+                                    .collect::<BTreeMap<_, _>>();
+
+                                let data = RobotSearchIndexReindexData {
+                                    batch_size: scan_batch_size,
+                                    pane_filter: pane,
+                                    since_filter: since,
+                                    until_filter: until,
+                                    scanned_segments,
+                                    submitted_docs,
+                                    accepted_docs,
+                                    skipped_empty_docs,
+                                    skipped_duplicate_docs,
+                                    skipped_cass_docs,
+                                    skipped_resize_pause_docs,
+                                    deferred_rate_limited_docs,
+                                    flushed_docs,
+                                    expired_docs,
+                                    evicted_docs,
+                                    pane_metadata_docs,
+                                    flush_operations,
+                                    final_document_count: index_stats.doc_count,
+                                    final_index_size_bytes: index_stats.total_bytes,
+                                    source_counts,
+                                };
+                                let response = RobotResponse::success(data, elapsed_ms(start));
+                                print_robot_response(&response, format, stats)?;
+                            }
+                        },
                         RobotCommands::Cass { command } => {
                             use frankenterm_core::cass::{CassClient, CassError};
 
@@ -30902,6 +31589,85 @@ mod tests {
         assert!(!records.iter().any(|r| r.pane_id == 3));
     }
 
+    #[tokio::test]
+    async fn load_distributed_remote_panes_only_returns_distributed_domains() {
+        let (storage, db_path) = setup_storage("distributed_remote_load").await;
+
+        storage
+            .upsert_pane(make_pane_record(10, "local", Some("local-pane")))
+            .await
+            .unwrap();
+        storage
+            .upsert_pane(make_pane_record(
+                11,
+                "distributed:agent-a:prod",
+                Some("remote-pane-a"),
+            ))
+            .await
+            .unwrap();
+        storage
+            .upsert_pane(make_pane_record(
+                12,
+                "distributed:agent-b:staging",
+                Some("remote-pane-b"),
+            ))
+            .await
+            .unwrap();
+
+        let remote = load_distributed_remote_panes(std::path::Path::new(&db_path))
+            .await
+            .unwrap();
+
+        assert_eq!(remote.len(), 2);
+        assert!(
+            remote
+                .iter()
+                .all(|pane| pane.domain.starts_with("distributed:"))
+        );
+        assert!(remote.iter().any(|pane| pane.pane_id == 11));
+        assert!(remote.iter().any(|pane| pane.pane_id == 12));
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn distributed_remote_output_is_searchable_for_query_path() {
+        let (storage, db_path) = setup_storage("distributed_remote_query").await;
+        let remote_pane_id = 42_001;
+
+        storage
+            .upsert_pane(make_pane_record(
+                remote_pane_id,
+                "distributed:agent-query:prod",
+                Some("remote-query-pane"),
+            ))
+            .await
+            .unwrap();
+
+        storage
+            .append_segment(
+                remote_pane_id,
+                "DIST_STATUS_QUERY_MARKER distributed pane output",
+                Some("remote_sender=agent-query;remote_seq=1".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let remote = load_distributed_remote_panes(std::path::Path::new(&db_path))
+            .await
+            .unwrap();
+        let matches = storage.search("DIST_STATUS_QUERY_MARKER").await.unwrap();
+
+        assert!(remote.iter().any(|pane| pane.pane_id == remote_pane_id));
+        assert!(
+            matches
+                .iter()
+                .any(|segment| segment.pane_id == remote_pane_id)
+        );
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
     #[cfg(feature = "distributed")]
     #[test]
     fn distributed_remote_pane_id_is_namespaced_and_stable() {
@@ -34128,6 +34894,152 @@ log_level = "debug"
     }
 
     #[test]
+    fn robot_search_hit_serialization_hybrid_fields_are_optional() {
+        let lexical_hit = RobotSearchHit {
+            segment_id: 7,
+            pane_id: 2,
+            seq: 99,
+            captured_at: 1234,
+            score: 42.5,
+            snippet: Some("snippet".to_string()),
+            content: None,
+            semantic_score: None,
+            fusion_rank: None,
+        };
+        let lexical_json = serde_json::to_value(&lexical_hit).unwrap();
+        assert!(lexical_json.get("semantic_score").is_none());
+        assert!(lexical_json.get("fusion_rank").is_none());
+
+        let hybrid_hit = RobotSearchHit {
+            segment_id: 8,
+            pane_id: 3,
+            seq: 100,
+            captured_at: 5678,
+            score: 0.321,
+            snippet: None,
+            content: Some("content".to_string()),
+            semantic_score: Some(0.77),
+            fusion_rank: Some(1),
+        };
+        let hybrid_json = serde_json::to_value(&hybrid_hit).unwrap();
+        assert_eq!(hybrid_json["semantic_score"], 0.77);
+        assert_eq!(hybrid_json["fusion_rank"], 1);
+    }
+
+    #[test]
+    fn robot_search_data_serialization_metrics_are_optional() {
+        let without_metrics = RobotSearchData {
+            query: "needle".to_string(),
+            results: vec![],
+            total_hits: 0,
+            limit: 20,
+            pane_filter: None,
+            since_filter: None,
+            until_filter: None,
+            mode: "lexical".to_string(),
+            metrics: None,
+        };
+        let without_metrics_json = serde_json::to_value(&without_metrics).unwrap();
+        assert!(without_metrics_json.get("metrics").is_none());
+
+        let with_metrics = RobotSearchData {
+            query: "needle".to_string(),
+            results: vec![],
+            total_hits: 0,
+            limit: 20,
+            pane_filter: None,
+            since_filter: None,
+            until_filter: None,
+            mode: "hybrid".to_string(),
+            metrics: Some(RobotSearchMetrics {
+                requested_mode: "hybrid".to_string(),
+                effective_mode: "lexical".to_string(),
+                fallback_reason: Some("semantic_query_empty".to_string()),
+                rrf_k: 60,
+                lexical_weight: 1.0,
+                semantic_weight: 1.0,
+                fusion_backend: "frankensearch_rrf".to_string(),
+                lexical_candidates: 3,
+                semantic_candidates: 0,
+                semantic_cache_hit: false,
+                semantic_latency_ms: 4,
+                semantic_rows_scanned: 0,
+                semantic_budget_state: "degraded".to_string(),
+                semantic_backoff_until_ms: None,
+            }),
+        };
+        let with_metrics_json = serde_json::to_value(&with_metrics).unwrap();
+        assert_eq!(with_metrics_json["metrics"]["requested_mode"], "hybrid");
+        assert_eq!(with_metrics_json["metrics"]["effective_mode"], "lexical");
+        assert_eq!(
+            with_metrics_json["metrics"]["fallback_reason"],
+            "semantic_query_empty"
+        );
+        assert_eq!(
+            with_metrics_json["metrics"]["fusion_backend"],
+            "frankensearch_rrf"
+        );
+    }
+
+    #[test]
+    fn robot_search_index_stats_data_serialization_optional_fields() {
+        let without_optional = RobotSearchIndexStatsData {
+            index_dir: "/tmp/ft-search".to_string(),
+            state_path: "/tmp/ft-search/index_state_v1.json".to_string(),
+            format_version: 1,
+            document_count: 0,
+            segment_count: 0,
+            index_size_bytes: 0,
+            pending_docs: 0,
+            max_index_size_bytes: 512 * 1024 * 1024,
+            ttl_days: 30,
+            flush_interval_secs: 5,
+            flush_docs_threshold: 50,
+            newest_captured_at_ms: None,
+            oldest_captured_at_ms: None,
+            freshness_age_ms: None,
+            last_update_ts: None,
+            source_counts: BTreeMap::new(),
+            embedder_tiers_available: vec!["hash".to_string()],
+            background_job_status: "idle".to_string(),
+            indexing_error_count: 0,
+            last_error: None,
+        };
+        let without_optional_json = serde_json::to_value(&without_optional).unwrap();
+        assert!(without_optional_json.get("last_update_ts").is_none());
+        assert!(without_optional_json.get("last_error").is_none());
+
+        let mut source_counts = BTreeMap::new();
+        source_counts.insert("scrollback".to_string(), 10);
+        let with_optional = RobotSearchIndexStatsData {
+            index_dir: "/tmp/ft-search".to_string(),
+            state_path: "/tmp/ft-search/index_state_v1.json".to_string(),
+            format_version: 1,
+            document_count: 10,
+            segment_count: 10,
+            index_size_bytes: 4096,
+            pending_docs: 2,
+            max_index_size_bytes: 512 * 1024 * 1024,
+            ttl_days: 30,
+            flush_interval_secs: 5,
+            flush_docs_threshold: 50,
+            newest_captured_at_ms: Some(1_700_000_000_000),
+            oldest_captured_at_ms: Some(1_699_999_000_000),
+            freshness_age_ms: Some(500),
+            last_update_ts: Some(1_700_000_000_000),
+            source_counts,
+            embedder_tiers_available: vec!["hash".to_string(), "model2vec".to_string()],
+            background_job_status: "idle".to_string(),
+            indexing_error_count: 1,
+            last_error: Some("disk full".to_string()),
+        };
+        let with_optional_json = serde_json::to_value(&with_optional).unwrap();
+        assert_eq!(with_optional_json["last_update_ts"], 1_700_000_000_000i64);
+        assert_eq!(with_optional_json["last_error"], "disk full");
+        assert_eq!(with_optional_json["source_counts"]["scrollback"], 10);
+    }
+
+    #[test]
     fn robot_workflow_list_returns_all_four_workflows() {
         // Replicate the hardcoded list from the List handler to verify completeness.
         let workflows: Vec<RobotWorkflowInfo> = vec![
@@ -35216,6 +36128,62 @@ log_level = "debug"
                     assert_eq!(mode, SearchModeArg::Semantic);
                 }
                 _ => panic!("expected RobotCommands::Search"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_search_index_stats_parses() {
+        let cli = Cli::try_parse_from(["ft", "robot", "search-index", "stats"])
+            .expect("robot search-index stats should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::SearchIndex {
+                    command: RobotSearchIndexCommands::Stats,
+                }) => {}
+                _ => panic!("expected RobotCommands::SearchIndex::Stats"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_search_index_reindex_parses_filters() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "search-index",
+            "reindex",
+            "--batch-size",
+            "250",
+            "--pane",
+            "7",
+            "--since",
+            "100",
+            "--until",
+            "200",
+        ])
+        .expect("robot search-index reindex should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::SearchIndex {
+                    command:
+                        RobotSearchIndexCommands::Reindex {
+                            batch_size,
+                            pane,
+                            since,
+                            until,
+                        },
+                }) => {
+                    assert_eq!(batch_size, 250);
+                    assert_eq!(pane, Some(7));
+                    assert_eq!(since, Some(100));
+                    assert_eq!(until, Some(200));
+                }
+                _ => panic!("expected RobotCommands::SearchIndex::Reindex"),
             },
             _ => panic!("expected Robot command"),
         }

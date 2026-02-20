@@ -468,6 +468,38 @@ pub struct SearchHit {
     pub fusion_rank: Option<usize>,
 }
 
+/// Response data for `ft robot search-index stats`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchIndexStatsData {
+    pub index_dir: String,
+    pub state_path: String,
+    pub format_version: u32,
+    pub document_count: usize,
+    pub segment_count: usize,
+    pub index_size_bytes: u64,
+    pub pending_docs: usize,
+    pub max_index_size_bytes: u64,
+    pub ttl_days: u64,
+    pub flush_interval_secs: u64,
+    pub flush_docs_threshold: usize,
+    #[serde(default)]
+    pub newest_captured_at_ms: Option<i64>,
+    #[serde(default)]
+    pub oldest_captured_at_ms: Option<i64>,
+    #[serde(default)]
+    pub freshness_age_ms: Option<i64>,
+    #[serde(default)]
+    pub last_update_ts: Option<i64>,
+    #[serde(default)]
+    pub source_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub embedder_tiers_available: Vec<String>,
+    pub background_job_status: String,
+    pub indexing_error_count: usize,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 /// Response data for `ft robot events`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventsData {

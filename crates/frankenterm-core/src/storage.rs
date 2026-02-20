@@ -19363,7 +19363,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
-                Some(crate::search::FusionBackend::Legacy),
+                Some(crate::search::FusionBackend::FrankenSearchRrf),
             )
             .await
             .unwrap();
@@ -19446,7 +19446,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
-                Some(crate::search::FusionBackend::Legacy),
+                Some(crate::search::FusionBackend::FrankenSearchRrf),
             )
             .await
             .unwrap();
@@ -19504,7 +19504,7 @@ mod storage_handle_tests {
                 60,
                 f32::NAN,
                 -1.0,
-                Some(crate::search::FusionBackend::Legacy),
+                Some(crate::search::FusionBackend::FrankenSearchRrf),
             )
             .await
             .unwrap();
@@ -19522,7 +19522,7 @@ mod storage_handle_tests {
                 60,
                 0.0,
                 0.0,
-                Some(crate::search::FusionBackend::Legacy),
+                Some(crate::search::FusionBackend::FrankenSearchRrf),
             )
             .await
             .unwrap();
@@ -19575,7 +19575,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
-                Some(crate::search::FusionBackend::Legacy),
+                Some(crate::search::FusionBackend::FrankenSearchRrf),
             )
             .await
             .unwrap();
@@ -19593,7 +19593,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
-                Some(crate::search::FusionBackend::Legacy),
+                Some(crate::search::FusionBackend::FrankenSearchRrf),
             )
             .await
             .unwrap();
@@ -19617,7 +19617,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
-                Some(crate::search::FusionBackend::Legacy),
+                Some(crate::search::FusionBackend::FrankenSearchRrf),
             )
             .await
             .unwrap();
@@ -19681,7 +19681,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
-                Some(crate::search::FusionBackend::Legacy),
+                Some(crate::search::FusionBackend::FrankenSearchRrf),
             )
             .await
             .unwrap();
@@ -19703,7 +19703,7 @@ mod storage_handle_tests {
                 60,
                 1.0,
                 1.0,
-                Some(crate::search::FusionBackend::Legacy),
+                Some(crate::search::FusionBackend::FrankenSearchRrf),
             )
             .await
             .unwrap();

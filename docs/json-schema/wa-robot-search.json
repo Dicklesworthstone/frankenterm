@@ -47,7 +47,7 @@
     },
     "metrics": {
       "type": "object",
-      "description": "Optional search pipeline metrics (present for semantic/hybrid MCP responses)",
+      "description": "Optional search pipeline metrics (present for semantic/hybrid responses)",
       "properties": {
         "requested_mode": {
           "type": "string",

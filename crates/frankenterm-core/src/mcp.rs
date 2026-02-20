@@ -6238,26 +6238,23 @@ mod tests {
     #[test]
     fn effective_search_fusion_backend_uses_config_selector() {
         let mut config = Config::default();
-        config.search.fusion_backend = "legacy".to_string();
+        config.search.fusion_backend = "frankensearch".to_string();
         assert_eq!(
             effective_search_fusion_backend(&config),
-            crate::search::FusionBackend::Legacy
+            crate::search::FusionBackend::FrankenSearchRrf
         );
 
         config.search.fusion_backend = "unknown-backend".to_string();
         assert_eq!(
             effective_search_fusion_backend(&config),
-            crate::search::FusionBackend::Legacy
+            crate::search::FusionBackend::FrankenSearchRrf
         );
 
-        #[cfg(feature = "frankensearch")]
-        {
-            config.search.fusion_backend = "frankensearch".to_string();
-            assert_eq!(
-                effective_search_fusion_backend(&config),
-                crate::search::FusionBackend::FrankenSearchRrf
-            );
-        }
+        config.search.fusion_backend = "legacy".to_string();
+        assert_eq!(
+            effective_search_fusion_backend(&config),
+            crate::search::FusionBackend::FrankenSearchRrf
+        );
     }
 
     // ── parse_mcp_output_format edge cases ───────────────────────────────

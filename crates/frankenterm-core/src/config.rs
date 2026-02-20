@@ -123,6 +123,8 @@ pub struct SearchConfig {
     pub fusion_backend: String,
     /// Enable cross-encoder reranking.
     pub reranker_enabled: bool,
+    /// Incremental document indexing settings (FrankenSearch pipeline).
+    pub indexing: SearchIndexingConfig,
     /// Background daemon configuration.
     pub daemon: SearchDaemonConfig,
 }
@@ -139,9 +141,41 @@ impl Default for SearchConfig {
             quality_weight: 0.7,
             quality_timeout_ms: 200,
             fast_only: false,
-            fusion_backend: "legacy".into(),
+            fusion_backend: "frankensearch".into(),
             reranker_enabled: false,
+            indexing: SearchIndexingConfig::default(),
             daemon: SearchDaemonConfig::default(),
+        }
+    }
+}
+
+/// Configuration for search indexing lifecycle and batching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchIndexingConfig {
+    /// Root directory for persisted search index artifacts.
+    pub index_dir: String,
+    /// Maximum on-disk index size in megabytes (0 disables size eviction).
+    pub max_index_mb: u64,
+    /// Time-to-live for indexed documents in days (0 disables TTL expiry).
+    pub ttl_days: u64,
+    /// Flush interval for batched writes.
+    pub flush_interval_secs: u64,
+    /// Flush threshold by pending document count.
+    pub flush_docs_threshold: usize,
+    /// Throughput ceiling for background indexing.
+    pub max_docs_per_second: u32,
+}
+
+impl Default for SearchIndexingConfig {
+    fn default() -> Self {
+        Self {
+            index_dir: "~/.ft/search_index".into(),
+            max_index_mb: 500,
+            ttl_days: 30,
+            flush_interval_secs: 5,
+            flush_docs_threshold: 50,
+            max_docs_per_second: 100,
         }
     }
 }
@@ -5421,7 +5455,21 @@ retention_tiers = []
         assert!((config.quality_weight - 0.7).abs() < 0.001);
         assert_eq!(config.quality_timeout_ms, 200);
         assert!(!config.fast_only);
-        assert_eq!(config.fusion_backend, "legacy");
+        assert_eq!(config.fusion_backend, "frankensearch");
+        assert_eq!(config.indexing.index_dir, "~/.ft/search_index");
+        assert_eq!(config.indexing.max_index_mb, 500);
+        assert_eq!(config.indexing.ttl_days, 30);
+    }
+
+    #[test]
+    fn search_indexing_config_defaults() {
+        let config = SearchIndexingConfig::default();
+        assert_eq!(config.index_dir, "~/.ft/search_index");
+        assert_eq!(config.max_index_mb, 500);
+        assert_eq!(config.ttl_days, 30);
+        assert_eq!(config.flush_interval_secs, 5);
+        assert_eq!(config.flush_docs_threshold, 50);
+        assert_eq!(config.max_docs_per_second, 100);
     }
 
     #[test]
@@ -6065,7 +6113,7 @@ mode = "periodic"
         assert!((sc.quality_weight - 0.7).abs() < 0.001);
         assert_eq!(sc.quality_timeout_ms, 200);
         assert!(!sc.fast_only);
-        assert_eq!(sc.fusion_backend, "legacy");
+        assert_eq!(sc.fusion_backend, "frankensearch");
         assert!(!sc.reranker_enabled);
     }
 

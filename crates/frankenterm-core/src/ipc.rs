@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::{IpcAuthToken, IpcScope};
+use crate::config::{IpcAuthToken, IpcScope, SearchConfig};
 use crate::crash::HealthSnapshot;
 use crate::events::{Event, EventBus, UserVarError, UserVarPayload};
 use crate::ingest::PaneRegistry;
@@ -46,6 +46,104 @@ fn now_ms() -> u64 {
 
 fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn now_ms_i64() -> i64 {
+    i64::try_from(now_ms()).unwrap_or(i64::MAX)
+}
+
+fn resolve_search_index_dir(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    }
+    if let Some(stripped) = trimmed.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(stripped);
+    }
+    PathBuf::from(trimmed)
+}
+
+fn effective_search_indexing_config(search_config: &SearchConfig) -> crate::search::IndexingConfig {
+    let mut effective = crate::search::IndexingConfig::default();
+    let indexing = &search_config.indexing;
+
+    if !indexing.index_dir.trim().is_empty() {
+        effective.index_dir = resolve_search_index_dir(&indexing.index_dir);
+    }
+    effective.max_index_size_bytes = indexing.max_index_mb.saturating_mul(1024 * 1024);
+    effective.ttl_days = indexing.ttl_days;
+    effective.flush_interval_secs = indexing.flush_interval_secs;
+    effective.flush_docs_threshold = indexing.flush_docs_threshold;
+    effective.max_docs_per_second = indexing.max_docs_per_second;
+    effective
+}
+
+fn search_embedder_tiers(search_config: &SearchConfig) -> Vec<String> {
+    let mut tiers = vec!["hash".to_string()];
+    if cfg!(feature = "semantic-search") && search_config.enabled {
+        tiers.push("model2vec".to_string());
+        tiers.push("fastembed".to_string());
+        if search_config.reranker_enabled {
+            tiers.push("cross-encoder".to_string());
+        }
+    }
+    tiers
+}
+
+fn build_search_status_payload(
+    search_config: Option<&SearchConfig>,
+) -> (serde_json::Value, serde_json::Value) {
+    let Some(search_config) = search_config else {
+        return (
+            serde_json::Value::Null,
+            serde_json::json!({
+                "freshness_secs": serde_json::Value::Null,
+                "indexing_error_count": 0,
+                "last_error": serde_json::Value::Null,
+                "background_job_status": "paused",
+            }),
+        );
+    };
+
+    let background_job_status = if search_config.daemon.enabled {
+        "idle"
+    } else {
+        "paused"
+    };
+
+    let index_config = effective_search_indexing_config(search_config);
+    match crate::search::SearchIndex::open(index_config) {
+        Ok(index) => {
+            let stats = index.stats(now_ms_i64());
+            let last_update_ts = stats.newest_captured_at_ms.or(stats.last_flush_at_ms);
+            let freshness_secs = stats.freshness_age_ms.map(|ms| ms.max(0) / 1000);
+            let search_index = serde_json::json!({
+                "index_size_bytes": stats.total_bytes,
+                "document_count": stats.doc_count,
+                "last_update_ts": last_update_ts,
+                "embedder_tiers_available": search_embedder_tiers(search_config),
+                "segment_count": stats.segment_count,
+            });
+            let search_health = serde_json::json!({
+                "freshness_secs": freshness_secs,
+                "indexing_error_count": 0,
+                "last_error": serde_json::Value::Null,
+                "background_job_status": background_job_status,
+            });
+            (search_index, search_health)
+        }
+        Err(err) => {
+            let search_health = serde_json::json!({
+                "freshness_secs": serde_json::Value::Null,
+                "indexing_error_count": 1,
+                "last_error": err.to_string(),
+                "background_job_status": background_job_status,
+            });
+            (serde_json::Value::Null, search_health)
+        }
+    }
 }
 
 // NOTE: StatusUpdate types (CursorPosition, PaneDimensions, StatusUpdate, StatusUpdateRateLimiter)
@@ -335,6 +433,8 @@ pub struct IpcHandlerContext {
     pub auth: Option<IpcAuth>,
     /// Optional RPC handler (robot/MCP parity).
     pub rpc_handler: Option<IpcRpcHandler>,
+    /// Optional search configuration for IPC status enrichment.
+    pub search_config: Option<SearchConfig>,
     // NOTE: rate_limiter field was removed in v0.2.0 (StatusUpdate removed)
 }
 
@@ -347,6 +447,7 @@ impl IpcHandlerContext {
             registry: None,
             auth: None,
             rpc_handler: None,
+            search_config: None,
         }
     }
 
@@ -358,6 +459,7 @@ impl IpcHandlerContext {
             registry: Some(registry),
             auth: None,
             rpc_handler: None,
+            search_config: None,
         }
     }
 
@@ -373,6 +475,7 @@ impl IpcHandlerContext {
             registry,
             auth,
             rpc_handler: None,
+            search_config: None,
         }
     }
 
@@ -384,11 +487,24 @@ impl IpcHandlerContext {
         auth: Option<IpcAuth>,
         rpc_handler: Option<IpcRpcHandler>,
     ) -> Self {
+        Self::with_auth_rpc_and_search_config(event_bus, registry, auth, rpc_handler, None)
+    }
+
+    /// Create a new handler context with optional auth, RPC handler, and search config.
+    #[must_use]
+    pub fn with_auth_rpc_and_search_config(
+        event_bus: Arc<EventBus>,
+        registry: Option<Arc<RwLock<PaneRegistry>>>,
+        auth: Option<IpcAuth>,
+        rpc_handler: Option<IpcRpcHandler>,
+        search_config: Option<SearchConfig>,
+    ) -> Self {
         Self {
             event_bus,
             registry,
             auth,
             rpc_handler,
+            search_config,
         }
     }
 }
@@ -520,13 +636,35 @@ impl IpcServer {
         registry: Arc<RwLock<PaneRegistry>>,
         auth: Option<IpcAuth>,
         rpc_handler: Option<IpcRpcHandler>,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        self.run_with_registry_auth_rpc_and_search_config(
+            event_bus,
+            registry,
+            auth,
+            rpc_handler,
+            None,
+            shutdown_rx,
+        )
+        .await;
+    }
+
+    /// Run the IPC server with registry, auth, RPC handler, and search config.
+    pub async fn run_with_registry_auth_rpc_and_search_config(
+        self,
+        event_bus: Arc<EventBus>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        auth: Option<IpcAuth>,
+        rpc_handler: Option<IpcRpcHandler>,
+        search_config: Option<SearchConfig>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
-        let ctx = Arc::new(IpcHandlerContext::with_auth_and_rpc(
+        let ctx = Arc::new(IpcHandlerContext::with_auth_rpc_and_search_config(
             event_bus,
             Some(registry),
             auth,
             rpc_handler,
+            search_config,
         ));
         self.run_with_context(ctx, &mut shutdown_rx).await;
     }
@@ -672,6 +810,21 @@ impl IpcServer {
         _registry: Arc<RwLock<PaneRegistry>>,
         _auth: Option<IpcAuth>,
         _rpc_handler: Option<IpcRpcHandler>,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        tracing::warn!("IPC server not supported on this platform");
+        let mut shutdown_rx = shutdown_rx;
+        Self::recv_shutdown(&mut shutdown_rx).await;
+    }
+
+    /// Run the IPC server with registry, auth, RPC handler, and search config (no-op on non-unix platforms).
+    pub async fn run_with_registry_auth_rpc_and_search_config(
+        self,
+        _event_bus: Arc<EventBus>,
+        _registry: Arc<RwLock<PaneRegistry>>,
+        _auth: Option<IpcAuth>,
+        _rpc_handler: Option<IpcRpcHandler>,
+        _search_config: Option<SearchConfig>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
         tracing::warn!("IPC server not supported on this platform");
@@ -817,6 +970,10 @@ async fn handle_request_with_context(
                 payload["resize_control_plane_watchdog"] = serde_json::Value::Null;
                 payload["resize_degradation_ladder"] = serde_json::Value::Null;
             }
+            let (search_index, search_health) =
+                build_search_status_payload(ctx.search_config.as_ref());
+            payload["search_index"] = search_index;
+            payload["search_health"] = search_health;
             IpcResponse::ok_with_data(payload)
         }
         IpcRequest::PaneState { pane_id } => handle_pane_state(pane_id, ctx).await,
@@ -1729,6 +1886,19 @@ mod tests {
                 streaming_health.get("dirty_rows_total"),
                 Some(&serde_json::json!(80))
             );
+            assert_eq!(data.get("search_index"), Some(&serde_json::Value::Null));
+            let search_health = data
+                .get("search_health")
+                .and_then(serde_json::Value::as_object)
+                .expect("search_health should be present in status payload");
+            assert_eq!(
+                search_health.get("background_job_status"),
+                Some(&serde_json::json!("paused"))
+            );
+            assert_eq!(
+                search_health.get("indexing_error_count"),
+                Some(&serde_json::json!(0))
+            );
 
             send_shutdown(&shutdown_tx).await;
             let _ = server_handle.await;
@@ -2217,6 +2387,7 @@ mod tests {
         assert!(ctx.registry.is_none());
         assert!(ctx.auth.is_none());
         assert!(ctx.rpc_handler.is_none());
+        assert!(ctx.search_config.is_none());
     }
 
     #[test]
@@ -2235,6 +2406,7 @@ mod tests {
         let ctx = IpcHandlerContext::with_auth(event_bus, None, Some(auth));
         assert!(ctx.auth.is_some());
         assert!(ctx.registry.is_none());
+        assert!(ctx.search_config.is_none());
     }
 
     #[test]
@@ -2243,6 +2415,68 @@ mod tests {
         let handler: IpcRpcHandler = Arc::new(|_req| Box::pin(async { IpcResponse::ok() }));
         let ctx = IpcHandlerContext::with_auth_and_rpc(event_bus, None, None, Some(handler));
         assert!(ctx.rpc_handler.is_some());
+        assert!(ctx.search_config.is_none());
+    }
+
+    #[test]
+    fn ipc_handler_context_with_auth_rpc_and_search_config() {
+        let event_bus = Arc::new(EventBus::new(10));
+        let handler: IpcRpcHandler = Arc::new(|_req| Box::pin(async { IpcResponse::ok() }));
+        let search_config = SearchConfig::default();
+        let ctx = IpcHandlerContext::with_auth_rpc_and_search_config(
+            event_bus,
+            None,
+            None,
+            Some(handler),
+            Some(search_config),
+        );
+        assert!(ctx.rpc_handler.is_some());
+        assert!(ctx.search_config.is_some());
+    }
+
+    #[test]
+    fn build_search_status_payload_with_config_includes_index_metrics() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut search_config = SearchConfig {
+            enabled: true,
+            ..SearchConfig::default()
+        };
+        search_config.daemon.enabled = true;
+        search_config.indexing.index_dir = temp_dir
+            .path()
+            .join("search-index")
+            .to_string_lossy()
+            .into_owned();
+
+        let (search_index, search_health) = build_search_status_payload(Some(&search_config));
+        let search_index = search_index
+            .as_object()
+            .expect("search_index should be an object when config is present");
+        assert_eq!(
+            search_index.get("document_count"),
+            Some(&serde_json::json!(0))
+        );
+        assert_eq!(
+            search_index.get("segment_count"),
+            Some(&serde_json::json!(0))
+        );
+        assert_eq!(
+            search_index.get("index_size_bytes"),
+            Some(&serde_json::json!(0))
+        );
+        assert!(search_index.get("embedder_tiers_available").is_some());
+
+        let search_health = search_health
+            .as_object()
+            .expect("search_health should be an object");
+        assert_eq!(
+            search_health.get("background_job_status"),
+            Some(&serde_json::json!("idle"))
+        );
+        assert_eq!(
+            search_health.get("indexing_error_count"),
+            Some(&serde_json::json!(0))
+        );
     }
 
     #[test]

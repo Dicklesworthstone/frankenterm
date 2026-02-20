@@ -1201,6 +1201,30 @@ fn accounts_list_minimal() {
 }
 
 #[test]
+fn search_index_stats_minimal() {
+    let json = wrap_envelope(json!({
+        "index_dir": "/tmp/ft-search",
+        "state_path": "/tmp/ft-search/index_state_v1.json",
+        "format_version": 1,
+        "document_count": 0,
+        "segment_count": 0,
+        "index_size_bytes": 0,
+        "pending_docs": 0,
+        "max_index_size_bytes": 524288000,
+        "ttl_days": 30,
+        "flush_interval_secs": 5,
+        "flush_docs_threshold": 50,
+        "background_job_status": "idle",
+        "indexing_error_count": 0
+    }));
+    let resp: RobotResponse<SearchIndexStatsData> = serde_json::from_value(json).unwrap();
+    let data = resp.into_result().unwrap();
+    assert!(data.last_error.is_none());
+    assert!(data.source_counts.is_empty());
+    assert!(data.embedder_tiers_available.is_empty());
+}
+
+#[test]
 fn rule_item_no_workflow() {
     let json = wrap_envelope(json!({
         "rules": [{
