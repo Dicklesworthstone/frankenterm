@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use frankensearch::{ScoredResult, SearchError, SearchPhase};
+use frankenterm_core::runtime_compat::task;
 use frankenterm_core::search_bridge::{
     BridgeCancellationToken, SearchBridgeError, SearchBridgeRequest, SearchBridgeResult,
 };
@@ -681,7 +682,7 @@ fn cancellation_token_cancelled_future_resolves_on_cancel() {
         .unwrap();
 
     rt.block_on(async {
-        let handle = tokio::spawn(async move {
+        let handle = task::spawn(async move {
             token2.cancelled().await;
         });
 
