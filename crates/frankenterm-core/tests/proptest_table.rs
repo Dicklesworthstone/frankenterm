@@ -39,8 +39,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::output::format::OutputFormat;
-use frankenterm_core::output::table::{Alignment, Column, Table, strip_ansi};
+use frankenterm_core::output::{Alignment, Column, OutputFormat, Table, strip_ansi};
 
 // =============================================================================
 // Strategies
@@ -75,42 +74,26 @@ fn arb_column() -> impl Strategy<Value = Column> {
         })
 }
 
-/// Generate a table with 1-4 columns and 0-5 rows.
-fn arb_table_plain() -> impl Strategy<Value = Table> {
+/// Generate table building blocks: (headers, rows).
+fn arb_table_parts() -> impl Strategy<Value = (Vec<String>, Vec<Vec<String>>)> {
     prop::collection::vec(arb_nonempty_string(), 1..=4).prop_flat_map(|headers| {
         let ncols = headers.len();
-        let cols: Vec<Column> = headers.into_iter().map(Column::new).collect();
         let rows = prop::collection::vec(
             prop::collection::vec(arb_nonempty_string(), ncols..=ncols),
             0..=5,
         );
-        (Just(cols), rows).prop_map(|(cols, rows)| {
-            let mut table = Table::new(cols).with_format(OutputFormat::Plain);
-            for row in rows {
-                table.add_row(row);
-            }
-            table
-        })
+        (Just(headers), rows)
     })
 }
 
-/// Generate a table for JSON output.
-fn arb_table_json() -> impl Strategy<Value = Table> {
-    prop::collection::vec(arb_nonempty_string(), 1..=4).prop_flat_map(|headers| {
-        let ncols = headers.len();
-        let cols: Vec<Column> = headers.into_iter().map(Column::new).collect();
-        let rows = prop::collection::vec(
-            prop::collection::vec(arb_nonempty_string(), ncols..=ncols),
-            0..=5,
-        );
-        (Just(cols), rows).prop_map(|(cols, rows)| {
-            let mut table = Table::new(cols).with_format(OutputFormat::Json);
-            for row in rows {
-                table.add_row(row);
-            }
-            table
-        })
-    })
+/// Build a Table from parts with a given format.
+fn build_table(headers: &[String], rows: &[Vec<String>], format: OutputFormat) -> Table {
+    let cols: Vec<Column> = headers.iter().map(|h| Column::new(h.clone())).collect();
+    let mut table = Table::new(cols).with_format(format);
+    for row in rows {
+        table.add_row(row.clone());
+    }
+    table
 }
 
 fn arb_ansi_wrapped_text() -> impl Strategy<Value = String> {
@@ -276,7 +259,8 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
     #[test]
-    fn json_render_valid_array(table in arb_table_json()) {
+    fn json_render_valid_array((headers, rows) in arb_table_parts()) {
+        let table = build_table(&headers, &rows, OutputFormat::Json);
         let output = table.render();
         let parsed: Result<Vec<serde_json::Value>, _> = serde_json::from_str(&output);
         prop_assert!(parsed.is_ok(), "JSON render should be valid: {}", output);
@@ -290,8 +274,9 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
     #[test]
-    fn json_render_array_len_matches_rows(table in arb_table_json()) {
-        let row_count = table.len();
+    fn json_render_array_len_matches_rows((headers, rows) in arb_table_parts()) {
+        let row_count = rows.len();
+        let table = build_table(&headers, &rows, OutputFormat::Json);
         let output = table.render();
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
         prop_assert_eq!(parsed.len(), row_count);
@@ -547,10 +532,9 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
     #[test]
-    fn calculate_widths_ge_header_len(table in arb_table_plain()) {
-        // We need access to internals — use render and check output
+    fn calculate_widths_ge_header_len((headers, rows) in arb_table_parts()) {
+        let table = build_table(&headers, &rows, OutputFormat::Plain);
         let output = table.render();
-        // The output should contain the header on the first line
         prop_assert!(!output.is_empty(), "render should produce output");
     }
 }
@@ -609,7 +593,8 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
     #[test]
-    fn plain_render_no_separator_line(table in arb_table_plain()) {
+    fn plain_render_no_separator_line((headers, rows) in arb_table_parts()) {
+        let table = build_table(&headers, &rows, OutputFormat::Plain);
         let output = table.render();
         prop_assert!(
             !output.contains('─'),
@@ -626,7 +611,7 @@ proptest! {
 
     #[test]
     fn render_non_empty_with_rows(
-        cells in prop::collection::vec("[a-z]{1,5}".to_string(), 1..=3)
+        cells in prop::collection::vec("[a-z]{1,5}", 1..=3)
     ) {
         let ncols = cells.len();
         let headers: Vec<Column> = (0..ncols).map(|i| Column::new(format!("H{}", i))).collect();
@@ -696,7 +681,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
     #[test]
-    fn render_deterministic(cells in prop::collection::vec("[a-z]{1,5}".to_string(), 1..=3)) {
+    fn render_deterministic(cells in prop::collection::vec("[a-z]{1,5}", 1..=3)) {
         let ncols = cells.len();
         let make_table = || {
             let headers: Vec<Column> = (0..ncols).map(|i| Column::new(format!("H{}", i))).collect();

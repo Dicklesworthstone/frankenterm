@@ -39,7 +39,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::output::format::{EffectiveFormat, OutputFormat, Style, colors};
+use frankenterm_core::output::{EffectiveFormat, OutputFormat, Style, colors};
 
 // =============================================================================
 // Strategies
@@ -201,8 +201,9 @@ proptest! {
     #[test]
     fn display_is_lowercase(format in arb_output_format()) {
         let displayed = format.to_string();
+        let lower = displayed.to_lowercase();
         prop_assert_eq!(
-            displayed, displayed.to_lowercase(),
+            displayed, lower,
             "Display should produce lowercase"
         );
     }
@@ -475,14 +476,14 @@ proptest! {
     #[test]
     fn style_disabled_all_colors_passthrough(text in arb_nonempty_string()) {
         let style = Style::new(false);
-        prop_assert_eq!(style.bold(&text), text);
-        prop_assert_eq!(style.dim(&text), text);
-        prop_assert_eq!(style.red(&text), text);
-        prop_assert_eq!(style.green(&text), text);
-        prop_assert_eq!(style.yellow(&text), text);
-        prop_assert_eq!(style.blue(&text), text);
-        prop_assert_eq!(style.cyan(&text), text);
-        prop_assert_eq!(style.gray(&text), text);
+        prop_assert_eq!(style.bold(&text), text.as_str());
+        prop_assert_eq!(style.dim(&text), text.as_str());
+        prop_assert_eq!(style.red(&text), text.as_str());
+        prop_assert_eq!(style.green(&text), text.as_str());
+        prop_assert_eq!(style.yellow(&text), text.as_str());
+        prop_assert_eq!(style.blue(&text), text.as_str());
+        prop_assert_eq!(style.cyan(&text), text.as_str());
+        prop_assert_eq!(style.gray(&text), text.as_str());
     }
 }
 

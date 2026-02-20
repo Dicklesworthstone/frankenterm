@@ -33,7 +33,7 @@ mod renderers;
 mod table;
 
 pub use error_renderer::{ErrorRenderer, get_code_for_error, render_error};
-pub use format::{OutputFormat, detect_format};
+pub use format::{EffectiveFormat, OutputFormat, Style, colors, detect_format};
 pub use renderers::{
     AccountListRenderer, ActionHistoryRenderer, AnalyticsAgentRenderer, AnalyticsDailyRenderer,
     AnalyticsExportRenderer, AnalyticsSummaryData, AnalyticsSummaryRenderer, AuditListRenderer,
