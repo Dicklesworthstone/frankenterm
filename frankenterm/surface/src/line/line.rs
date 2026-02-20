@@ -2452,16 +2452,14 @@ mod tests {
         }
 
         let sample_count = metrics.len();
-        let kp_fallback_ratio_percent = if sample_count == 0 {
-            0
-        } else {
-            kp_fallback_lines.saturating_mul(100) / sample_count
-        };
-        let fallback_fallback_ratio_percent = if sample_count == 0 {
-            0
-        } else {
-            fallback_fallback_lines.saturating_mul(100) / sample_count
-        };
+        let kp_fallback_ratio_percent = kp_fallback_lines
+            .saturating_mul(100)
+            .checked_div(sample_count)
+            .unwrap_or(0);
+        let fallback_fallback_ratio_percent = fallback_fallback_lines
+            .saturating_mul(100)
+            .checked_div(sample_count)
+            .unwrap_or(0);
 
         (
             metrics,

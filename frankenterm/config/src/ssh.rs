@@ -221,7 +221,8 @@ mod tests {
         let err = "a@b@c".parse::<SshParameters>().expect_err("should fail");
         assert!(
             err.to_string().contains("failed to parse ssh parameters"),
-            "unexpected error: {}", err
+            "unexpected error: {}",
+            err
         );
     }
 

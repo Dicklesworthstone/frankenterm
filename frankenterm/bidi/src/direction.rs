@@ -144,6 +144,7 @@ mod tests {
     fn direction_clone_copy() {
         let d = Direction::LeftToRight;
         let d2 = d; // Copy
+        #[allow(clippy::clone_on_copy)]
         let d3 = d.clone(); // Clone
         assert_eq!(d, d2);
         assert_eq!(d, d3);

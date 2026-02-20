@@ -112,7 +112,7 @@ fn bench_feature_vector(c: &mut Criterion) {
     // Measure entropy computation specifically via large output
     let big_text = generate_terminal_output(8192);
     group.bench_function("compute_8kb", |b| {
-        let elapsed = Duration::from_millis(1000);
+        let elapsed = Duration::from_secs(1);
         b.iter(|| OutputFeatures::compute(&big_text, elapsed));
     });
 

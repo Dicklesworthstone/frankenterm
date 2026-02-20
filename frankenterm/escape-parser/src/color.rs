@@ -463,7 +463,6 @@ mod tests {
 
     #[test]
     fn rgb_hash_consistency() {
-        use core::hash::{Hash, Hasher};
         let a = RgbColor::new_8bpc(10, 20, 30);
         let b = RgbColor::new_8bpc(10, 20, 30);
         let hash_of = |c: &RgbColor| {

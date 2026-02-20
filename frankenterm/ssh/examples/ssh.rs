@@ -80,9 +80,7 @@ fn main() {
                     editor.set_prompt("Enter [y/n]> ");
                     let ok = editor
                         .read_line(&mut host)?
-                        .is_some_and(|line| {
-                            matches!(line.as_ref(), "y" | "Y" | "yes" | "YES")
-                        });
+                        .is_some_and(|line| matches!(line.as_ref(), "y" | "Y" | "yes" | "YES"));
                     verify.answer(ok).await.context("send verify response")?;
                 }
                 SessionEvent::Authenticate(auth) => {

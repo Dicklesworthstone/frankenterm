@@ -222,6 +222,7 @@ mod tests {
     fn override_clone_copy() {
         let o = Override::LTR;
         let o2 = o; // Copy
+        #[allow(clippy::clone_on_copy)]
         let o3 = o.clone(); // Clone
         assert_eq!(o, o2);
         assert_eq!(o, o3);

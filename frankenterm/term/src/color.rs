@@ -352,7 +352,9 @@ mod tests {
             assert!(
                 b.0 >= a.0,
                 "Grey ramp not increasing at index {}: {:?} vs {:?}",
-                i, a, b
+                i,
+                a,
+                b
             );
         }
     }
@@ -365,7 +367,8 @@ mod tests {
             assert!(
                 (c.0 - c.1).abs() < 0.01 && (c.1 - c.2).abs() < 0.01,
                 "Entry {} is not grey: {:?}",
-                i, c
+                i,
+                c
             );
         }
     }

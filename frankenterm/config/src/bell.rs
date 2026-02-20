@@ -109,7 +109,12 @@ mod tests {
         let x: f32 = 0.37;
         let y = EasingFunction::Linear.evaluate_at_position(x);
         let expected = 3.0 * x * x - 2.0 * x * x * x;
-        assert!((y - expected).abs() < 1e-5, "expected {}, got {}", expected, y);
+        assert!(
+            (y - expected).abs() < 1e-5,
+            "expected {}, got {}",
+            expected,
+            y
+        );
     }
 
     #[test]

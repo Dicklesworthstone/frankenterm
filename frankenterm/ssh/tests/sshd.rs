@@ -384,9 +384,7 @@ impl Sshd {
             }
         }
 
-        Err(std::io::Error::other(
-            "ran out of ports when spawning sshd",
-        ))
+        Err(std::io::Error::other("ran out of ports when spawning sshd"))
     }
 }
 

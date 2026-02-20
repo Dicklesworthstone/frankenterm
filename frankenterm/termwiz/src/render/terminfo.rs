@@ -1264,9 +1264,9 @@ mod test {
         assert_eq!(
             result,
             vec![
-                Action::CSI(CSI::Sgr(Sgr::Foreground(
-                    ColorSpec::TrueColor((255, 128, 64).into()),
-                ))),
+                Action::CSI(CSI::Sgr(Sgr::Foreground(ColorSpec::TrueColor(
+                    (255, 128, 64).into()
+                ),))),
                 Action::Print('A'),
             ]
         );
@@ -1287,9 +1287,9 @@ mod test {
         assert_eq!(
             result,
             vec![
-                Action::CSI(CSI::Sgr(Sgr::Foreground(
-                    ColorSpec::TrueColor((255, 128, 64).into()),
-                ))),
+                Action::CSI(CSI::Sgr(Sgr::Foreground(ColorSpec::TrueColor(
+                    (255, 128, 64).into()
+                ),))),
                 Action::Print('A'),
             ]
         );

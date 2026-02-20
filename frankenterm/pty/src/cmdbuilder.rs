@@ -884,7 +884,7 @@ mod tests {
     #[test]
     fn args_appends_multiple() {
         let mut cmd = CommandBuilder::new("ls");
-        cmd.args(&["-l", "-a", "/tmp"]);
+        cmd.args(["-l", "-a", "/tmp"]);
         assert_eq!(cmd.get_argv().len(), 4);
     }
 

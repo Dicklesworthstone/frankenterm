@@ -619,7 +619,8 @@ mod test {
         let overhead = (encoded.len() as f64 / data.len() as f64 - 1.0) * 100.0;
         assert!(
             overhead < 16.0,
-            "zero-block overhead {:.1}% exceeds expected ~14%", overhead
+            "zero-block overhead {:.1}% exceeds expected ~14%",
+            overhead
         );
     }
 
@@ -669,7 +670,8 @@ mod test {
         for &b in &encoded {
             assert!(
                 (0x21u8..=0x7E).contains(&b),
-                "encoded output contains non-printable ASCII: 0x{:02x}", b
+                "encoded output contains non-printable ASCII: 0x{:02x}",
+                b
             );
         }
     }
@@ -701,10 +703,7 @@ mod test {
     fn dectab_high_bytes_all_invalid() {
         for (offset, &val) in DECTAB[128..].iter().enumerate() {
             let i = offset + 128;
-            assert_eq!(
-                val, INV,
-                "DECTAB[{i}] should be INV for non-ASCII byte"
-            );
+            assert_eq!(val, INV, "DECTAB[{i}] should be INV for non-ASCII byte");
         }
     }
 
@@ -725,7 +724,8 @@ mod test {
             let encoded = encode(&data);
             assert!(
                 !encoded.is_empty(),
-                "encode of {} bytes should not be empty", len
+                "encode of {} bytes should not be empty",
+                len
             );
         }
     }
@@ -738,7 +738,9 @@ mod test {
             let enc_len = encode(&data).len();
             assert!(
                 enc_len >= prev_len,
-                "encoded length should be monotonically non-decreasing: {} < {}", enc_len, prev_len
+                "encoded length should be monotonically non-decreasing: {} < {}",
+                enc_len,
+                prev_len
             );
             prev_len = enc_len;
         }
@@ -1291,7 +1293,8 @@ mod test {
         for &b in &ENCTAB {
             assert!(
                 (0x20u8..=0x7E).contains(&b),
-                "ENCTAB has non-printable: 0x{:02x}", b
+                "ENCTAB has non-printable: 0x{:02x}",
+                b
             );
         }
     }

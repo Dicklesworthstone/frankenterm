@@ -144,6 +144,7 @@ mod tests {
     fn color_attribute_clone_copy() {
         let a = ColorAttribute::PaletteIndex(3);
         let b = a;
+        #[allow(clippy::clone_on_copy)]
         let c = a.clone();
         assert_eq!(a, b);
         assert_eq!(a, c);

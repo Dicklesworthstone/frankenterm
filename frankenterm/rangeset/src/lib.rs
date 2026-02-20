@@ -1206,7 +1206,7 @@ mod tests {
         set.add_range(5..10);
         // All values should be contained even if internal representation varies
         for v in 1..15 {
-            assert!(set.contains(v), "should contain {v}");
+            assert!(set.contains(v), "should contain {}", v);
         }
         assert!(!set.contains(0));
         assert!(!set.contains(15));
@@ -1222,7 +1222,7 @@ mod tests {
         // Superset covers all
         set.add_range(1..11);
         for v in 1..11 {
-            assert!(set.contains(v), "should contain {v}");
+            assert!(set.contains(v), "should contain {}", v);
         }
         assert_eq!(set.len(), 10);
     }

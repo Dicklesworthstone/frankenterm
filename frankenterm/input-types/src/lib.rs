@@ -3912,7 +3912,7 @@ mod test {
         // KeyCode derives Ord - verify it doesn't panic
         let a = KeyCode::Char('a');
         let b = KeyCode::Char('b');
-        assert!(a < b || a >= b); // just exercise Ord
+        let _ = a.cmp(&b); // just exercise Ord
     }
 
     #[test]

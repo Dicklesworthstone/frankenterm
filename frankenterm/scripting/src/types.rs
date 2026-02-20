@@ -215,7 +215,7 @@ mod tests {
         let mid = HookHandler::new(0, None, |_, _| Ok(vec![]));
         let high = HookHandler::new(10, None, |_, _| Ok(vec![]));
 
-        let mut handlers = vec![&high, &low, &mid];
+        let mut handlers = [&high, &low, &mid];
         handlers.sort_by_key(|h| h.priority);
         assert_eq!(handlers[0].priority, -10);
         assert_eq!(handlers[1].priority, 0);
@@ -446,8 +446,8 @@ mod tests {
             prop_assert_eq!(merged.supports_async, a.supports_async);
             prop_assert_eq!(merged.supports_filesystem, a.supports_filesystem);
             prop_assert_eq!(merged.supports_network, a.supports_network);
-            // sandboxed: a && false = false (unless a was false already)
-            prop_assert_eq!(merged.sandboxed, a.sandboxed && false);
+            // sandboxed: merge ANDs the values, default is false so result is always false
+            prop_assert!(!merged.sandboxed);
             // limits: Some merged with None = Some
             prop_assert_eq!(merged.max_memory_bytes, a.max_memory_bytes);
             prop_assert_eq!(merged.max_execution_time, a.max_execution_time);

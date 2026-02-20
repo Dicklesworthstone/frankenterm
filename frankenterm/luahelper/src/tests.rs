@@ -77,9 +77,10 @@ fn i64_to_lua() {
 #[test]
 fn f64_to_lua() {
     let l = lua();
-    let result = dynamic_to_lua_value(&l, DynValue::F64(OrderedFloat(3.14))).unwrap();
+    let result =
+        dynamic_to_lua_value(&l, DynValue::F64(OrderedFloat(std::f64::consts::PI))).unwrap();
     match result {
-        LuaValue::Number(n) => assert!((n - 3.14).abs() < 1e-10),
+        LuaValue::Number(n) => assert!((n - std::f64::consts::PI).abs() < 1e-10),
         _ => panic!("{}", format!("expected Number, got {result:?}")),
     }
 }
@@ -176,8 +177,8 @@ fn lua_negative_integer_to_dynamic() {
 
 #[test]
 fn lua_number_to_dynamic() {
-    let result = lua_value_to_dynamic(LuaValue::Number(2.718)).unwrap();
-    assert_eq!(result, DynValue::F64(OrderedFloat(2.718)));
+    let result = lua_value_to_dynamic(LuaValue::Number(std::f64::consts::E)).unwrap();
+    assert_eq!(result, DynValue::F64(OrderedFloat(std::f64::consts::E)));
 }
 
 #[test]
@@ -281,7 +282,7 @@ fn lua_null_light_userdata_is_null() {
 #[test]
 fn lua_non_null_light_userdata_fails() {
     // Use a non-null pointer
-    let fake_ptr = 0x1 as *mut std::ffi::c_void;
+    let fake_ptr = std::ptr::without_provenance_mut::<std::ffi::c_void>(1);
     let result = lua_value_to_dynamic(LuaValue::LightUserData(mlua::LightUserData(fake_ptr)));
     assert!(result.is_err());
 }
@@ -523,7 +524,7 @@ fn object_with_multiple_types_to_lua() {
     if let LuaValue::Table(t) = result {
         assert_eq!(t.get::<_, String>("name").unwrap(), "test");
         assert_eq!(t.get::<_, i64>("count").unwrap(), 42);
-        assert_eq!(t.get::<_, bool>("active").unwrap(), true);
+        assert!(t.get::<_, bool>("active").unwrap());
     } else {
         panic!("expected Table");
     }
@@ -551,9 +552,9 @@ fn lua_min_integer_to_dynamic() {
 
 #[test]
 fn lua_negative_number_to_dynamic() {
-    let result = lua_value_to_dynamic(LuaValue::Number(-3.14)).unwrap();
+    let result = lua_value_to_dynamic(LuaValue::Number(-std::f64::consts::PI)).unwrap();
     if let DynValue::F64(f) = result {
-        assert!((f.into_inner() + 3.14).abs() < 1e-10);
+        assert!((f.into_inner() + std::f64::consts::PI).abs() < 1e-10);
     } else {
         panic!("expected F64");
     }
@@ -665,7 +666,7 @@ fn negative_keys_not_array() {
 
 #[test]
 fn value_printer_number() {
-    let debug = format!("{:?}", ValuePrinter(LuaValue::Number(3.14)));
+    let debug = format!("{:?}", ValuePrinter(LuaValue::Number(std::f64::consts::PI)));
     assert!(debug.contains("3.14"));
 }
 
@@ -863,7 +864,7 @@ fn userdata_without_tostring_errors() {
 #[test]
 fn value_printer_binary_string_uses_hex_escape() {
     let l = lua();
-    let s = l.create_string(&[0x00, 0xff, b'A']).unwrap();
+    let s = l.create_string([0x00, 0xff, b'A']).unwrap();
     let debug = format!("{:?}", ValuePrinter(LuaValue::String(s)));
     assert!(debug.starts_with("b\""));
     assert!(debug.contains("\\x00"));

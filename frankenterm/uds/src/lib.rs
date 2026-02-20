@@ -380,14 +380,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         let mut count = 0;
-        for result in listener.incoming() {
+        if let Some(result) = listener.incoming().next() {
             match result {
                 Ok(_stream) => {
                     count += 1;
-                    break;
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => panic!("{}", format!("unexpected error: {e}")),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("unexpected error: {e}"),
             }
         }
         assert_eq!(count, 1);
@@ -587,7 +586,7 @@ mod tests {
         let (mut server_stream, _) = listener.accept().unwrap();
         let _client_stream = client.join().unwrap();
         // DerefMut gives mutable access to inner StreamImpl
-        let inner: &mut StreamImpl = &mut *server_stream;
+        let inner: &mut StreamImpl = &mut server_stream;
         let _ = inner.set_nonblocking(true);
         cleanup(&path);
     }
@@ -598,7 +597,7 @@ mod tests {
         cleanup(&path);
         let mut listener = UnixListener::bind(&path).unwrap();
         // DerefMut gives mutable access to inner ListenerImpl
-        let inner: &mut ListenerImpl = &mut *listener;
+        let inner: &mut ListenerImpl = &mut listener;
         inner.set_nonblocking(true).unwrap();
         cleanup(&path);
     }
@@ -1525,10 +1524,11 @@ mod tests {
                 s.write_all(b"ABC").unwrap();
             }
         });
-        let (server, _) = listener.accept().unwrap();
+        let (mut server, _) = listener.accept().unwrap();
         client.join().unwrap();
         drop(listener);
-        let collected: Vec<u8> = server.bytes().map(|b| b.unwrap()).collect();
+        let mut collected = Vec::new();
+        std::io::Read::read_to_end(&mut server, &mut collected).unwrap();
         assert_eq!(collected, b"ABC");
         cleanup(&path);
     }

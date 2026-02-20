@@ -62,7 +62,6 @@ mod tests {
     extern crate alloc;
     use super::*;
     use alloc::collections::BTreeSet;
-    use core::hash::{Hash, Hasher};
 
     #[test]
     fn level_default_is_zero() {
@@ -180,6 +179,7 @@ mod tests {
     fn level_clone_copy() {
         let l = Level(42);
         let l2 = l; // Copy
+        #[allow(clippy::clone_on_copy)]
         let l3 = l.clone(); // Clone
         assert_eq!(l, l2);
         assert_eq!(l, l3);

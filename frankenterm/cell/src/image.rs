@@ -849,14 +849,14 @@ mod tests {
 
     #[test]
     fn image_cell_error_debug() {
-        let err = ImageCellError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test"));
+        let err = ImageCellError::Io(std::io::Error::other("test"));
         let dbg = format!("{:?}", err);
         assert!(dbg.contains("Io"));
     }
 
     #[test]
     fn image_cell_error_display() {
-        let err = ImageCellError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test error"));
+        let err = ImageCellError::Io(std::io::Error::other("test error"));
         let msg = format!("{}", err);
         assert!(msg.contains("test error"));
     }

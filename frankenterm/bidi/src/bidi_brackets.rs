@@ -152,6 +152,7 @@ mod tests {
     fn bracket_type_clone_copy() {
         let b = BracketType::Open;
         let b2 = b; // Copy
+        #[allow(clippy::clone_on_copy)]
         let b3 = b.clone(); // Clone
         assert_eq!(b, b2);
         assert_eq!(b, b3);

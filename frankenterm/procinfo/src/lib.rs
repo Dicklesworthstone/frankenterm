@@ -124,6 +124,7 @@ mod tests {
     fn status_clone_copy() {
         let a = LocalProcessStatus::Sleep;
         let b = a;
+        #[allow(clippy::clone_on_copy)]
         let c = a.clone();
         assert!(format!("{b:?}") == format!("{c:?}"));
     }
