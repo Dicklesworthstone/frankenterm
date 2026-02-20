@@ -105,12 +105,12 @@ proptest! {
         // with the double-hashing scheme (FNV-1a + DJB2 share factors
         // with certain bit-array sizes).
         fn mix_key(i: usize) -> [u8; 16] {
-            let a = (i as u64).wrapping_mul(0x9E3779B97F4A7C15); // golden ratio mix
-            let b = a ^ (a >> 30);
-            let c = b.wrapping_mul(0xBF58476D1CE4E5B9);
-            let d = c ^ (c >> 27);
-            let e = d.wrapping_mul(0x94D049BB133111EB);
-            let hi = e;
+            let mix1 = (i as u64).wrapping_mul(0x9E3779B97F4A7C15); // golden ratio mix
+            let mix2 = mix1 ^ (mix1 >> 30);
+            let mix3 = mix2.wrapping_mul(0xBF58476D1CE4E5B9);
+            let mix4 = mix3 ^ (mix3 >> 27);
+            let mix5 = mix4.wrapping_mul(0x94D049BB133111EB);
+            let hi = mix5;
             let lo = hi ^ (i as u64);
             let mut out = [0u8; 16];
             out[..8].copy_from_slice(&hi.to_le_bytes());

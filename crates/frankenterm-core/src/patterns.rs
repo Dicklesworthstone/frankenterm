@@ -2055,8 +2055,8 @@ impl PatternEngine {
         let redactor = Redactor::new();
 
         let mut candidate_rules: HashSet<usize> = HashSet::new();
-        let mut matched_anchors_by_rule: HashMap<usize, Vec<(String, (usize, usize))>> =
-            HashMap::new();
+        type AnchorMatches = HashMap<usize, Vec<(String, (usize, usize))>>;
+        let mut matched_anchors_by_rule: AnchorMatches = HashMap::new();
 
         for matched in matcher.find_overlapping_iter(text) {
             let Some(anchor) = index.anchor_list.get(matched.pattern().as_usize()) else {
@@ -4158,7 +4158,7 @@ rules:
         // "hellohello". This yields two anchor hits: one inside the overlap window
         // (blocked by the overlap gate) and one outside the window (blocked by the
         // dedupe gate). Both are reported as non-matching traces.
-        assert!(traces2.len() >= 1);
+        assert!(!traces2.is_empty());
         assert!(traces2.iter().all(|t| !t.eligible));
 
         let dedupe_trace = traces2

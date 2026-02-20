@@ -975,7 +975,6 @@ proptest! {
 
     #[test]
     fn disabled_config_returns_disabled_error(_dummy in 0..1_u32) {
-        use frankenterm_core::protocol_recovery::RecoveryError;
         let config = RecoveryConfig {
             enabled: false,
             ..RecoveryConfig::default()

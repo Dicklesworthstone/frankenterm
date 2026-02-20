@@ -463,7 +463,7 @@ proptest! {
     /// CassAgent Clone preserves fields.
     #[test]
     fn agent_clone_preserves(agent in arb_cass_agent()) {
-        let cloned = agent.clone();
+        let cloned = agent;
         let d1 = format!("{:?}", agent);
         let d2 = format!("{:?}", cloned);
         prop_assert_eq!(&d1, &d2);

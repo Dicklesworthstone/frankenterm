@@ -635,7 +635,7 @@ proptest! {
     #[test]
     fn prop_flatness_bounded_positive(psd in prop::collection::vec(0.001f64..100.0, 2..64)) {
         let f = spectral_flatness(&psd);
-        prop_assert!(f >= 0.0 && f <= 1.0 + 1e-10,
+        prop_assert!((0.0..=1.0 + 1e-10).contains(&f),
             "flatness {} should be in [0, 1]", f);
     }
 

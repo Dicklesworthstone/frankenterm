@@ -695,7 +695,7 @@ proptest! {
     #[test]
     fn with_half_life_secs_consistent(secs in 0.001_f64..10_000.0) {
         let ewma = Ewma::with_half_life_secs(secs);
-        prop_assert!((ewma.half_life_ms() - secs * 1000.0).abs() < 1e-6,
+        prop_assert!(secs.mul_add(-1000.0, ewma.half_life_ms()).abs() < 1e-6,
             "half_life_ms {} should equal secs*1000 {}", ewma.half_life_ms(), secs * 1000.0);
     }
 

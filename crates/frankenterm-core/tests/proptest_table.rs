@@ -638,7 +638,7 @@ proptest! {
         let line_count = output.lines().count();
         // At least header + rows (trailing newline may add empty line)
         prop_assert!(
-            line_count >= 1 + row_count,
+            line_count > row_count,
             "expected >= {} lines, got {}", 1 + row_count, line_count
         );
     }

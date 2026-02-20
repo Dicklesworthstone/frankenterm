@@ -3536,7 +3536,7 @@ mod tests {
         assert!((metrics.max_storage_lock_hold_ms() - 0.0).abs() < f64::EPSILON);
 
         metrics.record_storage_lock_wait(Duration::from_micros(500));
-        metrics.record_storage_lock_wait(Duration::from_micros(2_000));
+        metrics.record_storage_lock_wait(Duration::from_millis(2));
         metrics.record_storage_lock_hold(Duration::from_millis(2));
         metrics.record_storage_lock_hold(Duration::from_millis(10));
 

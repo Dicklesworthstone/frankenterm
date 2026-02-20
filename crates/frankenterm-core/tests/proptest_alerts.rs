@@ -473,7 +473,7 @@ proptest! {
     /// AlertPeriod Clone preserves equality.
     #[test]
     fn prop_period_clone(period in arb_period()) {
-        let cloned = period.clone();
+        let cloned = period;
         let json1 = serde_json::to_string(&period).unwrap();
         let json2 = serde_json::to_string(&cloned).unwrap();
         prop_assert_eq!(json1, json2);

@@ -652,6 +652,6 @@ proptest! {
     #[test]
     fn tls_mode_debug_all_variants(mode in arb_tls_mode()) {
         let debug = format!("{:?}", mode);
-        prop_assert!(debug.len() > 0);
+        prop_assert!(!debug.is_empty());
     }
 }

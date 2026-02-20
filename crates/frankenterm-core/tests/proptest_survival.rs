@@ -1200,9 +1200,9 @@ proptest! {
         let profile = ActivityProfile::new(alpha, default_act);
         let snapshot = profile.hourly_snapshot();
         let clamped = default_act.clamp(0.0, 1.0);
-        for h in 0..24 {
-            prop_assert!((snapshot[h] - clamped).abs() < 1e-10,
-                "hour {} should be {}, got {}", h, clamped, snapshot[h]);
+        for (h, &snap_val) in snapshot.iter().enumerate() {
+            prop_assert!((snap_val - clamped).abs() < 1e-10,
+                "hour {} should be {}, got {}", h, clamped, snap_val);
             prop_assert_eq!(profile.sample_count(h as u8), 0);
         }
     }
@@ -1227,7 +1227,7 @@ proptest! {
     ) {
         let profile = ActivityProfile::new(alpha, default_act);
         let prediction = profile.predict_hour(hour);
-        prop_assert!(prediction >= 0.0 && prediction <= 1.0,
+        prop_assert!((0.0..=1.0).contains(&prediction),
             "prediction should be in [0, 1], got {}", prediction);
     }
 
@@ -1355,7 +1355,7 @@ proptest! {
     ) {
         let scheduler = RestartScheduler::new(RestartSchedulerConfig::default());
         let activity = scheduler.activity_profile().predict_hour(hour);
-        prop_assert!(activity >= 0.0 && activity <= 1.0,
+        prop_assert!((0.0..=1.0).contains(&activity),
             "predicted activity should be in [0, 1], got {}", activity);
     }
 

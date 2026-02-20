@@ -516,7 +516,7 @@ proptest! {
             free_pages: free_pages.min(page_count),
         };
         let ratio = stats.free_ratio();
-        prop_assert!(ratio >= 0.0 && ratio <= 1.0,
+        prop_assert!((0.0..=1.0).contains(&ratio),
             "free_ratio {} should be in [0, 1]", ratio);
     }
 

@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn system_time_to_ms_works() {
-        let time = UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_000);
+        let time = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         assert_eq!(system_time_to_ms(time), Some(1_700_000_000_000));
     }
 

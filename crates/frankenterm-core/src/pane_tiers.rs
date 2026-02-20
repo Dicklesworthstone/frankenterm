@@ -557,7 +557,7 @@ mod tests {
         );
         assert_eq!(
             config.interval_for(PaneTier::Dormant),
-            Duration::from_millis(30000)
+            Duration::from_secs(30)
         );
     }
 
@@ -974,15 +974,15 @@ mod tests {
         let config = TierConfig::default();
         assert_eq!(
             config.interval_for(PaneTier::Thinking),
-            Duration::from_millis(2000)
+            Duration::from_secs(2)
         );
         assert_eq!(
             config.interval_for(PaneTier::Idle),
-            Duration::from_millis(5000)
+            Duration::from_secs(5)
         );
         assert_eq!(
             config.interval_for(PaneTier::Background),
-            Duration::from_millis(10000)
+            Duration::from_secs(10)
         );
     }
 

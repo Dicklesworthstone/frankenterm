@@ -721,7 +721,7 @@ proptest! {
     fn prop_stats_total_sum(
         values in prop::collection::vec(0i64..=100, 1..=20),
     ) {
-        let mut ft = FenwickTree::from_slice(&values);
+        let ft = FenwickTree::from_slice(&values);
         let stats = ft.stats();
         prop_assert_eq!(stats.total_sum, ft.total_sum());
     }
@@ -731,7 +731,7 @@ proptest! {
     fn prop_stats_len(
         values in prop::collection::vec(0i64..=100, 1..=20),
     ) {
-        let mut ft = FenwickTree::from_slice(&values);
+        let ft = FenwickTree::from_slice(&values);
         let stats = ft.stats();
         prop_assert_eq!(stats.element_count, values.len());
     }
@@ -756,7 +756,7 @@ proptest! {
     fn prop_stats_memory_positive(
         values in prop::collection::vec(0i64..=100, 1..=20),
     ) {
-        let mut ft = FenwickTree::from_slice(&values);
+        let ft = FenwickTree::from_slice(&values);
         let stats = ft.stats();
         prop_assert!(stats.memory_bytes > 0);
     }

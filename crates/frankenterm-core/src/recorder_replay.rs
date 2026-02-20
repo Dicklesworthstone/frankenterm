@@ -844,8 +844,8 @@ mod tests {
 
         let frames = session.collect_remaining();
         assert_eq!(frames[0].delay, Duration::ZERO); // First frame has no delay.
-        assert_eq!(frames[1].delay, Duration::from_millis(1000));
-        assert_eq!(frames[2].delay, Duration::from_millis(1000));
+        assert_eq!(frames[1].delay, Duration::from_secs(1));
+        assert_eq!(frames[2].delay, Duration::from_secs(1));
     }
 
     #[test]
@@ -863,7 +863,7 @@ mod tests {
         .unwrap();
 
         let frames = session.collect_remaining();
-        assert_eq!(frames[1].delay, Duration::from_millis(1000)); // 2000ms / 2.0
+        assert_eq!(frames[1].delay, Duration::from_secs(1)); // 2000ms / 2.0
     }
 
     #[test]

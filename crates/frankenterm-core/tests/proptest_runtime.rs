@@ -573,7 +573,7 @@ proptest! {
     /// ResizeWatchdogSeverity Clone preserves value.
     #[test]
     fn severity_clone_preserves(sev in arb_severity()) {
-        let cloned = sev.clone();
+        let cloned = sev;
         prop_assert_eq!(cloned, sev);
     }
 
@@ -635,7 +635,7 @@ proptest! {
     /// ResizeExecutionPhase Clone preserves value.
     #[test]
     fn execution_phase_clone(phase in arb_execution_phase()) {
-        let cloned = phase.clone();
+        let cloned = phase;
         let j1 = serde_json::to_string(&phase).unwrap();
         let j2 = serde_json::to_string(&cloned).unwrap();
         prop_assert_eq!(j1, j2);

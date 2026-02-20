@@ -813,8 +813,8 @@ proptest! {
     /// PaneBocpdSummary change_point_count is u64.
     #[test]
     fn prop_summary_count_nonneg(s in arb_pane_summary()) {
-        // change_point_count is u64 so always >= 0
-        prop_assert!(s.change_point_count <= u64::MAX);
+        // change_point_count is u64 so always >= 0 (no-op, type guarantees it)
+        let _ = s.change_point_count;
     }
 
     /// BocpdSnapshot serde is deterministic.

@@ -895,7 +895,7 @@ proptest! {
         telemetry.absorb(&report);
         prop_assert!(telemetry.total_passes >= before_passes + n_transitions as u64,
             "absorb should add report passes to telemetry");
-        prop_assert_eq!(telemetry.total_checks, report.total_checks() as u64);
+        prop_assert_eq!(telemetry.total_checks, report.total_checks());
     }
 }
 

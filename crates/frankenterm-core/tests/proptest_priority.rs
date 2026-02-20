@@ -587,7 +587,7 @@ proptest! {
     /// PanePriority Clone preserves value.
     #[test]
     fn prop_priority_clone(tier in arb_priority()) {
-        let cloned = tier.clone();
+        let cloned = tier;
         let j1 = serde_json::to_string(&tier).unwrap();
         let j2 = serde_json::to_string(&cloned).unwrap();
         prop_assert_eq!(j1, j2);

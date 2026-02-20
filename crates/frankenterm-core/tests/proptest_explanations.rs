@@ -656,7 +656,7 @@ proptest! {
         let cats = ["deny", "workflow", "event", "risk"];
         let templates = list_templates_by_category(cats[idx]);
         if let Some(tmpl) = templates.first() {
-            let found = get_explanation(&tmpl.id);
+            let found = get_explanation(tmpl.id);
             prop_assert!(found.is_some(), "known template '{}' should be findable", tmpl.id);
         }
     }

@@ -77,7 +77,7 @@ fn arb_unknown_format_string() -> impl Strategy<Value = String> {
         Just("rich".to_string()),
         Just("binary".to_string()),
         Just("markdown".to_string()),
-        Just("".to_string()),
+        Just(String::new()),
         Just("   ".to_string()),
         Just("jsons".to_string()),
         Just("plaintxt".to_string()),

@@ -590,7 +590,7 @@ proptest! {
         let max = ShardedMax::new();
         prop_assert_eq!(max.get(), 0);
         let sc = max.shard_count();
-        prop_assert!(sc >= 1 && sc <= 64);
+        prop_assert!((1..=64).contains(&sc));
     }
 
     /// ShardedCounter increment equals add(1).
