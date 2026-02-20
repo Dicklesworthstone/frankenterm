@@ -1814,7 +1814,7 @@ mod tests {
 
         // Recovery should load only the good entry
         {
-            let (wal, result) = DiskWal::<String>::open(&path, DiskWalConfig::default()).unwrap();
+            let (_wal, result) = DiskWal::<String>::open(&path, DiskWalConfig::default()).unwrap();
             assert_eq!(result.entries_loaded, 1);
             assert_eq!(result.corrupt_tail_entries, 1);
             // File should be truncated to good_size

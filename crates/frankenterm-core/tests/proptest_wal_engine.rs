@@ -511,7 +511,7 @@ proptest! {
 
 // ── Disk WAL properties ──────────────────────────────────────────────
 
-fn arb_disk_wal_config() -> impl Strategy<Value = DiskWalConfig> {
+fn _arb_disk_wal_config() -> impl Strategy<Value = DiskWalConfig> {
     (3..50usize, 1..20usize).prop_map(|(threshold, retained)| DiskWalConfig {
         wal_config: WalConfig {
             compaction_threshold: threshold,
@@ -755,7 +755,7 @@ proptest! {
 
         // Recovery should load all good entries
         {
-            let (wal, result) = DiskWal::<MuxMutation>::open(&path, config).unwrap();
+            let (_wal, result) = DiskWal::<MuxMutation>::open(&path, config).unwrap();
             prop_assert_eq!(
                 result.entries_loaded, expected_count,
                 "should recover all {} good entries, got {}", expected_count, result.entries_loaded
