@@ -953,3 +953,66 @@ proptest! {
         prop_assert_eq!(cloned.min_segments, config.min_segments);
     }
 }
+
+// =============================================================================
+// Additional behavioral invariants
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    /// EvictionTarget segments_to_remove <= current_segments.
+    #[test]
+    fn proptest_target_segments_to_remove_bounded(target in arb_eviction_target()) {
+        prop_assert!(target.segments_to_remove <= target.current_segments,
+            "segments_to_remove {} > current_segments {}",
+            target.segments_to_remove, target.current_segments);
+    }
+
+    /// EvictionPlan panes_affected equals targets.len().
+    #[test]
+    fn proptest_plan_panes_affected_eq_targets_len(plan in arb_eviction_plan()) {
+        prop_assert_eq!(plan.panes_affected, plan.targets.len(),
+            "panes_affected {} should equal targets.len() {}", plan.panes_affected, plan.targets.len());
+    }
+
+    /// EvictionReport Clone preserves fields.
+    #[test]
+    fn proptest_eviction_report_clone(report in arb_eviction_report()) {
+        let cloned = report.clone();
+        prop_assert_eq!(cloned.panes_trimmed, report.panes_trimmed);
+        prop_assert_eq!(cloned.segments_removed, report.segments_removed);
+        prop_assert_eq!(cloned.errors.len(), report.errors.len());
+    }
+
+    /// ScrollbackLine Clone preserves text.
+    #[test]
+    fn proptest_scrollback_line_clone(line in arb_scrollback_line()) {
+        let cloned = line.clone();
+        prop_assert_eq!(&cloned.text, &line.text);
+        prop_assert_eq!(cloned.bytes, line.bytes);
+    }
+
+    /// ImportanceScoringConfig Clone preserves baseline.
+    #[test]
+    fn proptest_scoring_config_clone(config in arb_importance_scoring_config()) {
+        let cloned = config.clone();
+        prop_assert!((cloned.baseline - config.baseline).abs() < 1e-10);
+    }
+
+    /// ImportanceBudgetReport Clone preserves fields.
+    #[test]
+    fn proptest_budget_report_clone(report in arb_importance_budget_report()) {
+        let cloned = report.clone();
+        prop_assert_eq!(cloned.lines_removed, report.lines_removed);
+        prop_assert_eq!(cloned.bytes_removed, report.bytes_removed);
+    }
+
+    /// ImportanceRetentionConfig Clone preserves byte_budget.
+    #[test]
+    fn proptest_retention_config_clone(config in arb_importance_retention_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.byte_budget_per_pane, config.byte_budget_per_pane);
+        prop_assert_eq!(cloned.min_lines, config.min_lines);
+    }
+}

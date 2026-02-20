@@ -502,3 +502,94 @@ fn correlation_type_debug_nonempty() {
     let debug = format!("{:?}", CorrelationType::Failover);
     assert!(!debug.is_empty());
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// DatabasePageStats free_ratio is in [0, 1] for valid inputs.
+    #[test]
+    fn prop_free_ratio_bounded_clamped(page_count in 1i64..10_000, free_pages in 0i64..10_000) {
+        let stats = DatabasePageStats {
+            page_count,
+            free_pages: free_pages.min(page_count),
+        };
+        let ratio = stats.free_ratio();
+        prop_assert!(ratio >= 0.0 && ratio <= 1.0,
+            "free_ratio {} should be in [0, 1]", ratio);
+    }
+
+    /// DatabasePageStats free_ratio with zero page_count returns 0.
+    #[test]
+    fn prop_free_ratio_zero_pages_edge(_dummy in 0..1u8) {
+        let stats = DatabasePageStats { page_count: 0, free_pages: 0 };
+        prop_assert!((stats.free_ratio() - 0.0).abs() < f64::EPSILON);
+    }
+
+    /// CheckpointResult serde roundtrip preserves wal_pages.
+    #[test]
+    fn prop_checkpoint_result_serde_ext(pages in 0i64..10_000) {
+        let result = CheckpointResult {
+            wal_pages: pages,
+            optimized: true,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: CheckpointResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.wal_pages, pages);
+    }
+
+    /// Gap serde roundtrip preserves seq_before and seq_after.
+    #[test]
+    fn prop_gap_serde_ext(seq_before in 0u64..1_000_000, gap_size in 1u64..100_000) {
+        let gap = Gap {
+            id: 1,
+            pane_id: 1,
+            seq_before,
+            seq_after: seq_before + gap_size,
+            reason: "test".to_string(),
+            detected_at: 12345,
+        };
+        let json = serde_json::to_string(&gap).unwrap();
+        let back: Gap = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.seq_before, seq_before);
+        prop_assert_eq!(back.seq_after, seq_before + gap_size);
+    }
+
+    /// MetricType as_str roundtrip through from_str.
+    #[test]
+    fn prop_metric_type_as_str_roundtrip(idx in 0usize..6) {
+        let variants = ["token_usage", "api_cost", "api_call", "rate_limit_hit", "workflow_cost", "session_duration"];
+        if idx < variants.len() {
+            let parsed: MetricType = variants[idx].parse().unwrap();
+            let s = parsed.as_str();
+            prop_assert_eq!(s, variants[idx]);
+        }
+    }
+
+    /// NotificationStatus as_str roundtrip through from_str.
+    #[test]
+    fn prop_notification_status_roundtrip(idx in 0usize..4) {
+        let variants = ["pending", "sent", "failed", "throttled"];
+        if idx < variants.len() {
+            let parsed: NotificationStatus = variants[idx].parse().unwrap();
+            let s = parsed.as_str();
+            prop_assert_eq!(s, variants[idx]);
+        }
+    }
+
+    /// FtsPaneProgress serde roundtrip preserves pane_id and indexed_count.
+    #[test]
+    fn prop_fts_pane_progress_serde_ext(pane_id in 1u64..1000, indexed in 0u64..10_000) {
+        let progress = FtsPaneProgress {
+            pane_id,
+            last_indexed_seq: 42,
+            indexed_count: indexed,
+            last_indexed_at: 12345,
+        };
+        let json = serde_json::to_string(&progress).unwrap();
+        let back: FtsPaneProgress = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, pane_id);
+        prop_assert_eq!(back.indexed_count, indexed);
+    }
+}

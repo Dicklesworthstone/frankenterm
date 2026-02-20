@@ -519,3 +519,108 @@ fn delivery_record_debug_nonempty() {
     let debug = format!("{:?}", record);
     assert!(!debug.is_empty());
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// NotificationDeliveryRecord JSON contains target field.
+    #[test]
+    fn prop_delivery_record_serde_roundtrip(
+        target in "[a-z]{3,10}",
+        accepted in any::<bool>(),
+        status_code in 100u16..600,
+    ) {
+        let record = NotificationDeliveryRecord {
+            target: target.clone(),
+            accepted,
+            status_code,
+            error: None,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(v["target"].as_str().unwrap(), target.as_str());
+        prop_assert_eq!(v["accepted"].as_bool().unwrap(), accepted);
+    }
+
+    /// NotificationDeliveryRecord error field in JSON when present.
+    #[test]
+    fn prop_delivery_record_error_preserved(
+        msg in "[a-z ]{5,30}",
+    ) {
+        let record = NotificationDeliveryRecord {
+            target: "test".to_string(),
+            accepted: false,
+            status_code: 500,
+            error: Some(msg.clone()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(v["error"].as_str().unwrap(), msg.as_str());
+    }
+
+    /// NotificationDelivery records JSON array length.
+    #[test]
+    fn prop_delivery_records_len_preserved(n in 0usize..10) {
+        let records: Vec<NotificationDeliveryRecord> = (0..n).map(|i| {
+            NotificationDeliveryRecord {
+                target: format!("t{}", i),
+                accepted: true,
+                status_code: 200,
+                error: None,
+            }
+        }).collect();
+        let delivery = NotificationDelivery {
+            sender: "test_sender".to_string(),
+            success: true,
+            rate_limited: false,
+            error: None,
+            records,
+        };
+        let json = serde_json::to_string(&delivery).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(v["records"].as_array().unwrap().len(), n);
+    }
+
+    /// NotificationDelivery Clone preserves success field.
+    #[test]
+    fn prop_delivery_clone_preserves(success in any::<bool>()) {
+        let delivery = NotificationDelivery {
+            sender: "s".to_string(),
+            success,
+            rate_limited: false,
+            error: None,
+            records: vec![],
+        };
+        let cloned = delivery.clone();
+        prop_assert_eq!(cloned.success, success);
+    }
+
+    /// NotificationPayload Clone preserves pane_id.
+    #[test]
+    fn prop_payload_clone_preserves(payload in arb_notification_payload()) {
+        let cloned = payload.clone();
+        prop_assert_eq!(cloned.pane_id, payload.pane_id);
+    }
+
+    /// NotificationPayload JSON has pane_id key.
+    #[test]
+    fn prop_payload_json_has_pane_id(payload in arb_notification_payload()) {
+        let json = serde_json::to_string(&payload).unwrap();
+        prop_assert!(json.contains("\"pane_id\""));
+    }
+
+    /// NotificationDeliveryRecord Debug is non-empty for all status codes.
+    #[test]
+    fn prop_delivery_record_debug_any_status(status in 100u16..600) {
+        let record = NotificationDeliveryRecord {
+            target: "t".to_string(),
+            accepted: true,
+            status_code: status,
+            error: None,
+        };
+        let debug = format!("{:?}", record);
+        prop_assert!(!debug.is_empty());
+    }
+}

@@ -564,3 +564,87 @@ proptest! {
         prop_assert!(!debug.is_empty());
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// ResizeWatchdogSeverity Clone preserves value.
+    #[test]
+    fn severity_clone_preserves(sev in arb_severity()) {
+        let cloned = sev.clone();
+        prop_assert_eq!(cloned, sev);
+    }
+
+    /// ResizeWatchdogAssessment serde roundtrip preserves severity.
+    #[test]
+    fn assessment_serde_preserves_severity(assessment in arb_assessment()) {
+        let json = serde_json::to_string(&assessment).unwrap();
+        let back: ResizeWatchdogAssessment = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.severity, assessment.severity);
+    }
+
+    /// ResizeWatchdogAssessment warning_line contains "safe-mode" when severity is SafeModeActive.
+    #[test]
+    fn assessment_safe_mode_warning(_dummy in 0..1u8) {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::SafeModeActive,
+            stalled_total: 5,
+            stalled_critical: 3,
+            warning_threshold_ms: 1000,
+            critical_threshold_ms: 5000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: true,
+            safe_mode_active: true,
+            legacy_fallback_enabled: false,
+            recommended_action: "test".to_string(),
+            sample_stalled: vec![],
+        };
+        let wl = assessment.warning_line();
+        prop_assert!(wl.is_some(), "SafeModeActive should produce warning_line");
+    }
+
+    /// ResizeWatchdogAssessment Healthy has no warning line.
+    #[test]
+    fn assessment_healthy_no_warning(_dummy in 0..1u8) {
+        let assessment = ResizeWatchdogAssessment {
+            severity: ResizeWatchdogSeverity::Healthy,
+            stalled_total: 0,
+            stalled_critical: 0,
+            warning_threshold_ms: 1000,
+            critical_threshold_ms: 5000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+            recommended_action: "all good".to_string(),
+            sample_stalled: vec![],
+        };
+        let wl = assessment.warning_line();
+        prop_assert!(wl.is_none(), "Healthy should produce no warning_line");
+    }
+
+    /// RuntimeLockMemoryTelemetrySnapshot Debug is non-empty.
+    #[test]
+    fn telemetry_snapshot_debug(snap in arb_telemetry_snapshot()) {
+        let debug = format!("{:?}", snap);
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// ResizeExecutionPhase Clone preserves value.
+    #[test]
+    fn execution_phase_clone(phase in arb_execution_phase()) {
+        let cloned = phase.clone();
+        let j1 = serde_json::to_string(&phase).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// ResizeStalledTransaction Clone preserves pane_id.
+    #[test]
+    fn stalled_transaction_clone_ext(txn in arb_stalled_transaction()) {
+        let cloned = txn.clone();
+        prop_assert_eq!(cloned.pane_id, txn.pane_id);
+    }
+}

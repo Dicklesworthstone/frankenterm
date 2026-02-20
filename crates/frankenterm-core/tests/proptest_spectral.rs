@@ -596,3 +596,67 @@ proptest! {
         prop_assert!((c1 - c2).abs() < 1e-15);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// generate_sine output length matches requested size (varied SR).
+    #[test]
+    fn prop_sine_length_varied(n in 2_usize..256, freq in 1.0f64..100.0, amp in 0.1f64..5.0) {
+        let signal = generate_sine(freq, amp, 0.0, n);
+        prop_assert_eq!(signal.len(), n);
+    }
+
+    /// generate_white_noise output length matches requested size (seeded).
+    #[test]
+    fn prop_white_noise_length_seeded(n in 2_usize..256, seed in 0u64..10000) {
+        let signal = generate_white_noise(seed, n);
+        prop_assert_eq!(signal.len(), n);
+    }
+
+    /// generate_impulse_train output length matches requested size (varied amp).
+    #[test]
+    fn prop_impulse_train_length_varied(n in 2_usize..256, period in 1_usize..50, amp in 0.1f64..10.0) {
+        let signal = generate_impulse_train(period, amp, n);
+        prop_assert_eq!(signal.len(), n);
+    }
+
+    /// hann_window output length matches input length (all ones).
+    #[test]
+    fn prop_hann_window_length_ones(n in 2_usize..256) {
+        let signal = vec![1.0f64; n];
+        let windowed = hann_window(&signal);
+        prop_assert_eq!(windowed.len(), n);
+    }
+
+    /// spectral_flatness is in [0, 1] for positive PSD.
+    #[test]
+    fn prop_flatness_bounded_positive(psd in prop::collection::vec(0.001f64..100.0, 2..64)) {
+        let f = spectral_flatness(&psd);
+        prop_assert!(f >= 0.0 && f <= 1.0 + 1e-10,
+            "flatness {} should be in [0, 1]", f);
+    }
+
+    /// psd_similarity self-similarity is 1.0 for random PSD.
+    #[test]
+    fn prop_psd_self_similarity_random(psd in prop::collection::vec(0.001f64..100.0, 2..64)) {
+        let sim = psd_similarity(&psd, &psd);
+        prop_assert!((sim - 1.0).abs() < 1e-10,
+            "self-similarity should be 1.0, got {}", sim);
+    }
+
+    /// detect_peaks with higher threshold gives fewer-or-equal peaks.
+    #[test]
+    fn prop_peaks_monotone_threshold_ext(
+        psd in prop::collection::vec(0.001f64..100.0, 4..64),
+        low_threshold in 0.5f64..2.0,
+    ) {
+        let high_threshold = low_threshold + 1.0;
+        let peaks_low = detect_peaks(&psd, low_threshold, 1000.0);
+        let peaks_high = detect_peaks(&psd, high_threshold, 1000.0);
+        prop_assert!(peaks_high.len() <= peaks_low.len(),
+            "higher threshold should give <= peaks: {} vs {}", peaks_high.len(), peaks_low.len());
+    }
+}
