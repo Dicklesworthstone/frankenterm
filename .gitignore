@@ -114,3 +114,7 @@ storage.sqlite3-*
 
 # Codegen sub-crate lock files (generated, not the workspace root Cargo.lock)
 **/codegen/Cargo.lock
+
+# ML model caches (fastembed, ONNX, etc.)
+.fastembed_cache/
+.onnx_cache/
