@@ -1238,3 +1238,134 @@ proptest! {
         }
     }
 }
+
+// ── Document type serde roundtrips ─────────────────────────────────────────
+
+fn arb_scrollback_line() -> impl Strategy<Value = ScrollbackLine> {
+    (
+        text_strategy(),
+        1_000i64..1_000_000,
+        proptest::option::of(1u64..1000),
+        proptest::option::of("[a-z]{4,12}"),
+    )
+        .prop_map(|(text, ts, pane_id, session_id)| {
+            let mut line = ScrollbackLine::new(text, ts);
+            line.pane_id = pane_id;
+            line.session_id = session_id;
+            line
+        })
+}
+
+fn arb_indexable_document() -> impl Strategy<Value = IndexableDocument> {
+    (
+        source_strategy(),
+        text_strategy(),
+        1_000i64..1_000_000,
+        proptest::option::of(1u64..1000),
+        proptest::option::of("[a-z]{4,12}"),
+    )
+        .prop_map(|(source, text, ts, pane_id, session_id)| {
+            IndexableDocument::text(source, text, ts, pane_id, session_id)
+        })
+}
+
+fn arb_indexed_document() -> impl Strategy<Value = frankenterm_core::search::IndexedDocument> {
+    (
+        1u64..10000,
+        source_strategy(),
+        "[a-z_]{4,16}",
+        "[0-9a-f]{64}",
+        text_strategy(),
+        1_000i64..1_000_000,
+        1_000i64..1_000_000,
+        1_000i64..1_000_000,
+        proptest::option::of(1u64..1000),
+        proptest::option::of("[a-z]{4,12}"),
+        0u64..10000,
+    )
+        .prop_map(
+            |(id, source, tag, hash, text, captured, indexed, accessed, pane, session, size)| {
+                frankenterm_core::search::IndexedDocument {
+                    id,
+                    source,
+                    source_tag: tag,
+                    content_hash: hash,
+                    text,
+                    captured_at_ms: captured,
+                    indexed_at_ms: indexed,
+                    last_accessed_at_ms: accessed,
+                    pane_id: pane,
+                    session_id: session,
+                    metadata: serde_json::Value::Null,
+                    size_bytes: size,
+                }
+            },
+        )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    /// ScrollbackLine serde roundtrip.
+    #[test]
+    fn scrollback_line_serde_roundtrip(line in arb_scrollback_line()) {
+        let json = serde_json::to_string(&line).expect("serialize");
+        let back: ScrollbackLine = serde_json::from_str(&json).expect("deserialize");
+        prop_assert_eq!(line, back);
+    }
+
+    /// IndexableDocument serde roundtrip.
+    #[test]
+    fn indexable_document_serde_roundtrip(doc in arb_indexable_document()) {
+        let json = serde_json::to_string(&doc).expect("serialize");
+        let back: IndexableDocument = serde_json::from_str(&json).expect("deserialize");
+        prop_assert_eq!(doc, back);
+    }
+
+    /// IndexedDocument serde roundtrip.
+    #[test]
+    fn indexed_document_serde_roundtrip(doc in arb_indexed_document()) {
+        let json = serde_json::to_string(&doc).expect("serialize");
+        let back: frankenterm_core::search::IndexedDocument =
+            serde_json::from_str(&json).expect("deserialize");
+        prop_assert_eq!(doc, back);
+    }
+
+    /// IndexableDocument::text sets metadata to Null.
+    #[test]
+    fn indexable_document_text_constructor_metadata_null(
+        source in source_strategy(),
+        text in text_strategy(),
+        ts in 1_000i64..1_000_000,
+    ) {
+        let doc = IndexableDocument::text(source, text, ts, None, None);
+        prop_assert_eq!(doc.metadata, serde_json::Value::Null);
+    }
+
+    /// ScrollbackLine::new sets optional fields to None.
+    #[test]
+    fn scrollback_line_new_defaults(text in text_strategy(), ts in 0i64..1_000_000) {
+        let line = ScrollbackLine::new(text.clone(), ts);
+        prop_assert_eq!(&line.text, &text);
+        prop_assert_eq!(line.captured_at_ms, ts);
+        prop_assert_eq!(line.pane_id, None);
+        prop_assert_eq!(line.session_id, None);
+    }
+
+    /// IndexedDocument preserves all field values through serde.
+    #[test]
+    fn indexed_document_fields_preserved(doc in arb_indexed_document()) {
+        let json = serde_json::to_string(&doc).expect("ser");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        prop_assert_eq!(
+            parsed["id"].as_u64().unwrap(),
+            doc.id,
+            "id mismatch"
+        );
+        prop_assert_eq!(
+            parsed["size_bytes"].as_u64().unwrap(),
+            doc.size_bytes,
+            "size_bytes mismatch"
+        );
+    }
+}
