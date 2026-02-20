@@ -512,34 +512,33 @@ fn summary_line_with_large_counts() {
 }
 
 // ── Global state lifecycle ───────────────────────────────────────────
+//
+// These tests share a process-global OnceLock<RwLock<Option<...>>> and
+// must run sequentially.  Consolidating them into a single #[test]
+// prevents parallel-test races where `clear_global()` in one test
+// interleaves with `update_global()` + `get_global()` in another.
 
 #[test]
-fn global_update_then_get_returns_some() {
+fn global_lifecycle_update_get_clear() {
+    // Phase 1: update → get returns Some
     let ctx = ResizeCrashContextBuilder::new(10000)
         .gate(sample_gate_active())
         .build();
     ResizeCrashContext::update_global(ctx);
     let got = ResizeCrashContext::get_global();
-    assert!(got.is_some());
-    // Clean up for other tests.
-    ResizeCrashContext::clear_global();
-}
+    assert!(got.is_some(), "get_global should return Some after update");
 
-#[test]
-fn global_clear_then_get_returns_none() {
+    // Phase 2: clear → get returns None
     ResizeCrashContext::clear_global();
-    // Note: another test may race to set this, but clear should work.
-    // We just verify the clear path doesn't panic.
-    let _ = ResizeCrashContext::get_global();
-}
+    let got = ResizeCrashContext::get_global();
+    assert!(got.is_none(), "get_global should return None after clear");
 
-#[test]
-fn build_and_update_global_sets_context() {
+    // Phase 3: build_and_update_global convenience path
     ResizeCrashContextBuilder::new(20000)
         .gate(sample_gate_active())
         .build_and_update_global();
     let got = ResizeCrashContext::get_global();
-    assert!(got.is_some());
+    assert!(got.is_some(), "get_global should return Some after build_and_update_global");
     ResizeCrashContext::clear_global();
 }
 

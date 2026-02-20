@@ -8,8 +8,7 @@ use proptest::prelude::*;
 
 use frankenterm_core::config::CaptureBudgetConfig;
 use frankenterm_core::tailer::{
-    CaptureScheduler, SchedulerSnapshot, StreamingBridge, StreamingHealth, TailerConfig,
-    TailerMode,
+    CaptureScheduler, SchedulerSnapshot, StreamingBridge, StreamingHealth, TailerConfig, TailerMode,
 };
 use std::time::Duration;
 
@@ -69,9 +68,10 @@ fn arb_tailer_config() -> impl Strategy<Value = TailerConfig> {
         1usize..100,  // max_concurrent
         0usize..4096, // overlap_size
         1u64..5000,   // send_timeout_ms
+        1u64..5000,   // capture_timeout_ms
     )
         .prop_map(
-            |(min_ms, max_ms_delta, backoff, max_concurrent, overlap_size, send_ms)| {
+            |(min_ms, max_ms_delta, backoff, max_concurrent, overlap_size, send_ms, capture_ms)| {
                 // Ensure min <= max by adding delta
                 let max_ms = min_ms + max_ms_delta;
                 TailerConfig {
@@ -81,18 +81,24 @@ fn arb_tailer_config() -> impl Strategy<Value = TailerConfig> {
                     max_concurrent,
                     overlap_size,
                     send_timeout: Duration::from_millis(send_ms),
+                    capture_timeout: Duration::from_millis(capture_ms),
                 }
             },
         )
 }
 
 /// Generate a vector of (pane_id, priority) pairs, pre-sorted by (priority, pane_id).
+/// Each pane ID appears at most once (deduplicated via HashSet before sorting).
 fn arb_ready_panes() -> impl Strategy<Value = Vec<(u64, u32)>> {
-    prop::collection::vec((1u64..1000, 0u32..1000), 0..50).prop_map(|mut panes| {
-        panes.sort_by_key(|&(id, prio)| (prio, id));
-        // Deduplicate pane IDs
-        panes.dedup_by_key(|p| p.0);
-        panes
+    prop::collection::vec((1u64..1000, 0u32..1000), 0..50).prop_map(|panes| {
+        // Deduplicate by pane ID first (keep first occurrence)
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped: Vec<(u64, u32)> = panes
+            .into_iter()
+            .filter(|(id, _)| seen.insert(*id))
+            .collect();
+        deduped.sort_by_key(|&(id, prio)| (prio, id));
+        deduped
     })
 }
 
@@ -277,13 +283,53 @@ proptest! {
         let mut sched = CaptureScheduler::new(budget);
         let selected = sched.select_panes(&panes, permits);
 
-        // Selected panes should be a prefix of the input (since input is sorted
-        // by priority and select_panes takes from the front).
-        let expected_prefix: Vec<u64> = panes.iter().take(selected.len()).map(|(id, _)| *id).collect();
+        // select_panes splits into high (prio<=50) and low (prio>50) tiers,
+        // reserving 20% of slots for low-priority fairness. The result is
+        // high_prefix ++ low_prefix, which preserves relative order within
+        // each tier but is NOT necessarily a prefix of the combined input.
+        let high_input: Vec<u64> = panes.iter()
+            .filter(|(_, prio)| *prio <= 50)
+            .map(|(id, _)| *id)
+            .collect();
+        let low_input: Vec<u64> = panes.iter()
+            .filter(|(_, prio)| *prio > 50)
+            .map(|(id, _)| *id)
+            .collect();
+
+        // Map selected IDs back to their priority tier
+        let pane_prio: std::collections::HashMap<u64, u32> =
+            panes.iter().copied().collect();
+        let selected_high: Vec<u64> = selected.iter()
+            .filter(|id| pane_prio.get(id).copied().unwrap_or(0) <= 50)
+            .copied()
+            .collect();
+        let selected_low: Vec<u64> = selected.iter()
+            .filter(|id| pane_prio.get(id).copied().unwrap_or(51) > 50)
+            .copied()
+            .collect();
+
+        // High-prio selected must be a prefix of high-prio input
+        let expected_high: Vec<u64> = high_input.iter().take(selected_high.len()).copied().collect();
+        prop_assert_eq!(
+            &selected_high,
+            &expected_high,
+            "high-prio selected should be a prefix of high-prio input"
+        );
+
+        // Low-prio selected must be a prefix of low-prio input
+        let expected_low: Vec<u64> = low_input.iter().take(selected_low.len()).copied().collect();
+        prop_assert_eq!(
+            &selected_low,
+            &expected_low,
+            "low-prio selected should be a prefix of low-prio input"
+        );
+
+        // Output order: all high-prio first, then all low-prio
+        let recombined: Vec<u64> = selected_high.iter().chain(selected_low.iter()).copied().collect();
         prop_assert_eq!(
             &selected,
-            &expected_prefix,
-            "selected panes should be a prefix of the sorted input"
+            &recombined,
+            "selected should be high-prio prefix followed by low-prio prefix"
         );
     }
 
@@ -639,6 +685,7 @@ fn tailer_config_default_invariants() {
     assert!(config.backoff_multiplier >= 1.0);
     assert!(config.max_concurrent >= 1);
     assert!(config.send_timeout > Duration::ZERO);
+    assert!(config.capture_timeout > Duration::ZERO);
 }
 
 // ─── TailerMode display ─────────────────────────────────────────────
@@ -835,16 +882,14 @@ fn scheduler_snapshot_json_includes_all_fields() {
 
 /// Strategy for mixed-priority pane lists sorted by (priority, pane_id)
 fn arb_mixed_priority_panes() -> impl Strategy<Value = Vec<(u64, u32)>> {
-    prop::collection::vec(
-        (1u64..100, prop_oneof![0u32..51, 51u32..101]),
-        1..30,
+    prop::collection::vec((1u64..100, prop_oneof![0u32..51, 51u32..101]), 1..30).prop_map(
+        |mut panes| {
+            panes.sort_by_key(|&(id, prio)| (prio, id));
+            // Deduplicate by pane_id
+            panes.dedup_by_key(|p| p.0);
+            panes
+        },
     )
-    .prop_map(|mut panes| {
-        panes.sort_by_key(|&(id, prio)| (prio, id));
-        // Deduplicate by pane_id
-        panes.dedup_by_key(|p| p.0);
-        panes
-    })
 }
 
 proptest! {
