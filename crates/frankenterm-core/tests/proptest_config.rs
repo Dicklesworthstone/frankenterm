@@ -21,8 +21,8 @@ use proptest::prelude::*;
 
 use frankenterm_core::config::{
     CaptureBudgetConfig, Config, DistributedAuthMode, LogFormat, PaneFilterConfig, PaneFilterRule,
-    PanePriorityConfig, PanePriorityRule, RetentionTier, SnapshotConfig, SnapshotSchedulingConfig,
-    SnapshotSchedulingMode, StorageConfig, SyncDirection,
+    PanePriorityConfig, PanePriorityRule, RetentionTier, SearchIndexingConfig, SnapshotConfig,
+    SnapshotSchedulingConfig, SnapshotSchedulingMode, StorageConfig, SyncDirection,
 };
 
 // =============================================================================
@@ -919,4 +919,86 @@ fn scheduling_config_default_values() {
     assert!((config.snapshot_threshold - 5.0).abs() < f64::EPSILON);
     assert!((config.work_completed_value - 2.0).abs() < f64::EPSILON);
     assert_eq!(config.periodic_fallback_minutes, 30);
+}
+
+// =============================================================================
+// SearchIndexingConfig — serde roundtrip and defaults
+// =============================================================================
+
+fn arb_search_indexing_config() -> impl Strategy<Value = SearchIndexingConfig> {
+    (
+        "[a-z/.~]{5,40}",  // index_dir
+        0_u64..10_000,      // max_index_mb
+        0_u64..365,         // ttl_days
+        1_u64..3600,        // flush_interval_secs
+        1_usize..10_000,    // flush_docs_threshold
+        1_u32..10_000,      // max_docs_per_second
+    )
+        .prop_map(
+            |(dir, max_mb, ttl, flush_int, flush_docs, max_dps)| SearchIndexingConfig {
+                index_dir: dir,
+                max_index_mb: max_mb,
+                ttl_days: ttl,
+                flush_interval_secs: flush_int,
+                flush_docs_threshold: flush_docs,
+                max_docs_per_second: max_dps,
+            },
+        )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// SearchIndexingConfig survives JSON roundtrip.
+    #[test]
+    fn prop_search_indexing_config_serde_roundtrip(cfg in arb_search_indexing_config()) {
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: SearchIndexingConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.index_dir, &cfg.index_dir);
+        prop_assert_eq!(back.max_index_mb, cfg.max_index_mb);
+        prop_assert_eq!(back.ttl_days, cfg.ttl_days);
+        prop_assert_eq!(back.flush_interval_secs, cfg.flush_interval_secs);
+        prop_assert_eq!(back.flush_docs_threshold, cfg.flush_docs_threshold);
+        prop_assert_eq!(back.max_docs_per_second, cfg.max_docs_per_second);
+    }
+
+    /// SearchIndexingConfig serde is deterministic.
+    #[test]
+    fn prop_search_indexing_config_deterministic(cfg in arb_search_indexing_config()) {
+        let j1 = serde_json::to_string(&cfg).unwrap();
+        let j2 = serde_json::to_string(&cfg).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// SearchIndexingConfig default has reasonable values.
+    #[test]
+    fn prop_search_indexing_config_default_valid(_dummy in 0..1u8) {
+        let cfg = SearchIndexingConfig::default();
+        prop_assert!(!cfg.index_dir.is_empty(), "index_dir should not be empty");
+        prop_assert!(cfg.max_index_mb > 0, "max_index_mb should be positive");
+        prop_assert!(cfg.ttl_days > 0, "ttl_days should be positive");
+        prop_assert!(cfg.flush_interval_secs > 0, "flush_interval should be positive");
+        prop_assert!(cfg.flush_docs_threshold > 0, "flush_docs_threshold should be positive");
+        prop_assert!(cfg.max_docs_per_second > 0, "max_docs_per_second should be positive");
+    }
+
+    /// SearchIndexingConfig JSON contains all key fields.
+    #[test]
+    fn prop_search_indexing_config_json_structure(cfg in arb_search_indexing_config()) {
+        let json = serde_json::to_string(&cfg).unwrap();
+        prop_assert!(json.contains("\"index_dir\""));
+        prop_assert!(json.contains("\"max_index_mb\""));
+        prop_assert!(json.contains("\"ttl_days\""));
+        prop_assert!(json.contains("\"max_docs_per_second\""));
+    }
+
+    /// SearchIndexingConfig default roundtrips through JSON.
+    #[test]
+    fn prop_search_indexing_config_default_roundtrip(_dummy in 0..1u8) {
+        let cfg = SearchIndexingConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: SearchIndexingConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.index_dir, &cfg.index_dir);
+        prop_assert_eq!(back.max_index_mb, cfg.max_index_mb);
+    }
 }
