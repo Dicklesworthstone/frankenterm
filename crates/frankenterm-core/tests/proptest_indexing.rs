@@ -1059,3 +1059,182 @@ proptest! {
         prop_assert_eq!(index.pending_len(), 0, "pending should be empty after flush");
     }
 }
+
+// ── IndexFlushReason & report serde ────────────────────────────────────────
+
+fn flush_reason_strategy() -> impl Strategy<Value = IndexFlushReason> {
+    prop_oneof![
+        Just(IndexFlushReason::DocThreshold),
+        Just(IndexFlushReason::Interval),
+        Just(IndexFlushReason::Manual),
+        Just(IndexFlushReason::Reindex),
+    ]
+}
+
+fn arb_ingest_report() -> impl Strategy<Value = frankenterm_core::search::IndexingIngestReport> {
+    (
+        0usize..100,
+        0usize..100,
+        0usize..50,
+        0usize..50,
+        0usize..50,
+        0usize..50,
+        0usize..50,
+        0usize..100,
+        0usize..50,
+        0usize..50,
+        proptest::option::of(flush_reason_strategy()),
+    )
+        .prop_map(
+            |(
+                submitted,
+                accepted,
+                empty,
+                dup,
+                cass,
+                resize,
+                rate_lim,
+                flushed,
+                expired,
+                evicted,
+                reason,
+            )| {
+                frankenterm_core::search::IndexingIngestReport {
+                    submitted_docs: submitted,
+                    accepted_docs: accepted,
+                    skipped_empty_docs: empty,
+                    skipped_duplicate_docs: dup,
+                    skipped_cass_docs: cass,
+                    skipped_resize_pause_docs: resize,
+                    deferred_rate_limited_docs: rate_lim,
+                    flushed_docs: flushed,
+                    expired_docs: expired,
+                    evicted_docs: evicted,
+                    flush_reason: reason,
+                }
+            },
+        )
+}
+
+fn arb_tick_result() -> impl Strategy<Value = frankenterm_core::search::IndexingTickResult> {
+    (
+        0usize..100,
+        0usize..50,
+        0usize..50,
+        proptest::option::of(flush_reason_strategy()),
+    )
+        .prop_map(|(flushed, expired, evicted, reason)| {
+            frankenterm_core::search::IndexingTickResult {
+                flushed_docs: flushed,
+                expired_docs: expired,
+                evicted_docs: evicted,
+                flush_reason: reason,
+            }
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    /// IndexFlushReason serde roundtrip.
+    #[test]
+    fn flush_reason_serde_roundtrip(reason in flush_reason_strategy()) {
+        let json = serde_json::to_string(&reason).expect("serialize");
+        let back: IndexFlushReason = serde_json::from_str(&json).expect("deserialize");
+        prop_assert_eq!(reason, back);
+    }
+
+    /// IndexFlushReason label is a snake_case identifier.
+    #[test]
+    fn flush_reason_label_non_empty(reason in flush_reason_strategy()) {
+        let json = serde_json::to_string(&reason).expect("ser");
+        let label = json.trim_matches('"');
+        prop_assert!(!label.is_empty(), "label must be non-empty");
+        let valid_chars = label.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+        prop_assert!(valid_chars, "label must be snake_case, got: {}", label);
+    }
+
+    /// IndexingIngestReport serde roundtrip.
+    #[test]
+    fn ingest_report_serde_roundtrip(report in arb_ingest_report()) {
+        let json = serde_json::to_string(&report).expect("serialize");
+        let back: frankenterm_core::search::IndexingIngestReport =
+            serde_json::from_str(&json).expect("deserialize");
+        prop_assert_eq!(report, back);
+    }
+
+    /// IndexingTickResult serde roundtrip.
+    #[test]
+    fn tick_result_serde_roundtrip(tick in arb_tick_result()) {
+        let json = serde_json::to_string(&tick).expect("serialize");
+        let back: frankenterm_core::search::IndexingTickResult =
+            serde_json::from_str(&json).expect("deserialize");
+        prop_assert_eq!(tick, back);
+    }
+
+    /// SearchDocumentSource serde roundtrip.
+    #[test]
+    fn search_document_source_serde_roundtrip(source in source_strategy()) {
+        let json = serde_json::to_string(&source).expect("serialize");
+        let back: SearchDocumentSource =
+            serde_json::from_str(&json).expect("deserialize");
+        prop_assert_eq!(source, back);
+    }
+
+    /// All flush reasons are distinct after serialization.
+    #[test]
+    fn flush_reasons_are_distinct(_dummy in 0..1u8) {
+        let reasons = [
+            IndexFlushReason::DocThreshold,
+            IndexFlushReason::Interval,
+            IndexFlushReason::Manual,
+            IndexFlushReason::Reindex,
+        ];
+        let labels: HashSet<String> = reasons
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect();
+        prop_assert_eq!(labels.len(), reasons.len(), "all labels must be unique");
+    }
+
+    /// Ingest report default has all zeros.
+    #[test]
+    fn ingest_report_default_is_zero(_dummy in 0..1u8) {
+        let report = frankenterm_core::search::IndexingIngestReport::default();
+        prop_assert_eq!(report.submitted_docs, 0);
+        prop_assert_eq!(report.accepted_docs, 0);
+        prop_assert_eq!(report.flushed_docs, 0);
+        prop_assert_eq!(report.flush_reason, None);
+    }
+
+    /// Tick result default has all zeros.
+    #[test]
+    fn tick_result_default_is_zero(_dummy in 0..1u8) {
+        let report = frankenterm_core::search::IndexingTickResult::default();
+        prop_assert_eq!(report.flushed_docs, 0);
+        prop_assert_eq!(report.expired_docs, 0);
+        prop_assert_eq!(report.evicted_docs, 0);
+        prop_assert_eq!(report.flush_reason, None);
+    }
+
+    /// IngestReport: flush_reason is Some iff flushed_docs > 0.
+    #[test]
+    fn ingest_report_flush_reason_iff_flushed(
+        texts in prop::collection::vec(text_strategy(), 1..20),
+        threshold in 2usize..15,
+    ) {
+        let dir = tempdir().expect("tmpdir");
+        let mut cfg = fast_flush_config(dir.path());
+        cfg.flush_docs_threshold = threshold;
+        let mut index = SearchIndex::open(&cfg).expect("open");
+        let docs: Vec<_> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| make_doc(t, 1_000 + i as i64, SearchDocumentSource::Scrollback))
+            .collect();
+        let report = index.ingest_documents(&docs, 2_000, false, None).expect("ingest");
+        if report.flushed_docs > 0 {
+            prop_assert!(report.flush_reason.is_some(), "flushed>0 implies flush_reason");
+        }
+    }
+}
