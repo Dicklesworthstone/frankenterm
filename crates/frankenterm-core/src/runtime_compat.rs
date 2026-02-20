@@ -359,7 +359,34 @@ pub mod task {
     {
         tokio::spawn(future)
     }
+
+    /// Spawns blocking work on the runtime's dedicated blocking thread pool,
+    /// returning a `JoinHandle` that can be awaited, aborted, or used in
+    /// `select!`.
+    ///
+    /// Use this when callers need direct `JoinHandle` control (e.g. `.abort()`).
+    /// For fire-and-forget blocking work, prefer the top-level
+    /// [`super::spawn_blocking`] helper which returns `Result<T, String>`.
+    pub fn spawn_blocking<F, T>(f: F) -> JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(f)
+    }
 }
+
+/// Re-export `join!` macro for concurrent future evaluation.
+///
+/// Wraps `tokio::join!` in the default (non-asupersync) build.
+#[cfg(not(feature = "asupersync-runtime"))]
+pub use tokio::join;
+
+/// Re-export `select!` macro for multiplexing futures.
+///
+/// Wraps `tokio::select!` in the default (non-asupersync) build.
+#[cfg(not(feature = "asupersync-runtime"))]
+pub use tokio::select;
 
 /// Unix socket aliases/helpers for the active runtime.
 #[cfg(feature = "asupersync-runtime")]
@@ -2436,5 +2463,130 @@ mod tests {
             .thread_name("ct-test")
             .build();
         assert!(rt.is_ok());
+    }
+
+    // ========================================================================
+    // task::spawn_blocking tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn task_spawn_blocking_returns_value() {
+        let handle = task::spawn_blocking(|| 42);
+        let result = handle.await.expect("join");
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn task_spawn_blocking_runs_closure() {
+        let handle = task::spawn_blocking(|| {
+            let mut sum = 0;
+            for i in 0..100 {
+                sum += i;
+            }
+            sum
+        });
+        assert_eq!(handle.await.expect("join"), 4950);
+    }
+
+    #[tokio::test]
+    async fn task_spawn_blocking_abort_cancels() {
+        let handle = task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_secs(60));
+            "never"
+        });
+        handle.abort();
+        let result = handle.await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn task_spawn_blocking_returns_join_handle() {
+        let handle: task::JoinHandle<String> =
+            task::spawn_blocking(|| "hello".to_string());
+        let val = handle.await.expect("join");
+        assert_eq!(val, "hello");
+    }
+
+    // ========================================================================
+    // join! macro tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn join_two_futures() {
+        let (a, b) = join!(async { 1 }, async { 2 });
+        assert_eq!(a, 1);
+        assert_eq!(b, 2);
+    }
+
+    #[tokio::test]
+    async fn join_three_futures() {
+        let (a, b, c) = join!(async { "x" }, async { "y" }, async { "z" });
+        assert_eq!(a, "x");
+        assert_eq!(b, "y");
+        assert_eq!(c, "z");
+    }
+
+    #[tokio::test]
+    async fn join_with_sleep() {
+        let (a, b) = join!(
+            async {
+                sleep(Duration::from_millis(1)).await;
+                10
+            },
+            async {
+                sleep(Duration::from_millis(1)).await;
+                20
+            }
+        );
+        assert_eq!(a + b, 30);
+    }
+
+    #[tokio::test]
+    async fn join_single_future() {
+        let (result,) = join!(async { 99 });
+        assert_eq!(result, 99);
+    }
+
+    // ========================================================================
+    // select! macro tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn select_first_branch_ready() {
+        let result = select! {
+            val = async { 1 } => val,
+            _ = sleep(Duration::from_secs(10)) => 0,
+        };
+        assert_eq!(result, 1);
+    }
+
+    #[tokio::test]
+    async fn select_sleep_branch() {
+        let result = select! {
+            () = sleep(Duration::from_millis(1)) => "timer",
+            () = sleep(Duration::from_secs(60)) => "never",
+        };
+        assert_eq!(result, "timer");
+    }
+
+    #[tokio::test]
+    async fn select_with_channel() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(42).await.expect("send");
+        let result = select! {
+            val = rx.recv() => val.unwrap_or(0),
+            () = sleep(Duration::from_secs(10)) => 0,
+        };
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn select_biased_picks_first_ready() {
+        let result = select! {
+            biased;
+            val = async { "first" } => val,
+            val = async { "second" } => val,
+        };
+        assert_eq!(result, "first");
     }
 }

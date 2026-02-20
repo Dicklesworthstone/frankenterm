@@ -406,7 +406,7 @@ impl QueryClient for ProductionQueryClient {
             let mut pane_views: Vec<PaneView> = panes.iter().map(PaneView::from).collect();
 
             if let Some(storage) = storage {
-                let (unhandled_res, last_activity_res) = tokio::join!(
+                let (unhandled_res, last_activity_res) = crate::runtime_compat::join!(
                     storage.count_unhandled_events_by_pane(),
                     storage.get_last_activity_by_pane()
                 );

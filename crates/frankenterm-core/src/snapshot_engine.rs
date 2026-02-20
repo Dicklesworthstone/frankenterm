@@ -180,7 +180,7 @@ impl SnapshotEngine {
         }
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-            tokio::task::spawn_blocking(work)
+            crate::runtime_compat::task::spawn_blocking(work)
                 .await
                 .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
                 .map_err(|e| SnapshotError::Database(e.to_string()))
@@ -423,7 +423,7 @@ impl SnapshotEngine {
                         #[cfg(not(feature = "asupersync-runtime"))]
                         let shutdown_fut = shutdown.changed();
 
-                        tokio::select! {
+                        crate::runtime_compat::select! {
                             () = sleep(interval) => {}
                             _ = shutdown_fut => {
                                 tracing::info!("snapshot engine shutting down");
@@ -489,7 +489,7 @@ impl SnapshotEngine {
                     #[cfg(not(feature = "asupersync-runtime"))]
                     let shutdown_fut = shutdown.changed();
 
-                    tokio::select! {
+                    crate::runtime_compat::select! {
                         maybe_trigger = maybe_trigger_fut => {
                             let Some(trigger) = maybe_trigger else {
                                 tracing::info!("trigger channel closed; intelligent scheduler stopping");

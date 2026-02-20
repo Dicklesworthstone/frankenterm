@@ -892,7 +892,7 @@ async fn concurrent_pool_acquire_and_evict() {
     });
 
     // Both should complete without deadlock
-    let (r1, r2) = tokio::join!(acquire_task, evict_task);
+    let (r1, r2) = frankenterm_core::runtime_compat::join!(acquire_task, evict_task);
     r1.unwrap();
     r2.unwrap();
 }

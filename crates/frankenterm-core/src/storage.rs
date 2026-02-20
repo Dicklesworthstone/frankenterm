@@ -5013,7 +5013,7 @@ impl StorageHandle {
         }
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-            tokio::task::spawn_blocking(work)
+            crate::runtime_compat::task::spawn_blocking(work)
                 .await
                 .map_err(|e| StorageError::Database(format!("{join_error_prefix}: {e}")))?
         }
@@ -19861,7 +19861,7 @@ mod storage_handle_tests {
         // Concurrent reads should work (WAL mode)
         let read1 = handle.get_segments(1, 10);
         let read2 = handle.get_segments(1, 10);
-        let (result1, result2) = tokio::join!(read1, read2);
+        let (result1, result2) = crate::runtime_compat::join!(read1, read2);
 
         assert!(result1.is_ok());
         assert!(result2.is_ok());

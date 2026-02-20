@@ -319,7 +319,7 @@ impl SearchBridge {
         let worker_cancellation = cancellation.clone();
 
         let mut worker =
-            tokio::task::spawn_blocking(move || -> Result<SearchBridgeResult, SearchError> {
+            crate::runtime_compat::task::spawn_blocking(move || -> Result<SearchBridgeResult, SearchError> {
                 let (cancel_done, cancel_thread) =
                     spawn_cancellation_thread(cx.clone(), worker_cancellation.clone());
 
@@ -362,7 +362,7 @@ impl SearchBridge {
             });
 
         let search_result = loop {
-            tokio::select! {
+            crate::runtime_compat::select! {
                 maybe_phase = phase_rx.recv() => {
                     if let Some(phase) = maybe_phase {
                         on_phase(phase);
