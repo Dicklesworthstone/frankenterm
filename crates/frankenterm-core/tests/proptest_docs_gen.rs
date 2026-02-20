@@ -924,7 +924,10 @@ fn parse_schema_mixed_required_optional_sorted() {
     });
     let doc = parse_schema(&schema);
     // Required first, then optional, each alphabetical
-    assert!(doc.properties[0].name == "beta", "required 'beta' should be first");
+    assert!(
+        doc.properties[0].name == "beta",
+        "required 'beta' should be first"
+    );
     assert!(doc.properties[0].required);
     assert!(!doc.properties[1].required);
     assert!(!doc.properties[2].required);

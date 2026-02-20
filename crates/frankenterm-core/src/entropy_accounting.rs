@@ -732,7 +732,11 @@ mod tests {
     fn compute_entropy_single_byte_repeated() {
         let data = vec![42u8; 1000];
         let h = compute_entropy(&data);
-        assert!(h < 0.01, "constant data should have near-zero entropy, got {}", h);
+        assert!(
+            h < 0.01,
+            "constant data should have near-zero entropy, got {}",
+            h
+        );
     }
 
     #[test]

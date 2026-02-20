@@ -41,10 +41,12 @@ pub trait Point: Clone {
     /// Squared Euclidean distance to another point.
     fn dist_sq(&self, other: &Self) -> f64 {
         let d = self.dims();
-        (0..d).map(|i| {
-            let diff = self.coord(i) - other.coord(i);
-            diff * diff
-        }).sum()
+        (0..d)
+            .map(|i| {
+                let diff = self.coord(i) - other.coord(i);
+                diff * diff
+            })
+            .sum()
     }
 }
 
@@ -67,7 +69,9 @@ impl VecPoint {
 
     /// Creates a 3D point.
     pub fn new3d(x: f64, y: f64, z: f64) -> Self {
-        Self { coords: vec![x, y, z] }
+        Self {
+            coords: vec![x, y, z],
+        }
     }
 }
 
@@ -212,8 +216,8 @@ impl<P: Point, V: Clone> KdTree<P, V> {
         let mut current = self.root.unwrap();
         loop {
             let dim = self.nodes[current].split_dim;
-            let go_left = self.nodes[new_idx].point.coord(dim)
-                < self.nodes[current].point.coord(dim);
+            let go_left =
+                self.nodes[new_idx].point.coord(dim) < self.nodes[current].point.coord(dim);
 
             if go_left {
                 match self.nodes[current].left {
@@ -333,13 +337,7 @@ impl<P: Point, V: Clone> KdTree<P, V> {
         results
     }
 
-    fn knn_recursive(
-        &self,
-        node: usize,
-        query: &P,
-        k: usize,
-        heap: &mut BinaryHeap<HeapEntry>,
-    ) {
+    fn knn_recursive(&self, node: usize, query: &P, k: usize, heap: &mut BinaryHeap<HeapEntry>) {
         let n = &self.nodes[node];
         let dist_sq = n.point.dist_sq(query);
 
@@ -582,11 +580,7 @@ mod tests {
 
     #[test]
     fn nearest_exact_match() {
-        let items = vec![
-            (pt(1.0, 2.0), 1),
-            (pt(3.0, 4.0), 2),
-            (pt(5.0, 6.0), 3),
-        ];
+        let items = vec![(pt(1.0, 2.0), 1), (pt(3.0, 4.0), 2), (pt(5.0, 6.0), 3)];
         let tree = KdTree::build(items, 2);
 
         let (_, v, dist) = tree.nearest(&pt(3.0, 4.0)).unwrap();
@@ -644,10 +638,7 @@ mod tests {
 
     #[test]
     fn range_query_empty() {
-        let items = vec![
-            (pt(1.0, 1.0), 1),
-            (pt(2.0, 2.0), 2),
-        ];
+        let items = vec![(pt(1.0, 1.0), 1), (pt(2.0, 2.0), 2)];
         let tree = KdTree::build(items, 2);
         let results = tree.range_query(&[10.0, 10.0], &[20.0, 20.0]);
         assert!(results.is_empty());
@@ -705,11 +696,7 @@ mod tests {
 
     #[test]
     fn points_returns_all() {
-        let items = vec![
-            (pt(1.0, 2.0), 1),
-            (pt(3.0, 4.0), 2),
-            (pt(5.0, 6.0), 3),
-        ];
+        let items = vec![(pt(1.0, 2.0), 1), (pt(3.0, 4.0), 2), (pt(5.0, 6.0), 3)];
         let tree = KdTree::build(items, 2);
         assert_eq!(tree.points().len(), 3);
     }
@@ -723,11 +710,7 @@ mod tests {
 
     #[test]
     fn duplicate_points() {
-        let items = vec![
-            (pt(1.0, 1.0), 1),
-            (pt(1.0, 1.0), 2),
-            (pt(1.0, 1.0), 3),
-        ];
+        let items = vec![(pt(1.0, 1.0), 1), (pt(1.0, 1.0), 2), (pt(1.0, 1.0), 3)];
         let tree = KdTree::build(items, 2);
         assert_eq!(tree.len(), 3);
 
@@ -737,11 +720,7 @@ mod tests {
 
     #[test]
     fn serde_roundtrip() {
-        let items = vec![
-            (pt(1.0, 2.0), 10),
-            (pt(3.0, 4.0), 20),
-            (pt(5.0, 6.0), 30),
-        ];
+        let items = vec![(pt(1.0, 2.0), 10), (pt(3.0, 4.0), 20), (pt(5.0, 6.0), 30)];
         let tree = KdTree::build(items, 2);
         let json = serde_json::to_string(&tree).unwrap();
         let restored: KdTree<VecPoint, i32> = serde_json::from_str(&json).unwrap();
@@ -801,11 +780,7 @@ mod tests {
 
     #[test]
     fn radius_query_zero_radius_exact_match() {
-        let items = vec![
-            (pt(0.0, 0.0), 1),
-            (pt(1.0, 0.0), 2),
-            (pt(0.0, 1.0), 3),
-        ];
+        let items = vec![(pt(0.0, 0.0), 1), (pt(1.0, 0.0), 2), (pt(0.0, 1.0), 3)];
         let tree = KdTree::build(items, 2);
         let results = tree.radius_query(&pt(0.0, 0.0), 0.0);
         assert_eq!(results.len(), 1);
@@ -815,11 +790,7 @@ mod tests {
     #[test]
     fn range_query_exact_boundary_inclusion() {
         // Points exactly on the boundary should be included (<=)
-        let items = vec![
-            (pt(0.0, 0.0), 1),
-            (pt(5.0, 5.0), 2),
-            (pt(10.0, 10.0), 3),
-        ];
+        let items = vec![(pt(0.0, 0.0), 1), (pt(5.0, 5.0), 2), (pt(10.0, 10.0), 3)];
         let tree = KdTree::build(items, 2);
         let results = tree.range_query(&[0.0, 0.0], &[5.0, 5.0]);
         assert_eq!(results.len(), 2);
@@ -1001,10 +972,7 @@ mod tests {
 
     #[test]
     fn clone_independence() {
-        let items = vec![
-            (pt(0.0, 0.0), 1),
-            (pt(5.0, 5.0), 2),
-        ];
+        let items = vec![(pt(0.0, 0.0), 1), (pt(5.0, 5.0), 2)];
         let tree = KdTree::build(items, 2);
         let mut cloned = tree.clone();
         cloned.insert(pt(10.0, 10.0), 3);
@@ -1040,10 +1008,7 @@ mod tests {
     #[test]
     fn radius_query_includes_boundary() {
         // Point at exactly radius distance should be included (<=)
-        let items = vec![
-            (pt(0.0, 0.0), 1),
-            (pt(1.0, 0.0), 2),
-        ];
+        let items = vec![(pt(0.0, 0.0), 1), (pt(1.0, 0.0), 2)];
         let tree = KdTree::build(items, 2);
         let results = tree.radius_query(&pt(0.0, 0.0), 1.0);
         assert_eq!(results.len(), 2); // both points: 0 dist and 1.0 dist
@@ -1122,11 +1087,7 @@ mod tests {
     #[test]
     fn radius_query_returns_sorted_candidate_distances() {
         // The results should have correct distance values
-        let items = vec![
-            (pt(0.0, 0.0), 1),
-            (pt(1.0, 0.0), 2),
-            (pt(2.0, 0.0), 3),
-        ];
+        let items = vec![(pt(0.0, 0.0), 1), (pt(1.0, 0.0), 2), (pt(2.0, 0.0), 3)];
         let tree = KdTree::build(items, 2);
         let results = tree.radius_query(&pt(0.0, 0.0), 3.0);
         assert_eq!(results.len(), 3);
@@ -1156,10 +1117,7 @@ mod tests {
         let expected: usize = items
             .iter()
             .filter(|(p, _)| {
-                p.coord(0) >= 3.0
-                    && p.coord(0) <= 7.0
-                    && p.coord(1) >= 3.0
-                    && p.coord(1) <= 7.0
+                p.coord(0) >= 3.0 && p.coord(0) <= 7.0 && p.coord(1) >= 3.0 && p.coord(1) <= 7.0
             })
             .count();
 

@@ -535,9 +535,16 @@ impl TransitionLog {
 pub fn is_valid_transition(from: StateLabel, to: StateLabel) -> bool {
     matches!(
         (from, to),
-        (StateLabel::Creating | StateLabel::Snapshotting, StateLabel::Active)
-            | (StateLabel::Active, StateLabel::Snapshotting | StateLabel::Closed)
-            | (StateLabel::Restoring, StateLabel::Active | StateLabel::Closed)
+        (
+            StateLabel::Creating | StateLabel::Snapshotting,
+            StateLabel::Active
+        ) | (
+            StateLabel::Active,
+            StateLabel::Snapshotting | StateLabel::Closed
+        ) | (
+            StateLabel::Restoring,
+            StateLabel::Active | StateLabel::Closed
+        )
     )
 }
 

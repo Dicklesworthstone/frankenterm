@@ -178,11 +178,7 @@ impl<T: Ord + Clone> SparseTable<T> {
 
 impl<T: Ord + Clone + fmt::Display> fmt::Display for SparseTable<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "SparseTable({} elements, {:?})",
-            self.len, self.op
-        )
+        write!(f, "SparseTable({} elements, {:?})", self.len, self.op)
     }
 }
 

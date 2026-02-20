@@ -74,14 +74,24 @@ impl TrieNode {
 
     /// Count total nodes in subtree (including self).
     fn node_count(&self) -> usize {
-        1 + self.children.values().map(TrieNode::node_count).sum::<usize>()
+        1 + self
+            .children
+            .values()
+            .map(TrieNode::node_count)
+            .sum::<usize>()
     }
 
     /// Approximate memory of this node and subtree.
     fn memory_bytes(&self) -> usize {
         let self_size = std::mem::size_of::<Self>()
-            + self.children.capacity() * (std::mem::size_of::<u8>() + std::mem::size_of::<TrieNode>());
-        self_size + self.children.values().map(TrieNode::memory_bytes).sum::<usize>()
+            + self.children.capacity()
+                * (std::mem::size_of::<u8>() + std::mem::size_of::<TrieNode>());
+        self_size
+            + self
+                .children
+                .values()
+                .map(TrieNode::memory_bytes)
+                .sum::<usize>()
     }
 
     /// Collect all keys in subtree.

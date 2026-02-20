@@ -737,7 +737,10 @@ fn assertion_result_has_description() {
     let scenario = ChaosScenario::new("test", "test")
         .with_assertion(ChaosAssertion::FaultNeverFired(FaultPoint::DbWrite));
     let results = injector.check_assertions(&scenario);
-    assert!(!results[0].detail.is_empty(), "AssertionResult should have detail text");
+    assert!(
+        !results[0].detail.is_empty(),
+        "AssertionResult should have detail text"
+    );
 }
 
 // ─── FaultMode serde roundtrip ──────────────────────────────────────

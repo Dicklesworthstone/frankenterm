@@ -750,7 +750,10 @@ mod tests {
         for i in 0..100 {
             filter.insert(&i);
         }
-        assert!(filter.load_factor() <= 1.0, "load_factor should not exceed 1.0");
+        assert!(
+            filter.load_factor() <= 1.0,
+            "load_factor should not exceed 1.0"
+        );
     }
 
     #[test]
@@ -775,8 +778,12 @@ mod tests {
             filter.insert(&i);
         }
         let stats = filter.stats();
-        assert!(stats.occupied_buckets <= stats.num_buckets,
-            "occupied {} > num_buckets {}", stats.occupied_buckets, stats.num_buckets);
+        assert!(
+            stats.occupied_buckets <= stats.num_buckets,
+            "occupied {} > num_buckets {}",
+            stats.occupied_buckets,
+            stats.num_buckets
+        );
     }
 
     #[test]
@@ -803,8 +810,12 @@ mod tests {
             }
         }
         // Should hold at least 90% of expected
-        assert!(inserted >= expected * 9 / 10,
-            "only inserted {} out of {} expected", inserted, expected);
+        assert!(
+            inserted >= expected * 9 / 10,
+            "only inserted {} out of {} expected",
+            inserted,
+            expected
+        );
     }
 
     #[test]
@@ -889,7 +900,10 @@ mod tests {
         let mut filter = CuckooFilter::new();
         filter.insert(&42);
         assert!(filter.delete(&42));
-        assert!(!filter.delete(&42), "second delete of same item should return false");
+        assert!(
+            !filter.delete(&42),
+            "second delete of same item should return false"
+        );
     }
 
     #[test]
@@ -927,8 +941,12 @@ mod tests {
                 large_inserted += 1;
             }
         }
-        assert!(large_inserted >= small_inserted,
-            "more kicks should allow more inserts: large={}, small={}", large_inserted, small_inserted);
+        assert!(
+            large_inserted >= small_inserted,
+            "more kicks should allow more inserts: large={}, small={}",
+            large_inserted,
+            small_inserted
+        );
     }
 
     #[test]
@@ -957,7 +975,11 @@ mod tests {
         assert_eq!(filter.count(), 25);
         // Odd numbers still present
         for i in (1..50).step_by(2) {
-            assert!(filter.lookup(&i), "odd number {} should still be present", i);
+            assert!(
+                filter.lookup(&i),
+                "odd number {} should still be present",
+                i
+            );
         }
         // Insert more
         for i in 50..75 {
@@ -972,7 +994,14 @@ mod tests {
             for i in 0..n {
                 for fp in [1u32, 42, 255, 1000, u32::MAX] {
                     let j = alt_index(i, fp, n);
-                    assert!(j < n, "alt_index({}, {}, {}) = {} out of bounds", i, fp, n, j);
+                    assert!(
+                        j < n,
+                        "alt_index({}, {}, {}) = {} out of bounds",
+                        i,
+                        fp,
+                        n,
+                        j
+                    );
                 }
             }
         }

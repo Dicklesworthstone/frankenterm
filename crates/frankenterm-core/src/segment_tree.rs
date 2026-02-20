@@ -140,7 +140,11 @@ impl SegmentTree {
     /// Panics if `left > right` or `right >= len()`.
     pub fn query(&mut self, left: usize, right: usize) -> i64 {
         assert!(left <= right, "left {left} > right {right}");
-        assert!(right < self.n, "right {right} out of bounds for len {}", self.n);
+        assert!(
+            right < self.n,
+            "right {right} out of bounds for len {}",
+            self.n
+        );
         self.query_ops += 1;
         self.query_impl(1, 0, self.n - 1, left, right)
     }
@@ -151,7 +155,11 @@ impl SegmentTree {
     ///
     /// Panics if `index >= len()`.
     pub fn point_update(&mut self, index: usize, delta: i64) {
-        assert!(index < self.n, "index {index} out of bounds for len {}", self.n);
+        assert!(
+            index < self.n,
+            "index {index} out of bounds for len {}",
+            self.n
+        );
         self.update_ops += 1;
         self.range_update_impl(1, 0, self.n - 1, index, index, delta);
     }
@@ -178,7 +186,11 @@ impl SegmentTree {
     /// Panics if `left > right` or `right >= len()`.
     pub fn range_update(&mut self, left: usize, right: usize, delta: i64) {
         assert!(left <= right, "left {left} > right {right}");
-        assert!(right < self.n, "right {right} out of bounds for len {}", self.n);
+        assert!(
+            right < self.n,
+            "right {right} out of bounds for len {}",
+            self.n
+        );
         self.update_ops += 1;
         self.range_update_impl(1, 0, self.n - 1, left, right, delta);
     }
@@ -247,10 +259,10 @@ impl SegmentTree {
             let left_len = (mid - start + 1) as i64;
             let right_len = (end - mid) as i64;
 
-            self.tree[left_child] = self.tree[left_child]
-                .wrapping_add(self.lazy[node].wrapping_mul(left_len));
-            self.tree[right_child] = self.tree[right_child]
-                .wrapping_add(self.lazy[node].wrapping_mul(right_len));
+            self.tree[left_child] =
+                self.tree[left_child].wrapping_add(self.lazy[node].wrapping_mul(left_len));
+            self.tree[right_child] =
+                self.tree[right_child].wrapping_add(self.lazy[node].wrapping_mul(right_len));
 
             self.lazy[left_child] = self.lazy[left_child].wrapping_add(self.lazy[node]);
             self.lazy[right_child] = self.lazy[right_child].wrapping_add(self.lazy[node]);
@@ -382,8 +394,8 @@ mod tests {
     #[test]
     fn test_multiple_range_updates() {
         let mut st = SegmentTree::from_slice(&[0, 0, 0, 0, 0]);
-        st.range_update(0, 2, 3);  // [3, 3, 3, 0, 0]
-        st.range_update(2, 4, 5);  // [3, 3, 8, 5, 5]
+        st.range_update(0, 2, 3); // [3, 3, 3, 0, 0]
+        st.range_update(2, 4, 5); // [3, 3, 8, 5, 5]
         assert_eq!(st.query(0, 4), 24);
         assert_eq!(st.query(2, 2), 8);
     }

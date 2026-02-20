@@ -514,11 +514,7 @@ mod tests {
         for i in 1..arr.len() {
             let s1 = &text[arr[i - 1]..];
             let s2 = &text[arr[i]..];
-            let common = s1
-                .iter()
-                .zip(s2.iter())
-                .take_while(|(a, b)| a == b)
-                .count();
+            let common = s1.iter().zip(s2.iter()).take_while(|(a, b)| a == b).count();
             assert_eq!(lcp[i], common, "LCP[{}] mismatch", i);
         }
     }

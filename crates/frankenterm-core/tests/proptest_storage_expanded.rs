@@ -12,9 +12,8 @@
 use frankenterm_core::storage::{
     ActionHistoryRecord, ActionUndoRecord, ApprovalTokenRecord, AuditActionRecord,
     AuditStreamRecord, MaintenanceRecord, MetricType, NotificationHistoryRecord,
-    NotificationStatus, PaneBookmarkRecord, PaneReservation, PreparedPlanRecord,
-    SavedSearchRecord, TimelineQuery, WorkflowActionPlanRecord, WorkflowRecord,
-    WorkflowStepLogRecord,
+    NotificationStatus, PaneBookmarkRecord, PaneReservation, PreparedPlanRecord, SavedSearchRecord,
+    TimelineQuery, WorkflowActionPlanRecord, WorkflowRecord, WorkflowStepLogRecord,
 };
 use proptest::prelude::*;
 

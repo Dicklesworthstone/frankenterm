@@ -34,11 +34,7 @@ fn brute_nearest(points: &[(VecPoint, i32)], query: &VecPoint) -> (usize, f64) {
         .unwrap()
 }
 
-fn brute_range(
-    points: &[(VecPoint, i32)],
-    min_bounds: &[f64],
-    max_bounds: &[f64],
-) -> Vec<i32> {
+fn brute_range(points: &[(VecPoint, i32)], min_bounds: &[f64], max_bounds: &[f64]) -> Vec<i32> {
     points
         .iter()
         .filter(|(p, _)| {
@@ -61,10 +57,7 @@ fn brute_radius(points: &[(VecPoint, i32)], query: &VecPoint, radius: f64) -> Ve
 }
 
 fn brute_knn_distances(points: &[(VecPoint, i32)], query: &VecPoint, k: usize) -> Vec<f64> {
-    let mut dists: Vec<f64> = points
-        .iter()
-        .map(|(p, _)| p.dist_sq(query))
-        .collect();
+    let mut dists: Vec<f64> = points.iter().map(|(p, _)| p.dist_sq(query)).collect();
     dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
     dists.truncate(k);
     dists

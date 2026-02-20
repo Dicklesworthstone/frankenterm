@@ -816,11 +816,7 @@ mod tests {
         }
         let j = hll1.jaccard(&hll2).unwrap();
         // Expected ~50/150 = 0.33
-        assert!(
-            j > 0.1 && j < 0.6,
-            "jaccard {} should be ~0.33",
-            j
-        );
+        assert!(j > 0.1 && j < 0.6, "jaccard {} should be ~0.33", j);
     }
 
     #[test]

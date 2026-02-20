@@ -107,7 +107,9 @@ impl CountMinSketch {
         let table = vec![vec![0u64; width]; depth];
 
         // Deterministic seeds for reproducibility
-        let seeds: Vec<u64> = (0..depth).map(|i| splitmix64(i as u64 + 0x12345678)).collect();
+        let seeds: Vec<u64> = (0..depth)
+            .map(|i| splitmix64(i as u64 + 0x12345678))
+            .collect();
 
         Self {
             table,
@@ -339,7 +341,12 @@ mod tests {
             cms.increment(&"test");
         }
         let est = cms.estimate(&"test");
-        assert!(est >= true_count, "estimate {} should be >= true {}", est, true_count);
+        assert!(
+            est >= true_count,
+            "estimate {} should be >= true {}",
+            est,
+            true_count
+        );
     }
 
     #[test]
@@ -381,7 +388,10 @@ mod tests {
 
     #[test]
     fn config_serde() {
-        let config = CmsConfig { width: 512, depth: 4 };
+        let config = CmsConfig {
+            width: 512,
+            depth: 4,
+        };
         let json = serde_json::to_string(&config).unwrap();
         let back: CmsConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, back);
@@ -409,7 +419,11 @@ mod tests {
         cms.add(&"b", 10);
         let ip = cms.inner_product(&cms).unwrap();
         // Self inner product = sum of squares of true frequencies + noise
-        assert!(ip >= 125, "inner product {} should be >= 5^2 + 10^2 = 125", ip);
+        assert!(
+            ip >= 125,
+            "inner product {} should be >= 5^2 + 10^2 = 125",
+            ip
+        );
     }
 
     #[test]
@@ -434,11 +448,20 @@ mod tests {
             cms.increment(&i);
         }
         let heavy = cms.estimate(&"heavy");
-        assert!(heavy >= 1000, "heavy hitter estimate {} should be >= 1000", heavy);
+        assert!(
+            heavy >= 1000,
+            "heavy hitter estimate {} should be >= 1000",
+            heavy
+        );
         // Heavy should dominate
         for i in 0..100u64 {
             let light = cms.estimate(&i);
-            assert!(heavy > light, "heavy {} should exceed light {}", heavy, light);
+            assert!(
+                heavy > light,
+                "heavy {} should exceed light {}",
+                heavy,
+                light
+            );
         }
     }
 
@@ -527,7 +550,11 @@ mod tests {
         cms2.add(&"only_b", 100);
         let ip = cms1.inner_product(&cms2).unwrap();
         // Orthogonal items should have small inner product (just noise)
-        assert!(ip < 10000, "orthogonal inner product {} should be small", ip);
+        assert!(
+            ip < 10000,
+            "orthogonal inner product {} should be small",
+            ip
+        );
     }
 
     #[test]

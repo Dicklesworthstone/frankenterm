@@ -669,8 +669,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::recording::{
-        RecorderEventCausality, RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel,
-        RecorderSegmentKind, RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEventCausality, RecorderEventSource,
+        RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
     };
 
     // ── Test helpers ──────────────────────────────────────────────────────

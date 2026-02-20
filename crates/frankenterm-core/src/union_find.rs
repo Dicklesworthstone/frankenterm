@@ -105,14 +105,24 @@ impl UnionFind {
     /// # Panics
     /// Panics if `x >= len()`.
     pub fn find(&mut self, x: usize) -> usize {
-        assert!(x < self.parent.len(), "index {} out of range [0, {})", x, self.parent.len());
+        assert!(
+            x < self.parent.len(),
+            "index {} out of range [0, {})",
+            x,
+            self.parent.len()
+        );
         self.find_ops += 1;
         self.find_inner(x)
     }
 
     /// Find without mutating (no path compression). Slower but usable with `&self`.
     pub fn find_immutable(&self, x: usize) -> usize {
-        assert!(x < self.parent.len(), "index {} out of range [0, {})", x, self.parent.len());
+        assert!(
+            x < self.parent.len(),
+            "index {} out of range [0, {})",
+            x,
+            self.parent.len()
+        );
         let mut root = x;
         while self.parent[root] != root {
             root = self.parent[root];
@@ -194,7 +204,8 @@ impl UnionFind {
 
     /// Get all components as vectors of element indices.
     pub fn all_components(&mut self) -> Vec<Vec<usize>> {
-        let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+        let mut groups: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
         for i in 0..self.parent.len() {
             let root = self.find(i);
             groups.entry(root).or_default().push(i);
@@ -230,7 +241,7 @@ impl UnionFind {
     /// Approximate memory usage in bytes.
     pub fn memory_bytes(&self) -> usize {
         self.parent.len() * std::mem::size_of::<usize>() * 2 // parent + size
-            + self.rank.len() * std::mem::size_of::<u8>()     // rank
+            + self.rank.len() * std::mem::size_of::<u8>() // rank
     }
 
     /// Reset: each element becomes its own singleton set again.
@@ -545,10 +556,7 @@ mod tests {
         uf.union(2, 4);
         uf.union(0, 1);
         let components = uf.all_components();
-        assert_eq!(
-            components,
-            vec![vec![0, 1], vec![2, 4], vec![3], vec![5]]
-        );
+        assert_eq!(components, vec![vec![0, 1], vec![2, 4], vec![3], vec![5]]);
     }
 
     #[test]

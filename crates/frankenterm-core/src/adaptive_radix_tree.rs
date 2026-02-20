@@ -60,15 +60,9 @@ enum InnerNode {
     /// Leaf node with no children.
     Empty,
     /// Up to 4 children: sorted (key, child_index) pairs.
-    Node4 {
-        keys: Vec<u8>,
-        children: Vec<usize>,
-    },
+    Node4 { keys: Vec<u8>, children: Vec<usize> },
     /// 5–16 children: sorted (key, child_index) pairs.
-    Node16 {
-        keys: Vec<u8>,
-        children: Vec<usize>,
-    },
+    Node16 { keys: Vec<u8>, children: Vec<usize> },
     /// 17–48 children: index[byte] → slot, slots[slot] → child_index.
     /// index entries are 0xFF for unused bytes.
     Node48 {
@@ -77,9 +71,7 @@ enum InnerNode {
         count: usize,
     },
     /// 49–256 children: direct byte-indexed array.
-    Node256 {
-        children: Vec<Option<usize>>,
-    },
+    Node256 { children: Vec<Option<usize>> },
 }
 
 impl InnerNode {
@@ -96,11 +88,10 @@ impl InnerNode {
     fn find_child(&self, byte: u8) -> Option<usize> {
         match self {
             InnerNode::Empty => None,
-            InnerNode::Node4 { keys, children } | InnerNode::Node16 { keys, children } => {
-                keys.iter()
-                    .position(|&k| k == byte)
-                    .map(|pos| children[pos])
-            }
+            InnerNode::Node4 { keys, children } | InnerNode::Node16 { keys, children } => keys
+                .iter()
+                .position(|&k| k == byte)
+                .map(|pos| children[pos]),
             InnerNode::Node48 {
                 index, children, ..
             } => {
@@ -286,9 +277,11 @@ impl InnerNode {
     fn children_sorted(&self) -> Vec<(u8, usize)> {
         match self {
             InnerNode::Empty => Vec::new(),
-            InnerNode::Node4 { keys, children } | InnerNode::Node16 { keys, children } => {
-                keys.iter().zip(children.iter()).map(|(&k, &c)| (k, c)).collect()
-            }
+            InnerNode::Node4 { keys, children } | InnerNode::Node16 { keys, children } => keys
+                .iter()
+                .zip(children.iter())
+                .map(|(&k, &c)| (k, c))
+                .collect(),
             InnerNode::Node48 {
                 index, children, ..
             } => {
@@ -302,13 +295,11 @@ impl InnerNode {
                 }
                 result
             }
-            InnerNode::Node256 { children } => {
-                children
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(byte, c)| c.map(|idx| (byte as u8, idx)))
-                    .collect()
-            }
+            InnerNode::Node256 { children } => children
+                .iter()
+                .enumerate()
+                .filter_map(|(byte, c)| c.map(|idx| (byte as u8, idx)))
+                .collect(),
         }
     }
 }
@@ -459,7 +450,13 @@ impl<V> AdaptiveRadixTree<V> {
 
     // ── Internal: Recursive insert ─────────────────────────────────
 
-    fn insert_recursive(&mut self, node_idx: usize, key: &[u8], depth: usize, value: V) -> Option<V> {
+    fn insert_recursive(
+        &mut self,
+        node_idx: usize,
+        key: &[u8],
+        depth: usize,
+        value: V,
+    ) -> Option<V> {
         let prefix_len = self.nodes[node_idx].prefix.len();
 
         // Find mismatch point in prefix
@@ -521,7 +518,9 @@ impl<V> AdaptiveRadixTree<V> {
 
         // Update the current node: truncate prefix to mismatch point
         self.nodes[node_idx].prefix = old_prefix[..mismatch].to_vec();
-        self.nodes[node_idx].inner.insert_child(old_byte, old_child_idx);
+        self.nodes[node_idx]
+            .inner
+            .insert_child(old_byte, old_child_idx);
 
         let new_depth = depth + mismatch;
         if new_depth == key.len() {
@@ -531,7 +530,9 @@ impl<V> AdaptiveRadixTree<V> {
             let new_byte = key[new_depth];
             let new_suffix = key[new_depth + 1..].to_vec();
             let new_child_idx = self.alloc_node(new_suffix, Some(value));
-            self.nodes[node_idx].inner.insert_child(new_byte, new_child_idx);
+            self.nodes[node_idx]
+                .inner
+                .insert_child(new_byte, new_child_idx);
             self.nodes[node_idx].inner.maybe_grow();
         }
     }

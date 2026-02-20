@@ -17,7 +17,7 @@
 //! Bead: ft-t58vf, ft-283h4.51
 
 use frankenterm_core::work_stealing_deque::{
-    new_deque, new_deque_default, StealResult, WorkStealingPool, WsDequeConfig, WsDequeStats,
+    StealResult, WorkStealingPool, WsDequeConfig, WsDequeStats, new_deque, new_deque_default,
 };
 use proptest::prelude::*;
 

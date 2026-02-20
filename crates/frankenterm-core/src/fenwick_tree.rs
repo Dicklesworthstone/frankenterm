@@ -149,7 +149,11 @@ impl FenwickTree {
     ///
     /// Panics if `index >= len()`.
     pub fn update(&mut self, index: usize, delta: i64) {
-        assert!(index < self.n, "index {index} out of bounds for len {}", self.n);
+        assert!(
+            index < self.n,
+            "index {index} out of bounds for len {}",
+            self.n
+        );
         self.update_ops += 1;
         let mut i = index + 1; // convert to 1-based
         while i <= self.n {
@@ -180,7 +184,11 @@ impl FenwickTree {
     /// Panics if `index >= len()`.
     #[must_use]
     pub fn prefix_sum(&self, index: usize) -> i64 {
-        assert!(index < self.n, "index {index} out of bounds for len {}", self.n);
+        assert!(
+            index < self.n,
+            "index {index} out of bounds for len {}",
+            self.n
+        );
         self.prefix_sum_internal(index + 1)
     }
 
@@ -202,7 +210,11 @@ impl FenwickTree {
     #[must_use]
     pub fn range_sum(&self, left: usize, right: usize) -> i64 {
         assert!(left <= right, "left {left} > right {right}");
-        assert!(right < self.n, "right {right} out of bounds for len {}", self.n);
+        assert!(
+            right < self.n,
+            "right {right} out of bounds for len {}",
+            self.n
+        );
         // Increment query count (interior mutability not needed for stats).
         let right_sum = self.prefix_sum_internal(right + 1);
         if left == 0 {
@@ -221,7 +233,11 @@ impl FenwickTree {
     /// Panics if `index >= len()`.
     #[must_use]
     pub fn point_query(&self, index: usize) -> i64 {
-        assert!(index < self.n, "index {index} out of bounds for len {}", self.n);
+        assert!(
+            index < self.n,
+            "index {index} out of bounds for len {}",
+            self.n
+        );
         if index == 0 {
             self.prefix_sum_internal(1)
         } else {
@@ -479,13 +495,13 @@ mod tests {
         ft.update(4, 2);
 
         // prefix sums: [3, 3, 10, 10, 12]
-        assert_eq!(ft.find_kth(1), Some(0));   // first index with prefix >= 1
-        assert_eq!(ft.find_kth(3), Some(0));   // prefix_sum(0) = 3 >= 3
-        assert_eq!(ft.find_kth(4), Some(2));   // prefix_sum(2) = 10 >= 4
-        assert_eq!(ft.find_kth(10), Some(2));  // prefix_sum(2) = 10 >= 10
-        assert_eq!(ft.find_kth(11), Some(4));  // prefix_sum(4) = 12 >= 11
-        assert_eq!(ft.find_kth(12), Some(4));  // prefix_sum(4) = 12 >= 12
-        assert_eq!(ft.find_kth(13), None);     // total = 12 < 13
+        assert_eq!(ft.find_kth(1), Some(0)); // first index with prefix >= 1
+        assert_eq!(ft.find_kth(3), Some(0)); // prefix_sum(0) = 3 >= 3
+        assert_eq!(ft.find_kth(4), Some(2)); // prefix_sum(2) = 10 >= 4
+        assert_eq!(ft.find_kth(10), Some(2)); // prefix_sum(2) = 10 >= 10
+        assert_eq!(ft.find_kth(11), Some(4)); // prefix_sum(4) = 12 >= 11
+        assert_eq!(ft.find_kth(12), Some(4)); // prefix_sum(4) = 12 >= 12
+        assert_eq!(ft.find_kth(13), None); // total = 12 < 13
     }
 
     #[test]

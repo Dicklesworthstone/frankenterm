@@ -278,13 +278,7 @@ impl WaveletTree {
         self.quantile_internal(self.root?, lo, hi, k)
     }
 
-    fn quantile_internal(
-        &self,
-        node_idx: usize,
-        lo: usize,
-        hi: usize,
-        k: usize,
-    ) -> Option<u8> {
+    fn quantile_internal(&self, node_idx: usize, lo: usize, hi: usize, k: usize) -> Option<u8> {
         let node = &self.nodes[node_idx];
 
         if node.lo == node.hi {
@@ -537,7 +531,14 @@ mod tests {
             let mut prev = 0;
             for pos in 0..=data.len() {
                 let r = wt.rank(symbol, pos);
-                assert!(r >= prev, "rank({}, {}) = {} < prev {}", symbol, pos, r, prev);
+                assert!(
+                    r >= prev,
+                    "rank({}, {}) = {} < prev {}",
+                    symbol,
+                    pos,
+                    r,
+                    prev
+                );
                 prev = r;
             }
         }
@@ -556,7 +557,10 @@ mod tests {
                     wt.rank(symbol, pos + 1),
                     n,
                     "select({}, {}) = {}, but rank at pos+1 != {}",
-                    symbol as char, n, pos, n,
+                    symbol as char,
+                    n,
+                    pos,
+                    n,
                 );
             }
         }
@@ -643,8 +647,16 @@ mod tests {
         let data = b"aabbccdd";
         let wt = WaveletTree::new(data);
         let freqs = wt.range_frequencies(2, 6); // "bbcc"
-        let b_count = freqs.iter().find(|&&(b, _)| b == b'b').map(|&(_, c)| c).unwrap_or(0);
-        let c_count = freqs.iter().find(|&&(b, _)| b == b'c').map(|&(_, c)| c).unwrap_or(0);
+        let b_count = freqs
+            .iter()
+            .find(|&&(b, _)| b == b'b')
+            .map(|&(_, c)| c)
+            .unwrap_or(0);
+        let c_count = freqs
+            .iter()
+            .find(|&&(b, _)| b == b'c')
+            .map(|&(_, c)| c)
+            .unwrap_or(0);
         assert_eq!(b_count, 2);
         assert_eq!(c_count, 2);
         assert_eq!(freqs.len(), 2); // only 'b' and 'c'

@@ -406,7 +406,7 @@ mod tests {
     #[test]
     fn embedding_all_zeros_for_too_short_input() {
         let emb = HashEmbedder::new(64); // default ngram (3,4)
-                                         // Inputs shorter than min ngram produce zero vectors
+        // Inputs shorter than min ngram produce zero vectors
         for text in ["", "a", "ab"] {
             let v = emb.embed(text).unwrap();
             assert!(

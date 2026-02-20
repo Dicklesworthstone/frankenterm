@@ -356,7 +356,7 @@ impl<T> WorkStealingPool<T> {
         for stealer in &self.stealers[worker_id] {
             match stealer.steal() {
                 StealResult::Success(item) => return StealResult::Success(item),
-                StealResult::Retry | StealResult::Empty => {},
+                StealResult::Retry | StealResult::Empty => {}
             }
         }
         StealResult::Empty
@@ -364,7 +364,8 @@ impl<T> WorkStealingPool<T> {
 
     /// Pop from own deque, or steal from others if empty.
     pub fn pop_or_steal(&self, worker_id: usize) -> Option<T> {
-        self.pop(worker_id).or_else(|| self.steal(worker_id).into_option())
+        self.pop(worker_id)
+            .or_else(|| self.steal(worker_id).into_option())
     }
 
     /// Get total stats across all workers.
@@ -564,7 +565,9 @@ mod tests {
 
     #[test]
     fn config_serde() {
-        let config = WsDequeConfig { initial_capacity: 128 };
+        let config = WsDequeConfig {
+            initial_capacity: 128,
+        };
         let json = serde_json::to_string(&config).unwrap();
         let back: WsDequeConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, back);
@@ -943,8 +946,8 @@ mod tests {
         }
         let stats = pool.stats();
         assert_eq!(stats.total_pushed, 15); // 3 per round * 5
-        assert_eq!(stats.total_popped, 5);  // 1 pop per round
-        assert_eq!(stats.total_stolen, 5);  // 1 steal per round
+        assert_eq!(stats.total_popped, 5); // 1 pop per round
+        assert_eq!(stats.total_stolen, 5); // 1 steal per round
     }
 
     #[test]
@@ -1030,32 +1033,64 @@ mod tests {
 
     #[test]
     fn config_equality() {
-        let c1 = WsDequeConfig { initial_capacity: 32 };
-        let c2 = WsDequeConfig { initial_capacity: 32 };
-        let c3 = WsDequeConfig { initial_capacity: 64 };
+        let c1 = WsDequeConfig {
+            initial_capacity: 32,
+        };
+        let c2 = WsDequeConfig {
+            initial_capacity: 32,
+        };
+        let c3 = WsDequeConfig {
+            initial_capacity: 64,
+        };
         assert_eq!(c1, c2);
         assert_ne!(c1, c3);
     }
 
     #[test]
     fn stats_equality() {
-        let s1 = WsDequeStats { len: 1, total_pushed: 2, total_popped: 3, total_stolen: 4, steal_failures: 5 };
-        let s2 = WsDequeStats { len: 1, total_pushed: 2, total_popped: 3, total_stolen: 4, steal_failures: 5 };
-        let s3 = WsDequeStats { len: 0, total_pushed: 2, total_popped: 3, total_stolen: 4, steal_failures: 5 };
+        let s1 = WsDequeStats {
+            len: 1,
+            total_pushed: 2,
+            total_popped: 3,
+            total_stolen: 4,
+            steal_failures: 5,
+        };
+        let s2 = WsDequeStats {
+            len: 1,
+            total_pushed: 2,
+            total_popped: 3,
+            total_stolen: 4,
+            steal_failures: 5,
+        };
+        let s3 = WsDequeStats {
+            len: 0,
+            total_pushed: 2,
+            total_popped: 3,
+            total_stolen: 4,
+            steal_failures: 5,
+        };
         assert_eq!(s1, s2);
         assert_ne!(s1, s3);
     }
 
     #[test]
     fn config_debug_format() {
-        let config = WsDequeConfig { initial_capacity: 64 };
+        let config = WsDequeConfig {
+            initial_capacity: 64,
+        };
         let debug = format!("{:?}", config);
         assert!(debug.contains("64"));
     }
 
     #[test]
     fn stats_debug_format() {
-        let stats = WsDequeStats { len: 5, total_pushed: 10, total_popped: 3, total_stolen: 2, steal_failures: 0 };
+        let stats = WsDequeStats {
+            len: 5,
+            total_pushed: 10,
+            total_popped: 3,
+            total_stolen: 2,
+            steal_failures: 0,
+        };
         let debug = format!("{:?}", stats);
         assert!(debug.contains("total_pushed"));
         assert!(debug.contains("10"));

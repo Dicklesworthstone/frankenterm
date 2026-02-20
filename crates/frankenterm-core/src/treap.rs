@@ -136,7 +136,8 @@ impl<K: Ord + Clone, V> Treap<K, V> {
 
     /// Look up a value by key.
     pub fn get(&self, key: &K) -> Option<&V> {
-        self.find_node(self.root, key).map(|idx| &self.nodes[idx].value)
+        self.find_node(self.root, key)
+            .map(|idx| &self.nodes[idx].value)
     }
 
     /// Check if a key exists.
@@ -177,11 +178,7 @@ impl<K: Ord + Clone, V> Treap<K, V> {
     /// Get the maximum key-value pair.
     pub fn max(&self) -> Option<(&K, &V)> {
         let len = self.len();
-        if len == 0 {
-            None
-        } else {
-            self.kth(len - 1)
-        }
+        if len == 0 { None } else { self.kth(len - 1) }
     }
 
     /// Collect all key-value pairs in sorted order.
@@ -289,9 +286,7 @@ impl<K: Ord + Clone, V> Treap<K, V> {
         match k.cmp(&left_size) {
             std::cmp::Ordering::Less => self.kth_node(self.nodes[idx].left, k),
             std::cmp::Ordering::Equal => Some((&self.nodes[idx].key, &self.nodes[idx].value)),
-            std::cmp::Ordering::Greater => {
-                self.kth_node(self.nodes[idx].right, k - left_size - 1)
-            }
+            std::cmp::Ordering::Greater => self.kth_node(self.nodes[idx].right, k - left_size - 1),
         }
     }
 
@@ -302,8 +297,7 @@ impl<K: Ord + Clone, V> Treap<K, V> {
             std::cmp::Ordering::Less => self.rank_of(self.nodes[idx].left, key),
             std::cmp::Ordering::Equal => self.node_size(self.nodes[idx].left),
             std::cmp::Ordering::Greater => {
-                1 + self.node_size(self.nodes[idx].left)
-                    + self.rank_of(self.nodes[idx].right, key)
+                1 + self.node_size(self.nodes[idx].left) + self.rank_of(self.nodes[idx].right, key)
             }
         }
     }
@@ -838,7 +832,11 @@ mod tests {
         for i in [5, 3, 8, 1, 4, 7, 9, 2, 6] {
             treap.insert(i, i * 10);
         }
-        let sorted: Vec<(i32, i32)> = treap.to_sorted_vec().iter().map(|&(&k, &v)| (k, v)).collect();
+        let sorted: Vec<(i32, i32)> = treap
+            .to_sorted_vec()
+            .iter()
+            .map(|&(&k, &v)| (k, v))
+            .collect();
         let expected: Vec<(i32, i32)> = (1..=9).map(|i| (i, i * 10)).collect();
         assert_eq!(sorted, expected);
     }

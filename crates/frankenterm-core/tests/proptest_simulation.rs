@@ -7,9 +7,8 @@
 //! `flame_samples`/`stage_summary` structural invariants.
 
 use frankenterm_core::simulation::{
-    EventAction, FontAtlasCachePolicy, FontRenderPrepMetrics, ResizeQueueMetrics,
-    ResizeTimeline, ResizeTimelineEvent, ResizeTimelineFlameSample, ResizeTimelineStage,
-    ResizeTimelineStageSample,
+    EventAction, FontAtlasCachePolicy, FontRenderPrepMetrics, ResizeQueueMetrics, ResizeTimeline,
+    ResizeTimelineEvent, ResizeTimelineFlameSample, ResizeTimelineStage, ResizeTimelineStageSample,
 };
 use proptest::prelude::*;
 

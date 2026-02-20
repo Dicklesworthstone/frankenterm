@@ -43,10 +43,7 @@ impl VanEmdeBoas {
     /// Panics if `universe_size` is 0 or exceeds 1_048_576 (2^20).
     pub fn new(universe_size: usize) -> Self {
         assert!(universe_size > 0, "universe size must be positive");
-        assert!(
-            universe_size <= 1_048_576,
-            "universe size must be <= 2^20"
-        );
+        assert!(universe_size <= 1_048_576, "universe size must be <= 2^20");
         let num_words = universe_size.div_ceil(64);
         Self {
             universe: universe_size,

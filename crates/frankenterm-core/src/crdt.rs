@@ -93,7 +93,9 @@ impl GCounter {
 
     /// Get the global counter value (sum of all replicas).
     pub fn value(&self) -> u64 {
-        self.counts.values().fold(0u64, |acc, v| acc.saturating_add(*v))
+        self.counts
+            .values()
+            .fold(0u64, |acc, v| acc.saturating_add(*v))
     }
 
     /// Get this replica's local count.
@@ -310,9 +312,7 @@ impl<T: Ord + Clone + Hash> OrSet<T> {
 
     /// Check if element is in the set (has at least one tag).
     pub fn contains(&self, item: &T) -> bool {
-        self.entries
-            .get(item)
-            .is_some_and(|tags| !tags.is_empty())
+        self.entries.get(item).is_some_and(|tags| !tags.is_empty())
     }
 
     /// Number of distinct elements.
@@ -557,9 +557,10 @@ impl<T: Clone + Eq + Ord> MvRegister<T> {
         // (componentwise) and A ≠ B
         let mut kept = Vec::new();
         for (i, entry) in all_entries.iter().enumerate() {
-            let dominated = all_entries.iter().enumerate().any(|(j, other_entry)| {
-                i != j && vv_dominates(&other_entry.vv, &entry.vv)
-            });
+            let dominated = all_entries
+                .iter()
+                .enumerate()
+                .any(|(j, other_entry)| i != j && vv_dominates(&other_entry.vv, &entry.vv));
             if !dominated {
                 kept.push(entry.clone());
             }

@@ -183,9 +183,7 @@ impl XorFilter {
 
         for attempt in 0..max_attempts {
             let seed = murmur_mix(attempt as u64 ^ 0x123456789abcdef0);
-            if let Some(fingerprints) =
-                try_build_8bit(&unique_keys, seed, block_length, total)
-            {
+            if let Some(fingerprints) = try_build_8bit(&unique_keys, seed, block_length, total) {
                 return Some(Self {
                     fingerprints,
                     seed,
@@ -357,9 +355,7 @@ impl XorFilter16 {
 
         for attempt in 0..max_attempts {
             let seed = murmur_mix(attempt as u64 ^ 0x123456789abcdef0);
-            if let Some(fingerprints) =
-                try_build_16bit(&unique_keys, seed, block_length, total)
-            {
+            if let Some(fingerprints) = try_build_16bit(&unique_keys, seed, block_length, total) {
                 return Some(Self {
                     fingerprints,
                     seed,
@@ -489,12 +485,7 @@ pub struct XorFilterStats {
 
 // ── Internal construction (8-bit) ──────────────────────────────────────
 
-fn try_build_8bit(
-    keys: &[u64],
-    seed: u64,
-    block_length: usize,
-    total: usize,
-) -> Option<Vec<u8>> {
+fn try_build_8bit(keys: &[u64], seed: u64, block_length: usize, total: usize) -> Option<Vec<u8>> {
     let n = keys.len();
 
     let mut h0s = Vec::with_capacity(n);
@@ -559,9 +550,8 @@ fn try_build_8bit(
     for &(key_idx, pos) in order.iter().rev() {
         let key = keys[key_idx];
         let fp = fingerprint8(key, seed);
-        let xor_val = fingerprints[h0s[key_idx]]
-            ^ fingerprints[h1s[key_idx]]
-            ^ fingerprints[h2s[key_idx]];
+        let xor_val =
+            fingerprints[h0s[key_idx]] ^ fingerprints[h1s[key_idx]] ^ fingerprints[h2s[key_idx]];
         fingerprints[pos] = fp ^ xor_val;
     }
 
@@ -570,12 +560,7 @@ fn try_build_8bit(
 
 // ── Internal construction (16-bit) ─────────────────────────────────────
 
-fn try_build_16bit(
-    keys: &[u64],
-    seed: u64,
-    block_length: usize,
-    total: usize,
-) -> Option<Vec<u16>> {
+fn try_build_16bit(keys: &[u64], seed: u64, block_length: usize, total: usize) -> Option<Vec<u16>> {
     let n = keys.len();
 
     let mut h0s = Vec::with_capacity(n);
@@ -638,9 +623,8 @@ fn try_build_16bit(
     for &(key_idx, pos) in order.iter().rev() {
         let key = keys[key_idx];
         let fp = fingerprint16(key, seed);
-        let xor_val = fingerprints[h0s[key_idx]]
-            ^ fingerprints[h1s[key_idx]]
-            ^ fingerprints[h2s[key_idx]];
+        let xor_val =
+            fingerprints[h0s[key_idx]] ^ fingerprints[h1s[key_idx]] ^ fingerprints[h2s[key_idx]];
         fingerprints[pos] = fp ^ xor_val;
     }
 
@@ -719,7 +703,11 @@ mod tests {
         let keys: Vec<u64> = (0..60).map(|i| 1u64 << i).collect();
         let filter = XorFilter::build(&keys).unwrap();
         for &k in &keys {
-            assert!(filter.contains(k), "false negative for 2^{}", k.trailing_zeros());
+            assert!(
+                filter.contains(k),
+                "false negative for 2^{}",
+                k.trailing_zeros()
+            );
         }
     }
 
@@ -741,10 +729,7 @@ mod tests {
         let filter = XorFilter::build(&keys).unwrap();
 
         let test_range = 1000..10000u64;
-        let fp_count = test_range
-            .clone()
-            .filter(|k| filter.contains(*k))
-            .count();
+        let fp_count = test_range.clone().filter(|k| filter.contains(*k)).count();
         let fp_rate = fp_count as f64 / (test_range.end - test_range.start) as f64;
         assert!(
             fp_rate < 0.02,
@@ -810,7 +795,11 @@ mod tests {
         let refs: Vec<&[u8]> = items.iter().map(|v| v.as_slice()).collect();
         let filter = XorFilter::from_bytes(&refs).unwrap();
         for item in &items {
-            assert!(filter.contains_bytes(item), "false negative for {:?}", String::from_utf8_lossy(item));
+            assert!(
+                filter.contains_bytes(item),
+                "false negative for {:?}",
+                String::from_utf8_lossy(item)
+            );
         }
     }
 
@@ -915,10 +904,7 @@ mod tests {
 
         let rate = fp as f64 / test_count as f64;
         // 16-bit FP ≈ 1/65535 ≈ 0.000015. Allow generous tolerance.
-        assert!(
-            rate < 0.001,
-            "16-bit FP rate {rate:.6} exceeds tolerance"
-        );
+        assert!(rate < 0.001, "16-bit FP rate {rate:.6} exceeds tolerance");
     }
 
     #[test]

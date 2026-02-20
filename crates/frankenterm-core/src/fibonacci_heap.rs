@@ -277,8 +277,7 @@ impl<K: Ord + Clone, V: Clone> FibonacciHeap<K, V> {
         }
 
         self.count += other.count;
-        self.free
-            .extend(other.free.iter().map(|&f| f + offset));
+        self.free.extend(other.free.iter().map(|&f| f + offset));
 
         other.nodes.clear();
         other.min = None;

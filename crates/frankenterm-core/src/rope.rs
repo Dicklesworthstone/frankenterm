@@ -40,9 +40,7 @@ const LEAF_MAX: usize = 512;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum RopeNode {
     /// Leaf node containing a string chunk.
-    Leaf {
-        text: String,
-    },
+    Leaf { text: String },
     /// Branch node with cached weight (left subtree length).
     Branch {
         left: usize,

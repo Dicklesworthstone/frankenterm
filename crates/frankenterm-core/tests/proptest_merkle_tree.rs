@@ -29,8 +29,7 @@ fn arb_tree(max_entries: usize) -> impl Strategy<Value = MerkleTree> {
 }
 
 fn arb_nonempty_tree(max_entries: usize) -> impl Strategy<Value = MerkleTree> {
-    prop::collection::vec(arb_entry(), 1..max_entries)
-        .prop_map(MerkleTree::from_entries)
+    prop::collection::vec(arb_entry(), 1..max_entries).prop_map(MerkleTree::from_entries)
 }
 
 // ── Hash properties ─────────────────────────────────────────────────

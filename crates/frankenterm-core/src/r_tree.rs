@@ -205,12 +205,7 @@ impl<V: Clone> RTree<V> {
         self.count += 1;
     }
 
-    fn insert_recursive(
-        &mut self,
-        node_idx: usize,
-        rect: Rect,
-        value: V,
-    ) -> Option<(usize, Rect)> {
+    fn insert_recursive(&mut self, node_idx: usize, rect: Rect, value: V) -> Option<(usize, Rect)> {
         if self.nodes[node_idx].is_leaf {
             self.nodes[node_idx].entries.push((rect, value));
             self.update_mbr(node_idx);
@@ -430,9 +425,8 @@ impl<V: Clone> RTree<V> {
                 .iter()
                 .map(|&c| (c, self.nodes[c].mbr.min_distance(x, y)))
                 .collect();
-            children_with_dist.sort_by(|a, b| {
-                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            children_with_dist
+                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
             for (child, min_dist) in children_with_dist {
                 if min_dist >= *best_dist {
@@ -452,11 +446,7 @@ impl<V: Clone> RTree<V> {
         result
     }
 
-    fn collect_entries<'a>(
-        &'a self,
-        node_idx: usize,
-        out: &mut Vec<(&'a Rect, &'a V)>,
-    ) {
+    fn collect_entries<'a>(&'a self, node_idx: usize, out: &mut Vec<(&'a Rect, &'a V)>) {
         let node = &self.nodes[node_idx];
         if node.is_leaf {
             for (rect, value) in &node.entries {
@@ -783,10 +773,7 @@ mod tests {
         // Insert more than MAX_ENTRIES to force splits
         let mut tree = RTree::new();
         for i in 0..20 {
-            tree.insert(
-                Rect::new(i as f64, 0.0, i as f64 + 1.0, 1.0),
-                i,
-            );
+            tree.insert(Rect::new(i as f64, 0.0, i as f64 + 1.0, 1.0), i);
         }
         assert_eq!(tree.len(), 20);
 

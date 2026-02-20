@@ -97,7 +97,9 @@ pub struct DisjointIntervalsConfig {
 
 impl Default for DisjointIntervalsConfig {
     fn default() -> Self {
-        Self { merge_adjacent: true }
+        Self {
+            merge_adjacent: true,
+        }
     }
 }
 
@@ -360,8 +362,7 @@ impl DisjointIntervals {
     /// Approximate memory usage.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.intervals.capacity() * std::mem::size_of::<Interval>()
+        std::mem::size_of::<Self>() + self.intervals.capacity() * std::mem::size_of::<Interval>()
     }
 }
 
@@ -579,7 +580,9 @@ mod tests {
 
     #[test]
     fn test_config_serde() {
-        let config = DisjointIntervalsConfig { merge_adjacent: false };
+        let config = DisjointIntervalsConfig {
+            merge_adjacent: false,
+        };
         let json = serde_json::to_string(&config).unwrap();
         let back: DisjointIntervalsConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, back);
@@ -657,7 +660,9 @@ mod tests {
 
     #[test]
     fn from_config_merge_adjacent_false() {
-        let config = DisjointIntervalsConfig { merge_adjacent: false };
+        let config = DisjointIntervalsConfig {
+            merge_adjacent: false,
+        };
         let mut di = DisjointIntervals::from_config(&config);
         di.insert(1, 5);
         di.insert(5, 8); // adjacent but shouldn't merge
@@ -668,7 +673,9 @@ mod tests {
 
     #[test]
     fn from_config_merge_adjacent_false_overlapping_still_merges() {
-        let config = DisjointIntervalsConfig { merge_adjacent: false };
+        let config = DisjointIntervalsConfig {
+            merge_adjacent: false,
+        };
         let mut di = DisjointIntervals::from_config(&config);
         di.insert(1, 6);
         di.insert(5, 8); // overlapping should still merge
@@ -831,7 +838,10 @@ mod tests {
         let a = Interval::new(0, 5);
         let b = Interval::new(5, 10); // adjacent
         assert!(!a.overlaps(&b), "adjacent should not strictly overlap");
-        assert!(a.overlaps_or_adjacent(&b), "adjacent should overlap-or-adjacent");
+        assert!(
+            a.overlaps_or_adjacent(&b),
+            "adjacent should overlap-or-adjacent"
+        );
 
         let c = Interval::new(4, 10); // overlapping
         assert!(a.overlaps(&c));
