@@ -23,10 +23,11 @@
 //! - Sleep non-negative: always completes (never panics)
 
 use proptest::prelude::*;
+use std::sync::Arc;
 use std::time::Duration;
 
 use frankenterm_core::runtime_compat::{
-    self, CompatRuntime, Mutex, RuntimeBuilder, RwLock, Semaphore, broadcast, mpsc, watch,
+    self, CompatRuntime, Mutex, RuntimeBuilder, RwLock, Semaphore, broadcast, mpsc, notify, watch,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -1095,6 +1096,168 @@ proptest! {
                 runtime_compat::task::yield_now().await;
             }
             assert_eq!(counter, n, "yield must not lose increments");
+        });
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Composite multi-primitive properties
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// spawn_blocking + join!: blocking computation and async work run concurrently.
+    #[test]
+    fn spawn_blocking_with_join(a in 0u64..100, b in 0u64..100) {
+        with_tokio(move || async move {
+            let blocking_handle = runtime_compat::task::spawn_blocking(move || {
+                (0..a).sum::<u64>()
+            });
+            let (blocking_result, async_result) = runtime_compat::join!(
+                async { blocking_handle.await.expect("blocking join") },
+                async { (0..b).sum::<u64>() }
+            );
+            let expected_a: u64 = (0..a).sum();
+            let expected_b: u64 = (0..b).sum();
+            assert_eq!(blocking_result, expected_a, "blocking arm");
+            assert_eq!(async_result, expected_b, "async arm");
+        });
+    }
+
+    /// select! with channel + timeout: value arrives before timeout.
+    #[test]
+    fn select_channel_before_timeout(val in any::<u64>()) {
+        with_tokio(move || async move {
+            let (tx, mut rx) = mpsc::channel(1);
+            // Send immediately so channel is ready before timeout.
+            tx.send(val).await.expect("send");
+            let result = runtime_compat::select! {
+                v = rx.recv() => v.unwrap_or(0),
+                () = runtime_compat::sleep(Duration::from_secs(60)) => u64::MAX,
+            };
+            assert_eq!(result, val, "channel should resolve before timeout");
+        });
+    }
+
+    /// Mutex + spawn: concurrent tasks safely accumulate into shared state.
+    #[test]
+    fn mutex_concurrent_spawn_accumulation(n in 1usize..20) {
+        with_tokio(move || async move {
+            let shared = Arc::new(Mutex::new(0u64));
+            let mut handles = Vec::new();
+            for _ in 0..n {
+                let m = shared.clone();
+                handles.push(runtime_compat::task::spawn(async move {
+                    let mut guard = m.lock().await;
+                    *guard += 1;
+                }));
+            }
+            for h in handles {
+                h.await.expect("task");
+            }
+            let final_val = *shared.lock().await;
+            assert_eq!(final_val, n as u64, "all spawned tasks must increment");
+        });
+    }
+
+    /// Channel fan-in: multiple senders, single receiver collects all values.
+    #[test]
+    fn channel_fan_in_collects_all(vals in proptest::collection::vec(any::<i32>(), 1..20)) {
+        with_tokio(move || async move {
+            let (tx, mut rx) = mpsc::channel(vals.len() + 1);
+            for v in &vals {
+                let tx_clone = tx.clone();
+                let v = *v;
+                runtime_compat::task::spawn(async move {
+                    tx_clone.send(v).await.expect("send");
+                });
+            }
+            drop(tx); // Drop original sender so rx completes.
+            let mut received = Vec::new();
+            while let Some(v) = runtime_compat::mpsc_recv_option(&mut rx).await {
+                received.push(v);
+            }
+            received.sort();
+            let mut expected = vals.clone();
+            expected.sort();
+            assert_eq!(received, expected, "fan-in must collect all values");
+        });
+    }
+
+    /// Semaphore + spawn: bounded concurrency with N permits.
+    #[test]
+    fn semaphore_bounds_concurrency(permits in 1usize..5, tasks in 2usize..10) {
+        with_tokio(move || async move {
+            let sem = Arc::new(Semaphore::new(permits));
+            let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let mut handles = Vec::new();
+            for _ in 0..tasks {
+                let s = sem.clone();
+                let c = completed.clone();
+                handles.push(runtime_compat::task::spawn(async move {
+                    let _permit = s.acquire().await.unwrap();
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    runtime_compat::task::yield_now().await;
+                }));
+            }
+            for h in handles {
+                h.await.expect("task");
+            }
+            let total = completed.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(total, tasks as u64, "all tasks must complete");
+        });
+    }
+
+    /// Watch + select!: latest value observed when combined with timeout.
+    #[test]
+    fn watch_latest_via_select(vals in proptest::collection::vec(1i32..1000, 1..10)) {
+        with_tokio(move || async move {
+            let (tx, mut rx) = runtime_compat::watch::channel(0i32);
+            for v in &vals {
+                tx.send(*v).expect("send");
+            }
+            // select! should immediately see the latest value.
+            let result = runtime_compat::select! {
+                _ = rx.changed() => *rx.borrow(),
+                () = runtime_compat::sleep(Duration::from_secs(60)) => -1,
+            };
+            let last = *vals.last().unwrap();
+            assert_eq!(result, last, "watch should reflect latest sent value");
+        });
+    }
+
+    /// spawn_blocking inside select!: blocking work completes before timeout.
+    #[test]
+    fn select_spawn_blocking_before_timeout(val in any::<i64>()) {
+        with_tokio(move || async move {
+            let result = runtime_compat::select! {
+                v = async {
+                    runtime_compat::task::spawn_blocking(move || val)
+                        .await
+                        .expect("blocking join")
+                } => v,
+                () = runtime_compat::sleep(Duration::from_secs(60)) => i64::MIN,
+            };
+            assert_eq!(result, val, "blocking task should complete before timeout");
+        });
+    }
+
+    /// Notify + spawn: notified task resumes and produces correct value.
+    #[test]
+    fn notify_resumes_waiting_task(val in any::<u32>()) {
+        with_tokio(move || async move {
+            let notify = Arc::new(notify::Notify::new());
+            let n = notify.clone();
+            let handle = runtime_compat::task::spawn(async move {
+                n.notified().await;
+                val
+            });
+            // Give the spawned task a chance to park.
+            runtime_compat::task::yield_now().await;
+            notify.notify_one();
+            let result = handle.await.expect("task");
+            assert_eq!(result, val, "notified task must produce correct value");
         });
     }
 }
