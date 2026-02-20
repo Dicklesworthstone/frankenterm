@@ -21,7 +21,9 @@
 use proptest::prelude::*;
 
 use frankenterm_core::survival::{
-    Covariates, HazardAction, Observation, SurvivalConfig, SurvivalModel, WeibullParams,
+    ActivityProfile, Covariates, HazardAction, HazardForecastPoint, HazardReport, Observation,
+    RestartMode, RestartRecommendation, RestartScoreBreakdown, RestartScheduler,
+    RestartSchedulerConfig, RiskFactor, SurvivalConfig, SurvivalModel, WeibullParams,
 };
 
 // =============================================================================
@@ -885,5 +887,494 @@ proptest! {
         // With zero betas, exp(β·X) = exp(0) = 1, so hazard = baseline.
         prop_assert!((full - baseline).abs() < 1e-10,
             "zero-beta hazard should equal baseline: {} vs {}", full, baseline);
+    }
+}
+
+// =============================================================================
+// Strategies for restart scheduling types
+// =============================================================================
+
+fn arb_risk_factor() -> impl Strategy<Value = RiskFactor> {
+    (
+        prop_oneof![
+            Just("rss_gb".to_string()),
+            Just("pane_count".to_string()),
+            Just("output_rate_mbps".to_string()),
+            Just("uptime_hours".to_string()),
+            Just("conn_error_rate".to_string()),
+        ],
+        0.0_f64..100.0,
+        -2.0_f64..2.0,
+        -5.0_f64..5.0,
+        0.0_f64..1.0,
+    )
+        .prop_map(|(name, value, coefficient, contribution, risk_fraction)| RiskFactor {
+            name,
+            value,
+            coefficient,
+            contribution,
+            risk_fraction,
+        })
+}
+
+fn arb_hazard_action() -> impl Strategy<Value = HazardAction> {
+    prop_oneof![
+        Just(HazardAction::None),
+        Just(HazardAction::IncreaseSnapshotFrequency),
+        Just(HazardAction::ImmediateSnapshot),
+        Just(HazardAction::AlertAndPrepareRestart),
+    ]
+}
+
+fn arb_hazard_report() -> impl Strategy<Value = HazardReport> {
+    (
+        any::<u64>(),
+        0.0_f64..10.0,
+        0.0_f64..1.0,
+        0.0_f64..1.0,
+        arb_hazard_action(),
+        prop::collection::vec(arb_risk_factor(), 0..6),
+        arb_params(),
+        any::<bool>(),
+        0_usize..1000,
+    )
+        .prop_map(
+            |(ts, hazard, surv, fail, action, factors, params, warmup, obs)| HazardReport {
+                timestamp_secs: ts,
+                hazard_rate: hazard,
+                survival_probability: surv,
+                failure_probability: fail,
+                action,
+                risk_factors: factors,
+                params,
+                in_warmup: warmup,
+                observation_count: obs,
+            },
+        )
+}
+
+fn arb_restart_mode() -> impl Strategy<Value = RestartMode> {
+    prop_oneof![
+        (0.0_f64..1.0).prop_map(|s| RestartMode::Automatic { min_score: s }),
+        Just(RestartMode::Advisory),
+        Just(RestartMode::Manual),
+    ]
+}
+
+fn arb_restart_config() -> impl Strategy<Value = RestartSchedulerConfig> {
+    (
+        arb_restart_mode(),
+        0.1_f64..2.0,
+        1.0_f64..20.0,
+        1.0_f64..48.0,
+        60_u32..2880,
+        0.01_f64..0.99,
+        0.0_f64..1.0,
+        any::<bool>(),
+        5_u32..120,
+    )
+        .prop_map(
+            |(mode, threshold, steepness, cooldown, horizon, alpha, default_act, snapshot, warning)| {
+                RestartSchedulerConfig {
+                    mode,
+                    hazard_threshold: threshold,
+                    urgency_steepness: steepness,
+                    cooldown_hours: cooldown,
+                    schedule_horizon_minutes: horizon,
+                    activity_ewma_alpha: alpha,
+                    default_activity: default_act,
+                    pre_restart_snapshot: snapshot,
+                    advance_warning_minutes: warning,
+                }
+            },
+        )
+}
+
+fn arb_forecast_point() -> impl Strategy<Value = HazardForecastPoint> {
+    (0_u32..2880, 0.0_f64..10.0, proptest::option::of(0.0_f64..1.0)).prop_map(
+        |(offset, hazard, activity)| HazardForecastPoint {
+            offset_minutes: offset,
+            hazard_rate: hazard,
+            predicted_activity: activity,
+        },
+    )
+}
+
+fn arb_score_breakdown() -> impl Strategy<Value = RestartScoreBreakdown> {
+    (0.0_f64..1.0, 0.0_f64..1.0, 0.0_f64..1.0, 0.0_f64..1.0).prop_map(
+        |(urgency, activity, recency, score)| RestartScoreBreakdown {
+            hazard_urgency: urgency,
+            activity_minimum: activity,
+            recency_penalty: recency,
+            score,
+        },
+    )
+}
+
+fn arb_recommendation() -> impl Strategy<Value = RestartRecommendation> {
+    (
+        any::<u64>(),
+        0_u32..2880,
+        0.0_f64..10.0,
+        0.0_f64..1.0,
+        arb_score_breakdown(),
+        any::<bool>(),
+        proptest::option::of(any::<u64>()),
+        proptest::option::of(any::<u64>()),
+    )
+        .prop_map(
+            |(epoch, offset, hazard, activity, breakdown, auto_exec, warning, snapshot)| {
+                RestartRecommendation {
+                    scheduled_for_epoch_secs: epoch,
+                    offset_minutes: offset,
+                    hazard_rate: hazard,
+                    predicted_activity: activity,
+                    breakdown,
+                    should_execute_automatically: auto_exec,
+                    warning_epoch_secs: warning,
+                    snapshot_epoch_secs: snapshot,
+                }
+            },
+        )
+}
+
+// =============================================================================
+// RiskFactor serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_risk_factor_serde_roundtrip(rf in arb_risk_factor()) {
+        let json = serde_json::to_string(&rf).unwrap();
+        let back: RiskFactor = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &rf.name);
+        prop_assert!((back.value - rf.value).abs() < 1e-10, "value mismatch");
+        prop_assert!((back.coefficient - rf.coefficient).abs() < 1e-10, "coefficient mismatch");
+    }
+
+    #[test]
+    fn prop_risk_factor_json_has_name(rf in arb_risk_factor()) {
+        let json = serde_json::to_string(&rf).unwrap();
+        prop_assert!(json.contains("\"name\""));
+    }
+}
+
+// =============================================================================
+// HazardReport serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_hazard_report_serde_roundtrip(report in arb_hazard_report()) {
+        let json = serde_json::to_string(&report).unwrap();
+        let back: HazardReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.timestamp_secs, report.timestamp_secs);
+        prop_assert_eq!(back.action, report.action);
+        prop_assert_eq!(back.in_warmup, report.in_warmup);
+        prop_assert_eq!(back.observation_count, report.observation_count);
+        prop_assert_eq!(back.risk_factors.len(), report.risk_factors.len());
+    }
+
+    #[test]
+    fn prop_hazard_report_serde_deterministic(report in arb_hazard_report()) {
+        let j1 = serde_json::to_string(&report).unwrap();
+        let j2 = serde_json::to_string(&report).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    #[test]
+    fn prop_hazard_report_json_contains_action(report in arb_hazard_report()) {
+        let json = serde_json::to_string(&report).unwrap();
+        prop_assert!(json.contains("\"action\""), "JSON should contain action field");
+    }
+}
+
+// =============================================================================
+// RestartMode serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_restart_mode_serde_roundtrip(mode in arb_restart_mode()) {
+        let json = serde_json::to_string(&mode).unwrap();
+        let back: RestartMode = serde_json::from_str(&json).unwrap();
+        match (&back, &mode) {
+            (RestartMode::Automatic { min_score: a }, RestartMode::Automatic { min_score: b }) => {
+                prop_assert!((a - b).abs() < 1e-10, "min_score mismatch: {} vs {}", a, b);
+            }
+            (RestartMode::Advisory, RestartMode::Advisory) => {}
+            (RestartMode::Manual, RestartMode::Manual) => {}
+            _ => prop_assert!(false, "mode variant mismatch: {:?} vs {:?}", back, mode),
+        }
+    }
+
+    #[test]
+    fn prop_restart_mode_default_is_advisory(_dummy in 0..1u8) {
+        let mode = RestartMode::default();
+        let is_advisory = matches!(mode, RestartMode::Advisory);
+        prop_assert!(is_advisory, "default mode should be Advisory");
+    }
+
+    #[test]
+    fn prop_restart_mode_json_has_mode_tag(mode in arb_restart_mode()) {
+        let json = serde_json::to_string(&mode).unwrap();
+        prop_assert!(json.contains("\"mode\""), "JSON should contain mode tag");
+    }
+}
+
+// =============================================================================
+// RestartSchedulerConfig serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_restart_config_serde_roundtrip(cfg in arb_restart_config()) {
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: RestartSchedulerConfig = serde_json::from_str(&json).unwrap();
+        // Float fields need approximate comparison
+        prop_assert!((back.hazard_threshold - cfg.hazard_threshold).abs() < 1e-10);
+        prop_assert!((back.urgency_steepness - cfg.urgency_steepness).abs() < 1e-10);
+        prop_assert!((back.cooldown_hours - cfg.cooldown_hours).abs() < 1e-10);
+        prop_assert!((back.activity_ewma_alpha - cfg.activity_ewma_alpha).abs() < 1e-10);
+        prop_assert!((back.default_activity - cfg.default_activity).abs() < 1e-10);
+        // Non-float fields are exact
+        prop_assert_eq!(back.schedule_horizon_minutes, cfg.schedule_horizon_minutes);
+        prop_assert_eq!(back.pre_restart_snapshot, cfg.pre_restart_snapshot);
+        prop_assert_eq!(back.advance_warning_minutes, cfg.advance_warning_minutes);
+    }
+
+    #[test]
+    fn prop_restart_config_default_valid(_dummy in 0..1u8) {
+        let cfg = RestartSchedulerConfig::default();
+        prop_assert!(cfg.hazard_threshold > 0.0);
+        prop_assert!(cfg.cooldown_hours > 0.0);
+        prop_assert!(cfg.schedule_horizon_minutes > 0);
+        prop_assert!(cfg.activity_ewma_alpha > 0.0 && cfg.activity_ewma_alpha < 1.0);
+    }
+
+    #[test]
+    fn prop_restart_config_serde_deterministic(cfg in arb_restart_config()) {
+        let j1 = serde_json::to_string(&cfg).unwrap();
+        let j2 = serde_json::to_string(&cfg).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}
+
+// =============================================================================
+// ActivityProfile property tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_activity_profile_serde_roundtrip(
+        alpha in 0.01_f64..0.99,
+        default_act in 0.0_f64..1.0,
+    ) {
+        let profile = ActivityProfile::new(alpha, default_act);
+        let json = serde_json::to_string(&profile).unwrap();
+        let back: ActivityProfile = serde_json::from_str(&json).unwrap();
+        // Float precision: compare hourly snapshots approximately
+        let orig_snap = profile.hourly_snapshot();
+        let back_snap = back.hourly_snapshot();
+        for h in 0..24 {
+            prop_assert!((orig_snap[h] - back_snap[h]).abs() < 1e-10,
+                "hour {} mismatch: {} vs {}", h, orig_snap[h], back_snap[h]);
+        }
+    }
+
+    #[test]
+    fn prop_activity_profile_new_all_hours_default(
+        alpha in 0.01_f64..0.99,
+        default_act in 0.0_f64..1.0,
+    ) {
+        let profile = ActivityProfile::new(alpha, default_act);
+        let snapshot = profile.hourly_snapshot();
+        let clamped = default_act.clamp(0.0, 1.0);
+        for h in 0..24 {
+            prop_assert!((snapshot[h] - clamped).abs() < 1e-10,
+                "hour {} should be {}, got {}", h, clamped, snapshot[h]);
+            prop_assert_eq!(profile.sample_count(h as u8), 0);
+        }
+    }
+
+    #[test]
+    fn prop_activity_profile_update_hour_increments_count(
+        alpha in 0.01_f64..0.99,
+        hour in 0_u8..24,
+        activity in 0.0_f64..1.0,
+    ) {
+        let mut profile = ActivityProfile::new(alpha, 0.5);
+        prop_assert_eq!(profile.sample_count(hour), 0);
+        profile.update_hour(hour, activity);
+        prop_assert_eq!(profile.sample_count(hour), 1);
+    }
+
+    #[test]
+    fn prop_activity_profile_predict_in_range(
+        alpha in 0.01_f64..0.99,
+        default_act in 0.0_f64..1.0,
+        hour in 0_u8..24,
+    ) {
+        let profile = ActivityProfile::new(alpha, default_act);
+        let prediction = profile.predict_hour(hour);
+        prop_assert!(prediction >= 0.0 && prediction <= 1.0,
+            "prediction should be in [0, 1], got {}", prediction);
+    }
+
+    #[test]
+    fn prop_activity_profile_first_update_sets_value(
+        alpha in 0.01_f64..0.99,
+        hour in 0_u8..24,
+        activity in 0.0_f64..1.0,
+    ) {
+        let mut profile = ActivityProfile::new(alpha, 0.5);
+        profile.update_hour(hour, activity);
+        let predicted = profile.predict_hour(hour);
+        // First sample should set the value directly (not EWMA blend)
+        let clamped = activity.clamp(0.0, 1.0);
+        prop_assert!((predicted - clamped).abs() < 1e-10,
+            "first update should set value to {}, got {}", clamped, predicted);
+    }
+}
+
+// =============================================================================
+// HazardForecastPoint serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_forecast_point_serde_roundtrip(fp in arb_forecast_point()) {
+        let json = serde_json::to_string(&fp).unwrap();
+        let back: HazardForecastPoint = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.offset_minutes, fp.offset_minutes);
+        prop_assert!((back.hazard_rate - fp.hazard_rate).abs() < 1e-10);
+        prop_assert_eq!(back.predicted_activity.is_some(), fp.predicted_activity.is_some());
+    }
+
+    #[test]
+    fn prop_forecast_point_serde_deterministic(fp in arb_forecast_point()) {
+        let j1 = serde_json::to_string(&fp).unwrap();
+        let j2 = serde_json::to_string(&fp).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}
+
+// =============================================================================
+// RestartScoreBreakdown serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_score_breakdown_serde_roundtrip(sb in arb_score_breakdown()) {
+        let json = serde_json::to_string(&sb).unwrap();
+        let back: RestartScoreBreakdown = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.hazard_urgency - sb.hazard_urgency).abs() < 1e-10);
+        prop_assert!((back.activity_minimum - sb.activity_minimum).abs() < 1e-10);
+        prop_assert!((back.recency_penalty - sb.recency_penalty).abs() < 1e-10);
+        prop_assert!((back.score - sb.score).abs() < 1e-10);
+    }
+
+    #[test]
+    fn prop_score_breakdown_json_has_score(sb in arb_score_breakdown()) {
+        let json = serde_json::to_string(&sb).unwrap();
+        prop_assert!(json.contains("\"score\""));
+    }
+}
+
+// =============================================================================
+// RestartRecommendation serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_recommendation_serde_roundtrip(rec in arb_recommendation()) {
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: RestartRecommendation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.scheduled_for_epoch_secs, rec.scheduled_for_epoch_secs);
+        prop_assert_eq!(back.offset_minutes, rec.offset_minutes);
+        prop_assert_eq!(back.should_execute_automatically, rec.should_execute_automatically);
+        prop_assert_eq!(back.warning_epoch_secs, rec.warning_epoch_secs);
+        prop_assert_eq!(back.snapshot_epoch_secs, rec.snapshot_epoch_secs);
+    }
+
+    #[test]
+    fn prop_recommendation_serde_deterministic(rec in arb_recommendation()) {
+        let j1 = serde_json::to_string(&rec).unwrap();
+        let j2 = serde_json::to_string(&rec).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    #[test]
+    fn prop_recommendation_json_structure(rec in arb_recommendation()) {
+        let json = serde_json::to_string(&rec).unwrap();
+        prop_assert!(json.contains("\"scheduled_for_epoch_secs\""));
+        prop_assert!(json.contains("\"breakdown\""));
+    }
+}
+
+// =============================================================================
+// RestartScheduler construction and basic properties
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_restart_scheduler_new_config_preserved(cfg in arb_restart_config()) {
+        let scheduler = RestartScheduler::new(cfg.clone());
+        prop_assert_eq!(scheduler.config(), &cfg);
+    }
+
+    #[test]
+    fn prop_restart_scheduler_default_config_valid(_dummy in 0..1u8) {
+        let scheduler = RestartScheduler::new(RestartSchedulerConfig::default());
+        let cfg = scheduler.config();
+        let is_advisory = matches!(cfg.mode, RestartMode::Advisory);
+        prop_assert!(is_advisory, "default scheduler mode should be Advisory");
+    }
+
+    #[test]
+    fn prop_restart_scheduler_activity_predict_in_range(
+        hour in 0_u8..24,
+    ) {
+        let scheduler = RestartScheduler::new(RestartSchedulerConfig::default());
+        let activity = scheduler.activity_profile().predict_hour(hour);
+        prop_assert!(activity >= 0.0 && activity <= 1.0,
+            "predicted activity should be in [0, 1], got {}", activity);
+    }
+
+    #[test]
+    fn prop_restart_scheduler_record_activity_updates_profile(
+        hour in 0_u8..24,
+        activity in 0.0_f64..1.0,
+    ) {
+        let mut scheduler = RestartScheduler::new(RestartSchedulerConfig::default());
+        let before = scheduler.activity_profile().sample_count(hour);
+        scheduler.activity_profile_mut().update_hour(hour, activity);
+        let after = scheduler.activity_profile().sample_count(hour);
+        prop_assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn prop_restart_scheduler_no_restart_initially(_dummy in 0..1u8) {
+        let scheduler = RestartScheduler::new(RestartSchedulerConfig::default());
+        prop_assert!(scheduler.last_restart_at().is_none(),
+            "fresh scheduler should have no last restart");
     }
 }
