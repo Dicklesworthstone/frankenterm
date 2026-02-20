@@ -24,9 +24,10 @@ use ratatui::{
 
 use super::query::{EventFilters, QueryClient, QueryError};
 use super::views::{
-    View, ViewState, filtered_event_indices, filtered_history_indices, filtered_pane_indices,
-    render_events_view, render_help_view, render_history_view, render_home_view, render_panes_view,
-    render_search_view, render_tabs, render_timeline_placeholder, render_triage_view,
+    SearchProgressPhase, View, ViewState, filtered_event_indices, filtered_history_indices,
+    filtered_pane_indices, render_events_view, render_help_view, render_history_view,
+    render_home_view, render_panes_view, render_search_view, render_tabs,
+    render_timeline_placeholder, render_triage_view,
 };
 
 /// Application configuration
@@ -422,6 +423,16 @@ impl<Q: QueryClient> App<Q> {
     /// Handle key events in the search view
     fn handle_search_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.view_state.search_fast_only = !self.view_state.search_fast_only;
+                let mode = if self.view_state.search_fast_only {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                self.view_state.search_phase_detail =
+                    Some(format!("fast-only mode {mode} (Ctrl+F to toggle)"));
+            }
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if !self.view_state.saved_searches.is_empty() {
                     self.view_state.saved_search_selected_index =
@@ -499,6 +510,10 @@ impl<Q: QueryClient> App<Q> {
                 self.view_state.search_last_query.clear();
                 self.view_state.search_selected_index = 0;
                 self.view_state.search_suggestions.clear();
+                self.view_state.search_phase = SearchProgressPhase::Idle;
+                self.view_state.search_initial_latency_ms = None;
+                self.view_state.search_refined_latency_ms = None;
+                self.view_state.search_phase_detail = None;
             }
             _ => {}
         }
@@ -548,16 +563,40 @@ impl<Q: QueryClient> App<Q> {
     fn execute_search(&mut self) {
         let query = self.view_state.search_query.trim().to_string();
         if query.is_empty() {
+            self.view_state.search_phase = SearchProgressPhase::Idle;
+            self.view_state.search_initial_latency_ms = None;
+            self.view_state.search_refined_latency_ms = None;
+            self.view_state.search_phase_detail = None;
             return;
         }
         self.view_state.search_last_query.clone_from(&query);
         self.view_state.search_selected_index = 0;
+        self.view_state.search_phase = SearchProgressPhase::RunningInitial;
+        self.view_state.search_initial_latency_ms = None;
+        self.view_state.search_refined_latency_ms = None;
+        self.view_state.search_phase_detail = None;
+        let started = Instant::now();
         match self.query_client.search(&query, 50) {
             Ok(results) => {
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                self.view_state.search_initial_latency_ms = Some(elapsed_ms);
+                if self.view_state.search_fast_only {
+                    self.view_state.search_phase = SearchProgressPhase::InitialOnly;
+                    self.view_state.search_phase_detail =
+                        Some("fast-only enabled; refinement skipped".to_string());
+                } else {
+                    self.view_state.search_phase = SearchProgressPhase::RefinementUnavailable;
+                    self.view_state.search_phase_detail =
+                        Some("single-pass backend; refined stream unavailable".to_string());
+                }
                 self.view_state.search_results = results;
                 self.view_state.clear_error();
             }
             Err(e) => {
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                self.view_state.search_initial_latency_ms = Some(elapsed_ms);
+                self.view_state.search_phase = SearchProgressPhase::RefinementFailed;
+                self.view_state.search_phase_detail = Some(e.to_string());
                 self.view_state.search_results.clear();
                 self.view_state.set_error(format!("Search failed: {e}"));
             }
@@ -1291,6 +1330,12 @@ mod tests {
         assert_eq!(app.view_state.search_last_query, "test");
         assert_eq!(app.view_state.search_results.len(), 2);
         assert_eq!(app.view_state.search_selected_index, 0);
+        assert_eq!(
+            app.view_state.search_phase,
+            SearchProgressPhase::RefinementUnavailable
+        );
+        assert!(app.view_state.search_initial_latency_ms.is_some());
+        assert!(app.view_state.search_refined_latency_ms.is_none());
     }
 
     #[test]
@@ -1324,6 +1369,10 @@ mod tests {
         assert!(app.view_state.search_query.is_empty());
         assert!(app.view_state.search_results.is_empty());
         assert!(app.view_state.search_last_query.is_empty());
+        assert_eq!(app.view_state.search_phase, SearchProgressPhase::Idle);
+        assert!(app.view_state.search_initial_latency_ms.is_none());
+        assert!(app.view_state.search_refined_latency_ms.is_none());
+        assert!(app.view_state.search_phase_detail.is_none());
     }
 
     #[test]
@@ -1333,6 +1382,12 @@ mod tests {
         app.execute_search();
         assert!(app.view_state.search_results.is_empty());
         assert!(app.view_state.error_message.is_some());
+        assert_eq!(
+            app.view_state.search_phase,
+            SearchProgressPhase::RefinementFailed
+        );
+        assert!(app.view_state.search_initial_latency_ms.is_some());
+        assert!(app.view_state.search_phase_detail.is_some());
     }
 
     #[test]
@@ -1350,6 +1405,45 @@ mod tests {
         app.view_state.search_query = "test".to_string();
         app.handle_search_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(app.view_state.search_query, "tes");
+    }
+
+    #[test]
+    fn search_ctrl_f_toggles_fast_only_mode() {
+        let mut app = App::new(SearchQueryClient, AppConfig::default());
+        assert!(!app.view_state.search_fast_only);
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(app.view_state.search_fast_only);
+        assert!(
+            app.view_state
+                .search_phase_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("enabled"))
+        );
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(!app.view_state.search_fast_only);
+    }
+
+    #[test]
+    fn search_fast_only_mode_marks_initial_only_phase() {
+        let mut app = App::new(SearchQueryClient, AppConfig::default());
+        app.view_state.search_fast_only = true;
+        app.view_state.search_query = "test".to_string();
+        app.execute_search();
+
+        assert_eq!(
+            app.view_state.search_phase,
+            SearchProgressPhase::InitialOnly
+        );
+        assert!(app.view_state.search_initial_latency_ms.is_some());
+        assert!(app.view_state.search_refined_latency_ms.is_none());
+        assert!(
+            app.view_state
+                .search_phase_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("fast-only"))
+        );
     }
 
     #[test]

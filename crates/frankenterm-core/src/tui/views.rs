@@ -117,6 +117,35 @@ impl View {
     }
 }
 
+/// Coarse search lifecycle shown in the TUI search surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchProgressPhase {
+    /// No active/previous search lifecycle state.
+    #[default]
+    Idle,
+    /// Initial phase is in-flight.
+    RunningInitial,
+    /// Initial phase completed and fast-only mode intentionally skipped refinement.
+    InitialOnly,
+    /// Backend returned a single-pass result set (no refinement stream available yet).
+    RefinementUnavailable,
+    /// Search failed before producing a usable refinement lifecycle.
+    RefinementFailed,
+}
+
+impl SearchProgressPhase {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::RunningInitial => "initializing",
+            Self::InitialOnly => "initial-only",
+            Self::RefinementUnavailable => "refinement-unavailable",
+            Self::RefinementFailed => "refinement-failed",
+        }
+    }
+}
+
 /// State for each view
 #[derive(Debug, Default)]
 pub struct ViewState {
@@ -164,6 +193,16 @@ pub struct ViewState {
     pub search_results: Vec<SearchResultView>,
     /// Search: selected result index
     pub search_selected_index: usize,
+    /// Search: current lifecycle phase for progressive delivery status.
+    pub search_phase: SearchProgressPhase,
+    /// Search: run only the fast/initial phase when true.
+    pub search_fast_only: bool,
+    /// Search: measured latency for initial phase (ms), when known.
+    pub search_initial_latency_ms: Option<u64>,
+    /// Search: measured latency for refined phase (ms), when known.
+    pub search_refined_latency_ms: Option<u64>,
+    /// Search: optional status detail shown in the UI.
+    pub search_phase_detail: Option<String>,
     /// Saved searches for search view.
     pub saved_searches: Vec<SavedSearchView>,
     /// Selected saved search index.
@@ -1181,14 +1220,14 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         .direction(Direction::Vertical)
         .constraints(if show_suggestions {
             vec![
-                Constraint::Length(3), // Search input
+                Constraint::Length(4), // Search input + status
                 Constraint::Length(5), // Suggestions
                 Constraint::Length(8), // Saved searches
                 Constraint::Min(5),    // Results + detail
             ]
         } else {
             vec![
-                Constraint::Length(3), // Search input
+                Constraint::Length(4), // Search input + status
                 Constraint::Length(0), // No suggestions
                 Constraint::Length(8), // Saved searches
                 Constraint::Min(5),    // Results + detail
@@ -1198,11 +1237,42 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 
     // Search input
     let cursor_indicator = if state.search_query.is_empty() {
-        "Search (FTS5) — type query, Enter to search"
+        "Search (FTS5) — type query, Enter to search, Ctrl+F toggle fast-only"
     } else {
-        "Search (FTS5) — Enter to search, Esc to clear"
+        "Search (FTS5) — Enter to search, Esc to clear, Ctrl+F toggle fast-only"
     };
-    let search_input = Paragraph::new(format!("{}_", state.search_query)).block(
+    let mode_label = if state.search_fast_only {
+        "fast-only"
+    } else {
+        "progressive"
+    };
+    let timing_label = search_timing_label(state);
+    let mut status_spans = vec![
+        Span::styled(
+            format!("mode={mode_label} "),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            format!("phase={} ", state.search_phase.label()),
+            search_phase_style(state.search_phase),
+        ),
+        Span::styled(
+            format!("timing={timing_label}"),
+            Style::default().fg(Color::Gray),
+        ),
+    ];
+    if let Some(detail) = state.search_phase_detail.as_deref() {
+        status_spans.push(Span::raw(" "));
+        status_spans.push(Span::styled(
+            truncate_str(detail, 40),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    let search_input = Paragraph::new(vec![
+        Line::from(format!("{}_", state.search_query)),
+        Line::from(status_spans),
+    ])
+    .block(
         Block::default()
             .title(cursor_indicator)
             .borders(Borders::ALL),
@@ -1296,12 +1366,14 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         let results = Paragraph::new(Span::styled(msg, Style::default().fg(Color::Gray))).block(
             Block::default()
                 .title(format!(
-                    "Results ({})",
+                    "Results ({} · phase={} · {})",
                     if state.search_last_query.is_empty() {
                         "waiting"
                     } else {
                         "0 matches"
-                    }
+                    },
+                    state.search_phase.label(),
+                    timing_label
                 ))
                 .borders(Borders::ALL),
         );
@@ -1322,15 +1394,24 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     // Results list
     let list_block = Block::default()
         .title(format!(
-            "Results ({} matches for '{}')",
+            "Results ({} matches for '{}' · {} · {})",
             state.search_results.len(),
             truncate_str(&state.search_last_query, 20),
+            state.search_phase.label(),
+            timing_label,
         ))
         .borders(Borders::ALL);
     let list_inner = list_block.inner(result_chunks[0]);
     list_block.render(result_chunks[0], buf);
 
-    let mut lines: Vec<Line> = Vec::with_capacity(state.search_results.len());
+    let mut lines: Vec<Line> = Vec::with_capacity(state.search_results.len() + 1);
+    lines.push(Line::from(Span::styled(
+        format!(
+            "status: mode={mode_label}, phase={}, timing={timing_label}",
+            state.search_phase.label()
+        ),
+        Style::default().fg(Color::Gray),
+    )));
     for (pos, result) in state.search_results.iter().enumerate() {
         let snippet_preview = truncate_str(&result.snippet, 40);
         if pos == selected {
@@ -1390,6 +1471,28 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             Line::from("Ctrl+N next, Ctrl+P prev, Ctrl+R run, Ctrl+E toggle enable"),
         ];
         Paragraph::new(details).render(detail_inner, buf);
+    }
+}
+
+fn search_phase_style(phase: SearchProgressPhase) -> Style {
+    match phase {
+        SearchProgressPhase::Idle => Style::default().fg(Color::Gray),
+        SearchProgressPhase::RunningInitial => Style::default().fg(Color::Yellow),
+        SearchProgressPhase::InitialOnly => Style::default().fg(Color::Cyan),
+        SearchProgressPhase::RefinementUnavailable => Style::default().fg(Color::Yellow),
+        SearchProgressPhase::RefinementFailed => Style::default().fg(Color::Red),
+    }
+}
+
+fn search_timing_label(state: &ViewState) -> String {
+    match (
+        state.search_initial_latency_ms,
+        state.search_refined_latency_ms,
+    ) {
+        (Some(initial), Some(refined)) => format!("{initial}ms/{refined}ms"),
+        (Some(initial), None) => format!("{initial}ms"),
+        (None, Some(refined)) => format!("?/{refined}ms"),
+        (None, None) => "-".to_string(),
     }
 }
 
@@ -1639,6 +1742,7 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  [Events] type digits to filter by pane/rule, u=unhandled-only"),
         Line::from("  [History] type text to filter, u=undoable-only"),
         Line::from("  [Search] Ctrl+N/Ctrl+P select saved, Ctrl+R run, Ctrl+E toggle"),
+        Line::from("  [Search] Ctrl+F toggle fast-only mode"),
         Line::from("  [Triage] e=expand/collapse workflow progress"),
         Line::from(""),
         Line::from(Span::styled(
@@ -2158,6 +2262,38 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_search_view(&state, area, &mut buf);
         // Should not panic; suggestions hidden when results present
+    }
+
+    #[test]
+    fn search_progress_phase_labels_are_stable() {
+        assert_eq!(SearchProgressPhase::Idle.label(), "idle");
+        assert_eq!(SearchProgressPhase::RunningInitial.label(), "initializing");
+        assert_eq!(SearchProgressPhase::InitialOnly.label(), "initial-only");
+        assert_eq!(
+            SearchProgressPhase::RefinementUnavailable.label(),
+            "refinement-unavailable"
+        );
+        assert_eq!(
+            SearchProgressPhase::RefinementFailed.label(),
+            "refinement-failed"
+        );
+    }
+
+    #[test]
+    fn render_search_view_with_progressive_status_metadata() {
+        let mut state = ViewState::default();
+        state.search_query = "panic".to_string();
+        state.search_last_query = "panic".to_string();
+        state.search_phase = SearchProgressPhase::RefinementUnavailable;
+        state.search_fast_only = false;
+        state.search_initial_latency_ms = Some(17);
+        state.search_phase_detail = Some("single-pass backend".to_string());
+        state.search_results = vec![search_result(10, "panic in worker", 0.88)];
+
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should render status/timing metadata without panicking.
     }
 
     // -----------------------------------------------------------------------

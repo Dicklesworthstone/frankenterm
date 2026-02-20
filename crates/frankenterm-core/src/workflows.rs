@@ -724,6 +724,11 @@ pub enum StepResult {
         /// Timeout for the wait condition in milliseconds
         wait_timeout_ms: Option<u64>,
     },
+    /// Jump to a specific step index.
+    JumpTo {
+        /// The target step index.
+        step: usize,
+    },
 }
 
 impl StepResult {
@@ -788,6 +793,12 @@ impl StepResult {
             wait_for: None,
             wait_timeout_ms: None,
         }
+    }
+
+    /// Create a JumpTo result.
+    #[must_use]
+    pub fn jump_to(step: usize) -> Self {
+        Self::JumpTo { step }
     }
 
     /// Create a SendText result with optional verification wait condition.
@@ -1219,6 +1230,24 @@ impl WorkflowDescriptor {
 
         Ok(())
     }
+
+    fn count_steps(&self, steps: &[DescriptorStep]) -> usize {
+        let mut count = 0;
+        for step in steps {
+            count += 1;
+            match step {
+                DescriptorStep::Conditional { then_steps, else_steps, .. } => {
+                    count += self.count_steps(then_steps);
+                    count += self.count_steps(else_steps);
+                }
+                DescriptorStep::Loop { body, .. } => {
+                    count += self.count_steps(body);
+                }
+                _ => {}
+            }
+        }
+        count
+    }
 }
 
 /// Matchers in descriptors (substring or regex).
@@ -1527,8 +1556,200 @@ impl DescriptorStep {
     }
 }
 
-/// Execute a single descriptor step, used for inline execution in conditionals and loops.
-async fn execute_descriptor_step(
+const DESCRIPTOR_MAX_RECURSION_DEPTH: usize = 64;
+
+#[derive(Debug, Clone)]
+enum ExecutableStep {
+    Action(DescriptorStep),
+    Jump(usize),
+    JumpIfFalse {
+        test_text: String,
+        matcher: DescriptorMatcher,
+        jump_to: usize,
+    },
+}
+
+/// Workflow implementation backed by a descriptor.
+pub struct DescriptorWorkflow {
+    name: &'static str,
+    description: &'static str,
+    descriptor: WorkflowDescriptor,
+    executable_steps: Vec<ExecutableStep>,
+    step_metadata: Vec<WorkflowStep>,
+}
+
+impl DescriptorWorkflow {
+    #[must_use]
+    pub fn new(descriptor: WorkflowDescriptor) -> Self {
+        let name: &'static str = Box::leak(descriptor.name.clone().into_boxed_str());
+        let desc_value = descriptor
+            .description
+            .clone()
+            .unwrap_or_else(|| "Descriptor workflow".to_string());
+        let description: &'static str = Box::leak(desc_value.into_boxed_str());
+
+        let (executable_steps, step_metadata) = Self::compile(&descriptor.steps);
+
+        Self {
+            name,
+            description,
+            descriptor,
+            executable_steps,
+            step_metadata,
+        }
+    }
+
+    fn compile(steps: &[DescriptorStep]) -> (Vec<ExecutableStep>, Vec<WorkflowStep>) {
+        let mut exec = Vec::new();
+        let mut meta = Vec::new();
+        Self::compile_recursive(steps, &mut exec, &mut meta, 0);
+        (exec, meta)
+    }
+
+    fn compile_recursive(
+        steps: &[DescriptorStep],
+        exec: &mut Vec<ExecutableStep>,
+        meta: &mut Vec<WorkflowStep>,
+        depth: usize,
+    ) {
+        if depth > DESCRIPTOR_MAX_RECURSION_DEPTH {
+            return;
+        }
+
+        for step in steps {
+            match step {
+                DescriptorStep::Loop { count, body, id: _, description: _ } => {
+                    for _ in 0..*count {
+                        Self::compile_recursive(body, exec, meta, depth + 1);
+                    }
+                }
+                DescriptorStep::Conditional {
+                    test_text,
+                    matcher,
+                    then_steps,
+                    else_steps,
+                    id,
+                    description,
+                } => {
+                    let jump_if_false_idx = exec.len();
+                    exec.push(ExecutableStep::JumpIfFalse {
+                        test_text: test_text.clone(),
+                        matcher: matcher.clone(),
+                        jump_to: 0,
+                    });
+                    meta.push(WorkflowStep::new(id.clone(), format!("Check: {}", description.as_deref().unwrap_or("condition"))));
+
+                    Self::compile_recursive(then_steps, exec, meta, depth + 1);
+
+                    let jump_end_idx = exec.len();
+                    exec.push(ExecutableStep::Jump(0));
+                    meta.push(WorkflowStep::new(format!("{id}_jump"), "Flow control"));
+
+                    let else_start_idx = exec.len();
+                    Self::compile_recursive(else_steps, exec, meta, depth + 1);
+                    let end_idx = exec.len();
+
+                    if let ExecutableStep::JumpIfFalse { jump_to, .. } = &mut exec[jump_if_false_idx] {
+                        *jump_to = else_start_idx;
+                    }
+                    if let ExecutableStep::Jump(target) = &mut exec[jump_end_idx] {
+                        *target = end_idx;
+                    }
+                }
+                _ => {
+                    exec.push(ExecutableStep::Action(step.clone()));
+                    meta.push(WorkflowStep::new(step.id(), step.description()));
+                }
+            }
+        }
+    }
+
+    pub fn from_yaml_str(input: &str) -> crate::Result<Self> {
+        WorkflowDescriptor::from_yaml_str(input).map(Self::new)
+    }
+
+    pub fn from_toml_str(input: &str) -> crate::Result<Self> {
+        WorkflowDescriptor::from_toml_str(input).map(Self::new)
+    }
+
+    #[must_use]
+    pub fn descriptor(&self) -> &WorkflowDescriptor {
+        &self.descriptor
+    }
+}
+
+impl Workflow for DescriptorWorkflow {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn description(&self) -> &'static str {
+        self.description
+    }
+
+    fn handles(&self, detection: &crate::patterns::Detection) -> bool {
+        if self.descriptor.triggers.is_empty() {
+            return false;
+        }
+        self.descriptor.triggers.iter().any(|trigger| {
+            let event_match = trigger.event_types.is_empty()
+                || trigger
+                    .event_types
+                    .iter()
+                    .any(|et| et == &detection.event_type);
+            let agent_match = trigger.agent_types.is_empty()
+                || trigger
+                    .agent_types
+                    .iter()
+                    .any(|at| at == &detection.agent_type.to_string());
+            let rule_match = trigger.rule_ids.is_empty()
+                || trigger.rule_ids.iter().any(|ri| ri == &detection.rule_id);
+            event_match && agent_match && rule_match
+        })
+    }
+
+    fn steps(&self) -> Vec<WorkflowStep> {
+        self.step_metadata.clone()
+    }
+
+    fn execute_step(
+        &self,
+        ctx: &mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        let step = self.executable_steps.get(step_idx).cloned();
+        let default_wait_timeout_ms = ctx.default_wait_timeout_ms();
+        let ctx_clone = ctx.clone();
+
+        Box::pin(async move {
+            let Some(step) = step else {
+                return StepResult::abort("Unexpected step index");
+            };
+
+            match step {
+                ExecutableStep::Action(desc_step) => {
+                    execute_atomic_descriptor_step(&desc_step, default_wait_timeout_ms, ctx_clone).await
+                }
+                ExecutableStep::Jump(target) => StepResult::jump_to(target),
+                ExecutableStep::JumpIfFalse { test_text, matcher, jump_to } => {
+                    let matches = match matcher {
+                        DescriptorMatcher::Substring { value } => test_text.contains(value.as_str()),
+                        DescriptorMatcher::Regex { pattern } => fancy_regex::Regex::new(&pattern)
+                            .map(|re| re.is_match(&test_text).unwrap_or(false))
+                            .unwrap_or(false),
+                    };
+                    if matches {
+                        StepResult::cont()
+                    } else {
+                        StepResult::jump_to(jump_to)
+                    }
+                }
+            }
+        })
+    }
+}
+
+async fn execute_atomic_descriptor_step(
     step: &DescriptorStep,
     default_wait_timeout_ms: u64,
     ctx_clone: WorkflowContext,
@@ -1600,258 +1821,7 @@ async fn execute_descriptor_step(
             StepResult::cont()
         }
         DescriptorStep::Abort { reason, .. } => StepResult::abort(reason.clone()),
-        DescriptorStep::Conditional {
-            test_text,
-            matcher,
-            then_steps,
-            else_steps,
-            ..
-        } => {
-            let matches = match matcher {
-                DescriptorMatcher::Substring { value } => test_text.contains(value.as_str()),
-                DescriptorMatcher::Regex { pattern } => fancy_regex::Regex::new(pattern)
-                    .map(|re| re.is_match(test_text).unwrap_or(false))
-                    .unwrap_or(false),
-            };
-            let branch = if matches { then_steps } else { else_steps };
-            for branch_step in branch {
-                let result = Box::pin(execute_descriptor_step(
-                    branch_step,
-                    default_wait_timeout_ms,
-                    ctx_clone.clone(),
-                ))
-                .await;
-                if !result.is_continue() {
-                    return result;
-                }
-            }
-            StepResult::cont()
-        }
-        DescriptorStep::Loop { count, body, .. } => {
-            for _iteration in 0..*count {
-                for body_step in body {
-                    let result = Box::pin(execute_descriptor_step(
-                        body_step,
-                        default_wait_timeout_ms,
-                        ctx_clone.clone(),
-                    ))
-                    .await;
-                    if !result.is_continue() {
-                        return result;
-                    }
-                }
-            }
-            StepResult::cont()
-        }
-    }
-}
-
-/// Workflow implementation backed by a descriptor.
-pub struct DescriptorWorkflow {
-    name: &'static str,
-    description: &'static str,
-    descriptor: WorkflowDescriptor,
-}
-
-impl DescriptorWorkflow {
-    #[must_use]
-    pub fn new(descriptor: WorkflowDescriptor) -> Self {
-        let name: &'static str = Box::leak(descriptor.name.clone().into_boxed_str());
-        let desc_value = descriptor
-            .description
-            .clone()
-            .unwrap_or_else(|| "Descriptor workflow".to_string());
-        let description: &'static str = Box::leak(desc_value.into_boxed_str());
-        Self {
-            name,
-            description,
-            descriptor,
-        }
-    }
-
-    pub fn from_yaml_str(input: &str) -> crate::Result<Self> {
-        WorkflowDescriptor::from_yaml_str(input).map(Self::new)
-    }
-
-    pub fn from_toml_str(input: &str) -> crate::Result<Self> {
-        WorkflowDescriptor::from_toml_str(input).map(Self::new)
-    }
-
-    #[must_use]
-    pub fn descriptor(&self) -> &WorkflowDescriptor {
-        &self.descriptor
-    }
-}
-
-impl Workflow for DescriptorWorkflow {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn description(&self) -> &'static str {
-        self.description
-    }
-
-    fn handles(&self, detection: &crate::patterns::Detection) -> bool {
-        if self.descriptor.triggers.is_empty() {
-            return false;
-        }
-        self.descriptor.triggers.iter().any(|trigger| {
-            let event_match = trigger.event_types.is_empty()
-                || trigger
-                    .event_types
-                    .iter()
-                    .any(|et| et == &detection.event_type);
-            let agent_match = trigger.agent_types.is_empty()
-                || trigger
-                    .agent_types
-                    .iter()
-                    .any(|at| at == &detection.agent_type.to_string());
-            let rule_match = trigger.rule_ids.is_empty()
-                || trigger.rule_ids.iter().any(|ri| ri == &detection.rule_id);
-            event_match && agent_match && rule_match
-        })
-    }
-
-    fn steps(&self) -> Vec<WorkflowStep> {
-        self.descriptor
-            .steps
-            .iter()
-            .map(|step| WorkflowStep::new(step.id(), step.description()))
-            .collect()
-    }
-
-    fn execute_step(
-        &self,
-        ctx: &mut WorkflowContext,
-        step_idx: usize,
-    ) -> BoxFuture<'_, StepResult> {
-        let step = self.descriptor.steps.get(step_idx).cloned();
-        let default_wait_timeout_ms = ctx.default_wait_timeout_ms();
-        let ctx_clone = ctx.clone();
-        Box::pin(async move {
-            let Some(step) = step else {
-                return StepResult::abort("Unexpected step index");
-            };
-
-            match step {
-                DescriptorStep::WaitFor {
-                    matcher,
-                    timeout_ms,
-                    ..
-                } => {
-                    let condition = WaitCondition::text_match(matcher.to_text_match());
-                    if let Some(timeout_ms) = timeout_ms {
-                        StepResult::wait_for_with_timeout(condition, timeout_ms)
-                    } else {
-                        StepResult::wait_for(condition)
-                    }
-                }
-                DescriptorStep::Sleep { duration_ms, .. } => StepResult::wait_for_with_timeout(
-                    WaitCondition::sleep(duration_ms),
-                    duration_ms,
-                ),
-                DescriptorStep::SendText {
-                    text,
-                    wait_for,
-                    wait_timeout_ms,
-                    ..
-                } => {
-                    if let Some(wait_for) = wait_for {
-                        let condition = WaitCondition::text_match(wait_for.to_text_match());
-                        StepResult::send_text_and_wait(
-                            text,
-                            condition,
-                            wait_timeout_ms.unwrap_or(default_wait_timeout_ms),
-                        )
-                    } else {
-                        StepResult::send_text(text)
-                    }
-                }
-                DescriptorStep::SendCtrl { key, .. } => {
-                    let mut ctx_clone = ctx_clone;
-                    let result = match key {
-                        DescriptorControlKey::CtrlC => ctx_clone.send_ctrl_c().await,
-                        DescriptorControlKey::CtrlD => ctx_clone.send_ctrl_d().await,
-                        DescriptorControlKey::CtrlZ => ctx_clone.send_ctrl_z().await,
-                    };
-                    match result {
-                        Ok(InjectionResult::Allowed { .. }) => StepResult::cont(),
-                        Ok(InjectionResult::Denied { decision, .. }) => StepResult::abort(format!(
-                            "Policy denied control send: {}",
-                            decision.reason().unwrap_or("denied")
-                        )),
-                        Ok(InjectionResult::RequiresApproval { decision, .. }) => {
-                            StepResult::abort(format!(
-                                "Control send requires approval: {}",
-                                decision.reason().unwrap_or("requires approval")
-                            ))
-                        }
-                        Ok(InjectionResult::Error { error, .. }) => {
-                            StepResult::abort(format!("Control send failed: {error}"))
-                        }
-                        Err(err) => StepResult::abort(err),
-                    }
-                }
-                DescriptorStep::Notify { message, id, .. } => {
-                    tracing::info!(step_id = %id, %message, "descriptor workflow notify");
-                    StepResult::cont()
-                }
-                DescriptorStep::Log { message, id, .. } => {
-                    tracing::info!(step_id = %id, %message, "descriptor workflow log");
-                    StepResult::cont()
-                }
-                DescriptorStep::Abort { reason, .. } => StepResult::abort(reason),
-                DescriptorStep::Conditional {
-                    test_text,
-                    matcher,
-                    then_steps,
-                    else_steps,
-                    ..
-                } => {
-                    let matches = match &matcher {
-                        DescriptorMatcher::Substring { value } => {
-                            test_text.contains(value.as_str())
-                        }
-                        DescriptorMatcher::Regex { pattern } => fancy_regex::Regex::new(pattern)
-                            .map(|re| re.is_match(&test_text).unwrap_or(false))
-                            .unwrap_or(false),
-                    };
-                    let branch = if matches { &then_steps } else { &else_steps };
-                    // Execute the first step of the matching branch; the rest are
-                    // flattened into subsequent top-level steps at parse time for
-                    // simplicity. For the MVP, we execute all branch steps inline.
-                    for branch_step in branch {
-                        let result = execute_descriptor_step(
-                            branch_step,
-                            default_wait_timeout_ms,
-                            ctx_clone.clone(),
-                        )
-                        .await;
-                        if !result.is_continue() {
-                            return result;
-                        }
-                    }
-                    StepResult::cont()
-                }
-                DescriptorStep::Loop { count, body, .. } => {
-                    for _iteration in 0..count {
-                        for body_step in &body {
-                            let result = execute_descriptor_step(
-                                body_step,
-                                default_wait_timeout_ms,
-                                ctx_clone.clone(),
-                            )
-                            .await;
-                            if !result.is_continue() {
-                                return result;
-                            }
-                        }
-                    }
-                    StepResult::cont()
-                }
-            }
-        })
+        _ => StepResult::abort("Nested step encountered in atomic execution"),
     }
 }
 
@@ -2736,6 +2706,7 @@ impl WorkflowEngine {
             StepResult::Retry { .. } => "retry",
             StepResult::WaitFor { .. } => "wait_for",
             StepResult::SendText { .. } => "send_text",
+            StepResult::JumpTo { .. } => "jump_to",
         };
         let result_data = serde_json::to_string(result).ok();
         let verification_refs = build_verification_refs(result, None);
@@ -5798,6 +5769,7 @@ impl WorkflowRunner {
                 StepResult::Abort { .. } => "abort",
                 StepResult::WaitFor { .. } => "wait_for",
                 StepResult::SendText { .. } => "send_text",
+                StepResult::JumpTo { .. } => "jump_to",
             };
 
             let steps = workflow.steps();
@@ -5900,6 +5872,44 @@ impl WorkflowRunner {
                             execution_id,
                             error = %e,
                             "Failed to update execution step"
+                        );
+                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                            reason,
+                        )) = e
+                        {
+                            self.lock_manager.release(pane_id, execution_id);
+                            record_workflow_terminal_action(
+                                &self.storage,
+                                &workflow_name,
+                                execution_id,
+                                pane_id,
+                                "workflow_aborted",
+                                "aborted",
+                                Some(&reason),
+                                Some(current_step),
+                                None,
+                                start_action_id,
+                            )
+                            .await;
+                            return WorkflowExecutionResult::Aborted {
+                                execution_id: execution_id.to_string(),
+                                reason,
+                                step_index: current_step,
+                                elapsed_ms: elapsed_ms(start_time),
+                            };
+                        }
+                    }
+                }
+                StepResult::JumpTo { step } => {
+                    current_step = step;
+                    retries = 0;
+
+                    // Update execution state
+                    if let Err(e) = self.update_execution_step(execution_id, current_step).await {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to update execution step after jump"
                         );
                         if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(
                             reason,
@@ -20377,5 +20387,31 @@ You've hit your usage limit. Try again at 5:00 PM.";
     fn wait_condition_pane_id_external() {
         let cond = WaitCondition::external("signal");
         assert_eq!(cond.pane_id(), None);
+    }
+
+    #[test]
+    fn descriptor_loop_execution() {
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "test_loop".to_string(),
+            description: None,
+            triggers: vec![],
+            steps: vec![
+                DescriptorStep::Loop {
+                    id: "loop".to_string(),
+                    description: None,
+                    count: 3,
+                    body: vec![
+                        DescriptorStep::Log {
+                            id: "log".to_string(),
+                            description: None,
+                            message: "iteration".to_string(),
+                        }
+                    ],
+                }
+            ],
+            on_failure: None,
+        };
+        let _workflow = DescriptorWorkflow::new(descriptor);
     }
 }
