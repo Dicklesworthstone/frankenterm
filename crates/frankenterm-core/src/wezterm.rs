@@ -729,6 +729,7 @@ impl WeztermClient {
                             .unwrap_or(scrollback_end)
                             .min(scrollback_end);
 
+                        #[allow(clippy::single_range_in_vec_init)]
                         match pool.get_lines(pane_id, vec![start..chunk_end]).await {
                             Ok(resp) => {
                                 let (mut lines, _images) = resp.lines.extract_data();

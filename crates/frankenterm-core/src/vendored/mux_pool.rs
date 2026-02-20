@@ -333,9 +333,7 @@ impl MuxPool {
             .execute_with_recovery("get_pane_render_changes_batch", move |client| {
                 let pane_ids = pane_ids_for_pipeline.clone();
                 Box::pin(async move {
-                    client
-                        .get_pane_render_changes_batch(&pane_ids, depth, timeout)
-                        .await
+                    Box::pin(client.get_pane_render_changes_batch(&pane_ids, depth, timeout)).await
                 })
             })
             .await;
@@ -357,8 +355,7 @@ impl MuxPool {
                     move |client| {
                         let pane_ids = pane_ids.clone();
                         Box::pin(async move {
-                            client
-                                .get_pane_render_changes_batch(&pane_ids, 1, timeout)
+                            Box::pin(client.get_pane_render_changes_batch(&pane_ids, 1, timeout))
                                 .await
                         })
                     },
@@ -539,6 +536,8 @@ mod tests {
                                         },
                                     )
                                 }
+                                Pdu::WriteToPane(_) => Pdu::UnitResponse(UnitResponse {}),
+                                Pdu::SendPaste(_) => Pdu::UnitResponse(UnitResponse {}),
                                 _ => continue,
                             };
                             responses.push((decoded.serial, response));
@@ -610,6 +609,8 @@ mod tests {
                                         })
                                     }
                                 }
+                                Pdu::WriteToPane(_) => Pdu::UnitResponse(UnitResponse {}),
+                                Pdu::SendPaste(_) => Pdu::UnitResponse(UnitResponse {}),
                                 _ => continue,
                             };
                             responses.push((decoded.serial, response));
@@ -904,7 +905,7 @@ mod tests {
 
         // Second acquire should timeout
         let pool2 = pool.clone();
-        let result = timeout(Duration::from_millis(200), pool2.list_panes()).await;
+        let result = timeout(Duration::from_millis(200), Box::pin(pool2.list_panes())).await;
 
         match result {
             Ok(Err(MuxPoolError::Pool(PoolError::AcquireTimeout))) => {} // expected
@@ -1136,7 +1137,7 @@ mod tests {
             enabled: false,
             retry_policy: RetryPolicy::new(
                 Duration::from_millis(100),
-                Duration::from_millis(1000),
+                Duration::from_secs(1),
                 2.0,
                 0.0,
                 Some(5),
@@ -1377,6 +1378,42 @@ mod tests {
         assert_eq!(resp.pane_id, 7);
         assert_eq!(resp.dimensions.cols, 80);
         assert_eq!(resp.dimensions.viewport_rows, 24);
+    }
+
+    #[tokio::test]
+    async fn pool_write_to_pane_succeeds() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = MuxPool::new(pool_config(socket_path, 4));
+        pool.write_to_pane(11, b"echo hi\n".to_vec())
+            .await
+            .expect("write_to_pane should succeed");
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.connections_created, 1);
+        assert_eq!(stats.pool.total_acquired, 1);
+    }
+
+    #[tokio::test]
+    async fn pool_send_paste_reuses_connection() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = MuxPool::new(pool_config(socket_path, 4));
+        pool.write_to_pane(12, b"first\n".to_vec())
+            .await
+            .expect("write_to_pane should succeed");
+        pool.send_paste(12, "second\n".to_string())
+            .await
+            .expect("send_paste should succeed");
+
+        let stats = pool.stats().await;
+        assert_eq!(
+            stats.connections_created, 1,
+            "send_paste should reuse the existing idle connection"
+        );
+        assert_eq!(stats.pool.total_acquired, 2);
     }
 
     #[tokio::test]

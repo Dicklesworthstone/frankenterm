@@ -365,9 +365,8 @@ impl DirectMuxClient {
             })
             .collect::<Vec<_>>();
 
-        let responses = self
-            .batch(requests, max_pipeline_depth, pipeline_timeout)
-            .await?;
+        let responses =
+            Box::pin(self.batch(requests, max_pipeline_depth, pipeline_timeout)).await?;
         let mut out = Vec::with_capacity(responses.len());
         for response in responses {
             match response {
@@ -395,10 +394,10 @@ impl DirectMuxClient {
         pipeline_timeout: Duration,
     ) -> Result<Vec<Pdu>, DirectMuxError> {
         let timeout_ms = duration_to_ms_u64(pipeline_timeout);
-        timeout(
+        Box::pin(timeout(
             pipeline_timeout,
             self.batch_inner(requests, max_pipeline_depth.max(1)),
-        )
+        ))
         .await
         .map_err(|_| DirectMuxError::BatchTimeout { timeout_ms })?
     }
@@ -1910,6 +1909,7 @@ mod tests {
 
     #[test]
     fn total_dirty_rows_ignores_descending_ranges() {
+        #[allow(clippy::reversed_empty_ranges)]
         let ranges: Vec<std::ops::Range<isize>> = vec![5..2, 3..3, 7..9];
         assert_eq!(total_dirty_rows(&ranges), 2);
     }
@@ -2187,7 +2187,7 @@ mod tests {
                     }
                     assert!(found_end, "should eventually see Ended or channel close");
                 }
-                Err(_) => panic!("subscription did not terminate within timeout"),
+                Err(e) => panic!("subscription did not terminate within timeout: {e}"),
             }
         });
     }

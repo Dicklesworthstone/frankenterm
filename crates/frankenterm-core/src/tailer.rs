@@ -43,6 +43,8 @@ pub struct TailerConfig {
     pub overlap_size: usize,
     /// Timeout for sending to channel
     pub send_timeout: Duration,
+    /// Timeout for a single pane text capture operation
+    pub capture_timeout: Duration,
 }
 
 impl Default for TailerConfig {
@@ -54,6 +56,7 @@ impl Default for TailerConfig {
             max_concurrent: 10,
             overlap_size: 256,
             send_timeout: Duration::from_millis(100),
+            capture_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -65,6 +68,8 @@ pub struct TailerMetrics {
     pub events_sent: u64,
     /// Number of send timeouts
     pub send_timeouts: u64,
+    /// Number of timed-out pane text captures
+    pub capture_timeouts: u64,
     /// Number of captures that found no changes
     pub no_change_captures: u64,
     /// Number of overflow GAP segments emitted due to sustained backpressure
@@ -772,6 +777,7 @@ where
             let semaphore = Arc::clone(&self.semaphore);
             let overlap_size = self.config.overlap_size;
             let send_timeout = self.config.send_timeout;
+            let capture_timeout = self.config.capture_timeout;
 
             task_set.spawn_poll_task(async move {
                 let Ok(_permit) = semaphore.acquire_owned().await else {
@@ -860,8 +866,8 @@ where
                     permit
                 );
 
-                let text = match source.get_text(pane_id, false).await {
-                    Ok(text) => {
+                let text = match timeout(capture_timeout, source.get_text(pane_id, false)).await {
+                    Ok(Ok(text)) => {
                         let mut guard = match capture_circuit_breaker.lock() {
                             Ok(guard) => guard,
                             Err(poisoned) => poisoned.into_inner(),
@@ -869,7 +875,7 @@ where
                         guard.record_success();
                         text
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         if let crate::Error::Wezterm(wez) = &err {
                             if let crate::error::WeztermError::CircuitOpen { retry_after_ms } = wez
                             {
@@ -892,6 +898,10 @@ where
                         }
                         drop(permit);
                         return (pane_id, PollOutcome::Error(err.to_string()));
+                    }
+                    Err(_) => {
+                        drop(permit);
+                        return (pane_id, PollOutcome::CaptureTimeout);
                     }
                 };
 
@@ -996,6 +1006,11 @@ where
                     tailer.record_poll(false, &self.config);
                     warn!(pane_id, "Tailer channel closed");
                 }
+                PollOutcome::CaptureTimeout => {
+                    tailer.record_poll(false, &self.config);
+                    self.metrics.capture_timeouts += 1;
+                    warn!(pane_id, "Tailer capture timed out");
+                }
                 PollOutcome::CircuitOpen { retry_after_ms } => {
                     tailer.record_poll(false, &self.config);
                     trace!(
@@ -1046,6 +1061,7 @@ pub enum PollOutcome {
     OverflowGapEmitted,
     NoCursor,
     ChannelClosed,
+    CaptureTimeout,
     CircuitOpen {
         retry_after_ms: u64,
     },
@@ -1383,11 +1399,35 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct HangingSource {
+        delay: Duration,
+    }
+
+    impl HangingSource {
+        fn new(delay: Duration) -> Self {
+            Self { delay }
+        }
+    }
+
+    impl PaneTextSource for HangingSource {
+        type Fut<'a> = Pin<Box<dyn Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            let delay = self.delay;
+            Box::pin(async move {
+                crate::runtime_compat::sleep(delay).await;
+                Ok(String::from("late"))
+            })
+        }
+    }
+
     #[test]
     fn tailer_config_default() {
         let config = TailerConfig::default();
         assert_eq!(config.min_interval, Duration::from_millis(50));
         assert_eq!(config.max_interval, Duration::from_secs(1));
+        assert_eq!(config.capture_timeout, Duration::from_secs(2));
         assert!(config.backoff_multiplier > 1.0);
     }
 
@@ -1615,6 +1655,50 @@ mod tests {
             metrics.send_timeouts >= 1,
             "Expected at least 1 backpressure timeout, got 0. Outcomes: {outcomes:?}, metrics: {metrics:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn supervisor_capture_timeout_records_metric() {
+        let source = Arc::new(HangingSource::new(Duration::from_millis(50)));
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(1),
+            max_interval: Duration::from_millis(50),
+            max_concurrent: 1,
+            send_timeout: Duration::from_millis(100),
+            capture_timeout: Duration::from_millis(5),
+            ..Default::default()
+        };
+
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        {
+            let mut cursor_guard = cursors.write().await;
+            cursor_guard.insert(1, PaneCursor::new(1));
+        }
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+
+        let mut poll_tasks = TailerPollTaskSet::new();
+        supervisor.spawn_ready(&mut poll_tasks);
+
+        let (pane_id, outcome) = poll_tasks
+            .join_next()
+            .await
+            .expect("expected timeout outcome");
+        assert!(matches!(outcome, PollOutcome::CaptureTimeout));
+        supervisor.handle_poll_result(pane_id, outcome);
+
+        assert_eq!(supervisor.metrics().capture_timeouts, 1);
+        assert!(!supervisor.capturing_panes.contains(&pane_id));
     }
 
     #[test]
@@ -2581,7 +2665,7 @@ mod tests {
             CapturedSegmentKind::Gap { reason } => {
                 assert!(reason.contains("pane_closed"));
             }
-            _ => panic!("expected Gap segment for pane close"),
+            CapturedSegmentKind::Delta => panic!("expected Gap segment for pane close"),
         }
     }
 
@@ -2642,6 +2726,7 @@ mod tests {
             max_concurrent: 20,
             overlap_size: 512,
             send_timeout: Duration::from_millis(200),
+            capture_timeout: Duration::from_secs(1),
         };
         assert_eq!(config.min_interval, Duration::from_millis(10));
         assert_eq!(config.max_interval, Duration::from_secs(5));
@@ -2649,6 +2734,7 @@ mod tests {
         assert_eq!(config.max_concurrent, 20);
         assert_eq!(config.overlap_size, 512);
         assert_eq!(config.send_timeout, Duration::from_millis(200));
+        assert_eq!(config.capture_timeout, Duration::from_secs(1));
     }
 
     #[test]
@@ -2665,10 +2751,12 @@ mod tests {
         let mut m = TailerMetrics::default();
         m.events_sent = 10;
         m.send_timeouts = 3;
+        m.capture_timeouts = 2;
         m.no_change_captures = 7;
         m.overflow_gaps_emitted = 1;
         assert_eq!(m.events_sent, 10);
         assert_eq!(m.send_timeouts, 3);
+        assert_eq!(m.capture_timeouts, 2);
         assert_eq!(m.no_change_captures, 7);
         assert_eq!(m.overflow_gaps_emitted, 1);
     }
@@ -2904,6 +2992,30 @@ mod tests {
         supervisor.handle_poll_result(1, PollOutcome::ChannelClosed);
 
         assert_eq!(supervisor.metrics().events_sent, 0);
+        assert!(!supervisor.capturing_panes.contains(&1));
+    }
+
+    #[test]
+    fn handle_poll_result_capture_timeout() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::CaptureTimeout);
+
+        assert_eq!(supervisor.metrics().events_sent, 0);
+        assert_eq!(supervisor.metrics().send_timeouts, 0);
+        assert_eq!(supervisor.metrics().capture_timeouts, 1);
         assert!(!supervisor.capturing_panes.contains(&1));
     }
 
