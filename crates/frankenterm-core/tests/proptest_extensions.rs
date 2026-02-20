@@ -617,3 +617,79 @@ fn sandbox_capabilities_debug_nonempty() {
     assert!(!debug.is_empty());
     assert!(debug.contains("SandboxCapabilities"));
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// FileAccessScope variants are all distinct under PartialEq.
+    #[test]
+    fn file_access_scope_distinct(a in arb_file_access_scope(), b in arb_file_access_scope()) {
+        if format!("{:?}", a) != format!("{:?}", b) {
+            prop_assert_ne!(a, b);
+        }
+    }
+
+    /// CapabilityLevel ReadOnly never allows send_text.
+    #[test]
+    fn read_only_no_send_text(_dummy in 0..1u8) {
+        let caps = CapabilityLevel::ReadOnly.to_capabilities();
+        prop_assert!(!caps.send_text);
+    }
+
+    /// SandboxViolation Display contains extension name.
+    #[test]
+    fn violation_display_has_extension(violation in arb_sandbox_violation()) {
+        let display = format!("{}", violation);
+        prop_assert!(display.contains(&violation.extension_name));
+    }
+
+    /// ExtensionManifest with level set uses level capabilities.
+    #[test]
+    fn manifest_level_overrides_caps(level in arb_capability_level()) {
+        let manifest = ExtensionManifest {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            capabilities: SandboxCapabilities::default(),
+            capability_level: Some(level),
+            allowed_hosts: vec![],
+            max_memory_bytes: 1024,
+            max_execution_ms: 100,
+        };
+        let effective = manifest.effective_capabilities();
+        let from_level = level.to_capabilities();
+        prop_assert_eq!(effective.read_pane_output, from_level.read_pane_output);
+    }
+
+    /// ValidationResult with no errors and no warnings serializes.
+    #[test]
+    fn validation_empty_serializes(_dummy in 0..1u8) {
+        let result = ValidationResult {
+            valid: true,
+            pack_name: None,
+            version: None,
+            rule_count: 0,
+            errors: vec![],
+            warnings: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        prop_assert!(json.contains("\"errors\""));
+    }
+
+    /// ExtensionRuleInfo Clone preserves id.
+    #[test]
+    fn rule_info_clone_preserves(rule in arb_extension_rule_info()) {
+        let cloned = rule.clone();
+        prop_assert_eq!(cloned.id, rule.id);
+    }
+
+    /// SandboxCapabilities Default has read_pane_output true and send_text false.
+    #[test]
+    fn sandbox_default_capabilities(_dummy in 0..1u8) {
+        let caps = SandboxCapabilities::default();
+        prop_assert!(caps.read_pane_output, "default should allow reading pane output");
+        prop_assert!(!caps.send_text, "default should not allow sending text");
+        prop_assert!(!caps.http_requests, "default should not allow http requests");
+    }
+}

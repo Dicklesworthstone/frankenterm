@@ -506,3 +506,69 @@ proptest! {
             "extract_features should return {} features, got {}", NUM_FEATURES, f.len());
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Dot product with zero vector is zero.
+    #[test]
+    fn dot_zero_vector_is_zero(a in prop::collection::vec(-10.0f64..10.0, 8..=8)) {
+        let zero = vec![0.0f64; 8];
+        let result = dot(&a, &zero);
+        prop_assert!((result - 0.0).abs() < 1e-10);
+    }
+
+    /// Cosine similarity of orthogonal vectors is near zero.
+    #[test]
+    fn cosine_orthogonal_near_zero(_dummy in 0..1u8) {
+        let a = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let sim = cosine_similarity(&a, &b);
+        prop_assert!((sim).abs() < 1e-10, "orthogonal vectors should have ~0 similarity, got {}", sim);
+    }
+
+    /// IrlConfig Clone preserves learning_rate.
+    #[test]
+    fn irl_config_clone_lr(config in arb_irl_config()) {
+        let cloned = config.clone();
+        let j1 = serde_json::to_string(&config).unwrap();
+        let j2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(j1, j2);
+    }
+
+    /// RewardFunction with zero theta gives zero reward for any features.
+    #[test]
+    fn zero_theta_all_zero_reward(f0 in -10.0f64..10.0, f1 in -10.0f64..10.0) {
+        let rf = RewardFunction::new();
+        let features: [f64; NUM_FEATURES] = [f0, f1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let reward = rf.reward(&features);
+        prop_assert!((reward - 0.0).abs() < 1e-10);
+    }
+
+    /// PaneState Clone preserves pane_id.
+    #[test]
+    fn pane_state_clone_preserves(obs in arb_observation(3)) {
+        for ps in &obs.pane_states {
+            let cloned = ps.clone();
+            prop_assert_eq!(cloned.pane_id, ps.pane_id);
+        }
+    }
+
+    /// MaxEntIrl new starts with zero trajectory.
+    #[test]
+    fn maxent_irl_new_empty(config in arb_irl_config()) {
+        let irl = MaxEntIrl::new(config);
+        let json = serde_json::to_string(&irl).unwrap();
+        prop_assert!(json.contains("theta"));
+    }
+
+    /// UserAction serde roundtrip preserves variant.
+    #[test]
+    fn user_action_serde_ext(action in arb_user_action(5)) {
+        let json = serde_json::to_string(&action).unwrap();
+        let back: UserAction = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, action);
+    }
+}

@@ -602,3 +602,80 @@ proptest! {
         prop_assert_eq!(json1, json2);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// ClusteringConfig Default has positive num_hashes.
+    #[test]
+    fn config_default_positive_hashes(_dummy in 0..1u8) {
+        let config = ClusteringConfig::default();
+        prop_assert!(config.num_hashes > 0);
+    }
+
+    /// ClusterInfo Clone preserves cluster_id.
+    #[test]
+    fn cluster_info_clone_preserves(
+        text in arb_error_text(),
+        ts in arb_timestamp(),
+    ) {
+        let config = ClusteringConfig::default();
+        let mut clusterer = ErrorClusterer::new(config);
+        let cid = clusterer.insert(&text, Some(1), ts);
+        let info = clusterer.clusters().iter().find(|c| c.cluster_id == cid).unwrap().clone();
+        let cloned = info.clone();
+        prop_assert_eq!(cloned.cluster_id, info.cluster_id);
+    }
+
+    /// Error count remains 0 before any insertions.
+    #[test]
+    fn fresh_clusterer_zero_error_count(_dummy in 0..1u8) {
+        let config = ClusteringConfig::default();
+        let clusterer = ErrorClusterer::new(config);
+        prop_assert_eq!(clusterer.error_count(), 0);
+    }
+
+    /// Inserting with None pane_id increments error count.
+    #[test]
+    fn insert_none_pane_id_increments(text in arb_error_text(), ts in arb_timestamp()) {
+        let config = ClusteringConfig::default();
+        let mut clusterer = ErrorClusterer::new(config);
+        clusterer.insert(&text, None, ts);
+        prop_assert_eq!(clusterer.error_count(), 1);
+    }
+
+    /// Two distinct texts produce clusters with total sizes summing to 2.
+    #[test]
+    fn two_inserts_total_size_two(
+        t1 in arb_error_text(),
+        t2 in arb_error_text(),
+        ts in arb_timestamp(),
+    ) {
+        let config = ClusteringConfig::default();
+        let mut clusterer = ErrorClusterer::new(config);
+        clusterer.insert(&t1, Some(1), ts);
+        clusterer.insert(&t2, Some(2), ts + 1);
+        let total: usize = clusterer.clusters().iter().map(|c| c.size).sum();
+        prop_assert_eq!(total, 2);
+    }
+
+    /// ClusteringConfig JSON has "num_hashes" key.
+    #[test]
+    fn config_json_has_num_hashes(config in arb_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(json.contains("\"num_hashes\""));
+    }
+
+    /// ClusterInfo first_seen_secs <= last_seen_secs after single insert.
+    #[test]
+    fn cluster_timestamp_ordering(text in arb_error_text(), ts in arb_timestamp()) {
+        let config = ClusteringConfig::default();
+        let mut clusterer = ErrorClusterer::new(config);
+        let cid = clusterer.insert(&text, Some(1), ts);
+        let clusters = clusterer.clusters();
+        let info = clusters.iter().find(|c| c.cluster_id == cid).unwrap();
+        prop_assert!(info.first_seen_secs <= info.last_seen_secs);
+    }
+}

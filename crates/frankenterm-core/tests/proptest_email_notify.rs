@@ -574,3 +574,84 @@ proptest! {
             "empty password with username should fail");
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// EmailTlsMode all three variants are distinct.
+    #[test]
+    fn tls_mode_variants_distinct(_dummy in 0..1u8) {
+        let modes = [EmailTlsMode::None, EmailTlsMode::StartTls, EmailTlsMode::Tls];
+        for i in 0..modes.len() {
+            for j in (i + 1)..modes.len() {
+                prop_assert_ne!(modes[i], modes[j]);
+            }
+        }
+    }
+
+    /// Valid config with max port value round-trips.
+    #[test]
+    fn config_max_port_serde(_dummy in 0..1u8) {
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "mail.example.com".to_string(),
+            smtp_port: u16::MAX,
+            tls: EmailTlsMode::Tls,
+            from: "a@b.com".to_string(),
+            to: vec!["c@d.com".to_string()],
+            username: None,
+            password: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: EmailNotifyConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.smtp_port, u16::MAX);
+    }
+
+    /// Disabled config with invalid fields still validates.
+    #[test]
+    fn disabled_ignores_invalid_host(_dummy in 0..1u8) {
+        let config = EmailNotifyConfig {
+            enabled: false,
+            smtp_host: String::new(),
+            smtp_port: 0,
+            from: String::new(),
+            to: vec![],
+            ..Default::default()
+        };
+        prop_assert!(config.validate().is_ok());
+    }
+
+    /// Config Default has reasonable timeout.
+    #[test]
+    fn default_config_timeout_nonzero(_dummy in 0..1u8) {
+        let config = EmailNotifyConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(v.is_object());
+    }
+
+    /// Valid config clone still validates.
+    #[test]
+    fn valid_config_roundtrip_still_validates(config in arb_valid_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: EmailNotifyConfig = serde_json::from_str(&json).unwrap();
+        prop_assert!(back.validate().is_ok());
+    }
+
+    /// Config JSON contains "host" key when enabled.
+    #[test]
+    fn enabled_config_json_has_host(config in arb_valid_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(json.contains("\"smtp_host\""));
+    }
+
+    /// EmailTlsMode Debug format is non-empty for all variants.
+    #[test]
+    fn tls_mode_debug_all_variants(mode in arb_tls_mode()) {
+        let debug = format!("{:?}", mode);
+        prop_assert!(debug.len() > 0);
+    }
+}

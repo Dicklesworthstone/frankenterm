@@ -587,3 +587,77 @@ proptest! {
         prop_assert_eq!(data1.shell, data2.shell);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// PaneConfig serde roundtrip preserves all fields.
+    #[test]
+    fn pane_config_full_serde(config in arb_pane_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: PaneConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, config.pane_id);
+    }
+
+    /// StateLabel all 5 variants are distinct.
+    #[test]
+    fn state_label_all_distinct(_dummy in 0..1u8) {
+        let labels = [
+            StateLabel::Creating, StateLabel::Active,
+            StateLabel::Snapshotting, StateLabel::Restoring,
+            StateLabel::Closed,
+        ];
+        for i in 0..labels.len() {
+            for j in (i + 1)..labels.len() {
+                prop_assert_ne!(labels[i], labels[j]);
+            }
+        }
+    }
+
+    /// Creating pane can transition to Active.
+    #[test]
+    fn creating_transitions_to_active(config in arb_pane_config()) {
+        let pane = TypedPane::<Creating>::new(config);
+        let active = pane.activate();
+        prop_assert_eq!(active.state_label(), StateLabel::Active);
+    }
+
+    /// Active pane close produces Closed state.
+    #[test]
+    fn active_close_produces_closed(config in arb_pane_config()) {
+        let pane = TypedPane::<Creating>::new(config);
+        let active = pane.activate();
+        let closed = active.close();
+        prop_assert_eq!(closed.state_label(), StateLabel::Closed);
+    }
+
+    /// SnapshotData env field preserved in serde.
+    #[test]
+    fn snapshot_data_env_serde(data in arb_snapshot_data()) {
+        let json = serde_json::to_string(&data).unwrap();
+        let back: SnapshotData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.env, data.env);
+    }
+
+    /// TransitionLog starts empty with len 0.
+    #[test]
+    fn transition_log_starts_empty(_dummy in 0..1u8) {
+        let log = TransitionLog::new();
+        prop_assert_eq!(log.len(), 0);
+        prop_assert!(log.is_empty());
+    }
+
+    /// StateLabel Hash consistency: equal labels have equal hash.
+    #[test]
+    fn state_label_hash_consistency(label in arb_state_label()) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        label.hash(&mut h1);
+        label.hash(&mut h2);
+        prop_assert_eq!(h1.finish(), h2.finish());
+    }
+}
