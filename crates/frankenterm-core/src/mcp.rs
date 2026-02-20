@@ -1493,8 +1493,7 @@ impl ToolHandler for WaStateTool {
             }
         };
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -1597,8 +1596,7 @@ impl ToolHandler for WaGetTextTool {
         let config = Arc::clone(&self.config);
         let db_path = self.db_path.as_ref().map(Arc::clone);
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -1793,8 +1791,7 @@ impl ToolHandler for WaWaitForTool {
             WaitMatcher::substring(&params.pattern)
         };
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -1922,8 +1919,7 @@ impl ToolHandler for WaSendTool {
 
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -2222,8 +2218,7 @@ impl ToolHandler for WaSearchTool {
             Hybrid(crate::storage::HybridSearchBundle),
         }
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -2502,8 +2497,7 @@ impl ToolHandler for WaEventsTool {
         };
 
         let db_path = Arc::clone(&self.db_path);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -2685,8 +2679,7 @@ impl ToolHandler for WaEventsAnnotateTool {
         }
 
         let db_path = Arc::clone(&self.db_path);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -2817,8 +2810,7 @@ impl ToolHandler for WaEventsTriageTool {
         }
 
         let db_path = Arc::clone(&self.db_path);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -2964,8 +2956,7 @@ impl ToolHandler for WaEventsLabelTool {
         }
 
         let db_path = Arc::clone(&self.db_path);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -3130,8 +3121,7 @@ impl ToolHandler for WaWorkflowRunTool {
 
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -3575,8 +3565,7 @@ impl ToolHandler for WaCassSearchTool {
             None
         };
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -3669,8 +3658,7 @@ impl ToolHandler for WaCassViewTool {
             return envelope_to_content(envelope);
         }
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -3750,8 +3738,7 @@ impl ToolHandler for WaCassStatusTool {
             }
         };
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -3835,8 +3822,7 @@ impl ToolHandler for WaReservationsTool {
         };
 
         let db_path = Arc::clone(&self.db_path);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -3939,8 +3925,7 @@ impl ToolHandler for WaReserveTool {
 
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -4073,8 +4058,7 @@ impl ToolHandler for WaReleaseTool {
 
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -4228,8 +4212,7 @@ impl ToolHandler for WaAccountsTool {
         };
 
         let db_path = Arc::clone(&self.db_path);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
@@ -4333,8 +4316,7 @@ impl ToolHandler for WaAccountsRefreshTool {
 
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 

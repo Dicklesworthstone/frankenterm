@@ -562,6 +562,18 @@ impl RuntimeBuilder {
         }
     }
 
+    /// No-op: asupersync handles I/O and timers automatically.
+    #[must_use]
+    pub fn enable_all(self) -> Self {
+        self
+    }
+
+    /// No-op: thread naming is not exposed in asupersync.
+    #[must_use]
+    pub fn thread_name(self, _name: &str) -> Self {
+        self
+    }
+
     pub fn build(self) -> Result<Runtime, String> {
         self.inner
             .build()
@@ -604,6 +616,19 @@ impl RuntimeBuilder {
         if self.supports_worker_threads {
             self.inner.worker_threads(n);
         }
+        self
+    }
+
+    /// No-op: `enable_all()` is already called in the constructors.
+    #[must_use]
+    pub fn enable_all(self) -> Self {
+        self
+    }
+
+    /// Sets the thread name for spawned worker threads.
+    #[must_use]
+    pub fn thread_name(mut self, name: &str) -> Self {
+        self.inner.thread_name(name);
         self
     }
 
@@ -2372,5 +2397,44 @@ mod tests {
 
         let received = server.await.expect("server task");
         assert_eq!(&received, b"ping");
+    }
+
+    // ========================================================================
+    // RuntimeBuilder enable_all and thread_name tests
+    // ========================================================================
+
+    #[test]
+    fn runtime_builder_enable_all_is_chainable() {
+        let rt = RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build();
+        assert!(rt.is_ok());
+    }
+
+    #[test]
+    fn runtime_builder_thread_name_is_chainable() {
+        let rt = RuntimeBuilder::multi_thread()
+            .thread_name("test-worker")
+            .build();
+        assert!(rt.is_ok());
+    }
+
+    #[test]
+    fn runtime_builder_full_chain() {
+        let rt = RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("full-chain-test")
+            .build();
+        assert!(rt.is_ok());
+    }
+
+    #[test]
+    fn runtime_builder_current_thread_with_enable_all_and_thread_name() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .thread_name("ct-test")
+            .build();
+        assert!(rt.is_ok());
     }
 }

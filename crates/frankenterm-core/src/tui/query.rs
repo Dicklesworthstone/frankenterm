@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use crate::circuit_breaker::CircuitBreakerStatus;
 use crate::config::WorkspaceLayout;
+use crate::runtime_compat::CompatRuntime;
 use crate::storage::{EventMuteRecord, StorageHandle};
 pub use crate::ui_query::{PaneBookmarkView, RulesetProfileState, SavedSearchView};
 use crate::wezterm::{PaneInfo, WeztermHandle, default_wezterm_handle};
@@ -292,7 +293,7 @@ pub struct ProductionQueryClient {
     #[allow(dead_code)]
     storage: Option<StorageHandle>,
     /// Dedicated runtime for async operations - avoids nested runtime panics
-    runtime: tokio::runtime::Runtime,
+    runtime: crate::runtime_compat::Runtime,
 }
 
 impl ProductionQueryClient {
@@ -302,9 +303,8 @@ impl ProductionQueryClient {
     /// avoiding "cannot start a runtime from within a runtime" panics.
     #[must_use]
     pub fn new(workspace_layout: WorkspaceLayout) -> Self {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let runtime = crate::runtime_compat::RuntimeBuilder::multi_thread()
             .worker_threads(2)
-            .enable_all()
             .thread_name("tui-query-runtime")
             .build()
             .expect("Failed to create TUI query runtime");
@@ -324,9 +324,8 @@ impl ProductionQueryClient {
     /// avoiding "cannot start a runtime from within a runtime" panics.
     #[must_use]
     pub fn with_storage(workspace_layout: WorkspaceLayout, storage: StorageHandle) -> Self {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let runtime = crate::runtime_compat::RuntimeBuilder::multi_thread()
             .worker_threads(2)
-            .enable_all()
             .thread_name("tui-query-runtime")
             .build()
             .expect("Failed to create TUI query runtime");
@@ -343,9 +342,8 @@ impl ProductionQueryClient {
     /// Create with a custom WezTerm interface (useful for tests/mocks).
     #[must_use]
     pub fn with_wezterm(workspace_layout: WorkspaceLayout, wezterm: WeztermHandle) -> Self {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let runtime = crate::runtime_compat::RuntimeBuilder::multi_thread()
             .worker_threads(2)
-            .enable_all()
             .thread_name("tui-query-runtime")
             .build()
             .expect("Failed to create TUI query runtime");
@@ -366,9 +364,8 @@ impl ProductionQueryClient {
         storage: StorageHandle,
         wezterm: WeztermHandle,
     ) -> Self {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let runtime = crate::runtime_compat::RuntimeBuilder::multi_thread()
             .worker_threads(2)
-            .enable_all()
             .thread_name("tui-query-runtime")
             .build()
             .expect("Failed to create TUI query runtime");
