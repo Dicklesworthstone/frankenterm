@@ -959,7 +959,10 @@ impl ResizeScheduler {
 
     /// Mark an active intent as complete.
     ///
-    /// Returns true when the supplied sequence matched the current active sequence.
+    /// Returns true when the supplied sequence matched the current active sequence
+    /// and no newer intent has superseded it. Returns false when the sequence does
+    /// not match or when a newer intent exists (use `cancel_active_if_superseded`
+    /// to clear superseded active intents).
     pub fn complete_active(&mut self, pane_id: u64, intent_seq: u64) -> bool {
         let Some(state) = self.panes.get(&pane_id) else {
             return false;
@@ -983,35 +986,39 @@ impl ResizeScheduler {
             return false;
         }
 
-        // Even if superseded, we must clear the active slot so pending work can proceed.
+        // Reject completion when superseded by a newer intent — the caller should
+        // use cancel_active_if_superseded to properly transition to the newer intent.
+        let is_stale = latest_seq.is_some_and(|latest| latest > intent_seq);
+        if is_stale {
+            self.metrics.completion_rejected = self.metrics.completion_rejected.saturating_add(1);
+            self.push_lifecycle_event(
+                pane_id,
+                intent_seq,
+                None,
+                ResizeLifecycleStage::Failed,
+                ResizeLifecycleDetail::ActiveCompletionRejected {
+                    active_seq: Some(active_seq),
+                },
+            );
+            self.publish_debug_snapshot();
+            return false;
+        }
+
+        // Active seq matches and is not superseded — clear the slot and commit.
         if let Some(state) = self.panes.get_mut(&pane_id) {
             state.active_seq = None;
             state.active_phase = None;
             state.active_phase_started_at_ms = None;
         }
 
-        let is_stale = latest_seq.is_some_and(|latest| latest > intent_seq);
-        if is_stale {
-            self.metrics.cancelled_active = self.metrics.cancelled_active.saturating_add(1);
-            self.push_lifecycle_event(
-                pane_id,
-                intent_seq,
-                None,
-                ResizeLifecycleStage::Cancelled,
-                ResizeLifecycleDetail::ActiveCancelledSuperseded {
-                    superseded_by_seq: latest_seq.unwrap_or(0), // Fallback should be unreachable if is_stale
-                },
-            );
-        } else {
-            self.metrics.completed_active = self.metrics.completed_active.saturating_add(1);
-            self.push_lifecycle_event(
-                pane_id,
-                intent_seq,
-                None,
-                ResizeLifecycleStage::Committed,
-                ResizeLifecycleDetail::ActiveCompleted,
-            );
-        }
+        self.metrics.completed_active = self.metrics.completed_active.saturating_add(1);
+        self.push_lifecycle_event(
+            pane_id,
+            intent_seq,
+            None,
+            ResizeLifecycleStage::Committed,
+            ResizeLifecycleDetail::ActiveCompleted,
+        );
         self.publish_debug_snapshot();
         true
     }
