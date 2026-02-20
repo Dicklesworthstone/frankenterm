@@ -177,6 +177,7 @@ pub struct MerkleTree {
 
 impl MerkleTree {
     /// Create an empty Merkle tree.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -185,6 +186,7 @@ impl MerkleTree {
     }
 
     /// Create a Merkle tree from key-value pairs.
+    #[must_use]
     pub fn from_entries(entries: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) -> Self {
         let mut tree = Self::new();
         for (k, v) in entries {
@@ -210,26 +212,31 @@ impl MerkleTree {
     }
 
     /// Get the value for a key.
+    #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
         self.entries.get(key).map(|v| v.as_slice())
     }
 
     /// Check if the tree contains a key.
+    #[must_use]
     pub fn contains_key(&self, key: &[u8]) -> bool {
         self.entries.contains_key(key)
     }
 
     /// The root hash of the tree.
+    #[must_use]
     pub fn root_hash(&self) -> MerkleHash {
         self.root_hash
     }
 
     /// Number of entries.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether the tree is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -282,6 +289,7 @@ impl MerkleTree {
     /// Generate an inclusion proof for a key.
     ///
     /// Returns `None` if the key is not in the tree.
+    #[must_use]
     pub fn proof(&self, key: &[u8]) -> Option<MerkleProof> {
         let entries: Vec<_> = self.entries.iter().collect();
         let idx = entries.iter().position(|(k, _)| k.as_slice() == key)?;
@@ -324,6 +332,7 @@ impl MerkleTree {
     /// Returns keys that are in one tree but not the other, or have
     /// different values. This is an O(k log n) operation where k is
     /// the number of differing entries.
+    #[must_use]
     pub fn diff(&self, other: &MerkleTree) -> TreeDiff {
         if self.root_hash == other.root_hash {
             return TreeDiff {
