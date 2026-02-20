@@ -878,3 +878,152 @@ proptest! {
         }
     }
 }
+
+// =============================================================================
+// Property: Collect remaining yields correct count
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn collect_remaining_count_matches_events(events in arb_events(15)) {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let n = events.len();
+        let mut session = make_session(events, ReplayConfig::instant()).unwrap();
+        let frames = session.collect_remaining();
+        prop_assert_eq!(frames.len(), n,
+            "collect_remaining should yield all {} events, got {}", n, frames.len());
+    }
+}
+
+// =============================================================================
+// Property: Stats completed flag after collect_remaining
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn stats_completed_after_drain(events in arb_events(10)) {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut session = make_session(events, ReplayConfig::instant()).unwrap();
+        let _ = session.collect_remaining();
+        let stats = session.stats();
+        prop_assert!(stats.completed, "stats.completed should be true after draining all frames");
+    }
+}
+
+// =============================================================================
+// Property: Frame indices are sequential starting from 0
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn frame_indices_sequential_from_zero(events in arb_events(10)) {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut session = make_session(events, ReplayConfig::instant()).unwrap();
+        let frames = session.collect_remaining();
+        for (i, frame) in frames.iter().enumerate() {
+            prop_assert_eq!(frame.frame_index, i,
+                "frame index {} should equal position {}", frame.frame_index, i);
+        }
+    }
+}
+
+// =============================================================================
+// Property: ReplayConfig with_panes sets filter
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn replay_config_with_panes_sets_filter(
+        pane_id in 1_u64..100,
+    ) {
+        let config = ReplayConfig::instant().with_panes(vec![pane_id]);
+        prop_assert!(!config.pane_filter.is_empty(),
+            "pane_filter should be non-empty after with_panes");
+        prop_assert!(config.pane_filter.contains(&pane_id),
+            "pane_filter should contain {}", pane_id);
+    }
+}
+
+// =============================================================================
+// Property: ReplayConfig with_kinds sets filter
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn replay_config_with_kinds_sets_filter(
+        kind in arb_event_kind(),
+    ) {
+        let config = ReplayConfig::instant().with_kinds(vec![kind]);
+        prop_assert!(!config.kind_filter.is_empty(),
+            "kind_filter should be non-empty after with_kinds");
+        prop_assert!(config.kind_filter.contains(&kind),
+            "kind_filter should contain {:?}", kind);
+    }
+}
+
+// =============================================================================
+// Property: ReplayStats default is zeroed
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn replay_stats_default_zeroed(_dummy in 0..1_u8) {
+        let stats = ReplayStats::default();
+        prop_assert_eq!(stats.frames_emitted, 0);
+        prop_assert_eq!(stats.frames_skipped, 0);
+        prop_assert_eq!(stats.original_duration_ms, 0);
+        prop_assert_eq!(stats.replay_duration_ms, 0);
+        prop_assert_eq!(stats.unique_panes, 0);
+        prop_assert!(!stats.completed);
+    }
+}
+
+// =============================================================================
+// Property: ReplayStats serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn replay_stats_serde_roundtrip(
+        emitted in 0_usize..1000,
+        skipped in 0_usize..500,
+        orig_dur in 0_u64..100_000,
+        replay_dur in 0_u64..100_000,
+    ) {
+        let stats = ReplayStats {
+            frames_emitted: emitted,
+            frames_skipped: skipped,
+            original_duration_ms: orig_dur,
+            replay_duration_ms: replay_dur,
+            unique_panes: 3,
+            by_kind: std::collections::HashMap::new(),
+            completed: true,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: ReplayStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.frames_emitted, emitted);
+        prop_assert_eq!(back.frames_skipped, skipped);
+        prop_assert_eq!(back.original_duration_ms, orig_dur);
+        prop_assert_eq!(back.replay_duration_ms, replay_dur);
+    }
+}

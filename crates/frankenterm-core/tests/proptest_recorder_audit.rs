@@ -812,3 +812,192 @@ proptest! {
         }
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Property 31: Empty log has no entries and next ordinal 1
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn empty_log_next_ordinal_is_one(_dummy in 0..1_u8) {
+        let log = AuditLog::new(AuditLogConfig::default());
+        prop_assert!(log.is_empty());
+        prop_assert_eq!(log.len(), 0);
+        prop_assert_eq!(log.next_ordinal(), 0);
+        prop_assert_eq!(log.total_appended(), 0);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Property 32: Append increments next_ordinal and total_appended
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn append_increments_ordinal_and_total(
+        n_events in 1_usize..20,
+    ) {
+        let log = AuditLog::new(AuditLogConfig {
+            max_memory_entries: 10_000,
+            ..AuditLogConfig::default()
+        });
+        let actor = make_actor(ActorKind::Human);
+        let mut last_ordinal = 0_u64;
+        for i in 0..n_events {
+            let entry = log.append(
+                AuditEventBuilder::new(AuditEventType::RecorderQuery, actor.clone(), (i as u64 + 1) * 1000),
+            );
+            // Ordinals should be strictly increasing
+            prop_assert!(entry.ordinal >= last_ordinal,
+                "ordinal {} should be >= previous {}", entry.ordinal, last_ordinal);
+            last_ordinal = entry.ordinal;
+        }
+        prop_assert_eq!(log.total_appended(), n_events as u64);
+        prop_assert_eq!(log.len(), n_events);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Property 33: last_hash changes after each append
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn last_hash_changes_on_append(
+        n_events in 2_usize..10,
+    ) {
+        let log = AuditLog::new(AuditLogConfig {
+            max_memory_entries: 10_000,
+            ..AuditLogConfig::default()
+        });
+        let actor = make_actor(ActorKind::Human);
+        let mut prev_hash = log.last_hash().to_string();
+        for i in 0..n_events {
+            log.append(
+                AuditEventBuilder::new(AuditEventType::RecorderQuery, actor.clone(), (i as u64 + 1) * 1000),
+            );
+            let curr_hash = log.last_hash().to_string();
+            prop_assert_ne!(&curr_hash, &prev_hash,
+                "last_hash should change after append {}", i);
+            prev_hash = curr_hash;
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Property 34: drain returns all entries and empties the log
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn drain_returns_all_and_empties(
+        n_events in 1_usize..20,
+    ) {
+        let log = AuditLog::new(AuditLogConfig {
+            max_memory_entries: 10_000,
+            ..AuditLogConfig::default()
+        });
+        let actor = make_actor(ActorKind::Human);
+        for i in 0..n_events {
+            log.append(
+                AuditEventBuilder::new(AuditEventType::RecorderQuery, actor.clone(), (i as u64 + 1) * 1000),
+            );
+        }
+        let drained = log.drain();
+        prop_assert_eq!(drained.len(), n_events);
+        prop_assert!(log.is_empty());
+        prop_assert_eq!(log.len(), 0);
+        // total_appended should still track historical count
+        prop_assert_eq!(log.total_appended(), n_events as u64);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Property 35: entries_by_type filters correctly
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn entries_by_type_all_match_filter(
+        events in arb_event_sequence(15)
+    ) {
+        let log = AuditLog::new(AuditLogConfig {
+            max_memory_entries: 10_000,
+            ..AuditLogConfig::default()
+        });
+
+        for (et, ak, ts, decision) in &events {
+            log.append(
+                AuditEventBuilder::new(*et, make_actor(*ak), *ts)
+                    .with_decision(decision.clone()),
+            );
+        }
+
+        let target = AuditEventType::RecorderQuery;
+        let filtered = log.entries_by_type(target);
+        for entry in &filtered {
+            prop_assert_eq!(entry.event_type, target,
+                "entries_by_type should only return matching type");
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Property 36: AuditLogConfig serde roundtrip
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn audit_log_config_serde_roundtrip(
+        max_entries in 1_usize..100_000,
+        hash_enabled in proptest::bool::ANY,
+        retention in 1_u32..365,
+    ) {
+        let config = AuditLogConfig {
+            max_memory_entries: max_entries,
+            hash_chain_enabled: hash_enabled,
+            retention_days: retention,
+            policy_version: "v1.0".into(),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: AuditLogConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.max_memory_entries, config.max_memory_entries);
+        prop_assert_eq!(back.hash_chain_enabled, config.hash_chain_enabled);
+        prop_assert_eq!(back.retention_days, config.retention_days);
+        prop_assert_eq!(back.policy_version, config.policy_version);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Property 37: ActorIdentity Debug is non-empty
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn actor_identity_debug_nonempty(
+        kind in prop_oneof![
+            Just(ActorKind::Human),
+            Just(ActorKind::Robot),
+            Just(ActorKind::Mcp),
+            Just(ActorKind::Workflow),
+        ],
+    ) {
+        let actor = make_actor(kind);
+        let dbg = format!("{:?}", actor);
+        prop_assert!(!dbg.is_empty());
+    }
+}

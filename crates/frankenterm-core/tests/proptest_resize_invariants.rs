@@ -804,3 +804,160 @@ proptest! {
         prop_assert_eq!(report.checks_passed, 6, "happy path has 6 transitions");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Property 31: Terminal phases (Committed, Failed, Cancelled) only go to Idle
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn terminal_phases_transition_to_idle(_dummy in 0..1_u8) {
+        let terminal = [
+            ResizePhase::Committed,
+            ResizePhase::Failed,
+            ResizePhase::Cancelled,
+        ];
+        for phase in terminal {
+            let transitions = phase.valid_transitions();
+            prop_assert!(transitions.contains(&ResizePhase::Idle),
+                "{:?} should be able to transition to Idle", phase);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 32: ResizeInvariantReport new is clean with zero counts
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn report_new_is_clean(_dummy in 0..1_u8) {
+        let report = ResizeInvariantReport::new();
+        prop_assert!(report.is_clean());
+        prop_assert!(!report.has_critical());
+        prop_assert_eq!(report.checks_passed, 0);
+        prop_assert_eq!(report.checks_failed, 0);
+        prop_assert_eq!(report.total_checks(), 0);
+        prop_assert!(report.violations.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 33: DimensionTriple with all same dimensions is clean
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn dimension_triple_uniform_is_clean(
+        rows in 10_usize..200,
+        cols in 40_usize..400,
+    ) {
+        let dims = DimensionTriple {
+            pty_rows: rows,
+            pty_cols: cols,
+            terminal_rows: rows,
+            terminal_cols: cols,
+            screen_rows: rows,
+            screen_cols: cols,
+        };
+        let mut report = ResizeInvariantReport::new();
+        check_presentation_invariants(&mut report, Some(1), Some(1), &dims);
+        prop_assert!(report.is_clean(),
+            "uniform dimensions should be clean, violations: {:?}", report.violations);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 34: ResizeInvariantTelemetry absorb is additive
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn telemetry_absorb_from_report(
+        n_transitions in 1_usize..10,
+    ) {
+        let mut telemetry = ResizeInvariantTelemetry::default();
+        // Build a report with some valid transitions
+        let mut report = ResizeInvariantReport::new();
+        for _ in 0..n_transitions {
+            check_phase_transition(&mut report, Some(1), Some(1),
+                ResizePhase::Idle, ResizePhase::Queued);
+        }
+        let before_passes = telemetry.total_passes;
+        telemetry.absorb(&report);
+        prop_assert!(telemetry.total_passes >= before_passes + n_transitions as u64,
+            "absorb should add report passes to telemetry");
+        prop_assert_eq!(telemetry.total_checks, report.total_checks() as u64);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 35: ResizeViolationSeverity Debug is non-empty
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn violation_severity_debug_nonempty(
+        sev in prop_oneof![
+            Just(ResizeViolationSeverity::Warning),
+            Just(ResizeViolationSeverity::Error),
+            Just(ResizeViolationSeverity::Critical),
+        ],
+    ) {
+        let dbg = format!("{:?}", sev);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 36: Idle can transition to Queued (basic FSM edge)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn idle_can_transition_to_queued(_dummy in 0..1_u8) {
+        let transitions = ResizePhase::Idle.valid_transitions();
+        prop_assert!(transitions.contains(&ResizePhase::Queued),
+            "Idle should be able to transition to Queued");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 37: ScreenSnapshot with cursor in bounds is clean
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn screen_snapshot_cursor_in_bounds_clean(
+        rows in 10_usize..200,
+        cols in 40_usize..400,
+    ) {
+        let snap = ScreenSnapshot {
+            physical_rows: rows,
+            physical_cols: cols,
+            lines_len: rows,
+            scrollback_size: 0,
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_phys_row: 0,
+        };
+        let mut report = ResizeInvariantReport::new();
+        check_screen_invariants(&mut report, Some(1), &snap);
+        prop_assert!(report.is_clean(),
+            "valid screen snapshot should be clean, violations: {:?}", report.violations);
+    }
+}

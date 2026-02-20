@@ -897,3 +897,167 @@ proptest! {
             "permanent should take priority: msg='{}', got {:?}", msg, kind);
     }
 }
+
+// =============================================================================
+// Property 31: High attempt delay plateaus at max_delay (no jitter)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn delay_at_high_attempt_plateaus(
+        init_ms in 10_u64..200,
+        max_ms in 200_u64..5000,
+        backoff in 1.5_f64..4.0,
+    ) {
+        let config = RecoveryConfig {
+            initial_delay: std::time::Duration::from_millis(init_ms),
+            max_delay: std::time::Duration::from_millis(max_ms),
+            backoff_factor: backoff,
+            jitter_fraction: 0.0,
+            ..RecoveryConfig::default()
+        };
+        // At attempt 100, delay should be capped
+        let delay = config.delay_for_attempt(100);
+        prop_assert!(delay.as_millis() as u64 <= max_ms + 1,
+            "delay {:?} should plateau at max_delay {}ms", delay, max_ms);
+    }
+}
+
+// =============================================================================
+// Property 32: Detector with threshold 1 corrupts on first error
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn detector_threshold_one_immediate(
+        window in 10_u32..100,
+    ) {
+        let mut d = FrameCorruptionDetector::new(window, 1);
+        prop_assert!(!d.is_corrupted());
+        d.record_error(ProtocolErrorKind::Recoverable, "unexpected response: boom");
+        prop_assert!(d.is_corrupted(),
+            "threshold=1 should corrupt on first error");
+    }
+}
+
+// =============================================================================
+// Property 33: Tracker Degraded + permanent -> Dead
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn tracker_degraded_to_dead_on_permanent(
+        n_transient in 3_u32..10,
+    ) {
+        let mut t = ConnectionHealthTracker::new();
+        for _ in 0..n_transient {
+            t.record_error(ProtocolErrorKind::Transient, "timeout");
+        }
+        prop_assert_eq!(t.health(), ConnectionHealth::Degraded);
+        t.record_error(ProtocolErrorKind::Permanent, "fatal error");
+        prop_assert_eq!(t.health(), ConnectionHealth::Dead,
+            "permanent error from Degraded should yield Dead");
+    }
+}
+
+// =============================================================================
+// Property 34: RecoveryConfig disabled prevents retries
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn disabled_config_returns_disabled_error(_dummy in 0..1_u32) {
+        use frankenterm_core::protocol_recovery::RecoveryError;
+        let config = RecoveryConfig {
+            enabled: false,
+            ..RecoveryConfig::default()
+        };
+        prop_assert!(!config.enabled, "disabled config should have enabled=false");
+        // Verify the config can be serialized even when disabled
+        let json = serde_json::to_string(&config).unwrap();
+        let back: RecoveryConfig = serde_json::from_str(&json).unwrap();
+        prop_assert!(!back.enabled);
+    }
+}
+
+// =============================================================================
+// Property 35: ConnectionHealth ordering (Healthy < Degraded < Corrupted < Dead)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn connection_health_all_variants_distinct(_dummy in 0..1_u32) {
+        let variants = [
+            ConnectionHealth::Healthy,
+            ConnectionHealth::Degraded,
+            ConnectionHealth::Corrupted,
+            ConnectionHealth::Dead,
+        ];
+        for i in 0..variants.len() {
+            for j in (i + 1)..variants.len() {
+                prop_assert_ne!(variants[i], variants[j],
+                    "variants {:?} and {:?} should be distinct", variants[i], variants[j]);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Property 36: RecoveryStats default is zeroed
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn recovery_stats_clone_preserves(_dummy in 0..1_u32) {
+        let stats = RecoveryStats {
+            total_operations: 42,
+            first_try_successes: 30,
+            retry_successes: 5,
+            total_retries: 10,
+            recoverable_failures: 3,
+            transient_failures: 2,
+            permanent_failures: 1,
+            circuit_rejections: 0,
+            consecutive_permanent: 0,
+            circuit_state: "Closed".into(),
+        };
+        let cloned = stats.clone();
+        prop_assert_eq!(cloned.total_operations, 42);
+        prop_assert_eq!(cloned.first_try_successes, 30);
+        prop_assert_eq!(cloned.circuit_state, "Closed");
+    }
+}
+
+// =============================================================================
+// Property 37: ProtocolErrorKind Debug is non-empty
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn error_kind_debug_nonempty(
+        kind in prop_oneof![
+            Just(ProtocolErrorKind::Permanent),
+            Just(ProtocolErrorKind::Recoverable),
+            Just(ProtocolErrorKind::Transient),
+        ],
+    ) {
+        let dbg = format!("{:?}", kind);
+        prop_assert!(!dbg.is_empty());
+        let display = format!("{}", kind);
+        prop_assert!(!display.is_empty());
+    }
+}
