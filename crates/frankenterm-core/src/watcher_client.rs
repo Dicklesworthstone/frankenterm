@@ -26,9 +26,14 @@
 //! The registry returns [`ClientPolicyDecision`] which either allows the action
 //! or denies it with a reason.
 //!
-//! ```ignore
-//! let reg = ClientRegistry::new(ClientRegistryConfig::default());
-//! let cid = reg.connect("agent-1", ClientRole::Watcher);
+//! ```
+//! use frankenterm_core::watcher_client::{
+//!     ClientRegistry, ClientRegistryConfig, ClientRole,
+//! };
+//! use frankenterm_core::policy::ActionKind;
+//!
+//! let mut reg = ClientRegistry::new(ClientRegistryConfig::default());
+//! let cid = reg.connect("agent-1", ClientRole::Watcher).unwrap();
 //! assert!(reg.authorize(&cid, ActionKind::ReadOutput).is_allowed());
 //! assert!(reg.authorize(&cid, ActionKind::SendText).is_denied());
 //! ```

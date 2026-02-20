@@ -38,7 +38,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use frankenterm_core::reservoir_sampler::ReservoirSampler;
+///
 /// let mut rs = ReservoirSampler::new(10); // keep 10 items
 /// for i in 0..1_000_000 {
 ///     rs.observe(i);

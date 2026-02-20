@@ -16,22 +16,27 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
+//! use frankenterm_core::completion_token::{
+//!     CompletionTracker, CompletionTrackerConfig,
+//!     CompletionBoundary, CompletionState, StepOutcome,
+//! };
+//!
 //! let mut tracker = CompletionTracker::new(CompletionTrackerConfig::default());
 //! let boundary = CompletionBoundary::new(&["policy", "injection", "audit"]);
-//! let token = tracker.begin("send_text", boundary);
+//! let token_id = tracker.begin("send_text", boundary).unwrap();
 //!
 //! // Policy subsystem completes its part:
-//! tracker.advance(&token.id, "policy", StepOutcome::Ok, "allow-listed");
+//! tracker.advance(&token_id, "policy", StepOutcome::Ok, "allow-listed");
 //!
 //! // Injection subsystem completes:
-//! tracker.advance(&token.id, "injection", StepOutcome::Ok, "sent 42 bytes");
+//! tracker.advance(&token_id, "injection", StepOutcome::Ok, "sent 42 bytes");
 //!
 //! // Audit subsystem completes (boundary fully met):
-//! tracker.advance(&token.id, "audit", StepOutcome::Ok, "recorded");
+//! tracker.advance(&token_id, "audit", StepOutcome::Ok, "recorded");
 //!
 //! // Token is now Completed:
-//! assert_eq!(tracker.state(&token.id), Some(CompletionState::Completed));
+//! assert_eq!(tracker.state(&token_id), Some(CompletionState::Completed));
 //! ```
 
 use serde::{Deserialize, Serialize};

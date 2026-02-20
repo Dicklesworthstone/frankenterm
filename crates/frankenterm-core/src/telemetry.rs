@@ -913,7 +913,9 @@ fn parse_kb_value(s: &str) -> Option<u64> {
 /// Lightweight scope timer that records elapsed time into a histogram.
 ///
 /// Usage:
-/// ```ignore
+/// ```
+/// use frankenterm_core::telemetry::{MetricRegistry, ScopeTimer};
+///
 /// let registry = MetricRegistry::new();
 /// registry.register_histogram("op_latency_us", 1024);
 /// {

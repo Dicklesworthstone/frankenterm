@@ -54,7 +54,9 @@ const BASE2: u128 = 263;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use frankenterm_core::stream_hash::StreamHash;
+///
 /// let mut producer = StreamHash::new();
 /// producer.update(b"hello ");
 /// producer.update(b"world");

@@ -70,13 +70,15 @@ fn hash_indices(data: &[u8], k: u32, m: usize) -> Vec<usize> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use frankenterm_core::bloom_filter::BloomFilter;
+///
 /// let mut bf = BloomFilter::with_capacity(1000, 0.01);
 /// bf.insert(b"hello");
 /// assert!(bf.contains(b"hello"));     // true (definitely inserted)
 /// assert!(!bf.contains(b"missing"));  // false (definitely not inserted)
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct BloomFilter {
     bits: Vec<u64>,
     num_bits: usize,
@@ -230,14 +232,16 @@ impl std::fmt::Debug for BloomFilter {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use frankenterm_core::bloom_filter::CountingBloomFilter;
+///
 /// let mut cbf = CountingBloomFilter::with_capacity(1000, 0.01);
 /// cbf.insert(b"hello");
 /// assert!(cbf.contains(b"hello"));
 /// cbf.remove(b"hello");
 /// assert!(!cbf.contains(b"hello"));
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CountingBloomFilter {
     /// Packed 4-bit counters: 16 counters per u64.
     counters: Vec<u64>,

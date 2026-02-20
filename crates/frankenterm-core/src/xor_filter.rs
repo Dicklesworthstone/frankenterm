@@ -122,7 +122,9 @@ impl std::error::Error for XorFilterError {}
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use frankenterm_core::xor_filter::XorFilter;
+///
 /// let keys: Vec<u64> = vec![42, 99, 1337];
 /// let filter = XorFilter::build(&keys).unwrap();
 /// assert!(filter.contains(42));
@@ -301,7 +303,9 @@ impl fmt::Display for XorFilter {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use frankenterm_core::xor_filter::XorFilter16;
+///
 /// let keys: Vec<u64> = (0..1000).collect();
 /// let filter = XorFilter16::build(&keys).unwrap();
 /// assert!(filter.contains(42));

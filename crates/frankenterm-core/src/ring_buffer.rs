@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use frankenterm_core::ring_buffer::RingBuffer;
+///
 /// let mut rb = RingBuffer::new(3);
 /// rb.push(1);
 /// rb.push(2);
@@ -107,6 +109,7 @@ impl<T> RingBuffer<T> {
     }
 
     /// Iterate from oldest to newest.
+    #[must_use]
     pub fn iter(&self) -> RingBufferIter<'_, T> {
         let start = if self.len < self.capacity {
             0

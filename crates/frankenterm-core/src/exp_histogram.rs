@@ -27,12 +27,14 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use frankenterm_core::exp_histogram::ExpHistogram;
+///
 /// let mut h = ExpHistogram::new(2.0, 0, 20); // base=2, buckets for [1, 2^20)
 /// h.record(1.5);
 /// h.record(100.0);
 /// h.record(1000.0);
-/// let p99 = h.percentile(0.99);
+/// let _p99 = h.percentile(0.99);
 /// ```
 pub struct ExpHistogram {
     /// Count per bucket.
