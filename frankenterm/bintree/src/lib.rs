@@ -1027,14 +1027,11 @@ mod tests {
         let mut cursor = t.cursor().go_right().unwrap();
         let mut leaves = vec![*cursor.leaf_mut().unwrap()];
 
-        match cursor.postorder_next() {
-            Ok(c) => {
-                cursor = c;
-                if cursor.is_leaf() {
-                    leaves.push(*cursor.leaf_mut().unwrap());
-                }
+        if let Ok(c) = cursor.postorder_next() {
+            cursor = c;
+            if cursor.is_leaf() {
+                leaves.push(*cursor.leaf_mut().unwrap());
             }
-            Err(_) => {}
         }
 
         assert_eq!(leaves, vec![2, 1]);
@@ -1386,6 +1383,7 @@ mod tests {
     fn path_branch_clone_copy() {
         let a = PathBranch::IsLeft;
         let b = a; // Copy
+        #[allow(clippy::clone_on_copy)]
         let c = a.clone();
         assert_eq!(b, c);
     }
@@ -1437,15 +1435,10 @@ mod tests {
         let mut cursor = t.cursor().go_right().unwrap();
         let mut leaves = vec![*cursor.leaf_mut().unwrap()];
 
-        loop {
-            match cursor.postorder_next() {
-                Ok(c) => {
-                    cursor = c;
-                    if cursor.is_leaf() {
-                        leaves.push(*cursor.leaf_mut().unwrap());
-                    }
-                }
-                Err(_) => break,
+        while let Ok(c) = cursor.postorder_next() {
+            cursor = c;
+            if cursor.is_leaf() {
+                leaves.push(*cursor.leaf_mut().unwrap());
             }
         }
         // Postorder visits right subtree leaves in reverse
@@ -1634,15 +1627,10 @@ mod tests {
         // preorder_next from leftmost leaf should visit all leaves
         let mut cursor = t.cursor().go_to_nth_leaf(0).unwrap();
         let mut leaves = vec![*cursor.leaf_mut().unwrap()];
-        loop {
-            match cursor.preorder_next() {
-                Ok(c) => {
-                    cursor = c;
-                    if cursor.is_leaf() {
-                        leaves.push(*cursor.leaf_mut().unwrap());
-                    }
-                }
-                Err(_) => break,
+        while let Ok(c) = cursor.preorder_next() {
+            cursor = c;
+            if cursor.is_leaf() {
+                leaves.push(*cursor.leaf_mut().unwrap());
             }
         }
         assert_eq!(leaves, vec![1, 2, 3]);

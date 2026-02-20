@@ -444,10 +444,10 @@ mod test {
         let caps = Capabilities::new_with_hints(ProbeHints::default()).unwrap();
 
         assert_eq!(caps.color_level(), ColorLevel::Sixteen);
-        assert_eq!(caps.sixel(), false);
-        assert_eq!(caps.hyperlinks(), true);
-        assert_eq!(caps.iterm2_image(), false);
-        assert_eq!(caps.bce(), false);
+        assert!(!caps.sixel());
+        assert!(caps.hyperlinks());
+        assert!(!caps.iterm2_image());
+        assert!(!caps.bce());
     }
 
     #[test]
@@ -456,7 +456,7 @@ mod test {
             Capabilities::new_with_hints(ProbeHints::default().colorterm_bce(Some("1".into())))
                 .unwrap();
 
-        assert_eq!(caps.bce(), true);
+        assert!(caps.bce());
     }
 
     #[test]
@@ -465,7 +465,7 @@ mod test {
             Capabilities::new_with_hints(ProbeHints::default().terminfo_db(Some(load_terminfo())))
                 .unwrap();
 
-        assert_eq!(caps.bce(), true);
+        assert!(caps.bce());
     }
 
     #[test]
@@ -534,7 +534,7 @@ mod test {
                 .term_program_version(Some("1.0.0".into())),
         )
         .unwrap();
-        assert_eq!(caps.iterm2_image(), false);
+        assert!(!caps.iterm2_image());
 
         let caps = Capabilities::new_with_hints(
             ProbeHints::default()
@@ -542,7 +542,7 @@ mod test {
                 .term_program_version(Some("2.9.0".into())),
         )
         .unwrap();
-        assert_eq!(caps.iterm2_image(), false);
+        assert!(!caps.iterm2_image());
 
         let caps = Capabilities::new_with_hints(
             ProbeHints::default()
@@ -550,7 +550,7 @@ mod test {
                 .term_program_version(Some("2.9.20150512".into())),
         )
         .unwrap();
-        assert_eq!(caps.iterm2_image(), true);
+        assert!(caps.iterm2_image());
 
         let caps = Capabilities::new_with_hints(
             ProbeHints::default()
@@ -558,7 +558,7 @@ mod test {
                 .term_program_version(Some("3.2.0beta5".into())),
         )
         .unwrap();
-        assert_eq!(caps.iterm2_image(), true);
+        assert!(caps.iterm2_image());
     }
 
     // ── Additional version_ge tests ─────────────────────────

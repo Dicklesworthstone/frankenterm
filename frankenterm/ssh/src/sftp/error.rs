@@ -421,13 +421,17 @@ mod tests {
     #[test]
     fn sftp_result_ok() {
         let result: SftpResult<i32> = Ok(42);
-        assert_eq!(result.unwrap(), 42);
+        #[allow(clippy::unnecessary_literal_unwrap)]
+        let v = result.unwrap();
+        assert_eq!(v, 42);
     }
 
     #[test]
     fn sftp_result_err() {
         let result: SftpResult<i32> = Err(SftpError::Failure);
-        assert_eq!(result.unwrap_err(), SftpError::Failure);
+        #[allow(clippy::unnecessary_literal_unwrap)]
+        let e = result.unwrap_err();
+        assert_eq!(e, SftpError::Failure);
     }
 
     #[test]

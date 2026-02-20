@@ -526,7 +526,7 @@ mod test {
     #[test]
     fn enctab_all_ascii() {
         for &b in &ENCTAB {
-            assert!(b.is_ascii(), "ENCTAB contains non-ASCII byte: {b}");
+            assert!(b.is_ascii(), "ENCTAB contains non-ASCII byte: {}", b);
         }
     }
 
@@ -554,7 +554,6 @@ mod test {
         let encoded = encode(b"tabs");
         let encoded_str = String::from_utf8(encoded).unwrap();
         let with_tabs = encoded_str
-            .replace("", "")
             .chars()
             .enumerate()
             .map(|(i, c)| {
@@ -592,7 +591,7 @@ mod test {
 
     #[test]
     fn roundtrip_repeated_pattern() {
-        let data: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF].repeat(50);
+        let data: Vec<u8> = [0xDE, 0xAD, 0xBE, 0xEF].repeat(50);
         assert_eq!(decode(&encode(&data)), data);
     }
 
@@ -620,7 +619,7 @@ mod test {
         let overhead = (encoded.len() as f64 / data.len() as f64 - 1.0) * 100.0;
         assert!(
             overhead < 16.0,
-            "zero-block overhead {overhead:.1}% exceeds expected ~14%"
+            "zero-block overhead {:.1}% exceeds expected ~14%", overhead
         );
     }
 
@@ -669,8 +668,8 @@ mod test {
         let encoded = encode(&data);
         for &b in &encoded {
             assert!(
-                b >= 0x21 && b <= 0x7E,
-                "encoded output contains non-printable ASCII: 0x{b:02x}"
+                (0x21u8..=0x7E).contains(&b),
+                "encoded output contains non-printable ASCII: 0x{:02x}", b
             );
         }
     }
@@ -700,9 +699,10 @@ mod test {
 
     #[test]
     fn dectab_high_bytes_all_invalid() {
-        for i in 128..=255usize {
+        for (offset, &val) in DECTAB[128..].iter().enumerate() {
+            let i = offset + 128;
             assert_eq!(
-                DECTAB[i], INV,
+                val, INV,
                 "DECTAB[{i}] should be INV for non-ASCII byte"
             );
         }
@@ -710,8 +710,8 @@ mod test {
 
     #[test]
     fn dectab_control_chars_all_invalid() {
-        for i in 0..0x20usize {
-            assert_eq!(DECTAB[i], INV, "DECTAB[{i}] should be INV for control char");
+        for (i, &val) in DECTAB[..0x20].iter().enumerate() {
+            assert_eq!(val, INV, "DECTAB[{i}] should be INV for control char");
         }
         assert_eq!(DECTAB[0x7F], INV, "DECTAB[DEL] should be INV");
     }
@@ -725,7 +725,7 @@ mod test {
             let encoded = encode(&data);
             assert!(
                 !encoded.is_empty(),
-                "encode of {len} bytes should not be empty"
+                "encode of {} bytes should not be empty", len
             );
         }
     }
@@ -738,7 +738,7 @@ mod test {
             let enc_len = encode(&data).len();
             assert!(
                 enc_len >= prev_len,
-                "encoded length should be monotonically non-decreasing: {enc_len} < {prev_len}"
+                "encoded length should be monotonically non-decreasing: {} < {}", enc_len, prev_len
             );
             prev_len = enc_len;
         }
@@ -750,7 +750,7 @@ mod test {
         let encoded = encode(&data);
         let valid: std::collections::HashSet<u8> = ENCTAB.iter().copied().collect();
         for &b in &encoded {
-            assert!(valid.contains(&b), "encoded byte 0x{b:02x} not in ENCTAB");
+            assert!(valid.contains(&b), "encoded byte 0x{:02x} not in ENCTAB", b);
         }
     }
 
@@ -1104,22 +1104,23 @@ mod test {
 
     #[test]
     fn enctab_first_26_are_uppercase() {
-        for i in 0..26 {
+        for (i, &b) in ENCTAB[..26].iter().enumerate() {
             assert!(
-                ENCTAB[i].is_ascii_uppercase(),
+                b.is_ascii_uppercase(),
                 "ENCTAB[{i}] = {} is not uppercase",
-                ENCTAB[i] as char
+                b as char
             );
         }
     }
 
     #[test]
     fn enctab_next_26_are_lowercase() {
-        for i in 26..52 {
+        for (offset, &b) in ENCTAB[26..52].iter().enumerate() {
+            let i = offset + 26;
             assert!(
-                ENCTAB[i].is_ascii_lowercase(),
+                b.is_ascii_lowercase(),
                 "ENCTAB[{i}] = {} is not lowercase",
-                ENCTAB[i] as char
+                b as char
             );
         }
     }
@@ -1128,11 +1129,12 @@ mod test {
 
     #[test]
     fn enctab_indices_52_to_61_are_digits() {
-        for i in 52..62 {
+        for (offset, &b) in ENCTAB[52..62].iter().enumerate() {
+            let i = offset + 52;
             assert!(
-                ENCTAB[i].is_ascii_digit(),
+                b.is_ascii_digit(),
                 "ENCTAB[{i}] = {} is not a digit",
-                ENCTAB[i] as char
+                b as char
             );
         }
     }
@@ -1143,7 +1145,7 @@ mod test {
     }
 
     #[test]
-    fn dectab_maps_A_to_zero() {
+    fn dectab_maps_a_to_zero() {
         assert_eq!(DECTAB[b'A' as usize], 0);
     }
 
@@ -1288,8 +1290,8 @@ mod test {
         // that doesn't need escaping in most contexts
         for &b in &ENCTAB {
             assert!(
-                b >= 0x20 && b <= 0x7E,
-                "ENCTAB has non-printable: 0x{b:02x}"
+                (0x20u8..=0x7E).contains(&b),
+                "ENCTAB has non-printable: 0x{:02x}", b
             );
         }
     }

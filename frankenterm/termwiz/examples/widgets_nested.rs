@@ -128,6 +128,7 @@ mod inner {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn run() -> Result<(), Error> {
         // Start with an empty string; typing into the app will
         // update this string.
@@ -202,12 +203,14 @@ mod inner {
 
 #[cfg(not(feature = "widgets"))]
 mod inner {
+    #[allow(clippy::result_large_err)]
     pub fn run() -> termwiz::Result<()> {
         println!("recompile with --features widgets");
         Ok(())
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn main() -> termwiz::Result<()> {
     inner::run()
 }

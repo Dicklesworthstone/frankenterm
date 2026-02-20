@@ -109,7 +109,7 @@ mod tests {
         let x: f32 = 0.37;
         let y = EasingFunction::Linear.evaluate_at_position(x);
         let expected = 3.0 * x * x - 2.0 * x * x * x;
-        assert!((y - expected).abs() < 1e-5, "expected {expected}, got {y}");
+        assert!((y - expected).abs() < 1e-5, "expected {}, got {}", expected, y);
     }
 
     #[test]
@@ -148,8 +148,8 @@ mod tests {
         let v1 = f.evaluate_at_position(0.25);
         let v2 = f.evaluate_at_position(0.5);
         let v3 = f.evaluate_at_position(0.75);
-        assert!(v1 < v2, "EaseIn not monotonic: {v1} >= {v2}");
-        assert!(v2 < v3, "EaseIn not monotonic: {v2} >= {v3}");
+        assert!(v1 < v2, "EaseIn not monotonic: {} >= {}", v1, v2);
+        assert!(v2 < v3, "EaseIn not monotonic: {} >= {}", v2, v3);
     }
 
     #[test]
@@ -158,8 +158,8 @@ mod tests {
         let v1 = f.evaluate_at_position(0.25);
         let v2 = f.evaluate_at_position(0.5);
         let v3 = f.evaluate_at_position(0.75);
-        assert!(v1 < v2, "EaseOut not monotonic: {v1} >= {v2}");
-        assert!(v2 < v3, "EaseOut not monotonic: {v2} >= {v3}");
+        assert!(v1 < v2, "EaseOut not monotonic: {} >= {}", v1, v2);
+        assert!(v2 < v3, "EaseOut not monotonic: {} >= {}", v2, v3);
     }
 
     #[test]
@@ -169,8 +169,8 @@ mod tests {
         let f = EasingFunction::EaseInOut;
         let start = f.evaluate_at_position(0.0);
         let end = f.evaluate_at_position(1.0);
-        assert!((start - 0.42).abs() < 0.01, "start: {start}");
-        assert!((end - 1.0).abs() < 0.01, "end: {end}");
+        assert!((start - 0.42).abs() < 0.01, "start: {}", start);
+        assert!((end - 1.0).abs() < 0.01, "end: {}", end);
     }
 
     #[test]

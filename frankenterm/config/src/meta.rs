@@ -50,6 +50,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn config_container_clone_copy() {
         let a = ConfigContainer::Vec;
         let b = a;

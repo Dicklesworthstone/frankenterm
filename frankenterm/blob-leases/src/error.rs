@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn io_error_source_is_some() {
         use std::error::Error as StdError;
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "oops");
+        let io_err = std::io::Error::other("oops");
         let err: Error = io_err.into();
         assert!(err.source().is_some());
     }
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn storage_dir_io_error_source_is_none() {
         use std::error::Error as StdError;
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "disk fail");
+        let io_err = std::io::Error::other("disk fail");
         let err = Error::StorageDirIoError(PathBuf::from("/store"), io_err);
         // No #[source] attribute on tuple variant, so source is None
         assert!(err.source().is_none());

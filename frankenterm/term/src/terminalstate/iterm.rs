@@ -79,7 +79,7 @@ impl TerminalState {
                         candidates.push(((width * y_scale) as usize, self.pixel_height));
                     }
 
-                    candidates.sort_by(|a, b| (a.0 * a.1).cmp(&(b.0 * b.1)));
+                    candidates.sort_by_key(|a| a.0 * a.1);
 
                     candidates.pop().unwrap()
                 } else {

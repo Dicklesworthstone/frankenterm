@@ -351,7 +351,8 @@ mod tests {
             let b = palette.colors.0[i + 1];
             assert!(
                 b.0 >= a.0,
-                "Grey ramp not increasing at index {i}: {a:?} vs {b:?}"
+                "Grey ramp not increasing at index {}: {:?} vs {:?}",
+                i, a, b
             );
         }
     }
@@ -363,7 +364,8 @@ mod tests {
             let c = palette.colors.0[i];
             assert!(
                 (c.0 - c.1).abs() < 0.01 && (c.1 - c.2).abs() < 0.01,
-                "Entry {i} is not grey: {c:?}"
+                "Entry {} is not grey: {:?}",
+                i, c
             );
         }
     }

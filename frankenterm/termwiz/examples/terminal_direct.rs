@@ -12,6 +12,7 @@ use termwiz::surface::Change;
 use termwiz::terminal::{new_terminal, Terminal};
 use termwiz::Error;
 
+#[allow(clippy::result_large_err)]
 fn main() -> Result<(), Error> {
     let caps = Capabilities::new_from_env()?;
     let mut terminal = new_terminal(caps)?;

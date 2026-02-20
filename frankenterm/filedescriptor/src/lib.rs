@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn error_from_io_error() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let io_err = std::io::Error::other("test");
         let err: Error = io_err.into();
         assert!(err.to_string().contains("IoError"));
     }
@@ -1199,8 +1199,9 @@ mod tests {
 
     #[test]
     fn result_type_alias_ok() {
-        let r: super::Result<i32> = Ok(42);
-        assert_eq!(r.unwrap(), 42);
+        #[allow(clippy::unnecessary_literal_unwrap)]
+        let v = Ok::<i32, Error>(42).unwrap();
+        assert_eq!(v, 42);
     }
 
     #[test]
@@ -1292,7 +1293,7 @@ mod tests {
 
     #[test]
     fn error_io_has_source() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "wrapped");
+        let io_err = std::io::Error::other("wrapped");
         let err: Error = io_err.into();
         use std::error::Error as StdError;
         assert!(err.source().is_some());

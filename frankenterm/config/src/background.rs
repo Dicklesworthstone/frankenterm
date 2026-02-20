@@ -459,6 +459,39 @@ pub struct Gradient {
 #[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(Gradient);
 
+impl Gradient {
+    pub fn build(&self) -> anyhow::Result<colorgrad::Gradient> {
+        use colorgrad::{BlendMode as CGMode, Interpolation as CGInterp};
+        let g = match &self.preset {
+            Some(p) => p.build(),
+            None => {
+                let colors: Vec<&str> = self.colors.iter().map(|s| s.as_str()).collect();
+                let mut g = colorgrad::CustomGradient::new();
+                g.html_colors(&colors);
+                g.mode(match self.blend {
+                    BlendMode::Rgb => CGMode::Rgb,
+                    BlendMode::LinearRgb => CGMode::LinearRgb,
+                    BlendMode::Hsv => CGMode::Hsv,
+                    BlendMode::Oklab => CGMode::Oklab,
+                });
+                g.interpolation(match self.interpolation {
+                    Interpolation::Linear => CGInterp::Linear,
+                    Interpolation::Basis => CGInterp::Basis,
+                    Interpolation::CatmullRom => CGInterp::CatmullRom,
+                });
+                g.build()?
+            }
+        };
+        match (self.segment_size, self.segment_smoothness) {
+            (Some(size), Some(smoothness)) => Ok(g.sharp(size, smoothness)),
+            (None, None) => Ok(g),
+            _ => anyhow::bail!(
+                "Gradient must either specify both segment_size and segment_smoothness, or neither"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,44 +709,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn gradient_preset_clone_copy() {
         let a = GradientPreset::Rainbow;
         let b = a;
         let c = a.clone();
         assert_eq!(a, b);
         assert_eq!(a, c);
-    }
-}
-
-impl Gradient {
-    pub fn build(&self) -> anyhow::Result<colorgrad::Gradient> {
-        use colorgrad::{BlendMode as CGMode, Interpolation as CGInterp};
-        let g = match &self.preset {
-            Some(p) => p.build(),
-            None => {
-                let colors: Vec<&str> = self.colors.iter().map(|s| s.as_str()).collect();
-                let mut g = colorgrad::CustomGradient::new();
-                g.html_colors(&colors);
-                g.mode(match self.blend {
-                    BlendMode::Rgb => CGMode::Rgb,
-                    BlendMode::LinearRgb => CGMode::LinearRgb,
-                    BlendMode::Hsv => CGMode::Hsv,
-                    BlendMode::Oklab => CGMode::Oklab,
-                });
-                g.interpolation(match self.interpolation {
-                    Interpolation::Linear => CGInterp::Linear,
-                    Interpolation::Basis => CGInterp::Basis,
-                    Interpolation::CatmullRom => CGInterp::CatmullRom,
-                });
-                g.build()?
-            }
-        };
-        match (self.segment_size, self.segment_smoothness) {
-            (Some(size), Some(smoothness)) => Ok(g.sharp(size, smoothness)),
-            (None, None) => Ok(g),
-            _ => anyhow::bail!(
-                "Gradient must either specify both segment_size and segment_smoothness, or neither"
-            ),
-        }
     }
 }

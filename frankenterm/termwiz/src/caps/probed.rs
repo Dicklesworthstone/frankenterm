@@ -40,23 +40,6 @@ impl XtVersion {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_xtversion_name() {
-        for (input, result) in [
-            ("WezTerm something", Some(("WezTerm", "something"))),
-            ("xterm(something)", Some(("xterm", "something"))),
-            ("something-else", None),
-        ] {
-            let version = XtVersion(input.to_string());
-            assert_eq!(version.name_and_version(), result, "{input}");
-        }
-    }
-}
-
 /// This struct is a helper that uses probing to determine specific capabilities
 /// of the associated Terminal instance.
 /// It will write and read data to and from the associated Terminal.
@@ -237,5 +220,22 @@ impl<'a> ProbeCapabilities<'a> {
         }
 
         Ok(size)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_xtversion_name() {
+        for (input, result) in [
+            ("WezTerm something", Some(("WezTerm", "something"))),
+            ("xterm(something)", Some(("xterm", "something"))),
+            ("something-else", None),
+        ] {
+            let version = XtVersion(input.to_string());
+            assert_eq!(version.name_and_version(), result, "{input}");
+        }
     }
 }

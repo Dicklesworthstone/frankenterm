@@ -73,17 +73,16 @@ fn main() {
                     eprintln!("{}", verify.message);
                     let mut terminal = line_editor_terminal()?;
                     let mut editor = LineEditor::new(&mut terminal);
-                    let mut host = PasswordPromptHost::default();
-                    host.echo = true;
-                    editor.set_prompt("Enter [y/n]> ");
-                    let ok = if let Some(line) = editor.read_line(&mut host)? {
-                        match line.as_ref() {
-                            "y" | "Y" | "yes" | "YES" => true,
-                            "n" | "N" | "no" | "NO" | _ => false,
-                        }
-                    } else {
-                        false
+                    let mut host = PasswordPromptHost {
+                        echo: true,
+                        ..PasswordPromptHost::default()
                     };
+                    editor.set_prompt("Enter [y/n]> ");
+                    let ok = editor
+                        .read_line(&mut host)?
+                        .is_some_and(|line| {
+                            matches!(line.as_ref(), "y" | "Y" | "yes" | "YES")
+                        });
                     verify.answer(ok).await.context("send verify response")?;
                 }
                 SessionEvent::Authenticate(auth) => {

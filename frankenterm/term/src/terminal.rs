@@ -370,6 +370,7 @@ mod tests {
             dpi: 96,
         };
         let b = a; // Copy
+        #[allow(clippy::clone_on_copy)]
         let c = a.clone(); // Clone
         assert_eq!(a, b);
         assert_eq!(a, c);

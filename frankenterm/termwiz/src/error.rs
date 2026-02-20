@@ -190,8 +190,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::error::Error as StdError;
-
     // ── StringWrap ──────────────────────────────────────────
 
     #[test]

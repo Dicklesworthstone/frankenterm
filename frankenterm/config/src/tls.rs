@@ -142,7 +142,7 @@ mod tests {
             .expect_err("invalid ssh bootstrap should fail");
         assert!(
             err.to_string().contains("failed to parse ssh parameters"),
-            "unexpected error: {err}"
+            "unexpected error: {}", err
         );
     }
 

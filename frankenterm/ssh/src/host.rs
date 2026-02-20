@@ -27,161 +27,6 @@ impl HostVerificationEvent {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn host_verification_failed_display_with_file() {
-        let err = HostVerificationFailed {
-            remote_address: "example.com:22".to_string(),
-            key: "SHA256:abc123".to_string(),
-            file: Some(std::path::PathBuf::from("/home/user/.ssh/known_hosts")),
-        };
-        let msg = format!("{}", err);
-        assert!(msg.contains("example.com:22"));
-        assert!(msg.contains("SHA256:abc123"));
-        assert!(msg.contains("known_hosts"));
-    }
-
-    #[test]
-    fn host_verification_failed_display_without_file() {
-        let err = HostVerificationFailed {
-            remote_address: "10.0.0.1:2222".to_string(),
-            key: "SHA256:xyz789".to_string(),
-            file: None,
-        };
-        let msg = format!("{}", err);
-        assert!(msg.contains("10.0.0.1:2222"));
-        assert!(msg.contains("SHA256:xyz789"));
-        assert!(msg.contains("None"));
-    }
-
-    #[test]
-    fn host_verification_failed_debug() {
-        let err = HostVerificationFailed {
-            remote_address: "host:22".to_string(),
-            key: "fingerprint".to_string(),
-            file: None,
-        };
-        let dbg = format!("{:?}", err);
-        assert!(dbg.contains("HostVerificationFailed"));
-        assert!(dbg.contains("host:22"));
-    }
-
-    #[test]
-    fn host_verification_failed_is_error() {
-        let err = HostVerificationFailed {
-            remote_address: "host:22".to_string(),
-            key: "fp".to_string(),
-            file: None,
-        };
-        // Verify it implements std::error::Error via thiserror
-        let error: &dyn std::error::Error = &err;
-        assert!(error.to_string().contains("host:22"));
-    }
-
-    #[test]
-    fn host_verification_event_debug() {
-        let (tx, _rx) = bounded(1);
-        let event = HostVerificationEvent {
-            message: "Trust this host?".to_string(),
-            reply: tx,
-        };
-        let dbg = format!("{:?}", event);
-        assert!(dbg.contains("HostVerificationEvent"));
-        assert!(dbg.contains("Trust this host?"));
-    }
-
-    #[test]
-    fn host_verification_event_try_answer_trust() {
-        let (tx, rx) = bounded(1);
-        let event = HostVerificationEvent {
-            message: "Trust?".to_string(),
-            reply: tx,
-        };
-        event.try_answer(true).unwrap();
-        let result = crate::runtime::block_on(rx.recv()).unwrap();
-        assert!(result);
-    }
-
-    #[test]
-    fn host_verification_event_try_answer_reject() {
-        let (tx, rx) = bounded(1);
-        let event = HostVerificationEvent {
-            message: "Trust?".to_string(),
-            reply: tx,
-        };
-        event.try_answer(false).unwrap();
-        let result = crate::runtime::block_on(rx.recv()).unwrap();
-        assert!(!result);
-    }
-
-    #[test]
-    fn host_verification_event_async_answer() {
-        let (tx, rx) = bounded(1);
-        let event = HostVerificationEvent {
-            message: "Trust?".to_string(),
-            reply: tx,
-        };
-        crate::runtime::block_on(async {
-            event.answer(true).await.unwrap();
-            let result = rx.recv().await.unwrap();
-            assert!(result);
-        });
-    }
-
-    #[test]
-    fn host_verification_failed_source_is_none() {
-        let err = HostVerificationFailed {
-            remote_address: "host:22".to_string(),
-            key: "fp".to_string(),
-            file: None,
-        };
-        let error: &dyn std::error::Error = &err;
-        assert!(error.source().is_none());
-    }
-
-    #[test]
-    fn host_verification_failed_with_path() {
-        let err = HostVerificationFailed {
-            remote_address: "server.example.com:22".to_string(),
-            key: "SHA256:abcdef1234567890".to_string(),
-            file: Some(std::path::PathBuf::from(
-                "/very/long/path/to/.ssh/known_hosts",
-            )),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("server.example.com:22"));
-        assert!(msg.contains("SHA256:abcdef1234567890"));
-        assert!(msg.contains("/very/long/path/to/.ssh/known_hosts"));
-    }
-
-    #[test]
-    fn host_verification_event_message_accessible() {
-        let (tx, _rx) = bounded(1);
-        let event = HostVerificationEvent {
-            message: "Do you trust this host?".to_string(),
-            reply: tx,
-        };
-        assert_eq!(event.message, "Do you trust this host?");
-    }
-
-    #[test]
-    fn host_verification_event_async_reject() {
-        let (tx, rx) = bounded(1);
-        let event = HostVerificationEvent {
-            message: "Trust?".to_string(),
-            reply: tx,
-        };
-        crate::runtime::block_on(async {
-            event.answer(false).await.unwrap();
-            let result = rx.recv().await.unwrap();
-            assert!(!result);
-        });
-    }
-}
-
 impl crate::sessioninner::SessionInner {
     #[cfg(feature = "libssh-rs")]
     pub fn host_verification_libssh(
@@ -363,5 +208,160 @@ impl crate::sessioninner::SessionInner {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_verification_failed_display_with_file() {
+        let err = HostVerificationFailed {
+            remote_address: "example.com:22".to_string(),
+            key: "SHA256:abc123".to_string(),
+            file: Some(std::path::PathBuf::from("/home/user/.ssh/known_hosts")),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("example.com:22"));
+        assert!(msg.contains("SHA256:abc123"));
+        assert!(msg.contains("known_hosts"));
+    }
+
+    #[test]
+    fn host_verification_failed_display_without_file() {
+        let err = HostVerificationFailed {
+            remote_address: "10.0.0.1:2222".to_string(),
+            key: "SHA256:xyz789".to_string(),
+            file: None,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("10.0.0.1:2222"));
+        assert!(msg.contains("SHA256:xyz789"));
+        assert!(msg.contains("None"));
+    }
+
+    #[test]
+    fn host_verification_failed_debug() {
+        let err = HostVerificationFailed {
+            remote_address: "host:22".to_string(),
+            key: "fingerprint".to_string(),
+            file: None,
+        };
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("HostVerificationFailed"));
+        assert!(dbg.contains("host:22"));
+    }
+
+    #[test]
+    fn host_verification_failed_is_error() {
+        let err = HostVerificationFailed {
+            remote_address: "host:22".to_string(),
+            key: "fp".to_string(),
+            file: None,
+        };
+        // Verify it implements std::error::Error via thiserror
+        let error: &dyn std::error::Error = &err;
+        assert!(error.to_string().contains("host:22"));
+    }
+
+    #[test]
+    fn host_verification_event_debug() {
+        let (tx, _rx) = bounded(1);
+        let event = HostVerificationEvent {
+            message: "Trust this host?".to_string(),
+            reply: tx,
+        };
+        let dbg = format!("{:?}", event);
+        assert!(dbg.contains("HostVerificationEvent"));
+        assert!(dbg.contains("Trust this host?"));
+    }
+
+    #[test]
+    fn host_verification_event_try_answer_trust() {
+        let (tx, rx) = bounded(1);
+        let event = HostVerificationEvent {
+            message: "Trust?".to_string(),
+            reply: tx,
+        };
+        event.try_answer(true).unwrap();
+        let result = crate::runtime::block_on(rx.recv()).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn host_verification_event_try_answer_reject() {
+        let (tx, rx) = bounded(1);
+        let event = HostVerificationEvent {
+            message: "Trust?".to_string(),
+            reply: tx,
+        };
+        event.try_answer(false).unwrap();
+        let result = crate::runtime::block_on(rx.recv()).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn host_verification_event_async_answer() {
+        let (tx, rx) = bounded(1);
+        let event = HostVerificationEvent {
+            message: "Trust?".to_string(),
+            reply: tx,
+        };
+        crate::runtime::block_on(async {
+            event.answer(true).await.unwrap();
+            let result = rx.recv().await.unwrap();
+            assert!(result);
+        });
+    }
+
+    #[test]
+    fn host_verification_failed_source_is_none() {
+        let err = HostVerificationFailed {
+            remote_address: "host:22".to_string(),
+            key: "fp".to_string(),
+            file: None,
+        };
+        let error: &dyn std::error::Error = &err;
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn host_verification_failed_with_path() {
+        let err = HostVerificationFailed {
+            remote_address: "server.example.com:22".to_string(),
+            key: "SHA256:abcdef1234567890".to_string(),
+            file: Some(std::path::PathBuf::from(
+                "/very/long/path/to/.ssh/known_hosts",
+            )),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("server.example.com:22"));
+        assert!(msg.contains("SHA256:abcdef1234567890"));
+        assert!(msg.contains("/very/long/path/to/.ssh/known_hosts"));
+    }
+
+    #[test]
+    fn host_verification_event_message_accessible() {
+        let (tx, _rx) = bounded(1);
+        let event = HostVerificationEvent {
+            message: "Do you trust this host?".to_string(),
+            reply: tx,
+        };
+        assert_eq!(event.message, "Do you trust this host?");
+    }
+
+    #[test]
+    fn host_verification_event_async_reject() {
+        let (tx, rx) = bounded(1);
+        let event = HostVerificationEvent {
+            message: "Trust?".to_string(),
+            reply: tx,
+        };
+        crate::runtime::block_on(async {
+            event.answer(false).await.unwrap();
+            let result = rx.recv().await.unwrap();
+            assert!(!result);
+        });
     }
 }

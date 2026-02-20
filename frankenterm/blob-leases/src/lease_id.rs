@@ -91,6 +91,7 @@ mod tests {
     fn clone_and_copy_are_equal() {
         let id = LeaseId::new();
         let copied = id;
+        #[allow(clippy::clone_on_copy)]
         let cloned = id.clone();
         assert_eq!(copied, cloned);
     }

@@ -824,6 +824,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn selection_mode_clone_copy() {
         let a = SelectionMode::Word;
         let b = a;
@@ -913,6 +914,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn pane_direction_clone_copy() {
         let a = PaneDirection::Left;
         let b = a;

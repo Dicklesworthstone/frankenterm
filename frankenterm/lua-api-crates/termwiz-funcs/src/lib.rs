@@ -79,7 +79,7 @@ pub enum FormatColor {
 }
 
 impl FormatColor {
-    fn to_attr(self) -> ColorAttribute {
+    fn into_attr(self) -> ColorAttribute {
         let spec: ColorSpec = self.into();
         let attr: ColorAttribute = spec.into();
         attr
@@ -115,8 +115,8 @@ impl From<FormatItem> for Change {
         match val {
             FormatItem::Attribute(change) => change.into(),
             FormatItem::Text(t) => t.into(),
-            FormatItem::Foreground(c) => AttributeChange::Foreground(c.to_attr()).into(),
-            FormatItem::Background(c) => AttributeChange::Background(c.to_attr()).into(),
+            FormatItem::Foreground(c) => AttributeChange::Foreground(c.into_attr()).into(),
+            FormatItem::Background(c) => AttributeChange::Background(c.into_attr()).into(),
             FormatItem::ResetAttributes => Change::AllAttributes(CellAttributes::default()),
         }
     }
@@ -143,7 +143,7 @@ impl termwiz::render::RenderTty for FormatTarget {
 
 pub fn format_as_escapes(items: Vec<FormatItem>) -> anyhow::Result<String> {
     let mut changes: Vec<Change> = items.into_iter().map(Into::into).collect();
-    changes.push(Change::AllAttributes(CellAttributes::default()).into());
+    changes.push(Change::AllAttributes(CellAttributes::default()));
     let mut renderer = new_frankenterm_terminfo_renderer();
     let mut target = FormatTarget { target: vec![] };
     renderer.render_to(&changes, &mut target)?;
@@ -151,7 +151,7 @@ pub fn format_as_escapes(items: Vec<FormatItem>) -> anyhow::Result<String> {
 }
 
 #[cfg(feature = "lua")]
-fn format<'lua>(_: &'lua Lua, items: Vec<FormatItem>) -> mlua::Result<String> {
+fn format(_: &Lua, items: Vec<FormatItem>) -> mlua::Result<String> {
     format_as_escapes(items).map_err(mlua::Error::external)
 }
 

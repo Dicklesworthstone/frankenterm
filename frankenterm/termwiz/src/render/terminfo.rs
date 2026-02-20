@@ -793,17 +793,17 @@ mod test {
 
     impl UnixTty for FakeTty {
         fn get_size(&mut self) -> Result<winsize> {
-            Ok(self.size.clone())
+            Ok(self.size)
         }
         fn set_size(&mut self, size: winsize) -> Result<()> {
-            self.size = size.clone();
+            self.size = size;
             Ok(())
         }
         fn get_termios(&mut self) -> Result<Termios> {
-            Ok(self.termios.clone())
+            Ok(self.termios)
         }
         fn set_termios(&mut self, termios: &Termios, _when: SetAttributeWhen) -> Result<()> {
-            self.termios = termios.clone();
+            self.termios = *termios;
             Ok(())
         }
         /// Waits until all written data has been transmitted.
@@ -1265,7 +1265,7 @@ mod test {
             result,
             vec![
                 Action::CSI(CSI::Sgr(Sgr::Foreground(
-                    ColorSpec::TrueColor((255, 128, 64).into()).into(),
+                    ColorSpec::TrueColor((255, 128, 64).into()),
                 ))),
                 Action::Print('A'),
             ]
@@ -1288,7 +1288,7 @@ mod test {
             result,
             vec![
                 Action::CSI(CSI::Sgr(Sgr::Foreground(
-                    ColorSpec::TrueColor((255, 128, 64).into()).into(),
+                    ColorSpec::TrueColor((255, 128, 64).into()),
                 ))),
                 Action::Print('A'),
             ]

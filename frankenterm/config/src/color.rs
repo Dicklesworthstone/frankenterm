@@ -825,7 +825,7 @@ brights = [ "#8ca6a6" ,"#e5164a" ,"#00b368" ,"#b3694d" ,"#0094f0" ,"#ff5792" ,"#
     fn rgba_color_from_tuple() {
         let c: RgbaColor = (0xff, 0x00, 0x80).into();
         let s: String = c.into();
-        assert!(s.contains("ff") || s.contains("FF") || s.len() > 0);
+        assert!(s.contains("ff") || s.contains("FF") || !s.is_empty());
     }
 
     #[test]

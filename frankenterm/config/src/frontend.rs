@@ -125,6 +125,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn frontend_selection_clone_copy() {
         let a = FrontEndSelection::WebGpu;
         let b = a;
@@ -150,6 +151,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn webgpu_power_preference_clone_copy() {
         let a = WebGpuPowerPreference::HighPerformance;
         let b = a;

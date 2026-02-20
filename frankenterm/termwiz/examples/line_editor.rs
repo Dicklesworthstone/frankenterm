@@ -91,6 +91,7 @@ fn word_at_cursor(line: &str, cursor_position: usize) -> Option<(std::ops::Range
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn main() -> termwiz::Result<()> {
     println!("Type `exit` to quit this example, or start a word with `h` and press Tab.");
     let mut terminal = line_editor_terminal()?;

@@ -8,6 +8,7 @@ const CTRL_C: KeyEvent = KeyEvent {
     modifiers: Modifiers::CTRL,
 };
 
+#[allow(clippy::result_large_err)]
 fn main() -> Result<(), Error> {
     let caps = Capabilities::new_from_env()?;
     let mut terminal = new_terminal(caps)?;

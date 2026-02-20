@@ -28,7 +28,7 @@ fn allocate_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-const USERNAME: LazyLock<String> = LazyLock::new(whoami::username);
+static USERNAME: LazyLock<String> = LazyLock::new(whoami::username);
 
 pub struct SshKeygen;
 
@@ -36,8 +36,8 @@ impl SshKeygen {
     // ssh-keygen -t rsa -f $ROOT/id_rsa -N "" -q
     pub fn generate_rsa(path: impl AsRef<Path>, passphrase: impl AsRef<str>) -> IoResult<bool> {
         let res = Command::new("ssh-keygen")
-            .args(&["-m", "PEM"])
-            .args(&["-t", "rsa"])
+            .args(["-m", "PEM"])
+            .args(["-t", "rsa"])
             .arg("-f")
             .arg(path.as_ref())
             .arg("-N")
@@ -352,10 +352,7 @@ impl Sshd {
             .arg(log_path.as_ref())
             .spawn()
             .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("spawning {} failed {:#}", BIN_PATH_STR, e),
-                )
+                std::io::Error::other(format!("spawning {} failed {:#}", BIN_PATH_STR, e))
             })?;
 
         for _ in 0..10 {
@@ -372,16 +369,13 @@ impl Sshd {
                     String::from_utf8(output.stderr).unwrap(),
                 );
 
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "{} failed [{}]: {}",
-                        BIN_PATH_STR,
-                        code.map(|x| x.to_string())
-                            .unwrap_or_else(|| String::from("???")),
-                        msg
-                    ),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "{} failed [{}]: {}",
+                    BIN_PATH_STR,
+                    code.map(|x| x.to_string())
+                        .unwrap_or_else(|| String::from("???")),
+                    msg
+                )));
             }
 
             // If the port is up, then we're good!
@@ -390,8 +384,7 @@ impl Sshd {
             }
         }
 
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(std::io::Error::other(
             "ran out of ports when spawning sshd",
         ))
     }
