@@ -15,6 +15,7 @@
 //! - Deterministic step logic testing
 //! - Shared runner across agent-specific workflows
 
+use crate::cass::{CassAgent, CassClient, CassSearchHit, SearchOptions};
 use crate::policy::{InjectionResult, PaneCapabilities, Redactor};
 use crate::storage::StorageHandle;
 use crate::wezterm::{
@@ -5636,11 +5637,15 @@ impl WorkflowRunner {
             fetch_workflow_start_action_id(&self.storage, execution_id).await
         };
 
-        // Create workflow context with injector for policy-gated actions
+        // Create workflow context with injector for policy-gated actions.
+        // Use prompt() capabilities (alt_screen: Some(false)) as the baseline —
+        // workflows are triggered by detections on active panes where normal-screen
+        // is the expected state. PaneCapabilities::default() leaves alt_screen as
+        // None which causes the policy engine to require approval for SendText.
         let mut ctx = WorkflowContext::new(
             self.storage.clone(),
             pane_id,
-            PaneCapabilities::default(),
+            PaneCapabilities::prompt(),
             execution_id,
         )
         .with_injector(Arc::clone(&self.injector));
@@ -8333,6 +8338,19 @@ impl Workflow for HandleSessionEnd {
 /// Default cooldown window in milliseconds (5 minutes).
 /// Auth events within this window for the same pane are suppressed.
 const AUTH_COOLDOWN_MS: i64 = 5 * 60 * 1000;
+const AUTH_CASS_HINT_LIMIT: usize = 3;
+const AUTH_CASS_TIMEOUT_SECS: u64 = 8;
+const AUTH_CASS_LOOKBACK_DAYS: u32 = 30;
+const AUTH_CASS_QUERY_MAX_CHARS: usize = 160;
+const AUTH_CASS_HINT_MAX_CHARS: usize = 140;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AuthCassHintsLookup {
+    query: Option<String>,
+    workspace: Option<String>,
+    hints: Vec<String>,
+    error: Option<String>,
+}
 
 /// Recovery strategy for an auth-required event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8420,6 +8438,215 @@ impl HandleAuthRequired {
     #[must_use]
     pub fn with_cooldown_ms(cooldown_ms: i64) -> Self {
         Self { cooldown_ms }
+    }
+
+    fn cass_agent_from_trigger(trigger: &serde_json::Value) -> Option<CassAgent> {
+        match trigger.get("agent_type").and_then(|v| v.as_str()) {
+            Some("codex") => Some(CassAgent::Codex),
+            Some("claude_code") => Some(CassAgent::ClaudeCode),
+            Some("gemini") => Some(CassAgent::Gemini),
+            Some("cursor") => Some(CassAgent::Cursor),
+            Some("aider") => Some(CassAgent::Aider),
+            Some("chatgpt") => Some(CassAgent::ChatGpt),
+            _ => None,
+        }
+    }
+
+    fn compact_whitespace(input: &str) -> String {
+        input.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn truncate_chars(input: &str, max_chars: usize) -> String {
+        input.chars().take(max_chars).collect()
+    }
+
+    fn normalized_cass_query(trigger: &serde_json::Value) -> Option<String> {
+        let candidates = [
+            trigger.get("matched_text").and_then(|v| v.as_str()),
+            trigger
+                .get("extracted")
+                .and_then(|v| v.get("message"))
+                .and_then(|v| v.as_str()),
+            trigger
+                .get("extracted")
+                .and_then(|v| v.get("error"))
+                .and_then(|v| v.as_str()),
+        ];
+
+        for raw in candidates.into_iter().flatten() {
+            let compact = Self::compact_whitespace(raw);
+            if compact.is_empty() {
+                continue;
+            }
+            return Some(Self::truncate_chars(&compact, AUTH_CASS_QUERY_MAX_CHARS));
+        }
+
+        let event_type = trigger
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let agent_type = trigger
+            .get("agent_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("agent");
+        let fallback = format!("{agent_type} {event_type} auth error");
+        Some(Self::truncate_chars(&fallback, AUTH_CASS_QUERY_MAX_CHARS))
+    }
+
+    fn workspace_for_pane(pane: &crate::storage::PaneRecord) -> Option<String> {
+        let cwd = pane.cwd.as_deref()?;
+        let parsed = crate::wezterm::CwdInfo::parse(cwd);
+        if parsed.is_remote || parsed.path.is_empty() {
+            return None;
+        }
+        Some(parsed.path)
+    }
+
+    fn format_cass_hint(hit: &CassSearchHit) -> Option<String> {
+        let snippet = hit
+            .content
+            .as_deref()
+            .map(Self::compact_whitespace)
+            .unwrap_or_default();
+        if snippet.is_empty() {
+            return None;
+        }
+
+        let source_path = hit
+            .source_path
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unknown");
+        let line_suffix = hit
+            .line_number
+            .map_or_else(String::new, |line| format!(":{line}"));
+        let compact_snippet = Self::truncate_chars(&snippet, AUTH_CASS_HINT_MAX_CHARS);
+
+        Some(format!("{source_path}{line_suffix} - {compact_snippet}"))
+    }
+
+    async fn lookup_cass_hints(
+        storage: &StorageHandle,
+        pane_id: u64,
+        trigger: &serde_json::Value,
+    ) -> AuthCassHintsLookup {
+        let query = Self::normalized_cass_query(trigger);
+        let Some(query_value) = query.clone() else {
+            return AuthCassHintsLookup::default();
+        };
+
+        let pane = match storage.get_pane(pane_id).await {
+            Ok(record) => record,
+            Err(error) => {
+                return AuthCassHintsLookup {
+                    query,
+                    workspace: None,
+                    hints: Vec::new(),
+                    error: Some(format!("pane_lookup_failed: {error}")),
+                };
+            }
+        };
+
+        let workspace = pane
+            .as_ref()
+            .and_then(Self::workspace_for_pane);
+
+        let options = SearchOptions {
+            limit: Some(AUTH_CASS_HINT_LIMIT),
+            offset: None,
+            agent: Self::cass_agent_from_trigger(trigger),
+            workspace: workspace.clone(),
+            days: Some(AUTH_CASS_LOOKBACK_DAYS),
+            fields: Some("minimal".to_string()),
+            max_tokens: Some(180),
+        };
+
+        let cass = CassClient::new().with_timeout_secs(AUTH_CASS_TIMEOUT_SECS);
+        match cass.search(&query_value, &options).await {
+            Ok(result) => {
+                let hints = result
+                    .hits
+                    .iter()
+                    .filter_map(Self::format_cass_hint)
+                    .take(AUTH_CASS_HINT_LIMIT)
+                    .collect();
+                AuthCassHintsLookup {
+                    query,
+                    workspace,
+                    hints,
+                    error: None,
+                }
+            }
+            Err(error) => AuthCassHintsLookup {
+                query,
+                workspace,
+                hints: Vec::new(),
+                error: Some(error.to_string()),
+            },
+        }
+    }
+
+    fn build_recovery_prompt(
+        strategy: &AuthRecoveryStrategy,
+        trigger: &serde_json::Value,
+        cass_lookup: &AuthCassHintsLookup,
+    ) -> String {
+        let mut lines = vec![
+            "Auth recovery needed for this pane.".to_string(),
+            format!("Strategy: {}", strategy.label()),
+        ];
+
+        match strategy {
+            AuthRecoveryStrategy::DeviceCode { code, url } => {
+                if let Some(device_code) = code {
+                    lines.push(format!("Device code: {device_code}"));
+                }
+                if let Some(login_url) = url {
+                    lines.push(format!("Login URL: {login_url}"));
+                }
+                lines.push("Complete device auth in browser, then continue.".to_string());
+            }
+            AuthRecoveryStrategy::ApiKeyError { key_hint } => {
+                if let Some(key_name) = key_hint {
+                    lines.push(format!("Check API key variable: {key_name}"));
+                } else {
+                    lines.push("Check API key configuration for this agent.".to_string());
+                }
+                lines.push("Fix credentials, then retry the previous command.".to_string());
+            }
+            AuthRecoveryStrategy::ManualIntervention { hint, .. } => {
+                lines.push(hint.clone());
+            }
+        }
+
+        if !cass_lookup.hints.is_empty() {
+            lines.push(String::new());
+            lines.push("Related fixes from past sessions (cass):".to_string());
+            for hint in &cass_lookup.hints {
+                lines.push(format!("- {hint}"));
+            }
+        } else if let Some(error) = cass_lookup.error.as_deref() {
+            lines.push(String::new());
+            lines.push(format!("Cass lookup unavailable: {error}"));
+        }
+
+        if let Some(query) = cass_lookup.query.as_deref() {
+            lines.push(String::new());
+            lines.push(format!("Cass query: {query}"));
+        }
+        if let Some(workspace) = cass_lookup.workspace.as_deref() {
+            lines.push(format!("Cass workspace filter: {workspace}"));
+        }
+        if let Some(matched_text) = trigger.get("matched_text").and_then(|v| v.as_str()) {
+            let compact = Self::truncate_chars(&Self::compact_whitespace(matched_text), 120);
+            if !compact.is_empty() {
+                lines.push(format!("Detected text: {compact}"));
+            }
+        }
+
+        let mut prompt = lines.join("\n");
+        prompt.push('\n');
+        prompt
     }
 }
 
@@ -8558,7 +8785,7 @@ impl Workflow for HandleAuthRequired {
                     StepResult::cont()
                 }
 
-                // Step 2: Record audit event and produce recovery plan
+                // Step 2: Record audit event, gather cass hints, and inject recovery prompt
                 2 => {
                     let strategy = AuthRecoveryStrategy::from_detection(&trigger);
                     let strategy_json = serde_json::to_value(&strategy).unwrap_or_default();
@@ -8570,6 +8797,14 @@ impl Workflow for HandleAuthRequired {
                         .get("rule_id")
                         .and_then(|v| v.as_str())
                         .map(ToString::to_string);
+                    let event_type = trigger
+                        .get("event_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let cass_lookup = Self::lookup_cass_hints(&storage, pane_id, &trigger).await;
+                    let cass_hint_count = cass_lookup.hints.len();
+                    let recovery_prompt =
+                        Self::build_recovery_prompt(&strategy, &trigger, &cass_lookup);
 
                     // Record the auth event in the audit log
                     let audit = crate::storage::AuditActionRecord {
@@ -8590,7 +8825,15 @@ impl Workflow for HandleAuthRequired {
                         )),
                         verification_summary: None,
                         decision_context: Some(
-                            serde_json::to_string(&strategy_json).unwrap_or_default(),
+                            serde_json::to_string(&serde_json::json!({
+                                "strategy": strategy_json,
+                                "event_type": event_type,
+                                "cass_query": cass_lookup.query,
+                                "cass_workspace": cass_lookup.workspace,
+                                "cass_hints": cass_lookup.hints,
+                                "cass_lookup_error": cass_lookup.error,
+                            }))
+                            .unwrap_or_default(),
                         ),
                         result: "recorded".to_string(),
                     };
@@ -8603,14 +8846,14 @@ impl Workflow for HandleAuthRequired {
                                 strategy = strategy.label(),
                                 "handle_auth_required: recorded auth event"
                             );
-
-                            StepResult::done(serde_json::json!({
-                                "status": "recorded",
-                                "pane_id": pane_id,
-                                "agent_type": agent_type,
-                                "strategy": strategy_json,
-                                "audit_id": audit_id,
-                            }))
+                            tracing::info!(
+                                pane_id,
+                                audit_id,
+                                event_type,
+                                cass_hint_count,
+                                "handle_auth_required: injecting auth recovery prompt"
+                            );
+                            StepResult::send_text(recovery_prompt)
                         }
                         Err(e) => {
                             tracing::error!(
@@ -15077,9 +15320,24 @@ steps:
         }
     }
 
-    /// Helper to create a test WorkflowRunner with storage
+    /// Helper to create a test WorkflowRunner with storage.
+    /// Uses a mock WezTerm handle with the given pane IDs pre-registered
+    /// so that SendText steps succeed without a real WezTerm binary.
     async fn create_test_runner(
         db_path: &str,
+    ) -> (
+        WorkflowRunner,
+        Arc<crate::storage::StorageHandle>,
+        Arc<PaneWorkflowLockManager>,
+    ) {
+        create_test_runner_with_panes(db_path, &[]).await
+    }
+
+    /// Like `create_test_runner` but pre-registers the given pane IDs in the
+    /// mock WezTerm backend so that SendText steps succeed for those panes.
+    async fn create_test_runner_with_panes(
+        db_path: &str,
+        pane_ids: &[u64],
     ) -> (
         WorkflowRunner,
         Arc<crate::storage::StorageHandle>,
@@ -15088,10 +15346,17 @@ steps:
         let engine = WorkflowEngine::default();
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
         let storage = Arc::new(crate::storage::StorageHandle::new(db_path).await.unwrap());
+
+        let mock = crate::wezterm::MockWezterm::new();
+        for &pid in pane_ids {
+            mock.add_default_pane(pid).await;
+        }
+        let handle: crate::wezterm::WeztermHandle = Arc::new(mock);
+
         let injector = Arc::new(crate::runtime_compat::Mutex::new(
             crate::policy::PolicyGatedInjector::new(
                 crate::policy::PolicyEngine::permissive(),
-                default_wezterm_handle(),
+                handle,
             ),
         ));
 
@@ -16986,6 +17251,44 @@ Try again at 3:00 PM UTC.
         assert_eq!(json["url"], "https://auth.openai.com/device");
     }
 
+    #[test]
+    fn handle_auth_required_normalized_cass_query_prefers_matched_text() {
+        let trigger = serde_json::json!({
+            "matched_text": "   invalid   api   key   from provider   ",
+            "event_type": "auth.error",
+            "agent_type": "codex"
+        });
+        let query = HandleAuthRequired::normalized_cass_query(&trigger)
+            .expect("query should be derived from matched text");
+        assert_eq!(query, "invalid api key from provider");
+    }
+
+    #[test]
+    fn handle_auth_required_build_recovery_prompt_includes_cass_hints() {
+        let strategy = AuthRecoveryStrategy::ApiKeyError {
+            key_hint: Some("OPENAI_API_KEY".to_string()),
+        };
+        let trigger = serde_json::json!({
+            "matched_text": "Invalid API key",
+        });
+        let lookup = AuthCassHintsLookup {
+            query: Some("Invalid API key".to_string()),
+            workspace: Some("/repo".to_string()),
+            hints: vec![
+                "/repo/sessions/a.jsonl:42 - rotate key and retry".to_string(),
+                "/repo/sessions/b.jsonl:13 - export OPENAI_API_KEY before launch".to_string(),
+            ],
+            error: None,
+        };
+
+        let prompt = HandleAuthRequired::build_recovery_prompt(&strategy, &trigger, &lookup);
+        assert!(prompt.contains("Strategy: api_key_error"));
+        assert!(prompt.contains("Related fixes from past sessions (cass):"));
+        assert!(prompt.contains("OPENAI_API_KEY"));
+        assert!(prompt.contains("Cass query: Invalid API key"));
+        assert!(prompt.contains("Cass workspace filter: /repo"));
+    }
+
     #[tokio::test]
     async fn handle_auth_required_audit_roundtrip() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -17723,7 +18026,7 @@ Try again at 3:00 PM UTC.
         ));
         let db_path_str = db_path.to_string_lossy().to_string();
 
-        let (runner, storage, _lock) = create_test_runner(&db_path_str).await;
+        let (runner, storage, _lock) = create_test_runner_with_panes(&db_path_str, &[201]).await;
         runner.register_workflow(Arc::new(HandleAuthRequired::new()));
 
         let pane_id = 201u64;
@@ -17796,7 +18099,7 @@ Try again at 3:00 PM UTC.
         ));
         let db_path_str = db_path.to_string_lossy().to_string();
 
-        let (runner, storage, _lock) = create_test_runner(&db_path_str).await;
+        let (runner, storage, _lock) = create_test_runner_with_panes(&db_path_str, &[202]).await;
         runner.register_workflow(Arc::new(HandleAuthRequired::new()));
 
         let pane_id = 202u64;
