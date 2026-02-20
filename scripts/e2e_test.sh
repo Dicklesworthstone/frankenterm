@@ -586,6 +586,116 @@ find_scenario_registry_entry() {
     return 1
 }
 
+get_scenario_prerequisites_csv() {
+    local name="$1"
+    local entry=""
+    local prereqs=""
+
+    entry=$(find_scenario_registry_entry "$name" || true)
+    if [[ -z "$entry" ]]; then
+        echo ""
+        return 0
+    fi
+
+    IFS='|' read -r _ _ _ prereqs _ <<< "$entry"
+    echo "$prereqs"
+}
+
+resolve_wezterm_bin_path() {
+    local candidate=""
+
+    if [[ -n "${WEZTERM_BIN:-}" ]]; then
+        if [[ -x "$WEZTERM_BIN" ]]; then
+            printf '%s\n' "$WEZTERM_BIN"
+            return 0
+        fi
+        if command -v "$WEZTERM_BIN" >/dev/null 2>&1; then
+            command -v "$WEZTERM_BIN"
+            return 0
+        fi
+    fi
+
+    if command -v wezterm >/dev/null 2>&1; then
+        command -v wezterm
+        return 0
+    fi
+
+    for candidate in \
+        "$PROJECT_ROOT/target/release/wezterm" \
+        "$PROJECT_ROOT/legacy_wezterm/target/release/wezterm" \
+        "$PROJECT_ROOT/frankenterm/target/release/wezterm" \
+        "$HOME/.local/bin/wezterm"; do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+resolve_prerequisite_tool() {
+    local tool="$1"
+
+    case "$tool" in
+        wezterm)
+            resolve_wezterm_bin_path
+            ;;
+        *)
+            command -v "$tool"
+            ;;
+    esac
+}
+
+check_scenario_prerequisites() {
+    local name="$1"
+    local artifacts_dir="${2:-}"
+    local prereqs_csv=""
+    local -a prereqs=()
+    local -a missing=()
+    local tool=""
+    local resolved_path=""
+
+    prereqs_csv=$(get_scenario_prerequisites_csv "$name")
+    if [[ -z "$prereqs_csv" ]]; then
+        return 0
+    fi
+
+    IFS=',' read -ra prereqs <<< "$prereqs_csv"
+    for tool in "${prereqs[@]}"; do
+        tool=$(trim_whitespace "$tool")
+        if [[ -z "$tool" ]]; then
+            continue
+        fi
+        if ! resolved_path="$(resolve_prerequisite_tool "$tool" 2>/dev/null)"; then
+            missing+=("$tool")
+            continue
+        fi
+        log_verbose "Scenario $name prerequisite satisfied: $tool -> $resolved_path"
+    done
+
+    if [[ "${#missing[@]}" -eq 0 ]]; then
+        return 0
+    fi
+
+    log_fail "Scenario $name missing prerequisites: ${missing[*]}"
+    if [[ -n "$artifacts_dir" ]]; then
+        printf '%s\n' "${missing[@]}" > "$artifacts_dir/missing_prerequisites.txt"
+        jq -n \
+            --arg scenario "$name" \
+            --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            --arg prereqs "$prereqs_csv" \
+            --argjson missing "$(printf '%s\n' "${missing[@]}" | jq -R . | jq -s .)" \
+            '{
+                scenario: $scenario,
+                generated_at: $generated_at,
+                configured_prerequisites: (if $prereqs == "" then [] else ($prereqs | split(",")) end),
+                missing_prerequisites: $missing
+            }' > "$artifacts_dir/prerequisites_check.json" 2>/dev/null || true
+    fi
+    return 1
+}
+
 scenario_metadata_json() {
     local name="$1"
     local entry=""
@@ -9146,6 +9256,8 @@ run_scenario_alt_screen_conformance() {
     local enter_seq_file="$PROJECT_ROOT/tests/e2e/alt_screen_enter.txt"
     local leave_seq_file="$PROJECT_ROOT/tests/e2e/alt_screen_leave.txt"
     local fixture_dummy_script="$PROJECT_ROOT/fixtures/e2e/dummy_alt_screen.sh"
+    local wezterm_bin=""
+    local wezterm_bin_escaped=""
 
     ipc_pane_state() {
         local target_pane="$1"
@@ -9405,10 +9517,11 @@ PY
         local enter_seq_file_safe="${enter_seq_file:-}"
         local leave_seq_file_safe="${leave_seq_file:-}"
         local fixture_dummy_script_safe="${fixture_dummy_script:-}"
+        local wezterm_bin_safe="${wezterm_bin:-wezterm}"
         local -a pane_ids=()
         log_verbose "Cleaning up alt_screen_conformance scenario"
         if declare -p spawned_panes >/dev/null 2>&1; then
-            pane_ids=("${spawned_panes[@]}")
+            pane_ids=("${spawned_panes[@]+"${spawned_panes[@]}"}")
         fi
 
         if [[ -n "$ft_pid_safe" ]] && kill -0 "$ft_pid_safe" 2>/dev/null; then
@@ -9418,7 +9531,7 @@ PY
 
         local pane_id=""
         for pane_id in "${pane_ids[@]+"${pane_ids[@]}"}"; do
-            WEZTERM_UNIX_SOCKET="$wezterm_socket_safe" wezterm cli --no-auto-start \
+            WEZTERM_UNIX_SOCKET="$wezterm_socket_safe" "$wezterm_bin_safe" cli --no-auto-start \
                 kill-pane --pane-id "$pane_id" 2>/dev/null || true
         done
 
@@ -9564,17 +9677,33 @@ esac
 EOS
     chmod +x "$runner_script"
 
+    if ! wezterm_bin="$(resolve_wezterm_bin_path)"; then
+        log_fail "WezTerm binary not found (checked WEZTERM_BIN, PATH, and common local build paths)"
+        echo "bootstrap_error: wezterm binary not found via resolver" >> "$scenario_dir/scenario.log"
+        emit_conformance_event "bootstrap" 0 0 "alt_screen_conformance_mux_ready" 0 0 0 0 0 "failed" "wezterm_missing" "bootstrap" >/dev/null
+        return 1
+    fi
+    wezterm_bin_escaped=$(printf '%q' "$wezterm_bin")
+    log_info "WezTerm binary: $wezterm_bin"
+    echo "wezterm_bin: $wezterm_bin" >> "$scenario_dir/scenario.log"
+
     # Start dedicated WezTerm mux.
     FT_WORKSPACE="$temp_workspace" FT_DATA_DIR="$FT_DATA_DIR" \
         WEZTERM_UNIX_SOCKET="$wezterm_socket" \
-        wezterm start --always-new-process --config-file "$config_file" \
+        "$wezterm_bin" start --always-new-process --config-file "$config_file" \
         --workspace "ft-e2e-alt-conformance" > "$scenario_dir/wezterm.log" 2>&1 &
     wezterm_pid=$!
 
-    local check_mux_cmd="WEZTERM_UNIX_SOCKET=\"$wezterm_socket\" wezterm cli --no-auto-start list >/dev/null 2>&1"
+    local check_mux_cmd="kill -0 $wezterm_pid 2>/dev/null && WEZTERM_UNIX_SOCKET=\"$wezterm_socket\" $wezterm_bin_escaped cli --no-auto-start list >/dev/null 2>&1"
     if ! wait_for_condition "wezterm mux ready" "$check_mux_cmd" "$wait_timeout"; then
-        log_fail "Timeout waiting for wezterm mux"
-        emit_conformance_event "bootstrap" 0 0 "alt_screen_conformance_mux_ready" 0 0 0 0 0 "failed" "wezterm_mux_timeout" "bootstrap" >/dev/null
+        local mux_error_code="wezterm_mux_timeout"
+        if ! kill -0 "$wezterm_pid" 2>/dev/null; then
+            mux_error_code="wezterm_start_failed"
+        fi
+        log_fail "WezTerm mux failed to become ready ($mux_error_code)"
+        echo "bootstrap_error: $mux_error_code" >> "$scenario_dir/scenario.log"
+        tail -n 40 "$scenario_dir/wezterm.log" >> "$scenario_dir/scenario.log" 2>/dev/null || true
+        emit_conformance_event "bootstrap" 0 0 "alt_screen_conformance_mux_ready" 0 0 0 0 0 "failed" "$mux_error_code" "bootstrap" >/dev/null
         return 1
     fi
 
@@ -9615,7 +9744,7 @@ EOS
         fi
 
         log_info "Alt-screen profile: $app (available=$command_available)"
-        spawn_output=$(WEZTERM_UNIX_SOCKET="$wezterm_socket" wezterm cli --no-auto-start spawn \
+        spawn_output=$(WEZTERM_UNIX_SOCKET="$wezterm_socket" "$wezterm_bin" cli --no-auto-start spawn \
             --cwd "$temp_workspace" -- env \
             ALT_ENTER_SEQ_FILE="$enter_seq_file" \
             ALT_LEAVE_SEQ_FILE="$leave_seq_file" \
@@ -9757,7 +9886,7 @@ EOS
         fi
 
         ipc_pane_state "$pane_id" > "$app_dir/pane_state_final.json" 2>&1 || true
-        WEZTERM_UNIX_SOCKET="$wezterm_socket" wezterm cli --no-auto-start get-text --pane-id "$pane_id" \
+        WEZTERM_UNIX_SOCKET="$wezterm_socket" "$wezterm_bin" cli --no-auto-start get-text --pane-id "$pane_id" \
             > "$app_log" 2>&1 || true
 
         jq -n \
@@ -10673,6 +10802,7 @@ run_scenario() {
         local attempt_started_at=""
         local backoff_secs=0
         local fault_effect_json="null"
+        local prereq_failed=false
 
         mkdir -p "$attempt_dir"
         attempt_started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -10681,10 +10811,15 @@ run_scenario() {
             log_warn "Retrying scenario $name (attempt $attempt/$max_attempts)"
         fi
 
-        dispatch_scenario "$name" "$attempt_dir" || attempt_result=$?
-        if [[ "$SOAK_MODE" == "true" ]]; then
-            fault_effect_json=$(apply_soak_fault_injection "$name" "$attempt_dir" "$fault_plan_json" "$attempt_result")
-            attempt_result=$(jq -r '.exit_code // 1' <<< "$fault_effect_json")
+        if ! check_scenario_prerequisites "$name" "$attempt_dir"; then
+            attempt_result=5
+            prereq_failed=true
+        else
+            dispatch_scenario "$name" "$attempt_dir" || attempt_result=$?
+            if [[ "$SOAK_MODE" == "true" ]]; then
+                fault_effect_json=$(apply_soak_fault_injection "$name" "$attempt_dir" "$fault_plan_json" "$attempt_result")
+                attempt_result=$(jq -r '.exit_code // 1' <<< "$fault_effect_json")
+            fi
         fi
         attempt_duration=$(( $(date +%s) - attempt_start ))
         selected_attempt_dir="$attempt_dir"
@@ -10711,6 +10846,9 @@ run_scenario() {
         fi
 
         result="$attempt_result"
+        if [[ "$prereq_failed" == "true" ]]; then
+            break
+        fi
         if [[ "$attempt" -lt "$max_attempts" ]]; then
             backoff_secs=$(scenario_retry_backoff_secs "$attempt")
             log_warn "Scenario $name failed attempt $attempt/$max_attempts (exit=$attempt_result); backing off ${backoff_secs}s"

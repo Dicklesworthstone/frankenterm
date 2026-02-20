@@ -20,6 +20,7 @@ This plan depends on:
 - `docs/resize-baseline-scenarios.md`
 - `docs/resize-artifact-fault-model-wa-1u90p.4.1.md`
 - `docs/resize-incident-response-rollback-runbook-wa-1u90p.8.4.md`
+- `docs/resize-user-facing-release-tuning-guidance-wa-1u90p.8.5.md`
 
 ## Rollout Control Surface
 
