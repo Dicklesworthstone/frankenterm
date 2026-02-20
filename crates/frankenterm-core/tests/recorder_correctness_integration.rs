@@ -347,7 +347,7 @@ fn replay_order_matches_merge_key_ordering() {
         .enumerate()
         .map(|(i, o)| (i, *o))
         .collect();
-    replay_sorted.sort_by(|a, b| a.1.cmp(&b.1));
+    replay_sorted.sort_by_key(|a| a.1);
 
     // Both orderings should place all events for pane 0 before pane 1 etc
     // (because timestamps increase monotonically within each round)

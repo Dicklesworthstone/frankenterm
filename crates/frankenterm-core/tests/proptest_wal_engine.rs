@@ -712,7 +712,7 @@ proptest! {
             let (wal, result) = DiskWal::<MuxMutation>::open(&path, config).unwrap();
             prop_assert_eq!(result.corrupt_tail_entries, 0, "rewritten file should be corruption-free");
             // Engine should be non-empty (at least retained entries + compaction marker)
-            prop_assert!(wal.engine().len() > 0 || ops.is_empty());
+            prop_assert!(!wal.engine().is_empty() || ops.is_empty());
         }
     }
 

@@ -389,7 +389,7 @@ proptest! {
 fn backoff_zero_current_grows() {
     let backoff = Backoff {
         initial: Duration::from_millis(10),
-        max: Duration::from_millis(1000),
+        max: Duration::from_secs(1),
         factor: 2,
         max_retries: None,
     };
