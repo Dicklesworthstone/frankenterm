@@ -4,7 +4,9 @@
 //! `CwdInfo` serde + `parse()` correctness,
 //! and `PaneInfo` serde + `effective_*` / `inferred_domain` methods.
 
-use frankenterm_core::wezterm::{CursorVisibility, CwdInfo, PaneInfo, PaneSize};
+use frankenterm_core::wezterm::{
+    BackendKind, BackendSelection, CursorVisibility, CwdInfo, PaneInfo, PaneSize,
+};
 use proptest::prelude::*;
 
 // =========================================================================
@@ -614,4 +616,132 @@ fn pane_info_minimal_extra_is_empty() {
         extra: std::collections::HashMap::new(),
     };
     assert!(pane.extra.is_empty());
+}
+
+// =========================================================================
+// Strategies: BackendKind + BackendSelection
+// =========================================================================
+
+fn arb_backend_kind() -> impl Strategy<Value = BackendKind> {
+    prop_oneof![Just(BackendKind::Cli), Just(BackendKind::Vendored),]
+}
+
+fn arb_backend_selection() -> impl Strategy<Value = BackendSelection> {
+    (
+        arb_backend_kind(),
+        "[a-z ]{5,40}",
+        proptest::option::of(prop_oneof![
+            Just(serde_json::json!({"compatible": true})),
+            Just(serde_json::json!({"compatible": false, "reason": "missing socket"})),
+            Just(serde_json::json!({"status": "unknown"})),
+        ]),
+    )
+        .prop_map(|(kind, reason, compatibility)| BackendSelection {
+            kind,
+            reason,
+            compatibility,
+        })
+}
+
+// =========================================================================
+// BackendKind — serde + Display
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_backend_kind_serde_roundtrip(kind in arb_backend_kind()) {
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: BackendKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, kind);
+    }
+
+    #[test]
+    fn prop_backend_kind_serde_snake_case(kind in arb_backend_kind()) {
+        let json = serde_json::to_string(&kind).unwrap();
+        let inner = json.trim_matches('"');
+        prop_assert!(
+            inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "serialized BackendKind should be snake_case, got '{}'", inner
+        );
+    }
+
+    #[test]
+    fn prop_backend_kind_display_non_empty(kind in arb_backend_kind()) {
+        let d = kind.to_string();
+        prop_assert!(!d.is_empty());
+    }
+
+    #[test]
+    fn prop_backend_kind_display_matches_serde(kind in arb_backend_kind()) {
+        let display = kind.to_string();
+        let serde = serde_json::to_string(&kind).unwrap();
+        let serde_inner = serde.trim_matches('"');
+        prop_assert_eq!(display, serde_inner);
+    }
+}
+
+// =========================================================================
+// BackendSelection — serde roundtrip
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_backend_selection_serde_roundtrip(sel in arb_backend_selection()) {
+        let json = serde_json::to_string(&sel).unwrap();
+        let back: BackendSelection = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.kind, sel.kind);
+        prop_assert_eq!(&back.reason, &sel.reason);
+        // Some(Value::Null) serializes as `"compatibility": null` which
+        // deserializes back as None for Option<Value>, so only check non-null
+        match &sel.compatibility {
+            Some(v) if !v.is_null() => {
+                prop_assert!(back.compatibility.is_some(),
+                    "non-null compatibility should survive roundtrip");
+            }
+            _ => {} // None or Some(null) both map to None after roundtrip
+        }
+    }
+
+    #[test]
+    fn prop_backend_selection_serde_deterministic(sel in arb_backend_selection()) {
+        let j1 = serde_json::to_string(&sel).unwrap();
+        let j2 = serde_json::to_string(&sel).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    #[test]
+    fn prop_backend_selection_json_has_kind(sel in arb_backend_selection()) {
+        let v: serde_json::Value = serde_json::to_value(&sel).unwrap();
+        let obj = v.as_object().unwrap();
+        prop_assert!(obj.contains_key("kind"));
+        prop_assert!(obj.contains_key("reason"));
+    }
+
+    #[test]
+    fn prop_backend_selection_compatibility_skip_none(_dummy in 0..1_u8) {
+        let sel = BackendSelection {
+            kind: BackendKind::Cli,
+            reason: "test".to_string(),
+            compatibility: None,
+        };
+        let json = serde_json::to_string(&sel).unwrap();
+        prop_assert!(!json.contains("compatibility"),
+                    "None compatibility should be skipped in serialization");
+    }
+
+    #[test]
+    fn prop_backend_selection_compatibility_present(_dummy in 0..1_u8) {
+        let sel = BackendSelection {
+            kind: BackendKind::Vendored,
+            reason: "socket available".to_string(),
+            compatibility: Some(serde_json::json!({"compatible": true})),
+        };
+        let json = serde_json::to_string(&sel).unwrap();
+        prop_assert!(json.contains("compatibility"),
+                    "Some compatibility should be present in serialization");
+    }
 }

@@ -8,7 +8,8 @@ use proptest::prelude::*;
 
 use frankenterm_core::config::CaptureBudgetConfig;
 use frankenterm_core::tailer::{
-    CaptureScheduler, SchedulerSnapshot, StreamingBridge, TailerConfig, TailerMode,
+    CaptureScheduler, SchedulerSnapshot, StreamingBridge, StreamingHealth, TailerConfig,
+    TailerMode,
 };
 use std::time::Duration;
 
@@ -962,5 +963,127 @@ proptest! {
                 "selected id {} not in input panes", id
             );
         }
+    }
+}
+
+// ─── Strategies: TailerMode + StreamingHealth ─────────────────────────
+
+fn arb_tailer_mode() -> impl Strategy<Value = TailerMode> {
+    prop_oneof![Just(TailerMode::Polling), Just(TailerMode::Streaming),]
+}
+
+fn arb_streaming_health() -> impl Strategy<Value = StreamingHealth> {
+    (
+        arb_tailer_mode(),
+        0u64..1_000_000,
+        0u64..1_000_000,
+        0u64..1_000_000,
+        0u64..10_000,
+        0u64..1_000,
+        0usize..500,
+    )
+        .prop_map(
+            |(mode, events, dirty_ranges, dirty_rows, gaps, fallback, active)| StreamingHealth {
+                mode,
+                events_processed: events,
+                dirty_ranges_total: dirty_ranges,
+                dirty_rows_total: dirty_rows,
+                gaps_emitted: gaps,
+                fallback_count: fallback,
+                active_panes: active,
+            },
+        )
+}
+
+// ─── TailerMode serde ─────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// TailerMode serde JSON roundtrip.
+    #[test]
+    fn tailer_mode_serde_roundtrip(mode in arb_tailer_mode()) {
+        let json = serde_json::to_string(&mode).unwrap();
+        let back: TailerMode = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, mode);
+    }
+
+    /// TailerMode serializes to snake_case.
+    #[test]
+    fn tailer_mode_serde_snake_case(mode in arb_tailer_mode()) {
+        let json = serde_json::to_string(&mode).unwrap();
+        let inner = json.trim_matches('"');
+        prop_assert!(
+            inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "serialized TailerMode should be snake_case, got '{}'", inner
+        );
+    }
+
+    /// TailerMode Display matches serde value.
+    #[test]
+    fn tailer_mode_display_matches_serde(mode in arb_tailer_mode()) {
+        let display = mode.to_string();
+        let serde = serde_json::to_string(&mode).unwrap();
+        let serde_inner = serde.trim_matches('"');
+        prop_assert_eq!(display, serde_inner);
+    }
+
+    /// TailerMode serde is deterministic.
+    #[test]
+    fn tailer_mode_serde_deterministic(mode in arb_tailer_mode()) {
+        let j1 = serde_json::to_string(&mode).unwrap();
+        let j2 = serde_json::to_string(&mode).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}
+
+// ─── StreamingHealth serde ────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// StreamingHealth serde JSON roundtrip preserves all fields.
+    #[test]
+    fn streaming_health_serde_roundtrip(health in arb_streaming_health()) {
+        let json = serde_json::to_string(&health).unwrap();
+        let back: StreamingHealth = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.mode, health.mode);
+        prop_assert_eq!(back.events_processed, health.events_processed);
+        prop_assert_eq!(back.dirty_ranges_total, health.dirty_ranges_total);
+        prop_assert_eq!(back.dirty_rows_total, health.dirty_rows_total);
+        prop_assert_eq!(back.gaps_emitted, health.gaps_emitted);
+        prop_assert_eq!(back.fallback_count, health.fallback_count);
+        prop_assert_eq!(back.active_panes, health.active_panes);
+    }
+
+    /// StreamingHealth serde is deterministic.
+    #[test]
+    fn streaming_health_serde_deterministic(health in arb_streaming_health()) {
+        let j1 = serde_json::to_string(&health).unwrap();
+        let j2 = serde_json::to_string(&health).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    /// StreamingHealth JSON has expected keys.
+    #[test]
+    fn streaming_health_json_keys(health in arb_streaming_health()) {
+        let v: serde_json::Value = serde_json::to_value(&health).unwrap();
+        let obj = v.as_object().unwrap();
+        prop_assert!(obj.contains_key("mode"));
+        prop_assert!(obj.contains_key("events_processed"));
+        prop_assert!(obj.contains_key("dirty_ranges_total"));
+        prop_assert!(obj.contains_key("dirty_rows_total"));
+        prop_assert!(obj.contains_key("gaps_emitted"));
+        prop_assert!(obj.contains_key("fallback_count"));
+        prop_assert!(obj.contains_key("active_panes"));
+    }
+
+    /// StreamingHealth clone matches original.
+    #[test]
+    fn streaming_health_clone(health in arb_streaming_health()) {
+        let cloned = health.clone();
+        prop_assert_eq!(cloned.mode, health.mode);
+        prop_assert_eq!(cloned.events_processed, health.events_processed);
+        prop_assert_eq!(cloned.active_panes, health.active_panes);
     }
 }
