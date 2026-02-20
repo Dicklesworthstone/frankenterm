@@ -39,6 +39,13 @@
   - [x] Verified regex safety (ReDoS check)
   - [x] Verified `quick_reject` optimization logic
 
-## 5) Hand off
+## 5) Random Exploration & Fixes
+- [x] Explored `crates/frankenterm-core/src/resize_scheduler.rs`
+  - [x] Found deadlock bug in `complete_active`: completing superseded work rejected but failed to clear state.
+  - [x] Created repro test `crates/frankenterm-core/tests/repro_resize_scheduler_deadlock.rs`.
+  - [x] Fixed: Updated `complete_active` to always clear slot and emit `ActiveCancelledSuperseded` when stale.
+  - [x] Verified invariant compliance (avoiding `StaleCommit`).
+
+## 6) Hand off
 - [x] Documented contributions in `AGENT_TODO.md`
 - [ ] Ready for `VioletStream` or `BoldRiver` to resume once build lock clears

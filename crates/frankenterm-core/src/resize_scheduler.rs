@@ -968,7 +968,6 @@ impl ResizeScheduler {
             return false;
         };
         let latest_seq = state.latest_seq;
-
         if active_seq != intent_seq {
             self.metrics.completion_rejected = self.metrics.completion_rejected.saturating_add(1);
             self.push_lifecycle_event(
@@ -984,34 +983,35 @@ impl ResizeScheduler {
             return false;
         }
 
-        if latest_seq.is_some_and(|latest| latest > active_seq) {
-            self.metrics.completion_rejected = self.metrics.completion_rejected.saturating_add(1);
-            self.push_lifecycle_event(
-                pane_id,
-                intent_seq,
-                None,
-                ResizeLifecycleStage::Failed,
-                ResizeLifecycleDetail::ActiveCompletionRejected {
-                    active_seq: Some(active_seq),
-                },
-            );
-            self.publish_debug_snapshot();
-            return false;
-        }
-
+        // Even if superseded, we must clear the active slot so pending work can proceed.
         if let Some(state) = self.panes.get_mut(&pane_id) {
             state.active_seq = None;
             state.active_phase = None;
             state.active_phase_started_at_ms = None;
         }
-        self.metrics.completed_active = self.metrics.completed_active.saturating_add(1);
-        self.push_lifecycle_event(
-            pane_id,
-            intent_seq,
-            None,
-            ResizeLifecycleStage::Committed,
-            ResizeLifecycleDetail::ActiveCompleted,
-        );
+
+        let is_stale = latest_seq.is_some_and(|latest| latest > intent_seq);
+        if is_stale {
+            self.metrics.cancelled_active = self.metrics.cancelled_active.saturating_add(1);
+            self.push_lifecycle_event(
+                pane_id,
+                intent_seq,
+                None,
+                ResizeLifecycleStage::Cancelled,
+                ResizeLifecycleDetail::ActiveCancelledSuperseded {
+                    superseded_by_seq: latest_seq.unwrap_or(0), // Fallback should be unreachable if is_stale
+                },
+            );
+        } else {
+            self.metrics.completed_active = self.metrics.completed_active.saturating_add(1);
+            self.push_lifecycle_event(
+                pane_id,
+                intent_seq,
+                None,
+                ResizeLifecycleStage::Committed,
+                ResizeLifecycleDetail::ActiveCompleted,
+            );
+        }
         self.publish_debug_snapshot();
         true
     }
