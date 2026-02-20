@@ -58,6 +58,7 @@ impl SuffixArray {
     /// Build a suffix array from a byte slice.
     ///
     /// Construction time: O(n log² n).
+    #[must_use]
     pub fn new(text: &[u8]) -> Self {
         let n = text.len();
         if n == 0 {
@@ -79,32 +80,38 @@ impl SuffixArray {
     }
 
     /// Build from a string.
+    #[must_use]
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Self {
         Self::new(text.as_bytes())
     }
 
     /// Return the text length.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.text.len()
     }
 
     /// Check if empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
 
     /// Get the suffix array.
+    #[must_use]
     pub fn suffix_array(&self) -> &[usize] {
         &self.sa
     }
 
     /// Get the LCP array.
+    #[must_use]
     pub fn lcp_array(&self) -> &[usize] {
         &self.lcp
     }
 
     /// Get the original text.
+    #[must_use]
     pub fn text(&self) -> &[u8] {
         &self.text
     }
@@ -113,6 +120,7 @@ impl SuffixArray {
     ///
     /// Returns a sorted list of starting positions in the original text.
     /// Time complexity: O(m log n + k) where m = pattern length, k = results.
+    #[must_use]
     pub fn search(&self, pattern: &[u8]) -> Vec<usize> {
         if pattern.is_empty() || self.sa.is_empty() {
             return Vec::new();
@@ -132,6 +140,7 @@ impl SuffixArray {
     }
 
     /// Search for a string pattern.
+    #[must_use]
     pub fn search_str(&self, pattern: &str) -> Vec<usize> {
         self.search(pattern.as_bytes())
     }
@@ -139,6 +148,7 @@ impl SuffixArray {
     /// Count the number of occurrences of a pattern.
     ///
     /// Time complexity: O(m log n).
+    #[must_use]
     pub fn count(&self, pattern: &[u8]) -> usize {
         if pattern.is_empty() || self.sa.is_empty() {
             return 0;
@@ -149,6 +159,7 @@ impl SuffixArray {
     }
 
     /// Count occurrences of a string pattern.
+    #[must_use]
     pub fn count_str(&self, pattern: &str) -> usize {
         self.count(pattern.as_bytes())
     }
@@ -157,6 +168,7 @@ impl SuffixArray {
     ///
     /// Returns `(start_pos, length)` of the longest substring that appears
     /// at least twice. Returns `(0, 0)` if no repeats exist.
+    #[must_use]
     pub fn longest_repeated_substring(&self) -> (usize, usize) {
         if self.lcp.is_empty() {
             return (0, 0);
@@ -180,6 +192,7 @@ impl SuffixArray {
     }
 
     /// Find the longest repeated substring as a string slice.
+    #[must_use]
     pub fn longest_repeated_substring_str(&self) -> &[u8] {
         let (pos, len) = self.longest_repeated_substring();
         if len == 0 {
@@ -192,6 +205,7 @@ impl SuffixArray {
     /// Count the number of distinct substrings.
     ///
     /// Uses the formula: n*(n+1)/2 - sum(LCP).
+    #[must_use]
     pub fn distinct_substring_count(&self) -> usize {
         let n = self.text.len();
         if n == 0 {

@@ -72,6 +72,7 @@ impl Default for Rope {
 
 impl Rope {
     /// Create an empty rope.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
@@ -80,6 +81,7 @@ impl Rope {
     }
 
     /// Create a rope from a string.
+    #[must_use]
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Self {
         if text.is_empty() {
@@ -91,6 +93,7 @@ impl Rope {
     }
 
     /// Return the total character count.
+    #[must_use]
     pub fn len(&self) -> usize {
         match self.root {
             Some(idx) => self.node_len(idx),
@@ -99,6 +102,7 @@ impl Rope {
     }
 
     /// Check if the rope is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -106,6 +110,7 @@ impl Rope {
     /// Get the character at the given index.
     ///
     /// Returns `None` if the index is out of bounds.
+    #[must_use]
     pub fn char_at(&self, index: usize) -> Option<char> {
         let root = self.root?;
         self.char_at_node(root, index)
@@ -114,6 +119,7 @@ impl Rope {
     /// Extract a substring as a new `String`.
     ///
     /// Returns characters in the range `[start, end)`.
+    #[must_use]
     pub fn substring(&self, start: usize, end: usize) -> String {
         if start >= end || start >= self.len() {
             return String::new();
@@ -127,6 +133,7 @@ impl Rope {
     }
 
     /// Convert the entire rope to a string.
+    #[must_use]
     pub fn to_string_full(&self) -> String {
         self.substring(0, self.len())
     }
@@ -229,6 +236,7 @@ impl Rope {
     }
 
     /// Return the number of lines (count of '\n' characters + 1 if non-empty).
+    #[must_use]
     pub fn line_count(&self) -> usize {
         if self.is_empty() {
             return 0;
@@ -238,12 +246,14 @@ impl Rope {
     }
 
     /// Get a specific line by 0-based line number.
+    #[must_use]
     pub fn line(&self, line_num: usize) -> Option<String> {
         let text = self.to_string_full();
         text.split('\n').nth(line_num).map(String::from)
     }
 
     /// Return the number of nodes (for diagnostics).
+    #[must_use]
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }

@@ -113,6 +113,7 @@ pub struct WaveletTree {
 
 impl WaveletTree {
     /// Builds a wavelet tree from a byte sequence.
+    #[must_use]
     pub fn new(data: &[u8]) -> Self {
         if data.is_empty() {
             return Self {
@@ -187,16 +188,19 @@ impl WaveletTree {
     }
 
     /// Returns the length of the sequence.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.data_len
     }
 
     /// Returns true if the sequence is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.data_len == 0
     }
 
     /// Returns the byte at position `pos`.
+    #[must_use]
     pub fn access(&self, pos: usize) -> Option<u8> {
         if pos >= self.data_len {
             return None;
@@ -205,6 +209,7 @@ impl WaveletTree {
     }
 
     /// Counts occurrences of `symbol` in positions [0, pos).
+    #[must_use]
     pub fn rank(&self, symbol: u8, pos: usize) -> usize {
         if pos == 0 || self.root.is_none() {
             return 0;
@@ -241,6 +246,7 @@ impl WaveletTree {
 
     /// Finds the position of the `nth` occurrence (1-indexed) of `symbol`.
     /// Returns None if there are fewer than `nth` occurrences.
+    #[must_use]
     pub fn select(&self, symbol: u8, nth: usize) -> Option<usize> {
         if nth == 0 || self.root.is_none() {
             return None;
@@ -261,6 +267,7 @@ impl WaveletTree {
     }
 
     /// Counts occurrences of `symbol` in range [lo, hi).
+    #[must_use]
     pub fn range_count(&self, symbol: u8, lo: usize, hi: usize) -> usize {
         if lo >= hi || lo >= self.data_len {
             return 0;
@@ -270,6 +277,7 @@ impl WaveletTree {
     }
 
     /// Returns the kth smallest value (0-indexed) in range [lo, hi).
+    #[must_use]
     pub fn quantile(&self, lo: usize, hi: usize, k: usize) -> Option<u8> {
         if lo >= hi || lo >= self.data_len || k >= hi - lo {
             return None;
@@ -302,6 +310,7 @@ impl WaveletTree {
     }
 
     /// Returns frequency of each distinct symbol in range [lo, hi).
+    #[must_use]
     pub fn range_frequencies(&self, lo: usize, hi: usize) -> Vec<(u8, usize)> {
         if lo >= hi || lo >= self.data_len {
             return Vec::new();
@@ -322,6 +331,7 @@ impl WaveletTree {
     }
 
     /// Returns the number of distinct symbols in the entire sequence.
+    #[must_use]
     pub fn alphabet_size(&self) -> usize {
         let mut seen = [false; 256];
         for &b in &self.original {
