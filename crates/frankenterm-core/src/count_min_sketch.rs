@@ -126,12 +126,12 @@ impl CountMinSketch {
     }
 
     /// Increment count for an item by 1.
-    pub fn increment<T: Hash>(&mut self, item: &T) {
+    pub fn increment<T: Hash + ?Sized>(&mut self, item: &T) {
         self.add(item, 1);
     }
 
     /// Add `count` to an item's frequency.
-    pub fn add<T: Hash>(&mut self, item: &T, count: u64) {
+    pub fn add<T: Hash + ?Sized>(&mut self, item: &T, count: u64) {
         for d in 0..self.depth {
             let idx = self.hash_to_index(item, d);
             self.table[d][idx] = self.table[d][idx].saturating_add(count);
@@ -140,7 +140,7 @@ impl CountMinSketch {
     }
 
     /// Estimate frequency of an item (guaranteed upper bound).
-    pub fn estimate<T: Hash>(&self, item: &T) -> u64 {
+    pub fn estimate<T: Hash + ?Sized>(&self, item: &T) -> u64 {
         let mut min = u64::MAX;
         for d in 0..self.depth {
             let idx = self.hash_to_index(item, d);
@@ -236,7 +236,7 @@ impl CountMinSketch {
 
     // ── Internal ──────────────────────────────────────────────────
 
-    fn hash_to_index<T: Hash>(&self, item: &T, row: usize) -> usize {
+    fn hash_to_index<T: Hash + ?Sized>(&self, item: &T, row: usize) -> usize {
         let mut hasher = FnvHasher::new_with_seed(self.seeds[row]);
         item.hash(&mut hasher);
         let hash = hasher.finish();
