@@ -957,4 +957,101 @@ mod tests {
         let globals = bindings_for_scope(Scope::Global);
         assert_eq!(globals.len(), 13); // q ? r Tab BackTab 1-8
     }
+
+    // -- Additional coverage to reach 30 tests --
+
+    #[test]
+    fn parity_timeline_zoom_and_scroll() {
+        assert_eq!(
+            resolve(&ki(Key::Char('+')), "Timeline"),
+            Some(Action::TimelineZoomIn)
+        );
+        assert_eq!(
+            resolve(&ki(Key::Char('-')), "Timeline"),
+            Some(Action::TimelineZoomOut)
+        );
+        assert_eq!(
+            resolve(&ki(Key::Right), "Timeline"),
+            Some(Action::TimelineScrollRight)
+        );
+        assert_eq!(
+            resolve(&ki(Key::Left), "Timeline"),
+            Some(Action::TimelineScrollLeft)
+        );
+        assert_eq!(
+            resolve(&ki(Key::Char('l')), "Timeline"),
+            Some(Action::TimelineScrollRight)
+        );
+        assert_eq!(
+            resolve(&ki(Key::Char('h')), "Timeline"),
+            Some(Action::TimelineScrollLeft)
+        );
+    }
+
+    #[test]
+    fn view_scope_known_views() {
+        assert_eq!(view_scope("Panes"), Some(Scope::Panes));
+        assert_eq!(view_scope("Events"), Some(Scope::Events));
+        assert_eq!(view_scope("Triage"), Some(Scope::Triage));
+        assert_eq!(view_scope("History"), Some(Scope::History));
+        assert_eq!(view_scope("Search"), Some(Scope::Search));
+        assert_eq!(view_scope("Timeline"), Some(Scope::Timeline));
+    }
+
+    #[test]
+    fn view_scope_unknown_views_return_none() {
+        assert_eq!(view_scope("Home"), None);
+        assert_eq!(view_scope("Help"), None);
+        assert_eq!(view_scope(""), None);
+        assert_eq!(view_scope("Unknown"), None);
+    }
+
+    #[test]
+    fn action_label_non_empty_for_all_variants() {
+        let actions = [
+            Action::Quit,
+            Action::ShowHelp,
+            Action::Refresh,
+            Action::NextTab,
+            Action::PrevTab,
+            Action::GoToView(1),
+            Action::ListNext,
+            Action::ListPrev,
+            Action::FilterAppendChar('a'),
+            Action::FilterDeleteChar,
+            Action::FilterClear,
+            Action::ToggleUnhandledOnly,
+            Action::ToggleBookmarkedOnly,
+            Action::CycleAgentFilter,
+            Action::CycleDomainFilter,
+            Action::CycleRulesetProfile,
+            Action::ApplyRulesetProfile,
+            Action::EventsFilterDigit('0'),
+            Action::TriagePrimaryAction,
+            Action::TriageMute,
+            Action::TriageToggleExpand,
+            Action::TriageNumberedAction(1),
+            Action::ToggleUndoableOnly,
+            Action::SearchNextSaved,
+            Action::SearchPrevSaved,
+            Action::SearchRunSaved,
+            Action::SearchToggleSaved,
+            Action::SearchExecute,
+            Action::TimelineZoomIn,
+            Action::TimelineZoomOut,
+            Action::TimelineScrollLeft,
+            Action::TimelineScrollRight,
+        ];
+        for action in &actions {
+            let label = action_label(action);
+            assert!(!label.is_empty(), "action_label({:?}) should be non-empty", action);
+        }
+    }
+
+    #[test]
+    fn unbound_key_in_timeline_returns_none() {
+        // Printable chars other than zoom/scroll controls are not bound
+        assert_eq!(resolve(&ki(Key::Char('x')), "Timeline"), None);
+        assert_eq!(resolve(&ki(Key::Char('z')), "Timeline"), None);
+    }
 }

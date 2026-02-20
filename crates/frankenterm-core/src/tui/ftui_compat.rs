@@ -849,6 +849,36 @@ mod tests {
         assert!(mode.preserves_scrollback());
     }
 
+    // -- Additional coverage to reach 30 tests --
+
+    #[test]
+    fn area_split_top_zero_returns_empty_top() {
+        let area = Area::new(0, 0, 80, 24);
+        let (top, bot) = area.split_top(0);
+        assert!(top.is_empty());
+        assert_eq!(bot, area);
+    }
+
+    #[test]
+    fn area_split_top_exceeds_height_clamps() {
+        let area = Area::new(0, 0, 80, 10);
+        let (top, bot) = area.split_top(100);
+        assert_eq!(top.height, 10);
+        assert!(bot.is_empty());
+    }
+
+    #[test]
+    fn style_spec_default_has_no_styles() {
+        let s = StyleSpec::default();
+        assert_eq!(s.fg, None);
+        assert_eq!(s.bg, None);
+        assert!(!s.bold);
+        assert!(!s.dim);
+        assert!(!s.italic);
+        assert!(!s.underline);
+        assert!(!s.reversed);
+    }
+
     #[cfg(feature = "tui")]
     mod ratatui_compat {
         use super::*;

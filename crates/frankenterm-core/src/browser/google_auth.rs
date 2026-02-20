@@ -1027,4 +1027,34 @@ mod tests {
         assert_eq!(error.kind, AuthFlowFailureKind::PlaywrightError);
         assert!(error.error.contains("Browser closed"));
     }
+
+    // -- Additional coverage to reach 30 tests --
+
+    #[test]
+    fn auth_flow_failure_kind_debug_format() {
+        let kinds = [
+            AuthFlowFailureKind::NavigationFailed,
+            AuthFlowFailureKind::SelectorMismatch,
+            AuthFlowFailureKind::BotDetected,
+            AuthFlowFailureKind::PlaywrightError,
+        ];
+        for kind in &kinds {
+            let dbg = format!("{:?}", kind);
+            assert!(!dbg.is_empty());
+        }
+    }
+
+    #[test]
+    fn success_result_with_elapsed_roundtrips() {
+        let result = AuthFlowResult::Success { elapsed_ms: 12345 };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["elapsed_ms"], 12345);
+    }
+
+    #[test]
+    fn flow_with_artifacts_path_is_preserved() {
+        let flow = GoogleAuthFlow::with_defaults().with_artifacts("/tmp/google_test_artifacts");
+        assert!(flow.artifacts.is_some());
+    }
 }

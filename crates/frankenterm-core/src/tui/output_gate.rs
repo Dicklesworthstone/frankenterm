@@ -608,4 +608,105 @@ pub(crate) mod tests {
 
         set_phase(GatePhase::Inactive);
     }
+
+    // -- Additional coverage to reach 30 tests --
+
+    #[test]
+    fn gate_phase_debug_format_contains_variant() {
+        assert!(format!("{:?}", GatePhase::Inactive).contains("Inactive"));
+        assert!(format!("{:?}", GatePhase::Active).contains("Active"));
+        assert!(format!("{:?}", GatePhase::Suspended).contains("Suspended"));
+    }
+
+    #[test]
+    fn gate_phase_clone_preserves_value() {
+        let phases = [GatePhase::Inactive, GatePhase::Active, GatePhase::Suspended];
+        for p in phases {
+            assert_eq!(p.clone(), p);
+        }
+    }
+
+    #[test]
+    fn gate_phase_copy_preserves_value() {
+        let p = GatePhase::Active;
+        let copied = p;
+        let again = p; // still usable because Copy
+        assert_eq!(copied, again);
+    }
+
+    #[test]
+    fn gate_phase_from_u8_unknown_values_default_inactive() {
+        for v in [3u8, 10, 100, 128, 254, 255] {
+            assert_eq!(GatePhase::from_u8(v), GatePhase::Inactive);
+        }
+    }
+
+    #[test]
+    fn gate_phase_eq_symmetry() {
+        let phases = [GatePhase::Inactive, GatePhase::Active, GatePhase::Suspended];
+        for a in &phases {
+            for b in &phases {
+                assert_eq!(*a == *b, *b == *a);
+            }
+        }
+    }
+
+    #[test]
+    fn gate_phase_ne_across_variants() {
+        assert_ne!(GatePhase::Inactive, GatePhase::Active);
+        assert_ne!(GatePhase::Active, GatePhase::Suspended);
+        assert_ne!(GatePhase::Inactive, GatePhase::Suspended);
+    }
+
+    #[test]
+    fn tui_aware_writer_flush_succeeds_when_suppressed() {
+        use std::io::Write;
+        let _lock = lock_gate();
+        set_phase(GatePhase::Active);
+        let writer = TuiAwareWriter;
+        let mut inner = writer.make();
+        assert!(inner.flush().is_ok());
+        set_phase(GatePhase::Inactive);
+    }
+
+    #[test]
+    fn tui_aware_writer_passes_through_when_suspended() {
+        use std::io::Write;
+        let _lock = lock_gate();
+        set_phase(GatePhase::Suspended);
+        let writer = TuiAwareWriter;
+        let mut inner = writer.make();
+        assert!(matches!(inner, TuiAwareWriterInner::Stderr(_)));
+        let result = inner.write(b"suspended write");
+        assert!(result.is_ok());
+        set_phase(GatePhase::Inactive);
+    }
+
+    #[test]
+    fn tui_aware_writer_suppressed_returns_full_length() {
+        use std::io::Write;
+        let _lock = lock_gate();
+        set_phase(GatePhase::Active);
+        let writer = TuiAwareWriter;
+        let mut inner = writer.make();
+        for len in [0, 1, 10, 100, 1024] {
+            let buf = vec![b'x'; len];
+            let n = inner.write(&buf).unwrap();
+            assert_eq!(n, len, "suppressed write should report full length");
+        }
+        set_phase(GatePhase::Inactive);
+    }
+
+    #[test]
+    fn tui_aware_writer_is_copy() {
+        let w1 = TuiAwareWriter;
+        let w2 = w1; // Copy
+        let w3 = w1; // still usable
+        // Both produce writers with same behavior
+        let _lock = lock_gate();
+        set_phase(GatePhase::Inactive);
+        assert!(matches!(w2.make(), TuiAwareWriterInner::Stderr(_)));
+        assert!(matches!(w3.make(), TuiAwareWriterInner::Stderr(_)));
+        set_phase(GatePhase::Inactive);
+    }
 }
