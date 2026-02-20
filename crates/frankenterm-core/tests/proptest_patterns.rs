@@ -860,3 +860,128 @@ proptest! {
         prop_assert!(!opts.include_non_matches);
     }
 }
+
+// ============================================================================
+// PatternEngine detect invariants
+// ============================================================================
+
+fn make_anchor_only_rule(id: &str, anchor: &str) -> RuleDef {
+    RuleDef {
+        id: format!("codex.{}", id),
+        agent_type: AgentType::Codex,
+        event_type: "test.event".to_string(),
+        severity: Severity::Info,
+        anchors: vec![anchor.to_string()],
+        regex: None,
+        description: "test anchor-only rule".to_string(),
+        remediation: None,
+        workflow: None,
+        manual_fix: None,
+        preview_command: None,
+        learn_more_url: None,
+    }
+}
+
+fn make_test_engine(rules: Vec<RuleDef>) -> PatternEngine {
+    let pack = PatternPack {
+        name: "test".to_string(),
+        version: "1.0.0".to_string(),
+        rules,
+    };
+    PatternEngine::with_packs(vec![pack]).expect("valid test engine")
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Anchor-only rule: repeated anchor produces at least one detection
+    /// (once the detect() multi-occurrence fix lands, this should be == repeat_count)
+    #[test]
+    fn prop_anchor_only_detects_repeated_anchors(repeat_count in 1usize..6) {
+        let anchor = "ALERT";
+        let engine = make_test_engine(vec![make_anchor_only_rule("r1", anchor)]);
+        let text = vec![anchor; repeat_count].join(" x ");
+        let detections = engine.detect(&text);
+
+        prop_assert!(
+            !detections.is_empty(),
+            "anchor-only rule should detect at least 1 occurrence in text with {} repeats: {:?}",
+            repeat_count, text
+        );
+        // Each detection must have the correct rule_id
+        for d in &detections {
+            prop_assert_eq!(&d.rule_id, "codex.r1");
+        }
+    }
+
+    /// Empty text always produces zero detections
+    #[test]
+    fn prop_detect_empty_text_no_detections(
+        anchor in "[a-zA-Z]{3,8}",
+    ) {
+        let engine = make_test_engine(vec![make_anchor_only_rule("r1", &anchor)]);
+        let detections = engine.detect("");
+        prop_assert!(detections.is_empty(), "empty text should yield zero detections");
+    }
+
+    /// Detection rule_id matches the rule that was defined
+    #[test]
+    fn prop_detection_rule_id_matches(
+        rule_id in "[a-z]{2,6}",
+        anchor in "[a-zA-Z]{4,10}",
+    ) {
+        let engine = make_test_engine(vec![make_anchor_only_rule(&rule_id, &anchor)]);
+        let detections = engine.detect(&anchor);
+        let expected_id = format!("codex.{}", rule_id);
+        for d in &detections {
+            prop_assert_eq!(&d.rule_id, &expected_id, "detection rule_id should match defined rule");
+        }
+    }
+
+    /// Detection span is within text bounds
+    #[test]
+    fn prop_detection_span_within_bounds(
+        anchor in "[a-zA-Z]{3,8}",
+        prefix in "[0-9 ]{0,10}",
+        suffix in "[0-9 ]{0,10}",
+    ) {
+        let engine = make_test_engine(vec![make_anchor_only_rule("r1", &anchor)]);
+        let text = format!("{}{}{}", prefix, anchor, suffix);
+        let detections = engine.detect(&text);
+        for d in &detections {
+            prop_assert!(
+                d.span.1 <= text.len(),
+                "span end ({}) should be <= text len ({})", d.span.1, text.len()
+            );
+            prop_assert!(
+                d.span.0 <= d.span.1,
+                "span start ({}) should be <= span end ({})", d.span.0, d.span.1
+            );
+        }
+    }
+
+    /// Two different anchor-only rules each produce detections independently
+    #[test]
+    fn prop_multiple_rules_detect_independently(
+        anchor_a in "[A-Z]{4,8}",
+        anchor_b in "[a-z]{4,8}",
+    ) {
+        let engine = make_test_engine(vec![
+            make_anchor_only_rule("ra", &anchor_a),
+            make_anchor_only_rule("rb", &anchor_b),
+        ]);
+        let text = format!("{} and {}", anchor_a, anchor_b);
+        let detections = engine.detect(&text);
+        let rule_ids: std::collections::HashSet<&str> = detections.iter()
+            .map(|d| d.rule_id.as_str())
+            .collect();
+        prop_assert!(
+            rule_ids.contains("codex.ra"),
+            "should detect anchor_a rule: detections={:?}", detections
+        );
+        prop_assert!(
+            rule_ids.contains("codex.rb"),
+            "should detect anchor_b rule: detections={:?}", detections
+        );
+    }
+}
