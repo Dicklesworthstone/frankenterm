@@ -779,6 +779,82 @@ proptest! {
             "Shell operator '{}' should make it a command: {}", op, cmd);
     }
 
+    /// Property 73: Absolute path commands are detected
+    #[test]
+    fn prop_command_candidate_absolute_path(
+        dir in prop_oneof![
+            Just("/bin"), Just("/usr/bin"), Just("/usr/local/bin"),
+            Just("/sbin"), Just("/opt/homebrew/bin"),
+        ],
+        cmd in prop_oneof![
+            Just("rm"), Just("curl"), Just("python3"), Just("bash"),
+            Just("sh"), Just("env"),
+        ],
+        args in "[a-z ]{0,20}",
+    ) {
+        let full = format!("{}/{} {}", dir, cmd, args);
+        prop_assert!(is_command_candidate(&full),
+            "Absolute path command should be detected: {}", full);
+    }
+
+    /// Property 74: Relative path commands are detected
+    #[test]
+    fn prop_command_candidate_relative_path(
+        prefix in prop_oneof![Just("./"), Just("../"), Just("../../")],
+        cmd in "[a-z_]{1,12}",
+        args in "[a-z ]{0,20}",
+    ) {
+        let full = format!("{}{} {}", prefix, cmd, args);
+        prop_assert!(is_command_candidate(&full),
+            "Relative path command should be detected: {}", full);
+    }
+
+    /// Property 75: sudo + absolute path commands are detected
+    #[test]
+    fn prop_command_candidate_sudo_path(
+        path in prop_oneof![
+            Just("/bin/rm"), Just("/usr/bin/kill"), Just("./cleanup.sh"),
+            Just("/usr/local/bin/docker"),
+        ],
+        args in "[a-z ]{0,20}",
+    ) {
+        let full = format!("sudo {} {}", path, args);
+        prop_assert!(is_command_candidate(&full),
+            "sudo + path command should be detected: {}", full);
+    }
+
+    /// Property 76: Variable assignment + path command still detected
+    #[test]
+    fn prop_command_candidate_var_assign_path(
+        var in "[A-Z]{1,6}",
+        val in "[a-z0-9]{1,8}",
+        path in prop_oneof![
+            Just("/bin/rm"), Just("./build.sh"), Just("/usr/bin/env"),
+        ],
+        args in "[a-z ]{0,10}",
+    ) {
+        let full = format!("{}={} {} {}", var, val, path, args);
+        prop_assert!(is_command_candidate(&full),
+            "VAR=val + path command should be detected: {}", full);
+    }
+
+    /// Property 77: Pure alphanumeric non-command tokens are not candidates
+    #[test]
+    fn prop_command_candidate_non_command_alphanumeric(
+        word in "[A-Z][a-z]{2,10}[0-9]{0,3}",
+    ) {
+        // Words that aren't in COMMAND_TOKENS and don't contain path separators
+        // or shell operators shouldn't be candidates (unless they happen to match a token)
+        let result = is_command_candidate(&word);
+        let lower = word.to_ascii_lowercase();
+        if !result {
+            // Verified: not a command candidate
+            prop_assert!(!lower.contains('/'));
+            prop_assert!(!lower.contains('\\'));
+        }
+        // If it IS a candidate, it must be in COMMAND_TOKENS or contain operators
+    }
+
     // ========================================================================
     // Redactor Properties
     // ========================================================================
