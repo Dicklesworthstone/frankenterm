@@ -787,3 +787,68 @@ proptest! {
         prop_assert_eq!(result.content_len, content.len(), "content_len mismatch");
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// process_segment result hash matches content_hash for various sizes.
+    #[test]
+    fn prop_result_hash_correct(content in arb_content(128)) {
+        let mut eng = engine();
+        let result = eng.process_segment(&content, 0).unwrap();
+        prop_assert_eq!(result.hash, content_hash(&content));
+    }
+
+    /// DedupConfig serde JSON has expected keys.
+    #[test]
+    fn prop_config_json_keys(config in arb_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        prop_assert!(json.contains("\"min_dedup_size\""));
+    }
+
+    /// DedupStats Clone preserves values.
+    #[test]
+    fn prop_stats_clone(stats in arb_dedup_stats()) {
+        let cloned = stats.clone();
+        let json1 = serde_json::to_string(&stats).unwrap();
+        let json2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// content_hash produces 64-char lowercase hex string.
+    #[test]
+    fn prop_hash_is_hex64(content in arb_content(256)) {
+        let hash = content_hash(&content);
+        prop_assert_eq!(hash.len(), 64, "hash length should be 64");
+        prop_assert!(hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash should be hex: {}", hash);
+    }
+
+    /// EngineCounters serde roundtrip.
+    #[test]
+    fn prop_counters_clone(content in arb_content(128)) {
+        let mut eng = engine();
+        eng.process_segment(&content, 0).unwrap();
+        let counters = eng.counters();
+        let json = serde_json::to_string(&counters).unwrap();
+        let back: EngineCounters = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_processed, counters.total_processed);
+    }
+
+    /// DedupStats Debug is non-empty.
+    #[test]
+    fn prop_stats_debug(stats in arb_dedup_stats()) {
+        let dbg = format!("{:?}", stats);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// Empty content produces consistent hash.
+    #[test]
+    fn prop_empty_content_hash(_dummy in 0..1u8) {
+        let h1 = content_hash(b"");
+        let h2 = content_hash(b"");
+        prop_assert_eq!(h1, h2, "empty content should have deterministic hash");
+    }
+}

@@ -728,3 +728,95 @@ proptest! {
         );
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// HistogramStats JSON has expected keys.
+    #[test]
+    fn prop_stats_json_keys(
+        values in prop::collection::vec(0.0f64..1000.0, 1..20),
+    ) {
+        let mut h = ExpHistogram::power_of_two(20);
+        for &v in &values {
+            h.record(v);
+        }
+        let stats = h.stats();
+        let json = serde_json::to_string(&stats).unwrap();
+        prop_assert!(json.contains("\"count\""));
+        prop_assert!(json.contains("\"min\""));
+        prop_assert!(json.contains("\"max\""));
+    }
+
+    /// HistogramStats Clone preserves count.
+    #[test]
+    fn prop_stats_clone(
+        values in prop::collection::vec(0.0f64..1000.0, 1..20),
+    ) {
+        let mut h = ExpHistogram::power_of_two(20);
+        for &v in &values {
+            h.record(v);
+        }
+        let stats = h.stats();
+        let cloned = stats.clone();
+        prop_assert_eq!(cloned.count, stats.count);
+    }
+
+    /// Empty histogram has zero count and zero sum.
+    #[test]
+    fn prop_empty_histogram(_dummy in 0..1u8) {
+        let h = ExpHistogram::power_of_two(20);
+        prop_assert_eq!(h.count(), 0);
+        prop_assert!((h.sum() - 0.0).abs() < f64::EPSILON);
+    }
+
+    /// Recording same value twice doubles count.
+    #[test]
+    fn prop_record_twice(value in 0.0f64..1000.0) {
+        let mut h = ExpHistogram::power_of_two(20);
+        h.record(value);
+        h.record(value);
+        prop_assert_eq!(h.count(), 2);
+    }
+
+    /// Clear restores empty state.
+    #[test]
+    fn prop_clear_restores_empty(
+        values in prop::collection::vec(0.0f64..1000.0, 1..20),
+    ) {
+        let mut h = ExpHistogram::power_of_two(20);
+        for &v in &values {
+            h.record(v);
+        }
+        h.clear();
+        prop_assert_eq!(h.count(), 0);
+        prop_assert!((h.sum() - 0.0).abs() < f64::EPSILON);
+    }
+
+    /// HistogramStats Debug is non-empty.
+    #[test]
+    fn prop_stats_debug(
+        values in prop::collection::vec(0.0f64..1000.0, 1..10),
+    ) {
+        let mut h = ExpHistogram::power_of_two(20);
+        for &v in &values {
+            h.record(v);
+        }
+        let dbg = format!("{:?}", h.stats());
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// Sum is non-negative for non-negative values.
+    #[test]
+    fn prop_sum_nonneg(
+        values in prop::collection::vec(0.0f64..1000.0, 1..20),
+    ) {
+        let mut h = ExpHistogram::power_of_two(20);
+        for &v in &values {
+            h.record(v);
+        }
+        prop_assert!(h.sum() >= 0.0, "sum should be non-negative");
+    }
+}

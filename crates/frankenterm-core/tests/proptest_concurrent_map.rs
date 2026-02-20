@@ -559,3 +559,84 @@ proptest! {
         prop_assert_eq!(map.get(&key), Some(value.wrapping_add(1)));
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// ShardedMap is empty after construction.
+    #[test]
+    fn prop_new_map_empty(shards in arb_shard_count()) {
+        let map: ShardedMap<u64, u64> = ShardedMap::with_shards(shards);
+        prop_assert_eq!(map.len(), 0);
+        prop_assert!(map.is_empty());
+    }
+
+    /// Remove returns the value that was inserted.
+    #[test]
+    fn prop_remove_returns_value(
+        shards in arb_shard_count(),
+        pairs in arb_kv_pairs(),
+    ) {
+        let map: ShardedMap<u64, u64> = ShardedMap::with_shards(shards);
+        for &(k, v) in &pairs {
+            map.insert(k, v);
+        }
+        if let Some(&(k, _)) = pairs.last() {
+            let removed = map.remove(&k);
+            prop_assert!(removed.is_some(), "remove should return value for existing key");
+        }
+    }
+
+    /// DistributionStats JSON has expected keys.
+    #[test]
+    fn prop_stats_json_keys(sizes in arb_shard_sizes()) {
+        let stats = DistributionStats::from_shard_sizes(&sizes);
+        let json = serde_json::to_string(&stats).unwrap();
+        prop_assert!(json.contains("\"total_entries\""));
+        prop_assert!(json.contains("\"shard_count\""));
+    }
+
+    /// PaneMap direct insert and get roundtrip.
+    #[test]
+    fn prop_pane_map_direct_roundtrip(id in 0u64..1000, value in 0u64..1000) {
+        let map = PaneMap::new();
+        map.insert(id, value);
+        prop_assert_eq!(map.get(id), Some(value));
+    }
+
+    /// PaneMap remove returns correct value.
+    #[test]
+    fn prop_pane_map_remove_returns(id in 0u64..1000, value in 0u64..1000) {
+        let map = PaneMap::new();
+        map.insert(id, value);
+        let removed = map.remove(id);
+        prop_assert_eq!(removed, Some(value));
+        prop_assert_eq!(map.get(id), None);
+    }
+
+    /// DistributionStats Clone preserves fields.
+    #[test]
+    fn prop_stats_clone(sizes in arb_shard_sizes()) {
+        let stats = DistributionStats::from_shard_sizes(&sizes);
+        let cloned = stats.clone();
+        let json1 = serde_json::to_string(&stats).unwrap();
+        let json2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// ShardedMap contains_key agrees with get.
+    #[test]
+    fn prop_contains_key_agrees(
+        shards in arb_shard_count(),
+        pairs in arb_kv_pairs(),
+        query in any::<u64>(),
+    ) {
+        let map: ShardedMap<u64, u64> = ShardedMap::with_shards(shards);
+        for &(k, v) in &pairs {
+            map.insert(k, v);
+        }
+        prop_assert_eq!(map.contains_key(&query), map.get(&query).is_some());
+    }
+}

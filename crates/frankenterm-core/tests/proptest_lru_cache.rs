@@ -1048,3 +1048,112 @@ proptest! {
         prop_assert!(!debug.is_empty(), "Stats Debug should not be empty");
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// New cache is empty.
+    #[test]
+    fn prop_new_cache_empty(capacity in arb_capacity()) {
+        let cache: LruCache<u64, u64> = LruCache::new(capacity);
+        prop_assert_eq!(cache.len(), 0);
+        prop_assert!(cache.is_empty());
+    }
+
+    /// Cache capacity is stable after mixed operations.
+    #[test]
+    fn prop_capacity_stable_after_ops(
+        capacity in arb_capacity(),
+        ops in arb_ops(20),
+    ) {
+        let mut cache = LruCache::new(capacity);
+        for op in &ops {
+            match op {
+                Op::Put(k, v) => { cache.put(*k, *v); }
+                Op::Get(k) => { cache.get(k); }
+                Op::Peek(k) => { cache.peek(k); }
+                Op::Remove(k) => { cache.remove(k); }
+                Op::ContainsKey(k) => { cache.contains_key(k); }
+            }
+        }
+        prop_assert_eq!(cache.capacity(), capacity);
+    }
+
+    /// Put then remove returns the value.
+    #[test]
+    fn prop_put_remove_roundtrip(
+        capacity in arb_capacity(),
+        key in arb_key(),
+        value in arb_value(),
+    ) {
+        let mut cache = LruCache::new(capacity);
+        cache.put(key, value);
+        let removed = cache.remove(&key);
+        prop_assert_eq!(removed, Some(value));
+    }
+
+    /// After clear, len is 0.
+    #[test]
+    fn prop_clear_empties(
+        capacity in arb_capacity(),
+        ops in arb_ops(15),
+    ) {
+        let mut cache = LruCache::new(capacity);
+        for op in &ops {
+            match op {
+                Op::Put(k, v) => { cache.put(*k, *v); }
+                Op::Get(k) => { cache.get(k); }
+                Op::Peek(k) => { cache.peek(k); }
+                Op::Remove(k) => { cache.remove(k); }
+                Op::ContainsKey(k) => { cache.contains_key(k); }
+            }
+        }
+        cache.clear();
+        prop_assert_eq!(cache.len(), 0);
+        prop_assert!(cache.is_empty());
+    }
+
+    /// contains_key agrees with get.
+    #[test]
+    fn prop_contains_key_agrees_with_get(
+        capacity in arb_capacity(),
+        key in arb_key(),
+        value in arb_value(),
+    ) {
+        let mut cache = LruCache::new(capacity);
+        cache.put(key, value);
+        prop_assert!(cache.contains_key(&key));
+        prop_assert!(cache.get(&key).is_some());
+    }
+
+    /// Stats hits + misses == total_lookups.
+    #[test]
+    fn prop_stats_total_lookups(
+        capacity in arb_capacity(),
+        ops in arb_ops(20),
+    ) {
+        let mut cache = LruCache::new(capacity);
+        for op in &ops {
+            match op {
+                Op::Put(k, v) => { cache.put(*k, *v); }
+                Op::Get(k) => { cache.get(k); }
+                Op::Peek(k) => { cache.peek(k); }
+                Op::Remove(k) => { cache.remove(k); }
+                Op::ContainsKey(k) => { cache.contains_key(k); }
+            }
+        }
+        let stats = cache.stats();
+        prop_assert_eq!(stats.hits + stats.misses, stats.total_lookups(),
+            "hits({}) + misses({}) != total_lookups({})",
+            stats.hits, stats.misses, stats.total_lookups());
+    }
+
+    /// Remove of absent key returns None.
+    #[test]
+    fn prop_remove_absent_returns_none(capacity in arb_capacity()) {
+        let mut cache: LruCache<u64, u64> = LruCache::new(capacity);
+        prop_assert_eq!(cache.remove(&999), None);
+    }
+}

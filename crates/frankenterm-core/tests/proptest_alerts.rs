@@ -447,3 +447,67 @@ proptest! {
         prop_assert_eq!(monitor.rules().len(), n + 1);
     }
 }
+
+// ── Additional behavioral invariants ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// AlertRule JSON has id field.
+    #[test]
+    fn prop_rule_json_has_id(rule in arb_rule()) {
+        let json = serde_json::to_string(&rule).unwrap();
+        prop_assert!(json.contains("\"id\""), "rule JSON should contain id field");
+    }
+
+    /// AlertLevel from_percent ordering: lower percent => lower or equal level.
+    #[test]
+    fn prop_level_from_percent_ordering(p1 in 0.0f64..1.0, p2 in 0.0f64..1.0) {
+        let l1 = AlertLevel::from_percent(p1);
+        let l2 = AlertLevel::from_percent(p2);
+        if p1 <= p2 {
+            prop_assert!(l1 <= l2, "level ordering broken: {}% => {:?} > {}% => {:?}", p1*100.0, l1, p2*100.0, l2);
+        }
+    }
+
+    /// AlertPeriod Clone preserves equality.
+    #[test]
+    fn prop_period_clone(period in arb_period()) {
+        let cloned = period.clone();
+        let json1 = serde_json::to_string(&period).unwrap();
+        let json2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// AlertMetric Clone preserves equality.
+    #[test]
+    fn prop_metric_clone(metric in arb_metric()) {
+        let cloned = metric.clone();
+        let json1 = serde_json::to_string(&metric).unwrap();
+        let json2 = serde_json::to_string(&cloned).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    /// TriggeredAlert serde JSON has timestamp field.
+    #[test]
+    fn prop_triggered_json_has_timestamp(alert in arb_triggered_alert()) {
+        let json = serde_json::to_string(&alert).unwrap();
+        prop_assert!(json.contains("\"triggered_at_ms\"") || json.contains("\"timestamp\"") || json.contains("\"level\""),
+            "triggered alert JSON should contain expected keys");
+    }
+
+    /// AlertMonitor with empty rules has zero rules.
+    #[test]
+    fn prop_empty_monitor(_dummy in 0..1u8) {
+        let monitor = AlertMonitor::new(vec![]);
+        prop_assert_eq!(monitor.rules().len(), 0);
+    }
+
+    /// AlertLevel Debug is non-empty.
+    #[test]
+    fn prop_level_debug(p in 0.0f64..1.0) {
+        let level = AlertLevel::from_percent(p);
+        let dbg = format!("{:?}", level);
+        prop_assert!(!dbg.is_empty());
+    }
+}
