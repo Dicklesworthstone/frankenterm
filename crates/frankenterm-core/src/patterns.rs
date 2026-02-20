@@ -2055,7 +2055,8 @@ impl PatternEngine {
         let redactor = Redactor::new();
 
         let mut candidate_rules: HashSet<usize> = HashSet::new();
-        let mut matched_anchor_by_rule: HashMap<usize, (String, (usize, usize))> = HashMap::new();
+        let mut matched_anchors_by_rule: HashMap<usize, Vec<(String, (usize, usize))>> =
+            HashMap::new();
 
         for matched in matcher.find_overlapping_iter(text) {
             let Some(anchor) = index.anchor_list.get(matched.pattern().as_usize()) else {
@@ -2065,9 +2066,10 @@ impl PatternEngine {
             if let Some(rule_indices) = index.anchor_to_rules.get(anchor) {
                 for &idx in rule_indices {
                     candidate_rules.insert(idx);
-                    matched_anchor_by_rule
+                    matched_anchors_by_rule
                         .entry(idx)
-                        .or_insert_with(|| (anchor.clone(), (matched.start(), matched.end())));
+                        .or_default()
+                        .push((anchor.clone(), (matched.start(), matched.end())));
                 }
             }
         }
@@ -2086,10 +2088,11 @@ impl PatternEngine {
             let compiled = &index.compiled_rules[idx];
             let rule = &compiled.def;
 
-            let (fallback_anchor, fallback_span) = matched_anchor_by_rule
+            let anchors = matched_anchors_by_rule
                 .get(&idx)
-                .cloned()
-                .unwrap_or_default();
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let (fallback_anchor, fallback_span) = anchors.first().cloned().unwrap_or_default();
 
             let pack_id = self
                 .library
@@ -2195,40 +2198,47 @@ impl PatternEngine {
                     traces.push(trace);
                 }
             } else {
-                // Anchor-only rule: anchor hit implies a match.
-                let detection = Detection {
-                    rule_id: rule.id.clone(),
-                    agent_type: rule.agent_type,
-                    event_type: rule.event_type.clone(),
-                    severity: rule.severity,
-                    confidence: 0.6,
-                    extracted: serde_json::Value::Object(serde_json::Map::new()),
-                    matched_text: fallback_anchor.clone(),
-                    span: fallback_span,
-                };
+                // Anchor-only rule: ALL anchor hits imply matches.
+                for (anchor_text, span) in anchors {
+                    let detection = Detection {
+                        rule_id: rule.id.clone(),
+                        agent_type: rule.agent_type,
+                        event_type: rule.event_type.clone(),
+                        severity: rule.severity,
+                        confidence: 0.6,
+                        extracted: serde_json::Value::Object(serde_json::Map::new()),
+                        matched_text: anchor_text.clone(),
+                        span: *span,
+                    };
 
-                let (eligible, gates) =
-                    Self::evaluate_trace_gates(&detection, overlap_len, context);
+                    let (eligible, gates) =
+                        Self::evaluate_trace_gates(&detection, overlap_len, context);
 
-                if eligible {
-                    context.mark_seen(&detection);
-                    detections.push(detection.clone());
-                }
+                    if eligible {
+                        context.mark_seen(&detection);
+                        detections.push(detection.clone());
+                    }
 
-                if eligible || opts.include_non_matches {
-                    let trace = Self::build_match_trace(
-                        text,
-                        &redactor,
-                        pack_id.clone(),
-                        Some("anchor".to_string()),
-                        &detection,
-                        eligible,
-                        gates,
-                        anchor_evidence.as_ref(),
-                        None,
-                        opts,
-                    );
-                    traces.push(trace);
+                    if eligible || opts.include_non_matches {
+                        // For anchor-only rules, we trace each anchor occurrence.
+                        // Re-generate evidence for this specific anchor occurrence.
+                        let specific_evidence =
+                            Self::trace_anchor_evidence(text, &redactor, anchor_text, *span, opts);
+
+                        let trace = Self::build_match_trace(
+                            text,
+                            &redactor,
+                            pack_id.clone(),
+                            Some("anchor".to_string()),
+                            &detection,
+                            eligible,
+                            gates,
+                            specific_evidence.as_ref(),
+                            None,
+                            opts,
+                        );
+                        traces.push(trace);
+                    }
                 }
             }
         }
@@ -5332,5 +5342,25 @@ rules:
             .iter()
             .find(|d| d.rule_id == "gemini.auth.oauth_required");
         assert!(d.is_some(), "Should match gemini.auth.oauth_required");
+    }
+
+    #[test]
+    fn detect_multiple_anchor_matches() {
+        let engine = engine_with_rules(vec![rule_with_anchor("test.multi", "foo", None)]);
+        let text = "foo bar foo baz foo";
+        let detections = engine.detect(text);
+
+        assert_eq!(
+            detections.len(),
+            3,
+            "Should detect all 3 occurrences of 'foo'"
+        );
+        assert_eq!(detections[0].matched_text, "foo");
+        assert_eq!(detections[1].matched_text, "foo");
+        assert_eq!(detections[2].matched_text, "foo");
+
+        // Check spans are different
+        assert_ne!(detections[0].span, detections[1].span);
+        assert_ne!(detections[1].span, detections[2].span);
     }
 }
