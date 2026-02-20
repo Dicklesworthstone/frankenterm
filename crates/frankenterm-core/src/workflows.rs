@@ -8547,9 +8547,7 @@ impl HandleAuthRequired {
             }
         };
 
-        let workspace = pane
-            .as_ref()
-            .and_then(Self::workspace_for_pane);
+        let workspace = pane.as_ref().and_then(Self::workspace_for_pane);
 
         let options = SearchOptions {
             limit: Some(AUTH_CASS_HINT_LIMIT),

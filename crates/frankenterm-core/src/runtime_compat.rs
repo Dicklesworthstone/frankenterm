@@ -329,6 +329,22 @@ pub mod broadcast {
     };
 }
 
+/// Oneshot channel aliases for the active runtime.
+///
+/// Note: this remains tokio-backed while the broader oneshot migration is
+/// completed; exposing it via runtime_compat centralizes call sites.
+pub mod oneshot {
+    pub use tokio::sync::oneshot::{Receiver, Sender, channel, error::RecvError};
+}
+
+/// Async notification primitive for the active runtime.
+///
+/// Note: this remains tokio-backed while the broader sync-primitive migration
+/// is completed; exposing it via runtime_compat centralizes call sites.
+pub mod notify {
+    pub use tokio::sync::Notify;
+}
+
 /// Task primitives used during runtime migration.
 ///
 /// Note: this remains tokio-backed while call sites are normalized through

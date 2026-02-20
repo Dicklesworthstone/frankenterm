@@ -38,9 +38,9 @@ use std::{
     time::Instant,
 };
 
+use crate::runtime_compat::oneshot;
 use rusqlite::{Connection, OptionalExtension, params, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
 
 use crate::error::{Result, StorageError};
 use crate::events::event_identity_key;

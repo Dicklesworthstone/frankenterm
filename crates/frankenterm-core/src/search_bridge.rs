@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(not(feature = "asupersync-runtime"))]
 use crate::runtime_compat::mpsc;
+use crate::runtime_compat::notify::Notify;
 use frankensearch::{Cx, ScoredResult, SearchError, SearchPhase, TwoTierMetrics, TwoTierSearcher};
 use thiserror::Error;
-use tokio::sync::Notify;
 
 /// Shared document-text provider for exclusion-aware search operations.
 pub type TextProvider = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;

@@ -8,8 +8,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::runtime_compat::notify::Notify;
 use crossbeam::queue::ArrayQueue;
-use tokio::sync::Notify;
 
 /// Construct a bounded SPSC channel.
 ///
