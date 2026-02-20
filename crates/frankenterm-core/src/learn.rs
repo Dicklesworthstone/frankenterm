@@ -7,13 +7,16 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
+//! # fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 //! use frankenterm_core::learn::{TutorialEngine, TutorialEvent};
 //!
 //! let mut engine = TutorialEngine::load_or_create()?;
 //! engine.handle_event(TutorialEvent::StartTrack("basics".into()))?;
 //! engine.handle_event(TutorialEvent::CompleteExercise("basics.1".into()))?;
 //! engine.save()?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::collections::HashSet;
@@ -1149,7 +1152,10 @@ impl TutorialEngine {
         }
 
         // Speed runner — basics complete and total time <= 3 minutes (secret)
-        if !has("speed_runner") && self.is_track_complete_internal("basics") && self.state.total_time_minutes <= 3 {
+        if !has("speed_runner")
+            && self.is_track_complete_internal("basics")
+            && self.state.total_time_minutes <= 3
+        {
             to_add.push((
                 "speed_runner".into(),
                 "Speed Runner".into(),
