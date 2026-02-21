@@ -193,7 +193,13 @@ impl SnapshotEngine {
         E: std::fmt::Display + Send + 'static,
         F: FnOnce() -> std::result::Result<T, E> + Send + 'static,
     {
-        Self::spawn_blocking_db(work).await.unwrap_or_default()
+        match Self::spawn_blocking_db(work).await {
+            Ok(val) => val,
+            Err(e) => {
+                tracing::warn!(error = %e, "best-effort DB operation failed, returning default");
+                T::default()
+            }
+        }
     }
 
     /// Capture a full mux state snapshot from the given pane list.
