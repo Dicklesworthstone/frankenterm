@@ -2471,9 +2471,7 @@ mod tests {
 
     #[tokio::test]
     async fn net_tcp_stream_connect_to_listener() {
-        let listener = net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
+        let listener = net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
 
         let stream = net::TcpStream::connect(addr).await;
@@ -2484,9 +2482,7 @@ mod tests {
     async fn net_tcp_roundtrip() {
         use io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
+        let listener = net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
 
         let server = task::spawn(async move {
@@ -2509,9 +2505,7 @@ mod tests {
 
     #[test]
     fn runtime_builder_enable_all_is_chainable() {
-        let rt = RuntimeBuilder::multi_thread()
-            .enable_all()
-            .build();
+        let rt = RuntimeBuilder::multi_thread().enable_all().build();
         assert!(rt.is_ok());
     }
 
@@ -2578,8 +2572,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_spawn_blocking_returns_join_handle() {
-        let handle: task::JoinHandle<String> =
-            task::spawn_blocking(|| "hello".to_string());
+        let handle: task::JoinHandle<String> = task::spawn_blocking(|| "hello".to_string());
         let val = handle.await.expect("join");
         assert_eq!(val, "hello");
     }

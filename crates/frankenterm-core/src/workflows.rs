@@ -13915,7 +13915,9 @@ steps:
         ));
 
         // Create a minimal storage handle using temp file
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread().build().unwrap();
+        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+            .build()
+            .unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -14004,7 +14006,9 @@ steps:
             ),
         ));
 
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread().build().unwrap();
+        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+            .build()
+            .unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -14089,7 +14093,9 @@ steps:
             ),
         ));
 
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread().build().unwrap();
+        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+            .build()
+            .unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -14273,7 +14279,9 @@ steps:
     /// Test that WorkflowContext has injector access after with_injector is called.
     #[test]
     fn workflow_context_injector_access() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread().build().unwrap();
+        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+            .build()
+            .unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -14374,7 +14382,9 @@ steps:
 
     #[test]
     fn handle_compaction_guard_checks() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread().build().unwrap();
+        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+            .build()
+            .unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir
             .path()
@@ -14482,7 +14492,9 @@ steps:
     /// Expected: Workflow proceeds through guards → step logs show completion path
     #[test]
     fn handle_compaction_integration_prompt_active_passes_guards() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread().build().unwrap();
+        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+            .build()
+            .unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir
             .path()
@@ -14546,7 +14558,9 @@ steps:
     /// Expected: Guard check fails with "alt-screen" in error message
     #[test]
     fn handle_compaction_integration_alt_screen_aborts() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread().build().unwrap();
+        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+            .build()
+            .unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir
             .path()
@@ -14593,7 +14607,9 @@ steps:
     /// Expected: Guard check fails with "running" in error message
     #[test]
     fn handle_compaction_integration_command_running_aborts() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread().build().unwrap();
+        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+            .build()
+            .unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir
             .path()
@@ -14640,7 +14656,9 @@ steps:
     /// Expected: Guard check fails with "gap" in error message
     #[test]
     fn handle_compaction_integration_recent_gap_aborts() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread().build().unwrap();
+        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+            .build()
+            .unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir
             .path()
@@ -14778,7 +14796,9 @@ steps:
 
         let workflow = HandleCompaction::new().with_prompt_config(config);
 
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread().build().unwrap();
+        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let temp_dir = tempfile::tempdir().unwrap();
             let db_path = temp_dir
@@ -14837,7 +14857,9 @@ steps:
 
         let workflow = HandleCompaction::new().with_prompt_config(config);
 
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread().build().unwrap();
+        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let temp_dir = tempfile::tempdir().unwrap();
             let db_path = temp_dir
@@ -17881,7 +17903,9 @@ Try again at 3:00 PM UTC.
 
     #[test]
     fn regression_runner_selects_session_end_workflow() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread().build().unwrap();
+        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+            .build()
+            .unwrap();
         let db_path =
             std::env::temp_dir().join(format!("wa_test_reg_sel_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();

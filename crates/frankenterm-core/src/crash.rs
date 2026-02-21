@@ -799,11 +799,8 @@ pub fn collect_incident_bundle(
     if let Some(cfg_path) = opts.config_path {
         if cfg_path.exists() {
             if let Ok(contents) = fs::read_to_string(cfg_path) {
-                let truncated = if contents.len() > 64 * 1024 {
-                    format!("{}\n... [truncated at 64 KiB]", &contents[..64 * 1024])
-                } else {
-                    contents
-                };
+                let truncated =
+                    truncate_utf8_with_marker(&contents, 64 * 1024, "\n... [truncated at 64 KiB]");
                 write_redacted_file(
                     "config_summary.toml",
                     &truncated,
@@ -1250,7 +1247,7 @@ pub fn replay_incident_bundle(
                                 .filter(|e| {
                                     e.get("matched_text_preview")
                                         .and_then(|v| v.as_str())
-                                        .is_some_and(|s| s.len() > 200)
+                                        .is_some_and(|s| s.chars().count() > 200)
                                 })
                                 .count();
                             checks.push(ReplayCheck {
@@ -1314,6 +1311,38 @@ pub fn replay_incident_bundle(
         checks,
         warnings,
     })
+}
+
+/// Truncate UTF-8 text to at most `max_bytes`, appending `marker` when truncated.
+///
+/// The returned string is always valid UTF-8 and never exceeds `max_bytes`.
+fn truncate_utf8_with_marker(content: &str, max_bytes: usize, marker: &str) -> String {
+    if content.len() <= max_bytes {
+        return content.to_string();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+
+    // If the marker itself would exceed the budget, return a bounded marker prefix.
+    if marker.len() >= max_bytes {
+        let mut marker_end = max_bytes;
+        while marker_end > 0 && !marker.is_char_boundary(marker_end) {
+            marker_end -= 1;
+        }
+        return marker[..marker_end].to_string();
+    }
+
+    let marker_bytes = marker.len();
+    let mut content_end = max_bytes - marker_bytes;
+    while content_end > 0 && !content.is_char_boundary(content_end) {
+        content_end -= 1;
+    }
+
+    let mut out = String::with_capacity(content_end + marker_bytes);
+    out.push_str(&content[..content_end]);
+    out.push_str(marker);
+    out
 }
 
 /// Write a file to the bundle directory, redacting secrets and tracking metadata.
@@ -2356,15 +2385,13 @@ mod tests {
             export_incident_bundle(&crash_dir, None, &out_dir, IncidentKind::Manual).unwrap();
 
         assert_eq!(result.kind, IncidentKind::Manual);
-        assert!(
-            result
-                .path
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("wa_incident_manual_")
-        );
+        assert!(result
+            .path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("wa_incident_manual_"));
     }
 
     #[test]
@@ -3327,12 +3354,10 @@ mod tests {
         // Empty directory — no manifest.json or incident_manifest.json
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
         assert_eq!(result.status, "fail");
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "manifest_valid" && !c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "manifest_valid" && !c.passed));
     }
 
     #[test]
@@ -3342,12 +3367,10 @@ mod tests {
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
         assert_eq!(result.status, "fail");
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "manifest_valid" && !c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "manifest_valid" && !c.passed));
     }
 
     #[test]
@@ -3366,26 +3389,20 @@ mod tests {
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
         // Manifest is valid
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "manifest_valid" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "manifest_valid" && c.passed));
         // No redaction report → warning
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("redaction_report"))
-        );
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.contains("redaction_report")));
         // No secrets found → passes
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "no_secrets_leaked" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "no_secrets_leaked" && c.passed));
     }
 
     #[test]
@@ -3418,12 +3435,10 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "redaction_report_valid" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "redaction_report_valid" && c.passed));
     }
 
     #[test]
@@ -3445,12 +3460,10 @@ mod tests {
         fs::write(tmp.path().join("redaction_report.json"), "{ bad json }").unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "redaction_report_valid" && !c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "redaction_report_valid" && !c.passed));
     }
 
     #[test]
@@ -3477,12 +3490,10 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "crash_report_valid" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "crash_report_valid" && c.passed));
     }
 
     #[test]
@@ -3504,12 +3515,10 @@ mod tests {
         fs::write(tmp.path().join("crash_report.json"), "not valid crash json").unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "crash_report_valid" && !c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "crash_report_valid" && !c.passed));
     }
 
     #[test]
@@ -3542,12 +3551,10 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "db_metadata_valid" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "db_metadata_valid" && c.passed));
     }
 
     #[test]
@@ -3587,18 +3594,14 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "events_structure_valid" && c.passed)
-        );
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "events_text_bounded" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "events_structure_valid" && c.passed));
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "events_text_bounded" && c.passed));
     }
 
     #[test]
@@ -3653,12 +3656,48 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "events_text_bounded" && !c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "events_text_bounded" && !c.passed));
+    }
+
+    #[test]
+    fn replay_bundle_rules_mode_multibyte_preview_at_char_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = IncidentBundleResult {
+            path: tmp.path().to_path_buf(),
+            kind: IncidentKind::Crash,
+            files: vec!["recent_events.json".to_string()],
+            total_size_bytes: 100,
+            wa_version: crate::VERSION.to_string(),
+            exported_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        fs::write(
+            tmp.path().join("incident_manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // 200 chars, but much more than 200 bytes in UTF-8.
+        let preview = "🦀".repeat(200);
+        let events = serde_json::json!([{
+            "rule_id": "r1",
+            "event_type": "match",
+            "severity": "warning",
+            "matched_text_preview": preview
+        }]);
+        fs::write(
+            tmp.path().join("recent_events.json"),
+            serde_json::to_string_pretty(&events).unwrap(),
+        )
+        .unwrap();
+
+        let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "events_text_bounded" && c.passed));
     }
 
     #[test]
@@ -3689,12 +3728,10 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "files_complete" && !c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "files_complete" && !c.passed));
     }
 
     #[test]
@@ -3716,12 +3753,10 @@ mod tests {
         fs::write(tmp.path().join("data.json"), "{}").unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "files_complete" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "files_complete" && c.passed));
     }
 
     // -- write_redacted_file tests --
@@ -3825,6 +3860,33 @@ mod tests {
 
         let result = collect_incident_bundle(&opts).unwrap();
         assert!(result.files.contains(&"config_summary.toml".to_string()));
+    }
+
+    #[test]
+    fn collect_incident_bundle_truncates_multibyte_config_safely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let out_dir = tmp.path().join("out");
+        let config_path = tmp.path().join("config.toml");
+
+        // 4-byte UTF-8 scalar repeated to exceed 64 KiB.
+        let huge_config = "🦀".repeat((64 * 1024 / 4) + 100);
+        fs::write(&config_path, huge_config).unwrap();
+
+        let opts = IncidentBundleOptions {
+            crash_dir: &crash_dir,
+            config_path: Some(&config_path),
+            out_dir: &out_dir,
+            kind: IncidentKind::Manual,
+            db_path: None,
+            max_events: 0,
+        };
+
+        let result = collect_incident_bundle(&opts).unwrap();
+        let config_summary = fs::read_to_string(result.path.join("config_summary.toml")).unwrap();
+
+        assert!(config_summary.len() <= 64 * 1024);
+        assert!(config_summary.contains("truncated at 64 KiB"));
     }
 
     // -- Additional edge case tests --

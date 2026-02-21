@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::runtime_compat::CompatRuntime;
 #[cfg(not(feature = "asupersync-runtime"))]
 use crate::runtime_compat::mpsc;
-use crate::runtime_compat::CompatRuntime;
 use crate::runtime_compat::notify::Notify;
 use frankensearch::{Cx, ScoredResult, SearchError, SearchPhase, TwoTierMetrics, TwoTierSearcher};
 use thiserror::Error;
@@ -318,19 +318,18 @@ impl SearchBridge {
         let searcher = Arc::clone(&self.searcher);
         let worker_cancellation = cancellation.clone();
 
-        let mut worker =
-            crate::runtime_compat::task::spawn_blocking(move || -> Result<SearchBridgeResult, SearchError> {
+        let mut worker = crate::runtime_compat::task::spawn_blocking(
+            move || -> Result<SearchBridgeResult, SearchError> {
                 let (cancel_done, cancel_thread) =
                     spawn_cancellation_thread(cx.clone(), worker_cancellation.clone());
 
-                let runtime =
-                    crate::runtime_compat::RuntimeBuilder::current_thread()
-                        .build()
-                        .map_err(|err| SearchError::InvalidConfig {
-                            field: "search_bridge.runtime".to_owned(),
-                            value: "tokio_current_thread".to_owned(),
-                            reason: err,
-                        })?;
+                let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+                    .build()
+                    .map_err(|err| SearchError::InvalidConfig {
+                        field: "search_bridge.runtime".to_owned(),
+                        value: "tokio_current_thread".to_owned(),
+                        reason: err,
+                    })?;
 
                 let search_result = runtime.block_on(async move {
                     let mut best_results = Vec::new();
@@ -359,7 +358,8 @@ impl SearchBridge {
                 }
 
                 search_result
-            });
+            },
+        );
 
         let search_result = loop {
             crate::runtime_compat::select! {
@@ -651,14 +651,13 @@ mod tests {
         {
             let joined = crate::runtime_compat::spawn_blocking(
                 move || -> Result<SearchBridgeResult, SearchError> {
-                    let runtime =
-                        crate::runtime_compat::RuntimeBuilder::current_thread()
-                            .build()
-                            .map_err(|err| SearchError::InvalidConfig {
-                                field: "search_bridge.raw.runtime".to_owned(),
-                                value: "tokio_current_thread".to_owned(),
-                                reason: err,
-                            })?;
+                    let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+                        .build()
+                        .map_err(|err| SearchError::InvalidConfig {
+                            field: "search_bridge.raw.runtime".to_owned(),
+                            value: "tokio_current_thread".to_owned(),
+                            reason: err,
+                        })?;
 
                     runtime.block_on(async move {
                         let cx = Cx::for_testing();

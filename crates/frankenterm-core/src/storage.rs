@@ -21193,9 +21193,9 @@ mod backpressure_integration_tests {
 #[cfg(test)]
 mod proptest_tests {
     use super::*;
+    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
     use proptest::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
 
     // Counter for unique temp DB paths
     static PROPTEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
