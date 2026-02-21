@@ -1179,6 +1179,30 @@ impl Mux {
         }
 
         self.prune_dead_windows();
+        let _ = self.remove_domain_internal(domain);
+    }
+
+    fn remove_domain_internal(&self, domain_id: DomainId) -> Option<Arc<dyn Domain>> {
+        let removed = self.domains.write().remove(&domain_id);
+        if removed.is_none() {
+            return None;
+        }
+
+        self.domains_by_name
+            .write()
+            .retain(|_, existing| existing.domain_id() != domain_id);
+
+        let should_replace_default = self
+            .default_domain
+            .read()
+            .as_ref()
+            .map_or(false, |existing| existing.domain_id() == domain_id);
+        if should_replace_default {
+            let replacement = self.domains.read().values().next().cloned();
+            *self.default_domain.write() = replacement;
+        }
+
+        removed
     }
 
     pub fn set_banner(&self, banner: Option<String>) {
@@ -1610,6 +1634,46 @@ mod tests {
         mux.notify(MuxNotification::Empty);
         assert_eq!(notifications.load(Ordering::Relaxed), 1);
         assert!(!mux.unsubscribe(sub_id));
+    }
+
+    #[test]
+    fn detached_domain_is_removed_from_domain_maps() {
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(domain::LocalDomain::new("default-test-domain").unwrap());
+        let mux = Mux::new(Some(Arc::clone(&default_domain)));
+
+        let detached_domain: Arc<dyn Domain> =
+            Arc::new(domain::LocalDomain::new("detached-test-domain").unwrap());
+        let detached_id = detached_domain.domain_id();
+        let detached_name = detached_domain.domain_name().to_string();
+
+        mux.add_domain(&detached_domain);
+        assert!(mux.get_domain(detached_id).is_some());
+        assert!(mux.get_domain_by_name(&detached_name).is_some());
+
+        mux.domain_was_detached(detached_id);
+
+        assert!(mux.get_domain(detached_id).is_none());
+        assert!(mux.get_domain_by_name(&detached_name).is_none());
+        assert!(mux.get_domain(default_domain.domain_id()).is_some());
+    }
+
+    #[test]
+    fn detaching_default_domain_promotes_remaining_domain() {
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(domain::LocalDomain::new("default-domain-to-detach").unwrap());
+        let mux = Mux::new(Some(Arc::clone(&default_domain)));
+
+        let replacement_domain: Arc<dyn Domain> =
+            Arc::new(domain::LocalDomain::new("replacement-domain").unwrap());
+        let replacement_id = replacement_domain.domain_id();
+        mux.add_domain(&replacement_domain);
+
+        mux.domain_was_detached(default_domain.domain_id());
+
+        assert!(mux.get_domain(default_domain.domain_id()).is_none());
+        assert!(mux.get_domain(replacement_id).is_some());
+        assert_eq!(mux.default_domain().domain_id(), replacement_id);
     }
 
     #[test]
