@@ -3295,6 +3295,16 @@ mod tests {
     use crate::storage::PaneRecord;
     use tempfile::TempDir;
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .expect("failed to build runtime for runtime tests");
+        runtime.block_on(future);
+    }
+
     async fn send_mpsc<T>(tx: &mpsc::Sender<T>, value: T) {
         #[cfg(feature = "asupersync-runtime")]
         {
@@ -3461,24 +3471,28 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn runtime_config_defaults_are_reasonable() {
-        let config = RuntimeConfig::default();
+    #[test]
+    fn runtime_config_defaults_are_reasonable() {
+        run_async_test(async {
+            let config = RuntimeConfig::default();
 
-        assert_eq!(config.discovery_interval, Duration::from_secs(5));
-        assert_eq!(config.capture_interval, Duration::from_millis(200));
-        assert_eq!(config.overlap_size, 1_048_576); // 1MB default
-        assert_eq!(config.channel_buffer, 1024);
+            assert_eq!(config.discovery_interval, Duration::from_secs(5));
+            assert_eq!(config.capture_interval, Duration::from_millis(200));
+            assert_eq!(config.overlap_size, 1_048_576); // 1MB default
+            assert_eq!(config.channel_buffer, 1024);
+        });
     }
 
-    #[tokio::test]
-    async fn runtime_can_be_created() {
-        let (_dir, db_path) = temp_db_path();
-        let storage = StorageHandle::new(&db_path).await.unwrap();
-        let engine = PatternEngine::new();
+    #[test]
+    fn runtime_can_be_created() {
+        run_async_test(async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let engine = PatternEngine::new();
 
-        let config = RuntimeConfig::default();
-        let _runtime = ObservationRuntime::new(config, storage, Arc::new(RwLock::new(engine)));
+            let config = RuntimeConfig::default();
+            let _runtime = ObservationRuntime::new(config, storage, Arc::new(RwLock::new(engine)));
+        });
     }
 
     #[test]
@@ -3810,23 +3824,25 @@ mod tests {
         assert_eq!(depth, 0);
     }
 
-    #[tokio::test]
-    async fn mpsc_queue_depth_increases_with_sends() {
-        let (tx, mut rx) = mpsc::channel::<u8>(16);
-        let max_cap = 16usize;
+    #[test]
+    fn mpsc_queue_depth_increases_with_sends() {
+        run_async_test(async {
+            let (tx, mut rx) = mpsc::channel::<u8>(16);
+            let max_cap = 16usize;
 
-        // Send some items
-        send_mpsc(&tx, 1).await;
-        send_mpsc(&tx, 2).await;
-        send_mpsc(&tx, 3).await;
+            // Send some items
+            send_mpsc(&tx, 1).await;
+            send_mpsc(&tx, 2).await;
+            send_mpsc(&tx, 3).await;
 
-        let depth = max_cap - tx.capacity();
-        assert_eq!(depth, 3);
+            let depth = max_cap - tx.capacity();
+            assert_eq!(depth, 3);
 
-        // Drain one item, depth should decrease
-        let _ = recv_mpsc(&mut rx).await;
-        let depth = max_cap - tx.capacity();
-        assert_eq!(depth, 2);
+            // Drain one item, depth should decrease
+            let _ = recv_mpsc(&mut rx).await;
+            let depth = max_cap - tx.capacity();
+            assert_eq!(depth, 2);
+        });
     }
 
     #[test]

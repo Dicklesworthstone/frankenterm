@@ -1785,6 +1785,89 @@ mod tests {
     }
 
     #[test]
+    fn send_paste_write_timeout_when_server_stops_reading_after_handshake() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("write-timeout.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for write-timeout test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    let response =
+                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "write-timeout-test".to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                        });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::SetClientId(_) => {
+                                    let mut out = Vec::new();
+                                    Pdu::UnitResponse(UnitResponse {})
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+
+                                    // Keep socket open but stop reading so the client
+                                    // write path eventually back-pressures.
+                                    sleep(Duration::from_millis(500)).await;
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            });
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should be ready before client connects");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.read_timeout = Duration::from_millis(200);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            client.config.write_timeout = Duration::from_millis(5);
+
+            let payload = "x".repeat(32 * 1024 * 1024);
+            let err = client
+                .send_paste(0, payload)
+                .await
+                .expect_err("send_paste should time out when peer stops reading");
+            assert!(matches!(err, DirectMuxError::WriteTimeout));
+
+            drop(client);
+            server.join().expect("server thread");
+        });
+    }
+
+    #[test]
     fn list_panes_read_timeout_when_server_stalls_after_handshake() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
