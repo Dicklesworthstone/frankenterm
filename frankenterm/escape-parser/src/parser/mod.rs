@@ -50,10 +50,13 @@ impl GetTcapBuilder {
 struct ParseState {
     sixel: Option<SixelBuilder>,
     dcs: Option<ShortDeviceControl>,
+    discarding_short_dcs: bool,
     get_tcap: Option<GetTcapBuilder>,
     #[cfg(feature = "tmux_cc")]
     tmux_state: Option<RefCell<crate::tmux_cc::Parser>>,
 }
+
+const MAX_SHORT_DCS_BYTES: usize = 8 * 1024 * 1024;
 
 /// The `Parser` struct holds the state machine that is used to decode
 /// a sequence of bytes.  The byte sequence can be streaming into the
@@ -240,6 +243,7 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
         self.state.sixel.take();
         self.state.get_tcap.take();
         self.state.dcs.take();
+        self.state.discarding_short_dcs = false;
         if byte == b'q' && intermediates.is_empty() && !ignored_extra_intermediates {
             self.state.sixel.replace(SixelBuilder::new(params));
         } else if byte == b'q' && intermediates == [b'+'] {
@@ -270,8 +274,27 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
     }
 
     fn dcs_put(&mut self, data: u8) {
-        if let Some(dcs) = self.state.dcs.as_mut() {
-            dcs.data.push(data);
+        if self.state.dcs.is_some() {
+            if self.state.discarding_short_dcs {
+                return;
+            }
+
+            let mut over_limit = false;
+            if let Some(dcs) = self.state.dcs.as_mut() {
+                if dcs.data.len() < MAX_SHORT_DCS_BYTES {
+                    dcs.data.push(data);
+                } else {
+                    over_limit = true;
+                }
+            }
+
+            if over_limit {
+                self.state.discarding_short_dcs = true;
+                log::warn!(
+                    "short DCS payload exceeded {} bytes; discarding until DCS terminator",
+                    MAX_SHORT_DCS_BYTES
+                );
+            }
         } else if let Some(sixel) = self.state.sixel.as_mut() {
             sixel.push(data);
         } else if let Some(tcap) = self.state.get_tcap.as_mut() {
@@ -300,6 +323,7 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
     }
 
     fn dcs_unhook(&mut self) {
+        self.state.discarding_short_dcs = false;
         if let Some(dcs) = self.state.dcs.take() {
             (self.callback)(Action::DeviceControl(
                 DeviceControlMode::ShortDeviceControl(Box::new(dcs)),
@@ -841,6 +865,28 @@ mod test {
             actions
         );
         assert_eq!(encode(&actions), "\x1bP$qm\x1b\\");
+    }
+
+    #[test]
+    fn overlong_short_dcs_is_discarded() {
+        let mut p = Parser::new();
+        let mut seq = Vec::with_capacity(MAX_SHORT_DCS_BYTES + 512);
+        seq.extend_from_slice(b"\x1bP$q");
+        seq.extend(std::iter::repeat_n(b'x', MAX_SHORT_DCS_BYTES + 128));
+        seq.extend_from_slice(b"\x1b\\");
+        seq.extend_from_slice(b"\x1bP$qOK\x1b\\");
+
+        let actions = p.parse_as_vec(&seq);
+        let mut short_dcs = Vec::new();
+        for action in actions {
+            if let Action::DeviceControl(DeviceControlMode::ShortDeviceControl(dcs)) = action {
+                short_dcs.push(*dcs);
+            }
+        }
+
+        assert_eq!(2, short_dcs.len());
+        assert_eq!(MAX_SHORT_DCS_BYTES, short_dcs[0].data.len());
+        assert_eq!(b"OK".to_vec(), short_dcs[1].data);
     }
 
     #[test]

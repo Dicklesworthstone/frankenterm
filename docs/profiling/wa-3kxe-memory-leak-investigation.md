@@ -3,6 +3,26 @@
 This document tracks reproducible steps and current findings for bead `wa-3kxe.1`:
 "Memory leak root cause analysis and patches (ESO methodology)".
 
+## Latest Session Update (2026-02-20)
+
+- Verified and restored the short-DCS memory cap implementation in
+  `frankenterm/escape-parser/src/parser/mod.rs`:
+  - `MAX_SHORT_DCS_BYTES` cap (`8 MiB`)
+  - `discarding_short_dcs` parser state flag
+  - bounded accumulation in `dcs_put`
+  - reset behavior on `dcs_hook`/`dcs_unhook`
+- Added/validated regression test:
+  - `overlong_short_dcs_is_discarded`
+  - confirms oversized short-DCS payloads are capped and subsequent short-DCS
+    parsing still works.
+- Validation executed via `rch exec`:
+  - `cargo fmt --check` ✅
+  - `cargo check --workspace --all-targets` ✅
+  - `cargo clippy --workspace --all-targets -- -D warnings` ❌ (pre-existing unrelated
+    lint in `crates/frankenterm-core/src/workflows.rs:8548`, `redundant_closure`)
+  - `cargo clippy -p frankenterm-escape-parser --all-targets --features std -- -D warnings` ✅
+  - `cargo test -p frankenterm-escape-parser --features std overlong_short_dcs_is_discarded -- --nocapture` ✅
+
 ## Scope
 
 Target process:
