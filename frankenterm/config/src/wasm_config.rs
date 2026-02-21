@@ -16,7 +16,7 @@
 //! to the next config format.
 
 use crate::{LoadedConfig, CONFIG_DIRS};
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
 use std::path::{Path, PathBuf};
 
@@ -41,6 +41,27 @@ pub(crate) fn try_load_wasm_config(
     overrides: &Value,
     evaluator: &WasmEvaluatorFn,
 ) -> Option<LoadedConfig> {
+    if let Some(explicit_path) = explicit_wasm_config_path_from_env() {
+        return match try_load_wasm_file(&explicit_path, overrides, evaluator) {
+            Ok(Some(loaded)) => Some(loaded),
+            Ok(None) => Some(LoadedConfig {
+                config: Err(anyhow!(
+                    "$FRANKENTERM_CONFIG_FILE points to {}, but the file does not exist",
+                    explicit_path.display()
+                )),
+                file_name: Some(explicit_path),
+                lua: None,
+                warnings: vec![],
+            }),
+            Err(err) => Some(LoadedConfig {
+                config: Err(err),
+                file_name: Some(explicit_path),
+                lua: None,
+                warnings: vec![],
+            }),
+        };
+    }
+
     let paths = wasm_config_search_paths();
 
     for path in &paths {
@@ -62,17 +83,20 @@ pub(crate) fn try_load_wasm_config(
     None
 }
 
+fn is_wasm_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("wasm"))
+}
+
+fn explicit_wasm_config_path_from_env() -> Option<PathBuf> {
+    std::env::var_os("FRANKENTERM_CONFIG_FILE")
+        .map(PathBuf::from)
+        .filter(|path| is_wasm_path(path))
+}
+
 /// Build the list of paths to search for `frankenterm.wasm`.
 fn wasm_config_search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-
-    // Highest priority: explicit environment variable
-    if let Some(path) = std::env::var_os("FRANKENTERM_CONFIG_FILE") {
-        let p = PathBuf::from(path);
-        if p.extension().is_some_and(|ext| ext == "wasm") {
-            paths.push(p);
-        }
-    }
 
     // XDG config dirs
     for dir in CONFIG_DIRS.iter() {
@@ -150,6 +174,33 @@ fn try_load_wasm_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = &self.previous {
+                std::env::set_var(self.key, prev);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     fn mock_evaluator(dynamic: Value) -> Box<WasmEvaluatorFn> {
         Box::new(move |_path| Ok(dynamic.clone()))
@@ -247,5 +298,34 @@ mod tests {
         // Unless someone has a frankenterm.wasm in their config dir, should be None
         // We can't guarantee this in CI so we just check it doesn't panic
         let _ = result;
+    }
+
+    #[test]
+    fn explicit_env_missing_wasm_returns_error() {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("missing-config.wasm");
+        let _guard = EnvVarGuard::set("FRANKENTERM_CONFIG_FILE", &missing_path);
+        let evaluator: Box<WasmEvaluatorFn> = Box::new(|_| Ok(Value::Null));
+
+        let loaded = try_load_wasm_config(&Value::default(), &*evaluator)
+            .expect("expected explicit env result");
+        assert_eq!(loaded.file_name, Some(missing_path));
+        assert!(loaded.config.is_err());
+    }
+
+    #[test]
+    fn explicit_env_wasm_extension_is_case_insensitive() {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.WASM");
+        std::fs::write(&path, b"fake wasm").unwrap();
+        let _guard = EnvVarGuard::set("FRANKENTERM_CONFIG_FILE", &path);
+
+        let evaluator = mock_evaluator(Value::Object(Default::default()));
+        let loaded = try_load_wasm_config(&Value::default(), &*evaluator)
+            .expect("expected explicit env result");
+        assert_eq!(loaded.file_name, Some(path));
+        assert!(loaded.config.is_ok());
     }
 }

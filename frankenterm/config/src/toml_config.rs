@@ -14,7 +14,7 @@
 //! to Lua config or defaults.
 
 use crate::{toml_to_dynamic, LoadedConfig, CONFIG_DIRS, HOME_DIR};
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
 use std::path::{Path, PathBuf};
 
@@ -25,6 +25,27 @@ use super::Config;
 /// Returns `Some(LoadedConfig)` if a TOML config was found and loaded
 /// (successfully or with an error), or `None` if no TOML config exists.
 pub(crate) fn try_load_toml_config(overrides: &Value) -> Option<LoadedConfig> {
+    if let Some(explicit_path) = explicit_toml_config_path_from_env() {
+        return match try_load_toml_file(&explicit_path, overrides) {
+            Ok(Some(loaded)) => Some(loaded),
+            Ok(None) => Some(LoadedConfig {
+                config: Err(anyhow!(
+                    "$FRANKENTERM_CONFIG_FILE points to {}, but the file does not exist",
+                    explicit_path.display()
+                )),
+                file_name: Some(explicit_path),
+                lua: None,
+                warnings: vec![],
+            }),
+            Err(err) => Some(LoadedConfig {
+                config: Err(err),
+                file_name: Some(explicit_path),
+                lua: None,
+                warnings: vec![],
+            }),
+        };
+    }
+
     let paths = toml_config_search_paths();
 
     for path in &paths {
@@ -46,17 +67,20 @@ pub(crate) fn try_load_toml_config(overrides: &Value) -> Option<LoadedConfig> {
     None
 }
 
+fn is_toml_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("toml"))
+}
+
+fn explicit_toml_config_path_from_env() -> Option<PathBuf> {
+    std::env::var_os("FRANKENTERM_CONFIG_FILE")
+        .map(PathBuf::from)
+        .filter(|path| is_toml_path(path))
+}
+
 /// Build the list of paths to search for `frankenterm.toml`.
 fn toml_config_search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-
-    // Highest priority: explicit environment variable
-    if let Some(path) = std::env::var_os("FRANKENTERM_CONFIG_FILE") {
-        let p = PathBuf::from(path);
-        if p.extension().is_some_and(|ext| ext == "toml") {
-            paths.push(p);
-        }
-    }
 
     // XDG config dirs (reuse existing CONFIG_DIRS but for frankenterm subdir)
     for dir in CONFIG_DIRS.iter() {
@@ -142,6 +166,33 @@ fn try_load_toml_file(path: &Path, overrides: &Value) -> anyhow::Result<Option<L
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = &self.previous {
+                std::env::set_var(self.key, prev);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn empty_toml_produces_default_config() {
@@ -207,6 +258,32 @@ color_scheme = "Catppuccin Mocha"
         let result = try_load_toml_file(&path, &Value::default());
         let _ = std::fs::remove_file(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn explicit_env_missing_toml_returns_error() {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("missing-config.toml");
+        let _guard = EnvVarGuard::set("FRANKENTERM_CONFIG_FILE", &missing_path);
+
+        let loaded = try_load_toml_config(&Value::default()).expect("expected explicit env result");
+        assert_eq!(loaded.file_name, Some(missing_path));
+        assert!(loaded.config.is_err());
+    }
+
+    #[test]
+    fn explicit_env_toml_extension_is_case_insensitive() {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frankenterm.TOML");
+        std::fs::write(&path, "scrollback_lines = 4242\n").unwrap();
+        let _guard = EnvVarGuard::set("FRANKENTERM_CONFIG_FILE", &path);
+
+        let loaded = try_load_toml_config(&Value::default()).expect("expected explicit env result");
+        assert_eq!(loaded.file_name, Some(path));
+        let cfg = loaded.config.expect("expected parsed config");
+        assert_eq!(cfg.scrollback_lines, 4242);
     }
 
     #[test]
