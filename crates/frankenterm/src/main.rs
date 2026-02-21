@@ -3679,7 +3679,15 @@ fn effective_search_rrf_k(config: &frankenterm_core::config::Config) -> u32 {
     config.search.rrf_k.max(1)
 }
 
+fn effective_search_quality_timeout_ms(config: &frankenterm_core::config::Config) -> u64 {
+    config.search.quality_timeout_ms.max(1)
+}
+
 fn effective_search_fusion_weights(config: &frankenterm_core::config::Config) -> (f32, f32) {
+    if config.search.fast_only {
+        return (1.0, 0.0);
+    }
+
     let quality_weight = if config.search.quality_weight.is_finite() {
         config.search.quality_weight.clamp(0.0, 1.0)
     } else {
@@ -12157,6 +12165,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let (hybrid_lexical_weight, hybrid_semantic_weight) =
                                 effective_search_fusion_weights(&config);
                             let hybrid_fusion_backend = effective_search_fusion_backend(&config);
+                            let mut semantic_budget_config = storage.semantic_budget_snapshot().config;
+                            semantic_budget_config.max_semantic_latency_ms =
+                                effective_search_quality_timeout_ms(&config);
+                            storage.set_semantic_budget_config(semantic_budget_config);
                             enum RobotSearchExecution {
                                 Lexical(Vec<frankenterm_core::storage::SearchResult>),
                                 Hybrid(frankenterm_core::storage::HybridSearchBundle),
@@ -16745,6 +16757,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let (hybrid_lexical_weight, hybrid_semantic_weight) =
                         effective_search_fusion_weights(&config);
                     let hybrid_fusion_backend = effective_search_fusion_backend(&config);
+                    let mut semantic_budget_config = storage.semantic_budget_snapshot().config;
+                    semantic_budget_config.max_semantic_latency_ms =
+                        effective_search_quality_timeout_ms(&config);
+                    storage.set_semantic_budget_config(semantic_budget_config);
 
                     let search_results = if let Some(candidate_panes) = pane_candidates {
                         if candidate_panes.is_empty() {
@@ -35134,6 +35150,27 @@ log_level = "debug"
             with_metrics_json["metrics"]["fusion_backend"],
             "frankensearch_rrf"
         );
+    }
+
+    #[test]
+    fn effective_search_quality_timeout_ms_clamps_to_positive() {
+        let mut config = frankenterm_core::config::Config::default();
+        config.search.quality_timeout_ms = 0;
+        assert_eq!(effective_search_quality_timeout_ms(&config), 1);
+
+        config.search.quality_timeout_ms = 250;
+        assert_eq!(effective_search_quality_timeout_ms(&config), 250);
+    }
+
+    #[test]
+    fn effective_search_fusion_weights_fast_only_disables_semantic_weight() {
+        let mut config = frankenterm_core::config::Config::default();
+        config.search.quality_weight = 0.25;
+        config.search.fast_only = true;
+
+        let (lexical, semantic) = effective_search_fusion_weights(&config);
+        assert!((lexical - 1.0).abs() < f32::EPSILON);
+        assert!((semantic - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]
