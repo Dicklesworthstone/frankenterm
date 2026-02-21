@@ -13,10 +13,10 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::restore_layout::{LayoutRestorer, RestoreConfig};
 use frankenterm_core::restore_process::{LaunchAction, LaunchConfig, ProcessLauncher};
 use frankenterm_core::restore_scrollback::{InjectionConfig, ScrollbackData, ScrollbackInjector};
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::session_pane_state::{
     AgentMetadata, CapturedEnv, PaneStateSnapshot, ProcessInfo, TerminalState,
 };

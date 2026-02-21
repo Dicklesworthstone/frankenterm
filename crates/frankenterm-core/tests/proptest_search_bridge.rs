@@ -652,9 +652,7 @@ fn cancellation_token_cancelled_future_returns_immediately_when_already_cancelle
     let token = BridgeCancellationToken::new();
     token.cancel();
 
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .unwrap();
+    let rt = RuntimeBuilder::current_thread().build().unwrap();
 
     rt.block_on(async {
         // This should return immediately since token is already cancelled
@@ -675,9 +673,7 @@ fn cancellation_token_cancelled_future_resolves_on_cancel() {
     let token = BridgeCancellationToken::new();
     let token2 = token.clone();
 
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .unwrap();
+    let rt = RuntimeBuilder::current_thread().build().unwrap();
 
     rt.block_on(async {
         let handle = task::spawn(async move {

@@ -642,7 +642,7 @@ async fn unix_stream_read(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::R
 
 #[cfg(not(feature = "asupersync-runtime"))]
 async fn unix_stream_read(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<usize> {
-    use tokio::io::AsyncReadExt;
+    use crate::runtime_compat::unix::AsyncReadExt;
     stream.read(buf).await
 }
 
@@ -943,8 +943,8 @@ fn bonus_lines_to_text(lines: codec::SerializedLines) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::sleep;
     use crate::runtime_compat::unix as compat_unix;
+    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder, sleep};
     use proptest::prelude::*;
     use std::collections::{HashMap, HashSet};
 
@@ -976,11 +976,10 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("failed to build runtime for mux_client tests");
-        runtime.block_on(future);
+        CompatRuntime::block_on(&runtime, future);
     }
 
     #[test]
@@ -1782,6 +1781,189 @@ mod tests {
                 DirectMuxError::SocketNotFound(_) => {}
                 other => panic!("expected SocketNotFound, got: {other}"),
             }
+        });
+    }
+
+    #[test]
+    fn list_panes_read_timeout_when_server_stalls_after_handshake() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("read-timeout.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for read-timeout test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    let response =
+                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "read-timeout-test".to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                        });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::SetClientId(_) => {
+                                    let mut out = Vec::new();
+                                    Pdu::UnitResponse(UnitResponse {})
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::ListPanes(_) => {
+                                    // Keep the socket open but silent past client read_timeout.
+                                    sleep(Duration::from_millis(250)).await;
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            });
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should be ready before client connects");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.read_timeout = Duration::from_millis(40);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+
+            let err = client
+                .list_panes()
+                .await
+                .expect_err("list_panes should time out when server stalls");
+            assert!(matches!(err, DirectMuxError::ReadTimeout));
+
+            drop(client);
+            server.join().expect("server thread");
+        });
+    }
+
+    #[test]
+    fn list_panes_handles_partial_frame_reads() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("partial-frame.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for partial-frame test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    let response =
+                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "partial-frame-test".to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                        });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::SetClientId(_) => {
+                                    let mut out = Vec::new();
+                                    Pdu::UnitResponse(UnitResponse {})
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::ListPanes(_) => {
+                                    let response = Pdu::ListPanesResponse(ListPanesResponse {
+                                        tabs: Vec::new(),
+                                        tab_titles: Vec::new(),
+                                        window_titles: HashMap::new(),
+                                    });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    assert!(
+                                        out.len() > 1,
+                                        "encoded frame should be splittable for partial-read test"
+                                    );
+                                    let split = (out.len() / 2).max(1).min(out.len() - 1);
+                                    stream
+                                        .write_all(&out[..split])
+                                        .await
+                                        .expect("write first frame chunk");
+                                    sleep(Duration::from_millis(20)).await;
+                                    stream
+                                        .write_all(&out[split..])
+                                        .await
+                                        .expect("write second frame chunk");
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            });
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should be ready before client connects");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.read_timeout = Duration::from_millis(200);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+
+            let panes = client
+                .list_panes()
+                .await
+                .expect("list_panes should succeed with split response frame");
+            assert!(panes.tabs.is_empty());
+
+            drop(client);
+            server.join().expect("server thread");
         });
     }
 

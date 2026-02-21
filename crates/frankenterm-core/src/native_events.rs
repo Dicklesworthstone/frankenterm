@@ -428,6 +428,7 @@ fn decode_wire_event(line: &str) -> Result<Option<NativeEvent>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::RuntimeBuilder;
     use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
     use std::sync::atomic::AtomicBool;
 
@@ -702,356 +703,384 @@ mod tests {
         assert!(err.to_string().contains("denied"));
     }
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("failed to build runtime for native events tests");
+        runtime.block_on(future);
+    }
+
+    async fn recv_event(
+        event_rx: &mut mpsc::Receiver<NativeEvent>,
+        timeout: Duration,
+        label: &'static str,
+    ) -> NativeEvent {
+        crate::runtime_compat::timeout(timeout, crate::runtime_compat::mpsc_recv_option(event_rx))
+            .await
+            .expect("timeout")
+            .expect(label)
+    }
+
     // ── NativeEventListener ────────────────────────────────────────
 
-    #[tokio::test]
-    async fn bind_empty_path_returns_error() {
-        let result = NativeEventListener::bind(PathBuf::from("")).await;
-        assert!(result.is_err());
-        match result {
-            Err(NativeEventError::EmptySocketPath) => {}
-            Err(other) => panic!("expected EmptySocketPath, got: {other}"),
-            Ok(_) => panic!("expected error"),
-        }
+    #[test]
+    fn bind_empty_path_returns_error() {
+        run_async_test(async {
+            let result = NativeEventListener::bind(PathBuf::from("")).await;
+            assert!(result.is_err());
+            match result {
+                Err(NativeEventError::EmptySocketPath) => {}
+                Err(other) => panic!("expected EmptySocketPath, got: {other}"),
+                Ok(_) => panic!("expected error"),
+            }
+        });
     }
 
-    #[tokio::test]
-    async fn bind_existing_regular_file_returns_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("exists.sock");
-        // Create the file first
-        std::fs::write(&socket_path, b"").expect("create file");
+    #[test]
+    fn bind_existing_regular_file_returns_error() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("exists.sock");
+            // Create the file first
+            std::fs::write(&socket_path, b"").expect("create file");
 
-        let result = NativeEventListener::bind(socket_path).await;
-        assert!(result.is_err());
-        match result {
-            Err(NativeEventError::SocketAlreadyExists(_)) => {}
-            Err(other) => panic!("expected SocketAlreadyExists, got: {other}"),
-            Ok(_) => panic!("expected error"),
-        }
+            let result = NativeEventListener::bind(socket_path).await;
+            assert!(result.is_err());
+            match result {
+                Err(NativeEventError::SocketAlreadyExists(_)) => {}
+                Err(other) => panic!("expected SocketAlreadyExists, got: {other}"),
+                Ok(_) => panic!("expected error"),
+            }
+        });
     }
 
-    #[tokio::test]
-    async fn bind_active_socket_returns_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("active.sock");
-        let _active_listener = UnixListener::bind(&socket_path).expect("bind active socket");
+    #[test]
+    fn bind_active_socket_returns_error() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("active.sock");
+            let _active_listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind active socket");
 
-        let result = NativeEventListener::bind(socket_path).await;
-        assert!(result.is_err());
-        match result {
-            Err(NativeEventError::SocketAlreadyExists(_)) => {}
-            Err(other) => panic!("expected SocketAlreadyExists, got: {other}"),
-            Ok(_) => panic!("expected error"),
-        }
+            let result = NativeEventListener::bind(socket_path).await;
+            assert!(result.is_err());
+            match result {
+                Err(NativeEventError::SocketAlreadyExists(_)) => {}
+                Err(other) => panic!("expected SocketAlreadyExists, got: {other}"),
+                Ok(_) => panic!("expected error"),
+            }
+        });
     }
 
-    #[tokio::test]
-    async fn bind_replaces_stale_socket_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("stale.sock");
-        let stale_listener = UnixListener::bind(&socket_path).expect("bind stale socket");
-        drop(stale_listener);
-        assert!(
-            socket_path.exists(),
-            "socket path should persist after listener drop"
-        );
+    #[test]
+    fn bind_replaces_stale_socket_path() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("stale.sock");
+            let stale_listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind stale socket");
+            drop(stale_listener);
+            assert!(
+                socket_path.exists(),
+                "socket path should persist after listener drop"
+            );
 
-        let listener = NativeEventListener::bind(socket_path.clone())
-            .await
-            .expect("bind replaces stale socket path");
-        assert!(
-            socket_path.exists(),
-            "rebound listener should recreate socket"
-        );
+            let listener = NativeEventListener::bind(socket_path.clone())
+                .await
+                .expect("bind replaces stale socket path");
+            assert!(
+                socket_path.exists(),
+                "rebound listener should recreate socket"
+            );
 
-        drop(listener);
+            drop(listener);
+        });
     }
 
-    #[tokio::test]
-    async fn listener_drop_removes_socket_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("drop-cleanup.sock");
-        let listener = NativeEventListener::bind(socket_path.clone())
-            .await
-            .expect("bind listener");
-        assert!(socket_path.exists(), "socket should exist after bind");
+    #[test]
+    fn listener_drop_removes_socket_file() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("drop-cleanup.sock");
+            let listener = NativeEventListener::bind(socket_path.clone())
+                .await
+                .expect("bind listener");
+            assert!(socket_path.exists(), "socket should exist after bind");
 
-        drop(listener);
+            drop(listener);
 
-        assert!(
-            !socket_path.exists(),
-            "socket path should be cleaned up on drop"
-        );
+            assert!(
+                !socket_path.exists(),
+                "socket path should be cleaned up on drop"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn bind_creates_parent_directories() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("sub").join("dir").join("deep.sock");
-        let result = NativeEventListener::bind(socket_path).await;
-        assert!(result.is_ok());
+    #[test]
+    fn bind_creates_parent_directories() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("sub").join("dir").join("deep.sock");
+            let result = NativeEventListener::bind(socket_path).await;
+            assert!(result.is_ok());
+        });
     }
 
     // ── Integration: listener + multiple events ────────────────────
 
-    #[tokio::test]
-    async fn listener_emits_events() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("native.sock");
-        let listener = NativeEventListener::bind(socket_path.clone())
-            .await
-            .expect("bind listener");
-        let (event_tx, mut event_rx) = mpsc::channel(8);
-        let shutdown = Arc::new(AtomicBool::new(false));
+    #[test]
+    fn listener_emits_events() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("native.sock");
+            let listener = NativeEventListener::bind(socket_path.clone())
+                .await
+                .expect("bind listener");
+            let (event_tx, mut event_rx) = mpsc::channel(8);
+            let shutdown = Arc::new(AtomicBool::new(false));
 
-        let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+            let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
-        let mut stream = compat_unix::connect(socket_path).await.expect("connect");
-        let payload = r#"{"type":"pane_output","pane_id":7,"data_b64":"aGV5","ts":42}"#;
-        stream
-            .write_all(format!("{payload}\n").as_bytes())
-            .await
-            .expect("write");
-
-        let event = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("event");
-
-        match event {
-            NativeEvent::PaneOutput {
-                pane_id,
-                data,
-                timestamp_ms,
-            } => {
-                assert_eq!(pane_id, 7);
-                assert_eq!(data, b"hey");
-                assert_eq!(timestamp_ms, 42);
-            }
-            _ => panic!("unexpected event type"),
-        }
-
-        shutdown.store(true, Ordering::SeqCst);
-        let _ = handle.await;
-    }
-
-    #[tokio::test]
-    async fn listener_handles_multiple_events_on_one_connection() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("multi.sock");
-        let listener = NativeEventListener::bind(socket_path.clone())
-            .await
-            .expect("bind listener");
-        let (event_tx, mut event_rx) = mpsc::channel(16);
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
-
-        let mut stream = compat_unix::connect(socket_path).await.expect("connect");
-
-        // Send hello (ignored) + two real events
-        let lines = [
-            r#"{"type":"hello","proto":1}"#,
-            r#"{"type":"pane_created","pane_id":1,"domain":"local","ts":100}"#,
-            r#"{"type":"pane_destroyed","pane_id":1,"ts":200}"#,
-        ];
-        for line in &lines {
+            let mut stream = compat_unix::connect(socket_path).await.expect("connect");
+            let payload = r#"{"type":"pane_output","pane_id":7,"data_b64":"aGV5","ts":42}"#;
             stream
-                .write_all(format!("{line}\n").as_bytes())
+                .write_all(format!("{payload}\n").as_bytes())
                 .await
                 .expect("write");
-        }
 
-        // Should receive exactly 2 events (hello is filtered)
-        let ev1 = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("event 1");
-        assert!(matches!(ev1, NativeEvent::PaneCreated { pane_id: 1, .. }));
+            let event = recv_event(&mut event_rx, Duration::from_secs(2), "event").await;
 
-        let ev2 = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("event 2");
-        assert!(matches!(ev2, NativeEvent::PaneDestroyed { pane_id: 1, .. }));
+            match event {
+                NativeEvent::PaneOutput {
+                    pane_id,
+                    data,
+                    timestamp_ms,
+                } => {
+                    assert_eq!(pane_id, 7);
+                    assert_eq!(data, b"hey");
+                    assert_eq!(timestamp_ms, 42);
+                }
+                _ => panic!("unexpected event type"),
+            }
 
-        shutdown.store(true, Ordering::SeqCst);
-        let _ = handle.await;
+            shutdown.store(true, Ordering::SeqCst);
+            let _ = handle.await;
+        });
     }
 
-    #[tokio::test]
-    async fn listener_skips_invalid_json_lines() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("invalid.sock");
-        let listener = NativeEventListener::bind(socket_path.clone())
-            .await
-            .expect("bind listener");
-        let (event_tx, mut event_rx) = mpsc::channel(16);
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
-
-        let mut stream = compat_unix::connect(socket_path).await.expect("connect");
-
-        // Send invalid JSON followed by valid event
-        let lines = [
-            "this is not json",
-            r#"{"type":"pane_destroyed","pane_id":42,"ts":999}"#,
-        ];
-        for line in &lines {
-            stream
-                .write_all(format!("{line}\n").as_bytes())
+    #[test]
+    fn listener_handles_multiple_events_on_one_connection() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("multi.sock");
+            let listener = NativeEventListener::bind(socket_path.clone())
                 .await
-                .expect("write");
-        }
+                .expect("bind listener");
+            let (event_tx, mut event_rx) = mpsc::channel(16);
+            let shutdown = Arc::new(AtomicBool::new(false));
 
-        // Should receive only the valid event
-        let event = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("event");
-        assert!(matches!(
-            event,
-            NativeEvent::PaneDestroyed {
-                pane_id: 42,
-                timestamp_ms: 999
+            let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+
+            let mut stream = compat_unix::connect(socket_path).await.expect("connect");
+
+            // Send hello (ignored) + two real events
+            let lines = [
+                r#"{"type":"hello","proto":1}"#,
+                r#"{"type":"pane_created","pane_id":1,"domain":"local","ts":100}"#,
+                r#"{"type":"pane_destroyed","pane_id":1,"ts":200}"#,
+            ];
+            for line in &lines {
+                stream
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .expect("write");
             }
-        ));
 
-        shutdown.store(true, Ordering::SeqCst);
-        let _ = handle.await;
+            // Should receive exactly 2 events (hello is filtered)
+            let ev1 = recv_event(&mut event_rx, Duration::from_secs(2), "event 1").await;
+            assert!(matches!(ev1, NativeEvent::PaneCreated { pane_id: 1, .. }));
+
+            let ev2 = recv_event(&mut event_rx, Duration::from_secs(2), "event 2").await;
+            assert!(matches!(ev2, NativeEvent::PaneDestroyed { pane_id: 1, .. }));
+
+            shutdown.store(true, Ordering::SeqCst);
+            let _ = handle.await;
+        });
     }
 
-    #[tokio::test]
-    async fn listener_accepts_reconnect_after_disconnect() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("reconnect.sock");
-        let listener = NativeEventListener::bind(socket_path.clone())
-            .await
-            .expect("bind listener");
-        let (event_tx, mut event_rx) = mpsc::channel(16);
-        let shutdown = Arc::new(AtomicBool::new(false));
+    #[test]
+    fn listener_skips_invalid_json_lines() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("invalid.sock");
+            let listener = NativeEventListener::bind(socket_path.clone())
+                .await
+                .expect("bind listener");
+            let (event_tx, mut event_rx) = mpsc::channel(16);
+            let shutdown = Arc::new(AtomicBool::new(false));
 
-        let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+            let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
-        // First connection sends one event and disconnects.
-        let mut stream_one = compat_unix::connect(socket_path.clone())
-            .await
-            .expect("connect first stream");
-        stream_one
-            .write_all(r#"{"type":"pane_destroyed","pane_id":41,"ts":100}"#.as_bytes())
-            .await
-            .expect("write first event");
-        stream_one.write_all(b"\n").await.expect("write newline");
-        drop(stream_one);
+            let mut stream = compat_unix::connect(socket_path).await.expect("connect");
 
-        let first = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("first event");
-        assert!(matches!(
-            first,
-            NativeEvent::PaneDestroyed {
-                pane_id: 41,
-                timestamp_ms: 100
+            // Send invalid JSON followed by valid event
+            let lines = [
+                "this is not json",
+                r#"{"type":"pane_destroyed","pane_id":42,"ts":999}"#,
+            ];
+            for line in &lines {
+                stream
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .expect("write");
             }
-        ));
 
-        // Second connection should still be accepted and delivered.
-        let mut stream_two = compat_unix::connect(socket_path)
-            .await
-            .expect("connect second stream");
-        stream_two
-            .write_all(
-                r#"{"type":"pane_created","pane_id":42,"domain":"local","ts":200}"#.as_bytes(),
-            )
-            .await
-            .expect("write second event");
-        stream_two.write_all(b"\n").await.expect("write newline");
+            // Should receive only the valid event
+            let event = recv_event(&mut event_rx, Duration::from_secs(2), "event").await;
+            assert!(matches!(
+                event,
+                NativeEvent::PaneDestroyed {
+                    pane_id: 42,
+                    timestamp_ms: 999
+                }
+            ));
 
-        let second = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("second event");
-        assert!(matches!(
-            second,
-            NativeEvent::PaneCreated {
-                pane_id: 42,
-                ref domain,
-                timestamp_ms: 200,
-                ..
-            } if domain == "local"
-        ));
-
-        shutdown.store(true, Ordering::SeqCst);
-        let _ = handle.await;
+            shutdown.store(true, Ordering::SeqCst);
+            let _ = handle.await;
+        });
     }
 
-    #[tokio::test]
-    async fn listener_drops_oversized_line_and_continues() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("oversized.sock");
-        let listener = NativeEventListener::bind(socket_path.clone())
-            .await
-            .expect("bind listener");
-        let (event_tx, mut event_rx) = mpsc::channel(16);
-        let shutdown = Arc::new(AtomicBool::new(false));
+    #[test]
+    fn listener_accepts_reconnect_after_disconnect() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("reconnect.sock");
+            let listener = NativeEventListener::bind(socket_path.clone())
+                .await
+                .expect("bind listener");
+            let (event_tx, mut event_rx) = mpsc::channel(16);
+            let shutdown = Arc::new(AtomicBool::new(false));
 
-        let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+            let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
-        let mut stream = compat_unix::connect(socket_path).await.expect("connect");
-        let oversized = "x".repeat(MAX_EVENT_LINE_BYTES + 1);
-        stream
-            .write_all(oversized.as_bytes())
-            .await
-            .expect("write oversized line");
-        stream.write_all(b"\n").await.expect("write newline");
-        stream
-            .write_all(r#"{"type":"pane_destroyed","pane_id":9,"ts":777}"#.as_bytes())
-            .await
-            .expect("write valid line");
-        stream.write_all(b"\n").await.expect("write newline");
+            // First connection sends one event and disconnects.
+            let mut stream_one = compat_unix::connect(socket_path.clone())
+                .await
+                .expect("connect first stream");
+            stream_one
+                .write_all(r#"{"type":"pane_destroyed","pane_id":41,"ts":100}"#.as_bytes())
+                .await
+                .expect("write first event");
+            stream_one.write_all(b"\n").await.expect("write newline");
+            drop(stream_one);
 
-        let event = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("event");
-        assert!(matches!(
-            event,
-            NativeEvent::PaneDestroyed {
-                pane_id: 9,
-                timestamp_ms: 777
-            }
-        ));
+            let first = recv_event(&mut event_rx, Duration::from_secs(2), "first event").await;
+            assert!(matches!(
+                first,
+                NativeEvent::PaneDestroyed {
+                    pane_id: 41,
+                    timestamp_ms: 100
+                }
+            ));
 
-        shutdown.store(true, Ordering::SeqCst);
-        let _ = handle.await;
+            // Second connection should still be accepted and delivered.
+            let mut stream_two = compat_unix::connect(socket_path)
+                .await
+                .expect("connect second stream");
+            stream_two
+                .write_all(
+                    r#"{"type":"pane_created","pane_id":42,"domain":"local","ts":200}"#.as_bytes(),
+                )
+                .await
+                .expect("write second event");
+            stream_two.write_all(b"\n").await.expect("write newline");
+
+            let second = recv_event(&mut event_rx, Duration::from_secs(2), "second event").await;
+            assert!(matches!(
+                second,
+                NativeEvent::PaneCreated {
+                    pane_id: 42,
+                    ref domain,
+                    timestamp_ms: 200,
+                    ..
+                } if domain == "local"
+            ));
+
+            shutdown.store(true, Ordering::SeqCst);
+            let _ = handle.await;
+        });
     }
 
-    #[tokio::test]
-    async fn shutdown_flag_stops_listener() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("shutdown.sock");
-        let listener = NativeEventListener::bind(socket_path.clone())
-            .await
-            .expect("bind listener");
-        let (event_tx, _event_rx) = mpsc::channel(8);
-        let shutdown = Arc::new(AtomicBool::new(false));
+    #[test]
+    fn listener_drops_oversized_line_and_continues() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("oversized.sock");
+            let listener = NativeEventListener::bind(socket_path.clone())
+                .await
+                .expect("bind listener");
+            let (event_tx, mut event_rx) = mpsc::channel(16);
+            let shutdown = Arc::new(AtomicBool::new(false));
 
-        let shutdown_clone = Arc::clone(&shutdown);
-        let handle = task::spawn(listener.run(event_tx, shutdown_clone));
+            let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
-        // Set shutdown flag
-        shutdown.store(true, Ordering::SeqCst);
+            let mut stream = compat_unix::connect(socket_path).await.expect("connect");
+            let oversized = "x".repeat(MAX_EVENT_LINE_BYTES + 1);
+            stream
+                .write_all(oversized.as_bytes())
+                .await
+                .expect("write oversized line");
+            stream.write_all(b"\n").await.expect("write newline");
+            stream
+                .write_all(r#"{"type":"pane_destroyed","pane_id":9,"ts":777}"#.as_bytes())
+                .await
+                .expect("write valid line");
+            stream.write_all(b"\n").await.expect("write newline");
 
-        // Listener should exit within a few poll intervals
-        let result = crate::runtime_compat::timeout(Duration::from_secs(2), handle).await;
-        assert!(result.is_ok(), "listener did not shut down in time");
-        assert!(
-            !socket_path.exists(),
-            "socket path should be removed after listener shutdown"
-        );
+            let event = recv_event(&mut event_rx, Duration::from_secs(2), "event").await;
+            assert!(matches!(
+                event,
+                NativeEvent::PaneDestroyed {
+                    pane_id: 9,
+                    timestamp_ms: 777
+                }
+            ));
+
+            shutdown.store(true, Ordering::SeqCst);
+            let _ = handle.await;
+        });
+    }
+
+    #[test]
+    fn shutdown_flag_stops_listener() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("shutdown.sock");
+            let listener = NativeEventListener::bind(socket_path.clone())
+                .await
+                .expect("bind listener");
+            let (event_tx, _event_rx) = mpsc::channel(8);
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            let shutdown_clone = Arc::clone(&shutdown);
+            let handle = task::spawn(listener.run(event_tx, shutdown_clone));
+
+            // Set shutdown flag
+            shutdown.store(true, Ordering::SeqCst);
+
+            // Listener should exit within a few poll intervals
+            let result = crate::runtime_compat::timeout(Duration::from_secs(2), handle).await;
+            assert!(result.is_ok(), "listener did not shut down in time");
+            assert!(
+                !socket_path.exists(),
+                "socket path should be removed after listener shutdown"
+            );
+        });
     }
 
     fn pane_destroyed_event(pane_id: u64) -> NativeEvent {
@@ -1061,45 +1090,63 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn dispatch_event_sends_when_capacity_available() {
-        let (tx, mut rx) = mpsc::channel(1);
+    #[test]
+    fn dispatch_event_sends_when_capacity_available() {
+        run_async_test(async {
+            let (tx, mut rx) = mpsc::channel(1);
 
-        let outcome =
-            dispatch_event_with_timeout(&tx, pane_destroyed_event(7), Duration::from_millis(20))
-                .await;
+            let outcome = dispatch_event_with_timeout(
+                &tx,
+                pane_destroyed_event(7),
+                Duration::from_millis(20),
+            )
+            .await;
 
-        assert_eq!(outcome, EventDispatchOutcome::Sent);
-        let event = rx.recv().await.expect("event should be delivered");
-        assert!(matches!(
-            event,
-            NativeEvent::PaneDestroyed { pane_id: 7, .. }
-        ));
+            assert_eq!(outcome, EventDispatchOutcome::Sent);
+            let event = crate::runtime_compat::mpsc_recv_option(&mut rx)
+                .await
+                .expect("event should be delivered");
+            assert!(matches!(
+                event,
+                NativeEvent::PaneDestroyed { pane_id: 7, .. }
+            ));
+        });
     }
 
-    #[tokio::test]
-    async fn dispatch_event_reports_closed_when_receiver_dropped() {
-        let (tx, rx) = mpsc::channel(1);
-        drop(rx);
+    #[test]
+    fn dispatch_event_reports_closed_when_receiver_dropped() {
+        run_async_test(async {
+            let (tx, rx) = mpsc::channel(1);
+            drop(rx);
 
-        let outcome =
-            dispatch_event_with_timeout(&tx, pane_destroyed_event(8), Duration::from_millis(20))
-                .await;
+            let outcome = dispatch_event_with_timeout(
+                &tx,
+                pane_destroyed_event(8),
+                Duration::from_millis(20),
+            )
+            .await;
 
-        assert_eq!(outcome, EventDispatchOutcome::Closed);
+            assert_eq!(outcome, EventDispatchOutcome::Closed);
+        });
     }
 
-    #[tokio::test]
-    async fn dispatch_event_reports_backpressure_when_queue_full() {
-        let (tx, _rx) = mpsc::channel(1);
-        tx.try_send(pane_destroyed_event(1))
-            .expect("first send should fit in queue");
+    #[test]
+    fn dispatch_event_reports_backpressure_when_queue_full() {
+        run_async_test(async {
+            let (tx, _rx) = mpsc::channel(1);
+            crate::runtime_compat::mpsc_send(&tx, pane_destroyed_event(1))
+                .await
+                .expect("first send should fit in queue");
 
-        let outcome =
-            dispatch_event_with_timeout(&tx, pane_destroyed_event(2), Duration::from_millis(10))
-                .await;
+            let outcome = dispatch_event_with_timeout(
+                &tx,
+                pane_destroyed_event(2),
+                Duration::from_millis(10),
+            )
+            .await;
 
-        assert_eq!(outcome, EventDispatchOutcome::Backpressure);
+            assert_eq!(outcome, EventDispatchOutcome::Backpressure);
+        });
     }
 
     // --- NativePaneState ---
