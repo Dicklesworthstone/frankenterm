@@ -69,7 +69,7 @@ for raw in sys.stdin:
                             "properties": {"text": {"type": "string"}},
                             "required": ["text"]
                         },
-                        "annotations": {"destructive": false}
+                        "annotations": {"destructive": False}
                     },
                     {
                         "name": "drop_db",
@@ -78,7 +78,7 @@ for raw in sys.stdin:
                             "type": "object",
                             "properties": {}
                         },
-                        "annotations": {"destructive": true}
+                        "annotations": {"destructive": True}
                     }
                 ]
             }
@@ -273,7 +273,10 @@ fn proxy_strict_mode_fails_startup_when_remote_is_unavailable() {
     config.mcp_client.proxy_strict = true;
     config.mcp_client.proxy_fallback_to_local = false;
 
-    let err = build_server_with_db(&config, None).expect_err("strict mode must fail on connect");
+    let err = match build_server_with_db(&config, None) {
+        Ok(_) => panic!("strict mode must fail on connect"),
+        Err(err) => err,
+    };
     let message = err.to_string();
     eprintln!("Strict-mode startup error: {message}");
     assert!(
