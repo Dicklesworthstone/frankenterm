@@ -198,6 +198,8 @@ pub mod session_dna;
 pub mod session_pane_state;
 pub mod session_restore;
 pub mod session_retention;
+#[cfg(feature = "redis-session")]
+pub mod session_store;
 pub mod session_topology;
 pub mod setup;
 pub mod sharded_counter;
