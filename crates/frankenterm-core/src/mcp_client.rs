@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 const LOG_TARGET: &str = "ft::mcp_client";
-const NO_DEFAULT_DISCOVERY_SENTINEL: &str = ".ft/__mcp_client_no_defaults__.json";
 
 const ERR_DISABLED: &str = "mcp_client.disabled";
 const ERR_DISCOVERY_DISABLED: &str = "mcp_client.discovery_disabled";
@@ -242,6 +241,15 @@ pub fn discover_servers(config: &Config) -> McpClientResult<Vec<ExternalServerCo
     if !settings.discovery_enabled {
         return Err(discovery_disabled_error());
     }
+    if !settings.include_default_paths && settings.discovery_paths.is_empty() {
+        tracing::info!(
+            target: LOG_TARGET,
+            event = "mcp_client_discover_empty",
+            include_default_paths = settings.include_default_paths,
+            "Outbound MCP discovery disabled for default paths and no explicit discovery paths configured"
+        );
+        return Ok(Vec::new());
+    }
 
     let loader = build_loader(settings);
     let search_paths: Vec<String> = loader
@@ -328,7 +336,17 @@ fn build_loader(settings: &McpClientConfig) -> ConfigLoader {
     let mut loader = if settings.include_default_paths {
         ConfigLoader::new()
     } else {
-        ConfigLoader::from_path(NO_DEFAULT_DISCOVERY_SENTINEL)
+        // include_default_paths=false must avoid any implicit config locations.
+        // At this point discovery_paths is guaranteed non-empty by discover_servers.
+        let mut paths = settings.discovery_paths.iter();
+        let first = paths
+            .next()
+            .expect("discovery_paths must be non-empty when default paths are disabled");
+        let mut loader = ConfigLoader::from_path(first.clone());
+        for path in paths {
+            loader = loader.with_path(path.clone());
+        }
+        return loader;
     };
 
     for path in settings.discovery_paths.iter().rev() {
@@ -470,6 +488,17 @@ mod tests {
         assert_eq!(discovered[0].name, "disabled-server");
         assert!(discovered[0].disabled);
         assert_eq!(discovered[1].name, "filesystem");
+    }
+
+    #[test]
+    fn discover_servers_no_defaults_and_no_paths_returns_empty() {
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.include_default_paths = false;
+        config.mcp_client.discovery_paths = Vec::new();
+
+        let discovered = discover_servers(&config).expect("discover servers");
+        assert!(discovered.is_empty());
     }
 
     #[test]
