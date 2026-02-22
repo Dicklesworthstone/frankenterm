@@ -432,6 +432,23 @@ proptest! {
         prop_assert!(is_transport_err, "transport errors should propagate: {:?}", result);
     }
 
+    // 17. Client timeout enforcement rejects slow transports
+    #[test]
+    fn client_timeout_enforcement(_seed in 0_u32..20) {
+        let client = EmbedClient::new("test://endpoint").with_timeout_ms(1);
+        let result = client.call_with(
+            DaemonRequest::Ping,
+            |_| {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                DaemonResponse::Pong
+                    .to_json_bytes()
+                    .map_err(|e| e.to_string())
+            },
+        );
+        let is_timeout = matches!(result, Err(ref e) if format!("{e}").contains("timed out"));
+        prop_assert!(is_timeout, "slow transport should trigger timeout: {:?}", result);
+    }
+
     // 18. Client ping succeeds via loopback
     #[test]
     fn client_ping_loopback(_seed in 0_u32..50) {
