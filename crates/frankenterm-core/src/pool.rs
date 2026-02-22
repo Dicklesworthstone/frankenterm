@@ -1330,4 +1330,23 @@ mod tests {
         let result = pool.acquire().await;
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn pool_error_boxed_std_error() {
+        let err: Box<dyn std::error::Error> = Box::new(PoolError::AcquireTimeout);
+        assert!(!err.to_string().is_empty());
+        let err2: Box<dyn std::error::Error> = Box::new(PoolError::Closed);
+        assert!(!err2.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pool_stats_total_timeouts_increments() {
+        let pool: Pool<String> = Pool::new(test_config(1));
+        let _held = pool.acquire().await.unwrap();
+
+        // This should timeout and increment timeout counter
+        let _err = pool.acquire().await.unwrap_err();
+        let stats = pool.stats().await;
+        assert_eq!(stats.total_timeouts, 1);
+    }
 }
