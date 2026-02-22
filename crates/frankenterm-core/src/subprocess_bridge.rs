@@ -669,9 +669,13 @@ mod tests {
         let out = b
             .invoke(&[
                 "-c",
-                "printf '{\"argc\":%s,\"arg1\":\"%s\",\"arg2\":\"%s\"}' $# \"$1\" \"$2\" -- one two",
+                "printf '{\"argc\":%s,\"arg1\":\"%s\",\"arg2\":\"%s\"}' $# \"$1\" \"$2\"",
+                "_",
+                "one",
+                "two",
             ])
             .unwrap();
+        assert_eq!(out["argc"], 2);
         assert_eq!(out["arg1"], "one");
         assert_eq!(out["arg2"], "two");
     }

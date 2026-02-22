@@ -133,6 +133,7 @@ pub trait OutcomeExt<T, E> {
         E: std::fmt::Display;
 
     /// Log non-Ok outcomes at appropriate tracing levels, then return self.
+    #[must_use]
     fn trace_non_ok(self, context: &str) -> Self;
 }
 

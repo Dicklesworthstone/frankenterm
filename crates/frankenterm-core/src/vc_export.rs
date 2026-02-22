@@ -221,17 +221,22 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn fixture_vc_export(script_body: &str) -> VcExport {
+    fn fixture_vc_export(script_body: &str) -> (tempfile::TempDir, VcExport) {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("vibe_cockpit");
         write_executable(&bin, script_body);
 
-        let bridge = SubprocessBridge::new(bin.to_string_lossy().as_ref());
+        let bin_path = bin.to_string_lossy().into_owned();
+        let session_bridge: SubprocessBridge<SessionTelemetry> = SubprocessBridge::new(&bin_path);
+        let metrics_bridge: SubprocessBridge<AgentMetrics> = SubprocessBridge::new(&bin_path);
 
-        VcExport {
-            session_bridge: bridge.clone(),
-            metrics_bridge: bridge,
-        }
+        (
+            dir,
+            VcExport {
+                session_bridge,
+                metrics_bridge,
+            },
+        )
     }
 
     #[test]
@@ -413,7 +418,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_export_session_telemetry_parses() {
-        let vc = fixture_vc_export(
+        let (_dir, vc) = fixture_vc_export(
             "#!/bin/sh\nif [ \"$1\" = \"export\" ]; then printf '{\"duration_secs\":9.0,\"commands\":2,\"errors\":1,\"agent_interactions\":4}'; else printf '{\"total_tokens\":10,\"tool_calls\":2,\"sessions\":1,\"avg_session_secs\":5.0}'; fi\n",
         );
 
@@ -427,7 +432,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_export_agent_metrics_parses() {
-        let vc = fixture_vc_export(
+        let (_dir, vc) = fixture_vc_export(
             "#!/bin/sh\nif [ \"$1\" = \"export\" ]; then printf '{\"duration_secs\":2.0,\"commands\":1,\"errors\":0,\"agent_interactions\":1}'; else printf '{\"total_tokens\":777,\"tool_calls\":8,\"sessions\":3,\"avg_session_secs\":12.5}'; fi\n",
         );
 
@@ -441,7 +446,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_export_session_envelope_not_degraded_on_success() {
-        let vc = fixture_vc_export(
+        let (_dir, vc) = fixture_vc_export(
             "#!/bin/sh\nif [ \"$1\" = \"export\" ]; then printf '{\"duration_secs\":1.0,\"commands\":1,\"errors\":0,\"agent_interactions\":1}'; else printf '{\"total_tokens\":1,\"tool_calls\":1,\"sessions\":1,\"avg_session_secs\":1.0}'; fi\n",
         );
         let envelope = vc.export_session_telemetry_envelope("s-ok");
@@ -452,7 +457,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_export_agent_envelope_not_degraded_on_success() {
-        let vc = fixture_vc_export(
+        let (_dir, vc) = fixture_vc_export(
             "#!/bin/sh\nif [ \"$1\" = \"export\" ]; then printf '{\"duration_secs\":1.0,\"commands\":1,\"errors\":0,\"agent_interactions\":1}'; else printf '{\"total_tokens\":1,\"tool_calls\":9,\"sessions\":2,\"avg_session_secs\":1.0}'; fi\n",
         );
         let envelope = vc.export_agent_metrics_envelope("a-ok");
@@ -464,7 +469,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_export_fills_session_id_when_missing() {
-        let vc = fixture_vc_export(
+        let (_dir, vc) = fixture_vc_export(
             "#!/bin/sh\nif [ \"$1\" = \"export\" ]; then printf '{\"duration_secs\":3.0,\"commands\":5,\"errors\":0,\"agent_interactions\":2}'; else printf '{\"total_tokens\":11,\"tool_calls\":2,\"sessions\":1,\"avg_session_secs\":5.0}'; fi\n",
         );
         let telemetry = vc.export_session_telemetry("sess-fill");
@@ -474,7 +479,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_export_fills_agent_id_when_missing() {
-        let vc = fixture_vc_export(
+        let (_dir, vc) = fixture_vc_export(
             "#!/bin/sh\nif [ \"$1\" = \"export\" ]; then printf '{\"duration_secs\":3.0,\"commands\":5,\"errors\":0,\"agent_interactions\":2}'; else printf '{\"total_tokens\":44,\"tool_calls\":6,\"sessions\":7,\"avg_session_secs\":8.5}'; fi\n",
         );
         let metrics = vc.export_agent_metrics("agent-fill");
@@ -484,7 +489,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_invalid_json_falls_back_to_degraded_defaults() {
-        let vc = fixture_vc_export("#!/bin/sh\nprintf 'not-json'\n");
+        let (_dir, vc) = fixture_vc_export("#!/bin/sh\nprintf 'not-json'\n");
         let telemetry = vc.export_session_telemetry("sess-bad");
         let metrics = vc.export_agent_metrics("agent-bad");
         assert_eq!(telemetry.session_id, Some("sess-bad".to_string()));
