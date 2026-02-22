@@ -513,6 +513,7 @@ fn poke_listener(addr: SocketAddr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web::error::ApiResponse;
 
     // =========================================================================
     // WebServerConfig tests

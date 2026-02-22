@@ -1394,10 +1394,10 @@ impl OutputCache {
         let len = content.len();
 
         // Check per-pane state first (fast path)
-        if let Some(state) = self.pane_states.get(&pane_id) {
+        if let Some(state) = self.pane_states.get_mut(&pane_id) {
             if state.content_hash == hash && state.content_len == len {
                 self.hits += 1;
-                self.pane_states.get_mut(&pane_id).unwrap().last_updated = now;
+                state.last_updated = now;
                 return false;
             }
         }
