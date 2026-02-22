@@ -569,6 +569,7 @@ impl DataflowGraph {
 
         let mut nodes_recomputed = 0;
         let mut nodes_changed = 0;
+        let mut changed_nodes: HashSet<NodeId> = HashSet::new();
         let now = Instant::now();
 
         for nid in to_recompute {
@@ -598,6 +599,7 @@ impl DataflowGraph {
                     if new_val != node.value {
                         node.value = new_val;
                         nodes_changed += 1;
+                        changed_nodes.insert(nid);
                     }
                 }
                 NodeKind::Debounce {
@@ -620,6 +622,7 @@ impl DataflowGraph {
                             if new_val != node.value {
                                 node.value = new_val;
                                 nodes_changed += 1;
+                                changed_nodes.insert(nid);
                             }
                             *last_change = Some(now);
                             *pending = None;
@@ -632,7 +635,7 @@ impl DataflowGraph {
         // Fire sink callbacks for changed nodes.
         let sink_ids: Vec<NodeId> = self.sinks.keys().copied().collect();
         for sid in sink_ids {
-            if reachable.contains(&sid) {
+            if changed_nodes.contains(&sid) {
                 if let (Some(node), Some(callback)) = (self.nodes.get(&sid), self.sinks.get(&sid)) {
                     callback(&node.value);
                 }
@@ -1150,6 +1153,37 @@ mod tests {
         g.update_source(s, Value::Bool(true)).unwrap();
         g.propagate();
         assert!(fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn sink_callback_not_fired_when_value_unchanged() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut g = DataflowGraph::new();
+        let s = g.add_source("s", Value::Int(1));
+        let m = g.add_map("threshold", vec![s], |i| match &i[0] {
+            Value::Int(v) => Value::Bool(*v > 0),
+            _ => Value::Bool(false),
+        });
+        g.propagate();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        g.add_sink(m, move |_val| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+
+        // Threshold output remains true; sink should not fire.
+        g.update_source(s, Value::Int(2)).unwrap();
+        g.propagate();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Crossing threshold flips output false; sink should fire exactly once.
+        g.update_source(s, Value::Int(0)).unwrap();
+        g.propagate();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
