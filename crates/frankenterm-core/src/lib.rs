@@ -184,6 +184,7 @@ pub mod r_tree;
 pub mod recorder_audit;
 pub mod recorder_export;
 pub mod recorder_invariants;
+pub mod recorder_migration;
 pub mod recorder_query;
 pub mod recorder_replay;
 pub mod recorder_retention;
