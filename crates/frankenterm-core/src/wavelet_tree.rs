@@ -279,10 +279,10 @@ impl WaveletTree {
     /// Returns the kth smallest value (0-indexed) in range [lo, hi).
     #[must_use]
     pub fn quantile(&self, lo: usize, hi: usize, k: usize) -> Option<u8> {
+        let hi = hi.min(self.data_len);
         if lo >= hi || lo >= self.data_len || k >= hi - lo {
             return None;
         }
-        let hi = hi.min(self.data_len);
         self.quantile_internal(self.root?, lo, hi, k)
     }
 

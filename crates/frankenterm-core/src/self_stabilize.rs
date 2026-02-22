@@ -301,21 +301,28 @@ impl ReconcileSession {
                 }
             }
 
-            // Also tell peer about removed keys via empty values marker
-            let remove_keys = diff.removed.clone();
+            // Tell peer about removed keys via empty values marker
+            for key in &diff.removed {
+                patches.push((key.clone(), Vec::new()));
+            }
 
             self.phase = Phase::Converged;
 
-            if patches.is_empty() && remove_keys.is_empty() {
+            if patches.is_empty() {
                 RoundResult::AlreadyConverged
             } else {
                 RoundResult::SendMessage(ReconcileMessage::Patch(patches))
             }
         } else {
-            // Non-authority received corrections — apply them
+            // Non-authority received corrections — apply them.
+            // Empty values are removal markers from the authority.
             let mut tree = self.local.clone();
             for (key, value) in entries {
-                tree.insert(key.clone(), value.clone());
+                if value.is_empty() {
+                    tree.remove(key);
+                } else {
+                    tree.insert(key.clone(), value.clone());
+                }
             }
             self.local = tree;
             self.phase = Phase::Converged;
@@ -936,5 +943,60 @@ mod tests {
         let (result, stats) = reconcile_with_stats(&authority, &replica, &config);
         assert!(stats.converged);
         assert_eq!(result.root_hash(), authority.root_hash());
+    }
+
+    #[test]
+    fn session_handle_patch_authority_sends_removal_markers() {
+        // Authority has {a: 1}, replica has {a: 1, b: 2, c: 3}.
+        // Authority should send empty-value markers for b and c.
+        let authority_tree = make_tree(&[(b"a", b"1")]);
+        let mut authority = ReconcileSession::new(authority_tree, true, ReconcileConfig::default());
+        authority.start();
+
+        // Simulate the replica sending its full state as a Patch
+        let replica_entries = vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+            (b"c".to_vec(), b"3".to_vec()),
+        ];
+        let result = authority.receive(&ReconcileMessage::Patch(replica_entries));
+
+        // Authority should send patches that include removal markers
+        match result {
+            RoundResult::SendMessage(ReconcileMessage::Patch(patches)) => {
+                // Should contain empty-value markers for b and c
+                let removals: Vec<_> = patches
+                    .iter()
+                    .filter(|(_, v)| v.is_empty())
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                assert!(removals.contains(&b"b".to_vec()), "missing removal for b");
+                assert!(removals.contains(&b"c".to_vec()), "missing removal for c");
+            }
+            other => panic!("expected SendMessage(Patch), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn session_handle_patch_non_authority_removes_excess_keys() {
+        // Non-authority has {a: 1, b: 2, c: 3}.
+        // Authority sends corrections with empty-value markers for b and c.
+        let replica_tree = make_tree(&[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]);
+        let mut replica = ReconcileSession::new(replica_tree, false, ReconcileConfig::default());
+        replica.start();
+
+        // Simulate authority sending corrections with removal markers
+        let patches = vec![
+            (b"b".to_vec(), Vec::new()), // removal marker
+            (b"c".to_vec(), Vec::new()), // removal marker
+        ];
+        let result = replica.receive(&ReconcileMessage::Patch(patches));
+        assert!(matches!(result, RoundResult::ApplyPatch(_)));
+
+        // Verify excess keys were removed
+        let local = replica.local_tree();
+        assert_eq!(local.get(b"a"), Some(b"1".as_slice()));
+        assert_eq!(local.get(b"b"), None, "key b should have been removed");
+        assert_eq!(local.get(b"c"), None, "key c should have been removed");
     }
 }

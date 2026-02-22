@@ -15,7 +15,7 @@
 //! [Leaf: "Hello"] [Leaf: ", "]
 //! ```
 //!
-//! Each internal node stores the total character count of its left subtree,
+//! Each internal node stores the total byte length of its left subtree,
 //! enabling O(log n) indexed access. Leaves store string chunks up to a
 //! configurable maximum size (`LEAF_MAX`).
 //!
@@ -45,9 +45,9 @@ enum RopeNode {
     Branch {
         left: usize,
         right: usize,
-        /// Total character count of the left subtree.
+        /// Total byte length of the left subtree.
         weight: usize,
-        /// Total character count of both subtrees.
+        /// Total byte length of both subtrees.
         total_len: usize,
     },
 }
@@ -309,7 +309,10 @@ impl Rope {
 
     fn char_at_node(&self, idx: usize, pos: usize) -> Option<char> {
         match &self.nodes[idx] {
-            RopeNode::Leaf { text } => text.chars().nth(pos),
+            RopeNode::Leaf { text } => {
+                // pos is a byte offset within this leaf; extract the char starting there.
+                text.get(pos..)?.chars().next()
+            }
             RopeNode::Branch {
                 left,
                 right,

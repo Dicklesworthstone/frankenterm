@@ -260,7 +260,7 @@ impl XorFilter {
     /// Theoretical false-positive rate for 8-bit fingerprints.
     #[must_use]
     pub fn theoretical_fp_rate() -> f64 {
-        1.0 / 255.0 // non-zero fingerprints: 255 possible values
+        1.0 / 256.0 // 2^-8: standard XOR filter FP rate for 8-bit fingerprints
     }
 
     /// Get serializable statistics.
@@ -433,7 +433,7 @@ impl XorFilter16 {
     /// Theoretical false-positive rate for 16-bit fingerprints.
     #[must_use]
     pub fn theoretical_fp_rate() -> f64 {
-        1.0 / 65535.0
+        1.0 / 65536.0 // 2^-16
     }
 
     /// Get serializable statistics.
