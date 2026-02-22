@@ -69,10 +69,7 @@ enum SoakVerdict {
 }
 
 /// Evaluate soak observations against thresholds.
-fn evaluate_soak(
-    observations: &[SoakObservation],
-    thresholds: &SoakThresholds,
-) -> SoakVerdict {
+fn evaluate_soak(observations: &[SoakObservation], thresholds: &SoakThresholds) -> SoakVerdict {
     if observations.is_empty() {
         return SoakVerdict::Continue;
     }
@@ -94,10 +91,7 @@ fn evaluate_soak(
     }
 
     // Check lag p99 (use max as proxy)
-    let max_lag = observations
-        .iter()
-        .map(|o| o.lag_ms)
-        .fold(0.0f64, f64::max);
+    let max_lag = observations.iter().map(|o| o.lag_ms).fold(0.0f64, f64::max);
     if max_lag > thresholds.max_lag_p99_ms {
         return SoakVerdict::AutoRollback(format!(
             "lag {max_lag:.1}ms > {:.1}ms budget",
@@ -335,7 +329,10 @@ fn test_soak_consecutive_unhealthy_triggers_rollback() {
     ];
     let verdict = evaluate_soak(&obs, &thresholds);
     let is_rollback = matches!(verdict, SoakVerdict::AutoRollback(_));
-    assert!(is_rollback, "should auto-rollback after 3 consecutive unhealthy");
+    assert!(
+        is_rollback,
+        "should auto-rollback after 3 consecutive unhealthy"
+    );
 }
 
 #[test]
@@ -344,11 +341,7 @@ fn test_soak_two_unhealthy_no_rollback() {
         max_unhealthy_consecutive: 3,
         ..Default::default()
     };
-    let obs = vec![
-        healthy_obs(0),
-        unhealthy_obs(100),
-        unhealthy_obs(200),
-    ];
+    let obs = vec![healthy_obs(0), unhealthy_obs(100), unhealthy_obs(200)];
     let verdict = evaluate_soak(&obs, &thresholds);
     assert_eq!(verdict, SoakVerdict::Continue);
 }

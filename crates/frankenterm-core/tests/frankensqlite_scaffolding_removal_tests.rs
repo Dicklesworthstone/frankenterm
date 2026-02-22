@@ -63,11 +63,17 @@ impl CleanupPlan {
     }
 
     fn pending_removals(&self) -> Vec<&CleanupItem> {
-        self.items.iter().filter(|i| i.action == CleanupAction::Remove && !i.verified).collect()
+        self.items
+            .iter()
+            .filter(|i| i.action == CleanupAction::Remove && !i.verified)
+            .collect()
     }
 
     fn pending_archives(&self) -> Vec<&CleanupItem> {
-        self.items.iter().filter(|i| i.action == CleanupAction::Archive && !i.verified).collect()
+        self.items
+            .iter()
+            .filter(|i| i.action == CleanupAction::Archive && !i.verified)
+            .collect()
     }
 
     fn all_verified(&self) -> bool {
@@ -92,7 +98,9 @@ impl CleanupPlan {
     }
 
     fn progress_pct(&self) -> f64 {
-        if self.items.is_empty() { return 100.0; }
+        if self.items.is_empty() {
+            return 100.0;
+        }
         (self.verified_count() as f64 / self.total_items() as f64) * 100.0
     }
 }
@@ -124,14 +132,16 @@ impl OperationsRunbook {
                 RunbookStep {
                     order: 1,
                     title: "Verify single backend bootstrap".to_string(),
-                    description: "bootstrap_recorder_storage() creates FrankenSqlite directly".to_string(),
+                    description: "bootstrap_recorder_storage() creates FrankenSqlite directly"
+                        .to_string(),
                     automated: true,
                     verified: false,
                 },
                 RunbookStep {
                     order: 2,
                     title: "Confirm no AppendLog references".to_string(),
-                    description: "grep for AppendLog usage in non-test, non-archive code".to_string(),
+                    description: "grep for AppendLog usage in non-test, non-archive code"
+                        .to_string(),
                     automated: true,
                     verified: false,
                 },
@@ -208,7 +218,9 @@ fn scan_references<'a>(hits: &'a [ReferenceHit], pattern: &str) -> Vec<&'a Refer
 }
 
 fn production_references(hits: &[ReferenceHit]) -> Vec<&ReferenceHit> {
-    hits.iter().filter(|h| h.is_production_reference()).collect()
+    hits.iter()
+        .filter(|h| h.is_production_reference())
+        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -312,7 +324,12 @@ fn test_cleanup_plan_full_transitional() {
 
 #[test]
 fn test_cleanup_action_serde_roundtrip() {
-    for action in &[CleanupAction::Remove, CleanupAction::Archive, CleanupAction::Simplify, CleanupAction::Keep] {
+    for action in &[
+        CleanupAction::Remove,
+        CleanupAction::Archive,
+        CleanupAction::Simplify,
+        CleanupAction::Keep,
+    ] {
         let json = serde_json::to_string(action).unwrap();
         let back: CleanupAction = serde_json::from_str(&json).unwrap();
         assert_eq!(*action, back);
@@ -386,9 +403,27 @@ fn test_runbook_steps_ordered() {
 #[test]
 fn test_scan_references_filters_by_pattern() {
     let hits = vec![
-        ReferenceHit { file: "lib.rs".to_string(), line: 10, pattern: "AppendLog".to_string(), is_test: false, is_archive: false },
-        ReferenceHit { file: "test.rs".to_string(), line: 20, pattern: "AppendLog".to_string(), is_test: true, is_archive: false },
-        ReferenceHit { file: "lib.rs".to_string(), line: 30, pattern: "FrankenSqlite".to_string(), is_test: false, is_archive: false },
+        ReferenceHit {
+            file: "lib.rs".to_string(),
+            line: 10,
+            pattern: "AppendLog".to_string(),
+            is_test: false,
+            is_archive: false,
+        },
+        ReferenceHit {
+            file: "test.rs".to_string(),
+            line: 20,
+            pattern: "AppendLog".to_string(),
+            is_test: true,
+            is_archive: false,
+        },
+        ReferenceHit {
+            file: "lib.rs".to_string(),
+            line: 30,
+            pattern: "FrankenSqlite".to_string(),
+            is_test: false,
+            is_archive: false,
+        },
     ];
     let results = scan_references(&hits, "AppendLog");
     assert_eq!(results.len(), 2);
@@ -397,8 +432,20 @@ fn test_scan_references_filters_by_pattern() {
 #[test]
 fn test_production_references_excludes_tests() {
     let hits = vec![
-        ReferenceHit { file: "lib.rs".to_string(), line: 10, pattern: "AppendLog".to_string(), is_test: false, is_archive: false },
-        ReferenceHit { file: "test.rs".to_string(), line: 20, pattern: "AppendLog".to_string(), is_test: true, is_archive: false },
+        ReferenceHit {
+            file: "lib.rs".to_string(),
+            line: 10,
+            pattern: "AppendLog".to_string(),
+            is_test: false,
+            is_archive: false,
+        },
+        ReferenceHit {
+            file: "test.rs".to_string(),
+            line: 20,
+            pattern: "AppendLog".to_string(),
+            is_test: true,
+            is_archive: false,
+        },
     ];
     let prod = production_references(&hits);
     assert_eq!(prod.len(), 1);
@@ -407,9 +454,13 @@ fn test_production_references_excludes_tests() {
 
 #[test]
 fn test_production_references_excludes_archives() {
-    let hits = vec![
-        ReferenceHit { file: "archive/old.rs".to_string(), line: 5, pattern: "MigrationEngine".to_string(), is_test: false, is_archive: true },
-    ];
+    let hits = vec![ReferenceHit {
+        file: "archive/old.rs".to_string(),
+        line: 5,
+        pattern: "MigrationEngine".to_string(),
+        is_test: false,
+        is_archive: true,
+    }];
     assert!(production_references(&hits).is_empty());
 }
 
@@ -417,11 +468,26 @@ fn test_production_references_excludes_archives() {
 fn test_no_append_log_references_remaining_simulation() {
     // Simulate post-cleanup: only test/archive references remain
     let hits = vec![
-        ReferenceHit { file: "tests/fixture.rs".to_string(), line: 10, pattern: "AppendLog".to_string(), is_test: true, is_archive: false },
-        ReferenceHit { file: "archive/legacy.rs".to_string(), line: 20, pattern: "AppendLog".to_string(), is_test: false, is_archive: true },
+        ReferenceHit {
+            file: "tests/fixture.rs".to_string(),
+            line: 10,
+            pattern: "AppendLog".to_string(),
+            is_test: true,
+            is_archive: false,
+        },
+        ReferenceHit {
+            file: "archive/legacy.rs".to_string(),
+            line: 20,
+            pattern: "AppendLog".to_string(),
+            is_test: false,
+            is_archive: true,
+        },
     ];
     let prod = production_references(&hits);
-    assert!(prod.is_empty(), "No production AppendLog references should remain");
+    assert!(
+        prod.is_empty(),
+        "No production AppendLog references should remain"
+    );
 }
 
 #[test]

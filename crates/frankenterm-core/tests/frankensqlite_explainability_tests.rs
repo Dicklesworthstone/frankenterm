@@ -300,45 +300,69 @@ impl LogDatabase {
 fn build_healthy_log_database() -> LogDatabase {
     let mut db = LogDatabase::new();
     // M0 Preflight
-    db.add(LogLevel::Info, "M0", vec![
-        ("migration_stage", "M0Preflight"),
-        ("event_count", "100"),
-        ("backend", "append_log"),
-        ("data_path", "/data/events.log"),
-    ]);
+    db.add(
+        LogLevel::Info,
+        "M0",
+        vec![
+            ("migration_stage", "M0Preflight"),
+            ("event_count", "100"),
+            ("backend", "append_log"),
+            ("data_path", "/data/events.log"),
+        ],
+    );
     // M1 Export
-    db.add(LogLevel::Info, "M1", vec![
-        ("migration_stage", "M1Export"),
-        ("events_exported", "100"),
-        ("event_count", "100"),
-        ("digest", "12345678"),
-    ]);
+    db.add(
+        LogLevel::Info,
+        "M1",
+        vec![
+            ("migration_stage", "M1Export"),
+            ("events_exported", "100"),
+            ("event_count", "100"),
+            ("digest", "12345678"),
+        ],
+    );
     // M2 Import
-    db.add(LogLevel::Info, "M2", vec![
-        ("migration_stage", "M2Import"),
-        ("event_count", "100"),
-        ("digest", "12345678"),
-    ]);
+    db.add(
+        LogLevel::Info,
+        "M2",
+        vec![
+            ("migration_stage", "M2Import"),
+            ("event_count", "100"),
+            ("digest", "12345678"),
+        ],
+    );
     // M5 Cutover
-    db.add(LogLevel::Info, "M5", vec![
-        ("migration_stage", "M5Cutover"),
-        ("backend", "franken_sqlite"),
-    ]);
+    db.add(
+        LogLevel::Info,
+        "M5",
+        vec![
+            ("migration_stage", "M5Cutover"),
+            ("backend", "franken_sqlite"),
+        ],
+    );
     // Bootstrap
-    db.add(LogLevel::Info, "bootstrap", vec![
-        ("backend", "franken_sqlite"),
-        ("data_path", "/data/recorder.db"),
-    ]);
+    db.add(
+        LogLevel::Info,
+        "bootstrap",
+        vec![
+            ("backend", "franken_sqlite"),
+            ("data_path", "/data/recorder.db"),
+        ],
+    );
     db
 }
 
 /// Build a log database with rollback-related entries.
 fn build_rollback_log_database() -> LogDatabase {
     let mut db = build_healthy_log_database();
-    db.add(LogLevel::Warn, "rollback", vec![
-        ("rollback_class", "Immediate"),
-        ("migration_stage", "M2Import"),
-    ]);
+    db.add(
+        LogLevel::Warn,
+        "rollback",
+        vec![
+            ("rollback_class", "Immediate"),
+            ("migration_stage", "M2Import"),
+        ],
+    );
     db
 }
 
@@ -351,10 +375,7 @@ fn evaluate_explainability(
     let mut missing_fields = Vec::new();
 
     for step in &tree.steps {
-        let step_ok = step
-            .required_fields
-            .iter()
-            .all(|f| log_db.has_field(f));
+        let step_ok = step.required_fields.iter().all(|f| log_db.has_field(f));
         if step_ok {
             steps_satisfied += 1;
         } else {
@@ -432,7 +453,11 @@ fn test_failure_modes_count() {
 #[test]
 fn test_all_failure_modes_have_descriptions() {
     for fm in FailureMode::all() {
-        assert!(!fm.description().is_empty(), "{:?} has empty description", fm);
+        assert!(
+            !fm.description().is_empty(),
+            "{:?} has empty description",
+            fm
+        );
     }
 }
 
@@ -441,7 +466,11 @@ fn test_triage_trees_cover_all_failure_modes() {
     let trees = build_triage_trees();
     let covered: std::collections::HashSet<_> = trees.iter().map(|t| &t.failure_mode).collect();
     for fm in FailureMode::all() {
-        assert!(covered.contains(&fm), "{:?} not covered by triage trees", fm);
+        assert!(
+            covered.contains(&fm),
+            "{:?} not covered by triage trees",
+            fm
+        );
     }
 }
 
@@ -746,12 +775,16 @@ fn test_explainability_report_empty_logs_mostly_not_diagnosable() {
 #[test]
 fn test_explainability_report_partial_logs() {
     let mut db = LogDatabase::new();
-    db.add(LogLevel::Info, "M0", vec![
-        ("migration_stage", "M0"),
-        ("event_count", "50"),
-        ("backend", "append_log"),
-        ("data_path", "/data"),
-    ]);
+    db.add(
+        LogLevel::Info,
+        "M0",
+        vec![
+            ("migration_stage", "M0"),
+            ("event_count", "50"),
+            ("backend", "append_log"),
+            ("data_path", "/data"),
+        ],
+    );
     let report = generate_explainability_report(&db);
     // Some modes should be diagnosable, others not
     assert!(report.failure_modes_diagnosable > 0);
@@ -785,10 +818,7 @@ fn test_required_field_set_deduplicates() {
 #[test]
 fn test_required_fields_across_all_trees() {
     let trees = build_triage_trees();
-    let mut all_fields: Vec<String> = trees
-        .iter()
-        .flat_map(|t| t.required_field_set())
-        .collect();
+    let mut all_fields: Vec<String> = trees.iter().flat_map(|t| t.required_field_set()).collect();
     all_fields.sort();
     all_fields.dedup();
     // Should cover the key log fields

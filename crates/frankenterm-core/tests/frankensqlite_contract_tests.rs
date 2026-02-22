@@ -104,18 +104,12 @@ async fn test_ordinal_monotonicity_append_log() {
     let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
     let r1 = storage
-        .append_batch(append_req(
-            "b1",
-            vec![sample_event("e1", 1, 0, "first")],
-        ))
+        .append_batch(append_req("b1", vec![sample_event("e1", 1, 0, "first")]))
         .await
         .unwrap();
 
     let r2 = storage
-        .append_batch(append_req(
-            "b2",
-            vec![sample_event("e2", 1, 1, "second")],
-        ))
+        .append_batch(append_req("b2", vec![sample_event("e2", 1, 1, "second")]))
         .await
         .unwrap();
 
@@ -191,10 +185,7 @@ async fn test_checkpoint_regression_append_log() {
     };
     // AppendLog backend returns CheckpointRegression error for backwards ordinals
     let result = storage.commit_checkpoint(cp2).await;
-    assert!(
-        result.is_err(),
-        "checkpoint regression must be rejected"
-    );
+    assert!(result.is_err(), "checkpoint regression must be rejected");
     assert!(matches!(
         result.unwrap_err(),
         RecorderStorageError::CheckpointRegression { .. }
@@ -259,10 +250,8 @@ async fn test_lag_metrics_append_log() {
 
 #[test]
 fn test_error_class_retryable() {
-    let err = RecorderStorageError::Io(std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        "timeout",
-    ));
+    let err =
+        RecorderStorageError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
     assert_eq!(err.class(), RecorderStorageErrorClass::Retryable);
 }
 
@@ -473,9 +462,7 @@ async fn test_empty_batch_append_log() {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
-    let result = storage
-        .append_batch(append_req("empty", vec![]))
-        .await;
+    let result = storage.append_batch(append_req("empty", vec![])).await;
 
     // Empty batch should either succeed with 0 count or be rejected
     match result {
@@ -764,9 +751,7 @@ async fn test_append_log_data_path_present() {
 
 #[test]
 fn test_frankensqlite_bootstrap_returns_unavailable() {
-    use frankenterm_core::recorder_storage::{
-        bootstrap_recorder_storage, RecorderStorageConfig,
-    };
+    use frankenterm_core::recorder_storage::{RecorderStorageConfig, bootstrap_recorder_storage};
     let dir = tempdir().unwrap();
     let config = RecorderStorageConfig {
         backend: RecorderBackendKind::FrankenSqlite,

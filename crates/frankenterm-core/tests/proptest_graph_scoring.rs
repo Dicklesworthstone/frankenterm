@@ -23,17 +23,15 @@ fn arb_graph(max_nodes: usize) -> impl Strategy<Value = AdjGraph> {
     (1..max_nodes).prop_flat_map(|n| {
         let max_edges = n * n;
         let edge_count = 0..max_edges.min(20);
-        (Just(n), proptest::collection::vec((0..n, 0..n), edge_count)).prop_map(
-            |(n, edges)| {
-                let mut g = AdjGraph::new(n);
-                for (src, dst) in edges {
-                    if src != dst {
-                        g.add_edge(src, dst);
-                    }
+        (Just(n), proptest::collection::vec((0..n, 0..n), edge_count)).prop_map(|(n, edges)| {
+            let mut g = AdjGraph::new(n);
+            for (src, dst) in edges {
+                if src != dst {
+                    g.add_edge(src, dst);
                 }
-                g
-            },
-        )
+            }
+            g
+        })
     })
 }
 

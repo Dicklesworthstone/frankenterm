@@ -14,9 +14,8 @@ fn arb_capacity() -> impl Strategy<Value = usize> {
 
 fn arb_bitset(max_cap: usize) -> impl Strategy<Value = CompactBitset> {
     (1..=max_cap).prop_flat_map(|cap| {
-        proptest::collection::vec(0..cap, 0..cap.min(50)).prop_map(move |indices| {
-            CompactBitset::from_indices(cap, indices)
-        })
+        proptest::collection::vec(0..cap, 0..cap.min(50))
+            .prop_map(move |indices| CompactBitset::from_indices(cap, indices))
     })
 }
 

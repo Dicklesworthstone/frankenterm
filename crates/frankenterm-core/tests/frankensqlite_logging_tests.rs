@@ -6,17 +6,17 @@
 use frankenterm_core::recorder_migration::{MigrationConfig, MigrationEngine, MigrationManifest};
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, AppendResponse,
-    CheckpointCommitOutcome, CheckpointConsumerId, CursorRecord, DurabilityLevel,
-    EventCursorError, FlushMode, FlushStats, RecorderBackendKind, RecorderCheckpoint,
-    RecorderEventCursor, RecorderEventReader, RecorderOffset, RecorderStorage,
-    RecorderStorageError, RecorderStorageHealth, RecorderStorageLag,
+    CheckpointCommitOutcome, CheckpointConsumerId, CursorRecord, DurabilityLevel, EventCursorError,
+    FlushMode, FlushStats, RecorderBackendKind, RecorderCheckpoint, RecorderEventCursor,
+    RecorderEventReader, RecorderOffset, RecorderStorage, RecorderStorageError,
+    RecorderStorageHealth, RecorderStorageLag,
 };
 use frankenterm_core::recording::{
     RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
     RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
 use frankenterm_core::storage::{
-    classify_migration_rollback_trigger, MigrationRollbackClassifierInput, MigrationStage,
+    MigrationRollbackClassifierInput, MigrationStage, classify_migration_rollback_trigger,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
-use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::{Context, SubscriberExt};
 
 // ---------------------------------------------------------------------------
 // LogCapture — tracing layer that captures structured fields
@@ -114,7 +114,10 @@ impl<S: Subscriber> Layer<S> for LogCapture {
     }
 }
 
-fn install_capture() -> (tracing::dispatcher::DefaultGuard, Arc<Mutex<Vec<CapturedEvent>>>) {
+fn install_capture() -> (
+    tracing::dispatcher::DefaultGuard,
+    Arc<Mutex<Vec<CapturedEvent>>>,
+) {
     let (layer, events) = LogCapture::new();
     let subscriber = tracing_subscriber::registry().with(layer);
     let dispatch = tracing::Dispatch::new(subscriber);
@@ -163,10 +166,7 @@ fn sample_event(seq: u64) -> RecorderEvent {
     }
 }
 
-async fn populate_source(
-    storage: &AppendLogRecorderStorage,
-    count: u64,
-) -> Vec<CursorRecord> {
+async fn populate_source(storage: &AppendLogRecorderStorage, count: u64) -> Vec<CursorRecord> {
     let batch_size = 50u64;
     let mut seq = 0u64;
     let mut all_records = Vec::new();
@@ -366,9 +366,7 @@ impl RecorderStorage for MockTargetStorage {
         self.health.clone()
     }
 
-    async fn lag_metrics(
-        &self,
-    ) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
+    async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
         Ok(RecorderStorageLag {
             latest_offset: None,
             consumers: vec![],
@@ -380,10 +378,7 @@ impl RecorderStorage for MockTargetStorage {
 // Helper to find events containing a specific field
 // ===========================================================================
 
-fn events_with_field(
-    events: &[CapturedEvent],
-    field_name: &str,
-) -> Vec<CapturedEvent> {
+fn events_with_field(events: &[CapturedEvent], field_name: &str) -> Vec<CapturedEvent> {
     events
         .iter()
         .filter(|e| e.fields.contains_key(field_name))
@@ -571,10 +566,7 @@ async fn test_m3_checkpoint_sync_logs_stage() {
     let target = MockTargetStorage::healthy();
     let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
     engine
         .m3_checkpoint_sync(&source, &target, &manifest)
         .await
@@ -598,10 +590,7 @@ async fn test_m5_cutover_logs_stage() {
     let target = MockTargetStorage::healthy();
     let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
     engine
         .m5_cutover(&target, &manifest, 1708000000, None)
         .await
@@ -684,10 +673,7 @@ fn test_rollback_no_trigger_logs_info() {
     let _ = classify_migration_rollback_trigger(&input);
 
     let events = captured.lock().unwrap();
-    let info_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.level == Level::INFO)
-        .collect();
+    let info_events: Vec<_> = events.iter().filter(|e| e.level == Level::INFO).collect();
     assert!(
         !info_events.is_empty(),
         "no-trigger classifier should log at info level"
@@ -706,10 +692,7 @@ fn test_rollback_trigger_logs_warn() {
     let _ = classify_migration_rollback_trigger(&input);
 
     let events = captured.lock().unwrap();
-    let warn_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.level == Level::WARN)
-        .collect();
+    let warn_events: Vec<_> = events.iter().filter(|e| e.level == Level::WARN).collect();
     assert!(
         !warn_events.is_empty(),
         "triggered rollback should log at warn level"
@@ -722,7 +705,7 @@ fn test_rollback_trigger_logs_warn() {
 
 #[test]
 fn test_bootstrap_logs_backend_kind() {
-    use frankenterm_core::recorder_storage::{bootstrap_recorder_storage, RecorderStorageConfig};
+    use frankenterm_core::recorder_storage::{RecorderStorageConfig, bootstrap_recorder_storage};
 
     let (_guard, captured) = install_capture();
     let dir = tempdir().unwrap();
@@ -742,7 +725,7 @@ fn test_bootstrap_logs_backend_kind() {
 
 #[test]
 fn test_bootstrap_logs_data_path() {
-    use frankenterm_core::recorder_storage::{bootstrap_recorder_storage, RecorderStorageConfig};
+    use frankenterm_core::recorder_storage::{RecorderStorageConfig, bootstrap_recorder_storage};
 
     let (_guard, captured) = install_capture();
     let dir = tempdir().unwrap();
@@ -895,10 +878,7 @@ async fn test_full_pipeline_emits_all_stage_logs() {
     let target = MockTargetStorage::healthy();
     let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
     engine
         .m3_checkpoint_sync(&source, &target, &manifest)
         .await
@@ -1000,10 +980,7 @@ fn test_rollback_classifier_warn_includes_write_failure_count() {
     let _ = classify_migration_rollback_trigger(&input);
 
     let events = captured.lock().unwrap();
-    let warn_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.level == Level::WARN)
-        .collect();
+    let warn_events: Vec<_> = events.iter().filter(|e| e.level == Level::WARN).collect();
     assert!(!warn_events.is_empty());
     assert!(
         has_field(&events, "high_severity_write_failures"),
@@ -1013,7 +990,7 @@ fn test_rollback_classifier_warn_includes_write_failure_count() {
 
 #[test]
 fn test_bootstrap_logs_at_info_level() {
-    use frankenterm_core::recorder_storage::{bootstrap_recorder_storage, RecorderStorageConfig};
+    use frankenterm_core::recorder_storage::{RecorderStorageConfig, bootstrap_recorder_storage};
 
     let (_guard, captured) = install_capture();
     let dir = tempdir().unwrap();
@@ -1025,10 +1002,7 @@ fn test_bootstrap_logs_at_info_level() {
     let _ = bootstrap_recorder_storage(config);
 
     let events = captured.lock().unwrap();
-    let info_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.level == Level::INFO)
-        .collect();
+    let info_events: Vec<_> = events.iter().filter(|e| e.level == Level::INFO).collect();
     assert!(
         !info_events.is_empty(),
         "bootstrap should log at INFO level"

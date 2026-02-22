@@ -3,30 +3,28 @@
 //! Tests the full M0→M5 pipeline and rollback tiers using AppendLog source
 //! and mock target storage.
 
-use frankenterm_core::recorder_migration::{
-    MigrationConfig, MigrationEngine, MigrationManifest,
-};
+use frankenterm_core::recorder_migration::{MigrationConfig, MigrationEngine, MigrationManifest};
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, AppendResponse,
-    CheckpointCommitOutcome, CheckpointConsumerId, CursorRecord, DurabilityLevel,
-    EventCursorError, FlushMode, FlushStats, RecorderBackendKind, RecorderCheckpoint,
-    RecorderEventCursor, RecorderEventReader, RecorderOffset, RecorderStorage,
-    RecorderStorageError, RecorderStorageHealth, RecorderStorageLag,
+    CheckpointCommitOutcome, CheckpointConsumerId, CursorRecord, DurabilityLevel, EventCursorError,
+    FlushMode, FlushStats, RecorderBackendKind, RecorderCheckpoint, RecorderEventCursor,
+    RecorderEventReader, RecorderOffset, RecorderStorage, RecorderStorageError,
+    RecorderStorageHealth, RecorderStorageLag,
 };
 use frankenterm_core::recording::{
     RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
     RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
 use frankenterm_core::storage::{
-    classify_migration_rollback_trigger, execute_migration_rollback_playbook,
-    MigrationRollbackClass, MigrationRollbackClassifierConfig, MigrationRollbackClassifierInput,
     MigrationForensicBackendState, MigrationForensicCaptureContext,
     MigrationForensicCorruptionDetail, MigrationForensicMigrationCheckpoint,
+    MigrationRollbackClass, MigrationRollbackClassifierConfig, MigrationRollbackClassifierInput,
     MigrationRollbackExecutionState, MigrationRollbackPlaybookContext, MigrationStage,
+    classify_migration_rollback_trigger, execute_migration_rollback_playbook,
 };
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::tempdir;
 
 // ---------------------------------------------------------------------------
@@ -71,10 +69,7 @@ fn sample_event(pane_id: u64, sequence: u64) -> RecorderEvent {
 }
 
 /// Populate an AppendLog source with N events and return cursor records.
-async fn populate_source(
-    storage: &AppendLogRecorderStorage,
-    count: u64,
-) -> Vec<CursorRecord> {
+async fn populate_source(storage: &AppendLogRecorderStorage, count: u64) -> Vec<CursorRecord> {
     let batch_size = 50u64;
     let mut sequence = 0u64;
     let mut all_records = Vec::new();
@@ -302,9 +297,7 @@ impl RecorderStorage for MockTargetStorage {
         }
     }
 
-    async fn lag_metrics(
-        &self,
-    ) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
+    async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
         Ok(RecorderStorageLag {
             latest_offset: None,
             consumers: vec![],
@@ -329,10 +322,7 @@ async fn test_e2e_full_migration_happy_path() {
         consumer_id: "e2e-test".to_string(),
     });
 
-    let manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
     assert_eq!(manifest.event_count, 100);
     assert_eq!(manifest.export_count, 100);
@@ -350,10 +340,7 @@ async fn test_e2e_m5_cutover_completes() {
     let target = MockTargetStorage::healthy();
     let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
     let cutover = engine
         .m5_cutover(
@@ -365,7 +352,10 @@ async fn test_e2e_m5_cutover_completes() {
         .await
         .unwrap();
 
-    assert_eq!(cutover.activated_backend, RecorderBackendKind::FrankenSqlite);
+    assert_eq!(
+        cutover.activated_backend,
+        RecorderBackendKind::FrankenSqlite
+    );
     assert!(cutover.target_healthy);
     assert!(cutover.source_retained_path.is_some());
 }
@@ -500,10 +490,7 @@ async fn test_e2e_m5_degraded_target_reports_unhealthy() {
     let target = MockTargetStorage::healthy();
     let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
     target.degraded_post_cutover.store(true, Ordering::Relaxed);
 
@@ -540,10 +527,7 @@ async fn test_e2e_checkpoint_monotonicity_across_cutover() {
     let target = MockTargetStorage::healthy();
     let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
     let sync_result = engine
         .m3_checkpoint_sync(&source, &target, &manifest)
@@ -553,11 +537,7 @@ async fn test_e2e_checkpoint_monotonicity_across_cutover() {
     assert_eq!(sync_result.consumers_found, 1);
     assert_eq!(sync_result.checkpoints_migrated, 1);
 
-    let target_cp = target
-        .read_checkpoint(&consumer)
-        .await
-        .unwrap()
-        .unwrap();
+    let target_cp = target.read_checkpoint(&consumer).await.unwrap().unwrap();
     assert_eq!(target_cp.upto_offset.ordinal, 10);
 }
 
@@ -587,10 +567,7 @@ async fn test_e2e_empty_source_migration() {
     let target = MockTargetStorage::healthy();
     let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
     assert_eq!(manifest.event_count, 0);
     assert_eq!(manifest.export_count, 0);
@@ -612,10 +589,7 @@ async fn test_e2e_large_dataset_200_events() {
         ..Default::default()
     });
 
-    let manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
     assert_eq!(manifest.event_count, 200);
     assert_eq!(manifest.export_count, 200);
@@ -708,10 +682,7 @@ async fn test_e2e_full_pipeline_with_m3_and_m5() {
     let target = MockTargetStorage::healthy();
     let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
     assert_eq!(manifest.export_count, 50);
 
     let sync = engine
@@ -732,7 +703,10 @@ async fn test_e2e_full_pipeline_with_m3_and_m5() {
         .await
         .unwrap();
     assert!(cutover.target_healthy);
-    assert_eq!(cutover.activated_backend, RecorderBackendKind::FrankenSqlite);
+    assert_eq!(
+        cutover.activated_backend,
+        RecorderBackendKind::FrankenSqlite
+    );
 }
 
 #[tokio::test]
@@ -745,10 +719,7 @@ async fn test_e2e_source_health_still_good_after_export() {
     let target = MockTargetStorage::healthy();
     let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let _manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let _manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
     let health = source.health().await;
     assert!(!health.degraded);
@@ -802,10 +773,7 @@ async fn test_e2e_single_event_migration() {
     let target = MockTargetStorage::healthy();
     let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
     assert_eq!(manifest.event_count, 1);
     assert_eq!(manifest.first_ordinal, 0);
@@ -874,10 +842,7 @@ async fn test_e2e_import_batch_size_splits_correctly() {
         ..Default::default()
     });
 
-    let manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
     assert_eq!(manifest.import_count, 15);
     // With batch size 5, 15 events → 3 batches
@@ -893,10 +858,7 @@ async fn test_e2e_manifest_serde_roundtrip() {
     let target = MockTargetStorage::healthy();
     let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine
-        .run_m0_m2(&source, &reader, &target)
-        .await
-        .unwrap();
+    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
     let json = serde_json::to_string(&manifest).unwrap();
     let roundtripped: MigrationManifest = serde_json::from_str(&json).unwrap();

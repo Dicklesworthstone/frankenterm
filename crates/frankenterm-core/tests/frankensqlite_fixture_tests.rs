@@ -13,10 +13,10 @@ use frankenterm_core::recorder_storage::{
     DurabilityLevel, RecorderBackendKind, RecorderCheckpoint, RecorderOffset, RecorderStorage,
 };
 use frankenterm_core::recording::{
-    RecorderControlMarkerType, RecorderEvent, RecorderEventCausality,
-    RecorderEventPayload, RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase,
-    RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
-    RECORDER_EVENT_SCHEMA_VERSION_V1, parse_recorder_event_json,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
+    RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
+    RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
+    parse_recorder_event_json,
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -116,7 +116,10 @@ fn load_fixture(json: &[u8]) -> Result<RecorderFixture, String> {
 /// Path to the fixtures directory (relative to crate root, resolved at test time).
 fn fixtures_dir() -> PathBuf {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    PathBuf::from(manifest).join("tests").join("fixtures").join("frankensqlite")
+    PathBuf::from(manifest)
+        .join("tests")
+        .join("fixtures")
+        .join("frankensqlite")
 }
 
 /// Load a named fixture from disk.
@@ -420,8 +423,7 @@ fn test_fixture_normal_loads_correctly() {
 fn test_fixture_normal_events_span_5_panes() {
     write_standard_fixtures();
     let fixture = load_fixture_from_disk("fixture_normal_100_events.json").unwrap();
-    let panes: std::collections::HashSet<u64> =
-        fixture.events.iter().map(|e| e.pane_id).collect();
+    let panes: std::collections::HashSet<u64> = fixture.events.iter().map(|e| e.pane_id).collect();
     assert_eq!(panes.len(), 5);
     for p in 1..=5 {
         assert!(panes.contains(&p));
@@ -699,8 +701,7 @@ fn test_fixture_large_10k_loads() {
 fn test_fixture_large_10k_spans_10_panes() {
     write_standard_fixtures();
     let fixture = load_fixture_from_disk("fixture_large_10k_events.json").unwrap();
-    let panes: std::collections::HashSet<u64> =
-        fixture.events.iter().map(|e| e.pane_id).collect();
+    let panes: std::collections::HashSet<u64> = fixture.events.iter().map(|e| e.pane_id).collect();
     assert_eq!(panes.len(), 10);
 }
 

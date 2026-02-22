@@ -128,10 +128,7 @@ const GATE_EVIDENCE_SCHEMA: &str = "ft.gate-evidence.v1";
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Evaluate R0 gate: all T1-T6 green + rollback drill template exists.
-fn evaluate_r0(
-    tier_results: &HashMap<String, bool>,
-    rollback_drill_exists: bool,
-) -> RolloutGate {
+fn evaluate_r0(tier_results: &HashMap<String, bool>, rollback_drill_exists: bool) -> RolloutGate {
     let mut criteria = Vec::new();
 
     // T1-T5 must be green (blocking)

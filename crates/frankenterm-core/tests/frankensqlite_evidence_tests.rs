@@ -11,8 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Each required evidence category.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 enum EvidenceTier {
     T1UnitTests,
@@ -179,38 +180,56 @@ impl EvidenceBuilder {
     }
 
     fn add_passing(&mut self, tier: EvidenceTier, tests: u32) -> &mut Self {
-        self.artifacts.insert(tier, EvidenceArtifact {
+        self.artifacts.insert(
             tier,
-            artifact_name: format!("{}_results.json", tier.label().to_lowercase().replace(' ', "_")),
-            byte_count: 1024 * tests as u64,
-            test_count: tests,
-            pass_count: tests,
-            fail_count: 0,
-        });
+            EvidenceArtifact {
+                tier,
+                artifact_name: format!(
+                    "{}_results.json",
+                    tier.label().to_lowercase().replace(' ', "_")
+                ),
+                byte_count: 1024 * tests as u64,
+                test_count: tests,
+                pass_count: tests,
+                fail_count: 0,
+            },
+        );
         self
     }
 
     fn add_failing(&mut self, tier: EvidenceTier, total: u32, failed: u32) -> &mut Self {
-        self.artifacts.insert(tier, EvidenceArtifact {
+        self.artifacts.insert(
             tier,
-            artifact_name: format!("{}_results.json", tier.label().to_lowercase().replace(' ', "_")),
-            byte_count: 1024 * total as u64,
-            test_count: total,
-            pass_count: total - failed,
-            fail_count: failed,
-        });
+            EvidenceArtifact {
+                tier,
+                artifact_name: format!(
+                    "{}_results.json",
+                    tier.label().to_lowercase().replace(' ', "_")
+                ),
+                byte_count: 1024 * total as u64,
+                test_count: total,
+                pass_count: total - failed,
+                fail_count: failed,
+            },
+        );
         self
     }
 
     fn add_empty(&mut self, tier: EvidenceTier) -> &mut Self {
-        self.artifacts.insert(tier, EvidenceArtifact {
+        self.artifacts.insert(
             tier,
-            artifact_name: format!("{}_results.json", tier.label().to_lowercase().replace(' ', "_")),
-            byte_count: 0,
-            test_count: 0,
-            pass_count: 0,
-            fail_count: 0,
-        });
+            EvidenceArtifact {
+                tier,
+                artifact_name: format!(
+                    "{}_results.json",
+                    tier.label().to_lowercase().replace(' ', "_")
+                ),
+                byte_count: 0,
+                test_count: 0,
+                pass_count: 0,
+                fail_count: 0,
+            },
+        );
         self
     }
 
@@ -247,7 +266,10 @@ fn test_evidence_tier_t6_is_advisory() {
 
 #[test]
 fn test_evidence_tier_t1_through_t5_are_blocking() {
-    let blocking: Vec<_> = EvidenceTier::all().into_iter().filter(|t| t.is_blocking()).collect();
+    let blocking: Vec<_> = EvidenceTier::all()
+        .into_iter()
+        .filter(|t| t.is_blocking())
+        .collect();
     // T1-T5 + MigrationDryRun + RollbackDrill = 7 blocking
     assert_eq!(blocking.len(), 7);
 }
@@ -625,7 +647,11 @@ fn test_evidence_builder_add_passing_then_failing_keeps_failing() {
     builder.add_passing(EvidenceTier::T1UnitTests, 10);
     builder.add_failing(EvidenceTier::T1UnitTests, 10, 3);
     let package = builder.build();
-    let t1 = package.artifacts.iter().find(|a| a.tier == EvidenceTier::T1UnitTests).unwrap();
+    let t1 = package
+        .artifacts
+        .iter()
+        .find(|a| a.tier == EvidenceTier::T1UnitTests)
+        .unwrap();
     assert_eq!(t1.fail_count, 3);
 }
 
@@ -634,7 +660,11 @@ fn test_evidence_builder_add_failing_then_complete_keeps_failing() {
     let mut builder = EvidenceBuilder::new("sha");
     builder.add_failing(EvidenceTier::T1UnitTests, 10, 2);
     let package = builder.build_complete_passing();
-    let t1 = package.artifacts.iter().find(|a| a.tier == EvidenceTier::T1UnitTests).unwrap();
+    let t1 = package
+        .artifacts
+        .iter()
+        .find(|a| a.tier == EvidenceTier::T1UnitTests)
+        .unwrap();
     // build_complete_passing skips already-present tiers
     assert_eq!(t1.fail_count, 2);
 }

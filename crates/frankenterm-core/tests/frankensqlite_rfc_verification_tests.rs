@@ -61,7 +61,12 @@ impl RecorderEventSource for InMemorySource {
 
     fn open_cursor(&self, pane_id: Option<u64>) -> Box<dyn RecorderEventCursor> {
         let filtered: Vec<RfcEvent> = match pane_id {
-            Some(pid) => self.events.iter().filter(|e| e.pane_id == pid).cloned().collect(),
+            Some(pid) => self
+                .events
+                .iter()
+                .filter(|e| e.pane_id == pid)
+                .cloned()
+                .collect(),
             None => self.events.clone(),
         };
         Box::new(InMemoryCursor {
@@ -111,8 +116,9 @@ fn make_test_events(count: u64, panes: u64) -> Vec<RfcEvent> {
 // RFC 2: Migration Engine M0-M5 stage model
 // ═══════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 enum MigrationStage {
     M0Inventory,
@@ -181,8 +187,9 @@ impl MigrationCheckpoint {
 // RFC 3: R0-R4 rollout gate serialization model
 // ═══════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 enum RolloutStage {
     R0Baseline,
@@ -194,7 +201,13 @@ enum RolloutStage {
 
 impl RolloutStage {
     fn all() -> Vec<Self> {
-        vec![Self::R0Baseline, Self::R1Shadow, Self::R2Canary, Self::R3Progressive, Self::R4Promotion]
+        vec![
+            Self::R0Baseline,
+            Self::R1Shadow,
+            Self::R2Canary,
+            Self::R3Progressive,
+            Self::R4Promotion,
+        ]
     }
 
     fn predecessor(&self) -> Option<Self> {
@@ -227,7 +240,9 @@ struct RfcSoakMetrics {
 
 impl RfcSoakMetrics {
     fn health_pass_rate(&self) -> f64 {
-        if self.health_checks_total == 0 { return 0.0; }
+        if self.health_checks_total == 0 {
+            return 0.0;
+        }
         self.health_checks_passed as f64 / self.health_checks_total as f64
     }
 }
@@ -395,8 +410,14 @@ fn test_migration_stages_ordered() {
 
 #[test]
 fn test_migration_predecessor_chain() {
-    assert_eq!(MigrationStage::M5Cutover.predecessor(), Some(MigrationStage::M4Catchup));
-    assert_eq!(MigrationStage::M4Catchup.predecessor(), Some(MigrationStage::M3Verify));
+    assert_eq!(
+        MigrationStage::M5Cutover.predecessor(),
+        Some(MigrationStage::M4Catchup)
+    );
+    assert_eq!(
+        MigrationStage::M4Catchup.predecessor(),
+        Some(MigrationStage::M3Verify)
+    );
     assert_eq!(MigrationStage::M0Inventory.predecessor(), None);
 }
 
@@ -404,7 +425,11 @@ fn test_migration_predecessor_chain() {
 fn test_migration_m0_through_m4_read_only() {
     for stage in MigrationStage::all() {
         if stage != MigrationStage::M5Cutover {
-            assert!(stage.is_read_only(), "Stage {:?} should be read-only", stage);
+            assert!(
+                stage.is_read_only(),
+                "Stage {:?} should be read-only",
+                stage
+            );
         }
     }
 }
@@ -486,7 +511,10 @@ fn test_rollout_stage_ordered() {
 
 #[test]
 fn test_rollout_predecessor_chain() {
-    assert_eq!(RolloutStage::R4Promotion.predecessor(), Some(RolloutStage::R3Progressive));
+    assert_eq!(
+        RolloutStage::R4Promotion.predecessor(),
+        Some(RolloutStage::R3Progressive)
+    );
     assert_eq!(RolloutStage::R0Baseline.predecessor(), None);
 }
 

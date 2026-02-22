@@ -154,9 +154,10 @@ impl ReviewBuilder {
         }
 
         // Unaccepted medium risks → conditional
-        let unaccepted_medium = self.residual_risks.iter().any(|r| {
-            !r.accepted && r.severity == RiskSeverity::Medium
-        });
+        let unaccepted_medium = self
+            .residual_risks
+            .iter()
+            .any(|r| !r.accepted && r.severity == RiskSeverity::Medium);
         if unaccepted_medium {
             return GoNoGoDecision::ConditionalGo;
         }
@@ -638,8 +639,11 @@ fn test_decision_matrix_coverage() {
     let mut b = ReviewBuilder::new("sha");
     b.add_gate("R0", true, 7, 7);
     b.add_risk(ResidualRisk {
-        id: "r".to_string(), description: "".to_string(),
-        severity: RiskSeverity::Critical, mitigation: "".to_string(), accepted: false,
+        id: "r".to_string(),
+        description: "".to_string(),
+        severity: RiskSeverity::Critical,
+        mitigation: "".to_string(),
+        accepted: false,
     });
     b.set_approval("ops", GoNoGoDecision::Go, "");
     matrix.insert("unaccepted_critical".to_string(), b.compute_decision());
@@ -648,8 +652,11 @@ fn test_decision_matrix_coverage() {
     let mut b = ReviewBuilder::new("sha");
     b.add_gate("R0", true, 7, 7);
     b.add_risk(ResidualRisk {
-        id: "r".to_string(), description: "".to_string(),
-        severity: RiskSeverity::Medium, mitigation: "".to_string(), accepted: false,
+        id: "r".to_string(),
+        description: "".to_string(),
+        severity: RiskSeverity::Medium,
+        mitigation: "".to_string(),
+        accepted: false,
     });
     b.set_approval("ops", GoNoGoDecision::Go, "");
     matrix.insert("unaccepted_medium".to_string(), b.compute_decision());

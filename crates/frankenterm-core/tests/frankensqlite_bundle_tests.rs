@@ -63,12 +63,12 @@ struct LogFieldCoverage {
 /// Triage summary for go/no-go decision.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 struct TriageSummary {
-    overall: String,          // "pass" | "fail" | "advisory_warn"
+    overall: String, // "pass" | "fail" | "advisory_warn"
     tiers_passed: u32,
     tiers_failed: u32,
     blocking_failures: Vec<String>,
     advisory_warnings: Vec<String>,
-    wave_readiness: String,   // BT tier label (BT1..BT5)
+    wave_readiness: String, // BT tier label (BT1..BT5)
     recommendation: String,
 }
 
@@ -183,8 +183,14 @@ impl BundleBuilder {
             }
         } else {
             // Check which tiers passed to determine wave
-            let t1_ok = self.tier_results.iter().any(|t| t.tier == "T1" && t.is_green());
-            let t2_ok = self.tier_results.iter().any(|t| t.tier == "T2" && t.is_green());
+            let t1_ok = self
+                .tier_results
+                .iter()
+                .any(|t| t.tier == "T1" && t.is_green());
+            let t2_ok = self
+                .tier_results
+                .iter()
+                .any(|t| t.tier == "T2" && t.is_green());
             if t1_ok && t2_ok {
                 "BT2"
             } else if t1_ok {
@@ -311,7 +317,11 @@ fn test_bundle_includes_correlation_ids() {
 fn test_bundle_collects_all_tier_results() {
     let bundle = build_all_green_bundle();
     assert_eq!(bundle.tier_results.len(), 6);
-    let tier_names: Vec<&str> = bundle.tier_results.iter().map(|t| t.tier.as_str()).collect();
+    let tier_names: Vec<&str> = bundle
+        .tier_results
+        .iter()
+        .map(|t| t.tier.as_str())
+        .collect();
     assert_eq!(tier_names, vec!["T1", "T2", "T3", "T4", "T5", "T6"]);
 }
 

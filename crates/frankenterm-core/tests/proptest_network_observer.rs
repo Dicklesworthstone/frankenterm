@@ -48,13 +48,13 @@ fn arb_pressure_tier() -> impl Strategy<Value = NetworkPressureTier> {
 }
 
 fn arb_config() -> impl Strategy<Value = NetworkObserverConfig> {
-    (1.0..500.0f64, 500.0..2000.0f64, 1..120u64).prop_map(
-        |(yellow, red, timeout)| NetworkObserverConfig {
+    (1.0..500.0f64, 500.0..2000.0f64, 1..120u64).prop_map(|(yellow, red, timeout)| {
+        NetworkObserverConfig {
             yellow_latency_ms: yellow,
             red_latency_ms: yellow.max(red), // Ensure red >= yellow
             timeout_secs: timeout,
-        },
-    )
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------

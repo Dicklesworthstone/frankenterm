@@ -17,8 +17,7 @@ fn arb_ascii(max_len: usize) -> impl Strategy<Value = Vec<u8>> {
 }
 
 fn arb_string(max_len: usize) -> impl Strategy<Value = String> {
-    proptest::collection::vec(b'a'..=b'z', 0..max_len)
-        .prop_map(|v| String::from_utf8(v).unwrap())
+    proptest::collection::vec(b'a'..=b'z', 0..max_len).prop_map(|v| String::from_utf8(v).unwrap())
 }
 
 // ---------------------------------------------------------------------------

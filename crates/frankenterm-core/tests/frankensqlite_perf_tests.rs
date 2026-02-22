@@ -4,9 +4,9 @@
 //! runs sustained ingest soak, and detects flaky variance.
 
 use frankenterm_core::recorder_storage::{
-    AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, CursorRecord,
-    DurabilityLevel, EventCursorError, FlushMode, RecorderBackendKind, RecorderEventCursor,
-    RecorderEventReader, RecorderOffset, RecorderStorage,
+    AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, CursorRecord, DurabilityLevel,
+    EventCursorError, FlushMode, RecorderBackendKind, RecorderEventCursor, RecorderEventReader,
+    RecorderOffset, RecorderStorage,
 };
 use frankenterm_core::recording::{
     RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
@@ -82,8 +82,11 @@ fn coefficient_of_variation(values: &[u64]) -> f64 {
     if mean < 1.0 {
         return 0.0;
     }
-    let variance =
-        values.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|v| (*v as f64 - mean).powi(2))
+        .sum::<f64>()
+        / values.len() as f64;
     variance.sqrt() / mean
 }
 
@@ -372,10 +375,7 @@ async fn test_slo_append_p50_under_1ms() {
     let p50 = percentile(&latencies, 50.0);
 
     // p50 should be under 1ms (1000us) — allow 5ms test headroom
-    assert!(
-        p50 < 5_000,
-        "append p50 = {p50}us, expected < 5ms"
-    );
+    assert!(p50 < 5_000, "append p50 = {p50}us, expected < 5ms");
 }
 
 #[tokio::test]
@@ -397,10 +397,7 @@ async fn test_slo_append_p99_under_10ms() {
     let p99 = percentile(&latencies, 99.0);
 
     // p99 should be under 10ms — allow 50ms test headroom for CI
-    assert!(
-        p99 < 50_000,
-        "append p99 = {p99}us, expected < 50ms"
-    );
+    assert!(p99 < 50_000, "append p99 = {p99}us, expected < 50ms");
 }
 
 #[tokio::test]
@@ -424,10 +421,7 @@ async fn test_slo_flush_durable_p50_under_5ms() {
     let p50 = percentile(&latencies, 50.0);
 
     // Durable flush p50 < 5ms — allow 50ms headroom
-    assert!(
-        p50 < 50_000,
-        "flush durable p50 = {p50}us, expected < 50ms"
-    );
+    assert!(p50 < 50_000, "flush durable p50 = {p50}us, expected < 50ms");
 }
 
 // ===========================================================================
@@ -599,10 +593,7 @@ async fn test_flake_flush_variance_under_threshold() {
     }
 
     let cv = coefficient_of_variation(&latencies);
-    assert!(
-        cv < 2.0,
-        "flush CV = {cv:.3}, expected < 2.0"
-    );
+    assert!(cv < 2.0, "flush CV = {cv:.3}, expected < 2.0");
 }
 
 // ===========================================================================
@@ -647,9 +638,7 @@ async fn test_multi_pane_append_no_contention_degradation() {
 
 #[tokio::test]
 async fn test_checkpoint_roundtrip_latency() {
-    use frankenterm_core::recorder_storage::{
-        CheckpointConsumerId, RecorderCheckpoint,
-    };
+    use frankenterm_core::recorder_storage::{CheckpointConsumerId, RecorderCheckpoint};
 
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
@@ -684,14 +673,8 @@ async fn test_checkpoint_roundtrip_latency() {
     assert_eq!(cp.unwrap().upto_offset.ordinal, 5);
 
     // Checkpoint SLO: p95 < 100ms
-    assert!(
-        commit_us < 100_000,
-        "checkpoint commit took {commit_us}us"
-    );
-    assert!(
-        read_us < 100_000,
-        "checkpoint read took {read_us}us"
-    );
+    assert!(commit_us < 100_000, "checkpoint commit took {commit_us}us");
+    assert!(read_us < 100_000, "checkpoint read took {read_us}us");
 }
 
 // ===========================================================================
@@ -920,10 +903,7 @@ async fn test_soak_window_p99_stability() {
 
     // No window p99 should exceed 100ms
     for (i, p99) in window_p99s.iter().enumerate() {
-        assert!(
-            *p99 < 100_000,
-            "window {i} p99 = {p99}us, expected < 100ms"
-        );
+        assert!(*p99 < 100_000, "window {i} p99 = {p99}us, expected < 100ms");
     }
 }
 

@@ -21,7 +21,11 @@ struct SemanticVersion {
 
 impl SemanticVersion {
     fn new(major: u32, minor: u32, patch: u32) -> Self {
-        Self { major, minor, patch }
+        Self {
+            major,
+            minor,
+            patch,
+        }
     }
 
     fn display(&self) -> String {
@@ -86,19 +90,30 @@ impl CompatMatrix {
     }
 
     fn lookup(&self, core: &SemanticVersion, sqlite: &SemanticVersion) -> Option<&CompatEntry> {
-        self.entries.iter().find(|e| e.core_version == *core && e.sqlite_version == *sqlite)
+        self.entries
+            .iter()
+            .find(|e| e.core_version == *core && e.sqlite_version == *sqlite)
     }
 
     fn supported_pairs(&self) -> Vec<&CompatEntry> {
-        self.entries.iter().filter(|e| e.level == CompatLevel::Supported).collect()
+        self.entries
+            .iter()
+            .filter(|e| e.level == CompatLevel::Supported)
+            .collect()
     }
 
     fn unsupported_pairs(&self) -> Vec<&CompatEntry> {
-        self.entries.iter().filter(|e| e.level == CompatLevel::Unsupported).collect()
+        self.entries
+            .iter()
+            .filter(|e| e.level == CompatLevel::Unsupported)
+            .collect()
     }
 
     fn deprecated_pairs(&self) -> Vec<&CompatEntry> {
-        self.entries.iter().filter(|e| e.level == CompatLevel::Deprecated).collect()
+        self.entries
+            .iter()
+            .filter(|e| e.level == CompatLevel::Deprecated)
+            .collect()
     }
 }
 
@@ -135,9 +150,7 @@ fn check_api_version(expected: &str, actual: &str) -> Option<VersionMismatchWarn
         expected_api_version: expected.to_string(),
         actual_api_version: actual.to_string(),
         severity,
-        message: format!(
-            "API version mismatch: expected {expected}, got {actual}"
-        ),
+        message: format!("API version mismatch: expected {expected}, got {actual}"),
     })
 }
 
@@ -173,7 +186,10 @@ impl CiVersionGate {
     }
 
     fn out_of_range_versions(&self) -> Vec<&SemanticVersion> {
-        self.test_versions.iter().filter(|v| !self.is_in_range(v)).collect()
+        self.test_versions
+            .iter()
+            .filter(|v| !self.is_in_range(v))
+            .collect()
     }
 }
 
@@ -290,15 +306,28 @@ fn test_version_mismatch_serde_roundtrip() {
 #[test]
 fn test_compatibility_matrix_minimum_version() {
     let mut matrix = CompatMatrix::new();
-    matrix.add(SemanticVersion::new(0, 1, 0), SemanticVersion::new(0, 1, 0), "baseline");
-    let entry = matrix.lookup(&SemanticVersion::new(0, 1, 0), &SemanticVersion::new(0, 1, 0)).unwrap();
+    matrix.add(
+        SemanticVersion::new(0, 1, 0),
+        SemanticVersion::new(0, 1, 0),
+        "baseline",
+    );
+    let entry = matrix
+        .lookup(
+            &SemanticVersion::new(0, 1, 0),
+            &SemanticVersion::new(0, 1, 0),
+        )
+        .unwrap();
     assert_eq!(entry.level, CompatLevel::Supported);
 }
 
 #[test]
 fn test_compatibility_matrix_maximum_version() {
     let mut matrix = CompatMatrix::new();
-    matrix.add(SemanticVersion::new(1, 0, 0), SemanticVersion::new(1, 0, 0), "current");
+    matrix.add(
+        SemanticVersion::new(1, 0, 0),
+        SemanticVersion::new(1, 0, 0),
+        "current",
+    );
     let pairs = matrix.supported_pairs();
     assert_eq!(pairs.len(), 1);
 }
@@ -306,7 +335,11 @@ fn test_compatibility_matrix_maximum_version() {
 #[test]
 fn test_compatibility_matrix_cross_major_unsupported() {
     let mut matrix = CompatMatrix::new();
-    matrix.add(SemanticVersion::new(1, 0, 0), SemanticVersion::new(2, 0, 0), "breaking");
+    matrix.add(
+        SemanticVersion::new(1, 0, 0),
+        SemanticVersion::new(2, 0, 0),
+        "breaking",
+    );
     let pairs = matrix.unsupported_pairs();
     assert_eq!(pairs.len(), 1);
 }
@@ -314,7 +347,11 @@ fn test_compatibility_matrix_cross_major_unsupported() {
 #[test]
 fn test_compatibility_matrix_deprecated_pairs() {
     let mut matrix = CompatMatrix::new();
-    matrix.add(SemanticVersion::new(1, 0, 0), SemanticVersion::new(1, 2, 0), "newer minor");
+    matrix.add(
+        SemanticVersion::new(1, 0, 0),
+        SemanticVersion::new(1, 2, 0),
+        "newer minor",
+    );
     let pairs = matrix.deprecated_pairs();
     assert_eq!(pairs.len(), 1);
 }
@@ -328,8 +365,16 @@ fn test_compatibility_matrix_api_version() {
 #[test]
 fn test_compatibility_matrix_serde_roundtrip() {
     let mut matrix = CompatMatrix::new();
-    matrix.add(SemanticVersion::new(1, 0, 0), SemanticVersion::new(1, 0, 0), "ok");
-    matrix.add(SemanticVersion::new(1, 0, 0), SemanticVersion::new(2, 0, 0), "bad");
+    matrix.add(
+        SemanticVersion::new(1, 0, 0),
+        SemanticVersion::new(1, 0, 0),
+        "ok",
+    );
+    matrix.add(
+        SemanticVersion::new(1, 0, 0),
+        SemanticVersion::new(2, 0, 0),
+        "bad",
+    );
     let json = serde_json::to_string_pretty(&matrix).unwrap();
     let back: CompatMatrix = serde_json::from_str(&json).unwrap();
     assert_eq!(matrix.entries.len(), back.entries.len());
@@ -338,7 +383,14 @@ fn test_compatibility_matrix_serde_roundtrip() {
 #[test]
 fn test_compatibility_matrix_lookup_missing() {
     let matrix = CompatMatrix::new();
-    assert!(matrix.lookup(&SemanticVersion::new(9, 9, 9), &SemanticVersion::new(9, 9, 9)).is_none());
+    assert!(
+        matrix
+            .lookup(
+                &SemanticVersion::new(9, 9, 9),
+                &SemanticVersion::new(9, 9, 9)
+            )
+            .is_none()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -453,7 +505,11 @@ fn test_ci_gate_serde_roundtrip() {
 
 #[test]
 fn test_compat_level_serde_roundtrip() {
-    for level in &[CompatLevel::Supported, CompatLevel::Deprecated, CompatLevel::Unsupported] {
+    for level in &[
+        CompatLevel::Supported,
+        CompatLevel::Deprecated,
+        CompatLevel::Unsupported,
+    ] {
         let json = serde_json::to_string(level).unwrap();
         let back: CompatLevel = serde_json::from_str(&json).unwrap();
         assert_eq!(*level, back);
@@ -492,7 +548,11 @@ fn test_full_matrix_build() {
 
 #[test]
 fn test_mismatch_severity_serde_roundtrip() {
-    for sev in &[MismatchSeverity::Info, MismatchSeverity::Warning, MismatchSeverity::Error] {
+    for sev in &[
+        MismatchSeverity::Info,
+        MismatchSeverity::Warning,
+        MismatchSeverity::Error,
+    ] {
         let json = serde_json::to_string(sev).unwrap();
         let back: MismatchSeverity = serde_json::from_str(&json).unwrap();
         assert_eq!(*sev, back);

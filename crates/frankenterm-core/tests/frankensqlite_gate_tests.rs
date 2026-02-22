@@ -106,7 +106,13 @@ impl BeadTier {
         match self {
             BeadTier::BT1 => vec![GateTier::T1],
             BeadTier::BT2 => vec![GateTier::T1, GateTier::T2],
-            BeadTier::BT3 => vec![GateTier::T1, GateTier::T2, GateTier::T3, GateTier::T4, GateTier::T5],
+            BeadTier::BT3 => vec![
+                GateTier::T1,
+                GateTier::T2,
+                GateTier::T3,
+                GateTier::T4,
+                GateTier::T5,
+            ],
             BeadTier::BT4 => GateTier::all(), // Including advisory T6
             BeadTier::BT5 => GateTier::all(),
         }
@@ -169,7 +175,13 @@ fn test_gate_tiers_are_exactly_six() {
 
 #[test]
 fn test_gate_t1_through_t5_are_blocking() {
-    for tier in &[GateTier::T1, GateTier::T2, GateTier::T3, GateTier::T4, GateTier::T5] {
+    for tier in &[
+        GateTier::T1,
+        GateTier::T2,
+        GateTier::T3,
+        GateTier::T4,
+        GateTier::T5,
+    ] {
         assert!(tier.is_blocking(), "{:?} should be blocking", tier);
     }
 }
@@ -227,7 +239,11 @@ fn test_gate_each_tier_has_unique_label() {
 #[test]
 fn test_gate_each_tier_has_nonempty_description() {
     for tier in GateTier::all() {
-        assert!(!tier.description().is_empty(), "{:?} has empty description", tier);
+        assert!(
+            !tier.description().is_empty(),
+            "{:?} has empty description",
+            tier
+        );
     }
 }
 
@@ -264,7 +280,10 @@ fn test_bt1_requires_only_t1() {
 
 #[test]
 fn test_bt2_requires_t1_and_t2() {
-    assert_eq!(BeadTier::BT2.required_tiers(), vec![GateTier::T1, GateTier::T2]);
+    assert_eq!(
+        BeadTier::BT2.required_tiers(),
+        vec![GateTier::T1, GateTier::T2]
+    );
 }
 
 #[test]
@@ -297,7 +316,11 @@ fn test_bead_tier_labels_unique() {
 #[test]
 fn test_bead_tier_descriptions_nonempty() {
     for bt in BeadTier::all() {
-        assert!(!bt.description().is_empty(), "{:?} has empty description", bt);
+        assert!(
+            !bt.description().is_empty(),
+            "{:?} has empty description",
+            bt
+        );
     }
 }
 
@@ -357,7 +380,11 @@ fn test_wave_all_pass_all_tiers_ready() {
 fn test_wave_all_fail_no_tiers_ready() {
     let readiness = evaluate_wave_readiness(&all_fail());
     for bt in BeadTier::all() {
-        assert!(!readiness[&bt], "{:?} should not be ready when all fail", bt);
+        assert!(
+            !readiness[&bt],
+            "{:?} should not be ready when all fail",
+            bt
+        );
     }
 }
 
@@ -376,8 +403,16 @@ fn test_wave_only_t1_passes_bt1_ready() {
 #[test]
 fn test_wave_t1_t2_pass_bt2_ready() {
     let results = vec![
-        GateResult { tier: GateTier::T1, passed: true, duration_s: 5 },
-        GateResult { tier: GateTier::T2, passed: true, duration_s: 10 },
+        GateResult {
+            tier: GateTier::T1,
+            passed: true,
+            duration_s: 5,
+        },
+        GateResult {
+            tier: GateTier::T2,
+            passed: true,
+            duration_s: 10,
+        },
     ];
     let readiness = evaluate_wave_readiness(&results);
     assert!(readiness[&BeadTier::BT1]);
@@ -387,10 +422,20 @@ fn test_wave_t1_t2_pass_bt2_ready() {
 
 #[test]
 fn test_wave_t1_through_t5_pass_bt3_ready() {
-    let results: Vec<_> = [GateTier::T1, GateTier::T2, GateTier::T3, GateTier::T4, GateTier::T5]
-        .into_iter()
-        .map(|t| GateResult { tier: t, passed: true, duration_s: 5 })
-        .collect();
+    let results: Vec<_> = [
+        GateTier::T1,
+        GateTier::T2,
+        GateTier::T3,
+        GateTier::T4,
+        GateTier::T5,
+    ]
+    .into_iter()
+    .map(|t| GateResult {
+        tier: t,
+        passed: true,
+        duration_s: 5,
+    })
+    .collect();
     let readiness = evaluate_wave_readiness(&results);
     assert!(readiness[&BeadTier::BT3]);
     assert!(!readiness[&BeadTier::BT4]); // T6 missing
@@ -600,9 +645,6 @@ fn test_tier_test_scripts_exist() {
         "test_frankensqlite_soak.sh",
     ];
     for name in &scripts {
-        assert!(
-            base.join(name).exists(),
-            "Missing test script: {name}"
-        );
+        assert!(base.join(name).exists(), "Missing test script: {name}");
     }
 }
