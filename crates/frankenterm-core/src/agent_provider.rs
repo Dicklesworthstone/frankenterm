@@ -48,53 +48,61 @@ pub enum AgentProvider {
     Unknown(String),
 }
 
+/// Source used when resolving an [`AgentProvider`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderResolutionSource {
+    ProcessName,
+    BinaryName,
+    Slug,
+    AgentType,
+}
+
+/// Structured diagnostics for provider-resolution decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderResolutionDiagnostics {
+    pub source: ProviderResolutionSource,
+    pub input: String,
+    pub normalized: String,
+    pub candidates: Vec<AgentProvider>,
+    pub selected: Option<AgentProvider>,
+    pub ambiguous: bool,
+}
+
+impl ProviderResolutionDiagnostics {
+    fn new(
+        source: ProviderResolutionSource,
+        input: String,
+        normalized: String,
+        candidates: Vec<AgentProvider>,
+        selected: Option<AgentProvider>,
+    ) -> Self {
+        Self {
+            source,
+            input,
+            normalized,
+            ambiguous: candidates.len() > 1,
+            candidates,
+            selected,
+        }
+    }
+
+    /// True when resolution did not produce a known provider.
+    pub fn is_unknown(&self) -> bool {
+        match &self.selected {
+            None => true,
+            Some(AgentProvider::Unknown(_)) => true,
+            Some(_) => false,
+        }
+    }
+}
+
 impl AgentProvider {
     /// Identify a provider from a running process name (case-insensitive substring match).
     ///
     /// Returns `None` when the name does not match any known agent pattern.
     pub fn from_process_name(name: &str) -> Option<Self> {
-        let lower = name.to_ascii_lowercase();
-        // Order matters: more-specific substrings first.
-        if lower.contains("claude-code")
-            || lower.contains("claude_code")
-            || lower.contains("claude")
-        {
-            return Some(Self::Claude);
-        }
-        if lower.contains("codex") {
-            return Some(Self::Codex);
-        }
-        if lower.contains("gemini") {
-            return Some(Self::Gemini);
-        }
-        if lower.contains("cursor") {
-            return Some(Self::Cursor);
-        }
-        if lower.contains("windsurf") {
-            return Some(Self::Windsurf);
-        }
-        if lower.contains("cline") {
-            return Some(Self::Cline);
-        }
-        if lower.contains("copilot") {
-            return Some(Self::GithubCopilot);
-        }
-        if lower.contains("devin") {
-            return Some(Self::Devin);
-        }
-        if lower.contains("grok") {
-            return Some(Self::Grok);
-        }
-        if lower.contains("aider") {
-            return Some(Self::Aider);
-        }
-        if lower.contains("opencode") {
-            return Some(Self::Opencode);
-        }
-        if lower.contains("factory") {
-            return Some(Self::Factory);
-        }
-        None
+        Self::diagnostics_from_process_name(name).selected
     }
 
     /// Identify a provider from a binary/executable name (case-insensitive exact or prefix match).
@@ -102,22 +110,72 @@ impl AgentProvider {
     /// Handles common binary names such as `claude`, `codex-cli`, `gemini-cli`, etc.
     /// Returns `None` when the binary name is unrecognized.
     pub fn from_binary_name(name: &str) -> Option<Self> {
-        let lower = name.to_ascii_lowercase();
-        match lower.as_str() {
-            "claude" | "claude-code" | "claude_code" => Some(Self::Claude),
-            "codex" | "codex-cli" => Some(Self::Codex),
-            "gemini" | "gemini-cli" => Some(Self::Gemini),
-            "cursor" => Some(Self::Cursor),
-            "windsurf" => Some(Self::Windsurf),
-            "cline" => Some(Self::Cline),
-            "copilot" | "github-copilot" => Some(Self::GithubCopilot),
-            "devin" => Some(Self::Devin),
-            "grok" | "grok-cli" => Some(Self::Grok),
-            "aider" => Some(Self::Aider),
-            "opencode" | "open-code" => Some(Self::Opencode),
-            "factory" | "factory-droid" => Some(Self::Factory),
-            _ => None,
-        }
+        Self::diagnostics_from_binary_name(name).selected
+    }
+
+    /// Resolve from a process name and return structured diagnostics.
+    pub fn diagnostics_from_process_name(name: &str) -> ProviderResolutionDiagnostics {
+        let normalized = name.to_ascii_lowercase();
+        let candidates = process_name_candidates(&normalized);
+        let selected = candidates.first().cloned();
+        ProviderResolutionDiagnostics::new(
+            ProviderResolutionSource::ProcessName,
+            name.to_string(),
+            normalized,
+            candidates,
+            selected,
+        )
+    }
+
+    /// Resolve from a binary name and return structured diagnostics.
+    pub fn diagnostics_from_binary_name(name: &str) -> ProviderResolutionDiagnostics {
+        let normalized = name.to_ascii_lowercase();
+        let candidates = binary_name_candidates(&normalized);
+        let selected = candidates.first().cloned();
+        ProviderResolutionDiagnostics::new(
+            ProviderResolutionSource::BinaryName,
+            name.to_string(),
+            normalized,
+            candidates,
+            selected,
+        )
+    }
+
+    /// Resolve from a canonical slug or alias and return structured diagnostics.
+    pub fn diagnostics_from_slug(slug: &str) -> ProviderResolutionDiagnostics {
+        let normalized = slug.to_ascii_lowercase();
+        let selected = Self::from_slug(slug.trim());
+        let candidates = if matches!(selected, Self::Unknown(_)) {
+            Vec::new()
+        } else {
+            vec![selected.clone()]
+        };
+        ProviderResolutionDiagnostics::new(
+            ProviderResolutionSource::Slug,
+            slug.to_string(),
+            normalized,
+            candidates,
+            Some(selected),
+        )
+    }
+
+    /// Resolve from legacy pattern `AgentType` and return structured diagnostics.
+    pub fn diagnostics_from_agent_type(
+        agent_type: &crate::patterns::AgentType,
+    ) -> ProviderResolutionDiagnostics {
+        let selected = Self::from_agent_type(agent_type);
+        let candidates = if matches!(selected, Self::Unknown(_)) {
+            Vec::new()
+        } else {
+            vec![selected.clone()]
+        };
+        ProviderResolutionDiagnostics::new(
+            ProviderResolutionSource::AgentType,
+            agent_type.to_string(),
+            agent_type.to_string(),
+            candidates,
+            Some(selected),
+        )
     }
 
     /// Human-readable display name suitable for UI labels.
@@ -226,6 +284,69 @@ impl AgentProvider {
             AgentProvider::Aider,
             AgentProvider::Windsurf,
         ]
+    }
+}
+
+fn process_name_candidates(normalized: &str) -> Vec<AgentProvider> {
+    let mut candidates = Vec::new();
+    // Order matters: more-specific priorities first.
+    if normalized.contains("claude-code")
+        || normalized.contains("claude_code")
+        || normalized.contains("claude")
+    {
+        candidates.push(AgentProvider::Claude);
+    }
+    if normalized.contains("codex") {
+        candidates.push(AgentProvider::Codex);
+    }
+    if normalized.contains("gemini") {
+        candidates.push(AgentProvider::Gemini);
+    }
+    if normalized.contains("cursor") {
+        candidates.push(AgentProvider::Cursor);
+    }
+    if normalized.contains("windsurf") {
+        candidates.push(AgentProvider::Windsurf);
+    }
+    if normalized.contains("cline") {
+        candidates.push(AgentProvider::Cline);
+    }
+    if normalized.contains("copilot") {
+        candidates.push(AgentProvider::GithubCopilot);
+    }
+    if normalized.contains("devin") {
+        candidates.push(AgentProvider::Devin);
+    }
+    if normalized.contains("grok") {
+        candidates.push(AgentProvider::Grok);
+    }
+    if normalized.contains("aider") {
+        candidates.push(AgentProvider::Aider);
+    }
+    if normalized.contains("opencode") {
+        candidates.push(AgentProvider::Opencode);
+    }
+    if normalized.contains("factory") {
+        candidates.push(AgentProvider::Factory);
+    }
+    candidates
+}
+
+fn binary_name_candidates(normalized: &str) -> Vec<AgentProvider> {
+    match normalized {
+        "claude" | "claude-code" | "claude_code" => vec![AgentProvider::Claude],
+        "codex" | "codex-cli" => vec![AgentProvider::Codex],
+        "gemini" | "gemini-cli" => vec![AgentProvider::Gemini],
+        "cursor" => vec![AgentProvider::Cursor],
+        "windsurf" => vec![AgentProvider::Windsurf],
+        "cline" => vec![AgentProvider::Cline],
+        "copilot" | "github-copilot" => vec![AgentProvider::GithubCopilot],
+        "devin" => vec![AgentProvider::Devin],
+        "grok" | "grok-cli" => vec![AgentProvider::Grok],
+        "aider" => vec![AgentProvider::Aider],
+        "opencode" | "open-code" => vec![AgentProvider::Opencode],
+        "factory" | "factory-droid" => vec![AgentProvider::Factory],
+        _ => Vec::new(),
     }
 }
 
@@ -781,5 +902,79 @@ mod tests {
         let original = AgentProvider::Claude;
         let cloned = original.clone();
         assert_eq!(original, cloned);
+    }
+
+    // -------------------------------------------------------------------------
+    // Structured diagnostics
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_diagnostics_from_process_name_unknown() {
+        let diag = AgentProvider::diagnostics_from_process_name("bash");
+        assert_eq!(diag.source, ProviderResolutionSource::ProcessName);
+        assert_eq!(diag.input, "bash");
+        assert_eq!(diag.normalized, "bash");
+        assert!(diag.candidates.is_empty());
+        assert_eq!(diag.selected, None);
+        assert!(!diag.ambiguous);
+        assert!(diag.is_unknown());
+    }
+
+    #[test]
+    fn test_diagnostics_from_process_name_ambiguous() {
+        let diag = AgentProvider::diagnostics_from_process_name("claude-codex bridge");
+        assert_eq!(
+            diag.candidates,
+            vec![AgentProvider::Claude, AgentProvider::Codex]
+        );
+        assert_eq!(diag.selected, Some(AgentProvider::Claude));
+        assert!(diag.ambiguous);
+        assert!(!diag.is_unknown());
+    }
+
+    #[test]
+    fn test_diagnostics_from_binary_name_known() {
+        let diag = AgentProvider::diagnostics_from_binary_name("codex-cli");
+        assert_eq!(diag.source, ProviderResolutionSource::BinaryName);
+        assert_eq!(diag.selected, Some(AgentProvider::Codex));
+        assert_eq!(diag.candidates, vec![AgentProvider::Codex]);
+        assert!(!diag.ambiguous);
+    }
+
+    #[test]
+    fn test_diagnostics_from_slug_unknown() {
+        let diag = AgentProvider::diagnostics_from_slug("x-new-agent");
+        assert_eq!(diag.source, ProviderResolutionSource::Slug);
+        assert!(diag.candidates.is_empty());
+        assert_eq!(
+            diag.selected,
+            Some(AgentProvider::Unknown("x-new-agent".to_string()))
+        );
+        assert!(diag.is_unknown());
+    }
+
+    #[test]
+    fn test_diagnostics_from_agent_type_known() {
+        let diag =
+            AgentProvider::diagnostics_from_agent_type(&crate::patterns::AgentType::ClaudeCode);
+        assert_eq!(diag.source, ProviderResolutionSource::AgentType);
+        assert_eq!(diag.input, "claude_code");
+        assert_eq!(diag.selected, Some(AgentProvider::Claude));
+        assert_eq!(diag.candidates, vec![AgentProvider::Claude]);
+        assert!(!diag.ambiguous);
+        assert!(!diag.is_unknown());
+    }
+
+    #[test]
+    fn test_diagnostics_from_agent_type_unknown() {
+        let diag = AgentProvider::diagnostics_from_agent_type(&crate::patterns::AgentType::Unknown);
+        assert_eq!(diag.source, ProviderResolutionSource::AgentType);
+        assert_eq!(diag.input, "unknown");
+        assert_eq!(
+            diag.selected,
+            Some(AgentProvider::Unknown("unknown".to_string()))
+        );
+        assert!(diag.candidates.is_empty());
+        assert!(diag.is_unknown());
     }
 }

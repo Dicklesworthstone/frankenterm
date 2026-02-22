@@ -138,7 +138,12 @@ impl AgentCorrelator {
 
             let state = infer_state_from_rule(&detection.rule_id);
             let session_id = extract_session_id(&detection.extracted);
-            let provider = AgentProvider::from_agent_type(&detection.agent_type);
+            let provider_diagnostics =
+                AgentProvider::diagnostics_from_agent_type(&detection.agent_type);
+            let provider = provider_diagnostics
+                .selected
+                .clone()
+                .unwrap_or_else(|| AgentProvider::Unknown("unknown".to_string()));
 
             let entry = self
                 .pane_agents
@@ -164,6 +169,14 @@ impl AgentCorrelator {
             if let Some(sid) = session_id {
                 entry.session_id = Some(sid);
             }
+
+            trace!(
+                pane_id,
+                source = ?provider_diagnostics.source,
+                provider_candidates = ?provider_diagnostics.candidates,
+                provider_selected = ?provider_diagnostics.selected,
+                "Provider resolved from pattern agent type"
+            );
 
             trace!(
                 pane_id,
@@ -318,32 +331,78 @@ impl Default for AgentCorrelator {
 
 /// Detect agent type from pane title keywords.
 fn detect_agent_from_title(title: &str) -> Option<AgentType> {
-    let lower = title.to_lowercase();
-    if lower.contains("claude") || lower.contains("claude-code") || lower.contains("claude code") {
-        return Some(AgentType::ClaudeCode);
+    let normalized = title.to_ascii_lowercase();
+    let mut candidates = Vec::new();
+    if normalized.contains("claude")
+        || normalized.contains("claude-code")
+        || normalized.contains("claude code")
+    {
+        candidates.push(AgentType::ClaudeCode);
     }
-    if lower.contains("codex") || lower.contains("openai") {
-        return Some(AgentType::Codex);
+    if normalized.contains("codex") || normalized.contains("openai") {
+        candidates.push(AgentType::Codex);
     }
-    if lower.contains("gemini") {
-        return Some(AgentType::Gemini);
+    if normalized.contains("gemini") {
+        candidates.push(AgentType::Gemini);
     }
-    None
+
+    if candidates.is_empty() {
+        trace!(
+            source = "pane_title",
+            input = %title,
+            normalized = %normalized,
+            "No agent keywords matched pane title"
+        );
+        return None;
+    }
+
+    if candidates.len() > 1 {
+        debug!(
+            source = "pane_title",
+            input = %title,
+            normalized = %normalized,
+            candidates = ?candidates,
+            "Ambiguous pane-title agent match; selecting first candidate"
+        );
+    }
+
+    candidates.into_iter().next()
 }
 
 /// Detect agent type from foreground process name.
 fn detect_agent_from_process(process: &str) -> Option<AgentType> {
-    let lower = process.to_lowercase();
-    if lower.contains("claude") {
-        return Some(AgentType::ClaudeCode);
+    let diagnostics = AgentProvider::diagnostics_from_process_name(process);
+    if diagnostics.ambiguous {
+        debug!(
+            source = "process_name",
+            input = %diagnostics.input,
+            normalized = %diagnostics.normalized,
+            candidates = ?diagnostics.candidates,
+            selected = ?diagnostics.selected,
+            "Ambiguous process-name provider match; selecting first candidate"
+        );
     }
-    if lower.contains("codex") {
-        return Some(AgentType::Codex);
+    if diagnostics.is_unknown() {
+        trace!(
+            source = "process_name",
+            input = %diagnostics.input,
+            normalized = %diagnostics.normalized,
+            "No known provider matched process name"
+        );
+        return None;
     }
-    if lower.contains("gemini") {
-        return Some(AgentType::Gemini);
+    let provider = diagnostics.selected?;
+    let agent_type = provider.to_agent_type();
+    if agent_type == AgentType::Unknown {
+        trace!(
+            source = "process_name",
+            input = %process,
+            provider = %provider,
+            "Resolved provider has no legacy AgentType mapping for correlator"
+        );
+        return None;
     }
-    None
+    Some(agent_type)
 }
 
 fn metadata_agent_type_for_provider(provider: &AgentProvider) -> String {
@@ -744,6 +803,14 @@ mod tests {
         assert_eq!(detect_agent_from_title("vim"), None);
     }
 
+    #[test]
+    fn detect_agent_from_title_ambiguous_prefers_first_match() {
+        assert_eq!(
+            detect_agent_from_title("claude and codex session"),
+            Some(AgentType::ClaudeCode)
+        );
+    }
+
     // ---- Process detection ----
 
     #[test]
@@ -759,6 +826,15 @@ mod tests {
         );
         assert_eq!(detect_agent_from_process("bash"), None);
         assert_eq!(detect_agent_from_process("node"), None);
+        assert_eq!(detect_agent_from_process("cursor"), None);
+    }
+
+    #[test]
+    fn detect_agent_from_process_ambiguous_prefers_first_provider_match() {
+        assert_eq!(
+            detect_agent_from_process("claude-codex-wrapper"),
+            Some(AgentType::ClaudeCode)
+        );
     }
 
     // ---- Session ID extraction ----

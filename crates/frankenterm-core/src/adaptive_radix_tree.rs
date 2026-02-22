@@ -446,7 +446,7 @@ impl<V> AdaptiveRadixTree<V> {
     /// Return the number of nodes in the tree (for diagnostics).
     #[must_use]
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.nodes.len() - self.free.len()
     }
 
     // ── Internal: Node allocation ──────────────────────────────────
@@ -770,7 +770,7 @@ impl<V> fmt::Display for AdaptiveRadixTree<V> {
             f,
             "AdaptiveRadixTree({} entries, {} nodes)",
             self.len,
-            self.nodes.len()
+            self.node_count()
         )
     }
 }
