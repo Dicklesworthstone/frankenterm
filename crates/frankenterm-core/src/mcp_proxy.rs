@@ -99,11 +99,30 @@ pub(super) fn compose_proxy_tools(
 
     let mut mounted_tools = 0usize;
     let mut mounted_servers = 0usize;
+    let mut used_route_prefixes = HashSet::new();
     let base_prefix = settings.proxy_prefix.trim();
 
     for server in selected {
         let server_name = server.name.clone();
         let route_prefix = format!("{base_prefix}/{}", sanitize_prefix_segment(&server_name));
+        if !insert_route_prefix(&mut used_route_prefixes, &route_prefix) {
+            let message = format!(
+                "mcp proxy route prefix collision for server '{server_name}': {route_prefix}"
+            );
+            if fail_fast {
+                return Err(crate::error::ConfigError::ValidationError(message).into());
+            }
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "mcp_proxy_route_prefix_collision",
+                server = %server_name,
+                route_prefix = %route_prefix,
+                fallback_to_local = settings.proxy_fallback_to_local,
+                strict = settings.proxy_strict,
+                "Remote MCP route prefix collision detected; skipping server"
+            );
+            continue;
+        }
         let remote = match FtMcpClient::connect_external(server, settings) {
             Ok(client) => client,
             Err(err) => {
@@ -226,6 +245,10 @@ pub(super) fn compose_proxy_tools(
     }
 
     Ok(builder)
+}
+
+fn insert_route_prefix(used_route_prefixes: &mut HashSet<String>, route_prefix: &str) -> bool {
+    used_route_prefixes.insert(route_prefix.to_ascii_lowercase())
 }
 
 fn list_remote_tools(
@@ -552,6 +575,13 @@ mod tests {
         let filtered = filter_remote_tools(&settings, vec![safe, destructive]);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "safe");
+    }
+
+    #[test]
+    fn insert_route_prefix_detects_case_insensitive_collisions() {
+        let mut used = HashSet::new();
+        assert!(insert_route_prefix(&mut used, "remote/github-copilot"));
+        assert!(!insert_route_prefix(&mut used, "REMOTE/GitHub-Copilot"));
     }
 
     #[test]
