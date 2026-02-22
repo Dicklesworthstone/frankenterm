@@ -420,9 +420,11 @@ impl<T: Clone + Eq> LwwRegister<T> {
 
     /// Set a new value with a timestamp. Only takes effect if the timestamp
     /// is greater than (or equal with higher replica ID) the current one.
+    ///
+    /// Tiebreaker matches [`merge`]: lexicographically greater writer ID wins.
     pub fn set(&mut self, value: T, timestamp: u64) {
         if timestamp > self.timestamp
-            || (timestamp == self.timestamp && self.replica_id >= self.writer_id)
+            || (timestamp == self.timestamp && self.replica_id > self.writer_id)
         {
             self.value = value;
             self.timestamp = timestamp;

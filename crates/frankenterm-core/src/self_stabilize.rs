@@ -158,9 +158,13 @@ impl ReconcileSession {
     }
 
     /// Start the protocol by producing the initial message.
+    ///
+    /// Resets all session state so the session can be reused across
+    /// reconnections without stale peer hashes.
     pub fn start(&mut self) -> ReconcileMessage {
         self.phase = Phase::Init;
         self.rounds = 0;
+        self.peer_root = None;
         ReconcileMessage::RootHash(self.local.root_hash())
     }
 
@@ -196,24 +200,12 @@ impl ReconcileSession {
             return RoundResult::AlreadyConverged;
         }
 
-        // States differ — start narrowing
-        if self.is_authority {
-            // Authority side: compute and send diff directly
-            // (We'll need the peer's tree to diff, but we can send level hashes
-            // to help the peer identify divergent entries)
-            self.phase = Phase::Narrowing { depth: 1 };
-            RoundResult::SendMessage(ReconcileMessage::LevelHashes {
-                depth: 1,
-                hashes: self.local.level_hashes(1),
-            })
-        } else {
-            // Non-authority: also send level hashes for comparison
-            self.phase = Phase::Narrowing { depth: 1 };
-            RoundResult::SendMessage(ReconcileMessage::LevelHashes {
-                depth: 1,
-                hashes: self.local.level_hashes(1),
-            })
-        }
+        // States differ — both sides send level hashes for narrowing
+        self.phase = Phase::Narrowing { depth: 1 };
+        RoundResult::SendMessage(ReconcileMessage::LevelHashes {
+            depth: 1,
+            hashes: self.local.level_hashes(1),
+        })
     }
 
     fn handle_level_hashes(&mut self, depth: usize, peer_hashes: &[MerkleHash]) -> RoundResult {
@@ -318,17 +310,45 @@ impl ReconcileSession {
                 RoundResult::SendMessage(ReconcileMessage::Patch(patches))
             }
         } else {
-            // Non-authority received corrections — apply them.
-            // None values are removal markers from the authority.
-            let mut tree = self.local.clone();
-            for (key, value) in entries {
-                if let Some(val) = value {
-                    tree.insert(key.clone(), val.clone());
-                } else {
+            // Non-authority received patch from authority.
+            let has_removals = entries.iter().any(|(_, v)| v.is_none());
+
+            if has_removals {
+                // Incremental corrections with explicit None removal markers.
+                let mut tree = self.local.clone();
+                for (key, value) in entries {
+                    if let Some(val) = value {
+                        tree.insert(key.clone(), val.clone());
+                    } else {
+                        tree.remove(key);
+                    }
+                }
+                self.local = tree;
+            } else {
+                // Full-state dump from authority (all entries are Some).
+                // Build the authority tree and diff to find surplus local keys
+                // that need removal.
+                let authority_tree = MerkleTree::from_entries(
+                    entries
+                        .iter()
+                        .filter_map(|(k, v)| v.as_ref().map(|val| (k.clone(), val.clone()))),
+                );
+                let diff = self.local.diff(&authority_tree);
+
+                let mut tree = self.local.clone();
+                // Apply authority entries (adds + updates)
+                for (key, value) in entries {
+                    if let Some(val) = value {
+                        tree.insert(key.clone(), val.clone());
+                    }
+                }
+                // Remove surplus local keys not in authority
+                for key in &diff.removed {
                     tree.remove(key);
                 }
+                self.local = tree;
             }
-            self.local = tree;
+
             self.phase = Phase::Converged;
             RoundResult::ApplyPatch(entries.to_vec())
         }

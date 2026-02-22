@@ -783,7 +783,18 @@ impl<T: Clone> VersionedStore<T> {
     }
 
     /// Push a new version.
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts that `timestamp_ms` is monotonically non-decreasing
+    /// (required by [`at_timestamp`] binary search).
     pub fn push(&mut self, state: T, timestamp_ms: u64) {
+        debug_assert!(
+            self.versions
+                .last()
+                .map_or(true, |(ts, _)| timestamp_ms >= *ts),
+            "VersionedStore::push requires monotonically non-decreasing timestamps"
+        );
         self.versions.push((timestamp_ms, state));
         self.current = self.versions.len() - 1;
     }
