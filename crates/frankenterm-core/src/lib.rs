@@ -57,6 +57,10 @@ pub mod auto_tune;
 pub mod backpressure;
 pub mod backpressure_severity;
 pub mod backup;
+#[cfg(feature = "subprocess-bridge")]
+pub mod beads_bridge;
+#[cfg(feature = "subprocess-bridge")]
+pub mod beads_types;
 pub mod bayesian_ledger;
 pub mod binomial_heap;
 pub mod bloom_filter;
