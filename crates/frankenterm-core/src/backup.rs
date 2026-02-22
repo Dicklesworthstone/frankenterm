@@ -885,7 +885,13 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
                 .map(|i| row_stmt.column_name(i).unwrap_or("?").to_string())
                 .collect();
 
-            let mut rows = row_stmt.query([]).unwrap();
+            let mut rows = match row_stmt.query([]) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(table = %name, error = %e, "Failed to query table for SQL dump");
+                    continue;
+                }
+            };
             while let Ok(Some(row)) = rows.next() {
                 let values: Vec<String> = (0..col_count)
                     .map(|i| match row.get_ref(i) {
