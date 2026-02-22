@@ -232,6 +232,7 @@ pub mod session_topology;
 pub mod setup;
 pub mod sharded_counter;
 pub mod sharding;
+pub mod shortest_path;
 pub mod simd_scan;
 pub mod skip_list;
 pub mod sliding_window;
