@@ -264,6 +264,7 @@ pub mod telemetry;
 pub mod test_artifacts;
 pub mod time_series;
 pub mod token_bucket;
+pub mod topological_sort;
 pub mod treap;
 pub mod trie;
 pub mod undo;
