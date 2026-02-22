@@ -2625,7 +2625,7 @@ mod tests {
     async fn select_first_branch_ready() {
         let result = select! {
             val = async { 1 } => val,
-            _ = sleep(Duration::from_secs(10)) => 0,
+            () = sleep(Duration::from_secs(10)) => 0,
         };
         assert_eq!(result, 1);
     }
@@ -2778,7 +2778,7 @@ mod tests {
 
         // Spawn a task that waits for the signal.
         let handle = task::spawn(async move {
-            if let Some(()) = sig.recv().await {
+            if sig.recv().await == Some(()) {
                 received_clone.store(true, Ordering::SeqCst);
             }
         });

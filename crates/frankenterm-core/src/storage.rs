@@ -9003,13 +9003,12 @@ fn record_gap_sync(conn: &Connection, pane_id: u64, reason: &str) -> Result<Opti
 
 /// Record an event (synchronous)
 fn record_event_sync(conn: &Connection, event: &StoredEvent) -> Result<i64> {
-    let extracted_json = event
-        .extracted
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_else(|e| {
+    let extracted_json = event.extracted.as_ref().map(|v| {
+        serde_json::to_string(v).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "event extracted field serialization failed");
             String::new()
-        }));
+        })
+    });
 
     let pane_id_i64 = u64_to_i64(event.pane_id, "pane_id")?;
 
@@ -9434,27 +9433,24 @@ fn upsert_pane_sync(conn: &Connection, pane: &PaneRecord) -> Result<()> {
 
 /// Upsert workflow execution (synchronous)
 fn upsert_workflow_sync(conn: &Connection, workflow: &WorkflowRecord) -> Result<()> {
-    let wait_condition_json = workflow
-        .wait_condition
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_else(|e| {
+    let wait_condition_json = workflow.wait_condition.as_ref().map(|v| {
+        serde_json::to_string(v).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "workflow wait_condition serialization failed");
             String::new()
-        }));
-    let context_json = workflow
-        .context
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_else(|e| {
+        })
+    });
+    let context_json = workflow.context.as_ref().map(|v| {
+        serde_json::to_string(v).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "workflow context serialization failed");
             String::new()
-        }));
-    let result_json = workflow
-        .result
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_else(|e| {
+        })
+    });
+    let result_json = workflow.result.as_ref().map(|v| {
+        serde_json::to_string(v).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "workflow result serialization failed");
             String::new()
-        }));
+        })
+    });
 
     let pane_id_i64 = u64_to_i64(workflow.pane_id, "pane_id")?;
     let current_step_i64 = usize_to_i64(workflow.current_step, "current_step")?;
@@ -9571,12 +9567,13 @@ fn insert_step_log_sync(
 /// Returns the session ID.
 fn upsert_agent_session_sync(conn: &Connection, session: &AgentSessionRecord) -> Result<i64> {
     let pane_id_i64 = u64_to_i64(session.pane_id, "pane_id")?;
-    let external_meta_json = session
-        .external_meta
-        .as_ref()
-        .and_then(|value| serde_json::to_string(value)
-            .inspect_err(|e| tracing::warn!(error = %e, "agent session external_meta serialization failed"))
-            .ok());
+    let external_meta_json = session.external_meta.as_ref().and_then(|value| {
+        serde_json::to_string(value)
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "agent session external_meta serialization failed"),
+            )
+            .ok()
+    });
 
     if session.id == 0 {
         // Insert new session

@@ -531,10 +531,10 @@ fn frame_to_sse(event_type: &'static str, seq: u64, frame: serde_json::Value) ->
         .inspect_err(|e| tracing::warn!(error = %e, event_type, "SSE frame serialization failed"))
         .ok()
         .map(|body| {
-        SseEvent::new(body)
-            .event_type(event_type)
-            .id(seq.to_string())
-    })
+            SseEvent::new(body)
+                .event_type(event_type)
+                .id(seq.to_string())
+        })
 }
 
 async fn send_rate_limited_sse(

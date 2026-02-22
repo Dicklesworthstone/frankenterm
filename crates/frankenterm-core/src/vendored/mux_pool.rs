@@ -432,7 +432,7 @@ impl MuxPool {
 mod tests {
     use super::*;
     use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
-    use crate::runtime_compat::{task, timeout};
+    use crate::runtime_compat::{CompatRuntime, task, timeout};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;

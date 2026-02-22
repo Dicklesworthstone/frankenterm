@@ -8,10 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::runtime_compat::CompatRuntime;
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::runtime_compat::mpsc;
 use crate::runtime_compat::notify::Notify;
+#[cfg(not(feature = "asupersync-runtime"))]
+use crate::runtime_compat::{CompatRuntime, mpsc};
 use frankensearch::{Cx, ScoredResult, SearchError, SearchPhase, TwoTierMetrics, TwoTierSearcher};
 use thiserror::Error;
 
