@@ -1018,6 +1018,24 @@ pub trait RecorderEventReader: Send + Sync {
         })
     }
 
+    /// Open a cursor positioned at the first event with ordinal >= `target_ordinal`.
+    ///
+    /// Backends may override for efficient seek. The default opens from start
+    /// and scans forward, yielding the target event on the first `next_batch`.
+    fn open_cursor_at_ordinal(
+        &self,
+        target_ordinal: u64,
+    ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+        // Default: use open_cursor with a synthetic offset. Backends that
+        // support ordinal-based seeking (like AppendLogEventSource) should
+        // override this for efficiency.
+        self.open_cursor(RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: target_ordinal,
+        })
+    }
+
     /// Return the current head offset (the next offset that would be written).
     fn head_offset(&self) -> std::result::Result<RecorderOffset, EventCursorError>;
 }

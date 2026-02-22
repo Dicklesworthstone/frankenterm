@@ -68,7 +68,9 @@ fn reindex_config(
     max_batches: usize,
 ) -> ReindexConfig {
     ReindexConfig {
-        data_path: path.join("events.log"),
+        source: RecorderSourceDescriptor::AppendLog {
+            data_path: path.join("events.log"),
+        },
         consumer_id: consumer_id.to_string(),
         batch_size,
         dedup_on_replay: true,
@@ -353,7 +355,9 @@ async fn recovery_drill_reindex_resume_integrity_consistent() {
 
     let lookup = DrillLookup::from_docs(&combined_docs);
     let integrity_cfg = IntegrityCheckConfig {
-        data_path: dir.path().join("events.log"),
+        source: RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        },
         ..IntegrityCheckConfig::default()
     };
     let integrity = IntegrityChecker::check(&lookup, &integrity_cfg).unwrap();

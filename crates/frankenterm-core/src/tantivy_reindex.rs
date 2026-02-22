@@ -14,16 +14,17 @@
 //! All operations use resumable checkpoints with a separate consumer ID
 //! so they don't interfere with the live incremental indexer.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::recorder_storage::{
-    CheckpointConsumerId, RecorderCheckpoint, RecorderOffset, RecorderStorage,
+    CheckpointConsumerId, EventCursorError, RecorderCheckpoint, RecorderEventCursor,
+    RecorderEventReader, RecorderOffset, RecorderSourceDescriptor, RecorderStorage,
 };
 use crate::recording::RECORDER_EVENT_SCHEMA_VERSION_V1;
 use crate::tantivy_ingest::{
-    AppendLogReader, IndexWriteError, IndexWriter, IndexerError, map_event_to_document,
+    AppendLogEventSource, IndexWriteError, IndexWriter, IndexerError, map_event_to_document,
 };
 
 // ---------------------------------------------------------------------------
@@ -35,6 +36,33 @@ pub const REINDEX_CONSUMER_PREFIX: &str = "tantivy-reindex";
 
 /// Default consumer ID prefix for backfill operations.
 pub const BACKFILL_CONSUMER_PREFIX: &str = "tantivy-backfill";
+
+/// Create a [`RecorderEventReader`] from a source descriptor.
+fn create_event_reader(
+    source: &RecorderSourceDescriptor,
+) -> Result<Box<dyn RecorderEventReader>, IndexerError> {
+    match source {
+        RecorderSourceDescriptor::AppendLog { data_path } => {
+            tracing::debug!(
+                reindex_source = %source,
+                "creating append-log event reader for reindex"
+            );
+            Ok(Box::new(AppendLogEventSource::from_path(
+                data_path.clone(),
+            )))
+        }
+        RecorderSourceDescriptor::FrankenSqlite { .. } => Err(IndexerError::Config(
+            "frankensqlite event reader not yet implemented for reindex".to_string(),
+        )),
+    }
+}
+
+/// Convert [`EventCursorError`] to [`IndexerError`].
+fn cursor_err(e: EventCursorError) -> IndexerError {
+    IndexerError::LogRead(crate::tantivy_ingest::LogReadError::Io(
+        std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+    ))
+}
 
 // ---------------------------------------------------------------------------
 // Extended writer trait for reindex operations
@@ -108,8 +136,8 @@ impl BackfillRange {
 /// Configuration for a full reindex operation.
 #[derive(Debug, Clone)]
 pub struct ReindexConfig {
-    /// Path to the append-log data file.
-    pub data_path: PathBuf,
+    /// Backend-neutral source descriptor.
+    pub source: RecorderSourceDescriptor,
     /// Consumer ID for reindex checkpoint tracking.
     pub consumer_id: String,
     /// Maximum events per batch before committing.
@@ -127,7 +155,9 @@ pub struct ReindexConfig {
 impl Default for ReindexConfig {
     fn default() -> Self {
         Self {
-            data_path: PathBuf::from(".ft/recorder-log/events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: PathBuf::from(".ft/recorder-log/events.log"),
+            },
             consumer_id: format!("{REINDEX_CONSUMER_PREFIX}-default"),
             batch_size: 1024,
             dedup_on_replay: true,
@@ -141,8 +171,8 @@ impl Default for ReindexConfig {
 /// Configuration for a partial backfill operation.
 #[derive(Debug, Clone)]
 pub struct BackfillConfig {
-    /// Path to the append-log data file.
-    pub data_path: PathBuf,
+    /// Backend-neutral source descriptor.
+    pub source: RecorderSourceDescriptor,
     /// Consumer ID for backfill checkpoint tracking.
     pub consumer_id: String,
     /// Maximum events per batch before committing.
@@ -160,7 +190,9 @@ pub struct BackfillConfig {
 impl Default for BackfillConfig {
     fn default() -> Self {
         Self {
-            data_path: PathBuf::from(".ft/recorder-log/events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: PathBuf::from(".ft/recorder-log/events.log"),
+            },
             consumer_id: format!("{BACKFILL_CONSUMER_PREFIX}-default"),
             batch_size: 1024,
             range: BackfillRange::All,
@@ -243,6 +275,7 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
         if config.batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
         }
+        let event_reader = create_event_reader(&config.source)?;
 
         let mut progress = ReindexProgress::new();
         let consumer_id = CheckpointConsumerId(config.consumer_id.clone());
@@ -260,24 +293,22 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
         // Read checkpoint for resume
         let checkpoint = storage.read_checkpoint(&consumer_id).await?;
 
-        let mut reader = match &checkpoint {
+        let mut cursor = match &checkpoint {
             Some(cp) => {
-                let mut r = AppendLogReader::open_at_offset(
-                    &config.data_path,
-                    cp.upto_offset.byte_offset,
-                    cp.upto_offset.ordinal,
-                )?;
+                let mut c = event_reader
+                    .open_cursor(cp.upto_offset.clone())
+                    .map_err(cursor_err)?;
                 // Skip past the checkpointed record
-                let _ = r.next_record()?;
+                let _ = c.next_batch(1).map_err(cursor_err)?;
                 progress.current_ordinal = Some(cp.upto_offset.ordinal);
-                r
+                c
             }
-            None => AppendLogReader::open(&config.data_path)?,
+            None => event_reader.open_cursor_from_start().map_err(cursor_err)?,
         };
 
         self.index_loop(
             storage,
-            &mut reader,
+            &mut *cursor,
             &consumer_id,
             &BackfillRange::All,
             config.batch_size,
@@ -320,41 +351,42 @@ impl<W: IndexWriter> ReindexPipeline<W> {
         if config.batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
         }
+        let event_reader = create_event_reader(&config.source)?;
 
         let mut progress = ReindexProgress::new();
         let consumer_id = CheckpointConsumerId(config.consumer_id.clone());
 
-        // For ordinal ranges, we can start scanning from the range start
         let checkpoint = storage.read_checkpoint(&consumer_id).await?;
 
-        let mut reader = match &checkpoint {
+        let mut cursor = match &checkpoint {
             Some(cp) => {
-                let mut r = AppendLogReader::open_at_offset(
-                    &config.data_path,
-                    cp.upto_offset.byte_offset,
-                    cp.upto_offset.ordinal,
-                )?;
-                let _ = r.next_record()?;
+                let mut c = event_reader
+                    .open_cursor(cp.upto_offset.clone())
+                    .map_err(cursor_err)?;
+                let _ = c.next_batch(1).map_err(cursor_err)?;
                 progress.current_ordinal = Some(cp.upto_offset.ordinal);
-                r
+                c
             }
             None => {
-                // For ordinal ranges, skip ahead to the start
+                // For ordinal ranges, seek to the range start to avoid
+                // wasting batches on events before the range.
                 if let BackfillRange::OrdinalRange { start, .. } = &config.range {
                     if *start > 0 {
-                        AppendLogReader::open_at_ordinal(&config.data_path, *start)?
+                        event_reader
+                            .open_cursor_at_ordinal(*start)
+                            .map_err(cursor_err)?
                     } else {
-                        AppendLogReader::open(&config.data_path)?
+                        event_reader.open_cursor_from_start().map_err(cursor_err)?
                     }
                 } else {
-                    AppendLogReader::open(&config.data_path)?
+                    event_reader.open_cursor_from_start().map_err(cursor_err)?
                 }
             }
         };
 
         self.index_loop(
             storage,
-            &mut reader,
+            &mut *cursor,
             &consumer_id,
             &config.range,
             config.batch_size,
@@ -378,7 +410,7 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     async fn index_loop<S: RecorderStorage>(
         &mut self,
         storage: &S,
-        reader: &mut AppendLogReader,
+        cursor: &mut dyn RecorderEventCursor,
         consumer_id: &CheckpointConsumerId,
         range: &BackfillRange,
         batch_size: usize,
@@ -392,7 +424,7 @@ impl<W: IndexWriter> ReindexPipeline<W> {
                 break;
             }
 
-            let batch = reader.read_batch(batch_size)?;
+            let batch = cursor.next_batch(batch_size).map_err(cursor_err)?;
             if batch.is_empty() {
                 progress.caught_up = true;
                 break;
@@ -400,7 +432,7 @@ impl<W: IndexWriter> ReindexPipeline<W> {
 
             let is_final_batch = batch.len() < batch_size;
             let mut last_offset: Option<RecorderOffset> = None;
-            let mut indexed_in_batch = 0u64;
+            let mut index_mutations_in_batch = 0u64;
 
             for record in &batch {
                 progress.events_read += 1;
@@ -432,13 +464,16 @@ impl<W: IndexWriter> ReindexPipeline<W> {
 
                 // Dedup
                 if dedup_on_replay {
-                    let _ = self.writer.delete_by_event_id(&doc.event_id);
+                    self.writer
+                        .delete_by_event_id(&doc.event_id)
+                        .map_err(IndexerError::IndexWrite)?;
+                    index_mutations_in_batch += 1;
                 }
 
                 match self.writer.add_document(&doc) {
                     Ok(()) => {
                         progress.events_indexed += 1;
-                        indexed_in_batch += 1;
+                        index_mutations_in_batch += 1;
                     }
                     Err(IndexWriteError::Rejected { .. }) => {
                         progress.events_skipped += 1;
@@ -451,7 +486,8 @@ impl<W: IndexWriter> ReindexPipeline<W> {
 
             // Only commit if we indexed or filtered something
             if let Some(offset) = last_offset {
-                if indexed_in_batch > 0 || progress.events_filtered > 0 {
+                // Checkpoint advancement must be coupled to committed index mutations.
+                if index_mutations_in_batch > 0 {
                     self.writer.commit().map_err(IndexerError::IndexWrite)?;
                 }
 
@@ -521,8 +557,8 @@ pub struct CheckedRange {
 /// Configuration for an integrity check.
 #[derive(Debug, Clone)]
 pub struct IntegrityCheckConfig {
-    /// Path to the append-log data file.
-    pub data_path: PathBuf,
+    /// Backend-neutral source descriptor.
+    pub source: RecorderSourceDescriptor,
     /// Range of ordinals to check (None = all).
     pub ordinal_range: Option<(u64, u64)>,
     /// Maximum events to check (0 = unlimited).
@@ -534,7 +570,9 @@ pub struct IntegrityCheckConfig {
 impl Default for IntegrityCheckConfig {
     fn default() -> Self {
         Self {
-            data_path: PathBuf::from(".ft/recorder-log/events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: PathBuf::from(".ft/recorder-log/events.log"),
+            },
             ordinal_range: None,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -548,20 +586,23 @@ pub struct IntegrityChecker;
 impl IntegrityChecker {
     /// Run an integrity check over the specified range.
     ///
-    /// Scans the append log and for each event, checks that:
+    /// Scans the event source and for each event, checks that:
     /// 1. A document with the event's `event_id` exists in the index.
     /// 2. The stored `log_offset` matches the event's actual ordinal.
     pub fn check<L: IndexLookup>(
         lookup: &L,
         config: &IntegrityCheckConfig,
     ) -> Result<IntegrityReport, IndexerError> {
-        let mut reader = match config.ordinal_range {
-            Some((start, _)) if start > 0 => {
-                AppendLogReader::open_at_ordinal(&config.data_path, start)?
-            }
-            _ => AppendLogReader::open(&config.data_path)?,
+        let event_reader = create_event_reader(&config.source)?;
+
+        let mut cursor = match config.ordinal_range {
+            Some((start, _)) if start > 0 => event_reader
+                .open_cursor_at_ordinal(start)
+                .map_err(cursor_err)?,
+            _ => event_reader.open_cursor_from_start().map_err(cursor_err)?,
         };
 
+        let start_ordinal = config.ordinal_range.map(|(s, _)| s);
         let end_ordinal = config.ordinal_range.map(|(_, end)| end);
 
         let mut report = IntegrityReport {
@@ -588,12 +629,20 @@ impl IntegrityChecker {
                 break;
             }
 
-            let record = match reader.next_record()? {
+            let batch = cursor.next_batch(1).map_err(cursor_err)?;
+            let record = match batch.into_iter().next() {
                 Some(r) => r,
                 None => break,
             };
 
             let ordinal = record.offset.ordinal;
+
+            // Before start of range — skip
+            if let Some(start) = start_ordinal {
+                if ordinal < start {
+                    continue;
+                }
+            }
 
             // Past end of range
             if let Some(end) = end_ordinal {
@@ -676,7 +725,6 @@ mod tests {
     };
     use crate::tantivy_ingest::{IndexCommitStats, IndexDocumentFields};
     use std::collections::HashMap;
-    use std::path::Path;
     use tempfile::tempdir;
 
     // -- test helpers --
@@ -753,6 +801,7 @@ mod tests {
         cleared: bool,
         clear_count: u64,
         reject_ids: Vec<String>,
+        fail_delete_ids: Vec<String>,
         fail_commit: bool,
     }
 
@@ -765,6 +814,7 @@ mod tests {
                 cleared: false,
                 clear_count: 0,
                 reject_ids: Vec::new(),
+                fail_delete_ids: Vec::new(),
                 fail_commit: false,
             }
         }
@@ -796,6 +846,11 @@ mod tests {
         }
 
         fn delete_by_event_id(&mut self, event_id: &str) -> Result<(), IndexWriteError> {
+            if self.fail_delete_ids.iter().any(|id| id == event_id) {
+                return Err(IndexWriteError::Rejected {
+                    reason: "delete-fail".to_string(),
+                });
+            }
             self.deleted_ids.push(event_id.to_string());
             Ok(())
         }
@@ -935,7 +990,9 @@ mod tests {
         populate_log(&storage, events).await;
 
         let config = ReindexConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "reindex-test".to_string(),
             batch_size: 10,
             dedup_on_replay: true,
@@ -968,7 +1025,9 @@ mod tests {
         populate_log(&storage, events).await;
 
         let config = ReindexConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "resume-reindex".to_string(),
             batch_size: 3,
             dedup_on_replay: true,
@@ -1001,7 +1060,9 @@ mod tests {
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
         let config = ReindexConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "empty-reindex".to_string(),
             batch_size: 10,
             clear_before_start: true,
@@ -1025,7 +1086,9 @@ mod tests {
         populate_log(&storage, vec![sample_event("e1", 1, 0, "text")]).await;
 
         let config = ReindexConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "no-clear".to_string(),
             batch_size: 10,
             clear_before_start: false,
@@ -1047,7 +1110,9 @@ mod tests {
         let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
         let config = ReindexConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             batch_size: 0,
             ..ReindexConfig::default()
         };
@@ -1073,7 +1138,9 @@ mod tests {
         populate_log(&storage, events).await;
 
         let config = BackfillConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "backfill-ord".to_string(),
             batch_size: 20,
             range: BackfillRange::OrdinalRange { start: 3, end: 6 },
@@ -1109,7 +1176,9 @@ mod tests {
         populate_log(&storage, events).await;
 
         let config = BackfillConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "backfill-resume".to_string(),
             batch_size: 2,
             range: BackfillRange::OrdinalRange { start: 2, end: 7 },
@@ -1165,7 +1234,9 @@ mod tests {
         populate_log(&storage, events).await;
 
         let config = BackfillConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "backfill-time".to_string(),
             batch_size: 20,
             range: BackfillRange::TimeRange {
@@ -1204,7 +1275,9 @@ mod tests {
         populate_log(&storage, events).await;
 
         let config = BackfillConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "backfill-all".to_string(),
             batch_size: 20,
             range: BackfillRange::All,
@@ -1233,7 +1306,9 @@ mod tests {
         populate_log(&storage, vec![bad, good]).await;
 
         let config = BackfillConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "backfill-schema".to_string(),
             batch_size: 20,
             range: BackfillRange::All,
@@ -1266,7 +1341,9 @@ mod tests {
         .await;
 
         let config = BackfillConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "backfill-reject".to_string(),
             batch_size: 20,
             range: BackfillRange::All,
@@ -1285,13 +1362,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backfill_dedup_rejected_docs_commit_delete_mutations() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        populate_log(
+            &storage,
+            vec![
+                sample_event("e1", 1, 0, "reject-a"),
+                sample_event("e2", 1, 1, "reject-b"),
+            ],
+        )
+        .await;
+
+        let config = BackfillConfig {
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
+            consumer_id: "backfill-dedup-reject".to_string(),
+            batch_size: 20,
+            range: BackfillRange::All,
+            dedup_on_replay: true,
+            expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            max_batches: 0,
+        };
+
+        let mut writer = MockReindexWriter::new();
+        writer.reject_ids = vec!["e1".to_string(), "e2".to_string()];
+
+        let mut pipeline = ReindexPipeline::new_for_backfill(writer);
+        let progress = pipeline.backfill(&storage, &config).await.unwrap();
+
+        assert_eq!(progress.events_indexed, 0);
+        assert_eq!(progress.events_skipped, 2);
+        assert_eq!(pipeline.backfill_writer().deleted_ids.len(), 2);
+        // Dedup deletes are index mutations and must be committed before checkpoint advance.
+        assert_eq!(pipeline.backfill_writer().commits, 1);
+    }
+
+    #[tokio::test]
     async fn backfill_batch_size_zero_errors() {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
         let config = BackfillConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             batch_size: 0,
             ..BackfillConfig::default()
         };
@@ -1325,7 +1444,9 @@ mod tests {
         let lookup = MockIndexLookup::from_docs(&docs);
 
         let config = IntegrityCheckConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             ordinal_range: None,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -1361,7 +1482,9 @@ mod tests {
         let lookup = MockIndexLookup::from_docs(&docs);
 
         let config = IntegrityCheckConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             ordinal_range: None,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -1393,7 +1516,9 @@ mod tests {
         lookup.total = 3;
 
         let config = IntegrityCheckConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             ordinal_range: None,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -1426,7 +1551,9 @@ mod tests {
         lookup.total = 4;
 
         let config = IntegrityCheckConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             ordinal_range: Some((3, 6)),
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -1457,7 +1584,9 @@ mod tests {
         let lookup = MockIndexLookup::from_docs(&docs);
 
         let config = IntegrityCheckConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             ordinal_range: None,
             max_events: 3,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -1477,7 +1606,9 @@ mod tests {
         let lookup = MockIndexLookup::new();
 
         let config = IntegrityCheckConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             ordinal_range: None,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -1505,7 +1636,9 @@ mod tests {
         lookup.total = 1;
 
         let config = IntegrityCheckConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             ordinal_range: None,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -1908,7 +2041,9 @@ mod tests {
 
         // Reindex all
         let config = ReindexConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "verify-test".to_string(),
             batch_size: 20,
             dedup_on_replay: false,
@@ -1926,7 +2061,9 @@ mod tests {
 
         // Verify consistency
         let check_config = IntegrityCheckConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             ordinal_range: None,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -1955,7 +2092,9 @@ mod tests {
         .await;
 
         let config = ReindexConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "dedup-test".to_string(),
             batch_size: 10,
             dedup_on_replay: true,
@@ -1991,7 +2130,9 @@ mod tests {
         .await;
 
         let config = ReindexConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "nodedup-test".to_string(),
             batch_size: 10,
             dedup_on_replay: false,
@@ -2009,6 +2150,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reindex_dedup_delete_failure_propagates() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        populate_log(&storage, vec![sample_event("e0", 1, 0, "text")]).await;
+
+        let config = ReindexConfig {
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
+            consumer_id: "fail-delete".to_string(),
+            batch_size: 10,
+            dedup_on_replay: true,
+            clear_before_start: false,
+            max_batches: 0,
+            expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+        };
+
+        let mut writer = MockReindexWriter::new();
+        writer.fail_delete_ids = vec!["e0".to_string()];
+        let mut pipeline = ReindexPipeline::new(writer);
+
+        let err = pipeline.full_reindex(&storage, &config).await.unwrap_err();
+        assert!(matches!(err, IndexerError::IndexWrite(_)));
+    }
+
+    #[tokio::test]
     async fn reindex_commit_failure_propagates() {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
@@ -2017,7 +2186,9 @@ mod tests {
         populate_log(&storage, vec![sample_event("e0", 1, 0, "text")]).await;
 
         let config = ReindexConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "fail-commit".to_string(),
             batch_size: 10,
             dedup_on_replay: false,
@@ -2042,7 +2213,9 @@ mod tests {
         populate_log(&storage, vec![sample_event("e0", 1, 0, "text")]).await;
 
         let config = BackfillConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "fail-commit-bf".to_string(),
             batch_size: 10,
             range: BackfillRange::All,
@@ -2096,7 +2269,9 @@ mod tests {
 
         // batch_size=3 means 4 batches (3+3+3+1)
         let config = ReindexConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "multi-batch".to_string(),
             batch_size: 3,
             dedup_on_replay: false,
@@ -2137,7 +2312,9 @@ mod tests {
         lookup.total = 3;
 
         let config = IntegrityCheckConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             ordinal_range: None,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -2218,7 +2395,9 @@ mod tests {
 
         // Backfill ordinals 3-7 only
         let config = BackfillConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "partial-verify".to_string(),
             batch_size: 20,
             range: BackfillRange::OrdinalRange { start: 3, end: 7 },
@@ -2235,7 +2414,9 @@ mod tests {
 
         // Check only the backfilled range — should be consistent
         let check_config = IntegrityCheckConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             ordinal_range: Some((3, 7)),
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -2247,7 +2428,9 @@ mod tests {
 
         // Check full range — should show gaps
         let full_check = IntegrityCheckConfig {
-            data_path: dir.path().join("events.log"),
+            source: RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             ordinal_range: None,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),

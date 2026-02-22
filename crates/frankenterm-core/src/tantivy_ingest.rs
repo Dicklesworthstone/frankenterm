@@ -544,6 +544,19 @@ impl crate::recorder_storage::RecorderEventReader for AppendLogEventSource {
         Ok(Box::new(AppendLogCursor { reader }))
     }
 
+    fn open_cursor_at_ordinal(
+        &self,
+        target_ordinal: u64,
+    ) -> std::result::Result<
+        Box<dyn crate::recorder_storage::RecorderEventCursor>,
+        crate::recorder_storage::EventCursorError,
+    > {
+        use crate::recorder_storage::EventCursorError;
+        let reader = AppendLogReader::open_at_ordinal(&self.data_path, target_ordinal)
+            .map_err(|e| EventCursorError::Io(e.to_string()))?;
+        Ok(Box::new(AppendLogCursor { reader }))
+    }
+
     fn head_offset(
         &self,
     ) -> std::result::Result<RecorderOffset, crate::recorder_storage::EventCursorError> {
@@ -964,8 +977,6 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
         storage: &S,
         reader: &dyn crate::recorder_storage::RecorderEventReader,
     ) -> Result<IndexerRunResult, IndexerError> {
-        use crate::recorder_storage::EventCursorError;
-
         if self.config.batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
         }
@@ -1171,6 +1182,7 @@ mod tests {
     use super::*;
     use crate::recorder_storage::{
         AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
+        RecorderEventReader,
     };
     use crate::recording::{
         RecorderControlMarkerType, RecorderEventCausality, RecorderEventPayload,
@@ -3573,7 +3585,8 @@ mod tests {
         };
         let mut indexer1 = IncrementalIndexer::new(icfg1, writer1);
         let _ = indexer1.run(&storage).await.unwrap();
-        let docs1 = indexer1.into_writer().written_docs();
+        let w1 = indexer1.into_writer();
+        let docs1 = w1.written_docs();
 
         // Reader path: capture docs written
         let writer2 = MockIndexWriter::new();
@@ -3583,7 +3596,8 @@ mod tests {
         };
         let mut indexer2 = IncrementalIndexer::new(icfg2, writer2);
         let _ = indexer2.run_with_reader(&storage, &source).await.unwrap();
-        let docs2 = indexer2.into_writer().written_docs();
+        let w2 = indexer2.into_writer();
+        let docs2 = w2.written_docs();
 
         assert_eq!(docs1.len(), docs2.len());
         for (d1, d2) in docs1.iter().zip(docs2.iter()) {
@@ -3591,7 +3605,7 @@ mod tests {
             assert_eq!(d1.pane_id, d2.pane_id);
             assert_eq!(d1.sequence, d2.sequence);
             assert_eq!(d1.schema_version, d2.schema_version);
-            assert_eq!(d1.text_content, d2.text_content);
+            assert_eq!(d1.text, d2.text);
         }
     }
 

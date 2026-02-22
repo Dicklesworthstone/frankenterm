@@ -415,7 +415,9 @@ async fn reindex_produces_queryable_results() {
 
     // Full reindex
     let config = ReindexConfig {
-        data_path: dir.path().join("events.log"),
+        source: RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        },
         consumer_id: "reindex-query-integ".to_string(),
         batch_size: 10,
         dedup_on_replay: true,
@@ -462,7 +464,9 @@ async fn backfill_range_produces_queryable_subset() {
 
     // Backfill only ordinals 3-6
     let config = BackfillConfig {
-        data_path: dir.path().join("events.log"),
+        source: RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        },
         consumer_id: "backfill-query".to_string(),
         batch_size: 20,
         range: BackfillRange::OrdinalRange { start: 3, end: 6 },
@@ -509,7 +513,9 @@ async fn integrity_check_after_full_indexing() {
     // Verify integrity
     let lookup = DocLookup::from_docs(&indexer.writer().docs);
     let check_config = IntegrityCheckConfig {
-        data_path: dir.path().join("events.log"),
+        source: RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        },
         ordinal_range: None,
         max_events: 0,
         expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -536,7 +542,9 @@ async fn integrity_detects_gap_after_partial_backfill() {
 
     // Only backfill ordinals 5-9
     let config = BackfillConfig {
-        data_path: dir.path().join("events.log"),
+        source: RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        },
         consumer_id: "gap-detect".to_string(),
         batch_size: 20,
         range: BackfillRange::OrdinalRange { start: 5, end: 9 },
@@ -552,7 +560,9 @@ async fn integrity_detects_gap_after_partial_backfill() {
 
     // Full check detects the gap
     let check_config = IntegrityCheckConfig {
-        data_path: dir.path().join("events.log"),
+        source: RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        },
         ordinal_range: None,
         max_events: 0,
         expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -1054,7 +1064,9 @@ async fn full_pipeline_reindex_query_quality() {
 
     // Reindex everything
     let config = ReindexConfig {
-        data_path: dir.path().join("events.log"),
+        source: RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        },
         consumer_id: "full-pipeline".to_string(),
         batch_size: 20,
         dedup_on_replay: true,
@@ -1070,7 +1082,9 @@ async fn full_pipeline_reindex_query_quality() {
     // Verify integrity
     let lookup = DocLookup::from_docs(&pipeline.writer().docs);
     let check_config = IntegrityCheckConfig {
-        data_path: dir.path().join("events.log"),
+        source: RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        },
         ordinal_range: None,
         max_events: 0,
         expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -1170,7 +1184,9 @@ async fn incremental_index_plus_backfill_coverage() {
 
     // Backfill the remaining range (6-11)
     let bf_config = BackfillConfig {
-        data_path: dir.path().join("events.log"),
+        source: RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        },
         consumer_id: "merge-backfill".to_string(),
         batch_size: 20,
         range: BackfillRange::OrdinalRange { start: 6, end: 11 },
@@ -1198,7 +1214,9 @@ async fn incremental_index_plus_backfill_coverage() {
     // Integrity check on combined set
     let lookup = DocLookup::from_docs(&all_docs);
     let check = IntegrityCheckConfig {
-        data_path: dir.path().join("events.log"),
+        source: RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        },
         ordinal_range: None,
         max_events: 0,
         expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
