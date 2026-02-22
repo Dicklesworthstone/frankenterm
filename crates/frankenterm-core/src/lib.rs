@@ -261,6 +261,7 @@ pub mod tantivy_query;
 pub mod tantivy_reindex;
 pub mod telemetry;
 pub mod test_artifacts;
+pub mod time_series;
 pub mod token_bucket;
 pub mod treap;
 pub mod trie;
