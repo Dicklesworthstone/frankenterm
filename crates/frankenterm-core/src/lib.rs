@@ -115,6 +115,7 @@ pub mod disk_scoring;
 pub mod docs_gen;
 pub mod drift;
 pub mod dry_run;
+pub mod edit_distance;
 pub mod email_notify;
 pub mod entropy_accounting;
 pub mod entropy_scheduler;
