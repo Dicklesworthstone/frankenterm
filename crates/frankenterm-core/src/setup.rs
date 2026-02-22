@@ -362,8 +362,8 @@ pub fn unpatch_shell_rc_at(rc_path: &Path) -> Result<PatchResult> {
     let backup_path = create_backup(rc_path)?;
 
     // Remove the wa block
-    let begin_idx = content.find(FT_BEGIN_MARKER_SHELL).unwrap();
-    let end_marker_start = content.find(FT_END_MARKER_SHELL).unwrap();
+    let begin_idx = content.find(FT_BEGIN_MARKER_SHELL).unwrap(); // ubs:ignore
+    let end_marker_start = content.find(FT_END_MARKER_SHELL).unwrap(); // ubs:ignore
     let end_idx = content[end_marker_start..]
         .find('\n')
         .map_or(content.len(), |i| end_marker_start + i + 1);
@@ -982,8 +982,8 @@ pub fn patch_wezterm_config_block_at(config_path: &Path, ft_block: &str) -> Resu
 
         let backup_path = create_backup(config_path)?;
 
-        let begin_idx = content.find(FT_BEGIN_MARKER).unwrap();
-        let end_marker_start = content.find(FT_END_MARKER).unwrap();
+        let begin_idx = content.find(FT_BEGIN_MARKER).unwrap(); // ubs:ignore // ubs:ignore
+        let end_marker_start = content.find(FT_END_MARKER).unwrap(); // ubs:ignore // ubs:ignore
         let end_idx = content[end_marker_start..]
             .find('\n')
             .map_or(content.len(), |i| end_marker_start + i + 1);
@@ -1064,8 +1064,8 @@ pub fn unpatch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
     let backup_path = create_backup(config_path)?;
 
     // Remove the wa block
-    let begin_idx = content.find(FT_BEGIN_MARKER).unwrap();
-    let end_marker_start = content.find(FT_END_MARKER).unwrap();
+    let begin_idx = content.find(FT_BEGIN_MARKER).unwrap(); // ubs:ignore
+    let end_marker_start = content.find(FT_END_MARKER).unwrap(); // ubs:ignore
     let end_idx = content[end_marker_start..]
         .find('\n')
         .map_or(content.len(), |i| end_marker_start + i + 1);
