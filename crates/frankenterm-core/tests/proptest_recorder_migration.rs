@@ -202,20 +202,15 @@ proptest! {
         prop_assert_eq!(d1, d2);
     }
 
-    // 7. FNV-1a: different ordinal sequences usually produce different digests
+    // 7. FNV-1a: different ordinal sequences produce different digests
     #[test]
-    fn fnv1a_collision_resistant(a in arb_ordinal_seq(20), b in arb_ordinal_seq(20)) {
+    fn fnv1a_different_inputs_differ(a in arb_ordinal_seq(20), b in arb_ordinal_seq(20)) {
         prop_assume!(a != b);
-        // Not guaranteed, but for random data collisions are astronomically rare.
-        // If this ever fails, it found a genuine hash collision — increase cases.
         let da = compute_digest(&a);
         let db = compute_digest(&b);
-        // We allow collisions but track them: if both match, that's notable.
-        // Instead of hard-failing on collision, just check determinism.
-        let da2 = compute_digest(&a);
-        prop_assert_eq!(da, da2);
-        let db2 = compute_digest(&b);
-        prop_assert_eq!(db, db2);
+        // With 64-bit hash and random u64 inputs, collision probability is ~2^-64
+        // per pair — effectively zero across 200 test cases.
+        prop_assert_ne!(da, db);
     }
 
     // 8. FNV-1a: order matters
@@ -235,11 +230,11 @@ proptest! {
 
     // 10. FNV-1a: single value shifts away from basis
     #[test]
-    fn fnv1a_single_shifts(ordinal in any::<u64>()) {
+    fn fnv1a_single_differs_from_basis(ordinal in any::<u64>()) {
         let d = compute_digest(&[ordinal]);
-        // After 8 byte XOR+multiply rounds, result differs from basis
-        // (unless ordinal is specifically constructed to cancel out — astronomically unlikely)
-        let _d = d; // always runs without panic
+        // fnv1a_feed is a bijection on u64, so exactly one x out of 2^64 maps
+        // back to BASIS. Probability of proptest hitting it: ~5e-20. Safe to assert.
+        prop_assert_ne!(d, FNV1A_OFFSET_BASIS);
     }
 
     // 11. FNV-1a: appending extends the digest
@@ -393,13 +388,30 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
-    // 22. Reset consumers count matches reset_consumers length
+    // 22. CheckpointSyncResult: migrated + reset consumers <= found
     #[test]
-    fn sync_result_reset_count_matches(result in arb_checkpoint_sync_result()) {
-        // The Vec may have any length independent of checkpoints_reset (strategy is independent)
-        // but after real migration, these should match — test clone/serde consistency
-        let cloned = result.clone();
-        prop_assert_eq!(result.reset_consumers.len(), cloned.reset_consumers.len());
+    fn sync_result_migrated_plus_reset_bounded(
+        found in 0..20usize,
+        migrated_frac in 0..100usize,
+        reset_frac in 0..100usize,
+    ) {
+        // In real M3, migrated + reset <= found (some consumers may have no checkpoint).
+        // Verify the invariant holds when we construct valid results.
+        let migrated = (migrated_frac * found) / 100;
+        let reset = ((reset_frac * found) / 100).min(found - migrated);
+        let reset_consumers: Vec<String> = (0..reset).map(|i| format!("c{i}")).collect();
+        let result = CheckpointSyncResult {
+            consumers_found: found,
+            checkpoints_migrated: migrated,
+            checkpoints_reset: reset,
+            reset_consumers,
+        };
+        prop_assert!(
+            result.checkpoints_migrated + result.checkpoints_reset <= result.consumers_found,
+            "migrated({}) + reset({}) > found({})",
+            result.checkpoints_migrated, result.checkpoints_reset, result.consumers_found
+        );
+        prop_assert_eq!(result.reset_consumers.len(), result.checkpoints_reset);
     }
 
     // 23. CheckpointSyncResult clone eq
@@ -540,27 +552,28 @@ proptest! {
         prop_assert_eq!(manifest.export_count, manifest.import_count);
     }
 
-    // 33. Checkpoint ordinal range validity: in_range iff within [first, last]
+    // 33. M3 checkpoint range logic: reset ordinal is always within manifest range
     #[test]
-    fn checkpoint_range_check(
+    fn checkpoint_reset_always_in_range(
         first_ordinal in 0..100u64,
-        range_size in 0..200u64,
+        range_size in 1..200u64,
         checkpoint_ordinal in 0..300u64,
     ) {
         let last_ordinal = first_ordinal + range_size;
         let in_range = checkpoint_ordinal >= first_ordinal && checkpoint_ordinal <= last_ordinal;
 
-        // This mirrors the M3 checkpoint sync logic
-        if in_range {
-            // Checkpoint migrated as-is
-            prop_assert!(checkpoint_ordinal >= first_ordinal);
-            prop_assert!(checkpoint_ordinal <= last_ordinal);
+        // M3 logic: if checkpoint is out of range, reset to first_ordinal.
+        // The key invariant: the resulting ordinal is ALWAYS within [first, last].
+        let effective_ordinal = if in_range {
+            checkpoint_ordinal
         } else {
-            // Checkpoint would be reset to first_ordinal
-            let reset_ordinal = first_ordinal;
-            prop_assert!(reset_ordinal >= first_ordinal);
-            prop_assert!(reset_ordinal <= last_ordinal || range_size == 0);
-        }
+            first_ordinal // reset point
+        };
+        prop_assert!(
+            effective_ordinal >= first_ordinal && effective_ordinal <= last_ordinal,
+            "effective ordinal {} not in [{}, {}]",
+            effective_ordinal, first_ordinal, last_ordinal
+        );
     }
 }
 
