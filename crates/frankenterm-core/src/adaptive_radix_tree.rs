@@ -316,6 +316,7 @@ pub struct AdaptiveRadixTree<V> {
     nodes: Vec<ArtNode<V>>,
     root: Option<usize>,
     len: usize,
+    free: Vec<usize>,
 }
 
 impl<V> Default for AdaptiveRadixTree<V> {
@@ -332,6 +333,7 @@ impl<V> AdaptiveRadixTree<V> {
             nodes: Vec::new(),
             root: None,
             len: 0,
+            free: Vec::new(),
         }
     }
 
@@ -408,6 +410,9 @@ impl<V> AdaptiveRadixTree<V> {
     pub fn remove(&mut self, key: &[u8]) -> Option<V> {
         let root = self.root?;
         let (new_root, removed) = self.remove_recursive(root, key, 0);
+        if new_root != Some(root) {
+            self.free_node(root);
+        }
         self.root = new_root;
         if removed.is_some() {
             self.len -= 1;
@@ -447,13 +452,26 @@ impl<V> AdaptiveRadixTree<V> {
     // ── Internal: Node allocation ──────────────────────────────────
 
     fn alloc_node(&mut self, prefix: Vec<u8>, value: Option<V>) -> usize {
-        let idx = self.nodes.len();
-        self.nodes.push(ArtNode {
+        let new_node = ArtNode {
             prefix,
             value,
             inner: InnerNode::Empty,
-        });
-        idx
+        };
+        if let Some(idx) = self.free.pop() {
+            self.nodes[idx] = new_node;
+            idx
+        } else {
+            let idx = self.nodes.len();
+            self.nodes.push(new_node);
+            idx
+        }
+    }
+
+    fn free_node(&mut self, idx: usize) {
+        self.nodes[idx].value = None;
+        self.nodes[idx].prefix.clear();
+        self.nodes[idx].inner = InnerNode::Empty;
+        self.free.push(idx);
     }
 
     // ── Internal: Recursive insert ─────────────────────────────────
@@ -606,12 +624,14 @@ impl<V> AdaptiveRadixTree<V> {
                     // Re-derive the byte from new child's prefix
                     // The new child already has the merged prefix
                     self.nodes[node_idx].inner.insert_child(byte, new_c);
+                    self.free_node(child);
                 }
             }
             None => {
                 // Child was removed
                 self.nodes[node_idx].inner.remove_child(byte);
                 self.nodes[node_idx].inner.maybe_shrink();
+                self.free_node(child);
 
                 // If this node has no value and exactly one child, merge
                 if self.nodes[node_idx].value.is_none()
