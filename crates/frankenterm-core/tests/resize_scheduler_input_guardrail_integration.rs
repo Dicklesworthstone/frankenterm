@@ -1,6 +1,8 @@
 use frankenterm_core::resize_scheduler::{
     ResizeDomain, ResizeIntent, ResizeScheduler, ResizeSchedulerConfig, ResizeWorkClass,
+    ScheduleFrameResult,
 };
+use serde_json::json;
 
 fn intent(
     pane_id: u64,
@@ -18,6 +20,25 @@ fn intent(
         domain: ResizeDomain::default(),
         tab_id: None,
     }
+}
+
+fn emit_guardrail_jsonl(test_name: &str, phase: &str, frame: &ScheduleFrameResult) {
+    println!(
+        "{}",
+        json!({
+            "test_name": test_name,
+            "phase": phase,
+            "input_guardrail_reason_code": frame.input_guardrail_reason_code,
+            "frame_budget_units": frame.frame_budget_units,
+            "effective_resize_budget_units": frame.effective_resize_budget_units,
+            "input_reserved_units": frame.input_reserved_units,
+            "input_reserved_base_units": frame.input_reserved_base_units,
+            "input_reserved_surge_units": frame.input_reserved_surge_units,
+            "input_resize_floor_units": frame.input_resize_floor_units,
+            "pending_input_events": frame.pending_input_events,
+            "scheduled_count": frame.scheduled.len(),
+        })
+    );
 }
 
 #[test]
@@ -228,4 +249,89 @@ fn guardrail_metrics_accumulate_correctly() {
 
     assert_eq!(scheduler.metrics().input_guardrail_frames, 3);
     assert_eq!(scheduler.metrics().input_guardrail_deferrals, 3);
+}
+
+#[test]
+fn surge_reserve_and_floor_clamp_surface_in_metrics() {
+    let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+        frame_budget_units: 5,
+        input_guardrail_enabled: true,
+        input_backlog_threshold: 1,
+        input_reserve_units: 2,
+        input_resize_floor_units: 2,
+        input_surge_enabled: true,
+        input_surge_backlog_threshold: 2,
+        input_surge_reserve_units: 3,
+        allow_single_oversubscription: false,
+        ..ResizeSchedulerConfig::default()
+    });
+
+    let _ = scheduler.submit_intent(intent(9, 1, ResizeWorkClass::Interactive, 4, 200));
+    let frame = scheduler.schedule_frame_with_input_backlog(5, 10);
+
+    assert_eq!(
+        frame.input_guardrail_reason_code,
+        "surge_reserve_clamped_by_floor"
+    );
+    assert_eq!(frame.input_reserved_base_units, 2);
+    assert_eq!(frame.input_reserved_surge_units, 1);
+    assert_eq!(frame.input_reserved_units, 3);
+    assert_eq!(frame.input_resize_floor_units, 2);
+    assert_eq!(frame.effective_resize_budget_units, 2);
+    assert_eq!(scheduler.metrics().input_guardrail_surge_frames, 1);
+    assert_eq!(scheduler.metrics().input_guardrail_floor_clamp_frames, 1);
+}
+
+#[test]
+fn e2e_guardrail_reason_code_trace() {
+    let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+        frame_budget_units: 8,
+        input_guardrail_enabled: true,
+        input_backlog_threshold: 2,
+        input_reserve_units: 2,
+        input_resize_floor_units: 2,
+        input_surge_enabled: true,
+        input_surge_backlog_threshold: 6,
+        input_surge_reserve_units: 2,
+        allow_single_oversubscription: false,
+        ..ResizeSchedulerConfig::default()
+    });
+
+    let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 6, 100));
+
+    let low_backlog = scheduler.schedule_frame_with_input_backlog(8, 1);
+    emit_guardrail_jsonl(
+        "e2e_guardrail_reason_code_trace",
+        "low_backlog",
+        &low_backlog,
+    );
+    assert_eq!(
+        low_backlog.input_guardrail_reason_code,
+        "backlog_below_threshold"
+    );
+    assert_eq!(low_backlog.input_reserved_units, 0);
+
+    let base_reserve = scheduler.schedule_frame_with_input_backlog(8, 3);
+    emit_guardrail_jsonl(
+        "e2e_guardrail_reason_code_trace",
+        "base_reserve",
+        &base_reserve,
+    );
+    assert_eq!(base_reserve.input_guardrail_reason_code, "base_reserve");
+    assert_eq!(base_reserve.input_reserved_base_units, 2);
+    assert_eq!(base_reserve.input_reserved_surge_units, 0);
+
+    let surge_reserve = scheduler.schedule_frame_with_input_backlog(8, 8);
+    emit_guardrail_jsonl(
+        "e2e_guardrail_reason_code_trace",
+        "surge_reserve",
+        &surge_reserve,
+    );
+    assert_eq!(surge_reserve.input_guardrail_reason_code, "base_plus_surge");
+    assert_eq!(surge_reserve.input_reserved_base_units, 2);
+    assert_eq!(surge_reserve.input_reserved_surge_units, 2);
+
+    let metrics = scheduler.metrics();
+    assert_eq!(metrics.input_guardrail_frames, 2);
+    assert_eq!(metrics.input_guardrail_surge_frames, 1);
 }

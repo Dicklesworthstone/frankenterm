@@ -20,6 +20,7 @@ use crate::resize_invariants::{
     check_phase_transition, check_scheduler_invariants, check_scheduler_snapshot_invariants,
 };
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 /// Global scheduling class for a resize intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -132,6 +133,14 @@ pub struct ResizeSchedulerConfig {
     pub input_backlog_threshold: u32,
     /// Work units reserved for input processing when guardrails activate.
     pub input_reserve_units: u32,
+    /// Minimum resize budget units that must remain after guardrail reservation.
+    pub input_resize_floor_units: u32,
+    /// Enable surge reserve when input backlog crosses a higher threshold.
+    pub input_surge_enabled: bool,
+    /// Minimum input backlog required before surge reserve activates.
+    pub input_surge_backlog_threshold: u32,
+    /// Additional reserve units applied while surge reserve is active.
+    pub input_surge_reserve_units: u32,
     /// Number of consecutive deferrals before background work is force-served.
     pub max_deferrals_before_force: u32,
     /// Per-frame aging credit added while a pane remains pending.
@@ -185,6 +194,10 @@ impl Default for ResizeSchedulerConfig {
             input_guardrail_enabled: true,
             input_backlog_threshold: 1,
             input_reserve_units: 2,
+            input_resize_floor_units: 1,
+            input_surge_enabled: true,
+            input_surge_backlog_threshold: 8,
+            input_surge_reserve_units: 1,
             max_deferrals_before_force: 3,
             aging_credit_per_frame: 5,
             max_aging_credit: 80,
@@ -273,6 +286,14 @@ pub struct ScheduleFrameResult {
     pub effective_resize_budget_units: u32,
     /// Work units reserved for input handling in this frame.
     pub input_reserved_units: u32,
+    /// Guardrail base reserve units for this frame.
+    pub input_reserved_base_units: u32,
+    /// Additional surge reserve units for this frame.
+    pub input_reserved_surge_units: u32,
+    /// Effective floor that guardrail reservation cannot violate.
+    pub input_resize_floor_units: u32,
+    /// Stable reason code describing guardrail budget decision.
+    pub input_guardrail_reason_code: String,
     /// Observed pending input backlog at scheduling time.
     pub pending_input_events: u32,
     /// Work units spent by scheduled picks.
@@ -314,12 +335,22 @@ pub struct ResizeSchedulerMetrics {
     pub input_guardrail_frames: u64,
     /// Count of candidate deferrals caused specifically by input guardrails.
     pub input_guardrail_deferrals: u64,
+    /// Count of frames where surge reserve activated.
+    pub input_guardrail_surge_frames: u64,
+    /// Count of frames where reservation clamped at configured floor.
+    pub input_guardrail_floor_clamp_frames: u64,
     /// Last frame budget units.
     pub last_frame_budget_units: u32,
     /// Last effective resize budget after guardrail reservation.
     pub last_effective_resize_budget_units: u32,
     /// Last observed pending input backlog.
     pub last_input_backlog: u32,
+    /// Last base reserve units applied by guardrails.
+    pub last_input_reserved_base_units: u32,
+    /// Last surge reserve units applied by guardrails.
+    pub last_input_reserved_surge_units: u32,
+    /// Last guardrail decision reason code.
+    pub last_input_guardrail_reason_code: String,
     /// Last frame consumed units.
     pub last_frame_spent_units: u32,
     /// Number of picks made in last frame.
@@ -678,6 +709,27 @@ struct FramePacingPlan {
     vsync_refresh_hz: Option<u32>,
     vsync_interval_us: Option<u32>,
 }
+
+#[derive(Debug, Clone)]
+struct GuardrailBudgetDecision {
+    effective_budget_units: u32,
+    total_reserved_units: u32,
+    base_reserved_units: u32,
+    surge_reserved_units: u32,
+    floor_units: u32,
+    reason_code: &'static str,
+    floor_clamped: bool,
+    surge_active: bool,
+}
+
+const GUARDRAIL_REASON_CONTROL_PLANE_DISABLED: &str = "control_plane_disabled";
+const GUARDRAIL_REASON_DISABLED: &str = "guardrail_disabled";
+const GUARDRAIL_REASON_BACKLOG_BELOW_THRESHOLD: &str = "backlog_below_threshold";
+const GUARDRAIL_REASON_BUDGET_AT_FLOOR: &str = "budget_at_floor";
+const GUARDRAIL_REASON_BASE_RESERVE: &str = "base_reserve";
+const GUARDRAIL_REASON_BASE_PLUS_SURGE: &str = "base_plus_surge";
+const GUARDRAIL_REASON_BASE_CLAMPED_BY_FLOOR: &str = "base_reserve_clamped_by_floor";
+const GUARDRAIL_REASON_SURGE_CLAMPED_BY_FLOOR: &str = "surge_reserve_clamped_by_floor";
 
 /// Global resize scheduler.
 #[derive(Debug)]
@@ -1119,6 +1171,10 @@ impl ResizeScheduler {
             self.metrics.last_vsync_adjusted_budget_units = pacing_plan.vsync_adjusted_budget_units;
             self.metrics.last_vsync_refresh_hz = pacing_plan.vsync_refresh_hz;
             self.metrics.last_vsync_interval_us = pacing_plan.vsync_interval_us;
+            self.metrics.last_input_reserved_base_units = 0;
+            self.metrics.last_input_reserved_surge_units = 0;
+            self.metrics.last_input_guardrail_reason_code =
+                GUARDRAIL_REASON_CONTROL_PLANE_DISABLED.to_string();
             self.metrics.last_hitch_detected = false;
             self.metrics.last_hitch_overrun_units = 0;
             self.publish_debug_snapshot();
@@ -1131,6 +1187,14 @@ impl ResizeScheduler {
                 vsync_interval_us: pacing_plan.vsync_interval_us,
                 effective_resize_budget_units: pacing_plan.pacing_budget_units,
                 input_reserved_units: 0,
+                input_reserved_base_units: 0,
+                input_reserved_surge_units: 0,
+                input_resize_floor_units: self
+                    .config
+                    .input_resize_floor_units
+                    .max(1)
+                    .min(pacing_plan.pacing_budget_units.max(1)),
+                input_guardrail_reason_code: GUARDRAIL_REASON_CONTROL_PLANE_DISABLED.to_string(),
                 pending_input_events,
                 budget_spent_units: 0,
                 hitch_detected: false,
@@ -1157,12 +1221,43 @@ impl ResizeScheduler {
         let mut scheduled = Vec::new();
         let mut deferred_panes = Vec::new();
         let budget_units = pacing_plan.pacing_budget_units.max(1);
-        let (effective_budget_units, input_reserved_units) =
+        let guardrail_decision =
             self.resolve_resize_budget_with_input_guardrail(budget_units, pending_input_events);
+        let effective_budget_units = guardrail_decision.effective_budget_units;
+        let input_reserved_units = guardrail_decision.total_reserved_units;
         if input_reserved_units > 0 {
             self.metrics.input_guardrail_frames =
                 self.metrics.input_guardrail_frames.saturating_add(1);
         }
+        if guardrail_decision.surge_active {
+            self.metrics.input_guardrail_surge_frames =
+                self.metrics.input_guardrail_surge_frames.saturating_add(1);
+        }
+        if guardrail_decision.floor_clamped {
+            self.metrics.input_guardrail_floor_clamp_frames = self
+                .metrics
+                .input_guardrail_floor_clamp_frames
+                .saturating_add(1);
+        }
+        self.metrics.last_input_reserved_base_units = guardrail_decision.base_reserved_units;
+        self.metrics.last_input_reserved_surge_units = guardrail_decision.surge_reserved_units;
+        self.metrics.last_input_guardrail_reason_code = guardrail_decision.reason_code.to_string();
+        debug!(
+            target: "frankenterm_core::resize_scheduler",
+            event = "resize_guardrail_budget_decision",
+            reason_code = guardrail_decision.reason_code,
+            requested_frame_budget_units = pacing_plan.requested_budget_units,
+            pacing_budget_units = budget_units,
+            pending_input_events,
+            effective_resize_budget_units = effective_budget_units,
+            input_reserved_units = guardrail_decision.total_reserved_units,
+            input_reserved_base_units = guardrail_decision.base_reserved_units,
+            input_reserved_surge_units = guardrail_decision.surge_reserved_units,
+            input_resize_floor_units = guardrail_decision.floor_units,
+            guardrail_surge_active = guardrail_decision.surge_active,
+            guardrail_floor_clamped = guardrail_decision.floor_clamped,
+            "resize scheduler guardrail decision"
+        );
         let mut forced_over_budget_served = false;
 
         // Domain budget partitioning: compute per-domain budget allocations.
@@ -1344,6 +1439,10 @@ impl ResizeScheduler {
             vsync_interval_us: pacing_plan.vsync_interval_us,
             effective_resize_budget_units: effective_budget_units,
             input_reserved_units,
+            input_reserved_base_units: guardrail_decision.base_reserved_units,
+            input_reserved_surge_units: guardrail_decision.surge_reserved_units,
+            input_resize_floor_units: guardrail_decision.floor_units,
+            input_guardrail_reason_code: guardrail_decision.reason_code.to_string(),
             pending_input_events,
             budget_spent_units: spent_units,
             hitch_detected,
@@ -1657,23 +1756,89 @@ impl ResizeScheduler {
         &self,
         budget_units: u32,
         pending_input_events: u32,
-    ) -> (u32, u32) {
+    ) -> GuardrailBudgetDecision {
+        let budget_units = budget_units.max(1);
+        let floor_units = self.config.input_resize_floor_units.max(1).min(budget_units);
+
         if !self.config.input_guardrail_enabled {
-            return (budget_units, 0);
-        }
-        if pending_input_events < self.config.input_backlog_threshold {
-            return (budget_units, 0);
-        }
-        if budget_units <= 1 {
-            return (budget_units, 0);
+            return GuardrailBudgetDecision {
+                effective_budget_units: budget_units,
+                total_reserved_units: 0,
+                base_reserved_units: 0,
+                surge_reserved_units: 0,
+                floor_units,
+                reason_code: GUARDRAIL_REASON_DISABLED,
+                floor_clamped: false,
+                surge_active: false,
+            };
         }
 
-        let reserve_units = self
+        if pending_input_events < self.config.input_backlog_threshold {
+            return GuardrailBudgetDecision {
+                effective_budget_units: budget_units,
+                total_reserved_units: 0,
+                base_reserved_units: 0,
+                surge_reserved_units: 0,
+                floor_units,
+                reason_code: GUARDRAIL_REASON_BACKLOG_BELOW_THRESHOLD,
+                floor_clamped: false,
+                surge_active: false,
+            };
+        }
+        if budget_units <= floor_units {
+            return GuardrailBudgetDecision {
+                effective_budget_units: budget_units,
+                total_reserved_units: 0,
+                base_reserved_units: 0,
+                surge_reserved_units: 0,
+                floor_units,
+                reason_code: GUARDRAIL_REASON_BUDGET_AT_FLOOR,
+                floor_clamped: false,
+                surge_active: false,
+            };
+        }
+
+        let max_reservable_units = budget_units.saturating_sub(floor_units);
+        let base_reserved_units = self
             .config
             .input_reserve_units
             .max(1)
-            .min(budget_units.saturating_sub(1));
-        (budget_units.saturating_sub(reserve_units), reserve_units)
+            .min(max_reservable_units);
+
+        let surge_active = self.config.input_surge_enabled
+            && pending_input_events
+                >= self
+                    .config
+                    .input_surge_backlog_threshold
+                    .max(self.config.input_backlog_threshold);
+        let surge_candidate_units = if surge_active {
+            self.config.input_surge_reserve_units.max(1)
+        } else {
+            0
+        };
+
+        let total_reserved_units = base_reserved_units
+            .saturating_add(surge_candidate_units)
+            .min(max_reservable_units);
+        let surge_reserved_units = total_reserved_units.saturating_sub(base_reserved_units);
+        let floor_clamped = total_reserved_units == max_reservable_units;
+        let reason_code = match (surge_reserved_units > 0, floor_clamped) {
+            (false, false) => GUARDRAIL_REASON_BASE_RESERVE,
+            (true, false) => GUARDRAIL_REASON_BASE_PLUS_SURGE,
+            (false, true) => GUARDRAIL_REASON_BASE_CLAMPED_BY_FLOOR,
+            (true, true) => GUARDRAIL_REASON_SURGE_CLAMPED_BY_FLOOR,
+        };
+
+        GuardrailBudgetDecision {
+            effective_budget_units: budget_units.saturating_sub(total_reserved_units),
+            total_reserved_units,
+            base_reserved_units,
+            surge_reserved_units,
+            floor_units,
+            reason_code,
+            floor_clamped,
+            surge_active: surge_reserved_units > 0,
+        }
     }
 
     fn evict_oldest_background_pending(&mut self) -> Option<(u64, u64)> {
@@ -2779,6 +2944,10 @@ mod tests {
         assert!(cfg.input_guardrail_enabled);
         assert_eq!(cfg.input_backlog_threshold, 1);
         assert_eq!(cfg.input_reserve_units, 2);
+        assert_eq!(cfg.input_resize_floor_units, 1);
+        assert!(cfg.input_surge_enabled);
+        assert_eq!(cfg.input_surge_backlog_threshold, 8);
+        assert_eq!(cfg.input_surge_reserve_units, 1);
         assert_eq!(cfg.max_deferrals_before_force, 3);
         assert_eq!(cfg.aging_credit_per_frame, 5);
         assert_eq!(cfg.max_aging_credit, 80);
@@ -3745,6 +3914,119 @@ mod tests {
         assert_eq!(frame.input_reserved_units, 0);
         assert_eq!(frame.effective_resize_budget_units, 8);
         assert_eq!(frame.scheduled.len(), 1);
+    }
+
+    #[test]
+    fn input_guardrail_surge_reserve_activates_and_reports_reason_code() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 8,
+            input_guardrail_enabled: true,
+            input_backlog_threshold: 1,
+            input_reserve_units: 2,
+            input_resize_floor_units: 2,
+            input_surge_enabled: true,
+            input_surge_backlog_threshold: 6,
+            input_surge_reserve_units: 3,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 4, 100));
+        let frame = scheduler.schedule_frame_with_input_backlog(8, 6);
+
+        assert_eq!(frame.input_reserved_base_units, 2);
+        assert_eq!(frame.input_reserved_surge_units, 3);
+        assert_eq!(frame.input_reserved_units, 5);
+        assert_eq!(frame.input_resize_floor_units, 2);
+        assert_eq!(frame.effective_resize_budget_units, 3);
+        assert_eq!(frame.input_guardrail_reason_code, "base_plus_surge");
+        assert_eq!(scheduler.metrics().input_guardrail_surge_frames, 1);
+        assert_eq!(scheduler.metrics().last_input_reserved_base_units, 2);
+        assert_eq!(scheduler.metrics().last_input_reserved_surge_units, 3);
+        assert_eq!(
+            scheduler.metrics().last_input_guardrail_reason_code,
+            "base_plus_surge"
+        );
+    }
+
+    #[test]
+    fn input_guardrail_floor_clamps_surge_reserve() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 5,
+            input_guardrail_enabled: true,
+            input_backlog_threshold: 1,
+            input_reserve_units: 2,
+            input_resize_floor_units: 2,
+            input_surge_enabled: true,
+            input_surge_backlog_threshold: 2,
+            input_surge_reserve_units: 3,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 4, 100));
+        let frame = scheduler.schedule_frame_with_input_backlog(5, 10);
+
+        // budget=5, floor=2 => max reservable=3; base=2, surge candidate=3 -> clamped to 3.
+        assert_eq!(frame.input_reserved_base_units, 2);
+        assert_eq!(frame.input_reserved_surge_units, 1);
+        assert_eq!(frame.input_reserved_units, 3);
+        assert_eq!(frame.effective_resize_budget_units, 2);
+        assert_eq!(frame.input_resize_floor_units, 2);
+        assert_eq!(
+            frame.input_guardrail_reason_code,
+            "surge_reserve_clamped_by_floor"
+        );
+        assert_eq!(scheduler.metrics().input_guardrail_floor_clamp_frames, 1);
+    }
+
+    #[test]
+    fn input_guardrail_saturates_cleanly_near_u32_max() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: u32::MAX,
+            input_guardrail_enabled: true,
+            input_backlog_threshold: 1,
+            input_reserve_units: u32::MAX,
+            input_resize_floor_units: 1,
+            input_surge_enabled: true,
+            input_surge_backlog_threshold: 1,
+            input_surge_reserve_units: u32::MAX,
+            pacing_governor_enabled: false,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 1, 100));
+        let frame = scheduler.schedule_frame_with_input_backlog(u32::MAX, 2);
+
+        assert_eq!(frame.frame_budget_units, u32::MAX);
+        assert_eq!(frame.input_reserved_units, u32::MAX - 1);
+        assert_eq!(frame.input_reserved_base_units, u32::MAX - 1);
+        assert_eq!(frame.input_reserved_surge_units, 0);
+        assert_eq!(frame.effective_resize_budget_units, 1);
+        assert_eq!(frame.input_guardrail_reason_code, "base_reserve_clamped_by_floor");
+    }
+
+    #[test]
+    fn input_guardrail_reason_codes_cover_disabled_and_threshold_paths() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 6,
+            input_guardrail_enabled: true,
+            input_backlog_threshold: 3,
+            input_reserve_units: 2,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        let below = scheduler.schedule_frame_with_input_backlog(6, 2);
+        assert_eq!(below.input_guardrail_reason_code, "backlog_below_threshold");
+        assert_eq!(below.input_reserved_units, 0);
+
+        scheduler.set_control_plane_enabled(true);
+        scheduler.set_emergency_disable(false);
+        scheduler.config.input_guardrail_enabled = false;
+        let disabled = scheduler.schedule_frame_with_input_backlog(6, 10);
+        assert_eq!(disabled.input_guardrail_reason_code, "guardrail_disabled");
+        assert_eq!(disabled.input_reserved_units, 0);
     }
 
     #[test]
