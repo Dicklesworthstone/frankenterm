@@ -91,6 +91,15 @@ That contract defines:
 - EV-gated architecture levers and fallback triggers
 - rollout and proof artifacts required before broad enablement
 
+## asupersync Migration Baseline
+
+The migration baseline for runtime convergence is documented in
+`docs/asupersync-migration-baseline.md`.
+It is the canonical source for:
+- inventory truth (`docs/asupersync-runtime-inventory.json`)
+- doctrine invariants (`Cx` propagation, scope ownership, cancellation boundaries)
+- risk ledger and sequencing scorecard used by downstream `ft-e34d9.*` beads
+
 ## Library integration map (Appendix F)
 
 | Library | Role in ft | Status |

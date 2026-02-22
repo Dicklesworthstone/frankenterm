@@ -1,0 +1,1161 @@
+{
+  "inventory_version": 2,
+  "generated_at": "2026-02-22T22:37:03Z",
+  "workspace": "/Users/jemanuel/projects/frankenterm",
+  "inventory_scope": {
+    "source_globs": [
+      "crates/**/*.rs",
+      "frankenterm/**/*.rs",
+      "**/Cargo.toml",
+      "Cargo.lock"
+    ],
+    "symbol_patterns": [
+      "asupersync::",
+      "tokio::",
+      "runtime_compat::",
+      "smol::",
+      "async_std::"
+    ],
+    "caveats": [
+      "Text-pattern inventory; does not prove runtime execution paths.",
+      "Feature-gated code may be present in source counts even when inactive.",
+      "Cargo manifest presence marks potential direct dependency exposure, not guaranteed linkage in every feature set."
+    ]
+  },
+  "pattern_reference_counts": {
+    "asupersync": 253,
+    "tokio": 1234,
+    "runtime_compat": 477,
+    "smol": 69,
+    "async_std": 0
+  },
+  "pattern_file_counts": {
+    "asupersync": 31,
+    "tokio": 73,
+    "runtime_compat": 72,
+    "smol": 12,
+    "async_std": 0
+  },
+  "usage_by_crate_root": [
+    {
+      "crate_root": "crates/frankenterm",
+      "asupersync": 124,
+      "tokio": 0,
+      "runtime_compat": 46,
+      "smol": 0,
+      "async_std": 0
+    },
+    {
+      "crate_root": "crates/frankenterm-core",
+      "asupersync": 122,
+      "tokio": 1234,
+      "runtime_compat": 431,
+      "smol": 0,
+      "async_std": 0
+    },
+    {
+      "crate_root": "frankenterm/async_ossl",
+      "asupersync": 1,
+      "tokio": 0,
+      "runtime_compat": 0,
+      "smol": 0,
+      "async_std": 0
+    },
+    {
+      "crate_root": "frankenterm/codec",
+      "asupersync": 1,
+      "tokio": 0,
+      "runtime_compat": 0,
+      "smol": 12,
+      "async_std": 0
+    },
+    {
+      "crate_root": "frankenterm/config",
+      "asupersync": 0,
+      "tokio": 0,
+      "runtime_compat": 0,
+      "smol": 5,
+      "async_std": 0
+    },
+    {
+      "crate_root": "frankenterm/mux",
+      "asupersync": 0,
+      "tokio": 0,
+      "runtime_compat": 0,
+      "smol": 1,
+      "async_std": 0
+    },
+    {
+      "crate_root": "frankenterm/promise",
+      "asupersync": 2,
+      "tokio": 0,
+      "runtime_compat": 0,
+      "smol": 0,
+      "async_std": 0
+    },
+    {
+      "crate_root": "frankenterm/pty",
+      "asupersync": 0,
+      "tokio": 0,
+      "runtime_compat": 0,
+      "smol": 5,
+      "async_std": 0
+    },
+    {
+      "crate_root": "frankenterm/scripting",
+      "asupersync": 0,
+      "tokio": 0,
+      "runtime_compat": 0,
+      "smol": 2,
+      "async_std": 0
+    },
+    {
+      "crate_root": "frankenterm/ssh",
+      "asupersync": 2,
+      "tokio": 0,
+      "runtime_compat": 0,
+      "smol": 44,
+      "async_std": 0
+    },
+    {
+      "crate_root": "frankenterm/uds",
+      "asupersync": 1,
+      "tokio": 0,
+      "runtime_compat": 0,
+      "smol": 0,
+      "async_std": 0
+    }
+  ],
+  "top_runtime_reference_files": [
+    {
+      "path": "crates/frankenterm-core/src/runtime_compat.rs",
+      "reference_count": 215
+    },
+    {
+      "path": "crates/frankenterm/src/main.rs",
+      "reference_count": 170
+    },
+    {
+      "path": "crates/frankenterm-core/src/storage.rs",
+      "reference_count": 86
+    },
+    {
+      "path": "crates/frankenterm-core/src/workflows.rs",
+      "reference_count": 82
+    },
+    {
+      "path": "crates/frankenterm-core/src/pool.rs",
+      "reference_count": 65
+    },
+    {
+      "path": "crates/frankenterm-core/tests/proptest_runtime_compat.rs",
+      "reference_count": 59
+    },
+    {
+      "path": "crates/frankenterm-core/src/snapshot_engine.rs",
+      "reference_count": 54
+    },
+    {
+      "path": "crates/frankenterm-core/src/tantivy_ingest.rs",
+      "reference_count": 46
+    },
+    {
+      "path": "crates/frankenterm-core/src/wezterm.rs",
+      "reference_count": 46
+    },
+    {
+      "path": "crates/frankenterm-core/src/tantivy_reindex.rs",
+      "reference_count": 45
+    },
+    {
+      "path": "crates/frankenterm-core/src/simulation.rs",
+      "reference_count": 42
+    },
+    {
+      "path": "crates/frankenterm-core/src/recorder_storage.rs",
+      "reference_count": 41
+    },
+    {
+      "path": "crates/frankenterm-core/src/ipc.rs",
+      "reference_count": 36
+    },
+    {
+      "path": "crates/frankenterm-core/src/approval.rs",
+      "reference_count": 34
+    },
+    {
+      "path": "crates/frankenterm-core/src/cleanup.rs",
+      "reference_count": 32
+    },
+    {
+      "path": "frankenterm/ssh/tests/e2e/sftp.rs",
+      "reference_count": 31
+    },
+    {
+      "path": "crates/frankenterm-core/src/undo.rs",
+      "reference_count": 28
+    },
+    {
+      "path": "crates/frankenterm-core/tests/frankensqlite_e2e_tests.rs",
+      "reference_count": 28
+    },
+    {
+      "path": "crates/frankenterm-core/src/recorder_migration.rs",
+      "reference_count": 27
+    },
+    {
+      "path": "crates/frankenterm-core/src/spsc_ring_buffer.rs",
+      "reference_count": 26
+    },
+    {
+      "path": "crates/frankenterm-core/tests/frankensqlite_perf_tests.rs",
+      "reference_count": 26
+    },
+    {
+      "path": "crates/frankenterm-core/src/tailer.rs",
+      "reference_count": 25
+    },
+    {
+      "path": "crates/frankenterm-core/tests/recorder_tantivy_integration.rs",
+      "reference_count": 25
+    },
+    {
+      "path": "crates/frankenterm-core/tests/perf_integration_tests.rs",
+      "reference_count": 24
+    },
+    {
+      "path": "crates/frankenterm-core/tests/runtime_compat_tests.rs",
+      "reference_count": 24
+    }
+  ],
+  "migration_classification": [
+    {
+      "path": "crates/frankenterm-core/src/runtime_compat.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "high",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 215
+    },
+    {
+      "path": "crates/frankenterm/src/main.rs",
+      "owner_module": "crates/frankenterm",
+      "criticality": "high",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 170
+    },
+    {
+      "path": "crates/frankenterm-core/src/storage.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "medium",
+      "migration_difficulty": "high",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 86
+    },
+    {
+      "path": "crates/frankenterm-core/src/workflows.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "medium",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 82
+    },
+    {
+      "path": "crates/frankenterm-core/src/pool.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "medium",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 65
+    },
+    {
+      "path": "crates/frankenterm-core/tests/proptest_runtime_compat.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "medium",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 59
+    },
+    {
+      "path": "crates/frankenterm-core/src/snapshot_engine.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "medium",
+      "migration_difficulty": "high",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 54
+    },
+    {
+      "path": "crates/frankenterm-core/src/tantivy_ingest.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "medium",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 46
+    },
+    {
+      "path": "crates/frankenterm-core/src/wezterm.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "medium",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 46
+    },
+    {
+      "path": "crates/frankenterm-core/src/tantivy_reindex.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "medium",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat sync/channel adapters",
+      "reference_count": 45
+    },
+    {
+      "path": "crates/frankenterm-core/src/simulation.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "medium",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 42
+    },
+    {
+      "path": "crates/frankenterm-core/src/recorder_storage.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "medium",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "runtime_compat sync/channel adapters",
+      "reference_count": 41
+    },
+    {
+      "path": "crates/frankenterm-core/src/ipc.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 36
+    },
+    {
+      "path": "crates/frankenterm-core/src/approval.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 34
+    },
+    {
+      "path": "crates/frankenterm-core/src/cleanup.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 32
+    },
+    {
+      "path": "frankenterm/ssh/tests/e2e/sftp.rs",
+      "owner_module": "frankenterm/ssh",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "asupersync-native adapter over smol surface",
+      "reference_count": 31
+    },
+    {
+      "path": "crates/frankenterm-core/src/undo.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 28
+    },
+    {
+      "path": "crates/frankenterm-core/tests/frankensqlite_e2e_tests.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat sync/channel adapters",
+      "reference_count": 28
+    },
+    {
+      "path": "crates/frankenterm-core/src/recorder_migration.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 27
+    },
+    {
+      "path": "crates/frankenterm-core/src/spsc_ring_buffer.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 26
+    },
+    {
+      "path": "crates/frankenterm-core/tests/frankensqlite_perf_tests.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 26
+    },
+    {
+      "path": "crates/frankenterm-core/src/tailer.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 25
+    },
+    {
+      "path": "crates/frankenterm-core/tests/recorder_tantivy_integration.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 25
+    },
+    {
+      "path": "crates/frankenterm-core/tests/perf_integration_tests.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 24
+    },
+    {
+      "path": "crates/frankenterm-core/tests/runtime_compat_tests.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 24
+    },
+    {
+      "path": "crates/frankenterm-core/src/outcome.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 22
+    },
+    {
+      "path": "crates/frankenterm-core/src/export.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 21
+    },
+    {
+      "path": "crates/frankenterm-core/tests/tantivy_integration_tests.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 20
+    },
+    {
+      "path": "crates/frankenterm-core/benches/spike_comparison.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 19
+    },
+    {
+      "path": "crates/frankenterm-core/src/distributed.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "high",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 19
+    },
+    {
+      "path": "crates/frankenterm-core/benches/ipc_throughput.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 18
+    },
+    {
+      "path": "crates/frankenterm-core/tests/session_persistence_tests.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 18
+    },
+    {
+      "path": "crates/frankenterm-core/src/events.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 17
+    },
+    {
+      "path": "crates/frankenterm-core/src/protocol_recovery.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 17
+    },
+    {
+      "path": "crates/frankenterm-core/tests/frankensqlite_contract_tests.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 16
+    },
+    {
+      "path": "crates/frankenterm-core/src/notifications.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 15
+    },
+    {
+      "path": "crates/frankenterm-core/src/sharding.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 15
+    },
+    {
+      "path": "crates/frankenterm-core/src/watchdog.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 15
+    },
+    {
+      "path": "crates/frankenterm-core/tests/web.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 15
+    },
+    {
+      "path": "crates/frankenterm-core/src/native_events.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 14
+    },
+    {
+      "path": "crates/frankenterm-core/src/replay.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 14
+    },
+    {
+      "path": "crates/frankenterm-core/src/restore_layout.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 14
+    },
+    {
+      "path": "crates/frankenterm-core/src/retry.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 14
+    },
+    {
+      "path": "crates/frankenterm-core/src/search_bridge.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 14
+    },
+    {
+      "path": "crates/frankenterm-core/tests/daemon_integration.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 14
+    },
+    {
+      "path": "crates/frankenterm-core/tests/frankensqlite_logging_tests.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat sync/channel adapters",
+      "reference_count": 13
+    },
+    {
+      "path": "frankenterm/codec/src/lib.rs",
+      "owner_module": "frankenterm/codec",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 13
+    },
+    {
+      "path": "crates/frankenterm-core/src/webhook.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat sync/channel adapters",
+      "reference_count": 12
+    },
+    {
+      "path": "crates/frankenterm-core/src/cx.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 11
+    },
+    {
+      "path": "crates/frankenterm-core/src/metrics.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 11
+    },
+    {
+      "path": "crates/frankenterm-core/src/orphan_reaper.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 11
+    },
+    {
+      "path": "crates/frankenterm-core/src/secrets.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 11
+    },
+    {
+      "path": "crates/frankenterm-core/benches/pdu_pipelining.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 10
+    },
+    {
+      "path": "crates/frankenterm-core/src/reports.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 10
+    },
+    {
+      "path": "crates/frankenterm-core/benches/compression_bypass.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 9
+    },
+    {
+      "path": "crates/frankenterm-core/benches/mux_pool_scaling.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 9
+    },
+    {
+      "path": "crates/frankenterm-core/src/restore_process.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 9
+    },
+    {
+      "path": "crates/frankenterm-core/src/restore_scrollback.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 9
+    },
+    {
+      "path": "crates/frankenterm-core/src/web.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "high",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 9
+    },
+    {
+      "path": "crates/frankenterm-core/tests/distributed_security_e2e.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "high",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 8
+    },
+    {
+      "path": "crates/frankenterm-core/benches/socket_throughput.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 7
+    },
+    {
+      "path": "crates/frankenterm-core/src/tui/query.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 7
+    },
+    {
+      "path": "crates/frankenterm-core/src/vendored/mux_client.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 7
+    },
+    {
+      "path": "crates/frankenterm-core/src/vendored/mux_pool.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 7
+    },
+    {
+      "path": "crates/frankenterm-core/src/wait.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 7
+    },
+    {
+      "path": "crates/frankenterm-core/tests/asupersync_spike.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 7
+    },
+    {
+      "path": "crates/frankenterm-core/tests/asupersync_unix_socket.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 7
+    },
+    {
+      "path": "crates/frankenterm-core/tests/common/fixtures.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 7
+    },
+    {
+      "path": "frankenterm/ssh/tests/e2e/sftp/file.rs",
+      "owner_module": "frankenterm/ssh",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "asupersync-native adapter over smol surface",
+      "reference_count": 7
+    },
+    {
+      "path": "crates/frankenterm-core/benches/native_events_latency.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 6
+    },
+    {
+      "path": "crates/frankenterm-core/tests/distributed_streaming_e2e.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 6
+    },
+    {
+      "path": "crates/frankenterm-core/benches/task_spawn.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 5
+    },
+    {
+      "path": "crates/frankenterm-core/src/diagnostic.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 5
+    },
+    {
+      "path": "crates/frankenterm-core/src/survival.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 5
+    },
+    {
+      "path": "crates/frankenterm-core/tests/frankensqlite_fixture_tests.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 5
+    },
+    {
+      "path": "crates/frankenterm-core/tests/proptest_restore_layout.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 5
+    },
+    {
+      "path": "frankenterm/pty/examples/whoami_async.rs",
+      "owner_module": "frankenterm/pty",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 5
+    },
+    {
+      "path": "frankenterm/ssh/src/lib.rs",
+      "owner_module": "frankenterm/ssh",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "asupersync-native adapter over smol surface",
+      "reference_count": 5
+    },
+    {
+      "path": "crates/frankenterm-core/src/telemetry.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 4
+    },
+    {
+      "path": "crates/frankenterm-core/tests/asupersync_cx_infrastructure.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 4
+    },
+    {
+      "path": "crates/frankenterm-core/tests/event_annotation_tests.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 4
+    },
+    {
+      "path": "crates/frankenterm-core/tests/proptest_search_bridge.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 4
+    },
+    {
+      "path": "crates/frankenterm-core/tests/proptest_snapshot.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 4
+    },
+    {
+      "path": "crates/frankenterm-core/tests/recorder_stack_integration.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 4
+    },
+    {
+      "path": "crates/frankenterm-core/benches/labruntime_overhead.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 3
+    },
+    {
+      "path": "crates/frankenterm-core/benches/shard_routing.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 3
+    },
+    {
+      "path": "crates/frankenterm-core/benches/subscription_streaming.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 3
+    },
+    {
+      "path": "crates/frankenterm-core/src/ingest.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "medium",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 3
+    },
+    {
+      "path": "crates/frankenterm-core/src/runtime.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 3
+    },
+    {
+      "path": "crates/frankenterm-core/tests/common/lab.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 3
+    },
+    {
+      "path": "crates/frankenterm-core/tests/labruntime_infrastructure.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 3
+    },
+    {
+      "path": "crates/frankenterm-core/tests/recorder_recovery_drills.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 3
+    },
+    {
+      "path": "crates/frankenterm-core/tests/runtime_compat_smoke.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 3
+    },
+    {
+      "path": "crates/frankenterm-core/tests/snapshot_e2e.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 3
+    },
+    {
+      "path": "crates/frankenterm-core/tests/web_streaming_dpor.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat sync/channel adapters",
+      "reference_count": 3
+    },
+    {
+      "path": "frankenterm/config/src/lib.rs",
+      "owner_module": "frankenterm/config",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
+      "reference_count": 3
+    },
+    {
+      "path": "crates/frankenterm-core/benches/fts_query.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 2
+    },
+    {
+      "path": "crates/frankenterm-core/benches/pool_benchmark.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat::sleep/timeout",
+      "reference_count": 2
+    },
+    {
+      "path": "crates/frankenterm-core/benches/sizing_benchmark.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat boundary adapter",
+      "reference_count": 2
+    },
+    {
+      "path": "crates/frankenterm-core/benches/storage_regression.rs",
+      "owner_module": "crates/frankenterm-core",
+      "criticality": "low",
+      "migration_difficulty": "low",
+      "recommended_target_primitive": "runtime_compat sync/channel adapters",
+      "reference_count": 2
+    }
+  ],
+  "runtime_manifests": [
+    {
+      "manifest": "Cargo.toml",
+      "tokio": 2,
+      "asupersync": 11,
+      "smol": 1,
+      "async_std": 0
+    },
+    {
+      "manifest": "crates/frankenterm/Cargo.toml",
+      "tokio": 0,
+      "asupersync": 3,
+      "smol": 0,
+      "async_std": 0
+    },
+    {
+      "manifest": "crates/frankenterm-core/Cargo.toml",
+      "tokio": 3,
+      "asupersync": 13,
+      "smol": 0,
+      "async_std": 0
+    },
+    {
+      "manifest": "frankenterm/async_ossl/Cargo.toml",
+      "tokio": 0,
+      "asupersync": 3,
+      "smol": 0,
+      "async_std": 0
+    },
+    {
+      "manifest": "frankenterm/codec/Cargo.toml",
+      "tokio": 0,
+      "asupersync": 3,
+      "smol": 4,
+      "async_std": 0
+    },
+    {
+      "manifest": "frankenterm/config/Cargo.toml",
+      "tokio": 0,
+      "asupersync": 0,
+      "smol": 1,
+      "async_std": 0
+    },
+    {
+      "manifest": "frankenterm/mux/Cargo.toml",
+      "tokio": 0,
+      "asupersync": 0,
+      "smol": 1,
+      "async_std": 0
+    },
+    {
+      "manifest": "frankenterm/promise/Cargo.toml",
+      "tokio": 0,
+      "asupersync": 4,
+      "smol": 0,
+      "async_std": 0
+    },
+    {
+      "manifest": "frankenterm/pty/Cargo.toml",
+      "tokio": 0,
+      "asupersync": 0,
+      "smol": 1,
+      "async_std": 0
+    },
+    {
+      "manifest": "frankenterm/scripting/Cargo.toml",
+      "tokio": 0,
+      "asupersync": 0,
+      "smol": 2,
+      "async_std": 0
+    },
+    {
+      "manifest": "frankenterm/ssh/Cargo.toml",
+      "tokio": 0,
+      "asupersync": 5,
+      "smol": 5,
+      "async_std": 0
+    },
+    {
+      "manifest": "frankenterm/uds/Cargo.toml",
+      "tokio": 0,
+      "asupersync": 3,
+      "smol": 0,
+      "async_std": 0
+    }
+  ],
+  "transitive_runtime_packages": [
+    {
+      "name": "asupersync",
+      "version": "0.2.2",
+      "source": "git+https://github.com/Dicklesworthstone/asupersync?rev=c7c15f630caf9bd2c6b9f39feed6212d64986dfa#c7c15f630caf9bd2c6b9f39feed6212d64986dfa"
+    },
+    {
+      "name": "async-channel",
+      "version": "2.5.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "async-io",
+      "version": "2.6.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "futures-lite",
+      "version": "2.6.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "polling",
+      "version": "3.11.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "smol",
+      "version": "2.0.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "tokio",
+      "version": "1.49.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+  ],
+  "observations": [
+    "crates/frankenterm/src/main.rs currently has high direct runtime reference density and should stay on a dedicated migration lane.",
+    "crates/frankenterm-core/src/runtime_compat.rs is the largest concentration point and should remain the primary boundary for runtime API normalization.",
+    "Vendored frankenterm crates still expose smol-centric features, representing major harmonization risk for deep migration tracks."
+  ]
+}
