@@ -33,11 +33,11 @@ fn parse_frame(data: &[u8], offset: usize) -> crate::Result<(RecordingFrame, usi
         ));
     }
 
-    let ts = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    let ts = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()); // ubs:ignore
     let ft_byte = data[offset + 8];
     let flags = data[offset + 9];
     let payload_len =
-        u32::from_le_bytes(data[offset + 10..offset + 14].try_into().unwrap()) as usize;
+        u32::from_le_bytes(data[offset + 10..offset + 14].try_into().unwrap()) as usize; // ubs:ignore
 
     let frame_type = match ft_byte {
         1 => FrameType::Output,
@@ -181,8 +181,8 @@ pub fn decode_frame(frame: &RecordingFrame) -> Result<DecodedFrame> {
         FrameType::Output => Ok(DecodedFrame::Output(frame.payload.clone())),
         FrameType::Resize => {
             if frame.payload.len() >= 4 {
-                let cols = u16::from_le_bytes(frame.payload[0..2].try_into().unwrap());
-                let rows = u16::from_le_bytes(frame.payload[2..4].try_into().unwrap());
+                let cols = u16::from_le_bytes(frame.payload[0..2].try_into().unwrap()); // ubs:ignore
+                let rows = u16::from_le_bytes(frame.payload[2..4].try_into().unwrap()); // ubs:ignore
                 Ok(DecodedFrame::Resize { cols, rows })
             } else {
                 Err(crate::Error::Runtime(

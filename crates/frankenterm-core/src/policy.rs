@@ -1657,9 +1657,11 @@ fn run_dcg(command: &str) -> Result<DcgDecision, DcgError> {
         })?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(payload.to_string().as_bytes())
-            .map_err(|e| DcgError::Failed(e.to_string()))?;
+        if let Err(e) = stdin.write_all(payload.to_string().as_bytes()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(DcgError::Failed(e.to_string()));
+        }
     }
 
     let output = child
