@@ -30,15 +30,15 @@ fn arb_offset() -> impl Strategy<Value = RecorderOffset> {
 
 fn arb_manifest() -> impl Strategy<Value = MigrationManifest> {
     (
-        0..1000u64,                                              // event_count
-        0..500u64,                                               // first_ordinal
-        0..1000u64,                                              // last_ordinal
+        0..1000u64,                                                // event_count
+        0..500u64,                                                 // first_ordinal
+        0..1000u64,                                                // last_ordinal
         proptest::collection::hash_map(0..20u64, 1..100u64, 0..5), // per_pane_counts
-        any::<u64>(),                                            // export_digest
-        0..500u64,                                               // export_count
-        any::<u64>(),                                            // import_digest
-        0..500u64,                                               // import_count
-        proptest::option::of(arb_offset()),                      // last_offset
+        any::<u64>(),                                              // export_digest
+        0..500u64,                                                 // export_count
+        any::<u64>(),                                              // import_digest
+        0..500u64,                                                 // import_count
+        proptest::option::of(arb_offset()),                        // last_offset
     )
         .prop_map(
             |(

@@ -7787,8 +7787,8 @@ async fn run_robot_rpc_via_cli(
     config_path: Option<&Path>,
     workspace_root: &Path,
 ) -> Result<frankenterm_core::ipc::IpcResponse, String> {
-    use std::process::Stdio;
     use asupersync::process::Command;
+    use std::process::Stdio;
 
     let exe =
         std::env::current_exe().map_err(|e| format!("failed to resolve wa executable: {e}"))?;
@@ -8251,9 +8251,9 @@ struct DistributedIngestState {
 impl DistributedIngestState {
     fn new() -> Self {
         Self {
-            aggregator: asupersync::sync::Mutex::new(frankenterm_core::wire_protocol::Aggregator::new(
-                4096,
-            )),
+            aggregator: asupersync::sync::Mutex::new(
+                frankenterm_core::wire_protocol::Aggregator::new(4096),
+            ),
             replay_guard: asupersync::sync::Mutex::new(
                 frankenterm_core::distributed::SessionReplayGuard::new(8192),
             ),
@@ -10154,11 +10154,13 @@ async fn run_watcher(
         // Create policy engine (permissive defaults for auto-handling)
         let policy_engine = PolicyEngine::permissive();
         let wezterm_handle = wezterm_handle.clone();
-        let injector = Arc::new(asupersync::sync::Mutex::new(PolicyGatedInjector::with_storage(
-            policy_engine,
-            wezterm_handle,
-            storage_for_workflows.as_ref().clone(),
-        )));
+        let injector = Arc::new(asupersync::sync::Mutex::new(
+            PolicyGatedInjector::with_storage(
+                policy_engine,
+                wezterm_handle,
+                storage_for_workflows.as_ref().clone(),
+            ),
+        ));
 
         // Create workflow engine and lock manager
         let workflow_engine = WorkflowEngine::new(config.workflows.max_concurrent as usize);
@@ -18077,12 +18079,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         );
 
                         let wezterm_handle = frankenterm_core::wezterm::default_wezterm_handle();
-                        let injector =
-                            Arc::new(asupersync::sync::Mutex::new(PolicyGatedInjector::with_storage(
+                        let injector = Arc::new(asupersync::sync::Mutex::new(
+                            PolicyGatedInjector::with_storage(
                                 policy_engine,
                                 wezterm_handle,
                                 storage.as_ref().clone(),
-                            )));
+                            ),
+                        ));
                         let runner_config = WorkflowRunnerConfig::default();
                         let runner = WorkflowRunner::new(
                             engine,
@@ -32398,7 +32401,10 @@ recorder_backend = "frankensqlite"
         .await
         .expect("read security response within timeout")
         .expect("read security response");
-        assert!(read_size > 0, "listener should emit security error response");
+        assert!(
+            read_size > 0,
+            "listener should emit security error response"
+        );
 
         let payload: serde_json::Value =
             serde_json::from_str(line.trim()).expect("parse security response json");
