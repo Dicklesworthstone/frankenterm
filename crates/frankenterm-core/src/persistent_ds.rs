@@ -740,15 +740,6 @@ fn collect_entries<'a, K: Clone + Eq + Hash, V: Clone>(
     }
 }
 
-impl<K: Clone + Eq + Hash, V: Clone> MapNode<K, V> {
-    fn leaf_value(&self) -> Option<&V> {
-        match self {
-            MapNode::Leaf(_, _, v) => Some(v),
-            _ => None,
-        }
-    }
-}
-
 // ── VersionedStore ────────────────────────────────────────────────
 
 /// A versioned container that tracks state over time.
