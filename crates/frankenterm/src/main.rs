@@ -6028,6 +6028,7 @@ fn build_workflow_by_name(
         Arc::new(frankenterm_core::workflows::HandleAuthRequired::new()),
         Arc::new(frankenterm_core::workflows::HandleClaudeCodeLimits::new()),
         Arc::new(frankenterm_core::workflows::HandleGeminiQuota::new()),
+        Arc::new(frankenterm_core::workflows::HandleProcessTriageLifecycle::new()),
     ];
 
     workflows.into_iter().find(|wf| wf.name() == name)
@@ -6491,6 +6492,9 @@ fn resolve_workflow(
         )),
         "handle_gemini_quota" => Some(std::sync::Arc::new(
             frankenterm_core::workflows::HandleGeminiQuota::new(),
+        )),
+        "handle_process_triage_lifecycle" => Some(std::sync::Arc::new(
+            frankenterm_core::workflows::HandleProcessTriageLifecycle::new(),
         )),
         _ => None,
     }
@@ -8323,7 +8327,7 @@ async fn distributed_persist_payload(
                 }
             }
 
-            let storage_guard = storage.lock().await;
+            let storage_guard = storage.lock().await.clone();
             if storage_guard.get_pane(remote_pane_id).await?.is_none() {
                 let ts = now_ms_i64();
                 distributed_upsert_pane(
@@ -8369,7 +8373,7 @@ async fn distributed_persist_payload(
         }
         WirePayload::Gap(gap) => {
             let remote_pane_id = distributed_remote_pane_id(sender, gap.pane_id);
-            let storage_guard = storage.lock().await;
+            let storage_guard = storage.lock().await.clone();
             if storage_guard.get_pane(remote_pane_id).await?.is_none() {
                 let ts = now_ms_i64();
                 distributed_upsert_pane(
@@ -8418,7 +8422,7 @@ async fn distributed_persist_payload(
                 now_ms_i64()
             };
 
-            let storage_guard = storage.lock().await;
+            let storage_guard = storage.lock().await.clone();
             if storage_guard.get_pane(remote_pane_id).await?.is_none() {
                 distributed_upsert_pane(
                     &storage_guard,
@@ -8476,7 +8480,7 @@ async fn distributed_persist_pane_meta(
         .clone()
         .or_else(|| Some(format!("remote:{sender}:{}", meta.pane_id)));
 
-    let storage_guard = storage.lock().await;
+    let storage_guard = storage.lock().await.clone();
     let is_new = storage_guard.get_pane(remote_pane_id).await?.is_none();
     distributed_upsert_pane(
         &storage_guard,
@@ -8973,7 +8977,7 @@ async fn distributed_agent_seed_segment_cursors(
     storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     cursors: &mut std::collections::HashMap<u64, i64>,
 ) -> anyhow::Result<()> {
-    let storage_guard = storage.lock().await;
+    let storage_guard = storage.lock().await.clone();
     let panes = storage_guard.get_panes().await?;
     for pane in panes {
         if !distributed_agent_local_pane(&pane) || cursors.contains_key(&pane.pane_id) {
@@ -9001,7 +9005,7 @@ async fn distributed_agent_send_pane_snapshot(
     use frankenterm_core::wire_protocol::WirePayload;
 
     let panes = {
-        let storage_guard = storage.lock().await;
+        let storage_guard = storage.lock().await.clone();
         storage_guard.get_panes().await?
     };
 
@@ -9047,7 +9051,7 @@ async fn distributed_agent_flush_pane_deltas(
 
     loop {
         let segments = {
-            let storage_guard = storage.lock().await;
+            let storage_guard = storage.lock().await.clone();
             storage_guard
                 .scan_segments(SegmentScanQuery {
                     after_id,
@@ -9102,7 +9106,7 @@ async fn distributed_agent_flush_all_panes(
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<usize> {
     let pane_ids = {
-        let storage_guard = storage.lock().await;
+        let storage_guard = storage.lock().await.clone();
         storage_guard
             .get_panes()
             .await?
@@ -9154,7 +9158,7 @@ async fn distributed_agent_stream_event(
             if let Some(mut envelope) = streamer.event_to_envelope(&other) {
                 if let WirePayload::PaneMeta(meta) = &mut envelope.payload {
                     let pane_record = {
-                        let storage_guard = storage.lock().await;
+                        let storage_guard = storage.lock().await.clone();
                         storage_guard.get_pane(meta.pane_id).await?
                     };
                     if let Some(record) = pane_record {
@@ -9973,8 +9977,11 @@ async fn run_watcher(
         workflow_runner.register_workflow(Arc::new(
             frankenterm_core::workflows::HandleGeminiQuota::new(),
         ));
+        workflow_runner.register_workflow(Arc::new(
+            frankenterm_core::workflows::HandleProcessTriageLifecycle::new(),
+        ));
         tracing::info!(
-            "Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_auth_required, handle_claude_code_limits, handle_gemini_quota"
+            "Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_auth_required, handle_claude_code_limits, handle_gemini_quota, handle_process_triage_lifecycle"
         );
 
         // Spawn workflow runner event loop
@@ -13781,6 +13788,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             trigger_event_types: Some(vec![
                                                 "usage.warning".to_string(),
                                                 "usage.reached".to_string(),
+                                            ]),
+                                            requires_pane: Some(true),
+                                        },
+                                        RobotWorkflowInfo {
+                                            name: "handle_process_triage_lifecycle".to_string(),
+                                            description: Some(
+                                                "Orchestrate process triage lifecycle phases \
+                                                 (snapshot, plan, apply, verify, diff, session)"
+                                                    .to_string(),
+                                            ),
+                                            enabled: true,
+                                            trigger_event_types: Some(vec![
+                                                "process_triage.lifecycle".to_string(),
                                             ]),
                                             requires_pane: Some(true),
                                         },
@@ -17731,6 +17751,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         Arc::new(frankenterm_core::workflows::HandleAuthRequired::new()),
                         Arc::new(frankenterm_core::workflows::HandleClaudeCodeLimits::new()),
                         Arc::new(frankenterm_core::workflows::HandleGeminiQuota::new()),
+                        Arc::new(frankenterm_core::workflows::HandleProcessTriageLifecycle::new()),
                     ];
 
                     println!(
@@ -17870,6 +17891,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         ));
                         runner.register_workflow(Arc::new(
                             frankenterm_core::workflows::HandleGeminiQuota::new(),
+                        ));
+                        runner.register_workflow(Arc::new(
+                            frankenterm_core::workflows::HandleProcessTriageLifecycle::new(),
                         ));
 
                         // Look up workflow
@@ -20502,6 +20526,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     ));
                     runner.register_workflow(std::sync::Arc::new(
                         frankenterm_core::workflows::HandleGeminiQuota::new(),
+                    ));
+                    runner.register_workflow(std::sync::Arc::new(
+                        frankenterm_core::workflows::HandleProcessTriageLifecycle::new(),
                     ));
 
                     println!("Workflow: {} ({})", workflow.name(), workflow.description());
@@ -31740,7 +31767,7 @@ mod tests {
         .unwrap();
 
         {
-            let storage_guard = storage.lock().await;
+            let storage_guard = storage.lock().await.clone();
             let remote = storage_guard.get_pane(remote_pane_id).await.unwrap();
             assert!(remote.is_some());
             assert!(
@@ -31759,7 +31786,7 @@ mod tests {
         }
 
         {
-            let storage_guard = storage.lock().await;
+            let storage_guard = storage.lock().await.clone();
             storage_guard.shutdown().await.unwrap();
         }
         drop(storage);
@@ -31806,7 +31833,7 @@ mod tests {
         }
 
         {
-            let storage_guard = storage.lock().await;
+            let storage_guard = storage.lock().await.clone();
             let segments = storage_guard
                 .get_segments(remote_pane_id, 16)
                 .await
@@ -31831,7 +31858,7 @@ mod tests {
         }
 
         {
-            let storage_guard = storage.lock().await;
+            let storage_guard = storage.lock().await.clone();
             storage_guard.shutdown().await.unwrap();
         }
         drop(storage);
@@ -35296,9 +35323,18 @@ log_level = "debug"
                 ]),
                 requires_pane: Some(true),
             },
+            RobotWorkflowInfo {
+                name: "handle_process_triage_lifecycle".to_string(),
+                description: Some(
+                    "Orchestrate process triage lifecycle phases (snapshot, plan, apply, verify, diff, session)".to_string(),
+                ),
+                enabled: true,
+                trigger_event_types: Some(vec!["process_triage.lifecycle".to_string()]),
+                requires_pane: Some(true),
+            },
         ];
 
-        assert_eq!(workflows.len(), 6, "must list exactly 6 workflows");
+        assert_eq!(workflows.len(), 7, "must list exactly 7 workflows");
         let names: Vec<&str> = workflows.iter().map(|w| w.name.as_str()).collect();
         assert!(names.contains(&"handle_compaction"));
         assert!(names.contains(&"handle_usage_limits"));
@@ -35306,6 +35342,7 @@ log_level = "debug"
         assert!(names.contains(&"handle_auth_required"));
         assert!(names.contains(&"handle_claude_code_limits"));
         assert!(names.contains(&"handle_gemini_quota"));
+        assert!(names.contains(&"handle_process_triage_lifecycle"));
         assert!(
             workflows.iter().all(|w| w.enabled),
             "all workflows must be enabled"

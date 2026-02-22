@@ -47,8 +47,8 @@ use crate::wezterm::{
 };
 use crate::workflows::{
     HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
-    HandleSessionEnd, HandleUsageLimits, PaneWorkflowLockManager, Workflow, WorkflowEngine,
-    WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
+    HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits, PaneWorkflowLockManager,
+    Workflow, WorkflowEngine, WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
 };
 
 const MCP_VERSION: &str = "v1";
@@ -4808,6 +4808,7 @@ fn builtin_workflows(config: &Config) -> Vec<Arc<dyn Workflow>> {
         Arc::new(HandleAuthRequired::new()),
         Arc::new(HandleClaudeCodeLimits::new()),
         Arc::new(HandleGeminiQuota::new()),
+        Arc::new(HandleProcessTriageLifecycle::new()),
     ]
 }
 
