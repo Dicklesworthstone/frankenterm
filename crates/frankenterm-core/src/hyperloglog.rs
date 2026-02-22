@@ -100,7 +100,7 @@ impl HyperLogLog {
         let remaining = if self.precision >= 64 {
             0u64
         } else {
-            (hash << self.precision) | (1u64 << (self.precision - 1))
+            hash << self.precision
         };
         let rho = remaining.leading_zeros() as u8 + 1;
 
@@ -116,7 +116,7 @@ impl HyperLogLog {
         let remaining = if self.precision >= 64 {
             0u64
         } else {
-            (hash << self.precision) | (1u64 << (self.precision - 1))
+            hash << self.precision
         };
         let rho = remaining.leading_zeros() as u8 + 1;
 

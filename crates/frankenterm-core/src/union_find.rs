@@ -259,10 +259,19 @@ impl UnionFind {
     // ── Internal ──────────────────────────────────────────────────
 
     fn find_inner(&mut self, x: usize) -> usize {
-        if self.parent[x] != x {
-            self.parent[x] = self.find_inner(self.parent[x]); // path compression
+        // Iterative path compression to avoid stack overflow on deep trees
+        let mut root = x;
+        while self.parent[root] != root {
+            root = self.parent[root];
         }
-        self.parent[x]
+        // Path compression: point all nodes on the path directly to root
+        let mut current = x;
+        while self.parent[current] != root {
+            let next = self.parent[current];
+            self.parent[current] = root;
+            current = next;
+        }
+        root
     }
 }
 

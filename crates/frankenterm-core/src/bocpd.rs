@@ -183,8 +183,10 @@ impl BocpdModel {
         }
 
         // Step 2: Compute growth probabilities (log-space)
-        let log_h = self.config.hazard_rate.ln();
-        let log_1mh = (1.0 - self.config.hazard_rate).ln();
+        // Clamp hazard_rate to avoid ln(0) = -inf which propagates NaN
+        let h = self.config.hazard_rate.clamp(1e-10, 1.0 - 1e-10);
+        let log_h = h.ln();
+        let log_1mh = (1.0 - h).ln();
 
         let mut new_log_probs = Vec::with_capacity(n + 1);
 

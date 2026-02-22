@@ -87,7 +87,7 @@ fn minhash_signature(shingles: &[u64], num_hashes: usize) -> Vec<u64> {
 
 /// Extract character n-gram shingles from text, returning their hashes.
 fn shingle(text: &str, n: usize) -> Vec<u64> {
-    if text.len() < n {
+    if n == 0 || text.len() < n {
         // For very short strings, use the whole string as one shingle
         return vec![hash_bytes(text.as_bytes())];
     }

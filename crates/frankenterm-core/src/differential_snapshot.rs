@@ -494,7 +494,8 @@ impl DiffSnapshotEngine {
                         pane_id,
                         new_state: current.clone(),
                     });
-                } else if fields.contains(&DirtyField::Scrollback) {
+                }
+                if fields.contains(&DirtyField::Scrollback) {
                     diffs.push(SnapshotDiff::PaneScrollbackChanged {
                         pane_id,
                         new_scrollback_ref: current.scrollback_ref.clone(),

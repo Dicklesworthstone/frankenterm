@@ -783,12 +783,14 @@ fn compute_state_hash(panes: &[PaneInfo]) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
-    // Sort by pane_id for deterministic ordering
-    let mut ids: Vec<u64> = panes.iter().map(|p| p.pane_id).collect();
-    ids.sort();
+    // Sort panes by pane_id for deterministic ordering
+    let mut sorted_panes: Vec<&PaneInfo> = panes.iter().collect();
+    sorted_panes.sort_by_key(|p| p.pane_id);
+
+    let ids: Vec<u64> = sorted_panes.iter().map(|p| p.pane_id).collect();
     ids.hash(&mut hasher);
 
-    for p in panes {
+    for p in &sorted_panes {
         p.pane_id.hash(&mut hasher);
         p.tab_id.hash(&mut hasher);
         p.window_id.hash(&mut hasher);

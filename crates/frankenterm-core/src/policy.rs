@@ -2147,12 +2147,21 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
 ///
 /// Supports `*` (any characters) and `?` (single character)
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let regex_pattern = pattern
-        .replace('.', r"\.")
-        .replace('*', ".*")
-        .replace('?', ".");
-    let full_pattern = format!("^{regex_pattern}$");
-    Regex::new(&full_pattern).is_ok_and(|re| re.is_match(text))
+    let mut regex_pattern = String::with_capacity(pattern.len() + 4);
+    regex_pattern.push('^');
+    for ch in pattern.chars() {
+        match ch {
+            '*' => regex_pattern.push_str(".*"),
+            '?' => regex_pattern.push('.'),
+            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' => {
+                regex_pattern.push('\\');
+                regex_pattern.push(ch);
+            }
+            c => regex_pattern.push(c),
+        }
+    }
+    regex_pattern.push('$');
+    Regex::new(&regex_pattern).is_ok_and(|re| re.is_match(text))
 }
 
 // ============================================================================
@@ -2660,38 +2669,38 @@ impl PolicyEngine {
 
         // Check reservation conflicts
         if input.action.is_mutating() && input.capabilities.is_reserved {
-            // Allow if this is the workflow that has the reservation
-            if let (Some(reserved_by), Some(workflow_id)) =
-                (&input.capabilities.reserved_by, &input.workflow_id)
-            {
-                if reserved_by == workflow_id {
-                    context.record_rule(
-                        "policy.pane_reserved",
-                        false,
-                        None,
-                        Some("reserved by same workflow".to_string()),
-                    );
-                    return PolicyDecision::allow().with_context(context);
-                }
+            let is_owner = matches!(
+                (&input.capabilities.reserved_by, &input.workflow_id),
+                (Some(reserved_by), Some(workflow_id)) if reserved_by == workflow_id
+            );
+            if is_owner {
+                // Owning workflow: record and fall through to command safety gate
+                context.record_rule(
+                    "policy.pane_reserved",
+                    false,
+                    None,
+                    Some("reserved by same workflow".to_string()),
+                );
+            } else {
+                // Non-owner: deny
+                let reason = format!(
+                    "Pane is reserved by workflow {}",
+                    input
+                        .capabilities
+                        .reserved_by
+                        .as_deref()
+                        .unwrap_or("unknown")
+                );
+                context.record_rule(
+                    "policy.pane_reserved",
+                    true,
+                    Some("deny"),
+                    Some(reason.clone()),
+                );
+                context.set_determining_rule("policy.pane_reserved");
+                return PolicyDecision::deny_with_rule(reason, "policy.pane_reserved")
+                    .with_context(context);
             }
-            // Otherwise deny
-            let reason = format!(
-                "Pane is reserved by workflow {}",
-                input
-                    .capabilities
-                    .reserved_by
-                    .as_deref()
-                    .unwrap_or("unknown")
-            );
-            context.record_rule(
-                "policy.pane_reserved",
-                true,
-                Some("deny"),
-                Some(reason.clone()),
-            );
-            context.set_determining_rule("policy.pane_reserved");
-            return PolicyDecision::deny_with_rule(reason, "policy.pane_reserved")
-                .with_context(context);
         }
         context.record_rule(
             "policy.pane_reserved",

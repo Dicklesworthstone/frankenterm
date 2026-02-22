@@ -132,9 +132,17 @@ impl<K: Ord + Clone, V> Treap<K, V> {
         let (left, existing, right) = self.split_by_key(self.root, &key);
         let old_value = existing.map(|idx| self.nodes[idx].value.clone());
 
-        // Merge left + new_node + right
-        let merged = self.merge(left, Some(new_idx));
-        self.root = self.merge(merged, right);
+        if let Some(existing_idx) = existing {
+            // Key already exists: update value in existing slot, discard unused new node
+            let new_node = self.nodes.pop().expect("just pushed");
+            self.nodes[existing_idx].value = new_node.value;
+            let merged = self.merge(left, Some(existing_idx));
+            self.root = self.merge(merged, right);
+        } else {
+            // New key: merge left + new_node + right
+            let merged = self.merge(left, Some(new_idx));
+            self.root = self.merge(merged, right);
+        }
         old_value
     }
 

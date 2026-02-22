@@ -156,6 +156,9 @@ impl<K: Ord + Clone, V: Clone> FibonacciHeap<K, V> {
             self.nodes[min_idx].value.clone(),
         );
 
+        // Save next pointer BEFORE remove_from_list modifies it
+        let next = self.nodes[min_idx].next;
+
         self.remove_from_list(min_idx);
         self.free.push(min_idx);
         self.count -= 1;
@@ -164,8 +167,6 @@ impl<K: Ord + Clone, V: Clone> FibonacciHeap<K, V> {
             self.min = None;
         } else {
             // Set min to some root node, then consolidate
-            // Find any remaining root node
-            let next = self.nodes[min_idx].next;
             if next == min_idx {
                 // min was the only root and had no children — shouldn't happen if count > 0
                 // This means children were added above

@@ -1454,17 +1454,18 @@ impl OutputCache {
         self.pane_states
             .retain(|_, state| state.last_updated > cutoff);
 
-        let hashes_to_remove: Vec<u64> = self
+        let hashes_to_remove: std::collections::HashSet<u64> = self
             .global_hashes
             .iter()
             .filter(|(_, ts)| **ts < cutoff)
             .map(|(hash, _)| *hash)
             .collect();
 
-        for hash in hashes_to_remove {
-            self.global_hashes.remove(&hash);
-            self.lru_order.retain(|h| *h != hash);
+        for hash in &hashes_to_remove {
+            self.global_hashes.remove(hash);
         }
+        // Single O(n) pass instead of O(n*m) per-hash retain calls
+        self.lru_order.retain(|h| !hashes_to_remove.contains(h));
     }
 
     /// Prune stale entries using the configured max_age.

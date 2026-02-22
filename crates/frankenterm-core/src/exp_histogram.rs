@@ -126,7 +126,9 @@ impl ExpHistogram {
 
     /// Record multiple occurrences of the same value.
     pub fn record_n(&mut self, value: f64, n: u64) {
-        for _ in 0..n {
+        // Cap iterations to avoid near-infinite loops for very large n
+        let capped = n.min(10_000_000);
+        for _ in 0..capped {
             self.record(value);
         }
     }

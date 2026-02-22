@@ -317,6 +317,7 @@ impl CircuitBreaker {
                 }
             }
             CircuitState::HalfOpen { .. } => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 self.state = CircuitState::Open {
                     opened_at: Instant::now(),
                 };

@@ -449,6 +449,12 @@ impl WalFrame {
     fn from_entry<T: Clone + Serialize>(entry: &WalEntry<T>) -> Result<Self, io::Error> {
         let payload =
             serde_json::to_vec(entry).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if payload.len() > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("WAL entry payload too large: {} bytes", payload.len()),
+            ));
+        }
         let mut crc_input = Vec::with_capacity(4 + payload.len());
         crc_input.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         crc_input.extend_from_slice(&payload);
