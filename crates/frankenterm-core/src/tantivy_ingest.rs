@@ -1326,6 +1326,10 @@ mod tests {
                 fail_commit: false,
             }
         }
+
+        fn written_docs(&self) -> &[IndexDocumentFields] {
+            &self.docs
+        }
     }
 
     impl IndexWriter for MockIndexWriter {
@@ -3439,5 +3443,382 @@ mod tests {
         let batch = cursor.next_batch(10).unwrap();
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0].event.event_id, "e1");
+    }
+
+    // =========================================================================
+    // E2.F1.T3: Schema-dedup-EOF parity validation across reader paths
+    // =========================================================================
+
+    /// Helper: run both paths and return (legacy_result, reader_result).
+    async fn run_both_paths(
+        storage: &AppendLogRecorderStorage,
+        source: &AppendLogEventSource,
+        base_config: IndexerConfig,
+    ) -> (IndexerRunResult, IndexerRunResult) {
+        // Legacy path
+        let legacy_config = IndexerConfig {
+            consumer_id: format!("{}-legacy", base_config.consumer_id),
+            ..base_config.clone()
+        };
+        let writer1 = MockIndexWriter::new();
+        let mut indexer1 = IncrementalIndexer::new(legacy_config, writer1);
+        let r1 = indexer1.run(storage).await.unwrap();
+
+        // Reader path
+        let reader_config = IndexerConfig {
+            consumer_id: format!("{}-reader", base_config.consumer_id),
+            ..base_config
+        };
+        let writer2 = MockIndexWriter::new();
+        let mut indexer2 = IncrementalIndexer::new(reader_config, writer2);
+        let r2 = indexer2.run_with_reader(storage, source).await.unwrap();
+
+        (r1, r2)
+    }
+
+    #[tokio::test]
+    async fn parity_single_event_indexing() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        populate_log(&storage, vec![sample_event("e1", 1, 0, "hello")]).await;
+
+        let source = AppendLogEventSource::from_storage(&storage);
+        let icfg = test_indexer_config(dir.path());
+        let (r1, r2) = run_both_paths(&storage, &source, icfg).await;
+
+        assert_eq!(r1.events_read, r2.events_read);
+        assert_eq!(r1.events_indexed, r2.events_indexed);
+        assert_eq!(r1.events_skipped, r2.events_skipped);
+        assert_eq!(r1.batches_committed, r2.batches_committed);
+        assert_eq!(r1.caught_up, r2.caught_up);
+        assert_eq!(r1.final_ordinal, r2.final_ordinal);
+        assert_eq!(r1.events_read, 1);
+    }
+
+    #[tokio::test]
+    async fn parity_batch_indexing_100_events() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        let events: Vec<_> = (0..100)
+            .map(|i| sample_event(&format!("e{i}"), i % 5, i, &format!("text-{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        let source = AppendLogEventSource::from_storage(&storage);
+        let icfg = test_indexer_config(dir.path());
+        let (r1, r2) = run_both_paths(&storage, &source, icfg).await;
+
+        assert_eq!(r1.events_read, 100);
+        assert_eq!(r1.events_read, r2.events_read);
+        assert_eq!(r1.events_indexed, r2.events_indexed);
+        assert_eq!(r1.final_ordinal, r2.final_ordinal);
+        assert_eq!(r1.caught_up, r2.caught_up);
+        assert!(r1.caught_up);
+    }
+
+    #[tokio::test]
+    async fn parity_eof_partial_batch_handling() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        // Write exactly 7 events with batch_size=3 → 2 full + 1 partial
+        let events: Vec<_> = (0..7)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t-{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        let source = AppendLogEventSource::from_storage(&storage);
+        let icfg = IndexerConfig {
+            batch_size: 3,
+            ..test_indexer_config(dir.path())
+        };
+        let (r1, r2) = run_both_paths(&storage, &source, icfg).await;
+
+        assert_eq!(r1.events_read, 7);
+        assert_eq!(r1.events_read, r2.events_read);
+        assert_eq!(r1.events_indexed, r2.events_indexed);
+        assert_eq!(r1.batches_committed, r2.batches_committed);
+        // 3 batches: [3, 3, 1]
+        assert_eq!(r1.batches_committed, 3);
+        assert!(r1.caught_up);
+        assert!(r2.caught_up);
+    }
+
+    #[tokio::test]
+    async fn parity_schema_fields_match_exactly() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        // Create events with different pane IDs and sources
+        let events = vec![
+            sample_event("e1", 1, 0, "first output"),
+            sample_event("e2", 2, 1, "second output"),
+            sample_event("e3", 1, 2, "third output"),
+        ];
+        populate_log(&storage, events).await;
+
+        let source = AppendLogEventSource::from_storage(&storage);
+
+        // Legacy path: capture docs written
+        let writer1 = MockIndexWriter::new();
+        let icfg1 = IndexerConfig {
+            consumer_id: "schema-legacy".to_string(),
+            ..test_indexer_config(dir.path())
+        };
+        let mut indexer1 = IncrementalIndexer::new(icfg1, writer1);
+        let _ = indexer1.run(&storage).await.unwrap();
+        let docs1 = indexer1.into_writer().written_docs();
+
+        // Reader path: capture docs written
+        let writer2 = MockIndexWriter::new();
+        let icfg2 = IndexerConfig {
+            consumer_id: "schema-reader".to_string(),
+            ..test_indexer_config(dir.path())
+        };
+        let mut indexer2 = IncrementalIndexer::new(icfg2, writer2);
+        let _ = indexer2.run_with_reader(&storage, &source).await.unwrap();
+        let docs2 = indexer2.into_writer().written_docs();
+
+        assert_eq!(docs1.len(), docs2.len());
+        for (d1, d2) in docs1.iter().zip(docs2.iter()) {
+            assert_eq!(d1.event_id, d2.event_id);
+            assert_eq!(d1.pane_id, d2.pane_id);
+            assert_eq!(d1.sequence, d2.sequence);
+            assert_eq!(d1.schema_version, d2.schema_version);
+            assert_eq!(d1.text_content, d2.text_content);
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_with_mixed_pane_ids() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        let events: Vec<_> = (0..20)
+            .map(|i| {
+                sample_event(
+                    &format!("e{i}"),
+                    (i % 4) + 1,
+                    i,
+                    &format!("pane-{}-text-{i}", (i % 4) + 1),
+                )
+            })
+            .collect();
+        populate_log(&storage, events).await;
+
+        let source = AppendLogEventSource::from_storage(&storage);
+        let icfg = test_indexer_config(dir.path());
+        let (r1, r2) = run_both_paths(&storage, &source, icfg).await;
+
+        assert_eq!(r1.events_read, 20);
+        assert_eq!(r1.events_read, r2.events_read);
+        assert_eq!(r1.events_indexed, r2.events_indexed);
+        assert_eq!(r1.final_ordinal, r2.final_ordinal);
+    }
+
+    #[tokio::test]
+    async fn parity_dedup_skips_identical_schema_mismatch() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        // Mix valid and invalid schema version events
+        let mut events = vec![
+            sample_event("e1", 1, 0, "valid"),
+            sample_event("e2", 1, 1, "valid"),
+        ];
+        // Create event with wrong schema
+        let mut bad_event = sample_event("e3", 1, 2, "bad-schema");
+        bad_event.schema_version = "ft.recorder.v99".to_string();
+        events.push(bad_event);
+        events.push(sample_event("e4", 1, 3, "valid-again"));
+
+        populate_log(&storage, events).await;
+
+        let source = AppendLogEventSource::from_storage(&storage);
+        let icfg = test_indexer_config(dir.path());
+        let (r1, r2) = run_both_paths(&storage, &source, icfg).await;
+
+        assert_eq!(r1.events_read, 4);
+        assert_eq!(r1.events_indexed, 3); // e3 skipped
+        assert_eq!(r1.events_skipped, 1);
+        assert_eq!(r1.events_read, r2.events_read);
+        assert_eq!(r1.events_indexed, r2.events_indexed);
+        assert_eq!(r1.events_skipped, r2.events_skipped);
+    }
+
+    // =========================================================================
+    // Mock FrankenSqlite cursor for testing abstraction
+    // =========================================================================
+
+    #[tokio::test]
+    async fn mock_frankensqlite_cursor_produces_identical_results() {
+        use crate::recorder_storage::{
+            CursorRecord, EventCursorError, RecorderEventCursor, RecorderEventReader,
+        };
+
+        struct MockSqliteCursor {
+            records: Vec<CursorRecord>,
+            pos: usize,
+        }
+
+        impl RecorderEventCursor for MockSqliteCursor {
+            fn next_batch(
+                &mut self,
+                max: usize,
+            ) -> std::result::Result<Vec<CursorRecord>, EventCursorError> {
+                let end = (self.pos + max).min(self.records.len());
+                let batch = self.records[self.pos..end].to_vec();
+                self.pos = end;
+                Ok(batch)
+            }
+
+            fn current_offset(&self) -> RecorderOffset {
+                if self.pos < self.records.len() {
+                    self.records[self.pos].offset.clone()
+                } else {
+                    RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 999,
+                        ordinal: self.records.len() as u64,
+                    }
+                }
+            }
+        }
+
+        struct MockSqliteReader {
+            records: Vec<CursorRecord>,
+        }
+
+        impl RecorderEventReader for MockSqliteReader {
+            fn open_cursor(
+                &self,
+                from: RecorderOffset,
+            ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+                let start = from.ordinal as usize;
+                let remaining: Vec<_> = self
+                    .records
+                    .iter()
+                    .filter(|r| r.offset.ordinal >= start as u64)
+                    .cloned()
+                    .collect();
+                Ok(Box::new(MockSqliteCursor {
+                    records: remaining,
+                    pos: 0,
+                }))
+            }
+
+            fn head_offset(&self) -> std::result::Result<RecorderOffset, EventCursorError> {
+                Ok(RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 999,
+                    ordinal: self.records.len() as u64,
+                })
+            }
+        }
+
+        // Populate both real append-log and mock sqlite with same events
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        let events: Vec<_> = (0..10)
+            .map(|i| sample_event(&format!("e{i}"), i % 3, i, &format!("text-{i}")))
+            .collect();
+        populate_log(&storage, events.clone()).await;
+
+        // Build mock records matching what append-log reader would produce
+        let mock_records: Vec<CursorRecord> = events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| CursorRecord {
+                event: e.clone(),
+                offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: i as u64 * 100, // fake offsets don't affect indexing
+                    ordinal: i as u64,
+                },
+            })
+            .collect();
+
+        // Run via real append-log source
+        let al_source = AppendLogEventSource::from_storage(&storage);
+        let icfg_al = IndexerConfig {
+            consumer_id: "parity-al".to_string(),
+            ..test_indexer_config(dir.path())
+        };
+        let writer_al = MockIndexWriter::new();
+        let mut indexer_al = IncrementalIndexer::new(icfg_al, writer_al);
+        let r_al = indexer_al
+            .run_with_reader(&storage, &al_source)
+            .await
+            .unwrap();
+
+        // Run via mock sqlite source
+        let sqlite_source = MockSqliteReader {
+            records: mock_records,
+        };
+        let icfg_sq = IndexerConfig {
+            consumer_id: "parity-sqlite".to_string(),
+            ..test_indexer_config(dir.path())
+        };
+        let writer_sq = MockIndexWriter::new();
+        let mut indexer_sq = IncrementalIndexer::new(icfg_sq, writer_sq);
+        let r_sq = indexer_sq
+            .run_with_reader(&storage, &sqlite_source)
+            .await
+            .unwrap();
+
+        // Both should produce identical results
+        assert_eq!(r_al.events_read, r_sq.events_read);
+        assert_eq!(r_al.events_indexed, r_sq.events_indexed);
+        assert_eq!(r_al.events_skipped, r_sq.events_skipped);
+        assert_eq!(r_al.caught_up, r_sq.caught_up);
+    }
+
+    #[test]
+    fn indexer_config_frankensqlite_descriptor() {
+        let cfg = IndexerConfig {
+            source: crate::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
+                db_path: PathBuf::from("/data/recorder.db"),
+            },
+            ..IndexerConfig::default()
+        };
+        assert!(cfg.data_path().is_none());
+        assert_eq!(
+            cfg.source.backend_kind(),
+            crate::recorder_storage::RecorderBackendKind::FrankenSqlite
+        );
+    }
+
+    #[test]
+    fn indexer_config_create_event_reader_append_log() {
+        let dir = tempdir().unwrap();
+        // Create the events.log file
+        let scfg = test_storage_config(dir.path());
+        let _storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        let cfg = test_indexer_config(dir.path());
+        let reader = cfg.create_event_reader();
+        assert!(reader.is_ok());
+    }
+
+    #[test]
+    fn indexer_config_create_event_reader_frankensqlite_errors() {
+        let cfg = IndexerConfig {
+            source: crate::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
+                db_path: PathBuf::from("/data/recorder.db"),
+            },
+            ..IndexerConfig::default()
+        };
+        let result = cfg.create_event_reader();
+        assert!(result.is_err());
     }
 }
