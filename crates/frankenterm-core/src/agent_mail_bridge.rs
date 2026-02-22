@@ -3,14 +3,15 @@
 //! Wraps the `agent_mail` CLI (or a future MCP client) via
 //! [`SubprocessBridge`] to exchange messages, reserve files, and
 //! coordinate work across concurrent coding agents.  All calls
-//! fail-open: when the bridge is unavailable, callers get `None` or
-//! empty results rather than blocking.
+//! fail-open for read/reservation paths and explicit `Result` errors
+//! for send/release paths.
 //!
-//! Feature-gated behind `subprocess-bridge`.
+//! Feature-gated behind `agent-mail`.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::subprocess_bridge::SubprocessBridge;
@@ -158,6 +159,17 @@ pub struct ReleaseResponse {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+/// Bridge-level failures for agent mail write/release operations.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum AgentMailBridgeError {
+    /// Message send failed.
+    #[error("send_message failed: {0}")]
+    SendFailed(String),
+    /// File-release request failed.
+    #[error("release_files failed: {0}")]
+    ReleaseFailed(String),
+}
+
 // =============================================================================
 // Bridge
 // =============================================================================
@@ -201,13 +213,13 @@ impl AgentMailBridge {
 
     /// Send a message to another agent.
     ///
-    /// Returns `None` on any failure (fail-open).
+    /// Returns [`AgentMailBridgeError::SendFailed`] on failure.
     pub fn send_message(
         &self,
         to: &str,
         subject: &str,
         body: &str,
-    ) -> Option<MessageId> {
+    ) -> Result<MessageId, AgentMailBridgeError> {
         match self.msg_bridge.invoke(&[
             "send",
             "--format=json",
@@ -220,33 +232,36 @@ impl AgentMailBridge {
         ]) {
             Ok(resp) => {
                 if resp.success {
-                    let id = resp
-                        .message_id
-                        .unwrap_or_else(|| "unknown".to_string());
+                    let id = resp.message_id.unwrap_or_else(|| "unknown".to_string());
                     debug!(
-                        bridge = "agent_mail",
-                        to = to,
+                        agent_mail = true,
+                        action = "send_message",
+                        agent = to,
                         message_id = %id,
                         "message sent"
                     );
-                    Some(MessageId::new(id))
+                    Ok(MessageId::new(id))
                 } else {
                     warn!(
-                        bridge = "agent_mail",
-                        to = to,
+                        agent_mail = true,
+                        action = "send_message",
+                        agent = to,
                         "send_message returned success=false"
                     );
-                    None
+                    Err(AgentMailBridgeError::SendFailed(
+                        "success=false".to_string(),
+                    ))
                 }
             }
             Err(err) => {
                 warn!(
-                    bridge = "agent_mail",
-                    to = to,
+                    agent_mail = true,
+                    action = "send_message",
+                    agent = to,
                     error = %err,
                     "send_message failed"
                 );
-                None
+                Err(AgentMailBridgeError::SendFailed(err.to_string()))
             }
         }
     }
@@ -255,12 +270,10 @@ impl AgentMailBridge {
     ///
     /// Returns an empty vec on any failure (fail-open).
     pub fn fetch_inbox(&self, agent_name: &str) -> Vec<MailMessage> {
-        match self.inbox_bridge.invoke(&[
-            "inbox",
-            "--format=json",
-            "--agent",
-            agent_name,
-        ]) {
+        match self
+            .inbox_bridge
+            .invoke(&["inbox", "--format=json", "--agent", agent_name])
+        {
             Ok(messages) => {
                 debug!(
                     bridge = "agent_mail",
@@ -286,11 +299,7 @@ impl AgentMailBridge {
     ///
     /// Returns [`ReservationResult`] with status [`Unavailable`](ReservationStatus::Unavailable)
     /// on bridge failure.
-    pub fn reserve_files(
-        &self,
-        agent_name: &str,
-        paths: &[&str],
-    ) -> ReservationResult {
+    pub fn reserve_files(&self, agent_name: &str, paths: &[&str]) -> ReservationResult {
         let paths_arg = paths.join(",");
         match self.reserve_bridge.invoke(&[
             "reserve",
@@ -330,31 +339,44 @@ impl AgentMailBridge {
 
     /// Release all file reservations held by an agent.
     ///
-    /// Returns `true` if release succeeded, `false` on failure (fail-open).
-    pub fn release_files(&self, agent_name: &str) -> bool {
-        match self.release_bridge.invoke(&[
-            "release",
-            "--format=json",
-            "--agent",
-            agent_name,
-        ]) {
+    /// Returns [`AgentMailBridgeError::ReleaseFailed`] on failure.
+    pub fn release_files(&self, agent_name: &str) -> Result<(), AgentMailBridgeError> {
+        match self
+            .release_bridge
+            .invoke(&["release", "--format=json", "--agent", agent_name])
+        {
             Ok(resp) => {
-                debug!(
-                    bridge = "agent_mail",
-                    agent = agent_name,
-                    released = resp.released,
-                    "files released"
-                );
-                resp.success
+                if resp.success {
+                    debug!(
+                        agent_mail = true,
+                        action = "release_files",
+                        agent = agent_name,
+                        released = resp.released,
+                        "files released"
+                    );
+                    Ok(())
+                } else {
+                    warn!(
+                        agent_mail = true,
+                        action = "release_files",
+                        agent = agent_name,
+                        released = resp.released,
+                        "release_files returned success=false"
+                    );
+                    Err(AgentMailBridgeError::ReleaseFailed(
+                        "success=false".to_string(),
+                    ))
+                }
             }
             Err(err) => {
                 warn!(
-                    bridge = "agent_mail",
+                    agent_mail = true,
+                    action = "release_files",
                     agent = agent_name,
                     error = %err,
                     "release_files failed"
                 );
-                false
+                Err(AgentMailBridgeError::ReleaseFailed(err.to_string()))
             }
         }
     }
@@ -362,11 +384,7 @@ impl AgentMailBridge {
     /// Register an agent with the coordination server.
     ///
     /// Returns `None` on failure (fail-open).
-    pub fn register_agent(
-        &self,
-        agent_name: &str,
-        project: &str,
-    ) -> Option<AgentRegistration> {
+    pub fn register_agent(&self, agent_name: &str, project: &str) -> Option<AgentRegistration> {
         match self.register_bridge.invoke(&[
             "register",
             "--format=json",
@@ -758,6 +776,35 @@ mod tests {
         assert_eq!(bridge.msg_bridge.binary_name(), BINARY_NAME);
     }
 
+    #[cfg(unix)]
+    fn write_executable(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn fixture_bridge(script_body: &str) -> (tempfile::TempDir, AgentMailBridge) {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join(BINARY_NAME);
+        write_executable(&bin, script_body);
+        let bin_path = bin.to_string_lossy().into_owned();
+
+        (
+            dir,
+            AgentMailBridge {
+                msg_bridge: SubprocessBridge::new(&bin_path),
+                inbox_bridge: SubprocessBridge::new(&bin_path),
+                reserve_bridge: SubprocessBridge::new(&bin_path),
+                release_bridge: SubprocessBridge::new(&bin_path),
+                register_bridge: SubprocessBridge::new(&bin_path),
+            },
+        )
+    }
+
     // -------------------------------------------------------------------------
     // Fail-open behavior
     // -------------------------------------------------------------------------
@@ -775,7 +822,7 @@ mod tests {
     #[test]
     fn test_fail_open_send_message() {
         let bridge = unavailable_bridge();
-        assert!(bridge.send_message("B", "hi", "hello").is_none());
+        assert!(bridge.send_message("B", "hi", "hello").is_err());
     }
 
     #[test]
@@ -796,7 +843,7 @@ mod tests {
     #[test]
     fn test_fail_open_release_files() {
         let bridge = unavailable_bridge();
-        assert!(!bridge.release_files("A"));
+        assert!(bridge.release_files("A").is_err());
     }
 
     #[test]
@@ -815,6 +862,74 @@ mod tests {
     fn test_fail_open_unread_count() {
         let bridge = unavailable_bridge();
         assert_eq!(bridge.unread_count("A"), 0);
+    }
+
+    #[test]
+    fn test_fail_open_when_agent_mail_unavailable() {
+        let bridge = unavailable_bridge();
+        assert!(bridge.send_message("B", "subject", "body").is_err());
+        assert!(bridge.fetch_inbox("A").is_empty());
+        let reservation = bridge.reserve_files("A", &["src/lib.rs"]);
+        assert_eq!(reservation.status, ReservationStatus::Unavailable);
+        assert!(bridge.release_files("A").is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Method behavior with fixture binary
+    // -------------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn test_send_message_returns_id() {
+        let (_dir, bridge) = fixture_bridge(
+            "#!/bin/sh\ncase \"$1\" in\n  send) printf '{\"message_id\":\"m-123\",\"success\":true}' ;;\n  inbox) printf '[]' ;;\n  reserve) printf '{\"status\":\"granted\",\"granted\":[],\"conflicts\":[]}' ;;\n  release) printf '{\"released\":0,\"success\":true}' ;;\n  register) printf '{\"agent_id\":1,\"agent_name\":\"A\"}' ;;\n  *) printf '{}' ;;\nesac\n",
+        );
+        let id = bridge.send_message("B", "subj", "body").unwrap();
+        assert_eq!(id.as_str(), "m-123");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fetch_inbox_parses_messages() {
+        let (_dir, bridge) = fixture_bridge(
+            "#!/bin/sh\ncase \"$1\" in\n  inbox) printf '[{\"id\":\"m-1\",\"from\":\"A\",\"to\":\"B\",\"subject\":\"Hi\",\"body\":\"Hello\",\"read\":false}]' ;;\n  send) printf '{\"message_id\":\"m-123\",\"success\":true}' ;;\n  reserve) printf '{\"status\":\"granted\",\"granted\":[],\"conflicts\":[]}' ;;\n  release) printf '{\"released\":0,\"success\":true}' ;;\n  register) printf '{\"agent_id\":1,\"agent_name\":\"A\"}' ;;\n  *) printf '{}' ;;\nesac\n",
+        );
+        let inbox = bridge.fetch_inbox("B");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].subject, "Hi");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_reserve_files_granted() {
+        let (_dir, bridge) = fixture_bridge(
+            "#!/bin/sh\ncase \"$1\" in\n  reserve) printf '{\"status\":\"granted\",\"granted\":[\"src/lib.rs\"],\"conflicts\":[]}' ;;\n  send) printf '{\"message_id\":\"m-123\",\"success\":true}' ;;\n  inbox) printf '[]' ;;\n  release) printf '{\"released\":0,\"success\":true}' ;;\n  register) printf '{\"agent_id\":1,\"agent_name\":\"A\"}' ;;\n  *) printf '{}' ;;\nesac\n",
+        );
+        let result = bridge.reserve_files("A", &["src/lib.rs"]);
+        assert_eq!(result.status, ReservationStatus::Granted);
+        assert_eq!(result.granted, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_reserve_files_conflict() {
+        let (_dir, bridge) = fixture_bridge(
+            "#!/bin/sh\ncase \"$1\" in\n  reserve) printf '{\"status\":\"conflict\",\"granted\":[],\"conflicts\":[{\"path\":\"src/lib.rs\",\"held_by\":\"OtherAgent\"}]}' ;;\n  send) printf '{\"message_id\":\"m-123\",\"success\":true}' ;;\n  inbox) printf '[]' ;;\n  release) printf '{\"released\":0,\"success\":true}' ;;\n  register) printf '{\"agent_id\":1,\"agent_name\":\"A\"}' ;;\n  *) printf '{}' ;;\nesac\n",
+        );
+        let result = bridge.reserve_files("A", &["src/lib.rs"]);
+        assert_eq!(result.status, ReservationStatus::Conflict);
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(result.conflicts[0].path, "src/lib.rs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_release_files_succeeds() {
+        let (_dir, bridge) = fixture_bridge(
+            "#!/bin/sh\ncase \"$1\" in\n  release) printf '{\"released\":2,\"success\":true}' ;;\n  send) printf '{\"message_id\":\"m-123\",\"success\":true}' ;;\n  inbox) printf '[]' ;;\n  reserve) printf '{\"status\":\"granted\",\"granted\":[],\"conflicts\":[]}' ;;\n  register) printf '{\"agent_id\":1,\"agent_name\":\"A\"}' ;;\n  *) printf '{}' ;;\nesac\n",
+        );
+        let released = bridge.release_files("A");
+        assert!(released.is_ok());
     }
 
     // -------------------------------------------------------------------------
@@ -848,10 +963,8 @@ mod tests {
 
     #[test]
     fn test_mail_message_read_flag() {
-        let unread: MailMessage =
-            serde_json::from_str(r#"{"read": false}"#).unwrap();
-        let read: MailMessage =
-            serde_json::from_str(r#"{"read": true}"#).unwrap();
+        let unread: MailMessage = serde_json::from_str(r#"{"read": false}"#).unwrap();
+        let read: MailMessage = serde_json::from_str(r#"{"read": true}"#).unwrap();
         assert!(!unread.read);
         assert!(read.read);
     }
