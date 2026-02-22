@@ -78,6 +78,7 @@ rustls-pemfile = { workspace = true, optional = true }
 x509-parser = { workspace = true, optional = true }
 # Lexical search (optional, behind feature)
 tantivy = { workspace = true, optional = true }
+nix = { workspace = true, optional = true, features = ["fs"] }
 # FrankenSearch integration (optional, behind feature)
 frankensearch = { workspace = true, optional = true }
 # Agent detection integration (optional, behind feature)
@@ -319,6 +320,7 @@ distributed = [
 sync = ["dep:asupersync"]
 asupersync-runtime = ["dep:asupersync"]
 recorder-lexical = ["dep:tantivy"]
+disk-pressure = ["dep:nix"]
 semantic-search = ["dep:tokenizers", "dep:safetensors", "dep:half", "dep:fastembed", "dep:rmp-serde"]
 # Feature gate for FrankenSearch integration.
 frankensearch = ["dep:frankensearch"]

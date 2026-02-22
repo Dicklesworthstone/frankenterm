@@ -2730,6 +2730,7 @@ dependencies = [
  "loom",
  "memchr",
  "mux",
+ "nix 0.29.0",
  "proptest",
  "rand 0.9.2",
  "ratatui",
