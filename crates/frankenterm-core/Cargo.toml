@@ -276,6 +276,10 @@ harness = false
 required-features = ["native-wezterm"]
 
 [[bench]]
+name = "ipc_throughput"
+harness = false
+
+[[bench]]
 name = "fork_hardening"
 harness = false
 

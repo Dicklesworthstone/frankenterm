@@ -16,7 +16,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 
 use crate::runtime_compat::mpsc;
-use crate::runtime_compat::task::{self, JoinSet};
+use crate::runtime_compat::task::JoinSet;
 use crate::runtime_compat::unix::{self as compat_unix, UnixListener, UnixStream};
 use base64::Engine as _;
 use serde::Deserialize;
@@ -428,8 +428,9 @@ fn decode_wire_event(line: &str) -> Result<Option<NativeEvent>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::RuntimeBuilder;
+    use crate::runtime_compat::task;
     use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
+    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -868,6 +869,7 @@ mod tests {
                 _ => panic!("unexpected event type"),
             }
 
+            drop(stream);
             shutdown.store(true, Ordering::SeqCst);
             let _ = handle.await;
         });
@@ -908,6 +910,7 @@ mod tests {
             let ev2 = recv_event(&mut event_rx, Duration::from_secs(2), "event 2").await;
             assert!(matches!(ev2, NativeEvent::PaneDestroyed { pane_id: 1, .. }));
 
+            drop(stream);
             shutdown.store(true, Ordering::SeqCst);
             let _ = handle.await;
         });
@@ -950,6 +953,7 @@ mod tests {
                 }
             ));
 
+            drop(stream);
             shutdown.store(true, Ordering::SeqCst);
             let _ = handle.await;
         });
@@ -1011,6 +1015,7 @@ mod tests {
                 } if domain == "local"
             ));
 
+            drop(stream_two);
             shutdown.store(true, Ordering::SeqCst);
             let _ = handle.await;
         });
@@ -1051,6 +1056,7 @@ mod tests {
                 }
             ));
 
+            drop(stream);
             shutdown.store(true, Ordering::SeqCst);
             let _ = handle.await;
         });
