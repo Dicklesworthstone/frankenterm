@@ -152,6 +152,7 @@ pub mod memory_pressure;
 pub mod merkle_tree;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+pub mod network_observer;
 pub mod notifications;
 pub mod orphan_reaper;
 #[cfg(any(feature = "web", feature = "sync", feature = "asupersync-runtime"))]
@@ -259,6 +260,8 @@ pub mod undo;
 pub mod union_find;
 pub mod user_preferences;
 pub mod van_emde_boas;
+#[cfg(feature = "subprocess-bridge")]
+pub mod vc_export;
 pub mod viewport_reflow_planner;
 pub mod voi;
 pub mod wait;
