@@ -17,6 +17,42 @@ FrankenRedis (`/dp/frankenredis`) is a clean-room Rust reimplementation of Redis
 
 **Integration relevance to FrankenTerm:** Medium-term. Both projects plan to adopt Asupersync as async runtime. Shared infrastructure opportunities exist in evidence logging, structured event schemas, and possibly TTL/expiry evaluation primitives.
 
+### 1.1 Scope Boundary for This Analysis
+
+This document is scoped to integration-planning decisions for FrankenTerm. It must answer:
+
+- Which FrankenRedis crates/components can be reused with minimal friction
+- Which parts require upstream changes before deep integration is practical
+- Where integration creates risk (correctness/performance/security/operability)
+- Which concrete planning beads should follow from this analysis
+
+Out of scope for this analysis:
+
+- Implementing runtime integration code in FrankenTerm
+- Rewriting FrankenRedis internals during this pass
+- Running production performance benchmarks under full swarm load
+
+### 1.2 Hypothesis Ledger and Evidence Requirements
+
+| ID | Hypothesis | Why It Matters | Evidence Required to Accept/Reject |
+|----|------------|----------------|------------------------------------|
+| H1 | `fr-protocol` can be extracted and reused in FrankenTerm with near-zero adaptation. | Enables immediate shared parsing substrate and reduces duplicated protocol logic. | Public API stability review, dependency isolation check, compile integration spike in FrankenTerm workspace. |
+| H2 | `fr-expire` can serve as a generic TTL primitive for session/workflow lease handling. | Low-cost reuse candidate that improves policy/workflow time reasoning. | Function semantics audit against FrankenTerm timeout/lease semantics and boundary-case tests. |
+| H3 | FrankenRedis evidence events can map into FrankenTerm audit/event pipelines without semantic loss. | Critical for unified forensic observability across projects. | Field-level schema mapping and a gap analysis against current `recorder_audit`/event payload contracts. |
+| H4 | Single-threaded runtime assumptions are the primary blocker to deep embedding in async FrankenTerm paths. | Identifies whether integration should be library embedding vs process/service boundary first. | Thread-safety trait audit (`Send`/`Sync` expectations), hot-path lock/contention model assessment, and integration pattern comparison. |
+| H5 | Upstream crate extraction or API hardening is lower risk than adapter-heavy integration inside FrankenTerm. | Avoids long-term adapter debt and preserves maintainability. | Coupling map + candidate extraction boundaries + explicit cost/risk tradeoff for each pattern. |
+| H6 | Conformance harness assets can be reused to validate FrankenTerm integration correctness. | Reduces integration regression risk and speeds confidence-building. | Inventory of reusable fixtures/contracts and required harness translation work. |
+
+### 1.3 Actionable Outcomes Required from This Analysis
+
+This analysis is only complete if it can directly feed downstream planning (`ft-2vuw7.2.3+`) with:
+
+- A ranked list of integration patterns (embed/service/adapter/hybrid) and decision criteria
+- A list of upstream change requests that are explicitly allowed and worth doing
+- A crate/subcrate extraction shortlist with dependency and API-surface rationale
+- A risk register with mitigation hooks that can be turned into implementation beads
+- A test and telemetry expectation baseline for the integration plan document
+
 ---
 
 ## 2. Repository Topology
