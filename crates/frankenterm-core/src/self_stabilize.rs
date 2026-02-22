@@ -46,7 +46,7 @@ pub enum ReconcileMessage {
     /// Phase 3: Send full diff of divergent entries.
     Diff(TreeDiff),
     /// Phase 4: Send authoritative entries for reconciliation.
-    Patch(Vec<(Vec<u8>, Vec<u8>)>),
+    Patch(Vec<(Vec<u8>, Option<Vec<u8>>)>),
     /// Protocol complete — states match.
     Converged,
 }
@@ -59,7 +59,7 @@ pub enum RoundResult {
     /// Need to exchange more information — send this message.
     SendMessage(ReconcileMessage),
     /// Apply these patches to converge.
-    ApplyPatch(Vec<(Vec<u8>, Vec<u8>)>),
+    ApplyPatch(Vec<(Vec<u8>, Option<Vec<u8>>)>),
     /// Remove these keys to converge.
     RemoveKeys(Vec<Vec<u8>>),
     /// Reconciliation complete after applying changes.
