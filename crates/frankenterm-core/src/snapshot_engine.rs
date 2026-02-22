@@ -1014,7 +1014,7 @@ fn cleanup_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::{sleep, timeout};
+    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder, sleep, timeout};
     use crate::wezterm::PaneSize;
 
     async fn recv_trigger(rx: &mut mpsc::Receiver<SnapshotTrigger>) -> SnapshotTrigger {
@@ -1031,6 +1031,16 @@ mod tests {
                 .await
                 .expect("snapshot trigger recv should succeed")
         }
+    }
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("snapshot test runtime should build");
+        runtime.block_on(future);
     }
 
     fn make_test_pane(id: u64, rows: u32, cols: u32) -> PaneInfo {
@@ -1112,197 +1122,215 @@ mod tests {
         (tmp, db_path)
     }
 
-    #[tokio::test]
-    async fn capture_single_pane() {
-        let (_tmp, db_path) = setup_test_db();
-        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
-        let panes = vec![make_test_pane(1, 24, 80)];
+    #[test]
+    fn capture_single_pane() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![make_test_pane(1, 24, 80)];
 
-        let result = engine.capture(&panes, SnapshotTrigger::Manual).await;
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert_eq!(result.pane_count, 1);
-        assert!(result.checkpoint_id > 0);
-        assert!(result.session_id.starts_with("sess-"));
+            let result = engine.capture(&panes, SnapshotTrigger::Manual).await;
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            assert_eq!(result.pane_count, 1);
+            assert!(result.checkpoint_id > 0);
+            assert!(result.session_id.starts_with("sess-"));
+        });
     }
 
-    #[tokio::test]
-    async fn capture_multiple_panes() {
-        let (_tmp, db_path) = setup_test_db();
-        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
-        let panes = vec![
-            make_test_pane(1, 24, 80),
-            make_test_pane(2, 24, 80),
-            make_test_pane(3, 30, 120),
-        ];
+    #[test]
+    fn capture_multiple_panes() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![
+                make_test_pane(1, 24, 80),
+                make_test_pane(2, 24, 80),
+                make_test_pane(3, 30, 120),
+            ];
 
-        let result = engine
-            .capture(&panes, SnapshotTrigger::Startup)
-            .await
-            .unwrap();
-        assert_eq!(result.pane_count, 3);
-
-        // Verify pane states were written
-        let conn = Connection::open(db_path.as_str()).unwrap();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM mux_pane_state WHERE checkpoint_id = ?1",
-                [result.checkpoint_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 3);
-    }
-
-    #[tokio::test]
-    async fn agent_metadata_persisted_when_detected_from_title() {
-        let (_tmp, db_path) = setup_test_db();
-        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
-        let mut pane = make_test_pane(1, 24, 80);
-        pane.title = Some("claude-code".to_string());
-
-        let result = engine
-            .capture(&[pane], SnapshotTrigger::Manual)
-            .await
-            .unwrap();
-
-        let conn = Connection::open(db_path.as_str()).unwrap();
-        let meta_json: Option<String> = conn
-            .query_row(
-                "SELECT agent_metadata_json FROM mux_pane_state WHERE checkpoint_id = ?1 AND pane_id = ?2",
-                rusqlite::params![result.checkpoint_id, 1i64],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        let meta_json = meta_json.expect("agent_metadata_json should be present");
-        let meta: crate::session_pane_state::AgentMetadata =
-            serde_json::from_str(&meta_json).unwrap();
-        assert_eq!(meta.agent_type, "claude_code");
-        assert_eq!(meta.state.as_deref(), Some("active"));
-    }
-
-    #[tokio::test]
-    async fn dedup_skips_unchanged_periodic() {
-        let (_tmp, db_path) = setup_test_db();
-        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
-        let panes = vec![make_test_pane(1, 24, 80)];
-
-        // First capture succeeds
-        let r1 = engine.capture(&panes, SnapshotTrigger::Periodic).await;
-        assert!(r1.is_ok());
-
-        // Second periodic capture with same data should be skipped
-        let r2 = engine.capture(&panes, SnapshotTrigger::Periodic).await;
-        assert!(matches!(r2, Err(SnapshotError::NoChanges)));
-    }
-
-    #[tokio::test]
-    async fn dedup_does_not_skip_manual() {
-        let (_tmp, db_path) = setup_test_db();
-        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
-        let panes = vec![make_test_pane(1, 24, 80)];
-
-        let r1 = engine.capture(&panes, SnapshotTrigger::Manual).await;
-        assert!(r1.is_ok());
-
-        // Manual capture should NOT be skipped even if unchanged
-        let r2 = engine.capture(&panes, SnapshotTrigger::Manual).await;
-        assert!(r2.is_ok());
-    }
-
-    #[tokio::test]
-    async fn empty_panes_returns_error() {
-        let (_tmp, db_path) = setup_test_db();
-        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
-
-        let result = engine.capture(&[], SnapshotTrigger::Manual).await;
-        assert!(matches!(result, Err(SnapshotError::NoPanes)));
-    }
-
-    #[tokio::test]
-    async fn session_reused_across_captures() {
-        let (_tmp, db_path) = setup_test_db();
-        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
-
-        let panes1 = vec![make_test_pane(1, 24, 80)];
-        let panes2 = vec![make_test_pane(1, 30, 120)]; // changed size
-
-        let r1 = engine
-            .capture(&panes1, SnapshotTrigger::Startup)
-            .await
-            .unwrap();
-        let r2 = engine
-            .capture(&panes2, SnapshotTrigger::Periodic)
-            .await
-            .unwrap();
-
-        // Same session, different checkpoints
-        assert_eq!(r1.session_id, r2.session_id);
-        assert_ne!(r1.checkpoint_id, r2.checkpoint_id);
-    }
-
-    #[tokio::test]
-    async fn cleanup_removes_old_checkpoints() {
-        let (_tmp, db_path) = setup_test_db();
-        let config = SnapshotConfig {
-            retention_count: 2,
-            retention_days: 365, // don't prune by age in this test
-            ..SnapshotConfig::default()
-        };
-        let engine = SnapshotEngine::new(db_path.clone(), config);
-
-        // Create 4 snapshots with different pane data
-        for i in 0..4u64 {
-            let panes = vec![make_test_pane(i, 24 + i as u32, 80)];
-            engine
-                .capture(&panes, SnapshotTrigger::Manual)
+            let result = engine
+                .capture(&panes, SnapshotTrigger::Startup)
                 .await
                 .unwrap();
-        }
+            assert_eq!(result.pane_count, 3);
 
-        // Should have 4 checkpoints
-        let conn = Connection::open(db_path.as_str()).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 4);
-
-        // Cleanup should remove 2 (keep latest 2)
-        let deleted = engine.cleanup().await.unwrap();
-        assert_eq!(deleted, 2);
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 2);
+            // Verify pane states were written
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM mux_pane_state WHERE checkpoint_id = ?1",
+                    [result.checkpoint_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 3);
+        });
     }
 
-    #[tokio::test]
-    async fn mark_shutdown_sets_flag() {
-        let (_tmp, db_path) = setup_test_db();
-        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
-        let panes = vec![make_test_pane(1, 24, 80)];
+    #[test]
+    fn agent_metadata_persisted_when_detected_from_title() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let mut pane = make_test_pane(1, 24, 80);
+            pane.title = Some("claude-code".to_string());
 
-        let r = engine
-            .capture(&panes, SnapshotTrigger::Startup)
-            .await
-            .unwrap();
-        engine.mark_shutdown().await.unwrap();
+            let result = engine
+                .capture(&[pane], SnapshotTrigger::Manual)
+                .await
+                .unwrap();
 
-        let conn = Connection::open(db_path.as_str()).unwrap();
-        let clean: i64 = conn
-            .query_row(
-                "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
-                [&r.session_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(clean, 1);
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let meta_json: Option<String> = conn
+                .query_row(
+                    "SELECT agent_metadata_json FROM mux_pane_state WHERE checkpoint_id = ?1 AND pane_id = ?2",
+                    rusqlite::params![result.checkpoint_id, 1i64],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            let meta_json = meta_json.expect("agent_metadata_json should be present");
+            let meta: crate::session_pane_state::AgentMetadata =
+                serde_json::from_str(&meta_json).unwrap();
+            assert_eq!(meta.agent_type, "claude_code");
+            assert_eq!(meta.state.as_deref(), Some("active"));
+        });
+    }
+
+    #[test]
+    fn dedup_skips_unchanged_periodic() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![make_test_pane(1, 24, 80)];
+
+            // First capture succeeds
+            let r1 = engine.capture(&panes, SnapshotTrigger::Periodic).await;
+            assert!(r1.is_ok());
+
+            // Second periodic capture with same data should be skipped
+            let r2 = engine.capture(&panes, SnapshotTrigger::Periodic).await;
+            assert!(matches!(r2, Err(SnapshotError::NoChanges)));
+        });
+    }
+
+    #[test]
+    fn dedup_does_not_skip_manual() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![make_test_pane(1, 24, 80)];
+
+            let r1 = engine.capture(&panes, SnapshotTrigger::Manual).await;
+            assert!(r1.is_ok());
+
+            // Manual capture should NOT be skipped even if unchanged
+            let r2 = engine.capture(&panes, SnapshotTrigger::Manual).await;
+            assert!(r2.is_ok());
+        });
+    }
+
+    #[test]
+    fn empty_panes_returns_error() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+
+            let result = engine.capture(&[], SnapshotTrigger::Manual).await;
+            assert!(matches!(result, Err(SnapshotError::NoPanes)));
+        });
+    }
+
+    #[test]
+    fn session_reused_across_captures() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+
+            let panes1 = vec![make_test_pane(1, 24, 80)];
+            let panes2 = vec![make_test_pane(1, 30, 120)]; // changed size
+
+            let r1 = engine
+                .capture(&panes1, SnapshotTrigger::Startup)
+                .await
+                .unwrap();
+            let r2 = engine
+                .capture(&panes2, SnapshotTrigger::Periodic)
+                .await
+                .unwrap();
+
+            // Same session, different checkpoints
+            assert_eq!(r1.session_id, r2.session_id);
+            assert_ne!(r1.checkpoint_id, r2.checkpoint_id);
+        });
+    }
+
+    #[test]
+    fn cleanup_removes_old_checkpoints() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let config = SnapshotConfig {
+                retention_count: 2,
+                retention_days: 365, // don't prune by age in this test
+                ..SnapshotConfig::default()
+            };
+            let engine = SnapshotEngine::new(db_path.clone(), config);
+
+            // Create 4 snapshots with different pane data
+            for i in 0..4u64 {
+                let panes = vec![make_test_pane(i, 24 + i as u32, 80)];
+                engine
+                    .capture(&panes, SnapshotTrigger::Manual)
+                    .await
+                    .unwrap();
+            }
+
+            // Should have 4 checkpoints
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 4);
+
+            // Cleanup should remove 2 (keep latest 2)
+            let deleted = engine.cleanup().await.unwrap();
+            assert_eq!(deleted, 2);
+
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 2);
+        });
+    }
+
+    #[test]
+    fn mark_shutdown_sets_flag() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![make_test_pane(1, 24, 80)];
+
+            let r = engine
+                .capture(&panes, SnapshotTrigger::Startup)
+                .await
+                .unwrap();
+            engine.mark_shutdown().await.unwrap();
+
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let clean: i64 = conn
+                .query_row(
+                    "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
+                    [&r.session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(clean, 1);
+        });
     }
 
     #[test]

@@ -3292,6 +3292,7 @@ fn detection_to_stored_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::CompatRuntime;
     use crate::storage::PaneRecord;
     use tempfile::TempDir;
 
@@ -3492,6 +3493,45 @@ mod tests {
 
             let config = RuntimeConfig::default();
             let _runtime = ObservationRuntime::new(config, storage, Arc::new(RwLock::new(engine)));
+        });
+    }
+
+    #[test]
+    fn runtime_startup_shutdown_with_mock_wezterm_is_clean() {
+        run_async_test(async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let engine = PatternEngine::new();
+
+            let mut config = RuntimeConfig::default();
+            config.discovery_interval = Duration::from_millis(10);
+            config.capture_interval = Duration::from_millis(10);
+            config.min_capture_interval = Duration::from_millis(5);
+            config.channel_buffer = 64;
+
+            let mock = crate::wezterm::MockWezterm::new();
+            mock.add_default_pane(0).await;
+            mock.inject_output(0, "boot output\n").await.unwrap();
+            let wezterm_handle: WeztermHandle = Arc::new(mock);
+
+            let mut runtime =
+                ObservationRuntime::new(config, storage, Arc::new(RwLock::new(engine)))
+                    .with_wezterm_handle(wezterm_handle);
+
+            let handle = runtime.start().await.expect("runtime should start");
+            sleep(Duration::from_millis(30)).await;
+
+            let summary = handle.shutdown_with_summary().await;
+            assert!(
+                summary.clean,
+                "shutdown should complete cleanly: {:?}",
+                summary.warnings
+            );
+            assert!(
+                summary.warnings.is_empty(),
+                "shutdown should not emit warnings for mock lifecycle: {:?}",
+                summary.warnings
+            );
         });
     }
 

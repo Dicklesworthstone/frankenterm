@@ -883,7 +883,21 @@ mod tests {
     use super::*;
     use crate::patterns::{AgentType, Severity};
     use serde_json::json;
+    use std::future::Future;
     use tempfile::tempdir;
+
+    fn run_async_test<F>(future: F)
+    where
+        F: Future<Output = ()>,
+    {
+        use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("recording test runtime should build");
+        runtime.block_on(future);
+    }
 
     #[test]
     fn recording_frame_encodes_header() {
@@ -928,33 +942,35 @@ mod tests {
         assert!(!serialized.contains(secret));
     }
 
-    #[tokio::test]
-    async fn recording_manager_redacts_output() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.war");
-        let secret = "sk-abc123456789012345678901234567890123456789012345678901";
+    #[test]
+    fn recording_manager_redacts_output() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("test.war");
+            let secret = "sk-abc123456789012345678901234567890123456789012345678901";
 
-        let manager = RecordingManager::new(RecordingOptions {
-            flush_threshold: 1,
-            redact_output: true,
-            redact_events: false,
+            let manager = RecordingManager::new(RecordingOptions {
+                flush_threshold: 1,
+                redact_output: true,
+                redact_events: false,
+            });
+
+            manager.start_recording(1, &path, 0).await.unwrap();
+            let segment = CapturedSegment {
+                pane_id: 1,
+                seq: 0,
+                content: format!("token {secret}"),
+                kind: CapturedSegmentKind::Delta,
+                captured_at: 10,
+            };
+            manager.record_segment(&segment).await.unwrap();
+            manager.stop_recording(1).await.unwrap();
+
+            let bytes = std::fs::read(&path).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains(secret));
+            assert!(text.contains("[REDACTED]"));
         });
-
-        manager.start_recording(1, &path, 0).await.unwrap();
-        let segment = CapturedSegment {
-            pane_id: 1,
-            seq: 0,
-            content: format!("token {secret}"),
-            kind: CapturedSegmentKind::Delta,
-            captured_at: 10,
-        };
-        manager.record_segment(&segment).await.unwrap();
-        manager.stop_recording(1).await.unwrap();
-
-        let bytes = std::fs::read(&path).unwrap();
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(!text.contains(secret));
-        assert!(text.contains("[REDACTED]"));
     }
 
     // -----------------------------------------------------------------------
@@ -1256,86 +1272,94 @@ mod tests {
         assert_eq!(recording.frames[2].header.flags & 1, 1); // gap flag
     }
 
-    #[tokio::test]
-    async fn recording_manager_multi_pane() {
-        let dir = tempdir().unwrap();
-        let path1 = dir.path().join("pane1.war");
-        let path2 = dir.path().join("pane2.war");
+    #[test]
+    fn recording_manager_multi_pane() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let path1 = dir.path().join("pane1.war");
+            let path2 = dir.path().join("pane2.war");
 
-        let manager = RecordingManager::new(RecordingOptions {
-            flush_threshold: 1,
-            redact_output: false,
-            redact_events: false,
+            let manager = RecordingManager::new(RecordingOptions {
+                flush_threshold: 1,
+                redact_output: false,
+                redact_events: false,
+            });
+
+            manager.start_recording(1, &path1, 0).await.unwrap();
+            manager.start_recording(2, &path2, 0).await.unwrap();
+
+            let seg1 = CapturedSegment {
+                pane_id: 1,
+                seq: 0,
+                content: "pane1_data".into(),
+                kind: CapturedSegmentKind::Delta,
+                captured_at: 10,
+            };
+            let seg2 = CapturedSegment {
+                pane_id: 2,
+                seq: 0,
+                content: "pane2_data".into(),
+                kind: CapturedSegmentKind::Delta,
+                captured_at: 10,
+            };
+
+            manager.record_segment(&seg1).await.unwrap();
+            manager.record_segment(&seg2).await.unwrap();
+
+            let stats1 = manager.stop_recording(1).await.unwrap().unwrap();
+            let stats2 = manager.stop_recording(2).await.unwrap().unwrap();
+
+            assert_eq!(stats1.pane_id, 1);
+            assert_eq!(stats1.frames_written, 1);
+            assert_eq!(stats2.pane_id, 2);
+            assert_eq!(stats2.frames_written, 1);
+
+            // Verify file isolation
+            let bytes1 = std::fs::read(&path1).unwrap();
+            let bytes2 = std::fs::read(&path2).unwrap();
+            assert!(String::from_utf8_lossy(&bytes1).contains("pane1_data"));
+            assert!(String::from_utf8_lossy(&bytes2).contains("pane2_data"));
+            assert!(!String::from_utf8_lossy(&bytes1).contains("pane2_data"));
         });
-
-        manager.start_recording(1, &path1, 0).await.unwrap();
-        manager.start_recording(2, &path2, 0).await.unwrap();
-
-        let seg1 = CapturedSegment {
-            pane_id: 1,
-            seq: 0,
-            content: "pane1_data".into(),
-            kind: CapturedSegmentKind::Delta,
-            captured_at: 10,
-        };
-        let seg2 = CapturedSegment {
-            pane_id: 2,
-            seq: 0,
-            content: "pane2_data".into(),
-            kind: CapturedSegmentKind::Delta,
-            captured_at: 10,
-        };
-
-        manager.record_segment(&seg1).await.unwrap();
-        manager.record_segment(&seg2).await.unwrap();
-
-        let stats1 = manager.stop_recording(1).await.unwrap().unwrap();
-        let stats2 = manager.stop_recording(2).await.unwrap().unwrap();
-
-        assert_eq!(stats1.pane_id, 1);
-        assert_eq!(stats1.frames_written, 1);
-        assert_eq!(stats2.pane_id, 2);
-        assert_eq!(stats2.frames_written, 1);
-
-        // Verify file isolation
-        let bytes1 = std::fs::read(&path1).unwrap();
-        let bytes2 = std::fs::read(&path2).unwrap();
-        assert!(String::from_utf8_lossy(&bytes1).contains("pane1_data"));
-        assert!(String::from_utf8_lossy(&bytes2).contains("pane2_data"));
-        assert!(!String::from_utf8_lossy(&bytes1).contains("pane2_data"));
     }
 
-    #[tokio::test]
-    async fn recording_manager_duplicate_start_fails() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.war");
+    #[test]
+    fn recording_manager_duplicate_start_fails() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("test.war");
 
-        let manager = RecordingManager::new(RecordingOptions::default());
-        manager.start_recording(1, &path, 0).await.unwrap();
+            let manager = RecordingManager::new(RecordingOptions::default());
+            manager.start_recording(1, &path, 0).await.unwrap();
 
-        let result = manager.start_recording(1, &path, 0).await;
-        assert!(result.is_err());
+            let result = manager.start_recording(1, &path, 0).await;
+            assert!(result.is_err());
+        });
     }
 
-    #[tokio::test]
-    async fn recording_manager_stop_nonexistent_returns_none() {
-        let manager = RecordingManager::new(RecordingOptions::default());
-        let result = manager.stop_recording(999).await.unwrap();
-        assert!(result.is_none());
+    #[test]
+    fn recording_manager_stop_nonexistent_returns_none() {
+        run_async_test(async {
+            let manager = RecordingManager::new(RecordingOptions::default());
+            let result = manager.stop_recording(999).await.unwrap();
+            assert!(result.is_none());
+        });
     }
 
-    #[tokio::test]
-    async fn recording_manager_segment_for_unknown_pane_is_noop() {
-        let manager = RecordingManager::new(RecordingOptions::default());
-        let segment = CapturedSegment {
-            pane_id: 999,
-            seq: 0,
-            content: "ghost".into(),
-            kind: CapturedSegmentKind::Delta,
-            captured_at: 0,
-        };
-        // Should not error
-        manager.record_segment(&segment).await.unwrap();
+    #[test]
+    fn recording_manager_segment_for_unknown_pane_is_noop() {
+        run_async_test(async {
+            let manager = RecordingManager::new(RecordingOptions::default());
+            let segment = CapturedSegment {
+                pane_id: 999,
+                seq: 0,
+                content: "ghost".into(),
+                kind: CapturedSegmentKind::Delta,
+                captured_at: 0,
+            };
+            // Should not error
+            manager.record_segment(&segment).await.unwrap();
+        });
     }
 
     // Ingress tap unit tests (ft-oegrb.2.2)

@@ -2282,6 +2282,17 @@ mod tests {
         }
     }
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        crate::runtime_compat::CompatRuntime::block_on(&runtime, future);
+    }
+
     #[test]
     fn cursor_starts_at_zero() {
         let cursor = PaneCursor::new(42);
@@ -2417,166 +2428,174 @@ mod tests {
         assert_eq!(seg2.content, "a\nc\n");
     }
 
-    #[tokio::test]
-    async fn persist_captured_segments_appends_rows() {
-        let db_path = temp_db_path();
-        let handle = StorageHandle::new(&db_path).await.unwrap();
-        handle.upsert_pane(test_pane_record(1)).await.unwrap();
+    #[test]
+    fn persist_captured_segments_appends_rows() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle.upsert_pane(test_pane_record(1)).await.unwrap();
 
-        let mut cursor = PaneCursor::new(1);
-        let seg0 = cursor
-            .capture_snapshot("hello\n", 1024, None)
-            .expect("first capture");
-        let seg1 = cursor
-            .capture_snapshot("hello\nworld\n", 1024, None)
-            .expect("second capture");
+            let mut cursor = PaneCursor::new(1);
+            let seg0 = cursor
+                .capture_snapshot("hello\n", 1024, None)
+                .expect("first capture");
+            let seg1 = cursor
+                .capture_snapshot("hello\nworld\n", 1024, None)
+                .expect("second capture");
 
-        let stored0 = persist_captured_segment(&handle, &seg0).await.unwrap();
-        let stored1 = persist_captured_segment(&handle, &seg1).await.unwrap();
+            let stored0 = persist_captured_segment(&handle, &seg0).await.unwrap();
+            let stored1 = persist_captured_segment(&handle, &seg1).await.unwrap();
 
-        assert_eq!(stored0.segment.seq, seg0.seq);
-        assert_eq!(stored1.segment.seq, seg1.seq);
+            assert_eq!(stored0.segment.seq, seg0.seq);
+            assert_eq!(stored1.segment.seq, seg1.seq);
 
-        let segments = handle.get_segments(1, 10).await.unwrap();
-        assert_eq!(segments.len(), 2);
-        assert!(segments.iter().any(|seg| seg.content == "hello\n"));
-        assert!(segments.iter().any(|seg| seg.content == "world\n"));
+            let segments = handle.get_segments(1, 10).await.unwrap();
+            assert_eq!(segments.len(), 2);
+            assert!(segments.iter().any(|seg| seg.content == "hello\n"));
+            assert!(segments.iter().any(|seg| seg.content == "world\n"));
 
-        handle.shutdown().await.unwrap();
-        cleanup_db(&db_path);
+            handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
     }
 
-    #[tokio::test]
-    async fn persist_captured_gap_records_gap() {
-        let db_path = temp_db_path();
-        let handle = StorageHandle::new(&db_path).await.unwrap();
-        handle.upsert_pane(test_pane_record(1)).await.unwrap();
+    #[test]
+    fn persist_captured_gap_records_gap() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle.upsert_pane(test_pane_record(1)).await.unwrap();
 
-        let mut cursor = PaneCursor::new(1);
-        let seg0 = cursor
-            .capture_snapshot("a\nb\n", 1024, None)
-            .expect("first capture");
-        persist_captured_segment(&handle, &seg0).await.unwrap();
+            let mut cursor = PaneCursor::new(1);
+            let seg0 = cursor
+                .capture_snapshot("a\nb\n", 1024, None)
+                .expect("first capture");
+            persist_captured_segment(&handle, &seg0).await.unwrap();
 
-        let gap_segment = cursor
-            .capture_snapshot("a\nc\n", 1024, None)
-            .expect("gap capture");
-        let persisted = persist_captured_segment(&handle, &gap_segment)
-            .await
-            .unwrap();
+            let gap_segment = cursor
+                .capture_snapshot("a\nc\n", 1024, None)
+                .expect("gap capture");
+            let persisted = persist_captured_segment(&handle, &gap_segment)
+                .await
+                .unwrap();
 
-        let gap = persisted.gap.expect("gap recorded");
-        let expected_reason = match &gap_segment.kind {
-            CapturedSegmentKind::Gap { reason } => reason.as_str(),
-            CapturedSegmentKind::Delta => "unexpected_delta",
-        };
+            let gap = persisted.gap.expect("gap recorded");
+            let expected_reason = match &gap_segment.kind {
+                CapturedSegmentKind::Gap { reason } => reason.as_str(),
+                CapturedSegmentKind::Delta => "unexpected_delta",
+            };
 
-        assert_eq!(gap.pane_id, 1);
-        assert_eq!(gap.reason, expected_reason);
-        assert_eq!(persisted.segment.seq, gap_segment.seq);
-        assert_eq!(persisted.segment.content, "a\nc\n");
+            assert_eq!(gap.pane_id, 1);
+            assert_eq!(gap.reason, expected_reason);
+            assert_eq!(persisted.segment.seq, gap_segment.seq);
+            assert_eq!(persisted.segment.content, "a\nc\n");
 
-        handle.shutdown().await.unwrap();
-        cleanup_db(&db_path);
+            handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
     }
 
-    #[tokio::test]
-    async fn persist_captured_segment_records_seq_discontinuity_gap() {
-        let db_path = temp_db_path();
-        let handle = StorageHandle::new(&db_path).await.unwrap();
-        handle.upsert_pane(test_pane_record(1)).await.unwrap();
+    #[test]
+    fn persist_captured_segment_records_seq_discontinuity_gap() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle.upsert_pane(test_pane_record(1)).await.unwrap();
 
-        // First, create a cursor and persist some segments normally
-        let mut cursor = PaneCursor::new(1);
-        let seg0 = cursor
-            .capture_snapshot("line1\n", 1024, None)
-            .expect("first capture");
-        persist_captured_segment(&handle, &seg0).await.unwrap();
+            // First, create a cursor and persist some segments normally
+            let mut cursor = PaneCursor::new(1);
+            let seg0 = cursor
+                .capture_snapshot("line1\n", 1024, None)
+                .expect("first capture");
+            persist_captured_segment(&handle, &seg0).await.unwrap();
 
-        let seg1 = cursor
-            .capture_snapshot("line1\nline2\n", 1024, None)
-            .expect("second capture");
-        persist_captured_segment(&handle, &seg1).await.unwrap();
+            let seg1 = cursor
+                .capture_snapshot("line1\nline2\n", 1024, None)
+                .expect("second capture");
+            persist_captured_segment(&handle, &seg1).await.unwrap();
 
-        // Now simulate a desync: manually advance the cursor's seq beyond what storage expects
-        cursor.next_seq = 100; // Storage expects seq=2, cursor will produce seq=100
+            // Now simulate a desync: manually advance the cursor's seq beyond what storage expects
+            cursor.next_seq = 100; // Storage expects seq=2, cursor will produce seq=100
 
-        let seg2 = cursor
-            .capture_snapshot("line1\nline2\nline3\n", 1024, None)
-            .expect("third capture");
-        assert_eq!(seg2.seq, 100); // Cursor produced seq=100
+            let seg2 = cursor
+                .capture_snapshot("line1\nline2\nline3\n", 1024, None)
+                .expect("third capture");
+            assert_eq!(seg2.seq, 100); // Cursor produced seq=100
 
-        // Persist should NOT error, instead record a gap
-        let persisted = persist_captured_segment(&handle, &seg2).await.unwrap();
+            // Persist should NOT error, instead record a gap
+            let persisted = persist_captured_segment(&handle, &seg2).await.unwrap();
 
-        // Storage used its own seq (2), not the cursor's (100)
-        assert_eq!(persisted.segment.seq, 2);
-        assert_eq!(persisted.segment.content, "line3\n");
+            // Storage used its own seq (2), not the cursor's (100)
+            assert_eq!(persisted.segment.seq, 2);
+            assert_eq!(persisted.segment.content, "line3\n");
 
-        // A gap should have been recorded for the discontinuity
-        let gap = persisted.gap.expect("discontinuity gap recorded");
-        assert!(
-            gap.reason.starts_with("seq_discontinuity:"),
-            "reason should indicate seq discontinuity: {}",
-            gap.reason
-        );
-        assert!(
-            gap.reason.contains("expected=100"),
-            "reason should include expected seq: {}",
-            gap.reason
-        );
-        assert!(
-            gap.reason.contains("actual=2"),
-            "reason should include actual seq: {}",
-            gap.reason
-        );
+            // A gap should have been recorded for the discontinuity
+            let gap = persisted.gap.expect("discontinuity gap recorded");
+            assert!(
+                gap.reason.starts_with("seq_discontinuity:"),
+                "reason should indicate seq discontinuity: {}",
+                gap.reason
+            );
+            assert!(
+                gap.reason.contains("expected=100"),
+                "reason should include expected seq: {}",
+                gap.reason
+            );
+            assert!(
+                gap.reason.contains("actual=2"),
+                "reason should include actual seq: {}",
+                gap.reason
+            );
 
-        handle.shutdown().await.unwrap();
-        cleanup_db(&db_path);
+            handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
     }
 
-    #[tokio::test]
-    async fn resync_seq_aligns_cursor_with_storage() {
-        let db_path = temp_db_path();
-        let handle = StorageHandle::new(&db_path).await.unwrap();
-        handle.upsert_pane(test_pane_record(1)).await.unwrap();
+    #[test]
+    fn resync_seq_aligns_cursor_with_storage() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle.upsert_pane(test_pane_record(1)).await.unwrap();
 
-        // Create a cursor and persist some segments normally
-        let mut cursor = PaneCursor::new(1);
-        let seg0 = cursor
-            .capture_snapshot("a\n", 1024, None)
-            .expect("first capture");
-        persist_captured_segment(&handle, &seg0).await.unwrap();
+            // Create a cursor and persist some segments normally
+            let mut cursor = PaneCursor::new(1);
+            let seg0 = cursor
+                .capture_snapshot("a\n", 1024, None)
+                .expect("first capture");
+            persist_captured_segment(&handle, &seg0).await.unwrap();
 
-        // Simulate desync
-        cursor.next_seq = 999;
+            // Simulate desync
+            cursor.next_seq = 999;
 
-        let seg1 = cursor
-            .capture_snapshot("a\nb\n", 1024, None)
-            .expect("second capture");
-        assert_eq!(seg1.seq, 999);
+            let seg1 = cursor
+                .capture_snapshot("a\nb\n", 1024, None)
+                .expect("second capture");
+            assert_eq!(seg1.seq, 999);
 
-        let persisted = persist_captured_segment(&handle, &seg1).await.unwrap();
-        assert_eq!(persisted.segment.seq, 1); // Storage used seq=1
+            let persisted = persist_captured_segment(&handle, &seg1).await.unwrap();
+            assert_eq!(persisted.segment.seq, 1); // Storage used seq=1
 
-        // Resync cursor to storage
-        cursor.resync_seq(persisted.segment.seq);
-        assert_eq!(cursor.next_seq, 2); // Should be storage_seq + 1
-        assert!(cursor.in_gap); // Should be marked in gap state
+            // Resync cursor to storage
+            cursor.resync_seq(persisted.segment.seq);
+            assert_eq!(cursor.next_seq, 2); // Should be storage_seq + 1
+            assert!(cursor.in_gap); // Should be marked in gap state
 
-        // Next capture should be aligned
-        let seg2 = cursor
-            .capture_snapshot("a\nb\nc\n", 1024, None)
-            .expect("third capture");
-        assert_eq!(seg2.seq, 2);
+            // Next capture should be aligned
+            let seg2 = cursor
+                .capture_snapshot("a\nb\nc\n", 1024, None)
+                .expect("third capture");
+            assert_eq!(seg2.seq, 2);
 
-        let persisted2 = persist_captured_segment(&handle, &seg2).await.unwrap();
-        assert_eq!(persisted2.segment.seq, 2);
-        // No gap this time since we resynced
-        assert!(persisted2.gap.is_none());
+            let persisted2 = persist_captured_segment(&handle, &seg2).await.unwrap();
+            assert_eq!(persisted2.segment.seq, 2);
+            // No gap this time since we resynced
+            assert!(persisted2.gap.is_none());
 
-        handle.shutdown().await.unwrap();
-        cleanup_db(&db_path);
+            handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
     }
 
     #[test]
@@ -2607,42 +2626,44 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn persist_captured_oversized_delta_records_truncation_gap() {
-        let db_path = temp_db_path();
-        let handle = StorageHandle::new(&db_path).await.unwrap();
-        handle.upsert_pane(test_pane_record(1)).await.unwrap();
+    #[test]
+    fn persist_captured_oversized_delta_records_truncation_gap() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle.upsert_pane(test_pane_record(1)).await.unwrap();
 
-        let oversized_content = format!(
-            "HEADER:{}",
-            "x".repeat(DEFAULT_MAX_PERSIST_SEGMENT_BYTES + 32)
-        );
-        let expected_tail =
-            trim_utf8_tail_to_max_bytes(&oversized_content, DEFAULT_MAX_PERSIST_SEGMENT_BYTES);
-        let oversized = CapturedSegment {
-            pane_id: 1,
-            seq: 0,
-            content: oversized_content,
-            kind: CapturedSegmentKind::Delta,
-            captured_at: 0,
-        };
+            let oversized_content = format!(
+                "HEADER:{}",
+                "x".repeat(DEFAULT_MAX_PERSIST_SEGMENT_BYTES + 32)
+            );
+            let expected_tail =
+                trim_utf8_tail_to_max_bytes(&oversized_content, DEFAULT_MAX_PERSIST_SEGMENT_BYTES);
+            let oversized = CapturedSegment {
+                pane_id: 1,
+                seq: 0,
+                content: oversized_content,
+                kind: CapturedSegmentKind::Delta,
+                captured_at: 0,
+            };
 
-        let persisted = persist_captured_segment(&handle, &oversized).await.unwrap();
-        let gap = persisted.gap.expect("truncation should record gap");
-        assert!(
-            gap.reason.contains("segment_truncated:original_bytes="),
-            "gap reason should include truncation marker: {}",
-            gap.reason
-        );
-        assert!(gap.reason.contains("max_bytes=65536"));
-        assert_eq!(persisted.segment.content, expected_tail);
-        assert_eq!(
-            persisted.segment.content.len(),
-            DEFAULT_MAX_PERSIST_SEGMENT_BYTES
-        );
+            let persisted = persist_captured_segment(&handle, &oversized).await.unwrap();
+            let gap = persisted.gap.expect("truncation should record gap");
+            assert!(
+                gap.reason.contains("segment_truncated:original_bytes="),
+                "gap reason should include truncation marker: {}",
+                gap.reason
+            );
+            assert!(gap.reason.contains("max_bytes=65536"));
+            assert_eq!(persisted.segment.content, expected_tail);
+            assert_eq!(
+                persisted.segment.content.len(),
+                DEFAULT_MAX_PERSIST_SEGMENT_BYTES
+            );
 
-        handle.shutdown().await.unwrap();
-        cleanup_db(&db_path);
+            handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
     }
 
     // Helper to create a test PaneInfo

@@ -1024,6 +1024,17 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        crate::runtime_compat::CompatRuntime::block_on(&runtime, future);
+    }
+
     // -- Weibull parameters ---------------------------------------------------
 
     #[test]
@@ -1772,32 +1783,34 @@ mod tests {
 
     // -- Async run test -------------------------------------------------------
 
-    #[tokio::test]
-    async fn model_run_and_shutdown() {
-        let model = Arc::new(SurvivalModel::new(SurvivalConfig {
-            warmup_observations: 0,
-            update_interval: Duration::from_millis(50),
-            ..Default::default()
-        }));
+    #[test]
+    fn model_run_and_shutdown() {
+        run_async_test(async {
+            let model = Arc::new(SurvivalModel::new(SurvivalConfig {
+                warmup_observations: 0,
+                update_interval: Duration::from_millis(50),
+                ..Default::default()
+            }));
 
-        // Add some observations
-        for i in 0..5 {
-            model.observe(Observation {
-                time: (i + 1) as f64 * 10.0,
-                event_observed: false,
-                covariates: Covariates::default(),
-                timestamp_secs: 0,
+            // Add some observations
+            for i in 0..5 {
+                model.observe(Observation {
+                    time: (i + 1) as f64 * 10.0,
+                    event_observed: false,
+                    covariates: Covariates::default(),
+                    timestamp_secs: 0,
+                });
+            }
+
+            let m = Arc::clone(&model);
+            let handle = crate::runtime_compat::task::spawn(async move {
+                m.run().await;
             });
-        }
 
-        let m = Arc::clone(&model);
-        let handle = crate::runtime_compat::task::spawn(async move {
-            m.run().await;
+            crate::runtime_compat::sleep(Duration::from_millis(200)).await;
+            model.shutdown();
+            handle.await.unwrap();
         });
-
-        crate::runtime_compat::sleep(Duration::from_millis(200)).await;
-        model.shutdown();
-        handle.await.unwrap();
     }
 
     // -----------------------------------------------------------------------
