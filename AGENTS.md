@@ -10,6 +10,28 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## RULE NUMBER 0.5: NEVER REMOVE crates/frankenterm-core
+
+**THE crates/frankenterm-core CRATE IS A PERMANENT PART OF THIS WORKSPACE. REMOVING IT IS FORBIDDEN.**
+
+This rule exists because agents have REPEATEDLY deleted this entire crate (860+ files, 624K+ lines of code) under the guise of "refactoring" or "consolidation." It has happened at least 3 times and caused enormous damage each time.
+
+**ABSOLUTE PROHIBITIONS:**
+- Do NOT delete, remove, or "consolidate" `crates/frankenterm-core/`
+- Do NOT stage deletions of files in `crates/frankenterm-core/`
+- Do NOT create commits that remove files from `crates/frankenterm-core/`
+- Do NOT propose, plan, or suggest removing this crate for any reason
+- The words "remove frankenterm-core", "consolidate into main crate", or "crate removal" should NEVER appear in any commit message
+
+**If you see frankenterm-core files missing from disk but present in git:**
+- This is the EXACT bug that keeps happening — an agent on another machine deleted them
+- Do NOT commit the deletions. Run `git checkout -- crates/frankenterm-core/` to restore them
+- Report the issue to the user
+
+**This crate is not optional. It is not redundant. It is not "extracted." It IS the core.**
+
+---
+
 ## RULE NUMBER 1: NO FILE DELETION
 
 **YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.
@@ -26,6 +48,16 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 2. **No exceptions by convenience:** Do not create temporary directories, detached worktrees, or parallel checkout trees for agent work.
 3. **Use branches in the main repo only:** All agent work must happen on normal branches in the primary checkout.
 4. **If you discover existing worktrees:** stop and report them, then rescue useful commits back into normal branches.
+
+---
+
+## FIRST-TIME SETUP ON ANY MACHINE
+
+Run this after cloning or on any machine where agents work on frankenterm:
+```bash
+bash scripts/install-hooks.sh
+```
+This installs a pre-commit guard that blocks mass deletions and any deletion of `crates/frankenterm-core/`.
 
 ---
 
