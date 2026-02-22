@@ -29,16 +29,17 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{BTreeMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     time::Instant,
 };
 
 use crate::runtime_compat::oneshot;
+use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 
@@ -46,8 +47,11 @@ use crate::error::{Result, StorageError};
 use crate::events::event_identity_key;
 use crate::lru_cache::LruCache;
 use crate::policy::Redactor;
+use crate::recorder_invariants::{InvariantReport, ViolationSeverity};
+use crate::recorder_storage::{RecorderBackendKind, RecorderOffset};
 use crate::runtime_compat::mpsc;
 use crate::search::{FusionBackend, HybridSearchService, SearchMode};
+use crate::storage_telemetry::{SloStatus, StorageHealthTier, StoragePipelineSnapshot};
 
 // =============================================================================
 // Schema Definition
@@ -723,6 +727,774 @@ pub struct MigrationStatusReport {
     pub target_version: i32,
     /// All migration entries with applied/pending status
     pub entries: Vec<MigrationStatusEntry>,
+}
+
+/// Migration phase for rollback trigger classification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationStage {
+    /// M0: preflight and writer freeze.
+    #[default]
+    Preflight,
+    /// M1: canonical export from source backend.
+    Export,
+    /// M2: canonical import into target backend.
+    Import,
+    /// M3: checkpoint synchronization.
+    CheckpointSync,
+    /// M4: projection reconciliation / rebuild.
+    ProjectionRebuild,
+    /// M5: target backend activation.
+    Activate,
+    /// Post-cutover soak / canary window.
+    Soak,
+}
+
+impl MigrationStage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preflight => "preflight",
+            Self::Export => "export",
+            Self::Import => "import",
+            Self::CheckpointSync => "checkpoint_sync",
+            Self::ProjectionRebuild => "projection_rebuild",
+            Self::Activate => "activate",
+            Self::Soak => "soak",
+        }
+    }
+}
+
+/// Rollback class selected by the classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationRollbackClass {
+    /// In-cutover invariant break; abort immediately and restore source backend.
+    Immediate,
+    /// Post-cutover degradation; controlled backend reversion and projection rebuild.
+    PostCutover,
+    /// Canonical data integrity emergency; freeze writes and restore known-good source.
+    DataIntegrityEmergency,
+}
+
+impl MigrationRollbackClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::PostCutover => "post_cutover",
+            Self::DataIntegrityEmergency => "data_integrity_emergency",
+        }
+    }
+}
+
+/// Trigger signal emitted by migration rollback classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationRollbackTrigger {
+    ImportDigestMismatch,
+    EventCardinalityMismatch,
+    CheckpointRegression,
+    CorruptImport,
+    InvariantErrors,
+    InvariantCritical,
+    SustainedSloBreach,
+    SloAppendP95Breached,
+    SloFlushP95Breached,
+    HealthTierBlack,
+    ProjectionLagBreach,
+    RepeatedWriteFailures,
+    RepeatedIndexFailures,
+    PolicyAuditRegression,
+    CanonicalDataLossConfirmed,
+    CanonicalCorruptionSuspected,
+}
+
+impl MigrationRollbackTrigger {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ImportDigestMismatch => "import_digest_mismatch",
+            Self::EventCardinalityMismatch => "event_cardinality_mismatch",
+            Self::CheckpointRegression => "checkpoint_regression",
+            Self::CorruptImport => "corrupt_import",
+            Self::InvariantErrors => "invariant_errors",
+            Self::InvariantCritical => "invariant_critical",
+            Self::SustainedSloBreach => "sustained_slo_breach",
+            Self::SloAppendP95Breached => "slo_append_p95_breached",
+            Self::SloFlushP95Breached => "slo_flush_p95_breached",
+            Self::HealthTierBlack => "health_tier_black",
+            Self::ProjectionLagBreach => "projection_lag_breach",
+            Self::RepeatedWriteFailures => "repeated_write_failures",
+            Self::RepeatedIndexFailures => "repeated_index_failures",
+            Self::PolicyAuditRegression => "policy_audit_regression",
+            Self::CanonicalDataLossConfirmed => "canonical_data_loss_confirmed",
+            Self::CanonicalCorruptionSuspected => "canonical_corruption_suspected",
+        }
+    }
+}
+
+/// Reduced invariant summary consumed by rollback classifier.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationInvariantSummary {
+    pub warning_count: usize,
+    pub error_count: usize,
+    pub critical_count: usize,
+}
+
+impl MigrationInvariantSummary {
+    #[must_use]
+    pub fn from_report(report: &InvariantReport) -> Self {
+        Self {
+            warning_count: report.count_by_severity(ViolationSeverity::Warning),
+            error_count: report.count_by_severity(ViolationSeverity::Error),
+            critical_count: report.count_by_severity(ViolationSeverity::Critical),
+        }
+    }
+
+    #[must_use]
+    pub const fn has_breakage(self) -> bool {
+        self.error_count > 0 || self.critical_count > 0
+    }
+}
+
+/// Reduced storage/SLO summary consumed by rollback classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationStorageSloSummary {
+    pub health_tier: StorageHealthTier,
+    pub slo_append_p95: SloStatus,
+    pub slo_flush_p95: SloStatus,
+}
+
+impl MigrationStorageSloSummary {
+    #[must_use]
+    pub fn from_snapshot(snapshot: &StoragePipelineSnapshot) -> Self {
+        Self {
+            health_tier: snapshot.health_tier,
+            slo_append_p95: snapshot.slo_append_p95,
+            slo_flush_p95: snapshot.slo_flush_p95,
+        }
+    }
+}
+
+/// Thresholds for migration rollback classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MigrationRollbackClassifierConfig {
+    /// Number of consecutive breach windows required before SLO-only rollback.
+    pub sustained_slo_windows: u32,
+    /// Threshold for repeated high-severity write failures.
+    pub repeated_write_failure_threshold: u32,
+    /// Threshold for repeated high-severity index failures.
+    pub repeated_index_failure_threshold: u32,
+}
+
+impl Default for MigrationRollbackClassifierConfig {
+    fn default() -> Self {
+        Self {
+            sustained_slo_windows: 3,
+            repeated_write_failure_threshold: 3,
+            repeated_index_failure_threshold: 3,
+        }
+    }
+}
+
+/// Input signal bundle for rollback trigger classification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MigrationRollbackClassifierInput {
+    pub stage: MigrationStage,
+    pub invariants: Option<MigrationInvariantSummary>,
+    pub storage_slo: Option<MigrationStorageSloSummary>,
+    pub import_digest_mismatch: bool,
+    pub event_cardinality_mismatch: bool,
+    pub checkpoint_regression: bool,
+    pub corrupt_import: bool,
+    pub projection_lag_breach: bool,
+    pub policy_audit_regression: bool,
+    pub confirmed_canonical_data_loss: bool,
+    pub suspected_canonical_corruption: bool,
+    pub high_severity_write_failures: u32,
+    pub high_severity_index_failures: u32,
+    pub consecutive_slo_breach_windows: u32,
+    pub config: MigrationRollbackClassifierConfig,
+}
+
+impl Default for MigrationRollbackClassifierInput {
+    fn default() -> Self {
+        Self {
+            stage: MigrationStage::Preflight,
+            invariants: None,
+            storage_slo: None,
+            import_digest_mismatch: false,
+            event_cardinality_mismatch: false,
+            checkpoint_regression: false,
+            corrupt_import: false,
+            projection_lag_breach: false,
+            policy_audit_regression: false,
+            confirmed_canonical_data_loss: false,
+            suspected_canonical_corruption: false,
+            high_severity_write_failures: 0,
+            high_severity_index_failures: 0,
+            consecutive_slo_breach_windows: 0,
+            config: MigrationRollbackClassifierConfig::default(),
+        }
+    }
+}
+
+/// Decision produced by rollback trigger classifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationRollbackDecision {
+    pub should_rollback: bool,
+    pub rollback_class: Option<MigrationRollbackClass>,
+    pub triggers: Vec<MigrationRollbackTrigger>,
+    pub stage: MigrationStage,
+    pub rationale: String,
+}
+
+impl MigrationRollbackDecision {
+    #[must_use]
+    fn no_rollback(stage: MigrationStage, rationale: String) -> Self {
+        Self {
+            should_rollback: false,
+            rollback_class: None,
+            triggers: Vec::new(),
+            stage,
+            rationale,
+        }
+    }
+}
+
+/// Classify rollback triggers from migration invariants and SLO signals.
+///
+/// Mapping follows the frankensqlite rollout contract:
+/// - immediate rollback: invariant breaks during cutover
+/// - post-cutover rollback: sustained SLO breaches or repeated failures
+/// - data-integrity emergency rollback: canonical data loss/corruption signals
+#[must_use]
+pub fn classify_migration_rollback_trigger(
+    input: &MigrationRollbackClassifierInput,
+) -> MigrationRollbackDecision {
+    let mut emergency_triggers = Vec::new();
+    let mut immediate_triggers = Vec::new();
+    let mut post_cutover_triggers = Vec::new();
+
+    let push_unique = |dst: &mut Vec<MigrationRollbackTrigger>, t: MigrationRollbackTrigger| {
+        if !dst.contains(&t) {
+            dst.push(t);
+        }
+    };
+
+    if input.confirmed_canonical_data_loss {
+        push_unique(
+            &mut emergency_triggers,
+            MigrationRollbackTrigger::CanonicalDataLossConfirmed,
+        );
+    }
+    if input.suspected_canonical_corruption {
+        push_unique(
+            &mut emergency_triggers,
+            MigrationRollbackTrigger::CanonicalCorruptionSuspected,
+        );
+    }
+
+    if input.import_digest_mismatch {
+        push_unique(
+            &mut immediate_triggers,
+            MigrationRollbackTrigger::ImportDigestMismatch,
+        );
+    }
+    if input.event_cardinality_mismatch {
+        push_unique(
+            &mut immediate_triggers,
+            MigrationRollbackTrigger::EventCardinalityMismatch,
+        );
+    }
+    if input.checkpoint_regression {
+        push_unique(
+            &mut immediate_triggers,
+            MigrationRollbackTrigger::CheckpointRegression,
+        );
+    }
+    if input.corrupt_import {
+        push_unique(
+            &mut immediate_triggers,
+            MigrationRollbackTrigger::CorruptImport,
+        );
+    }
+    if let Some(invariants) = input.invariants {
+        if invariants.critical_count > 0 {
+            push_unique(
+                &mut immediate_triggers,
+                MigrationRollbackTrigger::InvariantCritical,
+            );
+        }
+        if invariants.error_count > 0 {
+            push_unique(
+                &mut immediate_triggers,
+                MigrationRollbackTrigger::InvariantErrors,
+            );
+        }
+    }
+
+    let mut slo_detail_triggers = Vec::new();
+    if let Some(storage_slo) = input.storage_slo {
+        if matches!(storage_slo.health_tier, StorageHealthTier::Black) {
+            push_unique(
+                &mut slo_detail_triggers,
+                MigrationRollbackTrigger::HealthTierBlack,
+            );
+        }
+        if matches!(storage_slo.slo_append_p95, SloStatus::Breached) {
+            push_unique(
+                &mut slo_detail_triggers,
+                MigrationRollbackTrigger::SloAppendP95Breached,
+            );
+        }
+        if matches!(storage_slo.slo_flush_p95, SloStatus::Breached) {
+            push_unique(
+                &mut slo_detail_triggers,
+                MigrationRollbackTrigger::SloFlushP95Breached,
+            );
+        }
+    }
+    if input.projection_lag_breach {
+        push_unique(
+            &mut slo_detail_triggers,
+            MigrationRollbackTrigger::ProjectionLagBreach,
+        );
+    }
+
+    if !slo_detail_triggers.is_empty()
+        && input.consecutive_slo_breach_windows >= input.config.sustained_slo_windows
+    {
+        push_unique(
+            &mut post_cutover_triggers,
+            MigrationRollbackTrigger::SustainedSloBreach,
+        );
+        for trigger in slo_detail_triggers {
+            push_unique(&mut post_cutover_triggers, trigger);
+        }
+    }
+
+    if input.high_severity_write_failures >= input.config.repeated_write_failure_threshold {
+        push_unique(
+            &mut post_cutover_triggers,
+            MigrationRollbackTrigger::RepeatedWriteFailures,
+        );
+    }
+    if input.high_severity_index_failures >= input.config.repeated_index_failure_threshold {
+        push_unique(
+            &mut post_cutover_triggers,
+            MigrationRollbackTrigger::RepeatedIndexFailures,
+        );
+    }
+    if input.policy_audit_regression {
+        push_unique(
+            &mut post_cutover_triggers,
+            MigrationRollbackTrigger::PolicyAuditRegression,
+        );
+    }
+
+    let (rollback_class, mut triggers, rationale) = if !emergency_triggers.is_empty() {
+        (
+            Some(MigrationRollbackClass::DataIntegrityEmergency),
+            emergency_triggers.clone(),
+            "canonical data integrity emergency signal detected".to_string(),
+        )
+    } else if !immediate_triggers.is_empty() {
+        (
+            Some(MigrationRollbackClass::Immediate),
+            immediate_triggers.clone(),
+            "cutover invariant break detected; immediate rollback required".to_string(),
+        )
+    } else if !post_cutover_triggers.is_empty() {
+        (
+            Some(MigrationRollbackClass::PostCutover),
+            post_cutover_triggers.clone(),
+            "post-cutover degradation detected; controlled rollback required".to_string(),
+        )
+    } else {
+        let decision = MigrationRollbackDecision::no_rollback(
+            input.stage,
+            "no rollback trigger conditions satisfied".to_string(),
+        );
+        tracing::info!(
+            stage = input.stage.as_str(),
+            consecutive_slo_breach_windows = input.consecutive_slo_breach_windows,
+            high_severity_write_failures = input.high_severity_write_failures,
+            high_severity_index_failures = input.high_severity_index_failures,
+            "Migration rollback classifier found no trigger"
+        );
+        return decision;
+    };
+
+    if !immediate_triggers.is_empty() {
+        for trigger in immediate_triggers {
+            if !triggers.contains(&trigger) {
+                triggers.push(trigger);
+            }
+        }
+    }
+    if !post_cutover_triggers.is_empty() {
+        for trigger in post_cutover_triggers {
+            if !triggers.contains(&trigger) {
+                triggers.push(trigger);
+            }
+        }
+    }
+
+    let trigger_labels: Vec<&'static str> = triggers.iter().map(|t| t.as_str()).collect();
+    tracing::warn!(
+        stage = input.stage.as_str(),
+        rollback_class = rollback_class
+            .map(MigrationRollbackClass::as_str)
+            .unwrap_or("none"),
+        triggers = ?trigger_labels,
+        consecutive_slo_breach_windows = input.consecutive_slo_breach_windows,
+        high_severity_write_failures = input.high_severity_write_failures,
+        high_severity_index_failures = input.high_severity_index_failures,
+        "Migration rollback classifier triggered rollback"
+    );
+
+    MigrationRollbackDecision {
+        should_rollback: true,
+        rollback_class,
+        triggers,
+        stage: input.stage,
+        rationale,
+    }
+}
+
+/// Context for executing migration rollback automation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationRollbackPlaybookContext {
+    /// Selected rollback class from rollback trigger classification.
+    pub rollback_class: MigrationRollbackClass,
+    /// Stage at which rollback was initiated.
+    pub from_stage: MigrationStage,
+    /// Checkpoints captured before migration started; restored during post-cutover rollback.
+    pub pre_migration_checkpoints: BTreeMap<String, RecorderOffset>,
+    /// Optional forensic capture payload for Tier3 data-integrity emergencies.
+    pub forensic_capture: Option<MigrationForensicCaptureContext>,
+    /// Directory where forensic bundles are persisted.
+    pub forensics_output_dir: PathBuf,
+}
+
+/// Source/target backend state included in forensic bundles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationForensicBackendState {
+    pub health: bool,
+    pub head_offset: Option<RecorderOffset>,
+    pub last_checkpoint: Option<RecorderOffset>,
+}
+
+/// Migration checkpoint metadata included in forensic bundles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationForensicMigrationCheckpoint {
+    pub last_completed_stage: MigrationStage,
+    pub manifest: String,
+}
+
+/// Corruption details captured during data integrity emergency rollback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationForensicCorruptionDetail {
+    pub location: String,
+    pub affected_ordinals: Vec<u64>,
+    pub detail: String,
+}
+
+/// Forensic capture context supplied when executing Tier3 rollback automation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationForensicCaptureContext {
+    pub source_state: MigrationForensicBackendState,
+    pub target_state: MigrationForensicBackendState,
+    pub migration_checkpoint: MigrationForensicMigrationCheckpoint,
+    pub corruption_detail: MigrationForensicCorruptionDetail,
+}
+
+/// Forensic artifact persisted to disk during Tier3 rollback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationForensicBundle {
+    pub captured_at_ms: i64,
+    pub rollback_class: MigrationRollbackClass,
+    pub from_stage: MigrationStage,
+    pub source_state: MigrationForensicBackendState,
+    pub target_state: MigrationForensicBackendState,
+    pub migration_checkpoint: MigrationForensicMigrationCheckpoint,
+    pub corruption_detail: MigrationForensicCorruptionDetail,
+}
+
+/// Mutable runtime state used by rollback playbook automation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationRollbackExecutionState {
+    /// Whether migration mode is currently active (source writes quiesced).
+    pub migration_active: bool,
+    /// Current recorder backend selector.
+    pub backend_selector: RecorderBackendKind,
+    /// Whether target backend has partial migration artifacts.
+    pub target_has_partial_data: bool,
+    /// Current durable checkpoint view by consumer id.
+    pub checkpoints: BTreeMap<String, RecorderOffset>,
+    /// Latest source backend health verdict.
+    pub source_health: bool,
+    /// Latest index/projection health verdict.
+    pub index_health: bool,
+    /// Whether projection rebuild has been requested.
+    pub projection_rebuild_triggered: bool,
+    /// Emergency write freeze flag set by Tier3 data-integrity rollback.
+    pub emergency_freeze: bool,
+}
+
+impl Default for MigrationRollbackExecutionState {
+    fn default() -> Self {
+        Self {
+            migration_active: false,
+            backend_selector: RecorderBackendKind::AppendLog,
+            target_has_partial_data: false,
+            checkpoints: BTreeMap::new(),
+            source_health: true,
+            index_health: true,
+            projection_rebuild_triggered: false,
+            emergency_freeze: false,
+        }
+    }
+}
+
+impl MigrationRollbackExecutionState {
+    /// Whether recorder writes are currently blocked by emergency freeze.
+    #[must_use]
+    pub const fn recorder_writes_blocked(&self) -> bool {
+        self.emergency_freeze
+    }
+
+    /// Manual human-operated re-enable path after Tier3 freeze.
+    pub fn manual_reenable_recorder_writes(&mut self) {
+        self.emergency_freeze = false;
+    }
+}
+
+/// Summary emitted after successful rollback playbook execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationRollbackExecutionReport {
+    pub tier: MigrationRollbackClass,
+    pub from_stage: MigrationStage,
+    pub migration_active: bool,
+    pub backend_selector: RecorderBackendKind,
+    pub target_cleared: bool,
+    pub projection_rebuild_triggered: bool,
+    pub checkpoints_reset: bool,
+    pub source_health_verified: bool,
+    pub index_health_verified: bool,
+    pub emergency_freeze_active: bool,
+    pub forensic_bundle_path: Option<PathBuf>,
+}
+
+/// Failure cases for rollback playbook automation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MigrationRollbackExecutionError {
+    UnsupportedTier {
+        rollback_class: MigrationRollbackClass,
+    },
+    SourceHealthFailed {
+        tier: MigrationRollbackClass,
+    },
+    IndexHealthFailedPostCutover,
+    ForensicCaptureMissing,
+    ForensicPersistFailed {
+        path: PathBuf,
+        error: String,
+    },
+}
+
+/// Execute Tier1/Tier2/Tier3 rollback playbook actions.
+///
+/// Tier1 (`Immediate`) actions:
+/// - clear migration_active flag
+/// - clear partial target data marker
+/// - reset backend selector to append_log
+/// - verify source health
+///
+/// Tier2 (`PostCutover`) actions:
+/// - reset backend selector to append_log
+/// - trigger projection rebuild
+/// - reset consumer checkpoints to pre-migration snapshot
+/// - verify source and index health
+///
+/// Tier3 (`DataIntegrityEmergency`) actions:
+/// - freeze recorder writes until manual re-enable
+/// - capture forensic source/target/checkpoint/corruption bundle
+/// - persist forensic bundle to timestamped JSON file
+/// - emit CRITICAL structured alert logs
+pub fn execute_migration_rollback_playbook(
+    state: &mut MigrationRollbackExecutionState,
+    context: &MigrationRollbackPlaybookContext,
+) -> std::result::Result<MigrationRollbackExecutionReport, MigrationRollbackExecutionError> {
+    tracing::warn!(
+        rollback_executing = true,
+        tier = context.rollback_class.as_str(),
+        from_stage = context.from_stage.as_str(),
+        "Executing migration rollback playbook"
+    );
+
+    match context.rollback_class {
+        MigrationRollbackClass::Immediate => {
+            state.migration_active = false;
+            state.target_has_partial_data = false;
+            state.backend_selector = RecorderBackendKind::AppendLog;
+
+            if !state.source_health {
+                return Err(MigrationRollbackExecutionError::SourceHealthFailed {
+                    tier: MigrationRollbackClass::Immediate,
+                });
+            }
+
+            let report = MigrationRollbackExecutionReport {
+                tier: MigrationRollbackClass::Immediate,
+                from_stage: context.from_stage,
+                migration_active: state.migration_active,
+                backend_selector: state.backend_selector,
+                target_cleared: !state.target_has_partial_data,
+                projection_rebuild_triggered: false,
+                checkpoints_reset: false,
+                source_health_verified: true,
+                index_health_verified: false,
+                emergency_freeze_active: state.emergency_freeze,
+                forensic_bundle_path: None,
+            };
+
+            tracing::info!(
+                rollback_complete = true,
+                tier = report.tier.as_str(),
+                source_health = state.source_health,
+                "Migration rollback playbook complete"
+            );
+
+            Ok(report)
+        }
+        MigrationRollbackClass::PostCutover => {
+            state.migration_active = false;
+            state.backend_selector = RecorderBackendKind::AppendLog;
+            state.projection_rebuild_triggered = true;
+            state.checkpoints = context.pre_migration_checkpoints.clone();
+
+            if !state.source_health {
+                return Err(MigrationRollbackExecutionError::SourceHealthFailed {
+                    tier: MigrationRollbackClass::PostCutover,
+                });
+            }
+            if !state.index_health {
+                return Err(MigrationRollbackExecutionError::IndexHealthFailedPostCutover);
+            }
+
+            let report = MigrationRollbackExecutionReport {
+                tier: MigrationRollbackClass::PostCutover,
+                from_stage: context.from_stage,
+                migration_active: state.migration_active,
+                backend_selector: state.backend_selector,
+                target_cleared: !state.target_has_partial_data,
+                projection_rebuild_triggered: state.projection_rebuild_triggered,
+                checkpoints_reset: true,
+                source_health_verified: true,
+                index_health_verified: true,
+                emergency_freeze_active: state.emergency_freeze,
+                forensic_bundle_path: None,
+            };
+
+            tracing::info!(
+                rollback_complete = true,
+                tier = report.tier.as_str(),
+                source_health = state.source_health,
+                index_health = state.index_health,
+                "Migration rollback playbook complete"
+            );
+
+            Ok(report)
+        }
+        MigrationRollbackClass::DataIntegrityEmergency => {
+            state.migration_active = false;
+            state.backend_selector = RecorderBackendKind::AppendLog;
+            state.emergency_freeze = true;
+
+            let forensic_capture = context
+                .forensic_capture
+                .as_ref()
+                .ok_or(MigrationRollbackExecutionError::ForensicCaptureMissing)?;
+
+            std::fs::create_dir_all(&context.forensics_output_dir).map_err(|error| {
+                MigrationRollbackExecutionError::ForensicPersistFailed {
+                    path: context.forensics_output_dir.clone(),
+                    error: error.to_string(),
+                }
+            })?;
+
+            let captured_at = Utc::now();
+            let forensic_file_name =
+                format!("forensics_{}.json", captured_at.format("%Y%m%d_%H%M%S"));
+            let forensic_bundle_path = context.forensics_output_dir.join(forensic_file_name);
+
+            let bundle = MigrationForensicBundle {
+                captured_at_ms: captured_at.timestamp_millis(),
+                rollback_class: MigrationRollbackClass::DataIntegrityEmergency,
+                from_stage: context.from_stage,
+                source_state: forensic_capture.source_state.clone(),
+                target_state: forensic_capture.target_state.clone(),
+                migration_checkpoint: forensic_capture.migration_checkpoint.clone(),
+                corruption_detail: forensic_capture.corruption_detail.clone(),
+            };
+
+            let serialized = serde_json::to_vec_pretty(&bundle).map_err(|error| {
+                MigrationRollbackExecutionError::ForensicPersistFailed {
+                    path: forensic_bundle_path.clone(),
+                    error: error.to_string(),
+                }
+            })?;
+
+            std::fs::write(&forensic_bundle_path, serialized).map_err(|error| {
+                MigrationRollbackExecutionError::ForensicPersistFailed {
+                    path: forensic_bundle_path.clone(),
+                    error: error.to_string(),
+                }
+            })?;
+
+            tracing::error!(
+                CRITICAL = true,
+                forensic_bundle = %forensic_bundle_path.display(),
+                corruption_detail = %bundle.corruption_detail.detail,
+                "Data integrity emergency forensic bundle captured"
+            );
+            tracing::error!(
+                recorder_frozen = true,
+                reason = "data_integrity_emergency",
+                require = "manual_reenable",
+                "Recorder writes frozen pending manual re-enable"
+            );
+
+            let report = MigrationRollbackExecutionReport {
+                tier: MigrationRollbackClass::DataIntegrityEmergency,
+                from_stage: context.from_stage,
+                migration_active: state.migration_active,
+                backend_selector: state.backend_selector,
+                target_cleared: !state.target_has_partial_data,
+                projection_rebuild_triggered: false,
+                checkpoints_reset: false,
+                source_health_verified: false,
+                index_health_verified: false,
+                emergency_freeze_active: true,
+                forensic_bundle_path: Some(forensic_bundle_path),
+            };
+
+            tracing::info!(
+                rollback_complete = true,
+                tier = report.tier.as_str(),
+                recorder_frozen = state.emergency_freeze,
+                "Migration rollback playbook complete"
+            );
+
+            Ok(report)
+        }
+    }
 }
 
 /// Registry of all migrations.
@@ -23115,6 +23887,529 @@ mod timeline_correlation_tests {
 
         let by_tag = list_pane_bookmarks_by_tag_sync(&conn, "anything").unwrap();
         assert!(by_tag.is_empty());
+    }
+
+    #[test]
+    fn migration_invariant_summary_from_report_counts_severities() {
+        let report = InvariantReport {
+            violations: vec![
+                crate::recorder_invariants::Violation {
+                    kind: crate::recorder_invariants::ViolationKind::SequenceGap,
+                    severity: crate::recorder_invariants::ViolationSeverity::Warning,
+                    event_id: "evt-warning".to_string(),
+                    pane_id: 1,
+                    message: "warning".to_string(),
+                    event_index: 0,
+                },
+                crate::recorder_invariants::Violation {
+                    kind: crate::recorder_invariants::ViolationKind::SequenceRegression,
+                    severity: crate::recorder_invariants::ViolationSeverity::Error,
+                    event_id: "evt-error".to_string(),
+                    pane_id: 1,
+                    message: "error".to_string(),
+                    event_index: 1,
+                },
+                crate::recorder_invariants::Violation {
+                    kind: crate::recorder_invariants::ViolationKind::DuplicateEventId,
+                    severity: crate::recorder_invariants::ViolationSeverity::Critical,
+                    event_id: "evt-critical".to_string(),
+                    pane_id: 1,
+                    message: "critical".to_string(),
+                    event_index: 2,
+                },
+            ],
+            events_checked: 3,
+            panes_observed: 1,
+            domains_observed: 1,
+            passed: false,
+            backend_kind: None,
+        };
+
+        let summary = MigrationInvariantSummary::from_report(&report);
+        assert_eq!(summary.warning_count, 1);
+        assert_eq!(summary.error_count, 1);
+        assert_eq!(summary.critical_count, 1);
+        assert!(summary.has_breakage());
+    }
+
+    #[test]
+    fn migration_rollback_classifier_prefers_data_integrity_emergency() {
+        let input = MigrationRollbackClassifierInput {
+            stage: MigrationStage::Import,
+            confirmed_canonical_data_loss: true,
+            import_digest_mismatch: true,
+            ..Default::default()
+        };
+
+        let decision = classify_migration_rollback_trigger(&input);
+        assert!(decision.should_rollback);
+        assert_eq!(
+            decision.rollback_class,
+            Some(MigrationRollbackClass::DataIntegrityEmergency)
+        );
+        assert!(
+            decision
+                .triggers
+                .contains(&MigrationRollbackTrigger::CanonicalDataLossConfirmed)
+        );
+        assert!(
+            decision
+                .triggers
+                .contains(&MigrationRollbackTrigger::ImportDigestMismatch)
+        );
+    }
+
+    #[test]
+    fn migration_rollback_classifier_immediate_on_checkpoint_or_invariant_breakage() {
+        let input = MigrationRollbackClassifierInput {
+            stage: MigrationStage::CheckpointSync,
+            checkpoint_regression: true,
+            invariants: Some(MigrationInvariantSummary {
+                warning_count: 0,
+                error_count: 1,
+                critical_count: 0,
+            }),
+            ..Default::default()
+        };
+
+        let decision = classify_migration_rollback_trigger(&input);
+        assert!(decision.should_rollback);
+        assert_eq!(
+            decision.rollback_class,
+            Some(MigrationRollbackClass::Immediate)
+        );
+        assert!(
+            decision
+                .triggers
+                .contains(&MigrationRollbackTrigger::CheckpointRegression)
+        );
+        assert!(
+            decision
+                .triggers
+                .contains(&MigrationRollbackTrigger::InvariantErrors)
+        );
+    }
+
+    #[test]
+    fn migration_rollback_classifier_requires_sustained_slo_breach_window() {
+        let config = MigrationRollbackClassifierConfig {
+            sustained_slo_windows: 3,
+            repeated_write_failure_threshold: 3,
+            repeated_index_failure_threshold: 3,
+        };
+        let base_input = MigrationRollbackClassifierInput {
+            stage: MigrationStage::Soak,
+            storage_slo: Some(MigrationStorageSloSummary {
+                health_tier: StorageHealthTier::Black,
+                slo_append_p95: SloStatus::Breached,
+                slo_flush_p95: SloStatus::Met,
+            }),
+            projection_lag_breach: true,
+            config,
+            ..Default::default()
+        };
+
+        let not_sustained = MigrationRollbackClassifierInput {
+            consecutive_slo_breach_windows: 2,
+            ..base_input.clone()
+        };
+        let decision_not_sustained = classify_migration_rollback_trigger(&not_sustained);
+        assert!(!decision_not_sustained.should_rollback);
+
+        let sustained = MigrationRollbackClassifierInput {
+            consecutive_slo_breach_windows: 3,
+            ..base_input
+        };
+        let decision_sustained = classify_migration_rollback_trigger(&sustained);
+        assert!(decision_sustained.should_rollback);
+        assert_eq!(
+            decision_sustained.rollback_class,
+            Some(MigrationRollbackClass::PostCutover)
+        );
+        assert!(
+            decision_sustained
+                .triggers
+                .contains(&MigrationRollbackTrigger::SustainedSloBreach)
+        );
+        assert!(
+            decision_sustained
+                .triggers
+                .contains(&MigrationRollbackTrigger::ProjectionLagBreach)
+        );
+    }
+
+    #[test]
+    fn migration_rollback_classifier_post_cutover_on_repeated_failures() {
+        let input = MigrationRollbackClassifierInput {
+            stage: MigrationStage::Soak,
+            high_severity_write_failures: 3,
+            high_severity_index_failures: 4,
+            policy_audit_regression: true,
+            ..Default::default()
+        };
+
+        let decision = classify_migration_rollback_trigger(&input);
+        assert!(decision.should_rollback);
+        assert_eq!(
+            decision.rollback_class,
+            Some(MigrationRollbackClass::PostCutover)
+        );
+        assert!(
+            decision
+                .triggers
+                .contains(&MigrationRollbackTrigger::RepeatedWriteFailures)
+        );
+        assert!(
+            decision
+                .triggers
+                .contains(&MigrationRollbackTrigger::RepeatedIndexFailures)
+        );
+        assert!(
+            decision
+                .triggers
+                .contains(&MigrationRollbackTrigger::PolicyAuditRegression)
+        );
+    }
+
+    fn default_rollback_context(
+        rollback_class: MigrationRollbackClass,
+        from_stage: MigrationStage,
+        pre_migration_checkpoints: BTreeMap<String, RecorderOffset>,
+    ) -> MigrationRollbackPlaybookContext {
+        MigrationRollbackPlaybookContext {
+            rollback_class,
+            from_stage,
+            pre_migration_checkpoints,
+            forensic_capture: None,
+            forensics_output_dir: std::env::temp_dir(),
+        }
+    }
+
+    fn sample_forensic_capture() -> MigrationForensicCaptureContext {
+        MigrationForensicCaptureContext {
+            source_state: MigrationForensicBackendState {
+                health: true,
+                head_offset: Some(RecorderOffset {
+                    segment_id: 1,
+                    byte_offset: 512,
+                    ordinal: 32,
+                }),
+                last_checkpoint: Some(RecorderOffset {
+                    segment_id: 1,
+                    byte_offset: 480,
+                    ordinal: 30,
+                }),
+            },
+            target_state: MigrationForensicBackendState {
+                health: false,
+                head_offset: Some(RecorderOffset {
+                    segment_id: 7,
+                    byte_offset: 1024,
+                    ordinal: 41,
+                }),
+                last_checkpoint: Some(RecorderOffset {
+                    segment_id: 7,
+                    byte_offset: 1000,
+                    ordinal: 40,
+                }),
+            },
+            migration_checkpoint: MigrationForensicMigrationCheckpoint {
+                last_completed_stage: MigrationStage::ProjectionRebuild,
+                manifest: "manifest_sha256:abc123".to_string(),
+            },
+            corruption_detail: MigrationForensicCorruptionDetail {
+                location: "target.events.segment_7".to_string(),
+                affected_ordinals: vec![39, 40, 41],
+                detail: "checksum mismatch at ordinal 41".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_tier1_rollback_unquiesces_source() {
+        let mut state = MigrationRollbackExecutionState {
+            migration_active: true,
+            backend_selector: RecorderBackendKind::FrankenSqlite,
+            target_has_partial_data: true,
+            source_health: true,
+            index_health: true,
+            ..Default::default()
+        };
+        let context = default_rollback_context(
+            MigrationRollbackClass::Immediate,
+            MigrationStage::CheckpointSync,
+            BTreeMap::new(),
+        );
+
+        let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
+        assert!(!state.migration_active);
+        assert!(!report.migration_active);
+    }
+
+    #[test]
+    fn test_tier1_rollback_clears_target() {
+        let mut state = MigrationRollbackExecutionState {
+            migration_active: true,
+            backend_selector: RecorderBackendKind::FrankenSqlite,
+            target_has_partial_data: true,
+            source_health: true,
+            index_health: true,
+            ..Default::default()
+        };
+        let context = default_rollback_context(
+            MigrationRollbackClass::Immediate,
+            MigrationStage::Import,
+            BTreeMap::new(),
+        );
+
+        let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
+        assert!(!state.target_has_partial_data);
+        assert!(report.target_cleared);
+    }
+
+    #[test]
+    fn test_tier1_rollback_restores_backend_selector() {
+        let mut state = MigrationRollbackExecutionState {
+            migration_active: true,
+            backend_selector: RecorderBackendKind::FrankenSqlite,
+            target_has_partial_data: true,
+            source_health: true,
+            index_health: true,
+            ..Default::default()
+        };
+        let context = default_rollback_context(
+            MigrationRollbackClass::Immediate,
+            MigrationStage::ProjectionRebuild,
+            BTreeMap::new(),
+        );
+
+        let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
+        assert_eq!(state.backend_selector, RecorderBackendKind::AppendLog);
+        assert_eq!(report.backend_selector, RecorderBackendKind::AppendLog);
+    }
+
+    #[test]
+    fn test_tier2_rollback_triggers_projection_rebuild() {
+        let mut state = MigrationRollbackExecutionState {
+            migration_active: false,
+            backend_selector: RecorderBackendKind::FrankenSqlite,
+            target_has_partial_data: false,
+            source_health: true,
+            index_health: true,
+            ..Default::default()
+        };
+        let context = default_rollback_context(
+            MigrationRollbackClass::PostCutover,
+            MigrationStage::Soak,
+            BTreeMap::new(),
+        );
+
+        let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
+        assert!(state.projection_rebuild_triggered);
+        assert!(report.projection_rebuild_triggered);
+    }
+
+    #[test]
+    fn test_tier2_rollback_resets_checkpoints() {
+        let mut state = MigrationRollbackExecutionState {
+            migration_active: false,
+            backend_selector: RecorderBackendKind::FrankenSqlite,
+            target_has_partial_data: false,
+            source_health: true,
+            index_health: true,
+            checkpoints: BTreeMap::from([(
+                "lexical".to_string(),
+                RecorderOffset {
+                    segment_id: 9,
+                    byte_offset: 999,
+                    ordinal: 999,
+                },
+            )]),
+            ..Default::default()
+        };
+        let pre_migration = BTreeMap::from([
+            (
+                "lexical".to_string(),
+                RecorderOffset {
+                    segment_id: 1,
+                    byte_offset: 10,
+                    ordinal: 10,
+                },
+            ),
+            (
+                "semantic".to_string(),
+                RecorderOffset {
+                    segment_id: 1,
+                    byte_offset: 20,
+                    ordinal: 20,
+                },
+            ),
+        ]);
+        let context = default_rollback_context(
+            MigrationRollbackClass::PostCutover,
+            MigrationStage::Soak,
+            pre_migration.clone(),
+        );
+
+        let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
+        assert_eq!(state.checkpoints, pre_migration);
+        assert!(report.checkpoints_reset);
+    }
+
+    #[test]
+    fn test_rollback_verifies_source_health() {
+        let mut tier1_state = MigrationRollbackExecutionState {
+            migration_active: true,
+            backend_selector: RecorderBackendKind::FrankenSqlite,
+            target_has_partial_data: true,
+            source_health: false,
+            index_health: true,
+            ..Default::default()
+        };
+        let tier1_context = default_rollback_context(
+            MigrationRollbackClass::Immediate,
+            MigrationStage::CheckpointSync,
+            BTreeMap::new(),
+        );
+        let tier1_err =
+            execute_migration_rollback_playbook(&mut tier1_state, &tier1_context).unwrap_err();
+        assert_eq!(
+            tier1_err,
+            MigrationRollbackExecutionError::SourceHealthFailed {
+                tier: MigrationRollbackClass::Immediate
+            }
+        );
+
+        let mut tier2_state = MigrationRollbackExecutionState {
+            migration_active: false,
+            backend_selector: RecorderBackendKind::FrankenSqlite,
+            target_has_partial_data: false,
+            source_health: true,
+            index_health: false,
+            ..Default::default()
+        };
+        let tier2_context = default_rollback_context(
+            MigrationRollbackClass::PostCutover,
+            MigrationStage::Soak,
+            BTreeMap::new(),
+        );
+        let tier2_err =
+            execute_migration_rollback_playbook(&mut tier2_state, &tier2_context).unwrap_err();
+        assert_eq!(
+            tier2_err,
+            MigrationRollbackExecutionError::IndexHealthFailedPostCutover
+        );
+    }
+
+    #[test]
+    fn test_tier3_freezes_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let forensic_capture = sample_forensic_capture();
+        let context = MigrationRollbackPlaybookContext {
+            rollback_class: MigrationRollbackClass::DataIntegrityEmergency,
+            from_stage: MigrationStage::Activate,
+            pre_migration_checkpoints: BTreeMap::new(),
+            forensic_capture: Some(forensic_capture),
+            forensics_output_dir: temp.path().to_path_buf(),
+        };
+        let mut state = MigrationRollbackExecutionState::default();
+
+        let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
+
+        assert!(state.recorder_writes_blocked());
+        assert!(report.emergency_freeze_active);
+    }
+
+    #[test]
+    fn test_tier3_captures_forensic_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = MigrationRollbackPlaybookContext {
+            rollback_class: MigrationRollbackClass::DataIntegrityEmergency,
+            from_stage: MigrationStage::Activate,
+            pre_migration_checkpoints: BTreeMap::new(),
+            forensic_capture: Some(sample_forensic_capture()),
+            forensics_output_dir: temp.path().to_path_buf(),
+        };
+        let mut state = MigrationRollbackExecutionState::default();
+
+        let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
+        let path = report.forensic_bundle_path.unwrap();
+
+        assert!(path.exists());
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("forensics_"));
+        assert!(name.ends_with(".json"));
+    }
+
+    #[test]
+    fn test_tier3_bundle_contains_source_and_target_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let forensic_capture = sample_forensic_capture();
+        let context = MigrationRollbackPlaybookContext {
+            rollback_class: MigrationRollbackClass::DataIntegrityEmergency,
+            from_stage: MigrationStage::Activate,
+            pre_migration_checkpoints: BTreeMap::new(),
+            forensic_capture: Some(forensic_capture.clone()),
+            forensics_output_dir: temp.path().to_path_buf(),
+        };
+        let mut state = MigrationRollbackExecutionState::default();
+
+        let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
+        let bytes = std::fs::read(report.forensic_bundle_path.unwrap()).unwrap();
+        let bundle: MigrationForensicBundle = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(bundle.source_state, forensic_capture.source_state);
+        assert_eq!(bundle.target_state, forensic_capture.target_state);
+    }
+
+    #[test]
+    fn test_tier3_bundle_contains_migration_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let forensic_capture = sample_forensic_capture();
+        let context = MigrationRollbackPlaybookContext {
+            rollback_class: MigrationRollbackClass::DataIntegrityEmergency,
+            from_stage: MigrationStage::Activate,
+            pre_migration_checkpoints: BTreeMap::new(),
+            forensic_capture: Some(forensic_capture.clone()),
+            forensics_output_dir: temp.path().to_path_buf(),
+        };
+        let mut state = MigrationRollbackExecutionState::default();
+
+        let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
+        let bytes = std::fs::read(report.forensic_bundle_path.unwrap()).unwrap();
+        let bundle: MigrationForensicBundle = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            bundle.migration_checkpoint,
+            forensic_capture.migration_checkpoint
+        );
+    }
+
+    #[test]
+    fn test_tier3_remains_frozen_until_manual_reenable() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = MigrationRollbackExecutionState::default();
+        let emergency_context = MigrationRollbackPlaybookContext {
+            rollback_class: MigrationRollbackClass::DataIntegrityEmergency,
+            from_stage: MigrationStage::Activate,
+            pre_migration_checkpoints: BTreeMap::new(),
+            forensic_capture: Some(sample_forensic_capture()),
+            forensics_output_dir: temp.path().to_path_buf(),
+        };
+
+        execute_migration_rollback_playbook(&mut state, &emergency_context).unwrap();
+        assert!(state.recorder_writes_blocked());
+
+        let immediate_context = default_rollback_context(
+            MigrationRollbackClass::Immediate,
+            MigrationStage::CheckpointSync,
+            BTreeMap::new(),
+        );
+        execute_migration_rollback_playbook(&mut state, &immediate_context).unwrap();
+        assert!(state.recorder_writes_blocked());
+
+        state.manual_reenable_recorder_writes();
+        assert!(!state.recorder_writes_blocked());
     }
 
     // =========================================================================

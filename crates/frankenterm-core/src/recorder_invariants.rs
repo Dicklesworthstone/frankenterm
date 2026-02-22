@@ -12,7 +12,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use tracing::debug;
+
 use crate::event_id::{ClockAnomalyTracker, RecorderMergeKey, StreamKind};
+use crate::recorder_storage::RecorderBackendKind;
 use crate::recording::{RecorderEvent, RecorderEventPayload};
 
 // ---------------------------------------------------------------------------
@@ -93,6 +96,8 @@ pub struct InvariantReport {
     pub domains_observed: usize,
     /// Whether the event set passes all invariants.
     pub passed: bool,
+    /// Which backend produced the events (for telemetry tagging).
+    pub backend_kind: Option<RecorderBackendKind>,
 }
 
 impl InvariantReport {
@@ -179,6 +184,32 @@ impl InvariantChecker {
         Self { config }
     }
 
+    /// Check a slice of events from a known backend and return a violation report.
+    ///
+    /// The `backend_kind` is recorded in the report and emitted in diagnostic
+    /// logs so operators can correlate invariant violations with the storage
+    /// backend that produced the events.
+    #[must_use]
+    pub fn check_for_backend(
+        &self,
+        events: &[RecorderEvent],
+        backend_kind: RecorderBackendKind,
+    ) -> InvariantReport {
+        let mut report = self.check_inner(events);
+        report.backend_kind = Some(backend_kind);
+
+        debug!(
+            invariant = "all",
+            backend = %backend_kind,
+            events = report.events_checked,
+            violations = report.violations.len(),
+            passed = report.passed,
+            "invariant check complete"
+        );
+
+        report
+    }
+
     /// Check a slice of events and return a violation report.
     ///
     /// Events should be in the order they appear in the log (append order).
@@ -186,6 +217,11 @@ impl InvariantChecker {
     /// RecorderMergeKey ordering (requires pre-sorted input).
     #[must_use]
     pub fn check(&self, events: &[RecorderEvent]) -> InvariantReport {
+        self.check_inner(events)
+    }
+
+    /// Inner implementation shared by `check` and `check_for_backend`.
+    fn check_inner(&self, events: &[RecorderEvent]) -> InvariantReport {
         let mut violations = Vec::new();
 
         // Per-domain tracking: (pane_id, StreamKind) → last sequence
@@ -422,6 +458,7 @@ impl InvariantChecker {
             panes_observed: panes.len(),
             domains_observed: domains.len(),
             passed,
+            backend_kind: None,
         }
     }
 }
@@ -1502,6 +1539,7 @@ mod tests {
             panes_observed: 2,
             domains_observed: 3,
             passed: true,
+            backend_kind: None,
         };
         let c = report.clone();
         assert_eq!(c.violations.len(), 1);
@@ -1536,6 +1574,7 @@ mod tests {
             panes_observed: 1,
             domains_observed: 1,
             passed: true,
+            backend_kind: None,
         };
         assert!(!report.has_errors());
         assert!(!report.has_critical());
@@ -1552,6 +1591,7 @@ mod tests {
             panes_observed: 0,
             domains_observed: 0,
             passed: true,
+            backend_kind: None,
         };
         assert_eq!(report.count_by_kind(ViolationKind::SequenceRegression), 0);
         assert_eq!(report.count_by_kind(ViolationKind::DuplicateEventId), 0);
@@ -1565,6 +1605,7 @@ mod tests {
             panes_observed: 3,
             domains_observed: 5,
             passed: true,
+            backend_kind: None,
         };
         let dbg = format!("{:?}", report);
         assert!(dbg.contains("InvariantReport"));
@@ -1656,5 +1697,158 @@ mod tests {
         assert!(r.deterministic);
         assert!(r.divergence_index.is_none());
         assert!(r.message.is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // Backend-agnostic invariant checks (ft-2vuw7.1.4.1.1.2.1)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ordering_invariant_with_append_log_backend() {
+        let events = vec![
+            make_event("e1", 1, 0, 100, "a"),
+            make_event("e2", 1, 1, 200, "b"),
+            make_event("e3", 1, 2, 300, "c"),
+        ];
+        let checker = InvariantChecker::new();
+        let report = checker.check_for_backend(&events, RecorderBackendKind::AppendLog);
+        assert!(report.passed);
+        assert_eq!(report.backend_kind, Some(RecorderBackendKind::AppendLog));
+        assert_eq!(report.events_checked, 3);
+    }
+
+    #[test]
+    fn ordering_invariant_with_frankensqlite_backend() {
+        let events = vec![
+            make_event("e1", 1, 0, 100, "a"),
+            make_event("e2", 1, 1, 200, "b"),
+            make_event("e3", 1, 2, 300, "c"),
+        ];
+        let checker = InvariantChecker::new();
+        let report = checker.check_for_backend(&events, RecorderBackendKind::FrankenSqlite);
+        assert!(report.passed);
+        assert_eq!(report.backend_kind, Some(RecorderBackendKind::FrankenSqlite));
+    }
+
+    #[test]
+    fn completeness_invariant_backend_agnostic() {
+        // Same events produce same violations regardless of backend
+        let events = vec![
+            make_event("e1", 1, 0, 100, "a"),
+            make_event("e3", 1, 5, 200, "b"), // gap: 0 → 5
+        ];
+        let checker = InvariantChecker::new();
+
+        let report_al = checker.check_for_backend(&events, RecorderBackendKind::AppendLog);
+        let report_fs = checker.check_for_backend(&events, RecorderBackendKind::FrankenSqlite);
+
+        // Same number of violations
+        assert_eq!(report_al.violations.len(), report_fs.violations.len());
+        // Same pass/fail
+        assert_eq!(report_al.passed, report_fs.passed);
+        // Backend tag differs
+        assert_eq!(report_al.backend_kind, Some(RecorderBackendKind::AppendLog));
+        assert_eq!(report_fs.backend_kind, Some(RecorderBackendKind::FrankenSqlite));
+    }
+
+    #[test]
+    fn clock_invariant_backend_agnostic() {
+        // Clock regression detected the same way for both backends
+        let events = vec![
+            make_event("e1", 1, 0, 500, "a"),
+            make_event("e2", 1, 1, 100, "b"), // clock regression
+        ];
+        let checker = InvariantChecker::new();
+
+        let report_al = checker.check_for_backend(&events, RecorderBackendKind::AppendLog);
+        let report_fs = checker.check_for_backend(&events, RecorderBackendKind::FrankenSqlite);
+
+        assert_eq!(
+            report_al.count_by_kind(ViolationKind::ClockRegression),
+            report_fs.count_by_kind(ViolationKind::ClockRegression),
+        );
+    }
+
+    #[test]
+    fn check_without_backend_has_none() {
+        let events = vec![make_event("e1", 1, 0, 100, "a")];
+        let checker = InvariantChecker::new();
+        let report = checker.check(&events);
+        assert!(report.backend_kind.is_none());
+        assert!(report.passed);
+    }
+
+    #[test]
+    fn invariant_report_backend_kind_in_debug() {
+        let events = vec![make_event("e1", 1, 0, 100, "a")];
+        let checker = InvariantChecker::new();
+        let report = checker.check_for_backend(&events, RecorderBackendKind::AppendLog);
+        let dbg = format!("{:?}", report);
+        assert!(dbg.contains("AppendLog"));
+    }
+
+    #[test]
+    fn sequence_regression_detected_both_backends() {
+        let events = vec![
+            make_event("e1", 1, 5, 100, "a"),
+            make_event("e2", 1, 3, 200, "b"), // regression: 5 → 3
+        ];
+        let checker = InvariantChecker::new();
+
+        for backend in [RecorderBackendKind::AppendLog, RecorderBackendKind::FrankenSqlite] {
+            let report = checker.check_for_backend(&events, backend);
+            assert!(!report.passed);
+            assert!(
+                report.count_by_kind(ViolationKind::SequenceRegression) > 0,
+                "SequenceRegression not detected for {:?}",
+                backend
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_event_id_detected_both_backends() {
+        let events = vec![
+            make_event("dup", 1, 0, 100, "a"),
+            make_event("dup", 2, 0, 200, "b"), // same event_id
+        ];
+        let checker = InvariantChecker::new();
+
+        for backend in [RecorderBackendKind::AppendLog, RecorderBackendKind::FrankenSqlite] {
+            let report = checker.check_for_backend(&events, backend);
+            assert!(report.count_by_kind(ViolationKind::DuplicateEventId) > 0);
+            assert_eq!(report.backend_kind, Some(backend));
+        }
+    }
+
+    #[test]
+    fn causality_check_backend_agnostic() {
+        let mut events = vec![
+            make_event("e1", 1, 0, 100, "a"),
+            make_event("e2", 1, 1, 200, "b"),
+        ];
+        events[1].causality.parent_event_id = Some("nonexistent".to_string());
+
+        let checker = InvariantChecker::new();
+
+        let report_al = checker.check_for_backend(&events, RecorderBackendKind::AppendLog);
+        let report_fs = checker.check_for_backend(&events, RecorderBackendKind::FrankenSqlite);
+
+        assert_eq!(
+            report_al.count_by_kind(ViolationKind::DanglingParentRef),
+            report_fs.count_by_kind(ViolationKind::DanglingParentRef),
+        );
+    }
+
+    #[test]
+    fn empty_events_passes_both_backends() {
+        let checker = InvariantChecker::new();
+
+        for backend in [RecorderBackendKind::AppendLog, RecorderBackendKind::FrankenSqlite] {
+            let report = checker.check_for_backend(&[], backend);
+            assert!(report.passed);
+            assert_eq!(report.events_checked, 0);
+            assert_eq!(report.backend_kind, Some(backend));
+        }
     }
 }
