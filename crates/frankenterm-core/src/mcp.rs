@@ -24,6 +24,7 @@ use mcp_framework::{ResourceHandler, ResourceTemplate, StdioTransport, ToolHandl
 
 use crate::Result;
 use crate::accounts::AccountRecord;
+use crate::agent_provider::AgentProvider;
 use crate::approval::ApprovalStore;
 use crate::cass::{
     CassAgent, CassClient, CassError, CassSearchResult, CassStatus, CassViewResult,
@@ -4544,22 +4545,16 @@ fn resolve_workspace_id(config: &Config) -> Result<String> {
 }
 
 fn parse_caut_service(service: &str) -> Option<CautService> {
-    match service {
-        "openai" => Some(CautService::OpenAI),
-        _ => None,
+    let normalized = service.trim();
+    if normalized.eq_ignore_ascii_case("openai") {
+        return Some(CautService::OpenAI);
     }
+    let provider = AgentProvider::from_slug(normalized);
+    CautService::from_provider(&provider)
 }
 
 fn parse_cass_agent(agent: &str) -> Option<CassAgent> {
-    match agent.trim().to_lowercase().as_str() {
-        "codex" => Some(CassAgent::Codex),
-        "claude_code" | "claude-code" | "claude" => Some(CassAgent::ClaudeCode),
-        "gemini" => Some(CassAgent::Gemini),
-        "cursor" => Some(CassAgent::Cursor),
-        "aider" => Some(CassAgent::Aider),
-        "chatgpt" | "chat_gpt" | "chat-gpt" => Some(CassAgent::ChatGpt),
-        _ => None,
-    }
+    CassAgent::from_slug(agent)
 }
 
 fn check_refresh_cooldown(
@@ -5678,6 +5673,18 @@ mod tests {
     fn parse_caut_service_openai() {
         assert!(matches!(
             parse_caut_service("openai"),
+            Some(CautService::OpenAI)
+        ));
+    }
+
+    #[test]
+    fn parse_caut_service_provider_aliases() {
+        assert!(matches!(
+            parse_caut_service("codex"),
+            Some(CautService::OpenAI)
+        ));
+        assert!(matches!(
+            parse_caut_service("chat-gpt"),
             Some(CautService::OpenAI)
         ));
     }

@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
+use crate::agent_provider::AgentProvider;
 use crate::patterns::{AgentType, Detection};
 use crate::session_pane_state::AgentMetadata;
 use crate::wezterm::PaneInfo;
@@ -88,6 +89,8 @@ pub struct AgentCorrelator {
 struct PaneAgentState {
     /// Detected agent type.
     agent_type: AgentType,
+    /// Canonical provider identity for cross-module integration.
+    provider: AgentProvider,
     /// How the agent was detected.
     source: DetectionSource,
     /// Agent session ID if extracted from patterns.
@@ -135,12 +138,14 @@ impl AgentCorrelator {
 
             let state = infer_state_from_rule(&detection.rule_id);
             let session_id = extract_session_id(&detection.extracted);
+            let provider = AgentProvider::from_agent_type(&detection.agent_type);
 
             let entry = self
                 .pane_agents
                 .entry(pane_id)
                 .or_insert_with(|| PaneAgentState {
                     agent_type: detection.agent_type,
+                    provider: provider.clone(),
                     source: DetectionSource::PatternEngine,
                     session_id: None,
                     last_state: "active".to_string(),
@@ -150,6 +155,7 @@ impl AgentCorrelator {
 
             // Update agent type if detection is more specific
             entry.agent_type = detection.agent_type;
+            entry.provider = provider;
             entry.source = DetectionSource::PatternEngine;
             entry.last_state = state.to_string();
             entry.last_state_at = Instant::now();
@@ -161,7 +167,7 @@ impl AgentCorrelator {
 
             trace!(
                 pane_id,
-                agent = %entry.agent_type,
+                agent = %entry.provider,
                 state = %entry.last_state,
                 rule = %detection.rule_id,
                 "Agent state updated from detection"
@@ -184,6 +190,7 @@ impl AgentCorrelator {
                 pane.pane_id,
                 PaneAgentState {
                     agent_type,
+                    provider: AgentProvider::from_agent_type(&agent_type),
                     source: DetectionSource::PaneTitle,
                     session_id: None,
                     last_state: "active".to_string(),
@@ -210,6 +217,7 @@ impl AgentCorrelator {
                     pane.pane_id,
                     PaneAgentState {
                         agent_type,
+                        provider: AgentProvider::from_agent_type(&agent_type),
                         source: DetectionSource::ProcessName,
                         session_id: None,
                         last_state: "active".to_string(),
@@ -242,7 +250,11 @@ impl AgentCorrelator {
         };
 
         Some(AgentMetadata {
-            agent_type: state.agent_type.to_string(),
+            agent_type: if state.agent_type != AgentType::Unknown {
+                state.agent_type.to_string()
+            } else {
+                metadata_agent_type_for_provider(&state.provider)
+            },
             session_id: state.session_id.clone(),
             state: Some(effective_state),
         })
@@ -278,7 +290,7 @@ impl AgentCorrelator {
                 (
                     *pane_id,
                     RunningAgentInventoryEntry {
-                        slug: state.agent_type.to_string(),
+                        slug: state.provider.canonical_name().to_string(),
                         state: effective_state,
                         session_id: state.session_id.clone(),
                         source: state.source,
@@ -332,6 +344,15 @@ fn detect_agent_from_process(process: &str) -> Option<AgentType> {
         return Some(AgentType::Gemini);
     }
     None
+}
+
+fn metadata_agent_type_for_provider(provider: &AgentProvider) -> String {
+    let legacy = provider.to_agent_type();
+    if legacy != AgentType::Unknown {
+        legacy.to_string()
+    } else {
+        provider.canonical_name().to_string()
+    }
 }
 
 /// Infer agent state from a detection rule_id.
@@ -1273,5 +1294,29 @@ mod tests {
             &[make_detection("core.gemini:banner", AgentType::Gemini)],
         );
         assert_eq!(c.get_metadata(1).unwrap().agent_type, "gemini");
+    }
+
+    #[test]
+    fn metadata_agent_type_prefers_legacy_strings_for_supported_providers() {
+        assert_eq!(
+            metadata_agent_type_for_provider(&AgentProvider::Claude),
+            "claude_code"
+        );
+        assert_eq!(
+            metadata_agent_type_for_provider(&AgentProvider::Codex),
+            "codex"
+        );
+    }
+
+    #[test]
+    fn metadata_agent_type_uses_canonical_name_for_non_pattern_provider() {
+        assert_eq!(
+            metadata_agent_type_for_provider(&AgentProvider::Cursor),
+            "cursor"
+        );
+        assert_eq!(
+            metadata_agent_type_for_provider(&AgentProvider::Unknown("x-new".to_string())),
+            "x-new"
+        );
     }
 }

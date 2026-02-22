@@ -12,6 +12,7 @@ use crate::policy::Redactor;
 use crate::runtime_compat::process::Command;
 use crate::runtime_compat::timeout;
 use crate::suggestions::Platform;
+use crate::agent_provider::AgentProvider;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,6 +42,44 @@ impl CassAgent {
             Self::Aider => "aider",
             Self::ChatGpt => "chatgpt",
         }
+    }
+
+    #[must_use]
+    pub fn from_provider(provider: &AgentProvider) -> Option<Self> {
+        match provider {
+            AgentProvider::Codex => Some(Self::Codex),
+            AgentProvider::Claude => Some(Self::ClaudeCode),
+            AgentProvider::Gemini => Some(Self::Gemini),
+            AgentProvider::Cursor => Some(Self::Cursor),
+            AgentProvider::Aider => Some(Self::Aider),
+            AgentProvider::Unknown(slug) if Self::is_chatgpt_slug(slug) => Some(Self::ChatGpt),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn to_provider(self) -> AgentProvider {
+        match self {
+            Self::Codex => AgentProvider::Codex,
+            Self::ClaudeCode => AgentProvider::Claude,
+            Self::Gemini => AgentProvider::Gemini,
+            Self::Cursor => AgentProvider::Cursor,
+            Self::Aider => AgentProvider::Aider,
+            Self::ChatGpt => AgentProvider::Unknown("chatgpt".to_string()),
+        }
+    }
+
+    #[must_use]
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        let provider = AgentProvider::from_slug(slug.trim());
+        Self::from_provider(&provider)
+    }
+
+    fn is_chatgpt_slug(slug: &str) -> bool {
+        matches!(
+            slug.trim().to_ascii_lowercase().as_str(),
+            "chatgpt" | "chat_gpt" | "chat-gpt"
+        )
     }
 }
 
@@ -925,6 +964,48 @@ mod tests {
         assert_eq!(CassAgent::Codex.as_str(), "codex");
         assert_eq!(CassAgent::ClaudeCode.as_str(), "claude_code");
         assert_eq!(format!("{}", CassAgent::Gemini), "gemini");
+    }
+
+    #[test]
+    fn cass_agent_bridge_from_provider() {
+        assert_eq!(
+            CassAgent::from_provider(&AgentProvider::Claude),
+            Some(CassAgent::ClaudeCode)
+        );
+        assert_eq!(
+            CassAgent::from_provider(&AgentProvider::Codex),
+            Some(CassAgent::Codex)
+        );
+        assert_eq!(
+            CassAgent::from_provider(&AgentProvider::Gemini),
+            Some(CassAgent::Gemini)
+        );
+        assert_eq!(
+            CassAgent::from_provider(&AgentProvider::Unknown("chatgpt".to_string())),
+            Some(CassAgent::ChatGpt)
+        );
+        assert_eq!(
+            CassAgent::from_provider(&AgentProvider::GithubCopilot),
+            None
+        );
+    }
+
+    #[test]
+    fn cass_agent_bridge_to_provider() {
+        assert_eq!(CassAgent::ClaudeCode.to_provider(), AgentProvider::Claude);
+        assert_eq!(CassAgent::Codex.to_provider(), AgentProvider::Codex);
+        assert_eq!(
+            CassAgent::ChatGpt.to_provider(),
+            AgentProvider::Unknown("chatgpt".to_string())
+        );
+    }
+
+    #[test]
+    fn cass_agent_from_slug_uses_agent_provider_mapping() {
+        assert_eq!(CassAgent::from_slug("claude-code"), Some(CassAgent::ClaudeCode));
+        assert_eq!(CassAgent::from_slug("codex"), Some(CassAgent::Codex));
+        assert_eq!(CassAgent::from_slug("chat-gpt"), Some(CassAgent::ChatGpt));
+        assert_eq!(CassAgent::from_slug("github-copilot"), None);
     }
 
     #[test]

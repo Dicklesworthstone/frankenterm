@@ -8889,15 +8889,10 @@ impl HandleAuthRequired {
     }
 
     fn cass_agent_from_trigger(trigger: &serde_json::Value) -> Option<CassAgent> {
-        match trigger.get("agent_type").and_then(|v| v.as_str()) {
-            Some("codex") => Some(CassAgent::Codex),
-            Some("claude_code") => Some(CassAgent::ClaudeCode),
-            Some("gemini") => Some(CassAgent::Gemini),
-            Some("cursor") => Some(CassAgent::Cursor),
-            Some("aider") => Some(CassAgent::Aider),
-            Some("chatgpt") => Some(CassAgent::ChatGpt),
-            _ => None,
-        }
+        trigger
+            .get("agent_type")
+            .and_then(|v| v.as_str())
+            .and_then(CassAgent::from_slug)
     }
 
     fn compact_whitespace(input: &str) -> String {

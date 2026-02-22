@@ -11,6 +11,7 @@ use crate::policy::Redactor;
 use crate::runtime_compat::process::Command;
 use crate::runtime_compat::timeout;
 use crate::suggestions::Platform;
+use crate::agent_provider::AgentProvider;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,6 +31,31 @@ impl CautService {
             Self::OpenAI => "openai",
         }
     }
+
+    /// Map a canonical agent provider to the corresponding caut service.
+    #[must_use]
+    pub fn from_provider(provider: &AgentProvider) -> Option<Self> {
+        match provider {
+            AgentProvider::Codex => Some(Self::OpenAI),
+            AgentProvider::Unknown(slug) if is_openai_slug(slug) => Some(Self::OpenAI),
+            _ => None,
+        }
+    }
+
+    /// Canonical provider hint for this service.
+    #[must_use]
+    pub fn provider_hint(self) -> AgentProvider {
+        match self {
+            Self::OpenAI => AgentProvider::Codex,
+        }
+    }
+}
+
+fn is_openai_slug(slug: &str) -> bool {
+    matches!(
+        slug.trim().to_ascii_lowercase().as_str(),
+        "openai" | "chatgpt" | "chat-gpt" | "chat_gpt" | "gpt" | "gpt4" | "gpt-4"
+    )
 }
 
 impl std::fmt::Display for CautService {
@@ -640,6 +666,28 @@ mod tests {
     fn caut_service_display() {
         assert_eq!(CautService::OpenAI.as_str(), "openai");
         assert_eq!(format!("{}", CautService::OpenAI), "openai");
+    }
+
+    #[test]
+    fn caut_service_from_provider_bridge() {
+        assert_eq!(
+            CautService::from_provider(&AgentProvider::Codex),
+            Some(CautService::OpenAI)
+        );
+        assert_eq!(
+            CautService::from_provider(&AgentProvider::Unknown("openai".to_string())),
+            Some(CautService::OpenAI)
+        );
+        assert_eq!(
+            CautService::from_provider(&AgentProvider::Unknown("chat-gpt".to_string())),
+            Some(CautService::OpenAI)
+        );
+        assert_eq!(CautService::from_provider(&AgentProvider::Claude), None);
+    }
+
+    #[test]
+    fn caut_service_provider_hint_bridge() {
+        assert_eq!(CautService::OpenAI.provider_hint(), AgentProvider::Codex);
     }
 
     #[test]

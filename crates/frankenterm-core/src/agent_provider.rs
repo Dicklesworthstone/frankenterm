@@ -158,6 +158,13 @@ impl AgentProvider {
         }
     }
 
+    /// Stable lowercase canonical identifier.
+    ///
+    /// Alias for [`Self::canonical_slug`] kept for cross-module naming consistency.
+    pub fn canonical_name(&self) -> &str {
+        self.canonical_slug()
+    }
+
     /// Parse a canonical slug or known alias into an `AgentProvider`.
     ///
     /// Returns `Unknown(slug)` when the slug is not in the known set.
@@ -519,6 +526,15 @@ mod tests {
     fn test_canonical_slug_unknown() {
         let provider = AgentProvider::Unknown("custom".to_string());
         assert_eq!(provider.canonical_slug(), "custom");
+    }
+
+    #[test]
+    fn test_canonical_name_aliases_canonical_slug() {
+        let known = AgentProvider::Codex;
+        assert_eq!(known.canonical_name(), known.canonical_slug());
+
+        let unknown = AgentProvider::Unknown("custom-provider".to_string());
+        assert_eq!(unknown.canonical_name(), "custom-provider");
     }
 
     // -------------------------------------------------------------------------
