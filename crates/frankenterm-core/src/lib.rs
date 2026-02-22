@@ -62,9 +62,9 @@ pub mod backup;
 pub mod bayesian_ledger;
 #[cfg(feature = "subprocess-bridge")]
 pub mod beads_bridge;
-pub mod bimap;
 #[cfg(feature = "subprocess-bridge")]
 pub mod beads_types;
+pub mod bimap;
 pub mod binomial_heap;
 pub mod bloom_filter;
 pub mod bocpd;
@@ -88,8 +88,8 @@ pub mod config_profiles;
 pub mod conformal;
 pub mod consistent_hash;
 pub mod content_dedup;
-pub mod cooldown_tracker;
 pub mod continuous_backpressure;
+pub mod cooldown_tracker;
 pub mod count_min_sketch;
 pub mod cpu_pressure;
 pub mod crash;
@@ -153,6 +153,8 @@ pub mod logging;
 pub mod lru_cache;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+#[cfg(feature = "mcp")]
+pub mod mcp_error;
 pub mod memory_budget;
 pub mod memory_pressure;
 pub mod merkle_tree;
