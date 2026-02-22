@@ -244,6 +244,81 @@ impl ReindexProgress {
 }
 
 // ---------------------------------------------------------------------------
+// Operator observability — stats and callbacks
+// ---------------------------------------------------------------------------
+
+/// Completion statistics for operator dashboards and cutover verification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReindexStats {
+    /// Total events read from the source.
+    pub event_count: u64,
+    /// Events successfully indexed.
+    pub indexed_count: u64,
+    /// Events skipped (schema mismatch, rejected by writer).
+    pub skipped_count: u64,
+    /// Events filtered out (outside range).
+    pub filtered_count: u64,
+    /// Errors encountered (non-fatal).
+    pub error_count: u64,
+    /// Wall-clock duration in milliseconds.
+    pub duration_ms: u64,
+    /// Final ordinal position.
+    pub final_ordinal: Option<u64>,
+    /// Whether the operation fully caught up.
+    pub caught_up: bool,
+    /// Events per second throughput.
+    pub events_per_sec: f64,
+}
+
+impl ReindexStats {
+    /// Build stats from a progress snapshot and start timestamp.
+    pub fn from_progress(progress: &ReindexProgress, start_ms: u64) -> Self {
+        let now = epoch_ms_now();
+        let duration_ms = now.saturating_sub(start_ms);
+        let eps = if duration_ms > 0 {
+            progress.events_indexed as f64 / (duration_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+        Self {
+            event_count: progress.events_read,
+            indexed_count: progress.events_indexed,
+            skipped_count: progress.events_skipped,
+            filtered_count: progress.events_filtered,
+            error_count: 0,
+            duration_ms,
+            final_ordinal: progress.current_ordinal,
+            caught_up: progress.caught_up,
+            events_per_sec: eps,
+        }
+    }
+}
+
+/// Observer for reindex progress and completion events.
+///
+/// Implementations can wire these callbacks to dashboards, metrics
+/// registries, or structured log sinks.
+pub trait ReindexObserver: Send {
+    /// Called periodically as events are processed.
+    ///
+    /// `current` is the latest offset processed, `total_estimate` is the
+    /// best-effort estimate of total events in the source (0 if unknown),
+    /// and `eta_ms` is the estimated time remaining (0 if unknown).
+    fn on_progress(&self, current: &RecorderOffset, total_estimate: u64, eta_ms: u64);
+
+    /// Called once when the reindex operation completes.
+    fn on_complete(&self, stats: &ReindexStats);
+}
+
+/// No-op observer that discards all callbacks.
+pub struct NullObserver;
+
+impl ReindexObserver for NullObserver {
+    fn on_progress(&self, _current: &RecorderOffset, _total_estimate: u64, _eta_ms: u64) {}
+    fn on_complete(&self, _stats: &ReindexStats) {}
+}
+
+// ---------------------------------------------------------------------------
 // ReindexPipeline — orchestrates full reindex and backfill
 // ---------------------------------------------------------------------------
 
@@ -423,6 +498,208 @@ impl<W: IndexWriter> ReindexPipeline<W> {
         );
 
         Ok(progress)
+    }
+
+    /// Reindex `[from, to)` with operator observability callbacks.
+    ///
+    /// Same semantics as `reindex_range` but calls `observer.on_progress()`
+    /// after each committed batch and `observer.on_complete()` when done.
+    /// Emits operator-facing `info!` logs at batch boundaries.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reindex_range_observed<S: RecorderStorage, O: ReindexObserver>(
+        &mut self,
+        storage: &S,
+        source: &RecorderSourceDescriptor,
+        from: RecorderOffset,
+        to: RecorderOffset,
+        consumer_id_str: &str,
+        batch_size: usize,
+        dedup_on_replay: bool,
+        expected_schema: &str,
+        observer: &O,
+    ) -> Result<(ReindexProgress, ReindexStats), IndexerError> {
+        let start_ms = epoch_ms_now();
+
+        if batch_size == 0 {
+            return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
+        }
+        if to.ordinal <= from.ordinal {
+            let progress = ReindexProgress::new();
+            let stats = ReindexStats::from_progress(&progress, start_ms);
+            observer.on_complete(&stats);
+            tracing::info!(
+                reindex_complete = true,
+                duration_ms = %stats.duration_ms,
+                events = 0u64,
+                errors = 0u64,
+                "reindex range empty (to <= from)"
+            );
+            return Ok((progress, stats));
+        }
+
+        let total_estimate = to.ordinal.saturating_sub(from.ordinal);
+        tracing::info!(
+            reindex_progress = "starting",
+            from = %from.ordinal,
+            to = %to.ordinal,
+            estimated_events = total_estimate,
+            backend = %source,
+            "starting observed reindex [from, to)"
+        );
+
+        let event_reader = create_event_reader(source)?;
+        let consumer_id = CheckpointConsumerId(consumer_id_str.to_string());
+        let mut progress = ReindexProgress::new();
+
+        let mut cursor = if from.ordinal > 0 {
+            event_reader
+                .open_cursor_at_ordinal(from.ordinal)
+                .map_err(cursor_err)?
+        } else {
+            event_reader.open_cursor_from_start().map_err(cursor_err)?
+        };
+
+        let exclusive_range = ExclusiveOrdinalRange {
+            from_ordinal: from.ordinal,
+            to_ordinal: to.ordinal,
+        };
+
+        // Indexing loop with observer callbacks
+        let mut last_progress_ms = start_ms;
+        loop {
+            let batch = cursor
+                .next_batch(batch_size)
+                .map_err(cursor_err)?;
+            if batch.is_empty() {
+                progress.caught_up = true;
+                break;
+            }
+
+            let is_final_batch = batch.len() < batch_size;
+            let mut last_offset: Option<RecorderOffset> = None;
+            let mut index_mutations_in_batch = 0u64;
+
+            for record in &batch {
+                progress.events_read += 1;
+                let ordinal = record.offset.ordinal;
+
+                if ordinal >= exclusive_range.to_ordinal {
+                    progress.caught_up = true;
+                    last_offset = Some(record.offset.clone());
+                    break;
+                }
+
+                if ordinal < exclusive_range.from_ordinal {
+                    progress.events_filtered += 1;
+                    last_offset = Some(record.offset.clone());
+                    continue;
+                }
+
+                if record.event.schema_version != expected_schema {
+                    progress.events_skipped += 1;
+                    last_offset = Some(record.offset.clone());
+                    continue;
+                }
+
+                let doc = map_event_to_document(&record.event, ordinal);
+
+                if dedup_on_replay {
+                    self.writer
+                        .delete_by_event_id(&doc.event_id)
+                        .map_err(IndexerError::IndexWrite)?;
+                    index_mutations_in_batch += 1;
+                }
+
+                match self.writer.add_document(&doc) {
+                    Ok(()) => {
+                        progress.events_indexed += 1;
+                        index_mutations_in_batch += 1;
+                    }
+                    Err(IndexWriteError::Rejected { .. }) => {
+                        progress.events_skipped += 1;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+
+                last_offset = Some(record.offset.clone());
+            }
+
+            if let Some(offset) = last_offset {
+                if index_mutations_in_batch > 0 {
+                    self.writer.commit().map_err(IndexerError::IndexWrite)?;
+                }
+                progress.current_ordinal = Some(offset.ordinal);
+
+                let cp = RecorderCheckpoint {
+                    consumer: consumer_id.clone(),
+                    upto_offset: offset.clone(),
+                    schema_version: expected_schema.to_string(),
+                    committed_at_ms: epoch_ms_now(),
+                };
+                storage.commit_checkpoint(cp).await?;
+                progress.batches_committed += 1;
+
+                // Progress callback and operator log
+                let now_ms = epoch_ms_now();
+                let elapsed = now_ms.saturating_sub(start_ms);
+                let eta_ms = if progress.events_indexed > 0 && total_estimate > 0 {
+                    let rate = progress.events_indexed as f64 / elapsed.max(1) as f64;
+                    let remaining = total_estimate.saturating_sub(progress.events_indexed);
+                    (remaining as f64 / rate.max(0.001)) as u64
+                } else {
+                    0
+                };
+
+                observer.on_progress(&offset, total_estimate, eta_ms);
+
+                // Log at most once per second to avoid spam
+                if now_ms.saturating_sub(last_progress_ms) >= 1000 {
+                    let pct = if total_estimate > 0 {
+                        (progress.events_indexed as f64 / total_estimate as f64 * 100.0) as u64
+                    } else {
+                        0
+                    };
+                    tracing::info!(
+                        reindex_progress = %pct,
+                        events = progress.events_indexed,
+                        eta_ms = %eta_ms,
+                        "reindex progress"
+                    );
+                    last_progress_ms = now_ms;
+                }
+            }
+
+            if is_final_batch || progress.caught_up {
+                if !progress.caught_up {
+                    progress.caught_up = true;
+                }
+                break;
+            }
+        }
+
+        let stats = ReindexStats::from_progress(&progress, start_ms);
+        observer.on_complete(&stats);
+
+        tracing::info!(
+            reindex_complete = true,
+            duration_ms = %stats.duration_ms,
+            events = stats.indexed_count,
+            errors = %stats.error_count,
+            events_per_sec = %format!("{:.1}", stats.events_per_sec),
+            "reindex complete"
+        );
+
+        // Warn if no progress was made despite events existing
+        if progress.events_read > 0 && progress.events_indexed == 0 {
+            tracing::warn!(
+                reindex_stall = true,
+                events_read = progress.events_read,
+                events_skipped = progress.events_skipped,
+                "reindex completed with zero indexed events despite reading events"
+            );
+        }
+
+        Ok((progress, stats))
     }
 
     /// Backfill a specific range of events.
@@ -3210,5 +3487,378 @@ mod tests {
         };
         let cloned = r.clone();
         assert_eq!(r, cloned);
+    }
+
+    // =========================================================================
+    // Operator observability — ReindexStats + observer callbacks — E2.F2.T3
+    // =========================================================================
+
+    use std::sync::{Arc, Mutex};
+
+    /// Test observer that records all callback invocations.
+    struct TestObserver {
+        progress_calls: Arc<Mutex<Vec<(RecorderOffset, u64, u64)>>>,
+        complete_calls: Arc<Mutex<Vec<ReindexStats>>>,
+    }
+
+    impl TestObserver {
+        fn new() -> Self {
+            Self {
+                progress_calls: Arc::new(Mutex::new(Vec::new())),
+                complete_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl ReindexObserver for TestObserver {
+        fn on_progress(&self, current: &RecorderOffset, total_estimate: u64, eta_ms: u64) {
+            self.progress_calls
+                .lock()
+                .unwrap()
+                .push((current.clone(), total_estimate, eta_ms));
+        }
+
+        fn on_complete(&self, stats: &ReindexStats) {
+            self.complete_calls.lock().unwrap().push(stats.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn reindex_progress_callback_called() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events: Vec<_> = (0..10)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        let source = RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        };
+        let from = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 0,
+        };
+        let to = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 10,
+        };
+
+        let observer = TestObserver::new();
+        let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let (progress, _stats) = pipeline
+            .reindex_range_observed(
+                &storage,
+                &source,
+                from,
+                to,
+                "progress-cb-test",
+                5,
+                false,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+                &observer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(progress.events_indexed, 10);
+
+        // on_progress should have been called at least once per batch commit
+        let calls = observer.progress_calls.lock().unwrap();
+        assert!(calls.len() >= 2, "expected >= 2 progress calls, got {}", calls.len());
+    }
+
+    #[tokio::test]
+    async fn reindex_progress_percentage_monotonic() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events: Vec<_> = (0..20)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        let source = RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        };
+        let from = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 0,
+        };
+        let to = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 20,
+        };
+
+        let observer = TestObserver::new();
+        let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let _ = pipeline
+            .reindex_range_observed(
+                &storage,
+                &source,
+                from,
+                to,
+                "monotonic-test",
+                3,
+                false,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+                &observer,
+            )
+            .await
+            .unwrap();
+
+        // Progress ordinals should be monotonically increasing
+        let calls = observer.progress_calls.lock().unwrap();
+        assert!(calls.len() >= 2);
+        for i in 1..calls.len() {
+            assert!(
+                calls[i].0.ordinal >= calls[i - 1].0.ordinal,
+                "ordinal {} < {} at progress call {}",
+                calls[i].0.ordinal,
+                calls[i - 1].0.ordinal,
+                i
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reindex_stats_accurate_event_count() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events: Vec<_> = (0..8)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        let source = RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        };
+        let from = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 2,
+        };
+        let to = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 6,
+        };
+
+        let observer = TestObserver::new();
+        let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let (progress, stats) = pipeline
+            .reindex_range_observed(
+                &storage,
+                &source,
+                from,
+                to,
+                "stats-count-test",
+                20,
+                false,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+                &observer,
+            )
+            .await
+            .unwrap();
+
+        // Stats should match progress
+        assert_eq!(stats.indexed_count, progress.events_indexed);
+        assert_eq!(stats.indexed_count, 4); // ordinals 2, 3, 4, 5
+        assert_eq!(stats.event_count, progress.events_read);
+        assert_eq!(stats.skipped_count, 0);
+        assert_eq!(stats.filtered_count, 0);
+        assert!(stats.caught_up);
+        // final_ordinal may be the boundary event that triggered the stop
+        assert!(stats.final_ordinal.is_some());
+    }
+
+    #[tokio::test]
+    async fn reindex_complete_callback_with_stats() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events: Vec<_> = (0..5)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        let source = RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        };
+        let from = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 0,
+        };
+        let to = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 5,
+        };
+
+        let observer = TestObserver::new();
+        let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let _ = pipeline
+            .reindex_range_observed(
+                &storage,
+                &source,
+                from,
+                to,
+                "complete-cb-test",
+                20,
+                false,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+                &observer,
+            )
+            .await
+            .unwrap();
+
+        // on_complete should be called exactly once
+        let complete_calls = observer.complete_calls.lock().unwrap();
+        assert_eq!(complete_calls.len(), 1);
+        let stats = &complete_calls[0];
+        assert_eq!(stats.indexed_count, 5);
+        assert!(stats.caught_up);
+        assert!(stats.duration_ms < 10_000); // should finish in well under 10s
+    }
+
+    #[tokio::test]
+    async fn reindex_complete_callback_on_empty_range() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        populate_log(&storage, vec![sample_event("e0", 1, 0, "text")]).await;
+
+        let source = RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        };
+        let offset = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 5,
+        };
+
+        let observer = TestObserver::new();
+        let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let (progress, stats) = pipeline
+            .reindex_range_observed(
+                &storage,
+                &source,
+                offset.clone(),
+                offset,
+                "empty-complete-test",
+                20,
+                false,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+                &observer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(progress.events_indexed, 0);
+        // on_complete still called even for empty ranges
+        let complete_calls = observer.complete_calls.lock().unwrap();
+        assert_eq!(complete_calls.len(), 1);
+        assert_eq!(complete_calls[0].indexed_count, 0);
+        assert_eq!(stats.indexed_count, 0);
+    }
+
+    #[test]
+    fn reindex_stats_from_progress_computes_throughput() {
+        let mut progress = ReindexProgress::new();
+        progress.events_read = 1000;
+        progress.events_indexed = 900;
+        progress.events_skipped = 50;
+        progress.events_filtered = 50;
+        progress.current_ordinal = Some(999);
+        progress.caught_up = true;
+
+        // Simulate a 2-second run
+        let start_ms = epoch_ms_now().saturating_sub(2000);
+        let stats = ReindexStats::from_progress(&progress, start_ms);
+
+        assert_eq!(stats.event_count, 1000);
+        assert_eq!(stats.indexed_count, 900);
+        assert_eq!(stats.skipped_count, 50);
+        assert_eq!(stats.filtered_count, 50);
+        assert!(stats.caught_up);
+        assert_eq!(stats.final_ordinal, Some(999));
+        assert!(stats.duration_ms >= 1900);
+        assert!(stats.events_per_sec > 0.0);
+    }
+
+    #[test]
+    fn reindex_stats_debug_clone_eq() {
+        let stats = ReindexStats {
+            event_count: 100,
+            indexed_count: 95,
+            skipped_count: 3,
+            filtered_count: 2,
+            error_count: 0,
+            duration_ms: 500,
+            final_ordinal: Some(99),
+            caught_up: true,
+            events_per_sec: 190.0,
+        };
+        let debug = format!("{stats:?}");
+        assert!(debug.contains("ReindexStats"));
+        let cloned = stats.clone();
+        assert_eq!(stats, cloned);
+    }
+
+    #[test]
+    fn reindex_stats_serialization_roundtrip() {
+        let stats = ReindexStats {
+            event_count: 50,
+            indexed_count: 48,
+            skipped_count: 1,
+            filtered_count: 1,
+            error_count: 0,
+            duration_ms: 250,
+            final_ordinal: Some(49),
+            caught_up: true,
+            events_per_sec: 192.0,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: ReindexStats = serde_json::from_str(&json).unwrap();
+        // events_per_sec is f64 — compare other fields precisely
+        assert_eq!(back.event_count, stats.event_count);
+        assert_eq!(back.indexed_count, stats.indexed_count);
+        assert_eq!(back.duration_ms, stats.duration_ms);
+        assert!(back.caught_up);
+    }
+
+    #[test]
+    fn null_observer_compiles_and_runs() {
+        let observer = NullObserver;
+        let offset = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 42,
+        };
+        observer.on_progress(&offset, 100, 5000);
+        let stats = ReindexStats {
+            event_count: 0,
+            indexed_count: 0,
+            skipped_count: 0,
+            filtered_count: 0,
+            error_count: 0,
+            duration_ms: 0,
+            final_ordinal: None,
+            caught_up: false,
+            events_per_sec: 0.0,
+        };
+        observer.on_complete(&stats);
     }
 }
