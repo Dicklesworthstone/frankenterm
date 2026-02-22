@@ -65,17 +65,22 @@ pub fn detect_config(wasm_available: bool) -> DetectedConfig {
     // 1. Explicit env var override
     if let Some(path_os) = std::env::var_os("FRANKENTERM_CONFIG_FILE") {
         let path = PathBuf::from(path_os);
-        if path.exists() {
-            if let Some(format) = format_from_extension(&path) {
+        if let Some(format) = format_from_extension(&path) {
+            if path.exists() {
                 log::info!(
                     "Config: using {} from $FRANKENTERM_CONFIG_FILE",
                     format.label()
                 );
-                return DetectedConfig {
-                    format,
-                    path: Some(path),
-                };
+            } else {
+                log::warn!(
+                    "Config: $FRANKENTERM_CONFIG_FILE points to {}, but it does not exist",
+                    path.display()
+                );
             }
+            return DetectedConfig {
+                format,
+                path: Some(path),
+            };
         }
     }
 
@@ -220,15 +225,19 @@ pub fn load_detected_config(
 
 /// Determine config format from file extension.
 fn format_from_extension(path: &Path) -> Option<ConfigFormat> {
-    path.extension().and_then(|ext| {
-        let ext = ext.to_string_lossy();
-        match ext.as_ref() {
-            "toml" => Some(ConfigFormat::Toml),
-            "lua" => Some(ConfigFormat::Lua),
-            "wasm" => Some(ConfigFormat::Wasm),
-            _ => None,
-        }
-    })
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(|ext| {
+            if ext.eq_ignore_ascii_case("toml") {
+                Some(ConfigFormat::Toml)
+            } else if ext.eq_ignore_ascii_case("lua") {
+                Some(ConfigFormat::Lua)
+            } else if ext.eq_ignore_ascii_case("wasm") {
+                Some(ConfigFormat::Wasm)
+            } else {
+                None
+            }
+        })
 }
 
 /// Legacy Lua config search paths.
@@ -261,11 +270,23 @@ mod tests {
             Some(ConfigFormat::Toml)
         );
         assert_eq!(
+            format_from_extension(Path::new("config.TOML")),
+            Some(ConfigFormat::Toml)
+        );
+        assert_eq!(
             format_from_extension(Path::new("config.lua")),
             Some(ConfigFormat::Lua)
         );
         assert_eq!(
+            format_from_extension(Path::new("config.LUA")),
+            Some(ConfigFormat::Lua)
+        );
+        assert_eq!(
             format_from_extension(Path::new("config.wasm")),
+            Some(ConfigFormat::Wasm)
+        );
+        assert_eq!(
+            format_from_extension(Path::new("config.WASM")),
             Some(ConfigFormat::Wasm)
         );
         assert_eq!(format_from_extension(Path::new("config.json")), None);

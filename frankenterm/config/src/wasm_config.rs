@@ -9,13 +9,14 @@
 //!
 //! # Search order
 //!
-//! 1. `$FRANKENTERM_CONFIG_FILE` (environment variable, must end with `.wasm`)
-//! 2. `~/.config/frankenterm/frankenterm.wasm`
+//! 1. Explicit `--config-file` override (if it points to WASM)
+//! 2. `$FRANKENTERM_CONFIG_FILE` (environment variable, must end with `.wasm`)
+//! 3. `~/.config/frankenterm/frankenterm.wasm`
 //!
 //! If no WASM config is found, returns `None` and the caller falls through
 //! to the next config format.
 
-use crate::{LoadedConfig, CONFIG_DIRS};
+use crate::{LoadedConfig, CONFIG_DIRS, CONFIG_FILE_OVERRIDE};
 use anyhow::{anyhow, Context};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
 use std::path::{Path, PathBuf};
@@ -41,25 +42,16 @@ pub(crate) fn try_load_wasm_config(
     overrides: &Value,
     evaluator: &WasmEvaluatorFn,
 ) -> Option<LoadedConfig> {
+    if let Some(override_path) = explicit_config_file_override_path() {
+        if is_wasm_path(&override_path) {
+            return Some(load_required_wasm_path(override_path, overrides, evaluator));
+        }
+        // A non-WASM explicit override should be handled by the Lua/other path.
+        return None;
+    }
+
     if let Some(explicit_path) = explicit_wasm_config_path_from_env() {
-        return match try_load_wasm_file(&explicit_path, overrides, evaluator) {
-            Ok(Some(loaded)) => Some(loaded),
-            Ok(None) => Some(LoadedConfig {
-                config: Err(anyhow!(
-                    "$FRANKENTERM_CONFIG_FILE points to {}, but the file does not exist",
-                    explicit_path.display()
-                )),
-                file_name: Some(explicit_path),
-                lua: None,
-                warnings: vec![],
-            }),
-            Err(err) => Some(LoadedConfig {
-                config: Err(err),
-                file_name: Some(explicit_path),
-                lua: None,
-                warnings: vec![],
-            }),
-        };
+        return Some(load_required_wasm_path(explicit_path, overrides, evaluator));
     }
 
     let paths = wasm_config_search_paths();
@@ -88,10 +80,39 @@ fn is_wasm_path(path: &Path) -> bool {
         .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("wasm"))
 }
 
+fn explicit_config_file_override_path() -> Option<PathBuf> {
+    CONFIG_FILE_OVERRIDE.lock().unwrap().clone()
+}
+
 fn explicit_wasm_config_path_from_env() -> Option<PathBuf> {
     std::env::var_os("FRANKENTERM_CONFIG_FILE")
         .map(PathBuf::from)
         .filter(|path| is_wasm_path(path))
+}
+
+fn load_required_wasm_path(
+    explicit_path: PathBuf,
+    overrides: &Value,
+    evaluator: &WasmEvaluatorFn,
+) -> LoadedConfig {
+    match try_load_wasm_file(&explicit_path, overrides, evaluator) {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => LoadedConfig {
+            config: Err(anyhow!(
+                "explicit WASM config path {} does not exist",
+                explicit_path.display()
+            )),
+            file_name: Some(explicit_path),
+            lua: None,
+            warnings: vec![],
+        },
+        Err(err) => LoadedConfig {
+            config: Err(err),
+            file_name: Some(explicit_path),
+            lua: None,
+            warnings: vec![],
+        },
+    }
 }
 
 /// Build the list of paths to search for `frankenterm.wasm`.
@@ -199,6 +220,25 @@ mod tests {
             } else {
                 std::env::remove_var(self.key);
             }
+        }
+    }
+
+    struct ConfigFileOverrideGuard {
+        previous: Option<PathBuf>,
+    }
+
+    impl ConfigFileOverrideGuard {
+        fn set(path: Option<&Path>) -> Self {
+            let mut override_lock = crate::CONFIG_FILE_OVERRIDE.lock().unwrap();
+            let previous = override_lock.clone();
+            *override_lock = path.map(Path::to_path_buf);
+            Self { previous }
+        }
+    }
+
+    impl Drop for ConfigFileOverrideGuard {
+        fn drop(&mut self) {
+            *crate::CONFIG_FILE_OVERRIDE.lock().unwrap() = self.previous.clone();
         }
     }
 
@@ -327,5 +367,43 @@ mod tests {
             .expect("expected explicit env result");
         assert_eq!(loaded.file_name, Some(path));
         assert!(loaded.config.is_ok());
+    }
+
+    #[test]
+    fn explicit_override_missing_wasm_returns_error() {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_guard = EnvVarGuard::set(
+            "FRANKENTERM_CONFIG_FILE",
+            Path::new("/tmp/this_should_not_be_considered.wasm"),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("missing-override.wasm");
+        let _override_guard = ConfigFileOverrideGuard::set(Some(&missing_path));
+        let evaluator = mock_evaluator(Value::Object(Default::default()));
+
+        let loaded =
+            try_load_wasm_config(&Value::default(), &*evaluator).expect("expected override result");
+        assert_eq!(loaded.file_name, Some(missing_path));
+        assert!(loaded.config.is_err());
+    }
+
+    #[test]
+    fn non_wasm_override_skips_wasm_loader_even_with_env_wasm() {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let env_wasm = dir.path().join("from-env.wasm");
+        std::fs::write(&env_wasm, b"fake wasm").unwrap();
+        let _env_guard = EnvVarGuard::set("FRANKENTERM_CONFIG_FILE", &env_wasm);
+
+        let override_lua = dir.path().join("override.lua");
+        let _override_guard = ConfigFileOverrideGuard::set(Some(&override_lua));
+        let evaluator: Box<WasmEvaluatorFn> = Box::new(|_| panic!("should not evaluate wasm"));
+
+        let loaded = try_load_wasm_config(&Value::default(), &*evaluator);
+        assert!(
+            loaded.is_none(),
+            "non-WASM override should bypass WASM loader"
+        );
     }
 }

@@ -6,14 +6,15 @@
 //!
 //! # Search order
 //!
-//! 1. `$FRANKENTERM_CONFIG_FILE` (environment variable)
-//! 2. `~/.config/frankenterm/frankenterm.toml`
-//! 3. `~/.frankenterm.toml`
+//! 1. Explicit `--config-file` override (if it points to TOML)
+//! 2. `$FRANKENTERM_CONFIG_FILE` (environment variable)
+//! 3. `~/.config/frankenterm/frankenterm.toml`
+//! 4. `~/.frankenterm.toml`
 //!
 //! If no TOML config is found, returns `None` and the caller falls through
 //! to Lua config or defaults.
 
-use crate::{toml_to_dynamic, LoadedConfig, CONFIG_DIRS, HOME_DIR};
+use crate::{toml_to_dynamic, LoadedConfig, CONFIG_DIRS, CONFIG_FILE_OVERRIDE, HOME_DIR};
 use anyhow::{anyhow, Context};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
 use std::path::{Path, PathBuf};
@@ -25,25 +26,16 @@ use super::Config;
 /// Returns `Some(LoadedConfig)` if a TOML config was found and loaded
 /// (successfully or with an error), or `None` if no TOML config exists.
 pub(crate) fn try_load_toml_config(overrides: &Value) -> Option<LoadedConfig> {
+    if let Some(override_path) = explicit_config_file_override_path() {
+        if is_toml_path(&override_path) {
+            return Some(load_required_toml_path(override_path, overrides));
+        }
+        // A non-TOML explicit override should be handled by the Lua/other path.
+        return None;
+    }
+
     if let Some(explicit_path) = explicit_toml_config_path_from_env() {
-        return match try_load_toml_file(&explicit_path, overrides) {
-            Ok(Some(loaded)) => Some(loaded),
-            Ok(None) => Some(LoadedConfig {
-                config: Err(anyhow!(
-                    "$FRANKENTERM_CONFIG_FILE points to {}, but the file does not exist",
-                    explicit_path.display()
-                )),
-                file_name: Some(explicit_path),
-                lua: None,
-                warnings: vec![],
-            }),
-            Err(err) => Some(LoadedConfig {
-                config: Err(err),
-                file_name: Some(explicit_path),
-                lua: None,
-                warnings: vec![],
-            }),
-        };
+        return Some(load_required_toml_path(explicit_path, overrides));
     }
 
     let paths = toml_config_search_paths();
@@ -72,10 +64,35 @@ fn is_toml_path(path: &Path) -> bool {
         .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("toml"))
 }
 
+fn explicit_config_file_override_path() -> Option<PathBuf> {
+    CONFIG_FILE_OVERRIDE.lock().unwrap().clone()
+}
+
 fn explicit_toml_config_path_from_env() -> Option<PathBuf> {
     std::env::var_os("FRANKENTERM_CONFIG_FILE")
         .map(PathBuf::from)
         .filter(|path| is_toml_path(path))
+}
+
+fn load_required_toml_path(explicit_path: PathBuf, overrides: &Value) -> LoadedConfig {
+    match try_load_toml_file(&explicit_path, overrides) {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => LoadedConfig {
+            config: Err(anyhow!(
+                "explicit TOML config path {} does not exist",
+                explicit_path.display()
+            )),
+            file_name: Some(explicit_path),
+            lua: None,
+            warnings: vec![],
+        },
+        Err(err) => LoadedConfig {
+            config: Err(err),
+            file_name: Some(explicit_path),
+            lua: None,
+            warnings: vec![],
+        },
+    }
 }
 
 /// Build the list of paths to search for `frankenterm.toml`.
@@ -194,6 +211,25 @@ mod tests {
         }
     }
 
+    struct ConfigFileOverrideGuard {
+        previous: Option<PathBuf>,
+    }
+
+    impl ConfigFileOverrideGuard {
+        fn set(path: Option<&Path>) -> Self {
+            let mut override_lock = crate::CONFIG_FILE_OVERRIDE.lock().unwrap();
+            let previous = override_lock.clone();
+            *override_lock = path.map(Path::to_path_buf);
+            Self { previous }
+        }
+    }
+
+    impl Drop for ConfigFileOverrideGuard {
+        fn drop(&mut self) {
+            *crate::CONFIG_FILE_OVERRIDE.lock().unwrap() = self.previous.clone();
+        }
+    }
+
     #[test]
     fn empty_toml_produces_default_config() {
         let toml_str = "";
@@ -284,6 +320,41 @@ color_scheme = "Catppuccin Mocha"
         assert_eq!(loaded.file_name, Some(path));
         let cfg = loaded.config.expect("expected parsed config");
         assert_eq!(cfg.scrollback_lines, 4242);
+    }
+
+    #[test]
+    fn explicit_override_missing_toml_returns_error() {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_guard = EnvVarGuard::set(
+            "FRANKENTERM_CONFIG_FILE",
+            Path::new("/tmp/this_should_not_be_considered.toml"),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("missing-override.toml");
+        let _override_guard = ConfigFileOverrideGuard::set(Some(&missing_path));
+
+        let loaded = try_load_toml_config(&Value::default()).expect("expected override result");
+        assert_eq!(loaded.file_name, Some(missing_path));
+        assert!(loaded.config.is_err());
+    }
+
+    #[test]
+    fn non_toml_override_skips_toml_loader_even_with_env_toml() {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let env_toml = dir.path().join("from-env.toml");
+        std::fs::write(&env_toml, "scrollback_lines = 1111\n").unwrap();
+        let _env_guard = EnvVarGuard::set("FRANKENTERM_CONFIG_FILE", &env_toml);
+
+        let override_lua = dir.path().join("override.lua");
+        let _override_guard = ConfigFileOverrideGuard::set(Some(&override_lua));
+
+        let loaded = try_load_toml_config(&Value::default());
+        assert!(
+            loaded.is_none(),
+            "non-TOML override should bypass TOML loader"
+        );
     }
 
     #[test]
