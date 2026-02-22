@@ -314,6 +314,11 @@ path = "tests/proptest_casr_types.rs"
 required-features = ["session-resume"]
 
 [[test]]
+name = "proptest_session_resume"
+path = "tests/proptest_session_resume.rs"
+required-features = ["session-resume"]
+
+[[test]]
 name = "proptest_disk_pressure"
 path = "tests/proptest_disk_pressure.rs"
 required-features = ["disk-pressure"]
@@ -421,6 +426,10 @@ redis-session = [
 ]
 # Feature gate for cross_agent_session_resumer integration (vendored IR types).
 session-resume = []
+# Feature gate for generic subprocess bridge foundation.
+subprocess-bridge = []
+# Feature gate for vibe_cockpit telemetry export bridge.
+vc-export = ["subprocess-bridge"]
 
 # Optional heavy integrations - feature-gated (internal)
 frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-term"]
