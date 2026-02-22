@@ -265,7 +265,7 @@ impl MetricsSnapshot {
                 metric_name(&prefix, "event_bus_delta_oldest_lag_ms"),
                 "Age of oldest delta event in ms (-1 means none)",
                 bus.delta_oldest_lag_ms
-                    .map_or(-1_i64, |ms| ms as i64)
+                    .map_or(-1_i64, |ms| i64::try_from(ms).unwrap_or(i64::MAX))
                     .to_string(),
             );
             push_gauge(
@@ -273,7 +273,7 @@ impl MetricsSnapshot {
                 metric_name(&prefix, "event_bus_detection_oldest_lag_ms"),
                 "Age of oldest detection event in ms (-1 means none)",
                 bus.detection_oldest_lag_ms
-                    .map_or(-1_i64, |ms| ms as i64)
+                    .map_or(-1_i64, |ms| i64::try_from(ms).unwrap_or(i64::MAX))
                     .to_string(),
             );
             push_gauge(
@@ -281,7 +281,7 @@ impl MetricsSnapshot {
                 metric_name(&prefix, "event_bus_signal_oldest_lag_ms"),
                 "Age of oldest signal event in ms (-1 means none)",
                 bus.signal_oldest_lag_ms
-                    .map_or(-1_i64, |ms| ms as i64)
+                    .map_or(-1_i64, |ms| i64::try_from(ms).unwrap_or(i64::MAX))
                     .to_string(),
             );
         }

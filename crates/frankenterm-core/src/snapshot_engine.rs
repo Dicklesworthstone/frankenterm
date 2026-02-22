@@ -28,7 +28,7 @@ use serde_json::Value;
 use crate::agent_correlator::AgentCorrelator;
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::patterns::{AgentType, Detection, Severity};
-use crate::runtime_compat::{Mutex, RwLock, mpsc, sleep, watch};
+use crate::runtime_compat::{Mutex, RwLock, mpsc, timeout, watch};
 use crate::session_pane_state::PaneStateSnapshot;
 use crate::session_topology::TopologySnapshot;
 use crate::wezterm::PaneInfo;
@@ -241,7 +241,8 @@ impl SnapshotEngine {
         let pane_ids: Vec<u64> = panes.iter().map(|p| p.pane_id).collect();
         let db_path_for_detections = Arc::clone(&self.db_path);
         let cutoff_ms: i64 =
-            now_ms.saturating_sub(STATE_DETECTION_MAX_AGE.as_millis() as u64) as i64;
+            i64::try_from(now_ms.saturating_sub(STATE_DETECTION_MAX_AGE.as_millis() as u64))
+                .unwrap_or(i64::MAX);
 
         let detections_by_pane = Self::spawn_blocking_db_best_effort(move || {
             load_latest_detections_by_pane_sync(
@@ -429,12 +430,9 @@ impl SnapshotEngine {
                         #[cfg(not(feature = "asupersync-runtime"))]
                         let shutdown_fut = shutdown.changed();
 
-                        crate::runtime_compat::select! {
-                            () = sleep(interval) => {}
-                            _ = shutdown_fut => {
-                                tracing::info!("snapshot engine shutting down");
-                                break;
-                            }
+                        if timeout(interval, shutdown_fut).await.is_ok() {
+                            tracing::info!("snapshot engine shutting down");
+                            break;
                         }
                     }
 
@@ -482,26 +480,50 @@ impl SnapshotEngine {
                 #[cfg(feature = "asupersync-runtime")]
                 let scheduler_cx = crate::cx::for_testing();
 
+                enum TriggerPoll {
+                    Ready(SnapshotTrigger),
+                    Closed,
+                    TimedOut,
+                }
+
                 loop {
+                    #[cfg(feature = "asupersync-runtime")]
+                    let shutdown_check_fut = shutdown.changed(&scheduler_cx);
+                    #[cfg(not(feature = "asupersync-runtime"))]
+                    let shutdown_check_fut = shutdown.changed();
+
+                    if timeout(Duration::ZERO, shutdown_check_fut).await.is_ok() {
+                        tracing::info!("snapshot engine shutting down");
+                        break;
+                    }
+
                     let fallback_wait = next_fallback_at.saturating_duration_since(Instant::now());
 
-                    #[cfg(feature = "asupersync-runtime")]
-                    let maybe_trigger_fut = async { trigger_rx.recv(&scheduler_cx).await.ok() };
-                    #[cfg(not(feature = "asupersync-runtime"))]
-                    let maybe_trigger_fut = async { trigger_rx.recv().await };
+                    let trigger_poll = if fallback_wait.is_zero() {
+                        TriggerPoll::TimedOut
+                    } else {
+                        let wait_step = fallback_wait.min(Duration::from_millis(250));
 
-                    #[cfg(feature = "asupersync-runtime")]
-                    let shutdown_fut = shutdown.changed(&scheduler_cx);
-                    #[cfg(not(feature = "asupersync-runtime"))]
-                    let shutdown_fut = shutdown.changed();
+                        #[cfg(feature = "asupersync-runtime")]
+                        let recv_result = {
+                            let recv_fut = trigger_rx.recv(&scheduler_cx);
+                            timeout(wait_step, recv_fut).await.map(|result| result.ok())
+                        };
+                        #[cfg(not(feature = "asupersync-runtime"))]
+                        let recv_result = {
+                            let recv_fut = trigger_rx.recv();
+                            timeout(wait_step, recv_fut).await
+                        };
 
-                    crate::runtime_compat::select! {
-                        maybe_trigger = maybe_trigger_fut => {
-                            let Some(trigger) = maybe_trigger else {
-                                tracing::info!("trigger channel closed; intelligent scheduler stopping");
-                                break;
-                            };
+                        match recv_result {
+                            Ok(Some(trigger)) => TriggerPoll::Ready(trigger),
+                            Ok(None) => TriggerPoll::Closed,
+                            Err(_) => TriggerPoll::TimedOut,
+                        }
+                    };
 
+                    match trigger_poll {
+                        TriggerPoll::Ready(trigger) => {
                             let tv = self.trigger_value(trigger);
                             if tv > 0.0 {
                                 accumulated_value += tv;
@@ -513,15 +535,23 @@ impl SnapshotEngine {
                                 || accumulated_value >= snapshot_threshold;
 
                             if should_capture {
-                                let captured = self
-                                    .capture_from_provider(&pane_provider, trigger)
-                                    .await;
+                                let captured =
+                                    self.capture_from_provider(&pane_provider, trigger).await;
                                 if captured || immediate || snapshot_threshold <= 0.0 {
                                     accumulated_value = 0.0;
                                 }
                             }
                         }
-                        () = sleep(fallback_wait) => {
+                        TriggerPoll::Closed => {
+                            tracing::info!(
+                                "trigger channel closed; intelligent scheduler stopping"
+                            );
+                            break;
+                        }
+                        TriggerPoll::TimedOut => {
+                            if Instant::now() < next_fallback_at {
+                                continue;
+                            }
                             let captured = self
                                 .capture_from_provider(
                                     &pane_provider,
@@ -532,10 +562,6 @@ impl SnapshotEngine {
                                 accumulated_value = 0.0;
                             }
                             next_fallback_at = Instant::now() + fallback_interval;
-                        }
-                        _ = shutdown_fut => {
-                            tracing::info!("snapshot engine shutting down");
-                            break;
                         }
                     }
                 }
@@ -865,20 +891,20 @@ fn save_checkpoint_sync(
     let mut total_bytes: usize = 0;
 
     for ps in pane_states {
-        let terminal_json =
-            serde_json::to_string(&ps.terminal).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, pane_id = ps.pane_id, "terminal state serialization failed");
-                "{}".to_string()
-            });
-        let env_json = ps.env.as_ref().and_then(|e| serde_json::to_string(e)
-            .inspect_err(|e| tracing::warn!(error = %e, "snapshot env serialization failed"))
-            .ok());
-        let agent_json = ps
-            .agent
-            .as_ref()
-            .and_then(|a| serde_json::to_string(a)
+        let terminal_json = serde_json::to_string(&ps.terminal).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, pane_id = ps.pane_id, "terminal state serialization failed");
+            "{}".to_string()
+        });
+        let env_json = ps.env.as_ref().and_then(|e| {
+            serde_json::to_string(e)
+                .inspect_err(|e| tracing::warn!(error = %e, "snapshot env serialization failed"))
+                .ok()
+        });
+        let agent_json = ps.agent.as_ref().and_then(|a| {
+            serde_json::to_string(a)
                 .inspect_err(|e| tracing::warn!(error = %e, "snapshot agent serialization failed"))
-                .ok());
+                .ok()
+        });
         let scrollback_seq = ps.scrollback_ref.as_ref().map(|s| s.output_segments_seq);
         let last_output_at = ps.scrollback_ref.as_ref().map(|s| s.last_capture_at as i64);
 

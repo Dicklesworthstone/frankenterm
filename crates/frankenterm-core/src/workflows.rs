@@ -2707,7 +2707,9 @@ impl WorkflowEngine {
             StepResult::JumpTo { .. } => "jump_to",
         };
         let result_data = serde_json::to_string(result)
-            .inspect_err(|e| tracing::warn!(error = %e, "workflow step result serialization failed"))
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "workflow step result serialization failed"),
+            )
             .ok();
         let verification_refs = build_verification_refs(result, None);
         let error_code = step_error_code_from_result(result);
@@ -2814,7 +2816,9 @@ fn build_verification_refs(
         None
     } else {
         serde_json::to_string(&refs)
-            .inspect_err(|e| tracing::warn!(error = %e, "workflow verification_refs serialization failed"))
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "workflow verification_refs serialization failed"),
+            )
             .ok()
     }
 }
@@ -2924,7 +2928,9 @@ fn policy_summary_from_injection(result: &crate::policy::InjectionResult) -> Opt
         None
     } else {
         serde_json::to_string(&obj)
-            .inspect_err(|e| tracing::warn!(error = %e, "workflow decision_context serialization failed"))
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "workflow decision_context serialization failed"),
+            )
             .ok()
     }
 }
@@ -3037,7 +3043,9 @@ async fn record_workflow_start_action(
         undo_strategy: "workflow_abort".to_string(),
         undo_hint: Some(format!("ft robot workflow abort {execution_id}")),
         undo_payload: serde_json::to_string(&undo_payload)
-            .inspect_err(|e| tracing::warn!(error = %e, "workflow undo_payload serialization failed"))
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "workflow undo_payload serialization failed"),
+            )
             .ok(),
         undone_at: None,
         undone_by: None,
@@ -3129,7 +3137,9 @@ async fn record_workflow_terminal_action(
         "parent_action_id": start_action_id,
     });
     let summary = serde_json::to_string(&summary)
-        .inspect_err(|e| tracing::warn!(error = %e, "workflow terminal summary serialization failed"))
+        .inspect_err(
+            |e| tracing::warn!(error = %e, "workflow terminal summary serialization failed"),
+        )
         .ok();
     let _ = record_workflow_action(
         storage,
@@ -3426,7 +3436,7 @@ impl PaneWorkflowLockManager {
         workflow_name: &str,
         execution_id: &str,
     ) -> LockAcquisitionResult {
-        let mut locks = self.locks.lock().unwrap();
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(existing) = locks.get(&pane_id) {
             return LockAcquisitionResult::AlreadyLocked {
@@ -3470,7 +3480,7 @@ impl PaneWorkflowLockManager {
     ///
     /// `true` if the lock was released, `false` if not found or mismatched.
     pub fn release(&self, pane_id: u64, execution_id: &str) -> bool {
-        let mut locks = self.locks.lock().unwrap();
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(existing) = locks.get(&pane_id) {
             if existing.execution_id == execution_id {
@@ -3498,7 +3508,7 @@ impl PaneWorkflowLockManager {
     /// Returns lock information if locked, `None` if free.
     #[must_use]
     pub fn is_locked(&self, pane_id: u64) -> Option<PaneLockInfo> {
-        let locks = self.locks.lock().unwrap();
+        let locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
         locks.get(&pane_id).cloned()
     }
 
@@ -3507,7 +3517,7 @@ impl PaneWorkflowLockManager {
     /// Useful for diagnostics and monitoring.
     #[must_use]
     pub fn active_locks(&self) -> Vec<PaneLockInfo> {
-        let locks = self.locks.lock().unwrap();
+        let locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
         locks.values().cloned().collect()
     }
 
@@ -3538,7 +3548,7 @@ impl PaneWorkflowLockManager {
     ///
     /// **Use with caution** - only for recovery scenarios.
     pub fn force_release(&self, pane_id: u64) -> Option<PaneLockInfo> {
-        let removed = self.locks.lock().unwrap().remove(&pane_id);
+        let removed = self.locks.lock().unwrap_or_else(|e| e.into_inner()).remove(&pane_id);
         if let Some(ref info) = removed {
             tracing::warn!(
                 pane_id,
@@ -5826,7 +5836,9 @@ impl WorkflowRunner {
                 }
 
                 serde_json::to_string(&data)
-                    .inspect_err(|e| tracing::warn!(error = %e, "workflow step data serialization failed"))
+                    .inspect_err(
+                        |e| tracing::warn!(error = %e, "workflow step data serialization failed"),
+                    )
                     .ok()
             };
             let step_started_at = now_ms();

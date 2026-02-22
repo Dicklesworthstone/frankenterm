@@ -278,7 +278,12 @@ impl InteractiveBootstrap {
         let success_texts = serde_json::to_string(&self.config.success_text_markers)
             .unwrap_or_else(|_| "[]".to_string());
 
-        let login_url_escaped = login_url.replace('\'', "\\'");
+        let login_url_escaped = login_url.replace('\\', "\\\\").replace('\'', "\\'");
+        let profile_dir_escaped = profile_dir
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'");
 
         format!(
             r"
@@ -287,7 +292,7 @@ const {{ chromium }} = require('playwright');
 (async () => {{
   const TIMEOUT = {timeout};
   const POLL_INTERVAL = {poll_interval};
-  const profileDir = '{profile_dir_str}';
+  const profileDir = '{profile_dir_escaped}';
   const loginUrl = '{login_url_escaped}';
   const successUrls = {success_urls};
   const successTexts = {success_texts};
