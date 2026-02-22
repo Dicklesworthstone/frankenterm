@@ -804,10 +804,39 @@ pub fn build_tls_bundle(
 #[cfg(feature = "distributed")]
 #[must_use = "the returned server name is required for TLS/SNI verification"]
 pub fn build_tls_server_name(bind_addr: &str) -> Result<ServerName<'static>, DistributedTlsError> {
-    let host = bind_addr.split(':').next().unwrap_or(bind_addr).trim();
-    let name = if host.is_empty() { "localhost" } else { host };
-    ServerName::try_from(name.to_string())
+    let host = distributed_bind_host(bind_addr);
+    let name = if host.is_empty() {
+        "localhost".to_string()
+    } else {
+        host
+    };
+    if let Ok(ip) = name.parse::<std::net::IpAddr>() {
+        return Ok(ServerName::IpAddress(ip.into()));
+    }
+    ServerName::try_from(name)
         .map_err(|_| DistributedTlsError::Config("invalid server name".to_string()))
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_bind_host(bind_addr: &str) -> String {
+    let trimmed = bind_addr.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(addr) = trimmed.parse::<std::net::SocketAddr>() {
+        return addr.ip().to_string();
+    }
+    if let Some(stripped) = trimmed.strip_prefix('[') {
+        if let Some((host, _rest)) = stripped.split_once(']') {
+            return host.to_string();
+        }
+    }
+    if let Some((host, _port)) = trimmed.rsplit_once(':') {
+        if !host.is_empty() && !host.contains(':') {
+            return host.to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 // =============================================================================
@@ -2056,6 +2085,36 @@ mod tests {
             .find(|i| i.id == "security.tls_for_remote")
             .unwrap();
         assert!(tls.pass, "localhost should not require TLS");
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn tls_server_name_parses_ipv6_bind_addr() {
+        let name = build_tls_server_name("[::1]:4141").expect("parse ipv6 bind addr");
+        assert!(
+            matches!(name, ServerName::IpAddress(_)),
+            "expected ip server name, got {name:?}"
+        );
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn tls_server_name_parses_ipv4_bind_addr() {
+        let name = build_tls_server_name("127.0.0.1:4141").expect("parse ipv4 bind addr");
+        assert!(
+            matches!(name, ServerName::IpAddress(_)),
+            "expected ip server name, got {name:?}"
+        );
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn tls_server_name_parses_hostname_bind_addr() {
+        let name = build_tls_server_name("localhost:4141").expect("parse host bind addr");
+        assert!(
+            matches!(name, ServerName::DnsName(_)),
+            "expected dns server name, got {name:?}"
+        );
     }
 
     #[test]
