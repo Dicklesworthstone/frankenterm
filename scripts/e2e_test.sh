@@ -2067,6 +2067,39 @@ find_ft_binary() {
     return 0
 }
 
+scenario_can_run_without_ft_binary() {
+    local name="$1"
+
+    case "$name" in
+        alt_screen_conformance)
+            # Allow fixture-only conformance execution when wezterm is unavailable and
+            # fixture fallback is explicitly enabled.
+            if [[ "${FT_E2E_ALT_SCREEN_ALLOW_FIXTURE_ONLY:-1}" == "1" ]] \
+                && ! resolve_wezterm_bin_path >/dev/null 2>&1; then
+                return 0
+            fi
+            ;;
+    esac
+
+    return 1
+}
+
+all_scenarios_can_run_without_ft_binary() {
+    local name=""
+
+    if [[ "$#" -eq 0 ]]; then
+        return 1
+    fi
+
+    for name in "$@"; do
+        if ! scenario_can_run_without_ft_binary "$name"; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
 # ==============================================================================
 # Wait Helpers
 # ==============================================================================
@@ -11311,12 +11344,21 @@ main() {
         load_soak_resume_checkpoint "$scenarios_json"
     fi
 
-    # Find ft binary
+    # Find ft binary (or allow explicit no-ft fixture-only scenarios).
     if ! find_ft_binary; then
-        log_fail "Could not find ft binary"
-        exit 5
+        if all_scenarios_can_run_without_ft_binary "${scenarios_to_run[@]}"; then
+            FT_BINARY=""
+            log_warn "ft binary not found; continuing because selected scenario(s) support fixture-only mode without ft"
+        else
+            log_fail "Could not find ft binary"
+            exit 5
+        fi
     fi
-    log_verbose "Using ft binary: $FT_BINARY"
+    if [[ -n "$FT_BINARY" ]]; then
+        log_verbose "Using ft binary: $FT_BINARY"
+    else
+        log_verbose "No ft binary selected; fixture-only execution path enabled for selected scenario(s)"
+    fi
 
     # Setup artifacts
     setup_artifacts
