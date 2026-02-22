@@ -400,6 +400,8 @@ redis-session = [
     "dep:fr-expire",
     "dep:fr-persist",
 ]
+# Feature gate for cross_agent_session_resumer integration (vendored IR types).
+session-resume = []
 
 # Optional heavy integrations - feature-gated (internal)
 frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-term"]

@@ -62,6 +62,8 @@ pub mod bloom_filter;
 pub mod bocpd;
 pub mod build_coord;
 pub mod cass;
+#[cfg(feature = "session-resume")]
+pub mod casr_types;
 pub mod causal_dag;
 pub mod caut;
 pub mod chaos;
