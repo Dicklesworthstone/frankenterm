@@ -127,9 +127,13 @@ fn check_evidence_completeness(package: &EvidencePackage) -> GapReport {
         }
     }
 
+    let mut empty_blocking_count = 0usize;
     for artifact in &package.artifacts {
         if !artifact.is_non_empty() {
             empty_artifacts.push(artifact.artifact_name.clone());
+            if artifact.tier.is_blocking() {
+                empty_blocking_count += 1;
+            }
         }
         if artifact.fail_count > 0 && artifact.tier.is_blocking() {
             failing_tiers.push((artifact.tier, artifact.fail_count));
@@ -137,7 +141,7 @@ fn check_evidence_completeness(package: &EvidencePackage) -> GapReport {
     }
 
     let blocking_gaps = missing_tiers.iter().filter(|t| t.is_blocking()).count()
-        + empty_artifacts.len()
+        + empty_blocking_count
         + failing_tiers.len();
     let advisory_gaps = missing_tiers.iter().filter(|t| !t.is_blocking()).count();
     let is_complete = blocking_gaps == 0;

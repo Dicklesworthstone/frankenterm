@@ -173,7 +173,7 @@ impl ReviewBuilder {
             self.residual_risks.len(),
             self.approval.is_some()
         );
-        format!("sha256:{:016x}", fnv1a(content.as_bytes()))
+        format!("fnv1a:{:016x}", fnv1a(content.as_bytes()))
     }
 
     fn build(self) -> GoNoGoReview {
@@ -371,9 +371,9 @@ fn test_archive_hash_deterministic() {
 }
 
 #[test]
-fn test_archive_hash_starts_with_sha256() {
+fn test_archive_hash_starts_with_fnv1a() {
     let review = build_all_gates_pass_review();
-    assert!(review.archive_hash.starts_with("sha256:"));
+    assert!(review.archive_hash.starts_with("fnv1a:"));
 }
 
 #[test]

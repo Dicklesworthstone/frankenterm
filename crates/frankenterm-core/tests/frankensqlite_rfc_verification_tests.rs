@@ -85,7 +85,7 @@ impl RecorderEventCursor for InMemoryCursor {
     }
 
     fn seek_to_offset(&mut self, offset: u64) {
-        self.position = offset as usize;
+        self.position = (offset as usize).min(self.events.len());
     }
 
     fn current_offset(&self) -> u64 {
@@ -93,7 +93,7 @@ impl RecorderEventCursor for InMemoryCursor {
     }
 
     fn remaining_estimate(&self) -> u64 {
-        (self.events.len() - self.position) as u64
+        self.events.len().saturating_sub(self.position) as u64
     }
 }
 
