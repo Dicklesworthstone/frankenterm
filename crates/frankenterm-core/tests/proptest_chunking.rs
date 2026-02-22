@@ -670,10 +670,13 @@ proptest! {
         config in arb_chunk_policy_config(),
     ) {
         let chunks = build_semantic_chunks(&inputs, &config);
-        // After glue, two chunks can be merged. Each pre-glue chunk is at most
-        // max_chunk_chars + overlap_chars. Glue can combine two such chunks with
-        // a separator newline. We allow 2*(max_chunk_chars + overlap_chars) + 1.
-        let glue_limit = 2 * (config.max_chunk_chars + config.overlap_chars) + 1;
+        // Glue pass 2 can merge multiple tiny trailing chunks (<min_chunk_chars)
+        // into one large chunk. The worst case is one big pre-glue chunk
+        // (max_chunk_chars + overlap_chars) plus N tiny chunks each adding up to
+        // min_chunk_chars + 1 (newline separator) chars.
+        let max_merges = inputs.len();
+        let glue_limit = config.max_chunk_chars + config.overlap_chars
+            + max_merges * (config.min_chunk_chars + 1);
         for (i, chunk) in chunks.iter().enumerate() {
             prop_assert!(
                 chunk.text_chars <= glue_limit,

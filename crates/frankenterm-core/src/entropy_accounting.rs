@@ -95,7 +95,7 @@ impl EntropyEstimator {
         self.total += data.len() as u64;
         self.cached_entropy = None;
 
-        if self.total > self.window_size * 2 {
+        while self.total > self.window_size * 2 {
             self.decay();
         }
     }

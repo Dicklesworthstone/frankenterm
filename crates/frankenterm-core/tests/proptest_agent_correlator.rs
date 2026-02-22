@@ -8,6 +8,7 @@ use frankenterm_core::agent_correlator::{
     AgentCorrelator, AgentInventory, DetectionSource, InstalledAgentInventoryEntry,
     RunningAgentInventoryEntry,
 };
+use frankenterm_core::agent_provider::AgentProvider;
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use frankenterm_core::wezterm::PaneInfo;
 use proptest::prelude::*;
@@ -736,7 +737,7 @@ proptest! {
         let inv = correlator.inventory();
         let entry = inv.running.get(&pane_id);
         prop_assert!(entry.is_some());
-        let expected_slug = format!("{}", agent);
+        let expected_slug = AgentProvider::from_agent_type(&agent).canonical_name().to_string();
         prop_assert_eq!(&entry.unwrap().slug, &expected_slug);
     }
 

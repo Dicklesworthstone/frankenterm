@@ -92,7 +92,7 @@ proptest! {
         let json = serde_json::to_string(&kind).unwrap();
         let expected = match kind {
             RecorderBackendKind::AppendLog => "\"append_log\"",
-            RecorderBackendKind::FrankenSqlite => "\"franken_sqlite\"",
+            RecorderBackendKind::FrankenSqlite => "\"frankensqlite\"",
         };
         prop_assert_eq!(&json, expected);
     }
