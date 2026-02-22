@@ -7,12 +7,12 @@
 //! - JSON parsing with redacted error previews
 //! - version-tolerant parsing (ignores unknown fields)
 
+use crate::agent_provider::AgentProvider;
 use crate::error::Remediation;
 use crate::policy::Redactor;
 use crate::runtime_compat::process::Command;
 use crate::runtime_compat::timeout;
 use crate::suggestions::Platform;
-use crate::agent_provider::AgentProvider;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1002,7 +1002,10 @@ mod tests {
 
     #[test]
     fn cass_agent_from_slug_uses_agent_provider_mapping() {
-        assert_eq!(CassAgent::from_slug("claude-code"), Some(CassAgent::ClaudeCode));
+        assert_eq!(
+            CassAgent::from_slug("claude-code"),
+            Some(CassAgent::ClaudeCode)
+        );
         assert_eq!(CassAgent::from_slug("codex"), Some(CassAgent::Codex));
         assert_eq!(CassAgent::from_slug("chat-gpt"), Some(CassAgent::ChatGpt));
         assert_eq!(CassAgent::from_slug("github-copilot"), None);

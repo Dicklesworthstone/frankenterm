@@ -6,12 +6,12 @@
 //! - output size limits
 //! - JSON parsing with redacted error previews
 
+use crate::agent_provider::AgentProvider;
 use crate::error::Remediation;
 use crate::policy::Redactor;
 use crate::runtime_compat::process::Command;
 use crate::runtime_compat::timeout;
 use crate::suggestions::Platform;
-use crate::agent_provider::AgentProvider;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
