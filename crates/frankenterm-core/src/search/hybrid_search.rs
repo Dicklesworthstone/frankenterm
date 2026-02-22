@@ -68,6 +68,17 @@ fn rrf_component_score(rank: usize, k: u32, weight: f32) -> f32 {
     weight / (k as f32 + rank as f32 + 1.0)
 }
 
+fn dedupe_ranked_hits(items: &[(u64, f32)]) -> Vec<(u64, f32)> {
+    let mut seen = HashSet::with_capacity(items.len());
+    let mut deduped = Vec::with_capacity(items.len());
+    for &(id, score) in items {
+        if seen.insert(id) {
+            deduped.push((id, score));
+        }
+    }
+    deduped
+}
+
 /// Metrics from two-tier blending.
 #[derive(Debug, Clone, Default)]
 pub struct TwoTierMetrics {
@@ -95,6 +106,8 @@ pub fn rrf_fuse_weighted(
     lexical_weight: f32,
     semantic_weight: f32,
 ) -> Vec<FusedResult> {
+    let lexical = dedupe_ranked_hits(lexical);
+    let semantic = dedupe_ranked_hits(semantic);
     let mut scores: HashMap<u64, (f32, Option<usize>, Option<usize>)> = HashMap::new();
 
     for (rank, &(id, _score)) in lexical.iter().enumerate() {
@@ -133,9 +146,11 @@ fn rrf_fuse_with_frankensearch(
     semantic: &[(u64, f32)],
     k: u32,
 ) -> Vec<FusedResult> {
+    let lexical = dedupe_ranked_hits(lexical);
+    let semantic = dedupe_ranked_hits(semantic);
     #[cfg(not(feature = "frankensearch"))]
     {
-        return rrf_fuse_weighted(lexical, semantic, k, 1.0, 1.0);
+        return rrf_fuse_weighted(&lexical, &semantic, k, 1.0, 1.0);
     }
 
     #[cfg(feature = "frankensearch")]
@@ -735,11 +750,29 @@ mod tests {
 
     #[test]
     fn rrf_fuse_duplicate_ids_in_same_list() {
-        // When the same id appears twice in lexical, the second occurrence takes its own rank
+        // Duplicate IDs should not receive multiple contributions in the same lane.
+        // First rank wins; later duplicates are ignored.
         let lexical = vec![(1, 10.0), (1, 8.0)];
         let fused = rrf_fuse(&lexical, &[], 60);
-        // HashMap deduplicates by id, last rank wins in entry
         assert_eq!(fused.len(), 1);
+        assert!((fused[0].score - (1.0 / 61.0)).abs() < 1e-6);
+        assert_eq!(fused[0].lexical_rank, Some(0));
+    }
+
+    #[test]
+    fn rrf_fuse_ignores_duplicate_ids_per_lane() {
+        let lexical = vec![(10, 1.0), (10, 0.9), (20, 0.8)];
+        let semantic = vec![(10, 0.7), (10, 0.6), (30, 0.5)];
+        let fused = rrf_fuse(&lexical, &semantic, 60);
+
+        let id10 = fused
+            .iter()
+            .find(|hit| hit.id == 10)
+            .expect("id 10 present");
+        let expected = rrf_component_score(0, 60, 1.0) + rrf_component_score(0, 60, 1.0);
+        assert!((id10.score - expected).abs() < 1e-6);
+        assert_eq!(id10.lexical_rank, Some(0));
+        assert_eq!(id10.semantic_rank, Some(0));
     }
 
     // ---- blend_two_tier edge cases ----

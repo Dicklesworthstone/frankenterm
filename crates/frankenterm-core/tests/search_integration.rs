@@ -5,6 +5,7 @@ use frankenterm_core::search::{
     IndexingConfig, ScrollbackLine, SearchDocumentSource, SearchIndex, SearchMode,
     chunk_scrollback_lines, extract_agent_artifacts, extract_command_output_blocks,
 };
+use std::fs;
 use tempfile::tempdir;
 
 fn config_with_budget(index_dir: std::path::PathBuf, max_index_size_bytes: u64) -> IndexingConfig {
@@ -25,6 +26,100 @@ fn line(text: &str, captured_at_ms: i64) -> ScrollbackLine {
         pane_id: Some(7),
         session_id: Some("session-a".to_string()),
     }
+}
+
+fn assert_single_index_backend_reused_without_duplicate_state(index_dir: std::path::PathBuf) {
+    let now = 1_660_000_000_000_i64;
+
+    let mut index = SearchIndex::open(config_with_budget(index_dir.clone(), 1_000_000))
+        .expect("open initial index");
+    let ingest = index
+        .ingest_documents(
+            &[IndexableDocument::text(
+                SearchDocumentSource::Scrollback,
+                "first document",
+                now,
+                Some(11),
+                Some("session-1".to_string()),
+            )],
+            now + 1,
+            false,
+            None,
+        )
+        .expect("ingest initial doc");
+    assert_eq!(ingest.accepted_docs, 1);
+
+    let state_path = index.state_path().to_path_buf();
+    assert!(state_path.exists(), "state file should be persisted");
+    drop(index);
+
+    let reopened = SearchIndex::open(config_with_budget(index_dir.clone(), 1_000_000))
+        .expect("reopen existing index");
+    assert_eq!(reopened.state_path(), state_path.as_path());
+
+    let state_file_count = fs::read_dir(&index_dir)
+        .expect("read index dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name() == "index_state.json")
+        .count();
+    assert_eq!(
+        state_file_count, 1,
+        "reopening should not create duplicate index state artifacts"
+    );
+
+    let stats = reopened.stats(now + 2);
+    assert_eq!(stats.doc_count, 1);
+}
+
+#[test]
+fn test_api_compat_public_search_surface_smoke() {
+    let temp = tempdir().expect("tempdir");
+    let mut index = SearchIndex::open(config_with_budget(temp.path().join("api-index"), 1_000_000))
+        .expect("open index");
+
+    let now = 1_650_000_000_000_i64;
+    let doc = IndexableDocument::text(
+        SearchDocumentSource::Command,
+        "cargo check --workspace",
+        now,
+        Some(3),
+        Some("session-smoke".to_string()),
+    );
+    let ingest = index
+        .ingest_documents(&[doc], now + 1, false, None)
+        .expect("ingest");
+    assert_eq!(ingest.accepted_docs, 1);
+
+    let lexical_docs = index.search("cargo", 5, now + 2);
+    assert!(!lexical_docs.is_empty());
+
+    let lexical_ranked: Vec<(u64, f32)> = lexical_docs
+        .iter()
+        .enumerate()
+        .map(|(rank, hit)| (hit.id, 1.0 / (rank as f32 + 1.0)))
+        .collect();
+    let semantic_ranked = vec![(lexical_docs[0].id, 0.95)];
+
+    let fused = HybridSearchService::new()
+        .with_mode(SearchMode::Hybrid)
+        .with_rrf_k(50)
+        .with_alpha(0.7)
+        .fuse(&lexical_ranked, &semantic_ranked, 5);
+    assert!(!fused.is_empty());
+}
+
+#[test]
+fn test_single_index_backend_reused_on_reopen() {
+    let temp = tempdir().expect("tempdir");
+    let index_dir = temp.path().join("single-index");
+    assert_single_index_backend_reused_without_duplicate_state(index_dir);
+}
+
+#[test]
+fn test_tantivy_no_duplication() {
+    let temp = tempdir().expect("tempdir");
+    let index_dir = temp.path().join("tantivy-no-dup");
+    assert_single_index_backend_reused_without_duplicate_state(index_dir);
 }
 
 #[test]

@@ -61,6 +61,25 @@ impl EmbedServer {
             }
         }
     }
+
+    /// Process a JSON-encoded request payload and return an encoded response.
+    pub fn handle_encoded(&self, request_bytes: &[u8]) -> Vec<u8> {
+        let response = match DaemonRequest::from_json_bytes(request_bytes) {
+            Ok(request) => self.handle(request),
+            Err(err) => DaemonResponse::Error(format!("invalid daemon request: {err}")),
+        };
+
+        match response.to_json_bytes() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let fallback =
+                    DaemonResponse::Error(format!("failed to encode daemon response: {err}"));
+                fallback.to_json_bytes().unwrap_or_else(|_| {
+                    br#"{"type":"error","data":"failed to encode daemon response"}"#.to_vec()
+                })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -74,6 +93,10 @@ mod tests {
             text: text.to_string(),
             model: model.map(ToString::to_string),
         })
+    }
+
+    fn decode_response(bytes: &[u8]) -> DaemonResponse {
+        DaemonResponse::from_json_bytes(bytes).expect("decode daemon response")
     }
 
     #[test]
@@ -375,5 +398,60 @@ mod tests {
             other => panic!("expected embed, got {other:?}"),
         };
         assert_eq!(v1, v2);
+    }
+
+    #[test]
+    fn handle_encoded_ping_round_trip() {
+        let server = EmbedServer::new(9999);
+        let request_bytes = DaemonRequest::Ping
+            .to_json_bytes()
+            .expect("encode ping request");
+        let response_bytes = server.handle_encoded(&request_bytes);
+        assert!(matches!(
+            decode_response(&response_bytes),
+            DaemonResponse::Pong
+        ));
+    }
+
+    #[test]
+    fn handle_encoded_embed_round_trip() {
+        let server = EmbedServer::new(9999);
+        let request_bytes = embed_request(55, "semantic daemon", Some("fnv1a-hash-16"))
+            .to_json_bytes()
+            .expect("encode embed request");
+        let response_bytes = server.handle_encoded(&request_bytes);
+        let response = decode_response(&response_bytes);
+        let embed = match response {
+            DaemonResponse::Embed(embed) => embed,
+            other => panic!("expected embed response, got {other:?}"),
+        };
+        assert_eq!(embed.id, 55);
+        assert_eq!(embed.model, "fnv1a-hash-16");
+        assert_eq!(embed.vector.len(), 16);
+    }
+
+    #[test]
+    fn handle_encoded_invalid_json_maps_to_error_response() {
+        let server = EmbedServer::new(9999);
+        let response_bytes = server.handle_encoded(br#"{"type":"ping","data":}"#);
+        let response = decode_response(&response_bytes);
+        let err = match response {
+            DaemonResponse::Error(err) => err,
+            other => panic!("expected error response, got {other:?}"),
+        };
+        assert!(err.contains("invalid daemon request"));
+    }
+
+    #[test]
+    fn handle_encoded_oversized_request_maps_to_error_response() {
+        let server = EmbedServer::new(9999);
+        let oversized = vec![b'x'; (4 * 1024 * 1024) + 1];
+        let response_bytes = server.handle_encoded(&oversized);
+        let response = decode_response(&response_bytes);
+        let err = match response {
+            DaemonResponse::Error(err) => err,
+            other => panic!("expected error response, got {other:?}"),
+        };
+        assert!(err.contains("invalid daemon request"));
     }
 }
