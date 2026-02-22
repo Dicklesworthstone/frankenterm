@@ -133,7 +133,7 @@ impl std::fmt::Display for TriageAction {
 // =============================================================================
 
 /// A process with its triage classification and recommended action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassifiedProcess {
     /// Process ID.
     pub pid: u32,
@@ -216,6 +216,7 @@ const BUILD_TOOLS: &[&str] = &[
 ];
 
 /// Context for process classification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessContext {
     /// Process age (time since start).
     pub age: Duration,
@@ -223,6 +224,20 @@ pub struct ProcessContext {
     pub cpu_percent: f64,
     /// Whether this process is a test runner.
     pub is_test: bool,
+}
+
+/// Canonical schema identifier for process triage provider payloads.
+pub const PROCESS_TRIAGE_SCHEMA_VERSION_V1: &str = "ft.process_triage.v1";
+
+/// Versioned integration envelope for process triage provider responses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessTriageEnvelope<T> {
+    /// Schema version for compatibility checks.
+    pub schema_version: String,
+    /// Provider identifier for provenance and audit trails.
+    pub provider: String,
+    /// Envelope payload.
+    pub data: T,
 }
 
 /// Classify a process node and its context into a triage category.
@@ -399,6 +414,62 @@ pub fn classify(
 // Triage engine
 // =============================================================================
 
+/// Build a triage plan from a set of process trees.
+///
+/// Each entry is `(tree, pane_id, process_ages)` where `process_ages`
+/// maps PID to process age and CPU%.
+pub type TriageInput<'a> = (ProcessTree, Option<u64>, &'a dyn Fn(u32) -> ProcessContext);
+
+/// Provider contract for process triage classification and planning.
+pub trait ProcessTriageProvider {
+    /// Stable provider identifier.
+    fn provider_name(&self) -> &'static str;
+
+    /// Output schema version emitted by this provider.
+    fn schema_version(&self) -> &'static str {
+        PROCESS_TRIAGE_SCHEMA_VERSION_V1
+    }
+
+    /// Classify one process node with context.
+    fn classify(
+        &self,
+        node: &ProcessNode,
+        context: &ProcessContext,
+    ) -> (TriageCategory, TriageAction, String);
+
+    /// Build a triage plan from process trees.
+    fn build_plan(&self, trees: &[TriageInput<'_>]) -> TriagePlan {
+        build_plan_with_classifier(trees, &|node, context| self.classify(node, context))
+    }
+
+    /// Build a versioned integration envelope from process trees.
+    fn build_envelope(&self, trees: &[TriageInput<'_>]) -> ProcessTriageEnvelope<TriagePlan> {
+        ProcessTriageEnvelope {
+            schema_version: self.schema_version().to_string(),
+            provider: self.provider_name().to_string(),
+            data: self.build_plan(trees),
+        }
+    }
+}
+
+/// Default heuristic/classifier-based process triage provider.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HeuristicProcessTriageProvider;
+
+impl ProcessTriageProvider for HeuristicProcessTriageProvider {
+    fn provider_name(&self) -> &'static str {
+        "heuristic"
+    }
+
+    fn classify(
+        &self,
+        node: &ProcessNode,
+        context: &ProcessContext,
+    ) -> (TriageCategory, TriageAction, String) {
+        self::classify(node, context)
+    }
+}
+
 /// Configuration for the triage engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -431,7 +502,7 @@ impl Default for TriageConfig {
 }
 
 /// Triage plan — ordered list of classified processes with actions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TriagePlan {
     /// Classified processes, sorted by kill priority (lowest first = kill first).
     pub entries: Vec<ClassifiedProcess>,
@@ -465,17 +536,36 @@ impl TriagePlan {
     }
 }
 
-/// Build a triage plan from a set of process trees.
-///
-/// Each entry is `(tree, pane_id, process_ages)` where `process_ages`
-/// maps PID to process age and CPU%.
-pub type TriageInput<'a> = (ProcessTree, Option<u64>, &'a dyn Fn(u32) -> ProcessContext);
-
+/// Build a triage plan using the default heuristic provider.
 pub fn build_plan(trees: &[TriageInput<'_>]) -> TriagePlan {
+    let provider = HeuristicProcessTriageProvider;
+    provider.build_plan(trees)
+}
+
+/// Build a triage plan using an explicit provider implementation.
+pub fn build_plan_with_provider(
+    provider: &dyn ProcessTriageProvider,
+    trees: &[TriageInput<'_>],
+) -> TriagePlan {
+    provider.build_plan(trees)
+}
+
+/// Build a versioned triage envelope using an explicit provider implementation.
+pub fn build_plan_envelope(
+    provider: &dyn ProcessTriageProvider,
+    trees: &[TriageInput<'_>],
+) -> ProcessTriageEnvelope<TriagePlan> {
+    provider.build_envelope(trees)
+}
+
+fn build_plan_with_classifier(
+    trees: &[TriageInput<'_>],
+    classify_fn: &dyn Fn(&ProcessNode, &ProcessContext) -> (TriageCategory, TriageAction, String),
+) -> TriagePlan {
     let mut entries = Vec::new();
 
     for (tree, pane_id, context_fn) in trees {
-        classify_tree(&tree.root, *pane_id, context_fn, &mut entries);
+        classify_tree(&tree.root, *pane_id, context_fn, classify_fn, &mut entries);
     }
 
     // Sort by kill priority (lowest category = kill first).
@@ -500,10 +590,11 @@ fn classify_tree(
     node: &ProcessNode,
     pane_id: Option<u64>,
     context_fn: &dyn Fn(u32) -> ProcessContext,
+    classify_fn: &dyn Fn(&ProcessNode, &ProcessContext) -> (TriageCategory, TriageAction, String),
     out: &mut Vec<ClassifiedProcess>,
 ) {
     let context = context_fn(node.pid);
-    let (category, action, reason) = classify(node, &context);
+    let (category, action, reason) = classify_fn(node, &context);
 
     out.push(ClassifiedProcess {
         pid: node.pid,
@@ -515,7 +606,7 @@ fn classify_tree(
     });
 
     for child in &node.children {
-        classify_tree(child, pane_id, context_fn, out);
+        classify_tree(child, pane_id, context_fn, classify_fn, out);
     }
 }
 
@@ -1130,5 +1221,68 @@ mod tests {
         let ctx = make_context(48.0, 0.0, false);
         let (cat, _, _) = classify(&node, &ctx);
         assert_eq!(cat, TriageCategory::StaleSession);
+    }
+
+    #[test]
+    fn default_provider_matches_module_classifier() {
+        let provider = HeuristicProcessTriageProvider;
+        let node = make_node(42, 1, "claude-code", ProcessState::Running);
+        let ctx = make_context(2.0, 15.0, false);
+
+        let direct = classify(&node, &ctx);
+        let provider_result = provider.classify(&node, &ctx);
+
+        assert_eq!(provider_result, direct);
+    }
+
+    #[test]
+    fn build_plan_with_provider_matches_default() {
+        let provider = HeuristicProcessTriageProvider;
+        let tree = ProcessTree {
+            root: ProcessNode {
+                pid: 1,
+                ppid: 0,
+                name: "bash".into(),
+                argv: vec![],
+                state: ProcessState::Sleeping,
+                rss_kb: 5000,
+                children: vec![
+                    make_node(2, 1, "defunct", ProcessState::Zombie),
+                    make_node(3, 1, "claude", ProcessState::Running),
+                ],
+            },
+            total_processes: 3,
+            total_rss_kb: 25000,
+        };
+        let context_fn = |_pid: u32| make_context(2.0, 10.0, false);
+        let inputs = [(
+            tree,
+            Some(99),
+            &context_fn as &dyn Fn(u32) -> ProcessContext,
+        )];
+
+        let default_plan = build_plan(&inputs);
+        let provider_plan = build_plan_with_provider(&provider, &inputs);
+
+        assert_eq!(provider_plan, default_plan);
+    }
+
+    #[test]
+    fn build_plan_envelope_contains_schema_and_provider() {
+        let provider = HeuristicProcessTriageProvider;
+        let tree = ProcessTree {
+            root: make_node(1, 0, "bash", ProcessState::Running),
+            total_processes: 1,
+            total_rss_kb: 5000,
+        };
+        let context_fn = |_pid: u32| make_context(1.0, 5.0, false);
+        let inputs = [(tree, None, &context_fn as &dyn Fn(u32) -> ProcessContext)];
+
+        let expected_plan = build_plan_with_provider(&provider, &inputs);
+        let envelope = build_plan_envelope(&provider, &inputs);
+
+        assert_eq!(envelope.schema_version, PROCESS_TRIAGE_SCHEMA_VERSION_V1);
+        assert_eq!(envelope.provider, "heuristic");
+        assert_eq!(envelope.data, expected_plan);
     }
 }
