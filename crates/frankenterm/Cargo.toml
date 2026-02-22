@@ -55,6 +55,7 @@ distributed = ["frankenterm-core/distributed"]
 sync = ["frankenterm-core/sync"]
 asupersync-runtime = ["frankenterm-core/asupersync-runtime"]
 semantic-search = ["frankenterm-core/semantic-search"]
+redis-session = ["frankenterm-core/redis-session"]
 
 [dev-dependencies]
 assert_cmd = "2.1.2"

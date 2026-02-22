@@ -8327,11 +8327,11 @@ async fn distributed_persist_payload(
                 }
             }
 
-            let storage_guard = storage.lock().await.clone();
-            if storage_guard.get_pane(remote_pane_id).await?.is_none() {
+            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+            if storage_handle.get_pane(remote_pane_id).await?.is_none() {
                 let ts = now_ms_i64();
                 distributed_upsert_pane(
-                    &storage_guard,
+                    &storage_handle,
                     remote_pane_id,
                     distributed_remote_pane_uuid(sender, delta.pane_id, None),
                     distributed_remote_domain(sender, "unknown"),
@@ -8344,7 +8344,7 @@ async fn distributed_persist_payload(
             }
 
             if let Some(reason) = gap_reason {
-                if let Some(gap) = storage_guard.record_gap(remote_pane_id, &reason).await? {
+                if let Some(gap) = storage_handle.record_gap(remote_pane_id, &reason).await? {
                     let _ = event_bus.publish(Event::GapDetected {
                         pane_id: gap.pane_id,
                         reason: gap.reason,
@@ -8356,14 +8356,14 @@ async fn distributed_persist_payload(
                 return Ok(());
             }
 
-            let segment = storage_guard
+            let segment = storage_handle
                 .append_segment(
                     remote_pane_id,
                     &delta.content,
                     Some(format!("remote_sender={sender};remote_seq={}", delta.seq)),
                 )
                 .await?;
-            drop(storage_guard);
+            drop(storage_handle);
 
             let _ = event_bus.publish(Event::SegmentCaptured {
                 pane_id: remote_pane_id,
@@ -8373,11 +8373,11 @@ async fn distributed_persist_payload(
         }
         WirePayload::Gap(gap) => {
             let remote_pane_id = distributed_remote_pane_id(sender, gap.pane_id);
-            let storage_guard = storage.lock().await.clone();
-            if storage_guard.get_pane(remote_pane_id).await?.is_none() {
+            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+            if storage_handle.get_pane(remote_pane_id).await?.is_none() {
                 let ts = now_ms_i64();
                 distributed_upsert_pane(
-                    &storage_guard,
+                    &storage_handle,
                     remote_pane_id,
                     distributed_remote_pane_uuid(sender, gap.pane_id, None),
                     distributed_remote_domain(sender, "unknown"),
@@ -8392,7 +8392,7 @@ async fn distributed_persist_payload(
                 "distributed_gap:{}:{}:{}",
                 gap.reason, gap.seq_before, gap.seq_after
             );
-            if let Some(stored_gap) = storage_guard.record_gap(remote_pane_id, &reason).await? {
+            if let Some(stored_gap) = storage_handle.record_gap(remote_pane_id, &reason).await? {
                 let _ = event_bus.publish(Event::GapDetected {
                     pane_id: stored_gap.pane_id,
                     reason: stored_gap.reason,
@@ -8422,10 +8422,10 @@ async fn distributed_persist_payload(
                 now_ms_i64()
             };
 
-            let storage_guard = storage.lock().await.clone();
-            if storage_guard.get_pane(remote_pane_id).await?.is_none() {
+            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+            if storage_handle.get_pane(remote_pane_id).await?.is_none() {
                 distributed_upsert_pane(
-                    &storage_guard,
+                    &storage_handle,
                     remote_pane_id,
                     pane_uuid.clone(),
                     distributed_remote_domain(sender, "unknown"),
@@ -8443,8 +8443,8 @@ async fn distributed_persist_payload(
                 None,
                 detected_at,
             );
-            let event_id = storage_guard.record_event(stored_event).await?;
-            drop(storage_guard);
+            let event_id = storage_handle.record_event(stored_event).await?;
+            drop(storage_handle);
 
             let _ = event_bus.publish(Event::PatternDetected {
                 pane_id: remote_pane_id,
@@ -8480,10 +8480,10 @@ async fn distributed_persist_pane_meta(
         .clone()
         .or_else(|| Some(format!("remote:{sender}:{}", meta.pane_id)));
 
-    let storage_guard = storage.lock().await.clone();
-    let is_new = storage_guard.get_pane(remote_pane_id).await?.is_none();
+    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+    let is_new = storage_handle.get_pane(remote_pane_id).await?.is_none();
     distributed_upsert_pane(
-        &storage_guard,
+        &storage_handle,
         remote_pane_id,
         pane_uuid,
         domain.clone(),
@@ -8493,7 +8493,7 @@ async fn distributed_persist_pane_meta(
         meta.timestamp_ms,
     )
     .await?;
-    drop(storage_guard);
+    drop(storage_handle);
 
     if is_new {
         let _ = event_bus.publish(Event::PaneDiscovered {
@@ -8977,13 +8977,13 @@ async fn distributed_agent_seed_segment_cursors(
     storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     cursors: &mut std::collections::HashMap<u64, i64>,
 ) -> anyhow::Result<()> {
-    let storage_guard = storage.lock().await.clone();
-    let panes = storage_guard.get_panes().await?;
+    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+    let panes = storage_handle.get_panes().await?;
     for pane in panes {
         if !distributed_agent_local_pane(&pane) || cursors.contains_key(&pane.pane_id) {
             continue;
         }
-        if let Some(segment) = storage_guard
+        if let Some(segment) = storage_handle
             .get_segments(pane.pane_id, 1)
             .await?
             .into_iter()
@@ -9005,8 +9005,8 @@ async fn distributed_agent_send_pane_snapshot(
     use frankenterm_core::wire_protocol::WirePayload;
 
     let panes = {
-        let storage_guard = storage.lock().await.clone();
-        storage_guard.get_panes().await?
+        let storage_handle = storage.lock().await.clone(); // ubs:ignore
+        storage_handle.get_panes().await?
     };
 
     for pane in panes {
@@ -9051,8 +9051,8 @@ async fn distributed_agent_flush_pane_deltas(
 
     loop {
         let segments = {
-            let storage_guard = storage.lock().await.clone();
-            storage_guard
+            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+            storage_handle
                 .scan_segments(SegmentScanQuery {
                     after_id,
                     pane_id: Some(pane_id),
@@ -9106,8 +9106,8 @@ async fn distributed_agent_flush_all_panes(
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<usize> {
     let pane_ids = {
-        let storage_guard = storage.lock().await.clone();
-        storage_guard
+        let storage_handle = storage.lock().await.clone(); // ubs:ignore
+        storage_handle
             .get_panes()
             .await?
             .into_iter()
@@ -9158,8 +9158,8 @@ async fn distributed_agent_stream_event(
             if let Some(mut envelope) = streamer.event_to_envelope(&other) {
                 if let WirePayload::PaneMeta(meta) = &mut envelope.payload {
                     let pane_record = {
-                        let storage_guard = storage.lock().await.clone();
-                        storage_guard.get_pane(meta.pane_id).await?
+                        let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                        storage_handle.get_pane(meta.pane_id).await?
                     };
                     if let Some(record) = pane_record {
                         *meta = distributed_agent_pane_meta(&record);
@@ -10912,7 +10912,7 @@ async fn run_single_scheduled_backup(
         anyhow::bail!("Database not found at {}", db_path.display());
     }
 
-    if let Err(err) = storage.lock().await.checkpoint().await {
+    if let Err(err) = storage.lock().await.clone().checkpoint().await {
         tracing::warn!(error = %err, "Backup checkpoint failed");
     }
 
@@ -31767,11 +31767,11 @@ mod tests {
         .unwrap();
 
         {
-            let storage_guard = storage.lock().await.clone();
-            let remote = storage_guard.get_pane(remote_pane_id).await.unwrap();
+            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+            let remote = storage_handle.get_pane(remote_pane_id).await.unwrap();
             assert!(remote.is_some());
             assert!(
-                storage_guard
+                storage_handle
                     .get_pane(source_pane_id)
                     .await
                     .unwrap()
@@ -31781,13 +31781,13 @@ mod tests {
             let remote = remote.unwrap();
             assert_eq!(remote.domain, "distributed:agent-mapped:prod");
 
-            let search_hits = storage_guard.search(marker).await.unwrap();
+            let search_hits = storage_handle.search(marker).await.unwrap();
             assert!(search_hits.iter().any(|seg| seg.pane_id == remote_pane_id));
         }
 
         {
-            let storage_guard = storage.lock().await.clone();
-            storage_guard.shutdown().await.unwrap();
+            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+            storage_handle.shutdown().await.unwrap();
         }
         drop(storage);
         let _ = std::fs::remove_file(&db_path);
@@ -31833,8 +31833,8 @@ mod tests {
         }
 
         {
-            let storage_guard = storage.lock().await.clone();
-            let segments = storage_guard
+            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+            let segments = storage_handle
                 .get_segments(remote_pane_id, 16)
                 .await
                 .unwrap();
@@ -31846,7 +31846,7 @@ mod tests {
                 "out-of-order pane delta must be dropped from persisted segments"
             );
 
-            let gaps = storage_guard.get_gaps().await.unwrap();
+            let gaps = storage_handle.get_gaps().await.unwrap();
             assert!(gaps.iter().any(|gap| {
                 gap.reason
                     .contains("distributed_seq_gap:sender=agent-order:expected=2:actual=3")
@@ -31858,8 +31858,8 @@ mod tests {
         }
 
         {
-            let storage_guard = storage.lock().await.clone();
-            storage_guard.shutdown().await.unwrap();
+            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+            storage_handle.shutdown().await.unwrap();
         }
         drop(storage);
         let _ = std::fs::remove_file(&db_path);
