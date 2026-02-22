@@ -1646,7 +1646,7 @@ fn run_dcg(command: &str) -> Result<DcgDecision, DcgError> {
     let mut child = Command::new("dcg")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -1656,7 +1656,7 @@ fn run_dcg(command: &str) -> Result<DcgDecision, DcgError> {
             }
         })?;
 
-    if let Some(stdin) = child.stdin.as_mut() {
+    if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(payload.to_string().as_bytes())
             .map_err(|e| DcgError::Failed(e.to_string()))?;
@@ -1666,6 +1666,21 @@ fn run_dcg(command: &str) -> Result<DcgDecision, DcgError> {
         .wait_with_output()
         .map_err(|e| DcgError::Failed(e.to_string()))?;
 
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            format!("stdout: {}", stdout.trim())
+        } else {
+            "no stdout/stderr output".to_string()
+        };
+        return Err(DcgError::Failed(format!(
+            "dcg exited unsuccessfully ({detail})"
+        )));
+    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     if stdout.trim().is_empty() {
         return Ok(DcgDecision::Allow);
@@ -1674,7 +1689,11 @@ fn run_dcg(command: &str) -> Result<DcgDecision, DcgError> {
     let parsed: DcgResponse =
         serde_json::from_str(stdout.trim()).map_err(|e| DcgError::Failed(e.to_string()))?;
 
-    if parsed.hook_specific_output.permission_decision == "deny" {
+    if parsed
+        .hook_specific_output
+        .permission_decision
+        .eq_ignore_ascii_case("deny")
+    {
         return Ok(DcgDecision::Deny {
             rule_id: parsed.hook_specific_output.rule_id,
         });
