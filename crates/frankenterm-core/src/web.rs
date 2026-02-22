@@ -14,6 +14,7 @@ use crate::ui_query;
 use crate::{Error, Result, VERSION};
 use asupersync::net::TcpListener;
 use asupersync::stream::Stream;
+#[cfg(test)]
 use serde::Serialize;
 use serde_json::json;
 use std::net::{SocketAddr, TcpStream};
@@ -26,7 +27,9 @@ use tracing::{info, warn};
 
 mod web_framework {
     pub(crate) use fastapi::ResponseBody;
-    pub(crate) use fastapi::core::{BoxFuture, ControlFlow, Cx, Handler, Middleware, StartupOutcome};
+    pub(crate) use fastapi::core::{
+        BoxFuture, ControlFlow, Cx, Handler, Middleware, StartupOutcome,
+    };
     pub(crate) use fastapi::http::QueryString;
     pub(crate) use fastapi::prelude::{App, Method, Request, RequestContext, Response, StatusCode};
     pub(crate) use fastapi::{ServerConfig, ServerError, TcpServer};
@@ -46,6 +49,19 @@ mod openapi;
 mod router;
 mod sse;
 mod websocket;
+
+use error::{json_err, json_ok};
+#[cfg(test)]
+use handlers::{
+    BookmarkView, BookmarksResponse, EventAnnotationsView, EventView, EventsResponse,
+    HealthResponse, PaneView, PanesResponse, RulesetProfileResponse, RulesetProfileView,
+    SavedSearchView, SavedSearchesResponse, SearchHit, SearchResponse,
+};
+use handlers::{
+    handle_bookmarks, handle_events, handle_panes, handle_ruleset_profile, handle_saved_searches,
+    handle_search, health_response,
+};
+use middleware::{AppState, BodySizeGuard, RequestSpanLogger, StateInjector};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8000;
@@ -184,173 +200,6 @@ impl WebServerHandle {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RequestStart(Instant);
-
-#[derive(Debug, Clone, Default)]
-struct RequestSpanLogger;
-
-impl Middleware for RequestSpanLogger {
-    fn before<'a>(
-        &'a self,
-        _ctx: &'a RequestContext,
-        req: &'a mut Request,
-    ) -> BoxFuture<'a, ControlFlow> {
-        req.insert_extension(RequestStart(Instant::now()));
-        Box::pin(async { ControlFlow::Continue })
-    }
-
-    fn after<'a>(
-        &'a self,
-        _ctx: &'a RequestContext,
-        req: &'a Request,
-        response: Response,
-    ) -> BoxFuture<'a, Response> {
-        let start = req
-            .get_extension::<RequestStart>()
-            .map(|s| s.0)
-            .unwrap_or_else(Instant::now);
-        let duration = start.elapsed();
-        let method = req.method();
-        let path = req.path();
-        let status = response.status().as_u16();
-
-        info!(
-            target: "wa.web",
-            method = %method,
-            path = %path,
-            status,
-            duration_ms = duration.as_millis(),
-            "web request"
-        );
-
-        Box::pin(async move { response })
-    }
-
-    fn name(&self) -> &'static str {
-        "RequestSpanLogger"
-    }
-}
-
-// =============================================================================
-// Shared state injected via request extensions
-// =============================================================================
-
-/// Shared application state available to all handlers.
-#[derive(Clone)]
-struct AppState {
-    storage: Option<StorageHandle>,
-    event_bus: Option<Arc<EventBus>>,
-    redactor: Arc<Redactor>,
-}
-
-/// Middleware that injects [`AppState`] into every request.
-#[derive(Clone)]
-struct StateInjector {
-    state: AppState,
-}
-
-impl Middleware for StateInjector {
-    fn before<'a>(
-        &'a self,
-        _ctx: &'a RequestContext,
-        req: &'a mut Request,
-    ) -> BoxFuture<'a, ControlFlow> {
-        req.insert_extension(self.state.clone());
-        Box::pin(async { ControlFlow::Continue })
-    }
-
-    fn name(&self) -> &'static str {
-        "StateInjector"
-    }
-}
-
-/// Rejects requests whose Content-Length exceeds [`MAX_REQUEST_BODY_BYTES`].
-#[derive(Clone, Default)]
-struct BodySizeGuard;
-
-impl Middleware for BodySizeGuard {
-    fn before<'a>(
-        &'a self,
-        _ctx: &'a RequestContext,
-        req: &'a mut Request,
-    ) -> BoxFuture<'a, ControlFlow> {
-        if let Some(cl) = req
-            .headers()
-            .get("content-length")
-            .and_then(|v| std::str::from_utf8(v).ok())
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            if cl > MAX_REQUEST_BODY_BYTES {
-                let resp = json_err(
-                    StatusCode::BAD_REQUEST,
-                    "body_too_large",
-                    format!("Request body too large ({cl} bytes); max is {MAX_REQUEST_BODY_BYTES}"),
-                );
-                return Box::pin(async move { ControlFlow::Break(resp) });
-            }
-        }
-        Box::pin(async { ControlFlow::Continue })
-    }
-
-    fn name(&self) -> &'static str {
-        "BodySizeGuard"
-    }
-}
-
-// =============================================================================
-// Response envelope
-// =============================================================================
-
-#[derive(Serialize)]
-struct ApiResponse<T> {
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error_code: Option<String>,
-    version: &'static str,
-}
-
-impl<T: Serialize> ApiResponse<T> {
-    fn success(data: T) -> Self {
-        Self {
-            ok: true,
-            data: Some(data),
-            error: None,
-            error_code: None,
-            version: VERSION,
-        }
-    }
-}
-
-impl ApiResponse<()> {
-    fn error(code: &str, message: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            data: None,
-            error: Some(message.into()),
-            error_code: Some(code.to_string()),
-            version: VERSION,
-        }
-    }
-}
-
-fn json_ok<T: Serialize>(data: T) -> Response {
-    let resp = ApiResponse::success(data);
-    Response::json(&resp).unwrap_or_else(|_| Response::internal_error())
-}
-
-fn json_err(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
-    let resp = ApiResponse::<()>::error(code, message);
-    let body = serde_json::to_vec(&resp).unwrap_or_default();
-    Response::with_status(status)
-        .header("content-type", b"application/json".to_vec())
-        .body(ResponseBody::Bytes(body))
-}
-
 fn require_storage(req: &Request) -> std::result::Result<(StorageHandle, Arc<Redactor>), Response> {
     let state = req.get_extension::<AppState>().ok_or_else(|| {
         json_err(
@@ -440,37 +289,15 @@ fn parse_bool(qs: &QueryString<'_>, key: &str) -> bool {
 }
 
 fn parse_stream_max_hz(qs: &QueryString<'_>) -> u64 {
-    qs.get("max_hz")
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|hz| *hz > 0)
-        .unwrap_or(STREAM_DEFAULT_MAX_HZ)
-        .min(STREAM_MAX_MAX_HZ)
+    sse::parse_stream_max_hz(qs)
 }
 
-#[derive(Debug, Clone, Copy)]
-enum EventStreamChannel {
-    All,
-    Deltas,
-    Detections,
-    Signals,
-}
+type EventStreamChannel = sse::EventStreamChannel;
 
 fn parse_event_stream_channel(
     qs: &QueryString<'_>,
 ) -> std::result::Result<EventStreamChannel, Response> {
-    match qs.get("channel") {
-        None | Some("all") => Ok(EventStreamChannel::All),
-        Some("deltas" | "delta") => Ok(EventStreamChannel::Deltas),
-        Some("detections" | "detection") => Ok(EventStreamChannel::Detections),
-        Some("signals" | "signal") => Ok(EventStreamChannel::Signals),
-        Some(other) => Err(json_err(
-            StatusCode::BAD_REQUEST,
-            "invalid_channel",
-            format!(
-                "Invalid stream channel '{other}'. Expected one of: all, deltas, detections, signals"
-            ),
-        )),
-    }
+    sse::parse_event_stream_channel(qs)
 }
 
 fn epoch_ms_now() -> i64 {
@@ -499,1097 +326,37 @@ fn redact_json_value(value: &mut serde_json::Value, redactor: &Redactor) {
     }
 }
 
-#[derive(Debug, Clone)]
-struct SseEvent {
-    data: Option<String>,
-    event_type: Option<String>,
-    id: Option<String>,
-    comment: Option<String>,
-}
-
-impl SseEvent {
-    fn new(data: impl Into<String>) -> Self {
-        Self {
-            data: Some(data.into()),
-            event_type: None,
-            id: None,
-            comment: None,
-        }
-    }
-
-    fn comment(comment: impl Into<String>) -> Self {
-        Self {
-            data: None,
-            event_type: None,
-            id: None,
-            comment: Some(comment.into()),
-        }
-    }
-
-    fn event_type(mut self, event_type: impl Into<String>) -> Self {
-        self.event_type = Some(event_type.into());
-        self
-    }
-
-    fn id(mut self, id: impl Into<String>) -> Self {
-        self.id = Some(id.into());
-        self
-    }
-
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(256);
-
-        if let Some(comment) = &self.comment {
-            for line in comment.lines() {
-                out.extend_from_slice(b": ");
-                out.extend_from_slice(line.as_bytes());
-                out.push(b'\n');
-            }
-        }
-
-        if let Some(event_type) = &self.event_type {
-            out.extend_from_slice(b"event: ");
-            out.extend_from_slice(event_type.as_bytes());
-            out.push(b'\n');
-        }
-
-        if let Some(id) = &self.id {
-            out.extend_from_slice(b"id: ");
-            out.extend_from_slice(id.as_bytes());
-            out.push(b'\n');
-        }
-
-        if let Some(data) = &self.data {
-            for line in data.lines() {
-                out.extend_from_slice(b"data: ");
-                out.extend_from_slice(line.as_bytes());
-                out.push(b'\n');
-            }
-            if data.is_empty() {
-                out.extend_from_slice(b"data: \n");
-            }
-        }
-
-        out.push(b'\n');
-        out
-    }
-}
-
-struct SseResponse<S> {
-    stream: S,
-}
-
-impl<S> SseResponse<S>
-where
-    S: Stream<Item = Vec<u8>> + Send + 'static,
-{
-    fn new(stream: S) -> Self {
-        Self { stream }
-    }
-
-    fn into_response(self) -> Response {
-        Response::with_status(StatusCode::OK)
-            .header("content-type", b"text/event-stream".to_vec())
-            .header("cache-control", b"no-cache".to_vec())
-            .header("connection", b"keep-alive".to_vec())
-            .header("x-accel-buffering", b"no".to_vec())
-            .body(ResponseBody::stream(self.stream))
-    }
-}
-
-struct TokioSseStream {
-    rx: mpsc::Receiver<SseEvent>,
-}
-
-impl TokioSseStream {
-    fn new(rx: mpsc::Receiver<SseEvent>) -> Self {
-        Self { rx }
-    }
-}
-
-impl Stream for TokioSseStream {
-    type Item = Vec<u8>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.rx.poll_recv(cx) {
-            Poll::Ready(Some(event)) => Poll::Ready(Some(event.to_bytes())),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
 fn make_stream_frame(
     stream: &'static str,
     kind: &'static str,
     seq: u64,
     data: serde_json::Value,
 ) -> serde_json::Value {
-    json!({
-        "schema": STREAM_SCHEMA_VERSION,
-        "stream": stream,
-        "kind": kind,
-        "seq": seq,
-        "ts_ms": epoch_ms_now(),
-        "data": data
-    })
+    sse::make_stream_frame(stream, kind, seq, data)
 }
 
-fn frame_to_sse(event_type: &'static str, seq: u64, frame: serde_json::Value) -> Option<SseEvent> {
-    serde_json::to_string(&frame)
-        .inspect_err(|e| tracing::warn!(error = %e, event_type, "SSE frame serialization failed"))
-        .ok()
-        .map(|body| {
-            SseEvent::new(body)
-                .event_type(event_type)
-                .id(seq.to_string())
-        })
-}
-
-async fn send_rate_limited_sse(
-    tx: &mpsc::Sender<SseEvent>,
-    event: SseEvent,
-    next_emit_at: &mut Instant,
-    min_interval: Duration,
-    consecutive_drops: &mut u64,
-) -> bool {
-    let now = Instant::now();
-    if *next_emit_at > now {
-        sleep(*next_emit_at - now).await;
-    }
-    *next_emit_at = Instant::now() + min_interval;
-
-    match tx.try_send(event) {
-        Ok(()) => {
-            *consecutive_drops = 0;
-            true
-        }
-        Err(mpsc::TrySendError::Full(_)) => {
-            *consecutive_drops += 1;
-            *consecutive_drops < STREAM_MAX_CONSECUTIVE_DROPS
-        }
-        Err(mpsc::TrySendError::Closed(_)) => false,
-    }
+fn frame_to_sse(
+    event_type: &'static str,
+    seq: u64,
+    frame: serde_json::Value,
+) -> Option<sse::SseEvent> {
+    sse::frame_to_sse(event_type, seq, frame)
 }
 
 fn event_matches_pane(event: &Event, pane_filter: Option<u64>) -> bool {
-    pane_filter.is_none_or(|pane_id| event.pane_id() == Some(pane_id))
-}
-
-async fn emit_new_segment_frames(
-    storage: &StorageHandle,
-    pane_filter: Option<u64>,
-    started_at_ms: i64,
-    after_id: &mut Option<i64>,
-    redactor: &Redactor,
-    tx: &mpsc::Sender<SseEvent>,
-    seq: &mut u64,
-    next_emit_at: &mut Instant,
-    min_interval: Duration,
-    consecutive_drops: &mut u64,
-) -> bool {
-    for _ in 0..STREAM_SCAN_MAX_PAGES {
-        let query = SegmentScanQuery {
-            after_id: *after_id,
-            pane_id: pane_filter,
-            since: Some(started_at_ms),
-            until: None,
-            limit: STREAM_SCAN_LIMIT,
-        };
-
-        let segments = match storage.scan_segments(query).await {
-            Ok(segments) => segments,
-            Err(err) => {
-                *seq += 1;
-                let frame = make_stream_frame(
-                    "deltas",
-                    "error",
-                    *seq,
-                    json!({
-                        "code": "storage_error",
-                        "message": redactor.redact(&err.to_string())
-                    }),
-                );
-                if let Some(event) = frame_to_sse("error", *seq, frame) {
-                    let _ = send_rate_limited_sse(
-                        tx,
-                        event,
-                        next_emit_at,
-                        min_interval,
-                        consecutive_drops,
-                    )
-                    .await;
-                }
-                return false;
-            }
-        };
-
-        if segments.is_empty() {
-            break;
-        }
-
-        let page_len = segments.len();
-        for segment in segments {
-            *after_id = Some(segment.id);
-
-            *seq += 1;
-            let frame = make_stream_frame(
-                "deltas",
-                "delta",
-                *seq,
-                json!({
-                    "segment_id": segment.id,
-                    "pane_id": segment.pane_id,
-                    "seq": segment.seq,
-                    "captured_at": segment.captured_at,
-                    "content_len": segment.content_len,
-                    "content": redactor.redact(&segment.content),
-                }),
-            );
-
-            if let Some(event) = frame_to_sse("delta", *seq, frame) {
-                if !send_rate_limited_sse(tx, event, next_emit_at, min_interval, consecutive_drops)
-                    .await
-                {
-                    return false;
-                }
-            }
-        }
-
-        if page_len < STREAM_SCAN_LIMIT {
-            break;
-        }
-    }
-
-    true
+    sse::event_matches_pane(event, pane_filter)
 }
 
 fn handle_stream_events(
     req: &Request,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
-    let qs_raw = req.query().unwrap_or("").to_string();
-    let qs = QueryString::parse(&qs_raw);
-    let pane_filter = parse_u64(&qs, "pane_id");
-    let max_hz = parse_stream_max_hz(&qs);
-    let channel = match parse_event_stream_channel(&qs) {
-        Ok(channel) => channel,
-        Err(resp) => return Box::pin(async move { resp }),
-    };
-    let result = require_event_bus(req);
-
-    Box::pin(async move {
-        let (event_bus, redactor) = match result {
-            Ok(r) => r,
-            Err(resp) => return resp,
-        };
-
-        let mut subscriber = match channel {
-            EventStreamChannel::All => event_bus.subscribe(),
-            EventStreamChannel::Deltas => event_bus.subscribe_deltas(),
-            EventStreamChannel::Detections => event_bus.subscribe_detections(),
-            EventStreamChannel::Signals => event_bus.subscribe_signals(),
-        };
-
-        let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
-        task::spawn(async move {
-            let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
-            let mut next_emit_at = Instant::now();
-            let mut seq = 0_u64;
-            let mut consecutive_drops = 0_u64;
-
-            seq += 1;
-            let ready = make_stream_frame(
-                "events",
-                "ready",
-                seq,
-                json!({
-                    "channel": format!("{channel:?}").to_lowercase(),
-                    "max_hz": max_hz,
-                    "pane_id": pane_filter
-                }),
-            );
-            if let Some(event) = frame_to_sse("ready", seq, ready) {
-                if !send_rate_limited_sse(
-                    &tx,
-                    event,
-                    &mut next_emit_at,
-                    min_interval,
-                    &mut consecutive_drops,
-                )
-                .await
-                {
-                    return;
-                }
-            }
-
-            loop {
-                let recv_result = tokio::select! {
-                    () = tx.closed() => break,
-                    recv = timeout(
-                        Duration::from_secs(STREAM_KEEPALIVE_SECS),
-                        subscriber.recv(),
-                    ) => recv,
-                };
-
-                match recv_result {
-                    Ok(Ok(event)) => {
-                        if !event_matches_pane(&event, pane_filter) {
-                            continue;
-                        }
-
-                        let mut event_json = serde_json::to_value(&event).unwrap_or_else(|_| {
-                            json!({
-                                "error": "event_serialization_failed"
-                            })
-                        });
-                        redact_json_value(&mut event_json, &redactor);
-
-                        seq += 1;
-                        let frame = make_stream_frame(
-                            "events",
-                            "event",
-                            seq,
-                            json!({ "event": event_json }),
-                        );
-                        if let Some(event) = frame_to_sse("event", seq, frame) {
-                            if !send_rate_limited_sse(
-                                &tx,
-                                event,
-                                &mut next_emit_at,
-                                min_interval,
-                                &mut consecutive_drops,
-                            )
-                            .await
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(Err(RecvError::Lagged { missed_count })) => {
-                        seq += 1;
-                        let frame = make_stream_frame(
-                            "events",
-                            "lag",
-                            seq,
-                            json!({ "missed_count": missed_count }),
-                        );
-                        if let Some(event) = frame_to_sse("lag", seq, frame) {
-                            if !send_rate_limited_sse(
-                                &tx,
-                                event,
-                                &mut next_emit_at,
-                                min_interval,
-                                &mut consecutive_drops,
-                            )
-                            .await
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(Err(RecvError::Closed)) => break,
-                    Err(_) => {
-                        if tx.try_send(SseEvent::comment("keepalive")).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        SseResponse::new(TokioSseStream::new(rx)).into_response()
-    })
+    sse::handle_stream_events(req)
 }
 
 fn handle_stream_deltas(
     req: &Request,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
-    let qs_raw = req.query().unwrap_or("").to_string();
-    let qs = QueryString::parse(&qs_raw);
-    let pane_filter = parse_u64(&qs, "pane_id");
-    let max_hz = parse_stream_max_hz(&qs);
-    let result = require_storage_and_event_bus(req);
-
-    Box::pin(async move {
-        let (storage, event_bus, redactor) = match result {
-            Ok(r) => r,
-            Err(resp) => return resp,
-        };
-
-        let mut subscriber = event_bus.subscribe_deltas();
-        let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
-        let started_at_ms = epoch_ms_now();
-        task::spawn(async move {
-            let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
-            let mut next_emit_at = Instant::now();
-            let mut seq = 0_u64;
-            let mut consecutive_drops = 0_u64;
-            let mut after_id: Option<i64> = None;
-
-            seq += 1;
-            let ready = make_stream_frame(
-                "deltas",
-                "ready",
-                seq,
-                json!({
-                    "max_hz": max_hz,
-                    "pane_id": pane_filter
-                }),
-            );
-            if let Some(event) = frame_to_sse("ready", seq, ready) {
-                if !send_rate_limited_sse(
-                    &tx,
-                    event,
-                    &mut next_emit_at,
-                    min_interval,
-                    &mut consecutive_drops,
-                )
-                .await
-                {
-                    return;
-                }
-            }
-
-            loop {
-                let recv_result = tokio::select! {
-                    () = tx.closed() => break,
-                    recv = timeout(
-                        Duration::from_secs(STREAM_KEEPALIVE_SECS),
-                        subscriber.recv(),
-                    ) => recv,
-                };
-
-                match recv_result {
-                    Ok(Ok(Event::SegmentCaptured { pane_id, .. })) => {
-                        if pane_filter.is_some_and(|pid| pid != pane_id) {
-                            continue;
-                        }
-                        if !emit_new_segment_frames(
-                            &storage,
-                            pane_filter,
-                            started_at_ms,
-                            &mut after_id,
-                            &redactor,
-                            &tx,
-                            &mut seq,
-                            &mut next_emit_at,
-                            min_interval,
-                            &mut consecutive_drops,
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                    }
-                    Ok(Ok(Event::GapDetected { pane_id, reason })) => {
-                        if pane_filter.is_some_and(|pid| pid != pane_id) {
-                            continue;
-                        }
-
-                        seq += 1;
-                        let frame = make_stream_frame(
-                            "deltas",
-                            "gap",
-                            seq,
-                            json!({
-                                "pane_id": pane_id,
-                                "reason": redactor.redact(&reason),
-                            }),
-                        );
-                        if let Some(event) = frame_to_sse("gap", seq, frame) {
-                            if !send_rate_limited_sse(
-                                &tx,
-                                event,
-                                &mut next_emit_at,
-                                min_interval,
-                                &mut consecutive_drops,
-                            )
-                            .await
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(RecvError::Lagged { missed_count })) => {
-                        seq += 1;
-                        let frame = make_stream_frame(
-                            "deltas",
-                            "lag",
-                            seq,
-                            json!({ "missed_count": missed_count }),
-                        );
-                        if let Some(event) = frame_to_sse("lag", seq, frame) {
-                            if !send_rate_limited_sse(
-                                &tx,
-                                event,
-                                &mut next_emit_at,
-                                min_interval,
-                                &mut consecutive_drops,
-                            )
-                            .await
-                            {
-                                break;
-                            }
-                        }
-
-                        if !emit_new_segment_frames(
-                            &storage,
-                            pane_filter,
-                            started_at_ms,
-                            &mut after_id,
-                            &redactor,
-                            &tx,
-                            &mut seq,
-                            &mut next_emit_at,
-                            min_interval,
-                            &mut consecutive_drops,
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                    }
-                    Ok(Err(RecvError::Closed)) => break,
-                    Err(_) => {
-                        let _ = tx.try_send(SseEvent::comment("keepalive"));
-                    }
-                }
-            }
-        });
-
-        SseResponse::new(TokioSseStream::new(rx)).into_response()
-    })
-}
-
-// =============================================================================
-// /health
-// =============================================================================
-
-#[derive(Serialize)]
-struct HealthResponse {
-    ok: bool,
-    version: &'static str,
-}
-
-fn health_response() -> Response {
-    let payload = HealthResponse {
-        ok: true,
-        version: VERSION,
-    };
-    Response::json(&payload).unwrap_or_else(|_| Response::internal_error())
-}
-
-// =============================================================================
-// /panes
-// =============================================================================
-
-#[derive(Serialize)]
-struct PanesResponse {
-    panes: Vec<PaneView>,
-    total: usize,
-}
-
-#[derive(Serialize)]
-struct PaneView {
-    pane_id: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pane_uuid: Option<String>,
-    domain: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    window_id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tab_id: Option<u64>,
-    first_seen_at: i64,
-    last_seen_at: i64,
-}
-
-impl PaneView {
-    fn from_record(r: PaneRecord, redactor: &Redactor) -> Self {
-        Self {
-            pane_id: r.pane_id,
-            pane_uuid: r.pane_uuid,
-            domain: r.domain,
-            title: r.title.map(|t| redactor.redact(&t)),
-            cwd: r.cwd.map(|c| redactor.redact(&c)),
-            window_id: r.window_id,
-            tab_id: r.tab_id,
-            first_seen_at: r.first_seen_at,
-            last_seen_at: r.last_seen_at,
-        }
-    }
-}
-
-fn handle_panes(
-    req: &Request,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
-    let result = require_storage(req);
-    Box::pin(async move {
-        let (storage, redactor) = match result {
-            Ok(s) => s,
-            Err(resp) => return resp,
-        };
-        match storage.get_panes().await {
-            Ok(panes) => {
-                let total = panes.len();
-                let views: Vec<PaneView> = panes
-                    .into_iter()
-                    .map(|p| PaneView::from_record(p, &redactor))
-                    .collect();
-                json_ok(PanesResponse {
-                    panes: views,
-                    total,
-                })
-            }
-            Err(e) => json_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "storage_error",
-                format!("Failed to query panes: {e}"),
-            ),
-        }
-    })
-}
-
-// =============================================================================
-// /events
-// =============================================================================
-
-#[derive(Serialize)]
-struct EventsResponse {
-    events: Vec<EventView>,
-    total: usize,
-}
-
-#[derive(Serialize)]
-struct EventView {
-    id: i64,
-    pane_id: u64,
-    rule_id: String,
-    event_type: String,
-    severity: String,
-    confidence: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    extracted: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    matched_text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    annotations: Option<EventAnnotationsView>,
-    detected_at: i64,
-}
-
-#[derive(Serialize)]
-struct EventAnnotationsView {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    triage_state: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
-    labels: Vec<String>,
-}
-
-impl EventAnnotationsView {
-    fn from_stored(annotations: crate::storage::EventAnnotations, redactor: &Redactor) -> Self {
-        Self {
-            triage_state: annotations.triage_state.map(|v| redactor.redact(&v)),
-            note: annotations.note.map(|v| redactor.redact(&v)),
-            labels: annotations
-                .labels
-                .into_iter()
-                .map(|label| redactor.redact(&label))
-                .collect(),
-        }
-    }
-}
-
-impl EventView {
-    fn from_stored(
-        e: crate::storage::StoredEvent,
-        redactor: &Redactor,
-        annotations: Option<EventAnnotationsView>,
-    ) -> Self {
-        Self {
-            id: e.id,
-            pane_id: e.pane_id,
-            rule_id: e.rule_id,
-            event_type: e.event_type,
-            severity: e.severity,
-            confidence: e.confidence,
-            extracted: e.extracted,
-            matched_text: e.matched_text.map(|t| redactor.redact(&t)),
-            annotations,
-            detected_at: e.detected_at,
-        }
-    }
-}
-
-fn handle_events(
-    req: &Request,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
-    let result = require_storage(req);
-    let qs_raw = req.query().unwrap_or("").to_string();
-    let qs = QueryString::parse(&qs_raw);
-
-    let query = EventQuery {
-        limit: Some(parse_limit(&qs)),
-        pane_id: parse_u64(&qs, "pane_id"),
-        rule_id: qs.get("rule_id").map(String::from),
-        event_type: qs.get("event_type").map(String::from),
-        triage_state: qs.get("triage_state").map(String::from),
-        label: qs.get("label").map(String::from),
-        unhandled_only: parse_bool(&qs, "unhandled"),
-        since: parse_i64(&qs, "since"),
-        until: parse_i64(&qs, "until"),
-    };
-
-    Box::pin(async move {
-        let (storage, redactor) = match result {
-            Ok(s) => s,
-            Err(resp) => return resp,
-        };
-        match storage.get_events(query).await {
-            Ok(events) => {
-                let total = events.len();
-                let mut views: Vec<EventView> = Vec::with_capacity(total);
-                for event in events {
-                    let annotations = match storage.get_event_annotations(event.id).await {
-                        Ok(Some(annotations)) => {
-                            Some(EventAnnotationsView::from_stored(annotations, &redactor))
-                        }
-                        Ok(None) => None,
-                        Err(err) => {
-                            warn!(target: "wa.web", error = %err, event_id = event.id, "failed to load event annotations");
-                            None
-                        }
-                    };
-                    views.push(EventView::from_stored(event, &redactor, annotations));
-                }
-                json_ok(EventsResponse {
-                    events: views,
-                    total,
-                })
-            }
-            Err(e) => json_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "storage_error",
-                format!("Failed to query events: {e}"),
-            ),
-        }
-    })
-}
-
-// =============================================================================
-// /search
-// =============================================================================
-
-#[derive(Serialize)]
-struct SearchResponse {
-    results: Vec<SearchHit>,
-    total: usize,
-}
-
-#[derive(Serialize)]
-struct SearchHit {
-    segment_id: i64,
-    pane_id: u64,
-    score: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    snippet: Option<String>,
-    captured_at: i64,
-    content_len: usize,
-}
-
-impl SearchHit {
-    fn from_result(r: SearchResult, redactor: &Redactor) -> Self {
-        Self {
-            segment_id: r.segment.id,
-            pane_id: r.segment.pane_id,
-            score: r.score,
-            snippet: r.snippet.map(|s| redactor.redact(&s)),
-            captured_at: r.segment.captured_at,
-            content_len: r.segment.content_len,
-        }
-    }
-}
-
-fn handle_search(
-    req: &Request,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
-    let result = require_storage(req);
-    let qs_raw = req.query().unwrap_or("").to_string();
-    let qs = QueryString::parse(&qs_raw);
-
-    let query_str = qs.get("q").map(String::from);
-    let options = SearchOptions {
-        limit: Some(parse_limit(&qs)),
-        pane_id: parse_u64(&qs, "pane_id"),
-        since: parse_i64(&qs, "since"),
-        until: parse_i64(&qs, "until"),
-        include_snippets: Some(true),
-        snippet_max_tokens: Some(64),
-        highlight_prefix: None,
-        highlight_suffix: None,
-    };
-
-    Box::pin(async move {
-        let query = match query_str {
-            Some(q) if !q.is_empty() => q,
-            _ => {
-                return json_err(
-                    StatusCode::BAD_REQUEST,
-                    "missing_query",
-                    "Query parameter 'q' is required",
-                );
-            }
-        };
-        let (storage, redactor) = match result {
-            Ok(s) => s,
-            Err(resp) => return resp,
-        };
-        match storage.search_with_results(&query, options).await {
-            Ok(results) => {
-                let total = results.len();
-                let hits: Vec<SearchHit> = results
-                    .into_iter()
-                    .map(|r| SearchHit::from_result(r, &redactor))
-                    .collect();
-                json_ok(SearchResponse {
-                    results: hits,
-                    total,
-                })
-            }
-            Err(e) => json_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "storage_error",
-                format!("Search failed: {e}"),
-            ),
-        }
-    })
-}
-
-// =============================================================================
-// /bookmarks
-// =============================================================================
-
-#[derive(Serialize)]
-struct BookmarksResponse {
-    bookmarks: Vec<BookmarkView>,
-    total: usize,
-}
-
-#[derive(Serialize)]
-struct BookmarkView {
-    pane_id: u64,
-    alias: String,
-    tags: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    created_at: i64,
-    updated_at: i64,
-}
-
-impl BookmarkView {
-    fn from_query(bookmark: ui_query::PaneBookmarkView, redactor: &Redactor) -> Self {
-        Self {
-            pane_id: bookmark.pane_id,
-            alias: redactor.redact(&bookmark.alias),
-            tags: bookmark
-                .tags
-                .iter()
-                .map(|tag| redactor.redact(tag))
-                .collect(),
-            description: bookmark.description.map(|desc| redactor.redact(&desc)),
-            created_at: bookmark.created_at,
-            updated_at: bookmark.updated_at,
-        }
-    }
-}
-
-fn handle_bookmarks(
-    req: &Request,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
-    let result = require_storage(req);
-    Box::pin(async move {
-        let (storage, redactor) = match result {
-            Ok(s) => s,
-            Err(resp) => return resp,
-        };
-        match ui_query::list_pane_bookmarks(&storage).await {
-            Ok(bookmarks) => {
-                let total = bookmarks.len();
-                let views: Vec<BookmarkView> = bookmarks
-                    .into_iter()
-                    .map(|bookmark| BookmarkView::from_query(bookmark, &redactor))
-                    .collect();
-                json_ok(BookmarksResponse {
-                    bookmarks: views,
-                    total,
-                })
-            }
-            Err(e) => json_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "storage_error",
-                format!("Failed to query bookmarks: {e}"),
-            ),
-        }
-    })
-}
-
-// =============================================================================
-// /ruleset-profile
-// =============================================================================
-
-#[derive(Serialize)]
-struct RulesetProfileResponse {
-    active_profile: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    active_last_applied_at: Option<u64>,
-    profiles: Vec<RulesetProfileView>,
-    total: usize,
-}
-
-#[derive(Serialize)]
-struct RulesetProfileView {
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_applied_at: Option<u64>,
-    implicit: bool,
-}
-
-impl RulesetProfileView {
-    fn from_summary(summary: crate::rulesets::RulesetProfileSummary, redactor: &Redactor) -> Self {
-        Self {
-            name: summary.name,
-            description: summary.description.map(|d| redactor.redact(&d)),
-            path: summary.path.map(|p| redactor.redact(&p)),
-            last_applied_at: summary.last_applied_at,
-            implicit: summary.implicit,
-        }
-    }
-}
-
-fn handle_ruleset_profile(
-    req: &Request,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
-    let redactor = req
-        .get_extension::<AppState>()
-        .map(|s| Arc::clone(&s.redactor))
-        .unwrap_or_else(|| Arc::new(Redactor::new()));
-    Box::pin(async move {
-        let config_path = crate::config::resolve_config_path(None);
-        match ui_query::resolve_ruleset_profile_state(config_path.as_deref()) {
-            Ok(state) => {
-                let total = state.profiles.len();
-                let profiles = state
-                    .profiles
-                    .into_iter()
-                    .map(|profile| RulesetProfileView::from_summary(profile, &redactor))
-                    .collect();
-                json_ok(RulesetProfileResponse {
-                    active_profile: state.active_profile,
-                    active_last_applied_at: state.active_last_applied_at,
-                    profiles,
-                    total,
-                })
-            }
-            Err(e) => json_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "ruleset_profile_error",
-                format!("Failed to resolve ruleset profile state: {e}"),
-            ),
-        }
-    })
-}
-
-// =============================================================================
-// /saved-searches
-// =============================================================================
-
-#[derive(Serialize)]
-struct SavedSearchesResponse {
-    saved_searches: Vec<SavedSearchView>,
-    total: usize,
-}
-
-#[derive(Serialize)]
-struct SavedSearchView {
-    id: String,
-    name: String,
-    query: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pane_id: Option<u64>,
-    limit: i64,
-    since_mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    since_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    schedule_interval_ms: Option<i64>,
-    enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_run_at: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_result_count: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_error: Option<String>,
-    created_at: i64,
-    updated_at: i64,
-}
-
-impl SavedSearchView {
-    fn from_query(saved: ui_query::SavedSearchView, redactor: &Redactor) -> Self {
-        Self {
-            id: saved.id,
-            name: redactor.redact(&saved.name),
-            query: redactor.redact(&saved.query),
-            pane_id: saved.pane_id,
-            limit: saved.limit,
-            since_mode: saved.since_mode,
-            since_ms: saved.since_ms,
-            schedule_interval_ms: saved.schedule_interval_ms,
-            enabled: saved.enabled,
-            last_run_at: saved.last_run_at,
-            last_result_count: saved.last_result_count,
-            last_error: saved.last_error.map(|e| redactor.redact(&e)),
-            created_at: saved.created_at,
-            updated_at: saved.updated_at,
-        }
-    }
-}
-
-fn handle_saved_searches(
-    req: &Request,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
-    let result = require_storage(req);
-    Box::pin(async move {
-        let (storage, redactor) = match result {
-            Ok(s) => s,
-            Err(resp) => return resp,
-        };
-        match ui_query::list_saved_searches(&storage).await {
-            Ok(saved_searches) => {
-                let total = saved_searches.len();
-                let views = saved_searches
-                    .into_iter()
-                    .map(|saved| SavedSearchView::from_query(saved, &redactor))
-                    .collect();
-                json_ok(SavedSearchesResponse {
-                    saved_searches: views,
-                    total,
-                })
-            }
-            Err(e) => json_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "storage_error",
-                format!("Failed to query saved searches: {e}"),
-            ),
-        }
-    })
+    sse::handle_stream_deltas(req)
 }
 
 // =============================================================================
@@ -1746,7 +513,6 @@ fn poke_listener(addr: SocketAddr) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
 
     // =========================================================================
     // WebServerConfig tests
@@ -2139,8 +905,9 @@ mod tests {
     fn frame_to_sse_sets_event_type_and_id() {
         let frame = json!({"test": true});
         let sse = frame_to_sse("delta", 7, frame).unwrap();
-        assert_eq!(sse.id(), Some("7"));
-        assert_eq!(sse.event_type(), Some("delta"));
+        let payload = String::from_utf8(sse.to_bytes()).expect("valid UTF-8 SSE payload");
+        assert!(payload.contains("id: 7\n"));
+        assert!(payload.contains("event: delta\n"));
     }
 
     // =========================================================================
@@ -2305,9 +1072,11 @@ mod tests {
             title: Some("test pane".into()),
             cwd: Some("/home/user".into()),
             tty_name: None,
-            pid: None,
             first_seen_at: 1000,
             last_seen_at: 2000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
         };
         let view = PaneView::from_record(record, &redactor);
         assert_eq!(view.pane_id, 1);
@@ -2331,9 +1100,11 @@ mod tests {
             title: None,
             cwd: None,
             tty_name: None,
-            pid: None,
             first_seen_at: 500,
             last_seen_at: 600,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
         };
         let view = PaneView::from_record(record, &redactor);
         assert_eq!(view.pane_id, 99);
@@ -2356,9 +1127,11 @@ mod tests {
             title: None,
             cwd: None,
             tty_name: None,
-            pid: None,
             first_seen_at: 0,
             last_seen_at: 0,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
         };
         let view = PaneView::from_record(record, &redactor);
         let json = serde_json::to_value(&view).unwrap();
@@ -2380,7 +1153,12 @@ mod tests {
             confidence: 0.95,
             extracted: Some(json!({"wait_until": "2026-01-20"})),
             matched_text: Some("Usage limit reached".into()),
+            segment_id: None,
             detected_at: 5000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
         };
         let view = EventView::from_stored(stored, &redactor, None);
         assert_eq!(view.id, 10);
@@ -2407,7 +1185,12 @@ mod tests {
             confidence: 1.0,
             extracted: None,
             matched_text: None,
+            segment_id: None,
             detected_at: 0,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
         };
         let annotations = crate::storage::EventAnnotations {
             triage_state: Some("investigating".into()),
