@@ -853,7 +853,8 @@ async fn handle_client_with_context(
     // Check message size
     if line.len() > MAX_MESSAGE_SIZE {
         let response = IpcResponse::error("message too large");
-        let response_json = serde_json::to_string(&response).unwrap_or_default();
+        let response_json = serde_json::to_string(&response)
+            .unwrap_or_else(|_| r#"{"error":"message too large"}"#.to_string());
         writer.write_all(response_json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         return Ok(());
@@ -880,7 +881,8 @@ async fn handle_client_with_context(
     let response = response.with_timing(start);
 
     // Send response
-    let response_json = serde_json::to_string(&response).unwrap_or_default();
+    let response_json = serde_json::to_string(&response)
+        .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
     writer.write_all(response_json.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;

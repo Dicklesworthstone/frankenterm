@@ -268,7 +268,13 @@ impl RecorderAuditEntry {
     /// Compute the SHA-256 hash of this entry's canonical JSON.
     #[must_use]
     pub fn hash(&self) -> String {
-        let json = serde_json::to_string(self).unwrap_or_default();
+        let json = match serde_json::to_string(self) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!(error = %e, "audit entry serialization failed — hash chain broken");
+                return format!("SERIALIZATION_ERROR:{e}");
+            }
+        };
         let digest = Sha256::digest(json.as_bytes());
         hex::encode(digest)
     }

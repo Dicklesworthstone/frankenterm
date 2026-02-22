@@ -843,10 +843,16 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
         )))
     })?;
 
+    let write_err = |e: std::io::Error| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "SQL dump write failed: {e}"
+        )))
+    };
+
     // Write header
-    writeln!(file, "-- wa database backup (SQL dump)").ok();
-    writeln!(file, "-- Schema version: {}", SCHEMA_VERSION).ok();
-    writeln!(file, "BEGIN TRANSACTION;").ok();
+    writeln!(file, "-- wa database backup (SQL dump)").map_err(&write_err)?;
+    writeln!(file, "-- Schema version: {}", SCHEMA_VERSION).map_err(&write_err)?;
+    writeln!(file, "BEGIN TRANSACTION;").map_err(&write_err)?;
 
     // Get all table names
     let mut stmt = conn
@@ -868,8 +874,8 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
         .collect();
 
     for (name, create_sql) in &tables {
-        writeln!(file, "\n-- Table: {name}").ok();
-        writeln!(file, "{create_sql};").ok();
+        writeln!(file, "\n-- Table: {name}").map_err(&write_err)?;
+        writeln!(file, "{create_sql};").map_err(&write_err)?;
 
         // Dump rows as INSERT statements
         let row_sql = format!("SELECT * FROM \"{name}\"");
@@ -904,7 +910,7 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
                     col_names.join(", "),
                     values.join(", ")
                 )
-                .ok();
+                .map_err(&write_err)?;
             }
         }
     }
@@ -931,13 +937,13 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
         .collect();
 
     if !indexes.is_empty() {
-        writeln!(file, "\n-- Indexes").ok();
+        writeln!(file, "\n-- Indexes").map_err(&write_err)?;
         for idx_sql in &indexes {
-            writeln!(file, "{idx_sql};").ok();
+            writeln!(file, "{idx_sql};").map_err(&write_err)?;
         }
     }
 
-    writeln!(file, "\nCOMMIT;").ok();
+    writeln!(file, "\nCOMMIT;").map_err(&write_err)?;
 
     Ok(())
 }
