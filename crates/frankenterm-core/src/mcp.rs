@@ -30,15 +30,21 @@ use crate::cass::{
     CassAgent, CassClient, CassError, CassSearchResult, CassStatus, CassViewResult,
     SearchOptions as CassSearchOptions, ViewOptions as CassViewOptions,
 };
-use crate::caut::{CautClient, CautError, CautService};
+#[cfg(test)]
+use crate::caut::CautError;
+use crate::caut::{CautClient, CautService};
 use crate::config::{Config, PaneFilterConfig};
-use crate::error::{Error, WeztermError};
+use crate::error::WeztermError;
 use crate::ingest::Osc133State;
+#[cfg(test)]
 use crate::mcp_error::{
-    MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
-    MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_RESERVATION_CONFLICT,
-    MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError,
-    map_cass_error, map_caut_error, map_mcp_error,
+    MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND,
+    MCP_ERR_WEZTERM, map_caut_error,
+};
+use crate::mcp_error::{
+    MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS, MCP_ERR_POLICY, MCP_ERR_RESERVATION_CONFLICT,
+    MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WORKFLOW, McpToolError, map_cass_error,
+    map_mcp_error,
 };
 use crate::patterns::{AgentType, PatternEngine};
 use crate::policy::{
