@@ -342,6 +342,35 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # FrankenSqlite migration quality gates: T1-T6 tiered test coverage
+  # with BT1-BT5 wave readiness assessment. T6 is advisory.
+  # Implements: ft-2vuw7.1.4.1.4.2.3
+  frankensqlite-gates:
+    name: FrankenSqlite Gates
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: frankensqlite-gates
+
+      - name: Run FrankenSqlite CI quality gates
+        run: scripts/ci_frankensqlite_gates.sh
+
+      - name: Upload gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frankensqlite-gate-report
+          path: |
+            test_results/ci_frankensqlite_gates_*.log
+            test_results/frankensqlite_gate_report_*.json
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Recorder validation gates: wire load/invariant/quality/recovery harnesses
   # into CI with explicit thresholds and artifact retention.
   # Implements: wa-oegrb.7.5
