@@ -7843,7 +7843,9 @@ async fn run_robot_rpc_via_cli(
 }
 
 async fn record_ipc_rpc_audit(
-    storage: &Arc<frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
     request_id: Option<String>,
     summary: String,
     result: &str,
@@ -8252,9 +8254,12 @@ struct DistributedHandshake {
 
 #[cfg(feature = "distributed")]
 struct DistributedIngestState {
-    aggregator: frankenterm_core::runtime_compat::Mutex<frankenterm_core::wire_protocol::Aggregator>,
-    replay_guard: frankenterm_core::runtime_compat::Mutex<frankenterm_core::distributed::SessionReplayGuard>,
-    pane_seq_by_sender: frankenterm_core::runtime_compat::Mutex<std::collections::HashMap<(String, u64), u64>>,
+    aggregator:
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::wire_protocol::Aggregator>,
+    replay_guard:
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::distributed::SessionReplayGuard>,
+    pane_seq_by_sender:
+        frankenterm_core::runtime_compat::Mutex<std::collections::HashMap<(String, u64), u64>>,
 }
 
 #[cfg(feature = "distributed")]
@@ -8267,7 +8272,9 @@ impl DistributedIngestState {
             replay_guard: frankenterm_core::runtime_compat::Mutex::new(
                 frankenterm_core::distributed::SessionReplayGuard::new(8192),
             ),
-            pane_seq_by_sender: frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::new()),
+            pane_seq_by_sender: frankenterm_core::runtime_compat::Mutex::new(
+                std::collections::HashMap::new(),
+            ),
         }
     }
 }
@@ -8465,9 +8472,13 @@ where
 async fn distributed_persist_payload(
     sender: &str,
     payload: frankenterm_core::wire_protocol::WirePayload,
-    storage: &Arc<frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
     event_bus: &Arc<frankenterm_core::events::EventBus>,
-    pane_seq_by_sender: &frankenterm_core::runtime_compat::Mutex<std::collections::HashMap<(String, u64), u64>>,
+    pane_seq_by_sender: &frankenterm_core::runtime_compat::Mutex<
+        std::collections::HashMap<(String, u64), u64>,
+    >,
 ) -> anyhow::Result<()> {
     use frankenterm_core::events::Event;
     use frankenterm_core::wire_protocol::WirePayload;
@@ -8647,7 +8658,9 @@ async fn distributed_persist_payload(
 async fn distributed_persist_pane_meta(
     sender: &str,
     meta: frankenterm_core::wire_protocol::PaneMeta,
-    storage: &Arc<frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
     event_bus: &Arc<frankenterm_core::events::EventBus>,
 ) -> anyhow::Result<()> {
     use frankenterm_core::events::Event;
@@ -9156,7 +9169,9 @@ async fn distributed_agent_send_envelope(
 
 #[cfg(feature = "distributed")]
 async fn distributed_agent_seed_segment_cursors(
-    storage: &Arc<frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
     cursors: &mut std::collections::HashMap<u64, i64>,
 ) -> anyhow::Result<()> {
     let storage_handle = storage.lock().await.clone(); // ubs:ignore
@@ -9180,7 +9195,9 @@ async fn distributed_agent_seed_segment_cursors(
 #[cfg(feature = "distributed")]
 async fn distributed_agent_send_pane_snapshot(
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
-    storage: &Arc<frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<()> {
     use frankenterm_core::events::Event;
@@ -9219,7 +9236,9 @@ async fn distributed_agent_send_pane_snapshot(
 async fn distributed_agent_flush_pane_deltas(
     pane_id: u64,
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
-    storage: &Arc<frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<usize> {
@@ -9283,7 +9302,9 @@ async fn distributed_agent_flush_pane_deltas(
 #[cfg(feature = "distributed")]
 async fn distributed_agent_flush_all_panes(
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
-    storage: &Arc<frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<usize> {
@@ -9317,7 +9338,9 @@ async fn distributed_agent_flush_all_panes(
 async fn distributed_agent_stream_event(
     event: frankenterm_core::events::Event,
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
-    storage: &Arc<frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<()> {
@@ -9358,7 +9381,9 @@ async fn distributed_agent_stream_event(
 async fn distributed_agent_stream_session(
     io: DistributedIoStream,
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
-    storage: &Arc<frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
     event_bus: &Arc<frankenterm_core::events::EventBus>,
     token: Option<&str>,
     agent_id: &str,
@@ -9620,7 +9645,9 @@ async fn run_distributed_agent(
     let pattern_engine =
         PatternEngine::from_config_with_root(&config.patterns, patterns_root.as_deref())
             .map_err(|e| anyhow::anyhow!("Failed to load pattern packs: {e}"))?;
-    let pattern_engine = Arc::new(frankenterm_core::runtime_compat::RwLock::new(pattern_engine));
+    let pattern_engine = Arc::new(frankenterm_core::runtime_compat::RwLock::new(
+        pattern_engine,
+    ));
 
     let event_bus = Arc::new(EventBus::new(1000));
     let wezterm_handle = frankenterm_core::wezterm::wezterm_handle_from_config(config);
@@ -9999,7 +10026,9 @@ async fn run_watcher(
         PatternEngine::from_config_with_root(&config.patterns, patterns_root.as_deref())
             .map_err(|e| anyhow::anyhow!("Failed to load pattern packs: {e}"))?
     };
-    let pattern_engine = Arc::new(frankenterm_core::runtime_compat::RwLock::new(pattern_engine));
+    let pattern_engine = Arc::new(frankenterm_core::runtime_compat::RwLock::new(
+        pattern_engine,
+    ));
 
     // Create event bus for publishing detections to workflow runners
     let event_bus = Arc::new(EventBus::new(1000));
@@ -10038,7 +10067,9 @@ async fn run_watcher(
             tracing::info!("Notification pipeline disabled (no active senders)");
             None
         } else {
-            let mute_storage = Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage.clone()));
+            let mute_storage = Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                storage.clone(),
+            ));
             let mut pipeline = NotificationPipeline::with_mute_store(
                 config.notifications.to_notification_gate(),
                 senders,
@@ -10279,10 +10310,9 @@ async fn run_watcher(
     };
 
     #[cfg(not(feature = "distributed"))]
-    let distributed_listener_handle: Option<frankenterm_core::runtime_compat::task::JoinHandle<()>> = if config
-        .distributed
-        .enabled
-    {
+    let distributed_listener_handle: Option<
+        frankenterm_core::runtime_compat::task::JoinHandle<()>,
+    > = if config.distributed.enabled {
         tracing::warn!(
             "Distributed mode enabled in config, but ft was built without the distributed feature"
         );
@@ -11138,7 +11168,9 @@ async fn run_single_scheduled_backup(
     config: &frankenterm_core::config::ScheduledBackupConfig,
     workspace_root: &Path,
     db_path: &Path,
-    storage: &Arc<frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
 ) -> anyhow::Result<frankenterm_core::backup::ExportResult> {
     if !db_path.exists() {
         anyhow::bail!("Database not found at {}", db_path.display());
@@ -11252,7 +11284,10 @@ fn send_backup_notification(
 
 fn main() {
     use frankenterm_core::runtime_compat::CompatRuntime;
-    let rt = match frankenterm_core::runtime_compat::RuntimeBuilder::multi_thread().enable_all().build() {
+    let rt = match frankenterm_core::runtime_compat::RuntimeBuilder::multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("Failed to initialize async runtime: {e}");
@@ -11577,29 +11612,36 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                             };
                             let db_path = layout.db_path.to_string_lossy();
-                            let storage_handle = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    let response = RobotResponse::<()>::error_with_code(
-                                        ROBOT_ERR_STORAGE,
-                                        format!("Failed to open storage: {e}"),
-                                        None,
-                                        elapsed_ms(start),
-                                    );
-                                    print_robot_response(&response, format, stats)?;
-                                    return Ok(());
-                                }
-                            };
-                            
+                            let storage_handle =
+                                match frankenterm_core::storage::StorageHandle::new(&db_path).await
+                                {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        let response = RobotResponse::<()>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to open storage: {e}"),
+                                            None,
+                                            elapsed_ms(start),
+                                        );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
+
                             #[cfg(feature = "semantic-search")]
                             {
                                 use frankenterm_core::search::Embedder;
-                                use frankenterm_core::semantic_anomaly::{SemanticAnomalyDetector, SemanticAnomalyConfig};
-                                
-                                let segments = storage_handle.get_recent_segments(pane_id, limit, false).await?;
+                                use frankenterm_core::semantic_anomaly::{
+                                    SemanticAnomalyConfig, SemanticAnomalyDetector,
+                                };
+
+                                let segments = storage_handle
+                                    .get_recent_segments(pane_id, limit, false)
+                                    .await?;
                                 let embedder = frankenterm_core::search::HashEmbedder::default();
-                                let mut detector = SemanticAnomalyDetector::new(SemanticAnomalyConfig::default());
-                                
+                                let mut detector =
+                                    SemanticAnomalyDetector::new(SemanticAnomalyConfig::default());
+
                                 let mut last_shock = None;
                                 for seg in segments {
                                     if let Ok(vec) = embedder.embed(&seg.content) {
@@ -11608,7 +11650,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
-                                
+
                                 if let Some(shock) = last_shock {
                                     let response = RobotResponse::<serde_json::Value>::ok(
                                         serde_json::json!({
@@ -11617,7 +11659,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             "distance": shock.distance,
                                             "expected_distance": shock.expected_distance,
                                         }),
-                                        elapsed_ms(start)
+                                        elapsed_ms(start),
                                     );
                                     print_robot_response(&response, format, stats)?;
                                 } else {
@@ -11627,19 +11669,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             "z_score": 0.0,
                                             "distance": 0.0,
                                         }),
-                                        elapsed_ms(start)
+                                        elapsed_ms(start),
                                     );
                                     print_robot_response(&response, format, stats)?;
                                 }
                             }
-                            
+
                             #[cfg(not(feature = "semantic-search"))]
                             {
                                 let response = RobotResponse::<()>::error_with_code(
                                     "robot.unsupported",
-                                    "Semantic search feature is required for anomaly detection.".to_string(),
+                                    "Semantic search feature is required for anomaly detection."
+                                        .to_string(),
                                     None,
-                                    elapsed_ms(start)
+                                    elapsed_ms(start),
                                 );
                                 print_robot_response(&response, format, stats)?;
                             }
@@ -13889,13 +13932,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     // Create policy-gated injector with WezTerm client
                                     let wezterm_handle =
                                         frankenterm_core::wezterm::default_wezterm_handle();
-                                    let injector = Arc::new(frankenterm_core::runtime_compat::Mutex::new(
-                                        PolicyGatedInjector::with_storage(
-                                            policy_engine,
-                                            wezterm_handle,
-                                            storage.as_ref().clone(),
-                                        ),
-                                    ));
+                                    let injector =
+                                        Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                                            PolicyGatedInjector::with_storage(
+                                                policy_engine,
+                                                wezterm_handle,
+                                                storage.as_ref().clone(),
+                                            ),
+                                        ));
                                     let runner_config = WorkflowRunnerConfig::default();
                                     let runner = WorkflowRunner::new(
                                         engine,
@@ -14602,13 +14646,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     );
                                     let wezterm_handle =
                                         frankenterm_core::wezterm::default_wezterm_handle();
-                                    let injector = Arc::new(frankenterm_core::runtime_compat::Mutex::new(
-                                        PolicyGatedInjector::with_storage(
-                                            policy_engine,
-                                            wezterm_handle,
-                                            storage.as_ref().clone(),
-                                        ),
-                                    ));
+                                    let injector =
+                                        Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                                            PolicyGatedInjector::with_storage(
+                                                policy_engine,
+                                                wezterm_handle,
+                                                storage.as_ref().clone(),
+                                            ),
+                                        ));
                                     let runner_config = WorkflowRunnerConfig::default();
                                     let runner = WorkflowRunner::new(
                                         engine,
@@ -20817,13 +20862,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         true,
                     );
                     let wezterm_handle = frankenterm_core::wezterm::default_wezterm_handle();
-                    let injector = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
-                        frankenterm_core::policy::PolicyGatedInjector::with_storage(
-                            policy_engine,
-                            wezterm_handle,
-                            storage.as_ref().clone(),
-                        ),
-                    ));
+                    let injector =
+                        std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                            frankenterm_core::policy::PolicyGatedInjector::with_storage(
+                                policy_engine,
+                                wezterm_handle,
+                                storage.as_ref().clone(),
+                            ),
+                        ));
                     let runner_config =
                         frankenterm_core::workflows::WorkflowRunnerConfig::default();
                     let runner = frankenterm_core::workflows::WorkflowRunner::new(
@@ -32153,10 +32199,14 @@ recorder_backend = "frankensqlite"
     #[tokio::test]
     async fn distributed_persist_payload_maps_sender_scoped_pane_ids_for_query_visibility() {
         let (storage_handle, db_path) = setup_storage("distributed_persist_payload_map").await;
-        let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+        let storage =
+            std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
         let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
         let pane_seq_by_sender =
-            frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<(String, u64), u64>::new());
+            frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<
+                (String, u64),
+                u64,
+            >::new());
 
         let sender = "agent-mapped";
         let source_pane_id = 17;
@@ -32237,10 +32287,14 @@ recorder_backend = "frankensqlite"
     async fn distributed_persist_payload_out_of_order_records_sender_scoped_gap_and_drops_segment()
     {
         let (storage_handle, db_path) = setup_storage("distributed_persist_payload_ordering").await;
-        let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+        let storage =
+            std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
         let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
         let pane_seq_by_sender =
-            frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<(String, u64), u64>::new());
+            frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<
+                (String, u64),
+                u64,
+            >::new());
 
         let sender = "agent-order";
         let source_pane_id = 23;
@@ -32313,7 +32367,8 @@ recorder_backend = "frankensqlite"
         use std::sync::atomic::Ordering;
 
         let (storage_handle, db_path) = setup_storage("distributed_listener_stream_path").await;
-        let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+        let storage =
+            std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
         let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
         let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -32452,7 +32507,8 @@ recorder_backend = "frankensqlite"
 
         let (storage_handle, db_path) =
             setup_storage("distributed_listener_invalid_token_rejected").await;
-        let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+        let storage =
+            std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
         let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
         let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
