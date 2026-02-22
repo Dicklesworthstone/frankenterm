@@ -11,9 +11,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod mcp_framework {
-    pub(crate) use fastmcp::StdioTransport;
-    pub(crate) use fastmcp::prelude::*;
-    pub(crate) use fastmcp::{ResourceHandler, ResourceTemplate, ToolHandler};
+    pub mod prelude {
+        pub use fastmcp::prelude::*;
+    }
+
+    pub use fastmcp::StdioTransport;
+    pub use fastmcp::{ResourceHandler, ResourceTemplate, ToolHandler};
 }
 
 use mcp_framework::prelude::*;
@@ -30,6 +33,12 @@ use crate::caut::{CautClient, CautError, CautService};
 use crate::config::{Config, PaneFilterConfig};
 use crate::error::{Error, WeztermError};
 use crate::ingest::Osc133State;
+use crate::mcp_error::{
+    MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
+    MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_RESERVATION_CONFLICT,
+    MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError,
+    map_cass_error, map_caut_error, map_mcp_error,
+};
 use crate::patterns::{AgentType, PatternEngine};
 use crate::policy::{
     ActionKind, ActorKind, InjectionResult, PaneCapabilities, PolicyDecision, PolicyEngine,
@@ -52,20 +61,6 @@ use crate::workflows::{
 };
 
 const MCP_VERSION: &str = "v1";
-
-const MCP_ERR_INVALID_ARGS: &str = "FT-MCP-0001";
-const MCP_ERR_CONFIG: &str = "FT-MCP-0003";
-const MCP_ERR_WEZTERM: &str = "FT-MCP-0004";
-const MCP_ERR_STORAGE: &str = "FT-MCP-0005";
-const MCP_ERR_POLICY: &str = "FT-MCP-0006";
-const MCP_ERR_PANE_NOT_FOUND: &str = "FT-MCP-0007";
-const MCP_ERR_WORKFLOW: &str = "FT-MCP-0008";
-const MCP_ERR_TIMEOUT: &str = "FT-MCP-0009";
-const MCP_ERR_NOT_IMPLEMENTED: &str = "FT-MCP-0010";
-const MCP_ERR_FTS_QUERY: &str = "FT-MCP-0011";
-const MCP_ERR_RESERVATION_CONFLICT: &str = "FT-MCP-0012";
-const MCP_ERR_CAUT: &str = "FT-MCP-0013";
-const MCP_ERR_CASS: &str = "FT-MCP-0014";
 
 fn effective_search_rrf_k(config: &Config) -> u32 {
     config.search.rrf_k.max(1)
@@ -895,8 +890,7 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
 pub fn run_stdio_server(config: &Config, db_path: Option<PathBuf>) -> Result<()> {
     let server = build_server_with_db(config, db_path)?;
     let transport = StdioTransport::stdio();
-    server.run_transport(transport);
-    Ok(())
+    server.run_transport(transport)
 }
 
 fn tool_output_as_resource(uri: &str, contents: Vec<Content>) -> McpResult<Vec<ResourceContent>> {
@@ -4461,40 +4455,6 @@ impl ToolHandler for WaAccountsRefreshTool {
 const SEND_OSC_SEGMENT_LIMIT: usize = 200;
 const MCP_REFRESH_COOLDOWN_MS: i64 = 30_000;
 
-struct McpToolError {
-    code: &'static str,
-    message: String,
-    hint: Option<String>,
-}
-
-impl McpToolError {
-    fn new(code: &'static str, message: String, hint: Option<String>) -> Self {
-        Self {
-            code,
-            message,
-            hint,
-        }
-    }
-
-    fn from_error(err: Error) -> Self {
-        let (code, hint) = map_mcp_error(&err);
-        Self {
-            code,
-            message: err.to_string(),
-            hint,
-        }
-    }
-
-    fn from_caut_error(err: CautError) -> Self {
-        let (code, hint) = map_caut_error(&err);
-        Self {
-            code,
-            message: err.to_string(),
-            hint,
-        }
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct IpcPaneState {
     pane_id: u64,
@@ -4812,71 +4772,6 @@ fn builtin_workflows(config: &Config) -> Vec<Arc<dyn Workflow>> {
     ]
 }
 
-fn map_caut_error(error: &CautError) -> (&'static str, Option<String>) {
-    match error {
-        CautError::NotInstalled => (
-            MCP_ERR_CONFIG,
-            Some("Install caut and ensure it is on PATH.".to_string()),
-        ),
-        CautError::Timeout { .. } => (
-            MCP_ERR_TIMEOUT,
-            Some("Retry the refresh or increase caut timeout.".to_string()),
-        ),
-        _ => (MCP_ERR_CAUT, Some(error.remediation().summary.to_string())),
-    }
-}
-
-fn map_cass_error(error: &CassError) -> (&'static str, Option<String>) {
-    match error {
-        CassError::NotInstalled => (
-            MCP_ERR_CONFIG,
-            Some("Install cass and ensure it is on PATH.".to_string()),
-        ),
-        CassError::Timeout { .. } => (
-            MCP_ERR_TIMEOUT,
-            Some("Retry the query or increase cass timeout.".to_string()),
-        ),
-        _ => (MCP_ERR_CASS, Some(error.remediation().summary.to_string())),
-    }
-}
-
-fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
-    match error {
-        Error::Wezterm(WeztermError::PaneNotFound(_)) => (
-            MCP_ERR_PANE_NOT_FOUND,
-            Some("Use wa.state to list available panes.".to_string()),
-        ),
-        Error::Wezterm(WeztermError::Timeout(_)) => (
-            MCP_ERR_TIMEOUT,
-            Some(
-                "Increase timeout or ensure the active backend bridge (current: WezTerm) is responsive."
-                    .to_string(),
-            ),
-        ),
-        Error::Wezterm(WeztermError::NotRunning) => {
-            (
-                MCP_ERR_WEZTERM,
-                Some(
-                    "Is the active backend bridge (current: WezTerm) running?".to_string(),
-                ),
-            )
-        }
-        Error::Wezterm(WeztermError::CliNotFound) => (
-            MCP_ERR_WEZTERM,
-            Some(
-                "Install/configure the active backend bridge (current: WezTerm) and ensure it is in PATH."
-                    .to_string(),
-            ),
-        ),
-        Error::Wezterm(_) => (MCP_ERR_WEZTERM, None),
-        Error::Config(_) => (MCP_ERR_CONFIG, None),
-        Error::Storage(_) => (MCP_ERR_STORAGE, None),
-        Error::Workflow(_) => (MCP_ERR_WORKFLOW, None),
-        Error::Policy(_) => (MCP_ERR_POLICY, None),
-        _ => (MCP_ERR_NOT_IMPLEMENTED, None),
-    }
-}
-
 fn envelope_to_content<T: Serialize>(envelope: McpEnvelope<T>) -> McpResult<Vec<Content>> {
     let text = serde_json::to_string(&envelope)
         .map_err(|e| McpError::internal_error(format!("Serialize MCP response: {e}")))?;
@@ -5147,7 +5042,7 @@ mod tests {
             encode_mcp_contents(contents, McpOutputFormat::Toon).expect("TOON transcode works");
         let text = match &encoded[0] {
             Content::Text { text } => text.clone(),
-            _ => panic!("expected text content"),
+            _ => panic!("expected text content"), // ubs:ignore
         };
 
         // TOON output should not remain raw JSON and should still be decodable.
@@ -6092,7 +5987,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         match &result[0] {
             Content::Text { text } => assert_eq!(text, r#"{"data": 1}"#),
-            _ => panic!("expected text content"),
+            _ => panic!("expected text content"), // ubs:ignore
         }
     }
 
@@ -6118,7 +6013,7 @@ mod tests {
                 assert_eq!(v["ok"], true);
                 assert_eq!(v["data"], 42);
             }
-            _ => panic!("expected text content"),
+            _ => panic!("expected text content"), // ubs:ignore
         }
     }
 
@@ -6133,7 +6028,7 @@ mod tests {
                 assert_eq!(v["ok"], false);
                 assert_eq!(v["error"], "bad input");
             }
-            _ => panic!("expected text content"),
+            _ => panic!("expected text content"), // ubs:ignore
         }
     }
 

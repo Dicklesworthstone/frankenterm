@@ -150,7 +150,7 @@ fn rrf_fuse_with_frankensearch(
     let semantic = dedupe_ranked_hits(semantic);
     #[cfg(not(feature = "frankensearch"))]
     {
-        return rrf_fuse_weighted(&lexical, &semantic, k, 1.0, 1.0);
+        rrf_fuse_weighted(&lexical, &semantic, k, 1.0, 1.0)
     }
 
     #[cfg(feature = "frankensearch")]
