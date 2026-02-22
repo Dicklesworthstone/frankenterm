@@ -217,10 +217,15 @@ pub mod suffix_array;
 pub mod suggestions;
 pub mod survival;
 pub mod tailer;
+#[cfg(feature = "recorder-lexical")]
 pub mod tantivy_ingest;
+#[cfg(feature = "recorder-lexical")]
 pub mod tantivy_policy;
+#[cfg(feature = "recorder-lexical")]
 pub mod tantivy_quality;
+#[cfg(feature = "recorder-lexical")]
 pub mod tantivy_query;
+#[cfg(feature = "recorder-lexical")]
 pub mod tantivy_reindex;
 pub mod telemetry;
 pub mod test_artifacts;
