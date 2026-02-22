@@ -37,9 +37,7 @@ pub fn levenshtein(a: &[u8], b: &[u8]) -> usize {
         curr[0] = i;
         for j in 1..=n {
             let cost = if long[i - 1] == short[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -305,11 +303,7 @@ pub fn levenshtein_bounded(a: &[u8], b: &[u8], k: usize) -> Option<usize> {
         std::mem::swap(&mut prev, &mut curr);
     }
 
-    if prev[m] <= k {
-        Some(prev[m])
-    } else {
-        None
-    }
+    if prev[m] <= k { Some(prev[m]) } else { None }
 }
 
 /// Weighted edit distance with custom operation costs.
@@ -439,9 +433,7 @@ pub fn levenshtein_generic<T: PartialEq>(a: &[T], b: &[T]) -> usize {
         curr[0] = i;
         for j in 1..=n {
             let cost = if long[i - 1] == short[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -453,7 +445,11 @@ pub fn levenshtein_generic<T: PartialEq>(a: &[T], b: &[T]) -> usize {
 ///
 /// Returns a vector of (index, distance) pairs sorted by distance.
 #[must_use]
-pub fn nearest_neighbors(reference: &[u8], targets: &[&[u8]], max_results: usize) -> Vec<(usize, usize)> {
+pub fn nearest_neighbors(
+    reference: &[u8],
+    targets: &[&[u8]],
+    max_results: usize,
+) -> Vec<(usize, usize)> {
     let mut results: Vec<(usize, usize)> = targets
         .iter()
         .enumerate()
@@ -737,7 +733,10 @@ mod tests {
     #[test]
     fn script_insert() {
         let ops = edit_script(b"ac", b"abc");
-        let inserts = ops.iter().filter(|op| matches!(op, EditOp::Insert(_))).count();
+        let inserts = ops
+            .iter()
+            .filter(|op| matches!(op, EditOp::Insert(_)))
+            .count();
         assert_eq!(inserts, 1);
     }
 

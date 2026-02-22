@@ -261,11 +261,7 @@ impl<K: Eq + Hash + Clone> CooldownTracker<K> {
     #[must_use]
     pub fn stats(&self) -> CooldownStats {
         let now = Instant::now();
-        let active = self
-            .entries
-            .values()
-            .filter(|e| !e.is_expired(now))
-            .count();
+        let active = self.entries.values().filter(|e| !e.is_expired(now)).count();
         CooldownStats {
             tracked_entries: self.entries.len(),
             active_cooldowns: active,

@@ -2081,7 +2081,10 @@ mod tests {
             RecorderBackendKind::FrankenSqlite,
         );
         assert!(result.chain_intact);
-        assert_eq!(result.backend_kind, Some(RecorderBackendKind::FrankenSqlite));
+        assert_eq!(
+            result.backend_kind,
+            Some(RecorderBackendKind::FrankenSqlite)
+        );
         assert_eq!(result.total_entries, 5);
     }
 
@@ -2092,7 +2095,10 @@ mod tests {
         // Tamper: modify the second entry's body
         entries[1].justification = Some("tampered".to_string());
 
-        for backend in [RecorderBackendKind::AppendLog, RecorderBackendKind::FrankenSqlite] {
+        for backend in [
+            RecorderBackendKind::AppendLog,
+            RecorderBackendKind::FrankenSqlite,
+        ] {
             let result = AuditLog::verify_chain_for_backend(&entries, GENESIS_HASH, backend);
             assert!(
                 !result.chain_intact,
@@ -2108,7 +2114,10 @@ mod tests {
     #[test]
     fn audit_access_tier_enforcement_backend_agnostic() {
         // Access tier logic is independent of storage backend
-        for backend in [RecorderBackendKind::AppendLog, RecorderBackendKind::FrankenSqlite] {
+        for backend in [
+            RecorderBackendKind::AppendLog,
+            RecorderBackendKind::FrankenSqlite,
+        ] {
             assert!(
                 AccessTier::A3PrivilegedRaw.satisfies(AccessTier::A2FullQuery),
                 "A3 should satisfy A2 regardless of backend {:?}",
@@ -2133,7 +2142,10 @@ mod tests {
 
     #[test]
     fn audit_chain_empty_entries_both_backends() {
-        for backend in [RecorderBackendKind::AppendLog, RecorderBackendKind::FrankenSqlite] {
+        for backend in [
+            RecorderBackendKind::AppendLog,
+            RecorderBackendKind::FrankenSqlite,
+        ] {
             let result = AuditLog::verify_chain_for_backend(&[], GENESIS_HASH, backend);
             assert!(result.chain_intact);
             assert_eq!(result.total_entries, 0);

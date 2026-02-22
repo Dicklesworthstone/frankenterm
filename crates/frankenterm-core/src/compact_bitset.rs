@@ -354,10 +354,14 @@ impl CompactBitset {
     /// Iterate over indices of set bits in ascending order.
     pub fn iter_ones(&self) -> impl Iterator<Item = usize> + '_ {
         let cap = self.capacity;
-        self.words.iter().enumerate().flat_map(move |(wi, &word)| {
-            let base = wi * BITS_PER_WORD;
-            BitIter::new(word).map(move |bit| base + bit)
-        }).take_while(move |&idx| idx < cap)
+        self.words
+            .iter()
+            .enumerate()
+            .flat_map(move |(wi, &word)| {
+                let base = wi * BITS_PER_WORD;
+                BitIter::new(word).map(move |bit| base + bit)
+            })
+            .take_while(move |&idx| idx < cap)
     }
 
     /// Iterate over indices of clear bits in ascending order.

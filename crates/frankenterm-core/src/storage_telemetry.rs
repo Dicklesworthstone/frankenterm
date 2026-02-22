@@ -1593,7 +1593,10 @@ mod tests {
         let snap_fs = telem.snapshot_for_backend(RecorderBackendKind::FrankenSqlite);
 
         assert_eq!(snap_al.backend_kind, Some(RecorderBackendKind::AppendLog));
-        assert_eq!(snap_fs.backend_kind, Some(RecorderBackendKind::FrankenSqlite));
+        assert_eq!(
+            snap_fs.backend_kind,
+            Some(RecorderBackendKind::FrankenSqlite)
+        );
         assert_eq!(snap_al.total_events_appended, 10);
         assert_eq!(snap_fs.total_events_appended, 5);
     }

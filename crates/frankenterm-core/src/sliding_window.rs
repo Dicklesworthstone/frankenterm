@@ -440,7 +440,7 @@ mod tests {
     fn recent_count() {
         let mut w = SlidingWindow::new(1000, 10);
         // Record in different buckets (100ms each)
-        w.record(50);  // bucket 0
+        w.record(50); // bucket 0
         w.record(150); // bucket 1
         w.record(250); // bucket 2
         // Recent 1 bucket should have 1 event

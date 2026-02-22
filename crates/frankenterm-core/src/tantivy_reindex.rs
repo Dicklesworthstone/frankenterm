@@ -47,9 +47,7 @@ fn create_event_reader(
                 reindex_source = %source,
                 "creating append-log event reader for reindex"
             );
-            Ok(Box::new(AppendLogEventSource::from_path(
-                data_path.clone(),
-            )))
+            Ok(Box::new(AppendLogEventSource::from_path(data_path.clone())))
         }
         RecorderSourceDescriptor::FrankenSqlite { .. } => Err(IndexerError::Config(
             "frankensqlite event reader not yet implemented for reindex".to_string(),
@@ -567,9 +565,7 @@ impl<W: IndexWriter> ReindexPipeline<W> {
         // Indexing loop with observer callbacks
         let mut last_progress_ms = start_ms;
         loop {
-            let batch = cursor
-                .next_batch(batch_size)
-                .map_err(cursor_err)?;
+            let batch = cursor.next_batch(batch_size).map_err(cursor_err)?;
             if batch.is_empty() {
                 progress.caught_up = true;
                 break;
@@ -3569,7 +3565,11 @@ mod tests {
 
         // on_progress should have been called at least once per batch commit
         let calls = observer.progress_calls.lock().unwrap();
-        assert!(calls.len() >= 2, "expected >= 2 progress calls, got {}", calls.len());
+        assert!(
+            calls.len() >= 2,
+            "expected >= 2 progress calls, got {}",
+            calls.len()
+        );
     }
 
     #[tokio::test]

@@ -505,9 +505,7 @@ pub struct AppendLogEventSource {
 
 impl AppendLogEventSource {
     /// Create from an existing [`AppendLogRecorderStorage`].
-    pub fn from_storage(
-        storage: &crate::recorder_storage::AppendLogRecorderStorage,
-    ) -> Self {
+    pub fn from_storage(storage: &crate::recorder_storage::AppendLogRecorderStorage) -> Self {
         Self {
             data_path: storage.data_path().to_path_buf(),
         }
@@ -721,9 +719,7 @@ impl IndexerConfig {
                     indexer_source = %self.source,
                     "creating append-log event reader"
                 );
-                Ok(Box::new(AppendLogEventSource::from_path(
-                    data_path.clone(),
-                )))
+                Ok(Box::new(AppendLogEventSource::from_path(data_path.clone())))
             }
             crate::recorder_storage::RecorderSourceDescriptor::FrankenSqlite { db_path } => {
                 tracing::info!(
@@ -871,11 +867,8 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
                 // The checkpoint stores the offset of the last processed record,
                 // so we need to seek past it. We open at the checkpoint's byte
                 // offset and skip one record to get past it.
-                let mut r = AppendLogReader::open_at_offset(
-                    data_path,
-                    resume_byte,
-                    resume_ordinal,
-                )?;
+                let mut r =
+                    AppendLogReader::open_at_offset(data_path, resume_byte, resume_ordinal)?;
                 // Skip the checkpointed record itself
                 let _ = r.next_record()?;
                 r
@@ -989,11 +982,12 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
         // 2. Open cursor at resume point
         let mut cursor = match &checkpoint {
             Some(cp) => {
-                let mut c = reader
-                    .open_cursor(cp.upto_offset.clone())
-                    .map_err(|e| IndexerError::LogRead(LogReadError::Io(
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
-                    )))?;
+                let mut c = reader.open_cursor(cp.upto_offset.clone()).map_err(|e| {
+                    IndexerError::LogRead(LogReadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    )))
+                })?;
                 // Skip the checkpointed record itself
                 let _ = c.next_batch(1).map_err(|e| {
                     IndexerError::LogRead(LogReadError::Io(std::io::Error::new(
@@ -1063,8 +1057,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
 
                 if self.config.dedup_on_replay
                     && self.writer.delete_by_event_id(&doc.event_id).is_err()
-                {
-                }
+                {}
 
                 match self.writer.add_document(&doc) {
                     Ok(()) => result.events_indexed += 1,
@@ -3443,10 +3436,7 @@ mod tests {
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
-        let events = vec![
-            sample_event("e1", 1, 0, "a"),
-            sample_event("e2", 1, 1, "b"),
-        ];
+        let events = vec![sample_event("e1", 1, 0, "a"), sample_event("e2", 1, 1, "b")];
         populate_log(&storage, events).await;
 
         // Create source from path directly, not from storage reference

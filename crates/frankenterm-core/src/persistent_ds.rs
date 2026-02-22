@@ -570,10 +570,7 @@ fn map_insert<K: Clone + Eq + Hash, V: Clone>(
                 (MapNode::Leaf(hash, key, value), false)
             } else if *existing_hash == hash {
                 // Hash collision at this level
-                let entries = vec![
-                    (ek.clone(), ev.clone()),
-                    (key, value),
-                ];
+                let entries = vec![(ek.clone(), ev.clone()), (key, value)];
                 (MapNode::Collision(hash, entries), true)
             } else {
                 // Split into bitmap node
@@ -582,13 +579,7 @@ fn map_insert<K: Clone + Eq + Hash, V: Clone>(
                     children: Vec::new(),
                 };
                 // Re-insert existing leaf
-                let (n, _) = map_insert(
-                    &new_node,
-                    ek.clone(),
-                    ev.clone(),
-                    *existing_hash,
-                    shift,
-                );
+                let (n, _) = map_insert(&new_node, ek.clone(), ev.clone(), *existing_hash, shift);
                 // Insert new entry
                 map_insert(&n, key, value, hash, shift)
             }

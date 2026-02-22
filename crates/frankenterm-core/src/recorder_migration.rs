@@ -16,8 +16,8 @@ use tracing::{debug, warn};
 
 use crate::recorder_storage::{
     AppendRequest, CheckpointConsumerId, CursorRecord, DurabilityLevel, EventCursorError,
-    RecorderBackendKind, RecorderCheckpoint, RecorderEventReader, RecorderOffset,
-    RecorderStorage, RecorderStorageHealth,
+    RecorderBackendKind, RecorderCheckpoint, RecorderEventReader, RecorderOffset, RecorderStorage,
+    RecorderStorageHealth,
 };
 use crate::recording::{
     RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
@@ -181,30 +181,19 @@ fn fnv1a_feed(hash: u64, ordinal: u64) -> u64 {
 #[derive(Debug)]
 pub enum MigrationError {
     /// Source storage is degraded, cannot migrate.
-    SourceDegraded {
-        last_error: Option<String>,
-    },
+    SourceDegraded { last_error: Option<String> },
     /// Cursor/reader failure.
     CursorError(EventCursorError),
     /// Target storage rejected a write.
     TargetWriteError(String),
     /// Digest mismatch between export and import.
-    DigestMismatch {
-        expected: u64,
-        actual: u64,
-    },
+    DigestMismatch { expected: u64, actual: u64 },
     /// Event count mismatch between export and import.
-    CountMismatch {
-        expected: u64,
-        actual: u64,
-    },
+    CountMismatch { expected: u64, actual: u64 },
     /// Source storage error (lag_metrics, read_checkpoint, etc.).
     StorageError(String),
     /// Target checkpoint commit was rejected.
-    CheckpointCommitRejected {
-        consumer: String,
-        reason: String,
-    },
+    CheckpointCommitRejected { consumer: String, reason: String },
 }
 
 impl std::fmt::Display for MigrationError {
@@ -411,8 +400,7 @@ impl MigrationEngine {
         for chunk in records.chunks(self.config.import_batch_size) {
             let first_ord = chunk.first().map(|r| r.offset.ordinal).unwrap_or(0);
             let last_ord = chunk.last().map(|r| r.offset.ordinal).unwrap_or(0);
-            let batch_id =
-                format!("{}-{first_ord}-{last_ord}", self.config.consumer_id);
+            let batch_id = format!("{}-{first_ord}-{last_ord}", self.config.consumer_id);
 
             let events: Vec<_> = chunk.iter().map(|r| r.event.clone()).collect();
 
@@ -423,9 +411,10 @@ impl MigrationEngine {
                 producer_ts_ms: 0,
             };
 
-            target.append_batch(req).await.map_err(|e| {
-                MigrationError::TargetWriteError(e.to_string())
-            })?;
+            target
+                .append_batch(req)
+                .await
+                .map_err(|e| MigrationError::TargetWriteError(e.to_string()))?;
 
             // Compute digest over imported ordinals
             for record in chunk {
@@ -533,8 +522,7 @@ impl MigrationEngine {
 
             // Check if the checkpoint ordinal is within the migrated range
             let ordinal = checkpoint.upto_offset.ordinal;
-            let in_range = ordinal >= manifest.first_ordinal
-                && ordinal <= manifest.last_ordinal;
+            let in_range = ordinal >= manifest.first_ordinal && ordinal <= manifest.last_ordinal;
 
             let target_checkpoint = if in_range {
                 debug!(
@@ -728,8 +716,8 @@ mod tests {
         RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
         RecorderIngressKind, RecorderTextEncoding,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // -----------------------------------------------------------------------
     // Test helpers: mock reader + mock storage
@@ -1012,7 +1000,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("degraded"), "error should mention degraded: {msg}");
+        assert!(
+            msg.contains("degraded"),
+            "error should mention degraded: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1208,10 +1199,7 @@ mod tests {
             consumer_id: "test-migration".to_string(),
         });
 
-        let manifest = engine
-            .run_m0_m2(&source, &reader, &target)
-            .await
-            .unwrap();
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
         assert_eq!(manifest.event_count, 5);
         assert_eq!(manifest.first_ordinal, 0);
@@ -1384,10 +1372,7 @@ mod tests {
             ..Default::default()
         });
 
-        let manifest = engine
-            .run_m0_m2(&source, &reader, &target)
-            .await
-            .unwrap();
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
         assert_eq!(manifest.event_count, 3);
         assert_eq!(manifest.export_count, 3);
@@ -1404,10 +1389,7 @@ mod tests {
         let target = MockMigrationStorage::healthy();
         let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = engine
-            .run_m0_m2(&source, &reader, &target)
-            .await
-            .unwrap();
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
         assert_eq!(manifest.event_count, 0);
         assert_eq!(manifest.export_count, 0);
@@ -1664,7 +1646,10 @@ mod tests {
             ..Default::default()
         };
 
-        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+        let result = engine
+            .m3_checkpoint_sync(&source, &target, &manifest)
+            .await
+            .unwrap();
 
         assert_eq!(result.consumers_found, 2);
         assert_eq!(result.checkpoints_migrated, 2);
@@ -1688,7 +1673,10 @@ mod tests {
             ..Default::default()
         };
 
-        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+        let result = engine
+            .m3_checkpoint_sync(&source, &target, &manifest)
+            .await
+            .unwrap();
         assert_eq!(result.checkpoints_migrated, 1);
 
         let committed = target.committed.lock().unwrap();
@@ -1712,7 +1700,10 @@ mod tests {
             ..Default::default()
         };
 
-        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+        let result = engine
+            .m3_checkpoint_sync(&source, &target, &manifest)
+            .await
+            .unwrap();
         assert_eq!(result.checkpoints_reset, 1);
         assert_eq!(result.reset_consumers, vec!["stale"]);
 
@@ -1729,7 +1720,10 @@ mod tests {
 
         let manifest = MigrationManifest::default();
 
-        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+        let result = engine
+            .m3_checkpoint_sync(&source, &target, &manifest)
+            .await
+            .unwrap();
         assert_eq!(result.consumers_found, 0);
         assert_eq!(result.checkpoints_migrated, 0);
         assert_eq!(result.checkpoints_reset, 0);
@@ -1752,7 +1746,10 @@ mod tests {
             ..Default::default()
         };
 
-        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+        let result = engine
+            .m3_checkpoint_sync(&source, &target, &manifest)
+            .await
+            .unwrap();
         assert_eq!(result.checkpoints_migrated, 1);
         assert_eq!(result.checkpoints_reset, 0);
 
@@ -1762,10 +1759,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_m3_mixed_valid_and_stale_consumers() {
-        let consumers = vec![
-            make_consumer_lag("good", 2),
-            make_consumer_lag("stale", 0),
-        ];
+        let consumers = vec![make_consumer_lag("good", 2), make_consumer_lag("stale", 0)];
         let mut checkpoints = HashMap::new();
         checkpoints.insert("good".to_string(), make_checkpoint("good", 5));
         checkpoints.insert("stale".to_string(), make_checkpoint("stale", 100));
@@ -1780,7 +1774,10 @@ mod tests {
             ..Default::default()
         };
 
-        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+        let result = engine
+            .m3_checkpoint_sync(&source, &target, &manifest)
+            .await
+            .unwrap();
         assert_eq!(result.consumers_found, 2);
         assert_eq!(result.checkpoints_migrated, 2);
         assert_eq!(result.checkpoints_reset, 1);
@@ -1837,7 +1834,10 @@ mod tests {
             ..Default::default()
         };
 
-        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+        let result = engine
+            .m3_checkpoint_sync(&source, &target, &manifest)
+            .await
+            .unwrap();
         assert_eq!(result.consumers_found, 1);
         assert_eq!(result.checkpoints_migrated, 0);
         assert_eq!(result.checkpoints_reset, 0);
@@ -1993,9 +1993,6 @@ mod tests {
             .unwrap();
 
         let appended = target.appended.lock().unwrap();
-        assert_eq!(
-            appended[0].required_durability,
-            DurabilityLevel::Fsync,
-        );
+        assert_eq!(appended[0].required_durability, DurabilityLevel::Fsync,);
     }
 }

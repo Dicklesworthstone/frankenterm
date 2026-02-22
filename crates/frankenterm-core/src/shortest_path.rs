@@ -329,11 +329,7 @@ pub fn graph_diameter(g: &WeightedGraph) -> Option<f64> {
 ///
 /// Returns `(distance, path)` or `None` if unreachable.
 #[must_use]
-pub fn shortest_path(
-    g: &WeightedGraph,
-    source: usize,
-    target: usize,
-) -> Option<(f64, Vec<usize>)> {
+pub fn shortest_path(g: &WeightedGraph, source: usize, target: usize) -> Option<(f64, Vec<usize>)> {
     let result = dijkstra(g, source);
     let path = result.path_to(target)?;
     Some((result.distance_to(target), path))
@@ -407,7 +403,8 @@ pub fn k_shortest_paths(
             });
 
             // Exclude root path nodes (except spur_node)
-            let root_set: std::collections::HashSet<usize> = root_path[..i].iter().copied().collect();
+            let root_set: std::collections::HashSet<usize> =
+                root_path[..i].iter().copied().collect();
 
             while let Some(DijkstraEntry { node: u, dist: d }) = heap.pop() {
                 if d > dist[u] {

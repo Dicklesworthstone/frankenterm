@@ -964,7 +964,10 @@ pub enum EventCursorError {
     /// I/O or backend communication failure.
     Io(String),
     /// Data corruption or deserialization failure.
-    Corrupt { offset: RecorderOffset, reason: String },
+    Corrupt {
+        offset: RecorderOffset,
+        reason: String,
+    },
     /// Backend is unavailable or shutting down.
     Unavailable(String),
 }

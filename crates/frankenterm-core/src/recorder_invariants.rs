@@ -1727,7 +1727,10 @@ mod tests {
         let checker = InvariantChecker::new();
         let report = checker.check_for_backend(&events, RecorderBackendKind::FrankenSqlite);
         assert!(report.passed);
-        assert_eq!(report.backend_kind, Some(RecorderBackendKind::FrankenSqlite));
+        assert_eq!(
+            report.backend_kind,
+            Some(RecorderBackendKind::FrankenSqlite)
+        );
     }
 
     #[test]
@@ -1748,7 +1751,10 @@ mod tests {
         assert_eq!(report_al.passed, report_fs.passed);
         // Backend tag differs
         assert_eq!(report_al.backend_kind, Some(RecorderBackendKind::AppendLog));
-        assert_eq!(report_fs.backend_kind, Some(RecorderBackendKind::FrankenSqlite));
+        assert_eq!(
+            report_fs.backend_kind,
+            Some(RecorderBackendKind::FrankenSqlite)
+        );
     }
 
     #[test]
@@ -1795,7 +1801,10 @@ mod tests {
         ];
         let checker = InvariantChecker::new();
 
-        for backend in [RecorderBackendKind::AppendLog, RecorderBackendKind::FrankenSqlite] {
+        for backend in [
+            RecorderBackendKind::AppendLog,
+            RecorderBackendKind::FrankenSqlite,
+        ] {
             let report = checker.check_for_backend(&events, backend);
             assert!(!report.passed);
             assert!(
@@ -1814,7 +1823,10 @@ mod tests {
         ];
         let checker = InvariantChecker::new();
 
-        for backend in [RecorderBackendKind::AppendLog, RecorderBackendKind::FrankenSqlite] {
+        for backend in [
+            RecorderBackendKind::AppendLog,
+            RecorderBackendKind::FrankenSqlite,
+        ] {
             let report = checker.check_for_backend(&events, backend);
             assert!(report.count_by_kind(ViolationKind::DuplicateEventId) > 0);
             assert_eq!(report.backend_kind, Some(backend));
@@ -1844,7 +1856,10 @@ mod tests {
     fn empty_events_passes_both_backends() {
         let checker = InvariantChecker::new();
 
-        for backend in [RecorderBackendKind::AppendLog, RecorderBackendKind::FrankenSqlite] {
+        for backend in [
+            RecorderBackendKind::AppendLog,
+            RecorderBackendKind::FrankenSqlite,
+        ] {
             let report = checker.check_for_backend(&[], backend);
             assert!(report.passed);
             assert_eq!(report.events_checked, 0);
