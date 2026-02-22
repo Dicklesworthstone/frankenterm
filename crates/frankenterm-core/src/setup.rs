@@ -703,6 +703,8 @@ fn lua_escape(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('\'', "\\'")
         .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\0', "\\0")
 }
 
 // =============================================================================
@@ -795,7 +797,16 @@ fn find_return_line_start(content: &str) -> Option<usize> {
         if trimmed == "return" || trimmed.starts_with("return ") {
             last_match = Some(offset);
         }
-        offset = offset.saturating_add(line.len() + 1);
+        // Determine actual line separator length (CRLF vs LF)
+        let after_line = offset + line.len();
+        let sep_len = if content[after_line..].starts_with("\r\n") {
+            2
+        } else if content[after_line..].starts_with('\n') {
+            1
+        } else {
+            0 // last line, no separator
+        };
+        offset = after_line + sep_len;
     }
 
     last_match

@@ -528,7 +528,11 @@ fn format_transcript(
         if let Some(text) = &event.text {
             // Truncate long lines for readability.
             if text.len() > 200 {
-                write!(output, "{}...", &text[..197])
+                let end = (0..=197)
+                    .rev()
+                    .find(|&i| text.is_char_boundary(i))
+                    .unwrap_or(0);
+                write!(output, "{}...", &text[..end])
                     .map_err(|e| ExportError::FormatError(e.to_string()))?;
             } else {
                 output.push_str(text);

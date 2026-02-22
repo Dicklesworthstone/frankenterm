@@ -962,14 +962,15 @@ fn mask_text(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-    let len = text.len();
-    if len <= 8 {
-        "*".repeat(len)
+    let chars: Vec<char> = text.chars().collect();
+    let char_count = chars.len();
+    if char_count <= 8 {
+        "*".repeat(char_count)
     } else {
         // Show first 2 and last 2 characters, mask the rest.
-        let first = &text[..2];
-        let last = &text[text.len() - 2..];
-        format!("{}{}{}", first, "*".repeat(len - 4), last)
+        let first: String = chars[..2].iter().collect();
+        let last: String = chars[char_count - 2..].iter().collect();
+        format!("{}{}{}", first, "*".repeat(char_count - 4), last)
     }
 }
 

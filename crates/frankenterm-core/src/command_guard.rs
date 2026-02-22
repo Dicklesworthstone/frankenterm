@@ -925,7 +925,11 @@ impl CommandGuard {
         let entry = AuditEntry {
             pane_id,
             command: if command.len() > 256 {
-                format!("{}...", &command[..253])
+                let end = (0..=253)
+                    .rev()
+                    .find(|&i| command.is_char_boundary(i))
+                    .unwrap_or(0);
+                format!("{}...", &command[..end])
             } else {
                 command.to_string()
             },

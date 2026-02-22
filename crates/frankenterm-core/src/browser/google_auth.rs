@@ -321,7 +321,11 @@ impl GoogleAuthFlow {
         email: Option<&str>,
         artifacts_dir: Option<&Path>,
     ) -> String {
-        let profile_dir_str = profile_dir.display();
+        let profile_dir_str = profile_dir
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'");
         let timeout = self.config.flow_timeout_ms;
 
         let sel = &self.config.selectors;

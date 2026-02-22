@@ -551,7 +551,11 @@ impl OpenAiDeviceAuthFlow {
         email: Option<&str>,
         artifacts_dir: Option<&Path>,
     ) -> String {
-        let profile_dir_str = profile_dir.display();
+        let profile_dir_str = profile_dir
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'");
         let device_url = &self.config.device_url;
         let timeout = self.config.flow_timeout_ms;
         let headless = serde_json::to_string(&false).unwrap(); // always visible for device auth
