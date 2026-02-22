@@ -225,16 +225,18 @@ pub fn betweenness_centrality(graph: &impl GraphView) -> BetweennessResult {
 
         while let Some(v) = queue.pop_front() {
             stack.push(v);
-            let d_v = dist[&v];
+            let d_v = *dist.get(&v).unwrap_or(&0);
             for w in graph.successors(v) {
+                let d_w = *dist.get(&w).unwrap_or(&-1);
                 // First visit?
-                if dist[&w] < 0 {
+                if d_w < 0 {
                     dist.insert(w, d_v + 1);
                     queue.push_back(w);
                 }
                 // Shortest path through v?
-                if dist[&w] == d_v + 1 {
-                    *sigma.get_mut(&w).unwrap() += sigma[&v];
+                if *dist.get(&w).unwrap_or(&-1) == d_v + 1 {
+                    let sigma_v = *sigma.get(&v).unwrap_or(&0.0);
+                    *sigma.entry(w).or_insert(0.0) += sigma_v;
                     predecessors_map.entry(w).or_default().push(v);
                 }
             }
@@ -244,13 +246,17 @@ pub fn betweenness_centrality(graph: &impl GraphView) -> BetweennessResult {
         let mut delta: HashMap<usize, f64> = nodes.iter().map(|&node| (node, 0.0)).collect();
         while let Some(w) = stack.pop() {
             if let Some(preds) = predecessors_map.get(&w) {
+                let sigma_w = *sigma.get(&w).unwrap_or(&1.0); // avoid division by zero
+                let delta_w = *delta.get(&w).unwrap_or(&0.0);
                 for &v in preds {
-                    let d = (sigma[&v] / sigma[&w]) * (1.0 + delta[&w]);
-                    *delta.get_mut(&v).unwrap() += d;
+                    let sigma_v = *sigma.get(&v).unwrap_or(&0.0);
+                    let d = (sigma_v / sigma_w) * (1.0 + delta_w);
+                    *delta.entry(v).or_insert(0.0) += d;
                 }
             }
             if w != source {
-                *centrality.get_mut(&w).unwrap() += delta[&w];
+                let delta_w = *delta.get(&w).unwrap_or(&0.0);
+                *centrality.entry(w).or_insert(0.0) += delta_w;
             }
         }
     }
