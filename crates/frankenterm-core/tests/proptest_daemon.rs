@@ -1,3 +1,5 @@
+#![cfg(feature = "semantic-search")]
+
 //! Property-based tests for search daemon protocol, worker, and client.
 //!
 //! Bead: ft-3i6bf

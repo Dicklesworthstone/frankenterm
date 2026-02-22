@@ -1,3 +1,5 @@
+#![cfg(feature = "recorder-lexical")]
+
 //! Property-based tests for the `tantivy_policy` module.
 //!
 //! Covers `LoadRegime` classify + serde, `MergeStrategy` serde,

@@ -1,3 +1,5 @@
+#![cfg(feature = "recorder-lexical")]
+
 //! Property-based tests for the tantivy search pipeline.
 //!
 //! Bead: wa-4t7x

@@ -1,3 +1,5 @@
+#![cfg(feature = "recorder-lexical")]
+
 //! Property-based tests for the `tantivy_ingest` module.
 //!
 //! Covers `IndexDocumentFields` serde roundtrips — the canonical flat

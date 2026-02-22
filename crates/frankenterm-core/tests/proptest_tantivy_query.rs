@@ -1,3 +1,5 @@
+#![cfg(feature = "recorder-lexical")]
+
 //! Property-based tests for tantivy_query module.
 //!
 //! Verifies invariants for:

@@ -1,3 +1,5 @@
+#![cfg(feature = "recorder-lexical")]
+
 //! Property-based tests for the `tantivy_quality` module.
 //!
 //! Covers `QueryClass` enum serde, `LatencyBudget` serde,
