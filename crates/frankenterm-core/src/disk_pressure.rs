@@ -283,13 +283,19 @@ impl PidController {
     pub fn update(&mut self, error: f64, dt_secs: f64) -> f64 {
         let dt_secs = dt_secs.max(f64::EPSILON);
 
-        self.integral = (self.integral + error * dt_secs).clamp(self.integral_min, self.integral_max);
+        self.integral =
+            (self.integral + error * dt_secs).clamp(self.integral_min, self.integral_max);
 
-        self.last_derivative = self.previous_error.map_or(0.0, |prev| (error - prev) / dt_secs);
+        self.last_derivative = self
+            .previous_error
+            .map_or(0.0, |prev| (error - prev) / dt_secs);
         self.previous_error = Some(error);
 
-        self.kp
-            .mul_add(error, self.ki.mul_add(self.integral, self.kd * self.last_derivative))
+        self.kp.mul_add(
+            error,
+            self.ki
+                .mul_add(self.integral, self.kd * self.last_derivative),
+        )
     }
 
     /// Reset controller state.
@@ -437,16 +443,14 @@ impl DiskPressureMonitor {
     /// Diagnostic snapshot of the current state.
     #[must_use]
     pub fn snapshot(&self) -> PressureSnapshot {
-        let (available_bytes, total_bytes, usage_fraction) = self.last_sample.map_or(
-            (0, 0, 0.0),
-            |sample| {
+        let (available_bytes, total_bytes, usage_fraction) =
+            self.last_sample.map_or((0, 0, 0.0), |sample| {
                 (
                     sample.available_bytes,
                     sample.total_bytes,
                     sample.usage_fraction,
                 )
-            },
-        );
+            });
 
         PressureSnapshot {
             tier: self.current_tier(),
@@ -547,7 +551,7 @@ fn parse_df_data_line(line: &str) -> Option<(u64, u64)> {
 mod tests {
     use super::{
         DiskPressureConfig, DiskPressureMonitor, DiskPressureTier, EwmaEstimator, PidController,
-        PressureThresholds, classify_tier, parse_df_data_line,
+        PressureThresholds, classify_tier, parse_df_data_line, parse_df_output_kib,
     };
 
     #[test]
@@ -635,5 +639,274 @@ mod tests {
         let snapshot = monitor.snapshot();
         assert_eq!(snapshot.tier, tier);
         assert_eq!(snapshot.update_count, 1);
+    }
+
+    #[test]
+    fn ewma_alpha_zero_holds_first_sample() {
+        let mut ewma = EwmaEstimator::new(0.0);
+        assert!((ewma.update(0.3) - 0.3).abs() < 1e-9);
+        assert!((ewma.update(0.9) - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ewma_alpha_one_tracks_latest_sample() {
+        let mut ewma = EwmaEstimator::new(1.0);
+        assert!((ewma.update(0.1) - 0.1).abs() < 1e-9);
+        assert!((ewma.update(0.9) - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ewma_clamps_samples_to_unit_interval() {
+        let mut ewma = EwmaEstimator::new(0.5);
+        assert!((ewma.update(-5.0) - 0.0).abs() < 1e-9);
+        assert!((ewma.update(5.0) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ewma_is_monotone_for_monotone_input() {
+        let mut ewma = EwmaEstimator::new(0.4);
+        let mut prev = ewma.update(0.1);
+        for sample in [0.2, 0.3, 0.4, 0.8, 1.0] {
+            let current = ewma.update(sample);
+            assert!(current >= prev);
+            prev = current;
+        }
+    }
+
+    #[test]
+    fn ewma_converges_to_constant_signal() {
+        let mut ewma = EwmaEstimator::new(0.2);
+        let _ = ewma.update(0.0);
+        for _ in 0..60 {
+            let _ = ewma.update(1.0);
+        }
+        assert!(ewma.current() > 0.99);
+    }
+
+    #[test]
+    fn pid_zero_error_has_zero_output() {
+        let mut pid = PidController::new(1.0, 1.0, 1.0, -1.0, 1.0);
+        let output = pid.update(0.0, 1.0);
+        assert!(output.abs() < 1e-9);
+    }
+
+    #[test]
+    fn pid_proportional_only_matches_kp_times_error() {
+        let mut pid = PidController::new(2.0, 0.0, 0.0, -1.0, 1.0);
+        let output = pid.update(0.25, 1.0);
+        assert!((output - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pid_integral_accumulates_over_dt() {
+        let mut pid = PidController::new(0.0, 1.0, 0.0, -10.0, 10.0);
+        let output = pid.update(0.5, 2.0);
+        assert!((pid.integral() - 1.0).abs() < 1e-9);
+        assert!((output - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pid_derivative_responds_to_error_change() {
+        let mut pid = PidController::new(0.0, 0.0, 1.0, -10.0, 10.0);
+        let _ = pid.update(0.0, 1.0);
+        let output = pid.update(1.0, 0.5);
+        assert!((output - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pid_first_update_derivative_is_zero() {
+        let mut pid = PidController::new(0.0, 0.0, 1.0, -10.0, 10.0);
+        let output = pid.update(10.0, 1.0);
+        assert!(output.abs() < 1e-9);
+        assert!(pid.derivative().abs() < 1e-9);
+    }
+
+    #[test]
+    fn pid_lower_integral_clamp_is_enforced() {
+        let mut pid = PidController::new(0.0, 1.0, 0.0, -0.2, 0.2);
+        for _ in 0..20 {
+            let _ = pid.update(-1.0, 1.0);
+        }
+        assert!((pid.integral() + 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pid_swaps_inverted_integral_bounds() {
+        let mut pid = PidController::new(0.0, 1.0, 0.0, 2.0, -2.0);
+        for _ in 0..20 {
+            let _ = pid.update(1.0, 1.0);
+        }
+        assert!(pid.integral() <= 2.0);
+        assert!(pid.integral() >= -2.0);
+    }
+
+    #[test]
+    fn pid_zero_dt_is_still_finite() {
+        let mut pid = PidController::new(0.1, 0.1, 0.1, -1.0, 1.0);
+        let _ = pid.update(0.0, 1.0);
+        let output = pid.update(1.0, 0.0);
+        assert!(output.is_finite());
+    }
+
+    #[test]
+    fn classify_boundaries_are_inclusive() {
+        let thresholds = PressureThresholds::default();
+        assert_eq!(
+            classify_tier(thresholds.yellow, thresholds),
+            DiskPressureTier::Yellow
+        );
+        assert_eq!(
+            classify_tier(thresholds.red, thresholds),
+            DiskPressureTier::Red
+        );
+        assert_eq!(
+            classify_tier(thresholds.black, thresholds),
+            DiskPressureTier::Black
+        );
+    }
+
+    #[test]
+    fn classify_below_yellow_is_green() {
+        let thresholds = PressureThresholds::default();
+        assert_eq!(
+            classify_tier(thresholds.yellow - 0.0001, thresholds),
+            DiskPressureTier::Green
+        );
+    }
+
+    #[test]
+    fn classify_clamps_extreme_usage_values() {
+        let thresholds = PressureThresholds::default();
+        assert_eq!(classify_tier(-100.0, thresholds), DiskPressureTier::Green);
+        assert_eq!(classify_tier(100.0, thresholds), DiskPressureTier::Black);
+    }
+
+    #[test]
+    fn parse_df_line_rejects_missing_percent_column() {
+        let line = "/dev/disk3s1 100000 70000 30000 mounted_at_root";
+        assert!(parse_df_data_line(line).is_none());
+    }
+
+    #[test]
+    fn parse_df_line_rejects_too_few_columns() {
+        let line = "/dev/disk3s1 100000 70%";
+        assert!(parse_df_data_line(line).is_none());
+    }
+
+    #[test]
+    fn parse_df_output_uses_last_valid_line() {
+        let output = "Filesystem 512-blocks Used Available Capacity Mounted on\n\
+/dev/disk0s2 100 40 60 40% /\n\
+/dev/disk0s3 200 180 20 90% /data\n";
+        let parsed = parse_df_output_kib(output).expect("expected parse success");
+        assert_eq!(parsed.1, 200 * 1024);
+        assert_eq!(parsed.0, 20 * 1024);
+    }
+
+    #[test]
+    fn parse_df_output_ignores_blank_lines() {
+        let output = "Filesystem 512-blocks Used Available Capacity Mounted on\n\n\
+/dev/disk0s2 100 40 60 40% /\n\n";
+        let parsed = parse_df_output_kib(output).expect("expected parse success");
+        assert_eq!(parsed.1, 100 * 1024);
+        assert_eq!(parsed.0, 60 * 1024);
+    }
+
+    #[test]
+    fn parse_df_output_without_data_returns_none() {
+        let output = "Filesystem 512-blocks Used Available Capacity Mounted on\n";
+        assert!(parse_df_output_kib(output).is_none());
+    }
+
+    #[test]
+    fn monitor_initial_state_is_green_with_zero_updates() {
+        let monitor = DiskPressureMonitor::new(DiskPressureConfig::default());
+        assert_eq!(monitor.current_tier(), DiskPressureTier::Green);
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot.tier, DiskPressureTier::Green);
+        assert_eq!(snapshot.update_count, 0);
+    }
+
+    #[test]
+    fn monitor_tier_handle_matches_current_tier() {
+        let mut monitor = DiskPressureMonitor::new(DiskPressureConfig {
+            target_usage_fraction: 0.0,
+            thresholds: PressureThresholds {
+                yellow: 0.0,
+                red: 0.0,
+                black: 0.0,
+            },
+            ..DiskPressureConfig::default()
+        });
+        let tier_handle = monitor.tier_handle();
+        let tier = monitor.update();
+        assert_eq!(
+            tier_handle.load(std::sync::atomic::Ordering::Relaxed),
+            tier.as_u8() as u64
+        );
+    }
+
+    #[test]
+    fn monitor_disabled_does_not_advance_state() {
+        let mut monitor = DiskPressureMonitor::new(DiskPressureConfig {
+            enabled: false,
+            ..DiskPressureConfig::default()
+        });
+        let tier = monitor.update();
+        assert_eq!(tier, DiskPressureTier::Green);
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot.update_count, 0);
+    }
+
+    #[test]
+    fn monitor_sample_returns_consistent_ranges() {
+        let monitor = DiskPressureMonitor::new(DiskPressureConfig::default());
+        let sample = monitor.sample();
+        assert!(sample.usage_fraction.is_finite());
+        assert!(sample.usage_fraction >= 0.0);
+        assert!(sample.usage_fraction <= 1.0);
+        assert!(sample.total_bytes >= sample.available_bytes);
+    }
+
+    #[test]
+    fn monitor_update_count_increments_per_call() {
+        let mut monitor = DiskPressureMonitor::new(DiskPressureConfig::default());
+        let _ = monitor.update();
+        let _ = monitor.update();
+        assert_eq!(monitor.snapshot().update_count, 2);
+    }
+
+    #[test]
+    fn monitor_snapshot_numeric_fields_are_finite() {
+        let mut monitor = DiskPressureMonitor::new(DiskPressureConfig::default());
+        let _ = monitor.update();
+        let snapshot = monitor.snapshot();
+        assert!(snapshot.usage_fraction.is_finite());
+        assert!(snapshot.smoothed_usage_fraction.is_finite());
+        assert!(snapshot.pid_error.is_finite());
+        assert!(snapshot.pid_output.is_finite());
+        assert!(snapshot.effective_usage_fraction.is_finite());
+    }
+
+    #[test]
+    fn monitor_snapshot_timestamp_is_nonzero() {
+        let monitor = DiskPressureMonitor::new(DiskPressureConfig::default());
+        assert!(monitor.snapshot().timestamp_epoch_ms > 0);
+    }
+
+    #[test]
+    fn tier_serde_roundtrip() {
+        let tier = DiskPressureTier::Red;
+        let json = serde_json::to_string(&tier).expect("serialize tier");
+        let parsed: DiskPressureTier = serde_json::from_str(&json).expect("deserialize tier");
+        assert_eq!(parsed, DiskPressureTier::Red);
+    }
+
+    #[test]
+    fn tier_display_strings_match_expected() {
+        assert_eq!(DiskPressureTier::Green.to_string(), "GREEN");
+        assert_eq!(DiskPressureTier::Yellow.to_string(), "YELLOW");
+        assert_eq!(DiskPressureTier::Red.to_string(), "RED");
+        assert_eq!(DiskPressureTier::Black.to_string(), "BLACK");
     }
 }

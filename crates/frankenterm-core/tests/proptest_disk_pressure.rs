@@ -46,12 +46,7 @@ fn arb_usage_fraction() -> impl Strategy<Value = f64> {
 }
 
 fn arb_alpha() -> impl Strategy<Value = f64> {
-    prop_oneof![
-        Just(0.0f64),
-        Just(0.5f64),
-        Just(1.0f64),
-        0.0f64..=1.0,
-    ]
+    prop_oneof![Just(0.0f64), Just(0.5f64), Just(1.0f64), 0.0f64..=1.0,]
 }
 
 fn arb_pid_gains() -> impl Strategy<Value = (f64, f64, f64, f64, f64)> {
