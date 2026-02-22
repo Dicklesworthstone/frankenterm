@@ -4,7 +4,7 @@
 //! - **M0 Preflight**: health check, manifest capture, quiesce source
 //! - **M1 Export**: stream all events from source, compute digest
 //! - **M2 Import**: write events to target, verify digest match
-//! - **M3 Checkpoint sync**: (future bead)
+//! - **M3 Checkpoint sync**: migrate consumer checkpoints with monotonicity
 //! - **M4 Reserved**: (future bead)
 //! - **M5 Cutover**: (future bead)
 
@@ -12,9 +12,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{error, info};
 
+use tracing::{debug, warn};
+
 use crate::recorder_storage::{
-    AppendRequest, CursorRecord, DurabilityLevel, EventCursorError, RecorderEventReader,
-    RecorderOffset, RecorderStorage, RecorderStorageHealth,
+    AppendRequest, CheckpointConsumerId, CursorRecord, DurabilityLevel, EventCursorError,
+    RecorderCheckpoint, RecorderEventReader, RecorderOffset, RecorderStorage,
+    RecorderStorageHealth,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,6 +118,23 @@ pub struct MigrationCheckpoint {
 }
 
 // ---------------------------------------------------------------------------
+// M3 checkpoint sync result
+// ---------------------------------------------------------------------------
+
+/// Result of M3 checkpoint synchronization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointSyncResult {
+    /// Number of consumers discovered in source.
+    pub consumers_found: usize,
+    /// Number of checkpoints successfully migrated.
+    pub checkpoints_migrated: usize,
+    /// Number of checkpoints reset due to ordinal gaps.
+    pub checkpoints_reset: usize,
+    /// Consumer IDs that were reset.
+    pub reset_consumers: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // FNV-1a digest helpers
 // ---------------------------------------------------------------------------
 
@@ -157,6 +177,13 @@ pub enum MigrationError {
         expected: u64,
         actual: u64,
     },
+    /// Source storage error (lag_metrics, read_checkpoint, etc.).
+    StorageError(String),
+    /// Target checkpoint commit was rejected.
+    CheckpointCommitRejected {
+        consumer: String,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for MigrationError {
@@ -175,6 +202,13 @@ impl std::fmt::Display for MigrationError {
             }
             Self::CountMismatch { expected, actual } => {
                 write!(f, "count mismatch: expected={expected}, actual={actual}")
+            }
+            Self::StorageError(e) => write!(f, "storage error: {e}"),
+            Self::CheckpointCommitRejected { consumer, reason } => {
+                write!(
+                    f,
+                    "checkpoint commit rejected for consumer {consumer}: {reason}"
+                )
             }
         }
     }
@@ -420,6 +454,128 @@ impl MigrationEngine {
         );
 
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // M3 — Checkpoint synchronization
+    // -----------------------------------------------------------------------
+
+    /// Execute M3 checkpoint sync: migrate consumer checkpoints from source to target.
+    ///
+    /// For each consumer discovered via `lag_metrics()`:
+    /// 1. Read their checkpoint from source
+    /// 2. Verify the checkpoint ordinal falls within the manifest's ordinal range
+    /// 3. Commit the checkpoint to target
+    /// 4. On ordinal gap, reset to first_ordinal (safe replay point)
+    pub async fn m3_checkpoint_sync<S: RecorderStorage, T: RecorderStorage>(
+        &self,
+        source: &S,
+        target: &T,
+        manifest: &MigrationManifest,
+    ) -> Result<CheckpointSyncResult, MigrationError> {
+        // Discover consumers from source lag metrics
+        let lag = source
+            .lag_metrics()
+            .await
+            .map_err(|e| MigrationError::StorageError(e.to_string()))?;
+
+        let consumer_ids: Vec<CheckpointConsumerId> =
+            lag.consumers.iter().map(|c| c.consumer.clone()).collect();
+
+        info!(
+            migration_stage = "M3",
+            consumers = consumer_ids.len(),
+            "checkpoint sync starting"
+        );
+
+        let mut result = CheckpointSyncResult {
+            consumers_found: consumer_ids.len(),
+            checkpoints_migrated: 0,
+            checkpoints_reset: 0,
+            reset_consumers: Vec::new(),
+        };
+
+        if consumer_ids.is_empty() {
+            return Ok(result);
+        }
+
+        for consumer_id in &consumer_ids {
+            let checkpoint_opt = source
+                .read_checkpoint(consumer_id)
+                .await
+                .map_err(|e| MigrationError::StorageError(e.to_string()))?;
+
+            let checkpoint = match checkpoint_opt {
+                Some(cp) => cp,
+                None => continue,
+            };
+
+            // Check if the checkpoint ordinal is within the migrated range
+            let ordinal = checkpoint.upto_offset.ordinal;
+            let in_range = ordinal >= manifest.first_ordinal
+                && ordinal <= manifest.last_ordinal;
+
+            let target_checkpoint = if in_range {
+                debug!(
+                    checkpoint_migrated = true,
+                    consumer = %consumer_id.0,
+                    ordinal = ordinal,
+                    "migrating checkpoint as-is"
+                );
+                checkpoint
+            } else {
+                // Ordinal gap — reset to safe replay point
+                warn!(
+                    checkpoint_reset = true,
+                    consumer = %consumer_id.0,
+                    original_ordinal = ordinal,
+                    reset_ordinal = manifest.first_ordinal,
+                    reason = "ordinal_gap",
+                    "resetting checkpoint to safe replay point"
+                );
+                result.checkpoints_reset += 1;
+                result.reset_consumers.push(consumer_id.0.clone());
+
+                RecorderCheckpoint {
+                    consumer: consumer_id.clone(),
+                    upto_offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 0,
+                        ordinal: manifest.first_ordinal,
+                    },
+                    schema_version: checkpoint.schema_version,
+                    committed_at_ms: checkpoint.committed_at_ms,
+                }
+            };
+
+            let outcome = target
+                .commit_checkpoint(target_checkpoint)
+                .await
+                .map_err(|e| MigrationError::StorageError(e.to_string()))?;
+
+            use crate::recorder_storage::CheckpointCommitOutcome;
+            match outcome {
+                CheckpointCommitOutcome::Advanced
+                | CheckpointCommitOutcome::NoopAlreadyAdvanced => {
+                    result.checkpoints_migrated += 1;
+                }
+                CheckpointCommitOutcome::RejectedOutOfOrder => {
+                    return Err(MigrationError::CheckpointCommitRejected {
+                        consumer: consumer_id.0.clone(),
+                        reason: "rejected out of order".to_string(),
+                    });
+                }
+            }
+        }
+
+        info!(
+            migration_stage = "M3",
+            migrated = result.checkpoints_migrated,
+            reset = result.checkpoints_reset,
+            "checkpoint sync complete"
+        );
+
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -1243,5 +1399,362 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("count mismatch"), "msg: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // M3 mock storage with checkpoint support
+    // -----------------------------------------------------------------------
+
+    use crate::recorder_storage::RecorderConsumerLag;
+
+    /// Mock storage with configurable checkpoints and lag consumers.
+    struct MockCheckpointStorage {
+        health: RecorderStorageHealth,
+        checkpoints: Mutex<HashMap<String, RecorderCheckpoint>>,
+        consumers: Vec<RecorderConsumerLag>,
+        committed: Mutex<Vec<RecorderCheckpoint>>,
+        reject_commit: AtomicBool,
+    }
+
+    impl MockCheckpointStorage {
+        fn new(
+            consumers: Vec<RecorderConsumerLag>,
+            checkpoints: HashMap<String, RecorderCheckpoint>,
+        ) -> Self {
+            Self {
+                health: RecorderStorageHealth {
+                    backend: RecorderBackendKind::AppendLog,
+                    degraded: false,
+                    queue_depth: 0,
+                    queue_capacity: 100,
+                    latest_offset: None,
+                    last_error: None,
+                },
+                checkpoints: Mutex::new(checkpoints),
+                consumers,
+                committed: Mutex::new(Vec::new()),
+                reject_commit: AtomicBool::new(false),
+            }
+        }
+
+        fn empty_target() -> Self {
+            Self::new(vec![], HashMap::new())
+        }
+    }
+
+    impl RecorderStorage for MockCheckpointStorage {
+        fn backend_kind(&self) -> RecorderBackendKind {
+            self.health.backend
+        }
+
+        async fn append_batch(
+            &self,
+            _req: AppendRequest,
+        ) -> std::result::Result<AppendResponse, RecorderStorageError> {
+            Ok(AppendResponse {
+                backend: self.health.backend,
+                accepted_count: 0,
+                first_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 0,
+                },
+                last_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 0,
+                },
+                committed_durability: DurabilityLevel::Appended,
+                committed_at_ms: 0,
+            })
+        }
+
+        async fn flush(
+            &self,
+            _mode: FlushMode,
+        ) -> std::result::Result<FlushStats, RecorderStorageError> {
+            Ok(FlushStats {
+                backend: self.health.backend,
+                flushed_at_ms: 0,
+                latest_offset: None,
+            })
+        }
+
+        async fn read_checkpoint(
+            &self,
+            consumer: &CheckpointConsumerId,
+        ) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError> {
+            Ok(self.checkpoints.lock().unwrap().get(&consumer.0).cloned())
+        }
+
+        async fn commit_checkpoint(
+            &self,
+            checkpoint: RecorderCheckpoint,
+        ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+            if self.reject_commit.load(Ordering::Relaxed) {
+                return Ok(CheckpointCommitOutcome::RejectedOutOfOrder);
+            }
+            self.committed.lock().unwrap().push(checkpoint);
+            Ok(CheckpointCommitOutcome::Advanced)
+        }
+
+        async fn health(&self) -> RecorderStorageHealth {
+            self.health.clone()
+        }
+
+        async fn lag_metrics(
+            &self,
+        ) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
+            Ok(RecorderStorageLag {
+                latest_offset: None,
+                consumers: self.consumers.clone(),
+            })
+        }
+    }
+
+    fn make_checkpoint(consumer: &str, ordinal: u64) -> RecorderCheckpoint {
+        RecorderCheckpoint {
+            consumer: CheckpointConsumerId(consumer.to_string()),
+            upto_offset: RecorderOffset {
+                segment_id: 0,
+                byte_offset: ordinal * 100,
+                ordinal,
+            },
+            schema_version: "ft.recorder.event.v1".to_string(),
+            committed_at_ms: 1000,
+        }
+    }
+
+    fn make_consumer_lag(consumer: &str, behind: u64) -> RecorderConsumerLag {
+        RecorderConsumerLag {
+            consumer: CheckpointConsumerId(consumer.to_string()),
+            offsets_behind: behind,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // M3 tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_m3_migrates_all_consumer_checkpoints() {
+        let consumers = vec![
+            make_consumer_lag("indexer", 5),
+            make_consumer_lag("auditor", 10),
+        ];
+        let mut checkpoints = HashMap::new();
+        checkpoints.insert("indexer".to_string(), make_checkpoint("indexer", 3));
+        checkpoints.insert("auditor".to_string(), make_checkpoint("auditor", 2));
+
+        let source = MockCheckpointStorage::new(consumers, checkpoints);
+        let target = MockCheckpointStorage::empty_target();
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let manifest = MigrationManifest {
+            first_ordinal: 0,
+            last_ordinal: 10,
+            ..Default::default()
+        };
+
+        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+
+        assert_eq!(result.consumers_found, 2);
+        assert_eq!(result.checkpoints_migrated, 2);
+        assert_eq!(result.checkpoints_reset, 0);
+        assert_eq!(target.committed.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_m3_preserves_checkpoint_monotonicity() {
+        let consumers = vec![make_consumer_lag("idx", 0)];
+        let mut checkpoints = HashMap::new();
+        checkpoints.insert("idx".to_string(), make_checkpoint("idx", 5));
+
+        let source = MockCheckpointStorage::new(consumers, checkpoints);
+        let target = MockCheckpointStorage::empty_target();
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let manifest = MigrationManifest {
+            first_ordinal: 0,
+            last_ordinal: 10,
+            ..Default::default()
+        };
+
+        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+        assert_eq!(result.checkpoints_migrated, 1);
+
+        let committed = target.committed.lock().unwrap();
+        assert_eq!(committed[0].upto_offset.ordinal, 5);
+    }
+
+    #[tokio::test]
+    async fn test_m3_rejects_checkpoint_referencing_missing_ordinal() {
+        // Checkpoint at ordinal 20, but manifest only goes to 10 → reset
+        let consumers = vec![make_consumer_lag("stale", 0)];
+        let mut checkpoints = HashMap::new();
+        checkpoints.insert("stale".to_string(), make_checkpoint("stale", 20));
+
+        let source = MockCheckpointStorage::new(consumers, checkpoints);
+        let target = MockCheckpointStorage::empty_target();
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let manifest = MigrationManifest {
+            first_ordinal: 0,
+            last_ordinal: 10,
+            ..Default::default()
+        };
+
+        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+        assert_eq!(result.checkpoints_reset, 1);
+        assert_eq!(result.reset_consumers, vec!["stale"]);
+
+        let committed = target.committed.lock().unwrap();
+        // Reset to first_ordinal
+        assert_eq!(committed[0].upto_offset.ordinal, 0);
+    }
+
+    #[tokio::test]
+    async fn test_m3_handles_zero_consumers() {
+        let source = MockCheckpointStorage::new(vec![], HashMap::new());
+        let target = MockCheckpointStorage::empty_target();
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let manifest = MigrationManifest::default();
+
+        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+        assert_eq!(result.consumers_found, 0);
+        assert_eq!(result.checkpoints_migrated, 0);
+        assert_eq!(result.checkpoints_reset, 0);
+    }
+
+    #[tokio::test]
+    async fn test_m3_handles_consumer_at_head_offset() {
+        // Checkpoint at exactly last_ordinal — should pass without reset
+        let consumers = vec![make_consumer_lag("head", 0)];
+        let mut checkpoints = HashMap::new();
+        checkpoints.insert("head".to_string(), make_checkpoint("head", 10));
+
+        let source = MockCheckpointStorage::new(consumers, checkpoints);
+        let target = MockCheckpointStorage::empty_target();
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let manifest = MigrationManifest {
+            first_ordinal: 0,
+            last_ordinal: 10,
+            ..Default::default()
+        };
+
+        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+        assert_eq!(result.checkpoints_migrated, 1);
+        assert_eq!(result.checkpoints_reset, 0);
+
+        let committed = target.committed.lock().unwrap();
+        assert_eq!(committed[0].upto_offset.ordinal, 10);
+    }
+
+    #[tokio::test]
+    async fn test_m3_mixed_valid_and_stale_consumers() {
+        let consumers = vec![
+            make_consumer_lag("good", 2),
+            make_consumer_lag("stale", 0),
+        ];
+        let mut checkpoints = HashMap::new();
+        checkpoints.insert("good".to_string(), make_checkpoint("good", 5));
+        checkpoints.insert("stale".to_string(), make_checkpoint("stale", 100));
+
+        let source = MockCheckpointStorage::new(consumers, checkpoints);
+        let target = MockCheckpointStorage::empty_target();
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let manifest = MigrationManifest {
+            first_ordinal: 0,
+            last_ordinal: 10,
+            ..Default::default()
+        };
+
+        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+        assert_eq!(result.consumers_found, 2);
+        assert_eq!(result.checkpoints_migrated, 2);
+        assert_eq!(result.checkpoints_reset, 1);
+        assert_eq!(result.reset_consumers, vec!["stale"]);
+    }
+
+    #[tokio::test]
+    async fn test_m3_target_rejects_out_of_order() {
+        let consumers = vec![make_consumer_lag("rej", 0)];
+        let mut checkpoints = HashMap::new();
+        checkpoints.insert("rej".to_string(), make_checkpoint("rej", 5));
+
+        let source = MockCheckpointStorage::new(consumers, checkpoints);
+        let target = MockCheckpointStorage::empty_target();
+        target.reject_commit.store(true, Ordering::Relaxed);
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let manifest = MigrationManifest {
+            first_ordinal: 0,
+            last_ordinal: 10,
+            ..Default::default()
+        };
+
+        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("rejected"), "msg: {msg}");
+    }
+
+    #[test]
+    fn test_checkpoint_sync_result_serialize_roundtrip() {
+        let result = CheckpointSyncResult {
+            consumers_found: 3,
+            checkpoints_migrated: 2,
+            checkpoints_reset: 1,
+            reset_consumers: vec!["stale".to_string()],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let restored: CheckpointSyncResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(result, restored);
+    }
+
+    #[tokio::test]
+    async fn test_m3_consumer_without_checkpoint_skipped() {
+        // Consumer appears in lag_metrics but has no checkpoint stored
+        let consumers = vec![make_consumer_lag("ghost", 0)];
+        let source = MockCheckpointStorage::new(consumers, HashMap::new());
+        let target = MockCheckpointStorage::empty_target();
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let manifest = MigrationManifest {
+            first_ordinal: 0,
+            last_ordinal: 10,
+            ..Default::default()
+        };
+
+        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await.unwrap();
+        assert_eq!(result.consumers_found, 1);
+        assert_eq!(result.checkpoints_migrated, 0);
+        assert_eq!(result.checkpoints_reset, 0);
+        assert!(target.committed.lock().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // New error variant display tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_migration_error_storage_error_display() {
+        let err = MigrationError::StorageError("connection refused".to_string());
+        let msg = format!("{err}");
+        assert!(msg.contains("connection refused"), "msg: {msg}");
+    }
+
+    #[test]
+    fn test_migration_error_checkpoint_commit_rejected_display() {
+        let err = MigrationError::CheckpointCommitRejected {
+            consumer: "idx".to_string(),
+            reason: "out of order".to_string(),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("idx"), "msg: {msg}");
+        assert!(msg.contains("out of order"), "msg: {msg}");
     }
 }
