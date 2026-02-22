@@ -1,3 +1,5 @@
+#![cfg(feature = "recorder-lexical")]
+
 //! Cross-module integration tests for the tantivy ingest → query pipeline.
 //!
 //! Bead: wa-x1vd

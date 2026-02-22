@@ -1,3 +1,5 @@
+#![cfg(feature = "recorder-lexical")]
+
 //! Cross-module integration tests for recorder storage + tantivy ingest pipeline.
 //!
 //! These tests exercise the full lifecycle: append events to storage, index them

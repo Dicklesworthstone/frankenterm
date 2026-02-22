@@ -269,6 +269,7 @@ required-features = ["streaming"]
 [[bench]]
 name = "tantivy_search"
 harness = false
+required-features = ["recorder-lexical"]
 
 [[bench]]
 name = "semantic_compression"
@@ -294,6 +295,71 @@ harness = false
 [[bench]]
 name = "wal_throughput"
 harness = false
+
+[[test]]
+name = "proptest_daemon"
+path = "tests/proptest_daemon.rs"
+required-features = ["semantic-search"]
+
+[[test]]
+name = "proptest_recorder_lexical_ingest"
+path = "tests/proptest_recorder_lexical_ingest.rs"
+required-features = ["recorder-lexical"]
+
+[[test]]
+name = "proptest_recorder_lexical_schema"
+path = "tests/proptest_recorder_lexical_schema.rs"
+required-features = ["recorder-lexical"]
+
+[[test]]
+name = "proptest_search"
+path = "tests/proptest_search.rs"
+required-features = ["recorder-lexical"]
+
+[[test]]
+name = "proptest_tantivy_ingest"
+path = "tests/proptest_tantivy_ingest.rs"
+required-features = ["recorder-lexical"]
+
+[[test]]
+name = "proptest_tantivy_policy"
+path = "tests/proptest_tantivy_policy.rs"
+required-features = ["recorder-lexical"]
+
+[[test]]
+name = "proptest_tantivy_quality"
+path = "tests/proptest_tantivy_quality.rs"
+required-features = ["recorder-lexical"]
+
+[[test]]
+name = "proptest_tantivy_query"
+path = "tests/proptest_tantivy_query.rs"
+required-features = ["recorder-lexical"]
+
+[[test]]
+name = "proptest_tantivy_reindex"
+path = "tests/proptest_tantivy_reindex.rs"
+required-features = ["recorder-lexical"]
+
+[[test]]
+name = "recorder_recovery_drills"
+path = "tests/recorder_recovery_drills.rs"
+required-features = ["recorder-lexical"]
+
+[[test]]
+name = "recorder_tantivy_integration"
+path = "tests/recorder_tantivy_integration.rs"
+required-features = ["recorder-lexical"]
+
+[[test]]
+name = "tantivy_integration_tests"
+path = "tests/tantivy_integration_tests.rs"
+required-features = ["recorder-lexical"]
+
+[[test]]
+name = "tantivy_search_integration"
+path = "tests/tantivy_search_integration.rs"
+required-features = ["recorder-lexical"]
 
 [features]
 # Default-on so workspace builds include FrankenSearch + agent-detection integration.

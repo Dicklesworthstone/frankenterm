@@ -1,3 +1,5 @@
+#![cfg(feature = "recorder-lexical")]
+
 //! Repeatable recovery drills for recorder storage/indexing incidents.
 //!
 //! Bead: wa-oegrb.7.4

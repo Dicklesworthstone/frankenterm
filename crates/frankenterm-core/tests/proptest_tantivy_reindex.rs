@@ -1,3 +1,5 @@
+#![cfg(feature = "recorder-lexical")]
+
 //! Property-based tests for the `tantivy_reindex` module.
 //!
 //! Covers `BackfillRange` serde roundtrips, `includes()`/`past_end()`
