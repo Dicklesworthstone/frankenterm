@@ -140,6 +140,7 @@ pub mod graph_scoring;
 pub mod hyperloglog;
 pub mod incident_bundle;
 pub mod ingest;
+pub mod input_reserve;
 pub mod interval_tree;
 #[cfg(unix)]
 pub mod ipc;
@@ -222,6 +223,7 @@ pub mod search_explain;
 pub mod secrets;
 pub mod segment_tree;
 pub mod self_stabilize;
+pub mod semantic_anomaly;
 pub mod semantic_quality;
 pub mod sequence_model;
 pub mod session_correlation;
