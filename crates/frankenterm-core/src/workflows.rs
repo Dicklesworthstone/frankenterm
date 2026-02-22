@@ -3548,7 +3548,11 @@ impl PaneWorkflowLockManager {
     ///
     /// **Use with caution** - only for recovery scenarios.
     pub fn force_release(&self, pane_id: u64) -> Option<PaneLockInfo> {
-        let removed = self.locks.lock().unwrap_or_else(|e| e.into_inner()).remove(&pane_id);
+        let removed = self
+            .locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&pane_id);
         if let Some(ref info) = removed {
             tracing::warn!(
                 pane_id,
@@ -8354,6 +8358,422 @@ impl Workflow for HandleSessionEnd {
                 }
 
                 _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
+}
+
+// ============================================================================
+// HandleProcessTriageLifecycle — deterministic process-triage lifecycle wiring
+// ============================================================================
+
+const PROCESS_TRIAGE_LIFECYCLE_EVENT_TYPE: &str = "process_triage.lifecycle";
+const PROCESS_TRIAGE_LIFECYCLE_RULE_ID: &str = "process_triage.lifecycle";
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessTriagePlanStats {
+    entry_count: usize,
+    auto_safe_count: usize,
+    review_count: usize,
+    protected_count: usize,
+    has_protected_destructive: bool,
+}
+
+impl ProcessTriagePlanStats {
+    fn verify_invariants(self) -> Result<(), String> {
+        let total = self
+            .auto_safe_count
+            .saturating_add(self.review_count)
+            .saturating_add(self.protected_count);
+        if total != self.entry_count {
+            return Err(format!(
+                "triage plan counts mismatch (entries={}, auto_safe={}, review={}, protected={})",
+                self.entry_count, self.auto_safe_count, self.review_count, self.protected_count
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Wire process-triage lifecycle phases into the durable workflow runner.
+///
+/// This workflow does not mutate pane state directly. It provides deterministic
+/// orchestration and explicit abort semantics for the six lifecycle phases:
+/// snapshot -> plan -> apply -> verify -> diff -> session.
+pub struct HandleProcessTriageLifecycle;
+
+impl HandleProcessTriageLifecycle {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn triage_plan_value(trigger: &serde_json::Value) -> Option<&serde_json::Value> {
+        trigger
+            .pointer("/process_triage/plan")
+            .or_else(|| trigger.pointer("/extracted/triage_plan"))
+            .or_else(|| trigger.get("triage_plan"))
+    }
+
+    fn snapshot_value(
+        trigger: &serde_json::Value,
+        pane_id: u64,
+        execution_id: &str,
+    ) -> serde_json::Value {
+        trigger
+            .pointer("/process_triage/snapshot")
+            .or_else(|| trigger.pointer("/extracted/process_snapshot"))
+            .or_else(|| trigger.get("process_snapshot"))
+            .cloned()
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "status": "synthetic",
+                    "pane_id": pane_id,
+                    "execution_id": execution_id,
+                    "captured_at_ms": now_ms(),
+                })
+            })
+    }
+
+    fn diff_value(trigger: &serde_json::Value, stats: ProcessTriagePlanStats) -> serde_json::Value {
+        trigger
+            .pointer("/process_triage/diff")
+            .or_else(|| trigger.pointer("/extracted/triage_diff"))
+            .or_else(|| trigger.get("triage_diff"))
+            .cloned()
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "status": "derived",
+                    "entry_count": stats.entry_count,
+                    "auto_safe_count": stats.auto_safe_count,
+                    "review_count": stats.review_count,
+                    "protected_count": stats.protected_count,
+                })
+            })
+    }
+
+    fn plan_stats_from_trigger(
+        trigger: &serde_json::Value,
+    ) -> Result<ProcessTriagePlanStats, String> {
+        let Some(plan) = Self::triage_plan_value(trigger) else {
+            return Ok(ProcessTriagePlanStats {
+                entry_count: 0,
+                auto_safe_count: 0,
+                review_count: 0,
+                protected_count: 0,
+                has_protected_destructive: false,
+            });
+        };
+        Self::plan_stats(plan)
+    }
+
+    fn plan_stats(plan: &serde_json::Value) -> Result<ProcessTriagePlanStats, String> {
+        let entries: Vec<&serde_json::Value> = match plan.get("entries") {
+            Some(raw) => raw
+                .as_array()
+                .ok_or_else(|| "triage plan entries must be an array".to_string())?
+                .iter()
+                .collect(),
+            None => Vec::new(),
+        };
+
+        let mut inferred_auto_safe = 0usize;
+        let mut inferred_review = 0usize;
+        let mut inferred_protected = 0usize;
+        let mut has_protected_destructive = false;
+
+        for entry in &entries {
+            let category = entry
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let action = entry
+                .pointer("/action/action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+
+            if Self::category_is_auto_safe(category) {
+                inferred_auto_safe = inferred_auto_safe.saturating_add(1);
+            } else if Self::category_is_protected(category) {
+                inferred_protected = inferred_protected.saturating_add(1);
+                if !matches!(action, "protect" | "renice" | "flag_for_review") {
+                    has_protected_destructive = true;
+                }
+            } else {
+                inferred_review = inferred_review.saturating_add(1);
+            }
+        }
+
+        let read_count = |key: &str, fallback: usize| -> Result<usize, String> {
+            match plan.get(key) {
+                Some(raw) => raw
+                    .as_u64()
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| {
+                        format!("triage plan field '{key}' must be a non-negative integer")
+                    }),
+                None => Ok(fallback),
+            }
+        };
+
+        Ok(ProcessTriagePlanStats {
+            entry_count: entries.len(),
+            auto_safe_count: read_count("auto_safe_count", inferred_auto_safe)?,
+            review_count: read_count("review_count", inferred_review)?,
+            protected_count: read_count("protected_count", inferred_protected)?,
+            has_protected_destructive,
+        })
+    }
+
+    fn category_is_auto_safe(category: &str) -> bool {
+        matches!(
+            category,
+            "zombie" | "stuck_test" | "stuck_cli" | "duplicate_build"
+        )
+    }
+
+    fn category_is_protected(category: &str) -> bool {
+        matches!(category, "active_agent" | "system_process")
+    }
+
+    fn session_artifact(
+        trigger: &serde_json::Value,
+        pane_id: u64,
+        execution_id: &str,
+    ) -> serde_json::Value {
+        let ft_session_id = trigger
+            .pointer("/process_triage/ft_session_id")
+            .or_else(|| trigger.pointer("/extracted/ft_session_id"))
+            .or_else(|| trigger.get("ft_session_id"))
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("ft-{pane_id}-{execution_id}"));
+
+        let pt_session_id = trigger
+            .pointer("/process_triage/pt_session_id")
+            .or_else(|| trigger.pointer("/extracted/pt_session_id"))
+            .or_else(|| trigger.get("pt_session_id"))
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("pt-{execution_id}"));
+
+        let provider = trigger
+            .pointer("/process_triage/provider")
+            .or_else(|| trigger.pointer("/extracted/provider"))
+            .or_else(|| trigger.get("provider"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("heuristic");
+
+        serde_json::json!({
+            "ft_session_id": ft_session_id,
+            "pt_session_id": pt_session_id,
+            "provider": provider,
+        })
+    }
+}
+
+impl Default for HandleProcessTriageLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Workflow for HandleProcessTriageLifecycle {
+    fn name(&self) -> &'static str {
+        "handle_process_triage_lifecycle"
+    }
+
+    fn description(&self) -> &'static str {
+        "Orchestrate process triage lifecycle phases (snapshot, plan, apply, verify, diff, session)"
+    }
+
+    fn handles(&self, detection: &crate::patterns::Detection) -> bool {
+        detection.event_type == PROCESS_TRIAGE_LIFECYCLE_EVENT_TYPE
+            || detection.rule_id == PROCESS_TRIAGE_LIFECYCLE_RULE_ID
+    }
+
+    fn trigger_event_types(&self) -> &'static [&'static str] {
+        &[PROCESS_TRIAGE_LIFECYCLE_EVENT_TYPE]
+    }
+
+    fn trigger_rule_ids(&self) -> &'static [&'static str] {
+        &[PROCESS_TRIAGE_LIFECYCLE_RULE_ID]
+    }
+
+    fn steps(&self) -> Vec<WorkflowStep> {
+        vec![
+            WorkflowStep::new(
+                "snapshot",
+                "Capture process snapshot baseline for lifecycle run",
+            ),
+            WorkflowStep::new(
+                "plan",
+                "Build triage plan artifact from snapshot/provider data",
+            ),
+            WorkflowStep::new(
+                "apply",
+                "Apply triage plan actions through policy-gated semantics",
+            ),
+            WorkflowStep::new("verify", "Verify triage outcomes and invariant integrity"),
+            WorkflowStep::new(
+                "diff",
+                "Produce pre/post diff summary for audit and diagnostics",
+            ),
+            WorkflowStep::new(
+                "session",
+                "Emit session correlation artifact and finalize lifecycle",
+            ),
+        ]
+    }
+
+    fn execute_step(
+        &self,
+        ctx: &mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        let pane_id = ctx.pane_id();
+        let execution_id = ctx.execution_id().to_string();
+        let capabilities = ctx.capabilities().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+
+        Box::pin(async move {
+            let stats = match Self::plan_stats_from_trigger(&trigger) {
+                Ok(stats) => stats,
+                Err(reason) => {
+                    return StepResult::abort(format!(
+                        "process triage lifecycle: invalid triage plan payload: {reason}"
+                    ));
+                }
+            };
+
+            match step_idx {
+                0 => {
+                    if capabilities.alt_screen == Some(true) {
+                        return StepResult::abort(
+                            "process triage lifecycle: pane in alt-screen mode; refusing snapshot step",
+                        );
+                    }
+                    if capabilities.command_running {
+                        return StepResult::abort(
+                            "process triage lifecycle: command currently running; refusing snapshot step",
+                        );
+                    }
+                    tracing::info!(
+                        pane_id,
+                        execution_id = %execution_id,
+                        "handle_process_triage_lifecycle: snapshot step completed"
+                    );
+                    StepResult::cont()
+                }
+                1 => {
+                    tracing::info!(
+                        pane_id,
+                        execution_id = %execution_id,
+                        entry_count = stats.entry_count,
+                        auto_safe_count = stats.auto_safe_count,
+                        review_count = stats.review_count,
+                        protected_count = stats.protected_count,
+                        "handle_process_triage_lifecycle: plan step completed"
+                    );
+                    StepResult::cont()
+                }
+                2 => {
+                    if stats.has_protected_destructive {
+                        return StepResult::abort(
+                            "process triage lifecycle: protected category includes destructive action",
+                        );
+                    }
+                    tracing::info!(
+                        pane_id,
+                        execution_id = %execution_id,
+                        auto_safe_count = stats.auto_safe_count,
+                        review_count = stats.review_count,
+                        protected_count = stats.protected_count,
+                        "handle_process_triage_lifecycle: apply step completed"
+                    );
+                    StepResult::cont()
+                }
+                3 => match stats.verify_invariants() {
+                    Ok(()) => {
+                        tracing::info!(
+                            pane_id,
+                            execution_id = %execution_id,
+                            "handle_process_triage_lifecycle: verify step completed"
+                        );
+                        StepResult::cont()
+                    }
+                    Err(reason) => StepResult::abort(format!(
+                        "process triage lifecycle: verify step failed: {reason}"
+                    )),
+                },
+                4 => {
+                    let diff = Self::diff_value(&trigger, stats);
+                    if !diff.is_object() {
+                        return StepResult::abort(
+                            "process triage lifecycle: diff artifact must be a JSON object",
+                        );
+                    }
+                    tracing::info!(
+                        pane_id,
+                        execution_id = %execution_id,
+                        "handle_process_triage_lifecycle: diff step completed"
+                    );
+                    StepResult::cont()
+                }
+                5 => {
+                    let snapshot = Self::snapshot_value(&trigger, pane_id, &execution_id);
+                    let plan = Self::triage_plan_value(&trigger)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            serde_json::json!({
+                                "entries": [],
+                                "auto_safe_count": stats.auto_safe_count,
+                                "review_count": stats.review_count,
+                                "protected_count": stats.protected_count,
+                            })
+                        });
+                    let apply = trigger
+                        .pointer("/process_triage/apply")
+                        .or_else(|| trigger.pointer("/extracted/triage_apply"))
+                        .or_else(|| trigger.get("triage_apply"))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            serde_json::json!({
+                                "status": "derived",
+                                "applied_auto_safe_count": stats.auto_safe_count,
+                                "requires_approval_count": stats.review_count,
+                                "protected_skipped_count": stats.protected_count,
+                            })
+                        });
+                    let verify = serde_json::json!({
+                        "status": "ok",
+                        "entry_count": stats.entry_count,
+                        "invariants_passed": true,
+                    });
+                    let diff = Self::diff_value(&trigger, stats);
+                    let session = Self::session_artifact(&trigger, pane_id, &execution_id);
+
+                    tracing::info!(
+                        pane_id,
+                        execution_id = %execution_id,
+                        "handle_process_triage_lifecycle: session step completed"
+                    );
+
+                    StepResult::done(serde_json::json!({
+                        "status": "completed",
+                        "pane_id": pane_id,
+                        "workflow": "handle_process_triage_lifecycle",
+                        "snapshot": snapshot,
+                        "plan": plan,
+                        "apply": apply,
+                        "verify": verify,
+                        "diff": diff,
+                        "session": session,
+                    }))
+                }
+                _ => StepResult::abort(format!(
+                    "process triage lifecycle: unexpected step index: {step_idx}"
+                )),
             }
         })
     }
@@ -17152,6 +17572,182 @@ Try again at 3:00 PM UTC.
 
         storage.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // ========================================================================
+    // HandleProcessTriageLifecycle Tests (ft-2vuw7.5.4.1.2.1.1)
+    // ========================================================================
+
+    #[test]
+    fn handle_process_triage_lifecycle_metadata() {
+        let wf = HandleProcessTriageLifecycle::new();
+        assert_eq!(wf.name(), "handle_process_triage_lifecycle");
+        assert_eq!(wf.steps().len(), 6);
+        assert_eq!(wf.steps()[0].name, "snapshot");
+        assert_eq!(wf.steps()[5].name, "session");
+        assert_eq!(wf.trigger_event_types(), ["process_triage.lifecycle"]);
+        assert_eq!(wf.trigger_rule_ids(), ["process_triage.lifecycle"]);
+        assert!(!wf.is_destructive());
+    }
+
+    #[test]
+    fn handle_process_triage_lifecycle_handles_expected_detection() {
+        let wf = HandleProcessTriageLifecycle::new();
+
+        let detection = Detection {
+            rule_id: "process_triage.lifecycle".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "process_triage.lifecycle".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: "triage lifecycle requested".to_string(),
+            span: (0, 10),
+        };
+        assert!(wf.handles(&detection));
+
+        let non_matching = Detection {
+            rule_id: "codex.session.token_usage".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "session.summary".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: "Token usage".to_string(),
+            span: (0, 10),
+        };
+        assert!(!wf.handles(&non_matching));
+    }
+
+    #[tokio::test]
+    async fn handle_process_triage_lifecycle_step0_aborts_on_alt_screen() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("triage_lifecycle_alt_screen.db");
+        let storage = Arc::new(
+            crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
+
+        let mut caps = PaneCapabilities::default();
+        caps.alt_screen = Some(true);
+        let mut ctx = WorkflowContext::new(storage, 7, caps, "exec-triage-alt");
+
+        let wf = HandleProcessTriageLifecycle::new();
+        let result = wf.execute_step(&mut ctx, 0).await;
+        match result {
+            StepResult::Abort { reason } => {
+                assert!(reason.contains("alt-screen"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected abort, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_process_triage_lifecycle_step2_aborts_on_protected_destructive_action() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("triage_lifecycle_protected_abort.db");
+        let storage = Arc::new(
+            crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
+
+        let trigger = serde_json::json!({
+            "process_triage": {
+                "plan": {
+                    "entries": [
+                        {
+                            "category": "system_process",
+                            "action": { "action": "force_kill" }
+                        }
+                    ],
+                    "auto_safe_count": 0,
+                    "review_count": 0,
+                    "protected_count": 1
+                }
+            }
+        });
+
+        let mut ctx = WorkflowContext::new(
+            storage,
+            9,
+            PaneCapabilities::default(),
+            "exec-triage-protected",
+        )
+        .with_trigger(trigger);
+
+        let wf = HandleProcessTriageLifecycle::new();
+        let result = wf.execute_step(&mut ctx, 2).await;
+        match result {
+            StepResult::Abort { reason } => {
+                assert!(
+                    reason.contains("protected category includes destructive action"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected abort, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_process_triage_lifecycle_session_step_emits_all_artifacts() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("triage_lifecycle_session.db");
+        let storage = Arc::new(
+            crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
+
+        let trigger = serde_json::json!({
+            "process_triage": {
+                "ft_session_id": "ft-abc",
+                "pt_session_id": "pt-xyz",
+                "provider": "pt_cli",
+                "plan": {
+                    "entries": [
+                        {
+                            "category": "stuck_cli",
+                            "action": { "action": "graceful_kill" }
+                        },
+                        {
+                            "category": "active_agent",
+                            "action": { "action": "protect" }
+                        }
+                    ],
+                    "auto_safe_count": 1,
+                    "review_count": 0,
+                    "protected_count": 1
+                }
+            }
+        });
+
+        let mut ctx = WorkflowContext::new(
+            storage,
+            42,
+            PaneCapabilities::default(),
+            "exec-triage-session",
+        )
+        .with_trigger(trigger);
+        let wf = HandleProcessTriageLifecycle::new();
+        let result = wf.execute_step(&mut ctx, 5).await;
+
+        match result {
+            StepResult::Done { result } => {
+                assert_eq!(result["status"], "completed");
+                assert_eq!(result["workflow"], "handle_process_triage_lifecycle");
+                assert!(result["snapshot"].is_object());
+                assert!(result["plan"].is_object());
+                assert!(result["apply"].is_object());
+                assert!(result["verify"].is_object());
+                assert!(result["diff"].is_object());
+                assert_eq!(result["session"]["ft_session_id"], "ft-abc");
+                assert_eq!(result["session"]["pt_session_id"], "pt-xyz");
+                assert_eq!(result["session"]["provider"], "pt_cli");
+            }
+            other => panic!("expected done, got {other:?}"),
+        }
     }
 
     // ========================================================================
