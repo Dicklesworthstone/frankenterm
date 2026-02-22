@@ -8225,7 +8225,9 @@ impl StorageHandle {
         let _ = rx.await;
 
         // Wait for thread to finish (only the first caller does this)
-        let handle = self.writer_handle.lock().unwrap().take();
+        let handle = self.writer_handle.lock()
+            .map_err(|_| StorageError::Database("Writer handle mutex poisoned".to_string()))?
+            .take();
         if let Some(handle) = handle {
             handle
                 .join()
