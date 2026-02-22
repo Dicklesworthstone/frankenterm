@@ -462,8 +462,12 @@ impl DataflowGraph {
             return Err(DataflowError::CycleDetected { from, to });
         }
         // Wire up (existence verified above).
-        if let Some(n) = self.nodes.get_mut(&to) { n.inputs.push(from); }
-        if let Some(n) = self.nodes.get_mut(&from) { n.outputs.push(to); }
+        if let Some(n) = self.nodes.get_mut(&to) {
+            n.inputs.push(from);
+        }
+        if let Some(n) = self.nodes.get_mut(&from) {
+            n.outputs.push(to);
+        }
         self.invalidate_topo();
         self.dirty.insert(to);
         Ok(())
@@ -678,7 +682,9 @@ impl DataflowGraph {
                 }
             };
             if should_flush {
-                let Some(node) = self.nodes.get_mut(&nid) else { continue };
+                let Some(node) = self.nodes.get_mut(&nid) else {
+                    continue;
+                };
                 if let NodeKind::Debounce { pending, .. } = &mut node.kind {
                     if let Some(val) = pending.take() {
                         if val != node.value {

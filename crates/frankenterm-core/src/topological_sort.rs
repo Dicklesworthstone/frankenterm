@@ -391,16 +391,20 @@ pub fn condensation(g: &DiGraph) -> (Vec<usize>, DiGraph) {
     }
 
     let mut condensed = DiGraph::new(num_sccs);
-    let mut seen = vec![vec![false; num_sccs]; num_sccs];
+    let mut edges = Vec::new();
     for u in 0..n {
         for &v in g.successors(u) {
             let su = scc_of[u];
             let sv = scc_of[v];
-            if su != sv && !seen[su][sv] {
-                condensed.add_edge(su, sv);
-                seen[su][sv] = true;
+            if su != sv {
+                edges.push((su, sv));
             }
         }
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    for (su, sv) in edges {
+        condensed.add_edge(su, sv);
     }
 
     (scc_of, condensed)

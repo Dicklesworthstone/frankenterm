@@ -265,13 +265,21 @@ impl TimeSeries {
             return self.clone();
         }
 
-        let group_size = n.div_ceil(target_points);
         let mut result = TimeSeries::with_config(TimeSeriesConfig {
             max_points: target_points,
         });
 
         let points: Vec<DataPoint> = self.data.iter().copied().collect();
-        for chunk in points.chunks(group_size) {
+        let step = n as f64 / target_points as f64;
+
+        for i in 0..target_points {
+            let start = (i as f64 * step) as usize;
+            let end = ((i + 1) as f64 * step).round() as usize;
+            let end = end.min(n);
+            let chunk = &points[start..end];
+            if chunk.is_empty() {
+                continue;
+            }
             let avg_ts = chunk.iter().map(|dp| dp.timestamp_ms).sum::<u64>() / chunk.len() as u64;
             let avg_val = chunk.iter().map(|dp| dp.value).sum::<f64>() / chunk.len() as f64;
             result.push(avg_ts, avg_val);
@@ -296,6 +304,7 @@ impl TimeSeries {
             self.data.push_back(*dp);
         }
         self.total_inserted += other.len() as u64;
+        self.total_evicted += start as u64;
     }
 
     /// Iterate over all stored data points in chronological order.
