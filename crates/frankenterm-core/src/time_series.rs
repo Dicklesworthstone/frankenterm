@@ -265,7 +265,7 @@ impl TimeSeries {
             return self.clone();
         }
 
-        let group_size = (n + target_points - 1) / target_points;
+        let group_size = n.div_ceil(target_points);
         let mut result = TimeSeries::with_config(TimeSeriesConfig {
             max_points: target_points,
         });

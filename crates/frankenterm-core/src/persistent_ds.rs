@@ -792,7 +792,7 @@ impl<T: Clone> VersionedStore<T> {
         debug_assert!(
             self.versions
                 .last()
-                .map_or(true, |(ts, _)| timestamp_ms >= *ts),
+                .is_none_or(|(ts, _)| timestamp_ms >= *ts),
             "VersionedStore::push requires monotonically non-decreasing timestamps"
         );
         self.versions.push((timestamp_ms, state));

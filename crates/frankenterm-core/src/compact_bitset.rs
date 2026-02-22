@@ -29,7 +29,7 @@ impl CompactBitset {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "bitset capacity must be > 0");
-        let n_words = (capacity + BITS_PER_WORD - 1) / BITS_PER_WORD;
+        let n_words = capacity.div_ceil(BITS_PER_WORD);
         Self {
             words: vec![0u64; n_words],
             capacity,

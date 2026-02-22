@@ -153,7 +153,7 @@ pub fn pagerank(graph: &impl GraphView, config: &PageRankConfig) -> PageRankResu
             }
             new_rank.insert(
                 node,
-                teleport + config.damping * (incoming_sum + dangling_sum / n as f64),
+                config.damping.mul_add(incoming_sum + dangling_sum / n as f64, teleport),
             );
         }
 
@@ -271,7 +271,7 @@ pub fn betweenness_centrality(graph: &impl GraphView) -> BetweennessResult {
 }
 
 /// Normalize betweenness scores by (n-1)(n-2) for a directed graph.
-pub fn normalize_betweenness(scores: &mut HashMap<usize, f64>, node_count: usize) {
+pub fn normalize_betweenness<S: ::std::hash::BuildHasher>(scores: &mut HashMap<usize, f64, S>, node_count: usize) {
     if node_count <= 2 {
         return;
     }

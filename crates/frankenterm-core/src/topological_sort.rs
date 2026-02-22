@@ -105,7 +105,7 @@ impl DiGraph {
     #[must_use]
     pub fn has_source(&self) -> bool {
         let deg = self.in_degrees();
-        deg.iter().any(|&d| d == 0)
+        deg.contains(&0)
     }
 
     /// Whether the graph contains a node with no successors.
@@ -434,10 +434,10 @@ pub fn transitive_closure(g: &DiGraph) -> Vec<Vec<bool>> {
     let mut reach = vec![vec![false; n]; n];
 
     // Initialize direct edges
-    for u in 0..n {
-        reach[u][u] = true;
+    for (u, row) in reach.iter_mut().enumerate().take(n) {
+        row[u] = true;
         for &v in g.successors(u) {
-            reach[u][v] = true;
+            row[v] = true;
         }
     }
 

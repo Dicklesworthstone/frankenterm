@@ -275,13 +275,13 @@ pub fn floyd_warshall(g: &WeightedGraph) -> Option<Vec<Vec<f64>>> {
     let n = g.node_count();
     let mut dist = vec![vec![f64::INFINITY; n]; n];
 
-    for i in 0..n {
-        dist[i][i] = 0.0;
+    for (i, row) in dist.iter_mut().enumerate().take(n) {
+        row[i] = 0.0;
     }
-    for u in 0..n {
+    for (u, row) in dist.iter_mut().enumerate().take(n) {
         for &(v, w) in g.neighbors(u) {
-            if w < dist[u][v] {
-                dist[u][v] = w;
+            if w < row[v] {
+                row[v] = w;
             }
         }
     }
@@ -298,8 +298,8 @@ pub fn floyd_warshall(g: &WeightedGraph) -> Option<Vec<Vec<f64>>> {
     }
 
     // Check for negative cycles (diagonal < 0)
-    for i in 0..n {
-        if dist[i][i] < 0.0 {
+    for (i, row) in dist.iter().enumerate().take(n) {
+        if row[i] < 0.0 {
             return None;
         }
     }

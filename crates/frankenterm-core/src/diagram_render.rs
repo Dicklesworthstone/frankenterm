@@ -313,6 +313,7 @@ impl DiagramTable {
     }
 
     /// Set column alignments.
+    #[must_use]
     pub fn with_alignments(mut self, alignments: Vec<Align>) -> Self {
         self.alignments = alignments;
         self
@@ -368,6 +369,7 @@ impl DiagramTable {
         buf
     }
 
+    #[allow(clippy::unused_self)]
     fn write_separator(
         &self,
         buf: &mut String,

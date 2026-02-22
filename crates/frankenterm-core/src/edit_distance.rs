@@ -36,7 +36,7 @@ pub fn levenshtein(a: &[u8], b: &[u8]) -> usize {
     for i in 1..=m {
         curr[0] = i;
         for j in 1..=n {
-            let cost = if long[i - 1] == short[j - 1] { 0 } else { 1 };
+            let cost = usize::from(long[i - 1] != short[j - 1]);
             curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
@@ -69,6 +69,7 @@ pub fn levenshtein_normalized(a: &[u8], b: &[u8]) -> f64 {
 /// Extends Levenshtein with transposition of two adjacent characters.
 /// Uses full matrix — O(mn) time and space.
 #[must_use]
+#[allow(clippy::many_single_char_names)]
 pub fn damerau_levenshtein(a: &[u8], b: &[u8]) -> usize {
     let n = a.len();
     let m = b.len();
@@ -83,16 +84,16 @@ pub fn damerau_levenshtein(a: &[u8], b: &[u8]) -> usize {
     // Full matrix for transposition lookback
     let mut d = vec![vec![0usize; m + 1]; n + 1];
 
-    for i in 0..=n {
-        d[i][0] = i;
+    for (i, row) in d.iter_mut().enumerate().take(n + 1) {
+        row[0] = i;
     }
-    for j in 0..=m {
-        d[0][j] = j;
+    for (j, slot) in d[0].iter_mut().enumerate().take(m + 1) {
+        *slot = j;
     }
 
     for i in 1..=n {
         for j in 1..=m {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            let cost = usize::from(a[i - 1] != b[j - 1]);
             d[i][j] = (d[i - 1][j] + 1)
                 .min(d[i][j - 1] + 1)
                 .min(d[i - 1][j - 1] + cost);
@@ -160,7 +161,7 @@ pub fn lcs_length(a: &[u8], b: &[u8]) -> usize {
             };
         }
         std::mem::swap(&mut prev, &mut curr);
-        curr.iter_mut().for_each(|x| *x = 0);
+        curr.fill(0);
     }
 
     prev[n]
@@ -238,7 +239,7 @@ pub fn jaro_winkler(a: &[u8], b: &[u8]) -> f64 {
         .take_while(|(x, y)| x == y)
         .count();
     let scaling = 0.1;
-    jaro_sim + prefix_len as f64 * scaling * (1.0 - jaro_sim)
+    (prefix_len as f64 * scaling).mul_add(1.0 - jaro_sim, jaro_sim)
 }
 
 /// Jaro-Winkler similarity for strings.
@@ -253,6 +254,7 @@ pub fn jaro_winkler_str(a: &str, b: &str) -> f64 {
 /// Returns `None` if the true distance exceeds `k`.
 /// O(n*k) time and O(k) space.
 #[must_use]
+#[allow(clippy::many_single_char_names)]
 pub fn levenshtein_bounded(a: &[u8], b: &[u8], k: usize) -> Option<usize> {
     let n = a.len();
     let m = b.len();
@@ -265,8 +267,8 @@ pub fn levenshtein_bounded(a: &[u8], b: &[u8], k: usize) -> Option<usize> {
     let mut prev = vec![usize::MAX; m + 1];
     let mut curr = vec![usize::MAX; m + 1];
 
-    for j in 0..=k.min(m) {
-        prev[j] = j;
+    for (j, slot) in prev.iter_mut().enumerate().take(k.min(m) + 1) {
+        *slot = j;
     }
 
     for i in 1..=n {
@@ -287,7 +289,7 @@ pub fn levenshtein_bounded(a: &[u8], b: &[u8], k: usize) -> Option<usize> {
                 curr[0] = i;
                 continue;
             }
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            let cost = usize::from(a[i - 1] != b[j - 1]);
             let mut val = usize::MAX;
             if prev[j] != usize::MAX {
                 val = val.min(prev[j] + 1);
@@ -369,21 +371,22 @@ pub enum EditOp {
 
 /// Compute the edit script (sequence of operations) to transform `a` into `b`.
 #[must_use]
+#[allow(clippy::many_single_char_names)]
 pub fn edit_script(a: &[u8], b: &[u8]) -> Vec<EditOp> {
     let n = a.len();
     let m = b.len();
 
     // Full matrix for backtracking
     let mut d = vec![vec![0usize; m + 1]; n + 1];
-    for i in 0..=n {
-        d[i][0] = i;
+    for (i, row) in d.iter_mut().enumerate().take(n + 1) {
+        row[0] = i;
     }
-    for j in 0..=m {
-        d[0][j] = j;
+    for (j, slot) in d[0].iter_mut().enumerate().take(m + 1) {
+        *slot = j;
     }
     for i in 1..=n {
         for j in 1..=m {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            let cost = usize::from(a[i - 1] != b[j - 1]);
             d[i][j] = (d[i - 1][j] + 1)
                 .min(d[i][j - 1] + 1)
                 .min(d[i - 1][j - 1] + cost);
@@ -432,7 +435,7 @@ pub fn levenshtein_generic<T: PartialEq>(a: &[T], b: &[T]) -> usize {
     for i in 1..=m {
         curr[0] = i;
         for j in 1..=n {
-            let cost = if long[i - 1] == short[j - 1] { 0 } else { 1 };
+            let cost = usize::from(long[i - 1] != short[j - 1]);
             curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
