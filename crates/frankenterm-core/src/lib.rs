@@ -79,6 +79,7 @@ pub mod cleanup;
 #[cfg(feature = "subprocess-bridge")]
 pub mod code_scanner;
 pub mod command_guard;
+pub mod compact_bitset;
 pub mod completion_token;
 pub mod concurrent_map;
 pub mod config;
