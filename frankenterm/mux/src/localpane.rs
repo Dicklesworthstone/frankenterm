@@ -1053,6 +1053,9 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                         let pane = pane.downcast_ref::<LocalPane>().unwrap();
                         pane.tmux_domain.lock().take();
                     }
+                    // Ensure the tmux control-mode callback is removed immediately
+                    // rather than waiting for a future mux notify cycle.
+                    tmux.unsubscribe_notification();
                     mux.domain_was_detached(tmux.domain_id);
                 }
             }
@@ -1597,6 +1600,15 @@ impl LocalPane {
 
 impl Drop for LocalPane {
     fn drop(&mut self) {
+        if let Some(tmux) = self.tmux_domain.lock().take() {
+            // Eagerly tear down tmux-domain state if this pane is being dropped
+            // without a clean control-mode exit sequence.
+            tmux.unsubscribe_notification();
+            if let Some(mux) = Mux::try_get() {
+                mux.domain_was_detached(tmux.domain_id);
+            }
+        }
+
         // Avoid lingering zombies if we can, but don't block forever.
         // <https://github.com/wezterm/wezterm/issues/558>
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {

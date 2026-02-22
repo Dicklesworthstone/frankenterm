@@ -53,15 +53,16 @@ use crate::client::{ClientId, ClientInfo};
 use crate::pane::{CachePolicy, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
+use crate::tmux::TmuxDomain;
 use crate::window::{Window, WindowId};
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use config::keyassignment::SpawnTabDomain;
-use config::{configuration, ExitBehavior, GuiPosition};
+use config::{ExitBehavior, GuiPosition, configuration};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
+use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd, socketpair};
 use frankenterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
-use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use libc::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, c_int};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -82,7 +83,7 @@ use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
 #[cfg(windows)]
-use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use winapi::um::winsock2::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET};
 
 pub mod activity;
 pub mod client;
@@ -809,15 +810,34 @@ impl Mux {
     }
 
     pub fn add_domain(&self, domain: &Arc<dyn Domain>) {
-        if self.default_domain.read().is_none() {
-            *self.default_domain.write() = Some(Arc::clone(domain));
+        let domain_id = domain.domain_id();
+        let domain_name = domain.domain_name().to_string();
+        let domain_arc = Arc::clone(domain);
+        let mut replaced_domain_id = None;
+
+        {
+            let mut domains = self.domains.write();
+            let mut domains_by_name = self.domains_by_name.write();
+            if let Some(existing) = domains_by_name.insert(domain_name, Arc::clone(&domain_arc)) {
+                let existing_id = existing.domain_id();
+                if existing_id != domain_id {
+                    domains.remove(&existing_id);
+                    replaced_domain_id = Some(existing_id);
+                }
+            }
+            domains.insert(domain_id, Arc::clone(&domain_arc));
         }
-        self.domains
-            .write()
-            .insert(domain.domain_id(), Arc::clone(domain));
-        self.domains_by_name
-            .write()
-            .insert(domain.domain_name().to_string(), Arc::clone(domain));
+
+        let mut default_domain = self.default_domain.write();
+        if default_domain.is_none()
+            || replaced_domain_id.map_or(false, |existing_id| {
+                default_domain
+                    .as_ref()
+                    .map_or(false, |candidate| candidate.domain_id() == existing_id)
+            })
+        {
+            *default_domain = Some(domain_arc);
+        }
     }
 
     pub fn set_mux(mux: &Arc<Mux>) {
@@ -1184,9 +1204,21 @@ impl Mux {
 
     fn remove_domain_internal(&self, domain_id: DomainId) -> Option<Arc<dyn Domain>> {
         let removed = self.domains.write().remove(&domain_id);
-        if removed.is_none() {
-            return None;
+
+        // Tmux domains install mux notification subscriptions that should be
+        // removed eagerly when the domain is detached. Waiting for the next
+        // notification to lazily retain-drop stale callbacks can leak
+        // subscribers in long-idle sessions.
+        if let Some(tmux_domain) = removed
+            .as_ref()
+            .and_then(|domain| domain.downcast_ref::<TmuxDomain>())
+        {
+            if let Some(sub_id) = tmux_domain.inner.notification_sub_id.lock().take() {
+                let _ = self.unsubscribe(sub_id);
+            }
         }
+
+        removed.as_ref()?;
 
         self.domains_by_name
             .write()
@@ -1674,6 +1706,64 @@ mod tests {
         assert!(mux.get_domain(default_domain.domain_id()).is_none());
         assert!(mux.get_domain(replacement_id).is_some());
         assert_eq!(mux.default_domain().domain_id(), replacement_id);
+    }
+
+    #[test]
+    fn detaching_tmux_domain_eagerly_removes_notification_subscriber() {
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(domain::LocalDomain::new("default-domain-tmux-detach-test").unwrap());
+        let mux = Mux::new(Some(default_domain));
+
+        let tmux_domain = Arc::new(TmuxDomain::new(0));
+        let tmux_domain_dyn: Arc<dyn Domain> = tmux_domain.clone();
+        let tmux_domain_id = tmux_domain_dyn.domain_id();
+        mux.add_domain(&tmux_domain_dyn);
+
+        let sub_id = mux.subscribe(|_| true);
+        *tmux_domain.inner.notification_sub_id.lock() = Some(sub_id);
+
+        mux.domain_was_detached(tmux_domain_id);
+
+        assert!(mux.get_domain(tmux_domain_id).is_none());
+        assert!(
+            !mux.unsubscribe(sub_id),
+            "tmux notification subscriber should be removed eagerly on detach"
+        );
+        assert!(tmux_domain.inner.notification_sub_id.lock().is_none());
+    }
+
+    #[test]
+    fn add_domain_evicts_stale_same_name_domain_id() {
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(domain::LocalDomain::new("default-domain-add-domain-test").unwrap());
+        let mux = Mux::new(Some(default_domain));
+
+        let first: Arc<dyn Domain> =
+            Arc::new(domain::LocalDomain::new("duplicate-name-domain").unwrap());
+        let second: Arc<dyn Domain> =
+            Arc::new(domain::LocalDomain::new("duplicate-name-domain").unwrap());
+        let first_id = first.domain_id();
+        let second_id = second.domain_id();
+
+        mux.add_domain(&first);
+        assert!(mux.get_domain(first_id).is_some());
+        assert_eq!(
+            mux.get_domain_by_name("duplicate-name-domain")
+                .unwrap()
+                .domain_id(),
+            first_id
+        );
+
+        mux.add_domain(&second);
+
+        assert!(mux.get_domain(first_id).is_none());
+        assert!(mux.get_domain(second_id).is_some());
+        assert_eq!(
+            mux.get_domain_by_name("duplicate-name-domain")
+                .unwrap()
+                .domain_id(),
+            second_id
+        );
     }
 
     #[test]

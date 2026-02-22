@@ -643,8 +643,9 @@ impl TmuxDomainState {
         let Some(sub_id) = self.notification_sub_id.lock().take() else {
             return;
         };
-        let mux = Mux::get();
-        let _ = mux.unsubscribe(sub_id);
+        if let Some(mux) = Mux::try_get() {
+            let _ = mux.unsubscribe(sub_id);
+        }
     }
 }
 

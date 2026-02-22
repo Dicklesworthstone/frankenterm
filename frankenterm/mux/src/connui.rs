@@ -1,13 +1,13 @@
 use crate::termwiztermtab;
-use anyhow::{anyhow, bail, Context as _};
-use crossbeam::channel::{unbounded, Receiver, Sender};
+use anyhow::{Context as _, anyhow, bail};
+use crossbeam::channel::{Receiver, Sender, unbounded};
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_term::TerminalSize;
-use promise::spawn::block_on;
 use promise::Promise;
+use promise::spawn::block_on;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use termwiz::cell::{unicode_column_width, CellAttributes};
+use termwiz::cell::{CellAttributes, unicode_column_width};
 use termwiz::lineedit::*;
 use termwiz::surface::{Change, Position};
 use termwiz::terminal::*;
