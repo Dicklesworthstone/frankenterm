@@ -1,0 +1,185 @@
+{
+  "fixture_schema_version": "ft.fixture.v1",
+  "name": "fixture_mixed_payload_types",
+  "checksum": 8060471389063642782,
+  "expected_event_count": 8,
+  "events": [
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "fix-1-0",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "robot_mode",
+      "occurred_at_ms": 1700000000000,
+      "recorded_at_ms": 1700000000001,
+      "sequence": 0,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "ingress_text",
+      "text": "hello",
+      "encoding": "utf8",
+      "redaction": "none",
+      "ingress_kind": "send_text"
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "egr-1-1",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "wezterm_mux",
+      "occurred_at_ms": 1700000000001,
+      "recorded_at_ms": 1700000000003,
+      "sequence": 1,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "egress_output",
+      "text": "world",
+      "encoding": "utf8",
+      "redaction": "none",
+      "segment_kind": "delta",
+      "is_gap": false
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "lc-1-2",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "wezterm_mux",
+      "occurred_at_ms": 1700000000002,
+      "recorded_at_ms": 1700000000003,
+      "sequence": 2,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "lifecycle_marker",
+      "lifecycle_phase": "capture_started",
+      "reason": null,
+      "details": null
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "ctl-1-3",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "operator_action",
+      "occurred_at_ms": 1700000000003,
+      "recorded_at_ms": 1700000000004,
+      "sequence": 3,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "control_marker",
+      "control_marker_type": "prompt_boundary",
+      "details": {
+        "prompt": "$ "
+      }
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "fix-2-4",
+      "pane_id": 2,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "robot_mode",
+      "occurred_at_ms": 1700000000004,
+      "recorded_at_ms": 1700000000005,
+      "sequence": 4,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "ingress_text",
+      "text": "pane2-cmd",
+      "encoding": "utf8",
+      "redaction": "none",
+      "ingress_kind": "send_text"
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "egr-2-5",
+      "pane_id": 2,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "wezterm_mux",
+      "occurred_at_ms": 1700000000005,
+      "recorded_at_ms": 1700000000007,
+      "sequence": 5,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "egress_output",
+      "text": "pane2-output",
+      "encoding": "utf8",
+      "redaction": "none",
+      "segment_kind": "delta",
+      "is_gap": false
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "lc-2-6",
+      "pane_id": 2,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "wezterm_mux",
+      "occurred_at_ms": 1700000000006,
+      "recorded_at_ms": 1700000000007,
+      "sequence": 6,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "lifecycle_marker",
+      "lifecycle_phase": "pane_opened",
+      "reason": null,
+      "details": null
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "ctl-2-7",
+      "pane_id": 2,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "operator_action",
+      "occurred_at_ms": 1700000000007,
+      "recorded_at_ms": 1700000000008,
+      "sequence": 7,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "control_marker",
+      "control_marker_type": "prompt_boundary",
+      "details": {
+        "prompt": "$ "
+      }
+    }
+  ],
+  "checkpoints": []
+}
