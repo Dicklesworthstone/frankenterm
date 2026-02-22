@@ -64,6 +64,13 @@ crossterm = { workspace = true, optional = true }
 
 # FrankenTUI (optional, migration target — see docs/adr/)
 ftui = { workspace = true, optional = true }
+ftui-core = { path = "../../../frankentui/crates/ftui-core", optional = true }
+ftui-render = { path = "../../../frankentui/crates/ftui-render", optional = true }
+ftui-layout = { path = "../../../frankentui/crates/ftui-layout", optional = true }
+ftui-style = { path = "../../../frankentui/crates/ftui-style", optional = true }
+ftui-widgets = { path = "../../../frankentui/crates/ftui-widgets", optional = true }
+ftui-runtime = { path = "../../../frankentui/crates/ftui-runtime", optional = true }
+ftui-backend = { path = "../../../frankentui/crates/ftui-backend", optional = true }
 
 # MCP server (optional, behind feature)
 fastmcp = { workspace = true, optional = true }
@@ -302,6 +309,11 @@ path = "tests/proptest_daemon.rs"
 required-features = ["semantic-search"]
 
 [[test]]
+name = "proptest_disk_pressure"
+path = "tests/proptest_disk_pressure.rs"
+required-features = ["disk-pressure"]
+
+[[test]]
 name = "proptest_recorder_lexical_ingest"
 path = "tests/proptest_recorder_lexical_ingest.rs"
 required-features = ["recorder-lexical"]
@@ -374,6 +386,8 @@ web = ["dep:fastapi", "dep:asupersync"]
 streaming = ["web"]
 tui = ["dep:ratatui", "dep:crossterm"]
 ftui = ["dep:ftui"]
+tui-widgets = ["dep:ftui-render", "dep:ftui-layout", "dep:ftui-style", "dep:ftui-widgets"]
+tui-dashboard = ["tui-widgets", "dep:ftui-runtime", "dep:ftui-core", "dep:ftui-backend"]
 rollout = ["tui", "ftui"]
 metrics = []
 native-wezterm = []
