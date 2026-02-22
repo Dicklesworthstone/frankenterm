@@ -339,6 +339,92 @@ impl<W: IndexWriter> ReindexPipeline<W> {
         Self { writer }
     }
 
+    /// Reindex a deterministic, exclusive range `[from, to)`.
+    ///
+    /// Iterates events with `from.ordinal <= ordinal < to.ordinal`, applying
+    /// exactly-once semantics: each event in the range is indexed exactly once
+    /// per invocation (dedup deletes the previous copy if `dedup_on_replay` is set).
+    ///
+    /// Replay guarantee: invoking the same range twice with `dedup_on_replay = true`
+    /// produces identical index contents for that range.
+    pub async fn reindex_range<S: RecorderStorage>(
+        &mut self,
+        storage: &S,
+        source: &RecorderSourceDescriptor,
+        from: RecorderOffset,
+        to: RecorderOffset,
+        consumer_id_str: &str,
+        batch_size: usize,
+        dedup_on_replay: bool,
+        expected_schema: &str,
+    ) -> Result<ReindexProgress, IndexerError> {
+        if batch_size == 0 {
+            return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
+        }
+        if to.ordinal <= from.ordinal {
+            // Empty range
+            tracing::debug!(
+                reindex_range = true,
+                from = %from.ordinal,
+                to = %to.ordinal,
+                backend = %source,
+                "reindex range is empty (to <= from)"
+            );
+            return Ok(ReindexProgress::new());
+        }
+
+        tracing::debug!(
+            reindex_range = true,
+            from = %from.ordinal,
+            to = %to.ordinal,
+            backend = %source,
+            "starting deterministic range reindex [from, to)"
+        );
+
+        let event_reader = create_event_reader(source)?;
+        let consumer_id = CheckpointConsumerId(consumer_id_str.to_string());
+        let mut progress = ReindexProgress::new();
+
+        // Open cursor at the range start
+        let mut cursor = if from.ordinal > 0 {
+            event_reader
+                .open_cursor_at_ordinal(from.ordinal)
+                .map_err(cursor_err)?
+        } else {
+            event_reader.open_cursor_from_start().map_err(cursor_err)?
+        };
+
+        // Use an exclusive-upper-bound range filter
+        let exclusive_range = ExclusiveOrdinalRange {
+            from_ordinal: from.ordinal,
+            to_ordinal: to.ordinal,
+        };
+
+        self.index_loop_exclusive(
+            storage,
+            &mut *cursor,
+            &consumer_id,
+            &exclusive_range,
+            batch_size,
+            dedup_on_replay,
+            expected_schema,
+            0, // no max_batches limit
+            &mut progress,
+        )
+        .await?;
+
+        tracing::debug!(
+            reindex_range = true,
+            from = %from.ordinal,
+            to = %to.ordinal,
+            events_indexed = progress.events_indexed,
+            events_read = progress.events_read,
+            "deterministic range reindex complete"
+        );
+
+        Ok(progress)
+    }
+
     /// Backfill a specific range of events.
     ///
     /// Events outside the specified range are skipped. The operation uses
@@ -513,6 +599,126 @@ impl<W: IndexWriter> ReindexPipeline<W> {
 
         Ok(())
     }
+
+    /// Core indexing loop for exclusive `[from, to)` ordinal ranges.
+    ///
+    /// Unlike `index_loop`, this uses a direct ordinal comparison with an
+    /// exclusive upper bound rather than the `BackfillRange` enum.
+    #[allow(clippy::too_many_arguments)]
+    async fn index_loop_exclusive<S: RecorderStorage>(
+        &mut self,
+        storage: &S,
+        cursor: &mut dyn RecorderEventCursor,
+        consumer_id: &CheckpointConsumerId,
+        range: &ExclusiveOrdinalRange,
+        batch_size: usize,
+        dedup_on_replay: bool,
+        expected_schema: &str,
+        max_batches: usize,
+        progress: &mut ReindexProgress,
+    ) -> Result<(), IndexerError> {
+        loop {
+            if max_batches > 0 && progress.batches_committed >= max_batches as u64 {
+                break;
+            }
+
+            let batch = cursor.next_batch(batch_size).map_err(cursor_err)?;
+            if batch.is_empty() {
+                progress.caught_up = true;
+                break;
+            }
+
+            let is_final_batch = batch.len() < batch_size;
+            let mut last_offset: Option<RecorderOffset> = None;
+            let mut index_mutations_in_batch = 0u64;
+
+            for record in &batch {
+                progress.events_read += 1;
+                let ordinal = record.offset.ordinal;
+
+                // Exclusive upper bound: stop at to_ordinal
+                if ordinal >= range.to_ordinal {
+                    progress.caught_up = true;
+                    last_offset = Some(record.offset.clone());
+                    break;
+                }
+
+                // Skip events before the range start (should not happen if
+                // cursor was opened at the right position, but defensive).
+                if ordinal < range.from_ordinal {
+                    progress.events_filtered += 1;
+                    last_offset = Some(record.offset.clone());
+                    continue;
+                }
+
+                // Schema version check
+                if record.event.schema_version != expected_schema {
+                    progress.events_skipped += 1;
+                    last_offset = Some(record.offset.clone());
+                    continue;
+                }
+
+                let doc = map_event_to_document(&record.event, record.offset.ordinal);
+
+                // Dedup
+                if dedup_on_replay {
+                    self.writer
+                        .delete_by_event_id(&doc.event_id)
+                        .map_err(IndexerError::IndexWrite)?;
+                    index_mutations_in_batch += 1;
+                }
+
+                match self.writer.add_document(&doc) {
+                    Ok(()) => {
+                        progress.events_indexed += 1;
+                        index_mutations_in_batch += 1;
+                    }
+                    Err(IndexWriteError::Rejected { .. }) => {
+                        progress.events_skipped += 1;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+
+                last_offset = Some(record.offset.clone());
+            }
+
+            if let Some(offset) = last_offset {
+                if index_mutations_in_batch > 0 {
+                    self.writer.commit().map_err(IndexerError::IndexWrite)?;
+                }
+
+                progress.current_ordinal = Some(offset.ordinal);
+
+                let cp = RecorderCheckpoint {
+                    consumer: consumer_id.clone(),
+                    upto_offset: offset,
+                    schema_version: expected_schema.to_string(),
+                    committed_at_ms: epoch_ms_now(),
+                };
+                storage.commit_checkpoint(cp).await?;
+                progress.batches_committed += 1;
+            }
+
+            if is_final_batch || progress.caught_up {
+                if !progress.caught_up {
+                    progress.caught_up = true;
+                }
+                break;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Exclusive ordinal range `[from_ordinal, to_ordinal)`.
+///
+/// Used by `reindex_range()` for deterministic replay with an exclusive
+/// upper bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExclusiveOrdinalRange {
+    from_ordinal: u64,
+    to_ordinal: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -2439,5 +2645,570 @@ mod tests {
         let full_report = IntegrityChecker::check(&lookup, &full_check).unwrap();
         assert!(!full_report.is_consistent);
         assert_eq!(full_report.missing_from_index.len(), 5); // e0-e2, e8-e9
+    }
+
+    // =========================================================================
+    // Deterministic range reindex [from, to) — E2.F2.T2
+    // =========================================================================
+
+    use crate::recorder_storage::{
+        CursorRecord, EventCursorError, RecorderEventCursor, RecorderEventReader,
+    };
+
+    /// In-memory event reader for backend-neutral range parity tests.
+    struct InMemoryEventReader {
+        records: Vec<CursorRecord>,
+    }
+
+    impl InMemoryEventReader {
+        fn from_events(events: &[RecorderEvent]) -> Self {
+            let records: Vec<_> = events
+                .iter()
+                .enumerate()
+                .map(|(i, e)| CursorRecord {
+                    event: e.clone(),
+                    offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: i as u64 * 100,
+                        ordinal: i as u64,
+                    },
+                })
+                .collect();
+            Self { records }
+        }
+    }
+
+    struct InMemoryCursor {
+        records: Vec<CursorRecord>,
+        pos: usize,
+    }
+
+    impl RecorderEventCursor for InMemoryCursor {
+        fn next_batch(
+            &mut self,
+            max: usize,
+        ) -> std::result::Result<Vec<CursorRecord>, EventCursorError> {
+            let end = (self.pos + max).min(self.records.len());
+            let batch = self.records[self.pos..end].to_vec();
+            self.pos = end;
+            Ok(batch)
+        }
+
+        fn current_offset(&self) -> RecorderOffset {
+            if self.pos > 0 && self.pos <= self.records.len() {
+                self.records[self.pos - 1].offset.clone()
+            } else {
+                RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 0,
+                }
+            }
+        }
+    }
+
+    impl RecorderEventReader for InMemoryEventReader {
+        fn open_cursor(
+            &self,
+            from: RecorderOffset,
+        ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+            let start = from.ordinal as usize;
+            let remaining: Vec<_> = self
+                .records
+                .iter()
+                .filter(|r| r.offset.ordinal >= start as u64)
+                .cloned()
+                .collect();
+            Ok(Box::new(InMemoryCursor {
+                records: remaining,
+                pos: 0,
+            }))
+        }
+
+        fn open_cursor_at_ordinal(
+            &self,
+            target_ordinal: u64,
+        ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+            self.open_cursor(RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: target_ordinal,
+            })
+        }
+
+        fn head_offset(&self) -> std::result::Result<RecorderOffset, EventCursorError> {
+            Ok(self
+                .records
+                .last()
+                .map(|r| RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: r.offset.byte_offset + 100,
+                    ordinal: r.offset.ordinal + 1,
+                })
+                .unwrap_or(RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 0,
+                }))
+        }
+    }
+
+    #[tokio::test]
+    async fn reindex_range_from_to_exclusive() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events: Vec<_> = (0..10)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        let source = RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        };
+
+        // Range [5, 8) should index ordinals 5, 6, 7 — NOT 4 or 8
+        let from = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 5,
+        };
+        let to = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 8,
+        };
+
+        let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let progress = pipeline
+            .reindex_range(
+                &storage,
+                &source,
+                from,
+                to,
+                "range-exclusive-test",
+                20,
+                false,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(progress.events_indexed, 3);
+        assert!(progress.caught_up);
+
+        let ids: Vec<&str> = pipeline
+            .backfill_writer()
+            .docs
+            .iter()
+            .map(|d| d.event_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["e5", "e6", "e7"]);
+    }
+
+    #[tokio::test]
+    async fn reindex_range_empty_produces_zero_documents() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        populate_log(&storage, vec![sample_event("e0", 1, 0, "text")]).await;
+
+        let source = RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        };
+
+        // [5, 5) is empty
+        let from = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 5,
+        };
+        let to = from.clone();
+
+        let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let progress = pipeline
+            .reindex_range(
+                &storage,
+                &source,
+                from,
+                to,
+                "empty-range-test",
+                20,
+                false,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(progress.events_indexed, 0);
+        assert_eq!(progress.events_read, 0);
+        assert!(pipeline.backfill_writer().docs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reindex_range_single_event() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events: Vec<_> = (0..5)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        let source = RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        };
+
+        // [3, 4) should index exactly ordinal 3
+        let from = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 3,
+        };
+        let to = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 4,
+        };
+
+        let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let progress = pipeline
+            .reindex_range(
+                &storage,
+                &source,
+                from,
+                to,
+                "single-event-test",
+                20,
+                false,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(progress.events_indexed, 1);
+        assert_eq!(pipeline.backfill_writer().docs[0].event_id, "e3");
+    }
+
+    #[tokio::test]
+    async fn reindex_replay_same_range_idempotent() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events: Vec<_> = (0..10)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        let source = RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        };
+
+        let from = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 2,
+        };
+        let to = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 6,
+        };
+
+        // Run 1: index [2, 6)
+        let mut p1 = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let r1 = p1
+            .reindex_range(
+                &storage,
+                &source,
+                from.clone(),
+                to.clone(),
+                "replay-r1",
+                20,
+                true,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+            )
+            .await
+            .unwrap();
+
+        // Run 2: same range with different consumer (simulates replay)
+        let mut p2 = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let r2 = p2
+            .reindex_range(
+                &storage,
+                &source,
+                from,
+                to,
+                "replay-r2",
+                20,
+                true,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+            )
+            .await
+            .unwrap();
+
+        // Both runs should produce identical results
+        assert_eq!(r1.events_indexed, r2.events_indexed);
+        assert_eq!(r1.events_indexed, 4); // ordinals 2, 3, 4, 5
+
+        let ids1: Vec<&str> = p1
+            .backfill_writer()
+            .docs
+            .iter()
+            .map(|d| d.event_id.as_str())
+            .collect();
+        let ids2: Vec<&str> = p2
+            .backfill_writer()
+            .docs
+            .iter()
+            .map(|d| d.event_id.as_str())
+            .collect();
+        assert_eq!(ids1, ids2);
+        assert_eq!(ids1, vec!["e2", "e3", "e4", "e5"]);
+    }
+
+    #[tokio::test]
+    async fn reindex_range_parity_across_backends() {
+        // Tests that the same range produces identical documents from
+        // an AppendLog backend and an in-memory "FrankenSqlite-like" backend.
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events: Vec<_> = (0..8)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+            .collect();
+        populate_log(&storage, events.clone()).await;
+
+        // --- AppendLog backend ---
+        let source_al = RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        };
+        let from = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 2,
+        };
+        let to = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 5,
+        };
+
+        let mut p_al = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let r_al = p_al
+            .reindex_range(
+                &storage,
+                &source_al,
+                from.clone(),
+                to.clone(),
+                "parity-al",
+                20,
+                false,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+            )
+            .await
+            .unwrap();
+
+        // --- In-memory backend (simulating FrankenSqlite) ---
+        let mem_reader = InMemoryEventReader::from_events(&events);
+        let mut cursor = mem_reader.open_cursor_at_ordinal(from.ordinal).unwrap();
+
+        // Manually run the same range using the in-memory cursor
+        let mut mem_docs = Vec::new();
+        loop {
+            let batch = cursor.next_batch(20).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for record in &batch {
+                if record.offset.ordinal >= to.ordinal {
+                    break;
+                }
+                if record.offset.ordinal < from.ordinal {
+                    continue;
+                }
+                mem_docs.push(map_event_to_document(&record.event, record.offset.ordinal));
+            }
+            break; // single batch sufficient for 8 events
+        }
+
+        // Compare results
+        assert_eq!(r_al.events_indexed, mem_docs.len() as u64);
+        assert_eq!(r_al.events_indexed, 3); // ordinals 2, 3, 4
+
+        let al_ids: Vec<&str> = p_al
+            .backfill_writer()
+            .docs
+            .iter()
+            .map(|d| d.event_id.as_str())
+            .collect();
+        let mem_ids: Vec<&str> = mem_docs.iter().map(|d| d.event_id.as_str()).collect();
+        assert_eq!(al_ids, mem_ids);
+        assert_eq!(al_ids, vec!["e2", "e3", "e4"]);
+
+        // Verify document field parity
+        for (al_doc, mem_doc) in p_al.backfill_writer().docs.iter().zip(mem_docs.iter()) {
+            assert_eq!(al_doc.event_id, mem_doc.event_id);
+            assert_eq!(al_doc.pane_id, mem_doc.pane_id);
+            assert_eq!(al_doc.log_offset, mem_doc.log_offset);
+            assert_eq!(al_doc.sequence, mem_doc.sequence);
+        }
+    }
+
+    #[tokio::test]
+    async fn reindex_range_batch_size_zero_errors() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        let source = RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        };
+        let from = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 0,
+        };
+        let to = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 10,
+        };
+
+        let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let err = pipeline
+            .reindex_range(
+                &storage,
+                &source,
+                from,
+                to,
+                "zero-batch",
+                0,
+                false,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IndexerError::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn reindex_range_schema_mismatch_skipped() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let mut bad = sample_event("bad", 1, 0, "bad-schema");
+        bad.schema_version = "ft.recorder.event.v99".to_string();
+        let good1 = sample_event("good1", 1, 1, "ok");
+        let good2 = sample_event("good2", 1, 2, "ok");
+
+        populate_log(&storage, vec![bad, good1, good2]).await;
+
+        let source = RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        };
+        let from = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 0,
+        };
+        let to = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 3,
+        };
+
+        let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let progress = pipeline
+            .reindex_range(
+                &storage,
+                &source,
+                from,
+                to,
+                "schema-skip-test",
+                20,
+                false,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(progress.events_indexed, 2);
+        assert_eq!(progress.events_skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn reindex_range_reversed_bounds_empty() {
+        // [8, 3) should produce zero documents (to < from)
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        populate_log(
+            &storage,
+            vec![sample_event("e0", 1, 0, "t"), sample_event("e1", 1, 1, "t")],
+        )
+        .await;
+
+        let source = RecorderSourceDescriptor::AppendLog {
+            data_path: dir.path().join("events.log"),
+        };
+
+        let from = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 8,
+        };
+        let to = RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 3,
+        };
+
+        let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+        let progress = pipeline
+            .reindex_range(
+                &storage,
+                &source,
+                from,
+                to,
+                "reversed-test",
+                20,
+                false,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(progress.events_indexed, 0);
+        assert_eq!(progress.events_read, 0);
+    }
+
+    #[test]
+    fn exclusive_ordinal_range_debug() {
+        let r = ExclusiveOrdinalRange {
+            from_ordinal: 5,
+            to_ordinal: 10,
+        };
+        let debug = format!("{r:?}");
+        assert!(debug.contains("ExclusiveOrdinalRange"));
+        assert!(debug.contains("5"));
+        assert!(debug.contains("10"));
+    }
+
+    #[test]
+    fn exclusive_ordinal_range_clone_eq() {
+        let r = ExclusiveOrdinalRange {
+            from_ordinal: 0,
+            to_ordinal: 100,
+        };
+        let cloned = r.clone();
+        assert_eq!(r, cloned);
     }
 }
