@@ -196,8 +196,8 @@ pub fn map_event_to_document(event: &RecorderEvent, log_offset: u64) -> IndexDoc
         lifecycle_phase,
         is_gap,
         redaction,
-        occurred_at_ms: event.occurred_at_ms as i64,
-        recorded_at_ms: event.recorded_at_ms as i64,
+        occurred_at_ms: i64::try_from(event.occurred_at_ms).unwrap_or(i64::MAX),
+        recorded_at_ms: i64::try_from(event.recorded_at_ms).unwrap_or(i64::MAX),
         sequence: event.sequence,
         log_offset,
         text,
@@ -446,6 +446,14 @@ impl AppendLogReader {
             return Ok(None);
         }
 
+        // Guard against corrupt files with impossibly large payload lengths
+        const MAX_RECORD_PAYLOAD: u64 = 64 * 1024 * 1024; // 64 MiB
+        if payload_len > MAX_RECORD_PAYLOAD {
+            return Err(LogReadError::Deserialize {
+                byte_offset: record_start,
+                message: format!("record payload too large: {payload_len} bytes (max {MAX_RECORD_PAYLOAD})"),
+            });
+        }
         let mut payload_buf = vec![0u8; payload_len as usize];
         self.file.read_exact(&mut payload_buf)?;
 

@@ -211,7 +211,7 @@ fn delete_sessions_by_size(conn: &Connection, max_total_mb: u64) -> Result<usize
             [&session_id],
         )?;
 
-        freed += session_bytes as u64;
+        freed += u64::try_from(session_bytes).unwrap_or(0);
         deleted += 1;
 
         debug!(

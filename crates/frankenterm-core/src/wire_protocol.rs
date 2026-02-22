@@ -199,6 +199,9 @@ impl BackoffConfig {
     #[must_use]
     pub fn delay_ms(&self, attempt: u32) -> u64 {
         let delay = self.initial_ms as f64 * self.multiplier.powi(attempt as i32);
+        if delay.is_nan() || delay.is_sign_negative() {
+            return self.max_ms;
+        }
         (delay as u64).min(self.max_ms)
     }
 }
@@ -458,7 +461,8 @@ impl Aggregator {
             });
 
         // Dedup: skip if we've already seen this or a later seq from this sender.
-        if envelope.seq <= session.last_seq {
+        // Use messages_received > 0 to allow seq=0 on first message.
+        if session.messages_received > 0 && envelope.seq <= session.last_seq {
             session.duplicates_skipped += 1;
             session.last_seen_ms = session.last_seen_ms.max(envelope.sent_at_ms);
             return Ok(IngestResult::Duplicate {
@@ -519,10 +523,13 @@ impl Aggregator {
 // ---------------------------------------------------------------------------
 
 fn epoch_ms_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 // ---------------------------------------------------------------------------

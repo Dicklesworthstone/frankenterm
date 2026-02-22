@@ -937,7 +937,7 @@ fn scan_valid_prefix(file: &mut File) -> std::result::Result<ScanResult, Recorde
             break;
         }
 
-        file.seek(SeekFrom::Current(payload_len as i64))?;
+        file.seek(SeekFrom::Current(i64::try_from(payload_len).unwrap_or(i64::MAX)))?;
         offset = next_offset;
         records += 1;
     }

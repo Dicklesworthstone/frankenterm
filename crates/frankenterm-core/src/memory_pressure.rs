@@ -203,7 +203,7 @@ impl MemoryPressureMonitor {
     pub fn sample(&self) -> MemorySample {
         let (total_kb, available_kb) = read_memory_info();
         let used_percent = if total_kb > 0 {
-            ((total_kb - available_kb) as f64 / total_kb as f64) * 100.0
+            (total_kb.saturating_sub(available_kb) as f64 / total_kb as f64) * 100.0
         } else {
             0.0
         };
