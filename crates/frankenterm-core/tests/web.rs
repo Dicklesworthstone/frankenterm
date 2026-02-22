@@ -74,7 +74,7 @@ mod web_tests {
     async fn fetch_stream_prefix(
         addr: SocketAddr,
         raw_request: &[u8],
-        timeout: Duration,
+        read_timeout: Duration,
         min_bytes: usize,
     ) -> std::io::Result<String> {
         let mut last_err = None;
@@ -82,7 +82,7 @@ mod web_tests {
             match TcpStream::connect(addr).await {
                 Ok(mut stream) => {
                     stream.write_all(raw_request).await?;
-                    let deadline = Instant::now() + timeout;
+                    let deadline = Instant::now() + read_timeout;
                     let mut buf = Vec::new();
                     while buf.len() < min_bytes {
                         let now = Instant::now();

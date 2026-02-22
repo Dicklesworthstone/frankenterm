@@ -22,15 +22,30 @@ pub(super) fn parse_event_stream_channel(
     qs: &QueryString<'_>,
 ) -> std::result::Result<EventStreamChannel, Response> {
     match qs.get("channel") {
-        None | Some("all") => Ok(EventStreamChannel::All),
-        Some("deltas" | "delta") => Ok(EventStreamChannel::Deltas),
-        Some("detections" | "detection") => Ok(EventStreamChannel::Detections),
-        Some("signals" | "signal") => Ok(EventStreamChannel::Signals),
+        None => Ok(EventStreamChannel::All),
+        Some(channel) if channel.eq_ignore_ascii_case("all") => Ok(EventStreamChannel::All),
+        Some(channel)
+            if channel.eq_ignore_ascii_case("deltas") || channel.eq_ignore_ascii_case("delta") =>
+        {
+            Ok(EventStreamChannel::Deltas)
+        }
+        Some(channel)
+            if channel.eq_ignore_ascii_case("detections")
+                || channel.eq_ignore_ascii_case("detection") =>
+        {
+            Ok(EventStreamChannel::Detections)
+        }
+        Some(channel)
+            if channel.eq_ignore_ascii_case("signals")
+                || channel.eq_ignore_ascii_case("signal") =>
+        {
+            Ok(EventStreamChannel::Signals)
+        }
         Some(other) => Err(json_err(
             StatusCode::BAD_REQUEST,
             "invalid_channel",
             format!(
-                "Invalid stream channel '{other}'. Expected one of: all, deltas, detections, signals"
+                "Invalid stream channel '{other}'. Expected one of: all, delta(s), detection(s), signal(s)"
             ),
         )),
     }
@@ -608,4 +623,36 @@ pub(super) fn handle_stream_deltas(
 
         SseResponse::new(TokioSseStream::new(rx)).into_response()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_event_stream_channel_is_case_insensitive() {
+        let qs = QueryString::parse("channel=DELTAS");
+        assert!(matches!(
+            parse_event_stream_channel(&qs),
+            Ok(EventStreamChannel::Deltas)
+        ));
+
+        let qs = QueryString::parse("channel=Signal");
+        assert!(matches!(
+            parse_event_stream_channel(&qs),
+            Ok(EventStreamChannel::Signals)
+        ));
+
+        let qs = QueryString::parse("channel=Detection");
+        assert!(matches!(
+            parse_event_stream_channel(&qs),
+            Ok(EventStreamChannel::Detections)
+        ));
+    }
+
+    #[test]
+    fn parse_event_stream_channel_invalid_still_errors() {
+        let qs = QueryString::parse("channel=unknown");
+        assert!(parse_event_stream_channel(&qs).is_err());
+    }
 }

@@ -288,18 +288,22 @@ fn parse_bool(qs: &QueryString<'_>, key: &str) -> bool {
     matches!(qs.get(key), Some("1" | "true" | "yes"))
 }
 
+#[cfg(test)]
 fn parse_stream_max_hz(qs: &QueryString<'_>) -> u64 {
     sse::parse_stream_max_hz(qs)
 }
 
+#[cfg(test)]
 type EventStreamChannel = sse::EventStreamChannel;
 
+#[cfg(test)]
 fn parse_event_stream_channel(
     qs: &QueryString<'_>,
 ) -> std::result::Result<EventStreamChannel, Response> {
     sse::parse_event_stream_channel(qs)
 }
 
+#[cfg(test)]
 fn epoch_ms_now() -> i64 {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -326,6 +330,7 @@ fn redact_json_value(value: &mut serde_json::Value, redactor: &Redactor) {
     }
 }
 
+#[cfg(test)]
 fn make_stream_frame(
     stream: &'static str,
     kind: &'static str,
@@ -335,6 +340,7 @@ fn make_stream_frame(
     sse::make_stream_frame(stream, kind, seq, data)
 }
 
+#[cfg(test)]
 fn frame_to_sse(
     event_type: &'static str,
     seq: u64,
@@ -343,6 +349,7 @@ fn frame_to_sse(
     sse::frame_to_sse(event_type, seq, frame)
 }
 
+#[cfg(test)]
 fn event_matches_pane(event: &Event, pane_filter: Option<u64>) -> bool {
     sse::event_matches_pane(event, pane_filter)
 }
@@ -622,20 +629,22 @@ mod tests {
     #[test]
     fn api_response_success_has_ok_true() {
         let resp = ApiResponse::success("hello");
-        assert!(resp.ok);
-        assert_eq!(resp.data.as_deref(), Some("hello"));
-        assert!(resp.error.is_none());
-        assert!(resp.error_code.is_none());
-        assert_eq!(resp.version, VERSION);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["data"], serde_json::json!("hello"));
+        assert!(json.get("error").is_none());
+        assert!(json.get("error_code").is_none());
+        assert_eq!(json["version"], VERSION);
     }
 
     #[test]
     fn api_response_error_has_ok_false() {
         let resp = ApiResponse::<()>::error("test_code", "something went wrong");
-        assert!(!resp.ok);
-        assert!(resp.data.is_none());
-        assert_eq!(resp.error.as_deref(), Some("something went wrong"));
-        assert_eq!(resp.error_code.as_deref(), Some("test_code"));
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["ok"], false);
+        assert!(json.get("data").is_none());
+        assert_eq!(json["error"], "something went wrong");
+        assert_eq!(json["error_code"], "test_code");
     }
 
     #[test]
