@@ -1,0 +1,196 @@
+//! Middleware wrappers for MCP tool handling.
+
+use super::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum McpOutputFormat {
+    #[default]
+    Json,
+    Toon,
+}
+
+pub(super) fn parse_mcp_output_format(raw: &str) -> Option<McpOutputFormat> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "json" => Some(McpOutputFormat::Json),
+        "toon" => Some(McpOutputFormat::Toon),
+        _ => None,
+    }
+}
+
+pub(super) fn extract_mcp_output_format(
+    arguments: &mut serde_json::Value,
+) -> std::result::Result<McpOutputFormat, String> {
+    let Some(object) = arguments.as_object_mut() else {
+        return Ok(McpOutputFormat::Json);
+    };
+
+    let Some(raw_value) = object.remove("format") else {
+        return Ok(McpOutputFormat::Json);
+    };
+
+    let Some(raw_format) = raw_value.as_str() else {
+        return Err("Invalid format: expected string 'json' or 'toon'".to_string());
+    };
+
+    parse_mcp_output_format(raw_format)
+        .ok_or_else(|| format!("Invalid format '{raw_format}': expected one of ['json', 'toon']"))
+}
+
+pub(super) fn augment_tool_schema_with_format(input_schema: &mut serde_json::Value) {
+    let Some(schema_obj) = input_schema.as_object_mut() else {
+        return;
+    };
+    if schema_obj.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return;
+    }
+
+    let properties = schema_obj
+        .entry("properties")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(properties_obj) = properties.as_object_mut() else {
+        return;
+    };
+
+    properties_obj
+        .entry("format".to_string())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "type": "string",
+                "enum": ["json", "toon"],
+                "description": "Optional output format override for this call"
+            })
+        });
+}
+
+pub(super) fn encode_mcp_contents(
+    contents: Vec<Content>,
+    format: McpOutputFormat,
+) -> McpResult<Vec<Content>> {
+    match format {
+        McpOutputFormat::Json => Ok(contents),
+        McpOutputFormat::Toon => contents
+            .into_iter()
+            .map(|content| match content {
+                Content::Text { text } => {
+                    let value = serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+                        McpError::internal_error(format!(
+                            "Unable to transcode MCP payload to TOON: {e}"
+                        ))
+                    })?;
+                    Ok(Content::Text {
+                        text: toon_rust::encode(value, None),
+                    })
+                }
+                other => Ok(other),
+            })
+            .collect(),
+    }
+}
+
+/// Wrapper that allows per-call MCP output format negotiation (`json` or `toon`).
+///
+/// Each wrapped tool accepts an optional `format` argument in its input schema.
+/// The argument is stripped before forwarding to the inner handler so existing
+/// tool parameter structs do not need to change.
+pub(super) struct FormatAwareToolHandler<T: ToolHandler> {
+    inner: T,
+}
+
+impl<T: ToolHandler> FormatAwareToolHandler<T> {
+    pub(super) fn new(inner: T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T: ToolHandler> ToolHandler for FormatAwareToolHandler<T> {
+    fn definition(&self) -> Tool {
+        let mut definition = self.inner.definition();
+        augment_tool_schema_with_format(&mut definition.input_schema);
+        definition
+    }
+
+    fn call(&self, ctx: &McpContext, mut arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let format = match extract_mcp_output_format(&mut arguments) {
+            Ok(format) => format,
+            Err(message) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    message,
+                    Some("Set format to either 'json' or 'toon'.".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+        let contents = self.inner.call(ctx, arguments)?;
+        encode_mcp_contents(contents, format)
+    }
+}
+
+/// Wrapper that records an audit entry for every tool call.
+///
+/// Wraps any `ToolHandler` and intercepts `call()` to record:
+/// - tool name and redacted argument keys
+/// - success/failure outcome
+/// - error code (if any)
+/// - elapsed time
+pub(super) struct AuditedToolHandler<T: ToolHandler> {
+    inner: T,
+    pub(super) tool_name: String,
+    db_path: Arc<PathBuf>,
+}
+
+impl<T: ToolHandler> AuditedToolHandler<T> {
+    pub(super) fn new(inner: T, tool_name: impl Into<String>, db_path: Arc<PathBuf>) -> Self {
+        Self {
+            inner,
+            tool_name: tool_name.into(),
+            db_path,
+        }
+    }
+}
+
+impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
+    fn definition(&self) -> Tool {
+        self.inner.definition()
+    }
+
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let raw_args = arguments.clone();
+        let result = self.inner.call(ctx, arguments);
+
+        // Extract ok/error_code from the envelope in the result.
+        let (ok, error_code) = match &result {
+            Ok(contents) => {
+                let parsed = contents.first().and_then(|c| match c {
+                    Content::Text { text } => serde_json::from_str::<serde_json::Value>(text).ok(),
+                    _ => None,
+                });
+                let is_ok = parsed
+                    .as_ref()
+                    .and_then(|v| v.get("ok")?.as_bool())
+                    .unwrap_or(true);
+                let code = if !is_ok {
+                    parsed.and_then(|v| v.get("error_code")?.as_str().map(String::from))
+                } else {
+                    None
+                };
+                (is_ok, code)
+            }
+            Err(_) => (false, Some("MCP_INTERNAL".to_string())),
+        };
+
+        record_mcp_audit_sync(
+            &self.db_path,
+            &self.tool_name,
+            &raw_args,
+            ok,
+            error_code.as_deref(),
+            elapsed_ms(start),
+        );
+
+        result
+    }
+}

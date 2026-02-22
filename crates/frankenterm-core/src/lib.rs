@@ -153,6 +153,8 @@ pub mod logging;
 pub mod lru_cache;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+#[cfg(feature = "mcp-client")]
+pub mod mcp_client;
 #[cfg(feature = "mcp")]
 pub mod mcp_error;
 pub mod memory_budget;

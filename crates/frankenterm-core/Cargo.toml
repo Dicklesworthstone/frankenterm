@@ -393,6 +393,7 @@ frankenterm = ["frankenterm-deps"]
 vendored = ["frankenterm"]  # backward compat alias
 browser = ["browser-automation"]
 mcp = ["mcp-server"]
+mcp-client = ["dep:fastmcp"]
 web = ["dep:fastapi", "dep:asupersync"]
 streaming = ["web"]
 tui = ["dep:ratatui", "dep:crossterm"]
