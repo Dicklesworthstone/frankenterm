@@ -82,6 +82,13 @@ tantivy = { workspace = true, optional = true }
 frankensearch = { workspace = true, optional = true }
 # Agent detection integration (optional, behind feature)
 franken-agent-detection = { workspace = true, optional = true }
+# FrankenRedis session integration (optional, behind feature)
+# Pin exact crate versions while sourcing code from the sibling source-of-truth repo.
+fr-store = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-store", optional = true }
+fr-protocol = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-protocol", optional = true }
+fr-config = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-config", optional = true }
+fr-expire = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-expire", optional = true }
+fr-persist = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-persist", optional = true }
 
 # Semantic search (optional, behind feature)
 tokenizers = { version = "0.21", optional = true }
@@ -317,6 +324,14 @@ semantic-search = ["dep:tokenizers", "dep:safetensors", "dep:half", "dep:fastemb
 frankensearch = ["dep:frankensearch"]
 # Feature gate for filesystem-based coding-agent installation probes.
 agent-detection = ["dep:franken-agent-detection"]
+# Feature gate for FrankenRedis-backed session state primitives.
+redis-session = [
+    "dep:fr-store",
+    "dep:fr-protocol",
+    "dep:fr-config",
+    "dep:fr-expire",
+    "dep:fr-persist",
+]
 
 # Optional heavy integrations - feature-gated (internal)
 frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-term"]
