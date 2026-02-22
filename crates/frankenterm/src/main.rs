@@ -12165,7 +12165,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let (hybrid_lexical_weight, hybrid_semantic_weight) =
                                 effective_search_fusion_weights(&config);
                             let hybrid_fusion_backend = effective_search_fusion_backend(&config);
-                            let mut semantic_budget_config = storage.semantic_budget_snapshot().config;
+                            let mut semantic_budget_config =
+                                storage.semantic_budget_snapshot().config;
                             semantic_budget_config.max_semantic_latency_ms =
                                 effective_search_quality_timeout_ms(&config);
                             storage.set_semantic_budget_config(semantic_budget_config);
@@ -12340,7 +12341,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         pane_filter: canonical.pane,
                                         since_filter: canonical.since,
                                         until_filter: canonical.until,
-                                        mode: canonical.mode.as_str().to_string(),
+                                        mode: effective_mode.clone(),
                                         metrics: Some(RobotSearchMetrics {
                                             requested_mode,
                                             effective_mode,
@@ -35121,7 +35122,7 @@ log_level = "debug"
             pane_filter: None,
             since_filter: None,
             until_filter: None,
-            mode: "hybrid".to_string(),
+            mode: "lexical".to_string(),
             metrics: Some(RobotSearchMetrics {
                 requested_mode: "hybrid".to_string(),
                 effective_mode: "lexical".to_string(),
@@ -35140,6 +35141,7 @@ log_level = "debug"
             }),
         };
         let with_metrics_json = serde_json::to_value(&with_metrics).unwrap();
+        assert_eq!(with_metrics_json["mode"], "lexical");
         assert_eq!(with_metrics_json["metrics"]["requested_mode"], "hybrid");
         assert_eq!(with_metrics_json["metrics"]["effective_mode"], "lexical");
         assert_eq!(
