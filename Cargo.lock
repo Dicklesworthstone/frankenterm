@@ -2613,6 +2613,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
  "toml",
  "toml_edit 0.24.1+spec-1.1.0",
  "tracing",
