@@ -74,6 +74,8 @@ pub mod caut;
 pub mod chaos;
 pub mod circuit_breaker;
 pub mod cleanup;
+#[cfg(feature = "subprocess-bridge")]
+pub mod code_scanner;
 pub mod command_guard;
 pub mod completion_token;
 pub mod concurrent_map;
@@ -95,6 +97,7 @@ pub mod dancing_links;
 pub mod dataflow;
 pub mod degradation;
 pub mod desktop_notify;
+pub mod diagram_render;
 pub mod diagnostic;
 pub mod differential_snapshot;
 pub mod disjoint_intervals;
