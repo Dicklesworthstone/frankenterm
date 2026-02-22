@@ -8,6 +8,7 @@
 //! rebuild detection.
 
 use sha2::{Digest, Sha256};
+use tantivy::schema::Value;
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions,
 };
@@ -301,6 +302,69 @@ pub fn fields_to_document(
     doc.add_text(handles.details_json, &fields.details_json);
 
     doc
+}
+
+/// Extract an [`IndexDocumentFields`] from a retrieved Tantivy [`TantivyDocument`].
+///
+/// Reverses [`fields_to_document`]. Optional fields that were not stored in
+/// the document come back as `None`. The `text_symbols` field is NOT stored
+/// in the index (per schema contract), so it is reconstructed from `text`.
+pub fn document_to_fields(
+    doc: &TantivyDocument,
+    handles: &LexicalFieldHandles,
+) -> IndexDocumentFields {
+    let get_text = |field: Field| -> String {
+        doc.get_first(field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let get_text_opt = |field: Field| -> Option<String> {
+        doc.get_first(field)
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+    let get_u64 =
+        |field: Field| -> u64 { doc.get_first(field).and_then(|v| v.as_u64()).unwrap_or(0) };
+    let get_i64 =
+        |field: Field| -> i64 { doc.get_first(field).and_then(|v| v.as_i64()).unwrap_or(0) };
+    let get_bool = |field: Field| -> bool {
+        doc.get_first(field)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+
+    let text = get_text(handles.text);
+    // text_symbols is NOT stored — reconstruct from text (same content at index time)
+    let text_symbols = text.clone();
+
+    IndexDocumentFields {
+        schema_version: get_text(handles.schema_version),
+        lexical_schema_version: get_text(handles.lexical_schema_version),
+        event_id: get_text(handles.event_id),
+        pane_id: get_u64(handles.pane_id),
+        session_id: get_text_opt(handles.session_id),
+        workflow_id: get_text_opt(handles.workflow_id),
+        correlation_id: get_text_opt(handles.correlation_id),
+        parent_event_id: get_text_opt(handles.parent_event_id),
+        trigger_event_id: get_text_opt(handles.trigger_event_id),
+        root_event_id: get_text_opt(handles.root_event_id),
+        source: get_text(handles.source),
+        event_type: get_text(handles.event_type),
+        ingress_kind: get_text_opt(handles.ingress_kind),
+        segment_kind: get_text_opt(handles.segment_kind),
+        control_marker_type: get_text_opt(handles.control_marker_type),
+        lifecycle_phase: get_text_opt(handles.lifecycle_phase),
+        is_gap: get_bool(handles.is_gap),
+        redaction: get_text_opt(handles.redaction),
+        occurred_at_ms: get_i64(handles.occurred_at_ms),
+        recorded_at_ms: get_i64(handles.recorded_at_ms),
+        sequence: get_u64(handles.sequence),
+        log_offset: get_u64(handles.log_offset),
+        text,
+        text_symbols,
+        details_json: get_text(handles.details_json),
+    }
 }
 
 // ---------------------------------------------------------------------------

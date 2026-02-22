@@ -827,6 +827,500 @@ impl LexicalSearchService for InMemorySearchService {
 }
 
 // ---------------------------------------------------------------------------
+// TantivySearchService — production implementation backed by a real index
+// ---------------------------------------------------------------------------
+
+/// Production implementation of [`LexicalSearchService`] backed by a live
+/// Tantivy index managed by [`LexicalIndexer`](crate::recorder_lexical_ingest::LexicalIndexer).
+///
+/// Performs BM25 search using Tantivy's native query parser, then reconstructs
+/// [`IndexDocumentFields`] from stored fields. Domain-specific filters from
+/// [`SearchFilter`] are applied as Tantivy query clauses where possible and as
+/// post-filters for complex predicates.
+pub struct TantivySearchService {
+    index: tantivy::Index,
+    handles: crate::recorder_lexical_schema::LexicalFieldHandles,
+    reader: tantivy::IndexReader,
+}
+
+impl TantivySearchService {
+    /// Create a new search service from a [`LexicalIndexer`](crate::recorder_lexical_ingest::LexicalIndexer).
+    pub fn from_indexer(
+        indexer: &crate::recorder_lexical_ingest::LexicalIndexer,
+    ) -> Result<Self, SearchError> {
+        let index = indexer.index().clone();
+        let reader = index.reader().map_err(|e| SearchError::Internal {
+            reason: format!("failed to create index reader: {e}"),
+        })?;
+        Ok(Self {
+            index,
+            handles: indexer.handles(),
+            reader,
+        })
+    }
+
+    /// Create from raw Tantivy index and field handles.
+    pub fn new(
+        index: tantivy::Index,
+        handles: crate::recorder_lexical_schema::LexicalFieldHandles,
+    ) -> Result<Self, SearchError> {
+        let reader = index.reader().map_err(|e| SearchError::Internal {
+            reason: format!("failed to create index reader: {e}"),
+        })?;
+        Ok(Self {
+            index,
+            handles,
+            reader,
+        })
+    }
+
+    /// Reload the underlying reader to pick up newly committed segments.
+    pub fn reload(&self) -> Result<(), SearchError> {
+        self.reader.reload().map_err(|e| SearchError::Internal {
+            reason: format!("reader reload failed: {e}"),
+        })
+    }
+
+    /// Build a Tantivy query for the text portion of a [`SearchQuery`].
+    fn build_text_query(
+        &self,
+        text: &str,
+        text_boost: f32,
+        symbols_boost: f32,
+    ) -> Result<Box<dyn tantivy::query::Query>, SearchError> {
+        use tantivy::query::{BooleanQuery, BoostQuery, Occur};
+
+        let terms = tokenize_query(text);
+        if terms.is_empty() {
+            return Ok(Box::new(tantivy::query::AllQuery));
+        }
+
+        let _tokenizer_mgr = self.index.tokenizers();
+        let mut all_clauses = Vec::new();
+
+        for term in &terms {
+            let term_lower = term.to_lowercase();
+            let mut term_clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+
+            // Text field with boost
+            let text_term = tantivy::schema::Term::from_field_text(self.handles.text, &term_lower);
+            let text_query = tantivy::query::TermQuery::new(
+                text_term,
+                tantivy::schema::IndexRecordOption::WithFreqsAndPositions,
+            );
+            term_clauses.push((
+                Occur::Should,
+                Box::new(BoostQuery::new(Box::new(text_query), text_boost)),
+            ));
+
+            // text_symbols field with boost
+            let sym_term =
+                tantivy::schema::Term::from_field_text(self.handles.text_symbols, &term_lower);
+            let sym_query = tantivy::query::TermQuery::new(
+                sym_term,
+                tantivy::schema::IndexRecordOption::WithFreqsAndPositions,
+            );
+            term_clauses.push((
+                Occur::Should,
+                Box::new(BoostQuery::new(Box::new(sym_query), symbols_boost)),
+            ));
+
+            all_clauses.push((
+                Occur::Should,
+                Box::new(BooleanQuery::new(term_clauses)) as Box<dyn tantivy::query::Query>,
+            ));
+        }
+
+        Ok(Box::new(BooleanQuery::new(all_clauses)))
+    }
+
+    /// Build Tantivy filter clauses from `SearchFilter` items.
+    fn build_filter_query(
+        &self,
+        filters: &[SearchFilter],
+    ) -> Vec<(tantivy::query::Occur, Box<dyn tantivy::query::Query>)> {
+        use tantivy::query::{BooleanQuery, Occur, RangeQuery, TermQuery};
+        use tantivy::schema::{IndexRecordOption, Term};
+
+        let mut clauses = Vec::new();
+
+        for filter in filters {
+            match filter {
+                SearchFilter::PaneId { values } => {
+                    let sub: Vec<_> = values
+                        .iter()
+                        .map(|v| {
+                            let term = Term::from_field_u64(self.handles.pane_id, *v);
+                            (
+                                Occur::Should,
+                                Box::new(TermQuery::new(term, IndexRecordOption::Basic))
+                                    as Box<dyn tantivy::query::Query>,
+                            )
+                        })
+                        .collect();
+                    if !sub.is_empty() {
+                        clauses.push((
+                            Occur::Must,
+                            Box::new(BooleanQuery::new(sub)) as Box<dyn tantivy::query::Query>,
+                        ));
+                    }
+                }
+                SearchFilter::SessionId { value } => {
+                    let term = Term::from_field_text(self.handles.session_id, value);
+                    clauses.push((
+                        Occur::Must,
+                        Box::new(TermQuery::new(term, IndexRecordOption::Basic))
+                            as Box<dyn tantivy::query::Query>,
+                    ));
+                }
+                SearchFilter::Source { values } => {
+                    let sub: Vec<_> = values
+                        .iter()
+                        .map(|v| {
+                            let term = Term::from_field_text(self.handles.source, v);
+                            (
+                                Occur::Should,
+                                Box::new(TermQuery::new(term, IndexRecordOption::Basic))
+                                    as Box<dyn tantivy::query::Query>,
+                            )
+                        })
+                        .collect();
+                    if !sub.is_empty() {
+                        clauses.push((
+                            Occur::Must,
+                            Box::new(BooleanQuery::new(sub)) as Box<dyn tantivy::query::Query>,
+                        ));
+                    }
+                }
+                SearchFilter::EventType { values } => {
+                    let sub: Vec<_> = values
+                        .iter()
+                        .map(|v| {
+                            let term = Term::from_field_text(self.handles.event_type, v);
+                            (
+                                Occur::Should,
+                                Box::new(TermQuery::new(term, IndexRecordOption::Basic))
+                                    as Box<dyn tantivy::query::Query>,
+                            )
+                        })
+                        .collect();
+                    if !sub.is_empty() {
+                        clauses.push((
+                            Occur::Must,
+                            Box::new(BooleanQuery::new(sub)) as Box<dyn tantivy::query::Query>,
+                        ));
+                    }
+                }
+                SearchFilter::Direction { direction } => match direction {
+                    EventDirection::Ingress => {
+                        let term = Term::from_field_text(self.handles.event_type, "ingress_text");
+                        clauses.push((
+                            Occur::Must,
+                            Box::new(TermQuery::new(term, IndexRecordOption::Basic))
+                                as Box<dyn tantivy::query::Query>,
+                        ));
+                    }
+                    EventDirection::Egress => {
+                        let term = Term::from_field_text(self.handles.event_type, "egress_output");
+                        clauses.push((
+                            Occur::Must,
+                            Box::new(TermQuery::new(term, IndexRecordOption::Basic))
+                                as Box<dyn tantivy::query::Query>,
+                        ));
+                    }
+                    EventDirection::Both => {
+                        let sub = vec![
+                            (
+                                Occur::Should,
+                                Box::new(TermQuery::new(
+                                    Term::from_field_text(self.handles.event_type, "ingress_text"),
+                                    IndexRecordOption::Basic,
+                                ))
+                                    as Box<dyn tantivy::query::Query>,
+                            ),
+                            (
+                                Occur::Should,
+                                Box::new(TermQuery::new(
+                                    Term::from_field_text(self.handles.event_type, "egress_output"),
+                                    IndexRecordOption::Basic,
+                                ))
+                                    as Box<dyn tantivy::query::Query>,
+                            ),
+                        ];
+                        clauses.push((
+                            Occur::Must,
+                            Box::new(BooleanQuery::new(sub)) as Box<dyn tantivy::query::Query>,
+                        ));
+                    }
+                },
+                SearchFilter::TimeRange { min_ms, max_ms } => {
+                    let field = self.handles.occurred_at_ms;
+                    let lower = min_ms
+                        .map(|v| Term::from_field_i64(field, v))
+                        .map(std::ops::Bound::Included)
+                        .unwrap_or(std::ops::Bound::Unbounded);
+                    let upper = max_ms
+                        .map(|v| Term::from_field_i64(field, v))
+                        .map(std::ops::Bound::Included)
+                        .unwrap_or(std::ops::Bound::Unbounded);
+                    let rq = RangeQuery::new_term_bounds(
+                        "occurred_at_ms".to_string(),
+                        tantivy::schema::Type::I64,
+                        &lower,
+                        &upper,
+                    );
+                    clauses.push((Occur::Must, Box::new(rq) as Box<dyn tantivy::query::Query>));
+                }
+                // Remaining filters applied post-query for simplicity
+                _ => {}
+            }
+        }
+
+        clauses
+    }
+}
+
+impl LexicalSearchService for TantivySearchService {
+    fn search(&self, query: &SearchQuery) -> Result<SearchResults, SearchError> {
+        use tantivy::query::{BooleanQuery, Occur};
+
+        let start = std::time::Instant::now();
+
+        if query.text.is_empty() && query.filters.is_empty() {
+            return Err(SearchError::InvalidQuery {
+                reason: "query must have text or at least one filter".to_string(),
+            });
+        }
+
+        let searcher = self.reader.searcher();
+
+        // Build combined query: text + filters
+        let text_query =
+            self.build_text_query(&query.text, query.text_boost(), query.text_symbols_boost())?;
+        let filter_clauses = self.build_filter_query(&query.filters);
+
+        let final_query: Box<dyn tantivy::query::Query> = if filter_clauses.is_empty() {
+            text_query
+        } else {
+            let mut clauses = vec![(Occur::Must, text_query)];
+            clauses.extend(filter_clauses);
+            Box::new(BooleanQuery::new(clauses))
+        };
+
+        // Fetch more than limit to account for post-filters
+        let fetch_limit = (query.pagination.limit + 1) * 2;
+        let top_docs = searcher
+            .search(
+                &final_query,
+                &tantivy::collector::TopDocs::with_limit(fetch_limit),
+            )
+            .map_err(|e| SearchError::Internal {
+                reason: format!("search failed: {e}"),
+            })?;
+
+        // Reconstruct IndexDocumentFields from stored fields
+        let mut scored: Vec<(f32, IndexDocumentFields)> = Vec::with_capacity(top_docs.len());
+        for (score, doc_addr) in &top_docs {
+            let doc = searcher
+                .doc::<tantivy::TantivyDocument>(*doc_addr)
+                .map_err(|e| SearchError::Internal {
+                    reason: format!("failed to retrieve doc: {e}"),
+                })?;
+            let fields = crate::recorder_lexical_schema::document_to_fields(&doc, &self.handles);
+            scored.push((*score, fields));
+        }
+
+        // Apply remaining post-filters (those not handled as Tantivy queries)
+        let has_post_filters = query.filters.iter().any(|f| {
+            matches!(
+                f,
+                SearchFilter::WorkflowId { .. }
+                    | SearchFilter::CorrelationId { .. }
+                    | SearchFilter::IngressKind { .. }
+                    | SearchFilter::SegmentKind { .. }
+                    | SearchFilter::ControlMarkerType { .. }
+                    | SearchFilter::LifecyclePhase { .. }
+                    | SearchFilter::IsGap { .. }
+                    | SearchFilter::Redaction { .. }
+                    | SearchFilter::RecordedTimeRange { .. }
+                    | SearchFilter::SequenceRange { .. }
+                    | SearchFilter::LogOffsetRange { .. }
+            )
+        });
+        if has_post_filters {
+            scored.retain(|(_, doc)| query.filters.iter().all(|f| f.matches(doc)));
+        }
+
+        let total_hits = scored.len() as u64;
+
+        // Apply cursor filter
+        if let Some(ref cursor) = query.pagination.after {
+            scored.retain(|(score, doc)| InMemorySearchService::passes_cursor(doc, *score, cursor));
+        }
+
+        // Sort results
+        match query.sort.primary {
+            SortField::Relevance => {
+                scored.sort_by(|(sa, da), (sb, db)| {
+                    sb.partial_cmp(sa)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| TieBreakKey::from_doc(da).cmp(&TieBreakKey::from_doc(db)))
+                });
+            }
+            SortField::OccurredAt => {
+                if query.sort.descending {
+                    scored.sort_by(|(_, da), (_, db)| {
+                        db.occurred_at_ms
+                            .cmp(&da.occurred_at_ms)
+                            .then_with(|| TieBreakKey::from_doc(da).cmp(&TieBreakKey::from_doc(db)))
+                    });
+                } else {
+                    scored.sort_by(|(_, da), (_, db)| {
+                        da.occurred_at_ms
+                            .cmp(&db.occurred_at_ms)
+                            .then_with(|| TieBreakKey::from_doc(da).cmp(&TieBreakKey::from_doc(db)))
+                    });
+                }
+            }
+            SortField::RecordedAt => {
+                if query.sort.descending {
+                    scored.sort_by_key(|(_, d)| std::cmp::Reverse(d.recorded_at_ms));
+                } else {
+                    scored.sort_by_key(|(_, d)| d.recorded_at_ms);
+                }
+            }
+            SortField::Sequence => {
+                if query.sort.descending {
+                    scored.sort_by_key(|(_, d)| std::cmp::Reverse(d.sequence));
+                } else {
+                    scored.sort_by_key(|(_, d)| d.sequence);
+                }
+            }
+            SortField::LogOffset => {
+                if query.sort.descending {
+                    scored.sort_by_key(|(_, d)| std::cmp::Reverse(d.log_offset));
+                } else {
+                    scored.sort_by_key(|(_, d)| d.log_offset);
+                }
+            }
+        }
+
+        // Paginate
+        let limit = query.pagination.limit;
+        let has_more = scored.len() > limit;
+        let page: Vec<_> = scored.into_iter().take(limit).collect();
+
+        // Build hits with snippets
+        let terms = tokenize_query(&query.text);
+        let hits: Vec<SearchHit> = page
+            .iter()
+            .map(|(score, doc)| {
+                let snippets = extract_snippets(&doc.text, &terms, &query.snippet_config);
+                SearchHit {
+                    score: *score,
+                    doc: doc.clone(),
+                    snippets,
+                }
+            })
+            .collect();
+
+        let next_cursor = hits.last().map(PaginationCursor::from_hit);
+        let elapsed_us = start.elapsed().as_micros() as u64;
+
+        Ok(SearchResults {
+            hits,
+            total_hits,
+            has_more,
+            next_cursor,
+            elapsed_us,
+        })
+    }
+
+    fn count(&self, query: &SearchQuery) -> Result<u64, SearchError> {
+        use tantivy::query::{BooleanQuery, Occur};
+
+        let searcher = self.reader.searcher();
+
+        let text_query =
+            self.build_text_query(&query.text, query.text_boost(), query.text_symbols_boost())?;
+        let filter_clauses = self.build_filter_query(&query.filters);
+
+        let final_query: Box<dyn tantivy::query::Query> = if filter_clauses.is_empty() {
+            text_query
+        } else {
+            let mut clauses = vec![(Occur::Must, text_query)];
+            clauses.extend(filter_clauses);
+            Box::new(BooleanQuery::new(clauses))
+        };
+
+        let count = searcher
+            .search(&final_query, &tantivy::collector::Count)
+            .map_err(|e| SearchError::Internal {
+                reason: format!("count failed: {e}"),
+            })?;
+
+        Ok(count as u64)
+    }
+
+    fn get_by_event_id(&self, event_id: &str) -> Result<Option<IndexDocumentFields>, SearchError> {
+        let searcher = self.reader.searcher();
+        let term = tantivy::schema::Term::from_field_text(self.handles.event_id, event_id);
+        let query = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+        let top = searcher
+            .search(&query, &tantivy::collector::TopDocs::with_limit(1))
+            .map_err(|e| SearchError::Internal {
+                reason: format!("get_by_event_id failed: {e}"),
+            })?;
+        match top.first() {
+            Some((_score, addr)) => {
+                let doc = searcher
+                    .doc::<tantivy::TantivyDocument>(*addr)
+                    .map_err(|e| SearchError::Internal {
+                        reason: format!("doc retrieval failed: {e}"),
+                    })?;
+                Ok(Some(crate::recorder_lexical_schema::document_to_fields(
+                    &doc,
+                    &self.handles,
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn get_by_log_offset(
+        &self,
+        log_offset: u64,
+    ) -> Result<Option<IndexDocumentFields>, SearchError> {
+        let searcher = self.reader.searcher();
+        let term = tantivy::schema::Term::from_field_u64(self.handles.log_offset, log_offset);
+        let query = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+        let top = searcher
+            .search(&query, &tantivy::collector::TopDocs::with_limit(1))
+            .map_err(|e| SearchError::Internal {
+                reason: format!("get_by_log_offset failed: {e}"),
+            })?;
+        match top.first() {
+            Some((_score, addr)) => {
+                let doc = searcher
+                    .doc::<tantivy::TantivyDocument>(*addr)
+                    .map_err(|e| SearchError::Internal {
+                        reason: format!("doc retrieval failed: {e}"),
+                    })?;
+                Ok(Some(crate::recorder_lexical_schema::document_to_fields(
+                    &doc,
+                    &self.handles,
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -838,7 +1332,7 @@ mod tests {
         RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
         RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
     };
-    use crate::tantivy_ingest::map_event_to_document;
+    use crate::tantivy_ingest::{IndexWriter, map_event_to_document};
 
     fn make_doc(pane: u64, text: &str, seq: u64) -> IndexDocumentFields {
         make_ingress(&format!("doc-{pane}-{seq}"), pane, seq, text)
@@ -1949,5 +2443,247 @@ mod tests {
             let back: EventDirection = serde_json::from_str(&json).unwrap();
             assert_eq!(*d, back);
         }
+    }
+
+    // =========================================================================
+    // TantivySearchService tests
+    // =========================================================================
+
+    fn tantivy_service() -> (TantivySearchService, tempfile::TempDir) {
+        use crate::recorder_lexical_ingest::{LexicalIndexer, LexicalIndexerConfig};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = LexicalIndexerConfig {
+            index_dir: tmp.path().to_path_buf(),
+            writer_memory_bytes: 15_000_000,
+        };
+        let indexer = LexicalIndexer::open(config).unwrap();
+        let mut writer = indexer.create_writer().unwrap();
+
+        // Index same docs as test_service()
+        let docs = vec![
+            make_ingress("i1", 1, 0, "echo hello world"),
+            make_ingress("i2", 1, 1, "cargo test --release"),
+            make_ingress("i3", 2, 2, "git push origin main"),
+            make_egress("e1", 1, 3, "hello world\nfoo bar"),
+            make_egress("e2", 2, 4, "Compiling frankenterm v0.1.0"),
+            make_egress("e3", 2, 5, "error[E0308]: mismatched types"),
+            make_control("c1", 1, 6),
+        ];
+        for doc in &docs {
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+
+        let svc = TantivySearchService::from_indexer(&indexer).unwrap();
+        (svc, tmp)
+    }
+
+    #[test]
+    fn tantivy_simple_text_search() {
+        let (svc, _tmp) = tantivy_service();
+        let q = SearchQuery::simple("hello");
+        let results = svc.search(&q).unwrap();
+        assert!(
+            results.total_hits >= 1,
+            "expected at least 1 hit for 'hello'"
+        );
+        let ids: Vec<_> = results
+            .hits
+            .iter()
+            .map(|h| h.doc.event_id.as_str())
+            .collect();
+        assert!(ids.contains(&"i1"), "missing i1 in results: {:?}", ids);
+    }
+
+    #[test]
+    fn tantivy_search_no_results() {
+        let (svc, _tmp) = tantivy_service();
+        let q = SearchQuery::simple("xyznonexistent");
+        let results = svc.search(&q).unwrap();
+        assert_eq!(results.total_hits, 0);
+        assert!(results.hits.is_empty());
+    }
+
+    #[test]
+    fn tantivy_filter_by_pane_id() {
+        let (svc, _tmp) = tantivy_service();
+        let q = SearchQuery::simple("hello echo cargo git Compiling error")
+            .with_filter(SearchFilter::PaneId { values: vec![2] });
+        let results = svc.search(&q).unwrap();
+        assert!(results.hits.iter().all(|h| h.doc.pane_id == 2));
+    }
+
+    #[test]
+    fn tantivy_filter_by_event_type() {
+        let (svc, _tmp) = tantivy_service();
+        let q = SearchQuery::simple("hello echo cargo git Compiling error").with_filter(
+            SearchFilter::EventType {
+                values: vec!["ingress_text".to_string()],
+            },
+        );
+        let results = svc.search(&q).unwrap();
+        assert!(
+            results
+                .hits
+                .iter()
+                .all(|h| h.doc.event_type == "ingress_text")
+        );
+    }
+
+    #[test]
+    fn tantivy_get_by_event_id() {
+        let (svc, _tmp) = tantivy_service();
+        let doc = svc.get_by_event_id("i2").unwrap();
+        assert!(doc.is_some());
+        let doc = doc.unwrap();
+        assert_eq!(doc.event_id, "i2");
+        assert_eq!(doc.pane_id, 1);
+    }
+
+    #[test]
+    fn tantivy_get_by_event_id_missing() {
+        let (svc, _tmp) = tantivy_service();
+        let doc = svc.get_by_event_id("nonexistent").unwrap();
+        assert!(doc.is_none());
+    }
+
+    #[test]
+    fn tantivy_get_by_log_offset() {
+        let (svc, _tmp) = tantivy_service();
+        let doc = svc.get_by_log_offset(3).unwrap();
+        assert!(doc.is_some());
+        let doc = doc.unwrap();
+        assert_eq!(doc.event_id, "e1");
+        assert_eq!(doc.log_offset, 3);
+    }
+
+    #[test]
+    fn tantivy_count() {
+        let (svc, _tmp) = tantivy_service();
+        let q = SearchQuery::simple("hello");
+        let count = svc.count(&q).unwrap();
+        assert!(count >= 1, "expected at least 1 for 'hello', got {count}");
+    }
+
+    #[test]
+    fn tantivy_is_ready() {
+        let (svc, _tmp) = tantivy_service();
+        assert!(svc.is_ready());
+    }
+
+    #[test]
+    fn tantivy_empty_query_with_filter() {
+        let (svc, _tmp) = tantivy_service();
+        let q = SearchQuery {
+            text: String::new(),
+            filters: vec![SearchFilter::PaneId { values: vec![1] }],
+            sort: SearchSortOrder::default(),
+            pagination: Pagination::default(),
+            snippet_config: SnippetConfig::default(),
+            field_boosts: HashMap::new(),
+        };
+        let results = svc.search(&q).unwrap();
+        assert!(results.total_hits > 0);
+        assert!(results.hits.iter().all(|h| h.doc.pane_id == 1));
+    }
+
+    #[test]
+    fn tantivy_empty_query_no_filter_errors() {
+        let (svc, _tmp) = tantivy_service();
+        let q = SearchQuery {
+            text: String::new(),
+            filters: Vec::new(),
+            sort: SearchSortOrder::default(),
+            pagination: Pagination::default(),
+            snippet_config: SnippetConfig::default(),
+            field_boosts: HashMap::new(),
+        };
+        let err = svc.search(&q).unwrap_err();
+        assert!(matches!(err, SearchError::InvalidQuery { .. }));
+    }
+
+    #[test]
+    fn tantivy_pagination_limit() {
+        let (svc, _tmp) = tantivy_service();
+        let q = SearchQuery::simple("hello echo cargo git Compiling error").with_limit(2);
+        let results = svc.search(&q).unwrap();
+        assert!(results.hits.len() <= 2);
+    }
+
+    #[test]
+    fn tantivy_direction_filter_ingress() {
+        let (svc, _tmp) = tantivy_service();
+        let q = SearchQuery::simple("hello echo cargo git Compiling error").with_filter(
+            SearchFilter::Direction {
+                direction: EventDirection::Ingress,
+            },
+        );
+        let results = svc.search(&q).unwrap();
+        assert!(
+            results
+                .hits
+                .iter()
+                .all(|h| h.doc.event_type == "ingress_text")
+        );
+    }
+
+    #[test]
+    fn tantivy_snippets_generated() {
+        let (svc, _tmp) = tantivy_service();
+        let q = SearchQuery::simple("hello");
+        let results = svc.search(&q).unwrap();
+        let has_snippets = results.hits.iter().any(|h| !h.snippets.is_empty());
+        assert!(has_snippets, "expected at least one hit with snippets");
+    }
+
+    #[test]
+    fn tantivy_document_round_trip_fidelity() {
+        let (svc, _tmp) = tantivy_service();
+        let doc = svc.get_by_event_id("i1").unwrap().unwrap();
+        assert_eq!(doc.event_id, "i1");
+        assert_eq!(doc.pane_id, 1);
+        assert_eq!(doc.source, "robot_mode");
+        assert_eq!(doc.event_type, "ingress_text");
+        assert!(doc.text.contains("echo hello world"));
+        assert!(doc.session_id.is_some());
+        assert_eq!(doc.sequence, 0);
+        assert_eq!(doc.log_offset, 0);
+    }
+
+    #[test]
+    fn tantivy_reload_picks_up_new_docs() {
+        use crate::recorder_lexical_ingest::{LexicalIndexer, LexicalIndexerConfig};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = LexicalIndexerConfig {
+            index_dir: tmp.path().to_path_buf(),
+            writer_memory_bytes: 15_000_000,
+        };
+        let indexer = LexicalIndexer::open(config).unwrap();
+        let mut writer = indexer.create_writer().unwrap();
+        writer
+            .add_document(&make_ingress("r1", 1, 0, "initial doc"))
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer); // Must drop before creating a new writer
+
+        let svc = TantivySearchService::from_indexer(&indexer).unwrap();
+        let count_before = svc.count(&SearchQuery::simple("initial")).unwrap();
+        assert!(count_before >= 1);
+
+        // Add more docs and commit (previous writer must be dropped first)
+        let mut writer2 = indexer.create_writer().unwrap();
+        writer2
+            .add_document(&make_ingress("r2", 1, 1, "second doc"))
+            .unwrap();
+        writer2.commit().unwrap();
+
+        svc.reload().unwrap();
+        let doc = svc.get_by_event_id("r2").unwrap();
+        assert!(
+            doc.is_some(),
+            "newly committed doc should be visible after reload"
+        );
     }
 }
