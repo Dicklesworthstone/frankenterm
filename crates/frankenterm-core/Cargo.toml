@@ -309,6 +309,11 @@ path = "tests/proptest_daemon.rs"
 required-features = ["semantic-search"]
 
 [[test]]
+name = "proptest_casr_types"
+path = "tests/proptest_casr_types.rs"
+required-features = ["session-resume"]
+
+[[test]]
 name = "proptest_disk_pressure"
 path = "tests/proptest_disk_pressure.rs"
 required-features = ["disk-pressure"]
