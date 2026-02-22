@@ -25,8 +25,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use tracing::info;
 
 use crate::policy::ActorKind;
+use crate::recorder_storage::RecorderBackendKind;
 
 // =============================================================================
 // Constants
@@ -325,6 +327,8 @@ pub struct ChainVerification {
     pub missing_ordinals: Vec<u64>,
     /// Expected ordinal range (first, last).
     pub ordinal_range: Option<(u64, u64)>,
+    /// Which backend produced the audited events (for telemetry tagging).
+    pub backend_kind: Option<RecorderBackendKind>,
 }
 
 // =============================================================================
@@ -518,6 +522,31 @@ impl AuditLog {
         inner.entries.drain(..).collect()
     }
 
+    /// Verify the hash chain of entries from a known backend.
+    ///
+    /// The `backend_kind` is recorded in the result and emitted in
+    /// telemetry logs so operators can correlate chain verification
+    /// outcomes with the storage backend.
+    #[must_use]
+    pub fn verify_chain_for_backend(
+        entries: &[RecorderAuditEntry],
+        expected_prev_hash: &str,
+        backend_kind: RecorderBackendKind,
+    ) -> ChainVerification {
+        let mut result = Self::verify_chain(entries, expected_prev_hash);
+        result.backend_kind = Some(backend_kind);
+
+        info!(
+            audit = "chain_verified",
+            backend = %backend_kind,
+            entries = result.total_entries,
+            intact = result.chain_intact,
+            "audit chain verification complete"
+        );
+
+        result
+    }
+
     /// Verify the hash chain of the given entries.
     ///
     /// The entries must be in ordinal order. The `expected_prev_hash` is the
@@ -535,6 +564,7 @@ impl AuditLog {
                 first_break_at: None,
                 missing_ordinals: Vec::new(),
                 ordinal_range: None,
+                backend_kind: None,
             };
         }
 
@@ -580,6 +610,7 @@ impl AuditLog {
             first_break_at,
             missing_ordinals,
             ordinal_range: Some((first_ordinal, last_ordinal)),
+            backend_kind: None,
         }
     }
 }
@@ -1961,6 +1992,7 @@ mod tests {
             first_break_at: None,
             missing_ordinals: vec![],
             ordinal_range: Some((0, 9)),
+            backend_kind: None,
         };
         let c = v.clone();
         assert_eq!(v, c);
@@ -2006,5 +2038,165 @@ mod tests {
         assert_eq!(entry.ordinal, 100);
         assert_eq!(entry.prev_entry_hash, "abc123");
         assert_eq!(log.next_ordinal(), 101);
+    }
+
+    // -------------------------------------------------------------------------
+    // Backend-agnostic audit checks (ft-2vuw7.1.4.1.1.2.2)
+    // -------------------------------------------------------------------------
+
+    fn build_audit_log_with_entries(count: usize) -> AuditLog {
+        let log = AuditLog::new(AuditLogConfig::default());
+        let actor = ActorIdentity::new(ActorKind::Robot, "test-agent");
+        for i in 0..count {
+            log.append(AuditEventBuilder::new(
+                AuditEventType::RecorderQuery,
+                actor.clone(),
+                1000 + i as u64,
+            ));
+        }
+        log
+    }
+
+    #[test]
+    fn audit_chain_integrity_with_append_log() {
+        let log = build_audit_log_with_entries(5);
+        let entries = log.entries();
+        let result = AuditLog::verify_chain_for_backend(
+            &entries,
+            GENESIS_HASH,
+            RecorderBackendKind::AppendLog,
+        );
+        assert!(result.chain_intact);
+        assert_eq!(result.backend_kind, Some(RecorderBackendKind::AppendLog));
+        assert_eq!(result.total_entries, 5);
+    }
+
+    #[test]
+    fn audit_chain_integrity_with_frankensqlite() {
+        let log = build_audit_log_with_entries(5);
+        let entries = log.entries();
+        let result = AuditLog::verify_chain_for_backend(
+            &entries,
+            GENESIS_HASH,
+            RecorderBackendKind::FrankenSqlite,
+        );
+        assert!(result.chain_intact);
+        assert_eq!(result.backend_kind, Some(RecorderBackendKind::FrankenSqlite));
+        assert_eq!(result.total_entries, 5);
+    }
+
+    #[test]
+    fn audit_tamper_detection_backend_agnostic() {
+        let log = build_audit_log_with_entries(3);
+        let mut entries = log.entries();
+        // Tamper: modify the second entry's body
+        entries[1].justification = Some("tampered".to_string());
+
+        for backend in [RecorderBackendKind::AppendLog, RecorderBackendKind::FrankenSqlite] {
+            let result = AuditLog::verify_chain_for_backend(&entries, GENESIS_HASH, backend);
+            assert!(
+                !result.chain_intact,
+                "tamper should be detected for {:?}",
+                backend
+            );
+            assert_eq!(result.backend_kind, Some(backend));
+            // Break should be at the entry after the tampered one
+            assert!(result.first_break_at.is_some());
+        }
+    }
+
+    #[test]
+    fn audit_access_tier_enforcement_backend_agnostic() {
+        // Access tier logic is independent of storage backend
+        for backend in [RecorderBackendKind::AppendLog, RecorderBackendKind::FrankenSqlite] {
+            assert!(
+                AccessTier::A3PrivilegedRaw.satisfies(AccessTier::A2FullQuery),
+                "A3 should satisfy A2 regardless of backend {:?}",
+                backend
+            );
+            assert!(
+                !AccessTier::A1RedactedQuery.satisfies(AccessTier::A3PrivilegedRaw),
+                "A1 should not satisfy A3 regardless of backend {:?}",
+                backend
+            );
+        }
+    }
+
+    #[test]
+    fn verify_chain_without_backend_has_none() {
+        let log = build_audit_log_with_entries(2);
+        let entries = log.entries();
+        let result = AuditLog::verify_chain(&entries, GENESIS_HASH);
+        assert!(result.backend_kind.is_none());
+        assert!(result.chain_intact);
+    }
+
+    #[test]
+    fn audit_chain_empty_entries_both_backends() {
+        for backend in [RecorderBackendKind::AppendLog, RecorderBackendKind::FrankenSqlite] {
+            let result = AuditLog::verify_chain_for_backend(&[], GENESIS_HASH, backend);
+            assert!(result.chain_intact);
+            assert_eq!(result.total_entries, 0);
+            assert_eq!(result.backend_kind, Some(backend));
+        }
+    }
+
+    #[test]
+    fn audit_ordinal_continuity_backend_agnostic() {
+        let log = build_audit_log_with_entries(5);
+        let entries = log.entries();
+
+        let result_al = AuditLog::verify_chain_for_backend(
+            &entries,
+            GENESIS_HASH,
+            RecorderBackendKind::AppendLog,
+        );
+        let result_fs = AuditLog::verify_chain_for_backend(
+            &entries,
+            GENESIS_HASH,
+            RecorderBackendKind::FrankenSqlite,
+        );
+
+        // Same chain integrity result regardless of backend
+        assert_eq!(result_al.chain_intact, result_fs.chain_intact);
+        assert_eq!(result_al.missing_ordinals, result_fs.missing_ordinals);
+        assert_eq!(result_al.total_entries, result_fs.total_entries);
+    }
+
+    #[test]
+    fn chain_verification_backend_kind_in_debug() {
+        let log = build_audit_log_with_entries(1);
+        let entries = log.entries();
+        let result = AuditLog::verify_chain_for_backend(
+            &entries,
+            GENESIS_HASH,
+            RecorderBackendKind::FrankenSqlite,
+        );
+        let dbg = format!("{:?}", result);
+        assert!(dbg.contains("FrankenSqlite"));
+    }
+
+    #[test]
+    fn audit_ownership_boundary_documented() {
+        // Audit log is independent: it maintains its own hash chain
+        // and does NOT depend on RecorderStorage for its integrity.
+        // This test documents the ownership boundary:
+        // - AuditLog: owns chain integrity (hash chain, ordinal continuity)
+        // - RecorderStorage: owns event persistence (append_log or frankensqlite)
+        let log = AuditLog::new(AuditLogConfig::default());
+        let actor = ActorIdentity::new(ActorKind::Human, "operator");
+        log.append(AuditEventBuilder::new(
+            AuditEventType::RecorderQuery,
+            actor,
+            5000,
+        ));
+
+        // The audit log works purely in memory — no storage backend needed
+        assert_eq!(log.len(), 1);
+        let entries = log.entries();
+        let verification = AuditLog::verify_chain(&entries, GENESIS_HASH);
+        assert!(verification.chain_intact);
+        // backend_kind is None because audit chain is storage-independent
+        assert!(verification.backend_kind.is_none());
     }
 }
