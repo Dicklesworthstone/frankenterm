@@ -370,15 +370,16 @@ pub fn k_shortest_paths(
             let root_cost: f64 = if i == 0 {
                 0.0
             } else {
-                // Sum edge weights along root path
+                // Sum minimum edge weights along root path
                 let mut cost = 0.0;
                 for w in root_path.windows(2) {
-                    for &(v, wt) in g.neighbors(w[0]) {
-                        if v == w[1] {
-                            cost += wt;
-                            break;
-                        }
-                    }
+                    let min_w = g
+                        .neighbors(w[0])
+                        .iter()
+                        .filter(|&&(v, _)| v == w[1])
+                        .map(|&(_, wt)| wt)
+                        .fold(f64::INFINITY, f64::min);
+                    cost += min_w;
                 }
                 cost
             };
@@ -479,14 +480,15 @@ mod tests {
     }
 
     fn diamond_graph() -> WeightedGraph {
-        //     0
-        //    / \
-        //   1   4
-        //  / \
-        // 1   2
-        //  \ /
-        //   3
-        //   3
+        //       0
+        //      / \
+        //   w=1   w=4
+        //    /     \
+        //   1--w=2->2
+        //    \     /
+        //   w=5  w=1
+        //      \ /
+        //       3
         WeightedGraph::from_edges(
             4,
             &[

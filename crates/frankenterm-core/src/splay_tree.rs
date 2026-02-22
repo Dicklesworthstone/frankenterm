@@ -112,6 +112,8 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
         let mut right_tree: Option<usize> = None;
         let mut left_tail: Option<usize> = None;
         let mut right_tail: Option<usize> = None;
+        let mut left_spine = Vec::new();
+        let mut right_spine = Vec::new();
         let mut current = root;
 
         loop {
@@ -146,6 +148,7 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
                         }
                     }
                     right_tail = Some(current);
+                    right_spine.push(current);
                     current = self.nodes[current].left.unwrap();
                     // Detach
                     if let Some(rt) = right_tail {
@@ -182,6 +185,7 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
                         }
                     }
                     left_tail = Some(current);
+                    left_spine.push(current);
                     current = self.nodes[current].right.unwrap();
                     // Detach
                     if let Some(lt) = left_tail {
@@ -218,34 +222,15 @@ impl<K: Ord + Clone, V: Clone> SplayTree<K, V> {
         self.nodes[current].right = right_tree;
 
         // Update sizes bottom-up for affected nodes
-        self.rebuild_sizes_for_splay(left_tree, left_tail);
-        self.rebuild_sizes_for_splay(right_tree, right_tail);
+        for &idx in left_spine.iter().rev() {
+            self.update_size(idx);
+        }
+        for &idx in right_spine.iter().rev() {
+            self.update_size(idx);
+        }
         self.update_size(current);
 
         current
-    }
-
-    /// Rebuild sizes along the splay path.
-    fn rebuild_sizes_for_splay(&mut self, tree_root: Option<usize>, tail: Option<usize>) {
-        // We need to update sizes from tail up to tree_root
-        // Since we don't have parent pointers, we'll do a recursive update
-        if let Some(root) = tree_root {
-            self.rebuild_size(root);
-        }
-        let _ = tail; // tail is within the tree_root subtree
-    }
-
-    fn rebuild_size(&mut self, idx: usize) -> usize {
-        let left_size = match self.nodes[idx].left {
-            Some(l) => self.rebuild_size(l),
-            None => 0,
-        };
-        let right_size = match self.nodes[idx].right {
-            Some(r) => self.rebuild_size(r),
-            None => 0,
-        };
-        self.nodes[idx].size = left_size + right_size + 1;
-        self.nodes[idx].size
     }
 
     // ── Public operations ─────────────────────────────────────────

@@ -564,14 +564,14 @@ fn map_insert<K: Clone + Eq + Hash, V: Clone>(
 ) -> (MapNode<K, V>, bool) {
     match node {
         MapNode::Empty => (MapNode::Leaf(hash, key, value), true),
-        MapNode::Leaf(existing_hash, ek, _) => {
+        MapNode::Leaf(existing_hash, ek, ev) => {
             if ek == &key {
                 // Update existing
                 (MapNode::Leaf(hash, key, value), false)
             } else if *existing_hash == hash {
                 // Hash collision at this level
                 let entries = vec![
-                    (ek.clone(), node.leaf_value().unwrap().clone()),
+                    (ek.clone(), ev.clone()),
                     (key, value),
                 ];
                 (MapNode::Collision(hash, entries), true)
@@ -585,7 +585,7 @@ fn map_insert<K: Clone + Eq + Hash, V: Clone>(
                 let (n, _) = map_insert(
                     &new_node,
                     ek.clone(),
-                    node.leaf_value().unwrap().clone(),
+                    ev.clone(),
                     *existing_hash,
                     shift,
                 );

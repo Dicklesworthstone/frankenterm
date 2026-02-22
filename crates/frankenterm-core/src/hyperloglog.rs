@@ -149,13 +149,8 @@ impl HyperLogLog {
             return lc as u64;
         }
 
-        // Large range correction (for 64-bit hash)
-        let two_32: f64 = (1u64 << 32) as f64;
-        if raw_estimate > two_32 / 30.0 {
-            let corrected = -two_32 * (1.0 - raw_estimate / two_32).ln();
-            return corrected as u64;
-        }
-
+        // Large range correction is unnecessary for 64-bit hashes
+        // because hash collisions only become significant near 2^64 / 30.
         raw_estimate as u64
     }
 
