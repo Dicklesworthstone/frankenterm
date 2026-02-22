@@ -218,7 +218,7 @@ impl BackpressureManager {
         *self
             .current_tier
             .read()
-            .expect("backpressure lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Classify queue depths into a tier without applying any state change.
@@ -262,7 +262,7 @@ impl BackpressureManager {
         // Upgrades (toward Black) are immediate.
         // Downgrades require hysteresis.
         if proposed < current {
-            let entered = *self.tier_entered_at.read().expect("lock poisoned");
+            let entered = *self.tier_entered_at.read().unwrap_or_else(|e| e.into_inner());
             let elapsed_ms = entered.elapsed().as_millis() as u64;
             if elapsed_ms < self.config.hysteresis_ms {
                 return None; // too soon to downgrade
@@ -270,8 +270,8 @@ impl BackpressureManager {
         }
 
         // Apply transition.
-        *self.current_tier.write().expect("lock poisoned") = proposed;
-        *self.tier_entered_at.write().expect("lock poisoned") = Instant::now();
+        *self.current_tier.write().unwrap_or_else(|e| e.into_inner()) = proposed;
+        *self.tier_entered_at.write().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         self.transition_count.fetch_add(1, Ordering::Relaxed);
 
         match proposed {
@@ -304,7 +304,7 @@ impl BackpressureManager {
     pub fn pause_pane(&self, pane_id: u64) {
         self.paused_panes
             .write()
-            .expect("lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(pane_id);
     }
 
@@ -312,13 +312,13 @@ impl BackpressureManager {
     pub fn resume_pane(&self, pane_id: u64) {
         self.paused_panes
             .write()
-            .expect("lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&pane_id);
     }
 
     /// Resume all paused panes (e.g. on recovery to Green).
     pub fn resume_all_panes(&self) {
-        self.paused_panes.write().expect("lock poisoned").clear();
+        self.paused_panes.write().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Check if a pane is currently paused.
@@ -326,14 +326,14 @@ impl BackpressureManager {
     pub fn is_pane_paused(&self, pane_id: u64) -> bool {
         self.paused_panes
             .read()
-            .expect("lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .contains(&pane_id)
     }
 
     /// List currently paused pane IDs.
     #[must_use]
     pub fn paused_pane_ids(&self) -> Vec<u64> {
-        let guard = self.paused_panes.read().expect("lock poisoned");
+        let guard = self.paused_panes.read().unwrap_or_else(|e| e.into_inner());
         let mut ids: Vec<u64> = guard.iter().copied().collect();
         ids.sort_unstable();
         ids
@@ -377,7 +377,7 @@ impl BackpressureManager {
     #[must_use]
     pub fn snapshot(&self, depths: &QueueDepths) -> BackpressureSnapshot {
         let tier = self.current_tier();
-        let entered = *self.tier_entered_at.read().expect("lock poisoned");
+        let entered = *self.tier_entered_at.read().unwrap_or_else(|e| e.into_inner());
         let now_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)

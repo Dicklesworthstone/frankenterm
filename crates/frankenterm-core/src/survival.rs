@@ -754,7 +754,7 @@ impl SurvivalModel {
     /// Record a new observation and update model parameters.
     pub fn observe(&self, obs: Observation) {
         {
-            let mut observations = self.observations.write().expect("obs lock poisoned");
+            let mut observations = self.observations.write().unwrap_or_else(|e| e.into_inner());
             observations.push(obs);
 
             // Trim to max capacity (keep most recent)
@@ -778,7 +778,7 @@ impl SurvivalModel {
         if self.in_warmup() {
             return 0.0;
         }
-        let params = self.params.read().expect("params lock poisoned");
+        let params = self.params.read().unwrap_or_else(|e| e.into_inner());
         params.hazard(t, covariates)
     }
 
@@ -788,7 +788,7 @@ impl SurvivalModel {
         if self.in_warmup() {
             return 1.0;
         }
-        let params = self.params.read().expect("params lock poisoned");
+        let params = self.params.read().unwrap_or_else(|e| e.into_inner());
         params.survival_probability(t, covariates)
     }
 
@@ -820,7 +820,7 @@ impl SurvivalModel {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
 
-        let params = self.params.read().expect("params lock poisoned").clone();
+        let params = self.params.read().unwrap_or_else(|e| e.into_inner()).clone();
         let hazard = if self.in_warmup() {
             0.0
         } else {
@@ -892,7 +892,7 @@ impl SurvivalModel {
     /// Current model parameters.
     #[must_use]
     pub fn params(&self) -> WeibullParams {
-        self.params.read().expect("params lock poisoned").clone()
+        self.params.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Signal shutdown.
@@ -934,12 +934,12 @@ impl SurvivalModel {
     ///
     /// Uses a single gradient step per call (online learning).
     fn update_parameters(&self) {
-        let observations = self.observations.read().expect("obs lock poisoned");
+        let observations = self.observations.read().unwrap_or_else(|e| e.into_inner());
         if observations.is_empty() {
             return;
         }
 
-        let mut params = self.params.write().expect("params lock poisoned");
+        let mut params = self.params.write().unwrap_or_else(|e| e.into_inner());
         let lr = self.config.learning_rate;
 
         // Compute gradient of log-likelihood w.r.t. beta
