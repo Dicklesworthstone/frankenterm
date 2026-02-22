@@ -49,6 +49,8 @@ pub mod adaptive_radix_tree;
 pub mod agent_correlator;
 #[cfg(feature = "agent-detection")]
 pub mod agent_detection;
+#[cfg(feature = "agent-mail")]
+pub mod agent_mail_bridge;
 pub mod agent_provider;
 pub mod alerts;
 pub mod api_schema;
@@ -57,11 +59,11 @@ pub mod auto_tune;
 pub mod backpressure;
 pub mod backpressure_severity;
 pub mod backup;
+pub mod bayesian_ledger;
 #[cfg(feature = "subprocess-bridge")]
 pub mod beads_bridge;
 #[cfg(feature = "subprocess-bridge")]
 pub mod beads_types;
-pub mod bayesian_ledger;
 pub mod binomial_heap;
 pub mod bloom_filter;
 pub mod bocpd;
@@ -84,6 +86,7 @@ pub mod config_profiles;
 pub mod conformal;
 pub mod consistent_hash;
 pub mod content_dedup;
+pub mod cooldown_tracker;
 pub mod continuous_backpressure;
 pub mod count_min_sketch;
 pub mod cpu_pressure;
@@ -97,8 +100,8 @@ pub mod dancing_links;
 pub mod dataflow;
 pub mod degradation;
 pub mod desktop_notify;
-pub mod diagram_render;
 pub mod diagnostic;
+pub mod diagram_render;
 pub mod differential_snapshot;
 pub mod disjoint_intervals;
 #[cfg(feature = "disk-pressure")]
@@ -195,6 +198,8 @@ pub mod restore_process;
 pub mod restore_scrollback;
 pub mod retry;
 pub mod ring_buffer;
+#[cfg(feature = "vc-export")]
+pub mod robot_envelope;
 pub mod robot_types;
 pub mod rope;
 pub mod rulesets;
@@ -260,7 +265,7 @@ pub mod undo;
 pub mod union_find;
 pub mod user_preferences;
 pub mod van_emde_boas;
-#[cfg(feature = "subprocess-bridge")]
+#[cfg(feature = "vc-export")]
 pub mod vc_export;
 pub mod viewport_reflow_planner;
 pub mod voi;
