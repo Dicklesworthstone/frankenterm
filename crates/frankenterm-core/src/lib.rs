@@ -49,6 +49,7 @@ pub mod adaptive_radix_tree;
 pub mod agent_correlator;
 #[cfg(feature = "agent-detection")]
 pub mod agent_detection;
+pub mod agent_provider;
 pub mod alerts;
 pub mod api_schema;
 pub mod approval;
@@ -61,9 +62,9 @@ pub mod binomial_heap;
 pub mod bloom_filter;
 pub mod bocpd;
 pub mod build_coord;
-pub mod cass;
 #[cfg(feature = "session-resume")]
 pub mod casr_types;
+pub mod cass;
 pub mod causal_dag;
 pub mod caut;
 pub mod chaos;
@@ -93,6 +94,12 @@ pub mod desktop_notify;
 pub mod diagnostic;
 pub mod differential_snapshot;
 pub mod disjoint_intervals;
+#[cfg(feature = "disk-pressure")]
+pub mod disk_ballast;
+#[cfg(feature = "disk-pressure")]
+pub mod disk_pressure;
+#[cfg(feature = "disk-pressure")]
+pub mod disk_scoring;
 pub mod docs_gen;
 pub mod drift;
 pub mod dry_run;
@@ -199,6 +206,8 @@ pub mod session_correlation;
 pub mod session_dna;
 pub mod session_pane_state;
 pub mod session_restore;
+#[cfg(feature = "session-resume")]
+pub mod session_resume;
 pub mod session_retention;
 #[cfg(feature = "redis-session")]
 pub mod session_store;
@@ -217,6 +226,8 @@ pub mod storage;
 pub mod storage_targets;
 pub mod storage_telemetry;
 pub mod stream_hash;
+#[cfg(feature = "subprocess-bridge")]
+pub mod subprocess_bridge;
 pub mod suffix_array;
 pub mod suggestions;
 pub mod survival;
