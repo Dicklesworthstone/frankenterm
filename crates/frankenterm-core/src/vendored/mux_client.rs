@@ -1281,6 +1281,219 @@ mod tests {
     }
 
     #[test]
+    fn batch_render_changes_zero_pipeline_depth_is_clamped_and_succeeds() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("batch-depth-clamp.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let response =
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "batch-depth-clamp-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    });
+                                let mut out = Vec::new();
+                                response
+                                    .encode(&mut out, decoded.serial)
+                                    .expect("encode response");
+                                stream.write_all(&out).await.expect("write response");
+                            }
+                            Pdu::SetClientId(_) => {
+                                let mut out = Vec::new();
+                                Pdu::UnitResponse(UnitResponse {})
+                                    .encode(&mut out, decoded.serial)
+                                    .expect("encode response");
+                                stream.write_all(&out).await.expect("write response");
+                            }
+                            Pdu::GetPaneRenderChanges(request) => {
+                                let response = Pdu::GetPaneRenderChangesResponse(
+                                    GetPaneRenderChangesResponse {
+                                        pane_id: request.pane_id,
+                                        mouse_grabbed: false,
+                                        cursor_position:
+                                            mux::renderable::StableCursorPosition::default(),
+                                        dimensions: mux::renderable::RenderableDimensions {
+                                            cols: 80,
+                                            viewport_rows: 24,
+                                            scrollback_rows: 0,
+                                            physical_top: 0,
+                                            scrollback_top: 0,
+                                            dpi: 96,
+                                            pixel_width: 0,
+                                            pixel_height: 0,
+                                            reverse_video: false,
+                                        },
+                                        dirty_lines: Vec::new(),
+                                        title: format!("pane-{}", request.pane_id),
+                                        working_dir: None,
+                                        bonus_lines: Vec::new().into(),
+                                        input_serial: None,
+                                        seqno: request.pane_id,
+                                    },
+                                );
+                                let mut out = Vec::new();
+                                response
+                                    .encode(&mut out, decoded.serial)
+                                    .expect("encode response");
+                                stream.write_all(&out).await.expect("write response");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            let responses = client
+                .get_pane_render_changes_batch(&[41, 42], 0, Duration::from_secs(1))
+                .await
+                .expect("batch request with zero depth should be clamped");
+
+            assert_eq!(responses.len(), 2);
+            assert_eq!(responses[0].pane_id, 41);
+            assert_eq!(responses[1].pane_id, 42);
+
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[test]
+    fn batch_render_changes_times_out_when_server_stalls_mid_batch() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("batch-timeout.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut responded_once = false;
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let response =
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "batch-timeout-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    });
+                                let mut out = Vec::new();
+                                response
+                                    .encode(&mut out, decoded.serial)
+                                    .expect("encode response");
+                                stream.write_all(&out).await.expect("write response");
+                            }
+                            Pdu::SetClientId(_) => {
+                                let mut out = Vec::new();
+                                Pdu::UnitResponse(UnitResponse {})
+                                    .encode(&mut out, decoded.serial)
+                                    .expect("encode response");
+                                stream.write_all(&out).await.expect("write response");
+                            }
+                            Pdu::GetPaneRenderChanges(request) => {
+                                if !responded_once {
+                                    responded_once = true;
+                                    let response = Pdu::GetPaneRenderChangesResponse(
+                                        GetPaneRenderChangesResponse {
+                                            pane_id: request.pane_id,
+                                            mouse_grabbed: false,
+                                            cursor_position:
+                                                mux::renderable::StableCursorPosition::default(),
+                                            dimensions: mux::renderable::RenderableDimensions {
+                                                cols: 80,
+                                                viewport_rows: 24,
+                                                scrollback_rows: 0,
+                                                physical_top: 0,
+                                                scrollback_top: 0,
+                                                dpi: 96,
+                                                pixel_width: 0,
+                                                pixel_height: 0,
+                                                reverse_video: false,
+                                            },
+                                            dirty_lines: Vec::new(),
+                                            title: "pane-timeout".to_string(),
+                                            working_dir: None,
+                                            bonus_lines: Vec::new().into(),
+                                            input_serial: None,
+                                            seqno: 1,
+                                        },
+                                    );
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                } else {
+                                    // Hold the socket open but don't answer the second request
+                                    // so batch timeout is enforced by the client wrapper.
+                                    sleep(Duration::from_millis(200)).await;
+                                    return;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            client.config.read_timeout = Duration::from_millis(500);
+
+            let err = client
+                .get_pane_render_changes_batch(&[10, 20], 2, Duration::from_millis(25))
+                .await
+                .expect_err("batch should time out when server stalls mid-batch");
+            match err {
+                DirectMuxError::BatchTimeout { timeout_ms } => assert_eq!(timeout_ms, 25),
+                other => panic!("expected BatchTimeout, got: {other}"),
+            }
+
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[test]
     fn next_request_serial_rejects_overflow() {
         let mut serial = u64::MAX;
         let err = next_request_serial(&mut serial).expect_err("overflow should be rejected");
@@ -1633,6 +1846,24 @@ mod tests {
     }
 
     #[test]
+    fn protocol_error_kind_treats_connection_io_as_recoverable() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::NotConnected,
+        ] {
+            let err = DirectMuxError::Io(std::io::Error::from(kind));
+            assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable);
+        }
+    }
+
+    #[test]
+    fn protocol_error_kind_treats_other_io_as_transient() {
+        let err = DirectMuxError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Transient);
+    }
+
+    #[test]
     fn is_local_unix_socket_rejects_directory_paths() {
         let tmp = tempfile::tempdir().expect("temp dir");
         assert!(!is_local_unix_socket(tmp.path()));
@@ -1942,6 +2173,87 @@ mod tests {
                 .await
                 .expect_err("list_panes should time out when server stalls");
             assert!(matches!(err, DirectMuxError::ReadTimeout));
+
+            drop(client);
+            server.join().expect("server thread");
+        });
+    }
+
+    #[test]
+    fn list_panes_disconnected_when_server_closes_after_request() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("disconnected-after-request.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for disconnected test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    let response =
+                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "disconnected-test".to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                        });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::SetClientId(_) => {
+                                    let mut out = Vec::new();
+                                    Pdu::UnitResponse(UnitResponse {})
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::ListPanes(_) => {
+                                    // Close after consuming the request so the client sees EOF
+                                    // while awaiting the corresponding response.
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            });
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should be ready before client connects");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.read_timeout = Duration::from_millis(200);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+
+            let err = client
+                .list_panes()
+                .await
+                .expect_err("list_panes should fail when server closes without responding");
+            assert!(matches!(err, DirectMuxError::Disconnected));
 
             drop(client);
             server.join().expect("server thread");
