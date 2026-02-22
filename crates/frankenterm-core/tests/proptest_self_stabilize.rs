@@ -452,7 +452,12 @@ proptest! {
     fn msg_patch_serde(
         entries in prop::collection::vec(arb_entry(), 0..10)
     ) {
-        let msg = ReconcileMessage::Patch(entries);
+        let msg = ReconcileMessage::Patch(
+            entries
+                .into_iter()
+                .map(|(k, v)| (k, Some(v)))
+                .collect(),
+        );
         let json = serde_json::to_string(&msg).unwrap();
         let back: ReconcileMessage = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(msg, back);

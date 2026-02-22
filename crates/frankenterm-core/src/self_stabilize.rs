@@ -246,19 +246,19 @@ impl ReconcileSession {
             // Since we're the authority, request the peer's diff.
             self.phase = Phase::Patching;
             // Send our full state as a diff hint (peer will figure out what's different)
-            let all_entries: Vec<(Vec<u8>, Vec<u8>)> = self
+            let all_entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
                 .local
                 .iter()
-                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                .map(|(k, v)| (k.to_vec(), Some(v.to_vec())))
                 .collect();
             RoundResult::SendMessage(ReconcileMessage::Patch(all_entries))
         } else {
             // Non-authority: tell the authority what we have so it can compute diff
             self.phase = Phase::Patching;
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+            let entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
                 .local
                 .iter()
-                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                .map(|(k, v)| (k.to_vec(), Some(v.to_vec())))
                 .collect();
             RoundResult::SendMessage(ReconcileMessage::Patch(entries))
         }
@@ -278,32 +278,36 @@ impl ReconcileSession {
         }
     }
 
-    fn handle_patch(&mut self, entries: &[(Vec<u8>, Vec<u8>)]) -> RoundResult {
+    fn handle_patch(&mut self, entries: &[(Vec<u8>, Option<Vec<u8>>)]) -> RoundResult {
         if self.is_authority {
             // Authority received peer's state — compute diff and send corrections
-            let peer_tree = MerkleTree::from_entries(entries.iter().cloned());
+            let peer_tree = MerkleTree::from_entries(
+                entries
+                    .iter()
+                    .filter_map(|(k, v)| v.as_ref().map(|val| (k.clone(), val.clone()))),
+            );
             let diff = peer_tree.diff(&self.local);
 
             // Collect entries the peer needs
-            let mut patches: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut patches: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
 
             // Added entries (in our tree, not in peer's)
             for key in &diff.added {
                 if let Some(value) = self.local.get(key) {
-                    patches.push((key.clone(), value.to_vec()));
+                    patches.push((key.clone(), Some(value.to_vec())));
                 }
             }
 
             // Changed entries (use our values)
             for key in &diff.changed {
                 if let Some(value) = self.local.get(key) {
-                    patches.push((key.clone(), value.to_vec()));
+                    patches.push((key.clone(), Some(value.to_vec())));
                 }
             }
 
-            // Tell peer about removed keys via empty values marker
+            // Tell peer about removed keys via explicit None
             for key in &diff.removed {
-                patches.push((key.clone(), Vec::new()));
+                patches.push((key.clone(), None));
             }
 
             self.phase = Phase::Converged;
@@ -315,13 +319,13 @@ impl ReconcileSession {
             }
         } else {
             // Non-authority received corrections — apply them.
-            // Empty values are removal markers from the authority.
+            // None values are removal markers from the authority.
             let mut tree = self.local.clone();
             for (key, value) in entries {
-                if value.is_empty() {
-                    tree.remove(key);
+                if let Some(val) = value {
+                    tree.insert(key.clone(), val.clone());
                 } else {
-                    tree.insert(key.clone(), value.clone());
+                    tree.remove(key);
                 }
             }
             self.local = tree;
@@ -671,7 +675,7 @@ mod tests {
 
     #[test]
     fn reconcile_message_clone() {
-        let msg = ReconcileMessage::Patch(vec![(b"k".to_vec(), b"v".to_vec())]);
+        let msg = ReconcileMessage::Patch(vec![(b"k".to_vec(), Some(b"v".to_vec()))]);
         let cloned = msg.clone();
         assert_eq!(msg, cloned);
     }
@@ -685,7 +689,7 @@ mod tests {
                 hashes: vec![MerkleHash::from_bytes([0x22; 32])],
             },
             ReconcileMessage::Diff(MerkleTree::new().diff(&MerkleTree::new())),
-            ReconcileMessage::Patch(vec![(b"key".to_vec(), b"val".to_vec())]),
+            ReconcileMessage::Patch(vec![(b"key".to_vec(), Some(b"val".to_vec()))]),
             ReconcileMessage::Converged,
         ];
         for msg in &msgs {
@@ -713,7 +717,7 @@ mod tests {
 
     #[test]
     fn round_result_clone() {
-        let r = RoundResult::ApplyPatch(vec![(b"k".to_vec(), b"v".to_vec())]);
+        let r = RoundResult::ApplyPatch(vec![(b"k".to_vec(), Some(b"v".to_vec()))]);
         let cloned = r.clone();
         assert_eq!(r, cloned);
     }
@@ -844,7 +848,7 @@ mod tests {
         let tree = make_tree(&[(b"a", b"old")]);
         let mut session = ReconcileSession::new(tree, false, ReconcileConfig::default());
         session.start();
-        let patches = vec![(b"a".to_vec(), b"new".to_vec())];
+        let patches = vec![(b"a".to_vec(), Some(b"new".to_vec()))];
         let result = session.receive(&ReconcileMessage::Patch(patches.clone()));
         assert!(matches!(result, RoundResult::ApplyPatch(_)));
         // Local tree should be updated
@@ -955,9 +959,9 @@ mod tests {
 
         // Simulate the replica sending its full state as a Patch
         let replica_entries = vec![
-            (b"a".to_vec(), b"1".to_vec()),
-            (b"b".to_vec(), b"2".to_vec()),
-            (b"c".to_vec(), b"3".to_vec()),
+            (b"a".to_vec(), Some(b"1".to_vec())),
+            (b"b".to_vec(), Some(b"2".to_vec())),
+            (b"c".to_vec(), Some(b"3".to_vec())),
         ];
         let result = authority.receive(&ReconcileMessage::Patch(replica_entries));
 
@@ -967,7 +971,7 @@ mod tests {
                 // Should contain empty-value markers for b and c
                 let removals: Vec<_> = patches
                     .iter()
-                    .filter(|(_, v)| v.is_empty())
+                    .filter(|(_, v)| v.is_none())
                     .map(|(k, _)| k.clone())
                     .collect();
                 assert!(removals.contains(&b"b".to_vec()), "missing removal for b");
@@ -987,8 +991,8 @@ mod tests {
 
         // Simulate authority sending corrections with removal markers
         let patches = vec![
-            (b"b".to_vec(), Vec::new()), // removal marker
-            (b"c".to_vec(), Vec::new()), // removal marker
+            (b"b".to_vec(), None), // removal marker
+            (b"c".to_vec(), None), // removal marker
         ];
         let result = replica.receive(&ReconcileMessage::Patch(patches));
         assert!(matches!(result, RoundResult::ApplyPatch(_)));
