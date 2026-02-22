@@ -67,24 +67,22 @@ fn arb_severity() -> impl Strategy<Value = f64> {
 }
 
 fn arb_s3fifo_config() -> impl Strategy<Value = S3FifoConfig> {
-    (10usize..=100, 5u32..=40, 1usize..=5).prop_map(|(cap, small_pct, ghost_mul)| {
-        S3FifoConfig {
-            total_capacity: cap,
-            small_fraction: small_pct as f64 / 100.0,
-            ghost_capacity_multiplier: ghost_mul,
-        }
+    (10usize..=100, 5u32..=40, 1usize..=5).prop_map(|(cap, small_pct, ghost_mul)| S3FifoConfig {
+        total_capacity: cap,
+        small_fraction: small_pct as f64 / 100.0,
+        ghost_capacity_multiplier: ghost_mul,
     })
 }
 
 fn arb_reserve_floor_config() -> impl Strategy<Value = ReserveFloorConfig> {
-    (1u32..=10, 0u32..=10, 1u32..=20, 10u32..=100).prop_map(
-        |(base, surge, threshold, cold_pct)| ReserveFloorConfig {
+    (1u32..=10, 0u32..=10, 1u32..=20, 10u32..=100).prop_map(|(base, surge, threshold, cold_pct)| {
+        ReserveFloorConfig {
             base_floor_units: base,
             surge_reserve_units: surge,
             surge_backlog_threshold: threshold,
             cold_shed_severity: cold_pct as f64 / 100.0,
-        },
-    )
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------

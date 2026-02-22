@@ -8,8 +8,8 @@
 //!
 //! Computes the Exponentially Weighted Moving Average (EWMA) of embedding vectors
 //! to maintain a "Semantic Centroid" on the unit sphere. It tracks the EWMA of
-//! cosine distances to measure the expected semantic variance of the session. 
-//! A "Shock" occurs when a new segment's distance from the centroid exceeds the 
+//! cosine distances to measure the expected semantic variance of the session.
+//! A "Shock" occurs when a new segment's distance from the centroid exceeds the
 //! expected variance by a tunable Z-score threshold.
 //!
 //! By operating natively in the embedding space (e.g., `all-MiniLM-L6-v2`), this
@@ -110,7 +110,7 @@ impl SemanticAnomalyDetector {
         }
 
         let normalized_emb = normalize(embedding);
-        
+
         // Calculate Cosine Distance (1.0 - Cosine Similarity)
         // Since vectors are normalized, dot product is cosine similarity.
         let similarity = dot_product(&self.centroid, &normalized_emb);
@@ -120,10 +120,10 @@ impl SemanticAnomalyDetector {
 
         if self.samples >= self.config.min_samples {
             let std_dev = self.variance.sqrt();
-            
+
             // Avoid division by zero for identical repeated inputs
             let safe_std_dev = std_dev.max(1e-5);
-            
+
             let z_score = (distance - self.mean_distance) / safe_std_dev;
 
             if z_score >= self.config.shock_threshold_z {
@@ -139,17 +139,17 @@ impl SemanticAnomalyDetector {
         // Update statistics using Welford's online algorithm adapted for EWMA
         let diff = distance - self.mean_distance;
         self.mean_distance += self.config.variance_alpha * diff;
-        
+
         // Variance EWMA update: (1-alpha)*(var + alpha*diff^2)
         // See: https://fanf2.user.srcf.net/hermes/doc/antiforgery/stats.pdf
-        self.variance = (1.0 - self.config.variance_alpha) 
-            * (self.variance + self.config.variance_alpha * diff * diff);
+        self.variance = (1.0 - self.config.variance_alpha)
+            * (self.config.variance_alpha * diff).mul_add(diff, self.variance);
 
         // Update the semantic centroid via spherical linear interpolation (SLERP approximation)
         // We use simple vector addition and re-normalization for efficiency.
         for (i, val) in self.centroid.iter_mut().enumerate() {
-            *val = (1.0 - self.config.centroid_alpha) * (*val) 
-                 + self.config.centroid_alpha * normalized_emb[i];
+            *val = (1.0 - self.config.centroid_alpha)
+                .mul_add(*val, self.config.centroid_alpha * normalized_emb[i]);
         }
         self.centroid = normalize(&self.centroid);
 
@@ -162,7 +162,7 @@ impl SemanticAnomalyDetector {
     pub fn current_centroid(&self) -> &[f32] {
         &self.centroid
     }
-    
+
     /// Reset the detector's state (e.g., after an intentional context switch like ssh/su).
     pub fn reset(&mut self) {
         self.centroid.clear();
@@ -237,10 +237,17 @@ mod tests {
         // Sudden Shift to Context B: (0, 1, 0) - Orthogonal!
         let context_b = vec![0.0, 1.0, 0.0];
         let shock = detector.observe(&context_b);
-        
-        assert!(shock.is_some(), "Expected a semantic shock upon orthogonal shift");
+
+        assert!(
+            shock.is_some(),
+            "Expected a semantic shock upon orthogonal shift"
+        );
         let s = shock.unwrap();
-        assert!(s.z_score > 2.0, "Z-score {} should exceed threshold", s.z_score);
+        assert!(
+            s.z_score > 2.0,
+            "Z-score {} should exceed threshold",
+            s.z_score
+        );
         assert!(s.distance > 0.5, "Distance should be large (orthogonal)");
     }
 

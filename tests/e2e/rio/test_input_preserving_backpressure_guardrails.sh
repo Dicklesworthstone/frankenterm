@@ -75,36 +75,74 @@ log_jsonl "$DECISIONS_JSONL" "$SCENARIO" "anchor_verification" "$phase1_outcome"
 # ── Phase 2: Targeted test execution ───────────────────────────
 echo "[Phase 2] Running targeted guardrail tests (rch-offloaded via harness)..."
 
-export CARGO_TEST_TIMEOUT="${CARGO_TEST_TIMEOUT:-600}"
-TEST_FILTERS=(
-  "input_guardrail_surge_reserve_activates_and_reports_reason_code"
-  "input_guardrail_floor_clamps_surge_reserve"
-  "input_guardrail_saturates_cleanly_near_u32_max"
-  "e2e_guardrail_reason_code_trace"
-)
+run_targeted_guardrail_test() {
+  local label="$1"
+  shift
+  local tmp_log="${ARTIFACT_DIR}/.${label}.tmp.log"
+  local rc=0
+
+  if command -v rch &>/dev/null; then
+    if ! TMPDIR=/tmp rch exec -- cargo test -p frankenterm-core "$@" >"$tmp_log" 2>&1; then
+      rc=$?
+    fi
+  else
+    if ! env CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/ft-target}" \
+      cargo test -p frankenterm-core "$@" >"$tmp_log" 2>&1; then
+      rc=$?
+    fi
+  fi
+
+  cat "$tmp_log" >> "${ARTIFACT_DIR}/guardrail_test_output.txt"
+  if rg -q "\\[RCH\\] local" "${ARTIFACT_DIR}/guardrail_test_output.txt"; then
+    echo "  FAIL: local fallback detected during ${label}"
+    return 97
+  fi
+  return "$rc"
+}
 
 : > "${ARTIFACT_DIR}/guardrail_test_output.txt"
 phase2_failed=0
-for filter in "${TEST_FILTERS[@]}"; do
-  echo "  Running filter: ${filter}"
-  if cargo_test "$filter" >> "${ARTIFACT_DIR}/guardrail_test_output.txt" 2>&1; then
-    echo "    PASS: ${filter}"
-  else
-    phase2_failed=1
-    echo "    FAIL: ${filter}"
-  fi
-done
+
+echo "  Running unit test: input_guardrail_surge_reserve_activates_and_reports_reason_code"
+run_targeted_guardrail_test \
+  "unit_guardrail_surge" \
+  --lib \
+  resize_scheduler::tests::input_guardrail_surge_reserve_activates_and_reports_reason_code \
+  -- --nocapture || phase2_failed=1
+
+echo "  Running unit test: input_guardrail_floor_clamps_surge_reserve"
+run_targeted_guardrail_test \
+  "unit_guardrail_floor_clamp" \
+  --lib \
+  resize_scheduler::tests::input_guardrail_floor_clamps_surge_reserve \
+  -- --nocapture || phase2_failed=1
+
+echo "  Running unit test: input_guardrail_saturates_cleanly_near_u32_max"
+run_targeted_guardrail_test \
+  "unit_guardrail_saturation" \
+  --lib \
+  resize_scheduler::tests::input_guardrail_saturates_cleanly_near_u32_max \
+  -- --nocapture || phase2_failed=1
+
+echo "  Running integration test: e2e_guardrail_reason_code_trace"
+run_targeted_guardrail_test \
+  "integration_guardrail_trace" \
+  --test resize_scheduler_input_guardrail_integration \
+  e2e_guardrail_reason_code_trace \
+  -- --nocapture || phase2_failed=1
 
 if [[ "$phase2_failed" -eq 0 ]]; then
   PASS_COUNT=$((PASS_COUNT + 1))
   echo "  PASS: targeted guardrail tests"
   log_jsonl "$DECISIONS_JSONL" "$SCENARIO" "targeted_tests" "pass" \
-    "filters=${TEST_FILTERS[*]}" "rch_expected=true" "test_output=guardrail_test_output.txt"
+    "tests=unit_surge,unit_floor_clamp,unit_saturation,integration_trace" \
+    "rch_expected=true" "test_output=guardrail_test_output.txt"
 else
   FAIL_COUNT=$((FAIL_COUNT + 1))
   echo "  FAIL: targeted guardrail tests"
   log_jsonl "$DECISIONS_JSONL" "$SCENARIO" "targeted_tests" "fail" \
-    "filters=${TEST_FILTERS[*]}" "rch_expected=true" "test_output=guardrail_test_output.txt"
+    "tests=unit_surge,unit_floor_clamp,unit_saturation,integration_trace" \
+    "rch_expected=true" "test_output=guardrail_test_output.txt"
 fi
 
 # ── Phase 3: JSONL trace extraction + reason-code gates ────────

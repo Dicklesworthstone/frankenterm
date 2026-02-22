@@ -57,7 +57,10 @@ impl WorkItemClass {
     /// Whether this class counts toward the interactive budget.
     #[inline]
     pub fn is_interactive(self) -> bool {
-        matches!(self, Self::Input | Self::ViewportCore | Self::ViewportOverscan)
+        matches!(
+            self,
+            Self::Input | Self::ViewportCore | Self::ViewportOverscan
+        )
     }
 
     /// Bridge from [`ReflowBatchPriority`] to [`WorkItemClass`].
@@ -463,13 +466,20 @@ impl ReserveFloorPolicy {
         &self,
         total_budget: u32,
         tier: BackpressureTier,
-        _severity: f64,
+        severity: f64,
         input_backlog: u32,
     ) -> BudgetPartition {
         let floor = self.compute_floor(input_backlog);
         let interactive_budget = floor.min(total_budget);
         let background_budget = total_budget.saturating_sub(interactive_budget);
-        let shed_action = self.shed_action_for_tier(tier);
+        let tier_action = self.shed_action_for_tier(tier);
+        let shed_action = if matches!(tier_action, ShedAction::DropCold)
+            && severity < self.config.cold_shed_severity
+        {
+            ShedAction::ThrottleBackground
+        } else {
+            tier_action
+        };
 
         BudgetPartition {
             interactive_budget,
@@ -590,7 +600,9 @@ impl InputReserveController {
     ) -> FrameScheduleResult {
         self.frames_scheduled += 1;
 
-        let partition = self.policy.partition(total_budget, tier, severity, input_backlog);
+        let partition = self
+            .policy
+            .partition(total_budget, tier, severity, input_backlog);
         let all_items = self.queue.drain_all();
 
         let mut selected = Vec::new();
@@ -647,7 +659,8 @@ impl InputReserveController {
 
             // Budget check
             if item.class.is_interactive() {
-                if interactive_used.saturating_add(item.work_units) <= partition.interactive_budget {
+                if interactive_used.saturating_add(item.work_units) <= partition.interactive_budget
+                {
                     interactive_used += item.work_units;
                     selected.push(item);
                 } else {
@@ -1080,6 +1093,26 @@ mod tests {
     }
 
     #[test]
+    fn partition_red_tier_below_cold_shed_severity_does_not_drop_cold() {
+        let policy = ReserveFloorPolicy::new(ReserveFloorConfig {
+            cold_shed_severity: 0.8,
+            ..ReserveFloorConfig::default()
+        });
+        let part = policy.partition(10, BackpressureTier::Red, 0.6, 0);
+        assert_eq!(part.shed_action, ShedAction::ThrottleBackground);
+    }
+
+    #[test]
+    fn partition_red_tier_above_cold_shed_severity_drops_cold() {
+        let policy = ReserveFloorPolicy::new(ReserveFloorConfig {
+            cold_shed_severity: 0.8,
+            ..ReserveFloorConfig::default()
+        });
+        let part = policy.partition(10, BackpressureTier::Red, 0.9, 0);
+        assert_eq!(part.shed_action, ShedAction::DropCold);
+    }
+
+    #[test]
     fn floor_monotonicity_with_backlog() {
         let policy = ReserveFloorPolicy::new(ReserveFloorConfig::default());
         let f0 = policy.compute_floor(0);
@@ -1200,6 +1233,59 @@ mod tests {
             .iter()
             .any(|s| s.reason == ShedReason::ColdSeverityShed);
         assert!(cold_shed);
+    }
+
+    #[test]
+    fn controller_red_tier_below_severity_threshold_keeps_cold_scrollback() {
+        let mut ctrl = InputReserveController::new(InputReserveConfig {
+            reserve_floor: ReserveFloorConfig {
+                cold_shed_severity: 0.8,
+                ..ReserveFloorConfig::default()
+            },
+            ..InputReserveConfig::default()
+        });
+        ctrl.submit(
+            make_item(1, WorkItemClass::ColdScrollback, 1),
+            BackpressureTier::Red,
+            0.6,
+            1000,
+        );
+
+        let result = ctrl.schedule_frame(10, BackpressureTier::Red, 0.6, 0, 1500);
+        assert_eq!(result.selected.len(), 1);
+        assert_eq!(result.selected[0].id, 1);
+        assert!(
+            !result
+                .shed_markers
+                .iter()
+                .any(|s| s.reason == ShedReason::ColdSeverityShed)
+        );
+    }
+
+    #[test]
+    fn controller_red_tier_above_severity_threshold_sheds_cold_scrollback() {
+        let mut ctrl = InputReserveController::new(InputReserveConfig {
+            reserve_floor: ReserveFloorConfig {
+                cold_shed_severity: 0.8,
+                ..ReserveFloorConfig::default()
+            },
+            ..InputReserveConfig::default()
+        });
+        ctrl.submit(
+            make_item(1, WorkItemClass::ColdScrollback, 1),
+            BackpressureTier::Red,
+            0.9,
+            1000,
+        );
+
+        let result = ctrl.schedule_frame(10, BackpressureTier::Red, 0.9, 0, 1500);
+        assert!(result.selected.is_empty());
+        assert!(
+            result
+                .shed_markers
+                .iter()
+                .any(|s| s.reason == ShedReason::ColdSeverityShed)
+        );
     }
 
     #[test]
@@ -1337,7 +1423,9 @@ mod tests {
 
     #[test]
     fn work_item_class_priority_ordering() {
-        assert!(WorkItemClass::Input.priority_level() > WorkItemClass::ViewportCore.priority_level());
+        assert!(
+            WorkItemClass::Input.priority_level() > WorkItemClass::ViewportCore.priority_level()
+        );
         assert!(
             WorkItemClass::ViewportCore.priority_level()
                 > WorkItemClass::ViewportOverscan.priority_level()

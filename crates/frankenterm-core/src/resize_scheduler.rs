@@ -1758,7 +1758,11 @@ impl ResizeScheduler {
         pending_input_events: u32,
     ) -> GuardrailBudgetDecision {
         let budget_units = budget_units.max(1);
-        let floor_units = self.config.input_resize_floor_units.max(1).min(budget_units);
+        let floor_units = self
+            .config
+            .input_resize_floor_units
+            .max(1)
+            .min(budget_units);
 
         if !self.config.input_guardrail_enabled {
             return GuardrailBudgetDecision {
@@ -4004,7 +4008,10 @@ mod tests {
         assert_eq!(frame.input_reserved_base_units, u32::MAX - 1);
         assert_eq!(frame.input_reserved_surge_units, 0);
         assert_eq!(frame.effective_resize_budget_units, 1);
-        assert_eq!(frame.input_guardrail_reason_code, "base_reserve_clamped_by_floor");
+        assert_eq!(
+            frame.input_guardrail_reason_code,
+            "base_reserve_clamped_by_floor"
+        );
     }
 
     #[test]
