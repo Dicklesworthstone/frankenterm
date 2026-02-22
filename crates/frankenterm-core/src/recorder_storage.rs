@@ -5,6 +5,16 @@
 //! - bounded in-flight admission and explicit overload signaling
 //! - idempotent `batch_id` handling
 //! - persisted writer/checkpoint state and torn-tail recovery
+//!
+//! ## Write/checkpoint invariant contract
+//! - `append_batch` is append-only: accepted records advance `next_offset` and `next_ordinal`
+//!   monotonically and never rewrite prior bytes.
+//! - `batch_id` is idempotent within retention bounds: replaying an existing `batch_id`
+//!   returns the original `AppendResponse` without duplicating writes.
+//! - `commit_checkpoint` is monotonic per consumer: lower ordinals are rejected with
+//!   `CheckpointRegression`, identical ordinals are `NoopAlreadyAdvanced`, and higher ordinals
+//!   are accepted as `Advanced`.
+//! - checkpoint state is durable in `state.json` and survives reopen.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -27,7 +37,17 @@ pub enum RecorderBackendKind {
     /// Local append-only log backend.
     AppendLog,
     /// FrankenSQLite-backed backend (implemented in a follow-on bead).
+    #[serde(rename = "frankensqlite", alias = "franken_sqlite")]
     FrankenSqlite,
+}
+
+impl std::fmt::Display for RecorderBackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AppendLog => write!(f, "append_log"),
+            Self::FrankenSqlite => write!(f, "frankensqlite"),
+        }
+    }
 }
 
 /// Durability requested by append callers.
@@ -186,6 +206,12 @@ pub enum RecorderStorageError {
 
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("backend {backend} unavailable: {message}")]
+    BackendUnavailable {
+        backend: RecorderBackendKind,
+        message: String,
+    },
 }
 
 impl RecorderStorageError {
@@ -200,6 +226,7 @@ impl RecorderStorageError {
             Self::CorruptRecord { .. } => RecorderStorageErrorClass::Corruption,
             Self::Io(_) => RecorderStorageErrorClass::Retryable,
             Self::Json(_) => RecorderStorageErrorClass::TerminalData,
+            Self::BackendUnavailable { .. } => RecorderStorageErrorClass::DependencyUnavailable,
         }
     }
 }
@@ -208,6 +235,12 @@ impl RecorderStorageError {
 #[allow(async_fn_in_trait)]
 pub trait RecorderStorage: Send + Sync {
     fn backend_kind(&self) -> RecorderBackendKind;
+    /// Return append-log data path when available for file-backed backends.
+    ///
+    /// Backends without a file-based append log should return `None`.
+    fn append_log_data_path(&self) -> Option<&Path> {
+        None
+    }
 
     async fn append_batch(
         &self,
@@ -233,7 +266,8 @@ pub trait RecorderStorage: Send + Sync {
 }
 
 /// Append-log backend configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppendLogStorageConfig {
     /// Path to append-only data file.
     pub data_path: PathBuf,
@@ -288,6 +322,116 @@ impl Default for AppendLogStorageConfig {
             max_batch_bytes: 256 * 1024,
             max_idempotency_entries: 4096,
         }
+    }
+}
+
+/// Startup-time recorder storage selector/config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecorderStorageConfig {
+    /// Requested backend kind for recorder writes.
+    pub backend: RecorderBackendKind,
+    /// Append-log backend settings.
+    pub append_log: AppendLogStorageConfig,
+}
+
+impl Default for RecorderStorageConfig {
+    fn default() -> Self {
+        Self {
+            backend: RecorderBackendKind::AppendLog,
+            append_log: AppendLogStorageConfig::default(),
+        }
+    }
+}
+
+/// Runtime-selected recorder storage backend.
+#[derive(Debug)]
+pub enum RecorderStorageInstance {
+    AppendLog(AppendLogRecorderStorage),
+}
+
+impl RecorderStorage for RecorderStorageInstance {
+    fn backend_kind(&self) -> RecorderBackendKind {
+        match self {
+            Self::AppendLog(inner) => inner.backend_kind(),
+        }
+    }
+
+    fn append_log_data_path(&self) -> Option<&Path> {
+        match self {
+            Self::AppendLog(inner) => inner.append_log_data_path(),
+        }
+    }
+
+    async fn append_batch(
+        &self,
+        req: AppendRequest,
+    ) -> std::result::Result<AppendResponse, RecorderStorageError> {
+        match self {
+            Self::AppendLog(inner) => inner.append_batch(req).await,
+        }
+    }
+
+    async fn flush(
+        &self,
+        mode: FlushMode,
+    ) -> std::result::Result<FlushStats, RecorderStorageError> {
+        match self {
+            Self::AppendLog(inner) => inner.flush(mode).await,
+        }
+    }
+
+    async fn read_checkpoint(
+        &self,
+        consumer: &CheckpointConsumerId,
+    ) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError> {
+        match self {
+            Self::AppendLog(inner) => inner.read_checkpoint(consumer).await,
+        }
+    }
+
+    async fn commit_checkpoint(
+        &self,
+        checkpoint: RecorderCheckpoint,
+    ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+        match self {
+            Self::AppendLog(inner) => inner.commit_checkpoint(checkpoint).await,
+        }
+    }
+
+    async fn health(&self) -> RecorderStorageHealth {
+        match self {
+            Self::AppendLog(inner) => inner.health().await,
+        }
+    }
+
+    async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
+        match self {
+            Self::AppendLog(inner) => inner.lag_metrics().await,
+        }
+    }
+}
+
+/// Bootstrap recorder storage from startup selector config.
+pub fn bootstrap_recorder_storage(
+    config: RecorderStorageConfig,
+) -> std::result::Result<RecorderStorageInstance, RecorderStorageError> {
+    match config.backend {
+        RecorderBackendKind::AppendLog => {
+            tracing::info!(
+                target: "recorder::bootstrap",
+                backend = %RecorderBackendKind::AppendLog,
+                data_path = %config.append_log.data_path.display(),
+                state_path = %config.append_log.state_path.display(),
+                "Bootstrapping recorder append-log backend"
+            );
+            let storage = AppendLogRecorderStorage::open(config.append_log)?;
+            Ok(RecorderStorageInstance::AppendLog(storage))
+        }
+        RecorderBackendKind::FrankenSqlite => Err(RecorderStorageError::BackendUnavailable {
+            backend: RecorderBackendKind::FrankenSqlite,
+            message: "frankensqlite backend not yet implemented".to_string(),
+        }),
     }
 }
 
@@ -409,6 +553,26 @@ impl AppendLogRecorderStorage {
             ordinal: inner.next_ordinal - 1,
         })
     }
+
+    /// Return the append-log data file path.
+    pub fn data_path(&self) -> &Path {
+        &self.config.data_path
+    }
+
+    fn clear_last_error(inner: &mut AppendLogInner) {
+        inner.last_error = None;
+    }
+
+    fn record_last_error(
+        inner: &mut AppendLogInner,
+        operation: &'static str,
+        err: &RecorderStorageError,
+    ) {
+        inner.last_error = Some(format!(
+            "{operation} failed (class={:?}): {err}",
+            err.class()
+        ));
+    }
 }
 
 struct InFlightGuard<'a> {
@@ -424,6 +588,10 @@ impl Drop for InFlightGuard<'_> {
 impl RecorderStorage for AppendLogRecorderStorage {
     fn backend_kind(&self) -> RecorderBackendKind {
         RecorderBackendKind::AppendLog
+    }
+
+    fn append_log_data_path(&self) -> Option<&Path> {
+        Some(&self.config.data_path)
     }
 
     async fn append_batch(
@@ -453,95 +621,114 @@ impl RecorderStorage for AppendLogRecorderStorage {
         }
 
         let mut inner = self.inner.lock().await;
+        let AppendRequest {
+            batch_id,
+            events,
+            required_durability,
+            producer_ts_ms: _producer_ts_ms,
+        } = req;
 
-        if let Some(existing) = inner.idempotency_cache.get(&req.batch_id) {
-            return Ok(existing.clone());
+        if let Some(existing) = inner.idempotency_cache.get(&batch_id).cloned() {
+            Self::clear_last_error(&mut inner);
+            return Ok(existing);
         }
 
-        let mut encoded = Vec::with_capacity(req.events.len());
-        let mut total_bytes = 0usize;
-        for event in req.events {
-            let payload = serde_json::to_vec(&event)?;
-            total_bytes += payload.len() + 4;
-            encoded.push(payload);
-        }
+        let result = (|| -> std::result::Result<AppendResponse, RecorderStorageError> {
+            let mut encoded = Vec::with_capacity(events.len());
+            let mut total_bytes = 0usize;
+            for event in events {
+                let payload = serde_json::to_vec(&event)?;
+                total_bytes += payload.len() + 4;
+                encoded.push(payload);
+            }
 
-        if total_bytes > self.config.max_batch_bytes {
-            return Err(RecorderStorageError::InvalidRequest {
-                message: format!(
-                    "batch bytes {} exceeds max {}",
-                    total_bytes, self.config.max_batch_bytes
-                ),
-            });
-        }
-
-        let first_offset = RecorderOffset {
-            segment_id: inner.segment_id,
-            byte_offset: inner.next_offset,
-            ordinal: inner.next_ordinal,
-        };
-
-        let mut last_offset = first_offset.clone();
-
-        for payload in encoded {
-            let payload_len = payload.len();
-            if payload_len > u32::MAX as usize {
+            if total_bytes > self.config.max_batch_bytes {
                 return Err(RecorderStorageError::InvalidRequest {
-                    message: format!("record payload too large: {payload_len} bytes"),
+                    message: format!(
+                        "batch bytes {} exceeds max {}",
+                        total_bytes, self.config.max_batch_bytes
+                    ),
                 });
             }
 
-            let record_start = inner.next_offset;
-            let ordinal = inner.next_ordinal;
-            inner
-                .writer
-                .write_all(&(payload_len as u32).to_le_bytes())?;
-            inner.writer.write_all(&payload)?;
-            inner.next_offset += 4 + payload_len as u64;
-            inner.next_ordinal += 1;
-            last_offset = RecorderOffset {
+            let first_offset = RecorderOffset {
                 segment_id: inner.segment_id,
-                byte_offset: record_start,
-                ordinal,
+                byte_offset: inner.next_offset,
+                ordinal: inner.next_ordinal,
             };
-        }
 
-        match req.required_durability {
-            DurabilityLevel::Enqueued => {}
-            DurabilityLevel::Appended => {
-                inner.writer.flush()?;
-                self.persist_state(&inner)?;
+            let mut last_offset = first_offset.clone();
+
+            for payload in encoded {
+                let payload_len = payload.len();
+                if payload_len > u32::MAX as usize {
+                    return Err(RecorderStorageError::InvalidRequest {
+                        message: format!("record payload too large: {payload_len} bytes"),
+                    });
+                }
+
+                let record_start = inner.next_offset;
+                let ordinal = inner.next_ordinal;
+                inner
+                    .writer
+                    .write_all(&(payload_len as u32).to_le_bytes())?;
+                inner.writer.write_all(&payload)?;
+                inner.next_offset += 4 + payload_len as u64;
+                inner.next_ordinal += 1;
+                last_offset = RecorderOffset {
+                    segment_id: inner.segment_id,
+                    byte_offset: record_start,
+                    ordinal,
+                };
             }
-            DurabilityLevel::Fsync => {
-                inner.writer.flush()?;
-                inner.writer.get_ref().sync_data()?;
-                self.persist_state(&inner)?;
+
+            match required_durability {
+                DurabilityLevel::Enqueued => {}
+                DurabilityLevel::Appended => {
+                    inner.writer.flush()?;
+                    self.persist_state(&inner)?;
+                }
+                DurabilityLevel::Fsync => {
+                    inner.writer.flush()?;
+                    inner.writer.get_ref().sync_data()?;
+                    self.persist_state(&inner)?;
+                }
+            }
+
+            let response = AppendResponse {
+                backend: RecorderBackendKind::AppendLog,
+                accepted_count: last_offset
+                    .ordinal
+                    .saturating_sub(first_offset.ordinal)
+                    .saturating_add(1) as usize,
+                first_offset,
+                last_offset,
+                committed_durability: required_durability,
+                committed_at_ms: crate::recording::epoch_ms_now(),
+            };
+
+            inner
+                .idempotency_cache
+                .insert(batch_id.clone(), response.clone());
+            inner.idempotency_order.push_back(batch_id);
+            while inner.idempotency_cache.len() > self.config.max_idempotency_entries {
+                if let Some(evict) = inner.idempotency_order.pop_front() {
+                    inner.idempotency_cache.remove(&evict);
+                }
+            }
+            Ok(response)
+        })();
+
+        match result {
+            Ok(response) => {
+                Self::clear_last_error(&mut inner);
+                Ok(response)
+            }
+            Err(err) => {
+                Self::record_last_error(&mut inner, "append_batch", &err);
+                Err(err)
             }
         }
-
-        let response = AppendResponse {
-            backend: RecorderBackendKind::AppendLog,
-            accepted_count: last_offset
-                .ordinal
-                .saturating_sub(first_offset.ordinal)
-                .saturating_add(1) as usize,
-            first_offset,
-            last_offset,
-            committed_durability: req.required_durability,
-            committed_at_ms: crate::recording::epoch_ms_now(),
-        };
-
-        inner
-            .idempotency_cache
-            .insert(req.batch_id.clone(), response.clone());
-        inner.idempotency_order.push_back(req.batch_id);
-        while inner.idempotency_cache.len() > self.config.max_idempotency_entries {
-            if let Some(evict) = inner.idempotency_order.pop_front() {
-                inner.idempotency_cache.remove(&evict);
-            }
-        }
-
-        Ok(response)
     }
 
     async fn flush(
@@ -549,16 +736,29 @@ impl RecorderStorage for AppendLogRecorderStorage {
         mode: FlushMode,
     ) -> std::result::Result<FlushStats, RecorderStorageError> {
         let mut inner = self.inner.lock().await;
-        inner.writer.flush()?;
-        if mode == FlushMode::Durable {
-            inner.writer.get_ref().sync_data()?;
+        let result = (|| -> std::result::Result<FlushStats, RecorderStorageError> {
+            inner.writer.flush()?;
+            if mode == FlushMode::Durable {
+                inner.writer.get_ref().sync_data()?;
+            }
+            self.persist_state(&inner)?;
+            Ok(FlushStats {
+                backend: RecorderBackendKind::AppendLog,
+                flushed_at_ms: crate::recording::epoch_ms_now(),
+                latest_offset: Self::latest_offset(&inner),
+            })
+        })();
+
+        match result {
+            Ok(stats) => {
+                Self::clear_last_error(&mut inner);
+                Ok(stats)
+            }
+            Err(err) => {
+                Self::record_last_error(&mut inner, "flush", &err);
+                Err(err)
+            }
         }
-        self.persist_state(&inner)?;
-        Ok(FlushStats {
-            backend: RecorderBackendKind::AppendLog,
-            flushed_at_ms: crate::recording::epoch_ms_now(),
-            latest_offset: Self::latest_offset(&inner),
-        })
     }
 
     async fn read_checkpoint(
@@ -574,27 +774,42 @@ impl RecorderStorage for AppendLogRecorderStorage {
         checkpoint: RecorderCheckpoint,
     ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
         let mut inner = self.inner.lock().await;
-        let key = checkpoint.consumer.0.clone();
-        let outcome = match inner.checkpoints.get(&key) {
-            Some(existing) if checkpoint.upto_offset.ordinal < existing.upto_offset.ordinal => {
-                return Err(RecorderStorageError::CheckpointRegression {
-                    consumer: key,
-                    current_ordinal: existing.upto_offset.ordinal,
-                    attempted_ordinal: checkpoint.upto_offset.ordinal,
-                });
-            }
-            Some(existing) if checkpoint.upto_offset.ordinal == existing.upto_offset.ordinal => {
-                CheckpointCommitOutcome::NoopAlreadyAdvanced
-            }
-            _ => CheckpointCommitOutcome::Advanced,
-        };
+        let result = (|| -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+            let key = checkpoint.consumer.0.clone();
+            let outcome = match inner.checkpoints.get(&key) {
+                Some(existing) if checkpoint.upto_offset.ordinal < existing.upto_offset.ordinal => {
+                    return Err(RecorderStorageError::CheckpointRegression {
+                        consumer: key,
+                        current_ordinal: existing.upto_offset.ordinal,
+                        attempted_ordinal: checkpoint.upto_offset.ordinal,
+                    });
+                }
+                Some(existing)
+                    if checkpoint.upto_offset.ordinal == existing.upto_offset.ordinal =>
+                {
+                    CheckpointCommitOutcome::NoopAlreadyAdvanced
+                }
+                _ => CheckpointCommitOutcome::Advanced,
+            };
 
-        if outcome == CheckpointCommitOutcome::Advanced {
-            inner.checkpoints.insert(key, checkpoint);
-            self.persist_state(&inner)?;
+            if outcome == CheckpointCommitOutcome::Advanced {
+                inner.checkpoints.insert(key, checkpoint);
+                self.persist_state(&inner)?;
+            }
+
+            Ok(outcome)
+        })();
+
+        match result {
+            Ok(outcome) => {
+                Self::clear_last_error(&mut inner);
+                Ok(outcome)
+            }
+            Err(err) => {
+                Self::record_last_error(&mut inner, "commit_checkpoint", &err);
+                Err(err)
+            }
         }
-
-        Ok(outcome)
     }
 
     async fn health(&self) -> RecorderStorageHealth {
@@ -697,6 +912,89 @@ fn scan_valid_prefix(file: &mut File) -> std::result::Result<ScanResult, Recorde
     })
 }
 
+// ---------------------------------------------------------------------------
+// RecorderEventReader / RecorderEventCursor — backend-neutral event reading
+// ---------------------------------------------------------------------------
+
+/// Error during event cursor reading.
+#[derive(Debug)]
+pub enum EventCursorError {
+    /// I/O or backend communication failure.
+    Io(String),
+    /// Data corruption or deserialization failure.
+    Corrupt { offset: RecorderOffset, reason: String },
+    /// Backend is unavailable or shutting down.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for EventCursorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(msg) => write!(f, "event cursor I/O: {msg}"),
+            Self::Corrupt { offset, reason } => {
+                write!(
+                    f,
+                    "corrupt at segment={} byte={} ordinal={}: {reason}",
+                    offset.segment_id, offset.byte_offset, offset.ordinal
+                )
+            }
+            Self::Unavailable(msg) => write!(f, "event source unavailable: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for EventCursorError {}
+
+/// A single record from a backend-neutral event cursor.
+#[derive(Debug, Clone)]
+pub struct CursorRecord {
+    pub event: RecorderEvent,
+    pub offset: RecorderOffset,
+}
+
+/// Backend-neutral sequential reader of recorder events.
+///
+/// Implementations wrap a concrete storage backend (append-log file,
+/// FrankenSqlite, etc.) and expose a cursor-based iteration interface
+/// that the indexing pipeline consumes without knowing the backend.
+pub trait RecorderEventReader: Send + Sync {
+    /// Open a cursor positioned at `from`. Events with ordinal >= `from.ordinal`
+    /// will be yielded by the cursor.
+    fn open_cursor(
+        &self,
+        from: RecorderOffset,
+    ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError>;
+
+    /// Open a cursor at the very beginning of the event stream.
+    fn open_cursor_from_start(
+        &self,
+    ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+        self.open_cursor(RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 0,
+        })
+    }
+
+    /// Return the current head offset (the next offset that would be written).
+    fn head_offset(&self) -> std::result::Result<RecorderOffset, EventCursorError>;
+}
+
+/// Sequential cursor over recorder events.
+///
+/// Yields batches of [`CursorRecord`] (event + offset pairs). Advancing the
+/// cursor is monotonic — calling `next_batch` moves the position forward.
+pub trait RecorderEventCursor: Send {
+    /// Read the next batch of up to `max` records. Returns an empty vec at EOF.
+    fn next_batch(
+        &mut self,
+        max: usize,
+    ) -> std::result::Result<Vec<CursorRecord>, EventCursorError>;
+
+    /// Current cursor position (the offset of the *next* record to be read).
+    fn current_offset(&self) -> RecorderOffset;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +1040,97 @@ mod tests {
             max_batch_bytes: 128 * 1024,
             max_idempotency_entries: 8,
         }
+    }
+
+    fn recorder_test_config(path: &Path) -> RecorderStorageConfig {
+        RecorderStorageConfig {
+            backend: RecorderBackendKind::AppendLog,
+            append_log: test_config(path),
+        }
+    }
+
+    #[test]
+    fn bootstrap_selects_append_log_backend() {
+        let dir = tempdir().unwrap();
+        let config = recorder_test_config(dir.path());
+        let storage = bootstrap_recorder_storage(config).unwrap();
+        assert_eq!(storage.backend_kind(), RecorderBackendKind::AppendLog);
+    }
+
+    #[test]
+    fn bootstrap_frankensqlite_reports_dependency_unavailable() {
+        let dir = tempdir().unwrap();
+        let mut config = recorder_test_config(dir.path());
+        config.backend = RecorderBackendKind::FrankenSqlite;
+
+        let err = bootstrap_recorder_storage(config).unwrap_err();
+        assert!(matches!(
+            err,
+            RecorderStorageError::BackendUnavailable {
+                backend: RecorderBackendKind::FrankenSqlite,
+                ..
+            }
+        ));
+        assert_eq!(
+            err.class(),
+            RecorderStorageErrorClass::DependencyUnavailable
+        );
+    }
+
+    #[test]
+    fn bootstrap_frankensqlite_ignores_append_log_validation() {
+        let dir = tempdir().unwrap();
+        let mut config = recorder_test_config(dir.path());
+        config.backend = RecorderBackendKind::FrankenSqlite;
+        config.append_log.queue_capacity = 0; // invalid for append-log
+
+        let err = bootstrap_recorder_storage(config).unwrap_err();
+        assert!(matches!(
+            err,
+            RecorderStorageError::BackendUnavailable {
+                backend: RecorderBackendKind::FrankenSqlite,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn recorder_storage_config_serde_roundtrip() {
+        let dir = tempdir().unwrap();
+        let config = recorder_test_config(dir.path());
+        let json = serde_json::to_string(&config).unwrap();
+        let back: RecorderStorageConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.backend, RecorderBackendKind::AppendLog);
+        assert_eq!(
+            back.append_log.queue_capacity,
+            config.append_log.queue_capacity
+        );
+        assert_eq!(
+            back.append_log.max_batch_events,
+            config.append_log.max_batch_events
+        );
+    }
+
+    #[test]
+    fn recorder_storage_config_accepts_legacy_franken_sqlite_alias() {
+        let value = serde_json::json!({
+            "backend": "franken_sqlite",
+            "append_log": AppendLogStorageConfig::default()
+        });
+        let parsed: RecorderStorageConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.backend, RecorderBackendKind::FrankenSqlite);
+    }
+
+    #[test]
+    fn backend_kind_display_is_snake_case() {
+        assert_eq!(
+            RecorderBackendKind::AppendLog.to_string(),
+            "append_log".to_string()
+        );
+        assert_eq!(
+            RecorderBackendKind::FrankenSqlite.to_string(),
+            "frankensqlite".to_string()
+        );
     }
 
     #[tokio::test]
@@ -1245,6 +1634,108 @@ mod tests {
         assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
     }
 
+    #[tokio::test]
+    async fn health_records_checkpoint_regression_diagnostic() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let consumer = CheckpointConsumerId("diag-consumer".to_string());
+
+        let _ = storage
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer: consumer.clone(),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 5,
+                },
+                schema_version: "v1".to_string(),
+                committed_at_ms: 100,
+            })
+            .await
+            .unwrap();
+
+        let err = storage
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer: consumer.clone(),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 3,
+                },
+                schema_version: "v1".to_string(),
+                committed_at_ms: 101,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RecorderStorageError::CheckpointRegression { .. }
+        ));
+
+        let degraded = storage.health().await;
+        assert!(degraded.degraded);
+        let diagnostic = degraded.last_error.unwrap();
+        assert!(diagnostic.contains("commit_checkpoint failed"));
+        assert!(diagnostic.contains("TerminalData"));
+
+        let _ = storage
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer,
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 8,
+                },
+                schema_version: "v1".to_string(),
+                committed_at_ms: 102,
+            })
+            .await
+            .unwrap();
+
+        let healthy = storage.health().await;
+        assert!(!healthy.degraded);
+        assert!(healthy.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn health_records_append_diagnostic_and_clears_on_success() {
+        let dir = tempdir().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.max_batch_bytes = 1200;
+        let storage = AppendLogRecorderStorage::open(cfg).unwrap();
+
+        let err = storage
+            .append_batch(AppendRequest {
+                batch_id: "oversized".to_string(),
+                events: vec![sample_event("e-big", 1, 0, &"x".repeat(5000))],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 10,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
+
+        let degraded = storage.health().await;
+        assert!(degraded.degraded);
+        let diagnostic = degraded.last_error.unwrap();
+        assert!(diagnostic.contains("append_batch failed"));
+        assert!(diagnostic.contains("TerminalData"));
+
+        let _ = storage
+            .append_batch(AppendRequest {
+                batch_id: "small".to_string(),
+                events: vec![sample_event("e-small", 1, 1, "ok")],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 11,
+            })
+            .await
+            .unwrap();
+
+        let healthy = storage.health().await;
+        assert!(!healthy.degraded);
+        assert!(healthy.last_error.is_none());
+    }
+
     // ── Read checkpoint for unknown consumer ─────────────────────────
 
     #[tokio::test]
@@ -1548,7 +2039,7 @@ mod tests {
         let json = serde_json::to_string(&RecorderBackendKind::AppendLog).unwrap();
         assert!(json.contains("append_log"));
         let json = serde_json::to_string(&RecorderBackendKind::FrankenSqlite).unwrap();
-        assert!(json.contains("franken_sqlite"));
+        assert!(json.contains("frankensqlite"));
     }
 
     #[test]
@@ -2394,5 +2885,261 @@ mod tests {
         assert_eq!(back.consumers[0].offsets_behind, 3);
         assert_eq!(back.consumers[1].offsets_behind, 7);
         assert_eq!(back.latest_offset.unwrap().ordinal, 10);
+    }
+
+    // =========================================================================
+    // RecorderEventReader / RecorderEventCursor / CursorRecord trait tests
+    // =========================================================================
+
+    #[test]
+    fn cursor_record_clone_and_debug() {
+        let record = CursorRecord {
+            event: sample_event("cr-1", 1, 0, "test"),
+            offset: RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 0,
+            },
+        };
+        let cloned = record.clone();
+        assert_eq!(cloned.event.event_id, "cr-1");
+        assert_eq!(cloned.offset.ordinal, 0);
+        let dbg = format!("{:?}", record);
+        assert!(dbg.contains("CursorRecord"));
+    }
+
+    #[test]
+    fn event_cursor_error_display_io() {
+        let err = EventCursorError::Io("disk full".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("disk full"));
+        assert!(msg.contains("I/O"));
+    }
+
+    #[test]
+    fn event_cursor_error_display_corrupt() {
+        let err = EventCursorError::Corrupt {
+            offset: RecorderOffset {
+                segment_id: 0,
+                byte_offset: 42,
+                ordinal: 7,
+            },
+            reason: "bad CRC".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("42"));
+        assert!(msg.contains("bad CRC"));
+    }
+
+    #[test]
+    fn event_cursor_error_display_unavailable() {
+        let err = EventCursorError::Unavailable("shutting down".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("shutting down"));
+        assert!(msg.contains("unavailable"));
+    }
+
+    #[test]
+    fn event_cursor_error_is_std_error() {
+        let err = EventCursorError::Io("test".to_string());
+        let _: &dyn std::error::Error = &err;
+    }
+
+    /// Mock event reader for testing the trait ergonomics.
+    struct MockEventReader {
+        records: Vec<CursorRecord>,
+    }
+
+    impl RecorderEventReader for MockEventReader {
+        fn open_cursor(
+            &self,
+            from: RecorderOffset,
+        ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+            let start = from.ordinal as usize;
+            let remaining: Vec<_> = self
+                .records
+                .iter()
+                .filter(|r| r.offset.ordinal >= start as u64)
+                .cloned()
+                .collect();
+            Ok(Box::new(MockCursor {
+                records: remaining,
+                pos: 0,
+            }))
+        }
+
+        fn head_offset(&self) -> std::result::Result<RecorderOffset, EventCursorError> {
+            Ok(self
+                .records
+                .last()
+                .map(|r| RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: r.offset.byte_offset + 1,
+                    ordinal: r.offset.ordinal + 1,
+                })
+                .unwrap_or(RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 0,
+                }))
+        }
+    }
+
+    struct MockCursor {
+        records: Vec<CursorRecord>,
+        pos: usize,
+    }
+
+    impl RecorderEventCursor for MockCursor {
+        fn next_batch(
+            &mut self,
+            max: usize,
+        ) -> std::result::Result<Vec<CursorRecord>, EventCursorError> {
+            let end = (self.pos + max).min(self.records.len());
+            let batch = self.records[self.pos..end].to_vec();
+            self.pos = end;
+            Ok(batch)
+        }
+
+        fn current_offset(&self) -> RecorderOffset {
+            if self.pos < self.records.len() {
+                self.records[self.pos].offset.clone()
+            } else {
+                self.records
+                    .last()
+                    .map(|r| RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: r.offset.byte_offset + 1,
+                        ordinal: r.offset.ordinal + 1,
+                    })
+                    .unwrap_or(RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 0,
+                        ordinal: 0,
+                    })
+            }
+        }
+    }
+
+    #[test]
+    fn mock_event_reader_open_cursor_from_start() {
+        let records: Vec<CursorRecord> = (0..3)
+            .map(|i| CursorRecord {
+                event: sample_event(&format!("mock-{i}"), 1, i, "x"),
+                offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: i * 100,
+                    ordinal: i,
+                },
+            })
+            .collect();
+        let reader = MockEventReader { records };
+
+        let mut cursor = reader.open_cursor_from_start().unwrap();
+        let batch = cursor.next_batch(10).unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].event.event_id, "mock-0");
+    }
+
+    #[test]
+    fn mock_event_reader_open_cursor_at_offset() {
+        let records: Vec<CursorRecord> = (0..5)
+            .map(|i| CursorRecord {
+                event: sample_event(&format!("mock-{i}"), 1, i, "x"),
+                offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: i * 100,
+                    ordinal: i,
+                },
+            })
+            .collect();
+        let reader = MockEventReader { records };
+
+        let mut cursor = reader
+            .open_cursor(RecorderOffset {
+                segment_id: 0,
+                byte_offset: 200,
+                ordinal: 2,
+            })
+            .unwrap();
+        let batch = cursor.next_batch(10).unwrap();
+        assert_eq!(batch.len(), 3); // records 2, 3, 4
+        assert_eq!(batch[0].event.event_id, "mock-2");
+    }
+
+    #[test]
+    fn mock_cursor_batch_limits() {
+        let records: Vec<CursorRecord> = (0..5)
+            .map(|i| CursorRecord {
+                event: sample_event(&format!("mock-{i}"), 1, i, "x"),
+                offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: i * 100,
+                    ordinal: i,
+                },
+            })
+            .collect();
+        let reader = MockEventReader { records };
+        let mut cursor = reader.open_cursor_from_start().unwrap();
+
+        let b1 = cursor.next_batch(2).unwrap();
+        assert_eq!(b1.len(), 2);
+
+        let b2 = cursor.next_batch(2).unwrap();
+        assert_eq!(b2.len(), 2);
+
+        let b3 = cursor.next_batch(2).unwrap();
+        assert_eq!(b3.len(), 1);
+
+        let b4 = cursor.next_batch(2).unwrap();
+        assert!(b4.is_empty());
+    }
+
+    #[test]
+    fn mock_cursor_offset_advances() {
+        let records: Vec<CursorRecord> = (0..3)
+            .map(|i| CursorRecord {
+                event: sample_event(&format!("mock-{i}"), 1, i, "x"),
+                offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: i * 100,
+                    ordinal: i,
+                },
+            })
+            .collect();
+        let reader = MockEventReader { records };
+        let mut cursor = reader.open_cursor_from_start().unwrap();
+
+        assert_eq!(cursor.current_offset().ordinal, 0);
+        let _ = cursor.next_batch(2).unwrap();
+        assert_eq!(cursor.current_offset().ordinal, 2);
+        let _ = cursor.next_batch(10).unwrap();
+        assert_eq!(cursor.current_offset().ordinal, 3);
+    }
+
+    #[test]
+    fn mock_head_offset_empty_reader() {
+        let reader = MockEventReader { records: vec![] };
+        let head = reader.head_offset().unwrap();
+        assert_eq!(head.ordinal, 0);
+        assert_eq!(head.byte_offset, 0);
+    }
+
+    #[test]
+    fn mock_head_offset_with_records() {
+        let records: Vec<CursorRecord> = (0..5)
+            .map(|i| CursorRecord {
+                event: sample_event(&format!("mock-{i}"), 1, i, "x"),
+                offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: i * 100,
+                    ordinal: i,
+                },
+            })
+            .collect();
+        let reader = MockEventReader { records };
+        let head = reader.head_offset().unwrap();
+        assert_eq!(head.ordinal, 5);
+        assert_eq!(head.byte_offset, 401);
     }
 }

@@ -491,6 +491,127 @@ impl AppendLogReader {
 }
 
 // ---------------------------------------------------------------------------
+// AppendLogEventSource — RecorderEventReader backed by append-log file
+// ---------------------------------------------------------------------------
+
+/// Wraps the append-log data file to implement [`RecorderEventReader`].
+///
+/// This is the append-log concrete implementation of the backend-neutral
+/// event reader seam. It delegates to [`AppendLogReader`] for sequential
+/// record iteration.
+pub struct AppendLogEventSource {
+    data_path: PathBuf,
+}
+
+impl AppendLogEventSource {
+    /// Create from an existing [`AppendLogRecorderStorage`].
+    pub fn from_storage(
+        storage: &crate::recorder_storage::AppendLogRecorderStorage,
+    ) -> Self {
+        Self {
+            data_path: storage.data_path().to_path_buf(),
+        }
+    }
+
+    /// Create from a raw data path.
+    pub fn from_path(data_path: PathBuf) -> Self {
+        Self { data_path }
+    }
+}
+
+impl crate::recorder_storage::RecorderEventReader for AppendLogEventSource {
+    fn open_cursor(
+        &self,
+        from: RecorderOffset,
+    ) -> std::result::Result<
+        Box<dyn crate::recorder_storage::RecorderEventCursor>,
+        crate::recorder_storage::EventCursorError,
+    > {
+        use crate::recorder_storage::EventCursorError;
+        tracing::debug!(
+            source = "append_log",
+            from_offset = %from.ordinal,
+            from_byte = %from.byte_offset,
+            "opening event cursor"
+        );
+        let reader = if from.byte_offset == 0 && from.ordinal == 0 {
+            AppendLogReader::open(&self.data_path)
+                .map_err(|e| EventCursorError::Io(e.to_string()))?
+        } else {
+            AppendLogReader::open_at_offset(&self.data_path, from.byte_offset, from.ordinal)
+                .map_err(|e| EventCursorError::Io(e.to_string()))?
+        };
+        Ok(Box::new(AppendLogCursor { reader }))
+    }
+
+    fn head_offset(
+        &self,
+    ) -> std::result::Result<RecorderOffset, crate::recorder_storage::EventCursorError> {
+        use crate::recorder_storage::EventCursorError;
+        let file_len = std::fs::metadata(&self.data_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if file_len == 0 {
+            return Ok(RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 0,
+            });
+        }
+        let mut reader = AppendLogReader::open(&self.data_path)
+            .map_err(|e| EventCursorError::Io(e.to_string()))?;
+        loop {
+            match reader.next_record() {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(e) => return Err(EventCursorError::Io(e.to_string())),
+            }
+        }
+        Ok(RecorderOffset {
+            segment_id: 0,
+            byte_offset: reader.byte_offset(),
+            ordinal: reader.next_ordinal(),
+        })
+    }
+}
+
+/// Cursor wrapping [`AppendLogReader`] for the [`RecorderEventCursor`](crate::recorder_storage::RecorderEventCursor) trait.
+struct AppendLogCursor {
+    reader: AppendLogReader,
+}
+
+impl crate::recorder_storage::RecorderEventCursor for AppendLogCursor {
+    fn next_batch(
+        &mut self,
+        max: usize,
+    ) -> std::result::Result<
+        Vec<crate::recorder_storage::CursorRecord>,
+        crate::recorder_storage::EventCursorError,
+    > {
+        use crate::recorder_storage::{CursorRecord, EventCursorError};
+        let records = self
+            .reader
+            .read_batch(max)
+            .map_err(|e| EventCursorError::Io(e.to_string()))?;
+        Ok(records
+            .into_iter()
+            .map(|r| CursorRecord {
+                event: r.event,
+                offset: r.offset,
+            })
+            .collect())
+    }
+
+    fn current_offset(&self) -> RecorderOffset {
+        RecorderOffset {
+            segment_id: 0,
+            byte_offset: self.reader.byte_offset(),
+            ordinal: self.reader.next_ordinal(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IndexWriter trait — abstract index writing surface
 // ---------------------------------------------------------------------------
 
@@ -774,6 +895,146 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
             }
 
             result.batches_committed += 1;
+
+            if is_final_batch {
+                result.caught_up = true;
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Run the indexer using a backend-neutral [`RecorderEventReader`].
+    ///
+    /// This is the preferred entry point for backend-agnostic indexing.
+    /// The reader provides a cursor over recorder events regardless of whether
+    /// the underlying storage is an append-log file or FrankenSqlite.
+    pub async fn run_with_reader<S: RecorderStorage>(
+        &mut self,
+        storage: &S,
+        reader: &dyn crate::recorder_storage::RecorderEventReader,
+    ) -> Result<IndexerRunResult, IndexerError> {
+        use crate::recorder_storage::EventCursorError;
+
+        if self.config.batch_size == 0 {
+            return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
+        }
+
+        let consumer_id = CheckpointConsumerId(self.config.consumer_id.clone());
+
+        // 1. Read last checkpoint
+        let checkpoint = storage.read_checkpoint(&consumer_id).await?;
+
+        // 2. Open cursor at resume point
+        let mut cursor = match &checkpoint {
+            Some(cp) => {
+                let mut c = reader
+                    .open_cursor(cp.upto_offset.clone())
+                    .map_err(|e| IndexerError::LogRead(LogReadError::Io(
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                    )))?;
+                // Skip the checkpointed record itself
+                let _ = c.next_batch(1).map_err(|e| {
+                    IndexerError::LogRead(LogReadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    )))
+                })?;
+                tracing::debug!(
+                    cursor = "resume",
+                    from_ordinal = %cp.upto_offset.ordinal,
+                    "cursor opened at checkpoint"
+                );
+                c
+            }
+            None => {
+                tracing::debug!(cursor = "cold_start", "cursor opened from start");
+                reader.open_cursor_from_start().map_err(|e| {
+                    IndexerError::LogRead(LogReadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    )))
+                })?
+            }
+        };
+
+        let mut result = IndexerRunResult {
+            events_read: 0,
+            events_indexed: 0,
+            events_skipped: 0,
+            batches_committed: 0,
+            final_ordinal: checkpoint.as_ref().map(|cp| cp.upto_offset.ordinal),
+            caught_up: false,
+        };
+
+        // 3. Process batches via cursor
+        loop {
+            if self.config.max_batches > 0
+                && result.batches_committed >= self.config.max_batches as u64
+            {
+                break;
+            }
+
+            let batch = cursor.next_batch(self.config.batch_size).map_err(|e| {
+                IndexerError::LogRead(LogReadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )))
+            })?;
+            if batch.is_empty() {
+                result.caught_up = true;
+                break;
+            }
+
+            let is_final_batch = batch.len() < self.config.batch_size;
+            let mut last_offset: Option<RecorderOffset> = None;
+
+            for record in &batch {
+                result.events_read += 1;
+
+                if record.event.schema_version != self.config.expected_event_schema {
+                    result.events_skipped += 1;
+                    last_offset = Some(record.offset.clone());
+                    continue;
+                }
+
+                let doc = map_event_to_document(&record.event, record.offset.ordinal);
+
+                if self.config.dedup_on_replay
+                    && self.writer.delete_by_event_id(&doc.event_id).is_err()
+                {
+                }
+
+                match self.writer.add_document(&doc) {
+                    Ok(()) => result.events_indexed += 1,
+                    Err(IndexWriteError::Rejected { .. }) => result.events_skipped += 1,
+                    Err(e) => return Err(e.into()),
+                }
+
+                last_offset = Some(record.offset.clone());
+            }
+
+            self.writer.commit()?;
+
+            if let Some(offset) = last_offset {
+                result.final_ordinal = Some(offset.ordinal);
+                let cp = RecorderCheckpoint {
+                    consumer: consumer_id.clone(),
+                    upto_offset: offset,
+                    schema_version: self.config.expected_event_schema.clone(),
+                    committed_at_ms: epoch_ms_now(),
+                };
+                storage.commit_checkpoint(cp).await?;
+            }
+
+            result.batches_committed += 1;
+
+            tracing::debug!(
+                cursor_batch = batch.len(),
+                current_offset = %cursor.current_offset().ordinal,
+                "batch processed via cursor"
+            );
 
             if is_final_batch {
                 result.caught_up = true;
@@ -2834,5 +3095,285 @@ mod tests {
         // Should be after 2024-01-01 (1_704_067_200_000) and before 2030-01-01
         assert!(ms > 1_704_067_200_000);
         assert!(ms < 1_893_456_000_000);
+    }
+
+    // =========================================================================
+    // RecorderEventReader / RecorderEventCursor seam tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn append_log_event_source_wraps_reader_correctly() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        let events = vec![
+            sample_event("e1", 1, 0, "hello"),
+            sample_event("e2", 1, 1, "world"),
+            sample_event("e3", 2, 2, "three"),
+        ];
+        populate_log(&storage, events).await;
+
+        let source = AppendLogEventSource::from_storage(&storage);
+        let mut cursor = source.open_cursor_from_start().unwrap();
+
+        let batch = cursor.next_batch(10).unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].event.event_id, "e1");
+        assert_eq!(batch[1].event.event_id, "e2");
+        assert_eq!(batch[2].event.event_id, "e3");
+
+        // Second call returns empty (EOF)
+        let batch2 = cursor.next_batch(10).unwrap();
+        assert!(batch2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn event_cursor_next_batch_returns_correct_count() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        let events: Vec<_> = (0..5)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("text-{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        let source = AppendLogEventSource::from_storage(&storage);
+        let mut cursor = source.open_cursor_from_start().unwrap();
+
+        // Request batch of 2
+        let b1 = cursor.next_batch(2).unwrap();
+        assert_eq!(b1.len(), 2);
+        assert_eq!(b1[0].event.event_id, "e0");
+        assert_eq!(b1[1].event.event_id, "e1");
+
+        // Request batch of 2 again
+        let b2 = cursor.next_batch(2).unwrap();
+        assert_eq!(b2.len(), 2);
+        assert_eq!(b2[0].event.event_id, "e2");
+        assert_eq!(b2[1].event.event_id, "e3");
+
+        // Last batch has 1 remaining
+        let b3 = cursor.next_batch(2).unwrap();
+        assert_eq!(b3.len(), 1);
+        assert_eq!(b3[0].event.event_id, "e4");
+    }
+
+    #[tokio::test]
+    async fn event_cursor_offset_advances_monotonically() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        let events: Vec<_> = (0..4)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("text-{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        let source = AppendLogEventSource::from_storage(&storage);
+        let mut cursor = source.open_cursor_from_start().unwrap();
+
+        let initial = cursor.current_offset();
+        assert_eq!(initial.ordinal, 0);
+
+        let _ = cursor.next_batch(2).unwrap();
+        let mid = cursor.current_offset();
+        assert_eq!(mid.ordinal, 2);
+        assert!(mid.byte_offset > initial.byte_offset);
+
+        let _ = cursor.next_batch(10).unwrap();
+        let end = cursor.current_offset();
+        assert_eq!(end.ordinal, 4);
+        assert!(end.byte_offset > mid.byte_offset);
+    }
+
+    #[tokio::test]
+    async fn event_cursor_empty_source_returns_empty() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let _storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let source = AppendLogEventSource::from_path(scfg.data_path);
+        let mut cursor = source.open_cursor_from_start().unwrap();
+
+        let batch = cursor.next_batch(10).unwrap();
+        assert!(batch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn incremental_indexer_with_injected_source() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events = vec![
+            sample_event("e1", 1, 0, "first"),
+            sample_event("e2", 1, 1, "second"),
+            sample_event("e3", 2, 2, "third"),
+        ];
+        populate_log(&storage, events).await;
+
+        let source = AppendLogEventSource::from_storage(&storage);
+        let writer = MockIndexWriter::new();
+        let icfg = test_indexer_config(dir.path());
+        let mut indexer = IncrementalIndexer::new(icfg, writer);
+
+        let result = indexer.run_with_reader(&storage, &source).await.unwrap();
+        assert_eq!(result.events_read, 3);
+        assert_eq!(result.events_indexed, 3);
+        assert_eq!(result.events_skipped, 0);
+        assert!(result.caught_up);
+        assert_eq!(result.final_ordinal, Some(2));
+    }
+
+    #[tokio::test]
+    async fn head_offset_matches_written_events() {
+        use crate::recorder_storage::RecorderEventReader;
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        let source = AppendLogEventSource::from_storage(&storage);
+
+        // Empty log: head at 0
+        let head = source.head_offset().unwrap();
+        assert_eq!(head.ordinal, 0);
+        assert_eq!(head.byte_offset, 0);
+
+        // Write 3 events
+        let events: Vec<_> = (0..3)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("text-{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        let head = source.head_offset().unwrap();
+        assert_eq!(head.ordinal, 3);
+        assert!(head.byte_offset > 0);
+    }
+
+    #[tokio::test]
+    async fn cursor_open_at_offset_skips_prior_records() {
+        use crate::recorder_storage::RecorderEventReader;
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+
+        let events: Vec<_> = (0..5)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("text-{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        // Read all to find offset of record 2
+        let source = AppendLogEventSource::from_storage(&storage);
+        let mut cursor = source.open_cursor_from_start().unwrap();
+        let all = cursor.next_batch(10).unwrap();
+        let offset_2 = all[2].offset.clone();
+
+        // Open cursor at that offset
+        let mut cursor2 = source.open_cursor(offset_2).unwrap();
+        let batch = cursor2.next_batch(10).unwrap();
+        assert_eq!(batch.len(), 3); // records 2, 3, 4
+        assert_eq!(batch[0].event.event_id, "e2");
+        assert_eq!(batch[1].event.event_id, "e3");
+        assert_eq!(batch[2].event.event_id, "e4");
+    }
+
+    #[tokio::test]
+    async fn run_with_reader_matches_run_result() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events: Vec<_> = (0..4)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("text-{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        // Run via legacy path
+        let icfg1 = test_indexer_config(dir.path());
+        let writer1 = MockIndexWriter::new();
+        let mut indexer1 = IncrementalIndexer::new(
+            IndexerConfig {
+                consumer_id: "legacy-consumer".to_string(),
+                ..icfg1
+            },
+            writer1,
+        );
+        let result_legacy = indexer1.run(&storage).await.unwrap();
+
+        // Run via reader path
+        let source = AppendLogEventSource::from_storage(&storage);
+        let icfg2 = test_indexer_config(dir.path());
+        let writer2 = MockIndexWriter::new();
+        let mut indexer2 = IncrementalIndexer::new(
+            IndexerConfig {
+                consumer_id: "reader-consumer".to_string(),
+                ..icfg2
+            },
+            writer2,
+        );
+        let result_reader = indexer2.run_with_reader(&storage, &source).await.unwrap();
+
+        // Results should match
+        assert_eq!(result_legacy.events_read, result_reader.events_read);
+        assert_eq!(result_legacy.events_indexed, result_reader.events_indexed);
+        assert_eq!(result_legacy.events_skipped, result_reader.events_skipped);
+        assert_eq!(result_legacy.caught_up, result_reader.caught_up);
+        assert_eq!(result_legacy.final_ordinal, result_reader.final_ordinal);
+    }
+
+    #[tokio::test]
+    async fn run_with_reader_resumes_from_checkpoint() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events: Vec<_> = (0..6)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("text-{i}")))
+            .collect();
+        populate_log(&storage, events).await;
+
+        let source = AppendLogEventSource::from_storage(&storage);
+
+        // First run: process max 1 batch of 3
+        let icfg = IndexerConfig {
+            batch_size: 3,
+            max_batches: 1,
+            ..test_indexer_config(dir.path())
+        };
+        let writer = MockIndexWriter::new();
+        let mut indexer = IncrementalIndexer::new(icfg.clone(), writer);
+        let r1 = indexer.run_with_reader(&storage, &source).await.unwrap();
+        assert_eq!(r1.events_read, 3);
+        assert!(!r1.caught_up);
+
+        // Second run: should pick up remaining 3
+        let writer2 = MockIndexWriter::new();
+        let mut indexer2 = IncrementalIndexer::new(icfg, writer2);
+        let r2 = indexer2.run_with_reader(&storage, &source).await.unwrap();
+        assert_eq!(r2.events_read, 3);
+        assert!(r2.caught_up);
+        assert_eq!(r2.final_ordinal, Some(5));
+    }
+
+    #[tokio::test]
+    async fn event_source_from_path_works() {
+        let dir = tempdir().unwrap();
+        let scfg = test_storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+        let events = vec![
+            sample_event("e1", 1, 0, "a"),
+            sample_event("e2", 1, 1, "b"),
+        ];
+        populate_log(&storage, events).await;
+
+        // Create source from path directly, not from storage reference
+        let source = AppendLogEventSource::from_path(scfg.data_path);
+        let mut cursor = source.open_cursor_from_start().unwrap();
+        let batch = cursor.next_batch(10).unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].event.event_id, "e1");
     }
 }
