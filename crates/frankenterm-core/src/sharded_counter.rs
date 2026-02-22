@@ -428,6 +428,7 @@ mod tests {
             .map(|_| {
                 let c = Arc::clone(&c);
                 std::thread::spawn(move || {
+                    // ubs:ignore
                     for _ in 0..10_000 {
                         c.increment();
                     }
@@ -448,6 +449,7 @@ mod tests {
             .map(|_| {
                 let c = Arc::clone(&c);
                 std::thread::spawn(move || {
+                    // ubs:ignore
                     for i in 0..1_000u64 {
                         c.add(i);
                     }
@@ -509,6 +511,7 @@ mod tests {
             .map(|i| {
                 let m = Arc::clone(&m);
                 std::thread::spawn(move || {
+                    // ubs:ignore
                     for j in 0..1_000u64 {
                         m.observe(i * 1000 + j);
                     }
@@ -571,6 +574,7 @@ mod tests {
             .map(|i| {
                 let g = Arc::clone(&g);
                 std::thread::spawn(move || {
+                    // ubs:ignore
                     // Each thread writes its "timestamp" (thread index * 1000)
                     g.set((i + 1) * 1000);
                 })
@@ -665,6 +669,7 @@ mod tests {
             .map(|_| {
                 let c = Arc::clone(&c);
                 std::thread::spawn(move || {
+                    // ubs:ignore
                     for _ in 0..100_000 {
                         c.increment();
                     }
@@ -688,6 +693,7 @@ mod tests {
                 let counter = Arc::clone(&counter);
                 let max = Arc::clone(&max);
                 std::thread::spawn(move || {
+                    // ubs:ignore
                     for j in 0..10_000u64 {
                         counter.add(j);
                         max.observe(i * 10_000 + j);

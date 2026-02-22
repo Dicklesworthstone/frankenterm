@@ -210,10 +210,7 @@ pub fn render_flow(nodes: &[FlowNode], edges: &[FlowEdge]) -> String {
             let edge_label = edges
                 .iter()
                 .find(|e| {
-                    e.from == node.id
-                        && ordered
-                            .get(i + 1)
-                            .is_some_and(|next| next.id == e.to)
+                    e.from == node.id && ordered.get(i + 1).is_some_and(|next| next.id == e.to)
                 })
                 .and_then(|e| e.label.as_deref());
 
@@ -243,7 +240,10 @@ fn topological_order<'a>(nodes: &'a [FlowNode], edges: &[FlowEdge]) -> Vec<&'a F
     let mut adj: Vec<Vec<usize>> = vec![vec![]; nodes.len()];
 
     for edge in edges {
-        if let (Some(&from), Some(&to)) = (id_to_idx.get(edge.from.as_str()), id_to_idx.get(edge.to.as_str())) {
+        if let (Some(&from), Some(&to)) = (
+            id_to_idx.get(edge.from.as_str()),
+            id_to_idx.get(edge.to.as_str()),
+        ) {
             adj[from].push(to);
             in_degree[to] += 1;
         }
@@ -368,7 +368,14 @@ impl DiagramTable {
         buf
     }
 
-    fn write_separator(&self, buf: &mut String, widths: &[usize], left: char, mid: char, right: char) {
+    fn write_separator(
+        &self,
+        buf: &mut String,
+        widths: &[usize],
+        left: char,
+        mid: char,
+        right: char,
+    ) {
         write!(buf, "{}", left).ok();
         for (i, &w) in widths.iter().enumerate() {
             for _ in 0..w + 2 {
@@ -523,10 +530,13 @@ mod tests {
 
     #[test]
     fn tree_branch_size() {
-        let tree = TreeNode::branch("root", vec![
-            TreeNode::leaf("a"),
-            TreeNode::branch("b", vec![TreeNode::leaf("c")]),
-        ]);
+        let tree = TreeNode::branch(
+            "root",
+            vec![
+                TreeNode::leaf("a"),
+                TreeNode::branch("b", vec![TreeNode::leaf("c")]),
+            ],
+        );
         assert_eq!(tree.size(), 4);
         assert_eq!(tree.depth(), 3);
     }
@@ -541,10 +551,10 @@ mod tests {
 
     #[test]
     fn render_tree_with_children() {
-        let tree = TreeNode::branch("root", vec![
-            TreeNode::leaf("child1"),
-            TreeNode::leaf("child2"),
-        ]);
+        let tree = TreeNode::branch(
+            "root",
+            vec![TreeNode::leaf("child1"), TreeNode::leaf("child2")],
+        );
         let output = render_tree(&tree);
         assert!(output.contains("root"));
         assert!(output.contains("├── child1"));
@@ -553,9 +563,7 @@ mod tests {
 
     #[test]
     fn render_tree_nested() {
-        let tree = TreeNode::branch("A", vec![
-            TreeNode::branch("B", vec![TreeNode::leaf("C")]),
-        ]);
+        let tree = TreeNode::branch("A", vec![TreeNode::branch("B", vec![TreeNode::leaf("C")])]);
         let output = render_tree(&tree);
         assert!(output.contains("A"));
         assert!(output.contains("└── B"));
@@ -611,7 +619,10 @@ mod tests {
 
     #[test]
     fn render_flow_single_node() {
-        let nodes = vec![FlowNode { id: "a".into(), label: "Start".into() }];
+        let nodes = vec![FlowNode {
+            id: "a".into(),
+            label: "Start".into(),
+        }];
         let output = render_flow(&nodes, &[]);
         assert!(output.contains("Start"));
         assert!(!output.contains("▼"));
@@ -620,10 +631,20 @@ mod tests {
     #[test]
     fn render_flow_two_nodes() {
         let nodes = vec![
-            FlowNode { id: "a".into(), label: "Start".into() },
-            FlowNode { id: "b".into(), label: "End".into() },
+            FlowNode {
+                id: "a".into(),
+                label: "Start".into(),
+            },
+            FlowNode {
+                id: "b".into(),
+                label: "End".into(),
+            },
         ];
-        let edges = vec![FlowEdge { from: "a".into(), to: "b".into(), label: None }];
+        let edges = vec![FlowEdge {
+            from: "a".into(),
+            to: "b".into(),
+            label: None,
+        }];
         let output = render_flow(&nodes, &edges);
         assert!(output.contains("Start"));
         assert!(output.contains("End"));
@@ -633,10 +654,20 @@ mod tests {
     #[test]
     fn render_flow_with_edge_label() {
         let nodes = vec![
-            FlowNode { id: "a".into(), label: "A".into() },
-            FlowNode { id: "b".into(), label: "B".into() },
+            FlowNode {
+                id: "a".into(),
+                label: "A".into(),
+            },
+            FlowNode {
+                id: "b".into(),
+                label: "B".into(),
+            },
         ];
-        let edges = vec![FlowEdge { from: "a".into(), to: "b".into(), label: Some("next".into()) }];
+        let edges = vec![FlowEdge {
+            from: "a".into(),
+            to: "b".into(),
+            label: Some("next".into()),
+        }];
         let output = render_flow(&nodes, &edges);
         assert!(output.contains("next"));
     }
@@ -652,13 +683,30 @@ mod tests {
     #[test]
     fn topological_order_linear() {
         let nodes = vec![
-            FlowNode { id: "c".into(), label: "C".into() },
-            FlowNode { id: "b".into(), label: "B".into() },
-            FlowNode { id: "a".into(), label: "A".into() },
+            FlowNode {
+                id: "c".into(),
+                label: "C".into(),
+            },
+            FlowNode {
+                id: "b".into(),
+                label: "B".into(),
+            },
+            FlowNode {
+                id: "a".into(),
+                label: "A".into(),
+            },
         ];
         let edges = vec![
-            FlowEdge { from: "a".into(), to: "b".into(), label: None },
-            FlowEdge { from: "b".into(), to: "c".into(), label: None },
+            FlowEdge {
+                from: "a".into(),
+                to: "b".into(),
+                label: None,
+            },
+            FlowEdge {
+                from: "b".into(),
+                to: "c".into(),
+                label: None,
+            },
         ];
         let ordered = topological_order(&nodes, &edges);
         let ids: Vec<&str> = ordered.iter().map(|n| n.id.as_str()).collect();
@@ -672,8 +720,14 @@ mod tests {
     #[test]
     fn topological_order_disconnected() {
         let nodes = vec![
-            FlowNode { id: "x".into(), label: "X".into() },
-            FlowNode { id: "y".into(), label: "Y".into() },
+            FlowNode {
+                id: "x".into(),
+                label: "X".into(),
+            },
+            FlowNode {
+                id: "y".into(),
+                label: "Y".into(),
+            },
         ];
         let ordered = topological_order(&nodes, &[]);
         assert_eq!(ordered.len(), 2);
@@ -715,8 +769,8 @@ mod tests {
 
     #[test]
     fn table_center_aligned() {
-        let mut table = DiagramTable::new(vec!["Header".into()])
-            .with_alignments(vec![Align::Center]);
+        let mut table =
+            DiagramTable::new(vec!["Header".into()]).with_alignments(vec![Align::Center]);
         table.add_row(vec!["Hi".into()]);
         let output = table.render();
         assert!(output.contains("Hi"));
@@ -754,10 +808,7 @@ mod tests {
 
     #[test]
     fn render_topology_parent_child() {
-        let entries = vec![
-            (1, None, "root".into()),
-            (2, Some(1), "child".into()),
-        ];
+        let entries = vec![(1, None, "root".into()), (2, Some(1), "child".into())];
         let output = render_topology(&entries);
         assert!(output.contains("[1] root"));
         assert!(output.contains("[2] child"));
@@ -765,10 +816,7 @@ mod tests {
 
     #[test]
     fn render_topology_multiple_roots() {
-        let entries = vec![
-            (1, None, "left".into()),
-            (2, None, "right".into()),
-        ];
+        let entries = vec![(1, None, "left".into()), (2, None, "right".into())];
         let output = render_topology(&entries);
         assert!(output.contains("topology"));
         assert!(output.contains("[1] left"));

@@ -280,7 +280,10 @@ mod tests {
         let json_str = r#"{"name":"Bash","arguments":{},"new_field":"hello"}"#;
         let tc: ToolCall = serde_json::from_str(json_str).unwrap();
         assert_eq!(tc.name, "Bash");
-        assert_eq!(tc.extra.get("new_field").and_then(|v| v.as_str()), Some("hello"));
+        assert_eq!(
+            tc.extra.get("new_field").and_then(|v| v.as_str()),
+            Some("hello")
+        );
     }
 
     #[test]
@@ -318,7 +321,10 @@ mod tests {
         let json_str = json!({"ok": true, "dry_run": false, "new_field": 42});
         let out: CasrResumeOutput = serde_json::from_value(json_str).unwrap();
         assert!(out.ok);
-        assert_eq!(out.extra.get("new_field").and_then(|v| v.as_u64()), Some(42));
+        assert_eq!(
+            out.extra.get("new_field").and_then(|v| v.as_u64()),
+            Some(42)
+        );
     }
 
     #[test]
@@ -365,7 +371,10 @@ mod tests {
         let json_str = json!({"name": "X", "slug": "x", "installed": false, "beta": true});
         let status: CasrProviderStatus = serde_json::from_value(json_str).unwrap();
         assert!(!status.installed);
-        assert_eq!(status.extra.get("beta").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            status.extra.get("beta").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     // -- Helper function tests --
@@ -393,7 +402,10 @@ mod tests {
 
     #[test]
     fn normalize_role_unknown() {
-        assert_eq!(normalize_role("reasoning"), MessageRole::Other("reasoning".into()));
+        assert_eq!(
+            normalize_role("reasoning"),
+            MessageRole::Other("reasoning".into())
+        );
     }
 
     #[test]

@@ -183,10 +183,7 @@ impl NetworkObserver {
 
     /// Check if `rano` is available.
     pub fn is_available(&self) -> bool {
-        Command::new(&self.binary)
-            .arg("--version")
-            .output()
-            .is_ok()
+        Command::new(&self.binary).arg("--version").output().is_ok()
     }
 
     /// Access the config.
@@ -247,9 +244,7 @@ impl NetworkObserver {
         let output = Command::new(&self.binary)
             .args(args)
             .output()
-            .map_err(|e| {
-                NetworkObserverError::BinaryNotFound(format!("{}: {}", self.binary, e))
-            })?;
+            .map_err(|e| NetworkObserverError::BinaryNotFound(format!("{}: {}", self.binary, e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -310,10 +305,7 @@ pub fn attribute_failopen(
 }
 
 /// Classify network pressure from latency, returning Green if rano is unavailable.
-pub fn pressure_failopen(
-    observer: &NetworkObserver,
-    remote_addr: &str,
-) -> NetworkPressureTier {
+pub fn pressure_failopen(observer: &NetworkObserver, remote_addr: &str) -> NetworkPressureTier {
     match observer.attribute_connection(remote_addr) {
         Ok(attr) => observer.classify_pressure(&attr),
         Err(_) => NetworkPressureTier::Green, // fail open

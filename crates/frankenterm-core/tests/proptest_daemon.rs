@@ -97,18 +97,25 @@ fn arb_embed_request() -> impl Strategy<Value = EmbedRequest> {
 }
 
 fn arb_vector(dim: usize) -> impl Strategy<Value = Vec<f32>> {
-    proptest::collection::vec(any::<f32>().prop_filter("must be finite", |f| f.is_finite()), dim)
+    proptest::collection::vec(
+        any::<f32>().prop_filter("must be finite", |f| f.is_finite()),
+        dim,
+    )
 }
 
 fn arb_embed_response() -> impl Strategy<Value = EmbedResponse> {
-    (arb_embed_id(), arb_vector(32), arb_text_nonempty(), 0_u64..10_000).prop_map(
-        |(id, vector, model, elapsed_ms)| EmbedResponse {
+    (
+        arb_embed_id(),
+        arb_vector(32),
+        arb_text_nonempty(),
+        0_u64..10_000,
+    )
+        .prop_map(|(id, vector, model, elapsed_ms)| EmbedResponse {
             id,
             vector,
             model,
             elapsed_ms,
-        },
-    )
+        })
 }
 
 fn arb_daemon_request() -> impl Strategy<Value = DaemonRequest> {
@@ -127,9 +134,7 @@ fn arb_daemon_response() -> impl Strategy<Value = DaemonResponse> {
     ]
 }
 
-fn loopback_transport(
-    server: &EmbedServer,
-) -> impl FnMut(&[u8]) -> Result<Vec<u8>, String> + '_ {
+fn loopback_transport(server: &EmbedServer) -> impl FnMut(&[u8]) -> Result<Vec<u8>, String> + '_ {
     move |request_bytes| Ok(server.handle_encoded(request_bytes))
 }
 

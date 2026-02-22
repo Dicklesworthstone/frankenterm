@@ -61,7 +61,11 @@ fn arb_canonical_message() -> impl Strategy<Value = CanonicalMessage> {
             idx,
             role,
             content,
-            timestamp: if has_ts { Some(1_700_000_000_000) } else { None },
+            timestamp: if has_ts {
+                Some(1_700_000_000_000)
+            } else {
+                None
+            },
             author: None,
             tool_calls: vec![],
             tool_results: vec![],
@@ -76,22 +80,24 @@ fn arb_canonical_session() -> impl Strategy<Value = CanonicalSession> {
         any::<bool>(),
         proptest::collection::vec(arb_canonical_message(), 0..5),
     )
-        .prop_map(|(session_id, provider_slug, has_title, messages)| CanonicalSession {
-            session_id,
-            provider_slug,
-            workspace: Some(PathBuf::from("/tmp/ws")),
-            title: if has_title {
-                Some("Test title".to_string())
-            } else {
-                None
+        .prop_map(
+            |(session_id, provider_slug, has_title, messages)| CanonicalSession {
+                session_id,
+                provider_slug,
+                workspace: Some(PathBuf::from("/tmp/ws")),
+                title: if has_title {
+                    Some("Test title".to_string())
+                } else {
+                    None
+                },
+                started_at: Some(1_700_000_000_000),
+                ended_at: None,
+                messages,
+                metadata: json!({}),
+                source_path: PathBuf::from("/tmp/src.jsonl"),
+                model_name: None,
             },
-            started_at: Some(1_700_000_000_000),
-            ended_at: None,
-            messages,
-            metadata: json!({}),
-            source_path: PathBuf::from("/tmp/src.jsonl"),
-            model_name: None,
-        })
+        )
 }
 
 fn arb_list_entry() -> impl Strategy<Value = CasrListEntry> {

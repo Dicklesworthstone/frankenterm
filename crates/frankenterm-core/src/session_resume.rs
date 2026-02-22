@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::casr_types::{
-    CasrListEntry, CasrProviderStatus, CasrResumeOutput, CanonicalMessage, CanonicalSession,
+    CanonicalMessage, CanonicalSession, CasrListEntry, CasrProviderStatus, CasrResumeOutput,
 };
 
 // =============================================================================
@@ -191,8 +191,8 @@ impl SessionResumer {
         info!(session_resume = true, "discovering sessions via casr list");
 
         let output = self.run_casr(&["list", "--json"])?;
-        let entries: Vec<CasrListEntry> =
-            serde_json::from_str(&output).map_err(|e| SessionResumeError::ParseError(e.to_string()))?;
+        let entries: Vec<CasrListEntry> = serde_json::from_str(&output)
+            .map_err(|e| SessionResumeError::ParseError(e.to_string()))?;
 
         info!(
             session_resume = true,
@@ -243,8 +243,8 @@ impl SessionResumer {
         }
 
         let output = self.run_casr(&args)?;
-        let result: CasrResumeOutput =
-            serde_json::from_str(&output).map_err(|e| SessionResumeError::ParseError(e.to_string()))?;
+        let result: CasrResumeOutput = serde_json::from_str(&output)
+            .map_err(|e| SessionResumeError::ParseError(e.to_string()))?;
 
         if !result.ok {
             warn!(
@@ -262,8 +262,8 @@ impl SessionResumer {
     /// Calls `casr providers --json`.
     pub fn list_providers(&self) -> Result<Vec<CasrProviderStatus>, SessionResumeError> {
         let output = self.run_casr(&["providers", "--json"])?;
-        let providers: Vec<CasrProviderStatus> =
-            serde_json::from_str(&output).map_err(|e| SessionResumeError::ParseError(e.to_string()))?;
+        let providers: Vec<CasrProviderStatus> = serde_json::from_str(&output)
+            .map_err(|e| SessionResumeError::ParseError(e.to_string()))?;
         Ok(providers)
     }
 
@@ -332,10 +332,7 @@ impl SessionResumer {
         }
 
         let output = cmd.output().map_err(|e| {
-            SessionResumeError::CasrNotFound(format!(
-                "{}: {}",
-                self.config.casr_binary, e
-            ))
+            SessionResumeError::CasrNotFound(format!("{}: {}", self.config.casr_binary, e))
         })?;
 
         if !output.status.success() {
@@ -385,7 +382,10 @@ pub fn summarize_entry(entry: &CasrListEntry) -> String {
         .take(60)
         .collect::<String>();
     let msgs = entry.messages;
-    format!("[{}] {} ({} msgs) — {}", provider, entry.session_id, msgs, title)
+    format!(
+        "[{}] {} ({} msgs) — {}",
+        provider, entry.session_id, msgs, title
+    )
 }
 
 // =============================================================================
@@ -395,9 +395,9 @@ pub fn summarize_entry(entry: &CasrListEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::casr_types::MessageRole;
     use serde_json::json;
+    use std::collections::HashMap;
 
     // -- AgentProvider --
 
@@ -570,13 +570,7 @@ mod tests {
     #[test]
     fn export_for_recorder_empty_messages() {
         let r = SessionResumer::with_defaults();
-        let export = r.export_for_recorder(
-            "sess-2",
-            "codex",
-            Path::new("/tmp/x"),
-            vec![],
-            vec![],
-        );
+        let export = r.export_for_recorder("sess-2", "codex", Path::new("/tmp/x"), vec![], vec![]);
         assert_eq!(export.events_processed, 0);
         assert!(export.session.started_at.is_none());
         assert!(export.session.ended_at.is_none());
@@ -607,13 +601,7 @@ mod tests {
                 extra: json!({}),
             },
         ];
-        let export = r.export_for_recorder(
-            "s",
-            "cc",
-            Path::new("/x"),
-            messages,
-            vec![],
-        );
+        let export = r.export_for_recorder("s", "cc", Path::new("/x"), messages, vec![]);
         assert_eq!(export.session.started_at, Some(100));
         assert_eq!(export.session.ended_at, Some(200));
     }
@@ -621,13 +609,7 @@ mod tests {
     #[test]
     fn export_serde_roundtrip() {
         let r = SessionResumer::with_defaults();
-        let export = r.export_for_recorder(
-            "s1",
-            "codex",
-            Path::new("/tmp/x"),
-            vec![],
-            vec![42],
-        );
+        let export = r.export_for_recorder("s1", "codex", Path::new("/tmp/x"), vec![], vec![42]);
         let json_str = serde_json::to_string(&export).unwrap();
         let rt: RecorderCasrExport = serde_json::from_str(&json_str).unwrap();
         assert_eq!(rt.session.session_id, "s1");
@@ -662,8 +644,7 @@ mod tests {
 
     #[test]
     fn error_is_std_error() {
-        let e: Box<dyn std::error::Error> =
-            Box::new(SessionResumeError::Timeout);
+        let e: Box<dyn std::error::Error> = Box::new(SessionResumeError::Timeout);
         assert!(!e.to_string().is_empty());
     }
 

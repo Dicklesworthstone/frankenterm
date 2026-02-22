@@ -570,10 +570,7 @@ mod tests {
             },
             extra: HashMap::new(),
         };
-        assert_eq!(
-            CodeScanner::classify(&report),
-            ScanClassification::Critical
-        );
+        assert_eq!(CodeScanner::classify(&report), ScanClassification::Critical);
     }
 
     #[test]
@@ -589,10 +586,7 @@ mod tests {
             },
             extra: HashMap::new(),
         };
-        assert_eq!(
-            CodeScanner::classify(&report),
-            ScanClassification::Critical
-        );
+        assert_eq!(CodeScanner::classify(&report), ScanClassification::Critical);
     }
 
     // -------------------------------------------------------------------------
