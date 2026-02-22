@@ -82,6 +82,15 @@ pretend the stream is continuous.
 - MCP mirrors Robot Mode for tool and schema parity (feature-gated).
 - WezTerm integration is treated as a compatibility bridge, not the product boundary.
 
+## Latency Immunity Contract
+
+For local-interaction guarantees under remote mux degradation (CPU/swap/IO pressure),
+see `docs/latency-immunity-architecture-ft-1u90p.9.md`.
+That contract defines:
+- local-first interaction/reflow invariants
+- EV-gated architecture levers and fallback triggers
+- rollout and proof artifacts required before broad enablement
+
 ## Library integration map (Appendix F)
 
 | Library | Role in ft | Status |

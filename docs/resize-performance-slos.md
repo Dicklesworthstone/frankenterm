@@ -2,6 +2,7 @@
 
 **Parent track:** `wa-1u90p.1`  
 **Related tasks:** `wa-1u90p.1.2`, `wa-1u90p.1.3`, `wa-1u90p.1.4`, `wa-1u90p.1.5`  
+**Latency-immunity architecture:** `docs/latency-immunity-architecture-ft-1u90p.9.md` (`ft-1u90p.9`)  
 **Compatibility gate contract:** `docs/resize-no-regression-compatibility-contract-wa-1u90p.8.1.md` (`wa-1u90p.8.1`; consumed by `wa-1u90p.8.2` and `wa-1u90p.8.6`)  
 **Status:** Candidate v1.1 (numeric contract frozen; refresh calibration now pending live percentile capture from `wa-1u90p.1.3` telemetry surfaces)
 
