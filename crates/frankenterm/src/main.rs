@@ -32199,6 +32199,145 @@ recorder_backend = "frankensqlite"
     }
 
     #[cfg(feature = "distributed")]
+    #[asupersync::test]
+    async fn distributed_listener_persists_agent_stream_and_surfaces_remote_status_and_query() {
+        use asupersync::io::AsyncWriteExt;
+        use asupersync::net::TcpStream;
+        use frankenterm_core::wire_protocol::{PaneDelta, PaneMeta, WireEnvelope, WirePayload};
+        use std::sync::atomic::Ordering;
+
+        let (storage_handle, db_path) = setup_storage("distributed_listener_stream_path").await;
+        let storage = std::sync::Arc::new(asupersync::sync::Mutex::new(storage_handle));
+        let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+        let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let bind_probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+        let bind_addr = bind_probe.local_addr().expect("probe listener addr");
+        drop(bind_probe);
+
+        let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
+        distributed_config.enabled = true;
+        distributed_config.bind_addr = bind_addr.to_string();
+        distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
+        distributed_config.token = Some("dist-stream-token".to_string());
+
+        let listener_handle = spawn_distributed_listener(
+            distributed_config.clone(),
+            std::sync::Arc::clone(&storage),
+            std::sync::Arc::clone(&event_bus),
+            std::sync::Arc::clone(&shutdown_flag),
+        )
+        .await
+        .expect("spawn distributed listener");
+
+        let mut stream = TcpStream::connect(distributed_config.bind_addr.clone())
+            .await
+            .expect("connect distributed listener");
+
+        let sender = "agent-stream";
+        let source_pane_id = 91_u64;
+        let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+        let marker = "DIST_LISTENER_STREAM_MARKER";
+        let now = now_ms();
+
+        let handshake = DistributedHandshake {
+            token: distributed_config.token.clone(),
+            agent_id: Some(sender.to_string()),
+            session_id: Some("session-stream".to_string()),
+        };
+        let handshake_json = serde_json::to_string(&handshake).expect("serialize handshake");
+        stream
+            .write_all(handshake_json.as_bytes())
+            .await
+            .expect("write handshake");
+        stream
+            .write_all(b"\n")
+            .await
+            .expect("write handshake newline");
+
+        let pane_meta = PaneMeta {
+            pane_id: source_pane_id,
+            pane_uuid: Some("pane-stream-uuid".to_string()),
+            domain: "prod".to_string(),
+            title: Some("remote-stream-pane".to_string()),
+            cwd: Some("/remote/stream".to_string()),
+            rows: Some(40),
+            cols: Some(120),
+            observed: true,
+            timestamp_ms: now,
+        };
+        let pane_delta = PaneDelta {
+            pane_id: source_pane_id,
+            seq: 1,
+            content: marker.to_string(),
+            content_len: marker.len(),
+            captured_at_ms: now + 1,
+        };
+
+        let envelope_meta = WireEnvelope::new(1, sender, WirePayload::PaneMeta(pane_meta));
+        let envelope_delta = WireEnvelope::new(2, sender, WirePayload::PaneDelta(pane_delta));
+
+        for envelope in [envelope_meta, envelope_delta] {
+            let bytes = envelope.to_json().expect("serialize envelope");
+            stream.write_all(&bytes).await.expect("write envelope");
+            stream
+                .write_all(b"\n")
+                .await
+                .expect("write envelope newline");
+        }
+        stream.flush().await.expect("flush envelope writes");
+        drop(stream);
+
+        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(150)).await;
+
+        {
+            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+            let remote = storage_handle
+                .get_pane(remote_pane_id)
+                .await
+                .expect("query remote pane");
+            assert!(
+                remote.is_some(),
+                "distributed listener should persist pane metadata"
+            );
+
+            let search_hits = storage_handle
+                .search(marker)
+                .await
+                .expect("query remote output");
+            assert!(
+                search_hits
+                    .iter()
+                    .any(|segment| segment.pane_id == remote_pane_id),
+                "distributed listener should persist searchable pane deltas"
+            );
+        }
+
+        let remote_records = load_distributed_remote_panes(std::path::Path::new(&db_path))
+            .await
+            .expect("load distributed remote panes");
+        assert!(
+            remote_records
+                .iter()
+                .any(|pane| pane.pane_id == remote_pane_id
+                    && pane.domain.starts_with("distributed:")),
+            "remote panes persisted through listener should be visible in status/query merge path"
+        );
+
+        shutdown_flag.store(true, Ordering::SeqCst);
+        let _ = listener_handle.await;
+
+        {
+            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+            storage_handle.shutdown().await.expect("shutdown storage");
+        }
+        drop(storage);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+    }
+
+    #[cfg(feature = "distributed")]
     #[test]
     fn distributed_remote_pane_id_is_namespaced_and_stable() {
         let a1 = distributed_remote_pane_id("agent-a", 7);
