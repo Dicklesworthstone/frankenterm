@@ -233,6 +233,7 @@ pub mod sharded_counter;
 pub mod sharding;
 pub mod simd_scan;
 pub mod skip_list;
+pub mod sliding_window;
 pub mod snapshot_engine;
 pub mod sparse_table;
 pub mod spectral;
