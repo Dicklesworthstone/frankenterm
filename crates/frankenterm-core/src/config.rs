@@ -685,6 +685,9 @@ pub struct StorageConfig {
     /// Database file path (relative to workspace .ft dir if not absolute)
     pub db_path: String,
 
+    /// Recorder backend selector for startup bootstrap policy.
+    pub recorder_backend: crate::recorder_storage::RecorderBackendKind,
+
     /// Retention period in days (0 = no retention, keep forever).
     /// This is the global fallback; tier-specific overrides take precedence.
     pub retention_days: u32,
@@ -710,6 +713,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             db_path: "ft.db".to_string(),
+            recorder_backend: crate::recorder_storage::RecorderBackendKind::AppendLog,
             retention_days: 30,
             retention_max_mb: 0, // No size limit by default
             checkpoint_interval_secs: 60,
@@ -2892,6 +2896,14 @@ impl Config {
             });
         }
 
+        if self.storage.recorder_backend != new_config.storage.recorder_backend {
+            forbidden.push(ForbiddenChange {
+                name: "storage.recorder_backend".to_string(),
+                reason: "Recorder backend cannot be changed at runtime; requires restart"
+                    .to_string(),
+            });
+        }
+
         if self.general.data_dir != new_config.general.data_dir {
             forbidden.push(ForbiddenChange {
                 name: "general.data_dir".to_string(),
@@ -4646,6 +4658,24 @@ max_bytes_per_sec = 1048576
     }
 
     #[test]
+    fn hot_reload_forbids_recorder_backend_change() {
+        let config1 = Config::default();
+        let mut config2 = Config::default();
+        config2.storage.recorder_backend =
+            crate::recorder_storage::RecorderBackendKind::FrankenSqlite;
+
+        let result = config1.diff_for_hot_reload(&config2);
+
+        assert!(!result.allowed);
+        assert!(
+            result
+                .forbidden
+                .iter()
+                .any(|f| f.name == "storage.recorder_backend")
+        );
+    }
+
+    #[test]
     fn hot_reload_no_changes_detected() {
         let config1 = Config::default();
         let config2 = Config::default();
@@ -4897,6 +4927,10 @@ log_level = "debug"
     #[test]
     fn default_retention_tiers_exist() {
         let config = StorageConfig::default();
+        assert_eq!(
+            config.recorder_backend,
+            crate::recorder_storage::RecorderBackendKind::AppendLog
+        );
         assert_eq!(config.retention_tiers.len(), 3);
         assert_eq!(config.retention_tiers[0].name, "critical");
         assert_eq!(config.retention_tiers[0].retention_days, 90);
@@ -4904,6 +4938,33 @@ log_level = "debug"
         assert_eq!(config.retention_tiers[1].retention_days, 30);
         assert_eq!(config.retention_tiers[2].name, "info");
         assert_eq!(config.retention_tiers[2].retention_days, 7);
+    }
+
+    #[test]
+    fn storage_recorder_backend_toml_accepts_frankensqlite_and_legacy_alias() {
+        let config = Config::from_toml(
+            r#"
+[storage]
+recorder_backend = "frankensqlite"
+"#,
+        )
+        .expect("parse frankensqlite backend");
+        assert_eq!(
+            config.storage.recorder_backend,
+            crate::recorder_storage::RecorderBackendKind::FrankenSqlite
+        );
+
+        let legacy = Config::from_toml(
+            r#"
+[storage]
+recorder_backend = "franken_sqlite"
+"#,
+        )
+        .expect("parse legacy franken_sqlite backend");
+        assert_eq!(
+            legacy.storage.recorder_backend,
+            crate::recorder_storage::RecorderBackendKind::FrankenSqlite
+        );
     }
 
     #[test]

@@ -7499,7 +7499,7 @@ async fn batch_get_pane_text(
     escapes: bool,
     tail_lines: usize,
 ) -> BTreeMap<u64, RobotPaneTextResult> {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(
+    let semaphore = Arc::new(asupersync::sync::Semaphore::new(
         ROBOT_BATCH_GET_TEXT_MAX_CONCURRENT,
     ));
     let mut tasks = Vec::with_capacity(pane_ids.len());
@@ -7788,7 +7788,7 @@ async fn run_robot_rpc_via_cli(
     workspace_root: &Path,
 ) -> Result<frankenterm_core::ipc::IpcResponse, String> {
     use std::process::Stdio;
-    use tokio::process::Command;
+    use asupersync::process::Command;
 
     let exe =
         std::env::current_exe().map_err(|e| format!("failed to resolve wa executable: {e}"))?;
@@ -7833,7 +7833,7 @@ async fn run_robot_rpc_via_cli(
 }
 
 async fn record_ipc_rpc_audit(
-    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     request_id: Option<String>,
     summary: String,
     result: &str,
@@ -7870,7 +7870,7 @@ async fn handle_ipc_rpc_request(
     request: frankenterm_core::ipc::IpcRpcRequest,
     workspace_root: PathBuf,
     config_path: Option<PathBuf>,
-    storage: Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
 ) -> frankenterm_core::ipc::IpcResponse {
     let summary = build_ipc_rpc_summary(&request.args);
     tracing::debug!(
@@ -7911,7 +7911,7 @@ async fn handle_ipc_rpc_request(
 fn build_ipc_rpc_handler(
     workspace_root: PathBuf,
     config_path: Option<PathBuf>,
-    storage: Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
 ) -> frankenterm_core::ipc::IpcRpcHandler {
     Arc::new(move |request: frankenterm_core::ipc::IpcRpcRequest| {
         let workspace_root = workspace_root.clone();
@@ -8000,6 +8000,7 @@ const WATCHER_STABLE_RESET: Duration = Duration::from_secs(5 * 60);
 const WATCHER_BASE_BACKOFF: Duration = Duration::from_secs(2);
 const WATCHER_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const WATCHER_CRASH_LOOP_THRESHOLD: usize = 3;
+const RECORDER_BACKEND_MIGRATION_EPOCH: &str = "ft.recorder.backend.v1";
 
 struct WatcherCrashLoop {
     crash_times: VecDeque<Instant>,
@@ -8060,6 +8061,175 @@ fn watcher_error_is_non_retryable(err: &anyhow::Error) -> bool {
     let message = err.to_string();
     message.contains("Another watcher is already running")
         || message.contains("Failed to acquire watcher lock")
+        || message.contains("non-retryable:")
+}
+
+#[derive(Debug, Clone)]
+struct RecorderBackendStartupSelection {
+    requested_backend: frankenterm_core::recorder_storage::RecorderBackendKind,
+    selected_backend: frankenterm_core::recorder_storage::RecorderBackendKind,
+    fallback_reason: Option<String>,
+}
+
+fn recorder_append_log_storage_config(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    config: &frankenterm_core::config::Config,
+) -> frankenterm_core::recorder_storage::AppendLogStorageConfig {
+    let mut append_log = frankenterm_core::recorder_storage::AppendLogStorageConfig::default();
+    append_log.data_path = layout.ft_dir.join("recorder-log").join("events.log");
+    append_log.state_path = layout.ft_dir.join("recorder-log").join("state.json");
+    append_log.queue_capacity = (config.storage.writer_queue_size as usize).max(1);
+    append_log
+}
+
+fn recorder_startup_health_failure_reason(
+    health: &frankenterm_core::recorder_storage::RecorderStorageHealth,
+) -> Option<String> {
+    if health.degraded {
+        Some(
+            health
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "backend reported degraded startup health".to_string()),
+        )
+    } else {
+        None
+    }
+}
+
+async fn bootstrap_recorder_backend_with_probe(
+    requested_backend: frankenterm_core::recorder_storage::RecorderBackendKind,
+    append_log: frankenterm_core::recorder_storage::AppendLogStorageConfig,
+) -> std::result::Result<
+    (
+        frankenterm_core::recorder_storage::RecorderStorageInstance,
+        Option<String>,
+    ),
+    anyhow::Error,
+> {
+    use anyhow::Context as _;
+    use frankenterm_core::recorder_storage::{
+        RecorderBackendKind, RecorderStorage, RecorderStorageConfig, bootstrap_recorder_storage,
+    };
+
+    let make_config = |backend| RecorderStorageConfig {
+        backend,
+        append_log: append_log.clone(),
+    };
+    let attempt_bootstrap = |backend| bootstrap_recorder_storage(make_config(backend));
+
+    let mut fallback_reason: Option<String> = None;
+    let storage = match attempt_bootstrap(requested_backend) {
+        Ok(storage) => storage,
+        Err(err) if requested_backend == RecorderBackendKind::FrankenSqlite => {
+            let reason = format!("bootstrap_failed:{err}");
+            tracing::warn!(
+                backend = %requested_backend,
+                fallback = %RecorderBackendKind::AppendLog,
+                reason = %reason,
+                "Recorder backend unavailable at startup; falling back to append-log"
+            );
+            fallback_reason = Some(reason);
+            attempt_bootstrap(RecorderBackendKind::AppendLog)
+                .context("fallback append-log bootstrap failed")?
+        }
+        Err(err) => {
+            anyhow::bail!(
+                "non-retryable: failed to bootstrap recorder backend {}: {err}",
+                requested_backend
+            );
+        }
+    };
+
+    let health = storage.health().await;
+    if let Some(reason) = recorder_startup_health_failure_reason(&health) {
+        if requested_backend == RecorderBackendKind::FrankenSqlite {
+            tracing::warn!(
+                backend = %requested_backend,
+                fallback = %RecorderBackendKind::AppendLog,
+                reason = %reason,
+                "Recorder backend startup health probe failed; falling back to append-log"
+            );
+            let fallback_storage = attempt_bootstrap(RecorderBackendKind::AppendLog)
+                .context("append-log fallback bootstrap failed after health-probe failure")?;
+            let fallback_health = fallback_storage.health().await;
+            if let Some(fallback_health_reason) =
+                recorder_startup_health_failure_reason(&fallback_health)
+            {
+                anyhow::bail!(
+                    "non-retryable: append-log fallback startup health probe failed: {fallback_health_reason}"
+                );
+            }
+            let existing = fallback_reason.take();
+            fallback_reason = Some(match existing {
+                Some(previous) => format!("{previous};health_probe_failed:{reason}"),
+                None => format!("health_probe_failed:{reason}"),
+            });
+            return Ok((fallback_storage, fallback_reason));
+        }
+        anyhow::bail!(
+            "non-retryable: recorder backend {} startup health probe failed: {}",
+            requested_backend,
+            reason
+        );
+    }
+
+    Ok((storage, fallback_reason))
+}
+
+fn recorder_backend_lifecycle_payload(
+    selection: &RecorderBackendStartupSelection,
+) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "backend_kind".to_string(),
+        serde_json::Value::String(selection.selected_backend.to_string()),
+    );
+    payload.insert(
+        "requested_backend_kind".to_string(),
+        serde_json::Value::String(selection.requested_backend.to_string()),
+    );
+    payload.insert(
+        "migration_epoch".to_string(),
+        serde_json::Value::String(RECORDER_BACKEND_MIGRATION_EPOCH.to_string()),
+    );
+    if let Some(reason) = selection.fallback_reason.clone() {
+        payload.insert(
+            "fallback_reason".to_string(),
+            serde_json::Value::String(reason),
+        );
+    }
+    serde_json::Value::Object(payload)
+}
+
+async fn emit_recorder_backend_lifecycle_event(
+    storage: &frankenterm_core::storage::StorageHandle,
+    selection: &RecorderBackendStartupSelection,
+) -> anyhow::Result<i64> {
+    use anyhow::Context as _;
+
+    let event = frankenterm_core::storage::StoredEvent {
+        id: 0,
+        pane_id: 0,
+        rule_id: "system.recorder.backend".to_string(),
+        agent_type: "system".to_string(),
+        event_type: "recorder.backend_selected".to_string(),
+        severity: "info".to_string(),
+        confidence: 1.0,
+        extracted: Some(recorder_backend_lifecycle_payload(selection)),
+        matched_text: None,
+        segment_id: None,
+        detected_at: now_epoch_ms(),
+        dedupe_key: None,
+        handled_at: None,
+        handled_by_workflow_id: None,
+        handled_status: None,
+    };
+
+    storage
+        .record_event(event)
+        .await
+        .context("failed to record recorder backend lifecycle marker")
 }
 
 #[cfg(feature = "distributed")]
@@ -8072,22 +8242,22 @@ struct DistributedHandshake {
 
 #[cfg(feature = "distributed")]
 struct DistributedIngestState {
-    aggregator: tokio::sync::Mutex<frankenterm_core::wire_protocol::Aggregator>,
-    replay_guard: tokio::sync::Mutex<frankenterm_core::distributed::SessionReplayGuard>,
-    pane_seq_by_sender: tokio::sync::Mutex<std::collections::HashMap<(String, u64), u64>>,
+    aggregator: asupersync::sync::Mutex<frankenterm_core::wire_protocol::Aggregator>,
+    replay_guard: asupersync::sync::Mutex<frankenterm_core::distributed::SessionReplayGuard>,
+    pane_seq_by_sender: asupersync::sync::Mutex<std::collections::HashMap<(String, u64), u64>>,
 }
 
 #[cfg(feature = "distributed")]
 impl DistributedIngestState {
     fn new() -> Self {
         Self {
-            aggregator: tokio::sync::Mutex::new(frankenterm_core::wire_protocol::Aggregator::new(
+            aggregator: asupersync::sync::Mutex::new(frankenterm_core::wire_protocol::Aggregator::new(
                 4096,
             )),
-            replay_guard: tokio::sync::Mutex::new(
+            replay_guard: asupersync::sync::Mutex::new(
                 frankenterm_core::distributed::SessionReplayGuard::new(8192),
             ),
-            pane_seq_by_sender: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            pane_seq_by_sender: asupersync::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -8285,9 +8455,9 @@ where
 async fn distributed_persist_payload(
     sender: &str,
     payload: frankenterm_core::wire_protocol::WirePayload,
-    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     event_bus: &Arc<frankenterm_core::events::EventBus>,
-    pane_seq_by_sender: &tokio::sync::Mutex<std::collections::HashMap<(String, u64), u64>>,
+    pane_seq_by_sender: &asupersync::sync::Mutex<std::collections::HashMap<(String, u64), u64>>,
 ) -> anyhow::Result<()> {
     use frankenterm_core::events::Event;
     use frankenterm_core::wire_protocol::WirePayload;
@@ -8467,7 +8637,7 @@ async fn distributed_persist_payload(
 async fn distributed_persist_pane_meta(
     sender: &str,
     meta: frankenterm_core::wire_protocol::PaneMeta,
-    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     event_bus: &Arc<frankenterm_core::events::EventBus>,
 ) -> anyhow::Result<()> {
     use frankenterm_core::events::Event;
@@ -8514,7 +8684,7 @@ async fn distributed_handle_connection<S>(
     expected_token: Option<String>,
     allow_agent_ids: Arc<HashSet<String>>,
     ingest_state: Arc<DistributedIngestState>,
-    storage: Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     event_bus: Arc<frankenterm_core::events::EventBus>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
 ) where
@@ -8691,13 +8861,15 @@ async fn distributed_handle_connection<S>(
             }
         }
 
-        {
+        let validation_err = {
             let replay_id = format!("{session_id}:{}", envelope.sender);
             let mut replay_guard = ingest_state.replay_guard.lock().await;
-            if let Err(err) = replay_guard.validate(&replay_id, envelope.seq) {
-                distributed_publish_security_error(&mut reader, err).await;
-                continue;
-            }
+            replay_guard.validate(&replay_id, envelope.seq).err()
+        };
+
+        if let Some(err) = validation_err {
+            distributed_publish_security_error(&mut reader, err).await;
+            continue;
         }
 
         let sender = envelope.sender.clone();
@@ -8738,10 +8910,10 @@ async fn distributed_handle_connection<S>(
 #[cfg(feature = "distributed")]
 async fn spawn_distributed_listener(
     distributed_config: frankenterm_core::config::DistributedConfig,
-    storage: Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     event_bus: Arc<frankenterm_core::events::EventBus>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+) -> anyhow::Result<asupersync::task::JoinHandle<()>> {
     use asupersync::net::TcpListener;
     use std::sync::atomic::Ordering;
 
@@ -8974,7 +9146,7 @@ async fn distributed_agent_send_envelope(
 
 #[cfg(feature = "distributed")]
 async fn distributed_agent_seed_segment_cursors(
-    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     cursors: &mut std::collections::HashMap<u64, i64>,
 ) -> anyhow::Result<()> {
     let storage_handle = storage.lock().await.clone(); // ubs:ignore
@@ -8998,7 +9170,7 @@ async fn distributed_agent_seed_segment_cursors(
 #[cfg(feature = "distributed")]
 async fn distributed_agent_send_pane_snapshot(
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
-    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<()> {
     use frankenterm_core::events::Event;
@@ -9037,7 +9209,7 @@ async fn distributed_agent_send_pane_snapshot(
 async fn distributed_agent_flush_pane_deltas(
     pane_id: u64,
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
-    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<usize> {
@@ -9101,7 +9273,7 @@ async fn distributed_agent_flush_pane_deltas(
 #[cfg(feature = "distributed")]
 async fn distributed_agent_flush_all_panes(
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
-    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<usize> {
@@ -9135,7 +9307,7 @@ async fn distributed_agent_flush_all_panes(
 async fn distributed_agent_stream_event(
     event: frankenterm_core::events::Event,
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
-    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<()> {
@@ -9176,7 +9348,7 @@ async fn distributed_agent_stream_event(
 async fn distributed_agent_stream_session(
     io: DistributedIoStream,
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
-    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     event_bus: &Arc<frankenterm_core::events::EventBus>,
     token: Option<&str>,
     agent_id: &str,
@@ -9323,7 +9495,7 @@ fn distributed_agent_next_reconnect_backoff_ms(
 async fn distributed_agent_stream_forever(
     connect_addr: String,
     distributed_config: frankenterm_core::config::DistributedConfig,
-    storage: Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     event_bus: Arc<frankenterm_core::events::EventBus>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
     agent_id: String,
@@ -9438,7 +9610,7 @@ async fn run_distributed_agent(
     let pattern_engine =
         PatternEngine::from_config_with_root(&config.patterns, patterns_root.as_deref())
             .map_err(|e| anyhow::anyhow!("Failed to load pattern packs: {e}"))?;
-    let pattern_engine = Arc::new(tokio::sync::RwLock::new(pattern_engine));
+    let pattern_engine = Arc::new(asupersync::sync::RwLock::new(pattern_engine));
 
     let event_bus = Arc::new(EventBus::new(1000));
     let wezterm_handle = frankenterm_core::wezterm::wezterm_handle_from_config(config);
@@ -9498,11 +9670,11 @@ async fn run_distributed_agent(
 
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use asupersync::signal::unix::{SignalKind, signal};
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
 
-        tokio::select! {
+        asupersync::select! {
             _ = sigint.recv() => {
                 tracing::info!("Received SIGINT, shutting down distributed agent");
             }
@@ -9514,7 +9686,7 @@ async fn run_distributed_agent(
 
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await?;
+        asupersync::signal::ctrl_c().await?;
         tracing::info!("Received Ctrl+C, shutting down distributed agent");
     }
 
@@ -9605,9 +9777,9 @@ async fn run_watcher_with_backoff(
                     );
                 }
 
-                tokio::select! {
+                asupersync::select! {
                     () = frankenterm_core::runtime_compat::sleep(backoff) => {}
-                    _ = tokio::signal::ctrl_c() => {
+                    _ = asupersync::signal::ctrl_c() => {
                         tracing::info!("Watcher restart cancelled by Ctrl-C");
                         return Ok(());
                     }
@@ -9749,8 +9921,56 @@ async fn run_watcher(
     let storage_config = frankenterm_core::storage::StorageConfig {
         write_queue_size: config.storage.writer_queue_size as usize,
     };
+    let requested_recorder_backend = config.storage.recorder_backend;
+    let recorder_append_log_config = recorder_append_log_storage_config(layout, &config);
+    let (recorder_storage, recorder_fallback_reason) = bootstrap_recorder_backend_with_probe(
+        requested_recorder_backend,
+        recorder_append_log_config,
+    )
+    .await?;
+    let recorder_selected_backend = {
+        use frankenterm_core::recorder_storage::RecorderStorage as _;
+        recorder_storage.backend_kind()
+    };
+    let recorder_startup_selection = RecorderBackendStartupSelection {
+        requested_backend: requested_recorder_backend,
+        selected_backend: recorder_selected_backend,
+        fallback_reason: recorder_fallback_reason,
+    };
+    tracing::info!(
+        requested_backend = %recorder_startup_selection.requested_backend,
+        selected_backend = %recorder_startup_selection.selected_backend,
+        fallback_reason = %recorder_startup_selection
+            .fallback_reason
+            .as_deref()
+            .unwrap_or("none"),
+        migration_epoch = RECORDER_BACKEND_MIGRATION_EPOCH,
+        "Recorder backend startup selection resolved"
+    );
+
+    let recorder_health = {
+        use frankenterm_core::recorder_storage::RecorderStorage as _;
+        recorder_storage.health().await
+    };
+    tracing::info!(
+        backend = %recorder_health.backend,
+        degraded = recorder_health.degraded,
+        queue_depth = recorder_health.queue_depth,
+        queue_capacity = recorder_health.queue_capacity,
+        "Recorder backend startup health probe passed"
+    );
+
     let storage = StorageHandle::with_config(&db_path, storage_config).await?;
+    let lifecycle_event_id =
+        emit_recorder_backend_lifecycle_event(&storage, &recorder_startup_selection).await?;
     tracing::info!(db_path = %db_path, "Storage initialized");
+    tracing::info!(
+        event_id = lifecycle_event_id,
+        backend = %recorder_startup_selection.selected_backend,
+        requested_backend = %recorder_startup_selection.requested_backend,
+        migration_epoch = RECORDER_BACKEND_MIGRATION_EPOCH,
+        "Recorded recorder backend lifecycle marker event"
+    );
     let scheduler_storage = storage.clone();
 
     maybe_trigger_e2e_watcher_panic_once(layout);
@@ -9769,7 +9989,7 @@ async fn run_watcher(
         PatternEngine::from_config_with_root(&config.patterns, patterns_root.as_deref())
             .map_err(|e| anyhow::anyhow!("Failed to load pattern packs: {e}"))?
     };
-    let pattern_engine = Arc::new(tokio::sync::RwLock::new(pattern_engine));
+    let pattern_engine = Arc::new(asupersync::sync::RwLock::new(pattern_engine));
 
     // Create event bus for publishing detections to workflow runners
     let event_bus = Arc::new(EventBus::new(1000));
@@ -9808,7 +10028,7 @@ async fn run_watcher(
             tracing::info!("Notification pipeline disabled (no active senders)");
             None
         } else {
-            let mute_storage = Arc::new(tokio::sync::Mutex::new(storage.clone()));
+            let mute_storage = Arc::new(asupersync::sync::Mutex::new(storage.clone()));
             let mut pipeline = NotificationPipeline::with_mute_store(
                 config.notifications.to_notification_gate(),
                 senders,
@@ -9934,7 +10154,7 @@ async fn run_watcher(
         // Create policy engine (permissive defaults for auto-handling)
         let policy_engine = PolicyEngine::permissive();
         let wezterm_handle = wezterm_handle.clone();
-        let injector = Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::with_storage(
+        let injector = Arc::new(asupersync::sync::Mutex::new(PolicyGatedInjector::with_storage(
             policy_engine,
             wezterm_handle,
             storage_for_workflows.as_ref().clone(),
@@ -10047,7 +10267,7 @@ async fn run_watcher(
     };
 
     #[cfg(not(feature = "distributed"))]
-    let distributed_listener_handle: Option<tokio::task::JoinHandle<()>> = if config
+    let distributed_listener_handle: Option<asupersync::task::JoinHandle<()>> = if config
         .distributed
         .enabled
     {
@@ -10258,13 +10478,13 @@ async fn run_watcher(
     // Wait for signals (SIGINT/SIGTERM to shutdown, SIGHUP to reload config)
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use asupersync::signal::unix::{SignalKind, signal};
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sighup = signal(SignalKind::hangup())?;
 
         loop {
-            tokio::select! {
+            asupersync::select! {
                 _ = sigint.recv() => {
                     tracing::info!("Received SIGINT, initiating graceful shutdown");
                     break;
@@ -10330,7 +10550,7 @@ async fn run_watcher(
 
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await?;
+        asupersync::signal::ctrl_c().await?;
         tracing::info!("Received Ctrl+C, initiating graceful shutdown");
     }
 
@@ -10524,7 +10744,7 @@ async fn run_saved_search_scheduler(
             Ok(searches) => searches,
             Err(err) => {
                 tracing::warn!(error = %err, "Saved search scheduler: failed to list searches");
-                tokio::select! {
+                asupersync::select! {
                     () = frankenterm_core::runtime_compat::sleep(Duration::from_secs(1)) => {}
                     () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
                 }
@@ -10757,7 +10977,7 @@ async fn run_saved_search_scheduler(
         sleep_ms = sleep_ms.max(MIN_SLEEP_MS);
         let sleep_ms_u64 = u64::try_from(sleep_ms).unwrap_or(1_000);
 
-        tokio::select! {
+        asupersync::select! {
             () = frankenterm_core::runtime_compat::sleep(Duration::from_millis(sleep_ms_u64)) => {}
             () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
         }
@@ -10770,7 +10990,7 @@ async fn run_scheduled_backups(
     config: frankenterm_core::config::ScheduledBackupConfig,
     workspace_root: PathBuf,
     db_path: PathBuf,
-    storage: Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
     notify_config: frankenterm_core::desktop_notify::DesktopNotifyConfig,
 ) {
@@ -10806,7 +11026,7 @@ async fn run_scheduled_backups(
             Ok(next_run) => next_run,
             Err(err) => {
                 tracing::warn!(error = %err, "Failed to compute next backup schedule; retrying");
-                tokio::select! {
+                asupersync::select! {
                     () = frankenterm_core::runtime_compat::sleep(Duration::from_secs(60)) => {}
                     () = wait_for_shutdown(shutdown_flag.clone()) => break,
                 }
@@ -10825,7 +11045,7 @@ async fn run_scheduled_backups(
             "Scheduled backup queued"
         );
 
-        tokio::select! {
+        asupersync::select! {
             () = frankenterm_core::runtime_compat::sleep(sleep_duration) => {}
             () = wait_for_shutdown(shutdown_flag.clone()) => break,
         }
@@ -10874,7 +11094,7 @@ async fn run_scheduled_backups(
                     tracing::warn!(attempt, error = %err, "Scheduled backup attempt failed");
                     if attempt < 3 {
                         let backoff = Duration::from_secs(2_u64.pow(attempt - 1));
-                        tokio::select! {
+                        asupersync::select! {
                             () = frankenterm_core::runtime_compat::sleep(backoff) => {}
                             () = wait_for_shutdown(shutdown_flag.clone()) => break,
                         }
@@ -10906,7 +11126,7 @@ async fn run_single_scheduled_backup(
     config: &frankenterm_core::config::ScheduledBackupConfig,
     workspace_root: &Path,
     db_path: &Path,
-    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    storage: &Arc<asupersync::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
 ) -> anyhow::Result<frankenterm_core::backup::ExportResult> {
     if !db_path.exists() {
         anyhow::bail!("Database not found at {}", db_path.display());
@@ -10932,7 +11152,7 @@ async fn run_single_scheduled_backup(
     let db_path = db_path.to_path_buf();
     let workspace_root = workspace_root.to_path_buf();
     let workspace_root_for_closure = workspace_root.clone();
-    let export_result = tokio::task::spawn_blocking(move || {
+    let export_result = asupersync::task::spawn_blocking(move || {
         frankenterm_core::backup::export_backup(&db_path, &workspace_root_for_closure, &opts)
     })
     .await??;
@@ -10947,7 +11167,7 @@ async fn run_single_scheduled_backup(
     if retention_days > 0 || max_backups > 0 {
         let now = chrono::Local::now();
         let destination_root = destination_root.clone();
-        tokio::task::spawn_blocking(move || {
+        asupersync::task::spawn_blocking(move || {
             frankenterm_core::backup::prune_backups(
                 &destination_root,
                 retention_days,
@@ -11018,7 +11238,7 @@ fn send_backup_notification(
     let _ = notifier.notify_message(title, body, urgency);
 }
 
-#[tokio::main]
+#[asupersync::main]
 async fn main() {
     let robot_mode = sniff_robot_mode_from_args();
     if let Err(err) = Box::pin(run(robot_mode)).await {
@@ -13564,7 +13784,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     // Create policy-gated injector with WezTerm client
                                     let wezterm_handle =
                                         frankenterm_core::wezterm::default_wezterm_handle();
-                                    let injector = Arc::new(tokio::sync::Mutex::new(
+                                    let injector = Arc::new(asupersync::sync::Mutex::new(
                                         PolicyGatedInjector::with_storage(
                                             policy_engine,
                                             wezterm_handle,
@@ -14277,7 +14497,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     );
                                     let wezterm_handle =
                                         frankenterm_core::wezterm::default_wezterm_handle();
-                                    let injector = Arc::new(tokio::sync::Mutex::new(
+                                    let injector = Arc::new(asupersync::sync::Mutex::new(
                                         PolicyGatedInjector::with_storage(
                                             policy_engine,
                                             wezterm_handle,
@@ -17858,7 +18078,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                         let wezterm_handle = frankenterm_core::wezterm::default_wezterm_handle();
                         let injector =
-                            Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::with_storage(
+                            Arc::new(asupersync::sync::Mutex::new(PolicyGatedInjector::with_storage(
                                 policy_engine,
                                 wezterm_handle,
                                 storage.as_ref().clone(),
@@ -20491,7 +20711,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         true,
                     );
                     let wezterm_handle = frankenterm_core::wezterm::default_wezterm_handle();
-                    let injector = std::sync::Arc::new(tokio::sync::Mutex::new(
+                    let injector = std::sync::Arc::new(asupersync::sync::Mutex::new(
                         frankenterm_core::policy::PolicyGatedInjector::with_storage(
                             policy_engine,
                             wezterm_handle,
@@ -24121,7 +24341,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             // the main async runtime. The ProductionQueryClient creates its
             // own dedicated runtime for async operations.
             let layout_clone = layout.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = asupersync::task::spawn_blocking(move || {
                 let query_client = ProductionQueryClient::with_storage(layout_clone, storage);
                 run_tui(query_client, tui_config)
             })
@@ -24156,7 +24376,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             let layout_clone = layout.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = asupersync::task::spawn_blocking(move || {
                 let query_client = ProductionQueryClient::with_storage(layout_clone, storage);
                 run_tui(query_client, tui_config)
             })
@@ -24197,7 +24417,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             let layout_clone = layout.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = asupersync::task::spawn_blocking(move || {
                 let query_client = ProductionQueryClient::with_storage(layout_clone, storage);
                 run_tui(query_client, tui_config)
             })
@@ -31578,6 +31798,117 @@ mod tests {
             .map_or(0, |d| d.as_millis() as i64)
     }
 
+    #[test]
+    fn watcher_startup_default_backend_is_append_log() {
+        let config = frankenterm_core::config::Config::default();
+        assert_eq!(
+            config.storage.recorder_backend,
+            frankenterm_core::recorder_storage::RecorderBackendKind::AppendLog
+        );
+    }
+
+    #[test]
+    fn watcher_startup_frankensqlite_selected_via_config() {
+        let config = frankenterm_core::config::Config::from_toml(
+            r#"
+[storage]
+recorder_backend = "frankensqlite"
+"#,
+        )
+        .expect("parse config");
+
+        assert_eq!(
+            config.storage.recorder_backend,
+            frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite
+        );
+    }
+
+    #[asupersync::test]
+    async fn watcher_startup_frankensqlite_fallback_on_connection_failure() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "ft_recorder_fallback_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+
+        let append_log = frankenterm_core::recorder_storage::AppendLogStorageConfig {
+            data_path: temp_root.join("recorder-log/events.log"),
+            state_path: temp_root.join("recorder-log/state.json"),
+            ..frankenterm_core::recorder_storage::AppendLogStorageConfig::default()
+        };
+
+        let (storage, fallback_reason) = bootstrap_recorder_backend_with_probe(
+            frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite,
+            append_log,
+        )
+        .await
+        .expect("fallback to append-log should succeed");
+
+        use frankenterm_core::recorder_storage::RecorderStorage as _;
+        assert_eq!(
+            storage.backend_kind(),
+            frankenterm_core::recorder_storage::RecorderBackendKind::AppendLog
+        );
+        let reason = fallback_reason.expect("fallback reason should be present");
+        assert!(reason.contains("bootstrap_failed"));
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn health_probe_passes_for_non_degraded_backend() {
+        let health = frankenterm_core::recorder_storage::RecorderStorageHealth {
+            backend: frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite,
+            degraded: false,
+            queue_depth: 0,
+            queue_capacity: 1,
+            latest_offset: None,
+            last_error: None,
+        };
+        assert!(recorder_startup_health_failure_reason(&health).is_none());
+    }
+
+    #[test]
+    fn health_probe_fails_for_missing_tables_style_error() {
+        let health = frankenterm_core::recorder_storage::RecorderStorageHealth {
+            backend: frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite,
+            degraded: true,
+            queue_depth: 0,
+            queue_capacity: 1,
+            latest_offset: None,
+            last_error: Some("missing required recorder tables".to_string()),
+        };
+        assert_eq!(
+            recorder_startup_health_failure_reason(&health),
+            Some("missing required recorder tables".to_string())
+        );
+    }
+
+    #[test]
+    fn lifecycle_marker_includes_backend_kind() {
+        let selection = RecorderBackendStartupSelection {
+            requested_backend:
+                frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite,
+            selected_backend: frankenterm_core::recorder_storage::RecorderBackendKind::AppendLog,
+            fallback_reason: Some("bootstrap_failed:dependency unavailable".to_string()),
+        };
+        let payload = recorder_backend_lifecycle_payload(&selection);
+        assert_eq!(payload["backend_kind"], "append_log");
+        assert_eq!(payload["requested_backend_kind"], "frankensqlite");
+        assert_eq!(payload["migration_epoch"], RECORDER_BACKEND_MIGRATION_EPOCH);
+        assert_eq!(
+            payload["fallback_reason"],
+            "bootstrap_failed:dependency unavailable"
+        );
+    }
+
+    #[test]
+    fn watcher_error_non_retryable_marker_is_recognized() {
+        let err = anyhow::anyhow!("non-retryable: recorder backend startup failed");
+        assert!(watcher_error_is_non_retryable(&err));
+    }
+
     fn make_pane_record(
         pane_id: u64,
         domain: &str,
@@ -31633,7 +31964,7 @@ mod tests {
         assert!(!records.iter().any(|r| r.pane_id == 3));
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn load_distributed_remote_panes_only_returns_distributed_domains() {
         let (storage, db_path) = setup_storage("distributed_remote_load").await;
 
@@ -31674,7 +32005,7 @@ mod tests {
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn distributed_remote_output_is_searchable_for_query_path() {
         let (storage, db_path) = setup_storage("distributed_remote_query").await;
         let remote_pane_id = 42_001;
@@ -31713,13 +32044,13 @@ mod tests {
     }
 
     #[cfg(feature = "distributed")]
-    #[tokio::test]
+    #[asupersync::test]
     async fn distributed_persist_payload_maps_sender_scoped_pane_ids_for_query_visibility() {
         let (storage_handle, db_path) = setup_storage("distributed_persist_payload_map").await;
-        let storage = std::sync::Arc::new(tokio::sync::Mutex::new(storage_handle));
+        let storage = std::sync::Arc::new(asupersync::sync::Mutex::new(storage_handle));
         let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
         let pane_seq_by_sender =
-            tokio::sync::Mutex::new(std::collections::HashMap::<(String, u64), u64>::new());
+            asupersync::sync::Mutex::new(std::collections::HashMap::<(String, u64), u64>::new());
 
         let sender = "agent-mapped";
         let source_pane_id = 17;
@@ -31796,14 +32127,14 @@ mod tests {
     }
 
     #[cfg(feature = "distributed")]
-    #[tokio::test]
+    #[asupersync::test]
     async fn distributed_persist_payload_out_of_order_records_sender_scoped_gap_and_drops_segment()
     {
         let (storage_handle, db_path) = setup_storage("distributed_persist_payload_ordering").await;
-        let storage = std::sync::Arc::new(tokio::sync::Mutex::new(storage_handle));
+        let storage = std::sync::Arc::new(asupersync::sync::Mutex::new(storage_handle));
         let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
         let pane_seq_by_sender =
-            tokio::sync::Mutex::new(std::collections::HashMap::<(String, u64), u64>::new());
+            asupersync::sync::Mutex::new(std::collections::HashMap::<(String, u64), u64>::new());
 
         let sender = "agent-order";
         let source_pane_id = 23;
@@ -33141,7 +33472,7 @@ log_level = "debug"
         assert!(validate_uservar_request(1, name, value).is_ok());
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn robot_approve_valid_code_consumes() {
         let (storage, db_path) = setup_storage("valid").await;
         let workspace_id = "ws-valid";
@@ -33179,7 +33510,7 @@ log_level = "debug"
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn robot_approve_dry_run_does_not_consume() {
         let (storage, db_path) = setup_storage("dry_run").await;
         let workspace_id = "ws-dry";
@@ -33228,7 +33559,7 @@ log_level = "debug"
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn robot_approve_expired_code() {
         let (storage, db_path) = setup_storage("expired").await;
         let workspace_id = "ws-expired";
@@ -33262,7 +33593,7 @@ log_level = "debug"
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn robot_approve_consumed_code() {
         let (storage, db_path) = setup_storage("consumed").await;
         let workspace_id = "ws-consumed";
@@ -33297,7 +33628,7 @@ log_level = "debug"
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn robot_approve_wrong_pane() {
         let (storage, db_path) = setup_storage("wrong_pane").await;
         let workspace_id = "ws-pane";
@@ -33332,7 +33663,7 @@ log_level = "debug"
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn robot_approve_wrong_workspace() {
         let (storage, db_path) = setup_storage("wrong_ws").await;
         let code = "WS123456";
@@ -33350,7 +33681,7 @@ log_level = "debug"
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn robot_approve_fingerprint_mismatch() {
         let (storage, db_path) = setup_storage("fingerprint").await;
         let workspace_id = "ws-fp";
@@ -34198,7 +34529,7 @@ log_level = "debug"
         assert!(json["accounts"].as_array().unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn robot_accounts_db_round_trip() {
         // End-to-end: insert accounts into DB, fetch, build robot response
         let (storage, db_path) = setup_storage("robot_accounts").await;
@@ -34311,7 +34642,7 @@ log_level = "debug"
         assert_eq!(ROBOT_REFRESH_COOLDOWN_MS, 30_000);
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn robot_refresh_db_mirror_round_trip() {
         // Simulate the refresh → DB mirror path:
         // Parse CautRefresh fixture → from_caut → upsert → verify DB state
@@ -34406,7 +34737,7 @@ log_level = "debug"
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn robot_refresh_db_mirror_updates_existing() {
         // Verify that refresh updates percent_remaining for existing accounts
         let (storage, db_path) = setup_storage("refresh_update").await;
@@ -34611,7 +34942,7 @@ log_level = "debug"
     // Reservation DB integration tests
     // =========================================================================
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn reservation_create_and_list() {
         let (storage, db_path) = setup_storage("res_create_list").await;
 
@@ -34657,7 +34988,7 @@ log_level = "debug"
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn reservation_conflict_detection() {
         let (storage, db_path) = setup_storage("res_conflict").await;
 
@@ -34693,7 +35024,7 @@ log_level = "debug"
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn reservation_expire_stale() {
         let (storage, db_path) = setup_storage("res_expire").await;
 
@@ -36562,7 +36893,7 @@ log_level = "debug"
         }
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn read_search_policy_default_allows_robot_search() {
         let config = frankenterm_core::config::Config::default();
         let (decision, _domain) = authorize_read_or_search_policy(
@@ -36581,7 +36912,7 @@ log_level = "debug"
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn read_search_policy_rule_can_deny_robot_search() {
         let mut config = frankenterm_core::config::Config::default();
         config.safety.rules.enabled = true;
@@ -36920,7 +37251,7 @@ log_level = "debug"
         }
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn saved_search_scheduler_emits_alert_and_redacts_snippet() {
         use frankenterm_core::events::Event;
         use frankenterm_core::storage::{
@@ -37048,7 +37379,7 @@ log_level = "debug"
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn saved_search_scheduler_invalid_query_sets_last_error_and_backs_off() {
         use frankenterm_core::storage::{
             SAVED_SEARCH_DEFAULT_LIMIT, SAVED_SEARCH_SINCE_MODE_LAST_RUN, SavedSearchRecord,
@@ -37100,7 +37431,7 @@ log_level = "debug"
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn saved_search_scheduler_respects_interval_when_not_due() {
         use frankenterm_core::storage::{
             SAVED_SEARCH_DEFAULT_LIMIT, SAVED_SEARCH_SINCE_MODE_LAST_RUN, SavedSearchRecord,
@@ -37198,7 +37529,7 @@ log_level = "debug"
 
     // ── mute CLI storage round-trip tests ─────────────────────────────────
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn mute_add_list_remove_roundtrip() {
         use frankenterm_core::storage::EventMuteRecord;
 
@@ -37242,7 +37573,7 @@ log_level = "debug"
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn mute_permanent_no_expiry() {
         use frankenterm_core::storage::EventMuteRecord;
 
@@ -37269,7 +37600,7 @@ log_level = "debug"
         cleanup_storage(storage, &db_path).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn mute_expired_not_listed() {
         use frankenterm_core::storage::EventMuteRecord;
 
@@ -37689,7 +38020,7 @@ log_level = "debug"
         }
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn doctor_fixture_healthy_workspace() {
         let temp = unique_temp_dir("doctor_healthy");
         let layout = make_test_layout(&temp);

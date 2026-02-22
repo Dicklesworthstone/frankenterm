@@ -106,7 +106,8 @@ fastembed = { version = "4", optional = true }
 rmp-serde = { version = "1.3", optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util", "macros"] }
+
+tokio = { workspace = true, features = ["test-util"] }
 proptest = "1.8.0"
 tempfile = "3.23.0"
 criterion = { version = "0.7.0", features = ["async_tokio"] }
@@ -428,6 +429,8 @@ redis-session = [
 session-resume = []
 # Feature gate for generic subprocess bridge foundation.
 subprocess-bridge = []
+# Feature gate for mcp_agent_mail_rust coordination bridge.
+agent-mail = ["subprocess-bridge"]
 # Feature gate for vibe_cockpit telemetry export bridge.
 vc-export = ["subprocess-bridge"]
 

@@ -24,7 +24,7 @@ clap.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -48,6 +48,8 @@ mcp = ["frankenterm-core/mcp"]
 web = ["frankenterm-core/web"]
 tui = ["frankenterm-core/tui"]
 ftui = ["frankenterm-core/ftui"]
+tui-widgets = ["frankenterm-core/tui-widgets"]
+tui-dashboard = ["frankenterm-core/tui-dashboard", "tui-widgets"]
 rollout = ["frankenterm-core/rollout", "tui", "ftui"]
 metrics = ["frankenterm-core/metrics"]
 native-wezterm = ["frankenterm-core/native-wezterm"]
