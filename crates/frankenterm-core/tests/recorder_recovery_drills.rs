@@ -12,7 +12,8 @@ use tempfile::tempdir;
 
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, CheckpointConsumerId,
-    DurabilityLevel, RecorderCheckpoint, RecorderStorage, RecorderStorageError,
+    DurabilityLevel, RecorderCheckpoint, RecorderSourceDescriptor, RecorderStorage,
+    RecorderStorageError,
 };
 use frankenterm_core::recording::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
@@ -49,7 +50,9 @@ fn indexer_config(
     max_batches: usize,
 ) -> IndexerConfig {
     IndexerConfig {
-        data_path: path.join("events.log"),
+        source: RecorderSourceDescriptor::AppendLog {
+            data_path: path.join("events.log"),
+        },
         consumer_id: consumer_id.to_string(),
         batch_size,
         dedup_on_replay: true,

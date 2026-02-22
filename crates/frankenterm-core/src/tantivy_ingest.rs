@@ -671,8 +671,8 @@ pub struct IndexCommitStats {
 /// Configuration for the incremental indexer pipeline.
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
-    /// Path to the append-log data file.
-    pub data_path: PathBuf,
+    /// Backend-neutral source descriptor. Replaces the former `data_path` field.
+    pub source: crate::recorder_storage::RecorderSourceDescriptor,
     /// Consumer ID for checkpoint tracking (unique per index pipeline).
     pub consumer_id: String,
     /// Maximum events to read per batch before committing.
@@ -685,10 +685,53 @@ pub struct IndexerConfig {
     pub expected_event_schema: String,
 }
 
+impl IndexerConfig {
+    /// Convenience accessor for the data path when the source is append-log.
+    /// Returns `None` for non-file backends.
+    pub fn data_path(&self) -> Option<&Path> {
+        match &self.source {
+            crate::recorder_storage::RecorderSourceDescriptor::AppendLog { data_path } => {
+                Some(data_path)
+            }
+            _ => None,
+        }
+    }
+
+    /// Create a [`RecorderEventReader`](crate::recorder_storage::RecorderEventReader)
+    /// from this config's source descriptor.
+    pub fn create_event_reader(
+        &self,
+    ) -> Result<Box<dyn crate::recorder_storage::RecorderEventReader>, IndexerError> {
+        match &self.source {
+            crate::recorder_storage::RecorderSourceDescriptor::AppendLog { data_path } => {
+                tracing::info!(
+                    indexer_source = %self.source,
+                    "creating append-log event reader"
+                );
+                Ok(Box::new(AppendLogEventSource::from_path(
+                    data_path.clone(),
+                )))
+            }
+            crate::recorder_storage::RecorderSourceDescriptor::FrankenSqlite { db_path } => {
+                tracing::info!(
+                    indexer_source = %self.source,
+                    db_path = %db_path.display(),
+                    "frankensqlite event reader not yet implemented"
+                );
+                Err(IndexerError::Config(
+                    "frankensqlite event reader not yet implemented".to_string(),
+                ))
+            }
+        }
+    }
+}
+
 impl Default for IndexerConfig {
     fn default() -> Self {
         Self {
-            data_path: PathBuf::from(".ft/recorder-log/events.log"),
+            source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                data_path: PathBuf::from(".ft/recorder-log/events.log"),
+            },
             consumer_id: LEXICAL_INDEXER_CONSUMER.to_string(),
             batch_size: 512,
             dedup_on_replay: true,
@@ -800,6 +843,12 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
         let checkpoint = storage.read_checkpoint(&consumer_id).await?;
 
         // 2. Open log reader at resume point
+        let data_path = self.config.data_path().ok_or_else(|| {
+            IndexerError::Config(
+                "run() requires an AppendLog source; use run_with_reader() for other backends"
+                    .to_string(),
+            )
+        })?;
         let mut reader = match &checkpoint {
             Some(cp) => {
                 // Resume from the record AFTER the last checkpointed ordinal.
@@ -810,7 +859,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
                 // so we need to seek past it. We open at the checkpoint's byte
                 // offset and skip one record to get past it.
                 let mut r = AppendLogReader::open_at_offset(
-                    &self.config.data_path,
+                    data_path,
                     resume_byte,
                     resume_ordinal,
                 )?;
@@ -818,7 +867,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
                 let _ = r.next_record()?;
                 r
             }
-            None => AppendLogReader::open(&self.config.data_path)?,
+            None => AppendLogReader::open(data_path)?,
         };
 
         let mut result = IndexerRunResult {
@@ -1247,7 +1296,9 @@ mod tests {
 
     fn test_indexer_config(path: &Path) -> IndexerConfig {
         IndexerConfig {
-            data_path: path.join("events.log"),
+            source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                data_path: path.join("events.log"),
+            },
             consumer_id: "test-indexer".to_string(),
             batch_size: 10,
             dedup_on_replay: true,
@@ -1627,7 +1678,9 @@ mod tests {
 
         // First run: index first 3
         let icfg = IndexerConfig {
-            data_path: dir.path().join("events.log"),
+            source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            },
             consumer_id: "resume-test".to_string(),
             batch_size: 3,
             dedup_on_replay: true,
@@ -2721,7 +2774,9 @@ mod tests {
     #[test]
     fn indexer_config_clone() {
         let cfg = IndexerConfig {
-            data_path: PathBuf::from("/tmp/test.log"),
+            source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                data_path: PathBuf::from("/tmp/test.log"),
+            },
             consumer_id: "clone-test".to_string(),
             batch_size: 99,
             dedup_on_replay: false,
@@ -2729,7 +2784,7 @@ mod tests {
             expected_event_schema: "v99".to_string(),
         };
         let cloned = cfg.clone();
-        assert_eq!(cloned.data_path, cfg.data_path);
+        assert_eq!(cloned.source, cfg.source);
         assert_eq!(cloned.consumer_id, cfg.consumer_id);
         assert_eq!(cloned.batch_size, cfg.batch_size);
         assert_eq!(cloned.dedup_on_replay, cfg.dedup_on_replay);
@@ -2738,9 +2793,18 @@ mod tests {
     }
 
     #[test]
-    fn default_config_data_path() {
+    fn default_config_is_append_log() {
         let cfg = IndexerConfig::default();
-        assert_eq!(cfg.data_path, PathBuf::from(".ft/recorder-log/events.log"));
+        assert_eq!(
+            cfg.source,
+            crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                data_path: PathBuf::from(".ft/recorder-log/events.log"),
+            }
+        );
+        assert_eq!(
+            cfg.data_path(),
+            Some(Path::new(".ft/recorder-log/events.log"))
+        );
     }
 
     // =========================================================================

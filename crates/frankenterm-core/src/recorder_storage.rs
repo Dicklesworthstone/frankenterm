@@ -50,6 +50,48 @@ impl std::fmt::Display for RecorderBackendKind {
     }
 }
 
+/// Describes which backend source the indexer should read from.
+///
+/// This is the backend-neutral descriptor that `IndexerConfig` uses to
+/// select the right [`RecorderEventReader`] without hard-coding a file path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecorderSourceDescriptor {
+    /// Append-log file backend.
+    AppendLog {
+        /// Path to the append-log data file.
+        data_path: PathBuf,
+    },
+    /// FrankenSqlite database backend.
+    FrankenSqlite {
+        /// Path to the SQLite database file.
+        db_path: PathBuf,
+    },
+}
+
+impl std::fmt::Display for RecorderSourceDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AppendLog { data_path } => {
+                write!(f, "append_log({})", data_path.display())
+            }
+            Self::FrankenSqlite { db_path } => {
+                write!(f, "frankensqlite({})", db_path.display())
+            }
+        }
+    }
+}
+
+impl RecorderSourceDescriptor {
+    /// Return the backend kind for this descriptor.
+    pub fn backend_kind(&self) -> RecorderBackendKind {
+        match self {
+            Self::AppendLog { .. } => RecorderBackendKind::AppendLog,
+            Self::FrankenSqlite { .. } => RecorderBackendKind::FrankenSqlite,
+        }
+    }
+}
+
 /// Durability requested by append callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3141,5 +3183,87 @@ mod tests {
         let head = reader.head_offset().unwrap();
         assert_eq!(head.ordinal, 5);
         assert_eq!(head.byte_offset, 401);
+    }
+
+    // =========================================================================
+    // RecorderSourceDescriptor tests
+    // =========================================================================
+
+    #[test]
+    fn source_descriptor_append_log_display() {
+        let desc = RecorderSourceDescriptor::AppendLog {
+            data_path: PathBuf::from("/tmp/events.log"),
+        };
+        let display = desc.to_string();
+        assert!(display.contains("append_log"));
+        assert!(display.contains("/tmp/events.log"));
+    }
+
+    #[test]
+    fn source_descriptor_frankensqlite_display() {
+        let desc = RecorderSourceDescriptor::FrankenSqlite {
+            db_path: PathBuf::from("/tmp/recorder.db"),
+        };
+        let display = desc.to_string();
+        assert!(display.contains("frankensqlite"));
+        assert!(display.contains("/tmp/recorder.db"));
+    }
+
+    #[test]
+    fn source_descriptor_backend_kind() {
+        let al = RecorderSourceDescriptor::AppendLog {
+            data_path: PathBuf::from("x"),
+        };
+        assert_eq!(al.backend_kind(), RecorderBackendKind::AppendLog);
+
+        let fs = RecorderSourceDescriptor::FrankenSqlite {
+            db_path: PathBuf::from("y"),
+        };
+        assert_eq!(fs.backend_kind(), RecorderBackendKind::FrankenSqlite);
+    }
+
+    #[test]
+    fn source_descriptor_serde_roundtrip_append_log() {
+        let desc = RecorderSourceDescriptor::AppendLog {
+            data_path: PathBuf::from("/data/events.log"),
+        };
+        let json = serde_json::to_string(&desc).unwrap();
+        assert!(json.contains("append_log"));
+        let back: RecorderSourceDescriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, desc);
+    }
+
+    #[test]
+    fn source_descriptor_serde_roundtrip_frankensqlite() {
+        let desc = RecorderSourceDescriptor::FrankenSqlite {
+            db_path: PathBuf::from("/data/recorder.db"),
+        };
+        let json = serde_json::to_string(&desc).unwrap();
+        assert!(json.contains("franken_sqlite"));
+        let back: RecorderSourceDescriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, desc);
+    }
+
+    #[test]
+    fn source_descriptor_clone_and_eq() {
+        let desc = RecorderSourceDescriptor::AppendLog {
+            data_path: PathBuf::from("events.log"),
+        };
+        let cloned = desc.clone();
+        assert_eq!(desc, cloned);
+
+        let other = RecorderSourceDescriptor::FrankenSqlite {
+            db_path: PathBuf::from("db.sqlite"),
+        };
+        assert_ne!(desc, other);
+    }
+
+    #[test]
+    fn source_descriptor_debug() {
+        let desc = RecorderSourceDescriptor::AppendLog {
+            data_path: PathBuf::from("events.log"),
+        };
+        let dbg = format!("{:?}", desc);
+        assert!(dbg.contains("AppendLog"));
     }
 }

@@ -590,7 +590,9 @@ mod tests {
 
         // Run incremental indexer
         let pipeline_config = IndexerConfig {
-            data_path: storage_config.data_path.clone(),
+            source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                data_path: storage_config.data_path.clone(),
+            },
             consumer_id: LEXICAL_INDEXER_CONSUMER.to_string(),
             batch_size: 10,
             dedup_on_replay: true,
@@ -651,7 +653,9 @@ mod tests {
 
         // First run: index first 2 (batch_size=2, max_batches=1)
         let pipeline_config = IndexerConfig {
-            data_path: storage_config.data_path.clone(),
+            source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                data_path: storage_config.data_path.clone(),
+            },
             consumer_id: "resume-test".to_string(),
             batch_size: 2,
             dedup_on_replay: true,

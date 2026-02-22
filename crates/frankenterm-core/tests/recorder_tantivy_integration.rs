@@ -15,7 +15,7 @@ use frankenterm_core::event_id::{RecorderMergeKey, generate_event_id_v1};
 use frankenterm_core::recorder_invariants::{InvariantChecker, InvariantCheckerConfig};
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, CheckpointConsumerId,
-    DurabilityLevel, FlushMode, RecorderStorage,
+    DurabilityLevel, FlushMode, RecorderSourceDescriptor, RecorderStorage,
 };
 use frankenterm_core::recording::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
@@ -46,7 +46,9 @@ fn storage_config(path: &Path) -> AppendLogStorageConfig {
 
 fn indexer_config(path: &Path, consumer_id: &str) -> IndexerConfig {
     IndexerConfig {
-        data_path: path.join("events.log"),
+        source: RecorderSourceDescriptor::AppendLog {
+            data_path: path.join("events.log"),
+        },
         consumer_id: consumer_id.to_string(),
         batch_size: 10,
         dedup_on_replay: true,

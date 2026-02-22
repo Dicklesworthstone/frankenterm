@@ -709,7 +709,7 @@ proptest! {
         prop_assert_eq!(cloned.batch_size, config.batch_size);
         prop_assert_eq!(cloned.consumer_id, config.consumer_id);
         prop_assert_eq!(cloned.dedup_on_replay, config.dedup_on_replay);
-        prop_assert_eq!(cloned.data_path, config.data_path);
+        prop_assert_eq!(cloned.source, config.source);
     }
 }
 
