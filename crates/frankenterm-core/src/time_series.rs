@@ -685,6 +685,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "max_points must be > 0")]
     fn zero_capacity_panics() {
-        TimeSeries::with_config(TimeSeriesConfig { max_points: 0 });
+        let _ = TimeSeries::with_config(TimeSeriesConfig { max_points: 0 });
     }
 }

@@ -539,13 +539,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "window duration must be > 0")]
     fn zero_duration_panics() {
-        SlidingWindow::new(0, 10);
+        let _ = SlidingWindow::new(0, 10);
     }
 
     #[test]
     #[should_panic(expected = "n_buckets must be > 0")]
     fn zero_buckets_panics() {
-        SlidingWindow::new(1000, 0);
+        let _ = SlidingWindow::new(1000, 0);
     }
 
     #[test]
