@@ -284,6 +284,77 @@ Fields:
 - `key_count`: total keys after operation
 - `expired_count`: keys evicted in expiry cycle
 
+### End-to-End Script Suite (T3)
+
+Define a deterministic E2E script matrix that runs daemon/CLI/MCP paths end-to-end:
+
+1. **Happy path**
+   - Start watcher + session store
+   - Persist pane/window/session state
+   - Read state via CLI + MCP
+   - Verify parity and expected audit records
+2. **Failure injection**
+   - Inject malformed protocol frame
+   - Force policy denial scenario
+   - Simulate store-read miss and expiry race
+   - Assert fail-closed behavior and reason-coded errors
+3. **Recovery path**
+   - Restart daemon, replay persisted records
+   - Verify state restoration and audit continuity
+4. **Rollback validation**
+   - Disable `redis-session` feature path
+   - Confirm fallback behavior remains equivalent to baseline
+
+For each script capture:
+- preconditions
+- command sequence
+- expected structured outputs
+- explicit pass/fail assertions
+
+### Deterministic Fixtures, Replay Corpus, and Test-Data Lifecycle (T5)
+
+Establish fixture rules for durable, reproducible testing:
+
+- **Fixture classes**
+  - protocol frames (valid + malformed)
+  - session state payloads (small/large/boundary)
+  - expiry timelines (short/long/edge timestamps)
+  - audit/replay streams (normal + corrupted/truncated)
+- **Corpus layout**
+  - `tests/fixtures/unit/*`
+  - `tests/fixtures/integration/*`
+  - `tests/fixtures/e2e/*`
+  - `tests/fixtures/replay/*`
+- **Determinism controls**
+  - fixed timestamps in fixtures unless explicitly testing clock drift
+  - stable ordering guarantees for replay comparisons
+  - golden output snapshots for protocol + audit decoding
+- **Lifecycle policy**
+  - fixture version tag + changelog entry on schema changes
+  - stale fixture pruning during release prep
+  - mandatory fixture update when behavior contracts change
+
+### Performance, Soak, and Anti-Flake Validation Scripts (T6)
+
+Define sustained-load and reliability scripts with objective budgets:
+
+- **Performance budgets**
+  - session read/write latency envelopes (p50/p95/p99)
+  - memory growth budget under steady load
+  - command throughput floor for integration-critical paths
+- **Soak scenarios**
+  - 1h+ continuous pane event append/read workload
+  - mixed watcher + robot + policy command pressure
+  - periodic restart/recovery checkpoints during run
+- **Anti-flake controls**
+  - fixed seed where randomness is used
+  - retry policy with failure signature bucketing
+  - flaky-test quarantine criteria + owner assignment
+- **Artifacts**
+  - per-run metrics snapshot
+  - failure signatures and correlation IDs
+  - comparison summary vs previous baseline run
+
 ---
 
 ## P7: Rollout, Rollback, Risk Mitigation, and Acceptance Gates
