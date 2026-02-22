@@ -26,9 +26,7 @@ use tracing::{info, warn};
 
 mod web_framework {
     pub(crate) use fastapi::ResponseBody;
-    pub(crate) use fastapi::core::{
-        BoxFuture, ControlFlow, Cx, Handler, Middleware, SseEvent, SseResponse, StartupOutcome,
-    };
+    pub(crate) use fastapi::core::{BoxFuture, ControlFlow, Cx, Handler, Middleware, StartupOutcome};
     pub(crate) use fastapi::http::QueryString;
     pub(crate) use fastapi::prelude::{App, Method, Request, RequestContext, Response, StatusCode};
     pub(crate) use fastapi::{ServerConfig, ServerError, TcpServer};
@@ -36,8 +34,8 @@ mod web_framework {
 
 use web_framework::{
     App, BoxFuture, ControlFlow, Cx, Handler, Method, Middleware, QueryString, Request,
-    RequestContext, Response, ResponseBody, ServerConfig, ServerError, SseEvent, SseResponse,
-    StartupOutcome, StatusCode, TcpServer,
+    RequestContext, Response, ResponseBody, ServerConfig, ServerError, StartupOutcome, StatusCode,
+    TcpServer,
 };
 
 mod error;
@@ -501,6 +499,104 @@ fn redact_json_value(value: &mut serde_json::Value, redactor: &Redactor) {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SseEvent {
+    data: Option<String>,
+    event_type: Option<String>,
+    id: Option<String>,
+    comment: Option<String>,
+}
+
+impl SseEvent {
+    fn new(data: impl Into<String>) -> Self {
+        Self {
+            data: Some(data.into()),
+            event_type: None,
+            id: None,
+            comment: None,
+        }
+    }
+
+    fn comment(comment: impl Into<String>) -> Self {
+        Self {
+            data: None,
+            event_type: None,
+            id: None,
+            comment: Some(comment.into()),
+        }
+    }
+
+    fn event_type(mut self, event_type: impl Into<String>) -> Self {
+        self.event_type = Some(event_type.into());
+        self
+    }
+
+    fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+
+        if let Some(comment) = &self.comment {
+            for line in comment.lines() {
+                out.extend_from_slice(b": ");
+                out.extend_from_slice(line.as_bytes());
+                out.push(b'\n');
+            }
+        }
+
+        if let Some(event_type) = &self.event_type {
+            out.extend_from_slice(b"event: ");
+            out.extend_from_slice(event_type.as_bytes());
+            out.push(b'\n');
+        }
+
+        if let Some(id) = &self.id {
+            out.extend_from_slice(b"id: ");
+            out.extend_from_slice(id.as_bytes());
+            out.push(b'\n');
+        }
+
+        if let Some(data) = &self.data {
+            for line in data.lines() {
+                out.extend_from_slice(b"data: ");
+                out.extend_from_slice(line.as_bytes());
+                out.push(b'\n');
+            }
+            if data.is_empty() {
+                out.extend_from_slice(b"data: \n");
+            }
+        }
+
+        out.push(b'\n');
+        out
+    }
+}
+
+struct SseResponse<S> {
+    stream: S,
+}
+
+impl<S> SseResponse<S>
+where
+    S: Stream<Item = Vec<u8>> + Send + 'static,
+{
+    fn new(stream: S) -> Self {
+        Self { stream }
+    }
+
+    fn into_response(self) -> Response {
+        Response::with_status(StatusCode::OK)
+            .header("content-type", b"text/event-stream".to_vec())
+            .header("cache-control", b"no-cache".to_vec())
+            .header("connection", b"keep-alive".to_vec())
+            .header("x-accel-buffering", b"no".to_vec())
+            .body(ResponseBody::stream(self.stream))
+    }
+}
+
 struct TokioSseStream {
     rx: mpsc::Receiver<SseEvent>,
 }
@@ -512,10 +608,14 @@ impl TokioSseStream {
 }
 
 impl Stream for TokioSseStream {
-    type Item = SseEvent;
+    type Item = Vec<u8>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(event)) => Poll::Ready(Some(event.to_bytes())),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
