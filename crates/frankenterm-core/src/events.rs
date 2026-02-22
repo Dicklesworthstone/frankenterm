@@ -277,7 +277,10 @@ fn normalized_extracted(extracted: &serde_json::Value, redactor: &Redactor) -> O
             serde_json::Value::Number(n) => n.to_string(),
             serde_json::Value::Bool(b) => b.to_string(),
             serde_json::Value::Null => "null".to_string(),
-            _ => serde_json::to_string(value).unwrap_or_default(),
+            _ => serde_json::to_string(value).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "event value JSON serialization failed");
+                String::new()
+            }),
         };
 
         if rendered.is_empty() {

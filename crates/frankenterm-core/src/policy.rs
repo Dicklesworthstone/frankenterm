@@ -3071,7 +3071,9 @@ impl InjectionResult {
                 verification_summary: None,
                 decision_context: decision
                     .context()
-                    .and_then(|ctx| serde_json::to_string(ctx).ok()),
+                    .and_then(|ctx| serde_json::to_string(ctx)
+                        .inspect_err(|e| tracing::warn!(error = %e, "policy decision_context serialization failed"))
+                        .ok()),
                 result: "success".to_string(),
             },
             Self::Denied {
@@ -3096,7 +3098,9 @@ impl InjectionResult {
                 verification_summary: None,
                 decision_context: decision
                     .context()
-                    .and_then(|ctx| serde_json::to_string(ctx).ok()),
+                    .and_then(|ctx| serde_json::to_string(ctx)
+                        .inspect_err(|e| tracing::warn!(error = %e, "policy decision_context serialization failed"))
+                        .ok()),
                 result: "denied".to_string(),
             },
             Self::RequiresApproval {
@@ -3121,7 +3125,9 @@ impl InjectionResult {
                 verification_summary: None,
                 decision_context: decision
                     .context()
-                    .and_then(|ctx| serde_json::to_string(ctx).ok()),
+                    .and_then(|ctx| serde_json::to_string(ctx)
+                        .inspect_err(|e| tracing::warn!(error = %e, "policy decision_context serialization failed"))
+                        .ok()),
                 result: "require_approval".to_string(),
             },
             Self::Error {

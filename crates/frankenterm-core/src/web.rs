@@ -527,7 +527,10 @@ fn make_stream_frame(
 }
 
 fn frame_to_sse(event_type: &'static str, seq: u64, frame: serde_json::Value) -> Option<SseEvent> {
-    serde_json::to_string(&frame).ok().map(|body| {
+    serde_json::to_string(&frame)
+        .inspect_err(|e| tracing::warn!(error = %e, event_type, "SSE frame serialization failed"))
+        .ok()
+        .map(|body| {
         SseEvent::new(body)
             .event_type(event_type)
             .id(seq.to_string())

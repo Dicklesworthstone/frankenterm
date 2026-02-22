@@ -977,7 +977,9 @@ fn collect_recent_events_summary(db_path: &Path, max_events: usize) -> Option<St
         .ok()?;
 
     let events: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    serde_json::to_string_pretty(&events).ok()
+    serde_json::to_string_pretty(&events)
+        .inspect_err(|e| tracing::warn!(error = %e, "crash dump events serialization failed"))
+        .ok()
 }
 
 // ---------------------------------------------------------------------------

@@ -313,7 +313,10 @@ pub fn fields_to_document(
 /// Used for rebuild detection: if the fingerprint changes between runs, a
 /// full reindex is needed.
 pub fn schema_fingerprint(schema: &Schema) -> String {
-    let schema_json = serde_json::to_string(schema).unwrap_or_default();
+    let schema_json = serde_json::to_string(schema).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "schema serialization failed — fingerprint will be unreliable");
+        String::new()
+    });
 
     let mut hasher = Sha256::new();
     hasher.update(schema_json.as_bytes());

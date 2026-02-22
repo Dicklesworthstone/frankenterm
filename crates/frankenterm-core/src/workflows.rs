@@ -2706,7 +2706,9 @@ impl WorkflowEngine {
             StepResult::SendText { .. } => "send_text",
             StepResult::JumpTo { .. } => "jump_to",
         };
-        let result_data = serde_json::to_string(result).ok();
+        let result_data = serde_json::to_string(result)
+            .inspect_err(|e| tracing::warn!(error = %e, "workflow step result serialization failed"))
+            .ok();
         let verification_refs = build_verification_refs(result, None);
         let error_code = step_error_code_from_result(result);
 
@@ -2811,7 +2813,9 @@ fn build_verification_refs(
     if refs.is_empty() {
         None
     } else {
-        serde_json::to_string(&refs).ok()
+        serde_json::to_string(&refs)
+            .inspect_err(|e| tracing::warn!(error = %e, "workflow verification_refs serialization failed"))
+            .ok()
     }
 }
 
@@ -2919,7 +2923,9 @@ fn policy_summary_from_injection(result: &crate::policy::InjectionResult) -> Opt
     if obj.is_empty() {
         None
     } else {
-        serde_json::to_string(&obj).ok()
+        serde_json::to_string(&obj)
+            .inspect_err(|e| tracing::warn!(error = %e, "workflow decision_context serialization failed"))
+            .ok()
     }
 }
 
@@ -3006,7 +3012,9 @@ async fn record_workflow_start_action(
         "step_count": step_count,
         "start_step": start_step,
     });
-    let summary = serde_json::to_string(&summary).ok();
+    let summary = serde_json::to_string(&summary)
+        .inspect_err(|e| tracing::warn!(error = %e, "workflow start summary serialization failed"))
+        .ok();
     let action_id = record_workflow_action(
         storage,
         "workflow_start",
@@ -3028,7 +3036,9 @@ async fn record_workflow_start_action(
         undoable: true,
         undo_strategy: "workflow_abort".to_string(),
         undo_hint: Some(format!("ft robot workflow abort {execution_id}")),
-        undo_payload: serde_json::to_string(&undo_payload).ok(),
+        undo_payload: serde_json::to_string(&undo_payload)
+            .inspect_err(|e| tracing::warn!(error = %e, "workflow undo_payload serialization failed"))
+            .ok(),
         undone_at: None,
         undone_by: None,
     };
@@ -3082,7 +3092,9 @@ async fn record_workflow_step_action(
         "result_type": result_type,
         "parent_action_id": parent_action_id,
     });
-    let summary = serde_json::to_string(&summary).ok();
+    let summary = serde_json::to_string(&summary)
+        .inspect_err(|e| tracing::warn!(error = %e, "workflow step summary serialization failed"))
+        .ok();
     record_workflow_action(
         storage,
         "workflow_step",
@@ -3116,7 +3128,9 @@ async fn record_workflow_terminal_action(
         "steps_executed": steps_executed,
         "parent_action_id": start_action_id,
     });
-    let summary = serde_json::to_string(&summary).ok();
+    let summary = serde_json::to_string(&summary)
+        .inspect_err(|e| tracing::warn!(error = %e, "workflow terminal summary serialization failed"))
+        .ok();
     let _ = record_workflow_action(
         storage,
         action_kind,
@@ -5811,7 +5825,9 @@ impl WorkflowRunner {
                     }
                 }
 
-                serde_json::to_string(&data).ok()
+                serde_json::to_string(&data)
+                    .inspect_err(|e| tracing::warn!(error = %e, "workflow step data serialization failed"))
+                    .ok()
             };
             let step_started_at = now_ms();
             let step_completed_at = now_ms();
@@ -9120,7 +9136,10 @@ impl Workflow for HandleClaudeCodeLimits {
                         rule_id,
                         input_summary: Some(format!("Claude Code {limit_type} on pane {pane_id}")),
                         verification_summary: None,
-                        decision_context: Some(serde_json::to_string(&plan).unwrap_or_default()),
+                        decision_context: Some(serde_json::to_string(&plan).unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "quota audit plan serialization failed");
+                            String::new()
+                        })),
                         result: "recorded".to_string(),
                     };
 
@@ -9396,7 +9415,10 @@ impl Workflow for HandleGeminiQuota {
                         rule_id,
                         input_summary: Some(format!("Gemini {quota_type} on pane {pane_id}")),
                         verification_summary: None,
-                        decision_context: Some(serde_json::to_string(&plan).unwrap_or_default()),
+                        decision_context: Some(serde_json::to_string(&plan).unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "quota audit plan serialization failed");
+                            String::new()
+                        })),
                         result: "recorded".to_string(),
                     };
 

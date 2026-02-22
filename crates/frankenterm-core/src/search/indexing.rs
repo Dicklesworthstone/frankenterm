@@ -108,7 +108,10 @@ impl IndexableDocument {
 
     fn dedupe_basis(&self) -> String {
         if self.source == SearchDocumentSource::PaneMetadata {
-            let metadata = serde_json::to_string(&self.metadata).unwrap_or_default();
+            let metadata = serde_json::to_string(&self.metadata).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "search document metadata serialization failed");
+                String::new()
+            });
             normalize_index_text(&metadata)
         } else {
             normalize_index_text(&self.text)

@@ -866,12 +866,19 @@ fn save_checkpoint_sync(
 
     for ps in pane_states {
         let terminal_json =
-            serde_json::to_string(&ps.terminal).unwrap_or_else(|_| "{}".to_string());
-        let env_json = ps.env.as_ref().and_then(|e| serde_json::to_string(e).ok());
+            serde_json::to_string(&ps.terminal).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, pane_id = ps.pane_id, "terminal state serialization failed");
+                "{}".to_string()
+            });
+        let env_json = ps.env.as_ref().and_then(|e| serde_json::to_string(e)
+            .inspect_err(|e| tracing::warn!(error = %e, "snapshot env serialization failed"))
+            .ok());
         let agent_json = ps
             .agent
             .as_ref()
-            .and_then(|a| serde_json::to_string(a).ok());
+            .and_then(|a| serde_json::to_string(a)
+                .inspect_err(|e| tracing::warn!(error = %e, "snapshot agent serialization failed"))
+                .ok());
         let scrollback_seq = ps.scrollback_ref.as_ref().map(|s| s.output_segments_seq);
         let last_output_at = ps.scrollback_ref.as_ref().map(|s| s.last_capture_at as i64);
 

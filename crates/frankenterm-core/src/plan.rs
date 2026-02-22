@@ -597,7 +597,10 @@ impl StepAction {
             Self::ReleaseLock { lock_name } => format!("release_lock:name={lock_name}"),
             Self::StoreData { key, value } => {
                 // Use canonical JSON for value
-                let value_str = serde_json::to_string(value).unwrap_or_default();
+                let value_str = serde_json::to_string(value).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "plan StoreData value serialization failed");
+                    String::new()
+                });
                 format!("store_data:key={key},value={value_str}")
             }
             Self::RunWorkflow {
@@ -606,7 +609,9 @@ impl StepAction {
             } => {
                 let params_str = params
                     .as_ref()
-                    .and_then(|p| serde_json::to_string(p).ok())
+                    .and_then(|p| serde_json::to_string(p)
+                        .inspect_err(|e| tracing::warn!(error = %e, "plan RunWorkflow params serialization failed"))
+                        .ok())
                     .unwrap_or_default();
                 format!("run_workflow:id={workflow_id},params={params_str}")
             }
@@ -619,7 +624,10 @@ impl StepAction {
                 action_type,
                 payload,
             } => {
-                let payload_str = serde_json::to_string(payload).unwrap_or_default();
+                let payload_str = serde_json::to_string(payload).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "plan Custom payload serialization failed");
+                    String::new()
+                });
                 format!("custom:type={action_type},payload={payload_str}")
             }
         }
