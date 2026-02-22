@@ -1,8 +1,9 @@
 # Controlled Beta Feedback Loop (`ft-1u90p.8.7`)
 
-Date: 2026-02-18  
-Status: Preparatory spec while `ft-1u90p.7.7` (alt-screen conformance e2e) is still in progress  
-Depends on: `ft-1u90p.7.7`, `ft-1u90p.8.1`, `ft-1u90p.8.2`, `ft-1u90p.8.3`, `ft-1u90p.7.5`, `docs/resize-performance-slos.md`
+Date: 2026-02-22  
+Status: In progress (unblocked; instrumentation + checkpoint artifacts active)  
+Depends on: `ft-1u90p.8.1`, `ft-1u90p.8.2`, `ft-1u90p.8.3`, `ft-1u90p.7.5`, `docs/resize-performance-slos.md`  
+Related closure: `ft-1u90p.7.7` (closed 2026-02-22)
 
 ## Purpose
 
@@ -119,6 +120,20 @@ Each feedback item must map to a telemetry window and relevant resize metrics.
 - `evidence/wa-1u90p.8.7/cohort_daily_summary.json`
 - `evidence/wa-1u90p.8.7/decision_checkpoint_<YYYYMMDD>.md`
 
+### Current Checkpoint (2026-02-22)
+
+- Decision: `HOLD`
+- Basis:
+  - instrumentation path verified using deterministic fixture-only alt-screen conformance run
+  - sample sufficiency thresholds for promotion are not yet met
+  - real-user feedback ingestion has not started
+- Evidence:
+  - `e2e-artifacts/2026-02-22T17-53-14Z/scenario_01_alt_screen_conformance/`
+  - `evidence/wa-1u90p.8.7/beta_feedback_log.jsonl`
+  - `evidence/wa-1u90p.8.7/telemetry_feedback_correlation.csv`
+  - `evidence/wa-1u90p.8.7/cohort_daily_summary.json`
+  - `evidence/wa-1u90p.8.7/decision_checkpoint_20260222.md`
+
 ## Decision Rubric (Promotion / Hold / Rollback)
 
 Decisions are evaluated at fixed checkpoints (daily operational, weekly promotion).
@@ -163,7 +178,7 @@ Promotion is allowed only when all are true:
 
 ## Validation Commands
 
-Use existing rollout/observability surfaces while this bead remains dependency-gated:
+Use existing rollout/observability surfaces for daily and weekly checkpoints:
 
 ```bash
 # Current rollout and health posture

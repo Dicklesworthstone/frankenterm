@@ -1,0 +1,2 @@
+checkpoint_date,run_id,feedback_id,is_user_feedback,event_source,events_total,alt_true_count,alt_false_count,resize_pulse_count,failed_events,m1_p95_ms,m1_p99_ms,perceived_smoothness_score,correlation_ready,notes
+2026-02-22,8f1ab370a68e,checkpoint-2026-02-22-fixture-only,false,alt_screen_conformance_fixture_only,66,5,5,50,0,6,6,,false,"Synthetic fixture-only checkpoint; awaiting real user cohort telemetry+survey data"

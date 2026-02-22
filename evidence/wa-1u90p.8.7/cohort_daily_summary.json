@@ -1,0 +1,58 @@
+{
+  "issue_id": "ft-1u90p.8.7",
+  "checkpoint_date": "2026-02-22",
+  "decision": "HOLD",
+  "decision_reason": [
+    "sample sufficiency thresholds not met",
+    "no real-user survey responses captured yet",
+    "current checkpoint uses fixture-only conformance run"
+  ],
+  "dependencies": {
+    "ft-1u90p.7.7": "closed",
+    "ft-1u90p.8.1": "closed",
+    "ft-1u90p.8.2": "closed",
+    "ft-1u90p.8.3": "closed",
+    "ft-1u90p.7.5": "closed"
+  },
+  "sample_sufficiency": {
+    "targets": {
+      "resize_events_per_day": 500,
+      "alt_screen_transitions_per_day": 50,
+      "sessions_per_hardware_tier_per_day": 30,
+      "feedback_items_total": 40,
+      "feedback_items_per_workflow_group": 10
+    },
+    "observed": {
+      "resize_events_per_day": 66,
+      "alt_screen_transitions_per_day": 10,
+      "sessions_per_hardware_tier_per_day": {
+        "low": 0,
+        "mid": 0,
+        "high": 0,
+        "unknown": 1
+      },
+      "feedback_items_total": 0,
+      "feedback_items_per_workflow_group": {
+        "synthetic-harness": 1
+      }
+    },
+    "thresholds_met": false
+  },
+  "telemetry_snapshot": {
+    "run_id": "8f1ab370a68e",
+    "execution_mode": "fixture_only",
+    "events_total": 66,
+    "alt_true_count": 5,
+    "alt_false_count": 5,
+    "resize_pulse_count": 50,
+    "failed_events": 0,
+    "m1_p95_ms": 6,
+    "m1_p99_ms": 6,
+    "artifact_dir": "e2e-artifacts/2026-02-22T17-53-14Z/scenario_01_alt_screen_conformance"
+  },
+  "next_actions": [
+    "Collect real-user C2 feedback across low/mid/high hardware tiers",
+    "Ingest survey + telemetry joins into beta_feedback_log.jsonl and telemetry_feedback_correlation.csv",
+    "Re-evaluate GO/HOLD/ROLLBACK after minimum 14-day window"
+  ]
+}
