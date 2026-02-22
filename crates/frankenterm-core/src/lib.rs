@@ -62,6 +62,7 @@ pub mod backup;
 pub mod bayesian_ledger;
 #[cfg(feature = "subprocess-bridge")]
 pub mod beads_bridge;
+pub mod bimap;
 #[cfg(feature = "subprocess-bridge")]
 pub mod beads_types;
 pub mod binomial_heap;
