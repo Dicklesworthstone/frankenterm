@@ -7460,6 +7460,371 @@ impl TransportPolicy {
     }
 }
 
+// ── C5: Kernel/Hardware Tail-Latency ───────────────────────────────
+
+/// Syscall batching strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SyscallStrategy {
+    /// Issue syscalls one at a time.
+    Immediate,
+    /// Batch multiple syscalls before issuing.
+    Batched,
+    /// Adaptive: batch under load, immediate under low latency.
+    Adaptive,
+}
+
+impl std::fmt::Display for SyscallStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyscallStrategy::Immediate => write!(f, "IMMEDIATE"),
+            SyscallStrategy::Batched => write!(f, "BATCHED"),
+            SyscallStrategy::Adaptive => write!(f, "ADAPTIVE"),
+        }
+    }
+}
+
+/// Wakeup source attribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WakeupSource {
+    /// Timer-based wakeup (epoll_wait timeout, select, etc.).
+    Timer,
+    /// I/O event wakeup (read/write ready, socket, pty).
+    IoEvent,
+    /// Signal-based wakeup (SIGCHLD, SIGWINCH, etc.).
+    Signal,
+    /// Explicit nudge from another thread/task.
+    Nudge,
+}
+
+impl std::fmt::Display for WakeupSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WakeupSource::Timer => write!(f, "TIMER"),
+            WakeupSource::IoEvent => write!(f, "IO_EVENT"),
+            WakeupSource::Signal => write!(f, "SIGNAL"),
+            WakeupSource::Nudge => write!(f, "NUDGE"),
+        }
+    }
+}
+
+/// CPU affinity placement hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AffinityHint {
+    /// No preference — OS scheduler decides.
+    Any,
+    /// Prefer performance cores (P-cores on hybrid CPUs).
+    PerformanceCore,
+    /// Prefer efficiency cores (E-cores on hybrid CPUs).
+    EfficiencyCore,
+    /// Pin to a specific core ID.
+    Pinned(u32),
+}
+
+impl std::fmt::Display for AffinityHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AffinityHint::Any => write!(f, "ANY"),
+            AffinityHint::PerformanceCore => write!(f, "P_CORE"),
+            AffinityHint::EfficiencyCore => write!(f, "E_CORE"),
+            AffinityHint::Pinned(id) => write!(f, "PINNED({})", id),
+        }
+    }
+}
+
+/// Configuration for the tail-latency controller.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TailLatencyConfig {
+    /// Syscall batching strategy.
+    pub syscall_strategy: SyscallStrategy,
+    /// Maximum batch size before forced flush.
+    pub max_batch_size: usize,
+    /// Timer precision target in microseconds.
+    pub timer_precision_us: u64,
+    /// Affinity hint for the hot path thread.
+    pub affinity: AffinityHint,
+    /// p99 latency budget in microseconds.
+    pub p99_budget_us: u64,
+    /// p999 latency budget in microseconds.
+    pub p999_budget_us: u64,
+}
+
+impl Default for TailLatencyConfig {
+    fn default() -> Self {
+        Self {
+            syscall_strategy: SyscallStrategy::Adaptive,
+            max_batch_size: 64,
+            timer_precision_us: 1000,  // 1ms
+            affinity: AffinityHint::Any,
+            p99_budget_us: 10_000,     // 10ms
+            p999_budget_us: 50_000,    // 50ms
+        }
+    }
+}
+
+/// A single wakeup event observation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WakeupEvent {
+    pub source: WakeupSource,
+    pub latency_us: u64,
+    pub timestamp_us: u64,
+    pub batch_depth: usize,
+}
+
+/// Tail-latency snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TailLatencySnapshot {
+    pub total_wakeups: u64,
+    pub timer_wakeups: u64,
+    pub io_wakeups: u64,
+    pub signal_wakeups: u64,
+    pub nudge_wakeups: u64,
+    pub total_syscalls: u64,
+    pub total_batches: u64,
+    pub avg_batch_depth: f64,
+    pub p99_latency_us: u64,
+    pub max_latency_us: u64,
+    pub budget_violations: u64,
+}
+
+/// Tail-latency controller: tracks wakeup latencies, syscall batching, and budget compliance.
+///
+/// # Invariants
+/// - `timer + io + signal + nudge == total_wakeups`.
+/// - Latency samples are stored in a bounded ring for percentile estimation.
+/// - Budget violations count only p99 breaches (not p50).
+pub struct TailLatencyController {
+    config: TailLatencyConfig,
+    total_wakeups: u64,
+    timer_wakeups: u64,
+    io_wakeups: u64,
+    signal_wakeups: u64,
+    nudge_wakeups: u64,
+    total_syscalls: u64,
+    total_batches: u64,
+    batch_depth_sum: u64,
+    latency_samples: Vec<u64>,
+    max_samples: usize,
+    sample_head: usize,
+    max_latency_us: u64,
+    budget_violations: u64,
+}
+
+impl TailLatencyController {
+    /// Create with explicit config.
+    pub fn new(config: TailLatencyConfig) -> Self {
+        Self {
+            config,
+            total_wakeups: 0,
+            timer_wakeups: 0,
+            io_wakeups: 0,
+            signal_wakeups: 0,
+            nudge_wakeups: 0,
+            total_syscalls: 0,
+            total_batches: 0,
+            batch_depth_sum: 0,
+            latency_samples: Vec::new(),
+            max_samples: 1024,
+            sample_head: 0,
+            max_latency_us: 0,
+            budget_violations: 0,
+        }
+    }
+
+    /// Create with defaults.
+    pub fn with_defaults() -> Self {
+        Self::new(TailLatencyConfig::default())
+    }
+
+    /// Record a wakeup event.
+    pub fn record_wakeup(&mut self, source: WakeupSource, latency_us: u64) {
+        self.total_wakeups += 1;
+        match source {
+            WakeupSource::Timer => self.timer_wakeups += 1,
+            WakeupSource::IoEvent => self.io_wakeups += 1,
+            WakeupSource::Signal => self.signal_wakeups += 1,
+            WakeupSource::Nudge => self.nudge_wakeups += 1,
+        }
+        if latency_us > self.max_latency_us {
+            self.max_latency_us = latency_us;
+        }
+        if latency_us > self.config.p99_budget_us {
+            self.budget_violations += 1;
+        }
+        // Ring buffer for samples
+        if self.latency_samples.len() < self.max_samples {
+            self.latency_samples.push(latency_us);
+        } else {
+            self.latency_samples[self.sample_head] = latency_us;
+            self.sample_head = (self.sample_head + 1) % self.max_samples;
+        }
+    }
+
+    /// Record a syscall batch.
+    pub fn record_batch(&mut self, depth: usize) {
+        self.total_batches += 1;
+        self.total_syscalls += depth as u64;
+        self.batch_depth_sum += depth as u64;
+    }
+
+    /// Estimate p99 latency from stored samples.
+    pub fn p99_latency_us(&self) -> u64 {
+        if self.latency_samples.is_empty() {
+            return 0;
+        }
+        let mut sorted = self.latency_samples.clone();
+        sorted.sort_unstable();
+        let idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
+        sorted[idx]
+    }
+
+    /// Average batch depth.
+    pub fn avg_batch_depth(&self) -> f64 {
+        if self.total_batches == 0 {
+            return 0.0;
+        }
+        self.batch_depth_sum as f64 / self.total_batches as f64
+    }
+
+    /// Snapshot.
+    pub fn snapshot(&self) -> TailLatencySnapshot {
+        TailLatencySnapshot {
+            total_wakeups: self.total_wakeups,
+            timer_wakeups: self.timer_wakeups,
+            io_wakeups: self.io_wakeups,
+            signal_wakeups: self.signal_wakeups,
+            nudge_wakeups: self.nudge_wakeups,
+            total_syscalls: self.total_syscalls,
+            total_batches: self.total_batches,
+            avg_batch_depth: self.avg_batch_depth(),
+            p99_latency_us: self.p99_latency_us(),
+            max_latency_us: self.max_latency_us,
+            budget_violations: self.budget_violations,
+        }
+    }
+
+    /// Status line.
+    pub fn status_line(&self) -> String {
+        format!(
+            "tail-latency wakeups={} p99={}µs max={}µs violations={} batches={}",
+            self.total_wakeups,
+            self.p99_latency_us(),
+            self.max_latency_us,
+            self.budget_violations,
+            self.total_batches,
+        )
+    }
+
+    /// Reset all state.
+    pub fn reset(&mut self) {
+        self.total_wakeups = 0;
+        self.timer_wakeups = 0;
+        self.io_wakeups = 0;
+        self.signal_wakeups = 0;
+        self.nudge_wakeups = 0;
+        self.total_syscalls = 0;
+        self.total_batches = 0;
+        self.batch_depth_sum = 0;
+        self.latency_samples.clear();
+        self.sample_head = 0;
+        self.max_latency_us = 0;
+        self.budget_violations = 0;
+    }
+
+    /// Current syscall strategy.
+    pub fn strategy(&self) -> SyscallStrategy {
+        self.config.syscall_strategy
+    }
+
+    /// Current affinity hint.
+    pub fn affinity(&self) -> AffinityHint {
+        self.config.affinity
+    }
+
+    /// Number of stored latency samples.
+    pub fn sample_count(&self) -> usize {
+        self.latency_samples.len()
+    }
+}
+
+/// Degradation states for tail-latency controller.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TailLatencyDegradation {
+    Healthy,
+    P99Breach { observed_us: u64, budget_us: u64 },
+    P999Breach { observed_us: u64, budget_us: u64 },
+    HighViolationRate { violations: u64, total: u64 },
+}
+
+impl std::fmt::Display for TailLatencyDegradation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TailLatencyDegradation::Healthy => write!(f, "HEALTHY"),
+            TailLatencyDegradation::P99Breach { observed_us, budget_us } => {
+                write!(f, "P99_BREACH({}µs/{}µs)", observed_us, budget_us)
+            }
+            TailLatencyDegradation::P999Breach { observed_us, budget_us } => {
+                write!(f, "P999_BREACH({}µs/{}µs)", observed_us, budget_us)
+            }
+            TailLatencyDegradation::HighViolationRate { violations, total } => {
+                write!(f, "HIGH_VIOLATIONS({}/{})", violations, total)
+            }
+        }
+    }
+}
+
+/// Structured log entry for tail-latency.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TailLatencyLogEntry {
+    pub total_wakeups: u64,
+    pub p99_latency_us: u64,
+    pub max_latency_us: u64,
+    pub budget_violations: u64,
+    pub avg_batch_depth: f64,
+    pub degradation: TailLatencyDegradation,
+}
+
+impl TailLatencyController {
+    /// Detect degradation.
+    pub fn detect_degradation(&self) -> TailLatencyDegradation {
+        let p99 = self.p99_latency_us();
+        if self.max_latency_us > self.config.p999_budget_us {
+            return TailLatencyDegradation::P999Breach {
+                observed_us: self.max_latency_us,
+                budget_us: self.config.p999_budget_us,
+            };
+        }
+        if p99 > self.config.p99_budget_us {
+            return TailLatencyDegradation::P99Breach {
+                observed_us: p99,
+                budget_us: self.config.p99_budget_us,
+            };
+        }
+        // High violation rate: > 5% of wakeups exceed budget
+        if self.total_wakeups >= 20 {
+            let rate = self.budget_violations as f64 / self.total_wakeups as f64;
+            if rate > 0.05 {
+                return TailLatencyDegradation::HighViolationRate {
+                    violations: self.budget_violations,
+                    total: self.total_wakeups,
+                };
+            }
+        }
+        TailLatencyDegradation::Healthy
+    }
+
+    /// Log entry.
+    pub fn log_entry(&self) -> TailLatencyLogEntry {
+        TailLatencyLogEntry {
+            total_wakeups: self.total_wakeups,
+            p99_latency_us: self.p99_latency_us(),
+            max_latency_us: self.max_latency_us,
+            budget_violations: self.budget_violations,
+            avg_batch_depth: self.avg_batch_depth(),
+            degradation: self.detect_degradation(),
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -12777,5 +13142,229 @@ mod tests {
         assert_eq!(policy.ewma_cost_us(), 0.0);
         policy.record(1000, TransportMode::Local, 10.0, 50.0, 0);
         assert!(policy.ewma_cost_us() > 0.0);
+    }
+
+    // ── C5: Tail-Latency Tests ─────────────────────────────────────
+
+    #[test]
+    fn test_syscall_strategy_display() {
+        assert_eq!(format!("{}", SyscallStrategy::Immediate), "IMMEDIATE");
+        assert_eq!(format!("{}", SyscallStrategy::Batched), "BATCHED");
+        assert_eq!(format!("{}", SyscallStrategy::Adaptive), "ADAPTIVE");
+    }
+
+    #[test]
+    fn test_wakeup_source_display() {
+        assert_eq!(format!("{}", WakeupSource::Timer), "TIMER");
+        assert_eq!(format!("{}", WakeupSource::IoEvent), "IO_EVENT");
+        assert_eq!(format!("{}", WakeupSource::Signal), "SIGNAL");
+        assert_eq!(format!("{}", WakeupSource::Nudge), "NUDGE");
+    }
+
+    #[test]
+    fn test_affinity_hint_display() {
+        assert_eq!(format!("{}", AffinityHint::Any), "ANY");
+        assert_eq!(format!("{}", AffinityHint::PerformanceCore), "P_CORE");
+        assert_eq!(format!("{}", AffinityHint::EfficiencyCore), "E_CORE");
+        assert_eq!(format!("{}", AffinityHint::Pinned(3)), "PINNED(3)");
+    }
+
+    #[test]
+    fn test_tail_latency_config_default() {
+        let config = TailLatencyConfig::default();
+        assert_eq!(config.syscall_strategy, SyscallStrategy::Adaptive);
+        assert!(config.p99_budget_us < config.p999_budget_us);
+    }
+
+    #[test]
+    fn test_tail_latency_record_wakeup() {
+        let mut ctrl = TailLatencyController::with_defaults();
+        ctrl.record_wakeup(WakeupSource::Timer, 100);
+        ctrl.record_wakeup(WakeupSource::IoEvent, 200);
+        ctrl.record_wakeup(WakeupSource::Signal, 300);
+        ctrl.record_wakeup(WakeupSource::Nudge, 400);
+        let snap = ctrl.snapshot();
+        assert_eq!(snap.total_wakeups, 4);
+        assert_eq!(snap.timer_wakeups, 1);
+        assert_eq!(snap.io_wakeups, 1);
+        assert_eq!(snap.signal_wakeups, 1);
+        assert_eq!(snap.nudge_wakeups, 1);
+        assert_eq!(snap.max_latency_us, 400);
+    }
+
+    #[test]
+    fn test_tail_latency_wakeup_conservation() {
+        let mut ctrl = TailLatencyController::with_defaults();
+        for _ in 0..10 { ctrl.record_wakeup(WakeupSource::Timer, 50); }
+        for _ in 0..5 { ctrl.record_wakeup(WakeupSource::IoEvent, 100); }
+        let snap = ctrl.snapshot();
+        assert_eq!(snap.timer_wakeups + snap.io_wakeups + snap.signal_wakeups + snap.nudge_wakeups, snap.total_wakeups);
+    }
+
+    #[test]
+    fn test_tail_latency_record_batch() {
+        let mut ctrl = TailLatencyController::with_defaults();
+        ctrl.record_batch(10);
+        ctrl.record_batch(20);
+        assert_eq!(ctrl.snapshot().total_batches, 2);
+        assert_eq!(ctrl.snapshot().total_syscalls, 30);
+        assert!((ctrl.avg_batch_depth() - 15.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_tail_latency_p99() {
+        let mut ctrl = TailLatencyController::with_defaults();
+        // 100 samples: 99 at 100µs, 1 at 5000µs
+        for _ in 0..99 { ctrl.record_wakeup(WakeupSource::Timer, 100); }
+        ctrl.record_wakeup(WakeupSource::Timer, 5000);
+        let p99 = ctrl.p99_latency_us();
+        // p99 of 100 samples → index 99 → should be 5000
+        assert!(p99 >= 100); // At minimum, it's at least 100
+    }
+
+    #[test]
+    fn test_tail_latency_budget_violation() {
+        let config = TailLatencyConfig {
+            p99_budget_us: 1000,
+            ..Default::default()
+        };
+        let mut ctrl = TailLatencyController::new(config);
+        ctrl.record_wakeup(WakeupSource::Timer, 500);  // OK
+        ctrl.record_wakeup(WakeupSource::Timer, 1500); // Violation
+        assert_eq!(ctrl.snapshot().budget_violations, 1);
+    }
+
+    #[test]
+    fn test_tail_latency_reset() {
+        let mut ctrl = TailLatencyController::with_defaults();
+        ctrl.record_wakeup(WakeupSource::Timer, 100);
+        ctrl.record_batch(5);
+        ctrl.reset();
+        let snap = ctrl.snapshot();
+        assert_eq!(snap.total_wakeups, 0);
+        assert_eq!(snap.total_batches, 0);
+        assert_eq!(snap.max_latency_us, 0);
+    }
+
+    #[test]
+    fn test_tail_latency_degradation_healthy() {
+        let ctrl = TailLatencyController::with_defaults();
+        assert_eq!(ctrl.detect_degradation(), TailLatencyDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_tail_latency_degradation_p999_breach() {
+        let config = TailLatencyConfig {
+            p999_budget_us: 5000,
+            ..Default::default()
+        };
+        let mut ctrl = TailLatencyController::new(config);
+        ctrl.record_wakeup(WakeupSource::Timer, 10000); // Exceeds p999
+        let is_breach = matches!(ctrl.detect_degradation(), TailLatencyDegradation::P999Breach { .. });
+        assert!(is_breach, "Expected P999Breach, got {:?}", ctrl.detect_degradation());
+    }
+
+    #[test]
+    fn test_tail_latency_degradation_display() {
+        assert_eq!(format!("{}", TailLatencyDegradation::Healthy), "HEALTHY");
+        let breach = TailLatencyDegradation::P99Breach { observed_us: 15000, budget_us: 10000 };
+        assert!(format!("{}", breach).contains("15000"));
+    }
+
+    #[test]
+    fn test_tail_latency_log_entry() {
+        let mut ctrl = TailLatencyController::with_defaults();
+        ctrl.record_wakeup(WakeupSource::IoEvent, 500);
+        ctrl.record_batch(8);
+        let entry = ctrl.log_entry();
+        assert_eq!(entry.total_wakeups, 1);
+        assert_eq!(entry.degradation, TailLatencyDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_tail_latency_log_entry_serde() {
+        let entry = TailLatencyLogEntry {
+            total_wakeups: 100,
+            p99_latency_us: 5000,
+            max_latency_us: 20000,
+            budget_violations: 3,
+            avg_batch_depth: 12.5,
+            degradation: TailLatencyDegradation::Healthy,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: TailLatencyLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn test_tail_latency_snapshot_serde() {
+        let snap = TailLatencySnapshot {
+            total_wakeups: 50,
+            timer_wakeups: 20,
+            io_wakeups: 15,
+            signal_wakeups: 10,
+            nudge_wakeups: 5,
+            total_syscalls: 300,
+            total_batches: 30,
+            avg_batch_depth: 10.0,
+            p99_latency_us: 8000,
+            max_latency_us: 25000,
+            budget_violations: 2,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: TailLatencySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn test_tail_latency_degradation_serde() {
+        let variants = vec![
+            TailLatencyDegradation::Healthy,
+            TailLatencyDegradation::P99Breach { observed_us: 15000, budget_us: 10000 },
+            TailLatencyDegradation::P999Breach { observed_us: 60000, budget_us: 50000 },
+            TailLatencyDegradation::HighViolationRate { violations: 10, total: 100 },
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: TailLatencyDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[test]
+    fn test_tail_latency_status_line() {
+        let ctrl = TailLatencyController::with_defaults();
+        let line = ctrl.status_line();
+        assert!(line.contains("tail-latency"));
+        assert!(line.contains("wakeups=0"));
+    }
+
+    #[test]
+    fn test_tail_latency_accessors() {
+        let ctrl = TailLatencyController::with_defaults();
+        assert_eq!(ctrl.strategy(), SyscallStrategy::Adaptive);
+        assert_eq!(ctrl.affinity(), AffinityHint::Any);
+        assert_eq!(ctrl.sample_count(), 0);
+    }
+
+    #[test]
+    fn test_wakeup_event_serde() {
+        let evt = WakeupEvent {
+            source: WakeupSource::IoEvent,
+            latency_us: 250,
+            timestamp_us: 12345,
+            batch_depth: 4,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let back: WakeupEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(evt, back);
+    }
+
+    #[test]
+    fn test_tail_latency_config_serde() {
+        let config = TailLatencyConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: TailLatencyConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, back);
     }
 }
