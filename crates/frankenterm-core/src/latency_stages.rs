@@ -5530,6 +5530,144 @@ impl StarvationTracker {
     pub fn lane_state(&self, lane: SchedulerLane) -> &LaneFairnessState {
         &self.lanes[lane as usize]
     }
+
+    /// Reset starvation counters for all lanes.
+    pub fn reset(&mut self) {
+        for lane_state in &mut self.lanes {
+            lane_state.starved_epochs = 0;
+            lane_state.force_promoted = false;
+            lane_state.windowed_share = 0.0;
+            lane_state.windowed_completions = 0;
+            lane_state.windowed_deferred = 0;
+        }
+        self.epoch = 0;
+        self.total_starvation_events = 0;
+        self.events.clear();
+        self.history_head = 0;
+        for entry in &mut self.share_history {
+            for v in entry.iter_mut() {
+                *v = 0.0;
+            }
+        }
+    }
+
+    /// Get the most recent starvation events (up to limit).
+    pub fn recent_events(&self, limit: usize) -> &[StarvationEvent] {
+        let start = self.events.len().saturating_sub(limit);
+        &self.events[start..]
+    }
+
+    /// Whether a specific lane is force-promoted.
+    pub fn is_force_promoted(&self, lane: SchedulerLane) -> bool {
+        self.lanes[lane as usize].force_promoted
+    }
+}
+
+// AARSP Bead: ft-2p9cb.2.4.2
+
+/// Degradation signal from the starvation tracker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum FairnessDegradation {
+    /// Everything is fine.
+    Healthy,
+    /// One or more lanes are starving.
+    LaneStarvation {
+        starving_lanes: Vec<SchedulerLane>,
+    },
+    /// Gini coefficient is too high — severe unfairness.
+    SevereUnfairness {
+        gini: f64,
+        threshold: f64,
+    },
+    /// Force promotions are happening too frequently.
+    PromotionStorm {
+        events_in_window: u64,
+        threshold: u64,
+    },
+}
+
+impl fmt::Display for FairnessDegradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "HEALTHY"),
+            Self::LaneStarvation { starving_lanes } => {
+                write!(f, "LANE_STARVATION({:?})", starving_lanes)
+            }
+            Self::SevereUnfairness { gini, threshold } => {
+                write!(f, "SEVERE_UNFAIRNESS(gini={:.3}/thresh={:.3})", gini, threshold)
+            }
+            Self::PromotionStorm {
+                events_in_window,
+                threshold,
+            } => write!(f, "PROMOTION_STORM({}/{})", events_in_window, threshold),
+        }
+    }
+}
+
+/// Structured log entry for fairness/starvation events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FairnessLogEntry {
+    /// Epoch.
+    pub epoch: u64,
+    /// Per-lane windowed shares.
+    pub shares: Vec<f64>,
+    /// Per-lane starved epoch counts.
+    pub starved_epochs: Vec<u64>,
+    /// Gini coefficient.
+    pub gini_coefficient: f64,
+    /// Whether any lane is starving.
+    pub any_starving: bool,
+    /// Degradation signal.
+    pub degradation: FairnessDegradation,
+}
+
+impl StarvationTracker {
+    /// Detect degradation based on current state.
+    pub fn detect_degradation(&self) -> FairnessDegradation {
+        // Check for lane starvation.
+        let starving: Vec<SchedulerLane> = self
+            .lanes
+            .iter()
+            .filter(|l| l.force_promoted)
+            .map(|l| l.lane)
+            .collect();
+        if !starving.is_empty() {
+            return FairnessDegradation::LaneStarvation {
+                starving_lanes: starving,
+            };
+        }
+
+        // Check Gini coefficient (threshold: 0.5).
+        let gini = self.gini_coefficient();
+        if gini > 0.5 {
+            return FairnessDegradation::SevereUnfairness {
+                gini,
+                threshold: 0.5,
+            };
+        }
+
+        // Check for promotion storms (>5 events in last window).
+        if self.total_starvation_events > 5 {
+            return FairnessDegradation::PromotionStorm {
+                events_in_window: self.total_starvation_events,
+                threshold: 5,
+            };
+        }
+
+        FairnessDegradation::Healthy
+    }
+
+    /// Generate a structured log entry.
+    pub fn log_entry(&self) -> FairnessLogEntry {
+        FairnessLogEntry {
+            epoch: self.epoch,
+            shares: self.lanes.iter().map(|l| l.windowed_share).collect(),
+            starved_epochs: self.lanes.iter().map(|l| l.starved_epochs).collect(),
+            gini_coefficient: self.gini_coefficient(),
+            any_starving: self.any_starving(),
+            degradation: self.detect_degradation(),
+        }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -9344,5 +9482,115 @@ mod tests {
         assert_eq!(promoted.len(), 2);
         assert!(promoted.contains(&SchedulerLane::Control));
         assert!(promoted.contains(&SchedulerLane::Bulk));
+    }
+
+    // ── B4 Impl: Bridge methods ──
+
+    #[test]
+    fn test_starvation_reset() {
+        let config = StarvationConfig {
+            max_starved_epochs: 2,
+            ..Default::default()
+        };
+        let mut tracker = StarvationTracker::new(config);
+        tracker.observe_epoch(&[5, 0, 0], &[0.8, 0.0, 0.0]);
+        tracker.observe_epoch(&[5, 0, 0], &[0.8, 0.0, 0.0]);
+        assert!(tracker.any_starving());
+
+        tracker.reset();
+        assert_eq!(tracker.epoch(), 0);
+        assert!(!tracker.any_starving());
+        assert_eq!(tracker.snapshot().total_starvation_events, 0);
+    }
+
+    #[test]
+    fn test_starvation_recent_events() {
+        let config = StarvationConfig {
+            max_starved_epochs: 1,
+            ..Default::default()
+        };
+        let mut tracker = StarvationTracker::new(config);
+        tracker.observe_epoch(&[5, 0, 0], &[0.8, 0.0, 0.0]);
+        let recent = tracker.recent_events(10);
+        assert_eq!(recent.len(), 2); // Control and Bulk both starved.
+    }
+
+    #[test]
+    fn test_starvation_is_force_promoted() {
+        let config = StarvationConfig {
+            max_starved_epochs: 1,
+            ..Default::default()
+        };
+        let mut tracker = StarvationTracker::new(config);
+        assert!(!tracker.is_force_promoted(SchedulerLane::Bulk));
+        tracker.observe_epoch(&[5, 3, 0], &[0.5, 0.3, 0.0]);
+        assert!(tracker.is_force_promoted(SchedulerLane::Bulk));
+        assert!(!tracker.is_force_promoted(SchedulerLane::Input));
+    }
+
+    #[test]
+    fn test_fairness_degradation_healthy() {
+        let tracker = StarvationTracker::with_defaults();
+        assert_eq!(tracker.detect_degradation(), FairnessDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_fairness_degradation_starvation() {
+        let config = StarvationConfig {
+            max_starved_epochs: 1,
+            ..Default::default()
+        };
+        let mut tracker = StarvationTracker::new(config);
+        tracker.observe_epoch(&[5, 3, 0], &[0.5, 0.3, 0.0]);
+        let degradation = tracker.detect_degradation();
+        let is_starvation = matches!(degradation, FairnessDegradation::LaneStarvation { .. });
+        assert!(is_starvation, "Expected LaneStarvation, got {:?}", degradation);
+    }
+
+    #[test]
+    fn test_fairness_log_entry() {
+        let mut tracker = StarvationTracker::with_defaults();
+        tracker.observe_epoch(&[5, 3, 2], &[0.5, 0.3, 0.2]);
+        let entry = tracker.log_entry();
+        assert_eq!(entry.epoch, 1);
+        assert_eq!(entry.shares.len(), 3);
+        assert_eq!(entry.starved_epochs.len(), 3);
+    }
+
+    #[test]
+    fn test_fairness_degradation_serde() {
+        let variants = vec![
+            FairnessDegradation::Healthy,
+            FairnessDegradation::LaneStarvation { starving_lanes: vec![SchedulerLane::Bulk] },
+            FairnessDegradation::SevereUnfairness { gini: 0.7, threshold: 0.5 },
+            FairnessDegradation::PromotionStorm { events_in_window: 10, threshold: 5 },
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: FairnessDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[test]
+    fn test_fairness_log_entry_serde() {
+        let entry = FairnessLogEntry {
+            epoch: 5,
+            shares: vec![0.5, 0.3, 0.2],
+            starved_epochs: vec![0, 0, 0],
+            gini_coefficient: 0.1,
+            any_starving: false,
+            degradation: FairnessDegradation::Healthy,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: FairnessLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn test_fairness_degradation_display() {
+        assert_eq!(format!("{}", FairnessDegradation::Healthy), "HEALTHY");
+        let storm = FairnessDegradation::PromotionStorm { events_in_window: 10, threshold: 5 };
+        assert!(format!("{}", storm).contains("10/5"));
     }
 }
