@@ -2367,6 +2367,505 @@ impl FastProbe {
     }
 }
 
+// ── Runtime Enforcement ─────────────────────────────────────────────
+
+/// AARSP Bead: ft-2p9cb.1.3 — Runtime Budget Enforcement
+///
+/// This section implements the enforcement guards that sit on the critical path,
+/// applying deterministic mitigation when budgets are exceeded.
+
+/// Mitigation ladder with ordered escalation levels.
+///
+/// The ladder defines a strict partial order of increasingly aggressive
+/// mitigation actions. The enforcer escalates monotonically (never
+/// de-escalates within a single stage evaluation).
+///
+/// # Ladder ordering (least to most aggressive):
+/// ```text
+/// None(0) → Defer(1) → Degrade(2) → Shed(3) → Skip(4)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum MitigationLevel {
+    /// No mitigation needed.
+    None = 0,
+    /// Defer to next cycle.
+    Defer = 1,
+    /// Degrade quality.
+    Degrade = 2,
+    /// Shed load.
+    Shed = 3,
+    /// Skip entirely.
+    Skip = 4,
+}
+
+impl MitigationLevel {
+    /// Convert from Mitigation enum.
+    pub fn from_mitigation(m: Mitigation) -> Self {
+        match m {
+            Mitigation::None => Self::None,
+            Mitigation::Defer => Self::Defer,
+            Mitigation::Degrade => Self::Degrade,
+            Mitigation::Shed => Self::Shed,
+            Mitigation::Skip => Self::Skip,
+        }
+    }
+
+    /// Convert back to Mitigation enum.
+    pub fn to_mitigation(self) -> Mitigation {
+        match self {
+            Self::None => Mitigation::None,
+            Self::Defer => Mitigation::Defer,
+            Self::Degrade => Mitigation::Degrade,
+            Self::Shed => Mitigation::Shed,
+            Self::Skip => Mitigation::Skip,
+        }
+    }
+
+    /// All levels in escalation order.
+    pub const ALL: &[Self] = &[Self::None, Self::Defer, Self::Degrade, Self::Shed, Self::Skip];
+
+    /// Numeric severity (0-4).
+    pub fn severity(self) -> u8 {
+        self as u8
+    }
+}
+
+impl fmt::Display for MitigationLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("NONE"),
+            Self::Defer => f.write_str("DEFER"),
+            Self::Degrade => f.write_str("DEGRADE"),
+            Self::Shed => f.write_str("SHED"),
+            Self::Skip => f.write_str("SKIP"),
+        }
+    }
+}
+
+/// Policy constraint that limits which mitigations can be applied to a stage.
+///
+/// # Safety Contract
+/// Some stages are critical and must never be skipped. Others can tolerate
+/// degradation but not shedding. PolicyConstraint makes these rules explicit
+/// and machine-enforceable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyConstraint {
+    /// Stage this policy applies to.
+    pub stage: LatencyStage,
+    /// Maximum allowed mitigation level.
+    pub max_level: MitigationLevel,
+    /// Whether this stage is critical (violations generate alerts).
+    pub critical: bool,
+    /// Minimum observations before enforcement kicks in (warmup).
+    pub warmup_count: u64,
+}
+
+impl PolicyConstraint {
+    /// Check if a proposed mitigation level is allowed.
+    pub fn allows(&self, level: MitigationLevel) -> bool {
+        level <= self.max_level
+    }
+
+    /// Clamp a proposed level to the maximum allowed.
+    pub fn clamp(&self, level: MitigationLevel) -> MitigationLevel {
+        if level <= self.max_level {
+            level
+        } else {
+            self.max_level
+        }
+    }
+}
+
+/// Default policy constraints for all pipeline stages.
+pub fn default_policy_constraints() -> Vec<PolicyConstraint> {
+    vec![
+        PolicyConstraint {
+            stage: LatencyStage::PtyCapture,
+            max_level: MitigationLevel::Shed,
+            critical: true,
+            warmup_count: 10,
+        },
+        PolicyConstraint {
+            stage: LatencyStage::DeltaExtraction,
+            max_level: MitigationLevel::Degrade,
+            critical: false,
+            warmup_count: 10,
+        },
+        PolicyConstraint {
+            stage: LatencyStage::StorageWrite,
+            max_level: MitigationLevel::Defer,
+            critical: true,
+            warmup_count: 10,
+        },
+        PolicyConstraint {
+            stage: LatencyStage::PatternDetection,
+            max_level: MitigationLevel::Skip,
+            critical: false,
+            warmup_count: 10,
+        },
+        PolicyConstraint {
+            stage: LatencyStage::EventEmission,
+            max_level: MitigationLevel::Defer,
+            critical: true,
+            warmup_count: 10,
+        },
+        PolicyConstraint {
+            stage: LatencyStage::WorkflowDispatch,
+            max_level: MitigationLevel::Skip,
+            critical: false,
+            warmup_count: 5,
+        },
+        PolicyConstraint {
+            stage: LatencyStage::ActionExecution,
+            max_level: MitigationLevel::Shed,
+            critical: false,
+            warmup_count: 10,
+        },
+        PolicyConstraint {
+            stage: LatencyStage::ApiResponse,
+            max_level: MitigationLevel::Defer,
+            critical: true,
+            warmup_count: 10,
+        },
+    ]
+}
+
+/// Recovery protocol for stepping back from degraded to full quality.
+///
+/// After mitigation is applied, the system should recover once latency
+/// returns to acceptable levels. RecoveryProtocol defines how quickly
+/// and under what conditions recovery occurs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryProtocol {
+    /// Number of consecutive within-budget observations before de-escalating.
+    pub cooldown_observations: u64,
+    /// Maximum time in degraded state before forced recovery attempt (μs).
+    pub max_degraded_duration_us: u64,
+    /// Whether to step down one level at a time or jump to full.
+    pub gradual: bool,
+}
+
+impl Default for RecoveryProtocol {
+    fn default() -> Self {
+        Self {
+            cooldown_observations: 20,
+            max_degraded_duration_us: 30_000_000, // 30 seconds
+            gradual: true,
+        }
+    }
+}
+
+/// Per-stage enforcement state tracking mitigation and recovery.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageEnforcementState {
+    /// Current active mitigation level for this stage.
+    pub current_level: MitigationLevel,
+    /// Consecutive within-budget observations since last overflow.
+    pub consecutive_ok: u64,
+    /// Timestamp of last escalation (epoch μs, 0 if never escalated).
+    pub last_escalation_us: u64,
+    /// Total escalation count.
+    pub escalation_count: u64,
+    /// Total recovery count.
+    pub recovery_count: u64,
+}
+
+impl StageEnforcementState {
+    fn new() -> Self {
+        Self {
+            current_level: MitigationLevel::None,
+            consecutive_ok: 0,
+            last_escalation_us: 0,
+            escalation_count: 0,
+            recovery_count: 0,
+        }
+    }
+}
+
+/// Enforcement decision emitted for each stage observation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnforcementDecision {
+    /// Stage evaluated.
+    pub stage: LatencyStage,
+    /// Observed latency.
+    pub latency_us: f64,
+    /// Whether budget was exceeded.
+    pub overflow: bool,
+    /// Raw mitigation from the enforcer (before policy clamping).
+    pub raw_mitigation: MitigationLevel,
+    /// Clamped mitigation (after policy constraint).
+    pub applied_mitigation: MitigationLevel,
+    /// Whether this was a recovery (de-escalation).
+    pub recovery: bool,
+    /// Reason code.
+    pub reason: Option<ReasonCode>,
+    /// Whether warmup period is still active (enforcement suppressed).
+    pub warmup_active: bool,
+}
+
+/// Configuration for the runtime enforcer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeEnforcerConfig {
+    /// Base enforcer configuration.
+    pub enforcer_config: BudgetEnforcerConfig,
+    /// Per-stage policy constraints.
+    pub policy_constraints: Vec<PolicyConstraint>,
+    /// Recovery protocol.
+    pub recovery: RecoveryProtocol,
+    /// Whether to emit structured decision logs.
+    pub log_decisions: bool,
+}
+
+impl Default for RuntimeEnforcerConfig {
+    fn default() -> Self {
+        Self {
+            enforcer_config: BudgetEnforcerConfig::default(),
+            policy_constraints: default_policy_constraints(),
+            recovery: RecoveryProtocol::default(),
+            log_decisions: true,
+        }
+    }
+}
+
+/// The runtime budget enforcer with policy constraints and recovery.
+///
+/// Wraps BudgetEnforcer with:
+/// - Policy-safe mitigation clamping
+/// - Warmup suppression
+/// - Recovery protocol (gradual de-escalation)
+/// - Structured decision logging
+///
+/// # Determinism
+/// All decisions are deterministic given the same sequence of observations.
+/// No randomness, no system time — caller provides all timestamps.
+#[derive(Debug, Clone)]
+pub struct RuntimeEnforcer {
+    enforcer: BudgetEnforcer,
+    config: RuntimeEnforcerConfig,
+    states: Vec<(LatencyStage, StageEnforcementState)>,
+    decisions: Vec<EnforcementDecision>,
+    observation_count: u64,
+}
+
+impl RuntimeEnforcer {
+    /// Create a new runtime enforcer with the given configuration.
+    pub fn new(config: RuntimeEnforcerConfig) -> Self {
+        let enforcer = BudgetEnforcer::new(config.enforcer_config.clone());
+        let states = LatencyStage::PIPELINE_STAGES
+            .iter()
+            .map(|&s| (s, StageEnforcementState::new()))
+            .collect();
+        Self {
+            enforcer,
+            config,
+            states,
+            decisions: Vec::new(),
+            observation_count: 0,
+        }
+    }
+
+    /// Create with default configuration.
+    pub fn with_defaults() -> Self {
+        Self::new(RuntimeEnforcerConfig::default())
+    }
+
+    /// Record an observation and produce an enforcement decision.
+    ///
+    /// This is the main entry point for the critical path. It:
+    /// 1. Records the observation in the base enforcer
+    /// 2. Determines raw mitigation from overflow severity
+    /// 3. Applies policy constraints (clamping)
+    /// 4. Checks recovery conditions
+    /// 5. Updates enforcement state
+    /// 6. Emits a structured decision
+    pub fn enforce(
+        &mut self,
+        stage: LatencyStage,
+        latency_us: f64,
+        correlation_id: &str,
+        now_us: u64,
+    ) -> EnforcementDecision {
+        self.observation_count += 1;
+
+        // Step 1: Record in base enforcer.
+        let obs = self.enforcer.record(stage, latency_us, correlation_id);
+
+        // Find enforcement state for this stage.
+        let state = self
+            .states
+            .iter_mut()
+            .find(|(s, _)| *s == stage)
+            .map(|(_, st)| st);
+
+        let state = match state {
+            Some(s) => s,
+            None => {
+                // Unknown stage — pass through.
+                return EnforcementDecision {
+                    stage,
+                    latency_us,
+                    overflow: false,
+                    raw_mitigation: MitigationLevel::None,
+                    applied_mitigation: MitigationLevel::None,
+                    recovery: false,
+                    reason: None,
+                    warmup_active: true,
+                };
+            }
+        };
+
+        // Find policy constraint.
+        let constraint = self
+            .config
+            .policy_constraints
+            .iter()
+            .find(|c| c.stage == stage);
+
+        // Step 2: Check warmup.
+        let warmup_active = constraint
+            .map(|c| self.observation_count <= c.warmup_count)
+            .unwrap_or(false);
+
+        // Step 3: Determine raw mitigation level.
+        let raw_level = MitigationLevel::from_mitigation(obs.recommended_mitigation);
+
+        // Step 4: Apply policy constraint.
+        let clamped_level = if warmup_active {
+            MitigationLevel::None
+        } else {
+            constraint.map(|c| c.clamp(raw_level)).unwrap_or(raw_level)
+        };
+
+        // Step 5: Recovery check.
+        let mut recovery = false;
+        if obs.overflow {
+            state.consecutive_ok = 0;
+            if clamped_level > state.current_level {
+                state.current_level = clamped_level;
+                state.last_escalation_us = now_us;
+                state.escalation_count += 1;
+            }
+        } else {
+            state.consecutive_ok += 1;
+
+            // Check recovery conditions.
+            let cooldown_met =
+                state.consecutive_ok >= self.config.recovery.cooldown_observations;
+            let timeout_met = now_us.saturating_sub(state.last_escalation_us)
+                >= self.config.recovery.max_degraded_duration_us;
+
+            if state.current_level > MitigationLevel::None && (cooldown_met || timeout_met) {
+                recovery = true;
+                state.recovery_count += 1;
+                if self.config.recovery.gradual && state.current_level > MitigationLevel::None {
+                    // Step down one level.
+                    let severity = state.current_level.severity();
+                    state.current_level = if severity > 0 {
+                        MitigationLevel::ALL[severity as usize - 1]
+                    } else {
+                        MitigationLevel::None
+                    };
+                } else {
+                    state.current_level = MitigationLevel::None;
+                }
+                state.consecutive_ok = 0;
+            }
+        }
+
+        let decision = EnforcementDecision {
+            stage,
+            latency_us,
+            overflow: obs.overflow,
+            raw_mitigation: raw_level,
+            applied_mitigation: state.current_level,
+            recovery,
+            reason: obs.reason,
+            warmup_active,
+        };
+
+        if self.config.log_decisions {
+            self.decisions.push(decision.clone());
+        }
+
+        decision
+    }
+
+    /// Get the current mitigation level for a stage.
+    pub fn current_level(&self, stage: LatencyStage) -> MitigationLevel {
+        self.states
+            .iter()
+            .find(|(s, _)| *s == stage)
+            .map(|(_, st)| st.current_level)
+            .unwrap_or(MitigationLevel::None)
+    }
+
+    /// Get the enforcement state for a stage.
+    pub fn stage_state(&self, stage: LatencyStage) -> Option<&StageEnforcementState> {
+        self.states
+            .iter()
+            .find(|(s, _)| *s == stage)
+            .map(|(_, st)| st)
+    }
+
+    /// Get the underlying enforcer.
+    pub fn base_enforcer(&self) -> &BudgetEnforcer {
+        &self.enforcer
+    }
+
+    /// Get accumulated decisions and clear.
+    pub fn drain_decisions(&mut self) -> Vec<EnforcementDecision> {
+        std::mem::take(&mut self.decisions)
+    }
+
+    /// Total observations processed.
+    pub fn total_observations(&self) -> u64 {
+        self.observation_count
+    }
+
+    /// Total escalations across all stages.
+    pub fn total_escalations(&self) -> u64 {
+        self.states.iter().map(|(_, s)| s.escalation_count).sum()
+    }
+
+    /// Total recoveries across all stages.
+    pub fn total_recoveries(&self) -> u64 {
+        self.states.iter().map(|(_, s)| s.recovery_count).sum()
+    }
+
+    /// Whether all stages are at MitigationLevel::None.
+    pub fn is_fully_recovered(&self) -> bool {
+        self.states
+            .iter()
+            .all(|(_, s)| s.current_level == MitigationLevel::None)
+    }
+
+    /// Compact status string.
+    pub fn status_line(&self) -> String {
+        let degraded: Vec<String> = self
+            .states
+            .iter()
+            .filter(|(_, s)| s.current_level > MitigationLevel::None)
+            .map(|(stage, s)| format!("{}={}", stage, s.current_level))
+            .collect();
+        if degraded.is_empty() {
+            format!(
+                "enforcement=NOMINAL obs={} esc={} rec={}",
+                self.observation_count,
+                self.total_escalations(),
+                self.total_recoveries()
+            )
+        } else {
+            format!(
+                "enforcement=DEGRADED [{}] obs={} esc={} rec={}",
+                degraded.join(", "),
+                self.observation_count,
+                self.total_escalations(),
+                self.total_recoveries()
+            )
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3760,6 +4259,290 @@ mod tests {
         // Both should be usable (Copy semantics, no move).
         assert_eq!(probe.elapsed_us(200), 100.0);
         assert_eq!(copy.elapsed_us(200), 100.0);
+    }
+
+    // ── MitigationLevel ──
+
+    #[test]
+    fn test_mitigation_level_ordering() {
+        assert!(MitigationLevel::None < MitigationLevel::Defer);
+        assert!(MitigationLevel::Defer < MitigationLevel::Degrade);
+        assert!(MitigationLevel::Degrade < MitigationLevel::Shed);
+        assert!(MitigationLevel::Shed < MitigationLevel::Skip);
+    }
+
+    #[test]
+    fn test_mitigation_level_severity() {
+        assert_eq!(MitigationLevel::None.severity(), 0);
+        assert_eq!(MitigationLevel::Defer.severity(), 1);
+        assert_eq!(MitigationLevel::Degrade.severity(), 2);
+        assert_eq!(MitigationLevel::Shed.severity(), 3);
+        assert_eq!(MitigationLevel::Skip.severity(), 4);
+    }
+
+    #[test]
+    fn test_mitigation_level_roundtrip() {
+        for &level in MitigationLevel::ALL {
+            let mit = level.to_mitigation();
+            let back = MitigationLevel::from_mitigation(mit);
+            assert_eq!(level, back);
+        }
+    }
+
+    #[test]
+    fn test_mitigation_level_serde_roundtrip() {
+        for &level in MitigationLevel::ALL {
+            let json = serde_json::to_string(&level).unwrap();
+            let back: MitigationLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(level, back);
+        }
+    }
+
+    // ── PolicyConstraint ──
+
+    #[test]
+    fn test_policy_constraint_allows() {
+        let pc = PolicyConstraint {
+            stage: LatencyStage::StorageWrite,
+            max_level: MitigationLevel::Defer,
+            critical: true,
+            warmup_count: 10,
+        };
+        assert!(pc.allows(MitigationLevel::None));
+        assert!(pc.allows(MitigationLevel::Defer));
+        assert!(!pc.allows(MitigationLevel::Degrade));
+        assert!(!pc.allows(MitigationLevel::Skip));
+    }
+
+    #[test]
+    fn test_policy_constraint_clamp() {
+        let pc = PolicyConstraint {
+            stage: LatencyStage::StorageWrite,
+            max_level: MitigationLevel::Defer,
+            critical: true,
+            warmup_count: 10,
+        };
+        assert_eq!(pc.clamp(MitigationLevel::None), MitigationLevel::None);
+        assert_eq!(pc.clamp(MitigationLevel::Defer), MitigationLevel::Defer);
+        assert_eq!(pc.clamp(MitigationLevel::Skip), MitigationLevel::Defer);
+    }
+
+    #[test]
+    fn test_default_policy_constraints_cover_all_stages() {
+        let constraints = default_policy_constraints();
+        for &stage in LatencyStage::PIPELINE_STAGES {
+            assert!(
+                constraints.iter().any(|c| c.stage == stage),
+                "missing policy constraint for {stage}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_critical_stages_have_limited_mitigation() {
+        let constraints = default_policy_constraints();
+        for c in &constraints {
+            if c.critical {
+                // Critical stages should NOT allow Skip.
+                assert!(
+                    c.max_level < MitigationLevel::Skip,
+                    "critical stage {} allows Skip",
+                    c.stage
+                );
+            }
+        }
+    }
+
+    // ── RecoveryProtocol ──
+
+    #[test]
+    fn test_recovery_protocol_defaults() {
+        let rp = RecoveryProtocol::default();
+        assert_eq!(rp.cooldown_observations, 20);
+        assert_eq!(rp.max_degraded_duration_us, 30_000_000);
+        assert!(rp.gradual);
+    }
+
+    #[test]
+    fn test_recovery_protocol_serde_roundtrip() {
+        let rp = RecoveryProtocol::default();
+        let json = serde_json::to_string(&rp).unwrap();
+        let back: RecoveryProtocol = serde_json::from_str(&json).unwrap();
+        assert_eq!(rp, back);
+    }
+
+    // ── RuntimeEnforcer ──
+
+    #[test]
+    fn test_runtime_enforcer_new() {
+        let re = RuntimeEnforcer::with_defaults();
+        assert_eq!(re.total_observations(), 0);
+        assert_eq!(re.total_escalations(), 0);
+        assert_eq!(re.total_recoveries(), 0);
+        assert!(re.is_fully_recovered());
+    }
+
+    #[test]
+    fn test_runtime_enforcer_nominal() {
+        let mut re = RuntimeEnforcer::with_defaults();
+        // Record many nominal observations to get past warmup.
+        for i in 0..50 {
+            let d = re.enforce(LatencyStage::PtyCapture, 10.0, "test", i * 1000);
+            assert!(!d.overflow);
+            assert_eq!(d.applied_mitigation, MitigationLevel::None);
+        }
+        assert!(re.is_fully_recovered());
+        assert_eq!(re.total_escalations(), 0);
+    }
+
+    #[test]
+    fn test_runtime_enforcer_warmup_suppresses() {
+        let config = RuntimeEnforcerConfig {
+            policy_constraints: vec![PolicyConstraint {
+                stage: LatencyStage::DeltaExtraction,
+                max_level: MitigationLevel::Skip,
+                critical: false,
+                warmup_count: 5,
+            }],
+            ..RuntimeEnforcerConfig::default()
+        };
+        let mut re = RuntimeEnforcer::new(config);
+        // During warmup, even overflow shouldn't escalate.
+        for i in 0..5 {
+            let d = re.enforce(LatencyStage::DeltaExtraction, 100_000.0, "test", i * 1000);
+            assert!(d.warmup_active);
+            assert_eq!(d.applied_mitigation, MitigationLevel::None);
+        }
+    }
+
+    #[test]
+    fn test_runtime_enforcer_escalation() {
+        let mut re = RuntimeEnforcer::with_defaults();
+        // Get past warmup with normal observations.
+        for i in 0..20 {
+            re.enforce(LatencyStage::PatternDetection, 10.0, "test", i * 1000);
+        }
+        // Now trigger overflow (PatternDetection p999=10000, so 50000 overflows).
+        let d = re.enforce(LatencyStage::PatternDetection, 50_000.0, "test", 100_000);
+        assert!(d.overflow);
+        assert!(d.applied_mitigation >= MitigationLevel::None);
+        // Should have escalated.
+        let level = re.current_level(LatencyStage::PatternDetection);
+        assert!(level > MitigationLevel::None);
+    }
+
+    #[test]
+    fn test_runtime_enforcer_policy_clamp() {
+        let config = RuntimeEnforcerConfig {
+            policy_constraints: vec![PolicyConstraint {
+                stage: LatencyStage::StorageWrite,
+                max_level: MitigationLevel::Defer,
+                critical: true,
+                warmup_count: 0, // no warmup
+            }],
+            ..RuntimeEnforcerConfig::default()
+        };
+        let mut re = RuntimeEnforcer::new(config);
+        // StorageWrite with extreme overflow — policy should clamp to Defer.
+        re.enforce(LatencyStage::StorageWrite, 1_000_000.0, "test", 1000);
+        let level = re.current_level(LatencyStage::StorageWrite);
+        assert!(level <= MitigationLevel::Defer);
+    }
+
+    #[test]
+    fn test_runtime_enforcer_recovery() {
+        let config = RuntimeEnforcerConfig {
+            recovery: RecoveryProtocol {
+                cooldown_observations: 5,
+                max_degraded_duration_us: 1_000_000_000,
+                gradual: true,
+            },
+            policy_constraints: vec![PolicyConstraint {
+                stage: LatencyStage::PatternDetection,
+                max_level: MitigationLevel::Skip,
+                critical: false,
+                warmup_count: 0,
+            }],
+            ..RuntimeEnforcerConfig::default()
+        };
+        let mut re = RuntimeEnforcer::new(config);
+        // Trigger escalation.
+        re.enforce(LatencyStage::PatternDetection, 100_000.0, "test", 1000);
+        assert!(re.current_level(LatencyStage::PatternDetection) > MitigationLevel::None);
+
+        // Now send enough within-budget observations for recovery.
+        for i in 0..10 {
+            re.enforce(LatencyStage::PatternDetection, 10.0, "test", 2000 + i * 100);
+        }
+        // Should have recovered (at least partially).
+        let level = re.current_level(LatencyStage::PatternDetection);
+        // With gradual recovery, may have stepped down but not necessarily to None.
+        assert!(level < MitigationLevel::Skip);
+    }
+
+    #[test]
+    fn test_runtime_enforcer_status_line_nominal() {
+        let re = RuntimeEnforcer::with_defaults();
+        let status = re.status_line();
+        assert!(status.contains("NOMINAL"));
+    }
+
+    #[test]
+    fn test_runtime_enforcer_status_line_degraded() {
+        let config = RuntimeEnforcerConfig {
+            policy_constraints: vec![PolicyConstraint {
+                stage: LatencyStage::PatternDetection,
+                max_level: MitigationLevel::Skip,
+                critical: false,
+                warmup_count: 0,
+            }],
+            ..RuntimeEnforcerConfig::default()
+        };
+        let mut re = RuntimeEnforcer::new(config);
+        re.enforce(LatencyStage::PatternDetection, 100_000.0, "test", 1000);
+        let status = re.status_line();
+        assert!(status.contains("DEGRADED"));
+    }
+
+    #[test]
+    fn test_runtime_enforcer_drain_decisions() {
+        let mut re = RuntimeEnforcer::with_defaults();
+        re.enforce(LatencyStage::PtyCapture, 10.0, "test", 0);
+        re.enforce(LatencyStage::DeltaExtraction, 10.0, "test", 100);
+        let decisions = re.drain_decisions();
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(re.drain_decisions().len(), 0);
+    }
+
+    #[test]
+    fn test_enforcement_decision_serde_roundtrip() {
+        let d = EnforcementDecision {
+            stage: LatencyStage::PtyCapture,
+            latency_us: 42.0,
+            overflow: false,
+            raw_mitigation: MitigationLevel::None,
+            applied_mitigation: MitigationLevel::None,
+            recovery: false,
+            reason: None,
+            warmup_active: false,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: EnforcementDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, back);
+    }
+
+    #[test]
+    fn test_stage_enforcement_state_serde_roundtrip() {
+        let s = StageEnforcementState {
+            current_level: MitigationLevel::Degrade,
+            consecutive_ok: 5,
+            last_escalation_us: 1000,
+            escalation_count: 2,
+            recovery_count: 1,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: StageEnforcementState = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
     }
 
     // ── Helper ──
