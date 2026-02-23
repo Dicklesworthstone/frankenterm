@@ -2768,4 +2768,142 @@ proptest! {
         let is_valid = MemoryDomain::ALL.contains(&domain);
         prop_assert!(is_valid);
     }
+
+    // ── C2: Ingestion Parser invariants (ft-2p9cb.3.2.3) ──
+
+    /// Zero-copy ratio is always in [0.0, 1.0].
+    #[test]
+    fn ingest_zero_copy_ratio_bounded(
+        chunks in prop::collection::vec(prop::collection::vec(0_u8..255, 0..64), 1..10),
+    ) {
+        let mut parser = IngestParser::with_defaults();
+        for chunk in &chunks {
+            parser.feed(chunk);
+        }
+        let ratio = parser.zero_copy_ratio();
+        prop_assert!(ratio >= 0.0, "ratio {} < 0", ratio);
+        prop_assert!(ratio <= 1.0, "ratio {} > 1", ratio);
+    }
+
+    /// Complete lines: bytes_consumed > 0 and lines > 0.
+    #[test]
+    fn ingest_complete_line_positive(
+        prefix in prop::collection::vec(0_u8..254, 0..32),
+    ) {
+        let mut data = prefix;
+        data.push(b'\n');
+        let mut parser = IngestParser::with_defaults();
+        let result = parser.feed(&data);
+        match result {
+            ParseResult::Complete { lines, bytes_consumed } => {
+                prop_assert!(lines > 0);
+                prop_assert!(bytes_consumed > 0);
+            }
+            other => {
+                // Could be Invalid if exceeds max_line_bytes, which won't happen with 32-byte prefix.
+                panic!("Expected Complete, got {:?}", other);
+            }
+        }
+    }
+
+    /// Flush produces output only when buffer is non-empty.
+    #[test]
+    fn ingest_flush_nonempty(
+        data in prop::collection::vec(0_u8..254, 1..32),
+    ) {
+        let mut parser = IngestParser::with_defaults();
+        // Feed data without newline.
+        let no_newlines: Vec<u8> = data.iter().filter(|&&b| b != b'\n').cloned().collect();
+        if !no_newlines.is_empty() {
+            parser.feed(&no_newlines);
+            let result = parser.flush();
+            prop_assert!(result.is_some());
+        }
+    }
+
+    /// Reset zeroes all counters.
+    #[test]
+    fn ingest_reset_zeroes(
+        chunks in prop::collection::vec(prop::collection::vec(0_u8..255, 1..32), 1..5),
+    ) {
+        let mut parser = IngestParser::with_defaults();
+        for chunk in &chunks {
+            parser.feed(chunk);
+        }
+        parser.reset();
+        prop_assert_eq!(parser.total_bytes(), 0);
+        prop_assert_eq!(parser.total_lines(), 0);
+        prop_assert_eq!(parser.total_chunks(), 0);
+        prop_assert_eq!(parser.buffered_bytes(), 0);
+    }
+
+    /// ParseResult serde roundtrip.
+    #[test]
+    fn ingest_parse_result_serde(
+        variant in 0_u8..3,
+        count in 1_usize..100,
+    ) {
+        let result = match variant {
+            0 => ParseResult::Complete { lines: count, bytes_consumed: count * 10 },
+            1 => ParseResult::Partial { bytes_buffered: count },
+            _ => ParseResult::Invalid { bytes_skipped: count, reason: "test".to_string() },
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ParseResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(result, back);
+    }
+
+    /// IngestChunk serde roundtrip.
+    #[test]
+    fn ingest_chunk_serde(
+        pane_id in 0_u64..100,
+        offset in 0_u64..10000,
+        length in 0_usize..1000,
+        captured in 0_u64..1_000_000,
+    ) {
+        let chunk = IngestChunk {
+            pane_id,
+            offset,
+            length,
+            line_aligned: true,
+            captured_us: captured,
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        let back: IngestChunk = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(chunk, back);
+    }
+
+    /// IngestDegradation serde roundtrip.
+    #[test]
+    fn ingest_degradation_serde(
+        variant in 0_u8..4,
+        count in 1_usize..100,
+    ) {
+        let degradation = match variant {
+            0 => IngestDegradation::Healthy,
+            1 => IngestDegradation::HighBufferPressure { buffered_bytes: count, max_line_bytes: count * 2 },
+            2 => IngestDegradation::DataCorruption { invalid_bytes: count as u64, total_bytes: count as u64 * 10 },
+            _ => IngestDegradation::LowZeroCopy { ratio: 0.3, threshold: 0.5 },
+        };
+        let json = serde_json::to_string(&degradation).unwrap();
+        let back: IngestDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(degradation, back);
+    }
+
+    /// IngestParserConfig serde roundtrip.
+    #[test]
+    fn ingest_config_serde(
+        max_line in 100_usize..100000,
+        max_chunks in 1_usize..256,
+    ) {
+        let cfg = IngestParserConfig {
+            max_line_bytes: max_line,
+            max_buffered_chunks: max_chunks,
+            strip_escapes: false,
+            checksum: true,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: IngestParserConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(cfg, back);
+    }
 }
