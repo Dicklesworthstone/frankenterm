@@ -4193,6 +4193,164 @@ impl LaneScheduler {
             self.events.drain(0..self.events.len() / 2);
         }
     }
+
+    /// Check whether a lane has remaining CPU budget in the current epoch.
+    pub fn has_cpu_budget(&self, lane: SchedulerLane) -> bool {
+        let state = &self.lanes[lane as usize];
+        state.cpu_used_us < state.cpu_budget_us
+    }
+
+    /// Remaining CPU budget for a lane in the current epoch.
+    pub fn remaining_cpu_us(&self, lane: SchedulerLane) -> f64 {
+        let state = &self.lanes[lane as usize];
+        (state.cpu_budget_us - state.cpu_used_us).max(0.0)
+    }
+
+    /// Pick the next lane to service using strict priority.
+    ///
+    /// Returns the highest-priority lane that has items and CPU budget.
+    /// Falls through to lower priority lanes only when higher lanes are empty.
+    pub fn next_lane(&self) -> Option<SchedulerLane> {
+        for &lane in SchedulerLane::ALL {
+            let state = &self.lanes[lane as usize];
+            if state.depth > 0 && state.cpu_used_us < state.cpu_budget_us {
+                return Some(lane);
+            }
+        }
+        // Fallback: any lane with items (ignore budget for input lane).
+        if self.lanes[SchedulerLane::Input as usize].depth > 0 {
+            return Some(SchedulerLane::Input);
+        }
+        None
+    }
+
+    /// Compute fairness metric: ratio of actual CPU share to configured share per lane.
+    ///
+    /// Returns (lane, fairness_ratio) for each lane.
+    /// Fairness ratio = 1.0 means exactly fair; < 1.0 means under-served; > 1.0 means over-served.
+    pub fn fairness_ratios(&self) -> Vec<(SchedulerLane, f64)> {
+        let total_cpu: f64 = self.lanes.iter().map(|l| l.cpu_used_us).sum();
+        if total_cpu < 1e-6 {
+            return SchedulerLane::ALL.iter().map(|&l| (l, 1.0)).collect();
+        }
+        SchedulerLane::ALL
+            .iter()
+            .map(|&lane| {
+                let state = &self.lanes[lane as usize];
+                let actual_share = state.cpu_used_us / total_cpu;
+                let target_share = self.config.cpu_share(lane);
+                let ratio = if target_share > 0.0 {
+                    actual_share / target_share
+                } else {
+                    0.0
+                };
+                (lane, ratio)
+            })
+            .collect()
+    }
+
+    /// Detect scheduler degradation.
+    pub fn current_degradation(&self) -> SchedulerDegradation {
+        // Check for starvation: any lane with items but 0 completions over many epochs.
+        let input = &self.lanes[SchedulerLane::Input as usize];
+        let control = &self.lanes[SchedulerLane::Control as usize];
+        let bulk = &self.lanes[SchedulerLane::Bulk as usize];
+
+        // Input starvation is critical.
+        if input.depth > 0 && input.total_deferred > input.total_admitted / 2 + 1 {
+            return SchedulerDegradation::InputStarvation {
+                depth: input.depth,
+                deferred: input.total_deferred,
+            };
+        }
+
+        // Bulk starvation: many items shed, few completed.
+        if bulk.total_shed > bulk.total_completed + 10 {
+            return SchedulerDegradation::BulkStarvation {
+                shed_count: bulk.total_shed,
+                completed_count: bulk.total_completed,
+            };
+        }
+
+        // Control backlog: queue growing without drain.
+        if control.depth > control.capacity / 2 {
+            return SchedulerDegradation::ControlBacklog {
+                depth: control.depth,
+                capacity: control.capacity,
+            };
+        }
+
+        SchedulerDegradation::Healthy
+    }
+
+    /// Is the scheduler healthy?
+    pub fn is_healthy(&self) -> bool {
+        matches!(self.current_degradation(), SchedulerDegradation::Healthy)
+    }
+
+    /// Generate a structured log entry for the current epoch state.
+    pub fn log_entry(&self) -> SchedulerLogEntry {
+        SchedulerLogEntry {
+            epoch: self.epoch,
+            depths: SchedulerLane::ALL
+                .iter()
+                .map(|&l| (l, self.lanes[l as usize].depth))
+                .collect(),
+            cpu_used: SchedulerLane::ALL
+                .iter()
+                .map(|&l| (l, self.lanes[l as usize].cpu_used_us))
+                .collect(),
+            input_pressure: self.input_under_pressure(),
+            degradation: self.current_degradation(),
+            fairness: self.fairness_ratios(),
+        }
+    }
+}
+
+/// Scheduler degradation states.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SchedulerDegradation {
+    /// All lanes operating normally.
+    Healthy,
+    /// Input lane experiencing starvation (critical).
+    InputStarvation { depth: usize, deferred: u64 },
+    /// Bulk lane heavily shed, few items completing.
+    BulkStarvation { shed_count: u64, completed_count: u64 },
+    /// Control lane backlog growing.
+    ControlBacklog { depth: usize, capacity: usize },
+}
+
+impl fmt::Display for SchedulerDegradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "HEALTHY"),
+            Self::InputStarvation { depth, deferred } => {
+                write!(f, "INPUT_STARVATION depth={} deferred={}", depth, deferred)
+            }
+            Self::BulkStarvation {
+                shed_count,
+                completed_count,
+            } => write!(
+                f,
+                "BULK_STARVATION shed={} completed={}",
+                shed_count, completed_count
+            ),
+            Self::ControlBacklog { depth, capacity } => {
+                write!(f, "CONTROL_BACKLOG depth={}/{}", depth, capacity)
+            }
+        }
+    }
+}
+
+/// Structured log entry for a scheduling epoch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerLogEntry {
+    pub epoch: u64,
+    pub depths: Vec<(SchedulerLane, usize)>,
+    pub cpu_used: Vec<(SchedulerLane, f64)>,
+    pub input_pressure: bool,
+    pub degradation: SchedulerDegradation,
+    pub fairness: Vec<(SchedulerLane, f64)>,
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -7038,5 +7196,147 @@ mod tests {
         let back: SchedulingEvent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(event.item_id, back.item_id);
         assert_eq!(event.decision, back.decision);
+    }
+
+    // ── B1 Impl: CPU Budget, Fairness, Degradation ──
+
+    #[test]
+    fn test_scheduler_has_cpu_budget() {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.begin_epoch(10000.0);
+        assert!(sched.has_cpu_budget(SchedulerLane::Input));
+        assert!((sched.remaining_cpu_us(SchedulerLane::Input) - 5000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_scheduler_cpu_budget_exhaustion() {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.begin_epoch(10000.0);
+        sched.admit(LatencyStage::PtyCapture, 100.0, "x", 0, 0);
+        sched.complete(SchedulerLane::Input, 5001.0);
+        assert!(!sched.has_cpu_budget(SchedulerLane::Input));
+        assert_eq!(sched.remaining_cpu_us(SchedulerLane::Input), 0.0);
+    }
+
+    #[test]
+    fn test_scheduler_next_lane_priority() {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.begin_epoch(10000.0);
+        sched.admit(LatencyStage::StorageWrite, 100.0, "bulk", 0, 0);
+        sched.admit(LatencyStage::PtyCapture, 100.0, "input", 0, 0);
+        assert_eq!(sched.next_lane(), Some(SchedulerLane::Input));
+    }
+
+    #[test]
+    fn test_scheduler_next_lane_fallthrough() {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.begin_epoch(10000.0);
+        sched.admit(LatencyStage::StorageWrite, 100.0, "bulk", 0, 0);
+        assert_eq!(sched.next_lane(), Some(SchedulerLane::Bulk));
+    }
+
+    #[test]
+    fn test_scheduler_next_lane_empty() {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.begin_epoch(10000.0);
+        assert_eq!(sched.next_lane(), None);
+    }
+
+    #[test]
+    fn test_scheduler_fairness_ratios_no_work() {
+        let sched = LaneScheduler::with_defaults();
+        let ratios = sched.fairness_ratios();
+        assert_eq!(ratios.len(), 3);
+        for (_lane, ratio) in &ratios {
+            assert!((*ratio - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_scheduler_fairness_ratios_with_work() {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.begin_epoch(10000.0);
+        sched.admit(LatencyStage::PtyCapture, 100.0, "f1", 0, 0);
+        sched.complete(SchedulerLane::Input, 5000.0);
+        let ratios = sched.fairness_ratios();
+        let input_ratio = ratios
+            .iter()
+            .find(|(l, _)| *l == SchedulerLane::Input)
+            .unwrap()
+            .1;
+        assert!((input_ratio - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_scheduler_degradation_healthy() {
+        let sched = LaneScheduler::with_defaults();
+        assert_eq!(sched.current_degradation(), SchedulerDegradation::Healthy);
+        assert!(sched.is_healthy());
+    }
+
+    #[test]
+    fn test_scheduler_degradation_display() {
+        assert_eq!(format!("{}", SchedulerDegradation::Healthy), "HEALTHY");
+        let inp = SchedulerDegradation::InputStarvation {
+            depth: 10,
+            deferred: 50,
+        };
+        assert!(format!("{}", inp).contains("INPUT_STARVATION"));
+        let bulk = SchedulerDegradation::BulkStarvation {
+            shed_count: 100,
+            completed_count: 5,
+        };
+        assert!(format!("{}", bulk).contains("BULK_STARVATION"));
+        let ctrl = SchedulerDegradation::ControlBacklog {
+            depth: 70,
+            capacity: 128,
+        };
+        assert!(format!("{}", ctrl).contains("CONTROL_BACKLOG"));
+    }
+
+    #[test]
+    fn test_scheduler_log_entry() {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.begin_epoch(10000.0);
+        sched.admit(LatencyStage::PtyCapture, 100.0, "log", 0, 0);
+        let entry = sched.log_entry();
+        assert_eq!(entry.epoch, 1);
+        assert_eq!(entry.depths.len(), 3);
+        assert!(!entry.input_pressure);
+    }
+
+    #[test]
+    fn test_scheduler_log_entry_serde() {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.begin_epoch(10000.0);
+        let entry = sched.log_entry();
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let back: SchedulerLogEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(entry.epoch, back.epoch);
+        assert_eq!(entry.depths.len(), back.depths.len());
+    }
+
+    #[test]
+    fn test_scheduler_degradation_serde() {
+        let cases = vec![
+            SchedulerDegradation::Healthy,
+            SchedulerDegradation::InputStarvation {
+                depth: 5,
+                deferred: 20,
+            },
+            SchedulerDegradation::BulkStarvation {
+                shed_count: 50,
+                completed_count: 2,
+            },
+            SchedulerDegradation::ControlBacklog {
+                depth: 70,
+                capacity: 128,
+            },
+        ];
+        for case in cases {
+            let json = serde_json::to_string(&case).expect("serialize");
+            let back: SchedulerDegradation = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(case, back);
+        }
     }
 }
