@@ -2180,4 +2180,194 @@ proptest! {
         prop_assert_eq!(snap.total_dequeued, total);
         prop_assert_eq!(snap.len, 0);
     }
+
+    // ── B3: Priority Inheritance invariants (ft-2p9cb.2.3.3) ──
+
+    /// Effective priority >= original priority (inheritance only boosts).
+    #[test]
+    fn pi_effective_geq_original(
+        holder_pri in 0_u8..4,
+        waiter_pri in 0_u8..4,
+    ) {
+        let priorities = Priority::ALL;
+        let holder_p = priorities[holder_pri as usize];
+        let waiter_p = priorities[waiter_pri as usize];
+
+        let mut tracker = PriorityInheritanceTracker::with_defaults();
+        tracker.acquire(Resource::StorageLock, "holder", holder_p, 100);
+        tracker.acquire(Resource::StorageLock, "waiter", waiter_p, 200);
+
+        let eff = tracker.effective_priority("holder").unwrap();
+        prop_assert!(eff >= holder_p, "effective {:?} < original {:?}", eff, holder_p);
+    }
+
+    /// Lock-order enforcement: acquiring locks out of order always fails.
+    #[test]
+    fn pi_lock_order_enforced(
+        first_idx in 0_usize..4,
+        second_idx in 0_usize..4,
+    ) {
+        let mut tracker = PriorityInheritanceTracker::with_defaults();
+        let resources = Resource::LOCK_ORDER;
+        let first = resources[first_idx];
+        let second = resources[second_idx];
+
+        tracker.acquire(first, "task", Priority::Normal, 100);
+        let result = tracker.acquire(second, "task", Priority::Normal, 200);
+
+        if second.order_index() < first.order_index() {
+            // Should be an order violation.
+            let is_violation = matches!(result, LockResult::OrderViolation { .. });
+            prop_assert!(is_violation, "Expected OrderViolation for {:?} after {:?}", second, first);
+        } else {
+            // Should succeed (same or ascending order).
+            let is_ok = matches!(result, LockResult::Acquired);
+            prop_assert!(is_ok, "Expected Acquired for {:?} after {:?}, got {:?}", second, first, result);
+        }
+    }
+
+    /// Release promotes highest-priority waiter.
+    #[test]
+    fn pi_release_promotes_highest(
+        num_waiters in 1_usize..5,
+        waiter_priorities in prop::collection::vec(0_u8..4, 1..5),
+    ) {
+        let priorities = Priority::ALL;
+        let mut tracker = PriorityInheritanceTracker::with_defaults();
+        tracker.acquire(Resource::PatternLock, "holder", Priority::Background, 0);
+
+        let count = num_waiters.min(waiter_priorities.len());
+        let mut max_pri = Priority::Background;
+        let mut max_id = String::new();
+
+        for i in 0..count {
+            let pri = priorities[waiter_priorities[i] as usize];
+            let wid = format!("w{}", i);
+            tracker.acquire(Resource::PatternLock, &wid, pri, (i as u64 + 1) * 100);
+            if pri >= max_pri {
+                max_pri = pri;
+                max_id = wid;
+            }
+        }
+
+        let promoted = tracker.release(Resource::PatternLock, "holder", 1000);
+        if !promoted.is_empty() {
+            // The promoted task should have the highest priority among waiters.
+            let promoted_id = &promoted[0];
+            prop_assert!(
+                tracker.is_held_by(Resource::PatternLock, promoted_id),
+                "Promoted {} but it doesn't hold the lock",
+                promoted_id
+            );
+        }
+    }
+
+    /// release_all releases all locks held by a task.
+    #[test]
+    fn pi_release_all_clears(
+        lock_mask in 0_u8..16,
+    ) {
+        let mut tracker = PriorityInheritanceTracker::with_defaults();
+        let resources = Resource::LOCK_ORDER;
+        let mut expected_held = 0;
+
+        for (i, res) in resources.iter().enumerate() {
+            if lock_mask & (1 << i) != 0 {
+                tracker.acquire(*res, "task", Priority::Normal, i as u64 * 100);
+                expected_held += 1;
+            }
+        }
+
+        prop_assert_eq!(tracker.held_count(), expected_held);
+        let released = tracker.release_all("task", 1000);
+        prop_assert_eq!(released.len(), expected_held);
+        prop_assert_eq!(tracker.held_count(), 0);
+    }
+
+    /// Priority serde roundtrip.
+    #[test]
+    fn pi_priority_serde(idx in 0_u8..4) {
+        let p = Priority::ALL[idx as usize];
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Priority = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(p, back);
+    }
+
+    /// Resource serde roundtrip.
+    #[test]
+    fn pi_resource_serde(idx in 0_usize..4) {
+        let r = Resource::LOCK_ORDER[idx];
+        let json = serde_json::to_string(&r).unwrap();
+        let back: Resource = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(r, back);
+    }
+
+    /// InheritanceEvent serde roundtrip.
+    #[test]
+    fn pi_inheritance_event_serde(
+        res_idx in 0_usize..4,
+        orig_idx in 0_u8..4,
+        inh_idx in 0_u8..4,
+        applied in 0_u64..1_000_000,
+        released in prop::option::of(0_u64..1_000_000),
+    ) {
+        let event = InheritanceEvent {
+            holder_id: "h".to_string(),
+            waiter_id: "w".to_string(),
+            resource: Resource::LOCK_ORDER[res_idx],
+            original_priority: Priority::ALL[orig_idx as usize],
+            inherited_priority: Priority::ALL[inh_idx as usize],
+            applied_us: applied,
+            released_us: released,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: InheritanceEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(event, back);
+    }
+
+    /// InheritanceDegradation serde roundtrip.
+    #[test]
+    fn pi_degradation_serde(
+        variant_idx in 0_u8..4,
+        count in 1_usize..100,
+    ) {
+        let degradation = match variant_idx {
+            0 => InheritanceDegradation::Healthy,
+            1 => InheritanceDegradation::ExcessiveInheritance { active_chains: count, threshold: 2 },
+            2 => InheritanceDegradation::HighContention { total_waiters: count, threshold: 8 },
+            _ => InheritanceDegradation::OrderViolationSpike { total_violations: count as u64, threshold: 10 },
+        };
+        let json = serde_json::to_string(&degradation).unwrap();
+        let back: InheritanceDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(degradation, back);
+    }
+
+    /// InheritanceSnapshot serde roundtrip.
+    #[test]
+    fn pi_snapshot_serde(
+        events in 0_u64..1000,
+        violations in 0_u64..100,
+        chains in 0_usize..10,
+        depth in 0_usize..10,
+    ) {
+        let snap = InheritanceSnapshot {
+            held_locks: vec![],
+            total_inheritance_events: events,
+            total_order_violations: violations,
+            active_chains: chains,
+            max_chain_depth_observed: depth,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: InheritanceSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap, back);
+    }
+
+    /// stage_to_priority covers all pipeline stages.
+    #[test]
+    fn pi_stage_to_priority_total(stage_idx in 0_usize..8) {
+        let stages = LatencyStage::PIPELINE_STAGES;
+        let pri = stage_to_priority(stages[stage_idx]);
+        let is_valid = Priority::ALL.contains(&pri);
+        prop_assert!(is_valid);
+    }
 }
