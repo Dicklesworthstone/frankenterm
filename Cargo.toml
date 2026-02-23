@@ -395,8 +395,8 @@ fastmcp = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastm
 fastapi = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec", package = "fastapi-rust" }
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
-# Hard-pinned to the local source-of-truth repo per project policy.
-frankensearch = { git = "file:///dp/frankensearch", rev = "3ad4326fd63a3f53d0d90d48f0e5ea1c74c2a4da", package = "frankensearch", default-features = false, features = ["hybrid"] }
+# Pinned to a specific rev of the upstream GitHub repo for reproducibility.
+frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3ad4326fd63a3f53d0d90d48f0e5ea1c74c2a4da", package = "frankensearch", default-features = false, features = ["hybrid"] }
 # Agent detection (optional integration, enabled via frankenterm-core feature flag)
 franken-agent-detection = "0.1.0"
 
@@ -426,5 +426,5 @@ rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "f58
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "c7c15f630caf9bd2c6b9f39feed6212d64986dfa" }
 
-[patch."file:///dp/frankensearch"]
+[patch."https://github.com/Dicklesworthstone/frankensearch"]
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "c7c15f630caf9bd2c6b9f39feed6212d64986dfa" }
