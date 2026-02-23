@@ -1309,7 +1309,10 @@ static SQL_DESTRUCTIVE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static VAR_ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^[a-zA-Z_][a-zA-Z0-9_]*=(?:'[^']*'|"[^"]*"|\$\([^)]*\)|`[^`]*`|\\.|[^\s])*(\s+|$)"#).expect("var assign regex")
+    Regex::new(
+        r#"^[a-zA-Z_][a-zA-Z0-9_]*=(?:'[^']*'|"[^"]*"|\$\([^)]*\)|`[^`]*`|\\.|[^\s])*(\s+|$)"#,
+    )
+    .expect("var assign regex")
 });
 
 static COMMAND_RULES: &[CommandRule] = &[
@@ -1473,7 +1476,7 @@ pub fn is_command_candidate(text: &str) -> bool {
         // Prefix match for things like mkfs.ext4, docker-compose, etc.
         COMMAND_TOKENS.iter().any(|&cmd| {
             if lower.starts_with(cmd) {
-                // If it starts with the command, the next character must be non-alphanumeric 
+                // If it starts with the command, the next character must be non-alphanumeric
                 // (e.g., . in mkfs.ext4, - in docker-compose) to prevent matching "good" with "go"
                 lower[cmd.len()..].starts_with(|c: char| !c.is_alphanumeric())
             } else {

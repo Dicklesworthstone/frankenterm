@@ -19,12 +19,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::event_id::{generate_event_id_v1, RecorderMergeKey, StreamKind};
+use crate::event_id::{RecorderMergeKey, StreamKind, generate_event_id_v1};
 use crate::ingest::{CapturedSegment, CapturedSegmentKind};
 use crate::recording::{
-    captured_kind_to_segment, epoch_ms_now, EgressEvent, EgressTap, GlobalSequence, RecorderEvent,
+    EgressEvent, EgressTap, GlobalSequence, RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent,
     RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderLifecyclePhase,
-    RecorderRedactionLevel, RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RecorderRedactionLevel, RecorderTextEncoding, captured_kind_to_segment, epoch_ms_now,
 };
 
 // ---------------------------------------------------------------------------

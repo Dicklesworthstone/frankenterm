@@ -710,7 +710,9 @@ impl DegradationManager {
                         level: "degraded".to_string(),
                         reason: Some(reason.clone()),
                         since_epoch_ms: Some(*since_epoch_ms),
-                        duration_ms: Some(u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                        duration_ms: Some(
+                            u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        ),
                         recovery_attempts: *recovery_attempts,
                         affected_capabilities: affected_capabilities(*subsystem),
                     });
@@ -726,7 +728,9 @@ impl DegradationManager {
                         level: "unavailable".to_string(),
                         reason: Some(reason.clone()),
                         since_epoch_ms: Some(*since_epoch_ms),
-                        duration_ms: Some(u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                        duration_ms: Some(
+                            u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        ),
                         recovery_attempts: *recovery_attempts,
                         affected_capabilities: affected_capabilities(*subsystem),
                     });

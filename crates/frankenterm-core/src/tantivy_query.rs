@@ -300,8 +300,12 @@ impl TieBreakKey {
     pub fn from_doc(doc: &IndexDocumentFields) -> Self {
         Self {
             neg_occurred_at_ms: doc.occurred_at_ms.wrapping_neg(),
-            neg_sequence: i64::try_from(doc.sequence).unwrap_or(i64::MAX).wrapping_neg(),
-            neg_log_offset: i64::try_from(doc.log_offset).unwrap_or(i64::MAX).wrapping_neg(),
+            neg_sequence: i64::try_from(doc.sequence)
+                .unwrap_or(i64::MAX)
+                .wrapping_neg(),
+            neg_log_offset: i64::try_from(doc.log_offset)
+                .unwrap_or(i64::MAX)
+                .wrapping_neg(),
         }
     }
 }

@@ -215,10 +215,7 @@ impl BackpressureManager {
     /// Current tier (lock-free read when only an approximate value is needed).
     #[must_use]
     pub fn current_tier(&self) -> BackpressureTier {
-        *self
-            .current_tier
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
+        *self.current_tier.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Classify queue depths into a tier without applying any state change.
@@ -262,7 +259,10 @@ impl BackpressureManager {
         // Upgrades (toward Black) are immediate.
         // Downgrades require hysteresis.
         if proposed < current {
-            let entered = *self.tier_entered_at.read().unwrap_or_else(|e| e.into_inner());
+            let entered = *self
+                .tier_entered_at
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             let elapsed_ms = entered.elapsed().as_millis() as u64;
             if elapsed_ms < self.config.hysteresis_ms {
                 return None; // too soon to downgrade
@@ -271,7 +271,10 @@ impl BackpressureManager {
 
         // Apply transition.
         *self.current_tier.write().unwrap_or_else(|e| e.into_inner()) = proposed;
-        *self.tier_entered_at.write().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        *self
+            .tier_entered_at
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Instant::now();
         self.transition_count.fetch_add(1, Ordering::Relaxed);
 
         match proposed {
@@ -318,7 +321,10 @@ impl BackpressureManager {
 
     /// Resume all paused panes (e.g. on recovery to Green).
     pub fn resume_all_panes(&self) {
-        self.paused_panes.write().unwrap_or_else(|e| e.into_inner()).clear();
+        self.paused_panes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Check if a pane is currently paused.
@@ -377,7 +383,10 @@ impl BackpressureManager {
     #[must_use]
     pub fn snapshot(&self, depths: &QueueDepths) -> BackpressureSnapshot {
         let tier = self.current_tier();
-        let entered = *self.tier_entered_at.read().unwrap_or_else(|e| e.into_inner());
+        let entered = *self
+            .tier_entered_at
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let now_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)

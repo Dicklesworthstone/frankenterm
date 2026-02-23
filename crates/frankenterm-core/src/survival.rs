@@ -820,7 +820,11 @@ impl SurvivalModel {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
 
-        let params = self.params.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let params = self
+            .params
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let hazard = if self.in_warmup() {
             0.0
         } else {
@@ -892,7 +896,10 @@ impl SurvivalModel {
     /// Current model parameters.
     #[must_use]
     pub fn params(&self) -> WeibullParams {
-        self.params.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.params
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Signal shutdown.

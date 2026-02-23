@@ -451,7 +451,9 @@ impl AppendLogReader {
         if payload_len > MAX_RECORD_PAYLOAD {
             return Err(LogReadError::Deserialize {
                 byte_offset: record_start,
-                message: format!("record payload too large: {payload_len} bytes (max {MAX_RECORD_PAYLOAD})"),
+                message: format!(
+                    "record payload too large: {payload_len} bytes (max {MAX_RECORD_PAYLOAD})"
+                ),
             });
         }
         let mut payload_buf = vec![0u8; payload_len as usize];

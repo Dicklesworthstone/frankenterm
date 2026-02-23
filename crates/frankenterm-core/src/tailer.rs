@@ -2474,7 +2474,7 @@ mod tests {
         assert_eq!(supervisor.scheduler.global_bytes_remaining, 744);
     }
 
-    #[tokio::test]
+    #[test]
     fn supervisor_budget_hot_reload() {
         let config = TailerConfig::default();
         let (tx, _rx) = mpsc::channel(10);
