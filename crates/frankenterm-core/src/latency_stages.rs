@@ -1768,6 +1768,347 @@ impl BudgetEnforcer {
     }
 }
 
+// ── Instrumentation Probes ─────────────────────────────────────────
+
+/// A correlation context that propagates across async boundaries.
+///
+/// Created at the start of a pipeline run and threaded through all
+/// stages. Each stage records its start/end timestamps and the
+/// context carries accumulated timing data.
+///
+/// # AARSP Bead: ft-2p9cb.1.2
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CorrelationContext {
+    /// Unique run identifier.
+    pub run_id: String,
+    /// Correlation ID (same as run_id unless explicitly set).
+    pub correlation_id: String,
+    /// Scenario ID for deterministic replay.
+    pub scenario_id: Option<String>,
+    /// Accumulated per-stage timing entries.
+    pub timings: Vec<StageTiming>,
+    /// The next expected stage in the pipeline.
+    pub next_expected: Option<LatencyStage>,
+    /// Whether the context was propagated correctly (no gaps).
+    pub propagation_intact: bool,
+    /// Creation timestamp (epoch microseconds, provided by caller).
+    pub created_at_us: u64,
+}
+
+impl CorrelationContext {
+    /// Create a new correlation context for a pipeline run.
+    pub fn new(run_id: &str, created_at_us: u64) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            correlation_id: run_id.to_string(),
+            scenario_id: None,
+            timings: Vec::with_capacity(LatencyStage::PIPELINE_STAGES.len()),
+            next_expected: Some(LatencyStage::PIPELINE_STAGES[0]),
+            propagation_intact: true,
+            created_at_us,
+        }
+    }
+
+    /// Create with an explicit correlation ID.
+    pub fn with_correlation(run_id: &str, correlation_id: &str, created_at_us: u64) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            correlation_id: correlation_id.to_string(),
+            scenario_id: None,
+            timings: Vec::with_capacity(LatencyStage::PIPELINE_STAGES.len()),
+            next_expected: Some(LatencyStage::PIPELINE_STAGES[0]),
+            propagation_intact: true,
+            created_at_us,
+        }
+    }
+
+    /// Record the start of a stage. Returns a StageProbe for timing.
+    ///
+    /// # Propagation Check
+    /// If the stage doesn't match `next_expected`, a gap is recorded
+    /// and `propagation_intact` is set to false.
+    pub fn begin_stage(&mut self, stage: LatencyStage, start_us: u64) -> StageProbe {
+        // Check propagation integrity.
+        if let Some(expected) = self.next_expected {
+            if stage != expected {
+                self.propagation_intact = false;
+            }
+        }
+
+        StageProbe {
+            stage,
+            start_us,
+            correlation_id: self.correlation_id.clone(),
+        }
+    }
+
+    /// Record the completion of a stage.
+    ///
+    /// Computes latency and updates the correlation chain.
+    pub fn end_stage(&mut self, probe: StageProbe, end_us: u64) {
+        let latency_us = if end_us >= probe.start_us {
+            (end_us - probe.start_us) as f64
+        } else {
+            0.0 // Clock regression — treat as zero.
+        };
+
+        self.timings.push(StageTiming {
+            stage: probe.stage,
+            start_us: probe.start_us,
+            end_us,
+            latency_us,
+        });
+
+        // Advance expected stage.
+        self.next_expected = Self::next_stage_after(probe.stage);
+    }
+
+    /// Convert to a PipelineRun for the BudgetEnforcer.
+    pub fn to_pipeline_run(&self) -> PipelineRun {
+        let observations: Vec<StageObservation> = self
+            .timings
+            .iter()
+            .map(|t| StageObservation {
+                stage: t.stage,
+                latency_us: t.latency_us,
+                correlation_id: self.correlation_id.clone(),
+                scenario_id: self.scenario_id.clone(),
+                start_epoch_us: t.start_us,
+                end_epoch_us: t.end_us,
+                overflow: false, // Will be filled by enforcer.
+                reason: None,
+                mitigation: Mitigation::None,
+            })
+            .collect();
+
+        let total: f64 = observations.iter().map(|o| o.latency_us).sum();
+        PipelineRun {
+            run_id: self.run_id.clone(),
+            correlation_id: self.correlation_id.clone(),
+            scenario_id: self.scenario_id.clone(),
+            stages: observations,
+            total_latency_us: total,
+            has_overflow: false,
+            reasons: vec![],
+        }
+    }
+
+    /// Get total elapsed time from first stage start to last stage end.
+    pub fn total_elapsed_us(&self) -> u64 {
+        if self.timings.is_empty() {
+            return 0;
+        }
+        let first_start = self.timings.first().map(|t| t.start_us).unwrap_or(0);
+        let last_end = self.timings.last().map(|t| t.end_us).unwrap_or(0);
+        last_end.saturating_sub(first_start)
+    }
+
+    /// Get the number of stages recorded.
+    pub fn stage_count(&self) -> usize {
+        self.timings.len()
+    }
+
+    /// Check for missing stages in the pipeline.
+    pub fn missing_stages(&self) -> Vec<LatencyStage> {
+        let recorded: std::collections::HashSet<LatencyStage> =
+            self.timings.iter().map(|t| t.stage).collect();
+        LatencyStage::PIPELINE_STAGES
+            .iter()
+            .filter(|s| !recorded.contains(s))
+            .copied()
+            .collect()
+    }
+
+    fn next_stage_after(stage: LatencyStage) -> Option<LatencyStage> {
+        let stages = LatencyStage::PIPELINE_STAGES;
+        let pos = stages.iter().position(|&s| s == stage)?;
+        stages.get(pos + 1).copied()
+    }
+}
+
+/// A timing probe for a single stage.
+///
+/// Created by `CorrelationContext::begin_stage()`, consumed by `end_stage()`.
+/// Carries the stage identity and start timestamp.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageProbe {
+    /// Which stage is being timed.
+    pub stage: LatencyStage,
+    /// Start timestamp in epoch microseconds.
+    pub start_us: u64,
+    /// Correlation ID from the context.
+    pub correlation_id: String,
+}
+
+/// Timing data for a completed stage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageTiming {
+    pub stage: LatencyStage,
+    pub start_us: u64,
+    pub end_us: u64,
+    pub latency_us: f64,
+}
+
+/// Overhead tracker for instrumentation itself.
+///
+/// Measures how much time the instrumentation probes add to the pipeline.
+/// This is essential for proving the "bounded overhead" acceptance criterion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstrumentationOverhead {
+    /// Cumulative overhead from begin_stage/end_stage calls (microseconds).
+    pub total_overhead_us: f64,
+    /// Number of probe pairs measured.
+    pub probe_count: u64,
+    /// Mean overhead per probe pair.
+    pub mean_overhead_us: f64,
+    /// Maximum observed overhead.
+    pub max_overhead_us: f64,
+    /// Budget: maximum allowed overhead per probe pair (default 1μs).
+    pub budget_per_probe_us: f64,
+    /// Whether overhead is within budget.
+    pub within_budget: bool,
+}
+
+impl InstrumentationOverhead {
+    /// Create a new overhead tracker with default 1μs per-probe budget.
+    pub fn new() -> Self {
+        Self {
+            total_overhead_us: 0.0,
+            probe_count: 0,
+            mean_overhead_us: 0.0,
+            max_overhead_us: 0.0,
+            budget_per_probe_us: 1.0,
+            within_budget: true,
+        }
+    }
+
+    /// Record a probe's overhead.
+    pub fn record(&mut self, overhead_us: f64) {
+        self.total_overhead_us += overhead_us;
+        self.probe_count += 1;
+        self.mean_overhead_us = self.total_overhead_us / self.probe_count as f64;
+        if overhead_us > self.max_overhead_us {
+            self.max_overhead_us = overhead_us;
+        }
+        self.within_budget = self.max_overhead_us <= self.budget_per_probe_us;
+    }
+
+    /// Get the overhead as a fraction of total pipeline time.
+    pub fn overhead_fraction(&self, total_pipeline_us: f64) -> f64 {
+        if total_pipeline_us <= 0.0 {
+            return 0.0;
+        }
+        self.total_overhead_us / total_pipeline_us
+    }
+}
+
+impl Default for InstrumentationOverhead {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Extended enforcer that combines budget enforcement with correlation tracking.
+///
+/// Provides a high-level API for instrumenting pipeline runs end-to-end.
+#[derive(Debug, Clone)]
+pub struct InstrumentedEnforcer {
+    enforcer: BudgetEnforcer,
+    overhead: InstrumentationOverhead,
+    completed_runs: u64,
+    overflow_runs: u64,
+}
+
+impl InstrumentedEnforcer {
+    /// Create with default configuration.
+    pub fn new() -> Self {
+        Self {
+            enforcer: BudgetEnforcer::with_defaults(),
+            overhead: InstrumentationOverhead::new(),
+            completed_runs: 0,
+            overflow_runs: 0,
+        }
+    }
+
+    /// Create with custom configuration.
+    pub fn with_config(config: BudgetEnforcerConfig) -> Self {
+        Self {
+            enforcer: BudgetEnforcer::new(config),
+            overhead: InstrumentationOverhead::new(),
+            completed_runs: 0,
+            overflow_runs: 0,
+        }
+    }
+
+    /// Process a completed correlation context through the enforcer.
+    ///
+    /// Records each stage timing and returns per-stage results.
+    pub fn process_run(
+        &mut self,
+        ctx: &CorrelationContext,
+    ) -> Vec<ObservationResult> {
+        let mut results = Vec::with_capacity(ctx.timings.len());
+        let mut any_overflow = false;
+
+        for timing in &ctx.timings {
+            let result = self.enforcer.record(
+                timing.stage,
+                timing.latency_us,
+                &ctx.correlation_id,
+            );
+            if result.overflow {
+                any_overflow = true;
+            }
+            results.push(result);
+        }
+
+        self.completed_runs += 1;
+        if any_overflow {
+            self.overflow_runs += 1;
+        }
+
+        results
+    }
+
+    /// Record instrumentation overhead for a probe pair.
+    pub fn record_overhead(&mut self, overhead_us: f64) {
+        self.overhead.record(overhead_us);
+    }
+
+    /// Get the underlying enforcer for snapshot/diagnostics.
+    pub fn enforcer(&self) -> &BudgetEnforcer {
+        &self.enforcer
+    }
+
+    /// Get the overhead tracker.
+    pub fn overhead(&self) -> &InstrumentationOverhead {
+        &self.overhead
+    }
+
+    /// Get statistics.
+    pub fn completed_runs(&self) -> u64 {
+        self.completed_runs
+    }
+
+    pub fn overflow_runs(&self) -> u64 {
+        self.overflow_runs
+    }
+
+    /// Overflow rate as fraction of completed runs.
+    pub fn overflow_rate(&self) -> f64 {
+        if self.completed_runs == 0 {
+            return 0.0;
+        }
+        self.overflow_runs as f64 / self.completed_runs as f64
+    }
+}
+
+impl Default for InstrumentedEnforcer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2591,6 +2932,318 @@ mod tests {
         }
         let mean = window.mean().unwrap();
         assert!((mean - 5.5).abs() < 0.01);
+    }
+
+    // ── CorrelationContext ──
+
+    #[test]
+    fn test_correlation_context_new() {
+        let ctx = CorrelationContext::new("run-001", 1_000_000);
+        assert_eq!(ctx.run_id, "run-001");
+        assert_eq!(ctx.correlation_id, "run-001");
+        assert!(ctx.propagation_intact);
+        assert_eq!(ctx.next_expected, Some(LatencyStage::PtyCapture));
+        assert!(ctx.timings.is_empty());
+        assert_eq!(ctx.created_at_us, 1_000_000);
+    }
+
+    #[test]
+    fn test_correlation_context_with_correlation() {
+        let ctx = CorrelationContext::with_correlation("run-001", "corr-abc", 500);
+        assert_eq!(ctx.run_id, "run-001");
+        assert_eq!(ctx.correlation_id, "corr-abc");
+    }
+
+    #[test]
+    fn test_correlation_context_begin_end_stage() {
+        let mut ctx = CorrelationContext::new("run-001", 1000);
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, 1000);
+        assert_eq!(probe.stage, LatencyStage::PtyCapture);
+        assert_eq!(probe.start_us, 1000);
+        assert_eq!(probe.correlation_id, "run-001");
+        ctx.end_stage(probe, 1500);
+        assert_eq!(ctx.timings.len(), 1);
+        assert_eq!(ctx.timings[0].latency_us, 500.0);
+        assert_eq!(ctx.next_expected, Some(LatencyStage::DeltaExtraction));
+        assert!(ctx.propagation_intact);
+    }
+
+    #[test]
+    fn test_correlation_context_full_pipeline() {
+        let mut ctx = CorrelationContext::new("run-full", 0);
+        let mut t = 1000_u64;
+        for &stage in LatencyStage::PIPELINE_STAGES {
+            let probe = ctx.begin_stage(stage, t);
+            t += 100;
+            ctx.end_stage(probe, t);
+            t += 10; // gap
+        }
+        assert_eq!(ctx.stage_count(), 8);
+        assert!(ctx.propagation_intact);
+        assert!(ctx.missing_stages().is_empty());
+        // next_expected should be None after last stage
+        assert_eq!(ctx.next_expected, None);
+    }
+
+    #[test]
+    fn test_correlation_context_gap_detection() {
+        let mut ctx = CorrelationContext::new("run-gap", 0);
+        // Skip PtyCapture, start with DeltaExtraction
+        let probe = ctx.begin_stage(LatencyStage::DeltaExtraction, 1000);
+        ctx.end_stage(probe, 1500);
+        assert!(!ctx.propagation_intact);
+        assert_eq!(ctx.missing_stages().len(), 7); // all except DeltaExtraction
+    }
+
+    #[test]
+    fn test_correlation_context_clock_regression() {
+        let mut ctx = CorrelationContext::new("run-clock", 0);
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, 2000);
+        // End before start — should clamp to 0
+        ctx.end_stage(probe, 1000);
+        assert_eq!(ctx.timings[0].latency_us, 0.0);
+    }
+
+    #[test]
+    fn test_correlation_context_total_elapsed() {
+        let mut ctx = CorrelationContext::new("run-elapsed", 0);
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, 1000);
+        ctx.end_stage(probe, 1500);
+        let probe = ctx.begin_stage(LatencyStage::DeltaExtraction, 1600);
+        ctx.end_stage(probe, 2000);
+        assert_eq!(ctx.total_elapsed_us(), 1000); // 2000 - 1000
+    }
+
+    #[test]
+    fn test_correlation_context_total_elapsed_empty() {
+        let ctx = CorrelationContext::new("run-empty", 0);
+        assert_eq!(ctx.total_elapsed_us(), 0);
+    }
+
+    #[test]
+    fn test_correlation_context_to_pipeline_run() {
+        let mut ctx = CorrelationContext::new("run-convert", 0);
+        ctx.scenario_id = Some("test-scenario".into());
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, 1000);
+        ctx.end_stage(probe, 1500);
+        let probe = ctx.begin_stage(LatencyStage::DeltaExtraction, 1600);
+        ctx.end_stage(probe, 2100);
+
+        let run = ctx.to_pipeline_run();
+        assert_eq!(run.run_id, "run-convert");
+        assert_eq!(run.correlation_id, "run-convert");
+        assert_eq!(run.scenario_id, Some("test-scenario".into()));
+        assert_eq!(run.stages.len(), 2);
+        assert!((run.total_latency_us - 1000.0).abs() < 0.01); // 500 + 500
+        assert!(!run.has_overflow);
+    }
+
+    #[test]
+    fn test_correlation_context_serde_roundtrip() {
+        let mut ctx = CorrelationContext::new("run-serde", 1000);
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, 1000);
+        ctx.end_stage(probe, 1500);
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: CorrelationContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(ctx, back);
+    }
+
+    // ── StageProbe ──
+
+    #[test]
+    fn test_stage_probe_serde_roundtrip() {
+        let probe = StageProbe {
+            stage: LatencyStage::StorageWrite,
+            start_us: 12345,
+            correlation_id: "corr-001".into(),
+        };
+        let json = serde_json::to_string(&probe).unwrap();
+        let back: StageProbe = serde_json::from_str(&json).unwrap();
+        assert_eq!(probe, back);
+    }
+
+    // ── StageTiming ──
+
+    #[test]
+    fn test_stage_timing_serde_roundtrip() {
+        let timing = StageTiming {
+            stage: LatencyStage::PatternDetection,
+            start_us: 100,
+            end_us: 500,
+            latency_us: 400.0,
+        };
+        let json = serde_json::to_string(&timing).unwrap();
+        let back: StageTiming = serde_json::from_str(&json).unwrap();
+        assert_eq!(timing, back);
+    }
+
+    // ── InstrumentationOverhead ──
+
+    #[test]
+    fn test_overhead_new_defaults() {
+        let oh = InstrumentationOverhead::new();
+        assert_eq!(oh.probe_count, 0);
+        assert_eq!(oh.total_overhead_us, 0.0);
+        assert_eq!(oh.budget_per_probe_us, 1.0);
+        assert!(oh.within_budget);
+    }
+
+    #[test]
+    fn test_overhead_default_matches_new() {
+        let a = InstrumentationOverhead::new();
+        let b = InstrumentationOverhead::default();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_overhead_record_within_budget() {
+        let mut oh = InstrumentationOverhead::new();
+        oh.record(0.5);
+        oh.record(0.3);
+        oh.record(0.8);
+        assert_eq!(oh.probe_count, 3);
+        assert!((oh.total_overhead_us - 1.6).abs() < 1e-10);
+        assert!((oh.mean_overhead_us - 1.6 / 3.0).abs() < 1e-10);
+        assert!((oh.max_overhead_us - 0.8).abs() < 1e-10);
+        assert!(oh.within_budget);
+    }
+
+    #[test]
+    fn test_overhead_record_exceeds_budget() {
+        let mut oh = InstrumentationOverhead::new();
+        oh.record(0.5);
+        oh.record(1.5); // exceeds 1μs budget
+        assert!(!oh.within_budget);
+        assert!((oh.max_overhead_us - 1.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_overhead_fraction() {
+        let mut oh = InstrumentationOverhead::new();
+        oh.record(0.5);
+        oh.record(0.5);
+        // total_overhead = 1.0μs, pipeline = 1000μs → 0.001 = 0.1%
+        let frac = oh.overhead_fraction(1000.0);
+        assert!((frac - 0.001).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_overhead_fraction_zero_pipeline() {
+        let oh = InstrumentationOverhead::new();
+        assert_eq!(oh.overhead_fraction(0.0), 0.0);
+        assert_eq!(oh.overhead_fraction(-1.0), 0.0);
+    }
+
+    #[test]
+    fn test_overhead_serde_roundtrip() {
+        let mut oh = InstrumentationOverhead::new();
+        oh.record(0.3);
+        oh.record(0.7);
+        let json = serde_json::to_string(&oh).unwrap();
+        let back: InstrumentationOverhead = serde_json::from_str(&json).unwrap();
+        assert_eq!(oh, back);
+    }
+
+    // ── InstrumentedEnforcer ──
+
+    #[test]
+    fn test_instrumented_enforcer_new() {
+        let ie = InstrumentedEnforcer::new();
+        assert_eq!(ie.completed_runs(), 0);
+        assert_eq!(ie.overflow_runs(), 0);
+        assert_eq!(ie.overflow_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_instrumented_enforcer_default_matches_new() {
+        let a = InstrumentedEnforcer::new();
+        let b = InstrumentedEnforcer::default();
+        assert_eq!(a.completed_runs(), b.completed_runs());
+        assert_eq!(a.overflow_runs(), b.overflow_runs());
+    }
+
+    #[test]
+    fn test_instrumented_enforcer_process_nominal_run() {
+        let mut ie = InstrumentedEnforcer::new();
+        let mut ctx = CorrelationContext::new("run-nominal", 0);
+        let mut t = 1000_u64;
+        for &stage in LatencyStage::PIPELINE_STAGES {
+            let probe = ctx.begin_stage(stage, t);
+            t += 50; // 50μs per stage — well within budget
+            ctx.end_stage(probe, t);
+            t += 10;
+        }
+        let results = ie.process_run(&ctx);
+        assert_eq!(results.len(), 8);
+        assert!(results.iter().all(|r| !r.overflow));
+        assert_eq!(ie.completed_runs(), 1);
+        assert_eq!(ie.overflow_runs(), 0);
+        assert_eq!(ie.overflow_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_instrumented_enforcer_process_overflow_run() {
+        let mut ie = InstrumentedEnforcer::new();
+        let mut ctx = CorrelationContext::new("run-overflow", 0);
+        // PtyCapture within budget
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, 0);
+        ctx.end_stage(probe, 50);
+        // DeltaExtraction WAY over budget (100ms vs 1ms p999)
+        let probe = ctx.begin_stage(LatencyStage::DeltaExtraction, 100);
+        ctx.end_stage(probe, 100_100); // 100,000μs
+        let results = ie.process_run(&ctx);
+        assert!(results.iter().any(|r| r.overflow));
+        assert_eq!(ie.completed_runs(), 1);
+        assert_eq!(ie.overflow_runs(), 1);
+        assert!((ie.overflow_rate() - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_instrumented_enforcer_overhead_tracking() {
+        let mut ie = InstrumentedEnforcer::new();
+        ie.record_overhead(0.3);
+        ie.record_overhead(0.5);
+        assert_eq!(ie.overhead().probe_count, 2);
+        assert!(ie.overhead().within_budget);
+    }
+
+    #[test]
+    fn test_instrumented_enforcer_overflow_rate() {
+        let mut ie = InstrumentedEnforcer::new();
+
+        // Run 1: nominal
+        let mut ctx = CorrelationContext::new("run-1", 0);
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, 0);
+        ctx.end_stage(probe, 10);
+        ie.process_run(&ctx);
+
+        // Run 2: overflow
+        let mut ctx2 = CorrelationContext::new("run-2", 0);
+        let probe = ctx2.begin_stage(LatencyStage::PtyCapture, 0);
+        ctx2.end_stage(probe, 1_000_000); // 1s — way over any budget
+        ie.process_run(&ctx2);
+
+        assert_eq!(ie.completed_runs(), 2);
+        assert_eq!(ie.overflow_runs(), 1);
+        assert!((ie.overflow_rate() - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_instrumented_enforcer_enforcer_access() {
+        let ie = InstrumentedEnforcer::new();
+        assert!(ie.enforcer().has_stage(LatencyStage::PtyCapture));
+        assert!(!ie.enforcer().has_stage(LatencyStage::EndToEndCapture));
+    }
+
+    #[test]
+    fn test_instrumented_enforcer_with_config() {
+        let config = BudgetEnforcerConfig {
+            window_size: 50,
+            ..BudgetEnforcerConfig::default()
+        };
+        let ie = InstrumentedEnforcer::with_config(config);
+        assert_eq!(ie.completed_runs(), 0);
+        assert!(ie.enforcer().has_stage(LatencyStage::PtyCapture));
     }
 
     // ── Helper ──
