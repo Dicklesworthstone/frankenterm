@@ -6304,6 +6304,132 @@ impl IngestParser {
     pub fn buffered_bytes(&self) -> usize {
         self.buffer.len()
     }
+
+    /// Reset parser state.
+    pub fn reset(&mut self) {
+        self.buffer.clear();
+        self.total_bytes = 0;
+        self.total_lines = 0;
+        self.total_chunks = 0;
+        self.total_invalid_bytes = 0;
+        self.total_consumed = 0;
+        self.zero_copy_bytes = 0;
+    }
+
+    /// Total bytes processed.
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Total lines emitted.
+    pub fn total_lines(&self) -> u64 {
+        self.total_lines
+    }
+
+    /// Total chunks processed.
+    pub fn total_chunks(&self) -> u64 {
+        self.total_chunks
+    }
+}
+
+// AARSP Bead: ft-2p9cb.3.2.2
+
+/// Degradation signal from the ingestion parser.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IngestDegradation {
+    /// Parser is healthy.
+    Healthy,
+    /// High buffer pressure — too much data buffered.
+    HighBufferPressure {
+        buffered_bytes: usize,
+        max_line_bytes: usize,
+    },
+    /// Data corruption detected.
+    DataCorruption {
+        invalid_bytes: u64,
+        total_bytes: u64,
+    },
+    /// Low zero-copy ratio — too much data is being copied.
+    LowZeroCopy {
+        ratio: f64,
+        threshold: f64,
+    },
+}
+
+impl fmt::Display for IngestDegradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "HEALTHY"),
+            Self::HighBufferPressure {
+                buffered_bytes,
+                max_line_bytes,
+            } => write!(f, "HIGH_BUFFER({}/{})", buffered_bytes, max_line_bytes),
+            Self::DataCorruption {
+                invalid_bytes,
+                total_bytes,
+            } => write!(f, "CORRUPT({}/{})", invalid_bytes, total_bytes),
+            Self::LowZeroCopy { ratio, threshold } => {
+                write!(f, "LOW_ZC({:.1}%/thresh={:.1}%)", ratio * 100.0, threshold * 100.0)
+            }
+        }
+    }
+}
+
+/// Structured log entry for ingestion parser.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngestLogEntry {
+    /// Total bytes.
+    pub total_bytes: u64,
+    /// Total lines.
+    pub total_lines: u64,
+    /// Zero-copy ratio.
+    pub zero_copy_ratio: f64,
+    /// Buffered bytes.
+    pub buffered_bytes: usize,
+    /// Degradation signal.
+    pub degradation: IngestDegradation,
+}
+
+impl IngestParser {
+    /// Detect degradation.
+    pub fn detect_degradation(&self) -> IngestDegradation {
+        // Check buffer pressure (>75% of max line length).
+        if self.buffer.len() > self.config.max_line_bytes * 3 / 4 {
+            return IngestDegradation::HighBufferPressure {
+                buffered_bytes: self.buffer.len(),
+                max_line_bytes: self.config.max_line_bytes,
+            };
+        }
+
+        // Check data corruption (>1% invalid).
+        if self.total_bytes > 100 && self.total_invalid_bytes * 100 > self.total_bytes {
+            return IngestDegradation::DataCorruption {
+                invalid_bytes: self.total_invalid_bytes,
+                total_bytes: self.total_bytes,
+            };
+        }
+
+        // Check zero-copy ratio (< 50% after sufficient data).
+        if self.total_consumed > 1000 && self.zero_copy_ratio() < 0.5 {
+            return IngestDegradation::LowZeroCopy {
+                ratio: self.zero_copy_ratio(),
+                threshold: 0.5,
+            };
+        }
+
+        IngestDegradation::Healthy
+    }
+
+    /// Generate a structured log entry.
+    pub fn log_entry(&self) -> IngestLogEntry {
+        IngestLogEntry {
+            total_bytes: self.total_bytes,
+            total_lines: self.total_lines,
+            zero_copy_ratio: self.zero_copy_ratio(),
+            buffered_bytes: self.buffer.len(),
+            degradation: self.detect_degradation(),
+        }
+    }
 }
 
 /// Find the position of the first newline byte in a slice.
@@ -10734,5 +10860,86 @@ mod tests {
             }
         );
         assert_eq!(parser.buffered_bytes(), 7); // "partial"
+    }
+
+    // ── C2 Impl: Parser bridge methods ──
+
+    #[test]
+    fn test_ingest_parser_reset() {
+        let mut parser = IngestParser::with_defaults();
+        parser.feed(b"hello\n");
+        parser.feed(b"world");
+        assert!(parser.total_bytes() > 0);
+
+        parser.reset();
+        assert_eq!(parser.total_bytes(), 0);
+        assert_eq!(parser.total_lines(), 0);
+        assert_eq!(parser.total_chunks(), 0);
+        assert_eq!(parser.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_ingest_degradation_healthy() {
+        let parser = IngestParser::with_defaults();
+        assert_eq!(parser.detect_degradation(), IngestDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_ingest_degradation_high_buffer() {
+        let config = IngestParserConfig {
+            max_line_bytes: 20,
+            ..Default::default()
+        };
+        let mut parser = IngestParser::new(config);
+        // Feed data > 75% of max_line_bytes (15 bytes) without a newline.
+        parser.feed(b"0123456789abcdef");
+        let degradation = parser.detect_degradation();
+        let is_high = matches!(degradation, IngestDegradation::HighBufferPressure { .. });
+        assert!(is_high, "Expected HighBufferPressure, got {:?}", degradation);
+    }
+
+    #[test]
+    fn test_ingest_log_entry() {
+        let mut parser = IngestParser::with_defaults();
+        parser.feed(b"test line\n");
+        let entry = parser.log_entry();
+        assert_eq!(entry.total_lines, 1);
+        assert_eq!(entry.degradation, IngestDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_ingest_degradation_serde() {
+        let variants = vec![
+            IngestDegradation::Healthy,
+            IngestDegradation::HighBufferPressure { buffered_bytes: 100, max_line_bytes: 120 },
+            IngestDegradation::DataCorruption { invalid_bytes: 10, total_bytes: 200 },
+            IngestDegradation::LowZeroCopy { ratio: 0.3, threshold: 0.5 },
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: IngestDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[test]
+    fn test_ingest_log_entry_serde() {
+        let entry = IngestLogEntry {
+            total_bytes: 1000,
+            total_lines: 50,
+            zero_copy_ratio: 0.8,
+            buffered_bytes: 5,
+            degradation: IngestDegradation::Healthy,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: IngestLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn test_ingest_degradation_display() {
+        assert_eq!(format!("{}", IngestDegradation::Healthy), "HEALTHY");
+        let buf = IngestDegradation::HighBufferPressure { buffered_bytes: 100, max_line_bytes: 120 };
+        assert!(format!("{}", buf).contains("100/120"));
     }
 }
