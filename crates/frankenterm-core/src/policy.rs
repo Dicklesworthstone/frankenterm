@@ -1291,9 +1291,9 @@ struct CommandRule {
 }
 
 static RM_RF_ROOT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\brm\s+-rf\s+(/|~)(\s|$)").expect("rm -rf root regex"));
+    LazyLock::new(|| Regex::new(r"(?i)\brm\s+-(rf|fr)\s+(/|~)(\s|$)").expect("rm -rf root regex"));
 static RM_RF_GENERIC: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\brm\s+-rf\s+").expect("rm -rf regex"));
+    LazyLock::new(|| Regex::new(r"(?i)\brm\s+-(rf|fr)\s+").expect("rm -rf regex"));
 static GIT_RESET_HARD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bgit\s+reset\b.*\s--hard\b").expect("git reset --hard"));
 static GIT_CLEAN_FD: LazyLock<Regex> = LazyLock::new(|| {
@@ -1306,6 +1306,10 @@ static GIT_BRANCH_DELETE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bgit\s+branch\b.*\s-D\b").expect("git branch -D"));
 static SQL_DESTRUCTIVE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(drop\s+database|drop\s+table|truncate\s+table)\b").expect("sql destructive")
+});
+
+static VAR_ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^[a-zA-Z_][a-zA-Z0-9_]*=(?:'[^']*'|"[^"]*"|\$\([^)]*\)|`[^`]*`|\\.|[^\s])*(\s+|$)"#).expect("var assign regex")
 });
 
 static COMMAND_RULES: &[CommandRule] = &[
@@ -1441,9 +1445,19 @@ pub fn is_command_candidate(text: &str) -> bool {
         break;
     }
 
+    // Strip leading variable assignments (e.g. FOO=bar, FOO="a b")
+    while let Some(mat) = VAR_ASSIGN.find(trimmed) {
+        trimmed = &trimmed[mat.end()..];
+    }
+
+    if trimmed.is_empty() {
+        return false;
+    }
+
     // Helper to check if a token matches any known command, handling paths
     let is_match = |token: &str| {
-        let lower = token.to_ascii_lowercase();
+        let clean_token = token.replace('"', "").replace('\'', "");
+        let lower = clean_token.to_ascii_lowercase();
 
         // Always treat path-like tokens as candidates (e.g. ./script.sh, /bin/destroy)
         // We defer to DCG to determine if the script/binary is actually dangerous.
@@ -1452,38 +1466,27 @@ pub fn is_command_candidate(text: &str) -> bool {
         }
 
         // For bare commands, check the known token list
-        COMMAND_TOKENS.contains(&lower.as_str())
+        if COMMAND_TOKENS.contains(&lower.as_str()) {
+            return true;
+        }
+
+        // Prefix match for things like mkfs.ext4, docker-compose, etc.
+        COMMAND_TOKENS.iter().any(|&cmd| {
+            if lower.starts_with(cmd) {
+                // If it starts with the command, the next character must be non-alphanumeric 
+                // (e.g., . in mkfs.ext4, - in docker-compose) to prevent matching "good" with "go"
+                lower[cmd.len()..].starts_with(|c: char| !c.is_alphanumeric())
+            } else {
+                false
+            }
+        })
     };
 
     let mut parts = trimmed.split_whitespace();
-    let mut token = parts.next().unwrap_or("");
-
-    // Skip variable assignments (VAR=val) to find the command.
-    // We stop if the token looks like a path (contains / or \ before =),
-    // because that implies it's a command (e.g. ./foo=bar), not an assignment.
-    while let Some(eq_pos) = token.find('=') {
-        // If the part before '=' contains a path separator, it's a command, not an assignment.
-        if token[..eq_pos].contains('/') || token[..eq_pos].contains('\\') {
-            break;
-        }
-
-        if let Some(next) = parts.next() {
-            token = next;
-        } else {
-            break;
-        }
-    }
+    let token = parts.next().unwrap_or("");
 
     if is_match(token) {
         return true;
-    }
-
-    if token.eq_ignore_ascii_case("sudo") {
-        if let Some(next) = parts.next() {
-            if is_match(next) {
-                return true;
-            }
-        }
     }
 
     trimmed.contains("&&")
@@ -1491,6 +1494,8 @@ pub fn is_command_candidate(text: &str) -> bool {
         || trimmed.contains('|')
         || trimmed.contains('>')
         || trimmed.contains(';')
+        || trimmed.contains("$(")
+        || trimmed.contains('`')
 }
 
 #[derive(Debug)]
@@ -1565,7 +1570,6 @@ where
                     if !matches!(worst_outcome, Some(CommandGateOutcome::Deny { .. })) {
                         worst_outcome = Some(result);
                     }
-                    continue;
                 }
                 CommandGateOutcome::Allow => {}
             }

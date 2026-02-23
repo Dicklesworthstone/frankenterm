@@ -339,7 +339,7 @@ impl CaptureScheduler {
 
         let effective_limit = available_permits.min(budget_limit);
         if effective_limit == 0 {
-            if !ready_panes.is_empty() && self.budget.max_captures_per_sec > 0 {
+            if !ready_panes.is_empty() && budget_limit == 0 {
                 self.metrics.global_rate_limited += 1;
                 self.metrics.throttle_events += 1;
             }
@@ -352,8 +352,12 @@ impl CaptureScheduler {
         let split_idx = ready_panes.partition_point(|&(_, prio)| prio <= 50);
         let (high_prio, low_prio) = ready_panes.split_at(split_idx);
 
-        // Reserve 20% for low priority to prevent starvation
-        let target_low_count = (effective_limit * 2) / 10; // 20%
+        // Reserve 20% for low priority to prevent starvation (at least 1 if limit >= 2)
+        let target_low_count = if effective_limit >= 2 {
+            1.max((effective_limit * 2) / 10)
+        } else {
+            0
+        };
 
         // Calculate allocations allowing spillover
         let guaranteed_low = low_prio.len().min(target_low_count);
@@ -764,6 +768,23 @@ where
                 .get(&pane_id)
                 .is_some_and(|t| t.overflow_gap_pending);
 
+            // Attempt to synchronously acquire a permit. This prevents queueing up tasks
+            // in the task_set faster than the semaphore allows, keeping `available_permits()`
+            // perfectly accurate for the next `spawn_ready` call.
+            let permit = match self.semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    // This is unexpected since we bound `selected` by `available`, but if it happens,
+                    // just record backpressure.
+                    if let Some(tailer) = self.tailers.get_mut(&pane_id) {
+                        tailer.record_poll(false, &self.config);
+                        tailer.consecutive_backpressure += 1;
+                        self.metrics.send_timeouts += 1;
+                    }
+                    continue;
+                }
+            };
+
             // Mark as capturing to prevent duplicate spawns
             self.capturing_panes.insert(pane_id);
 
@@ -774,15 +795,12 @@ where
             let capture_circuit_breaker = Arc::clone(&self.capture_circuit_breaker);
             let egress_tap = self.egress_tap.clone();
             let global_sequence = Arc::clone(&self.global_sequence);
-            let semaphore = Arc::clone(&self.semaphore);
             let overlap_size = self.config.overlap_size;
             let send_timeout = self.config.send_timeout;
             let capture_timeout = self.config.capture_timeout;
 
             task_set.spawn_poll_task(async move {
-                let Ok(_permit) = semaphore.acquire_owned().await else {
-                    return (pane_id, PollOutcome::Backpressure);
-                };
+                let _permit = permit; // Hold permit for the duration of the task
 
                 let has_cursor = {
                     let cursors = cursors.read().await;
@@ -1778,20 +1796,17 @@ mod tests {
             supervisor.capturing_panes.insert(1);
             supervisor.handle_poll_result(1, PollOutcome::Backpressure);
         }
-
-        let tailer = supervisor.tailers.get(&1).unwrap();
         assert_eq!(
-            tailer.consecutive_backpressure,
+            supervisor.tailers.get(&1).unwrap().consecutive_backpressure,
             OVERFLOW_BACKPRESSURE_THRESHOLD - 1
         );
-        assert!(!tailer.overflow_gap_pending);
+        assert!(!supervisor.tailers.get(&1).unwrap().overflow_gap_pending);
 
         // One more should trigger overflow
         supervisor.capturing_panes.insert(1);
         supervisor.handle_poll_result(1, PollOutcome::Backpressure);
 
-        let tailer = supervisor.tailers.get(&1).unwrap();
-        assert!(tailer.overflow_gap_pending);
+        assert!(supervisor.tailers.get(&1).unwrap().overflow_gap_pending);
     }
 
     #[test]
@@ -2460,7 +2475,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervisor_budget_hot_reload() {
+    fn supervisor_budget_hot_reload() {
         let config = TailerConfig::default();
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
@@ -2992,6 +3007,7 @@ mod tests {
         supervisor.handle_poll_result(1, PollOutcome::ChannelClosed);
 
         assert_eq!(supervisor.metrics().events_sent, 0);
+        assert_eq!(supervisor.metrics().send_timeouts, 0);
         assert!(!supervisor.capturing_panes.contains(&1));
     }
 

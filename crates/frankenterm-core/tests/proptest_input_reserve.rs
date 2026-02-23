@@ -115,10 +115,8 @@ proptest! {
         items in proptest::collection::vec(arb_work_item(0..500), 1..100),
     ) {
         let mut q = S3FifoQueue::new(config);
-        let mut total_shed = 0u64;
         for item in &items {
-            let shed = q.admit(item.clone(), BackpressureTier::Green, 0.0, 1000);
-            total_shed += shed.len() as u64;
+            let _shed = q.admit(item.clone(), BackpressureTier::Green, 0.0, 1000);
         }
         let stats = q.stats();
         // admitted == items in queue + evicted + promoted_that_were_evicted

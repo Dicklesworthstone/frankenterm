@@ -48,17 +48,24 @@ impl ToolHandler for WaRulesListTool {
             }
         };
 
-        let agent_filter: Option<AgentType> =
-            params
-                .agent_type
-                .as_ref()
-                .and_then(|s| match s.to_lowercase().as_str() {
-                    "codex" => Some(AgentType::Codex),
-                    "claude_code" => Some(AgentType::ClaudeCode),
-                    "gemini" => Some(AgentType::Gemini),
-                    "wezterm" => Some(AgentType::Wezterm),
-                    _ => None,
-                });
+        let agent_filter: Option<AgentType> = match params.agent_type.as_ref() {
+            Some(s) => match s.to_lowercase().as_str() {
+                "codex" => Some(AgentType::Codex),
+                "claude_code" => Some(AgentType::ClaudeCode),
+                "gemini" => Some(AgentType::Gemini),
+                "wezterm" => Some(AgentType::Wezterm),
+                _ => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Unknown agent_type: {s}"),
+                        Some("Valid types: codex, claude_code, gemini, wezterm".to_string()),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            },
+            None => None,
+        };
 
         let engine = PatternEngine::new();
         let rules = engine.rules();
