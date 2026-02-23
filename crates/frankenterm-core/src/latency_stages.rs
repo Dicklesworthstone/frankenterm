@@ -4608,6 +4608,61 @@ impl InputRing {
             self.total_dropped,
         )
     }
+
+    /// Batch dequeue up to `max` items. Returns items in FIFO order.
+    pub fn drain(&mut self, max: usize, now_us: u64) -> Vec<InputRingItem> {
+        let count = max.min(self.len);
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(item) = self.dequeue(now_us) {
+                items.push(item);
+            } else {
+                break;
+            }
+        }
+        items
+    }
+
+    /// Dequeue items that have passed their deadline.
+    /// Expired items are returned so the caller can handle them (e.g., log, escalate).
+    pub fn drain_expired(&mut self, now_us: u64) -> Vec<InputRingItem> {
+        let mut expired = Vec::new();
+        let mut remaining = Vec::new();
+
+        // Drain all items, separate expired from still-valid.
+        let all = self.drain(self.len, now_us);
+        for item in all {
+            if item.deadline_us > 0 && now_us > item.deadline_us {
+                expired.push(item);
+            } else {
+                remaining.push(item);
+            }
+        }
+
+        // Re-enqueue non-expired items.
+        for item in remaining {
+            // Direct re-insert (bypass normal enqueue to preserve seq numbers).
+            if self.len < self.config.capacity {
+                self.buffer[self.tail] = Some(item);
+                self.tail = (self.tail + 1) % self.config.capacity;
+                self.len += 1;
+                // Adjust counters to compensate for the drain+re-enqueue.
+                self.total_dequeued -= 1;
+            }
+        }
+
+        expired
+    }
+
+    /// Utilization fraction (0.0 to 1.0).
+    pub fn utilization(&self) -> f64 {
+        self.len as f64 / self.config.capacity as f64
+    }
+
+    /// Capacity of the ring.
+    pub fn capacity(&self) -> usize {
+        self.config.capacity
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -7764,5 +7819,73 @@ mod tests {
         let back: InputRingItem = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(item.seq, back.seq);
         assert_eq!(item.stage, back.stage);
+    }
+
+    // ── B2 Impl: Drain, Expiry, Utilization ──
+
+    #[test]
+    fn test_input_ring_drain() {
+        let mut ring = InputRing::with_defaults();
+        for i in 0..10 {
+            ring.enqueue(LatencyStage::PtyCapture, 10.0, &format!("d-{}", i), i * 100, 0)
+                .unwrap();
+        }
+        let items = ring.drain(5, 2000);
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[0].seq, 1);
+        assert_eq!(items[4].seq, 5);
+        assert_eq!(ring.len(), 5);
+    }
+
+    #[test]
+    fn test_input_ring_drain_more_than_available() {
+        let mut ring = InputRing::with_defaults();
+        for i in 0..3 {
+            ring.enqueue(LatencyStage::PtyCapture, 10.0, &format!("dm-{}", i), 0, 0)
+                .unwrap();
+        }
+        let items = ring.drain(100, 1000);
+        assert_eq!(items.len(), 3);
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn test_input_ring_drain_expired() {
+        let mut ring = InputRing::with_defaults();
+        // Item with deadline=500, item with deadline=2000, item with no deadline.
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "exp", 100, 500).unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "ok", 200, 2000).unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "nodeadline", 300, 0).unwrap();
+
+        let expired = ring.drain_expired(1000);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].correlation_id, "exp");
+        // Remaining ring should have 2 items.
+        assert_eq!(ring.len(), 2);
+    }
+
+    #[test]
+    fn test_input_ring_utilization() {
+        let cfg = InputRingConfig {
+            capacity: 10,
+            ..Default::default()
+        };
+        let mut ring = InputRing::new(cfg);
+        assert!((ring.utilization() - 0.0).abs() < 1e-6);
+        for i in 0..5 {
+            ring.enqueue(LatencyStage::PtyCapture, 10.0, &format!("u-{}", i), 0, 0)
+                .unwrap();
+        }
+        assert!((ring.utilization() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_input_ring_capacity() {
+        let cfg = InputRingConfig {
+            capacity: 42,
+            ..Default::default()
+        };
+        let ring = InputRing::new(cfg);
+        assert_eq!(ring.capacity(), 42);
     }
 }
