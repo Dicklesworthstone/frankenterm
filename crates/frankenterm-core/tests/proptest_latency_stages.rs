@@ -438,3 +438,173 @@ proptest! {
         prop_assert!(agg.is_finite());
     }
 }
+
+// ── BudgetEnforcer Property Tests ───────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// Recording within-budget observations never produces overflow.
+    #[test]
+    fn enforcer_no_overflow_within_budget(
+        stage in arb_stage(),
+    ) {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        // Use 1μs — guaranteed within any budget.
+        let result = enforcer.record(stage, 1.0, "test");
+        prop_assert!(!result.overflow);
+        prop_assert_eq!(result.recommended_mitigation, Mitigation::None);
+    }
+
+    /// Recording way above p999 always produces overflow.
+    #[test]
+    fn enforcer_always_overflow_above_p999(
+        stage in arb_stage(),
+    ) {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        if let Some(budget) = enforcer.stage_budget(stage).copied() {
+            let above = budget.p999_us * 2.0;
+            let result = enforcer.record(stage, above, "test");
+            prop_assert!(result.overflow, "should overflow at {}μs (p999={}μs)", above, budget.p999_us);
+        }
+    }
+
+    /// Total observations equals sum of records.
+    #[test]
+    fn enforcer_observation_count_consistent(
+        records in prop::collection::vec(
+            (arb_stage(), 1.0..100_000.0_f64),
+            1..=50,
+        ),
+    ) {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        for (stage, latency) in &records {
+            enforcer.record(*stage, *latency, "test");
+        }
+        prop_assert_eq!(enforcer.total_observations(), records.len() as u64);
+    }
+
+    /// Overflow count ≤ observation count.
+    #[test]
+    fn enforcer_overflow_bounded(
+        records in prop::collection::vec(
+            (arb_stage(), 1.0..1_000_000.0_f64),
+            1..=50,
+        ),
+    ) {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        for (stage, latency) in &records {
+            enforcer.record(*stage, *latency, "test");
+        }
+        prop_assert!(enforcer.total_overflows() <= enforcer.total_observations());
+    }
+
+    /// Snapshot stages match pipeline stages.
+    #[test]
+    fn enforcer_snapshot_coverage(
+        stage in arb_stage(),
+    ) {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        enforcer.record(stage, 100.0, "test");
+        let snap = enforcer.snapshot();
+        prop_assert_eq!(snap.stages.len(), LatencyStage::PIPELINE_STAGES.len());
+    }
+
+    /// EnforcerSnapshot survives JSON roundtrip.
+    #[test]
+    fn enforcer_snapshot_serde(
+        records in prop::collection::vec(
+            (arb_stage(), 1.0..10_000.0_f64),
+            1..=20,
+        ),
+    ) {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        for (stage, latency) in &records {
+            enforcer.record(*stage, *latency, "test");
+        }
+        let snap = enforcer.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: EnforcerSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap.total_observations, back.total_observations);
+        prop_assert_eq!(snap.total_overflows, back.total_overflows);
+        prop_assert_eq!(snap.stages.len(), back.stages.len());
+    }
+
+    /// Log entries only generated when configured.
+    #[test]
+    fn enforcer_log_overflow_only(
+        latency in 1.0..500.0_f64,
+    ) {
+        let config = BudgetEnforcerConfig {
+            log_overflows_only: true,
+            log_all_observations: false,
+            ..BudgetEnforcerConfig::default()
+        };
+        let mut enforcer = BudgetEnforcer::new(config);
+        // DeltaExtraction p50 = 200μs, so ≤200 should be within budget.
+        enforcer.record(LatencyStage::DeltaExtraction, latency.min(150.0), "test");
+        prop_assert_eq!(enforcer.log_count(), 0, "within-budget should not log");
+    }
+
+    /// Mitigation severity increases with percentile tier.
+    #[test]
+    fn enforcer_mitigation_monotonic_severity(
+        stage in arb_stage(),
+    ) {
+        let enforcer = BudgetEnforcer::with_defaults();
+        let m_p50 = enforcer.mitigation_for(stage, Percentile::P50);
+        let m_p95 = enforcer.mitigation_for(stage, Percentile::P95);
+        let m_p99 = enforcer.mitigation_for(stage, Percentile::P99);
+        let m_p999 = enforcer.mitigation_for(stage, Percentile::P999);
+
+        fn severity(m: Mitigation) -> u8 {
+            match m {
+                Mitigation::None => 0,
+                Mitigation::Defer => 1,
+                Mitigation::Degrade => 2,
+                Mitigation::Shed => 3,
+                Mitigation::Skip => 4,
+            }
+        }
+
+        // p50 is always None, and severity should be non-decreasing.
+        prop_assert_eq!(m_p50, Mitigation::None);
+        prop_assert!(severity(m_p95) <= severity(m_p99),
+            "p95 mitigation ({:?}) more severe than p99 ({:?}) for {}", m_p95, m_p99, stage);
+        prop_assert!(severity(m_p99) <= severity(m_p999),
+            "p99 mitigation ({:?}) more severe than p999 ({:?}) for {}", m_p99, m_p999, stage);
+    }
+
+    /// Build_run total equals sum of observations.
+    #[test]
+    fn enforcer_build_run_total_consistent(
+        latencies in prop::collection::vec(100.0..50_000.0_f64, 1..=8),
+    ) {
+        let enforcer = BudgetEnforcer::with_defaults();
+        let mut t = 1_000_000_u64;
+        let observations: Vec<StageObservation> = LatencyStage::PIPELINE_STAGES
+            .iter()
+            .take(latencies.len())
+            .zip(latencies.iter())
+            .map(|(&stage, &lat)| {
+                let obs = StageObservation {
+                    stage,
+                    latency_us: lat,
+                    correlation_id: "test".into(),
+                    scenario_id: None,
+                    start_epoch_us: t,
+                    end_epoch_us: t + lat as u64,
+                    overflow: false,
+                    reason: None,
+                    mitigation: Mitigation::None,
+                };
+                t += lat as u64 + 100;
+                obs
+            })
+            .collect();
+
+        let expected_total: f64 = observations.iter().map(|o| o.latency_us).sum();
+        let run = enforcer.build_run("r1", "c1", observations);
+        prop_assert!((run.total_latency_us - expected_total).abs() < 1e-6);
+    }
+}
