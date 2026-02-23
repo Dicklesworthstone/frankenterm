@@ -58,6 +58,7 @@ pub mod approval;
 pub mod ars_secret_scan;
 pub mod ars_symbolic_exec;
 pub mod ars_generalize;
+pub mod ars_timeout;
 pub mod auto_tune;
 pub mod backpressure;
 pub mod backpressure_severity;
