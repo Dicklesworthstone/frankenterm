@@ -1241,4 +1241,412 @@ proptest! {
         prop_assert_eq!(snap.observation_count, back.observation_count);
         prop_assert_eq!(snap.fully_recovered, back.fully_recovered);
     }
+
+    // ── A4: Adaptive Budget Allocator ──
+
+    /// StagePressure compute invariants.
+    #[test]
+    fn stage_pressure_headroom_sign(
+        observed in 0.001_f64..100_000.0,
+        budget in 0.001_f64..100_000.0,
+    ) {
+        let p = StagePressure::compute(LatencyStage::PtyCapture, observed, budget);
+        if observed < budget {
+            prop_assert!(p.headroom > 0.0);
+            prop_assert!(!p.is_over_budget());
+            prop_assert!(p.donatable_slack_us() > 0.0);
+            prop_assert!(p.deficit_us() == 0.0);
+        } else if observed > budget {
+            prop_assert!(p.headroom < 0.0);
+            prop_assert!(p.is_over_budget());
+            prop_assert!(p.donatable_slack_us() == 0.0);
+            prop_assert!(p.deficit_us() > 0.0);
+        }
+    }
+
+    /// StagePressure serde roundtrip.
+    #[test]
+    fn stage_pressure_serde_roundtrip(
+        stage in arb_stage(),
+        observed in 0.001_f64..100_000.0,
+        budget in 0.001_f64..100_000.0,
+    ) {
+        let p = StagePressure::compute(stage, observed, budget);
+        let json = serde_json::to_string(&p).unwrap();
+        let back: StagePressure = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(p.stage, back.stage);
+        prop_assert!((p.headroom - back.headroom).abs() < 1e-10);
+        prop_assert!((p.observed_p95_us - back.observed_p95_us).abs() < 1e-10);
+        prop_assert!((p.budget_p95_us - back.budget_p95_us).abs() < 1e-10);
+    }
+
+    /// AdaptiveAllocatorConfig validation: default is always valid.
+    #[test]
+    fn allocator_config_default_valid(_dummy in 0..1_u8) {
+        let cfg = AdaptiveAllocatorConfig::default();
+        let errors = cfg.validate();
+        prop_assert!(errors.is_empty());
+    }
+
+    /// AdaptiveAllocator conservation: sum of lane budgets = constant after allocation.
+    #[test]
+    fn allocator_conservation_invariant(
+        epochs in 1_usize..50,
+        pressure_factor in 0.5_f64..3.0,
+        stressed_idx in 0_usize..8,
+    ) {
+        let cfg = AdaptiveAllocatorConfig {
+            warmup_observations: 0,
+            min_donor_headroom: 0.05,
+            ..Default::default()
+        };
+        let mut alloc = AdaptiveAllocator::new(&default_budgets(), cfg);
+        let total = alloc.total_budget_us();
+
+        for _e in 0..epochs {
+            let pressures: Vec<StagePressure> = alloc
+                .lanes()
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let factor = if i == stressed_idx % alloc.lanes().len() {
+                        pressure_factor
+                    } else {
+                        0.3
+                    };
+                    StagePressure::compute(l.stage, l.current_p95_us * factor, l.current_p95_us)
+                })
+                .collect();
+            alloc.allocate(&pressures, "conservation-test");
+        }
+
+        let sum: f64 = alloc.lanes().iter().map(|l| l.current_p95_us).sum();
+        // Allow up to 1us drift from float accumulation.
+        prop_assert!(
+            (sum - total).abs() < 1.0,
+            "conservation violated: sum={} total={}",
+            sum, total
+        );
+    }
+
+    /// AdaptiveAllocator floor invariant: no lane drops below min_budget_pct.
+    #[test]
+    fn allocator_floor_invariant(
+        epochs in 1_usize..30,
+        min_pct in 0.3_f64..0.9,
+    ) {
+        let cfg = AdaptiveAllocatorConfig {
+            warmup_observations: 0,
+            min_budget_pct: min_pct,
+            max_adjustment_pct: 0.20,
+            min_donor_headroom: 0.05,
+            ..Default::default()
+        };
+        let mut alloc = AdaptiveAllocator::new(&default_budgets(), cfg);
+
+        // All donating to ApiResponse.
+        for _e in 0..epochs {
+            let pressures: Vec<StagePressure> = alloc
+                .lanes()
+                .iter()
+                .map(|l| {
+                    if l.stage == LatencyStage::ApiResponse {
+                        StagePressure::compute(l.stage, l.current_p95_us * 3.0, l.current_p95_us)
+                    } else {
+                        StagePressure::compute(l.stage, l.current_p95_us * 0.1, l.current_p95_us)
+                    }
+                })
+                .collect();
+            alloc.allocate(&pressures, "floor-test");
+        }
+
+        for lane in alloc.lanes() {
+            let floor = lane.default_p95_us * min_pct;
+            prop_assert!(
+                lane.current_p95_us >= floor - 1e-6,
+                "{} below floor: {} < {}",
+                lane.stage, lane.current_p95_us, floor
+            );
+        }
+    }
+
+    /// AdaptiveAllocator ceiling invariant: no lane exceeds max_budget_pct.
+    #[test]
+    fn allocator_ceiling_invariant(
+        epochs in 1_usize..30,
+        max_pct in 1.5_f64..5.0,
+    ) {
+        let cfg = AdaptiveAllocatorConfig {
+            warmup_observations: 0,
+            max_budget_pct: max_pct,
+            max_adjustment_pct: 0.20,
+            min_donor_headroom: 0.05,
+            ..Default::default()
+        };
+        let mut alloc = AdaptiveAllocator::new(&default_budgets(), cfg);
+
+        for _e in 0..epochs {
+            let pressures: Vec<StagePressure> = alloc
+                .lanes()
+                .iter()
+                .map(|l| {
+                    if l.stage == LatencyStage::PtyCapture {
+                        StagePressure::compute(l.stage, l.current_p95_us * 5.0, l.current_p95_us)
+                    } else {
+                        StagePressure::compute(l.stage, l.current_p95_us * 0.1, l.current_p95_us)
+                    }
+                })
+                .collect();
+            alloc.allocate(&pressures, "ceiling-test");
+        }
+
+        for lane in alloc.lanes() {
+            let ceiling = lane.default_p95_us * max_pct;
+            prop_assert!(
+                lane.current_p95_us <= ceiling + 1e-6,
+                "{} above ceiling: {} > {}",
+                lane.stage, lane.current_p95_us, ceiling
+            );
+        }
+    }
+
+    /// AdaptiveAllocator determinism: same input → same output.
+    #[test]
+    fn allocator_deterministic_replay(
+        epochs in 1_usize..20,
+        factor in 0.5_f64..3.0,
+    ) {
+        let cfg = AdaptiveAllocatorConfig {
+            warmup_observations: 0,
+            min_donor_headroom: 0.05,
+            ..Default::default()
+        };
+        let budgets = default_budgets();
+
+        // Build pressure sequence from a fresh allocator.
+        let mut alloc_ref = AdaptiveAllocator::new(&budgets, cfg.clone());
+        let mut pressure_seq = Vec::new();
+        for _e in 0..epochs {
+            let pressures: Vec<StagePressure> = alloc_ref
+                .lanes()
+                .iter()
+                .map(|l| {
+                    if l.stage == LatencyStage::StorageWrite {
+                        StagePressure::compute(l.stage, l.current_p95_us * factor, l.current_p95_us)
+                    } else {
+                        StagePressure::compute(l.stage, l.current_p95_us * 0.5, l.current_p95_us)
+                    }
+                })
+                .collect();
+            pressure_seq.push(pressures.clone());
+            alloc_ref.allocate(&pressures, "det-ref");
+        }
+
+        // Replay on second allocator.
+        let mut alloc2 = AdaptiveAllocator::new(&budgets, cfg);
+        for pressures in &pressure_seq {
+            alloc2.allocate(pressures, "det-ref");
+        }
+
+        for (l1, l2) in alloc_ref.lanes().iter().zip(alloc2.lanes().iter()) {
+            prop_assert!(
+                (l1.current_p95_us - l2.current_p95_us).abs() < 1e-6,
+                "replay diverged for {}: {} vs {}",
+                l1.stage, l1.current_p95_us, l2.current_p95_us
+            );
+        }
+    }
+
+    /// AdaptiveAllocator reset restores exact defaults.
+    #[test]
+    fn allocator_reset_restores(
+        epochs in 1_usize..10,
+    ) {
+        let cfg = AdaptiveAllocatorConfig {
+            warmup_observations: 0,
+            min_donor_headroom: 0.05,
+            ..Default::default()
+        };
+        let mut alloc = AdaptiveAllocator::new(&default_budgets(), cfg);
+
+        for _e in 0..epochs {
+            let pressures: Vec<StagePressure> = alloc
+                .lanes()
+                .iter()
+                .map(|l| StagePressure::compute(l.stage, l.current_p95_us * 1.5, l.current_p95_us))
+                .collect();
+            alloc.allocate(&pressures, "pre-reset");
+        }
+
+        alloc.reset();
+
+        for lane in alloc.lanes() {
+            prop_assert!(
+                (lane.current_p95_us - lane.default_p95_us).abs() < 1e-6,
+                "{} not reset: {} vs {}",
+                lane.stage, lane.current_p95_us, lane.default_p95_us
+            );
+        }
+    }
+
+    /// AllocationDecision serde roundtrip.
+    #[test]
+    fn allocation_decision_serde_roundtrip(
+        epoch in 1_u64..1000,
+        donor_count in 0_usize..5,
+        receiver_count in 0_usize..5,
+    ) {
+        let d = AllocationDecision {
+            epoch,
+            correlation_id: format!("prop-{}", epoch),
+            adjustments: Vec::new(),
+            slack_pool_before_us: 0.0,
+            slack_pool_after_us: 0.0,
+            warmup: false,
+            reason: AllocationReason::SlackRedistributed { donor_count, receiver_count },
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: AllocationDecision = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(d.epoch, back.epoch);
+        prop_assert_eq!(d.reason, back.reason);
+    }
+
+    /// AllocatorSnapshot serde roundtrip.
+    #[test]
+    fn allocator_snapshot_serde_roundtrip(
+        epochs in 0_usize..5,
+    ) {
+        let cfg = AdaptiveAllocatorConfig {
+            warmup_observations: 0,
+            min_donor_headroom: 0.05,
+            ..Default::default()
+        };
+        let mut alloc = AdaptiveAllocator::new(&default_budgets(), cfg);
+        for _e in 0..epochs {
+            let pressures: Vec<StagePressure> = alloc
+                .lanes()
+                .iter()
+                .map(|l| StagePressure::compute(l.stage, l.current_p95_us * 0.8, l.current_p95_us))
+                .collect();
+            alloc.allocate(&pressures, "snap-serde");
+        }
+        let snap = alloc.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: AllocatorSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap.epoch, back.epoch);
+        prop_assert_eq!(snap.lanes.len(), back.lanes.len());
+        prop_assert!((snap.total_budget_us - back.total_budget_us).abs() < 1e-6);
+    }
+
+    /// AllocatorDegradation serde roundtrip.
+    #[test]
+    fn allocator_degradation_serde_roundtrip(
+        variant_idx in 0_usize..4,
+        count in 1_usize..20,
+    ) {
+        let degradation = match variant_idx {
+            0 => AllocatorDegradation::Healthy,
+            1 => AllocatorDegradation::Oscillating { lane_count: count },
+            2 => AllocatorDegradation::ConservationDrift { drift_us: count as f64 * 0.1 },
+            _ => AllocatorDegradation::FloorSaturation { lane_count: count },
+        };
+        let json = serde_json::to_string(&degradation).unwrap();
+        let back: AllocatorDegradation = serde_json::from_str(&json).unwrap();
+        match (&degradation, &back) {
+            (AllocatorDegradation::ConservationDrift { drift_us: a },
+             AllocatorDegradation::ConservationDrift { drift_us: b }) => {
+                prop_assert!((a - b).abs() < 1e-10);
+            }
+            _ => prop_assert_eq!(degradation, back),
+        }
+    }
+
+    /// AllocationLogEntry serde roundtrip.
+    #[test]
+    fn allocation_log_entry_serde(
+        epoch in 1_u64..1000,
+        donated in 0.0_f64..10000.0,
+        received in 0.0_f64..10000.0,
+    ) {
+        let entry = AllocationLogEntry {
+            epoch,
+            correlation_id: format!("log-{}", epoch),
+            reason: "SLACK_REDISTRIBUTED donors=2 receivers=1".into(),
+            adjustment_count: 3,
+            total_donated_us: donated,
+            total_received_us: received,
+            conservation_error_us: 0.001,
+            degradation: AllocatorDegradation::Healthy,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: AllocationLogEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(entry.epoch, back.epoch);
+        prop_assert!((entry.total_donated_us - back.total_donated_us).abs() < 1e-10);
+        prop_assert!((entry.total_received_us - back.total_received_us).abs() < 1e-10);
+    }
+
+    /// Adjusted budgets maintain monotonic invariant.
+    #[test]
+    fn adjusted_budgets_monotonic(
+        epochs in 1_usize..20,
+    ) {
+        let cfg = AdaptiveAllocatorConfig {
+            warmup_observations: 0,
+            min_donor_headroom: 0.05,
+            ..Default::default()
+        };
+        let mut alloc = AdaptiveAllocator::new(&default_budgets(), cfg);
+
+        for _e in 0..epochs {
+            let pressures: Vec<StagePressure> = alloc
+                .lanes()
+                .iter()
+                .map(|l| {
+                    if l.stage == LatencyStage::StorageWrite {
+                        StagePressure::compute(l.stage, l.current_p95_us * 1.8, l.current_p95_us)
+                    } else {
+                        StagePressure::compute(l.stage, l.current_p95_us * 0.3, l.current_p95_us)
+                    }
+                })
+                .collect();
+            alloc.allocate(&pressures, "mono-test");
+        }
+
+        let adjusted = alloc.adjusted_budgets();
+        for b in &adjusted {
+            prop_assert!(
+                b.p50_us <= b.p95_us + 1e-6,
+                "{}: p50={} > p95={}", b.stage, b.p50_us, b.p95_us
+            );
+            prop_assert!(
+                b.p95_us <= b.p99_us + 1e-6,
+                "{}: p95={} > p99={}", b.stage, b.p95_us, b.p99_us
+            );
+            prop_assert!(
+                b.p99_us <= b.p999_us + 1e-6,
+                "{}: p99={} > p999={}", b.stage, b.p99_us, b.p999_us
+            );
+        }
+    }
+
+    /// Warmup produces no adjustments.
+    #[test]
+    fn allocator_warmup_noop(
+        warmup in 1_u64..100,
+    ) {
+        let cfg = AdaptiveAllocatorConfig {
+            warmup_observations: warmup,
+            ..Default::default()
+        };
+        let mut alloc = AdaptiveAllocator::new(&default_budgets(), cfg);
+        let pressures: Vec<StagePressure> = alloc
+            .lanes()
+            .iter()
+            .map(|l| StagePressure::compute(l.stage, l.current_p95_us * 2.0, l.current_p95_us))
+            .collect();
+        let d = alloc.allocate(&pressures, "warmup-prop");
+        prop_assert!(d.warmup);
+        prop_assert!(d.adjustments.is_empty());
+        prop_assert_eq!(d.reason, AllocationReason::Warmup);
+    }
 }
