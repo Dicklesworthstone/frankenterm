@@ -57,6 +57,7 @@ pub mod api_schema;
 pub mod approval;
 pub mod ars_compile;
 pub mod ars_fst;
+pub mod ars_intercept;
 pub mod ars_secret_scan;
 pub mod ars_symbolic_exec;
 pub mod ars_evidence;

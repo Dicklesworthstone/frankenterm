@@ -25,6 +25,7 @@ use tracing::warn;
 use crate::config::PaneFilterConfig;
 use crate::error::Result;
 use crate::storage::{Gap, PaneRecord, Segment, StorageHandle};
+use crate::trauma_guard::{TraumaDecision, TraumaState};
 use crate::wezterm::{PaneInfo, stable_hash};
 
 // =============================================================================
@@ -623,6 +624,8 @@ pub struct PaneRegistry {
     uuid_index: HashMap<String, u64>,
     /// Cursors for each pane (delta extraction state)
     cursors: HashMap<u64, PaneCursor>,
+    /// Per-pane trauma guard state (recent command + error-signature history)
+    trauma_states: HashMap<u64, TraumaState>,
     /// Pane filter configuration (cached)
     filter_config: PaneFilterConfig,
 }
@@ -641,6 +644,7 @@ impl PaneRegistry {
             entries: HashMap::new(),
             uuid_index: HashMap::new(),
             cursors: HashMap::new(),
+            trauma_states: HashMap::new(),
             filter_config: PaneFilterConfig::default(),
         }
     }
@@ -652,6 +656,7 @@ impl PaneRegistry {
             entries: HashMap::new(),
             uuid_index: HashMap::new(),
             cursors: HashMap::new(),
+            trauma_states: HashMap::new(),
             filter_config,
         }
     }
@@ -789,6 +794,7 @@ impl PaneRegistry {
                 let entry = PaneEntry::new(pane, fingerprint, observation);
                 self.uuid_index.insert(entry.pane_uuid.clone(), pane_id);
                 self.entries.insert(pane_id, entry);
+                self.trauma_states.insert(pane_id, TraumaState::new());
 
                 // Only create cursor if observed
                 if self
@@ -817,6 +823,7 @@ impl PaneRegistry {
             }
             self.entries.remove(pane_id);
             self.cursors.remove(pane_id);
+            self.trauma_states.remove(pane_id);
         }
 
         diff
@@ -910,6 +917,41 @@ impl PaneRegistry {
     /// Get mutable cursor for a pane
     pub fn get_cursor_mut(&mut self, pane_id: u64) -> Option<&mut PaneCursor> {
         self.cursors.get_mut(&pane_id)
+    }
+
+    /// Get trauma guard state for a pane.
+    #[must_use]
+    pub fn get_trauma_state(&self, pane_id: u64) -> Option<&TraumaState> {
+        self.trauma_states.get(&pane_id)
+    }
+
+    /// Get mutable trauma guard state for a pane.
+    pub fn get_trauma_state_mut(&mut self, pane_id: u64) -> Option<&mut TraumaState> {
+        self.trauma_states.get_mut(&pane_id)
+    }
+
+    /// Record a command result in the pane's trauma guard state.
+    pub fn record_trauma_command_result(
+        &mut self,
+        pane_id: u64,
+        timestamp_ms: u64,
+        command: &str,
+        error_signatures: &[String],
+    ) -> Result<TraumaDecision> {
+        if !self.entries.contains_key(&pane_id) {
+            return Err(crate::Error::Wezterm(
+                crate::error::WeztermError::PaneNotFound(pane_id),
+            ));
+        }
+
+        let state = self.trauma_states.entry(pane_id).or_default();
+        Ok(state.record_command_result(timestamp_ms, command, error_signatures))
+    }
+
+    /// Count panes with an allocated trauma guard state.
+    #[must_use]
+    pub fn trauma_state_count(&self) -> usize {
+        self.trauma_states.len()
     }
 
     /// Re-evaluate observation decision for a pane (e.g., after filter change)
@@ -2863,6 +2905,57 @@ mod tests {
 
         // Observed panes should have cursors
         assert!(registry.get_cursor(1).is_some());
+    }
+
+    #[test]
+    fn discovery_tick_initializes_trauma_state_for_new_panes() {
+        let mut registry = PaneRegistry::new();
+        let panes = vec![
+            make_pane(1, "bash", Some("/home")),
+            make_pane(2, "vim", Some("/tmp")),
+        ];
+
+        registry.discovery_tick(panes);
+
+        assert_eq!(registry.trauma_state_count(), 2);
+        assert!(registry.get_trauma_state(1).is_some());
+        assert!(registry.get_trauma_state(2).is_some());
+    }
+
+    #[test]
+    fn record_trauma_command_result_tracks_recurrence() {
+        let mut registry = PaneRegistry::new();
+        registry.discovery_tick(vec![make_pane(1, "bash", Some("/home"))]);
+
+        let signatures = vec!["core.codex:error_loop".to_string()];
+        let first = registry
+            .record_trauma_command_result(1, 1_000, "cargo test", &signatures)
+            .unwrap();
+        let second = registry
+            .record_trauma_command_result(1, 1_100, "cargo test", &signatures)
+            .unwrap();
+        let third = registry
+            .record_trauma_command_result(1, 1_200, "cargo test", &signatures)
+            .unwrap();
+
+        assert!(!first.should_intervene);
+        assert!(!second.should_intervene);
+        assert!(third.should_intervene);
+        assert_eq!(third.reason_code.as_deref(), Some("recurring_failure_loop"));
+    }
+
+    #[test]
+    fn discovery_tick_removes_trauma_state_for_closed_panes() {
+        let mut registry = PaneRegistry::new();
+        registry.discovery_tick(vec![make_pane(1, "bash", Some("/home"))]);
+
+        assert_eq!(registry.trauma_state_count(), 1);
+        assert!(registry.get_trauma_state(1).is_some());
+
+        registry.discovery_tick(vec![]);
+
+        assert_eq!(registry.trauma_state_count(), 0);
+        assert!(registry.get_trauma_state(1).is_none());
     }
 
     #[test]
