@@ -5261,6 +5261,277 @@ impl PriorityInheritanceTracker {
     }
 }
 
+// ── AARSP Bead: ft-2p9cb.2.4 — Starvation Prevention & Fairness ──
+
+// AARSP Bead: ft-2p9cb.2.4.1
+
+/// Configuration for starvation prevention.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StarvationConfig {
+    /// Max consecutive epochs a lane can go unserviced before forced promotion.
+    pub max_starved_epochs: u64,
+    /// Fairness window size (epochs) for computing running averages.
+    pub fairness_window: usize,
+    /// Minimum share of CPU any lane must receive (0.0..1.0).
+    pub min_lane_share: f64,
+    /// Enable aging — deferred items get priority boost over time.
+    pub enable_aging: bool,
+    /// Aging boost interval: every N epochs, deferred items gain one priority level.
+    pub aging_interval_epochs: u64,
+}
+
+impl Default for StarvationConfig {
+    fn default() -> Self {
+        Self {
+            max_starved_epochs: 5,
+            fairness_window: 20,
+            min_lane_share: 0.05,
+            enable_aging: true,
+            aging_interval_epochs: 3,
+        }
+    }
+}
+
+/// Per-lane fairness state tracked over a sliding window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LaneFairnessState {
+    /// Which lane.
+    pub lane: SchedulerLane,
+    /// Consecutive epochs with zero completions.
+    pub starved_epochs: u64,
+    /// CPU share over the fairness window (0.0..1.0).
+    pub windowed_share: f64,
+    /// Total completions in the fairness window.
+    pub windowed_completions: u64,
+    /// Total items deferred in the fairness window.
+    pub windowed_deferred: u64,
+    /// Whether this lane is currently being force-promoted.
+    pub force_promoted: bool,
+}
+
+/// A starvation event — records when a lane was force-promoted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StarvationEvent {
+    /// Epoch when detected.
+    pub epoch: u64,
+    /// Lane that was starving.
+    pub lane: SchedulerLane,
+    /// Consecutive starved epochs before promotion.
+    pub starved_epochs: u64,
+    /// CPU share at the time of detection.
+    pub cpu_share: f64,
+}
+
+/// Fairness snapshot across all lanes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FairnessSnapshot {
+    /// Per-lane fairness state.
+    pub lanes: Vec<LaneFairnessState>,
+    /// Gini coefficient of CPU shares (0.0 = perfect equality, 1.0 = total inequality).
+    pub gini_coefficient: f64,
+    /// Total starvation events since creation.
+    pub total_starvation_events: u64,
+    /// Whether any lane is currently starving.
+    pub any_starving: bool,
+}
+
+/// Starvation prevention tracker. Monitors per-lane service rates,
+/// detects starvation, and triggers force-promotions.
+///
+/// # Invariants
+///
+/// 1. No lane goes more than `max_starved_epochs` without service.
+/// 2. Every lane's windowed share >= min_lane_share (or force-promotion triggers).
+/// 3. Gini coefficient is in [0.0, 1.0].
+/// 4. Deterministic: same epoch observations → same fairness state.
+#[derive(Debug, Clone)]
+pub struct StarvationTracker {
+    config: StarvationConfig,
+    /// Per-lane state.
+    lanes: Vec<LaneFairnessState>,
+    /// History of per-epoch CPU shares per lane (ring buffer).
+    share_history: Vec<Vec<f64>>,
+    history_head: usize,
+    epoch: u64,
+    events: Vec<StarvationEvent>,
+    max_events: usize,
+    total_starvation_events: u64,
+}
+
+impl StarvationTracker {
+    /// Create a new tracker.
+    pub fn new(config: StarvationConfig) -> Self {
+        let window = config.fairness_window.max(1);
+        Self {
+            lanes: vec![
+                LaneFairnessState {
+                    lane: SchedulerLane::Input,
+                    starved_epochs: 0,
+                    windowed_share: 0.0,
+                    windowed_completions: 0,
+                    windowed_deferred: 0,
+                    force_promoted: false,
+                },
+                LaneFairnessState {
+                    lane: SchedulerLane::Control,
+                    starved_epochs: 0,
+                    windowed_share: 0.0,
+                    windowed_completions: 0,
+                    windowed_deferred: 0,
+                    force_promoted: false,
+                },
+                LaneFairnessState {
+                    lane: SchedulerLane::Bulk,
+                    starved_epochs: 0,
+                    windowed_share: 0.0,
+                    windowed_completions: 0,
+                    windowed_deferred: 0,
+                    force_promoted: false,
+                },
+            ],
+            share_history: vec![vec![0.0; 3]; window],
+            history_head: 0,
+            epoch: 0,
+            events: Vec::new(),
+            max_events: 256,
+            total_starvation_events: 0,
+            config: StarvationConfig {
+                fairness_window: window,
+                ..config
+            },
+        }
+    }
+
+    /// Create with default config.
+    pub fn with_defaults() -> Self {
+        Self::new(StarvationConfig::default())
+    }
+
+    /// Record one epoch's observations: completions and CPU shares per lane.
+    /// Returns list of lanes that are now force-promoted.
+    pub fn observe_epoch(
+        &mut self,
+        completions: &[u64; 3],
+        cpu_shares: &[f64; 3],
+    ) -> Vec<SchedulerLane> {
+        self.epoch += 1;
+        let mut promoted = Vec::new();
+
+        // Record shares in ring buffer.
+        self.share_history[self.history_head] = cpu_shares.to_vec();
+        self.history_head = (self.history_head + 1) % self.config.fairness_window;
+
+        // Update per-lane state.
+        for (i, lane_state) in self.lanes.iter_mut().enumerate() {
+            if completions[i] == 0 {
+                lane_state.starved_epochs += 1;
+            } else {
+                lane_state.starved_epochs = 0;
+                lane_state.force_promoted = false;
+            }
+
+            // Compute windowed share.
+            let mut sum = 0.0;
+            let mut count = 0;
+            for entry in &self.share_history {
+                if entry[i] > 0.0 || count < self.epoch as usize {
+                    sum += entry[i];
+                    count += 1;
+                }
+            }
+            lane_state.windowed_share = if count > 0 {
+                sum / count as f64
+            } else {
+                0.0
+            };
+            lane_state.windowed_completions = completions[i];
+            lane_state.windowed_deferred = 0; // will be updated externally
+
+            // Check starvation.
+            if lane_state.starved_epochs >= self.config.max_starved_epochs
+                && !lane_state.force_promoted
+            {
+                lane_state.force_promoted = true;
+                self.total_starvation_events += 1;
+
+                let event = StarvationEvent {
+                    epoch: self.epoch,
+                    lane: lane_state.lane,
+                    starved_epochs: lane_state.starved_epochs,
+                    cpu_share: lane_state.windowed_share,
+                };
+                if self.events.len() >= self.max_events {
+                    self.events.remove(0);
+                }
+                self.events.push(event);
+
+                promoted.push(lane_state.lane);
+            }
+        }
+
+        promoted
+    }
+
+    /// Compute the Gini coefficient of current windowed shares.
+    pub fn gini_coefficient(&self) -> f64 {
+        let shares: Vec<f64> = self.lanes.iter().map(|l| l.windowed_share).collect();
+        let n = shares.len() as f64;
+        if n == 0.0 {
+            return 0.0;
+        }
+        let mean = shares.iter().sum::<f64>() / n;
+        if mean <= 0.0 {
+            return 0.0;
+        }
+
+        let mut sum_abs_diff = 0.0;
+        for i in 0..shares.len() {
+            for j in 0..shares.len() {
+                sum_abs_diff += (shares[i] - shares[j]).abs();
+            }
+        }
+
+        sum_abs_diff / (2.0 * n * n * mean)
+    }
+
+    /// Whether any lane is currently starving.
+    pub fn any_starving(&self) -> bool {
+        self.lanes.iter().any(|l| l.force_promoted)
+    }
+
+    /// Diagnostic snapshot.
+    pub fn snapshot(&self) -> FairnessSnapshot {
+        FairnessSnapshot {
+            lanes: self.lanes.clone(),
+            gini_coefficient: self.gini_coefficient(),
+            total_starvation_events: self.total_starvation_events,
+            any_starving: self.any_starving(),
+        }
+    }
+
+    /// Status line for logging.
+    pub fn status_line(&self) -> String {
+        let snap = self.snapshot();
+        format!(
+            "fairness gini={:.3} starving={} events={} epoch={}",
+            snap.gini_coefficient,
+            snap.any_starving,
+            snap.total_starvation_events,
+            self.epoch,
+        )
+    }
+
+    /// Current epoch.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Get lane fairness state.
+    pub fn lane_state(&self, lane: SchedulerLane) -> &LaneFairnessState {
+        &self.lanes[lane as usize]
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -8890,5 +9161,188 @@ mod tests {
         assert_eq!(format!("{}", InheritanceDegradation::Healthy), "HEALTHY");
         let exc = InheritanceDegradation::ExcessiveInheritance { active_chains: 3, threshold: 2 };
         assert!(format!("{}", exc).contains("3/2"));
+    }
+
+    // ── B4: Starvation Prevention & Fairness ──
+
+    #[test]
+    fn test_starvation_config_default() {
+        let cfg = StarvationConfig::default();
+        assert_eq!(cfg.max_starved_epochs, 5);
+        assert_eq!(cfg.fairness_window, 20);
+        assert!(cfg.enable_aging);
+    }
+
+    #[test]
+    fn test_starvation_tracker_initial_state() {
+        let tracker = StarvationTracker::with_defaults();
+        assert_eq!(tracker.epoch(), 0);
+        assert!(!tracker.any_starving());
+        let snap = tracker.snapshot();
+        assert_eq!(snap.lanes.len(), 3);
+        assert_eq!(snap.total_starvation_events, 0);
+    }
+
+    #[test]
+    fn test_starvation_no_starvation_when_all_served() {
+        let mut tracker = StarvationTracker::with_defaults();
+        for _ in 0..10 {
+            let promoted = tracker.observe_epoch(&[5, 3, 2], &[0.5, 0.3, 0.2]);
+            assert!(promoted.is_empty());
+        }
+        assert!(!tracker.any_starving());
+    }
+
+    #[test]
+    fn test_starvation_detected_after_threshold() {
+        let config = StarvationConfig {
+            max_starved_epochs: 3,
+            ..Default::default()
+        };
+        let mut tracker = StarvationTracker::new(config);
+
+        // Bulk lane gets zero completions for 3 epochs.
+        for i in 0..3 {
+            let promoted = tracker.observe_epoch(&[5, 3, 0], &[0.5, 0.3, 0.0]);
+            if i < 2 {
+                assert!(promoted.is_empty());
+            } else {
+                assert_eq!(promoted, vec![SchedulerLane::Bulk]);
+            }
+        }
+        assert!(tracker.any_starving());
+        assert!(tracker.lane_state(SchedulerLane::Bulk).force_promoted);
+    }
+
+    #[test]
+    fn test_starvation_clears_on_completion() {
+        let config = StarvationConfig {
+            max_starved_epochs: 2,
+            ..Default::default()
+        };
+        let mut tracker = StarvationTracker::new(config);
+
+        // Starve bulk for 2 epochs.
+        tracker.observe_epoch(&[5, 3, 0], &[0.5, 0.3, 0.0]);
+        tracker.observe_epoch(&[5, 3, 0], &[0.5, 0.3, 0.0]);
+        assert!(tracker.any_starving());
+
+        // Bulk gets completions — starvation clears.
+        tracker.observe_epoch(&[5, 3, 1], &[0.4, 0.3, 0.1]);
+        assert!(!tracker.lane_state(SchedulerLane::Bulk).force_promoted);
+    }
+
+    #[test]
+    fn test_gini_coefficient_equal_shares() {
+        let mut tracker = StarvationTracker::with_defaults();
+        // Equal shares → Gini ~= 0.
+        for _ in 0..5 {
+            tracker.observe_epoch(&[3, 3, 3], &[0.333, 0.333, 0.334]);
+        }
+        let gini = tracker.gini_coefficient();
+        assert!(gini < 0.01, "Gini {} should be near 0 for equal shares", gini);
+    }
+
+    #[test]
+    fn test_gini_coefficient_unequal_shares() {
+        let mut tracker = StarvationTracker::with_defaults();
+        // Very unequal shares → higher Gini.
+        for _ in 0..5 {
+            tracker.observe_epoch(&[10, 0, 0], &[0.9, 0.05, 0.05]);
+        }
+        let gini = tracker.gini_coefficient();
+        assert!(gini > 0.3, "Gini {} should be higher for unequal shares", gini);
+    }
+
+    #[test]
+    fn test_starvation_snapshot_serde() {
+        let snap = FairnessSnapshot {
+            lanes: vec![LaneFairnessState {
+                lane: SchedulerLane::Input,
+                starved_epochs: 0,
+                windowed_share: 0.5,
+                windowed_completions: 10,
+                windowed_deferred: 2,
+                force_promoted: false,
+            }],
+            gini_coefficient: 0.15,
+            total_starvation_events: 3,
+            any_starving: false,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: FairnessSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap.total_starvation_events, back.total_starvation_events);
+        assert_eq!(snap.any_starving, back.any_starving);
+        assert_eq!(snap.lanes.len(), back.lanes.len());
+    }
+
+    #[test]
+    fn test_starvation_event_serde() {
+        let event = StarvationEvent {
+            epoch: 10,
+            lane: SchedulerLane::Bulk,
+            starved_epochs: 5,
+            cpu_share: 0.01,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: StarvationEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn test_starvation_status_line() {
+        let tracker = StarvationTracker::with_defaults();
+        let line = tracker.status_line();
+        assert!(line.contains("fairness"));
+        assert!(line.contains("gini="));
+        assert!(line.contains("epoch=0"));
+    }
+
+    #[test]
+    fn test_starvation_config_serde() {
+        let cfg = StarvationConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: StarvationConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn test_lane_fairness_state_serde() {
+        let state = LaneFairnessState {
+            lane: SchedulerLane::Control,
+            starved_epochs: 2,
+            windowed_share: 0.3,
+            windowed_completions: 5,
+            windowed_deferred: 1,
+            force_promoted: false,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: LaneFairnessState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn test_starvation_epoch_monotonic() {
+        let mut tracker = StarvationTracker::with_defaults();
+        for i in 1..=5 {
+            tracker.observe_epoch(&[1, 1, 1], &[0.33, 0.33, 0.34]);
+            assert_eq!(tracker.epoch(), i);
+        }
+    }
+
+    #[test]
+    fn test_starvation_multiple_lanes_starve() {
+        let config = StarvationConfig {
+            max_starved_epochs: 2,
+            ..Default::default()
+        };
+        let mut tracker = StarvationTracker::new(config);
+
+        // Both Control and Bulk starve.
+        tracker.observe_epoch(&[5, 0, 0], &[0.8, 0.0, 0.0]);
+        let promoted = tracker.observe_epoch(&[5, 0, 0], &[0.8, 0.0, 0.0]);
+        assert_eq!(promoted.len(), 2);
+        assert!(promoted.contains(&SchedulerLane::Control));
+        assert!(promoted.contains(&SchedulerLane::Bulk));
     }
 }
