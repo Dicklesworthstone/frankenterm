@@ -3533,6 +3533,167 @@ impl AdaptiveAllocator {
             self.decisions.drain(0..self.decisions.len() / 2);
         }
     }
+
+    /// Extract pressure signals from an EnforcerSnapshot.
+    ///
+    /// This bridges the BudgetEnforcer output into the allocator input,
+    /// using observed p95 from the enforcer's percentile estimates.
+    pub fn pressures_from_snapshot(snapshot: &EnforcerSnapshot) -> Vec<StagePressure> {
+        snapshot
+            .stages
+            .iter()
+            .filter(|ss| !ss.stage.is_aggregate())
+            .map(|ss| {
+                let observed_p95 = ss.percentiles.p95_us.unwrap_or(0.0);
+                StagePressure::compute(ss.stage, observed_p95, ss.budget.p95_us)
+            })
+            .collect()
+    }
+
+    /// Generate updated StageBudgets reflecting current allocations.
+    ///
+    /// Returns budgets with p95 adjusted to the allocator's current values.
+    /// Other percentiles (p50, p99, p999) are scaled proportionally so
+    /// the monotonic invariant is preserved.
+    pub fn adjusted_budgets(&self) -> Vec<StageBudget> {
+        self.lanes
+            .iter()
+            .map(|lane| {
+                let ratio = if lane.default_p95_us > 0.0 {
+                    lane.current_p95_us / lane.default_p95_us
+                } else {
+                    1.0
+                };
+                // Find the original budget from defaults.
+                let defaults = default_budgets();
+                let orig = defaults
+                    .iter()
+                    .find(|b| b.stage == lane.stage)
+                    .cloned()
+                    .unwrap_or(StageBudget {
+                        stage: lane.stage,
+                        p50_us: lane.default_p95_us * 0.5,
+                        p95_us: lane.default_p95_us,
+                        p99_us: lane.default_p95_us * 2.0,
+                        p999_us: lane.default_p95_us * 5.0,
+                    });
+                StageBudget {
+                    stage: lane.stage,
+                    p50_us: orig.p50_us * ratio,
+                    p95_us: lane.current_p95_us,
+                    p99_us: orig.p99_us * ratio,
+                    p999_us: orig.p999_us * ratio,
+                }
+            })
+            .collect()
+    }
+
+    /// Check allocator health — detects potential instability.
+    pub fn current_degradation(&self) -> AllocatorDegradation {
+        // Check for oscillation: if many lanes flip between donor/receiver rapidly.
+        let oscillating = self
+            .lanes
+            .iter()
+            .filter(|l| l.donor_epochs > 0 && l.over_budget_epochs > 0)
+            .count();
+
+        if oscillating > self.lanes.len() / 2 {
+            return AllocatorDegradation::Oscillating { lane_count: oscillating };
+        }
+
+        // Check conservation drift.
+        let drift = self.global_slack_us().abs();
+        if drift > 1.0 {
+            return AllocatorDegradation::ConservationDrift { drift_us: drift };
+        }
+
+        // Check if too many lanes are at their floor.
+        let at_floor = self
+            .lanes
+            .iter()
+            .filter(|l| {
+                (l.current_p95_us - l.default_p95_us * self.config.min_budget_pct).abs() < 1e-6
+            })
+            .count();
+
+        if at_floor > self.lanes.len() / 2 {
+            return AllocatorDegradation::FloorSaturation { lane_count: at_floor };
+        }
+
+        AllocatorDegradation::Healthy
+    }
+
+    /// Is the allocator in a healthy state?
+    pub fn is_healthy(&self) -> bool {
+        matches!(self.current_degradation(), AllocatorDegradation::Healthy)
+    }
+
+    /// Generate a structured log entry for the most recent allocation decision.
+    pub fn last_log_entry(&self) -> Option<AllocationLogEntry> {
+        self.decisions.last().map(|d| AllocationLogEntry {
+            epoch: d.epoch,
+            correlation_id: d.correlation_id.clone(),
+            reason: d.reason.to_string(),
+            adjustment_count: d.adjustments.len(),
+            total_donated_us: d
+                .adjustments
+                .iter()
+                .filter(|a| a.delta_us < 0.0)
+                .map(|a| -a.delta_us)
+                .sum(),
+            total_received_us: d
+                .adjustments
+                .iter()
+                .filter(|a| a.delta_us > 0.0)
+                .map(|a| a.delta_us)
+                .sum(),
+            conservation_error_us: self.global_slack_us(),
+            degradation: self.current_degradation(),
+        })
+    }
+}
+
+/// Degradation states for the adaptive allocator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AllocatorDegradation {
+    /// All invariants hold, allocator operating normally.
+    Healthy,
+    /// Multiple lanes oscillating between donor and receiver roles.
+    Oscillating { lane_count: usize },
+    /// Budget conservation invariant has drifted beyond tolerance.
+    ConservationDrift { drift_us: f64 },
+    /// Too many lanes pinned at their minimum floor.
+    FloorSaturation { lane_count: usize },
+}
+
+impl fmt::Display for AllocatorDegradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "HEALTHY"),
+            Self::Oscillating { lane_count } => {
+                write!(f, "OSCILLATING lanes={}", lane_count)
+            }
+            Self::ConservationDrift { drift_us } => {
+                write!(f, "CONSERVATION_DRIFT drift={:.3}us", drift_us)
+            }
+            Self::FloorSaturation { lane_count } => {
+                write!(f, "FLOOR_SATURATION lanes={}", lane_count)
+            }
+        }
+    }
+}
+
+/// Structured log entry for an allocation epoch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AllocationLogEntry {
+    pub epoch: u64,
+    pub correlation_id: String,
+    pub reason: String,
+    pub adjustment_count: usize,
+    pub total_donated_us: f64,
+    pub total_received_us: f64,
+    pub conservation_error_us: f64,
+    pub degradation: AllocatorDegradation,
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -5870,5 +6031,222 @@ mod tests {
 
         let pd = alloc.allocation(LatencyStage::PatternDetection).unwrap();
         assert_eq!(pd.over_budget_epochs, 5);
+    }
+
+    // ── A4 Impl: Bridge, Degradation, Logging ──
+
+    #[test]
+    fn test_pressures_from_enforcer_snapshot() {
+        let enforcer = BudgetEnforcer::with_defaults();
+        let snap = enforcer.snapshot();
+        let pressures = AdaptiveAllocator::pressures_from_snapshot(&snap);
+        // Should have one pressure per non-aggregate stage.
+        assert_eq!(pressures.len(), 8);
+        for p in &pressures {
+            assert!(!p.stage.is_aggregate());
+        }
+    }
+
+    #[test]
+    fn test_pressures_from_snapshot_headroom_with_data() {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        // Record some low-latency observations for PtyCapture.
+        for _ in 0..10 {
+            enforcer.record(LatencyStage::PtyCapture, 1000.0, "test");
+        }
+        let snap = enforcer.snapshot();
+        let pressures = AdaptiveAllocator::pressures_from_snapshot(&snap);
+        let pty = pressures.iter().find(|p| p.stage == LatencyStage::PtyCapture).unwrap();
+        // PtyCapture budget is 10000 p95, observed ~1000 → headroom > 0.
+        assert!(pty.headroom > 0.0, "expected positive headroom: {}", pty.headroom);
+    }
+
+    #[test]
+    fn test_adjusted_budgets_default_is_identity() {
+        let alloc = AdaptiveAllocator::with_defaults();
+        let adjusted = alloc.adjusted_budgets();
+        let defaults = default_budgets();
+        for adj in &adjusted {
+            let orig = defaults.iter().find(|b| b.stage == adj.stage).unwrap();
+            assert!(
+                (adj.p95_us - orig.p95_us).abs() < 1e-6,
+                "{}: adjusted p95={} vs default p95={}",
+                adj.stage,
+                adj.p95_us,
+                orig.p95_us
+            );
+        }
+    }
+
+    #[test]
+    fn test_adjusted_budgets_proportional_scaling() {
+        let cfg = AdaptiveAllocatorConfig {
+            warmup_observations: 0,
+            min_donor_headroom: 0.05,
+            ..Default::default()
+        };
+        let mut alloc = AdaptiveAllocator::new(&default_budgets(), cfg);
+
+        // Run epochs with StorageWrite over-budget to trigger redistribution.
+        for i in 0..20 {
+            let pressures: Vec<StagePressure> = alloc
+                .lanes()
+                .iter()
+                .map(|l| {
+                    if l.stage == LatencyStage::StorageWrite {
+                        StagePressure::compute(l.stage, l.current_p95_us * 1.5, l.current_p95_us)
+                    } else {
+                        StagePressure::compute(l.stage, l.current_p95_us * 0.3, l.current_p95_us)
+                    }
+                })
+                .collect();
+            alloc.allocate(&pressures, &format!("adj-{}", i));
+        }
+
+        let adjusted = alloc.adjusted_budgets();
+        for budget in &adjusted {
+            // Monotonic invariant: p50 <= p95 <= p99 <= p999.
+            assert!(
+                budget.p50_us <= budget.p95_us + 1e-6,
+                "{}: p50={} > p95={}",
+                budget.stage,
+                budget.p50_us,
+                budget.p95_us
+            );
+            assert!(
+                budget.p95_us <= budget.p99_us + 1e-6,
+                "{}: p95={} > p99={}",
+                budget.stage,
+                budget.p95_us,
+                budget.p99_us
+            );
+            assert!(
+                budget.p99_us <= budget.p999_us + 1e-6,
+                "{}: p99={} > p999={}",
+                budget.stage,
+                budget.p99_us,
+                budget.p999_us
+            );
+        }
+    }
+
+    #[test]
+    fn test_allocator_degradation_healthy() {
+        let alloc = AdaptiveAllocator::with_defaults();
+        assert_eq!(alloc.current_degradation(), AllocatorDegradation::Healthy);
+        assert!(alloc.is_healthy());
+    }
+
+    #[test]
+    fn test_allocator_degradation_display() {
+        assert_eq!(format!("{}", AllocatorDegradation::Healthy), "HEALTHY");
+        assert!(format!("{}", AllocatorDegradation::Oscillating { lane_count: 5 })
+            .contains("OSCILLATING"));
+        assert!(
+            format!(
+                "{}",
+                AllocatorDegradation::ConservationDrift { drift_us: 1.5 }
+            )
+            .contains("CONSERVATION_DRIFT")
+        );
+        assert!(
+            format!("{}", AllocatorDegradation::FloorSaturation { lane_count: 4 })
+                .contains("FLOOR_SATURATION")
+        );
+    }
+
+    #[test]
+    fn test_allocator_log_entry_generation() {
+        let cfg = AdaptiveAllocatorConfig {
+            warmup_observations: 0,
+            min_donor_headroom: 0.05,
+            ..Default::default()
+        };
+        let mut alloc = AdaptiveAllocator::new(&default_budgets(), cfg);
+        // Nominal epoch.
+        let pressures: Vec<StagePressure> = alloc
+            .lanes()
+            .iter()
+            .map(|l| StagePressure::compute(l.stage, l.current_p95_us * 0.5, l.current_p95_us))
+            .collect();
+        alloc.allocate(&pressures, "log-test");
+
+        let entry = alloc.last_log_entry().unwrap();
+        assert_eq!(entry.epoch, 1);
+        assert_eq!(entry.correlation_id, "log-test");
+        assert_eq!(entry.reason, "ALL_WITHIN_BUDGET");
+        assert_eq!(entry.adjustment_count, 0);
+    }
+
+    #[test]
+    fn test_allocator_log_entry_redistribution() {
+        let cfg = AdaptiveAllocatorConfig {
+            warmup_observations: 0,
+            min_donor_headroom: 0.05,
+            ..Default::default()
+        };
+        let mut alloc = AdaptiveAllocator::new(&default_budgets(), cfg);
+
+        // Multiple epochs to get headroom negative for StorageWrite.
+        for i in 0..10 {
+            let pressures: Vec<StagePressure> = alloc
+                .lanes()
+                .iter()
+                .map(|l| {
+                    if l.stage == LatencyStage::StorageWrite {
+                        StagePressure::compute(l.stage, l.current_p95_us * 2.0, l.current_p95_us)
+                    } else {
+                        StagePressure::compute(l.stage, l.current_p95_us * 0.2, l.current_p95_us)
+                    }
+                })
+                .collect();
+            alloc.allocate(&pressures, &format!("log-redist-{}", i));
+        }
+
+        let entry = alloc.last_log_entry().unwrap();
+        assert!(entry.reason.contains("SLACK_REDISTRIBUTED"));
+        assert!(entry.adjustment_count > 0);
+        assert!(entry.total_donated_us > 0.0);
+        assert!(entry.total_received_us > 0.0);
+    }
+
+    #[test]
+    fn test_allocator_log_entry_serde() {
+        let entry = AllocationLogEntry {
+            epoch: 10,
+            correlation_id: "serde-test".into(),
+            reason: "WARMUP".into(),
+            adjustment_count: 0,
+            total_donated_us: 0.0,
+            total_received_us: 0.0,
+            conservation_error_us: 0.001,
+            degradation: AllocatorDegradation::Healthy,
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let back: AllocationLogEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(entry.epoch, back.epoch);
+        assert_eq!(entry.reason, back.reason);
+    }
+
+    #[test]
+    fn test_allocator_degradation_serde() {
+        let cases = vec![
+            AllocatorDegradation::Healthy,
+            AllocatorDegradation::Oscillating { lane_count: 3 },
+            AllocatorDegradation::ConservationDrift { drift_us: 1.23 },
+            AllocatorDegradation::FloorSaturation { lane_count: 5 },
+        ];
+        for case in cases {
+            let json = serde_json::to_string(&case).expect("serialize");
+            let back: AllocatorDegradation = serde_json::from_str(&json).expect("deserialize");
+            // For f64 variant, use tolerance.
+            match (&case, &back) {
+                (
+                    AllocatorDegradation::ConservationDrift { drift_us: a },
+                    AllocatorDegradation::ConservationDrift { drift_us: b },
+                ) => assert!((a - b).abs() < 1e-10),
+                _ => assert_eq!(case, back),
+            }
+        }
     }
 }
