@@ -1222,6 +1222,552 @@ pub fn verification_matrix() -> Vec<VerificationEntry> {
     ]
 }
 
+// ── Runtime Budget Enforcer ─────────────────────────────────────────
+
+/// Configuration for the budget enforcer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BudgetEnforcerConfig {
+    /// Per-stage budgets. If empty, default_budgets() is used.
+    pub stage_budgets: Vec<StageBudget>,
+    /// Pipeline composition tree. If None, default_pipeline_tree() is used.
+    pub pipeline_tree: Option<BudgetNode>,
+    /// Per-stage mitigation policy.
+    pub mitigation_policy: Vec<StageMitigationPolicy>,
+    /// Window size for percentile estimation (number of observations).
+    pub window_size: usize,
+    /// Whether to emit structured logs for every observation.
+    pub log_all_observations: bool,
+    /// Whether to emit structured logs only for overflows.
+    pub log_overflows_only: bool,
+}
+
+impl Default for BudgetEnforcerConfig {
+    fn default() -> Self {
+        Self {
+            stage_budgets: default_budgets(),
+            pipeline_tree: None,
+            mitigation_policy: default_mitigation_policies(),
+            window_size: 1000,
+            log_all_observations: false,
+            log_overflows_only: true,
+        }
+    }
+}
+
+/// Mitigation policy for a specific stage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageMitigationPolicy {
+    pub stage: LatencyStage,
+    /// Which mitigation to apply when the stage overflows at p95.
+    pub on_p95_overflow: Mitigation,
+    /// Which mitigation to apply when the stage overflows at p99.
+    pub on_p99_overflow: Mitigation,
+    /// Which mitigation to apply when the stage overflows at p999.
+    pub on_p999_overflow: Mitigation,
+}
+
+/// Default mitigation policies for each stage.
+pub fn default_mitigation_policies() -> Vec<StageMitigationPolicy> {
+    vec![
+        StageMitigationPolicy {
+            stage: LatencyStage::PtyCapture,
+            on_p95_overflow: Mitigation::None,
+            on_p99_overflow: Mitigation::Defer,
+            on_p999_overflow: Mitigation::Shed,
+        },
+        StageMitigationPolicy {
+            stage: LatencyStage::DeltaExtraction,
+            on_p95_overflow: Mitigation::None,
+            on_p99_overflow: Mitigation::Degrade,
+            on_p999_overflow: Mitigation::Degrade,
+        },
+        StageMitigationPolicy {
+            stage: LatencyStage::StorageWrite,
+            on_p95_overflow: Mitigation::None,
+            on_p99_overflow: Mitigation::Defer,
+            on_p999_overflow: Mitigation::Defer,
+        },
+        StageMitigationPolicy {
+            stage: LatencyStage::PatternDetection,
+            on_p95_overflow: Mitigation::None,
+            on_p99_overflow: Mitigation::Degrade,
+            on_p999_overflow: Mitigation::Skip,
+        },
+        StageMitigationPolicy {
+            stage: LatencyStage::EventEmission,
+            on_p95_overflow: Mitigation::None,
+            on_p99_overflow: Mitigation::None,
+            on_p999_overflow: Mitigation::Defer,
+        },
+        StageMitigationPolicy {
+            stage: LatencyStage::WorkflowDispatch,
+            on_p95_overflow: Mitigation::None,
+            on_p99_overflow: Mitigation::Skip,
+            on_p999_overflow: Mitigation::Skip,
+        },
+        StageMitigationPolicy {
+            stage: LatencyStage::ActionExecution,
+            on_p95_overflow: Mitigation::None,
+            on_p99_overflow: Mitigation::Degrade,
+            on_p999_overflow: Mitigation::Shed,
+        },
+        StageMitigationPolicy {
+            stage: LatencyStage::ApiResponse,
+            on_p95_overflow: Mitigation::None,
+            on_p99_overflow: Mitigation::None,
+            on_p999_overflow: Mitigation::Defer,
+        },
+    ]
+}
+
+/// A sliding window of latency observations for percentile estimation.
+#[derive(Debug, Clone)]
+struct LatencyWindow {
+    /// Ring buffer of observations in insertion order.
+    samples: Vec<f64>,
+    /// Current write position.
+    pos: usize,
+    /// Number of observations added (may exceed capacity).
+    count: u64,
+    /// Capacity (window_size).
+    capacity: usize,
+}
+
+impl LatencyWindow {
+    fn new(capacity: usize) -> Self {
+        Self {
+            samples: Vec::with_capacity(capacity),
+            pos: 0,
+            count: 0,
+            capacity,
+        }
+    }
+
+    fn push(&mut self, value: f64) {
+        if self.samples.len() < self.capacity {
+            self.samples.push(value);
+        } else {
+            self.samples[self.pos] = value;
+        }
+        self.pos = (self.pos + 1) % self.capacity;
+        self.count += 1;
+    }
+
+    /// Estimate percentile from the window. Returns None if empty.
+    fn percentile(&self, p: f64) -> Option<f64> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let mut sorted = self.samples.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((sorted.len() as f64 * p).ceil() as usize).min(sorted.len()) - 1;
+        Some(sorted[idx])
+    }
+
+    fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn total_count(&self) -> u64 {
+        self.count
+    }
+
+    fn mean(&self) -> Option<f64> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        Some(self.samples.iter().sum::<f64>() / self.samples.len() as f64)
+    }
+}
+
+/// Per-stage runtime state.
+#[derive(Debug, Clone)]
+struct StageState {
+    budget: StageBudget,
+    policy: StageMitigationPolicy,
+    window: LatencyWindow,
+    overflow_count: u64,
+    last_overflow_reason: Option<ReasonCode>,
+    last_mitigation: Mitigation,
+}
+
+/// Runtime result from recording a stage observation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObservationResult {
+    /// The stage that was measured.
+    pub stage: LatencyStage,
+    /// Observed latency in microseconds.
+    pub latency_us: f64,
+    /// Whether any percentile budget was exceeded.
+    pub overflow: bool,
+    /// The most severe violated percentile (if any).
+    pub violated_percentile: Option<Percentile>,
+    /// Reason code for the violation (if any).
+    pub reason: Option<ReasonCode>,
+    /// Mitigation recommended by the enforcer.
+    pub recommended_mitigation: Mitigation,
+    /// Current estimated percentiles for this stage.
+    pub current_percentiles: PercentileSnapshot,
+}
+
+/// Point-in-time percentile estimates for a stage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PercentileSnapshot {
+    pub p50_us: Option<f64>,
+    pub p95_us: Option<f64>,
+    pub p99_us: Option<f64>,
+    pub p999_us: Option<f64>,
+    pub sample_count: usize,
+    pub total_observations: u64,
+}
+
+/// Aggregate diagnostic snapshot of the enforcer state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnforcerSnapshot {
+    /// Per-stage snapshots.
+    pub stages: Vec<StageSnapshot>,
+    /// Total observations across all stages.
+    pub total_observations: u64,
+    /// Total overflows across all stages.
+    pub total_overflows: u64,
+    /// Aggregate pipeline budget slack at each percentile.
+    pub slack: Vec<(Percentile, f64)>,
+}
+
+/// Diagnostic snapshot for a single stage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageSnapshot {
+    pub stage: LatencyStage,
+    pub budget: StageBudget,
+    pub percentiles: PercentileSnapshot,
+    pub overflow_count: u64,
+    pub mean_us: Option<f64>,
+    pub last_mitigation: Mitigation,
+}
+
+/// The budget enforcer tracks per-stage latency observations and
+/// detects when budgets are exceeded, recommending mitigations.
+///
+/// # Determinism
+///
+/// The enforcer is deterministic for a given sequence of observations.
+/// No randomness, no system time — caller provides all timing data.
+///
+/// # Thread Safety
+///
+/// This struct is NOT thread-safe. For multi-threaded use, wrap in
+/// an appropriate synchronization primitive (Mutex, RwLock).
+#[derive(Debug, Clone)]
+pub struct BudgetEnforcer {
+    config: BudgetEnforcerConfig,
+    states: Vec<StageState>,
+    pipeline_tree: BudgetNode,
+    run_counter: u64,
+    log_entries: Vec<LatencyLogEntry>,
+}
+
+impl BudgetEnforcer {
+    /// Create a new budget enforcer with the given configuration.
+    pub fn new(config: BudgetEnforcerConfig) -> Self {
+        let pipeline_tree = config
+            .pipeline_tree
+            .clone()
+            .unwrap_or_else(default_pipeline_tree);
+
+        let states = config
+            .stage_budgets
+            .iter()
+            .filter(|b| !b.stage.is_aggregate())
+            .map(|budget| {
+                let policy = config
+                    .mitigation_policy
+                    .iter()
+                    .find(|p| p.stage == budget.stage)
+                    .cloned()
+                    .unwrap_or(StageMitigationPolicy {
+                        stage: budget.stage,
+                        on_p95_overflow: Mitigation::None,
+                        on_p99_overflow: Mitigation::None,
+                        on_p999_overflow: Mitigation::None,
+                    });
+                StageState {
+                    budget: *budget,
+                    policy,
+                    window: LatencyWindow::new(config.window_size),
+                    overflow_count: 0,
+                    last_overflow_reason: None,
+                    last_mitigation: Mitigation::None,
+                }
+            })
+            .collect();
+
+        Self {
+            config,
+            states,
+            pipeline_tree,
+            run_counter: 0,
+            log_entries: Vec::new(),
+        }
+    }
+
+    /// Create a new enforcer with default configuration.
+    pub fn with_defaults() -> Self {
+        Self::new(BudgetEnforcerConfig::default())
+    }
+
+    /// Record a latency observation for a stage.
+    ///
+    /// Returns the observation result with overflow detection and
+    /// mitigation recommendation.
+    ///
+    /// # Arguments
+    /// - `stage`: which pipeline stage was measured.
+    /// - `latency_us`: observed latency in microseconds.
+    /// - `correlation_id`: ID linking this to a pipeline run.
+    pub fn record(
+        &mut self,
+        stage: LatencyStage,
+        latency_us: f64,
+        correlation_id: &str,
+    ) -> ObservationResult {
+        self.run_counter += 1;
+
+        let state = match self.states.iter_mut().find(|s| s.budget.stage == stage) {
+            Some(s) => s,
+            None => {
+                // Unknown stage — return benign result.
+                return ObservationResult {
+                    stage,
+                    latency_us,
+                    overflow: false,
+                    violated_percentile: None,
+                    reason: None,
+                    recommended_mitigation: Mitigation::None,
+                    current_percentiles: PercentileSnapshot {
+                        p50_us: None,
+                        p95_us: None,
+                        p99_us: None,
+                        p999_us: None,
+                        sample_count: 0,
+                        total_observations: 0,
+                    },
+                };
+            }
+        };
+
+        state.window.push(latency_us);
+
+        // Check budget at each percentile level (most severe first).
+        let mut violated = None;
+        let mut reason = None;
+        let mut mitigation = Mitigation::None;
+
+        // Check p999 first (most severe), then p99, p95, p50.
+        for &pctl in &[
+            Percentile::P999,
+            Percentile::P99,
+            Percentile::P95,
+            Percentile::P50,
+        ] {
+            if state.budget.exceeds(pctl, latency_us) {
+                violated = Some(pctl);
+                reason = Some(state.budget.violation_reason(pctl));
+                mitigation = match pctl {
+                    Percentile::P999 => state.policy.on_p999_overflow,
+                    Percentile::P99 => state.policy.on_p99_overflow,
+                    Percentile::P95 => state.policy.on_p95_overflow,
+                    _ => Mitigation::None,
+                };
+                break; // Most severe violation wins.
+            }
+        }
+
+        let overflow = violated.is_some();
+        if overflow {
+            state.overflow_count += 1;
+            state.last_overflow_reason = reason.clone();
+            state.last_mitigation = mitigation;
+        }
+
+        let percentiles = PercentileSnapshot {
+            p50_us: state.window.percentile(0.5),
+            p95_us: state.window.percentile(0.95),
+            p99_us: state.window.percentile(0.99),
+            p999_us: state.window.percentile(0.999),
+            sample_count: state.window.len(),
+            total_observations: state.window.total_count(),
+        };
+
+        // Emit structured log if configured.
+        if self.config.log_all_observations || (self.config.log_overflows_only && overflow) {
+            self.log_entries.push(LatencyLogEntry {
+                timestamp: String::new(), // Caller provides real timestamp.
+                subsystem: format!("latency.{}", stage.reason_prefix().to_lowercase()),
+                correlation_id: correlation_id.to_string(),
+                scenario_id: None,
+                inputs: serde_json::json!({
+                    "stage": stage.reason_prefix(),
+                    "latency_us": latency_us,
+                }),
+                decision: if overflow {
+                    format!("overflow_{}", mitigation)
+                } else {
+                    "within_budget".to_string()
+                },
+                outcome: serde_json::json!({
+                    "overflow": overflow,
+                    "violated_percentile": violated.map(|p| p.to_string()),
+                    "mitigation": mitigation.to_string(),
+                    "p50_us": percentiles.p50_us,
+                    "p95_us": percentiles.p95_us,
+                }),
+                reason_code: reason.as_ref().map(|r| r.to_string()),
+            });
+        }
+
+        ObservationResult {
+            stage,
+            latency_us,
+            overflow,
+            violated_percentile: violated,
+            reason,
+            recommended_mitigation: mitigation,
+            current_percentiles: percentiles,
+        }
+    }
+
+    /// Build a complete PipelineRun from accumulated observations.
+    ///
+    /// Caller provides per-stage observations in pipeline order.
+    pub fn build_run(
+        &self,
+        run_id: &str,
+        correlation_id: &str,
+        observations: Vec<StageObservation>,
+    ) -> PipelineRun {
+        let total: f64 = observations.iter().map(|o| o.latency_us).sum();
+        let has_overflow = observations.iter().any(|o| o.overflow);
+        let reasons: Vec<ReasonCode> = observations
+            .iter()
+            .filter_map(|o| o.reason.clone())
+            .collect();
+
+        PipelineRun {
+            run_id: run_id.to_string(),
+            correlation_id: correlation_id.to_string(),
+            scenario_id: None,
+            stages: observations,
+            total_latency_us: total,
+            has_overflow,
+            reasons,
+        }
+    }
+
+    /// Get a diagnostic snapshot of the enforcer state.
+    pub fn snapshot(&self) -> EnforcerSnapshot {
+        let stages: Vec<StageSnapshot> = self
+            .states
+            .iter()
+            .map(|s| StageSnapshot {
+                stage: s.budget.stage,
+                budget: s.budget,
+                percentiles: PercentileSnapshot {
+                    p50_us: s.window.percentile(0.5),
+                    p95_us: s.window.percentile(0.95),
+                    p99_us: s.window.percentile(0.99),
+                    p999_us: s.window.percentile(0.999),
+                    sample_count: s.window.len(),
+                    total_observations: s.window.total_count(),
+                },
+                overflow_count: s.overflow_count,
+                mean_us: s.window.mean(),
+                last_mitigation: s.last_mitigation,
+            })
+            .collect();
+
+        let total_observations: u64 = stages
+            .iter()
+            .map(|s| s.percentiles.total_observations)
+            .sum();
+        let total_overflows: u64 = stages.iter().map(|s| s.overflow_count).sum();
+
+        // Compute slack at each percentile.
+        let slack: Vec<(Percentile, f64)> = Percentile::ALL
+            .iter()
+            .map(|&p| {
+                let agg = self.pipeline_tree.aggregate(p);
+                let observed_sum: f64 = stages
+                    .iter()
+                    .filter_map(|s| {
+                        let pctl_val = match p {
+                            Percentile::P50 => s.percentiles.p50_us,
+                            Percentile::P95 => s.percentiles.p95_us,
+                            Percentile::P99 => s.percentiles.p99_us,
+                            Percentile::P999 => s.percentiles.p999_us,
+                        };
+                        pctl_val
+                    })
+                    .sum();
+                (p, agg - observed_sum)
+            })
+            .collect();
+
+        EnforcerSnapshot {
+            stages,
+            total_observations,
+            total_overflows,
+            slack,
+        }
+    }
+
+    /// Get the accumulated log entries and clear the buffer.
+    pub fn drain_logs(&mut self) -> Vec<LatencyLogEntry> {
+        std::mem::take(&mut self.log_entries)
+    }
+
+    /// Get the number of accumulated log entries.
+    pub fn log_count(&self) -> usize {
+        self.log_entries.len()
+    }
+
+    /// Get the total number of observations across all stages.
+    pub fn total_observations(&self) -> u64 {
+        self.states.iter().map(|s| s.window.total_count()).sum()
+    }
+
+    /// Get the total number of overflow events across all stages.
+    pub fn total_overflows(&self) -> u64 {
+        self.states.iter().map(|s| s.overflow_count).sum()
+    }
+
+    /// Check if a specific stage has a budget registered.
+    pub fn has_stage(&self, stage: LatencyStage) -> bool {
+        self.states.iter().any(|s| s.budget.stage == stage)
+    }
+
+    /// Get the budget for a specific stage.
+    pub fn stage_budget(&self, stage: LatencyStage) -> Option<&StageBudget> {
+        self.states
+            .iter()
+            .find(|s| s.budget.stage == stage)
+            .map(|s| &s.budget)
+    }
+
+    /// Get the mitigation recommendation for a stage at a given percentile.
+    pub fn mitigation_for(&self, stage: LatencyStage, percentile: Percentile) -> Mitigation {
+        self.states
+            .iter()
+            .find(|s| s.budget.stage == stage)
+            .map(|s| match percentile {
+                Percentile::P999 => s.policy.on_p999_overflow,
+                Percentile::P99 => s.policy.on_p99_overflow,
+                Percentile::P95 => s.policy.on_p95_overflow,
+                Percentile::P50 => Mitigation::None,
+            })
+            .unwrap_or(Mitigation::None)
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1783,6 +2329,268 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         let back: LatencyLogEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(entry, back);
+    }
+
+    // ── Helper ──
+
+    // ── BudgetEnforcer Tests ──
+
+    #[test]
+    fn test_enforcer_creation_default() {
+        let enforcer = BudgetEnforcer::with_defaults();
+        assert_eq!(enforcer.total_observations(), 0);
+        assert_eq!(enforcer.total_overflows(), 0);
+        for &stage in LatencyStage::PIPELINE_STAGES {
+            assert!(enforcer.has_stage(stage), "missing stage {stage}");
+        }
+    }
+
+    #[test]
+    fn test_enforcer_record_within_budget() {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        let result = enforcer.record(LatencyStage::DeltaExtraction, 100.0, "test-001");
+        assert!(!result.overflow);
+        assert_eq!(result.recommended_mitigation, Mitigation::None);
+        assert_eq!(enforcer.total_observations(), 1);
+        assert_eq!(enforcer.total_overflows(), 0);
+    }
+
+    #[test]
+    fn test_enforcer_record_exceeds_p999() {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        // DeltaExtraction p999 budget is 5000μs. Send 10000μs.
+        let result = enforcer.record(LatencyStage::DeltaExtraction, 10_000.0, "test-002");
+        assert!(result.overflow);
+        assert_eq!(result.violated_percentile, Some(Percentile::P999));
+        assert!(result.reason.is_some());
+        assert_ne!(result.recommended_mitigation, Mitigation::None);
+        assert_eq!(enforcer.total_overflows(), 1);
+    }
+
+    #[test]
+    fn test_enforcer_record_exceeds_p99_not_p999() {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        // DeltaExtraction p99=1000, p999=5000. Send 2000μs.
+        let result = enforcer.record(LatencyStage::DeltaExtraction, 2_000.0, "test-003");
+        assert!(result.overflow);
+        assert_eq!(result.violated_percentile, Some(Percentile::P99));
+    }
+
+    #[test]
+    fn test_enforcer_percentile_estimation() {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        // Add 100 observations for PtyCapture.
+        for i in 0..100 {
+            enforcer.record(LatencyStage::PtyCapture, (i + 1) as f64 * 10.0, "test");
+        }
+        let snap = enforcer.snapshot();
+        let pty_snap = snap
+            .stages
+            .iter()
+            .find(|s| s.stage == LatencyStage::PtyCapture)
+            .unwrap();
+        assert_eq!(pty_snap.percentiles.sample_count, 100);
+        assert_eq!(pty_snap.percentiles.total_observations, 100);
+        // p50 should be around 500μs (50th value in 10,20,...,1000)
+        let p50 = pty_snap.percentiles.p50_us.unwrap();
+        assert!(p50 > 400.0 && p50 < 600.0, "p50 = {p50}");
+    }
+
+    #[test]
+    fn test_enforcer_window_wraps() {
+        let config = BudgetEnforcerConfig {
+            window_size: 10,
+            ..BudgetEnforcerConfig::default()
+        };
+        let mut enforcer = BudgetEnforcer::new(config);
+        // Add 25 observations — wraps around.
+        for i in 0..25 {
+            enforcer.record(LatencyStage::PtyCapture, (i + 1) as f64, "test");
+        }
+        let snap = enforcer.snapshot();
+        let pty_snap = snap
+            .stages
+            .iter()
+            .find(|s| s.stage == LatencyStage::PtyCapture)
+            .unwrap();
+        assert_eq!(pty_snap.percentiles.sample_count, 10);
+        assert_eq!(pty_snap.percentiles.total_observations, 25);
+    }
+
+    #[test]
+    fn test_enforcer_snapshot_slack() {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        // Record normal values for all stages.
+        for &stage in LatencyStage::PIPELINE_STAGES {
+            enforcer.record(stage, 10.0, "test");
+        }
+        let snap = enforcer.snapshot();
+        // Slack should be positive for all percentiles (10μs is well under budget).
+        for (pctl, slack) in &snap.slack {
+            assert!(*slack > 0.0, "negative slack at {pctl}: {slack}");
+        }
+    }
+
+    #[test]
+    fn test_enforcer_log_overflows_only() {
+        let config = BudgetEnforcerConfig {
+            log_overflows_only: true,
+            log_all_observations: false,
+            ..BudgetEnforcerConfig::default()
+        };
+        let mut enforcer = BudgetEnforcer::new(config);
+        enforcer.record(LatencyStage::DeltaExtraction, 100.0, "test"); // within budget
+        assert_eq!(enforcer.log_count(), 0);
+        enforcer.record(LatencyStage::DeltaExtraction, 100_000.0, "test"); // overflow
+        assert_eq!(enforcer.log_count(), 1);
+    }
+
+    #[test]
+    fn test_enforcer_log_all() {
+        let config = BudgetEnforcerConfig {
+            log_overflows_only: false,
+            log_all_observations: true,
+            ..BudgetEnforcerConfig::default()
+        };
+        let mut enforcer = BudgetEnforcer::new(config);
+        enforcer.record(LatencyStage::DeltaExtraction, 100.0, "test");
+        enforcer.record(LatencyStage::DeltaExtraction, 200.0, "test");
+        assert_eq!(enforcer.log_count(), 2);
+    }
+
+    #[test]
+    fn test_enforcer_drain_logs() {
+        let config = BudgetEnforcerConfig {
+            log_all_observations: true,
+            ..BudgetEnforcerConfig::default()
+        };
+        let mut enforcer = BudgetEnforcer::new(config);
+        enforcer.record(LatencyStage::PtyCapture, 100.0, "test");
+        let logs = enforcer.drain_logs();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(enforcer.log_count(), 0);
+    }
+
+    #[test]
+    fn test_enforcer_mitigation_for_stage() {
+        let enforcer = BudgetEnforcer::with_defaults();
+        // PatternDetection: p99=Degrade, p999=Skip
+        assert_eq!(
+            enforcer.mitigation_for(LatencyStage::PatternDetection, Percentile::P99),
+            Mitigation::Degrade
+        );
+        assert_eq!(
+            enforcer.mitigation_for(LatencyStage::PatternDetection, Percentile::P999),
+            Mitigation::Skip
+        );
+        assert_eq!(
+            enforcer.mitigation_for(LatencyStage::PatternDetection, Percentile::P50),
+            Mitigation::None
+        );
+    }
+
+    #[test]
+    fn test_enforcer_unknown_stage() {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        // Aggregate stages have no state — should return benign result.
+        let result = enforcer.record(LatencyStage::EndToEndCapture, 100.0, "test");
+        assert!(!result.overflow);
+        assert_eq!(result.current_percentiles.sample_count, 0);
+    }
+
+    #[test]
+    fn test_enforcer_build_run() {
+        let enforcer = BudgetEnforcer::with_defaults();
+        let obs = vec![StageObservation {
+            stage: LatencyStage::PtyCapture,
+            latency_us: 5000.0,
+            correlation_id: "run-001".into(),
+            scenario_id: None,
+            start_epoch_us: 1000,
+            end_epoch_us: 6000,
+            overflow: false,
+            reason: None,
+            mitigation: Mitigation::None,
+        }];
+        let run = enforcer.build_run("run-001", "corr-001", obs);
+        assert_eq!(run.run_id, "run-001");
+        assert_eq!(run.total_latency_us, 5000.0);
+        assert!(!run.has_overflow);
+    }
+
+    #[test]
+    fn test_enforcer_multiple_stages_tracking() {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        let stages = [
+            LatencyStage::PtyCapture,
+            LatencyStage::DeltaExtraction,
+            LatencyStage::StorageWrite,
+        ];
+        for &stage in &stages {
+            for i in 1..=10 {
+                enforcer.record(stage, i as f64 * 100.0, "test");
+            }
+        }
+        assert_eq!(enforcer.total_observations(), 30);
+        let snap = enforcer.snapshot();
+        assert_eq!(snap.stages.len(), 8); // all pipeline stages tracked
+        for s in &snap.stages {
+            if stages.contains(&s.stage) {
+                assert_eq!(s.percentiles.total_observations, 10);
+            }
+        }
+    }
+
+    #[test]
+    fn test_enforcer_snapshot_serde_roundtrip() {
+        let mut enforcer = BudgetEnforcer::with_defaults();
+        for &stage in LatencyStage::PIPELINE_STAGES {
+            enforcer.record(stage, 100.0, "test");
+        }
+        let snap = enforcer.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: EnforcerSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap.total_observations, back.total_observations);
+        assert_eq!(snap.stages.len(), back.stages.len());
+    }
+
+    #[test]
+    fn test_default_mitigation_policies_cover_all_stages() {
+        let policies = default_mitigation_policies();
+        for &stage in LatencyStage::PIPELINE_STAGES {
+            assert!(
+                policies.iter().any(|p| p.stage == stage),
+                "missing mitigation policy for {stage}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_latency_window_empty() {
+        let window = LatencyWindow::new(10);
+        assert!(window.percentile(0.5).is_none());
+        assert!(window.mean().is_none());
+        assert_eq!(window.len(), 0);
+        assert_eq!(window.total_count(), 0);
+    }
+
+    #[test]
+    fn test_latency_window_single() {
+        let mut window = LatencyWindow::new(10);
+        window.push(42.0);
+        assert_eq!(window.percentile(0.5), Some(42.0));
+        assert_eq!(window.mean(), Some(42.0));
+        assert_eq!(window.len(), 1);
+    }
+
+    #[test]
+    fn test_latency_window_mean() {
+        let mut window = LatencyWindow::new(100);
+        for i in 1..=10 {
+            window.push(i as f64);
+        }
+        let mean = window.mean().unwrap();
+        assert!((mean - 5.5).abs() < 0.01);
     }
 
     // ── Helper ──
