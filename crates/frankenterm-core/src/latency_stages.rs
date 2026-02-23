@@ -6874,6 +6874,97 @@ impl TieredScrollbackManager {
             }
         });
     }
+
+    /// Bulk ingest multiple segments. Returns assigned IDs.
+    pub fn ingest_bulk(
+        &mut self,
+        items: &[(u64, u64, u64)], // (pane_id, byte_size, line_count)
+        now_us: u64,
+    ) -> Vec<u64> {
+        items
+            .iter()
+            .map(|&(pane_id, byte_size, line_count)| self.ingest(pane_id, byte_size, line_count, now_us))
+            .collect()
+    }
+
+    /// Segments for a given pane, ordered by creation time.
+    pub fn segments_for_pane(&self, pane_id: u64) -> Vec<&ScrollbackSegment> {
+        self.segments
+            .iter()
+            .filter(|s| s.pane_id == pane_id)
+            .collect()
+    }
+
+    /// Tier-specific byte count.
+    pub fn tier_bytes(&self, tier: ScrollbackTier) -> u64 {
+        match tier {
+            ScrollbackTier::Hot => self.hot_bytes,
+            ScrollbackTier::Warm => self.warm_bytes,
+            ScrollbackTier::Cold => self.cold_bytes,
+        }
+    }
+
+    /// Total line count across all segments.
+    pub fn total_lines(&self) -> u64 {
+        self.segments.iter().map(|s| s.line_count).sum()
+    }
+
+    /// Evict the oldest hot-tier segments until hot utilization drops below the target ratio.
+    /// Evicted segments are removed entirely (not migrated). Returns bytes freed.
+    pub fn evict_hot_to_target(&mut self, target_utilization: f64) -> u64 {
+        let target_bytes = (self.hot_config.max_bytes as f64 * target_utilization) as u64;
+        let mut freed = 0u64;
+        while self.hot_bytes > target_bytes {
+            // Find the oldest hot segment by created_us
+            let oldest_idx = self
+                .segments
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.tier == ScrollbackTier::Hot)
+                .min_by_key(|(_, s)| s.created_us)
+                .map(|(i, _)| i);
+            match oldest_idx {
+                Some(idx) => {
+                    let removed = self.segments.remove(idx);
+                    self.hot_bytes = self.hot_bytes.saturating_sub(removed.byte_size);
+                    freed += removed.byte_size;
+                }
+                None => break,
+            }
+        }
+        freed
+    }
+
+    /// Oldest segment in the hot tier, if any.
+    pub fn oldest_hot_segment(&self) -> Option<&ScrollbackSegment> {
+        self.segments
+            .iter()
+            .filter(|s| s.tier == ScrollbackTier::Hot)
+            .min_by_key(|s| s.created_us)
+    }
+
+    /// Age of the oldest hot segment in microseconds, or 0 if none.
+    pub fn oldest_hot_age_us(&self, now_us: u64) -> u64 {
+        self.oldest_hot_segment()
+            .map(|s| now_us.saturating_sub(s.last_accessed_us))
+            .unwrap_or(0)
+    }
+
+    /// Distinct pane IDs with data in the manager.
+    pub fn active_pane_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.segments.iter().map(|s| s.pane_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Cold tier utilization (0.0–1.0).
+    pub fn cold_utilization(&self) -> f64 {
+        if self.cold_config.max_bytes == 0 {
+            return 0.0;
+        }
+        self.cold_bytes as f64 / self.cold_config.max_bytes as f64
+    }
 }
 
 /// Degradation states for the tiered scrollback system.
@@ -11802,5 +11893,132 @@ mod tests {
         let json = serde_json::to_string(&seg).unwrap();
         let back: ScrollbackSegment = serde_json::from_str(&json).unwrap();
         assert_eq!(seg, back);
+    }
+
+    // ── C3 Impl Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_tiered_scrollback_ingest_bulk() {
+        let mut mgr = TieredScrollbackManager::with_defaults();
+        let items = vec![(1, 100, 10), (2, 200, 20), (3, 300, 30)];
+        let ids = mgr.ingest_bulk(&items, 0);
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(mgr.segment_count(), 3);
+        assert_eq!(mgr.total_bytes(), 600);
+    }
+
+    #[test]
+    fn test_tiered_scrollback_segments_for_pane() {
+        let mut mgr = TieredScrollbackManager::with_defaults();
+        mgr.ingest(1, 100, 10, 0);
+        mgr.ingest(2, 200, 20, 0);
+        mgr.ingest(1, 300, 30, 0);
+        let pane1 = mgr.segments_for_pane(1);
+        assert_eq!(pane1.len(), 2);
+        assert_eq!(pane1[0].byte_size, 100);
+        assert_eq!(pane1[1].byte_size, 300);
+    }
+
+    #[test]
+    fn test_tiered_scrollback_tier_bytes() {
+        let mut mgr = TieredScrollbackManager::with_defaults();
+        mgr.ingest(1, 1000, 10, 0);
+        assert_eq!(mgr.tier_bytes(ScrollbackTier::Hot), 1000);
+        assert_eq!(mgr.tier_bytes(ScrollbackTier::Warm), 0);
+        assert_eq!(mgr.tier_bytes(ScrollbackTier::Cold), 0);
+    }
+
+    #[test]
+    fn test_tiered_scrollback_total_lines() {
+        let mut mgr = TieredScrollbackManager::with_defaults();
+        mgr.ingest(1, 100, 10, 0);
+        mgr.ingest(2, 200, 25, 0);
+        assert_eq!(mgr.total_lines(), 35);
+    }
+
+    #[test]
+    fn test_tiered_scrollback_evict_hot_to_target() {
+        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1000, target_latency_us: 10, compression_ratio: 1.0 };
+        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 10000, target_latency_us: 500, compression_ratio: 1.0 };
+        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 100000, target_latency_us: 10000, compression_ratio: 0.25 };
+        let mut mgr = TieredScrollbackManager::new(hot, warm, cold, TierMigrationPolicy::default());
+
+        mgr.ingest(1, 300, 10, 100);
+        mgr.ingest(2, 300, 10, 200);
+        mgr.ingest(3, 300, 10, 300);
+        // 900/1000 = 90%. Evict to 50%.
+        let freed = mgr.evict_hot_to_target(0.5);
+        assert!(freed >= 400, "Should have freed enough to reach 50%: freed={}", freed);
+        assert!(mgr.hot_utilization() <= 0.51);
+    }
+
+    #[test]
+    fn test_tiered_scrollback_oldest_hot() {
+        let mut mgr = TieredScrollbackManager::with_defaults();
+        mgr.ingest(1, 100, 10, 1000);
+        mgr.ingest(2, 200, 20, 2000);
+        let oldest = mgr.oldest_hot_segment().unwrap();
+        assert_eq!(oldest.created_us, 1000);
+        assert_eq!(mgr.oldest_hot_age_us(5000), 4000);
+    }
+
+    #[test]
+    fn test_tiered_scrollback_oldest_hot_empty() {
+        let mgr = TieredScrollbackManager::with_defaults();
+        assert!(mgr.oldest_hot_segment().is_none());
+        assert_eq!(mgr.oldest_hot_age_us(1000), 0);
+    }
+
+    #[test]
+    fn test_tiered_scrollback_active_pane_ids() {
+        let mut mgr = TieredScrollbackManager::with_defaults();
+        mgr.ingest(3, 100, 10, 0);
+        mgr.ingest(1, 200, 20, 0);
+        mgr.ingest(3, 300, 30, 0);
+        mgr.ingest(2, 400, 40, 0);
+        let ids = mgr.active_pane_ids();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_tiered_scrollback_cold_utilization() {
+        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1000, target_latency_us: 10, compression_ratio: 1.0 };
+        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 5000, target_latency_us: 500, compression_ratio: 1.0 };
+        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 10000, target_latency_us: 10000, compression_ratio: 0.5 };
+        let policy = TierMigrationPolicy {
+            hot_to_warm_age_us: 10,
+            warm_to_cold_age_us: 100,
+            min_segment_bytes: 1,
+            pressure_threshold: 0.99,
+            max_concurrent_migrations: 10,
+        };
+        let mut mgr = TieredScrollbackManager::new(hot, warm, cold, policy);
+        mgr.ingest(1, 2000, 20, 0);
+        mgr.migrate(50);   // hot→warm
+        mgr.migrate(200);  // warm→cold
+        // 2000 * 0.5 = 1000 cold bytes, util = 1000/10000 = 0.1
+        assert!((mgr.cold_utilization() - 0.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_tiered_scrollback_migration_events_recorded() {
+        let policy = TierMigrationPolicy {
+            hot_to_warm_age_us: 0,
+            warm_to_cold_age_us: 1_000_000,
+            min_segment_bytes: 1,
+            pressure_threshold: 0.99,
+            max_concurrent_migrations: 10,
+        };
+        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1_000_000, target_latency_us: 10, compression_ratio: 1.0 };
+        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 1_000_000, target_latency_us: 500, compression_ratio: 1.0 };
+        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 10_000_000, target_latency_us: 10000, compression_ratio: 0.25 };
+        let mut mgr = TieredScrollbackManager::new(hot, warm, cold, policy);
+        mgr.ingest(1, 500, 5, 0);
+        mgr.ingest(2, 600, 6, 0);
+        mgr.migrate(1);
+        let events = mgr.recent_migrations();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].from_tier, ScrollbackTier::Hot);
+        assert_eq!(events[0].to_tier, ScrollbackTier::Warm);
     }
 }
