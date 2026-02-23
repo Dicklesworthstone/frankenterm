@@ -3256,3 +3256,171 @@ proptest! {
         prop_assert!(est_diff < tol, "est roundtrip: {} vs {}", dec.estimated_cost_us, back.estimated_cost_us);
     }
 }
+
+// ── C5: Tail-Latency Property Tests ────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(150))]
+
+    /// Wakeup count conservation: timer + io + signal + nudge == total.
+    #[test]
+    fn tail_latency_wakeup_conservation(
+        sources in proptest::collection::vec(0_u8..4, 1..50),
+    ) {
+        let mut ctrl = TailLatencyController::with_defaults();
+        for &s in &sources {
+            let source = match s {
+                0 => WakeupSource::Timer,
+                1 => WakeupSource::IoEvent,
+                2 => WakeupSource::Signal,
+                _ => WakeupSource::Nudge,
+            };
+            ctrl.record_wakeup(source, 100);
+        }
+        let snap = ctrl.snapshot();
+        prop_assert_eq!(
+            snap.timer_wakeups + snap.io_wakeups + snap.signal_wakeups + snap.nudge_wakeups,
+            snap.total_wakeups,
+        );
+    }
+
+    /// Max latency is non-decreasing as more samples arrive.
+    #[test]
+    fn tail_latency_max_nondecreasing(
+        latencies in proptest::collection::vec(1_u64..100000, 2..30),
+    ) {
+        let mut ctrl = TailLatencyController::with_defaults();
+        let mut prev_max = 0u64;
+        for &lat in &latencies {
+            ctrl.record_wakeup(WakeupSource::Timer, lat);
+            let cur_max = ctrl.snapshot().max_latency_us;
+            prop_assert!(cur_max >= prev_max);
+            prev_max = cur_max;
+        }
+    }
+
+    /// p99 <= max latency always.
+    #[test]
+    fn tail_latency_p99_le_max(
+        latencies in proptest::collection::vec(1_u64..100000, 1..50),
+    ) {
+        let mut ctrl = TailLatencyController::with_defaults();
+        for &lat in &latencies {
+            ctrl.record_wakeup(WakeupSource::Timer, lat);
+        }
+        prop_assert!(ctrl.p99_latency_us() <= ctrl.snapshot().max_latency_us);
+    }
+
+    /// p50 <= p99 always.
+    #[test]
+    fn tail_latency_p50_le_p99(
+        latencies in proptest::collection::vec(1_u64..100000, 1..50),
+    ) {
+        let mut ctrl = TailLatencyController::with_defaults();
+        for &lat in &latencies {
+            ctrl.record_wakeup(WakeupSource::Timer, lat);
+        }
+        prop_assert!(ctrl.p50_latency_us() <= ctrl.p99_latency_us());
+    }
+
+    /// Wakeup distribution sums to 1.0 when total > 0.
+    #[test]
+    fn tail_latency_distribution_sums_to_one(
+        n in 1_usize..50,
+    ) {
+        let mut ctrl = TailLatencyController::with_defaults();
+        for i in 0..n {
+            let source = match i % 4 {
+                0 => WakeupSource::Timer,
+                1 => WakeupSource::IoEvent,
+                2 => WakeupSource::Signal,
+                _ => WakeupSource::Nudge,
+            };
+            ctrl.record_wakeup(source, 100);
+        }
+        let (t, io, s, nd) = ctrl.wakeup_distribution();
+        let sum = t + io + s + nd;
+        let diff = (sum - 1.0).abs();
+        prop_assert!(diff < 1e-10, "distribution sum {} != 1.0", sum);
+    }
+
+    /// Violation rate is bounded [0, 1].
+    #[test]
+    fn tail_latency_violation_rate_bounded(
+        latencies in proptest::collection::vec(1_u64..50000, 1..30),
+    ) {
+        let config = TailLatencyConfig {
+            p99_budget_us: 10000,
+            ..Default::default()
+        };
+        let mut ctrl = TailLatencyController::new(config);
+        for &lat in &latencies {
+            ctrl.record_wakeup(WakeupSource::Timer, lat);
+        }
+        let rate = ctrl.violation_rate();
+        prop_assert!(rate >= 0.0 && rate <= 1.0, "rate={}", rate);
+    }
+
+    /// Batch depth sum == total_syscalls.
+    #[test]
+    fn tail_latency_batch_sum(
+        depths in proptest::collection::vec(1_usize..100, 1..20),
+    ) {
+        let mut ctrl = TailLatencyController::with_defaults();
+        let mut expected_syscalls = 0u64;
+        for &d in &depths {
+            ctrl.record_batch(d);
+            expected_syscalls += d as u64;
+        }
+        prop_assert_eq!(ctrl.snapshot().total_syscalls, expected_syscalls);
+        prop_assert_eq!(ctrl.snapshot().total_batches, depths.len() as u64);
+    }
+
+    /// Reset clears all state.
+    #[test]
+    fn tail_latency_reset_zeroes(
+        n in 1_usize..20,
+    ) {
+        let mut ctrl = TailLatencyController::with_defaults();
+        for _ in 0..n {
+            ctrl.record_wakeup(WakeupSource::Timer, 500);
+        }
+        ctrl.record_batch(10);
+        ctrl.reset();
+        let snap = ctrl.snapshot();
+        prop_assert_eq!(snap.total_wakeups, 0);
+        prop_assert_eq!(snap.total_batches, 0);
+        prop_assert_eq!(snap.max_latency_us, 0);
+        prop_assert_eq!(snap.budget_violations, 0);
+    }
+
+    /// SyscallStrategy serde roundtrip.
+    #[test]
+    fn tail_latency_strategy_serde(idx in 0_u8..3) {
+        let strategy = match idx {
+            0 => SyscallStrategy::Immediate,
+            1 => SyscallStrategy::Batched,
+            _ => SyscallStrategy::Adaptive,
+        };
+        let json = serde_json::to_string(&strategy).unwrap();
+        let back: SyscallStrategy = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(strategy, back);
+    }
+
+    /// TailLatencyDegradation serde roundtrip.
+    #[test]
+    fn tail_latency_degradation_serde(
+        variant in 0_u8..4,
+        obs in 1_u64..100000,
+    ) {
+        let degradation = match variant {
+            0 => TailLatencyDegradation::Healthy,
+            1 => TailLatencyDegradation::P99Breach { observed_us: obs, budget_us: obs / 2 },
+            2 => TailLatencyDegradation::P999Breach { observed_us: obs, budget_us: obs / 2 },
+            _ => TailLatencyDegradation::HighViolationRate { violations: obs, total: obs * 10 },
+        };
+        let json = serde_json::to_string(&degradation).unwrap();
+        let back: TailLatencyDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(degradation, back);
+    }
+}
