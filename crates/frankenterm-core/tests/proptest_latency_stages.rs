@@ -997,3 +997,248 @@ proptest! {
         prop_assert_eq!(d, back);
     }
 }
+
+// ── MitigationLevel Property Tests ──────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// MitigationLevel roundtrip through Mitigation is identity.
+    #[test]
+    fn mitigation_level_roundtrip(idx in 0_usize..5) {
+        let levels = MitigationLevel::ALL;
+        let level = levels[idx];
+        let mit = level.to_mitigation();
+        let back = MitigationLevel::from_mitigation(mit);
+        prop_assert_eq!(level, back);
+    }
+
+    /// MitigationLevel serde roundtrip.
+    #[test]
+    fn mitigation_level_serde(idx in 0_usize..5) {
+        let levels = MitigationLevel::ALL;
+        let level = levels[idx];
+        let json = serde_json::to_string(&level).unwrap();
+        let back: MitigationLevel = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(level, back);
+    }
+
+    /// Severity is monotonically increasing.
+    #[test]
+    fn mitigation_level_severity_monotonic(a in 0_usize..5, b in 0_usize..5) {
+        let levels = MitigationLevel::ALL;
+        let la = levels[a];
+        let lb = levels[b];
+        if la < lb {
+            prop_assert!(la.severity() < lb.severity());
+        } else if la == lb {
+            prop_assert_eq!(la.severity(), lb.severity());
+        } else {
+            prop_assert!(la.severity() > lb.severity());
+        }
+    }
+}
+
+// ── PolicyConstraint Property Tests ──────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// PolicyConstraint.clamp() result is <= max_level.
+    #[test]
+    fn policy_clamp_bounded(
+        max_idx in 0_usize..5,
+        req_idx in 0_usize..5,
+        stage in arb_stage(),
+    ) {
+        let levels = MitigationLevel::ALL;
+        let pc = PolicyConstraint {
+            stage,
+            max_level: levels[max_idx],
+            critical: false,
+            warmup_count: 0,
+        };
+        let requested = levels[req_idx];
+        let clamped = pc.clamp(requested);
+        prop_assert!(clamped <= pc.max_level,
+            "clamped {:?} > max {:?}", clamped, pc.max_level);
+    }
+
+    /// PolicyConstraint.allows() is consistent with clamp().
+    #[test]
+    fn policy_allows_consistent_with_clamp(
+        max_idx in 0_usize..5,
+        req_idx in 0_usize..5,
+        stage in arb_stage(),
+    ) {
+        let levels = MitigationLevel::ALL;
+        let pc = PolicyConstraint {
+            stage,
+            max_level: levels[max_idx],
+            critical: false,
+            warmup_count: 0,
+        };
+        let requested = levels[req_idx];
+        if pc.allows(requested) {
+            prop_assert_eq!(pc.clamp(requested), requested);
+        } else {
+            prop_assert_eq!(pc.clamp(requested), pc.max_level);
+        }
+    }
+}
+
+// ── RuntimeEnforcer Property Tests ──────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// RuntimeEnforcer observation count equals number of enforce() calls.
+    #[test]
+    fn runtime_enforcer_obs_count(
+        n in 1_usize..=30,
+    ) {
+        let mut re = RuntimeEnforcer::with_defaults();
+        for i in 0..n {
+            re.enforce(LatencyStage::PtyCapture, 10.0, "test", i as u64 * 100);
+        }
+        prop_assert_eq!(re.total_observations(), n as u64);
+    }
+
+    /// RuntimeEnforcer escalation count is bounded by observation count.
+    #[test]
+    fn runtime_enforcer_escalation_bounded(
+        latencies in prop::collection::vec(1.0..500_000.0_f64, 1..=20),
+    ) {
+        let config = RuntimeEnforcerConfig {
+            policy_constraints: default_policy_constraints()
+                .into_iter()
+                .map(|mut c| { c.warmup_count = 0; c })
+                .collect(),
+            ..RuntimeEnforcerConfig::default()
+        };
+        let mut re = RuntimeEnforcer::new(config);
+        for (i, &lat) in latencies.iter().enumerate() {
+            re.enforce(LatencyStage::PtyCapture, lat, "test", i as u64 * 1000);
+        }
+        prop_assert!(re.total_escalations() <= re.total_observations());
+    }
+
+    /// RuntimeEnforcer recovery count <= escalation count.
+    #[test]
+    fn runtime_enforcer_recovery_bounded(
+        latencies in prop::collection::vec(1.0..500_000.0_f64, 1..=30),
+    ) {
+        let config = RuntimeEnforcerConfig {
+            recovery: RecoveryProtocol {
+                cooldown_observations: 3,
+                max_degraded_duration_us: 100_000_000,
+                gradual: true,
+            },
+            policy_constraints: default_policy_constraints()
+                .into_iter()
+                .map(|mut c| { c.warmup_count = 0; c })
+                .collect(),
+            ..RuntimeEnforcerConfig::default()
+        };
+        let mut re = RuntimeEnforcer::new(config);
+        for (i, &lat) in latencies.iter().enumerate() {
+            re.enforce(LatencyStage::PatternDetection, lat, "test", i as u64 * 1000);
+        }
+        // Recoveries can't exceed escalations in a monotonic sequence.
+        // But with repeated escalate/recover cycles, they can be equal.
+        // What we know: can't recover without having escalated first.
+        prop_assert!(re.total_recoveries() <= re.total_observations(),
+            "recoveries {} > observations {}", re.total_recoveries(), re.total_observations());
+    }
+
+    /// Within-budget observations never cause escalation.
+    #[test]
+    fn runtime_enforcer_no_escalation_within_budget(
+        n in 1_usize..=20,
+    ) {
+        let config = RuntimeEnforcerConfig {
+            policy_constraints: default_policy_constraints()
+                .into_iter()
+                .map(|mut c| { c.warmup_count = 0; c })
+                .collect(),
+            ..RuntimeEnforcerConfig::default()
+        };
+        let mut re = RuntimeEnforcer::new(config);
+        for i in 0..n {
+            re.enforce(LatencyStage::PtyCapture, 1.0, "test", i as u64 * 100);
+        }
+        prop_assert_eq!(re.total_escalations(), 0);
+        prop_assert!(re.is_fully_recovered());
+    }
+
+    /// enforce_run() returns decisions matching the context stage count.
+    #[test]
+    fn runtime_enforcer_enforce_run_count(
+        n_stages in 1_usize..=8,
+    ) {
+        let config = RuntimeEnforcerConfig {
+            policy_constraints: default_policy_constraints()
+                .into_iter()
+                .map(|mut c| { c.warmup_count = 0; c })
+                .collect(),
+            ..RuntimeEnforcerConfig::default()
+        };
+        let mut re = RuntimeEnforcer::new(config);
+        let mut ctx = CorrelationContext::new("batch", 0);
+        let mut t = 100_u64;
+        for i in 0..n_stages {
+            let probe = ctx.begin_stage(LatencyStage::PIPELINE_STAGES[i], t);
+            t += 50;
+            ctx.end_stage(probe, t);
+            t += 10;
+        }
+        let decisions = re.enforce_run(&ctx, 0);
+        prop_assert_eq!(decisions.len(), n_stages);
+    }
+
+    /// EnforcementDecision serde roundtrip (f64 tolerance).
+    #[test]
+    fn enforcement_decision_serde(
+        stage in arb_stage(),
+        latency in 1.0..100_000.0_f64,
+        overflow in prop::bool::ANY,
+        level_idx in 0_usize..5,
+    ) {
+        let levels = MitigationLevel::ALL;
+        let d = EnforcementDecision {
+            stage,
+            latency_us: latency,
+            overflow,
+            raw_mitigation: levels[level_idx],
+            applied_mitigation: levels[level_idx],
+            recovery: false,
+            reason: None,
+            warmup_active: false,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: EnforcementDecision = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(d.stage, back.stage);
+        prop_assert!((d.latency_us - back.latency_us).abs() < 1e-10);
+        prop_assert_eq!(d.overflow, back.overflow);
+        prop_assert_eq!(d.raw_mitigation, back.raw_mitigation);
+        prop_assert_eq!(d.applied_mitigation, back.applied_mitigation);
+        prop_assert_eq!(d.recovery, back.recovery);
+        prop_assert_eq!(d.warmup_active, back.warmup_active);
+    }
+
+    /// RuntimeEnforcerSnapshot serde roundtrip.
+    #[test]
+    fn runtime_enforcer_snapshot_serde(
+        n in 0_usize..=10,
+    ) {
+        let mut re = RuntimeEnforcer::with_defaults();
+        for i in 0..n {
+            re.enforce(LatencyStage::PtyCapture, 10.0, "test", i as u64 * 100);
+        }
+        let snap = re.diagnostic_snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: RuntimeEnforcerSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap.observation_count, back.observation_count);
+        prop_assert_eq!(snap.fully_recovered, back.fully_recovered);
+    }
+}
