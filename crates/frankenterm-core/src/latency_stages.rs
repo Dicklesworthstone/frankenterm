@@ -2864,6 +2864,54 @@ impl RuntimeEnforcer {
             )
         }
     }
+
+    /// Process a complete CorrelationContext through the enforcer.
+    ///
+    /// Returns per-stage enforcement decisions.
+    pub fn enforce_run(
+        &mut self,
+        ctx: &CorrelationContext,
+        base_time_us: u64,
+    ) -> Vec<EnforcementDecision> {
+        let mut decisions = Vec::with_capacity(ctx.timings.len());
+        for timing in &ctx.timings {
+            let d = self.enforce(
+                timing.stage,
+                timing.latency_us,
+                &ctx.correlation_id,
+                base_time_us + timing.end_us,
+            );
+            decisions.push(d);
+        }
+        decisions
+    }
+
+    /// Get a full diagnostic snapshot.
+    pub fn diagnostic_snapshot(&self) -> RuntimeEnforcerSnapshot {
+        RuntimeEnforcerSnapshot {
+            observation_count: self.observation_count,
+            total_escalations: self.total_escalations(),
+            total_recoveries: self.total_recoveries(),
+            fully_recovered: self.is_fully_recovered(),
+            stage_states: self
+                .states
+                .iter()
+                .map(|(s, st)| (*s, st.clone()))
+                .collect(),
+            base_snapshot: self.enforcer.snapshot(),
+        }
+    }
+}
+
+/// Full diagnostic snapshot of the runtime enforcer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeEnforcerSnapshot {
+    pub observation_count: u64,
+    pub total_escalations: u64,
+    pub total_recoveries: u64,
+    pub fully_recovered: bool,
+    pub stage_states: Vec<(LatencyStage, StageEnforcementState)>,
+    pub base_snapshot: EnforcerSnapshot,
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -4543,6 +4591,89 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: StageEnforcementState = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    // ── RuntimeEnforcer Impl extensions ──
+
+    #[test]
+    fn test_runtime_enforcer_enforce_run() {
+        let config = RuntimeEnforcerConfig {
+            policy_constraints: default_policy_constraints()
+                .into_iter()
+                .map(|mut c| {
+                    c.warmup_count = 0;
+                    c
+                })
+                .collect(),
+            ..RuntimeEnforcerConfig::default()
+        };
+        let mut re = RuntimeEnforcer::new(config);
+        let mut ctx = CorrelationContext::new("batch-run", 0);
+        let mut t = 1000_u64;
+        for &stage in LatencyStage::PIPELINE_STAGES {
+            let probe = ctx.begin_stage(stage, t);
+            t += 50; // 50μs, well within budget
+            ctx.end_stage(probe, t);
+            t += 10;
+        }
+        let decisions = re.enforce_run(&ctx, 0);
+        assert_eq!(decisions.len(), 8);
+        assert!(decisions.iter().all(|d| !d.overflow));
+    }
+
+    #[test]
+    fn test_runtime_enforcer_diagnostic_snapshot() {
+        let mut re = RuntimeEnforcer::with_defaults();
+        re.enforce(LatencyStage::PtyCapture, 10.0, "test", 0);
+        let snap = re.diagnostic_snapshot();
+        assert_eq!(snap.observation_count, 1);
+        assert_eq!(snap.total_escalations, 0);
+        assert!(snap.fully_recovered);
+        assert_eq!(snap.stage_states.len(), 8);
+    }
+
+    #[test]
+    fn test_runtime_enforcer_snapshot_serde_roundtrip() {
+        let mut re = RuntimeEnforcer::with_defaults();
+        for i in 0..5 {
+            re.enforce(LatencyStage::PtyCapture, 10.0, "test", i * 100);
+        }
+        let snap = re.diagnostic_snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: RuntimeEnforcerSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap.observation_count, back.observation_count);
+        assert_eq!(snap.total_escalations, back.total_escalations);
+        assert_eq!(snap.fully_recovered, back.fully_recovered);
+    }
+
+    #[test]
+    fn test_runtime_enforcer_timeout_recovery() {
+        let config = RuntimeEnforcerConfig {
+            recovery: RecoveryProtocol {
+                cooldown_observations: 1000, // high, so cooldown won't trigger
+                max_degraded_duration_us: 5000, // 5ms timeout
+                gradual: false, // jump to full
+            },
+            policy_constraints: vec![PolicyConstraint {
+                stage: LatencyStage::PatternDetection,
+                max_level: MitigationLevel::Skip,
+                critical: false,
+                warmup_count: 0,
+            }],
+            ..RuntimeEnforcerConfig::default()
+        };
+        let mut re = RuntimeEnforcer::new(config);
+        // Trigger escalation at time 1000.
+        re.enforce(LatencyStage::PatternDetection, 100_000.0, "test", 1000);
+        assert!(re.current_level(LatencyStage::PatternDetection) > MitigationLevel::None);
+
+        // Record ok observation at time 7000 (6ms after escalation, past 5ms timeout).
+        let d = re.enforce(LatencyStage::PatternDetection, 10.0, "test", 7000);
+        assert!(d.recovery);
+        assert_eq!(
+            re.current_level(LatencyStage::PatternDetection),
+            MitigationLevel::None
+        );
     }
 
     // ── Helper ──
