@@ -5941,6 +5941,117 @@ impl MemoryPool {
     pub fn total_blocks(&self) -> usize {
         self.total_blocks
     }
+
+    /// Shrink pool: return excess free blocks to reclaim memory.
+    /// Returns number of blocks reclaimed.
+    pub fn shrink(&mut self, target_free: usize) -> usize {
+        let excess = self.free_list.len().saturating_sub(target_free);
+        if excess > 0 {
+            self.free_list.truncate(self.free_list.len() - excess);
+            self.total_blocks -= excess;
+        }
+        excess
+    }
+
+    /// Reset pool to initial state.
+    pub fn reset(&mut self) {
+        let initial = self.config.initial_blocks.min(self.config.max_blocks);
+        self.free_list = (0..initial as u64).collect();
+        self.next_block_id = initial as u64;
+        self.total_blocks = initial;
+        self.in_use = 0;
+        self.total_allocs = 0;
+        self.total_frees = 0;
+        self.total_exhausted = 0;
+    }
+}
+
+// AARSP Bead: ft-2p9cb.3.1.2
+
+/// Degradation signal from the memory pool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PoolDegradation {
+    /// Pool is healthy.
+    Healthy,
+    /// Pool is under pressure (utilization above high-water mark).
+    HighUtilization { utilization: f64, threshold: f64 },
+    /// Pool is exhausted — allocations are failing.
+    Exhausted { total_exhausted: u64 },
+    /// Pool is fragmented — many blocks but high free count.
+    Fragmented { total_blocks: usize, free_count: usize },
+}
+
+impl fmt::Display for PoolDegradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "HEALTHY"),
+            Self::HighUtilization {
+                utilization,
+                threshold,
+            } => write!(f, "HIGH_UTIL({:.1}%/thresh={:.1}%)", utilization * 100.0, threshold * 100.0),
+            Self::Exhausted { total_exhausted } => write!(f, "EXHAUSTED({})", total_exhausted),
+            Self::Fragmented {
+                total_blocks,
+                free_count,
+            } => write!(f, "FRAGMENTED({}/{}free)", total_blocks, free_count),
+        }
+    }
+}
+
+/// Structured log entry for pool health.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PoolLogEntry {
+    /// Domain.
+    pub domain: MemoryDomain,
+    /// Utilization.
+    pub utilization: f64,
+    /// In use.
+    pub in_use: usize,
+    /// Total blocks.
+    pub total_blocks: usize,
+    /// Degradation signal.
+    pub degradation: PoolDegradation,
+}
+
+impl MemoryPool {
+    /// Detect degradation.
+    pub fn detect_degradation(&self) -> PoolDegradation {
+        if self.total_exhausted > 0 {
+            return PoolDegradation::Exhausted {
+                total_exhausted: self.total_exhausted,
+            };
+        }
+
+        if self.under_pressure() {
+            return PoolDegradation::HighUtilization {
+                utilization: self.utilization(),
+                threshold: self.config.high_water_mark,
+            };
+        }
+
+        // Fragmentation: total blocks > 2x initial and > 50% free.
+        if self.total_blocks > self.config.initial_blocks * 2
+            && self.free_list.len() > self.total_blocks / 2
+        {
+            return PoolDegradation::Fragmented {
+                total_blocks: self.total_blocks,
+                free_count: self.free_list.len(),
+            };
+        }
+
+        PoolDegradation::Healthy
+    }
+
+    /// Generate a structured log entry.
+    pub fn log_entry(&self) -> PoolLogEntry {
+        PoolLogEntry {
+            domain: self.config.domain,
+            utilization: self.utilization(),
+            in_use: self.in_use,
+            total_blocks: self.total_blocks,
+            degradation: self.detect_degradation(),
+        }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -10043,5 +10154,127 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: PoolConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    // ── C1 Impl: Pool bridge methods ──
+
+    #[test]
+    fn test_pool_shrink() {
+        let mut pool = MemoryPool::with_defaults();
+        assert_eq!(pool.free_count(), 64);
+        let reclaimed = pool.shrink(10);
+        assert_eq!(reclaimed, 54);
+        assert_eq!(pool.free_count(), 10);
+        assert_eq!(pool.total_blocks(), 10);
+    }
+
+    #[test]
+    fn test_pool_shrink_no_excess() {
+        let config = PoolConfig {
+            initial_blocks: 4,
+            max_blocks: 10,
+            ..Default::default()
+        };
+        let mut pool = MemoryPool::new(config);
+        let reclaimed = pool.shrink(10);
+        assert_eq!(reclaimed, 0);
+    }
+
+    #[test]
+    fn test_pool_reset() {
+        let mut pool = MemoryPool::with_defaults();
+        pool.allocate();
+        pool.allocate();
+        pool.allocate();
+        assert_eq!(pool.in_use(), 3);
+
+        pool.reset();
+        assert_eq!(pool.in_use(), 0);
+        assert_eq!(pool.total_blocks(), 64);
+        assert_eq!(pool.free_count(), 64);
+    }
+
+    #[test]
+    fn test_pool_degradation_healthy() {
+        let pool = MemoryPool::with_defaults();
+        assert_eq!(pool.detect_degradation(), PoolDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_pool_degradation_exhausted() {
+        let config = PoolConfig {
+            initial_blocks: 1,
+            max_blocks: 1,
+            ..Default::default()
+        };
+        let mut pool = MemoryPool::new(config);
+        pool.allocate();
+        pool.allocate(); // exhausted
+        let degradation = pool.detect_degradation();
+        let is_exhausted = matches!(degradation, PoolDegradation::Exhausted { .. });
+        assert!(is_exhausted, "Expected Exhausted, got {:?}", degradation);
+    }
+
+    #[test]
+    fn test_pool_degradation_high_util() {
+        let config = PoolConfig {
+            initial_blocks: 4,
+            max_blocks: 4,
+            high_water_mark: 0.5,
+            ..Default::default()
+        };
+        let mut pool = MemoryPool::new(config);
+        pool.allocate();
+        pool.allocate();
+        pool.allocate();
+        let degradation = pool.detect_degradation();
+        let is_high = matches!(degradation, PoolDegradation::HighUtilization { .. });
+        assert!(is_high, "Expected HighUtilization, got {:?}", degradation);
+    }
+
+    #[test]
+    fn test_pool_log_entry() {
+        let mut pool = MemoryPool::with_defaults();
+        pool.allocate();
+        let entry = pool.log_entry();
+        assert_eq!(entry.domain, MemoryDomain::Shared);
+        assert_eq!(entry.in_use, 1);
+        assert_eq!(entry.degradation, PoolDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_pool_degradation_serde() {
+        let variants = vec![
+            PoolDegradation::Healthy,
+            PoolDegradation::HighUtilization { utilization: 0.9, threshold: 0.85 },
+            PoolDegradation::Exhausted { total_exhausted: 5 },
+            PoolDegradation::Fragmented { total_blocks: 100, free_count: 60 },
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: PoolDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[test]
+    fn test_pool_log_entry_serde() {
+        let entry = PoolLogEntry {
+            domain: MemoryDomain::PtyCapture,
+            utilization: 0.5,
+            in_use: 32,
+            total_blocks: 64,
+            degradation: PoolDegradation::Healthy,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: PoolLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn test_pool_degradation_display() {
+        assert_eq!(format!("{}", PoolDegradation::Healthy), "HEALTHY");
+        let exhausted = PoolDegradation::Exhausted { total_exhausted: 5 };
+        assert!(format!("{}", exhausted).contains("5"));
     }
 }
