@@ -1056,6 +1056,656 @@ impl OnFailure {
 }
 
 // ============================================================================
+// Mission Schema Pack
+// ============================================================================
+
+/// Current schema version for mission nouns and ownership contracts.
+pub const MISSION_SCHEMA_VERSION: u32 = 1;
+
+/// Stable mission identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MissionId(pub String);
+
+impl MissionId {
+    /// Create an ID from a hash string.
+    #[must_use]
+    pub fn from_hash(hash: &str) -> Self {
+        let clean_hash = hash.strip_prefix("sha256:").unwrap_or(hash);
+        Self(format!("mission:{clean_hash}"))
+    }
+}
+
+impl fmt::Display for MissionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Stable candidate-action identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CandidateActionId(pub String);
+
+impl CandidateActionId {
+    /// Create an ID from a hash string.
+    #[must_use]
+    pub fn from_hash(hash: &str) -> Self {
+        let clean_hash = hash.strip_prefix("sha256:").unwrap_or(hash);
+        Self(format!("candidate:{clean_hash}"))
+    }
+}
+
+impl fmt::Display for CandidateActionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Stable assignment identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AssignmentId(pub String);
+
+impl AssignmentId {
+    /// Create an ID from a hash string.
+    #[must_use]
+    pub fn from_hash(hash: &str) -> Self {
+        let clean_hash = hash.strip_prefix("sha256:").unwrap_or(hash);
+        Self(format!("assignment:{clean_hash}"))
+    }
+}
+
+impl fmt::Display for AssignmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Stable reservation-intent identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReservationIntentId(pub String);
+
+impl ReservationIntentId {
+    /// Create an ID from a hash string.
+    #[must_use]
+    pub fn from_hash(hash: &str) -> Self {
+        let clean_hash = hash.strip_prefix("sha256:").unwrap_or(hash);
+        Self(format!("reservation:{clean_hash}"))
+    }
+}
+
+impl fmt::Display for ReservationIntentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Explicit ownership boundary role in mission orchestration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionActorRole {
+    Planner,
+    Dispatcher,
+    Operator,
+}
+
+impl fmt::Display for MissionActorRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Planner => f.write_str("planner"),
+            Self::Dispatcher => f.write_str("dispatcher"),
+            Self::Operator => f.write_str("operator"),
+        }
+    }
+}
+
+/// Explicit owner mapping for mission decisions and execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionOwnership {
+    pub planner: String,
+    pub dispatcher: String,
+    pub operator: String,
+}
+
+impl MissionOwnership {
+    /// Resolve the actor name for a role.
+    #[must_use]
+    pub fn actor_for(&self, role: MissionActorRole) -> &str {
+        match role {
+            MissionActorRole::Planner => &self.planner,
+            MissionActorRole::Dispatcher => &self.dispatcher,
+            MissionActorRole::Operator => &self.operator,
+        }
+    }
+
+    /// Deterministic string representation used by `Mission::canonical_string`.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "planner={},dispatcher={},operator={}",
+            self.planner, self.dispatcher, self.operator
+        )
+    }
+
+    /// Validate explicit ownership boundaries.
+    pub fn validate(&self) -> Result<(), MissionValidationError> {
+        let planner = self.planner.trim();
+        let dispatcher = self.dispatcher.trim();
+        let operator = self.operator.trim();
+
+        if planner.is_empty() {
+            return Err(MissionValidationError::EmptyOwnershipActor {
+                role: MissionActorRole::Planner,
+            });
+        }
+        if dispatcher.is_empty() {
+            return Err(MissionValidationError::EmptyOwnershipActor {
+                role: MissionActorRole::Dispatcher,
+            });
+        }
+        if operator.is_empty() {
+            return Err(MissionValidationError::EmptyOwnershipActor {
+                role: MissionActorRole::Operator,
+            });
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for actor in [planner, dispatcher, operator] {
+            if !seen.insert(actor) {
+                return Err(MissionValidationError::DuplicateOwnershipActor(
+                    actor.to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Source/provenance envelope for mission generation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionProvenance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bead_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_sha: Option<String>,
+}
+
+impl MissionProvenance {
+    /// Deterministic string representation used by `Mission::canonical_string`.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "bead={},thread={},source={},sha={}",
+            self.bead_id.as_deref().unwrap_or(""),
+            self.thread_id.as_deref().unwrap_or(""),
+            self.source_command.as_deref().unwrap_or(""),
+            self.source_sha.as_deref().unwrap_or("")
+        )
+    }
+}
+
+/// Planner-emitted candidate action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateAction {
+    pub candidate_id: CandidateActionId,
+    pub requested_by: MissionActorRole,
+    pub action: StepAction,
+    pub rationale: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    pub created_at_ms: i64,
+}
+
+impl CandidateAction {
+    /// Deterministic string representation used by `Mission::canonical_string`.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        let mut parts = vec![
+            format!("id={}", self.candidate_id.0),
+            format!("requested_by={}", self.requested_by),
+            format!("action={}", self.action.canonical_string()),
+            format!("rationale={}", self.rationale),
+            format!("created_at_ms={}", self.created_at_ms),
+        ];
+        if let Some(score) = self.score {
+            parts.push(format!("score={score:.6}"));
+        }
+        parts.join(",")
+    }
+}
+
+/// Dispatcher reservation request intent prior to lock acquisition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReservationIntent {
+    pub reservation_id: ReservationIntentId,
+    pub requested_by: MissionActorRole,
+    pub paths: Vec<String>,
+    pub exclusive: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub requested_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+}
+
+impl ReservationIntent {
+    /// Deterministic string representation used by `Assignment::canonical_string`.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        let mut paths = self.paths.clone();
+        paths.sort();
+        format!(
+            "id={},requested_by={},exclusive={},paths={},reason={},requested_at_ms={},expires_at_ms={}",
+            self.reservation_id.0,
+            self.requested_by,
+            self.exclusive,
+            paths.join(";"),
+            self.reason.as_deref().unwrap_or(""),
+            self.requested_at_ms,
+            self.expires_at_ms
+                .map_or_else(|| "none".to_string(), |v| v.to_string())
+        )
+    }
+}
+
+/// Approval lifecycle for an assignment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ApprovalState {
+    NotRequired,
+    Pending {
+        requested_by: String,
+        requested_at_ms: i64,
+    },
+    Approved {
+        approved_by: String,
+        approved_at_ms: i64,
+        approval_code_hash: String,
+    },
+    Denied {
+        denied_by: String,
+        denied_at_ms: i64,
+        reason_code: String,
+    },
+    Expired {
+        expired_at_ms: i64,
+        reason_code: String,
+    },
+}
+
+impl ApprovalState {
+    /// Deterministic string representation used by `Assignment::canonical_string`.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        match self {
+            Self::NotRequired => "not_required".to_string(),
+            Self::Pending {
+                requested_by,
+                requested_at_ms,
+            } => format!("pending:{requested_by}:{requested_at_ms}"),
+            Self::Approved {
+                approved_by,
+                approved_at_ms,
+                approval_code_hash,
+            } => format!("approved:{approved_by}:{approved_at_ms}:{approval_code_hash}"),
+            Self::Denied {
+                denied_by,
+                denied_at_ms,
+                reason_code,
+            } => format!("denied:{denied_by}:{denied_at_ms}:{reason_code}"),
+            Self::Expired {
+                expired_at_ms,
+                reason_code,
+            } => format!("expired:{expired_at_ms}:{reason_code}"),
+        }
+    }
+}
+
+/// Final assignment execution outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Outcome {
+    Success {
+        reason_code: String,
+        completed_at_ms: i64,
+    },
+    Failed {
+        reason_code: String,
+        error_code: String,
+        completed_at_ms: i64,
+    },
+    Cancelled {
+        reason_code: String,
+        completed_at_ms: i64,
+    },
+}
+
+impl Outcome {
+    /// Deterministic string representation used by `Assignment::canonical_string`.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        match self {
+            Self::Success {
+                reason_code,
+                completed_at_ms,
+            } => format!("success:{reason_code}:{completed_at_ms}"),
+            Self::Failed {
+                reason_code,
+                error_code,
+                completed_at_ms,
+            } => format!("failed:{reason_code}:{error_code}:{completed_at_ms}"),
+            Self::Cancelled {
+                reason_code,
+                completed_at_ms,
+            } => format!("cancelled:{reason_code}:{completed_at_ms}"),
+        }
+    }
+}
+
+/// Escalation severity for operator routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationLevel {
+    Observe,
+    Human,
+    Emergency,
+}
+
+impl fmt::Display for EscalationLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observe => f.write_str("observe"),
+            Self::Human => f.write_str("human"),
+            Self::Emergency => f.write_str("emergency"),
+        }
+    }
+}
+
+/// Escalation envelope for execution anomalies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Escalation {
+    pub level: EscalationLevel,
+    pub triggered_by: MissionActorRole,
+    pub reason_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub escalated_at_ms: i64,
+}
+
+impl Escalation {
+    /// Deterministic string representation used by `Assignment::canonical_string`.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "level={},triggered_by={},reason_code={},error_code={},summary={},escalated_at_ms={}",
+            self.level,
+            self.triggered_by,
+            self.reason_code,
+            self.error_code.as_deref().unwrap_or(""),
+            self.summary.as_deref().unwrap_or(""),
+            self.escalated_at_ms
+        )
+    }
+}
+
+/// Dispatcher-selected execution assignment for a mission candidate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Assignment {
+    pub assignment_id: AssignmentId,
+    pub candidate_id: CandidateActionId,
+    pub assigned_by: MissionActorRole,
+    pub assignee: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reservation_intent: Option<ReservationIntent>,
+    pub approval_state: ApprovalState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Outcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation: Option<Escalation>,
+    pub created_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at_ms: Option<i64>,
+}
+
+impl Assignment {
+    /// Deterministic string representation used by `Mission::canonical_string`.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        let mut parts = vec![
+            format!("id={}", self.assignment_id.0),
+            format!("candidate_id={}", self.candidate_id.0),
+            format!("assigned_by={}", self.assigned_by),
+            format!("assignee={}", self.assignee),
+            format!("approval={}", self.approval_state.canonical_string()),
+            format!("created_at_ms={}", self.created_at_ms),
+            format!(
+                "updated_at_ms={}",
+                self.updated_at_ms
+                    .map_or_else(|| "none".to_string(), |v| v.to_string())
+            ),
+        ];
+
+        if let Some(reservation_intent) = &self.reservation_intent {
+            parts.push(format!(
+                "reservation={}",
+                reservation_intent.canonical_string()
+            ));
+        }
+        if let Some(outcome) = &self.outcome {
+            parts.push(format!("outcome={}", outcome.canonical_string()));
+        }
+        if let Some(escalation) = &self.escalation {
+            parts.push(format!("escalation={}", escalation.canonical_string()));
+        }
+        parts.join(",")
+    }
+}
+
+/// Canonical mission object for planner/dispatcher/operator orchestration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Mission {
+    pub mission_version: u32,
+    pub mission_id: MissionId,
+    pub title: String,
+    pub workspace_id: String,
+    pub ownership: MissionOwnership,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<MissionProvenance>,
+    pub created_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<CandidateAction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assignments: Vec<Assignment>,
+}
+
+impl Mission {
+    /// Construct a mission with explicit ownership boundaries.
+    #[must_use]
+    pub fn new(
+        mission_id: MissionId,
+        title: impl Into<String>,
+        workspace_id: impl Into<String>,
+        ownership: MissionOwnership,
+        created_at_ms: i64,
+    ) -> Self {
+        Self {
+            mission_version: MISSION_SCHEMA_VERSION,
+            mission_id,
+            title: title.into(),
+            workspace_id: workspace_id.into(),
+            ownership,
+            provenance: None,
+            created_at_ms,
+            updated_at_ms: None,
+            candidates: Vec::new(),
+            assignments: Vec::new(),
+        }
+    }
+
+    /// Compute the mission hash from canonical mission serialization.
+    #[must_use]
+    pub fn compute_hash(&self) -> String {
+        let canonical = self.canonical_string();
+        let hash = sha256_hex(&canonical);
+        format!("sha256:{}", &hash[..32])
+    }
+
+    /// Deterministic canonical string for stable/diff-friendly serialization checks.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        let mut parts = vec![
+            format!("v={}", self.mission_version),
+            format!("mission_id={}", self.mission_id.0),
+            format!("title={}", self.title),
+            format!("workspace_id={}", self.workspace_id),
+            format!("ownership={}", self.ownership.canonical_string()),
+            format!("created_at_ms={}", self.created_at_ms),
+            format!(
+                "updated_at_ms={}",
+                self.updated_at_ms
+                    .map_or_else(|| "none".to_string(), |v| v.to_string())
+            ),
+        ];
+
+        if let Some(provenance) = &self.provenance {
+            parts.push(format!("provenance={}", provenance.canonical_string()));
+        }
+
+        let mut candidate_parts: Vec<String> = self
+            .candidates
+            .iter()
+            .map(CandidateAction::canonical_string)
+            .collect();
+        candidate_parts.sort();
+        for (index, candidate) in candidate_parts.iter().enumerate() {
+            parts.push(format!("candidate[{index}]={candidate}"));
+        }
+
+        let mut assignment_parts: Vec<String> = self
+            .assignments
+            .iter()
+            .map(Assignment::canonical_string)
+            .collect();
+        assignment_parts.sort();
+        for (index, assignment) in assignment_parts.iter().enumerate() {
+            parts.push(format!("assignment[{index}]={assignment}"));
+        }
+
+        parts.join("|")
+    }
+
+    /// Validate schema and ownership invariants.
+    pub fn validate(&self) -> Result<(), MissionValidationError> {
+        if self.mission_version > MISSION_SCHEMA_VERSION {
+            return Err(MissionValidationError::UnsupportedMissionVersion {
+                version: self.mission_version,
+                max_supported: MISSION_SCHEMA_VERSION,
+            });
+        }
+        if self.title.trim().is_empty() {
+            return Err(MissionValidationError::MissingTitle);
+        }
+        if self.workspace_id.trim().is_empty() {
+            return Err(MissionValidationError::MissingWorkspaceId);
+        }
+        self.ownership.validate()?;
+
+        let mut candidate_ids = std::collections::HashSet::new();
+        for candidate in &self.candidates {
+            if !candidate_ids.insert(candidate.candidate_id.clone()) {
+                return Err(MissionValidationError::DuplicateCandidateId(
+                    candidate.candidate_id.clone(),
+                ));
+            }
+        }
+
+        let mut assignment_ids = std::collections::HashSet::new();
+        for assignment in &self.assignments {
+            if !assignment_ids.insert(assignment.assignment_id.clone()) {
+                return Err(MissionValidationError::DuplicateAssignmentId(
+                    assignment.assignment_id.clone(),
+                ));
+            }
+            if !candidate_ids.contains(&assignment.candidate_id) {
+                return Err(MissionValidationError::UnknownCandidateReference(
+                    assignment.candidate_id.clone(),
+                ));
+            }
+            if assignment.assignee.trim().is_empty() {
+                return Err(MissionValidationError::EmptyAssignee(
+                    assignment.assignment_id.clone(),
+                ));
+            }
+            if let Some(reservation_intent) = &assignment.reservation_intent {
+                if reservation_intent.paths.is_empty() {
+                    return Err(MissionValidationError::EmptyReservationPaths(
+                        reservation_intent.reservation_id.clone(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Errors that can occur during mission schema validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissionValidationError {
+    UnsupportedMissionVersion { version: u32, max_supported: u32 },
+    EmptyOwnershipActor { role: MissionActorRole },
+    DuplicateOwnershipActor(String),
+    MissingTitle,
+    MissingWorkspaceId,
+    DuplicateCandidateId(CandidateActionId),
+    DuplicateAssignmentId(AssignmentId),
+    UnknownCandidateReference(CandidateActionId),
+    EmptyAssignee(AssignmentId),
+    EmptyReservationPaths(ReservationIntentId),
+}
+
+impl fmt::Display for MissionValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedMissionVersion {
+                version,
+                max_supported,
+            } => {
+                write!(
+                    f,
+                    "Unsupported mission version: {version} (max supported: {max_supported})"
+                )
+            }
+            Self::EmptyOwnershipActor { role } => {
+                write!(f, "Missing mission ownership actor for role: {role}")
+            }
+            Self::DuplicateOwnershipActor(actor) => {
+                write!(f, "Ownership actor reused across boundaries: {actor}")
+            }
+            Self::MissingTitle => f.write_str("Mission title cannot be empty"),
+            Self::MissingWorkspaceId => f.write_str("Mission workspace_id cannot be empty"),
+            Self::DuplicateCandidateId(id) => write!(f, "Duplicate candidate ID: {}", id.0),
+            Self::DuplicateAssignmentId(id) => write!(f, "Duplicate assignment ID: {}", id.0),
+            Self::UnknownCandidateReference(id) => {
+                write!(f, "Assignment references unknown candidate ID: {}", id.0)
+            }
+            Self::EmptyAssignee(id) => write!(f, "Assignment has empty assignee: {}", id.0),
+            Self::EmptyReservationPaths(id) => {
+                write!(f, "Reservation intent has empty paths: {}", id.0)
+            }
+        }
+    }
+}
+
+impl std::error::Error for MissionValidationError {}
+
+// ============================================================================
 // Validation Errors
 // ============================================================================
 
@@ -2543,6 +3193,175 @@ mod tests {
                 json
             );
         }
+    }
+
+    fn sample_mission() -> Mission {
+        let mut mission = Mission::new(
+            MissionId("mission:core".to_string()),
+            "Recover failing pane loop",
+            "ws-main",
+            MissionOwnership {
+                planner: "planner-agent".to_string(),
+                dispatcher: "dispatcher-agent".to_string(),
+                operator: "operator-human".to_string(),
+            },
+            1_704_000_000_000,
+        );
+        mission.provenance = Some(MissionProvenance {
+            bead_id: Some("ft-1i2ge.1.1".to_string()),
+            thread_id: Some("ft-1i2ge.1.1".to_string()),
+            source_command: Some("ft mission plan".to_string()),
+            source_sha: Some("abc123".to_string()),
+        });
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:a".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::SendText {
+                pane_id: 1,
+                text: "/retry".to_string(),
+                paste_mode: Some(false),
+            },
+            rationale: "Retry once after cooldown".to_string(),
+            score: Some(0.92),
+            created_at_ms: 1_704_000_000_100,
+        });
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("assignment:a".to_string()),
+            candidate_id: CandidateActionId("candidate:a".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "executor-agent-1".to_string(),
+            reservation_intent: Some(ReservationIntent {
+                reservation_id: ReservationIntentId("reservation:a".to_string()),
+                requested_by: MissionActorRole::Dispatcher,
+                paths: vec!["crates/frankenterm-core/src/plan.rs".to_string()],
+                exclusive: true,
+                reason: Some("mission replay update".to_string()),
+                requested_at_ms: 1_704_000_000_200,
+                expires_at_ms: Some(1_704_000_360_200),
+            }),
+            approval_state: ApprovalState::Approved {
+                approved_by: "operator-human".to_string(),
+                approved_at_ms: 1_704_000_000_220,
+                approval_code_hash: "sha256:abcd".to_string(),
+            },
+            outcome: Some(Outcome::Success {
+                reason_code: "retry_applied".to_string(),
+                completed_at_ms: 1_704_000_000_700,
+            }),
+            escalation: None,
+            created_at_ms: 1_704_000_000_210,
+            updated_at_ms: Some(1_704_000_000_705),
+        });
+        mission
+    }
+
+    #[test]
+    fn mission_json_roundtrip_preserves_required_fields() {
+        let mission = sample_mission();
+        let json = serde_json::to_string_pretty(&mission).unwrap();
+        let decoded: Mission = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(mission.mission_version, decoded.mission_version);
+        assert_eq!(mission.mission_id, decoded.mission_id);
+        assert_eq!(mission.title, decoded.title);
+        assert_eq!(mission.workspace_id, decoded.workspace_id);
+        assert_eq!(mission.ownership, decoded.ownership);
+        assert_eq!(mission.provenance, decoded.provenance);
+        assert_eq!(mission.candidates.len(), decoded.candidates.len());
+        assert_eq!(mission.assignments.len(), decoded.assignments.len());
+        assert!(decoded.validate().is_ok());
+    }
+
+    #[test]
+    fn mission_validate_rejects_duplicate_ownership_actor() {
+        let mut mission = sample_mission();
+        mission.ownership.dispatcher = mission.ownership.planner.clone();
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::DuplicateOwnershipActor(_)
+        ));
+    }
+
+    #[test]
+    fn mission_validate_rejects_unknown_candidate_reference() {
+        let mut mission = sample_mission();
+        mission.assignments[0].candidate_id = CandidateActionId("candidate:missing".to_string());
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::UnknownCandidateReference(_)
+        ));
+    }
+
+    #[test]
+    fn mission_validate_rejects_empty_reservation_paths() {
+        let mut mission = sample_mission();
+        mission.assignments[0].reservation_intent = Some(ReservationIntent {
+            reservation_id: ReservationIntentId("reservation:empty".to_string()),
+            requested_by: MissionActorRole::Dispatcher,
+            paths: Vec::new(),
+            exclusive: false,
+            reason: None,
+            requested_at_ms: 1_704_000_000_111,
+            expires_at_ms: None,
+        });
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::EmptyReservationPaths(_)
+        ));
+    }
+
+    #[test]
+    fn mission_canonical_string_is_order_independent() {
+        let mut first = sample_mission();
+        first.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:b".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::WaitFor {
+                pane_id: Some(2),
+                condition: WaitCondition::Pattern {
+                    pane_id: Some(2),
+                    rule_id: "core.codex:done".to_string(),
+                },
+                timeout_ms: 1_000,
+            },
+            rationale: "Observe completion signal".to_string(),
+            score: Some(0.33),
+            created_at_ms: 1_704_000_000_333,
+        });
+        first.assignments.push(Assignment {
+            assignment_id: AssignmentId("assignment:b".to_string()),
+            candidate_id: CandidateActionId("candidate:b".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "executor-agent-2".to_string(),
+            reservation_intent: None,
+            approval_state: ApprovalState::NotRequired,
+            outcome: None,
+            escalation: Some(Escalation {
+                level: EscalationLevel::Observe,
+                triggered_by: MissionActorRole::Dispatcher,
+                reason_code: "monitor_first".to_string(),
+                error_code: None,
+                summary: Some("No direct intervention yet".to_string()),
+                escalated_at_ms: 1_704_000_000_400,
+            }),
+            created_at_ms: 1_704_000_000_390,
+            updated_at_ms: None,
+        });
+
+        let mut second = first.clone();
+        second.candidates.reverse();
+        second.assignments.reverse();
+
+        assert_eq!(first.canonical_string(), second.canonical_string());
+        assert_eq!(first.compute_hash(), second.compute_hash());
+        assert!(first.validate().is_ok());
+        assert!(second.validate().is_ok());
     }
 
     #[test]

@@ -7047,6 +7047,338 @@ impl TieredScrollbackManager {
     }
 }
 
+// ── C4: Adaptive Transport Policy ──────────────────────────────────
+
+/// Transport mode for data transfer between pipeline stages.
+///
+/// # Invariants
+/// - Local mode: zero-copy or memcpy, no serialization overhead.
+/// - Compressed mode: zstd/lz4-style framing, higher latency, lower bandwidth.
+/// - Bypass mode: skip compression when data is already compact or small.
+/// - Mode selection is deterministic given the same cost model inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TransportMode {
+    /// In-process zero-copy or memcpy (fastest).
+    Local,
+    /// Compressed transfer for large or remote payloads.
+    Compressed,
+    /// Skip compression — data is small or already compact.
+    Bypass,
+}
+
+impl std::fmt::Display for TransportMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransportMode::Local => write!(f, "LOCAL"),
+            TransportMode::Compressed => write!(f, "COMPRESSED"),
+            TransportMode::Bypass => write!(f, "BYPASS"),
+        }
+    }
+}
+
+/// Cost model inputs for transport mode selection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TransportCostModel {
+    /// Compression CPU cost per byte (microseconds).
+    pub compress_cost_per_byte_us: f64,
+    /// Decompression CPU cost per byte (microseconds).
+    pub decompress_cost_per_byte_us: f64,
+    /// Network transfer cost per byte (microseconds) — 0 for local.
+    pub network_cost_per_byte_us: f64,
+    /// Expected compression ratio (0.0–1.0, lower = better compression).
+    pub expected_compression_ratio: f64,
+    /// Threshold below which bypass is cheaper than compress.
+    pub bypass_threshold_bytes: u64,
+    /// Threshold above which compression is always used.
+    pub compress_threshold_bytes: u64,
+}
+
+impl Default for TransportCostModel {
+    fn default() -> Self {
+        Self {
+            compress_cost_per_byte_us: 0.01,
+            decompress_cost_per_byte_us: 0.005,
+            network_cost_per_byte_us: 0.0,
+            expected_compression_ratio: 0.4,
+            bypass_threshold_bytes: 4096,
+            compress_threshold_bytes: 65536,
+        }
+    }
+}
+
+/// Transport policy configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TransportPolicyConfig {
+    /// Cost model for mode selection.
+    pub cost_model: TransportCostModel,
+    /// Enable adaptive mode switching (vs. fixed mode).
+    pub adaptive: bool,
+    /// Fixed mode when adaptive is disabled.
+    pub fixed_mode: TransportMode,
+    /// EWMA alpha for cost tracking (0.0–1.0).
+    pub ewma_alpha: f64,
+    /// Maximum history entries for cost tracking.
+    pub max_history: usize,
+}
+
+impl Default for TransportPolicyConfig {
+    fn default() -> Self {
+        Self {
+            cost_model: TransportCostModel::default(),
+            adaptive: true,
+            fixed_mode: TransportMode::Local,
+            ewma_alpha: 0.1,
+            max_history: 256,
+        }
+    }
+}
+
+/// A single transport decision record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TransportDecision {
+    pub payload_bytes: u64,
+    pub selected_mode: TransportMode,
+    pub estimated_cost_us: f64,
+    pub actual_cost_us: f64,
+    pub savings_us: f64,
+    pub timestamp_us: u64,
+}
+
+/// Snapshot of the adaptive transport policy state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TransportPolicySnapshot {
+    pub total_decisions: u64,
+    pub local_count: u64,
+    pub compressed_count: u64,
+    pub bypass_count: u64,
+    pub total_bytes_transferred: u64,
+    pub total_savings_us: f64,
+    pub ewma_cost_us: f64,
+}
+
+/// Adaptive transport policy engine.
+///
+/// # Invariants
+/// - `local_count + compressed_count + bypass_count == total_decisions`.
+/// - Mode selection is pure function of (payload_bytes, cost_model, ewma state).
+/// - EWMA cost tracks running average of actual transfer costs.
+pub struct TransportPolicy {
+    config: TransportPolicyConfig,
+    total_decisions: u64,
+    local_count: u64,
+    compressed_count: u64,
+    bypass_count: u64,
+    total_bytes: u64,
+    total_savings_us: f64,
+    ewma_cost_us: f64,
+    decisions: Vec<TransportDecision>,
+}
+
+impl TransportPolicy {
+    /// Create with explicit config.
+    pub fn new(config: TransportPolicyConfig) -> Self {
+        Self {
+            config,
+            total_decisions: 0,
+            local_count: 0,
+            compressed_count: 0,
+            bypass_count: 0,
+            total_bytes: 0,
+            total_savings_us: 0.0,
+            ewma_cost_us: 0.0,
+            decisions: Vec::new(),
+        }
+    }
+
+    /// Create with defaults.
+    pub fn with_defaults() -> Self {
+        Self::new(TransportPolicyConfig::default())
+    }
+
+    /// Select the optimal transport mode for a given payload.
+    pub fn select_mode(&self, payload_bytes: u64) -> TransportMode {
+        if !self.config.adaptive {
+            return self.config.fixed_mode;
+        }
+        let cm = &self.config.cost_model;
+        if cm.network_cost_per_byte_us == 0.0 {
+            // Local transfer — no network cost
+            return TransportMode::Local;
+        }
+        if payload_bytes <= cm.bypass_threshold_bytes {
+            return TransportMode::Bypass;
+        }
+        if payload_bytes >= cm.compress_threshold_bytes {
+            return TransportMode::Compressed;
+        }
+        // Cost comparison: bypass vs compressed
+        let bypass_cost = payload_bytes as f64 * cm.network_cost_per_byte_us;
+        let compress_cost = payload_bytes as f64 * cm.compress_cost_per_byte_us
+            + payload_bytes as f64 * cm.expected_compression_ratio * cm.network_cost_per_byte_us
+            + payload_bytes as f64 * cm.expected_compression_ratio * cm.decompress_cost_per_byte_us;
+        if bypass_cost <= compress_cost {
+            TransportMode::Bypass
+        } else {
+            TransportMode::Compressed
+        }
+    }
+
+    /// Record a transport decision and its outcome.
+    pub fn record(
+        &mut self,
+        payload_bytes: u64,
+        mode: TransportMode,
+        estimated_cost_us: f64,
+        actual_cost_us: f64,
+        timestamp_us: u64,
+    ) {
+        let savings = estimated_cost_us - actual_cost_us;
+        self.total_decisions += 1;
+        match mode {
+            TransportMode::Local => self.local_count += 1,
+            TransportMode::Compressed => self.compressed_count += 1,
+            TransportMode::Bypass => self.bypass_count += 1,
+        }
+        self.total_bytes += payload_bytes;
+        self.total_savings_us += savings;
+
+        // EWMA update
+        let alpha = self.config.ewma_alpha;
+        self.ewma_cost_us = alpha * actual_cost_us + (1.0 - alpha) * self.ewma_cost_us;
+
+        let decision = TransportDecision {
+            payload_bytes,
+            selected_mode: mode,
+            estimated_cost_us,
+            actual_cost_us,
+            savings_us: savings,
+            timestamp_us,
+        };
+        if self.decisions.len() < self.config.max_history {
+            self.decisions.push(decision);
+        }
+    }
+
+    /// Snapshot of current state.
+    pub fn snapshot(&self) -> TransportPolicySnapshot {
+        TransportPolicySnapshot {
+            total_decisions: self.total_decisions,
+            local_count: self.local_count,
+            compressed_count: self.compressed_count,
+            bypass_count: self.bypass_count,
+            total_bytes_transferred: self.total_bytes,
+            total_savings_us: self.total_savings_us,
+            ewma_cost_us: self.ewma_cost_us,
+        }
+    }
+
+    /// One-line status.
+    pub fn status_line(&self) -> String {
+        format!(
+            "transport decisions={} local={} compressed={} bypass={} ewma={:.1}µs",
+            self.total_decisions,
+            self.local_count,
+            self.compressed_count,
+            self.bypass_count,
+            self.ewma_cost_us,
+        )
+    }
+
+    /// Recent decision history.
+    pub fn recent_decisions(&self) -> &[TransportDecision] {
+        &self.decisions
+    }
+
+    /// Reset all state.
+    pub fn reset(&mut self) {
+        self.total_decisions = 0;
+        self.local_count = 0;
+        self.compressed_count = 0;
+        self.bypass_count = 0;
+        self.total_bytes = 0;
+        self.total_savings_us = 0.0;
+        self.ewma_cost_us = 0.0;
+        self.decisions.clear();
+    }
+}
+
+/// Degradation states for the transport policy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TransportDegradation {
+    Healthy,
+    HighCost { ewma_cost_us: f64, threshold_us: f64 },
+    ModeImbalance { dominant_mode: String, share: f64 },
+}
+
+impl std::fmt::Display for TransportDegradation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransportDegradation::Healthy => write!(f, "HEALTHY"),
+            TransportDegradation::HighCost { ewma_cost_us, threshold_us } => {
+                write!(f, "HIGH_COST({:.1}µs/{:.1}µs)", ewma_cost_us, threshold_us)
+            }
+            TransportDegradation::ModeImbalance { dominant_mode, share } => {
+                write!(f, "MODE_IMBALANCE({}={:.1}%)", dominant_mode, share * 100.0)
+            }
+        }
+    }
+}
+
+/// Structured log entry for transport policy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TransportLogEntry {
+    pub total_decisions: u64,
+    pub local_count: u64,
+    pub compressed_count: u64,
+    pub bypass_count: u64,
+    pub ewma_cost_us: f64,
+    pub degradation: TransportDegradation,
+}
+
+impl TransportPolicy {
+    /// Detect degradation.
+    pub fn detect_degradation(&self) -> TransportDegradation {
+        // High cost threshold: 100µs EWMA
+        if self.ewma_cost_us > 100.0 {
+            return TransportDegradation::HighCost {
+                ewma_cost_us: self.ewma_cost_us,
+                threshold_us: 100.0,
+            };
+        }
+        // Mode imbalance: any single mode > 95% of decisions (with 20+ decisions)
+        if self.total_decisions >= 20 {
+            let max_count = self.local_count.max(self.compressed_count).max(self.bypass_count);
+            let share = max_count as f64 / self.total_decisions as f64;
+            if share > 0.95 {
+                let mode_name = if max_count == self.local_count {
+                    "Local"
+                } else if max_count == self.compressed_count {
+                    "Compressed"
+                } else {
+                    "Bypass"
+                };
+                return TransportDegradation::ModeImbalance {
+                    dominant_mode: mode_name.to_string(),
+                    share,
+                };
+            }
+        }
+        TransportDegradation::Healthy
+    }
+
+    /// Create a structured log entry.
+    pub fn log_entry(&self) -> TransportLogEntry {
+        TransportLogEntry {
+            total_decisions: self.total_decisions,
+            local_count: self.local_count,
+            compressed_count: self.compressed_count,
+            bypass_count: self.bypass_count,
+            ewma_cost_us: self.ewma_cost_us,
+            degradation: self.detect_degradation(),
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -12020,5 +12352,235 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].from_tier, ScrollbackTier::Hot);
         assert_eq!(events[0].to_tier, ScrollbackTier::Warm);
+    }
+
+    // ── C4: Transport Policy Tests ─────────────────────────────────
+
+    #[test]
+    fn test_transport_mode_display() {
+        assert_eq!(format!("{}", TransportMode::Local), "LOCAL");
+        assert_eq!(format!("{}", TransportMode::Compressed), "COMPRESSED");
+        assert_eq!(format!("{}", TransportMode::Bypass), "BYPASS");
+    }
+
+    #[test]
+    fn test_transport_cost_model_default() {
+        let cm = TransportCostModel::default();
+        assert!(cm.compress_cost_per_byte_us > 0.0);
+        assert!(cm.bypass_threshold_bytes < cm.compress_threshold_bytes);
+    }
+
+    #[test]
+    fn test_transport_policy_local_when_no_network() {
+        let policy = TransportPolicy::with_defaults();
+        // Default cost model has network_cost=0 → always Local
+        assert_eq!(policy.select_mode(100), TransportMode::Local);
+        assert_eq!(policy.select_mode(100_000), TransportMode::Local);
+    }
+
+    #[test]
+    fn test_transport_policy_bypass_small() {
+        let config = TransportPolicyConfig {
+            cost_model: TransportCostModel {
+                network_cost_per_byte_us: 0.001,
+                bypass_threshold_bytes: 4096,
+                compress_threshold_bytes: 65536,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let policy = TransportPolicy::new(config);
+        assert_eq!(policy.select_mode(1000), TransportMode::Bypass);
+    }
+
+    #[test]
+    fn test_transport_policy_compressed_large() {
+        let config = TransportPolicyConfig {
+            cost_model: TransportCostModel {
+                network_cost_per_byte_us: 0.001,
+                bypass_threshold_bytes: 4096,
+                compress_threshold_bytes: 65536,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let policy = TransportPolicy::new(config);
+        assert_eq!(policy.select_mode(100_000), TransportMode::Compressed);
+    }
+
+    #[test]
+    fn test_transport_policy_fixed_mode() {
+        let config = TransportPolicyConfig {
+            adaptive: false,
+            fixed_mode: TransportMode::Compressed,
+            ..Default::default()
+        };
+        let policy = TransportPolicy::new(config);
+        assert_eq!(policy.select_mode(1), TransportMode::Compressed);
+        assert_eq!(policy.select_mode(1_000_000), TransportMode::Compressed);
+    }
+
+    #[test]
+    fn test_transport_policy_record() {
+        let mut policy = TransportPolicy::with_defaults();
+        policy.record(1024, TransportMode::Local, 10.0, 8.0, 1000);
+        let snap = policy.snapshot();
+        assert_eq!(snap.total_decisions, 1);
+        assert_eq!(snap.local_count, 1);
+        assert_eq!(snap.total_bytes_transferred, 1024);
+        assert!(snap.ewma_cost_us > 0.0);
+    }
+
+    #[test]
+    fn test_transport_policy_decision_counts() {
+        let mut policy = TransportPolicy::with_defaults();
+        policy.record(100, TransportMode::Local, 1.0, 1.0, 100);
+        policy.record(200, TransportMode::Compressed, 2.0, 2.0, 200);
+        policy.record(300, TransportMode::Bypass, 3.0, 3.0, 300);
+        let snap = policy.snapshot();
+        assert_eq!(snap.local_count + snap.compressed_count + snap.bypass_count, snap.total_decisions);
+    }
+
+    #[test]
+    fn test_transport_policy_ewma_converges() {
+        let mut policy = TransportPolicy::with_defaults();
+        for i in 0..100 {
+            policy.record(1000, TransportMode::Local, 50.0, 50.0, i * 100);
+        }
+        // EWMA should converge toward 50.0
+        assert!((policy.snapshot().ewma_cost_us - 50.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_transport_policy_reset() {
+        let mut policy = TransportPolicy::with_defaults();
+        policy.record(1024, TransportMode::Local, 10.0, 8.0, 1000);
+        policy.reset();
+        let snap = policy.snapshot();
+        assert_eq!(snap.total_decisions, 0);
+        assert_eq!(snap.total_bytes_transferred, 0);
+        assert_eq!(snap.ewma_cost_us, 0.0);
+    }
+
+    #[test]
+    fn test_transport_degradation_healthy() {
+        let policy = TransportPolicy::with_defaults();
+        assert_eq!(policy.detect_degradation(), TransportDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_transport_degradation_high_cost() {
+        let mut policy = TransportPolicy::with_defaults();
+        // Drive EWMA above 100µs
+        for i in 0..50 {
+            policy.record(10000, TransportMode::Compressed, 200.0, 200.0, i * 100);
+        }
+        let is_high = matches!(policy.detect_degradation(), TransportDegradation::HighCost { .. });
+        assert!(is_high, "Expected HighCost, got {:?}", policy.detect_degradation());
+    }
+
+    #[test]
+    fn test_transport_degradation_display() {
+        assert_eq!(format!("{}", TransportDegradation::Healthy), "HEALTHY");
+        let high = TransportDegradation::HighCost { ewma_cost_us: 150.0, threshold_us: 100.0 };
+        assert!(format!("{}", high).contains("150.0"));
+    }
+
+    #[test]
+    fn test_transport_log_entry() {
+        let mut policy = TransportPolicy::with_defaults();
+        policy.record(1024, TransportMode::Local, 10.0, 8.0, 1000);
+        let entry = policy.log_entry();
+        assert_eq!(entry.total_decisions, 1);
+        assert_eq!(entry.degradation, TransportDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_transport_log_entry_serde() {
+        let entry = TransportLogEntry {
+            total_decisions: 10,
+            local_count: 5,
+            compressed_count: 3,
+            bypass_count: 2,
+            ewma_cost_us: 25.5,
+            degradation: TransportDegradation::Healthy,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: TransportLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn test_transport_snapshot_serde() {
+        let snap = TransportPolicySnapshot {
+            total_decisions: 100,
+            local_count: 50,
+            compressed_count: 30,
+            bypass_count: 20,
+            total_bytes_transferred: 1_000_000,
+            total_savings_us: 500.0,
+            ewma_cost_us: 25.0,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: TransportPolicySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn test_transport_decision_serde() {
+        let dec = TransportDecision {
+            payload_bytes: 4096,
+            selected_mode: TransportMode::Compressed,
+            estimated_cost_us: 15.0,
+            actual_cost_us: 12.0,
+            savings_us: 3.0,
+            timestamp_us: 99999,
+        };
+        let json = serde_json::to_string(&dec).unwrap();
+        let back: TransportDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(dec, back);
+    }
+
+    #[test]
+    fn test_transport_degradation_serde() {
+        let variants = vec![
+            TransportDegradation::Healthy,
+            TransportDegradation::HighCost { ewma_cost_us: 150.0, threshold_us: 100.0 },
+            TransportDegradation::ModeImbalance { dominant_mode: "Local".to_string(), share: 0.98 },
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: TransportDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[test]
+    fn test_transport_status_line() {
+        let policy = TransportPolicy::with_defaults();
+        let line = policy.status_line();
+        assert!(line.contains("transport"));
+        assert!(line.contains("decisions=0"));
+    }
+
+    #[test]
+    fn test_transport_mode_mid_range_cost_comparison() {
+        // In the mid-range, mode depends on cost model
+        let config = TransportPolicyConfig {
+            cost_model: TransportCostModel {
+                compress_cost_per_byte_us: 0.05,
+                decompress_cost_per_byte_us: 0.02,
+                network_cost_per_byte_us: 0.01,
+                expected_compression_ratio: 0.3,
+                bypass_threshold_bytes: 1000,
+                compress_threshold_bytes: 100000,
+            },
+            ..Default::default()
+        };
+        let policy = TransportPolicy::new(config);
+        // 10000 bytes: bypass cost = 10000 * 0.01 = 100
+        // compress cost = 10000*0.05 + 10000*0.3*0.01 + 10000*0.3*0.02 = 500 + 30 + 60 = 590
+        // bypass is cheaper
+        assert_eq!(policy.select_mode(10000), TransportMode::Bypass);
     }
 }

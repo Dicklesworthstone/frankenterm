@@ -27,6 +27,7 @@
 //! - Deconvolution: (f ⊘ g)(t) = sup_{s≥0} { f(t+s) - g(s) }
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 // ── Piecewise-Linear Curve ──────────────────────────────────────────
 
@@ -713,6 +714,535 @@ pub struct StageAnalysis {
     pub name: String,
     pub delay_bound_ms: f64,
     pub backlog_bound_bytes: f64,
+}
+
+/// Quantile latency budget in milliseconds.
+///
+/// Each quantile must be finite, non-negative, and monotonic:
+/// `p50 <= p95 <= p99 <= p999`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct QuantileBudgetMs {
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub p999_ms: f64,
+}
+
+impl QuantileBudgetMs {
+    /// Construct and validate a quantile budget.
+    pub fn try_new(
+        median_ms: f64,
+        high_ms: f64,
+        critical_ms: f64,
+        worst_case_ms: f64,
+    ) -> Result<Self, BudgetContractError> {
+        let out = Self {
+            p50_ms: median_ms,
+            p95_ms: high_ms,
+            p99_ms: critical_ms,
+            p999_ms: worst_case_ms,
+        };
+        out.validate("quantile_budget")?;
+        Ok(out)
+    }
+
+    /// Zero budget for all quantiles.
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self {
+            p50_ms: 0.0,
+            p95_ms: 0.0,
+            p99_ms: 0.0,
+            p999_ms: 0.0,
+        }
+    }
+
+    /// Element-wise addition.
+    #[must_use]
+    pub fn sum_with(self, rhs: Self) -> Self {
+        Self {
+            p50_ms: self.p50_ms + rhs.p50_ms,
+            p95_ms: self.p95_ms + rhs.p95_ms,
+            p99_ms: self.p99_ms + rhs.p99_ms,
+            p999_ms: self.p999_ms + rhs.p999_ms,
+        }
+    }
+
+    /// Element-wise positive headroom: `max(self - rhs, 0)`.
+    #[must_use]
+    pub fn headroom_against(self, rhs: Self) -> Self {
+        Self {
+            p50_ms: (self.p50_ms - rhs.p50_ms).max(0.0),
+            p95_ms: (self.p95_ms - rhs.p95_ms).max(0.0),
+            p99_ms: (self.p99_ms - rhs.p99_ms).max(0.0),
+            p999_ms: (self.p999_ms - rhs.p999_ms).max(0.0),
+        }
+    }
+
+    /// Element-wise positive overflow: `max(rhs - self, 0)`.
+    #[must_use]
+    pub fn overflow_against(self, rhs: Self) -> Self {
+        Self {
+            p50_ms: (rhs.p50_ms - self.p50_ms).max(0.0),
+            p95_ms: (rhs.p95_ms - self.p95_ms).max(0.0),
+            p99_ms: (rhs.p99_ms - self.p99_ms).max(0.0),
+            p999_ms: (rhs.p999_ms - self.p999_ms).max(0.0),
+        }
+    }
+
+    /// Whether any quantile is strictly positive.
+    #[must_use]
+    pub fn any_positive(self) -> bool {
+        self.p50_ms > 0.0 || self.p95_ms > 0.0 || self.p99_ms > 0.0 || self.p999_ms > 0.0
+    }
+
+    fn validate(&self, label: &str) -> Result<(), BudgetContractError> {
+        let fields = [
+            ("p50_ms", self.p50_ms),
+            ("p95_ms", self.p95_ms),
+            ("p99_ms", self.p99_ms),
+            ("p999_ms", self.p999_ms),
+        ];
+        for (name, value) in fields {
+            if !value.is_finite() || value < 0.0 {
+                return Err(BudgetContractError::InvalidQuantileValue {
+                    label: label.to_string(),
+                    field: name.to_string(),
+                    value,
+                    reason: "value must be finite and non-negative".to_string(),
+                });
+            }
+        }
+
+        if self.p50_ms > self.p95_ms || self.p95_ms > self.p99_ms || self.p99_ms > self.p999_ms {
+            return Err(BudgetContractError::InvalidQuantileOrder {
+                label: label.to_string(),
+                p50_ms: self.p50_ms,
+                p95_ms: self.p95_ms,
+                p99_ms: self.p99_ms,
+                p999_ms: self.p999_ms,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// Stage-level overflow policy.
+///
+/// `Strict` means a stage cannot exceed its own quantile budget.
+/// `BorrowUpTo` allows borrowing from aggregate slack up to `max_extra_ms`
+/// per quantile for that stage.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageSlackPolicy {
+    Strict,
+    BorrowUpTo { max_extra_ms: f64 },
+}
+
+impl StageSlackPolicy {
+    fn borrow_cap_ms(self) -> f64 {
+        match self {
+            Self::Strict => 0.0,
+            Self::BorrowUpTo { max_extra_ms } => max_extra_ms.max(0.0),
+        }
+    }
+
+    fn validate(self, stage_id: &str) -> Result<(), BudgetContractError> {
+        if let Self::BorrowUpTo { max_extra_ms } = self
+            && (!max_extra_ms.is_finite() || max_extra_ms < 0.0)
+        {
+            return Err(BudgetContractError::InvalidSlackPolicy {
+                stage_id: stage_id.to_string(),
+                reason: "max_extra_ms must be finite and non-negative".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Stage contract for input-to-visible-response latency accounting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LatencyStageContract {
+    pub stage_id: String,
+    pub interface_in: String,
+    pub interface_out: String,
+    pub target_ms: QuantileBudgetMs,
+    pub slack_policy: StageSlackPolicy,
+}
+
+/// End-to-end path contract with deterministic budget composition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LatencyPathContract {
+    pub path_id: String,
+    pub stages: Vec<LatencyStageContract>,
+    pub aggregate_target_ms: QuantileBudgetMs,
+}
+
+impl LatencyPathContract {
+    /// Build and validate a latency path contract.
+    pub fn new(
+        path_id: impl Into<String>,
+        stages: Vec<LatencyStageContract>,
+    ) -> Result<Self, BudgetContractError> {
+        if stages.is_empty() {
+            return Err(BudgetContractError::EmptyStages);
+        }
+
+        let mut seen = HashSet::with_capacity(stages.len());
+        for stage in &stages {
+            if stage.stage_id.trim().is_empty() {
+                return Err(BudgetContractError::InvalidStageId(
+                    "stage_id must not be empty".to_string(),
+                ));
+            }
+            if !seen.insert(stage.stage_id.clone()) {
+                return Err(BudgetContractError::DuplicateStageId(
+                    stage.stage_id.clone(),
+                ));
+            }
+            stage.target_ms.validate(&stage.stage_id)?;
+            stage.slack_policy.validate(&stage.stage_id)?;
+        }
+
+        let aggregate_target_ms = compose_stage_targets(&stages);
+        Ok(Self {
+            path_id: path_id.into(),
+            stages,
+            aggregate_target_ms,
+        })
+    }
+}
+
+/// Observed stage latency quantiles in milliseconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageLatencyObservation {
+    pub stage_id: String,
+    pub observed_ms: QuantileBudgetMs,
+}
+
+/// Stage-level budget accounting output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageBudgetDelta {
+    pub stage_id: String,
+    pub target_ms: QuantileBudgetMs,
+    pub observed_ms: QuantileBudgetMs,
+    pub overflow_ms: QuantileBudgetMs,
+    pub headroom_ms: QuantileBudgetMs,
+    pub borrowed_ms: QuantileBudgetMs,
+    pub residual_overflow_ms: QuantileBudgetMs,
+    pub slack_policy: StageSlackPolicy,
+}
+
+/// End-to-end budget accounting output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LatencyBudgetEvaluation {
+    pub path_id: String,
+    pub aggregate_target_ms: QuantileBudgetMs,
+    pub aggregate_observed_ms: QuantileBudgetMs,
+    pub aggregate_overflow_ms: QuantileBudgetMs,
+    pub aggregate_headroom_ms: QuantileBudgetMs,
+    pub aggregate_residual_overflow_ms: QuantileBudgetMs,
+    pub stage_deltas: Vec<StageBudgetDelta>,
+    pub overflow_reasons: Vec<String>,
+    pub within_budget: bool,
+}
+
+/// Errors for latency contract composition/evaluation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BudgetContractError {
+    EmptyStages,
+    InvalidStageId(String),
+    DuplicateStageId(String),
+    DuplicateObservation(String),
+    MissingObservation(String),
+    UnknownObservedStage(String),
+    InvalidSlackPolicy {
+        stage_id: String,
+        reason: String,
+    },
+    InvalidQuantileValue {
+        label: String,
+        field: String,
+        value: f64,
+        reason: String,
+    },
+    InvalidQuantileOrder {
+        label: String,
+        p50_ms: f64,
+        p95_ms: f64,
+        p99_ms: f64,
+        p999_ms: f64,
+    },
+}
+
+impl std::fmt::Display for BudgetContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyStages => write!(f, "latency contract must include at least one stage"),
+            Self::InvalidStageId(reason) => write!(f, "invalid stage_id: {reason}"),
+            Self::DuplicateStageId(stage_id) => write!(f, "duplicate stage_id: {stage_id}"),
+            Self::DuplicateObservation(stage_id) => {
+                write!(f, "duplicate observation for stage_id: {stage_id}")
+            }
+            Self::MissingObservation(stage_id) => {
+                write!(f, "missing observation for stage_id: {stage_id}")
+            }
+            Self::UnknownObservedStage(stage_id) => {
+                write!(f, "observation provided for unknown stage_id: {stage_id}")
+            }
+            Self::InvalidSlackPolicy { stage_id, reason } => {
+                write!(f, "invalid slack policy for {stage_id}: {reason}")
+            }
+            Self::InvalidQuantileValue {
+                label,
+                field,
+                value,
+                reason,
+            } => write!(
+                f,
+                "invalid quantile value for {label}.{field}={value}: {reason}"
+            ),
+            Self::InvalidQuantileOrder {
+                label,
+                p50_ms,
+                p95_ms,
+                p99_ms,
+                p999_ms,
+            } => write!(
+                f,
+                "invalid quantile ordering for {label}: p50={p50_ms}, p95={p95_ms}, p99={p99_ms}, p999={p999_ms}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BudgetContractError {}
+
+/// Compose aggregate target quantiles by summing stage targets.
+#[must_use]
+pub fn compose_stage_targets(stages: &[LatencyStageContract]) -> QuantileBudgetMs {
+    stages.iter().fold(QuantileBudgetMs::zero(), |acc, stage| {
+        acc.sum_with(stage.target_ms)
+    })
+}
+
+/// Evaluate stage observations against a latency path contract.
+///
+/// Deterministic slack algebra:
+/// - Per-stage overflow/headroom is computed per quantile.
+/// - Borrowable stages can consume aggregate headroom up to their borrow cap.
+/// - Borrow allocation is deterministic in stage order.
+pub fn evaluate_latency_budget(
+    contract: &LatencyPathContract,
+    observations: &[StageLatencyObservation],
+) -> Result<LatencyBudgetEvaluation, BudgetContractError> {
+    let mut observed_by_stage: HashMap<String, QuantileBudgetMs> =
+        HashMap::with_capacity(observations.len());
+    for obs in observations {
+        obs.observed_ms
+            .validate(&format!("observation:{}", obs.stage_id))?;
+        if observed_by_stage
+            .insert(obs.stage_id.clone(), obs.observed_ms)
+            .is_some()
+        {
+            return Err(BudgetContractError::DuplicateObservation(
+                obs.stage_id.clone(),
+            ));
+        }
+    }
+
+    let mut stage_deltas = Vec::with_capacity(contract.stages.len());
+    for stage in &contract.stages {
+        let observed = observed_by_stage
+            .remove(&stage.stage_id)
+            .ok_or_else(|| BudgetContractError::MissingObservation(stage.stage_id.clone()))?;
+        let overflow = stage.target_ms.overflow_against(observed);
+        let headroom = stage.target_ms.headroom_against(observed);
+        stage_deltas.push(StageBudgetDelta {
+            stage_id: stage.stage_id.clone(),
+            target_ms: stage.target_ms,
+            observed_ms: observed,
+            overflow_ms: overflow,
+            headroom_ms: headroom,
+            borrowed_ms: QuantileBudgetMs::zero(),
+            residual_overflow_ms: overflow,
+            slack_policy: stage.slack_policy,
+        });
+    }
+
+    if let Some((unknown_stage_id, _)) = observed_by_stage.into_iter().next() {
+        return Err(BudgetContractError::UnknownObservedStage(unknown_stage_id));
+    }
+
+    let mut pool_p50: f64 = stage_deltas.iter().map(|s| s.headroom_ms.p50_ms).sum();
+    let mut pool_p95: f64 = stage_deltas.iter().map(|s| s.headroom_ms.p95_ms).sum();
+    let mut pool_p99: f64 = stage_deltas.iter().map(|s| s.headroom_ms.p99_ms).sum();
+    let mut pool_p999: f64 = stage_deltas.iter().map(|s| s.headroom_ms.p999_ms).sum();
+
+    for stage in &mut stage_deltas {
+        let cap = stage.slack_policy.borrow_cap_ms();
+
+        let p50_request = stage.overflow_ms.p50_ms.min(cap);
+        let p50_borrowed = p50_request.min(pool_p50);
+        pool_p50 = (pool_p50 - p50_borrowed).max(0.0);
+        stage.borrowed_ms.p50_ms = p50_borrowed;
+        stage.residual_overflow_ms.p50_ms = (stage.overflow_ms.p50_ms - p50_borrowed).max(0.0);
+
+        let p95_request = stage.overflow_ms.p95_ms.min(cap);
+        let p95_borrowed = p95_request.min(pool_p95);
+        pool_p95 = (pool_p95 - p95_borrowed).max(0.0);
+        stage.borrowed_ms.p95_ms = p95_borrowed;
+        stage.residual_overflow_ms.p95_ms = (stage.overflow_ms.p95_ms - p95_borrowed).max(0.0);
+
+        let p99_request = stage.overflow_ms.p99_ms.min(cap);
+        let p99_borrowed = p99_request.min(pool_p99);
+        pool_p99 = (pool_p99 - p99_borrowed).max(0.0);
+        stage.borrowed_ms.p99_ms = p99_borrowed;
+        stage.residual_overflow_ms.p99_ms = (stage.overflow_ms.p99_ms - p99_borrowed).max(0.0);
+
+        let p999_quantile_request = stage.overflow_ms.p999_ms.min(cap);
+        let p999_quantile_borrowed = p999_quantile_request.min(pool_p999);
+        pool_p999 = (pool_p999 - p999_quantile_borrowed).max(0.0);
+        stage.borrowed_ms.p999_ms = p999_quantile_borrowed;
+        stage.residual_overflow_ms.p999_ms =
+            (stage.overflow_ms.p999_ms - p999_quantile_borrowed).max(0.0);
+    }
+
+    let aggregate_observed_ms = stage_deltas
+        .iter()
+        .fold(QuantileBudgetMs::zero(), |acc, stage| {
+            acc.sum_with(stage.observed_ms)
+        });
+    let aggregate_target_ms = contract.aggregate_target_ms;
+    let aggregate_overflow_ms = aggregate_target_ms.overflow_against(aggregate_observed_ms);
+    let aggregate_headroom_ms = aggregate_target_ms.headroom_against(aggregate_observed_ms);
+    let aggregate_residual_overflow_ms = stage_deltas
+        .iter()
+        .fold(QuantileBudgetMs::zero(), |acc, stage| {
+            acc.sum_with(stage.residual_overflow_ms)
+        });
+
+    let mut overflow_reasons = Vec::new();
+    for stage in &stage_deltas {
+        if stage.residual_overflow_ms.p50_ms > 0.0 {
+            overflow_reasons.push(format!(
+                "{} p50 overflow {:.3}ms (target {:.3}ms, observed {:.3}ms, borrowed {:.3}ms)",
+                stage.stage_id,
+                stage.residual_overflow_ms.p50_ms,
+                stage.target_ms.p50_ms,
+                stage.observed_ms.p50_ms,
+                stage.borrowed_ms.p50_ms
+            ));
+        }
+        if stage.residual_overflow_ms.p95_ms > 0.0 {
+            overflow_reasons.push(format!(
+                "{} p95 overflow {:.3}ms (target {:.3}ms, observed {:.3}ms, borrowed {:.3}ms)",
+                stage.stage_id,
+                stage.residual_overflow_ms.p95_ms,
+                stage.target_ms.p95_ms,
+                stage.observed_ms.p95_ms,
+                stage.borrowed_ms.p95_ms
+            ));
+        }
+        if stage.residual_overflow_ms.p99_ms > 0.0 {
+            overflow_reasons.push(format!(
+                "{} p99 overflow {:.3}ms (target {:.3}ms, observed {:.3}ms, borrowed {:.3}ms)",
+                stage.stage_id,
+                stage.residual_overflow_ms.p99_ms,
+                stage.target_ms.p99_ms,
+                stage.observed_ms.p99_ms,
+                stage.borrowed_ms.p99_ms
+            ));
+        }
+        if stage.residual_overflow_ms.p999_ms > 0.0 {
+            overflow_reasons.push(format!(
+                "{} p999 overflow {:.3}ms (target {:.3}ms, observed {:.3}ms, borrowed {:.3}ms)",
+                stage.stage_id,
+                stage.residual_overflow_ms.p999_ms,
+                stage.target_ms.p999_ms,
+                stage.observed_ms.p999_ms,
+                stage.borrowed_ms.p999_ms
+            ));
+        }
+    }
+
+    let within_budget =
+        !aggregate_residual_overflow_ms.any_positive() && overflow_reasons.is_empty();
+
+    Ok(LatencyBudgetEvaluation {
+        path_id: contract.path_id.clone(),
+        aggregate_target_ms,
+        aggregate_observed_ms,
+        aggregate_overflow_ms,
+        aggregate_headroom_ms,
+        aggregate_residual_overflow_ms,
+        stage_deltas,
+        overflow_reasons,
+        within_budget,
+    })
+}
+
+/// Canonical stage decomposition for the input-to-visible response path.
+///
+/// This contract is explicit and deterministic:
+/// input decode → policy gate → terminal injection → capture refresh
+/// → delta persist → visibility projection.
+#[must_use]
+pub fn input_to_visible_response_contract_v1() -> LatencyPathContract {
+    let stages = vec![
+        LatencyStageContract {
+            stage_id: "input_decode".to_string(),
+            interface_in: "cli/mcp request bytes".to_string(),
+            interface_out: "normalized action payload".to_string(),
+            target_ms: QuantileBudgetMs::try_new(3.0, 7.0, 11.0, 18.0)
+                .expect("hardcoded quantiles must be valid"),
+            slack_policy: StageSlackPolicy::Strict,
+        },
+        LatencyStageContract {
+            stage_id: "policy_gate".to_string(),
+            interface_in: "normalized action payload".to_string(),
+            interface_out: "policy decision + risk context".to_string(),
+            target_ms: QuantileBudgetMs::try_new(4.0, 9.0, 14.0, 22.0)
+                .expect("hardcoded quantiles must be valid"),
+            slack_policy: StageSlackPolicy::Strict,
+        },
+        LatencyStageContract {
+            stage_id: "transport_inject".to_string(),
+            interface_in: "allowed action request".to_string(),
+            interface_out: "terminal transport ack".to_string(),
+            target_ms: QuantileBudgetMs::try_new(6.0, 14.0, 24.0, 40.0)
+                .expect("hardcoded quantiles must be valid"),
+            slack_policy: StageSlackPolicy::Strict,
+        },
+        LatencyStageContract {
+            stage_id: "capture_refresh".to_string(),
+            interface_in: "terminal transport ack".to_string(),
+            interface_out: "new pane snapshot/delta".to_string(),
+            target_ms: QuantileBudgetMs::try_new(12.0, 28.0, 45.0, 70.0)
+                .expect("hardcoded quantiles must be valid"),
+            slack_policy: StageSlackPolicy::BorrowUpTo { max_extra_ms: 12.0 },
+        },
+        LatencyStageContract {
+            stage_id: "delta_persist".to_string(),
+            interface_in: "new pane snapshot/delta".to_string(),
+            interface_out: "persisted segment/event rows".to_string(),
+            target_ms: QuantileBudgetMs::try_new(5.0, 12.0, 18.0, 30.0)
+                .expect("hardcoded quantiles must be valid"),
+            slack_policy: StageSlackPolicy::BorrowUpTo { max_extra_ms: 8.0 },
+        },
+        LatencyStageContract {
+            stage_id: "visibility_projection".to_string(),
+            interface_in: "persisted segment/event rows".to_string(),
+            interface_out: "visible status/get-text/search surface".to_string(),
+            target_ms: QuantileBudgetMs::try_new(4.0, 10.0, 16.0, 26.0)
+                .expect("hardcoded quantiles must be valid"),
+            slack_policy: StageSlackPolicy::BorrowUpTo { max_extra_ms: 6.0 },
+        },
+    ];
+
+    LatencyPathContract::new("input_to_visible_response_v1", stages)
+        .expect("hardcoded contract must be valid")
 }
 
 /// Analyze the FrankenTerm pane pipeline for N panes with given profiles.
@@ -1620,5 +2150,180 @@ mod tests {
         let analysis = analyze_frankenterm_pipeline(&[], &config);
         assert!(analysis.is_stable);
         assert_eq!(analysis.stages.len(), 3);
+    }
+
+    #[test]
+    fn quantile_budget_rejects_non_monotonic_order() {
+        let err = QuantileBudgetMs::try_new(4.0, 3.0, 5.0, 6.0).unwrap_err();
+        assert!(matches!(
+            err,
+            BudgetContractError::InvalidQuantileOrder { .. }
+        ));
+    }
+
+    #[test]
+    fn input_visible_contract_v1_has_deterministic_totals() {
+        let contract = input_to_visible_response_contract_v1();
+        assert_eq!(contract.path_id, "input_to_visible_response_v1");
+        assert_eq!(contract.stages.len(), 6);
+        assert!(approx_eq(contract.aggregate_target_ms.p50_ms, 34.0));
+        assert!(approx_eq(contract.aggregate_target_ms.p95_ms, 80.0));
+        assert!(approx_eq(contract.aggregate_target_ms.p99_ms, 128.0));
+        assert!(approx_eq(contract.aggregate_target_ms.p999_ms, 206.0));
+
+        let recomposed = compose_stage_targets(&contract.stages);
+        assert_eq!(recomposed, contract.aggregate_target_ms);
+    }
+
+    #[test]
+    fn evaluate_latency_budget_rejects_missing_stage_observation() {
+        let contract = input_to_visible_response_contract_v1();
+        let observations = vec![
+            StageLatencyObservation {
+                stage_id: "input_decode".to_string(),
+                observed_ms: QuantileBudgetMs::try_new(3.0, 7.0, 11.0, 18.0).unwrap(),
+            },
+            // Missing the other required stages.
+        ];
+
+        let err = evaluate_latency_budget(&contract, &observations).unwrap_err();
+        assert!(matches!(err, BudgetContractError::MissingObservation(_)));
+    }
+
+    #[test]
+    fn evaluate_latency_budget_flags_strict_stage_overflow() {
+        let contract = input_to_visible_response_contract_v1();
+        let mut observations = Vec::with_capacity(contract.stages.len());
+        for stage in &contract.stages {
+            let observed = if stage.stage_id == "policy_gate" {
+                // Strict stage overflows p99/p999 by 1ms each.
+                QuantileBudgetMs::try_new(4.0, 9.0, 15.0, 23.0).unwrap()
+            } else {
+                stage.target_ms
+            };
+            observations.push(StageLatencyObservation {
+                stage_id: stage.stage_id.clone(),
+                observed_ms: observed,
+            });
+        }
+
+        let eval = evaluate_latency_budget(&contract, &observations).unwrap();
+        assert!(!eval.within_budget);
+        assert!(eval.aggregate_residual_overflow_ms.p99_ms > 0.0);
+        assert!(
+            eval.overflow_reasons
+                .iter()
+                .any(|reason| reason.contains("policy_gate p99 overflow"))
+        );
+    }
+
+    #[test]
+    fn evaluate_latency_budget_borrows_slack_when_available() {
+        let contract = input_to_visible_response_contract_v1();
+        let observations = vec![
+            StageLatencyObservation {
+                stage_id: "input_decode".to_string(),
+                observed_ms: QuantileBudgetMs::try_new(2.0, 5.0, 9.0, 13.0).unwrap(),
+            },
+            StageLatencyObservation {
+                stage_id: "policy_gate".to_string(),
+                observed_ms: QuantileBudgetMs::try_new(3.0, 6.0, 10.0, 14.0).unwrap(),
+            },
+            StageLatencyObservation {
+                stage_id: "transport_inject".to_string(),
+                observed_ms: QuantileBudgetMs::try_new(5.0, 11.0, 18.0, 26.0).unwrap(),
+            },
+            StageLatencyObservation {
+                stage_id: "capture_refresh".to_string(),
+                observed_ms: QuantileBudgetMs::try_new(18.0, 34.0, 51.0, 79.0).unwrap(),
+            },
+            StageLatencyObservation {
+                stage_id: "delta_persist".to_string(),
+                observed_ms: QuantileBudgetMs::try_new(2.0, 5.0, 9.0, 12.0).unwrap(),
+            },
+            StageLatencyObservation {
+                stage_id: "visibility_projection".to_string(),
+                observed_ms: QuantileBudgetMs::try_new(2.0, 4.0, 8.0, 11.0).unwrap(),
+            },
+        ];
+
+        let eval = evaluate_latency_budget(&contract, &observations).unwrap();
+        assert!(eval.within_budget);
+        assert!(!eval.aggregate_overflow_ms.any_positive());
+        assert!(!eval.aggregate_residual_overflow_ms.any_positive());
+        let capture = eval
+            .stage_deltas
+            .iter()
+            .find(|d| d.stage_id == "capture_refresh")
+            .expect("capture stage present");
+        assert!(capture.borrowed_ms.p50_ms > 0.0);
+        assert!(approx_eq(capture.residual_overflow_ms.p50_ms, 0.0));
+    }
+
+    #[test]
+    fn evaluate_latency_budget_enforces_borrow_cap_adversarially() {
+        let contract = input_to_visible_response_contract_v1();
+        let observations = vec![
+            StageLatencyObservation {
+                stage_id: "input_decode".to_string(),
+                observed_ms: QuantileBudgetMs::try_new(0.0, 1.0, 2.0, 3.0).unwrap(),
+            },
+            StageLatencyObservation {
+                stage_id: "policy_gate".to_string(),
+                observed_ms: QuantileBudgetMs::try_new(0.0, 1.0, 2.0, 3.0).unwrap(),
+            },
+            StageLatencyObservation {
+                stage_id: "transport_inject".to_string(),
+                observed_ms: QuantileBudgetMs::try_new(0.0, 1.0, 2.0, 3.0).unwrap(),
+            },
+            StageLatencyObservation {
+                stage_id: "capture_refresh".to_string(),
+                // Very large overflow against cap=12ms.
+                observed_ms: QuantileBudgetMs::try_new(40.0, 60.0, 90.0, 140.0).unwrap(),
+            },
+            StageLatencyObservation {
+                stage_id: "delta_persist".to_string(),
+                observed_ms: QuantileBudgetMs::try_new(0.0, 1.0, 2.0, 3.0).unwrap(),
+            },
+            StageLatencyObservation {
+                stage_id: "visibility_projection".to_string(),
+                observed_ms: QuantileBudgetMs::try_new(0.0, 1.0, 2.0, 3.0).unwrap(),
+            },
+        ];
+
+        let eval = evaluate_latency_budget(&contract, &observations).unwrap();
+        assert!(!eval.within_budget);
+        let capture = eval
+            .stage_deltas
+            .iter()
+            .find(|d| d.stage_id == "capture_refresh")
+            .expect("capture stage present");
+        // Cap for capture stage is 12ms.
+        assert!(capture.borrowed_ms.p50_ms <= 12.0 + TOL);
+        assert!(capture.residual_overflow_ms.p50_ms > 0.0);
+        assert!(
+            eval.overflow_reasons
+                .iter()
+                .any(|reason| reason.contains("capture_refresh p50 overflow"))
+        );
+    }
+
+    #[test]
+    fn evaluate_latency_budget_rejects_unknown_stage_observation() {
+        let contract = input_to_visible_response_contract_v1();
+        let mut observations = Vec::with_capacity(contract.stages.len() + 1);
+        for stage in &contract.stages {
+            observations.push(StageLatencyObservation {
+                stage_id: stage.stage_id.clone(),
+                observed_ms: stage.target_ms,
+            });
+        }
+        observations.push(StageLatencyObservation {
+            stage_id: "unknown_stage".to_string(),
+            observed_ms: QuantileBudgetMs::try_new(1.0, 1.0, 1.0, 1.0).unwrap(),
+        });
+
+        let err = evaluate_latency_budget(&contract, &observations).unwrap_err();
+        assert!(matches!(err, BudgetContractError::UnknownObservedStage(_)));
     }
 }
