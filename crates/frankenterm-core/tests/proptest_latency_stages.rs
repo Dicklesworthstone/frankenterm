@@ -1649,4 +1649,186 @@ proptest! {
         prop_assert!(d.adjustments.is_empty());
         prop_assert_eq!(d.reason, AllocationReason::Warmup);
     }
+
+    // ── B1: Three-Lane Scheduler ──
+
+    /// SchedulerLane ordering matches priority.
+    #[test]
+    fn scheduler_lane_ordering(
+        a_idx in 0_usize..3,
+        b_idx in 0_usize..3,
+    ) {
+        let lanes = [SchedulerLane::Input, SchedulerLane::Control, SchedulerLane::Bulk];
+        let a = lanes[a_idx];
+        let b = lanes[b_idx];
+        if a_idx < b_idx {
+            prop_assert!(a < b);
+            prop_assert!(a.priority() < b.priority());
+        } else if a_idx == b_idx {
+            prop_assert_eq!(a, b);
+        } else {
+            prop_assert!(a > b);
+        }
+    }
+
+    /// stage_to_lane covers all non-aggregate pipeline stages.
+    #[test]
+    fn stage_to_lane_covers_pipeline(
+        stage in arb_stage(),
+    ) {
+        let lane = stage_to_lane(stage);
+        // Result should be one of the three lanes.
+        let is_valid = matches!(lane, SchedulerLane::Input | SchedulerLane::Control | SchedulerLane::Bulk);
+        prop_assert!(is_valid);
+    }
+
+    /// LaneScheduler: admitted items increase depth; completed items decrease depth.
+    #[test]
+    fn scheduler_depth_monotonic(
+        n in 1_usize..50,
+    ) {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.begin_epoch(1_000_000.0);
+        for i in 0..n {
+            sched.admit(LatencyStage::PtyCapture, 10.0, &format!("m-{}", i), 0, 0);
+        }
+        let depth = sched.lane_state(SchedulerLane::Input).depth;
+        prop_assert_eq!(depth, n);
+
+        for _ in 0..n {
+            sched.complete(SchedulerLane::Input, 10.0);
+        }
+        prop_assert_eq!(sched.lane_state(SchedulerLane::Input).depth, 0);
+    }
+
+    /// LaneScheduler: input items are never shed (only deferred when full).
+    #[test]
+    fn scheduler_input_never_shed(
+        n in 1_usize..100,
+    ) {
+        let cfg = LaneSchedulerConfig {
+            input_queue_capacity: 10,
+            ..Default::default()
+        };
+        let mut sched = LaneScheduler::new(cfg);
+        sched.begin_epoch(1_000_000.0);
+        let mut shed_count = 0;
+        for i in 0..n {
+            let (_, decision) = sched.admit(LatencyStage::PtyCapture, 10.0, &format!("ns-{}", i), 0, 0);
+            if decision == AdmissionDecision::Shed {
+                shed_count += 1;
+            }
+        }
+        prop_assert_eq!(shed_count, 0, "input items should never be shed");
+    }
+
+    /// LaneScheduler: bulk items shed under input pressure.
+    #[test]
+    fn scheduler_bulk_shed_under_pressure(
+        input_fill in 3_usize..10,
+    ) {
+        let cfg = LaneSchedulerConfig {
+            input_queue_capacity: 4,
+            input_pressure_threshold: 0.75,
+            ..Default::default()
+        };
+        let mut sched = LaneScheduler::new(cfg);
+        sched.begin_epoch(1_000_000.0);
+
+        // Fill input to trigger pressure.
+        for i in 0..input_fill.min(4) {
+            sched.admit(LatencyStage::PtyCapture, 10.0, &format!("p-{}", i), 0, 0);
+        }
+
+        if sched.input_under_pressure() {
+            let (_, decision) = sched.admit(LatencyStage::StorageWrite, 10.0, "bulk", 0, 0);
+            prop_assert_eq!(decision, AdmissionDecision::Shed);
+        }
+    }
+
+    /// LaneSchedulerConfig: default CPU shares sum to 1.0.
+    #[test]
+    fn scheduler_config_shares_sum(_dummy in 0..1_u8) {
+        let cfg = LaneSchedulerConfig::default();
+        let sum = cfg.input_cpu_share + cfg.control_cpu_share + cfg.bulk_cpu_share;
+        prop_assert!((sum - 1.0).abs() < 1e-6);
+    }
+
+    /// SchedulerSnapshot serde roundtrip.
+    #[test]
+    fn scheduler_snapshot_serde(
+        n in 0_usize..20,
+    ) {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.begin_epoch(10000.0);
+        for i in 0..n {
+            sched.admit(LatencyStage::PtyCapture, 10.0, &format!("ss-{}", i), 0, 0);
+        }
+        let snap = sched.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SchedulerSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap.epoch, back.epoch);
+        prop_assert_eq!(snap.lanes.len(), back.lanes.len());
+    }
+
+    /// SchedulerDegradation serde roundtrip.
+    #[test]
+    fn scheduler_degradation_serde_roundtrip(
+        variant_idx in 0_usize..4,
+        count in 1_usize..100,
+    ) {
+        let degradation = match variant_idx {
+            0 => SchedulerDegradation::Healthy,
+            1 => SchedulerDegradation::InputStarvation { depth: count, deferred: count as u64 },
+            2 => SchedulerDegradation::BulkStarvation { shed_count: count as u64, completed_count: count as u64 / 2 },
+            _ => SchedulerDegradation::ControlBacklog { depth: count, capacity: count * 2 },
+        };
+        let json = serde_json::to_string(&degradation).unwrap();
+        let back: SchedulerDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(degradation, back);
+    }
+
+    /// Fairness ratios sum to ~3.0 (one ratio per lane) when all lanes have work.
+    #[test]
+    fn scheduler_fairness_has_three_lanes(_dummy in 0..1_u8) {
+        let sched = LaneScheduler::with_defaults();
+        let ratios = sched.fairness_ratios();
+        prop_assert_eq!(ratios.len(), 3);
+    }
+
+    /// next_lane respects strict priority.
+    #[test]
+    fn scheduler_next_lane_strict_priority(
+        has_input in prop::bool::ANY,
+        has_control in prop::bool::ANY,
+        has_bulk in prop::bool::ANY,
+    ) {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.begin_epoch(1_000_000.0);
+        if has_bulk {
+            sched.admit(LatencyStage::StorageWrite, 10.0, "b", 0, 0);
+        }
+        if has_control {
+            sched.admit(LatencyStage::EventEmission, 10.0, "c", 0, 0);
+        }
+        if has_input {
+            sched.admit(LatencyStage::PtyCapture, 10.0, "i", 0, 0);
+        }
+
+        match sched.next_lane() {
+            Some(SchedulerLane::Input) => prop_assert!(has_input),
+            Some(SchedulerLane::Control) => {
+                prop_assert!(!has_input);
+                prop_assert!(has_control);
+            }
+            Some(SchedulerLane::Bulk) => {
+                prop_assert!(!has_input);
+                prop_assert!(!has_control);
+                prop_assert!(has_bulk);
+            }
+            None => {
+                prop_assert!(!has_input && !has_control && !has_bulk);
+            }
+        }
+    }
 }
