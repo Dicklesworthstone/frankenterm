@@ -608,3 +608,392 @@ proptest! {
         prop_assert!((run.total_latency_us - expected_total).abs() < 1e-6);
     }
 }
+
+// ── CorrelationContext Property Tests ─────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// Full pipeline context has correct stage count and is propagation-intact.
+    #[test]
+    fn correlation_full_pipeline_intact(
+        gap_us in prop::collection::vec(1_u64..1000, 8..=8),
+        dur_us in prop::collection::vec(10_u64..10000, 8..=8),
+    ) {
+        let mut ctx = CorrelationContext::new("run-prop", 0);
+        let mut t = 1000_u64;
+        for (i, &stage) in LatencyStage::PIPELINE_STAGES.iter().enumerate() {
+            let probe = ctx.begin_stage(stage, t);
+            t += dur_us[i];
+            ctx.end_stage(probe, t);
+            t += gap_us[i];
+        }
+        prop_assert_eq!(ctx.stage_count(), 8);
+        prop_assert!(ctx.propagation_intact);
+        prop_assert!(ctx.missing_stages().is_empty());
+    }
+
+    /// Skipping a non-last stage breaks propagation_intact.
+    /// (Skipping the last stage doesn't trigger a mismatch because no subsequent
+    /// begin_stage call is made.)
+    #[test]
+    fn correlation_gap_breaks_propagation(
+        skip_idx in 1_usize..7, // exclude last stage (index 7)
+    ) {
+        let mut ctx = CorrelationContext::new("run-skip", 0);
+        let mut t = 1000_u64;
+        for (i, &stage) in LatencyStage::PIPELINE_STAGES.iter().enumerate() {
+            if i == skip_idx {
+                t += 100; // skip this stage
+                continue;
+            }
+            let probe = ctx.begin_stage(stage, t);
+            t += 100;
+            ctx.end_stage(probe, t);
+            t += 10;
+        }
+        prop_assert!(!ctx.propagation_intact);
+        prop_assert_eq!(ctx.missing_stages().len(), 1);
+    }
+
+    /// total_elapsed_us equals last_end - first_start.
+    #[test]
+    fn correlation_total_elapsed(
+        durations in prop::collection::vec(1_u64..5000, 1..=8),
+        gaps in prop::collection::vec(0_u64..500, 1..=8),
+    ) {
+        let stages_to_use = durations.len().min(LatencyStage::PIPELINE_STAGES.len());
+        if stages_to_use == 0 {
+            return Ok(());
+        }
+        let mut ctx = CorrelationContext::new("run-elapsed", 0);
+        let start = 1000_u64;
+        let mut t = start;
+        for i in 0..stages_to_use {
+            let probe = ctx.begin_stage(LatencyStage::PIPELINE_STAGES[i], t);
+            t += durations[i];
+            ctx.end_stage(probe, t);
+            if i < stages_to_use - 1 && i < gaps.len() {
+                t += gaps[i];
+            }
+        }
+        let expected = t - start;
+        prop_assert_eq!(ctx.total_elapsed_us(), expected);
+    }
+
+    /// CorrelationContext survives serde roundtrip.
+    #[test]
+    fn correlation_serde_roundtrip(
+        n_stages in 1_usize..=8,
+    ) {
+        let mut ctx = CorrelationContext::new("run-serde-prop", 0);
+        let mut t = 100_u64;
+        for i in 0..n_stages {
+            let probe = ctx.begin_stage(LatencyStage::PIPELINE_STAGES[i], t);
+            t += 100;
+            ctx.end_stage(probe, t);
+            t += 10;
+        }
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: CorrelationContext = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(ctx, back);
+    }
+
+    /// validate() returns empty for well-formed contexts.
+    #[test]
+    fn correlation_validate_valid(
+        n_stages in 1_usize..=8,
+    ) {
+        let mut ctx = CorrelationContext::new("run-valid-prop", 0);
+        let mut t = 100_u64;
+        for i in 0..n_stages {
+            let probe = ctx.begin_stage(LatencyStage::PIPELINE_STAGES[i], t);
+            t += 100;
+            ctx.end_stage(probe, t);
+            t += 10;
+        }
+        let errors = ctx.validate();
+        prop_assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    }
+
+    /// to_pipeline_run total equals sum of stage latencies.
+    #[test]
+    fn correlation_to_pipeline_run_total(
+        durations in prop::collection::vec(1_u64..10000, 1..=8),
+    ) {
+        let stages_to_use = durations.len().min(LatencyStage::PIPELINE_STAGES.len());
+        let mut ctx = CorrelationContext::new("run-total", 0);
+        let mut t = 100_u64;
+        let mut expected_total = 0.0_f64;
+        for i in 0..stages_to_use {
+            let probe = ctx.begin_stage(LatencyStage::PIPELINE_STAGES[i], t);
+            t += durations[i];
+            ctx.end_stage(probe, t);
+            expected_total += durations[i] as f64;
+            t += 10;
+        }
+        let run = ctx.to_pipeline_run();
+        prop_assert!((run.total_latency_us - expected_total).abs() < 1e-6,
+            "total {:.6} != expected {:.6}", run.total_latency_us, expected_total);
+    }
+}
+
+// ── InstrumentationOverhead Property Tests ──────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// Mean overhead equals total / count.
+    #[test]
+    fn overhead_mean_equals_total_div_count(
+        values in prop::collection::vec(0.0..10.0_f64, 1..=50),
+    ) {
+        let mut oh = InstrumentationOverhead::new();
+        for &v in &values {
+            oh.record(v);
+        }
+        let expected = oh.total_overhead_us / oh.probe_count as f64;
+        prop_assert!((oh.mean_overhead_us - expected).abs() < 1e-10);
+    }
+
+    /// Max overhead tracks the true maximum.
+    #[test]
+    fn overhead_max_tracks_true_max(
+        values in prop::collection::vec(0.0..100.0_f64, 1..=50),
+    ) {
+        let mut oh = InstrumentationOverhead::new();
+        for &v in &values {
+            oh.record(v);
+        }
+        let true_max = values.iter().cloned().fold(0.0_f64, f64::max);
+        prop_assert!((oh.max_overhead_us - true_max).abs() < 1e-10);
+    }
+
+    /// within_budget reflects max vs budget.
+    #[test]
+    fn overhead_within_budget_consistent(
+        values in prop::collection::vec(0.0..5.0_f64, 1..=20),
+    ) {
+        let mut oh = InstrumentationOverhead::new();
+        for &v in &values {
+            oh.record(v);
+        }
+        let expected = oh.max_overhead_us <= oh.budget_per_probe_us;
+        prop_assert_eq!(oh.within_budget, expected);
+    }
+
+    /// Overhead fraction is consistent.
+    #[test]
+    fn overhead_fraction_consistent(
+        values in prop::collection::vec(0.01..1.0_f64, 1..=20),
+        pipeline_us in 100.0..100_000.0_f64,
+    ) {
+        let mut oh = InstrumentationOverhead::new();
+        for &v in &values {
+            oh.record(v);
+        }
+        let frac = oh.overhead_fraction(pipeline_us);
+        let expected = oh.total_overhead_us / pipeline_us;
+        prop_assert!((frac - expected).abs() < 1e-10);
+    }
+
+    /// InstrumentationOverhead survives serde roundtrip (f64 tolerance).
+    #[test]
+    fn overhead_serde_roundtrip(
+        values in prop::collection::vec(0.0..10.0_f64, 1..=20),
+    ) {
+        let mut oh = InstrumentationOverhead::new();
+        for &v in &values {
+            oh.record(v);
+        }
+        let json = serde_json::to_string(&oh).unwrap();
+        let back: InstrumentationOverhead = serde_json::from_str(&json).unwrap();
+        prop_assert!((oh.total_overhead_us - back.total_overhead_us).abs() < 1e-10);
+        prop_assert_eq!(oh.probe_count, back.probe_count);
+        prop_assert!((oh.mean_overhead_us - back.mean_overhead_us).abs() < 1e-10);
+        prop_assert!((oh.max_overhead_us - back.max_overhead_us).abs() < 1e-10);
+        prop_assert!((oh.budget_per_probe_us - back.budget_per_probe_us).abs() < 1e-10);
+        prop_assert_eq!(oh.within_budget, back.within_budget);
+    }
+}
+
+// ── InstrumentedEnforcer Property Tests ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// completed_runs equals number of process_run calls.
+    #[test]
+    fn instrumented_run_count(
+        n_runs in 1_usize..=10,
+    ) {
+        let mut ie = InstrumentedEnforcer::new();
+        for i in 0..n_runs {
+            let mut ctx = CorrelationContext::new(&format!("run-{i}"), 0);
+            let probe = ctx.begin_stage(LatencyStage::PtyCapture, 0);
+            ctx.end_stage(probe, 50);
+            ie.process_run(&ctx);
+        }
+        prop_assert_eq!(ie.completed_runs(), n_runs as u64);
+    }
+
+    /// overflow_runs <= completed_runs.
+    #[test]
+    fn instrumented_overflow_bounded(
+        latencies in prop::collection::vec(1.0..1_000_000.0_f64, 1..=10),
+    ) {
+        let mut ie = InstrumentedEnforcer::new();
+        for (i, &lat) in latencies.iter().enumerate() {
+            let mut ctx = CorrelationContext::new(&format!("run-{i}"), 0);
+            let probe = ctx.begin_stage(LatencyStage::PtyCapture, 0);
+            ctx.end_stage(probe, lat as u64);
+            ie.process_run(&ctx);
+        }
+        prop_assert!(ie.overflow_runs() <= ie.completed_runs());
+    }
+
+    /// overflow_rate is in [0.0, 1.0].
+    #[test]
+    fn instrumented_overflow_rate_bounded(
+        latencies in prop::collection::vec(1.0..500_000.0_f64, 1..=10),
+    ) {
+        let mut ie = InstrumentedEnforcer::new();
+        for (i, &lat) in latencies.iter().enumerate() {
+            let mut ctx = CorrelationContext::new(&format!("run-{i}"), 0);
+            let probe = ctx.begin_stage(LatencyStage::DeltaExtraction, 0);
+            ctx.end_stage(probe, lat as u64);
+            ie.process_run(&ctx);
+        }
+        let rate = ie.overflow_rate();
+        prop_assert!(rate >= 0.0 && rate <= 1.0, "rate out of bounds: {}", rate);
+    }
+
+    /// Degradation level increases monotonically with overhead.
+    #[test]
+    fn instrumented_degradation_monotonic(
+        overhead in 0.0..50.0_f64,
+    ) {
+        let mut ie = InstrumentedEnforcer::new();
+        ie.record_overhead(overhead);
+        let deg = ie.current_degradation();
+        if overhead <= 1.0 {
+            prop_assert_eq!(deg, InstrumentationDegradation::Full);
+        } else if overhead <= 5.0 {
+            prop_assert_eq!(deg, InstrumentationDegradation::SkipOverhead);
+        } else if overhead <= 10.0 {
+            prop_assert_eq!(deg, InstrumentationDegradation::SkipCorrelation);
+        } else {
+            prop_assert_eq!(deg, InstrumentationDegradation::Passthrough);
+        }
+    }
+
+    /// Diagnostic snapshot serde roundtrip.
+    #[test]
+    fn instrumented_diagnostic_serde(
+        n_runs in 0_usize..=5,
+    ) {
+        let mut ie = InstrumentedEnforcer::new();
+        for i in 0..n_runs {
+            let mut ctx = CorrelationContext::new(&format!("run-{i}"), 0);
+            let probe = ctx.begin_stage(LatencyStage::PtyCapture, 0);
+            ctx.end_stage(probe, 100);
+            ie.process_run(&ctx);
+        }
+        let diag = ie.diagnostic();
+        let json = serde_json::to_string(&diag).unwrap();
+        let back: InstrumentationDiagnostic = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(diag, back);
+    }
+
+    /// process_validated_run returns errors for empty runs.
+    #[test]
+    fn instrumented_validated_empty_run(
+        _seed in 0_u32..1000,
+    ) {
+        let mut ie = InstrumentedEnforcer::new();
+        let ctx = CorrelationContext::new("run-empty", 0);
+        let (_results, errors) = ie.process_validated_run(&ctx);
+        let has_empty = errors.iter().any(|e| matches!(e, InstrumentationError::EmptyRun { .. }));
+        prop_assert!(has_empty, "should detect empty run");
+    }
+}
+
+// ── FastProbe Property Tests ────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// FastProbe elapsed is non-negative when end >= start.
+    #[test]
+    fn fast_probe_elapsed_nonneg(
+        stage in arb_stage(),
+        start in 0_u64..1_000_000,
+        delta in 0_u64..1_000_000,
+    ) {
+        let probe = FastProbe::begin(stage, start);
+        let elapsed = probe.elapsed_us(start + delta);
+        prop_assert!(elapsed >= 0.0);
+        prop_assert!((elapsed - delta as f64).abs() < 1e-10);
+    }
+
+    /// FastProbe returns 0 on clock regression.
+    #[test]
+    fn fast_probe_clock_regression(
+        stage in arb_stage(),
+        start in 1_u64..1_000_000,
+        regress in 1_u64..1_000_000,
+    ) {
+        let end = if regress >= start { 0 } else { start - regress };
+        let probe = FastProbe::begin(stage, start);
+        let elapsed = probe.elapsed_us(end);
+        prop_assert!((elapsed - 0.0).abs() < 1e-10);
+    }
+}
+
+// ── InstrumentationError Serde ──────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// All InstrumentationError variants survive serde roundtrip.
+    #[test]
+    fn instrumentation_error_serde(
+        stage in arb_stage(),
+        start in 0_u64..1_000_000,
+        end in 0_u64..1_000_000,
+    ) {
+        let errors = vec![
+            InstrumentationError::UnterminatedProbe { stage, start_us: start },
+            InstrumentationError::OrphanedEnd { stage },
+            InstrumentationError::ClockRegression { stage, start_us: start, end_us: end },
+            InstrumentationError::DuplicateStage { stage },
+            InstrumentationError::EmptyRun { run_id: format!("run-{start}") },
+            InstrumentationError::OverheadBudgetExceeded {
+                max_observed_us: start as f64 / 1000.0,
+                budget_us: 1.0,
+            },
+        ];
+        for err in &errors {
+            let json = serde_json::to_string(err).unwrap();
+            let back: InstrumentationError = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(err, &back);
+        }
+    }
+
+    /// InstrumentationDegradation survives serde roundtrip.
+    #[test]
+    fn degradation_serde(
+        idx in 0_usize..4,
+    ) {
+        let variants = [
+            InstrumentationDegradation::Full,
+            InstrumentationDegradation::SkipOverhead,
+            InstrumentationDegradation::SkipCorrelation,
+            InstrumentationDegradation::Passthrough,
+        ];
+        let d = variants[idx];
+        let json = serde_json::to_string(&d).unwrap();
+        let back: InstrumentationDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(d, back);
+    }
+}
