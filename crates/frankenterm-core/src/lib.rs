@@ -160,6 +160,7 @@ pub mod mcp;
 pub mod mcp_client;
 #[cfg(feature = "mcp")]
 pub mod mcp_error;
+pub mod mdl_extraction;
 pub mod memory_budget;
 pub mod memory_pressure;
 pub mod merkle_tree;
