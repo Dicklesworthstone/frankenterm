@@ -7377,6 +7377,87 @@ impl TransportPolicy {
             degradation: self.detect_degradation(),
         }
     }
+
+    /// Select mode AND record outcome in one step (convenience).
+    pub fn select_and_record(
+        &mut self,
+        payload_bytes: u64,
+        actual_cost_us: f64,
+        timestamp_us: u64,
+    ) -> TransportMode {
+        let mode = self.select_mode(payload_bytes);
+        let estimated = self.estimate_cost(payload_bytes, mode);
+        self.record(payload_bytes, mode, estimated, actual_cost_us, timestamp_us);
+        mode
+    }
+
+    /// Estimate cost for a given payload + mode using the cost model.
+    pub fn estimate_cost(&self, payload_bytes: u64, mode: TransportMode) -> f64 {
+        let cm = &self.config.cost_model;
+        match mode {
+            TransportMode::Local => 0.0,
+            TransportMode::Bypass => payload_bytes as f64 * cm.network_cost_per_byte_us,
+            TransportMode::Compressed => {
+                let compress = payload_bytes as f64 * cm.compress_cost_per_byte_us;
+                let transfer =
+                    payload_bytes as f64 * cm.expected_compression_ratio * cm.network_cost_per_byte_us;
+                let decompress =
+                    payload_bytes as f64 * cm.expected_compression_ratio * cm.decompress_cost_per_byte_us;
+                compress + transfer + decompress
+            }
+        }
+    }
+
+    /// Mode distribution as fractions (local_share, compressed_share, bypass_share).
+    pub fn mode_distribution(&self) -> (f64, f64, f64) {
+        if self.total_decisions == 0 {
+            return (0.0, 0.0, 0.0);
+        }
+        let total = self.total_decisions as f64;
+        (
+            self.local_count as f64 / total,
+            self.compressed_count as f64 / total,
+            self.bypass_count as f64 / total,
+        )
+    }
+
+    /// Average cost per byte across all recorded decisions.
+    pub fn avg_cost_per_byte(&self) -> f64 {
+        if self.total_bytes == 0 {
+            return 0.0;
+        }
+        self.ewma_cost_us / (self.total_bytes as f64 / self.total_decisions as f64)
+    }
+
+    /// Total bytes transferred.
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Total savings (sum of estimated - actual across all decisions).
+    pub fn total_savings_us(&self) -> f64 {
+        self.total_savings_us
+    }
+
+    /// Current EWMA cost.
+    pub fn ewma_cost_us(&self) -> f64 {
+        self.ewma_cost_us
+    }
+
+    /// Update the cost model at runtime (e.g., after measuring real network costs).
+    pub fn update_cost_model(&mut self, cost_model: TransportCostModel) {
+        self.config.cost_model = cost_model;
+    }
+
+    /// Switch between adaptive and fixed mode.
+    pub fn set_adaptive(&mut self, adaptive: bool) {
+        self.config.adaptive = adaptive;
+    }
+
+    /// Set fixed mode (used when adaptive is disabled).
+    pub fn set_fixed_mode(&mut self, mode: TransportMode) {
+        self.config.fixed_mode = mode;
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -12582,5 +12663,119 @@ mod tests {
         // compress cost = 10000*0.05 + 10000*0.3*0.01 + 10000*0.3*0.02 = 500 + 30 + 60 = 590
         // bypass is cheaper
         assert_eq!(policy.select_mode(10000), TransportMode::Bypass);
+    }
+
+    // ── C4 Impl Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_transport_estimate_cost_local() {
+        let policy = TransportPolicy::with_defaults();
+        assert_eq!(policy.estimate_cost(1000, TransportMode::Local), 0.0);
+    }
+
+    #[test]
+    fn test_transport_estimate_cost_bypass() {
+        let config = TransportPolicyConfig {
+            cost_model: TransportCostModel {
+                network_cost_per_byte_us: 0.01,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let policy = TransportPolicy::new(config);
+        let cost = policy.estimate_cost(10000, TransportMode::Bypass);
+        assert!((cost - 100.0).abs() < 0.001); // 10000 * 0.01
+    }
+
+    #[test]
+    fn test_transport_estimate_cost_compressed() {
+        let config = TransportPolicyConfig {
+            cost_model: TransportCostModel {
+                compress_cost_per_byte_us: 0.05,
+                decompress_cost_per_byte_us: 0.02,
+                network_cost_per_byte_us: 0.01,
+                expected_compression_ratio: 0.5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let policy = TransportPolicy::new(config);
+        let cost = policy.estimate_cost(1000, TransportMode::Compressed);
+        // 1000*0.05 + 1000*0.5*0.01 + 1000*0.5*0.02 = 50 + 5 + 10 = 65
+        assert!((cost - 65.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_transport_select_and_record() {
+        let mut policy = TransportPolicy::with_defaults();
+        let mode = policy.select_and_record(1024, 5.0, 1000);
+        assert_eq!(mode, TransportMode::Local);
+        assert_eq!(policy.snapshot().total_decisions, 1);
+    }
+
+    #[test]
+    fn test_transport_mode_distribution_empty() {
+        let policy = TransportPolicy::with_defaults();
+        let (l, c, b) = policy.mode_distribution();
+        assert_eq!(l, 0.0);
+        assert_eq!(c, 0.0);
+        assert_eq!(b, 0.0);
+    }
+
+    #[test]
+    fn test_transport_mode_distribution() {
+        let mut policy = TransportPolicy::with_defaults();
+        policy.record(100, TransportMode::Local, 1.0, 1.0, 0);
+        policy.record(100, TransportMode::Local, 1.0, 1.0, 1);
+        policy.record(100, TransportMode::Compressed, 2.0, 2.0, 2);
+        policy.record(100, TransportMode::Bypass, 3.0, 3.0, 3);
+        let (l, c, b) = policy.mode_distribution();
+        assert!((l - 0.5).abs() < 0.001);
+        assert!((c - 0.25).abs() < 0.001);
+        assert!((b - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_transport_total_bytes() {
+        let mut policy = TransportPolicy::with_defaults();
+        policy.record(1000, TransportMode::Local, 1.0, 1.0, 0);
+        policy.record(2000, TransportMode::Bypass, 2.0, 2.0, 1);
+        assert_eq!(policy.total_bytes(), 3000);
+    }
+
+    #[test]
+    fn test_transport_update_cost_model() {
+        let mut policy = TransportPolicy::with_defaults();
+        let new_model = TransportCostModel {
+            network_cost_per_byte_us: 0.1,
+            ..Default::default()
+        };
+        policy.update_cost_model(new_model);
+        // With non-zero network cost, small payloads should now get bypass
+        let config = TransportPolicyConfig {
+            cost_model: TransportCostModel {
+                network_cost_per_byte_us: 0.1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let policy2 = TransportPolicy::new(config);
+        assert_eq!(policy2.select_mode(100), TransportMode::Bypass);
+    }
+
+    #[test]
+    fn test_transport_set_adaptive() {
+        let mut policy = TransportPolicy::with_defaults();
+        policy.set_adaptive(false);
+        policy.set_fixed_mode(TransportMode::Compressed);
+        assert_eq!(policy.select_mode(1), TransportMode::Compressed);
+    }
+
+    #[test]
+    fn test_transport_ewma_accessor() {
+        let mut policy = TransportPolicy::with_defaults();
+        assert_eq!(policy.ewma_cost_us(), 0.0);
+        policy.record(1000, TransportMode::Local, 10.0, 50.0, 0);
+        assert!(policy.ewma_cost_us() > 0.0);
     }
 }
