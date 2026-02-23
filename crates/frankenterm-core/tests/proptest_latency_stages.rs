@@ -1831,4 +1831,353 @@ proptest! {
             }
         }
     }
+
+    // ── B2: InputRing invariants (ft-2p9cb.2.2.3) ──
+
+    /// len never exceeds capacity after any sequence of enqueue/dequeue ops.
+    #[test]
+    fn input_ring_len_bounded(
+        cap in 1_usize..64,
+        enqueue_count in 0_usize..128,
+        dequeue_count in 0_usize..128,
+    ) {
+        let config = InputRingConfig {
+            capacity: cap,
+            high_water_mark: 0.75,
+            track_sojourn: true,
+        };
+        let mut ring = InputRing::new(config);
+
+        for i in 0..enqueue_count {
+            let _ = ring.enqueue(LatencyStage::PtyCapture, 10.0, "x", i as u64, 0);
+        }
+        for _ in 0..dequeue_count {
+            ring.dequeue(1000);
+        }
+
+        prop_assert!(ring.len() <= cap, "len {} > capacity {}", ring.len(), cap);
+    }
+
+    /// total_enqueued = total_dequeued + len (dropped are separate).
+    #[test]
+    fn input_ring_accounting_invariant(
+        cap in 1_usize..32,
+        ops in prop::collection::vec(prop::bool::ANY, 0..200),
+    ) {
+        let config = InputRingConfig {
+            capacity: cap,
+            high_water_mark: 0.75,
+            track_sojourn: false,
+        };
+        let mut ring = InputRing::new(config);
+        let mut t = 0_u64;
+
+        for enqueue in ops {
+            if enqueue {
+                let _ = ring.enqueue(LatencyStage::DeltaExtraction, 5.0, "op", t, 0);
+            } else {
+                ring.dequeue(t);
+            }
+            t += 1;
+        }
+
+        let snap = ring.snapshot();
+        prop_assert_eq!(
+            snap.total_enqueued,
+            snap.total_dequeued + snap.len as u64,
+            "enqueued={} != dequeued={} + len={}",
+            snap.total_enqueued,
+            snap.total_dequeued,
+            snap.len
+        );
+    }
+
+    /// Backpressure signal is consistent with fill level.
+    #[test]
+    fn input_ring_backpressure_consistent(
+        cap in 2_usize..64,
+        hwm in 0.1_f64..0.99,
+        fill_count in 0_usize..128,
+    ) {
+        let config = InputRingConfig {
+            capacity: cap,
+            high_water_mark: hwm,
+            track_sojourn: false,
+        };
+        let mut ring = InputRing::new(config);
+
+        for i in 0..fill_count {
+            let _ = ring.enqueue(LatencyStage::StorageWrite, 1.0, "bp", i as u64, 0);
+        }
+
+        let utilization = ring.len() as f64 / cap as f64;
+        match ring.backpressure() {
+            RingBackpressure::Full => prop_assert!(ring.is_full()),
+            RingBackpressure::SlowDown => {
+                prop_assert!(!ring.is_full());
+                prop_assert!(utilization >= hwm, "util {} < hwm {}", utilization, hwm);
+            }
+            RingBackpressure::Accept => {
+                prop_assert!(utilization < hwm, "util {} >= hwm {} but Accept", utilization, hwm);
+            }
+        }
+    }
+
+    /// Sequences are strictly monotonically increasing.
+    #[test]
+    fn input_ring_seq_monotonic(
+        cap in 1_usize..32,
+        count in 1_usize..64,
+    ) {
+        let config = InputRingConfig {
+            capacity: cap,
+            high_water_mark: 0.75,
+            track_sojourn: false,
+        };
+        let mut ring = InputRing::new(config);
+
+        let mut seqs = Vec::new();
+        for i in 0..count {
+            if let Ok(seq) = ring.enqueue(LatencyStage::PtyCapture, 1.0, "s", i as u64, 0) {
+                seqs.push(seq);
+            }
+            // Dequeue half the time to make room.
+            if i % 2 == 0 {
+                ring.dequeue(i as u64);
+            }
+        }
+
+        for w in seqs.windows(2) {
+            prop_assert!(w[1] > w[0], "seq {} not > {}", w[1], w[0]);
+        }
+    }
+
+    /// FIFO ordering: dequeued items come out in enqueue order.
+    #[test]
+    fn input_ring_fifo_ordering(
+        cap in 4_usize..32,
+        count in 1_usize..64,
+    ) {
+        let config = InputRingConfig {
+            capacity: cap,
+            high_water_mark: 0.9,
+            track_sojourn: false,
+        };
+        let mut ring = InputRing::new(config);
+
+        // Enqueue up to capacity.
+        let mut enqueued_seqs = Vec::new();
+        for i in 0..count.min(cap) {
+            if let Ok(seq) = ring.enqueue(LatencyStage::EventEmission, 1.0, "f", i as u64, 0) {
+                enqueued_seqs.push(seq);
+            }
+        }
+
+        // Dequeue all.
+        let mut dequeued_seqs = Vec::new();
+        while let Some(item) = ring.dequeue(1000) {
+            dequeued_seqs.push(item.seq);
+        }
+
+        prop_assert_eq!(enqueued_seqs, dequeued_seqs, "FIFO violated");
+    }
+
+    /// drain(max) returns at most min(max, len) items.
+    #[test]
+    fn input_ring_drain_bounded(
+        cap in 2_usize..32,
+        fill in 0_usize..64,
+        drain_max in 0_usize..64,
+    ) {
+        let config = InputRingConfig {
+            capacity: cap,
+            high_water_mark: 0.75,
+            track_sojourn: false,
+        };
+        let mut ring = InputRing::new(config);
+
+        for i in 0..fill {
+            let _ = ring.enqueue(LatencyStage::PatternDetection, 1.0, "d", i as u64, 0);
+        }
+
+        let before_len = ring.len();
+        let drained = ring.drain(drain_max, 1000);
+        let expected_count = drain_max.min(before_len);
+
+        prop_assert_eq!(drained.len(), expected_count, "drain returned {} items, expected {}", drained.len(), expected_count);
+        prop_assert_eq!(ring.len(), before_len - expected_count);
+    }
+
+    /// drain_expired only removes items past their deadline.
+    #[test]
+    fn input_ring_drain_expired_correct(
+        cap in 4_usize..32,
+        now in 100_u64..1000,
+        deadlines in prop::collection::vec(0_u64..200, 1..16),
+    ) {
+        let config = InputRingConfig {
+            capacity: cap,
+            high_water_mark: 0.9,
+            track_sojourn: false,
+        };
+        let mut ring = InputRing::new(config);
+
+        let mut expected_expired = 0_usize;
+        let mut expected_remaining = 0_usize;
+        for (i, &dl) in deadlines.iter().enumerate() {
+            if i >= cap {
+                break;
+            }
+            if ring.enqueue(LatencyStage::WorkflowDispatch, 1.0, "e", 0, dl).is_ok() {
+                if dl > 0 && now > dl {
+                    expected_expired += 1;
+                } else {
+                    expected_remaining += 1;
+                }
+            }
+        }
+
+        let expired = ring.drain_expired(now);
+        prop_assert_eq!(expired.len(), expected_expired, "expired count mismatch");
+        prop_assert_eq!(ring.len(), expected_remaining, "remaining count mismatch");
+
+        // All expired items should have deadline < now.
+        for item in &expired {
+            prop_assert!(item.deadline_us > 0 && now > item.deadline_us);
+        }
+    }
+
+    /// utilization is always in [0.0, 1.0].
+    #[test]
+    fn input_ring_utilization_bounded(
+        cap in 1_usize..64,
+        fill in 0_usize..128,
+    ) {
+        let config = InputRingConfig {
+            capacity: cap,
+            high_water_mark: 0.75,
+            track_sojourn: false,
+        };
+        let mut ring = InputRing::new(config);
+
+        for i in 0..fill {
+            let _ = ring.enqueue(LatencyStage::ApiResponse, 1.0, "u", i as u64, 0);
+        }
+
+        let u = ring.utilization();
+        prop_assert!(u >= 0.0 && u <= 1.0, "utilization {} out of bounds", u);
+        let expected = ring.len() as f64 / cap as f64;
+        let diff = (u - expected).abs();
+        prop_assert!(diff < 1e-10, "utilization {} != expected {}", u, expected);
+    }
+
+    /// Snapshot serde roundtrip.
+    #[test]
+    fn input_ring_snapshot_serde(
+        cap in 1_usize..32,
+        fill in 0_usize..32,
+    ) {
+        let config = InputRingConfig {
+            capacity: cap,
+            high_water_mark: 0.75,
+            track_sojourn: true,
+        };
+        let mut ring = InputRing::new(config);
+
+        for i in 0..fill {
+            let _ = ring.enqueue(LatencyStage::PtyCapture, 10.0, "serde", i as u64, 0);
+        }
+        // Dequeue some to generate sojourn stats.
+        for _ in 0..fill / 2 {
+            ring.dequeue(100);
+        }
+
+        let snap = ring.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: InputRingSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap.capacity, back.capacity);
+        prop_assert_eq!(snap.len, back.len);
+        prop_assert_eq!(snap.total_enqueued, back.total_enqueued);
+        prop_assert_eq!(snap.total_dequeued, back.total_dequeued);
+        prop_assert_eq!(snap.total_dropped, back.total_dropped);
+        prop_assert_eq!(snap.backpressure, back.backpressure);
+    }
+
+    /// InputRingItem serde roundtrip.
+    #[test]
+    fn input_ring_item_serde(
+        stage_idx in 0_usize..8,
+        cost in 0.0_f64..1e6,
+        seq in 1_u64..1000,
+        arrived in 0_u64..1_000_000,
+        deadline in 0_u64..1_000_000,
+    ) {
+        let stages = LatencyStage::PIPELINE_STAGES;
+        let item = InputRingItem {
+            seq,
+            stage: stages[stage_idx],
+            estimated_cost_us: cost,
+            correlation_id: "pt".to_string(),
+            arrived_us: arrived,
+            deadline_us: deadline,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let back: InputRingItem = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(item.seq, back.seq);
+        prop_assert_eq!(item.stage, back.stage);
+        prop_assert_eq!(item.correlation_id, back.correlation_id);
+        prop_assert_eq!(item.arrived_us, back.arrived_us);
+        prop_assert_eq!(item.deadline_us, back.deadline_us);
+        let diff = (item.estimated_cost_us - back.estimated_cost_us).abs();
+        let tol = item.estimated_cost_us.abs() * 1e-12 + 1e-10;
+        prop_assert!(diff < tol, "cost roundtrip: {} vs {} diff {}", item.estimated_cost_us, back.estimated_cost_us, diff);
+    }
+
+    /// RingBackpressure serde roundtrip.
+    #[test]
+    fn ring_backpressure_serde(variant in 0_u8..3) {
+        let bp = match variant {
+            0 => RingBackpressure::Accept,
+            1 => RingBackpressure::SlowDown,
+            _ => RingBackpressure::Full,
+        };
+        let json = serde_json::to_string(&bp).unwrap();
+        let back: RingBackpressure = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(bp, back);
+    }
+
+    /// Wraparound: ring works correctly through multiple full cycles.
+    #[test]
+    fn input_ring_wraparound_integrity(
+        cap in 2_usize..16,
+        cycles in 1_usize..8,
+    ) {
+        let config = InputRingConfig {
+            capacity: cap,
+            high_water_mark: 0.9,
+            track_sojourn: false,
+        };
+        let mut ring = InputRing::new(config);
+
+        for cycle in 0..cycles {
+            // Fill to capacity.
+            for i in 0..cap {
+                let t = (cycle * cap + i) as u64;
+                let result = ring.enqueue(LatencyStage::PtyCapture, 1.0, "w", t, 0);
+                prop_assert!(result.is_ok(), "enqueue failed at cycle {} item {}", cycle, i);
+            }
+            prop_assert!(ring.is_full());
+
+            // Drain all.
+            let drained = ring.drain(cap, 1000);
+            prop_assert_eq!(drained.len(), cap);
+            prop_assert!(ring.is_empty());
+        }
+
+        let snap = ring.snapshot();
+        let total = (cap * cycles) as u64;
+        prop_assert_eq!(snap.total_enqueued, total);
+        prop_assert_eq!(snap.total_dequeued, total);
+        prop_assert_eq!(snap.len, 0);
+    }
 }
