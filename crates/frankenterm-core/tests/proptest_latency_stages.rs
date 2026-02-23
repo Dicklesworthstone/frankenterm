@@ -2370,4 +2370,187 @@ proptest! {
         let is_valid = Priority::ALL.contains(&pri);
         prop_assert!(is_valid);
     }
+
+    // ── B4: Starvation Prevention invariants (ft-2p9cb.2.4.3) ──
+
+    /// No lane starves for more than max_starved_epochs.
+    #[test]
+    fn starvation_capped_at_threshold(
+        max_epochs in 1_u64..10,
+        num_epochs in 1_usize..30,
+    ) {
+        let config = StarvationConfig {
+            max_starved_epochs: max_epochs,
+            ..Default::default()
+        };
+        let mut tracker = StarvationTracker::new(config);
+
+        for _ in 0..num_epochs {
+            // Only serve Input, starve Control and Bulk.
+            tracker.observe_epoch(&[5, 0, 0], &[0.8, 0.0, 0.0]);
+        }
+
+        // After enough epochs, starving lanes should be force-promoted.
+        if num_epochs as u64 >= max_epochs {
+            let is_promoted = tracker.is_force_promoted(SchedulerLane::Control)
+                || tracker.is_force_promoted(SchedulerLane::Bulk);
+            prop_assert!(is_promoted, "Expected force promotion after {} epochs", num_epochs);
+        }
+    }
+
+    /// Gini coefficient is always in [0.0, 1.0].
+    #[test]
+    fn starvation_gini_bounded(
+        shares in prop::collection::vec(0.0_f64..1.0, 3..=3),
+        num_epochs in 1_usize..10,
+    ) {
+        let mut tracker = StarvationTracker::with_defaults();
+        let s: [f64; 3] = [shares[0], shares[1], shares[2]];
+
+        for _ in 0..num_epochs {
+            tracker.observe_epoch(&[1, 1, 1], &s);
+        }
+
+        let gini = tracker.gini_coefficient();
+        prop_assert!(gini >= 0.0, "Gini {} < 0", gini);
+        prop_assert!(gini <= 1.0, "Gini {} > 1", gini);
+    }
+
+    /// Epoch counter is strictly monotonically increasing.
+    #[test]
+    fn starvation_epoch_monotonic(
+        num_epochs in 1_usize..20,
+    ) {
+        let mut tracker = StarvationTracker::with_defaults();
+        for i in 1..=num_epochs {
+            tracker.observe_epoch(&[1, 1, 1], &[0.33, 0.33, 0.34]);
+            prop_assert_eq!(tracker.epoch(), i as u64);
+        }
+    }
+
+    /// Force-promotion clears when a lane gets completions.
+    #[test]
+    fn starvation_clears_on_service(
+        starve_count in 1_u64..5,
+    ) {
+        let config = StarvationConfig {
+            max_starved_epochs: starve_count,
+            ..Default::default()
+        };
+        let mut tracker = StarvationTracker::new(config);
+
+        for _ in 0..starve_count {
+            tracker.observe_epoch(&[5, 3, 0], &[0.5, 0.3, 0.0]);
+        }
+        prop_assert!(tracker.is_force_promoted(SchedulerLane::Bulk));
+
+        // Service the starved lane.
+        tracker.observe_epoch(&[5, 3, 1], &[0.4, 0.3, 0.1]);
+        prop_assert!(!tracker.is_force_promoted(SchedulerLane::Bulk));
+    }
+
+    /// Reset zeroes all state.
+    #[test]
+    fn starvation_reset_zeroes(
+        num_epochs in 1_usize..10,
+    ) {
+        let config = StarvationConfig {
+            max_starved_epochs: 1,
+            ..Default::default()
+        };
+        let mut tracker = StarvationTracker::new(config);
+
+        for _ in 0..num_epochs {
+            tracker.observe_epoch(&[5, 0, 0], &[0.8, 0.0, 0.0]);
+        }
+
+        tracker.reset();
+        prop_assert_eq!(tracker.epoch(), 0);
+        prop_assert!(!tracker.any_starving());
+        prop_assert_eq!(tracker.snapshot().total_starvation_events, 0);
+    }
+
+    /// FairnessSnapshot serde roundtrip.
+    #[test]
+    fn starvation_snapshot_serde(
+        events in 0_u64..100,
+        gini in 0.0_f64..1.0,
+    ) {
+        let snap = FairnessSnapshot {
+            lanes: vec![],
+            gini_coefficient: gini,
+            total_starvation_events: events,
+            any_starving: events > 0,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: FairnessSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap.total_starvation_events, back.total_starvation_events);
+        prop_assert_eq!(snap.any_starving, back.any_starving);
+        let diff = (snap.gini_coefficient - back.gini_coefficient).abs();
+        let tol = snap.gini_coefficient.abs() * 1e-12 + 1e-10;
+        prop_assert!(diff < tol);
+    }
+
+    /// StarvationEvent serde roundtrip.
+    #[test]
+    fn starvation_event_serde(
+        epoch in 0_u64..1000,
+        lane_idx in 0_u8..3,
+        starved in 0_u64..100,
+        share in 0.0_f64..1.0,
+    ) {
+        let lanes = [SchedulerLane::Input, SchedulerLane::Control, SchedulerLane::Bulk];
+        let event = StarvationEvent {
+            epoch,
+            lane: lanes[lane_idx as usize],
+            starved_epochs: starved,
+            cpu_share: share,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: StarvationEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(event.epoch, back.epoch);
+        prop_assert_eq!(event.lane, back.lane);
+        prop_assert_eq!(event.starved_epochs, back.starved_epochs);
+        let diff = (event.cpu_share - back.cpu_share).abs();
+        prop_assert!(diff < 1e-10);
+    }
+
+    /// FairnessDegradation serde roundtrip.
+    #[test]
+    fn starvation_degradation_serde(
+        variant_idx in 0_u8..4,
+        count in 1_usize..100,
+    ) {
+        let degradation = match variant_idx {
+            0 => FairnessDegradation::Healthy,
+            1 => FairnessDegradation::LaneStarvation { starving_lanes: vec![SchedulerLane::Bulk] },
+            2 => FairnessDegradation::SevereUnfairness { gini: 0.7, threshold: 0.5 },
+            _ => FairnessDegradation::PromotionStorm { events_in_window: count as u64, threshold: 5 },
+        };
+        let json = serde_json::to_string(&degradation).unwrap();
+        let back: FairnessDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(degradation, back);
+    }
+
+    /// StarvationConfig serde roundtrip.
+    #[test]
+    fn starvation_config_serde(
+        max_epochs in 1_u64..20,
+        window in 1_usize..50,
+        min_share in 0.01_f64..0.5,
+    ) {
+        let cfg = StarvationConfig {
+            max_starved_epochs: max_epochs,
+            fairness_window: window,
+            min_lane_share: min_share,
+            enable_aging: true,
+            aging_interval_epochs: 3,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: StarvationConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(cfg.max_starved_epochs, back.max_starved_epochs);
+        prop_assert_eq!(cfg.fairness_window, back.fairness_window);
+        let diff = (cfg.min_lane_share - back.min_lane_share).abs();
+        prop_assert!(diff < 1e-10);
+    }
 }
