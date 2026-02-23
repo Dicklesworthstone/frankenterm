@@ -56,6 +56,7 @@ pub mod alerts;
 pub mod api_schema;
 pub mod approval;
 pub mod ars_secret_scan;
+pub mod ars_symbolic_exec;
 pub mod auto_tune;
 pub mod backpressure;
 pub mod backpressure_severity;
