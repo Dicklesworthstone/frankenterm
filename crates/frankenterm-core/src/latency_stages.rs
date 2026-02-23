@@ -5096,6 +5096,169 @@ impl PriorityInheritanceTracker {
             snap.active_chains,
         )
     }
+
+    /// Release all locks held by a task. Returns resources that were released.
+    pub fn release_all(&mut self, task_id: &str, now_us: u64) -> Vec<Resource> {
+        let mut released = Vec::new();
+        for resource in Resource::LOCK_ORDER {
+            if self.is_held_by(resource, task_id) {
+                self.release(resource, task_id, now_us);
+                released.push(resource);
+            }
+        }
+        released
+    }
+
+    /// Expire stale inheritance — auto-release boosts that have persisted too long.
+    /// Returns the number of inheritances expired.
+    pub fn expire_stale_inheritance(&mut self, now_us: u64) -> usize {
+        let max_dur = self.config.max_inheritance_duration_us;
+        let mut expired_count = 0;
+
+        for lock_opt in &mut self.locks {
+            if let Some(held) = lock_opt {
+                if held.effective_priority > held.original_priority
+                    && now_us.saturating_sub(held.acquired_us) > max_dur
+                {
+                    held.effective_priority = held.original_priority;
+                    expired_count += 1;
+                }
+            }
+        }
+
+        // Also close open events that are past duration.
+        for event in &mut self.events {
+            if event.released_us.is_none()
+                && now_us.saturating_sub(event.applied_us) > max_dur
+            {
+                event.released_us = Some(now_us);
+            }
+        }
+
+        expired_count
+    }
+
+    /// Count of currently held locks.
+    pub fn held_count(&self) -> usize {
+        self.locks.iter().filter(|l| l.is_some()).count()
+    }
+
+    /// Total number of waiters across all held locks.
+    pub fn total_waiters(&self) -> usize {
+        self.locks
+            .iter()
+            .filter_map(|l| l.as_ref())
+            .map(|h| h.waiters.len())
+            .sum()
+    }
+}
+
+// AARSP Bead: ft-2p9cb.2.3.2
+
+/// Degradation signal from the priority inheritance tracker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum InheritanceDegradation {
+    /// Everything is fine.
+    Healthy,
+    /// Too many concurrent inheritance chains — possible priority ceiling issue.
+    ExcessiveInheritance {
+        active_chains: usize,
+        threshold: usize,
+    },
+    /// Lock contention is high — many waiters.
+    HighContention {
+        total_waiters: usize,
+        threshold: usize,
+    },
+    /// Lock-order violations are accumulating.
+    OrderViolationSpike {
+        total_violations: u64,
+        threshold: u64,
+    },
+}
+
+impl fmt::Display for InheritanceDegradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "HEALTHY"),
+            Self::ExcessiveInheritance {
+                active_chains,
+                threshold,
+            } => write!(f, "EXCESSIVE_INHERITANCE({}/{})", active_chains, threshold),
+            Self::HighContention {
+                total_waiters,
+                threshold,
+            } => write!(f, "HIGH_CONTENTION({}/{})", total_waiters, threshold),
+            Self::OrderViolationSpike {
+                total_violations,
+                threshold,
+            } => write!(f, "ORDER_VIOLATION_SPIKE({}/{})", total_violations, threshold),
+        }
+    }
+}
+
+/// Structured log entry for priority inheritance events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InheritanceLogEntry {
+    /// Timestamp.
+    pub timestamp_us: u64,
+    /// Number of held locks.
+    pub held_locks: usize,
+    /// Total inheritance events so far.
+    pub total_inheritance_events: u64,
+    /// Total order violations so far.
+    pub total_order_violations: u64,
+    /// Active inheritance chains.
+    pub active_chains: usize,
+    /// Current degradation signal.
+    pub degradation: InheritanceDegradation,
+}
+
+impl PriorityInheritanceTracker {
+    /// Detect degradation based on current state.
+    pub fn detect_degradation(&self) -> InheritanceDegradation {
+        let snap = self.snapshot();
+
+        // Threshold: more than 2 concurrent inheritance chains.
+        if snap.active_chains > 2 {
+            return InheritanceDegradation::ExcessiveInheritance {
+                active_chains: snap.active_chains,
+                threshold: 2,
+            };
+        }
+
+        // Threshold: more than 8 total waiters.
+        let total_waiters = self.total_waiters();
+        if total_waiters > 8 {
+            return InheritanceDegradation::HighContention {
+                total_waiters,
+                threshold: 8,
+            };
+        }
+
+        // Threshold: more than 10 order violations.
+        if snap.total_order_violations > 10 {
+            return InheritanceDegradation::OrderViolationSpike {
+                total_violations: snap.total_order_violations,
+                threshold: 10,
+            };
+        }
+
+        InheritanceDegradation::Healthy
+    }
+
+    /// Generate a structured log entry.
+    pub fn log_entry(&self, now_us: u64) -> InheritanceLogEntry {
+        let snap = self.snapshot();
+        InheritanceLogEntry {
+            timestamp_us: now_us,
+            held_locks: snap.held_locks.len(),
+            total_inheritance_events: snap.total_inheritance_events,
+            total_order_violations: snap.total_order_violations,
+            active_chains: snap.active_chains,
+            degradation: self.detect_degradation(),
+        }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -8589,5 +8752,143 @@ mod tests {
         // With lock-order enforcement disabled, this should succeed.
         let result = tracker.acquire(Resource::StorageLock, "task-1", Priority::Normal, 200);
         assert_eq!(result, LockResult::Acquired);
+    }
+
+    // ── B3 Impl: Bridge methods ──
+
+    #[test]
+    fn test_pi_release_all() {
+        let mut tracker = PriorityInheritanceTracker::with_defaults();
+        tracker.acquire(Resource::StorageLock, "t1", Priority::Normal, 100);
+        tracker.acquire(Resource::PatternLock, "t1", Priority::Normal, 200);
+        tracker.acquire(Resource::EventBusLock, "t1", Priority::Normal, 300);
+
+        let released = tracker.release_all("t1", 400);
+        assert_eq!(released.len(), 3);
+        assert_eq!(tracker.held_count(), 0);
+    }
+
+    #[test]
+    fn test_pi_expire_stale_inheritance() {
+        let config = PriorityInheritanceConfig {
+            max_inheritance_duration_us: 100,
+            ..Default::default()
+        };
+        let mut tracker = PriorityInheritanceTracker::new(config);
+        tracker.acquire(Resource::StorageLock, "low", Priority::Background, 0);
+        tracker.acquire(Resource::StorageLock, "high", Priority::Critical, 50);
+
+        // Before expiry.
+        assert_eq!(
+            tracker.effective_priority("low"),
+            Some(Priority::Critical)
+        );
+
+        // After expiry (200us > 100us max).
+        let expired = tracker.expire_stale_inheritance(200);
+        assert_eq!(expired, 1);
+        assert_eq!(
+            tracker.effective_priority("low"),
+            Some(Priority::Background)
+        );
+    }
+
+    #[test]
+    fn test_pi_held_count() {
+        let mut tracker = PriorityInheritanceTracker::with_defaults();
+        assert_eq!(tracker.held_count(), 0);
+        tracker.acquire(Resource::StorageLock, "t1", Priority::Normal, 100);
+        assert_eq!(tracker.held_count(), 1);
+        tracker.acquire(Resource::PatternLock, "t2", Priority::Normal, 200);
+        assert_eq!(tracker.held_count(), 2);
+    }
+
+    #[test]
+    fn test_pi_total_waiters() {
+        let mut tracker = PriorityInheritanceTracker::with_defaults();
+        tracker.acquire(Resource::StorageLock, "holder", Priority::Background, 100);
+        tracker.acquire(Resource::StorageLock, "w1", Priority::Normal, 200);
+        tracker.acquire(Resource::StorageLock, "w2", Priority::Elevated, 300);
+        assert_eq!(tracker.total_waiters(), 2);
+    }
+
+    #[test]
+    fn test_pi_degradation_healthy() {
+        let tracker = PriorityInheritanceTracker::with_defaults();
+        assert_eq!(tracker.detect_degradation(), InheritanceDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_pi_degradation_excessive_inheritance() {
+        let mut tracker = PriorityInheritanceTracker::with_defaults();
+        // Create 3 locks each with inheritance (>2 threshold).
+        for (i, resource) in [Resource::StorageLock, Resource::PatternLock, Resource::EventBusLock].iter().enumerate() {
+            tracker.acquire(*resource, &format!("low-{}", i), Priority::Background, i as u64 * 100);
+            tracker.acquire(*resource, &format!("high-{}", i), Priority::Critical, i as u64 * 100 + 50);
+        }
+        let degradation = tracker.detect_degradation();
+        let is_excessive = matches!(degradation, InheritanceDegradation::ExcessiveInheritance { .. });
+        assert!(is_excessive, "Expected ExcessiveInheritance, got {:?}", degradation);
+    }
+
+    #[test]
+    fn test_pi_degradation_order_violation_spike() {
+        let mut tracker = PriorityInheritanceTracker::with_defaults();
+        // Generate >10 order violations.
+        for _ in 0..11 {
+            tracker.acquire(Resource::WorkflowLock, "task", Priority::Normal, 100);
+            let _ = tracker.acquire(Resource::StorageLock, "task", Priority::Normal, 200);
+            tracker.release(Resource::WorkflowLock, "task", 300);
+        }
+        let degradation = tracker.detect_degradation();
+        let is_spike = matches!(degradation, InheritanceDegradation::OrderViolationSpike { .. });
+        assert!(is_spike, "Expected OrderViolationSpike, got {:?}", degradation);
+    }
+
+    #[test]
+    fn test_pi_log_entry() {
+        let mut tracker = PriorityInheritanceTracker::with_defaults();
+        tracker.acquire(Resource::StorageLock, "t1", Priority::Normal, 100);
+        let entry = tracker.log_entry(500);
+        assert_eq!(entry.timestamp_us, 500);
+        assert_eq!(entry.held_locks, 1);
+        assert_eq!(entry.degradation, InheritanceDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_inheritance_degradation_serde() {
+        let variants = vec![
+            InheritanceDegradation::Healthy,
+            InheritanceDegradation::ExcessiveInheritance { active_chains: 3, threshold: 2 },
+            InheritanceDegradation::HighContention { total_waiters: 10, threshold: 8 },
+            InheritanceDegradation::OrderViolationSpike { total_violations: 15, threshold: 10 },
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: InheritanceDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[test]
+    fn test_inheritance_log_entry_serde() {
+        let entry = InheritanceLogEntry {
+            timestamp_us: 1000,
+            held_locks: 2,
+            total_inheritance_events: 5,
+            total_order_violations: 1,
+            active_chains: 1,
+            degradation: InheritanceDegradation::Healthy,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: InheritanceLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn test_inheritance_degradation_display() {
+        assert_eq!(format!("{}", InheritanceDegradation::Healthy), "HEALTHY");
+        let exc = InheritanceDegradation::ExcessiveInheritance { active_chains: 3, threshold: 2 };
+        assert!(format!("{}", exc).contains("3/2"));
     }
 }
