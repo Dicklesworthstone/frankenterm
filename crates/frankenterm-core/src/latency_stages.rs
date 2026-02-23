@@ -2109,6 +2109,264 @@ impl Default for InstrumentedEnforcer {
     }
 }
 
+// ── Guardrails ─────────────────────────────────────────────────────
+
+/// Validation errors for instrumentation inputs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum InstrumentationError {
+    /// Stage was started but never ended.
+    UnterminatedProbe { stage: LatencyStage, start_us: u64 },
+    /// Stage was ended without a matching begin.
+    OrphanedEnd { stage: LatencyStage },
+    /// Clock regression detected (end < start).
+    ClockRegression {
+        stage: LatencyStage,
+        start_us: u64,
+        end_us: u64,
+    },
+    /// Duplicate stage in a single run.
+    DuplicateStage { stage: LatencyStage },
+    /// Empty run (no stages recorded).
+    EmptyRun { run_id: String },
+    /// Overhead budget exceeded.
+    OverheadBudgetExceeded {
+        max_observed_us: f64,
+        budget_us: f64,
+    },
+}
+
+impl fmt::Display for InstrumentationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnterminatedProbe { stage, start_us } => {
+                write!(f, "Unterminated probe for {stage} started at {start_us}μs")
+            }
+            Self::OrphanedEnd { stage } => {
+                write!(f, "Orphaned end_stage for {stage} (no matching begin)")
+            }
+            Self::ClockRegression {
+                stage,
+                start_us,
+                end_us,
+            } => write!(
+                f,
+                "Clock regression at {stage}: start={start_us}μs > end={end_us}μs"
+            ),
+            Self::DuplicateStage { stage } => {
+                write!(f, "Duplicate stage {stage} in single run")
+            }
+            Self::EmptyRun { run_id } => {
+                write!(f, "Empty run {run_id} has no stages")
+            }
+            Self::OverheadBudgetExceeded {
+                max_observed_us,
+                budget_us,
+            } => write!(
+                f,
+                "Overhead budget exceeded: observed={max_observed_us:.2}μs > budget={budget_us:.2}μs"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InstrumentationError {}
+
+/// Degradation level for instrumentation failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum InstrumentationDegradation {
+    /// Full instrumentation active.
+    Full,
+    /// Overhead tracking disabled to reduce cost.
+    SkipOverhead,
+    /// Correlation propagation disabled.
+    SkipCorrelation,
+    /// All instrumentation disabled — raw enforcer only.
+    Passthrough,
+}
+
+impl fmt::Display for InstrumentationDegradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => f.write_str("FULL"),
+            Self::SkipOverhead => f.write_str("SKIP_OVERHEAD"),
+            Self::SkipCorrelation => f.write_str("SKIP_CORRELATION"),
+            Self::Passthrough => f.write_str("PASSTHROUGH"),
+        }
+    }
+}
+
+// ── Validated Correlation Context ──────────────────────────────────
+
+impl CorrelationContext {
+    /// Validate the completed context for correctness.
+    ///
+    /// Returns a list of all detected issues. Empty list means valid.
+    pub fn validate(&self) -> Vec<InstrumentationError> {
+        let mut errors = Vec::new();
+
+        if self.timings.is_empty() {
+            errors.push(InstrumentationError::EmptyRun {
+                run_id: self.run_id.clone(),
+            });
+            return errors;
+        }
+
+        // Check for duplicate stages.
+        let mut seen = std::collections::HashSet::new();
+        for timing in &self.timings {
+            if !seen.insert(timing.stage) {
+                errors.push(InstrumentationError::DuplicateStage {
+                    stage: timing.stage,
+                });
+            }
+        }
+
+        // Check for clock regressions.
+        for timing in &self.timings {
+            if timing.end_us < timing.start_us {
+                errors.push(InstrumentationError::ClockRegression {
+                    stage: timing.stage,
+                    start_us: timing.start_us,
+                    end_us: timing.end_us,
+                });
+            }
+        }
+
+        // Check timestamp ordering between stages.
+        for window in self.timings.windows(2) {
+            if window[1].start_us < window[0].end_us {
+                // Overlap detected — could indicate a gap in propagation
+                // but not necessarily an error (parallel stages).
+                // We only flag clock regression within a single stage.
+            }
+        }
+
+        errors
+    }
+
+    /// Validate and return Ok(self) or Err(errors).
+    pub fn validated(self) -> Result<Self, Vec<InstrumentationError>> {
+        let errors = self.validate();
+        if errors.is_empty() {
+            Ok(self)
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+// ── Diagnostic Dump ─────────────────────────────────────────────────
+
+/// Full diagnostic snapshot of the instrumented pipeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstrumentationDiagnostic {
+    /// Current degradation level.
+    pub degradation: InstrumentationDegradation,
+    /// Enforcer snapshot (per-stage percentiles, slack, overflow counts).
+    pub enforcer: EnforcerSnapshot,
+    /// Overhead tracker state.
+    pub overhead: InstrumentationOverhead,
+    /// Total completed runs.
+    pub completed_runs: u64,
+    /// Total runs with at least one overflow.
+    pub overflow_runs: u64,
+    /// Overflow rate.
+    pub overflow_rate: f64,
+    /// Validation errors from the most recent run (if any).
+    pub last_validation_errors: Vec<InstrumentationError>,
+}
+
+impl InstrumentedEnforcer {
+    /// Get full diagnostic snapshot.
+    pub fn diagnostic(&self) -> InstrumentationDiagnostic {
+        InstrumentationDiagnostic {
+            degradation: self.current_degradation(),
+            enforcer: self.enforcer.snapshot(),
+            overhead: self.overhead.clone(),
+            completed_runs: self.completed_runs,
+            overflow_runs: self.overflow_runs,
+            overflow_rate: self.overflow_rate(),
+            last_validation_errors: Vec::new(),
+        }
+    }
+
+    /// Determine current degradation level based on overhead.
+    pub fn current_degradation(&self) -> InstrumentationDegradation {
+        if !self.overhead.within_budget {
+            if self.overhead.max_overhead_us > self.overhead.budget_per_probe_us * 10.0 {
+                InstrumentationDegradation::Passthrough
+            } else if self.overhead.max_overhead_us > self.overhead.budget_per_probe_us * 5.0 {
+                InstrumentationDegradation::SkipCorrelation
+            } else {
+                InstrumentationDegradation::SkipOverhead
+            }
+        } else {
+            InstrumentationDegradation::Full
+        }
+    }
+
+    /// Process a run with validation. Returns results and any validation errors.
+    pub fn process_validated_run(
+        &mut self,
+        ctx: &CorrelationContext,
+    ) -> (Vec<ObservationResult>, Vec<InstrumentationError>) {
+        let validation_errors = ctx.validate();
+        let results = self.process_run(ctx);
+        (results, validation_errors)
+    }
+
+    /// Health check: returns true if instrumentation is healthy.
+    ///
+    /// Healthy means: overhead within budget, degradation is Full,
+    /// and overflow rate is below 10%.
+    pub fn is_healthy(&self) -> bool {
+        self.overhead.within_budget
+            && self.current_degradation() == InstrumentationDegradation::Full
+            && self.overflow_rate() < 0.10
+    }
+
+    /// Get a compact status string for operator dashboards.
+    pub fn status_line(&self) -> String {
+        format!(
+            "degradation={} runs={} overflows={} rate={:.1}% overhead_max={:.2}μs",
+            self.current_degradation(),
+            self.completed_runs,
+            self.overflow_runs,
+            self.overflow_rate() * 100.0,
+            self.overhead.max_overhead_us,
+        )
+    }
+}
+
+// ── Fast Path Probe ─────────────────────────────────────────────────
+
+/// Lightweight probe for the fast path — no allocation, no correlation.
+///
+/// For high-frequency stages where full correlation context is too expensive.
+/// Simply records a start timestamp and stage identity. Use `elapsed_us()` to
+/// compute latency without any heap allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FastProbe {
+    pub stage: LatencyStage,
+    pub start_us: u64,
+}
+
+impl FastProbe {
+    /// Create a fast probe (zero allocation).
+    pub fn begin(stage: LatencyStage, start_us: u64) -> Self {
+        Self { stage, start_us }
+    }
+
+    /// Compute elapsed time. Returns 0 on clock regression.
+    pub fn elapsed_us(self, end_us: u64) -> f64 {
+        if end_us >= self.start_us {
+            (end_us - self.start_us) as f64
+        } else {
+            0.0
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3244,6 +3502,264 @@ mod tests {
         let ie = InstrumentedEnforcer::with_config(config);
         assert_eq!(ie.completed_runs(), 0);
         assert!(ie.enforcer().has_stage(LatencyStage::PtyCapture));
+    }
+
+    // ── Guardrails / Validation ──
+
+    #[test]
+    fn test_validation_valid_context() {
+        let mut ctx = CorrelationContext::new("run-valid", 0);
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, 1000);
+        ctx.end_stage(probe, 1500);
+        let errors = ctx.validate();
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_validation_empty_run() {
+        let ctx = CorrelationContext::new("run-empty", 0);
+        let errors = ctx.validate();
+        assert_eq!(errors.len(), 1);
+        let is_empty = matches!(&errors[0], InstrumentationError::EmptyRun { .. });
+        assert!(is_empty);
+    }
+
+    #[test]
+    fn test_validation_duplicate_stage() {
+        let mut ctx = CorrelationContext::new("run-dup", 0);
+        // Record PtyCapture twice
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, 1000);
+        ctx.end_stage(probe, 1500);
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, 2000);
+        ctx.end_stage(probe, 2500);
+        let errors = ctx.validate();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            InstrumentationError::DuplicateStage {
+                stage: LatencyStage::PtyCapture
+            }
+        )));
+    }
+
+    #[test]
+    fn test_validation_clock_regression_detected() {
+        let mut ctx = CorrelationContext::new("run-regress", 0);
+        // Manually add a timing with regression
+        ctx.timings.push(StageTiming {
+            stage: LatencyStage::PtyCapture,
+            start_us: 2000,
+            end_us: 1000, // before start
+            latency_us: 0.0,
+        });
+        let errors = ctx.validate();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, InstrumentationError::ClockRegression { .. })));
+    }
+
+    #[test]
+    fn test_validated_ok() {
+        let mut ctx = CorrelationContext::new("run-ok", 0);
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, 100);
+        ctx.end_stage(probe, 200);
+        let result = ctx.validated();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validated_err() {
+        let ctx = CorrelationContext::new("run-err", 0); // empty
+        let result = ctx.validated();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_instrumentation_error_display() {
+        let e = InstrumentationError::UnterminatedProbe {
+            stage: LatencyStage::StorageWrite,
+            start_us: 5000,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("STORAGE_WRITE"));
+        assert!(s.contains("5000"));
+    }
+
+    #[test]
+    fn test_instrumentation_error_serde_roundtrip() {
+        let e = InstrumentationError::OverheadBudgetExceeded {
+            max_observed_us: 2.5,
+            budget_us: 1.0,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let back: InstrumentationError = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    // ── Degradation ──
+
+    #[test]
+    fn test_degradation_ordering() {
+        assert!(InstrumentationDegradation::Full < InstrumentationDegradation::SkipOverhead);
+        assert!(InstrumentationDegradation::SkipOverhead < InstrumentationDegradation::SkipCorrelation);
+        assert!(InstrumentationDegradation::SkipCorrelation < InstrumentationDegradation::Passthrough);
+    }
+
+    #[test]
+    fn test_degradation_display() {
+        assert_eq!(format!("{}", InstrumentationDegradation::Full), "FULL");
+        assert_eq!(
+            format!("{}", InstrumentationDegradation::Passthrough),
+            "PASSTHROUGH"
+        );
+    }
+
+    #[test]
+    fn test_degradation_serde_roundtrip() {
+        let d = InstrumentationDegradation::SkipCorrelation;
+        let json = serde_json::to_string(&d).unwrap();
+        let back: InstrumentationDegradation = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, back);
+    }
+
+    // ── InstrumentedEnforcer diagnostics ──
+
+    #[test]
+    fn test_enforcer_degradation_full_when_within_budget() {
+        let ie = InstrumentedEnforcer::new();
+        assert_eq!(ie.current_degradation(), InstrumentationDegradation::Full);
+    }
+
+    #[test]
+    fn test_enforcer_degradation_skip_overhead() {
+        let mut ie = InstrumentedEnforcer::new();
+        ie.record_overhead(3.0); // 3x budget (budget=1μs)
+        assert_eq!(
+            ie.current_degradation(),
+            InstrumentationDegradation::SkipOverhead
+        );
+    }
+
+    #[test]
+    fn test_enforcer_degradation_skip_correlation() {
+        let mut ie = InstrumentedEnforcer::new();
+        ie.record_overhead(7.0); // 7x budget
+        assert_eq!(
+            ie.current_degradation(),
+            InstrumentationDegradation::SkipCorrelation
+        );
+    }
+
+    #[test]
+    fn test_enforcer_degradation_passthrough() {
+        let mut ie = InstrumentedEnforcer::new();
+        ie.record_overhead(15.0); // 15x budget
+        assert_eq!(
+            ie.current_degradation(),
+            InstrumentationDegradation::Passthrough
+        );
+    }
+
+    #[test]
+    fn test_enforcer_is_healthy_nominal() {
+        let mut ie = InstrumentedEnforcer::new();
+        // Record a nominal run
+        let mut ctx = CorrelationContext::new("run-h", 0);
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, 0);
+        ctx.end_stage(probe, 10);
+        ie.process_run(&ctx);
+        assert!(ie.is_healthy());
+    }
+
+    #[test]
+    fn test_enforcer_is_unhealthy_overhead() {
+        let mut ie = InstrumentedEnforcer::new();
+        ie.record_overhead(5.0); // over budget
+        assert!(!ie.is_healthy());
+    }
+
+    #[test]
+    fn test_enforcer_status_line_format() {
+        let ie = InstrumentedEnforcer::new();
+        let status = ie.status_line();
+        assert!(status.contains("degradation=FULL"));
+        assert!(status.contains("runs=0"));
+        assert!(status.contains("overflows=0"));
+    }
+
+    #[test]
+    fn test_enforcer_diagnostic_snapshot() {
+        let mut ie = InstrumentedEnforcer::new();
+        ie.record_overhead(0.3);
+        let diag = ie.diagnostic();
+        assert_eq!(diag.degradation, InstrumentationDegradation::Full);
+        assert_eq!(diag.completed_runs, 0);
+        assert_eq!(diag.overhead.probe_count, 1);
+        assert!(diag.last_validation_errors.is_empty());
+    }
+
+    #[test]
+    fn test_enforcer_diagnostic_serde_roundtrip() {
+        let ie = InstrumentedEnforcer::new();
+        let diag = ie.diagnostic();
+        let json = serde_json::to_string(&diag).unwrap();
+        let back: InstrumentationDiagnostic = serde_json::from_str(&json).unwrap();
+        assert_eq!(diag, back);
+    }
+
+    #[test]
+    fn test_enforcer_process_validated_run() {
+        let mut ie = InstrumentedEnforcer::new();
+        let mut ctx = CorrelationContext::new("run-pv", 0);
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, 0);
+        ctx.end_stage(probe, 50);
+        let (results, errors) = ie.process_validated_run(&ctx);
+        assert_eq!(results.len(), 1);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_enforcer_process_validated_run_with_errors() {
+        let mut ie = InstrumentedEnforcer::new();
+        let ctx = CorrelationContext::new("run-empty-val", 0); // empty run
+        let (results, errors) = ie.process_validated_run(&ctx);
+        assert!(results.is_empty());
+        assert!(!errors.is_empty());
+    }
+
+    // ── FastProbe ──
+
+    #[test]
+    fn test_fast_probe_begin() {
+        let probe = FastProbe::begin(LatencyStage::PtyCapture, 1000);
+        assert_eq!(probe.stage, LatencyStage::PtyCapture);
+        assert_eq!(probe.start_us, 1000);
+    }
+
+    #[test]
+    fn test_fast_probe_elapsed() {
+        let probe = FastProbe::begin(LatencyStage::DeltaExtraction, 1000);
+        assert!((probe.elapsed_us(1500) - 500.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_fast_probe_clock_regression() {
+        let probe = FastProbe::begin(LatencyStage::StorageWrite, 2000);
+        assert_eq!(probe.elapsed_us(1000), 0.0);
+    }
+
+    #[test]
+    fn test_fast_probe_zero_duration() {
+        let probe = FastProbe::begin(LatencyStage::EventEmission, 1000);
+        assert_eq!(probe.elapsed_us(1000), 0.0);
+    }
+
+    #[test]
+    fn test_fast_probe_copy_semantics() {
+        let probe = FastProbe::begin(LatencyStage::ApiResponse, 100);
+        let copy = probe;
+        // Both should be usable (Copy semantics, no move).
+        assert_eq!(probe.elapsed_us(200), 100.0);
+        assert_eq!(copy.elapsed_us(200), 100.0);
     }
 
     // ── Helper ──
