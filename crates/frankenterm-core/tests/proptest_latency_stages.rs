@@ -2907,3 +2907,196 @@ proptest! {
         prop_assert_eq!(cfg, back);
     }
 }
+
+// ── C3: Tiered Scrollback Property Tests ───────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(150))]
+
+    /// Tier byte conservation: hot + warm + cold == total_bytes.
+    #[test]
+    fn scrollback_conservation(
+        sizes in proptest::collection::vec(1_u64..10000, 1..20),
+    ) {
+        let mut mgr = TieredScrollbackManager::with_defaults();
+        for (i, &sz) in sizes.iter().enumerate() {
+            mgr.ingest(i as u64 % 5, sz, 1, i as u64 * 1000);
+        }
+        let snap = mgr.snapshot();
+        prop_assert_eq!(snap.hot_bytes + snap.warm_bytes + snap.cold_bytes, snap.total_bytes);
+    }
+
+    /// After migration, tier byte counts stay consistent.
+    #[test]
+    fn scrollback_migration_conservation(
+        sizes in proptest::collection::vec(100_u64..5000, 1..10),
+    ) {
+        let policy = TierMigrationPolicy {
+            hot_to_warm_age_us: 100,
+            warm_to_cold_age_us: 500,
+            min_segment_bytes: 1,
+            pressure_threshold: 0.99,
+            max_concurrent_migrations: 100,
+        };
+        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1_000_000, target_latency_us: 10, compression_ratio: 1.0 };
+        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 1_000_000, target_latency_us: 500, compression_ratio: 1.0 };
+        // compression_ratio=1.0 for cold to ensure exact conservation
+        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 10_000_000, target_latency_us: 10000, compression_ratio: 1.0 };
+        let mut mgr = TieredScrollbackManager::new(hot, warm, cold, policy);
+
+        for (i, &sz) in sizes.iter().enumerate() {
+            mgr.ingest(0, sz, 1, 0);
+            let _ = mgr.migrate(i as u64 * 200);
+        }
+        let snap = mgr.snapshot();
+        prop_assert_eq!(snap.hot_bytes + snap.warm_bytes + snap.cold_bytes, snap.total_bytes);
+    }
+
+    /// Hot utilization is bounded [0, max_possible].
+    #[test]
+    fn scrollback_hot_util_bounded(
+        sizes in proptest::collection::vec(1_u64..5000, 0..15),
+    ) {
+        let mut mgr = TieredScrollbackManager::with_defaults();
+        for &sz in &sizes {
+            mgr.ingest(0, sz, 1, 0);
+        }
+        let util = mgr.hot_utilization();
+        prop_assert!(util >= 0.0);
+        // Can exceed 1.0 if we overshoot, but should always be finite
+        prop_assert!(util.is_finite());
+    }
+
+    /// Tier rank monotonically increases: Hot < Warm < Cold.
+    #[test]
+    fn scrollback_tier_rank_monotonic(tier_idx in 0_usize..3) {
+        let tier = ScrollbackTier::ALL[tier_idx];
+        prop_assert_eq!(tier.rank(), tier_idx);
+        if let Some(demoted) = tier.demote() {
+            prop_assert!(demoted.rank() > tier.rank());
+        }
+    }
+
+    /// Ingest always increases segment count and hot bytes.
+    #[test]
+    fn scrollback_ingest_monotonic(
+        n in 1_usize..20,
+        sz in 1_u64..10000,
+    ) {
+        let mut mgr = TieredScrollbackManager::with_defaults();
+        for i in 0..n {
+            let prev_count = mgr.segment_count();
+            let prev_hot = mgr.tier_bytes(ScrollbackTier::Hot);
+            mgr.ingest(0, sz, 1, i as u64);
+            prop_assert_eq!(mgr.segment_count(), prev_count + 1);
+            prop_assert_eq!(mgr.tier_bytes(ScrollbackTier::Hot), prev_hot + sz);
+        }
+    }
+
+    /// Evict pane removes exactly that pane's segments.
+    #[test]
+    fn scrollback_evict_pane_precise(
+        pane_a_count in 1_usize..10,
+        pane_b_count in 1_usize..10,
+    ) {
+        let mut mgr = TieredScrollbackManager::with_defaults();
+        for i in 0..pane_a_count {
+            mgr.ingest(1, 100, 1, i as u64);
+        }
+        for i in 0..pane_b_count {
+            mgr.ingest(2, 200, 1, i as u64);
+        }
+        mgr.evict_pane(1);
+        prop_assert_eq!(mgr.segment_count(), pane_b_count);
+        prop_assert_eq!(mgr.segments_for_pane(1).len(), 0);
+        prop_assert_eq!(mgr.segments_for_pane(2).len(), pane_b_count);
+    }
+
+    /// Reset clears everything.
+    #[test]
+    fn scrollback_reset_zeroes(
+        sizes in proptest::collection::vec(1_u64..5000, 1..10),
+    ) {
+        let mut mgr = TieredScrollbackManager::with_defaults();
+        for &sz in &sizes {
+            mgr.ingest(0, sz, 1, 0);
+        }
+        mgr.reset();
+        prop_assert_eq!(mgr.segment_count(), 0);
+        prop_assert_eq!(mgr.total_bytes(), 0);
+        prop_assert_eq!(mgr.total_lines(), 0);
+    }
+
+    /// ScrollbackTier serde roundtrip.
+    #[test]
+    fn scrollback_tier_serde(tier_idx in 0_usize..3) {
+        let tier = ScrollbackTier::ALL[tier_idx];
+        let json = serde_json::to_string(&tier).unwrap();
+        let back: ScrollbackTier = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(tier, back);
+    }
+
+    /// TierMigrationEvent serde roundtrip.
+    #[test]
+    fn scrollback_migration_event_serde(
+        seg_id in 0_u64..1000,
+        bytes in 1_u64..100000,
+        dur in 0_u64..10000,
+    ) {
+        let evt = TierMigrationEvent {
+            segment_id: seg_id,
+            from_tier: ScrollbackTier::Hot,
+            to_tier: ScrollbackTier::Warm,
+            bytes_migrated: bytes,
+            duration_us: dur,
+            timestamp_us: 12345,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let back: TierMigrationEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(evt, back);
+    }
+
+    /// ScrollbackDegradation serde roundtrip.
+    #[test]
+    fn scrollback_degradation_serde(
+        variant in 0_u8..4,
+        val in 1_usize..100,
+    ) {
+        let degradation = match variant {
+            0 => ScrollbackDegradation::Healthy,
+            1 => ScrollbackDegradation::HotPressure { utilization: 0.9, threshold: 0.85 },
+            2 => ScrollbackDegradation::WarmPressure { utilization: 0.88, threshold: 0.85 },
+            _ => ScrollbackDegradation::MigrationBacklog { pending: val, max_concurrent: val + 1 },
+        };
+        let json = serde_json::to_string(&degradation).unwrap();
+        let back: ScrollbackDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(degradation, back);
+    }
+
+    /// TieredScrollbackSnapshot serde roundtrip.
+    #[test]
+    fn scrollback_snapshot_serde(
+        hot in 0_u64..100000,
+        warm in 0_u64..100000,
+        cold in 0_u64..100000,
+    ) {
+        let snap = TieredScrollbackSnapshot {
+            hot_bytes: hot,
+            warm_bytes: warm,
+            cold_bytes: cold,
+            hot_segments: 1,
+            warm_segments: 2,
+            cold_segments: 3,
+            total_migrations: 5,
+            total_bytes: hot + warm + cold,
+            hot_utilization: 0.5,
+            warm_utilization: 0.3,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: TieredScrollbackSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap.hot_bytes, back.hot_bytes);
+        prop_assert_eq!(snap.warm_bytes, back.warm_bytes);
+        prop_assert_eq!(snap.cold_bytes, back.cold_bytes);
+        prop_assert_eq!(snap.total_bytes, back.total_bytes);
+    }
+}
