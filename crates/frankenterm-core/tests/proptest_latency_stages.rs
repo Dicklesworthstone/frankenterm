@@ -3100,3 +3100,159 @@ proptest! {
         prop_assert_eq!(snap.total_bytes, back.total_bytes);
     }
 }
+
+// ── C4: Transport Policy Property Tests ────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(150))]
+
+    /// Decision count conservation: local + compressed + bypass == total.
+    #[test]
+    fn transport_decision_conservation(
+        modes in proptest::collection::vec(0_u8..3, 1..50),
+    ) {
+        let mut policy = TransportPolicy::with_defaults();
+        for (i, &m) in modes.iter().enumerate() {
+            let mode = match m {
+                0 => TransportMode::Local,
+                1 => TransportMode::Compressed,
+                _ => TransportMode::Bypass,
+            };
+            policy.record(100, mode, 10.0, 8.0, i as u64);
+        }
+        let snap = policy.snapshot();
+        prop_assert_eq!(snap.local_count + snap.compressed_count + snap.bypass_count, snap.total_decisions);
+    }
+
+    /// EWMA cost is always non-negative.
+    #[test]
+    fn transport_ewma_nonnegative(
+        costs in proptest::collection::vec(0.0_f64..1000.0, 1..30),
+    ) {
+        let mut policy = TransportPolicy::with_defaults();
+        for (i, &cost) in costs.iter().enumerate() {
+            policy.record(1000, TransportMode::Local, cost, cost, i as u64);
+        }
+        prop_assert!(policy.ewma_cost_us() >= 0.0);
+    }
+
+    /// Mode distribution sums to 1.0 (when decisions > 0).
+    #[test]
+    fn transport_distribution_sums_to_one(
+        n in 1_usize..50,
+    ) {
+        let mut policy = TransportPolicy::with_defaults();
+        for i in 0..n {
+            let mode = match i % 3 {
+                0 => TransportMode::Local,
+                1 => TransportMode::Compressed,
+                _ => TransportMode::Bypass,
+            };
+            policy.record(100, mode, 10.0, 10.0, i as u64);
+        }
+        let (l, c, b) = policy.mode_distribution();
+        let sum = l + c + b;
+        let diff = (sum - 1.0).abs();
+        prop_assert!(diff < 1e-10, "distribution sum {} != 1.0", sum);
+    }
+
+    /// Local mode selected when network cost is zero.
+    #[test]
+    fn transport_local_when_no_network(
+        payload in 1_u64..1_000_000,
+    ) {
+        let policy = TransportPolicy::with_defaults(); // network_cost = 0.0
+        prop_assert_eq!(policy.select_mode(payload), TransportMode::Local);
+    }
+
+    /// Estimate cost for Local is always 0.
+    #[test]
+    fn transport_local_estimate_zero(
+        payload in 1_u64..1_000_000,
+    ) {
+        let policy = TransportPolicy::with_defaults();
+        let cost = policy.estimate_cost(payload, TransportMode::Local);
+        prop_assert_eq!(cost, 0.0);
+    }
+
+    /// Estimate cost for Bypass is non-negative.
+    #[test]
+    fn transport_bypass_estimate_nonneg(
+        payload in 1_u64..100_000,
+    ) {
+        let config = TransportPolicyConfig {
+            cost_model: TransportCostModel {
+                network_cost_per_byte_us: 0.01,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let policy = TransportPolicy::new(config);
+        let cost = policy.estimate_cost(payload, TransportMode::Bypass);
+        prop_assert!(cost >= 0.0);
+    }
+
+    /// Estimate cost for Compressed is non-negative.
+    #[test]
+    fn transport_compressed_estimate_nonneg(
+        payload in 1_u64..100_000,
+    ) {
+        let policy = TransportPolicy::with_defaults();
+        let cost = policy.estimate_cost(payload, TransportMode::Compressed);
+        prop_assert!(cost >= 0.0);
+    }
+
+    /// Reset zeroes all counters.
+    #[test]
+    fn transport_reset_zeroes(
+        n in 1_usize..20,
+    ) {
+        let mut policy = TransportPolicy::with_defaults();
+        for i in 0..n {
+            policy.record(100, TransportMode::Local, 10.0, 8.0, i as u64);
+        }
+        policy.reset();
+        let snap = policy.snapshot();
+        prop_assert_eq!(snap.total_decisions, 0);
+        prop_assert_eq!(snap.total_bytes_transferred, 0);
+        prop_assert_eq!(snap.ewma_cost_us, 0.0);
+    }
+
+    /// TransportMode serde roundtrip.
+    #[test]
+    fn transport_mode_serde(mode_idx in 0_u8..3) {
+        let mode = match mode_idx {
+            0 => TransportMode::Local,
+            1 => TransportMode::Compressed,
+            _ => TransportMode::Bypass,
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        let back: TransportMode = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(mode, back);
+    }
+
+    /// TransportDecision serde roundtrip.
+    #[test]
+    fn transport_decision_serde(
+        payload in 1_u64..100000,
+        est in 0.0_f64..1000.0,
+        act in 0.0_f64..1000.0,
+    ) {
+        let dec = TransportDecision {
+            payload_bytes: payload,
+            selected_mode: TransportMode::Bypass,
+            estimated_cost_us: est,
+            actual_cost_us: act,
+            savings_us: est - act,
+            timestamp_us: 12345,
+        };
+        let json = serde_json::to_string(&dec).unwrap();
+        let back: TransportDecision = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(dec.payload_bytes, back.payload_bytes);
+        prop_assert_eq!(dec.selected_mode, back.selected_mode);
+        // f64 tolerance
+        let est_diff = (dec.estimated_cost_us - back.estimated_cost_us).abs();
+        let tol = dec.estimated_cost_us.abs() * 1e-12 + 1e-10;
+        prop_assert!(est_diff < tol, "est roundtrip: {} vs {}", dec.estimated_cost_us, back.estimated_cost_us);
+    }
+}
