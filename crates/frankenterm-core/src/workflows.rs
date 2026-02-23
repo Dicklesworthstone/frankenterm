@@ -1730,12 +1730,20 @@ impl Workflow for DescriptorWorkflow {
                     matcher,
                     jump_to,
                 } => {
+                    let mut actual_text = test_text;
+                    if actual_text.contains("${trigger}") {
+                        let trigger_str = ctx_clone.trigger().map_or_else(
+                            || String::new(),
+                            |val| serde_json::to_string(val).unwrap_or_default(),
+                        );
+                        actual_text = actual_text.replace("${trigger}", &trigger_str);
+                    }
                     let matches = match matcher {
                         DescriptorMatcher::Substring { value } => {
-                            test_text.contains(value.as_str())
+                            actual_text.contains(value.as_str())
                         }
                         DescriptorMatcher::Regex { pattern } => fancy_regex::Regex::new(&pattern)
-                            .map(|re| re.is_match(&test_text).unwrap_or(false))
+                            .map(|re| re.is_match(&actual_text).unwrap_or(false))
                             .unwrap_or(false),
                     };
                     if matches {
