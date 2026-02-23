@@ -7823,6 +7823,74 @@ impl TailLatencyController {
             degradation: self.detect_degradation(),
         }
     }
+
+    /// Estimate p50 latency from stored samples.
+    pub fn p50_latency_us(&self) -> u64 {
+        if self.latency_samples.is_empty() {
+            return 0;
+        }
+        let mut sorted = self.latency_samples.clone();
+        sorted.sort_unstable();
+        let idx = (sorted.len() / 2).min(sorted.len() - 1);
+        sorted[idx]
+    }
+
+    /// Wakeup source distribution as fractions (timer, io, signal, nudge).
+    pub fn wakeup_distribution(&self) -> (f64, f64, f64, f64) {
+        if self.total_wakeups == 0 {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        let total = self.total_wakeups as f64;
+        (
+            self.timer_wakeups as f64 / total,
+            self.io_wakeups as f64 / total,
+            self.signal_wakeups as f64 / total,
+            self.nudge_wakeups as f64 / total,
+        )
+    }
+
+    /// Violation rate (0.0–1.0).
+    pub fn violation_rate(&self) -> f64 {
+        if self.total_wakeups == 0 {
+            return 0.0;
+        }
+        self.budget_violations as f64 / self.total_wakeups as f64
+    }
+
+    /// Whether the controller is currently within p99 budget.
+    pub fn within_p99_budget(&self) -> bool {
+        self.p99_latency_us() <= self.config.p99_budget_us
+    }
+
+    /// Whether the controller is currently within p999 budget.
+    pub fn within_p999_budget(&self) -> bool {
+        self.max_latency_us <= self.config.p999_budget_us
+    }
+
+    /// Update syscall strategy at runtime.
+    pub fn set_strategy(&mut self, strategy: SyscallStrategy) {
+        self.config.syscall_strategy = strategy;
+    }
+
+    /// Update affinity hint at runtime.
+    pub fn set_affinity(&mut self, hint: AffinityHint) {
+        self.config.affinity = hint;
+    }
+
+    /// Update p99 budget.
+    pub fn set_p99_budget(&mut self, budget_us: u64) {
+        self.config.p99_budget_us = budget_us;
+    }
+
+    /// Total wakeups count.
+    pub fn total_wakeups(&self) -> u64 {
+        self.total_wakeups
+    }
+
+    /// Total budget violations.
+    pub fn budget_violations(&self) -> u64 {
+        self.budget_violations
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -13366,5 +13434,92 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let back: TailLatencyConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, back);
+    }
+
+    // ── C5 Impl Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_tail_latency_p50() {
+        let mut ctrl = TailLatencyController::with_defaults();
+        for i in 1..=100 {
+            ctrl.record_wakeup(WakeupSource::Timer, i * 10);
+        }
+        let p50 = ctrl.p50_latency_us();
+        // Median of 10..1000 step 10 → ~500
+        assert!(p50 >= 400 && p50 <= 600, "p50={}", p50);
+    }
+
+    #[test]
+    fn test_tail_latency_wakeup_distribution() {
+        let mut ctrl = TailLatencyController::with_defaults();
+        for _ in 0..6 { ctrl.record_wakeup(WakeupSource::Timer, 100); }
+        for _ in 0..3 { ctrl.record_wakeup(WakeupSource::IoEvent, 100); }
+        for _ in 0..1 { ctrl.record_wakeup(WakeupSource::Signal, 100); }
+        let (t, io, s, n) = ctrl.wakeup_distribution();
+        assert!((t - 0.6).abs() < 0.01);
+        assert!((io - 0.3).abs() < 0.01);
+        assert!((s - 0.1).abs() < 0.01);
+        assert_eq!(n, 0.0);
+    }
+
+    #[test]
+    fn test_tail_latency_wakeup_distribution_empty() {
+        let ctrl = TailLatencyController::with_defaults();
+        let (t, io, s, n) = ctrl.wakeup_distribution();
+        assert_eq!(t, 0.0);
+        assert_eq!(io, 0.0);
+        assert_eq!(s, 0.0);
+        assert_eq!(n, 0.0);
+    }
+
+    #[test]
+    fn test_tail_latency_violation_rate() {
+        let config = TailLatencyConfig {
+            p99_budget_us: 100,
+            ..Default::default()
+        };
+        let mut ctrl = TailLatencyController::new(config);
+        for _ in 0..8 { ctrl.record_wakeup(WakeupSource::Timer, 50); }
+        for _ in 0..2 { ctrl.record_wakeup(WakeupSource::Timer, 200); }
+        assert!((ctrl.violation_rate() - 0.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_tail_latency_within_budget() {
+        let mut ctrl = TailLatencyController::with_defaults();
+        for _ in 0..10 { ctrl.record_wakeup(WakeupSource::Timer, 100); }
+        assert!(ctrl.within_p99_budget());
+        assert!(ctrl.within_p999_budget());
+    }
+
+    #[test]
+    fn test_tail_latency_set_strategy() {
+        let mut ctrl = TailLatencyController::with_defaults();
+        ctrl.set_strategy(SyscallStrategy::Batched);
+        assert_eq!(ctrl.strategy(), SyscallStrategy::Batched);
+    }
+
+    #[test]
+    fn test_tail_latency_set_affinity() {
+        let mut ctrl = TailLatencyController::with_defaults();
+        ctrl.set_affinity(AffinityHint::Pinned(7));
+        assert_eq!(ctrl.affinity(), AffinityHint::Pinned(7));
+    }
+
+    #[test]
+    fn test_tail_latency_set_p99_budget() {
+        let mut ctrl = TailLatencyController::with_defaults();
+        ctrl.set_p99_budget(5000);
+        for _ in 0..10 { ctrl.record_wakeup(WakeupSource::Timer, 4000); }
+        assert!(ctrl.within_p99_budget());
+    }
+
+    #[test]
+    fn test_tail_latency_total_accessors() {
+        let mut ctrl = TailLatencyController::with_defaults();
+        ctrl.record_wakeup(WakeupSource::Timer, 100);
+        ctrl.record_wakeup(WakeupSource::Timer, 20000); // violation (default budget=10000)
+        assert_eq!(ctrl.total_wakeups(), 2);
+        assert_eq!(ctrl.budget_violations(), 1);
     }
 }
