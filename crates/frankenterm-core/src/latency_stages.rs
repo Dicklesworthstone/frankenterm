@@ -3696,6 +3696,505 @@ pub struct AllocationLogEntry {
     pub degradation: AllocatorDegradation,
 }
 
+// ── B1: Three-Lane Scheduler Architecture ─────────────────────────
+//
+// Defines three scheduling lanes for the pipeline:
+// - Input: User keystrokes, terminal I/O — highest priority, bounded queue.
+// - Control: System signals, health checks — medium priority.
+// - Bulk: Background tasks, batch indexing — lowest priority, elastic.
+//
+// Admission policy ensures input lane immunity during bulk pressure.
+// AARSP Bead: ft-2p9cb.2.1.1
+
+/// Scheduling lane classification.
+///
+/// Tasks are assigned to lanes based on their latency-sensitivity.
+/// The scheduler services lanes in strict priority order: Input > Control > Bulk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SchedulerLane {
+    /// User-facing I/O: keystrokes, display updates, PTY reads.
+    /// Latency target: < 5ms p99. Never starved.
+    Input = 0,
+    /// System control: health checks, pane lifecycle, config reloads.
+    /// Latency target: < 50ms p99. May be deferred under extreme input pressure.
+    Control = 1,
+    /// Background work: batch indexing, pattern scanning, log rotation.
+    /// Latency target: best-effort. Throttled to protect input/control lanes.
+    Bulk = 2,
+}
+
+impl SchedulerLane {
+    /// All lanes in priority order (highest first).
+    pub const ALL: &'static [Self] = &[Self::Input, Self::Control, Self::Bulk];
+
+    /// Priority value (lower = higher priority).
+    pub fn priority(self) -> u8 {
+        self as u8
+    }
+
+    /// Which pipeline stages belong to this lane by default.
+    pub fn default_stages(self) -> &'static [LatencyStage] {
+        match self {
+            Self::Input => &[
+                LatencyStage::PtyCapture,
+                LatencyStage::DeltaExtraction,
+                LatencyStage::ApiResponse,
+            ],
+            Self::Control => &[
+                LatencyStage::EventEmission,
+                LatencyStage::WorkflowDispatch,
+                LatencyStage::ActionExecution,
+            ],
+            Self::Bulk => &[
+                LatencyStage::StorageWrite,
+                LatencyStage::PatternDetection,
+            ],
+        }
+    }
+
+    /// Human-readable name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Control => "control",
+            Self::Bulk => "bulk",
+        }
+    }
+}
+
+impl fmt::Display for SchedulerLane {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+/// Map a pipeline stage to its scheduling lane.
+pub fn stage_to_lane(stage: LatencyStage) -> SchedulerLane {
+    match stage {
+        LatencyStage::PtyCapture
+        | LatencyStage::DeltaExtraction
+        | LatencyStage::ApiResponse => SchedulerLane::Input,
+        LatencyStage::EventEmission
+        | LatencyStage::WorkflowDispatch
+        | LatencyStage::ActionExecution => SchedulerLane::Control,
+        LatencyStage::StorageWrite
+        | LatencyStage::PatternDetection => SchedulerLane::Bulk,
+        // Aggregates don't schedule directly.
+        LatencyStage::EndToEndCapture | LatencyStage::EndToEndAction => SchedulerLane::Bulk,
+    }
+}
+
+/// A schedulable work item.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkItem {
+    /// Unique item ID.
+    pub id: u64,
+    /// Which lane this item belongs to.
+    pub lane: SchedulerLane,
+    /// Which pipeline stage this work is for.
+    pub stage: LatencyStage,
+    /// Estimated cost in microseconds.
+    pub estimated_cost_us: f64,
+    /// Correlation ID for tracing.
+    pub correlation_id: String,
+    /// Deadline in microseconds from epoch (0 = no deadline).
+    pub deadline_us: u64,
+}
+
+/// Admission decision for a work item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdmissionDecision {
+    /// Item admitted to its lane queue.
+    Admitted,
+    /// Item deferred: bulk lane full, will retry.
+    Deferred,
+    /// Item shed: queue overflow, item dropped.
+    Shed,
+    /// Item promoted: moved to higher-priority lane due to deadline pressure.
+    Promoted { from: SchedulerLane, to: SchedulerLane },
+}
+
+impl fmt::Display for AdmissionDecision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Admitted => write!(f, "ADMITTED"),
+            Self::Deferred => write!(f, "DEFERRED"),
+            Self::Shed => write!(f, "SHED"),
+            Self::Promoted { from, to } => write!(f, "PROMOTED {}→{}", from, to),
+        }
+    }
+}
+
+/// Configuration for the three-lane scheduler.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LaneSchedulerConfig {
+    /// Maximum queue depth per lane.
+    pub input_queue_capacity: usize,
+    pub control_queue_capacity: usize,
+    pub bulk_queue_capacity: usize,
+    /// Maximum fraction of CPU time each lane can consume per scheduling epoch.
+    /// Must sum to ≤ 1.0.
+    pub input_cpu_share: f64,
+    pub control_cpu_share: f64,
+    pub bulk_cpu_share: f64,
+    /// If input queue depth exceeds this fraction, shed bulk items.
+    pub input_pressure_threshold: f64,
+    /// Enable deadline-based promotion from bulk → control.
+    pub enable_deadline_promotion: bool,
+    /// Deadline promotion threshold: if remaining time < this fraction of deadline, promote.
+    pub deadline_promotion_fraction: f64,
+}
+
+impl Default for LaneSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            input_queue_capacity: 256,
+            control_queue_capacity: 128,
+            bulk_queue_capacity: 1024,
+            input_cpu_share: 0.50,
+            control_cpu_share: 0.30,
+            bulk_cpu_share: 0.20,
+            input_pressure_threshold: 0.75,
+            enable_deadline_promotion: true,
+            deadline_promotion_fraction: 0.25,
+        }
+    }
+}
+
+impl LaneSchedulerConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let total_share = self.input_cpu_share + self.control_cpu_share + self.bulk_cpu_share;
+        if total_share > 1.0 + 1e-6 {
+            errors.push(format!(
+                "CPU shares sum to {} (must be ≤ 1.0)",
+                total_share
+            ));
+        }
+        if self.input_cpu_share < 0.0 || self.control_cpu_share < 0.0 || self.bulk_cpu_share < 0.0
+        {
+            errors.push("CPU shares must be non-negative".into());
+        }
+        if self.input_pressure_threshold <= 0.0 || self.input_pressure_threshold > 1.0 {
+            errors.push(format!(
+                "input_pressure_threshold must be in (0.0, 1.0], got {}",
+                self.input_pressure_threshold
+            ));
+        }
+        if self.deadline_promotion_fraction <= 0.0 || self.deadline_promotion_fraction >= 1.0 {
+            errors.push(format!(
+                "deadline_promotion_fraction must be in (0.0, 1.0), got {}",
+                self.deadline_promotion_fraction
+            ));
+        }
+        errors
+    }
+
+    /// Get queue capacity for a lane.
+    pub fn capacity(&self, lane: SchedulerLane) -> usize {
+        match lane {
+            SchedulerLane::Input => self.input_queue_capacity,
+            SchedulerLane::Control => self.control_queue_capacity,
+            SchedulerLane::Bulk => self.bulk_queue_capacity,
+        }
+    }
+
+    /// Get CPU share for a lane.
+    pub fn cpu_share(&self, lane: SchedulerLane) -> f64 {
+        match lane {
+            SchedulerLane::Input => self.input_cpu_share,
+            SchedulerLane::Control => self.control_cpu_share,
+            SchedulerLane::Bulk => self.bulk_cpu_share,
+        }
+    }
+}
+
+/// Per-lane queue state tracked by the scheduler.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LaneState {
+    pub lane: SchedulerLane,
+    pub depth: usize,
+    pub capacity: usize,
+    pub total_admitted: u64,
+    pub total_deferred: u64,
+    pub total_shed: u64,
+    pub total_completed: u64,
+    pub cpu_used_us: f64,
+    pub cpu_budget_us: f64,
+}
+
+impl LaneState {
+    fn new(lane: SchedulerLane, capacity: usize) -> Self {
+        Self {
+            lane,
+            depth: 0,
+            capacity,
+            total_admitted: 0,
+            total_deferred: 0,
+            total_shed: 0,
+            total_completed: 0,
+            cpu_used_us: 0.0,
+            cpu_budget_us: 0.0,
+        }
+    }
+
+    /// Queue utilization fraction (0.0 to 1.0).
+    pub fn utilization(&self) -> f64 {
+        if self.capacity > 0 {
+            self.depth as f64 / self.capacity as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Is the queue at or above capacity?
+    pub fn is_full(&self) -> bool {
+        self.depth >= self.capacity
+    }
+}
+
+/// Scheduling event for structured logging.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulingEvent {
+    pub item_id: u64,
+    pub lane: SchedulerLane,
+    pub stage: LatencyStage,
+    pub decision: AdmissionDecision,
+    pub queue_depth_before: usize,
+    pub queue_depth_after: usize,
+    pub correlation_id: String,
+    pub reason_code: Option<String>,
+}
+
+/// Diagnostic snapshot of the three-lane scheduler.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerSnapshot {
+    pub epoch: u64,
+    pub lanes: Vec<LaneState>,
+    pub total_items_processed: u64,
+    pub input_pressure: bool,
+    pub config: LaneSchedulerConfig,
+}
+
+/// The three-lane scheduler.
+///
+/// Manages admission, ordering, and completion tracking for work items
+/// across three priority lanes: Input, Control, Bulk.
+///
+/// # Invariants
+///
+/// 1. **Input immunity**: Input lane items are never shed while input queue < capacity.
+/// 2. **Strict ordering**: Input > Control > Bulk in scheduling priority.
+/// 3. **Bounded queues**: Each lane has a fixed capacity; overflow triggers shed/defer.
+/// 4. **Determinism**: Same item sequence → same scheduling decisions.
+#[derive(Debug, Clone)]
+pub struct LaneScheduler {
+    config: LaneSchedulerConfig,
+    lanes: Vec<LaneState>,
+    epoch: u64,
+    next_item_id: u64,
+    events: Vec<SchedulingEvent>,
+    max_events: usize,
+}
+
+impl LaneScheduler {
+    /// Create a new scheduler with the given configuration.
+    pub fn new(config: LaneSchedulerConfig) -> Self {
+        let lanes = vec![
+            LaneState::new(SchedulerLane::Input, config.input_queue_capacity),
+            LaneState::new(SchedulerLane::Control, config.control_queue_capacity),
+            LaneState::new(SchedulerLane::Bulk, config.bulk_queue_capacity),
+        ];
+        Self {
+            config,
+            lanes,
+            epoch: 0,
+            next_item_id: 1,
+            events: Vec::new(),
+            max_events: 1000,
+        }
+    }
+
+    /// Create a scheduler with default configuration.
+    pub fn with_defaults() -> Self {
+        Self::new(LaneSchedulerConfig::default())
+    }
+
+    /// Admit a work item to the appropriate lane.
+    ///
+    /// Returns the admission decision and assigns an item ID.
+    pub fn admit(
+        &mut self,
+        stage: LatencyStage,
+        estimated_cost_us: f64,
+        correlation_id: &str,
+        deadline_us: u64,
+        now_us: u64,
+    ) -> (WorkItem, AdmissionDecision) {
+        let lane = stage_to_lane(stage);
+        let item_id = self.next_item_id;
+        self.next_item_id += 1;
+
+        let item = WorkItem {
+            id: item_id,
+            lane,
+            stage,
+            estimated_cost_us,
+            correlation_id: correlation_id.to_string(),
+            deadline_us,
+        };
+
+        let decision = self.apply_admission(&item, now_us);
+
+        let lane_state = &self.lanes[lane as usize];
+        self.push_event(SchedulingEvent {
+            item_id,
+            lane,
+            stage,
+            decision: decision.clone(),
+            queue_depth_before: if matches!(decision, AdmissionDecision::Admitted) {
+                lane_state.depth.saturating_sub(1)
+            } else {
+                lane_state.depth
+            },
+            queue_depth_after: lane_state.depth,
+            correlation_id: correlation_id.to_string(),
+            reason_code: match &decision {
+                AdmissionDecision::Deferred => Some("BULK_QUEUE_FULL".into()),
+                AdmissionDecision::Shed => Some("QUEUE_OVERFLOW".into()),
+                AdmissionDecision::Promoted { .. } => Some("DEADLINE_PROMOTION".into()),
+                _ => None,
+            },
+        });
+
+        (item, decision)
+    }
+
+    /// Mark an item as completed.
+    pub fn complete(&mut self, lane: SchedulerLane, actual_cost_us: f64) {
+        let state = &mut self.lanes[lane as usize];
+        if state.depth > 0 {
+            state.depth -= 1;
+            state.total_completed += 1;
+            state.cpu_used_us += actual_cost_us;
+        }
+    }
+
+    /// Start a new scheduling epoch. Resets per-epoch CPU counters.
+    pub fn begin_epoch(&mut self, epoch_budget_us: f64) {
+        self.epoch += 1;
+        for state in &mut self.lanes {
+            state.cpu_used_us = 0.0;
+            state.cpu_budget_us = epoch_budget_us * self.config.cpu_share(state.lane);
+        }
+    }
+
+    /// Is the input lane under pressure?
+    pub fn input_under_pressure(&self) -> bool {
+        let input = &self.lanes[SchedulerLane::Input as usize];
+        input.utilization() >= self.config.input_pressure_threshold
+    }
+
+    /// Get the lane state for a specific lane.
+    pub fn lane_state(&self, lane: SchedulerLane) -> &LaneState {
+        &self.lanes[lane as usize]
+    }
+
+    /// Get a diagnostic snapshot.
+    pub fn snapshot(&self) -> SchedulerSnapshot {
+        SchedulerSnapshot {
+            epoch: self.epoch,
+            lanes: self.lanes.clone(),
+            total_items_processed: self.lanes.iter().map(|l| l.total_completed).sum(),
+            input_pressure: self.input_under_pressure(),
+            config: self.config.clone(),
+        }
+    }
+
+    /// Get the last N scheduling events.
+    pub fn recent_events(&self, n: usize) -> &[SchedulingEvent] {
+        let start = self.events.len().saturating_sub(n);
+        &self.events[start..]
+    }
+
+    /// Status line for logging.
+    pub fn status_line(&self) -> String {
+        let depths: Vec<String> = self
+            .lanes
+            .iter()
+            .map(|l| format!("{}={}/{}", l.lane, l.depth, l.capacity))
+            .collect();
+        format!(
+            "scheduler epoch={} [{}] pressure={}",
+            self.epoch,
+            depths.join(" "),
+            self.input_under_pressure()
+        )
+    }
+
+    fn apply_admission(&mut self, item: &WorkItem, now_us: u64) -> AdmissionDecision {
+        let lane_idx = item.lane as usize;
+
+        // Check if input lane is under pressure — shed bulk items.
+        if item.lane == SchedulerLane::Bulk && self.input_under_pressure() {
+            self.lanes[lane_idx].total_shed += 1;
+            return AdmissionDecision::Shed;
+        }
+
+        // Check for deadline-based promotion.
+        if self.config.enable_deadline_promotion
+            && item.lane == SchedulerLane::Bulk
+            && item.deadline_us > 0
+            && now_us > 0
+        {
+            let remaining = item.deadline_us.saturating_sub(now_us);
+            let threshold =
+                (item.deadline_us as f64 * self.config.deadline_promotion_fraction) as u64;
+            if remaining < threshold {
+                // Promote to control lane.
+                let control_idx = SchedulerLane::Control as usize;
+                if !self.lanes[control_idx].is_full() {
+                    self.lanes[control_idx].depth += 1;
+                    self.lanes[control_idx].total_admitted += 1;
+                    return AdmissionDecision::Promoted {
+                        from: SchedulerLane::Bulk,
+                        to: SchedulerLane::Control,
+                    };
+                }
+            }
+        }
+
+        // Try to admit to the item's lane.
+        let state = &mut self.lanes[lane_idx];
+        if state.is_full() {
+            // Input items are never shed — they wait (defer).
+            // Control items defer. Bulk items are shed.
+            match item.lane {
+                SchedulerLane::Input | SchedulerLane::Control => {
+                    state.total_deferred += 1;
+                    AdmissionDecision::Deferred
+                }
+                SchedulerLane::Bulk => {
+                    state.total_shed += 1;
+                    AdmissionDecision::Shed
+                }
+            }
+        } else {
+            state.depth += 1;
+            state.total_admitted += 1;
+            AdmissionDecision::Admitted
+        }
+    }
+
+    fn push_event(&mut self, event: SchedulingEvent) {
+        self.events.push(event);
+        if self.events.len() > self.max_events {
+            self.events.drain(0..self.events.len() / 2);
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -6248,5 +6747,296 @@ mod tests {
                 _ => assert_eq!(case, back),
             }
         }
+    }
+
+    // ── B1: Three-Lane Scheduler ──
+
+    #[test]
+    fn test_scheduler_lane_priority_order() {
+        assert!(SchedulerLane::Input < SchedulerLane::Control);
+        assert!(SchedulerLane::Control < SchedulerLane::Bulk);
+        assert_eq!(SchedulerLane::Input.priority(), 0);
+        assert_eq!(SchedulerLane::Control.priority(), 1);
+        assert_eq!(SchedulerLane::Bulk.priority(), 2);
+    }
+
+    #[test]
+    fn test_scheduler_lane_all_complete() {
+        assert_eq!(SchedulerLane::ALL.len(), 3);
+    }
+
+    #[test]
+    fn test_scheduler_lane_display() {
+        assert_eq!(format!("{}", SchedulerLane::Input), "input");
+        assert_eq!(format!("{}", SchedulerLane::Control), "control");
+        assert_eq!(format!("{}", SchedulerLane::Bulk), "bulk");
+    }
+
+    #[test]
+    fn test_stage_to_lane_mapping() {
+        assert_eq!(stage_to_lane(LatencyStage::PtyCapture), SchedulerLane::Input);
+        assert_eq!(stage_to_lane(LatencyStage::DeltaExtraction), SchedulerLane::Input);
+        assert_eq!(stage_to_lane(LatencyStage::ApiResponse), SchedulerLane::Input);
+        assert_eq!(stage_to_lane(LatencyStage::EventEmission), SchedulerLane::Control);
+        assert_eq!(stage_to_lane(LatencyStage::WorkflowDispatch), SchedulerLane::Control);
+        assert_eq!(stage_to_lane(LatencyStage::ActionExecution), SchedulerLane::Control);
+        assert_eq!(stage_to_lane(LatencyStage::StorageWrite), SchedulerLane::Bulk);
+        assert_eq!(stage_to_lane(LatencyStage::PatternDetection), SchedulerLane::Bulk);
+    }
+
+    #[test]
+    fn test_scheduler_config_default_valid() {
+        let cfg = LaneSchedulerConfig::default();
+        let errors = cfg.validate();
+        assert!(errors.is_empty(), "default config should be valid: {:?}", errors);
+    }
+
+    #[test]
+    fn test_scheduler_config_cpu_share_overflow() {
+        let cfg = LaneSchedulerConfig {
+            input_cpu_share: 0.5,
+            control_cpu_share: 0.4,
+            bulk_cpu_share: 0.3,
+            ..Default::default()
+        };
+        let errors = cfg.validate();
+        assert!(!errors.is_empty());
+        assert!(errors[0].contains("CPU shares"));
+    }
+
+    #[test]
+    fn test_scheduler_admit_basic() {
+        let mut sched = LaneScheduler::with_defaults();
+        let (item, decision) = sched.admit(
+            LatencyStage::PtyCapture,
+            100.0,
+            "test-1",
+            0,
+            1000,
+        );
+        assert_eq!(item.lane, SchedulerLane::Input);
+        assert_eq!(decision, AdmissionDecision::Admitted);
+        assert_eq!(sched.lane_state(SchedulerLane::Input).depth, 1);
+    }
+
+    #[test]
+    fn test_scheduler_bulk_shed_under_input_pressure() {
+        let cfg = LaneSchedulerConfig {
+            input_queue_capacity: 4,
+            input_pressure_threshold: 0.75,
+            ..Default::default()
+        };
+        let mut sched = LaneScheduler::new(cfg);
+
+        // Fill input to 3/4 capacity (75%) = at threshold.
+        for i in 0..3 {
+            sched.admit(LatencyStage::PtyCapture, 10.0, &format!("inp-{}", i), 0, 0);
+        }
+        assert!(sched.input_under_pressure());
+
+        // Bulk item should be shed.
+        let (_item, decision) = sched.admit(
+            LatencyStage::StorageWrite,
+            1000.0,
+            "bulk-shed",
+            0,
+            0,
+        );
+        assert_eq!(decision, AdmissionDecision::Shed);
+    }
+
+    #[test]
+    fn test_scheduler_input_never_shed() {
+        let cfg = LaneSchedulerConfig {
+            input_queue_capacity: 2,
+            ..Default::default()
+        };
+        let mut sched = LaneScheduler::new(cfg);
+
+        // Fill input to capacity.
+        sched.admit(LatencyStage::PtyCapture, 10.0, "a", 0, 0);
+        sched.admit(LatencyStage::PtyCapture, 10.0, "b", 0, 0);
+
+        // Next input item should be deferred, not shed.
+        let (_item, decision) = sched.admit(LatencyStage::PtyCapture, 10.0, "c", 0, 0);
+        assert_eq!(decision, AdmissionDecision::Deferred);
+    }
+
+    #[test]
+    fn test_scheduler_bulk_queue_full_shed() {
+        let cfg = LaneSchedulerConfig {
+            bulk_queue_capacity: 2,
+            input_pressure_threshold: 0.99, // Don't trigger pressure shedding.
+            ..Default::default()
+        };
+        let mut sched = LaneScheduler::new(cfg);
+
+        sched.admit(LatencyStage::StorageWrite, 100.0, "b1", 0, 0);
+        sched.admit(LatencyStage::StorageWrite, 100.0, "b2", 0, 0);
+
+        // Queue full — bulk items shed.
+        let (_item, decision) = sched.admit(LatencyStage::StorageWrite, 100.0, "b3", 0, 0);
+        assert_eq!(decision, AdmissionDecision::Shed);
+    }
+
+    #[test]
+    fn test_scheduler_deadline_promotion() {
+        let cfg = LaneSchedulerConfig {
+            enable_deadline_promotion: true,
+            deadline_promotion_fraction: 0.25,
+            input_pressure_threshold: 0.99,
+            ..Default::default()
+        };
+        let mut sched = LaneScheduler::new(cfg);
+
+        // Bulk item with tight deadline: now=900, deadline=1000, remaining=100 < 250 (25% of 1000).
+        let (_item, decision) = sched.admit(
+            LatencyStage::PatternDetection,
+            50.0,
+            "promoted-1",
+            1000,
+            900,
+        );
+        assert_eq!(
+            decision,
+            AdmissionDecision::Promoted {
+                from: SchedulerLane::Bulk,
+                to: SchedulerLane::Control,
+            }
+        );
+        // Control queue should have the item.
+        assert_eq!(sched.lane_state(SchedulerLane::Control).depth, 1);
+    }
+
+    #[test]
+    fn test_scheduler_complete_decrements() {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.admit(LatencyStage::PtyCapture, 100.0, "c1", 0, 0);
+        assert_eq!(sched.lane_state(SchedulerLane::Input).depth, 1);
+
+        sched.complete(SchedulerLane::Input, 95.0);
+        assert_eq!(sched.lane_state(SchedulerLane::Input).depth, 0);
+        assert_eq!(sched.lane_state(SchedulerLane::Input).total_completed, 1);
+        assert!((sched.lane_state(SchedulerLane::Input).cpu_used_us - 95.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_scheduler_begin_epoch_resets_cpu() {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.begin_epoch(10000.0);
+        let input = sched.lane_state(SchedulerLane::Input);
+        assert!((input.cpu_budget_us - 5000.0).abs() < 1e-6); // 50% of 10000
+        let control = sched.lane_state(SchedulerLane::Control);
+        assert!((control.cpu_budget_us - 3000.0).abs() < 1e-6); // 30%
+        let bulk = sched.lane_state(SchedulerLane::Bulk);
+        assert!((bulk.cpu_budget_us - 2000.0).abs() < 1e-6); // 20%
+    }
+
+    #[test]
+    fn test_scheduler_snapshot_serde() {
+        let mut sched = LaneScheduler::with_defaults();
+        sched.admit(LatencyStage::PtyCapture, 100.0, "snap", 0, 0);
+        let snap = sched.snapshot();
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: SchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(snap.epoch, back.epoch);
+        assert_eq!(snap.lanes.len(), back.lanes.len());
+    }
+
+    #[test]
+    fn test_scheduler_status_line() {
+        let sched = LaneScheduler::with_defaults();
+        let s = sched.status_line();
+        assert!(s.contains("scheduler"));
+        assert!(s.contains("input=0/256"));
+        assert!(s.contains("control=0/128"));
+        assert!(s.contains("bulk=0/1024"));
+    }
+
+    #[test]
+    fn test_scheduler_recent_events() {
+        let mut sched = LaneScheduler::with_defaults();
+        for i in 0..5 {
+            sched.admit(LatencyStage::PtyCapture, 10.0, &format!("ev-{}", i), 0, 0);
+        }
+        let events = sched.recent_events(3);
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn test_admission_decision_display() {
+        assert_eq!(format!("{}", AdmissionDecision::Admitted), "ADMITTED");
+        assert_eq!(format!("{}", AdmissionDecision::Deferred), "DEFERRED");
+        assert_eq!(format!("{}", AdmissionDecision::Shed), "SHED");
+        assert_eq!(
+            format!(
+                "{}",
+                AdmissionDecision::Promoted {
+                    from: SchedulerLane::Bulk,
+                    to: SchedulerLane::Control,
+                }
+            ),
+            "PROMOTED bulk→control"
+        );
+    }
+
+    #[test]
+    fn test_lane_state_utilization() {
+        let mut state = LaneState::new(SchedulerLane::Input, 100);
+        assert_eq!(state.utilization(), 0.0);
+        state.depth = 50;
+        assert!((state.utilization() - 0.5).abs() < 1e-6);
+        state.depth = 100;
+        assert!((state.utilization() - 1.0).abs() < 1e-6);
+        assert!(state.is_full());
+    }
+
+    #[test]
+    fn test_default_stages_cover_all_pipeline() {
+        let mut covered: Vec<LatencyStage> = Vec::new();
+        for &lane in SchedulerLane::ALL {
+            covered.extend_from_slice(lane.default_stages());
+        }
+        for &stage in LatencyStage::PIPELINE_STAGES {
+            assert!(
+                covered.contains(&stage),
+                "stage {} not covered by any lane",
+                stage
+            );
+        }
+    }
+
+    #[test]
+    fn test_work_item_serde() {
+        let item = WorkItem {
+            id: 42,
+            lane: SchedulerLane::Input,
+            stage: LatencyStage::PtyCapture,
+            estimated_cost_us: 500.0,
+            correlation_id: "serde-test".into(),
+            deadline_us: 0,
+        };
+        let json = serde_json::to_string(&item).expect("serialize");
+        let back: WorkItem = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(item.id, back.id);
+        assert_eq!(item.lane, back.lane);
+    }
+
+    #[test]
+    fn test_scheduling_event_serde() {
+        let event = SchedulingEvent {
+            item_id: 1,
+            lane: SchedulerLane::Bulk,
+            stage: LatencyStage::StorageWrite,
+            decision: AdmissionDecision::Shed,
+            queue_depth_before: 1024,
+            queue_depth_after: 1024,
+            correlation_id: "shed-test".into(),
+            reason_code: Some("QUEUE_OVERFLOW".into()),
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: SchedulingEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event.item_id, back.item_id);
+        assert_eq!(event.decision, back.decision);
     }
 }
