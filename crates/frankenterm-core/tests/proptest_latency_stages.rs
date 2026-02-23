@@ -2553,4 +2553,219 @@ proptest! {
         let diff = (cfg.min_lane_share - back.min_lane_share).abs();
         prop_assert!(diff < 1e-10);
     }
+
+    // ── C1: Memory Pool invariants (ft-2p9cb.3.1.3) ──
+
+    /// in_use + free_count == total_blocks after any sequence of alloc/free.
+    #[test]
+    fn pool_conservation_invariant(
+        initial in 1_usize..32,
+        max_blocks in 1_usize..64,
+        ops in prop::collection::vec(prop::bool::ANY, 0..100),
+    ) {
+        let max_b = max_blocks.max(initial);
+        let config = PoolConfig {
+            initial_blocks: initial,
+            max_blocks: max_b,
+            ..Default::default()
+        };
+        let mut pool = MemoryPool::new(config);
+        let mut held_ids: Vec<u64> = Vec::new();
+
+        for alloc in ops {
+            if alloc {
+                match pool.allocate() {
+                    AllocResult::FromFreeList { block_id } | AllocResult::Grown { block_id } => {
+                        held_ids.push(block_id);
+                    }
+                    AllocResult::PoolExhausted => {}
+                }
+            } else if let Some(id) = held_ids.pop() {
+                pool.free(id);
+            }
+        }
+
+        prop_assert_eq!(
+            pool.in_use() + pool.free_count(),
+            pool.total_blocks(),
+            "in_use {} + free {} != total {}",
+            pool.in_use(),
+            pool.free_count(),
+            pool.total_blocks()
+        );
+    }
+
+    /// total_blocks never exceeds max_blocks.
+    #[test]
+    fn pool_total_bounded(
+        initial in 1_usize..16,
+        max_blocks in 1_usize..32,
+        alloc_count in 0_usize..100,
+    ) {
+        let max_b = max_blocks.max(initial);
+        let config = PoolConfig {
+            initial_blocks: initial,
+            max_blocks: max_b,
+            ..Default::default()
+        };
+        let mut pool = MemoryPool::new(config);
+
+        for _ in 0..alloc_count {
+            pool.allocate();
+        }
+
+        prop_assert!(
+            pool.total_blocks() <= max_b,
+            "total {} > max {}",
+            pool.total_blocks(),
+            max_b
+        );
+    }
+
+    /// Utilization is always in [0.0, 1.0].
+    #[test]
+    fn pool_utilization_bounded(
+        initial in 1_usize..16,
+        alloc_count in 0_usize..32,
+    ) {
+        let config = PoolConfig {
+            initial_blocks: initial,
+            max_blocks: initial,
+            ..Default::default()
+        };
+        let mut pool = MemoryPool::new(config);
+
+        for _ in 0..alloc_count {
+            pool.allocate();
+        }
+
+        let u = pool.utilization();
+        prop_assert!(u >= 0.0 && u <= 1.0, "utilization {} out of bounds", u);
+    }
+
+    /// Alloc then free returns to same state (after shrink to match).
+    #[test]
+    fn pool_alloc_free_roundtrip(
+        initial in 2_usize..32,
+        count in 1_usize..16,
+    ) {
+        let count = count.min(initial);
+        let config = PoolConfig {
+            initial_blocks: initial,
+            max_blocks: initial,
+            ..Default::default()
+        };
+        let mut pool = MemoryPool::new(config);
+
+        let mut ids = Vec::new();
+        for _ in 0..count {
+            if let AllocResult::FromFreeList { block_id } = pool.allocate() {
+                ids.push(block_id);
+            }
+        }
+
+        for id in ids {
+            pool.free(id);
+        }
+
+        prop_assert_eq!(pool.in_use(), 0);
+        prop_assert_eq!(pool.free_count(), initial);
+    }
+
+    /// Shrink reduces total_blocks correctly.
+    #[test]
+    fn pool_shrink_bounded(
+        initial in 4_usize..32,
+        target_free in 0_usize..32,
+    ) {
+        let config = PoolConfig {
+            initial_blocks: initial,
+            max_blocks: initial * 2,
+            ..Default::default()
+        };
+        let mut pool = MemoryPool::new(config);
+        let before_free = pool.free_count();
+        let reclaimed = pool.shrink(target_free);
+
+        if target_free < before_free {
+            prop_assert_eq!(reclaimed, before_free - target_free);
+            prop_assert_eq!(pool.free_count(), target_free);
+        } else {
+            prop_assert_eq!(reclaimed, 0);
+        }
+    }
+
+    /// Reset restores initial state.
+    #[test]
+    fn pool_reset_restores_initial(
+        initial in 1_usize..32,
+        alloc_count in 0_usize..32,
+    ) {
+        let config = PoolConfig {
+            initial_blocks: initial,
+            max_blocks: initial * 2,
+            ..Default::default()
+        };
+        let mut pool = MemoryPool::new(config);
+
+        for _ in 0..alloc_count {
+            pool.allocate();
+        }
+
+        pool.reset();
+        prop_assert_eq!(pool.in_use(), 0);
+        prop_assert_eq!(pool.total_blocks(), initial);
+        prop_assert_eq!(pool.free_count(), initial);
+    }
+
+    /// MemoryDomain serde roundtrip.
+    #[test]
+    fn pool_domain_serde(idx in 0_usize..8) {
+        let d = MemoryDomain::ALL[idx];
+        let json = serde_json::to_string(&d).unwrap();
+        let back: MemoryDomain = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(d, back);
+    }
+
+    /// AllocResult serde roundtrip.
+    #[test]
+    fn pool_alloc_result_serde(
+        variant in 0_u8..3,
+        block_id in 0_u64..1000,
+    ) {
+        let result = match variant {
+            0 => AllocResult::FromFreeList { block_id },
+            1 => AllocResult::Grown { block_id },
+            _ => AllocResult::PoolExhausted,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: AllocResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(result, back);
+    }
+
+    /// PoolDegradation serde roundtrip.
+    #[test]
+    fn pool_degradation_serde(
+        variant in 0_u8..4,
+        count in 1_usize..100,
+    ) {
+        let degradation = match variant {
+            0 => PoolDegradation::Healthy,
+            1 => PoolDegradation::HighUtilization { utilization: 0.9, threshold: 0.85 },
+            2 => PoolDegradation::Exhausted { total_exhausted: count as u64 },
+            _ => PoolDegradation::Fragmented { total_blocks: count * 2, free_count: count },
+        };
+        let json = serde_json::to_string(&degradation).unwrap();
+        let back: PoolDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(degradation, back);
+    }
+
+    /// stage_to_domain covers all pipeline stages.
+    #[test]
+    fn pool_stage_to_domain_total(stage_idx in 0_usize..8) {
+        let stages = LatencyStage::PIPELINE_STAGES;
+        let domain = stage_to_domain(stages[stage_idx]);
+        let is_valid = MemoryDomain::ALL.contains(&domain);
+        prop_assert!(is_valid);
+    }
 }
