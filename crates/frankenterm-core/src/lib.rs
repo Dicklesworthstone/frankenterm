@@ -196,6 +196,7 @@ pub mod recorder_retention;
 pub mod recorder_storage;
 pub mod recording;
 pub mod replay;
+pub mod replay_capture;
 pub mod reports;
 pub mod reservoir_sampler;
 pub mod resize_crash_forensics;

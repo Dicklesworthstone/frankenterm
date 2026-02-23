@@ -476,7 +476,7 @@ pub enum RecorderLifecyclePhase {
 }
 
 /// Causal linkage between recorder events.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecorderEventCausality {
     pub parent_event_id: Option<String>,
     pub trigger_event_id: Option<String>,
