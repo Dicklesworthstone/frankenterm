@@ -11,7 +11,9 @@ use std::collections::HashMap;
 
 use tracing::{debug, warn};
 
-use crate::beads_types::{BeadStatusCounts, BeadSummary};
+use crate::beads_types::{
+    resolve_bead_readiness, BeadIssueDetail, BeadReadinessReport, BeadStatusCounts, BeadSummary,
+};
 use crate::subprocess_bridge::SubprocessBridge;
 
 /// High-level beads bridge wrapping the `br` CLI.
@@ -112,6 +114,80 @@ impl BeadsBridge {
         }
     }
 
+    /// List all beads including closed items.
+    ///
+    /// Returns an empty vec on any failure (fail-open).
+    pub fn list_all_with_closed(&self) -> Vec<BeadSummary> {
+        match self.bridge.invoke(&["list", "--all", "--limit", "0", "--json"]) {
+            Ok(beads) => {
+                debug!(
+                    bridge = "br",
+                    count = beads.len(),
+                    "listed beads including closed items"
+                );
+                beads
+            }
+            Err(err) => {
+                warn!(
+                    bridge = "br",
+                    error = %err,
+                    "beads list --all failed, degrading gracefully"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Load detailed issue records (`br show`) for every known bead.
+    ///
+    /// Uses degraded fallback records when detail resolution fails.
+    pub fn list_all_details(&self) -> Vec<BeadIssueDetail> {
+        let summaries = self.list_all_with_closed();
+        if summaries.is_empty() {
+            return Vec::new();
+        }
+
+        let detail_bridge: SubprocessBridge<Vec<BeadIssueDetail>> =
+            SubprocessBridge::new(self.bridge.binary_name());
+        let mut details = Vec::with_capacity(summaries.len());
+
+        for summary in summaries {
+            let issue_id = summary.id.clone();
+            match detail_bridge.invoke(&["show", &issue_id, "--json"]) {
+                Ok(mut rows) => {
+                    if let Some(mut detail) = rows.pop() {
+                        detail.ingest_warning = None;
+                        details.push(detail);
+                    } else {
+                        warn!(
+                            bridge = "br",
+                            issue_id,
+                            "empty show result, using partial graph fallback"
+                        );
+                        details.push(BeadIssueDetail::from_summary(summary));
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        bridge = "br",
+                        issue_id,
+                        error = %err,
+                        "detail fetch failed, using partial graph fallback"
+                    );
+                    details.push(BeadIssueDetail::from_summary(summary));
+                }
+            }
+        }
+
+        details
+    }
+
+    /// Resolve actionable/ready candidates from the full Beads DAG.
+    pub fn readiness_report(&self) -> BeadReadinessReport {
+        let details = self.list_all_details();
+        resolve_bead_readiness(&details)
+    }
+
     /// Count beads by status.
     pub fn count_by_status(&self) -> BeadStatusCounts {
         let beads = self.list_all();
@@ -156,7 +232,9 @@ impl Default for BeadsBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::beads_types::{BeadIssueType, BeadStatus};
+    use crate::beads_types::{
+        BeadDependencyRef, BeadIssueDetail, BeadIssueType, BeadResolverReasonCode, BeadStatus,
+    };
 
     fn sample_bead(id: &str, status: BeadStatus, priority: u8) -> BeadSummary {
         BeadSummary {
@@ -169,6 +247,23 @@ mod tests {
             labels: vec![],
             dependency_count: 0,
             dependent_count: 0,
+            extra: HashMap::new(),
+        }
+    }
+
+    fn sample_detail(id: &str, status: BeadStatus, priority: u8) -> BeadIssueDetail {
+        BeadIssueDetail {
+            id: id.to_string(),
+            title: format!("Detail {}", id),
+            status,
+            priority,
+            issue_type: BeadIssueType::Task,
+            assignee: None,
+            labels: Vec::new(),
+            dependencies: Vec::new(),
+            dependents: Vec::new(),
+            parent: None,
+            ingest_warning: None,
             extra: HashMap::new(),
         }
     }
@@ -462,6 +557,51 @@ mod tests {
             bridge: SubprocessBridge::new("definitely-missing-br-binary-xyz"),
         };
         assert!(!bridge.is_available());
+    }
+
+    // -------------------------------------------------------------------------
+    // Readiness resolver plumbing
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_readiness_report_from_details_produces_ready_ids() {
+        let mut dep = sample_detail("dep", BeadStatus::Closed, 2);
+        dep.dependents.push(BeadDependencyRef {
+            id: "task".to_string(),
+            title: None,
+            status: Some("open".to_string()),
+            priority: Some(1),
+            dependency_type: Some("blocks".to_string()),
+        });
+
+        let mut task = sample_detail("task", BeadStatus::Open, 1);
+        task.dependencies.push(BeadDependencyRef {
+            id: "dep".to_string(),
+            title: None,
+            status: Some("closed".to_string()),
+            priority: Some(2),
+            dependency_type: Some("blocks".to_string()),
+        });
+
+        let report = resolve_bead_readiness(&[dep, task]);
+        assert_eq!(report.ready_ids, vec!["task".to_string()]);
+        let task_entry = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == "task")
+            .unwrap();
+        assert_eq!(task_entry.blocker_count, 0);
+        assert!(task_entry.ready);
+    }
+
+    #[test]
+    fn test_readiness_report_marks_partial_graph_reason() {
+        let summary = sample_bead("fallback", BeadStatus::Open, 1);
+        let detail = BeadIssueDetail::from_summary(summary);
+        let report = resolve_bead_readiness(&[detail]);
+        assert!(report
+            .degraded_reason_codes
+            .contains(&BeadResolverReasonCode::PartialGraphData));
     }
 
     // -------------------------------------------------------------------------

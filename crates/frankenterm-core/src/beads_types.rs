@@ -3,7 +3,7 @@
 //! These mirror the JSON output of `br list --json` and `br show --json`
 //! without depending on the `beads_rust` crate directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +99,295 @@ impl BeadSummary {
     }
 }
 
+/// Degraded-mode reason codes for DAG readiness resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeadResolverReasonCode {
+    MissingDependencyNode,
+    CyclicDependencyGraph,
+    PartialGraphData,
+}
+
+/// Dependency or dependent edge reference from `br show --json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeadDependencyRef {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub priority: Option<u8>,
+    #[serde(default)]
+    pub dependency_type: Option<String>,
+}
+
+impl BeadDependencyRef {
+    /// Whether this edge should block readiness.
+    ///
+    /// `parent-child` is treated as a taxonomy edge and does not block.
+    #[must_use]
+    pub fn blocks_readiness(&self) -> bool {
+        !matches!(self.dependency_type.as_deref(), Some("parent-child"))
+    }
+}
+
+/// Detailed issue snapshot from `br show --json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeadIssueDetail {
+    pub id: String,
+    pub title: String,
+    pub status: BeadStatus,
+    pub priority: u8,
+    pub issue_type: BeadIssueType,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub dependencies: Vec<BeadDependencyRef>,
+    #[serde(default)]
+    pub dependents: Vec<BeadDependencyRef>,
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// Optional ingest warning set by local fallback ingestion paths.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ingest_warning: Option<BeadResolverReasonCode>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl BeadIssueDetail {
+    /// Build a degraded detail from a summary when `br show` is unavailable.
+    #[must_use]
+    pub fn from_summary(summary: BeadSummary) -> Self {
+        Self {
+            id: summary.id,
+            title: summary.title,
+            status: summary.status,
+            priority: summary.priority,
+            issue_type: summary.issue_type,
+            assignee: summary.assignee,
+            labels: summary.labels,
+            dependencies: Vec::new(),
+            dependents: Vec::new(),
+            parent: None,
+            ingest_warning: Some(BeadResolverReasonCode::PartialGraphData),
+            extra: summary.extra,
+        }
+    }
+
+    /// Whether this issue is in a state that can be considered for readiness.
+    #[must_use]
+    pub fn is_actionable(&self) -> bool {
+        matches!(self.status, BeadStatus::Open | BeadStatus::InProgress)
+    }
+}
+
+/// Readiness candidate with graph-derived hints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeadReadyCandidate {
+    pub id: String,
+    pub title: String,
+    pub status: BeadStatus,
+    pub priority: u8,
+    pub blocker_count: usize,
+    pub blocker_ids: Vec<String>,
+    pub transitive_unblock_count: usize,
+    pub critical_path_depth_hint: usize,
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_reasons: Vec<BeadResolverReasonCode>,
+}
+
+/// Full resolver output for actionable issues.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeadReadinessReport {
+    pub candidates: Vec<BeadReadyCandidate>,
+    pub ready_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_reason_codes: Vec<BeadResolverReasonCode>,
+}
+
+impl BeadReadinessReport {
+    /// Number of actionable items that are currently ready/unblocked.
+    #[must_use]
+    pub fn ready_count(&self) -> usize {
+        self.ready_ids.len()
+    }
+}
+
+/// Resolve actionable/ready issue candidates from detailed Beads DAG data.
+#[must_use]
+pub fn resolve_bead_readiness(issues: &[BeadIssueDetail]) -> BeadReadinessReport {
+    let mut issue_by_id: HashMap<String, &BeadIssueDetail> = HashMap::new();
+    for issue in issues {
+        issue_by_id.insert(issue.id.clone(), issue);
+    }
+
+    // Build reverse graph: dependency -> dependents (blocking edges only).
+    let mut downstream: HashMap<String, Vec<String>> = HashMap::new();
+    for issue in issues {
+        downstream.entry(issue.id.clone()).or_default();
+    }
+    for issue in issues {
+        for dep in &issue.dependencies {
+            if dep.blocks_readiness() && issue_by_id.contains_key(&dep.id) {
+                downstream
+                    .entry(dep.id.clone())
+                    .or_default()
+                    .push(issue.id.clone());
+            }
+        }
+    }
+    for children in downstream.values_mut() {
+        children.sort();
+        children.dedup();
+    }
+
+    let mut depth_memo: HashMap<String, usize> = HashMap::new();
+    let mut cycle_seen = false;
+    for issue in issues {
+        let mut visiting = HashSet::new();
+        let _ = compute_depth(
+            &issue.id,
+            &downstream,
+            &mut depth_memo,
+            &mut visiting,
+            &mut cycle_seen,
+        );
+    }
+
+    let mut candidates = Vec::new();
+    let mut ready_ids = Vec::new();
+    let mut global_degraded: HashSet<BeadResolverReasonCode> = HashSet::new();
+
+    for issue in issues {
+        if !issue.is_actionable() {
+            continue;
+        }
+
+        let mut blockers = Vec::new();
+        let mut degraded: HashSet<BeadResolverReasonCode> = HashSet::new();
+
+        if let Some(reason) = issue.ingest_warning {
+            degraded.insert(reason);
+        }
+
+        for dep in &issue.dependencies {
+            if !dep.blocks_readiness() {
+                continue;
+            }
+            match issue_by_id.get(&dep.id) {
+                Some(dep_issue) if dep_issue.status == BeadStatus::Closed => {}
+                Some(_) => blockers.push(dep.id.clone()),
+                None => {
+                    blockers.push(dep.id.clone());
+                    degraded.insert(BeadResolverReasonCode::MissingDependencyNode);
+                }
+            }
+        }
+
+        blockers.sort();
+        blockers.dedup();
+
+        if cycle_seen {
+            degraded.insert(BeadResolverReasonCode::CyclicDependencyGraph);
+        }
+
+        let ready = blockers.is_empty();
+        if ready {
+            ready_ids.push(issue.id.clone());
+        }
+
+        let transitive_unblock_count = count_transitive_descendants(&issue.id, &downstream);
+        let critical_path_depth_hint = *depth_memo.get(&issue.id).unwrap_or(&0);
+
+        let mut degraded_reasons: Vec<BeadResolverReasonCode> = degraded.into_iter().collect();
+        degraded_reasons.sort();
+
+        for reason in &degraded_reasons {
+            global_degraded.insert(*reason);
+        }
+
+        candidates.push(BeadReadyCandidate {
+            id: issue.id.clone(),
+            title: issue.title.clone(),
+            status: issue.status,
+            priority: issue.priority,
+            blocker_count: blockers.len(),
+            blocker_ids: blockers,
+            transitive_unblock_count,
+            critical_path_depth_hint,
+            ready,
+            degraded_reasons,
+        });
+    }
+
+    candidates.sort_by_key(|c| (c.priority, c.id.clone()));
+    ready_ids.sort();
+
+    let mut degraded_reason_codes: Vec<BeadResolverReasonCode> = global_degraded.into_iter().collect();
+    degraded_reason_codes.sort();
+
+    BeadReadinessReport {
+        candidates,
+        ready_ids,
+        degraded_reason_codes,
+    }
+}
+
+fn compute_depth(
+    issue_id: &str,
+    downstream: &HashMap<String, Vec<String>>,
+    memo: &mut HashMap<String, usize>,
+    visiting: &mut HashSet<String>,
+    cycle_seen: &mut bool,
+) -> usize {
+    if let Some(depth) = memo.get(issue_id) {
+        return *depth;
+    }
+
+    let key = issue_id.to_string();
+    if !visiting.insert(key.clone()) {
+        *cycle_seen = true;
+        return 0;
+    }
+
+    let children = downstream.get(issue_id).cloned().unwrap_or_default();
+    let depth = if children.is_empty() {
+        0
+    } else {
+        let mut max_child = 0usize;
+        for child in children {
+            max_child = max_child.max(compute_depth(&child, downstream, memo, visiting, cycle_seen));
+        }
+        1 + max_child
+    };
+
+    visiting.remove(&key);
+    memo.insert(key, depth);
+    depth
+}
+
+fn count_transitive_descendants(issue_id: &str, downstream: &HashMap<String, Vec<String>>) -> usize {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = downstream.get(issue_id).cloned().unwrap_or_default();
+
+    while let Some(node) = stack.pop() {
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        if let Some(children) = downstream.get(&node) {
+            for child in children {
+                stack.push(child.clone());
+            }
+        }
+    }
+
+    seen.len()
+}
+
 /// Counts of beads by status (returned by `bead_count_by_status`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BeadStatusCounts {
@@ -153,6 +442,37 @@ mod tests {
             labels: vec![],
             dependency_count: 0,
             dependent_count: 0,
+            extra: HashMap::new(),
+        }
+    }
+
+    fn sample_detail(
+        id: &str,
+        status: BeadStatus,
+        priority: u8,
+        dependency_ids: &[(&str, &str)],
+    ) -> BeadIssueDetail {
+        BeadIssueDetail {
+            id: id.to_string(),
+            title: format!("Bead {}", id),
+            status,
+            priority,
+            issue_type: BeadIssueType::Task,
+            assignee: None,
+            labels: Vec::new(),
+            dependencies: dependency_ids
+                .iter()
+                .map(|(dep_id, dep_type)| BeadDependencyRef {
+                    id: (*dep_id).to_string(),
+                    title: None,
+                    status: None,
+                    priority: None,
+                    dependency_type: Some((*dep_type).to_string()),
+                })
+                .collect(),
+            dependents: Vec::new(),
+            parent: None,
+            ingest_warning: None,
             extra: HashMap::new(),
         }
     }
@@ -437,5 +757,95 @@ mod tests {
         let json = serde_json::to_string(&counts).unwrap();
         let back: BeadStatusCounts = serde_json::from_str(&json).unwrap();
         assert_eq!(back.total(), 21);
+    }
+
+    // -------------------------------------------------------------------------
+    // Readiness resolver
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn beads_readiness_resolver_marks_ready_when_blockers_closed() {
+        let issues = vec![
+            sample_detail("dep", BeadStatus::Closed, 1, &[]),
+            sample_detail("a", BeadStatus::Open, 0, &[("dep", "blocks")]),
+        ];
+
+        let report = resolve_bead_readiness(&issues);
+        assert_eq!(report.ready_count(), 1);
+        assert_eq!(report.ready_ids, vec!["a"]);
+
+        let a = report.candidates.iter().find(|c| c.id == "a").unwrap();
+        assert!(a.ready);
+        assert_eq!(a.blocker_count, 0);
+    }
+
+    #[test]
+    fn beads_readiness_resolver_honors_parent_child_non_blocking_edges() {
+        let issues = vec![
+            sample_detail("parent", BeadStatus::Open, 2, &[]),
+            sample_detail("child", BeadStatus::Open, 1, &[("parent", "parent-child")]),
+        ];
+
+        let report = resolve_bead_readiness(&issues);
+        let child = report.candidates.iter().find(|c| c.id == "child").unwrap();
+        assert!(child.ready, "parent-child edge must not block readiness");
+        assert_eq!(child.blocker_count, 0);
+    }
+
+    #[test]
+    fn beads_readiness_resolver_counts_blockers_and_transitive_unblocks() {
+        // Graph:
+        //   root (open) -> mid (open) -> leaf (open)
+        //   blocker (open) -> root (open)
+        let issues = vec![
+            sample_detail("blocker", BeadStatus::Open, 0, &[]),
+            sample_detail("root", BeadStatus::Open, 1, &[("blocker", "blocks")]),
+            sample_detail("mid", BeadStatus::Open, 2, &[("root", "blocks")]),
+            sample_detail("leaf", BeadStatus::Open, 3, &[("mid", "blocks")]),
+        ];
+
+        let report = resolve_bead_readiness(&issues);
+        let root = report.candidates.iter().find(|c| c.id == "root").unwrap();
+        assert_eq!(root.blocker_count, 1);
+        assert_eq!(root.blocker_ids, vec!["blocker".to_string()]);
+        assert_eq!(root.transitive_unblock_count, 2); // mid + leaf
+        assert_eq!(root.critical_path_depth_hint, 2);
+    }
+
+    #[test]
+    fn beads_readiness_resolver_marks_missing_dependency_as_degraded() {
+        let issues = vec![sample_detail(
+            "a",
+            BeadStatus::Open,
+            0,
+            &[("missing-node", "blocks")],
+        )];
+
+        let report = resolve_bead_readiness(&issues);
+        let a = report.candidates.iter().find(|c| c.id == "a").unwrap();
+        assert!(!a.ready);
+        assert_eq!(a.blocker_count, 1);
+        assert!(a
+            .degraded_reasons
+            .contains(&BeadResolverReasonCode::MissingDependencyNode));
+        assert!(report
+            .degraded_reason_codes
+            .contains(&BeadResolverReasonCode::MissingDependencyNode));
+    }
+
+    #[test]
+    fn beads_readiness_resolver_propagates_partial_graph_warning() {
+        let mut summary = sample_bead("fallback", BeadStatus::Open, 1);
+        summary.dependency_count = 2;
+        let detail = BeadIssueDetail::from_summary(summary);
+        let report = resolve_bead_readiness(&[detail]);
+        let fallback = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == "fallback")
+            .unwrap();
+        assert!(fallback
+            .degraded_reasons
+            .contains(&BeadResolverReasonCode::PartialGraphData));
     }
 }
