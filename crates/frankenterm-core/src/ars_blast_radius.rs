@@ -340,7 +340,8 @@ impl BlastRadiusController {
             state.record_success(&self.config);
             // If tier promoted, upgrade the reflex bucket rate.
             if state.tier != old_tier {
-                let (rate, burst) = self.tier_rate(state.tier);
+                let new_tier = state.tier;
+                let (rate, burst) = self.tier_rate(new_tier);
                 self.reflex_buckets
                     .insert(reflex_id, TokenBucket::new(burst, rate / 60.0));
             }
@@ -354,7 +355,8 @@ impl BlastRadiusController {
             state.record_failure(&self.config);
             // If tier demoted, downgrade the reflex bucket rate.
             if state.tier != old_tier {
-                let (rate, burst) = self.tier_rate(state.tier);
+                let new_tier = state.tier;
+                let (rate, burst) = self.tier_rate(new_tier);
                 self.reflex_buckets
                     .insert(reflex_id, TokenBucket::new(burst, rate / 60.0));
             }
