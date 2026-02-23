@@ -7893,6 +7893,300 @@ impl TailLatencyController {
     }
 }
 
+// ── D1: Bayesian Hitch-Risk Posterior Model ────────────────────────
+
+/// Evidence signal types for the hitch-risk posterior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EvidenceSignal {
+    /// p99 latency probe from a specific stage.
+    LatencyProbe,
+    /// Backpressure level change.
+    BackpressureChange,
+    /// Queue depth observation.
+    QueueDepth,
+    /// Budget violation event.
+    BudgetViolation,
+    /// GC or memory pressure event.
+    MemoryPressure,
+    /// CPU load observation.
+    CpuLoad,
+}
+
+impl std::fmt::Display for EvidenceSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EvidenceSignal::LatencyProbe => write!(f, "LATENCY_PROBE"),
+            EvidenceSignal::BackpressureChange => write!(f, "BACKPRESSURE"),
+            EvidenceSignal::QueueDepth => write!(f, "QUEUE_DEPTH"),
+            EvidenceSignal::BudgetViolation => write!(f, "BUDGET_VIOLATION"),
+            EvidenceSignal::MemoryPressure => write!(f, "MEMORY_PRESSURE"),
+            EvidenceSignal::CpuLoad => write!(f, "CPU_LOAD"),
+        }
+    }
+}
+
+/// A single evidence entry in the ledger.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceEntry {
+    pub signal: EvidenceSignal,
+    pub value: f64,
+    pub log_likelihood_ratio: f64,
+    pub timestamp_us: u64,
+}
+
+/// Hitch-risk level classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HitchRiskLevel {
+    /// Low risk — system is healthy.
+    Low,
+    /// Elevated risk — some signals above baseline.
+    Elevated,
+    /// High risk — multiple signals indicate impending hitch.
+    High,
+    /// Critical — hitch is imminent or occurring.
+    Critical,
+}
+
+impl std::fmt::Display for HitchRiskLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HitchRiskLevel::Low => write!(f, "LOW"),
+            HitchRiskLevel::Elevated => write!(f, "ELEVATED"),
+            HitchRiskLevel::High => write!(f, "HIGH"),
+            HitchRiskLevel::Critical => write!(f, "CRITICAL"),
+        }
+    }
+}
+
+/// Configuration for the hitch-risk model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HitchRiskConfig {
+    /// Prior probability of hitch (0.0–1.0).
+    pub prior_hitch_prob: f64,
+    /// Threshold for Elevated risk (log-odds).
+    pub elevated_threshold: f64,
+    /// Threshold for High risk (log-odds).
+    pub high_threshold: f64,
+    /// Threshold for Critical risk (log-odds).
+    pub critical_threshold: f64,
+    /// Maximum evidence entries to retain.
+    pub max_evidence: usize,
+    /// Decay factor for old evidence (0.0–1.0, 1.0 = no decay).
+    pub evidence_decay: f64,
+}
+
+impl Default for HitchRiskConfig {
+    fn default() -> Self {
+        Self {
+            prior_hitch_prob: 0.05,
+            elevated_threshold: 1.0,
+            high_threshold: 3.0,
+            critical_threshold: 5.0,
+            max_evidence: 512,
+            evidence_decay: 0.95,
+        }
+    }
+}
+
+/// Snapshot of the hitch-risk model state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HitchRiskSnapshot {
+    pub log_odds: f64,
+    pub posterior_prob: f64,
+    pub risk_level: HitchRiskLevel,
+    pub evidence_count: usize,
+    pub total_updates: u64,
+}
+
+/// Bayesian hitch-risk posterior model.
+///
+/// # Invariants
+/// - `posterior_prob` is always in [0, 1].
+/// - `log_odds` is the log-odds form of posterior (allows stable additive updates).
+/// - Evidence is decayed by `evidence_decay` each update to reduce stale signal weight.
+/// - Risk level is monotonically mapped from log_odds via thresholds.
+pub struct HitchRiskModel {
+    config: HitchRiskConfig,
+    log_odds: f64,
+    evidence: Vec<EvidenceEntry>,
+    total_updates: u64,
+}
+
+impl HitchRiskModel {
+    /// Create with explicit config.
+    pub fn new(config: HitchRiskConfig) -> Self {
+        let prior = config.prior_hitch_prob.clamp(1e-10, 1.0 - 1e-10);
+        let log_odds = (prior / (1.0 - prior)).ln();
+        Self {
+            config,
+            log_odds,
+            evidence: Vec::new(),
+            total_updates: 0,
+        }
+    }
+
+    /// Create with defaults.
+    pub fn with_defaults() -> Self {
+        Self::new(HitchRiskConfig::default())
+    }
+
+    /// Submit evidence and update the posterior.
+    /// `log_likelihood_ratio` > 0 means evidence favors hitch, < 0 favors healthy.
+    pub fn update(&mut self, signal: EvidenceSignal, value: f64, llr: f64, timestamp_us: u64) {
+        // Decay existing log-odds
+        self.log_odds *= self.config.evidence_decay;
+        // Add new evidence
+        self.log_odds += llr;
+        self.total_updates += 1;
+
+        let entry = EvidenceEntry {
+            signal,
+            value,
+            log_likelihood_ratio: llr,
+            timestamp_us,
+        };
+        if self.evidence.len() < self.config.max_evidence {
+            self.evidence.push(entry);
+        } else {
+            // Circular overwrite
+            let idx = (self.total_updates as usize - 1) % self.config.max_evidence;
+            self.evidence[idx] = entry;
+        }
+    }
+
+    /// Current posterior probability of hitch.
+    pub fn posterior_prob(&self) -> f64 {
+        let odds = self.log_odds.exp();
+        if odds.is_infinite() {
+            return 1.0;
+        }
+        odds / (1.0 + odds)
+    }
+
+    /// Current risk level.
+    pub fn risk_level(&self) -> HitchRiskLevel {
+        if self.log_odds >= self.config.critical_threshold {
+            HitchRiskLevel::Critical
+        } else if self.log_odds >= self.config.high_threshold {
+            HitchRiskLevel::High
+        } else if self.log_odds >= self.config.elevated_threshold {
+            HitchRiskLevel::Elevated
+        } else {
+            HitchRiskLevel::Low
+        }
+    }
+
+    /// Current log-odds.
+    pub fn log_odds(&self) -> f64 {
+        self.log_odds
+    }
+
+    /// Snapshot.
+    pub fn snapshot(&self) -> HitchRiskSnapshot {
+        HitchRiskSnapshot {
+            log_odds: self.log_odds,
+            posterior_prob: self.posterior_prob(),
+            risk_level: self.risk_level(),
+            evidence_count: self.evidence.len(),
+            total_updates: self.total_updates,
+        }
+    }
+
+    /// Status line.
+    pub fn status_line(&self) -> String {
+        format!(
+            "hitch-risk level={} prob={:.3} log_odds={:.2} evidence={} updates={}",
+            self.risk_level(),
+            self.posterior_prob(),
+            self.log_odds,
+            self.evidence.len(),
+            self.total_updates,
+        )
+    }
+
+    /// Reset to prior.
+    pub fn reset(&mut self) {
+        let prior = self.config.prior_hitch_prob.clamp(1e-10, 1.0 - 1e-10);
+        self.log_odds = (prior / (1.0 - prior)).ln();
+        self.evidence.clear();
+        self.total_updates = 0;
+    }
+
+    /// Recent evidence entries.
+    pub fn recent_evidence(&self) -> &[EvidenceEntry] {
+        &self.evidence
+    }
+}
+
+/// Degradation states for the hitch-risk model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum HitchRiskDegradation {
+    Healthy,
+    ElevatedRisk { posterior_prob: f64 },
+    HighRisk { posterior_prob: f64, evidence_count: usize },
+    CriticalRisk { posterior_prob: f64, log_odds: f64 },
+}
+
+impl std::fmt::Display for HitchRiskDegradation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HitchRiskDegradation::Healthy => write!(f, "HEALTHY"),
+            HitchRiskDegradation::ElevatedRisk { posterior_prob } => {
+                write!(f, "ELEVATED({:.1}%)", posterior_prob * 100.0)
+            }
+            HitchRiskDegradation::HighRisk { posterior_prob, evidence_count } => {
+                write!(f, "HIGH({:.1}%, {} evidence)", posterior_prob * 100.0, evidence_count)
+            }
+            HitchRiskDegradation::CriticalRisk { posterior_prob, log_odds } => {
+                write!(f, "CRITICAL({:.1}%, lo={:.2})", posterior_prob * 100.0, log_odds)
+            }
+        }
+    }
+}
+
+/// Log entry for hitch-risk model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HitchRiskLogEntry {
+    pub log_odds: f64,
+    pub posterior_prob: f64,
+    pub risk_level: HitchRiskLevel,
+    pub evidence_count: usize,
+    pub total_updates: u64,
+    pub degradation: HitchRiskDegradation,
+}
+
+impl HitchRiskModel {
+    /// Detect degradation.
+    pub fn detect_degradation(&self) -> HitchRiskDegradation {
+        match self.risk_level() {
+            HitchRiskLevel::Critical => HitchRiskDegradation::CriticalRisk {
+                posterior_prob: self.posterior_prob(),
+                log_odds: self.log_odds,
+            },
+            HitchRiskLevel::High => HitchRiskDegradation::HighRisk {
+                posterior_prob: self.posterior_prob(),
+                evidence_count: self.evidence.len(),
+            },
+            HitchRiskLevel::Elevated => HitchRiskDegradation::ElevatedRisk {
+                posterior_prob: self.posterior_prob(),
+            },
+            HitchRiskLevel::Low => HitchRiskDegradation::Healthy,
+        }
+    }
+
+    /// Log entry.
+    pub fn log_entry(&self) -> HitchRiskLogEntry {
+        HitchRiskLogEntry {
+            log_odds: self.log_odds,
+            posterior_prob: self.posterior_prob(),
+            risk_level: self.risk_level(),
+            evidence_count: self.evidence.len(),
+            total_updates: self.total_updates,
+            degradation: self.detect_degradation(),
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -13521,5 +13815,204 @@ mod tests {
         ctrl.record_wakeup(WakeupSource::Timer, 20000); // violation (default budget=10000)
         assert_eq!(ctrl.total_wakeups(), 2);
         assert_eq!(ctrl.budget_violations(), 1);
+    }
+
+    // ── D1: Hitch-Risk Model Tests ─────────────────────────────────
+
+    #[test]
+    fn test_evidence_signal_display() {
+        assert_eq!(format!("{}", EvidenceSignal::LatencyProbe), "LATENCY_PROBE");
+        assert_eq!(format!("{}", EvidenceSignal::CpuLoad), "CPU_LOAD");
+    }
+
+    #[test]
+    fn test_hitch_risk_level_display() {
+        assert_eq!(format!("{}", HitchRiskLevel::Low), "LOW");
+        assert_eq!(format!("{}", HitchRiskLevel::Critical), "CRITICAL");
+    }
+
+    #[test]
+    fn test_hitch_risk_config_default() {
+        let config = HitchRiskConfig::default();
+        assert!(config.prior_hitch_prob > 0.0 && config.prior_hitch_prob < 1.0);
+        assert!(config.elevated_threshold < config.high_threshold);
+        assert!(config.high_threshold < config.critical_threshold);
+    }
+
+    #[test]
+    fn test_hitch_risk_model_initial_state() {
+        let model = HitchRiskModel::with_defaults();
+        assert_eq!(model.risk_level(), HitchRiskLevel::Low);
+        assert!(model.posterior_prob() < 0.5);
+        assert_eq!(model.snapshot().total_updates, 0);
+    }
+
+    #[test]
+    fn test_hitch_risk_posterior_bounded() {
+        let model = HitchRiskModel::with_defaults();
+        let prob = model.posterior_prob();
+        assert!(prob >= 0.0 && prob <= 1.0, "prob={}", prob);
+    }
+
+    #[test]
+    fn test_hitch_risk_positive_evidence() {
+        let mut model = HitchRiskModel::with_defaults();
+        // Strong positive evidence → risk increases
+        for i in 0..20 {
+            model.update(EvidenceSignal::LatencyProbe, 10000.0, 2.0, i * 100);
+        }
+        assert!(model.posterior_prob() > 0.5);
+        let level_is_elevated = matches!(
+            model.risk_level(),
+            HitchRiskLevel::Elevated | HitchRiskLevel::High | HitchRiskLevel::Critical
+        );
+        assert!(level_is_elevated, "level={:?}", model.risk_level());
+    }
+
+    #[test]
+    fn test_hitch_risk_negative_evidence() {
+        let mut model = HitchRiskModel::with_defaults();
+        // Strong negative evidence → risk decreases
+        for i in 0..20 {
+            model.update(EvidenceSignal::LatencyProbe, 10.0, -2.0, i * 100);
+        }
+        assert!(model.posterior_prob() < 0.1);
+        assert_eq!(model.risk_level(), HitchRiskLevel::Low);
+    }
+
+    #[test]
+    fn test_hitch_risk_reset() {
+        let mut model = HitchRiskModel::with_defaults();
+        for i in 0..10 {
+            model.update(EvidenceSignal::BudgetViolation, 1.0, 3.0, i * 100);
+        }
+        model.reset();
+        assert_eq!(model.risk_level(), HitchRiskLevel::Low);
+        assert_eq!(model.snapshot().total_updates, 0);
+        assert_eq!(model.recent_evidence().len(), 0);
+    }
+
+    #[test]
+    fn test_hitch_risk_evidence_capped() {
+        let config = HitchRiskConfig {
+            max_evidence: 10,
+            ..Default::default()
+        };
+        let mut model = HitchRiskModel::new(config);
+        for i in 0..50 {
+            model.update(EvidenceSignal::QueueDepth, 100.0, 0.1, i * 100);
+        }
+        assert_eq!(model.recent_evidence().len(), 10);
+    }
+
+    #[test]
+    fn test_hitch_risk_snapshot_serde() {
+        let snap = HitchRiskSnapshot {
+            log_odds: 2.5,
+            posterior_prob: 0.924,
+            risk_level: HitchRiskLevel::High,
+            evidence_count: 15,
+            total_updates: 42,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: HitchRiskSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap.risk_level, back.risk_level);
+        assert_eq!(snap.evidence_count, back.evidence_count);
+    }
+
+    #[test]
+    fn test_hitch_risk_degradation_healthy() {
+        let model = HitchRiskModel::with_defaults();
+        assert_eq!(model.detect_degradation(), HitchRiskDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_hitch_risk_degradation_elevated() {
+        let mut model = HitchRiskModel::with_defaults();
+        // Push log_odds above elevated threshold (1.0)
+        for i in 0..10 {
+            model.update(EvidenceSignal::LatencyProbe, 5000.0, 1.5, i * 100);
+        }
+        let is_elevated_or_higher = matches!(
+            model.detect_degradation(),
+            HitchRiskDegradation::ElevatedRisk { .. }
+            | HitchRiskDegradation::HighRisk { .. }
+            | HitchRiskDegradation::CriticalRisk { .. }
+        );
+        assert!(is_elevated_or_higher, "Got {:?}", model.detect_degradation());
+    }
+
+    #[test]
+    fn test_hitch_risk_degradation_display() {
+        assert_eq!(format!("{}", HitchRiskDegradation::Healthy), "HEALTHY");
+        let elev = HitchRiskDegradation::ElevatedRisk { posterior_prob: 0.75 };
+        assert!(format!("{}", elev).contains("75.0%"));
+    }
+
+    #[test]
+    fn test_hitch_risk_log_entry() {
+        let model = HitchRiskModel::with_defaults();
+        let entry = model.log_entry();
+        assert_eq!(entry.risk_level, HitchRiskLevel::Low);
+        assert_eq!(entry.total_updates, 0);
+    }
+
+    #[test]
+    fn test_hitch_risk_log_entry_serde() {
+        let entry = HitchRiskLogEntry {
+            log_odds: 1.5,
+            posterior_prob: 0.818,
+            risk_level: HitchRiskLevel::Elevated,
+            evidence_count: 5,
+            total_updates: 10,
+            degradation: HitchRiskDegradation::ElevatedRisk { posterior_prob: 0.818 },
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: HitchRiskLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry.risk_level, back.risk_level);
+    }
+
+    #[test]
+    fn test_hitch_risk_degradation_serde() {
+        let variants = vec![
+            HitchRiskDegradation::Healthy,
+            HitchRiskDegradation::ElevatedRisk { posterior_prob: 0.7 },
+            HitchRiskDegradation::HighRisk { posterior_prob: 0.9, evidence_count: 20 },
+            HitchRiskDegradation::CriticalRisk { posterior_prob: 0.99, log_odds: 5.5 },
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: HitchRiskDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[test]
+    fn test_evidence_entry_serde() {
+        let entry = EvidenceEntry {
+            signal: EvidenceSignal::BackpressureChange,
+            value: 3.5,
+            log_likelihood_ratio: 1.2,
+            timestamp_us: 99999,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: EvidenceEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn test_hitch_risk_status_line() {
+        let model = HitchRiskModel::with_defaults();
+        let line = model.status_line();
+        assert!(line.contains("hitch-risk"));
+        assert!(line.contains("level=LOW"));
+    }
+
+    #[test]
+    fn test_hitch_risk_config_serde() {
+        let config = HitchRiskConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: HitchRiskConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, back);
     }
 }
