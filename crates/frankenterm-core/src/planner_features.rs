@@ -1578,6 +1578,409 @@ impl UtilityPolicyTuner {
     }
 }
 
+// ── Mission runtime config schema (ft-1i2ge.5.4) ────────────────────────────
+
+/// Validation error for mission configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigValidationError {
+    pub field: String,
+    pub message: String,
+}
+
+/// Severity level for config diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDiagnosticSeverity {
+    Error,
+    Warning,
+    Info,
+}
+
+/// A single config diagnostic (error, warning, or info).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigDiagnostic {
+    pub severity: ConfigDiagnosticSeverity,
+    pub field: String,
+    pub message: String,
+}
+
+/// Result of validating a mission runtime config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigValidationResult {
+    pub valid: bool,
+    pub diagnostics: Vec<ConfigDiagnostic>,
+}
+
+impl ConfigValidationResult {
+    /// Count errors only.
+    #[must_use]
+    pub fn error_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == ConfigDiagnosticSeverity::Error)
+            .count()
+    }
+
+    /// Count warnings only.
+    #[must_use]
+    pub fn warning_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == ConfigDiagnosticSeverity::Warning)
+            .count()
+    }
+}
+
+/// Unified mission runtime configuration schema.
+///
+/// This is the top-level config that operators provide to configure the
+/// mission control loop. It bundles all sub-configs with validation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionRuntimeConfig {
+    /// Active mission profile kind.
+    pub profile: MissionProfileKind,
+    /// Cadence interval in milliseconds.
+    pub cadence_ms: u64,
+    /// Maximum triggers to batch before forcing evaluation.
+    pub max_trigger_batch: usize,
+    /// Whether to include blocked candidates in extraction reports.
+    pub include_blocked_in_extraction: bool,
+    /// Scorer configuration overrides (applied on top of profile defaults).
+    #[serde(default)]
+    pub scorer_overrides: ScorerConfigOverrides,
+    /// Governor configuration overrides (applied on top of profile defaults).
+    #[serde(default)]
+    pub governor_overrides: GovernorConfigOverrides,
+    /// Extraction configuration overrides.
+    #[serde(default)]
+    pub extraction_overrides: ExtractionConfigOverrides,
+    /// Maximum assignments per solver round (0 = use solver default).
+    pub max_assignments_per_round: usize,
+    /// Minimum score threshold override (0.0 = use profile default).
+    pub min_score_override: f64,
+    /// Safety gates to apply in addition to profile defaults.
+    #[serde(default)]
+    pub additional_safety_gates: Vec<SafetyGate>,
+    /// Conflict pairs to apply in addition to profile defaults.
+    #[serde(default)]
+    pub additional_conflicts: Vec<ConflictPair>,
+}
+
+/// Partial overrides for scorer weights (all optional).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScorerConfigOverrides {
+    pub impact_weight: Option<f64>,
+    pub urgency_weight: Option<f64>,
+    pub risk_weight: Option<f64>,
+    pub fit_weight: Option<f64>,
+    pub confidence_weight: Option<f64>,
+    pub effort_weight: Option<f64>,
+    pub safety_bonus: Option<f64>,
+    pub regression_bonus: Option<f64>,
+    pub min_confidence_threshold: Option<f64>,
+}
+
+/// Partial overrides for governor config (all optional).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GovernorConfigOverrides {
+    pub reassignment_cooldown_cycles: Option<u64>,
+    pub starvation_threshold_cycles: Option<u64>,
+    pub starvation_boost_per_cycle: Option<f64>,
+    pub starvation_max_boost: Option<f64>,
+    pub history_window: Option<usize>,
+    pub thrash_flip_threshold: Option<u32>,
+    pub thrash_penalty: Option<f64>,
+}
+
+/// Partial overrides for extraction config (all optional).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExtractionConfigOverrides {
+    pub max_unblock_count: Option<usize>,
+    pub max_critical_depth: Option<usize>,
+    pub max_staleness_hours: Option<f64>,
+    pub impact_unblock_weight: Option<f64>,
+    pub impact_depth_weight: Option<f64>,
+    pub urgency_priority_weight: Option<f64>,
+    pub urgency_staleness_weight: Option<f64>,
+}
+
+impl Default for MissionRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            profile: MissionProfileKind::Balanced,
+            cadence_ms: 30_000,
+            max_trigger_batch: 10,
+            include_blocked_in_extraction: false,
+            scorer_overrides: ScorerConfigOverrides::default(),
+            governor_overrides: GovernorConfigOverrides::default(),
+            extraction_overrides: ExtractionConfigOverrides::default(),
+            max_assignments_per_round: 0,
+            min_score_override: 0.0,
+            additional_safety_gates: Vec::new(),
+            additional_conflicts: Vec::new(),
+        }
+    }
+}
+
+impl MissionRuntimeConfig {
+    /// Validate the configuration, returning diagnostics.
+    #[must_use]
+    pub fn validate(&self) -> ConfigValidationResult {
+        let mut diagnostics = Vec::new();
+
+        // Cadence bounds.
+        if self.cadence_ms == 0 {
+            diagnostics.push(ConfigDiagnostic {
+                severity: ConfigDiagnosticSeverity::Error,
+                field: "cadence_ms".to_string(),
+                message: "Cadence must be > 0".to_string(),
+            });
+        } else if self.cadence_ms < 1000 {
+            diagnostics.push(ConfigDiagnostic {
+                severity: ConfigDiagnosticSeverity::Warning,
+                field: "cadence_ms".to_string(),
+                message: "Cadence below 1s may cause excessive CPU usage".to_string(),
+            });
+        }
+
+        if self.max_trigger_batch == 0 {
+            diagnostics.push(ConfigDiagnostic {
+                severity: ConfigDiagnosticSeverity::Error,
+                field: "max_trigger_batch".to_string(),
+                message: "Trigger batch size must be > 0".to_string(),
+            });
+        }
+
+        // Validate weight overrides are in [0,1].
+        Self::validate_weight_range(
+            &mut diagnostics,
+            "scorer_overrides.impact_weight",
+            self.scorer_overrides.impact_weight,
+        );
+        Self::validate_weight_range(
+            &mut diagnostics,
+            "scorer_overrides.urgency_weight",
+            self.scorer_overrides.urgency_weight,
+        );
+        Self::validate_weight_range(
+            &mut diagnostics,
+            "scorer_overrides.risk_weight",
+            self.scorer_overrides.risk_weight,
+        );
+        Self::validate_weight_range(
+            &mut diagnostics,
+            "scorer_overrides.fit_weight",
+            self.scorer_overrides.fit_weight,
+        );
+        Self::validate_weight_range(
+            &mut diagnostics,
+            "scorer_overrides.confidence_weight",
+            self.scorer_overrides.confidence_weight,
+        );
+        Self::validate_weight_range(
+            &mut diagnostics,
+            "scorer_overrides.effort_weight",
+            self.scorer_overrides.effort_weight,
+        );
+
+        // Bonus multipliers should be >= 1.0.
+        if let Some(bonus) = self.scorer_overrides.safety_bonus {
+            if bonus < 1.0 {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Warning,
+                    field: "scorer_overrides.safety_bonus".to_string(),
+                    message: "Safety bonus < 1.0 would penalize safety-tagged beads".to_string(),
+                });
+            }
+        }
+
+        // Governor: penalty should be in (0, 1].
+        if let Some(penalty) = self.governor_overrides.thrash_penalty {
+            if penalty <= 0.0 || penalty > 1.0 {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Error,
+                    field: "governor_overrides.thrash_penalty".to_string(),
+                    message: "Thrash penalty must be in (0.0, 1.0]".to_string(),
+                });
+            }
+        }
+
+        // Governor: history window should be reasonable.
+        if let Some(window) = self.governor_overrides.history_window {
+            if window == 0 {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Error,
+                    field: "governor_overrides.history_window".to_string(),
+                    message: "History window must be > 0".to_string(),
+                });
+            }
+        }
+
+        // min_score_override bounds.
+        if self.min_score_override < 0.0 || self.min_score_override > 1.0 {
+            diagnostics.push(ConfigDiagnostic {
+                severity: ConfigDiagnosticSeverity::Error,
+                field: "min_score_override".to_string(),
+                message: "min_score_override must be in [0.0, 1.0]".to_string(),
+            });
+        }
+
+        let has_errors = diagnostics
+            .iter()
+            .any(|d| d.severity == ConfigDiagnosticSeverity::Error);
+
+        ConfigValidationResult {
+            valid: !has_errors,
+            diagnostics,
+        }
+    }
+
+    fn validate_weight_range(
+        diagnostics: &mut Vec<ConfigDiagnostic>,
+        field: &str,
+        value: Option<f64>,
+    ) {
+        if let Some(v) = value {
+            if v < 0.0 || v > 1.0 {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Error,
+                    field: field.to_string(),
+                    message: format!("Weight must be in [0.0, 1.0], got {}", v),
+                });
+            }
+        }
+    }
+
+    /// Resolve this config into concrete sub-configs by applying overrides to profile defaults.
+    #[must_use]
+    pub fn resolve(&self) -> ResolvedMissionConfig {
+        let profile = MissionProfile::from_kind(self.profile);
+
+        // Scorer config with overrides.
+        let mut scorer = profile.scorer_config.clone();
+        if let Some(v) = self.scorer_overrides.impact_weight {
+            scorer.weights.impact = v;
+        }
+        if let Some(v) = self.scorer_overrides.urgency_weight {
+            scorer.weights.urgency = v;
+        }
+        if let Some(v) = self.scorer_overrides.risk_weight {
+            scorer.weights.risk = v;
+        }
+        if let Some(v) = self.scorer_overrides.fit_weight {
+            scorer.weights.fit = v;
+        }
+        if let Some(v) = self.scorer_overrides.confidence_weight {
+            scorer.weights.confidence = v;
+        }
+        if let Some(v) = self.scorer_overrides.effort_weight {
+            scorer.effort_weight = v;
+        }
+        if let Some(v) = self.scorer_overrides.safety_bonus {
+            scorer.safety_bonus = v;
+        }
+        if let Some(v) = self.scorer_overrides.regression_bonus {
+            scorer.regression_bonus = v;
+        }
+        if let Some(v) = self.scorer_overrides.min_confidence_threshold {
+            scorer.min_confidence_threshold = v;
+        }
+
+        // Governor config with overrides.
+        let mut governor = profile.governor_config.clone();
+        if let Some(v) = self.governor_overrides.reassignment_cooldown_cycles {
+            governor.reassignment_cooldown_cycles = v;
+        }
+        if let Some(v) = self.governor_overrides.starvation_threshold_cycles {
+            governor.starvation_threshold_cycles = v;
+        }
+        if let Some(v) = self.governor_overrides.starvation_boost_per_cycle {
+            governor.starvation_boost_per_cycle = v;
+        }
+        if let Some(v) = self.governor_overrides.starvation_max_boost {
+            governor.starvation_max_boost = v;
+        }
+        if let Some(v) = self.governor_overrides.history_window {
+            governor.history_window = v;
+        }
+        if let Some(v) = self.governor_overrides.thrash_flip_threshold {
+            governor.thrash_flip_threshold = v;
+        }
+        if let Some(v) = self.governor_overrides.thrash_penalty {
+            governor.thrash_penalty = v;
+        }
+
+        // Extraction config with overrides.
+        let mut extraction = profile.extraction_config.clone();
+        if let Some(v) = self.extraction_overrides.max_unblock_count {
+            extraction.max_unblock_count = v;
+        }
+        if let Some(v) = self.extraction_overrides.max_critical_depth {
+            extraction.max_critical_depth = v;
+        }
+        if let Some(v) = self.extraction_overrides.max_staleness_hours {
+            extraction.max_staleness_hours = v;
+        }
+        if let Some(v) = self.extraction_overrides.impact_unblock_weight {
+            extraction.impact_unblock_weight = v;
+        }
+        if let Some(v) = self.extraction_overrides.impact_depth_weight {
+            extraction.impact_depth_weight = v;
+        }
+        if let Some(v) = self.extraction_overrides.urgency_priority_weight {
+            extraction.urgency_priority_weight = v;
+        }
+        if let Some(v) = self.extraction_overrides.urgency_staleness_weight {
+            extraction.urgency_staleness_weight = v;
+        }
+
+        // Solver config.
+        let mut solver = SolverConfig {
+            min_score: if self.min_score_override > 0.0 {
+                self.min_score_override
+            } else {
+                scorer.min_confidence_threshold * 0.5
+            },
+            max_assignments: if self.max_assignments_per_round > 0 {
+                self.max_assignments_per_round
+            } else {
+                SolverConfig::default().max_assignments
+            },
+            safety_gates: self.additional_safety_gates.clone(),
+            conflicts: self.additional_conflicts.clone(),
+        };
+        // Merge profile defaults for solver if any.
+        let default_solver = SolverConfig::default();
+        if solver.max_assignments == 0 {
+            solver.max_assignments = default_solver.max_assignments;
+        }
+
+        ResolvedMissionConfig {
+            profile: self.profile,
+            cadence_ms: self.cadence_ms,
+            max_trigger_batch: self.max_trigger_batch,
+            include_blocked_in_extraction: self.include_blocked_in_extraction,
+            scorer_config: scorer,
+            governor_config: governor,
+            extraction_config: extraction,
+            solver_config: solver,
+        }
+    }
+}
+
+/// Fully resolved config with no optionals — ready for the mission loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedMissionConfig {
+    pub profile: MissionProfileKind,
+    pub cadence_ms: u64,
+    pub max_trigger_batch: usize,
+    pub include_blocked_in_extraction: bool,
+    pub scorer_config: ScorerConfig,
+    pub governor_config: GovernorConfig,
+    pub extraction_config: PlannerExtractionConfig,
+    pub solver_config: SolverConfig,
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3913,5 +4316,367 @@ mod tests {
             urgency.governor_config.starvation_max_boost
                 > conservative.governor_config.starvation_max_boost
         );
+    }
+
+    // ── Mission runtime config tests (ft-1i2ge.5.4) ─────────────────────────
+
+    #[test]
+    fn config_default_valid() {
+        let config = MissionRuntimeConfig::default();
+        let result = config.validate();
+        assert!(result.valid);
+        assert_eq!(result.error_count(), 0);
+    }
+
+    #[test]
+    fn config_cadence_zero_error() {
+        let config = MissionRuntimeConfig {
+            cadence_ms: 0,
+            ..MissionRuntimeConfig::default()
+        };
+        let result = config.validate();
+        assert!(!result.valid);
+        assert!(result.error_count() > 0);
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|d| d.field == "cadence_ms" && d.severity == ConfigDiagnosticSeverity::Error));
+    }
+
+    #[test]
+    fn config_cadence_low_warning() {
+        let config = MissionRuntimeConfig {
+            cadence_ms: 500,
+            ..MissionRuntimeConfig::default()
+        };
+        let result = config.validate();
+        assert!(result.valid); // warning, not error
+        assert!(result.warning_count() > 0);
+    }
+
+    #[test]
+    fn config_trigger_batch_zero_error() {
+        let config = MissionRuntimeConfig {
+            max_trigger_batch: 0,
+            ..MissionRuntimeConfig::default()
+        };
+        let result = config.validate();
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn config_weight_out_of_range_error() {
+        let config = MissionRuntimeConfig {
+            scorer_overrides: ScorerConfigOverrides {
+                impact_weight: Some(1.5),
+                ..ScorerConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        let result = config.validate();
+        assert!(!result.valid);
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|d| d.field.contains("impact_weight")));
+    }
+
+    #[test]
+    fn config_negative_weight_error() {
+        let config = MissionRuntimeConfig {
+            scorer_overrides: ScorerConfigOverrides {
+                risk_weight: Some(-0.1),
+                ..ScorerConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        let result = config.validate();
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn config_safety_bonus_below_one_warning() {
+        let config = MissionRuntimeConfig {
+            scorer_overrides: ScorerConfigOverrides {
+                safety_bonus: Some(0.8),
+                ..ScorerConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        let result = config.validate();
+        assert!(result.valid); // warning only
+        assert!(result.warning_count() > 0);
+    }
+
+    #[test]
+    fn config_thrash_penalty_zero_error() {
+        let config = MissionRuntimeConfig {
+            governor_overrides: GovernorConfigOverrides {
+                thrash_penalty: Some(0.0),
+                ..GovernorConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        let result = config.validate();
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn config_thrash_penalty_over_one_error() {
+        let config = MissionRuntimeConfig {
+            governor_overrides: GovernorConfigOverrides {
+                thrash_penalty: Some(1.5),
+                ..GovernorConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        let result = config.validate();
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn config_history_window_zero_error() {
+        let config = MissionRuntimeConfig {
+            governor_overrides: GovernorConfigOverrides {
+                history_window: Some(0),
+                ..GovernorConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        let result = config.validate();
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn config_min_score_out_of_range_error() {
+        let config = MissionRuntimeConfig {
+            min_score_override: 1.5,
+            ..MissionRuntimeConfig::default()
+        };
+        let result = config.validate();
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn config_resolve_default() {
+        let config = MissionRuntimeConfig::default();
+        let resolved = config.resolve();
+        assert_eq!(resolved.profile, MissionProfileKind::Balanced);
+        assert_eq!(resolved.cadence_ms, 30_000);
+        assert!(
+            (resolved.scorer_config.weights.impact
+                - MissionProfile::balanced().scorer_config.weights.impact)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn config_resolve_applies_scorer_overrides() {
+        let config = MissionRuntimeConfig {
+            scorer_overrides: ScorerConfigOverrides {
+                impact_weight: Some(0.99),
+                safety_bonus: Some(2.0),
+                ..ScorerConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        let resolved = config.resolve();
+        assert!((resolved.scorer_config.weights.impact - 0.99).abs() < 1e-9);
+        assert!((resolved.scorer_config.safety_bonus - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn config_resolve_applies_governor_overrides() {
+        let config = MissionRuntimeConfig {
+            governor_overrides: GovernorConfigOverrides {
+                reassignment_cooldown_cycles: Some(10),
+                thrash_penalty: Some(0.7),
+                ..GovernorConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        let resolved = config.resolve();
+        assert_eq!(resolved.governor_config.reassignment_cooldown_cycles, 10);
+        assert!((resolved.governor_config.thrash_penalty - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn config_resolve_applies_extraction_overrides() {
+        let config = MissionRuntimeConfig {
+            extraction_overrides: ExtractionConfigOverrides {
+                max_staleness_hours: Some(100.0),
+                ..ExtractionConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        let resolved = config.resolve();
+        assert!((resolved.extraction_config.max_staleness_hours - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn config_resolve_safety_first_profile() {
+        let config = MissionRuntimeConfig {
+            profile: MissionProfileKind::SafetyFirst,
+            ..MissionRuntimeConfig::default()
+        };
+        let resolved = config.resolve();
+        assert_eq!(resolved.profile, MissionProfileKind::SafetyFirst);
+        let safety = MissionProfile::safety_first();
+        assert!(
+            (resolved.scorer_config.weights.risk - safety.scorer_config.weights.risk).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn config_resolve_max_assignments_override() {
+        let config = MissionRuntimeConfig {
+            max_assignments_per_round: 42,
+            ..MissionRuntimeConfig::default()
+        };
+        let resolved = config.resolve();
+        assert_eq!(resolved.solver_config.max_assignments, 42);
+    }
+
+    #[test]
+    fn config_resolve_min_score_override() {
+        let config = MissionRuntimeConfig {
+            min_score_override: 0.5,
+            ..MissionRuntimeConfig::default()
+        };
+        let resolved = config.resolve();
+        assert!((resolved.solver_config.min_score - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn config_resolve_additional_gates_and_conflicts() {
+        let config = MissionRuntimeConfig {
+            additional_safety_gates: vec![SafetyGate {
+                name: "freeze".to_string(),
+                denied_bead_ids: vec!["b1".to_string()],
+            }],
+            additional_conflicts: vec![ConflictPair {
+                bead_a: "a".to_string(),
+                bead_b: "b".to_string(),
+            }],
+            ..MissionRuntimeConfig::default()
+        };
+        let resolved = config.resolve();
+        assert_eq!(resolved.solver_config.safety_gates.len(), 1);
+        assert_eq!(resolved.solver_config.conflicts.len(), 1);
+    }
+
+    #[test]
+    fn config_runtime_serde_roundtrip() {
+        let config = MissionRuntimeConfig {
+            profile: MissionProfileKind::Throughput,
+            cadence_ms: 15_000,
+            max_trigger_batch: 5,
+            scorer_overrides: ScorerConfigOverrides {
+                impact_weight: Some(0.5),
+                ..ScorerConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: MissionRuntimeConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.profile, MissionProfileKind::Throughput);
+        assert_eq!(back.cadence_ms, 15_000);
+        assert_eq!(back.scorer_overrides.impact_weight, Some(0.5));
+    }
+
+    #[test]
+    fn config_resolved_serde_roundtrip() {
+        let config = MissionRuntimeConfig::default();
+        let resolved = config.resolve();
+        let json = serde_json::to_string(&resolved).unwrap();
+        let back: ResolvedMissionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.profile, MissionProfileKind::Balanced);
+        assert_eq!(back.cadence_ms, 30_000);
+    }
+
+    #[test]
+    fn config_validation_result_serde_roundtrip() {
+        let result = ConfigValidationResult {
+            valid: false,
+            diagnostics: vec![ConfigDiagnostic {
+                severity: ConfigDiagnosticSeverity::Error,
+                field: "test".to_string(),
+                message: "bad".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ConfigValidationResult = serde_json::from_str(&json).unwrap();
+        assert!(!back.valid);
+        assert_eq!(back.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn config_severity_serde_roundtrip() {
+        let severities = vec![
+            ConfigDiagnosticSeverity::Error,
+            ConfigDiagnosticSeverity::Warning,
+            ConfigDiagnosticSeverity::Info,
+        ];
+        for sev in &severities {
+            let json = serde_json::to_string(sev).unwrap();
+            let back: ConfigDiagnosticSeverity = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, sev);
+        }
+    }
+
+    #[test]
+    fn config_multiple_validation_errors() {
+        let config = MissionRuntimeConfig {
+            cadence_ms: 0,
+            max_trigger_batch: 0,
+            min_score_override: -1.0,
+            ..MissionRuntimeConfig::default()
+        };
+        let result = config.validate();
+        assert!(!result.valid);
+        assert!(result.error_count() >= 3);
+    }
+
+    #[test]
+    fn config_overrides_default_empty() {
+        let overrides = ScorerConfigOverrides::default();
+        assert!(overrides.impact_weight.is_none());
+        assert!(overrides.safety_bonus.is_none());
+        let gov = GovernorConfigOverrides::default();
+        assert!(gov.reassignment_cooldown_cycles.is_none());
+        let ext = ExtractionConfigOverrides::default();
+        assert!(ext.max_unblock_count.is_none());
+    }
+
+    #[test]
+    fn config_resolve_preserves_profile_when_no_overrides() {
+        for kind in &[
+            MissionProfileKind::Balanced,
+            MissionProfileKind::SafetyFirst,
+            MissionProfileKind::Throughput,
+            MissionProfileKind::UrgencyDriven,
+            MissionProfileKind::Conservative,
+        ] {
+            let config = MissionRuntimeConfig {
+                profile: *kind,
+                ..MissionRuntimeConfig::default()
+            };
+            let resolved = config.resolve();
+            let profile = MissionProfile::from_kind(*kind);
+            assert!(
+                (resolved.scorer_config.weights.impact - profile.scorer_config.weights.impact)
+                    .abs()
+                    < 1e-9,
+                "{:?}: impact mismatch",
+                kind
+            );
+            assert!(
+                (resolved.scorer_config.weights.risk - profile.scorer_config.weights.risk).abs()
+                    < 1e-9,
+                "{:?}: risk mismatch",
+                kind
+            );
+        }
     }
 }
