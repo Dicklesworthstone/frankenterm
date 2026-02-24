@@ -22074,8 +22074,8 @@ mod tests {
         trace.push(TraceAction::SchedulerAdmit { lane: SchedulerLane::Input, cost_us: 5.0 }, InvariantDomain::Scheduler, 20, None);
         trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 30, None);
         let hist = c.domain_histogram(&trace);
-        assert_eq!(hist.get("Composition"), Some(&2));
-        assert_eq!(hist.get("Scheduler"), Some(&1));
+        assert_eq!(hist.get("composition"), Some(&2));
+        assert_eq!(hist.get("scheduler"), Some(&1));
     }
 
     #[test]
