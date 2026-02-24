@@ -237,6 +237,7 @@ pub mod replay_report;
 pub mod replay_robot;
 pub mod replay_risk_scoring;
 pub mod replay_scenario_matrix;
+pub mod replay_shadow_rollout;
 pub mod replay_test_orchestrator;
 pub mod replay_merge;
 pub mod replay_provenance;
