@@ -13813,6 +13813,90 @@ impl AckProtocolManager {
     pub fn config(&self) -> &AckProtocolConfig {
         &self.config
     }
+
+    // ── F3 Impl: Bridge methods ──
+
+    /// Total acks issued.
+    pub fn total_acks(&self) -> u64 { self.total_acks }
+
+    /// Total completions (success + timeout + cancel).
+    pub fn total_completions(&self) -> u64 { self.total_completions }
+
+    /// Total timeouts.
+    pub fn total_timeouts(&self) -> u64 { self.total_timeouts }
+
+    /// Total cancellations.
+    pub fn total_cancellations(&self) -> u64 { self.total_cancellations }
+
+    /// Total slow acks recorded.
+    pub fn slow_ack_count(&self) -> u64 { self.slow_ack_count }
+
+    /// Completion rate: total_completions / total_acks.
+    pub fn completion_rate(&self) -> f64 {
+        if self.total_acks == 0 { return 1.0; }
+        self.total_completions as f64 / self.total_acks as f64
+    }
+
+    /// Timeout rate: total_timeouts / total_completions.
+    pub fn timeout_rate(&self) -> f64 {
+        if self.total_completions == 0 { return 0.0; }
+        self.total_timeouts as f64 / self.total_completions as f64
+    }
+
+    /// Whether there are any pending operations.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Get a pending token by correlation ID.
+    pub fn get_pending(&self, correlation_id: u64) -> Option<&AckToken> {
+        self.pending.get(&correlation_id)
+    }
+
+    /// Complete with explanation.
+    pub fn complete_with_explanation(
+        &mut self,
+        correlation_id: u64,
+        reason: CompletionReason,
+        timestamp_us: u64,
+        explanation: String,
+    ) -> Option<DeferredResult> {
+        self.complete(correlation_id, reason, timestamp_us).map(|mut r| {
+            r.explanation = Some(explanation);
+            r
+        })
+    }
+
+    /// Issue an ack and immediately check if it was slow.
+    pub fn issue_ack_checked(
+        &mut self,
+        stage: LatencyStage,
+        summary: String,
+        request_received_us: u64,
+        ack_sent_us: u64,
+    ) -> AckToken {
+        let token = self.issue_ack(stage, summary, ack_sent_us);
+        if ack_sent_us.saturating_sub(request_received_us) > self.config.ack_deadline_us {
+            self.record_slow_ack();
+        }
+        token
+    }
+
+    /// Map AckProtocol to InvariantDomain.
+    pub fn to_invariant_domain() -> InvariantDomain {
+        InvariantDomain::Composition
+    }
+
+    /// Generate a progress update for a pending operation.
+    pub fn make_progress(&self, correlation_id: u64, fraction: f64, message: String, timestamp_us: u64) -> Option<ProgressUpdate> {
+        if !self.pending.contains_key(&correlation_id) { return None; }
+        Some(ProgressUpdate {
+            correlation_id,
+            timestamp_us,
+            fraction: fraction.clamp(0.0, 1.0),
+            message,
+        })
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -25796,5 +25880,145 @@ mod tests {
         assert!(result.is_some());
         assert_eq!(mgr.pending_count(), 0);
         assert_eq!(mgr.snapshot().total_completions, 1);
+    }
+
+    // ── F3 Impl: Bridge method tests ──
+
+    #[test]
+    fn test_ack_total_acks_accessor() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        assert_eq!(mgr.total_acks(), 0);
+        mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
+        assert_eq!(mgr.total_acks(), 1);
+    }
+
+    #[test]
+    fn test_ack_total_completions_accessor() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
+        mgr.complete(1, CompletionReason::Success, 200);
+        assert_eq!(mgr.total_completions(), 1);
+    }
+
+    #[test]
+    fn test_ack_total_timeouts_accessor() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
+        mgr.sweep_timeouts(6_000_000);
+        assert_eq!(mgr.total_timeouts(), 1);
+    }
+
+    #[test]
+    fn test_ack_total_cancellations() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
+        mgr.complete(1, CompletionReason::Cancelled { reason: "x".to_string() }, 200);
+        assert_eq!(mgr.total_cancellations(), 1);
+    }
+
+    #[test]
+    fn test_ack_slow_count_accessor() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        mgr.record_slow_ack();
+        mgr.record_slow_ack();
+        assert_eq!(mgr.slow_ack_count(), 2);
+    }
+
+    #[test]
+    fn test_ack_completion_rate() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        assert!((mgr.completion_rate() - 1.0).abs() < f64::EPSILON);
+        mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
+        mgr.issue_ack(LatencyStage::StorageWrite, "b".to_string(), 100);
+        mgr.complete(1, CompletionReason::Success, 200);
+        assert!((mgr.completion_rate() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_ack_timeout_rate() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        assert!((mgr.timeout_rate() - 0.0).abs() < f64::EPSILON);
+        mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
+        mgr.issue_ack(LatencyStage::StorageWrite, "b".to_string(), 100);
+        mgr.complete(1, CompletionReason::Success, 200);
+        mgr.complete(2, CompletionReason::Timeout, 300);
+        assert!((mgr.timeout_rate() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_ack_has_pending() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        assert!(!mgr.has_pending());
+        mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
+        assert!(mgr.has_pending());
+    }
+
+    #[test]
+    fn test_ack_get_pending() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let token = mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
+        let got = mgr.get_pending(token.correlation_id);
+        assert!(got.is_some());
+        assert_eq!(got.unwrap().summary, "a");
+        assert!(mgr.get_pending(999).is_none());
+    }
+
+    #[test]
+    fn test_ack_complete_with_explanation() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let token = mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
+        let result = mgr.complete_with_explanation(
+            token.correlation_id,
+            CompletionReason::Success,
+            200,
+            "Pattern found".to_string(),
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().explanation, Some("Pattern found".to_string()));
+    }
+
+    #[test]
+    fn test_ack_issue_checked_slow() {
+        let cfg = AckProtocolConfig { ack_deadline_us: 100, ..Default::default() };
+        let mut mgr = AckProtocolManager::new(cfg);
+        // Ack took 200μs but deadline is 100μs → slow.
+        mgr.issue_ack_checked(LatencyStage::PtyCapture, "a".to_string(), 1000, 1201);
+        assert_eq!(mgr.slow_ack_count(), 1);
+    }
+
+    #[test]
+    fn test_ack_issue_checked_fast() {
+        let cfg = AckProtocolConfig { ack_deadline_us: 100, ..Default::default() };
+        let mut mgr = AckProtocolManager::new(cfg);
+        // Ack took 50μs, deadline is 100μs → fast.
+        mgr.issue_ack_checked(LatencyStage::PtyCapture, "a".to_string(), 1000, 1050);
+        assert_eq!(mgr.slow_ack_count(), 0);
+    }
+
+    #[test]
+    fn test_ack_to_invariant_domain() {
+        assert_eq!(AckProtocolManager::to_invariant_domain(), InvariantDomain::Composition);
+    }
+
+    #[test]
+    fn test_ack_make_progress() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let token = mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
+        let prog = mgr.make_progress(token.correlation_id, 0.5, "halfway".to_string(), 500);
+        assert!(prog.is_some());
+        let p = prog.unwrap();
+        assert!((p.fraction - 0.5).abs() < f64::EPSILON);
+        // Non-existent correlation ID.
+        assert!(mgr.make_progress(999, 0.5, "x".to_string(), 500).is_none());
+    }
+
+    #[test]
+    fn test_ack_make_progress_clamps_fraction() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let token = mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
+        let p = mgr.make_progress(token.correlation_id, 2.0, "over".to_string(), 500).unwrap();
+        assert!((p.fraction - 1.0).abs() < f64::EPSILON);
+        let p2 = mgr.make_progress(token.correlation_id, -0.5, "under".to_string(), 500).unwrap();
+        assert!((p2.fraction - 0.0).abs() < f64::EPSILON);
     }
 }
