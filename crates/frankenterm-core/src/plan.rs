@@ -2619,6 +2619,657 @@ impl fmt::Display for MissionTxValidationError {
 
 impl std::error::Error for MissionTxValidationError {}
 
+// ============================================================================
+// Intent Ledger — Append-Only Event-Sourced Transaction Persistence (H2)
+// ============================================================================
+
+/// Schema version for the intent ledger wire format.
+pub const INTENT_LEDGER_SCHEMA_VERSION: u32 = 1;
+
+/// A single entry in the append-only intent ledger.
+///
+/// Each entry captures a transaction decision point with full causal context.
+/// Entries form a hash chain: each entry's `prev_hash` references the preceding
+/// entry's `entry_hash`, creating a tamper-evident audit trail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    /// Monotonically increasing sequence number (1-indexed).
+    pub seq: u64,
+    /// SHA-256 hash of this entry's canonical content (hex-encoded).
+    pub entry_hash: String,
+    /// SHA-256 hash of the previous entry (hex for chain, empty string for genesis).
+    pub prev_hash: String,
+    /// Transaction this entry belongs to.
+    pub tx_id: TxId,
+    /// Timestamp when this entry was created (epoch ms).
+    pub created_at_ms: i64,
+    /// The kind of ledger event.
+    pub kind: LedgerEntryKind,
+    /// Correlation hooks for cross-system tracing.
+    pub correlation: LedgerCorrelation,
+}
+
+/// Discriminated union of ledger event kinds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LedgerEntryKind {
+    /// Transaction intent was registered.
+    IntentRegistered {
+        summary: String,
+        requested_by: String,
+    },
+    /// Execution plan was created and attached.
+    PlanCreated {
+        plan_id: TxPlanId,
+        step_count: u32,
+        precondition_count: u32,
+        compensation_count: u32,
+    },
+    /// A precondition was evaluated.
+    PreconditionEvaluated {
+        precondition_index: u32,
+        passed: bool,
+        detail: String,
+    },
+    /// A lifecycle state transition occurred.
+    StateTransition {
+        from: MissionTxState,
+        to: MissionTxState,
+        kind: MissionTxTransitionKind,
+    },
+    /// A step execution result was recorded.
+    StepExecuted {
+        step_id: TxStepId,
+        ordinal: u32,
+        succeeded: bool,
+        detail: String,
+    },
+    /// A compensation action was executed.
+    CompensationExecuted {
+        for_step_id: TxStepId,
+        succeeded: bool,
+        detail: String,
+    },
+    /// Final outcome was sealed.
+    OutcomeSealed {
+        outcome_kind: String,
+        reason_code: Option<String>,
+        error_code: Option<String>,
+    },
+    /// A causal receipt was recorded (mirrors TxReceipt).
+    ReceiptRecorded {
+        receipt_seq: u64,
+        state: MissionTxState,
+        reason_code: Option<String>,
+        error_code: Option<String>,
+    },
+}
+
+/// Correlation context linking a ledger entry to external systems.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerCorrelation {
+    /// Mission run identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_run_id: Option<String>,
+    /// Pane identifiers involved in this decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pane_ids: Vec<u64>,
+    /// Agent identifiers involved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_ids: Vec<String>,
+    /// Bead/issue identifiers related to this work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bead_ids: Vec<String>,
+    /// Thread identifiers (agent mail).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thread_ids: Vec<String>,
+    /// Policy check identifiers that influenced this decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_check_ids: Vec<String>,
+    /// Reservation identifiers held during this decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reservation_ids: Vec<String>,
+    /// Approval identifiers granted for this decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approval_ids: Vec<String>,
+}
+
+impl LedgerCorrelation {
+    /// Create an empty correlation context.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            mission_run_id: None,
+            pane_ids: Vec::new(),
+            agent_ids: Vec::new(),
+            bead_ids: Vec::new(),
+            thread_ids: Vec::new(),
+            policy_check_ids: Vec::new(),
+            reservation_ids: Vec::new(),
+            approval_ids: Vec::new(),
+        }
+    }
+
+    /// Create a correlation with just a mission run id.
+    #[must_use]
+    pub fn with_mission(mission_run_id: impl Into<String>) -> Self {
+        Self {
+            mission_run_id: Some(mission_run_id.into()),
+            ..Self::empty()
+        }
+    }
+}
+
+impl LedgerEntry {
+    /// Compute the canonical SHA-256 hash for this entry's content.
+    ///
+    /// The hash covers: seq, prev_hash, tx_id, created_at_ms, kind (JSON),
+    /// and correlation (JSON). This makes the chain tamper-evident.
+    #[must_use]
+    pub fn compute_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.seq.to_le_bytes());
+        hasher.update(self.prev_hash.as_bytes());
+        hasher.update(self.tx_id.0.as_bytes());
+        hasher.update(self.created_at_ms.to_le_bytes());
+        // Canonical JSON of kind and correlation for determinism
+        if let Ok(kind_json) = serde_json::to_string(&self.kind) {
+            hasher.update(kind_json.as_bytes());
+        }
+        if let Ok(corr_json) = serde_json::to_string(&self.correlation) {
+            hasher.update(corr_json.as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Verify this entry's hash matches its content.
+    #[must_use]
+    pub fn verify_hash(&self) -> bool {
+        self.entry_hash == self.compute_hash()
+    }
+}
+
+/// Validation errors specific to the intent ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerValidationError {
+    /// Entry sequence is not monotonically increasing.
+    NonMonotonicSequence { expected: u64, actual: u64 },
+    /// Hash chain is broken (prev_hash doesn't match previous entry_hash).
+    BrokenHashChain { seq: u64, expected_prev: String, actual_prev: String },
+    /// Entry hash doesn't match recomputed content hash.
+    TamperedEntry { seq: u64 },
+    /// Genesis entry has non-empty prev_hash.
+    InvalidGenesis,
+    /// Ledger is empty when entries were expected.
+    EmptyLedger,
+    /// Transaction ID mismatch within a single-tx ledger.
+    TxIdMismatch { seq: u64, expected: TxId, actual: TxId },
+}
+
+impl fmt::Display for LedgerValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonMonotonicSequence { expected, actual } => {
+                write!(f, "Non-monotonic ledger sequence: expected {expected}, got {actual}")
+            }
+            Self::BrokenHashChain { seq, expected_prev, actual_prev } => {
+                write!(f, "Broken hash chain at seq {seq}: expected prev {expected_prev}, got {actual_prev}")
+            }
+            Self::TamperedEntry { seq } => {
+                write!(f, "Tampered ledger entry at seq {seq}: hash mismatch")
+            }
+            Self::InvalidGenesis => f.write_str("Genesis entry must have empty prev_hash"),
+            Self::EmptyLedger => f.write_str("Ledger is empty"),
+            Self::TxIdMismatch { seq, expected, actual } => {
+                write!(f, "Tx ID mismatch at seq {seq}: expected {expected}, got {actual}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LedgerValidationError {}
+
+/// Append-only intent ledger for a single transaction.
+///
+/// Maintains a hash-chained sequence of decision entries with full causal
+/// correlation context. Supports timeline queries for `tx show` reconstruction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentLedger {
+    /// Schema version for forward compatibility.
+    pub schema_version: u32,
+    /// The transaction this ledger tracks.
+    pub tx_id: TxId,
+    /// Ordered entries forming the hash chain.
+    entries: Vec<LedgerEntry>,
+}
+
+impl IntentLedger {
+    /// Create a new empty ledger for a transaction.
+    #[must_use]
+    pub fn new(tx_id: TxId) -> Self {
+        Self {
+            schema_version: INTENT_LEDGER_SCHEMA_VERSION,
+            tx_id,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Append a new entry to the ledger.
+    ///
+    /// Automatically assigns sequence number, computes prev_hash from the
+    /// last entry, and computes the entry's content hash.
+    pub fn append(
+        &mut self,
+        created_at_ms: i64,
+        kind: LedgerEntryKind,
+        correlation: LedgerCorrelation,
+    ) -> &LedgerEntry {
+        let seq = self.entries.len() as u64 + 1;
+        let prev_hash = self
+            .entries
+            .last()
+            .map(|e| e.entry_hash.clone())
+            .unwrap_or_default();
+
+        let mut entry = LedgerEntry {
+            seq,
+            entry_hash: String::new(),
+            prev_hash,
+            tx_id: self.tx_id.clone(),
+            created_at_ms,
+            kind,
+            correlation,
+        };
+        entry.entry_hash = entry.compute_hash();
+        self.entries.push(entry);
+        self.entries.last().unwrap()
+    }
+
+    /// Number of entries in the ledger.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the ledger has no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Get all entries as a slice.
+    #[must_use]
+    pub fn entries(&self) -> &[LedgerEntry] {
+        &self.entries
+    }
+
+    /// Get the most recent entry.
+    #[must_use]
+    pub fn last_entry(&self) -> Option<&LedgerEntry> {
+        self.entries.last()
+    }
+
+    /// Get entry by sequence number (1-indexed).
+    #[must_use]
+    pub fn entry_at(&self, seq: u64) -> Option<&LedgerEntry> {
+        if seq == 0 || seq as usize > self.entries.len() {
+            return None;
+        }
+        Some(&self.entries[seq as usize - 1])
+    }
+
+    /// Query entries by kind discriminant.
+    pub fn entries_of_kind(&self, kind_tag: &str) -> Vec<&LedgerEntry> {
+        self.entries
+            .iter()
+            .filter(|e| {
+                let tag = match &e.kind {
+                    LedgerEntryKind::IntentRegistered { .. } => "intent_registered",
+                    LedgerEntryKind::PlanCreated { .. } => "plan_created",
+                    LedgerEntryKind::PreconditionEvaluated { .. } => "precondition_evaluated",
+                    LedgerEntryKind::StateTransition { .. } => "state_transition",
+                    LedgerEntryKind::StepExecuted { .. } => "step_executed",
+                    LedgerEntryKind::CompensationExecuted { .. } => "compensation_executed",
+                    LedgerEntryKind::OutcomeSealed { .. } => "outcome_sealed",
+                    LedgerEntryKind::ReceiptRecorded { .. } => "receipt_recorded",
+                };
+                tag == kind_tag
+            })
+            .collect()
+    }
+
+    /// Query entries within a time range (inclusive).
+    pub fn entries_in_range(&self, start_ms: i64, end_ms: i64) -> Vec<&LedgerEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.created_at_ms >= start_ms && e.created_at_ms <= end_ms)
+            .collect()
+    }
+
+    /// Query entries mentioning a specific pane.
+    pub fn entries_for_pane(&self, pane_id: u64) -> Vec<&LedgerEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.correlation.pane_ids.contains(&pane_id))
+            .collect()
+    }
+
+    /// Query entries mentioning a specific agent.
+    pub fn entries_for_agent(&self, agent_id: &str) -> Vec<&LedgerEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.correlation.agent_ids.iter().any(|a| a == agent_id))
+            .collect()
+    }
+
+    /// Extract the current lifecycle state from the ledger.
+    ///
+    /// Scans state transition entries in order to find the latest state.
+    #[must_use]
+    pub fn current_state(&self) -> MissionTxState {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                LedgerEntryKind::StateTransition { to, .. } => Some(to.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Build a timeline of state transitions for `tx show`.
+    pub fn state_timeline(&self) -> Vec<StateTimelineEntry> {
+        self.entries
+            .iter()
+            .filter_map(|e| match &e.kind {
+                LedgerEntryKind::StateTransition { from, to, kind } => {
+                    Some(StateTimelineEntry {
+                        seq: e.seq,
+                        timestamp_ms: e.created_at_ms,
+                        from: from.clone(),
+                        to: to.clone(),
+                        kind: kind.clone(),
+                        correlation: e.correlation.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Validate the entire ledger's integrity.
+    ///
+    /// Checks: monotonic sequences, hash chain continuity, content hash
+    /// integrity, genesis validity, and tx_id consistency.
+    pub fn validate(&self) -> Result<(), LedgerValidationError> {
+        if self.entries.is_empty() {
+            return Ok(()); // Empty ledger is valid
+        }
+
+        // Genesis entry
+        let first = &self.entries[0];
+        if !first.prev_hash.is_empty() {
+            return Err(LedgerValidationError::InvalidGenesis);
+        }
+        if first.seq != 1 {
+            return Err(LedgerValidationError::NonMonotonicSequence {
+                expected: 1,
+                actual: first.seq,
+            });
+        }
+        if !first.verify_hash() {
+            return Err(LedgerValidationError::TamperedEntry { seq: first.seq });
+        }
+        if first.tx_id != self.tx_id {
+            return Err(LedgerValidationError::TxIdMismatch {
+                seq: first.seq,
+                expected: self.tx_id.clone(),
+                actual: first.tx_id.clone(),
+            });
+        }
+
+        // Remaining entries
+        for i in 1..self.entries.len() {
+            let prev = &self.entries[i - 1];
+            let curr = &self.entries[i];
+
+            let expected_seq = prev.seq + 1;
+            if curr.seq != expected_seq {
+                return Err(LedgerValidationError::NonMonotonicSequence {
+                    expected: expected_seq,
+                    actual: curr.seq,
+                });
+            }
+
+            if curr.prev_hash != prev.entry_hash {
+                return Err(LedgerValidationError::BrokenHashChain {
+                    seq: curr.seq,
+                    expected_prev: prev.entry_hash.clone(),
+                    actual_prev: curr.prev_hash.clone(),
+                });
+            }
+
+            if !curr.verify_hash() {
+                return Err(LedgerValidationError::TamperedEntry { seq: curr.seq });
+            }
+
+            if curr.tx_id != self.tx_id {
+                return Err(LedgerValidationError::TxIdMismatch {
+                    seq: curr.seq,
+                    expected: self.tx_id.clone(),
+                    actual: curr.tx_id.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Serialize the ledger to JSONL (one JSON line per entry).
+    ///
+    /// This is the canonical persistence format for append-only storage.
+    #[must_use]
+    pub fn to_jsonl(&self) -> String {
+        self.entries
+            .iter()
+            .filter_map(|e| serde_json::to_string(e).ok())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Deserialize a ledger from JSONL lines.
+    pub fn from_jsonl(tx_id: TxId, lines: &str) -> Result<Self, String> {
+        let mut ledger = Self::new(tx_id);
+        for (i, line) in lines.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let entry: LedgerEntry = serde_json::from_str(line)
+                .map_err(|e| format!("line {}: {}", i + 1, e))?;
+            ledger.entries.push(entry);
+        }
+        Ok(ledger)
+    }
+}
+
+/// A state transition in the timeline (for `tx show` display).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateTimelineEntry {
+    pub seq: u64,
+    pub timestamp_ms: i64,
+    pub from: MissionTxState,
+    pub to: MissionTxState,
+    pub kind: MissionTxTransitionKind,
+    pub correlation: LedgerCorrelation,
+}
+
+/// Builder for recording a full transaction lifecycle into a ledger.
+///
+/// Provides high-level methods that map to `LedgerEntryKind` variants,
+/// automatically managing timestamps and correlation propagation.
+pub struct LedgerRecorder<'a> {
+    ledger: &'a mut IntentLedger,
+    default_correlation: LedgerCorrelation,
+}
+
+impl<'a> LedgerRecorder<'a> {
+    /// Create a recorder bound to a ledger with default correlation.
+    pub fn new(ledger: &'a mut IntentLedger, correlation: LedgerCorrelation) -> Self {
+        Self {
+            ledger,
+            default_correlation: correlation,
+        }
+    }
+
+    /// Record that a transaction intent was registered.
+    pub fn record_intent(&mut self, ts: i64, summary: &str, requested_by: &str) -> &LedgerEntry {
+        self.ledger.append(
+            ts,
+            LedgerEntryKind::IntentRegistered {
+                summary: summary.to_string(),
+                requested_by: requested_by.to_string(),
+            },
+            self.default_correlation.clone(),
+        )
+    }
+
+    /// Record that an execution plan was created.
+    pub fn record_plan(
+        &mut self,
+        ts: i64,
+        plan_id: &TxPlanId,
+        step_count: u32,
+        precondition_count: u32,
+        compensation_count: u32,
+    ) -> &LedgerEntry {
+        self.ledger.append(
+            ts,
+            LedgerEntryKind::PlanCreated {
+                plan_id: plan_id.clone(),
+                step_count,
+                precondition_count,
+                compensation_count,
+            },
+            self.default_correlation.clone(),
+        )
+    }
+
+    /// Record a precondition evaluation result.
+    pub fn record_precondition(
+        &mut self,
+        ts: i64,
+        index: u32,
+        passed: bool,
+        detail: &str,
+    ) -> &LedgerEntry {
+        self.ledger.append(
+            ts,
+            LedgerEntryKind::PreconditionEvaluated {
+                precondition_index: index,
+                passed,
+                detail: detail.to_string(),
+            },
+            self.default_correlation.clone(),
+        )
+    }
+
+    /// Record a lifecycle state transition.
+    pub fn record_transition(
+        &mut self,
+        ts: i64,
+        from: MissionTxState,
+        to: MissionTxState,
+        kind: MissionTxTransitionKind,
+    ) -> &LedgerEntry {
+        self.ledger.append(
+            ts,
+            LedgerEntryKind::StateTransition { from, to, kind },
+            self.default_correlation.clone(),
+        )
+    }
+
+    /// Record a step execution result.
+    pub fn record_step(
+        &mut self,
+        ts: i64,
+        step_id: &TxStepId,
+        ordinal: u32,
+        succeeded: bool,
+        detail: &str,
+    ) -> &LedgerEntry {
+        self.ledger.append(
+            ts,
+            LedgerEntryKind::StepExecuted {
+                step_id: step_id.clone(),
+                ordinal,
+                succeeded,
+                detail: detail.to_string(),
+            },
+            self.default_correlation.clone(),
+        )
+    }
+
+    /// Record a compensation action result.
+    pub fn record_compensation(
+        &mut self,
+        ts: i64,
+        for_step_id: &TxStepId,
+        succeeded: bool,
+        detail: &str,
+    ) -> &LedgerEntry {
+        self.ledger.append(
+            ts,
+            LedgerEntryKind::CompensationExecuted {
+                for_step_id: for_step_id.clone(),
+                succeeded,
+                detail: detail.to_string(),
+            },
+            self.default_correlation.clone(),
+        )
+    }
+
+    /// Record that the final outcome was sealed.
+    pub fn record_outcome(
+        &mut self,
+        ts: i64,
+        outcome_kind: &str,
+        reason_code: Option<&str>,
+        error_code: Option<&str>,
+    ) -> &LedgerEntry {
+        self.ledger.append(
+            ts,
+            LedgerEntryKind::OutcomeSealed {
+                outcome_kind: outcome_kind.to_string(),
+                reason_code: reason_code.map(String::from),
+                error_code: error_code.map(String::from),
+            },
+            self.default_correlation.clone(),
+        )
+    }
+
+    /// Record a receipt (mirrors TxReceipt for ledger correlation).
+    pub fn record_receipt(
+        &mut self,
+        ts: i64,
+        receipt_seq: u64,
+        state: MissionTxState,
+        reason_code: Option<&str>,
+        error_code: Option<&str>,
+    ) -> &LedgerEntry {
+        self.ledger.append(
+            ts,
+            LedgerEntryKind::ReceiptRecorded {
+                receipt_seq,
+                state,
+                reason_code: reason_code.map(String::from),
+                error_code: error_code.map(String::from),
+            },
+            self.default_correlation.clone(),
+        )
+    }
+}
+
 /// Mission policy preflight stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -7927,5 +8578,786 @@ mod tests {
     fn plan_no_preconditions_helper() {
         let plan = ActionPlan::builder("Test", "ws").build();
         assert!(!plan.has_preconditions());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Intent Ledger (H2) Tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn test_ledger() -> IntentLedger {
+        IntentLedger::new(TxId("tx-test-001".to_string()))
+    }
+
+    fn test_correlation() -> LedgerCorrelation {
+        LedgerCorrelation {
+            mission_run_id: Some("run-42".to_string()),
+            pane_ids: vec![1, 2],
+            agent_ids: vec!["agent-a".to_string()],
+            bead_ids: vec!["ft-test.1".to_string()],
+            thread_ids: Vec::new(),
+            policy_check_ids: Vec::new(),
+            reservation_ids: Vec::new(),
+            approval_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ledger_new_is_empty() {
+        let ledger = test_ledger();
+        assert!(ledger.is_empty());
+        assert_eq!(ledger.len(), 0);
+        assert!(ledger.last_entry().is_none());
+        assert!(ledger.entry_at(1).is_none());
+    }
+
+    #[test]
+    fn ledger_append_assigns_seq_and_hash() {
+        let mut ledger = test_ledger();
+        let corr = LedgerCorrelation::empty();
+        ledger.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "test tx".to_string(),
+                requested_by: "operator".to_string(),
+            },
+            corr,
+        );
+        assert_eq!(ledger.len(), 1);
+        let entry = ledger.entry_at(1).unwrap();
+        assert_eq!(entry.seq, 1);
+        assert!(!entry.entry_hash.is_empty());
+        assert!(entry.prev_hash.is_empty()); // genesis
+        assert!(entry.verify_hash());
+    }
+
+    #[test]
+    fn ledger_hash_chain_links_entries() {
+        let mut ledger = test_ledger();
+        let corr = LedgerCorrelation::empty();
+
+        ledger.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "s".to_string(),
+                requested_by: "o".to_string(),
+            },
+            corr.clone(),
+        );
+        ledger.append(
+            2000,
+            LedgerEntryKind::StateTransition {
+                from: MissionTxState::Draft,
+                to: MissionTxState::Planned,
+                kind: MissionTxTransitionKind::PlanCreated,
+            },
+            corr,
+        );
+
+        let e1 = ledger.entry_at(1).unwrap();
+        let e2 = ledger.entry_at(2).unwrap();
+        assert_eq!(e2.prev_hash, e1.entry_hash);
+        assert_eq!(e2.seq, 2);
+        assert!(e2.verify_hash());
+    }
+
+    #[test]
+    fn ledger_validate_happy_path() {
+        let mut ledger = test_ledger();
+        let corr = LedgerCorrelation::empty();
+
+        ledger.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "tx".to_string(),
+                requested_by: "op".to_string(),
+            },
+            corr.clone(),
+        );
+        ledger.append(
+            2000,
+            LedgerEntryKind::PlanCreated {
+                plan_id: TxPlanId("plan-1".to_string()),
+                step_count: 2,
+                precondition_count: 1,
+                compensation_count: 1,
+            },
+            corr.clone(),
+        );
+        ledger.append(
+            3000,
+            LedgerEntryKind::StateTransition {
+                from: MissionTxState::Draft,
+                to: MissionTxState::Planned,
+                kind: MissionTxTransitionKind::PlanCreated,
+            },
+            corr,
+        );
+
+        assert!(ledger.validate().is_ok());
+    }
+
+    #[test]
+    fn ledger_validate_detects_tampering() {
+        let mut ledger = test_ledger();
+        let corr = LedgerCorrelation::empty();
+
+        ledger.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "tx".to_string(),
+                requested_by: "op".to_string(),
+            },
+            corr.clone(),
+        );
+        ledger.append(
+            2000,
+            LedgerEntryKind::PlanCreated {
+                plan_id: TxPlanId("plan-1".to_string()),
+                step_count: 2,
+                precondition_count: 0,
+                compensation_count: 0,
+            },
+            corr,
+        );
+
+        // Tamper with entry 2's timestamp
+        ledger.entries[1].created_at_ms = 9999;
+
+        let result = ledger.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, LedgerValidationError::TamperedEntry { seq: 2 }));
+    }
+
+    #[test]
+    fn ledger_validate_detects_broken_chain() {
+        let mut ledger = test_ledger();
+        let corr = LedgerCorrelation::empty();
+
+        ledger.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "tx".to_string(),
+                requested_by: "op".to_string(),
+            },
+            corr.clone(),
+        );
+        ledger.append(
+            2000,
+            LedgerEntryKind::PlanCreated {
+                plan_id: TxPlanId("plan-1".to_string()),
+                step_count: 1,
+                precondition_count: 0,
+                compensation_count: 0,
+            },
+            corr,
+        );
+
+        // Break the chain
+        ledger.entries[1].prev_hash = "bogus".to_string();
+        // Recompute entry hash to avoid TamperedEntry error
+        ledger.entries[1].entry_hash = ledger.entries[1].compute_hash();
+
+        let err = ledger.validate().unwrap_err();
+        assert!(matches!(err, LedgerValidationError::BrokenHashChain { seq: 2, .. }));
+    }
+
+    #[test]
+    fn ledger_validate_detects_invalid_genesis() {
+        let mut ledger = test_ledger();
+        let corr = LedgerCorrelation::empty();
+
+        ledger.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "tx".to_string(),
+                requested_by: "op".to_string(),
+            },
+            corr,
+        );
+
+        // Set genesis prev_hash to non-empty
+        ledger.entries[0].prev_hash = "non-empty".to_string();
+        ledger.entries[0].entry_hash = ledger.entries[0].compute_hash();
+
+        let err = ledger.validate().unwrap_err();
+        assert!(matches!(err, LedgerValidationError::InvalidGenesis));
+    }
+
+    #[test]
+    fn ledger_validate_detects_tx_id_mismatch() {
+        let mut ledger = test_ledger();
+        let corr = LedgerCorrelation::empty();
+
+        ledger.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "tx".to_string(),
+                requested_by: "op".to_string(),
+            },
+            corr,
+        );
+
+        // Change tx_id on the entry
+        ledger.entries[0].tx_id = TxId("wrong-tx".to_string());
+        ledger.entries[0].prev_hash = String::new(); // keep genesis valid
+        ledger.entries[0].entry_hash = ledger.entries[0].compute_hash();
+
+        let err = ledger.validate().unwrap_err();
+        assert!(matches!(err, LedgerValidationError::TxIdMismatch { seq: 1, .. }));
+    }
+
+    #[test]
+    fn ledger_empty_validates_ok() {
+        let ledger = test_ledger();
+        assert!(ledger.validate().is_ok());
+    }
+
+    #[test]
+    fn ledger_entries_of_kind_filters_correctly() {
+        let mut ledger = test_ledger();
+        let corr = LedgerCorrelation::empty();
+
+        ledger.append(1000, LedgerEntryKind::IntentRegistered {
+            summary: "tx".to_string(),
+            requested_by: "op".to_string(),
+        }, corr.clone());
+        ledger.append(2000, LedgerEntryKind::StateTransition {
+            from: MissionTxState::Draft,
+            to: MissionTxState::Planned,
+            kind: MissionTxTransitionKind::PlanCreated,
+        }, corr.clone());
+        ledger.append(3000, LedgerEntryKind::StateTransition {
+            from: MissionTxState::Planned,
+            to: MissionTxState::Prepared,
+            kind: MissionTxTransitionKind::PrepareSucceeded,
+        }, corr);
+
+        let transitions = ledger.entries_of_kind("state_transition");
+        assert_eq!(transitions.len(), 2);
+        let intents = ledger.entries_of_kind("intent_registered");
+        assert_eq!(intents.len(), 1);
+        let steps = ledger.entries_of_kind("step_executed");
+        assert_eq!(steps.len(), 0);
+    }
+
+    #[test]
+    fn ledger_entries_in_range() {
+        let mut ledger = test_ledger();
+        let corr = LedgerCorrelation::empty();
+
+        for ts in [1000, 2000, 3000, 4000, 5000] {
+            ledger.append(ts, LedgerEntryKind::ReceiptRecorded {
+                receipt_seq: ts as u64 / 1000,
+                state: MissionTxState::Draft,
+                reason_code: None,
+                error_code: None,
+            }, corr.clone());
+        }
+
+        let range = ledger.entries_in_range(2000, 4000);
+        assert_eq!(range.len(), 3);
+        assert_eq!(range[0].created_at_ms, 2000);
+        assert_eq!(range[2].created_at_ms, 4000);
+    }
+
+    #[test]
+    fn ledger_entries_for_pane_filters() {
+        let mut ledger = test_ledger();
+
+        let corr_pane1 = LedgerCorrelation {
+            pane_ids: vec![1],
+            ..LedgerCorrelation::empty()
+        };
+        let corr_pane2 = LedgerCorrelation {
+            pane_ids: vec![2],
+            ..LedgerCorrelation::empty()
+        };
+
+        ledger.append(1000, LedgerEntryKind::StepExecuted {
+            step_id: TxStepId("s1".to_string()),
+            ordinal: 1,
+            succeeded: true,
+            detail: "ok".to_string(),
+        }, corr_pane1);
+        ledger.append(2000, LedgerEntryKind::StepExecuted {
+            step_id: TxStepId("s2".to_string()),
+            ordinal: 2,
+            succeeded: true,
+            detail: "ok".to_string(),
+        }, corr_pane2);
+
+        assert_eq!(ledger.entries_for_pane(1).len(), 1);
+        assert_eq!(ledger.entries_for_pane(2).len(), 1);
+        assert_eq!(ledger.entries_for_pane(99).len(), 0);
+    }
+
+    #[test]
+    fn ledger_entries_for_agent_filters() {
+        let mut ledger = test_ledger();
+
+        let corr_a = LedgerCorrelation {
+            agent_ids: vec!["alice".to_string()],
+            ..LedgerCorrelation::empty()
+        };
+        let corr_b = LedgerCorrelation {
+            agent_ids: vec!["bob".to_string()],
+            ..LedgerCorrelation::empty()
+        };
+
+        ledger.append(1000, LedgerEntryKind::IntentRegistered {
+            summary: "a".to_string(),
+            requested_by: "alice".to_string(),
+        }, corr_a);
+        ledger.append(2000, LedgerEntryKind::IntentRegistered {
+            summary: "b".to_string(),
+            requested_by: "bob".to_string(),
+        }, corr_b);
+
+        assert_eq!(ledger.entries_for_agent("alice").len(), 1);
+        assert_eq!(ledger.entries_for_agent("bob").len(), 1);
+        assert_eq!(ledger.entries_for_agent("eve").len(), 0);
+    }
+
+    #[test]
+    fn ledger_current_state_tracks_transitions() {
+        let mut ledger = test_ledger();
+        let corr = LedgerCorrelation::empty();
+
+        assert_eq!(ledger.current_state(), MissionTxState::Draft); // default
+
+        ledger.append(1000, LedgerEntryKind::StateTransition {
+            from: MissionTxState::Draft,
+            to: MissionTxState::Planned,
+            kind: MissionTxTransitionKind::PlanCreated,
+        }, corr.clone());
+        assert_eq!(ledger.current_state(), MissionTxState::Planned);
+
+        ledger.append(2000, LedgerEntryKind::StateTransition {
+            from: MissionTxState::Planned,
+            to: MissionTxState::Prepared,
+            kind: MissionTxTransitionKind::PrepareSucceeded,
+        }, corr.clone());
+        assert_eq!(ledger.current_state(), MissionTxState::Prepared);
+
+        ledger.append(3000, LedgerEntryKind::StateTransition {
+            from: MissionTxState::Prepared,
+            to: MissionTxState::Committing,
+            kind: MissionTxTransitionKind::CommitStarted,
+        }, corr);
+        assert_eq!(ledger.current_state(), MissionTxState::Committing);
+    }
+
+    #[test]
+    fn ledger_state_timeline_extracts_transitions() {
+        let mut ledger = test_ledger();
+        let corr = test_correlation();
+
+        ledger.append(1000, LedgerEntryKind::IntentRegistered {
+            summary: "tx".to_string(),
+            requested_by: "op".to_string(),
+        }, corr.clone());
+        ledger.append(2000, LedgerEntryKind::StateTransition {
+            from: MissionTxState::Draft,
+            to: MissionTxState::Planned,
+            kind: MissionTxTransitionKind::PlanCreated,
+        }, corr.clone());
+        ledger.append(3000, LedgerEntryKind::PreconditionEvaluated {
+            precondition_index: 0,
+            passed: true,
+            detail: "ok".to_string(),
+        }, corr.clone());
+        ledger.append(4000, LedgerEntryKind::StateTransition {
+            from: MissionTxState::Planned,
+            to: MissionTxState::Prepared,
+            kind: MissionTxTransitionKind::PrepareSucceeded,
+        }, corr);
+
+        let timeline = ledger.state_timeline();
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0].from, MissionTxState::Draft);
+        assert_eq!(timeline[0].to, MissionTxState::Planned);
+        assert_eq!(timeline[1].from, MissionTxState::Planned);
+        assert_eq!(timeline[1].to, MissionTxState::Prepared);
+        assert_eq!(timeline[0].timestamp_ms, 2000);
+        assert_eq!(timeline[1].timestamp_ms, 4000);
+    }
+
+    #[test]
+    fn ledger_jsonl_roundtrip() {
+        let mut ledger = test_ledger();
+        let corr = test_correlation();
+
+        ledger.append(1000, LedgerEntryKind::IntentRegistered {
+            summary: "test tx".to_string(),
+            requested_by: "op".to_string(),
+        }, corr.clone());
+        ledger.append(2000, LedgerEntryKind::StateTransition {
+            from: MissionTxState::Draft,
+            to: MissionTxState::Planned,
+            kind: MissionTxTransitionKind::PlanCreated,
+        }, corr.clone());
+        ledger.append(3000, LedgerEntryKind::OutcomeSealed {
+            outcome_kind: "committed".to_string(),
+            reason_code: None,
+            error_code: None,
+        }, corr);
+
+        let jsonl = ledger.to_jsonl();
+        let restored = IntentLedger::from_jsonl(
+            TxId("tx-test-001".to_string()),
+            &jsonl,
+        ).unwrap();
+
+        assert_eq!(restored.len(), ledger.len());
+        for (orig, rest) in ledger.entries().iter().zip(restored.entries().iter()) {
+            assert_eq!(orig.seq, rest.seq);
+            assert_eq!(orig.entry_hash, rest.entry_hash);
+            assert_eq!(orig.prev_hash, rest.prev_hash);
+            assert_eq!(orig.tx_id, rest.tx_id);
+            assert_eq!(orig.created_at_ms, rest.created_at_ms);
+        }
+        assert!(restored.validate().is_ok());
+    }
+
+    #[test]
+    fn ledger_serde_roundtrip() {
+        let mut ledger = test_ledger();
+        let corr = LedgerCorrelation::empty();
+
+        ledger.append(1000, LedgerEntryKind::IntentRegistered {
+            summary: "tx".to_string(),
+            requested_by: "op".to_string(),
+        }, corr);
+
+        let json = serde_json::to_string(&ledger).unwrap();
+        let restored: IntentLedger = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored.tx_id, ledger.tx_id);
+        assert!(restored.validate().is_ok());
+    }
+
+    #[test]
+    fn ledger_entry_serde_roundtrip() {
+        let entry = LedgerEntry {
+            seq: 1,
+            entry_hash: "abc123".to_string(),
+            prev_hash: String::new(),
+            tx_id: TxId("tx-1".to_string()),
+            created_at_ms: 1000,
+            kind: LedgerEntryKind::StepExecuted {
+                step_id: TxStepId("s1".to_string()),
+                ordinal: 1,
+                succeeded: true,
+                detail: "done".to_string(),
+            },
+            correlation: test_correlation(),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let restored: LedgerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.seq, entry.seq);
+        assert_eq!(restored.entry_hash, entry.entry_hash);
+        assert_eq!(restored.tx_id, entry.tx_id);
+    }
+
+    #[test]
+    fn ledger_correlation_serde_roundtrip() {
+        let corr = test_correlation();
+        let json = serde_json::to_string(&corr).unwrap();
+        let restored: LedgerCorrelation = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.mission_run_id, corr.mission_run_id);
+        assert_eq!(restored.pane_ids, corr.pane_ids);
+        assert_eq!(restored.agent_ids, corr.agent_ids);
+        assert_eq!(restored.bead_ids, corr.bead_ids);
+    }
+
+    #[test]
+    fn ledger_correlation_empty_skips_defaults() {
+        let corr = LedgerCorrelation::empty();
+        let json = serde_json::to_string(&corr).unwrap();
+        // Empty vecs should be skipped
+        assert!(!json.contains("pane_ids"));
+        assert!(!json.contains("agent_ids"));
+    }
+
+    #[test]
+    fn ledger_correlation_with_mission() {
+        let corr = LedgerCorrelation::with_mission("run-99");
+        assert_eq!(corr.mission_run_id, Some("run-99".to_string()));
+        assert!(corr.pane_ids.is_empty());
+    }
+
+    #[test]
+    fn ledger_recorder_happy_path() {
+        let mut ledger = test_ledger();
+        let corr = test_correlation();
+
+        {
+            let mut rec = LedgerRecorder::new(&mut ledger, corr);
+            rec.record_intent(1000, "Apply updates", "operator");
+            rec.record_plan(
+                2000,
+                &TxPlanId("plan-1".to_string()),
+                2, 1, 1,
+            );
+            rec.record_precondition(3000, 0, true, "prompt active");
+            rec.record_transition(
+                4000,
+                MissionTxState::Draft,
+                MissionTxState::Planned,
+                MissionTxTransitionKind::PlanCreated,
+            );
+            rec.record_transition(
+                5000,
+                MissionTxState::Planned,
+                MissionTxState::Prepared,
+                MissionTxTransitionKind::PrepareSucceeded,
+            );
+            rec.record_step(
+                6000,
+                &TxStepId("s1".to_string()),
+                1, true, "acquired lock",
+            );
+            rec.record_step(
+                7000,
+                &TxStepId("s2".to_string()),
+                2, true, "sent text",
+            );
+            rec.record_transition(
+                8000,
+                MissionTxState::Prepared,
+                MissionTxState::Committing,
+                MissionTxTransitionKind::CommitStarted,
+            );
+            rec.record_receipt(9000, 1, MissionTxState::Committed, None, None);
+            rec.record_transition(
+                10000,
+                MissionTxState::Committing,
+                MissionTxState::Committed,
+                MissionTxTransitionKind::CommitSucceeded,
+            );
+            rec.record_outcome(11000, "committed", None, None);
+        }
+
+        assert_eq!(ledger.len(), 11);
+        assert!(ledger.validate().is_ok());
+        assert_eq!(ledger.current_state(), MissionTxState::Committed);
+
+        let timeline = ledger.state_timeline();
+        assert_eq!(timeline.len(), 4);
+        assert_eq!(timeline.last().unwrap().to, MissionTxState::Committed);
+    }
+
+    #[test]
+    fn ledger_recorder_compensation_path() {
+        let mut ledger = test_ledger();
+        let corr = LedgerCorrelation::with_mission("run-fail");
+
+        {
+            let mut rec = LedgerRecorder::new(&mut ledger, corr);
+            rec.record_intent(1000, "Failing tx", "operator");
+            rec.record_transition(
+                2000,
+                MissionTxState::Draft,
+                MissionTxState::Planned,
+                MissionTxTransitionKind::PlanCreated,
+            );
+            rec.record_transition(
+                3000,
+                MissionTxState::Planned,
+                MissionTxState::Prepared,
+                MissionTxTransitionKind::PrepareSucceeded,
+            );
+            rec.record_transition(
+                4000,
+                MissionTxState::Prepared,
+                MissionTxState::Committing,
+                MissionTxTransitionKind::CommitStarted,
+            );
+            rec.record_step(
+                5000,
+                &TxStepId("s1".to_string()),
+                1, false, "partial failure",
+            );
+            rec.record_transition(
+                6000,
+                MissionTxState::Committing,
+                MissionTxState::Compensating,
+                MissionTxTransitionKind::CommitPartial,
+            );
+            rec.record_compensation(
+                7000,
+                &TxStepId("s1".to_string()),
+                true, "rolled back step 1",
+            );
+            rec.record_transition(
+                8000,
+                MissionTxState::Compensating,
+                MissionTxState::RolledBack,
+                MissionTxTransitionKind::CompensationSucceeded,
+            );
+            rec.record_outcome(
+                9000,
+                "rolled_back",
+                Some("commit_partial"),
+                Some("FTX2007"),
+            );
+        }
+
+        assert_eq!(ledger.len(), 9);
+        assert!(ledger.validate().is_ok());
+        assert_eq!(ledger.current_state(), MissionTxState::RolledBack);
+    }
+
+    #[test]
+    fn ledger_hash_deterministic() {
+        let mut l1 = test_ledger();
+        let mut l2 = test_ledger();
+        let corr = LedgerCorrelation::empty();
+
+        l1.append(1000, LedgerEntryKind::IntentRegistered {
+            summary: "tx".to_string(),
+            requested_by: "op".to_string(),
+        }, corr.clone());
+        l2.append(1000, LedgerEntryKind::IntentRegistered {
+            summary: "tx".to_string(),
+            requested_by: "op".to_string(),
+        }, corr);
+
+        assert_eq!(
+            l1.entry_at(1).unwrap().entry_hash,
+            l2.entry_at(1).unwrap().entry_hash,
+        );
+    }
+
+    #[test]
+    fn ledger_entry_at_zero_returns_none() {
+        let mut ledger = test_ledger();
+        ledger.append(1000, LedgerEntryKind::IntentRegistered {
+            summary: "tx".to_string(),
+            requested_by: "op".to_string(),
+        }, LedgerCorrelation::empty());
+
+        assert!(ledger.entry_at(0).is_none());
+        assert!(ledger.entry_at(1).is_some());
+        assert!(ledger.entry_at(2).is_none());
+    }
+
+    #[test]
+    fn ledger_validation_error_display() {
+        let err = LedgerValidationError::TamperedEntry { seq: 3 };
+        let msg = format!("{err}");
+        assert!(msg.contains("seq 3"));
+
+        let err = LedgerValidationError::BrokenHashChain {
+            seq: 5,
+            expected_prev: "abc".to_string(),
+            actual_prev: "def".to_string(),
+        };
+        assert!(format!("{err}").contains("seq 5"));
+    }
+
+    #[test]
+    fn ledger_all_entry_kinds_roundtrip() {
+        let kinds = vec![
+            LedgerEntryKind::IntentRegistered {
+                summary: "s".to_string(),
+                requested_by: "r".to_string(),
+            },
+            LedgerEntryKind::PlanCreated {
+                plan_id: TxPlanId("p".to_string()),
+                step_count: 3,
+                precondition_count: 1,
+                compensation_count: 2,
+            },
+            LedgerEntryKind::PreconditionEvaluated {
+                precondition_index: 0,
+                passed: true,
+                detail: "ok".to_string(),
+            },
+            LedgerEntryKind::StateTransition {
+                from: MissionTxState::Draft,
+                to: MissionTxState::Planned,
+                kind: MissionTxTransitionKind::PlanCreated,
+            },
+            LedgerEntryKind::StepExecuted {
+                step_id: TxStepId("s1".to_string()),
+                ordinal: 1,
+                succeeded: true,
+                detail: "done".to_string(),
+            },
+            LedgerEntryKind::CompensationExecuted {
+                for_step_id: TxStepId("s1".to_string()),
+                succeeded: false,
+                detail: "failed".to_string(),
+            },
+            LedgerEntryKind::OutcomeSealed {
+                outcome_kind: "committed".to_string(),
+                reason_code: None,
+                error_code: None,
+            },
+            LedgerEntryKind::ReceiptRecorded {
+                receipt_seq: 1,
+                state: MissionTxState::Committed,
+                reason_code: Some("ok".to_string()),
+                error_code: None,
+            },
+        ];
+
+        for kind in kinds {
+            let json = serde_json::to_string(&kind).unwrap();
+            let restored: LedgerEntryKind = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&restored).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    #[test]
+    fn ledger_jsonl_empty_lines_skipped() {
+        let jsonl = "\n\n";
+        let ledger = IntentLedger::from_jsonl(TxId("tx-1".to_string()), jsonl).unwrap();
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn ledger_jsonl_bad_line_returns_error() {
+        let result = IntentLedger::from_jsonl(
+            TxId("tx-1".to_string()),
+            "not valid json",
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("line 1"));
+    }
+
+    #[test]
+    fn ledger_large_chain_validates() {
+        let mut ledger = test_ledger();
+        let corr = LedgerCorrelation::empty();
+
+        for i in 0..100 {
+            ledger.append(
+                1000 * (i + 1),
+                LedgerEntryKind::ReceiptRecorded {
+                    receipt_seq: i as u64 + 1,
+                    state: MissionTxState::Draft,
+                    reason_code: None,
+                    error_code: None,
+                },
+                corr.clone(),
+            );
+        }
+
+        assert_eq!(ledger.len(), 100);
+        assert!(ledger.validate().is_ok());
+
+        // Every entry should link to the previous
+        for i in 1..100 {
+            assert_eq!(
+                ledger.entries()[i].prev_hash,
+                ledger.entries()[i - 1].entry_hash,
+            );
+        }
     }
 }
