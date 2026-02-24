@@ -69,14 +69,14 @@ impl CollectingCaptureSink {
 
     /// Return a snapshot of all collected events.
     pub fn events(&self) -> Vec<(RecorderEvent, RecorderMergeKey)> {
-        self.events.lock().unwrap().clone()
+        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     /// Return just the recorder events without merge keys.
     pub fn recorder_events(&self) -> Vec<RecorderEvent> {
         self.events
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|(e, _)| e.clone())
             .collect()
@@ -84,7 +84,7 @@ impl CollectingCaptureSink {
 
     /// Return the number of collected events.
     pub fn len(&self) -> usize {
-        self.events.lock().unwrap().len()
+        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
     /// Return true if no events have been collected.
@@ -94,13 +94,13 @@ impl CollectingCaptureSink {
 
     /// Clear all collected events.
     pub fn clear(&self) {
-        self.events.lock().unwrap().clear();
+        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 }
 
 impl CaptureSink for CollectingCaptureSink {
     fn on_event(&self, event: RecorderEvent, merge_key: RecorderMergeKey) {
-        self.events.lock().unwrap().push((event, merge_key));
+        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((event, merge_key));
     }
 }
 
@@ -671,7 +671,7 @@ impl CaptureAdapter {
 
     /// Get or create a per-pane sequence counter, returning the next value.
     fn next_pane_seq(&self, pane_id: u64) -> u64 {
-        let mut map = self.pane_sequences.lock().unwrap();
+        let mut map = self.pane_sequences.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let counter = map.entry(pane_id).or_insert_with(|| AtomicU64::new(0));
         counter.fetch_add(1, Ordering::Relaxed)
     }

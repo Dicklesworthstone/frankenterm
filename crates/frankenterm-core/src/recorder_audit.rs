@@ -408,7 +408,7 @@ impl AuditLog {
 
     /// Append a new audit entry. Returns the finalized entry with ordinal and hash chain.
     pub fn append(&self, builder: AuditEventBuilder) -> RecorderAuditEntry {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let entry = RecorderAuditEntry {
             audit_version: AUDIT_SCHEMA_VERSION.to_string(),
@@ -444,14 +444,14 @@ impl AuditLog {
     /// Return all in-memory entries.
     #[must_use]
     pub fn entries(&self) -> Vec<RecorderAuditEntry> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.entries.iter().cloned().collect()
     }
 
     /// Return entries matching the given event type.
     #[must_use]
     pub fn entries_by_type(&self, event_type: AuditEventType) -> Vec<RecorderAuditEntry> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner
             .entries
             .iter()
@@ -463,7 +463,7 @@ impl AuditLog {
     /// Return entries for the given actor kind.
     #[must_use]
     pub fn entries_by_actor(&self, actor_kind: ActorKind) -> Vec<RecorderAuditEntry> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner
             .entries
             .iter()
@@ -475,7 +475,7 @@ impl AuditLog {
     /// Return entries in a time range (inclusive).
     #[must_use]
     pub fn entries_in_range(&self, start_ms: u64, end_ms: u64) -> Vec<RecorderAuditEntry> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner
             .entries
             .iter()
@@ -487,38 +487,38 @@ impl AuditLog {
     /// Number of in-memory entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().entries.len()
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.len()
     }
 
     /// Whether the log has no in-memory entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().entries.is_empty()
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.is_empty()
     }
 
     /// Total entries ever appended (including those evicted from memory).
     #[must_use]
     pub fn total_appended(&self) -> u64 {
-        self.inner.lock().unwrap().total_appended
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).total_appended
     }
 
     /// The next ordinal that will be assigned.
     #[must_use]
     pub fn next_ordinal(&self) -> u64 {
-        self.inner.lock().unwrap().next_ordinal
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).next_ordinal
     }
 
     /// The hash of the most recently appended entry.
     #[must_use]
     pub fn last_hash(&self) -> String {
-        self.inner.lock().unwrap().last_hash.clone()
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_hash.clone()
     }
 
     /// Drain all in-memory entries (for flush to disk).
     ///
     /// Returns the drained entries. The hash chain state is preserved.
     pub fn drain(&self) -> Vec<RecorderAuditEntry> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.entries.drain(..).collect()
     }
 
@@ -797,7 +797,7 @@ impl AuditLog {
     /// Compute summary statistics over in-memory entries.
     #[must_use]
     pub fn stats(&self) -> AuditStats {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stats = AuditStats {
             total_entries: inner.entries.len() as u64,
             ..Default::default()

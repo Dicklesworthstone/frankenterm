@@ -2642,12 +2642,19 @@ async fn handle_native_event(
                 last_decision_at: Some(timestamp_ms),
             };
 
-            let storage_guard = storage.lock().await;
-            if let Err(err) = storage_guard.upsert_pane(record).await {
-                warn!(pane_id, error = %err, "Failed to upsert pane from native event");
+            // Acquire and release the storage lock for each operation separately
+            // to avoid holding the lock across multiple .await points, which would
+            // block other tasks from accessing storage.
+            {
+                let storage_guard = storage.lock().await;
+                if let Err(err) = storage_guard.upsert_pane(record).await {
+                    warn!(pane_id, error = %err, "Failed to upsert pane from native event");
+                }
             }
-            let max_seq = storage_guard.get_max_seq(pane_id).await.unwrap_or(None);
-            drop(storage_guard);
+            let max_seq = {
+                let storage_guard = storage.lock().await;
+                storage_guard.get_max_seq(pane_id).await.unwrap_or(None)
+            };
 
             if observed {
                 let next_seq = max_seq.map_or(0, |seq| seq + 1);

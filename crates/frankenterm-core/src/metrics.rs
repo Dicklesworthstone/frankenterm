@@ -520,6 +520,10 @@ async fn handle_connection(
         }
     }
 
+    // Explicitly shut down the write half to ensure the TCP connection is
+    // terminated cleanly rather than relying on implicit drop.
+    let _ = socket.shutdown().await;
+
     Ok(())
 }
 

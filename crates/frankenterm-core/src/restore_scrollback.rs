@@ -161,7 +161,7 @@ impl InjectionGuard {
     /// Create a new injection guard that suppresses the given pane IDs.
     pub fn new(suppressed: Arc<std::sync::Mutex<HashSet<u64>>>, pane_ids: Vec<u64>) -> Self {
         {
-            let mut set = suppressed.lock().expect("injection guard lock");
+            let mut set = suppressed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for &id in &pane_ids {
                 set.insert(id);
             }
@@ -183,7 +183,7 @@ impl InjectionGuard {
 
 impl Drop for InjectionGuard {
     fn drop(&mut self) {
-        let mut set = self.suppressed.lock().expect("injection guard lock");
+        let mut set = self.suppressed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for &id in &self.pane_ids {
             set.remove(&id);
         }

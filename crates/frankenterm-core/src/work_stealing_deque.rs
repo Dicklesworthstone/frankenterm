@@ -152,14 +152,14 @@ impl<T> Clone for Worker<T> {
 impl<T> Worker<T> {
     /// Push an item onto the bottom of the deque.
     pub fn push(&self, item: T) {
-        let mut state = self.state.lock().expect("lock poisoned");
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.buffer.push_back(item);
         state.total_pushed += 1;
     }
 
     /// Pop an item from the bottom of the deque (LIFO).
     pub fn pop(&self) -> Option<T> {
-        let mut state = self.state.lock().expect("lock poisoned");
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let item = state.buffer.pop_back();
         if item.is_some() {
             state.total_popped += 1;
@@ -169,7 +169,7 @@ impl<T> Worker<T> {
 
     /// Number of items currently in the deque.
     pub fn len(&self) -> usize {
-        let state = self.state.lock().expect("lock poisoned");
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.buffer.len()
     }
 
@@ -180,7 +180,7 @@ impl<T> Worker<T> {
 
     /// Get statistics.
     pub fn stats(&self) -> WsDequeStats {
-        let state = self.state.lock().expect("lock poisoned");
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         WsDequeStats {
             len: state.buffer.len(),
             total_pushed: state.total_pushed,

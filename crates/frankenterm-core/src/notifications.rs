@@ -222,7 +222,7 @@ pub struct NotificationOutcome {
 pub struct NotificationPipeline {
     gate: NotificationGate,
     senders: Vec<Box<dyn NotificationSender>>,
-    mute_store: Option<Arc<crate::runtime_compat::Mutex<StorageHandle>>>,
+    mute_store: Option<Arc<crate::runtime_compat::RwLock<StorageHandle>>>,
 }
 
 impl NotificationPipeline {
@@ -241,7 +241,7 @@ impl NotificationPipeline {
     pub fn with_mute_store(
         gate: NotificationGate,
         senders: Vec<Box<dyn NotificationSender>>,
-        storage: Arc<crate::runtime_compat::Mutex<StorageHandle>>,
+        storage: Arc<crate::runtime_compat::RwLock<StorageHandle>>,
     ) -> Self {
         Self {
             gate,
@@ -267,8 +267,11 @@ impl NotificationPipeline {
         if let Some(storage) = &self.mute_store {
             let identity_key = event_identity_key(detection, pane_id, pane_uuid);
             let now_ms = now_epoch_ms();
+            // Use read() instead of exclusive lock() since is_event_muted
+            // only needs &self access. This avoids holding an exclusive lock
+            // across the .await point and allows concurrent mute checks.
             let muted = {
-                let storage_guard = storage.lock().await;
+                let storage_guard = storage.read().await;
                 storage_guard
                     .is_event_muted(&identity_key, now_ms)
                     .await
@@ -811,7 +814,7 @@ mod tests {
             NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sender = MockSender::new("mock", Arc::clone(&sent));
-        let storage_arc = Arc::new(crate::runtime_compat::Mutex::new(storage));
+        let storage_arc = Arc::new(crate::runtime_compat::RwLock::new(storage));
         let mut pipeline =
             NotificationPipeline::with_mute_store(gate, vec![Box::new(sender)], storage_arc);
 

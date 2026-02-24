@@ -2101,63 +2101,88 @@ impl WorkflowContext {
     /// - Checks policy authorization
     /// - Emits audit entries
     /// - Only sends if allowed
+    ///
+    /// Note: The injector lock (tokio::sync::Mutex) is intentionally held across
+    /// the `.await` because `inject()` requires `&mut self` for the entire
+    /// policy-check-then-send operation. This is safe because:
+    /// 1. `inject()` does not re-acquire this lock (no re-entrant locking)
+    /// 2. tokio::sync::Mutex is designed for async contexts
+    /// 3. The lock ensures atomicity of policy evaluation + send
     pub async fn send_text(
         &mut self,
         text: &str,
     ) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let mut guard = injector.lock().await;
-        Ok(guard
-            .send_text(
-                self.pane_id,
-                text,
-                crate::policy::ActorKind::Workflow,
-                &self.capabilities,
-                Some(&self.execution_id),
-            )
-            .await)
+        let result = {
+            let mut guard = injector.lock().await;
+            guard
+                .send_text(
+                    self.pane_id,
+                    text,
+                    crate::policy::ActorKind::Workflow,
+                    &self.capabilities,
+                    Some(&self.execution_id),
+                )
+                .await
+        };
+        Ok(result)
     }
 
     /// Send Ctrl-C (interrupt) to the target pane via policy-gated injection.
+    ///
+    /// See [`send_text`](Self::send_text) for lock safety rationale.
     pub async fn send_ctrl_c(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let mut guard = injector.lock().await;
-        Ok(guard
-            .send_ctrl_c(
-                self.pane_id,
-                crate::policy::ActorKind::Workflow,
-                &self.capabilities,
-                Some(&self.execution_id),
-            )
-            .await)
+        let result = {
+            let mut guard = injector.lock().await;
+            guard
+                .send_ctrl_c(
+                    self.pane_id,
+                    crate::policy::ActorKind::Workflow,
+                    &self.capabilities,
+                    Some(&self.execution_id),
+                )
+                .await
+        };
+        Ok(result)
     }
 
     /// Send Ctrl-D (EOF) to the target pane via policy-gated injection.
+    ///
+    /// See [`send_text`](Self::send_text) for lock safety rationale.
     pub async fn send_ctrl_d(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let mut guard = injector.lock().await;
-        Ok(guard
-            .send_ctrl_d(
-                self.pane_id,
-                crate::policy::ActorKind::Workflow,
-                &self.capabilities,
-                Some(&self.execution_id),
-            )
-            .await)
+        let result = {
+            let mut guard = injector.lock().await;
+            guard
+                .send_ctrl_d(
+                    self.pane_id,
+                    crate::policy::ActorKind::Workflow,
+                    &self.capabilities,
+                    Some(&self.execution_id),
+                )
+                .await
+        };
+        Ok(result)
     }
 
     /// Send Ctrl-Z (suspend) to the target pane via policy-gated injection.
+    ///
+    /// See [`send_text`](Self::send_text) for lock safety rationale.
     pub async fn send_ctrl_z(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let mut guard = injector.lock().await;
-        Ok(guard
-            .send_ctrl_z(
-                self.pane_id,
-                crate::policy::ActorKind::Workflow,
-                &self.capabilities,
-                Some(&self.execution_id),
-            )
-            .await)
+        let result = {
+            let mut guard = injector.lock().await;
+            guard
+                .send_ctrl_z(
+                    self.pane_id,
+                    crate::policy::ActorKind::Workflow,
+                    &self.capabilities,
+                    Some(&self.execution_id),
+                )
+                .await
+        };
+        Ok(result)
     }
 
     // ========================================================================

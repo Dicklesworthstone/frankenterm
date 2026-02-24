@@ -514,7 +514,9 @@ async fn handle_server_exit(
 }
 
 fn poke_listener(addr: SocketAddr) {
-    let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(200));
+    if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 #[cfg(test)]
