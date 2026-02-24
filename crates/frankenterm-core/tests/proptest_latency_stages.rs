@@ -5298,4 +5298,306 @@ proptest! {
         let id2 = FaultIsolationManager::to_invariant_domain(domain);
         prop_assert_eq!(id1, id2);
     }
+
+    // ── F2: Circuit Breakers Property Tests ──
+
+    /// BreakerState serde roundtrip.
+    #[test]
+    fn breaker_state_serde_roundtrip(idx in 0u32..3) {
+        let state = match idx % 3 {
+            0 => BreakerState::Closed,
+            1 => BreakerState::Open,
+            _ => BreakerState::HalfOpen,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: BreakerState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(state, back);
+    }
+
+    /// StageBreakerConfig serde roundtrip with arbitrary values.
+    #[test]
+    fn stage_breaker_config_serde(
+        threshold in 1u32..100,
+        open_us in 1000u64..10_000_000,
+        max_probes in 1u32..20,
+        success_th in 1u32..20,
+    ) {
+        let cfg = StageBreakerConfig {
+            failure_threshold: threshold,
+            open_duration_us: open_us,
+            half_open_max_probes: max_probes,
+            half_open_success_threshold: success_th,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: StageBreakerConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(cfg, back);
+    }
+
+    /// New BreakerManager always starts all-closed.
+    #[test]
+    fn breaker_manager_starts_all_closed(
+        threshold in 1u32..100,
+        open_us in 1000u64..10_000_000,
+    ) {
+        let cfg = StageBreakerConfig {
+            failure_threshold: threshold,
+            open_duration_us: open_us,
+            ..Default::default()
+        };
+        let mgr = BreakerManager::new(cfg);
+        prop_assert!(mgr.all_closed());
+        prop_assert_eq!(mgr.open_count(), 0);
+        let avail = mgr.availability();
+        prop_assert!((avail - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// Failures below threshold keep breaker closed.
+    #[test]
+    fn failures_below_threshold_stay_closed(
+        threshold in 2u32..20,
+        stage in arb_stage(),
+    ) {
+        let cfg = StageBreakerConfig {
+            failure_threshold: threshold,
+            ..Default::default()
+        };
+        let mut mgr = BreakerManager::new(cfg);
+        for i in 0..(threshold - 1) {
+            mgr.record_failure(stage, 100 + i as u64);
+        }
+        prop_assert_eq!(mgr.breaker_state(stage), BreakerState::Closed);
+    }
+
+    /// Failures at threshold trip breaker.
+    #[test]
+    fn failures_at_threshold_trip_breaker(
+        threshold in 1u32..20,
+        stage in arb_stage(),
+    ) {
+        let cfg = StageBreakerConfig {
+            failure_threshold: threshold,
+            ..Default::default()
+        };
+        let mut mgr = BreakerManager::new(cfg);
+        for i in 0..threshold {
+            mgr.record_failure(stage, 100 + i as u64);
+        }
+        prop_assert_eq!(mgr.breaker_state(stage), BreakerState::Open);
+        prop_assert_eq!(mgr.total_trips(), 1);
+    }
+
+    /// open_count + closed_count always equals total stages (8).
+    #[test]
+    fn open_plus_closed_equals_total(
+        fail_count in 0u32..10,
+        stage in arb_stage(),
+    ) {
+        let cfg = StageBreakerConfig {
+            failure_threshold: 3,
+            ..Default::default()
+        };
+        let mut mgr = BreakerManager::new(cfg);
+        for i in 0..fail_count {
+            mgr.record_failure(stage, 100 + i as u64);
+        }
+        let open = mgr.open_stages().len();
+        let half = mgr.half_open_stages().len();
+        let closed = mgr.closed_stages().len();
+        prop_assert_eq!(open + half + closed, 8);
+    }
+
+    /// Success in closed state resets failure counter.
+    #[test]
+    fn success_resets_consecutive_failures(
+        fails in 1u32..5,
+        stage in arb_stage(),
+    ) {
+        let cfg = StageBreakerConfig {
+            failure_threshold: 10, // High so we don't trip.
+            ..Default::default()
+        };
+        let mut mgr = BreakerManager::new(cfg);
+        for i in 0..fails {
+            mgr.record_failure(stage, 100 + i as u64);
+        }
+        mgr.record_success(stage);
+        let st = mgr.stage_state(stage).unwrap();
+        prop_assert_eq!(st.consecutive_failures, 0);
+    }
+
+    /// Recovery via half-open: success threshold closes breaker.
+    #[test]
+    fn half_open_recovery_closes_breaker(
+        threshold in 1u32..10,
+        stage in arb_stage(),
+    ) {
+        let cfg = StageBreakerConfig {
+            failure_threshold: 1,
+            open_duration_us: 100,
+            half_open_max_probes: threshold + 5,
+            half_open_success_threshold: threshold,
+        };
+        let mut mgr = BreakerManager::new(cfg);
+        mgr.record_failure(stage, 10);
+        prop_assert_eq!(mgr.breaker_state(stage), BreakerState::Open);
+        // Transition to half-open.
+        mgr.allow_request(stage, 200);
+        prop_assert_eq!(mgr.breaker_state(stage), BreakerState::HalfOpen);
+        // Record enough successes.
+        for _ in 0..threshold {
+            mgr.record_success(stage);
+        }
+        prop_assert_eq!(mgr.breaker_state(stage), BreakerState::Closed);
+        prop_assert_eq!(mgr.total_recoveries(), 1);
+    }
+
+    /// Failure in half-open reopens breaker.
+    #[test]
+    fn half_open_failure_reopens(stage in arb_stage()) {
+        let cfg = StageBreakerConfig {
+            failure_threshold: 1,
+            open_duration_us: 100,
+            ..Default::default()
+        };
+        let mut mgr = BreakerManager::new(cfg);
+        mgr.record_failure(stage, 10);
+        mgr.allow_request(stage, 200);
+        prop_assert_eq!(mgr.breaker_state(stage), BreakerState::HalfOpen);
+        mgr.record_failure(stage, 300);
+        prop_assert_eq!(mgr.breaker_state(stage), BreakerState::Open);
+    }
+
+    /// plan_recovery returns steps ordered by pipeline position.
+    #[test]
+    fn plan_recovery_pipeline_ordered(stages in prop::collection::hash_set(arb_stage(), 1..=4)) {
+        let cfg = StageBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        };
+        let mut mgr = BreakerManager::new(cfg);
+        for stage in &stages {
+            mgr.record_failure(*stage, 100);
+        }
+        let plan = mgr.plan_recovery();
+        prop_assert_eq!(plan.len(), stages.len());
+        // Verify order follows pipeline.
+        for i in 1..plan.len() {
+            let pos_prev = LatencyStage::PIPELINE_STAGES.iter().position(|s| *s == plan[i-1].stage);
+            let pos_curr = LatencyStage::PIPELINE_STAGES.iter().position(|s| *s == plan[i].stage);
+            let is_ordered = pos_prev <= pos_curr;
+            prop_assert!(is_ordered, "Steps not in pipeline order");
+        }
+    }
+
+    /// initiate_recovery only transitions breakers past open_duration.
+    #[test]
+    fn initiate_recovery_respects_duration(
+        open_us in 100u64..10_000,
+        stage in arb_stage(),
+    ) {
+        let cfg = StageBreakerConfig {
+            failure_threshold: 1,
+            open_duration_us: open_us,
+            ..Default::default()
+        };
+        let mut mgr = BreakerManager::new(cfg);
+        mgr.record_failure(stage, 10);
+        // Before cooldown.
+        let count = mgr.initiate_recovery(10 + open_us - 1);
+        prop_assert_eq!(count, 0);
+        // After cooldown.
+        let count = mgr.initiate_recovery(10 + open_us + 1);
+        prop_assert_eq!(count, 1);
+        prop_assert_eq!(mgr.breaker_state(stage), BreakerState::HalfOpen);
+    }
+
+    /// availability is in [0.0, 1.0].
+    #[test]
+    fn availability_bounded(
+        fail_stages in prop::collection::hash_set(arb_stage(), 0..=8),
+    ) {
+        let cfg = StageBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        };
+        let mut mgr = BreakerManager::new(cfg);
+        for stage in &fail_stages {
+            mgr.record_failure(*stage, 100);
+        }
+        let a = mgr.availability();
+        prop_assert!(a >= 0.0 && a <= 1.0, "availability out of range: {}", a);
+    }
+
+    /// record_failures_batch is equivalent to individual calls.
+    #[test]
+    fn record_failures_batch_equivalent(
+        count in 0u32..20,
+        stage in arb_stage(),
+    ) {
+        let cfg = StageBreakerConfig::default();
+        let mut mgr1 = BreakerManager::new(cfg.clone());
+        let mut mgr2 = BreakerManager::new(cfg);
+        for i in 0..count {
+            mgr1.record_failure(stage, 1000 + i as u64);
+        }
+        mgr2.record_failures_batch(stage, count, 1000);
+        prop_assert_eq!(mgr1.breaker_state(stage), mgr2.breaker_state(stage));
+    }
+
+    /// reset clears all counters and returns to closed.
+    #[test]
+    fn reset_clears_all_breakers(stages in prop::collection::hash_set(arb_stage(), 1..=4)) {
+        let cfg = StageBreakerConfig { failure_threshold: 1, ..Default::default() };
+        let mut mgr = BreakerManager::new(cfg);
+        for stage in &stages {
+            mgr.record_failure(*stage, 100);
+        }
+        let had_open = !mgr.all_closed();
+        prop_assert!(had_open);
+        mgr.reset();
+        prop_assert!(mgr.all_closed());
+        prop_assert_eq!(mgr.total_trips(), 0);
+        prop_assert_eq!(mgr.total_recoveries(), 0);
+    }
+
+    /// BreakerManagerSnapshot serde roundtrip.
+    #[test]
+    fn breaker_snapshot_serde(stage in arb_stage()) {
+        let cfg = StageBreakerConfig { failure_threshold: 1, ..Default::default() };
+        let mut mgr = BreakerManager::new(cfg);
+        mgr.record_failure(stage, 100);
+        let snap = mgr.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: BreakerManagerSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap, back);
+    }
+
+    /// BreakerManagerDegradation serde roundtrip.
+    #[test]
+    fn breaker_degradation_serde(idx in 0u32..3) {
+        let deg = match idx % 3 {
+            0 => BreakerManagerDegradation::Healthy,
+            1 => BreakerManagerDegradation::BreakerTripped { open_count: 1 },
+            _ => BreakerManagerDegradation::CascadeRisk { open_count: 4 },
+        };
+        let json = serde_json::to_string(&deg).unwrap();
+        let back: BreakerManagerDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(deg, back);
+    }
+
+    /// ChoreographyOutcome serde roundtrip.
+    #[test]
+    fn choreography_outcome_serde(idx in 0u32..3, stage in arb_stage()) {
+        let outcome = match idx % 3 {
+            0 => ChoreographyOutcome::FullRecovery,
+            1 => ChoreographyOutcome::PartialRecovery {
+                recovered: vec![stage],
+                failed: vec![],
+            },
+            _ => ChoreographyOutcome::Aborted { reason: "test".to_string() },
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        let back: ChoreographyOutcome = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(outcome, back);
+    }
 }
