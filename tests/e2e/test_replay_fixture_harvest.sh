@@ -25,6 +25,12 @@ log_json() {
   echo "$payload" >>"$json_log"
 }
 
+extract_section_json_line() {
+  local file="$1"
+  local marker="$2"
+  awk -v marker="$marker" '$0 == marker { getline; print; exit }' "$file"
+}
+
 run_harvest_command() {
   local source_dir="$1"
   local output_dir="$2"
@@ -155,7 +161,20 @@ fi
 
 schema_fail=0
 while IFS= read -r artifact; do
-  if ! jq -e '.schema_version == "ft.replay.fixture.harvest.v1" and (.metadata.event_count >= 100) and (.metadata.decision_count >= 1)' "$artifact" >/dev/null; then
+  header_json="$(extract_section_json_line "$artifact" "--- ftreplay-header ---")"
+  footer_json="$(extract_section_json_line "$artifact" "--- ftreplay-footer ---")"
+
+  if [[ -z "$header_json" || -z "$footer_json" ]]; then
+    schema_fail=1
+    break
+  fi
+
+  if ! jq -e '.schema_version == "ftreplay.v1" and (.content.event_count >= 100) and (.content.decision_count >= 1) and (.integrity.timeline_sha256 | type == "string")' <<<"$header_json" >/dev/null; then
+    schema_fail=1
+    break
+  fi
+
+  if ! jq -e '.schema_version == "ftreplay.v1" and (.event_count_verified >= 100) and (.decision_count_verified >= 1) and (.integrity_check.timeline_sha256_match == true)' <<<"$footer_json" >/dev/null; then
     schema_fail=1
     break
   fi
