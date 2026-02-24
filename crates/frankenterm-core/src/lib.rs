@@ -231,6 +231,7 @@ pub mod replay_guardrails_gate;
 pub mod replay_performance;
 pub mod replay_remediation;
 pub mod replay_report;
+pub mod replay_robot;
 pub mod replay_risk_scoring;
 pub mod replay_scenario_matrix;
 pub mod replay_merge;
