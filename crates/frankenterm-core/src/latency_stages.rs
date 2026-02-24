@@ -13048,6 +13048,56 @@ impl FaultIsolationManager {
         }
         self.history.clear();
     }
+
+    /// Count of healthy domains.
+    pub fn healthy_count(&self) -> usize {
+        self.states.values().filter(|s| s.health == DomainHealth::Healthy).count()
+    }
+
+    /// Count of non-healthy domains.
+    pub fn unhealthy_count(&self) -> usize {
+        self.states.values().filter(|s| s.health != DomainHealth::Healthy).count()
+    }
+
+    /// Total faults across all domains.
+    pub fn total_faults(&self) -> u64 {
+        self.states.values().map(|s| s.total_faults).sum()
+    }
+
+    /// Total restarts across all domains.
+    pub fn total_restarts(&self) -> u64 {
+        self.states.values().map(|s| s.total_restarts).sum()
+    }
+
+    /// Faults for a specific domain.
+    pub fn domain_faults(&self, domain: FaultDomain) -> u64 {
+        self.states.get(&domain).map_or(0, |s| s.total_faults)
+    }
+
+    /// Restarts for a specific domain.
+    pub fn domain_restarts(&self, domain: FaultDomain) -> u64 {
+        self.states.get(&domain).map_or(0, |s| s.total_restarts)
+    }
+
+    /// Whether all domains are healthy.
+    pub fn all_healthy(&self) -> bool {
+        self.states.values().all(|s| s.health == DomainHealth::Healthy)
+    }
+
+    /// Map FaultDomain to InvariantDomain for cross-system integration.
+    pub fn to_invariant_domain(domain: FaultDomain) -> InvariantDomain {
+        match domain {
+            FaultDomain::Scheduler => InvariantDomain::Scheduler,
+            FaultDomain::Budget => InvariantDomain::Budget,
+            FaultDomain::Recovery => InvariantDomain::Recovery,
+            FaultDomain::Io | FaultDomain::Storage => InvariantDomain::Composition,
+        }
+    }
+
+    /// Access config.
+    pub fn config(&self) -> &FaultIsolationConfig {
+        &self.config
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -24175,5 +24225,59 @@ mod tests {
             assert_eq!(mgr.domain_health(*d), DomainHealth::Healthy);
         }
         assert!(mgr.fault_history().is_empty());
+    }
+
+    // ── F1 Impl: Bridge method tests ─────────────────────────────
+
+    #[test]
+    fn test_healthy_unhealthy_count() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        assert_eq!(mgr.healthy_count(), 5);
+        assert_eq!(mgr.unhealthy_count(), 0);
+        mgr.record_fault(FaultDomain::Scheduler, "x".to_string(), 100);
+        assert_eq!(mgr.healthy_count(), 4);
+        assert_eq!(mgr.unhealthy_count(), 1);
+    }
+
+    #[test]
+    fn test_total_faults_and_restarts() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Scheduler, "a".to_string(), 100);
+        mgr.record_fault(FaultDomain::Budget, "b".to_string(), 200);
+        assert_eq!(mgr.total_faults(), 2);
+        assert_eq!(mgr.total_restarts(), 0);
+    }
+
+    #[test]
+    fn test_domain_faults_and_restarts() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Io, "x".to_string(), 100);
+        mgr.record_fault(FaultDomain::Io, "y".to_string(), 200);
+        assert_eq!(mgr.domain_faults(FaultDomain::Io), 2);
+        assert_eq!(mgr.domain_faults(FaultDomain::Budget), 0);
+    }
+
+    #[test]
+    fn test_all_healthy() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        assert!(mgr.all_healthy());
+        mgr.record_fault(FaultDomain::Storage, "x".to_string(), 100);
+        assert!(!mgr.all_healthy());
+    }
+
+    #[test]
+    fn test_to_invariant_domain() {
+        assert_eq!(FaultIsolationManager::to_invariant_domain(FaultDomain::Scheduler), InvariantDomain::Scheduler);
+        assert_eq!(FaultIsolationManager::to_invariant_domain(FaultDomain::Budget), InvariantDomain::Budget);
+        assert_eq!(FaultIsolationManager::to_invariant_domain(FaultDomain::Recovery), InvariantDomain::Recovery);
+        assert_eq!(FaultIsolationManager::to_invariant_domain(FaultDomain::Io), InvariantDomain::Composition);
+        assert_eq!(FaultIsolationManager::to_invariant_domain(FaultDomain::Storage), InvariantDomain::Composition);
+    }
+
+    #[test]
+    fn test_config_accessor_fault() {
+        let cfg = FaultIsolationConfig { auto_isolate: false, ..Default::default() };
+        let mgr = FaultIsolationManager::new(cfg.clone());
+        assert_eq!(*mgr.config(), cfg);
     }
 }
