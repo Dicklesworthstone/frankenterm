@@ -12629,6 +12629,427 @@ impl ProofGate {
     }
 }
 
+// ── F1: Fault-Domain Isolation and Crash-Only Service Contracts ────
+//
+// Explicit fault-domain boundaries, crash-only restart semantics,
+// and blast-radius containment for latency subsystems.
+
+/// Fault domain — an isolated region that can fail independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FaultDomain {
+    /// Scheduler fault domain (lane management, admission control).
+    Scheduler,
+    /// Budget fault domain (percentile tracking, SLO enforcement).
+    Budget,
+    /// Recovery fault domain (mitigation, escalation, cooldown).
+    Recovery,
+    /// IO fault domain (PTY capture, event emission).
+    Io,
+    /// Storage fault domain (write pipeline, indexing).
+    Storage,
+}
+
+impl FaultDomain {
+    /// All fault domains.
+    pub const ALL: &'static [Self] = &[
+        Self::Scheduler,
+        Self::Budget,
+        Self::Recovery,
+        Self::Io,
+        Self::Storage,
+    ];
+}
+
+impl fmt::Display for FaultDomain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Scheduler => write!(f, "scheduler"),
+            Self::Budget => write!(f, "budget"),
+            Self::Recovery => write!(f, "recovery"),
+            Self::Io => write!(f, "io"),
+            Self::Storage => write!(f, "storage"),
+        }
+    }
+}
+
+/// Health state of a fault domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DomainHealth {
+    /// Operating normally.
+    Healthy,
+    /// Degraded but functional.
+    Degraded,
+    /// Crashed and awaiting restart.
+    Crashed,
+    /// Restarting (crash-only recovery in progress).
+    Restarting,
+    /// Isolated (quarantined to prevent blast-radius expansion).
+    Isolated,
+}
+
+impl fmt::Display for DomainHealth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "healthy"),
+            Self::Degraded => write!(f, "degraded"),
+            Self::Crashed => write!(f, "crashed"),
+            Self::Restarting => write!(f, "restarting"),
+            Self::Isolated => write!(f, "isolated"),
+        }
+    }
+}
+
+/// Crash-only service contract: specifies restart behavior for a domain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CrashOnlyContract {
+    /// Domain this contract governs.
+    pub domain: FaultDomain,
+    /// Maximum restart attempts before isolation.
+    pub max_restarts: u32,
+    /// Cooldown between restarts (μs).
+    pub restart_cooldown_us: u64,
+    /// Whether to checkpoint state before crash restart.
+    pub checkpoint_on_crash: bool,
+    /// Timeout for restart completion (μs). 0 = no timeout.
+    pub restart_timeout_us: u64,
+}
+
+impl Default for CrashOnlyContract {
+    fn default() -> Self {
+        Self {
+            domain: FaultDomain::Scheduler,
+            max_restarts: 3,
+            restart_cooldown_us: 100_000,
+            checkpoint_on_crash: true,
+            restart_timeout_us: 5_000_000,
+        }
+    }
+}
+
+/// A fault event recording a domain failure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaultEvent {
+    /// Domain that faulted.
+    pub domain: FaultDomain,
+    /// Timestamp (epoch μs).
+    pub timestamp_us: u64,
+    /// Description of the fault.
+    pub description: String,
+    /// Whether recovery was attempted.
+    pub recovery_attempted: bool,
+    /// Whether recovery succeeded.
+    pub recovery_succeeded: bool,
+}
+
+/// Snapshot of a fault domain's state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaultDomainState {
+    /// The domain.
+    pub domain: FaultDomain,
+    /// Current health.
+    pub health: DomainHealth,
+    /// Total faults observed.
+    pub total_faults: u64,
+    /// Total restarts performed.
+    pub total_restarts: u64,
+    /// Consecutive failures (resets on success).
+    pub consecutive_failures: u32,
+    /// Timestamp of last fault (0 = never).
+    pub last_fault_us: u64,
+    /// Timestamp of last restart (0 = never).
+    pub last_restart_us: u64,
+}
+
+/// Configuration for the fault isolation manager.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaultIsolationConfig {
+    /// Contracts for each domain.
+    pub contracts: Vec<CrashOnlyContract>,
+    /// Whether to auto-isolate domains that exceed max_restarts.
+    pub auto_isolate: bool,
+    /// Maximum fault history entries to retain.
+    pub max_history: usize,
+}
+
+impl Default for FaultIsolationConfig {
+    fn default() -> Self {
+        Self {
+            contracts: FaultDomain::ALL.iter().map(|d| {
+                CrashOnlyContract { domain: *d, ..Default::default() }
+            }).collect(),
+            auto_isolate: true,
+            max_history: 1000,
+        }
+    }
+}
+
+/// Degradation state for the fault isolation manager.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum FaultIsolationDegradation {
+    /// All domains healthy.
+    Healthy,
+    /// Some domains degraded.
+    PartialDegradation { degraded_count: usize },
+    /// Some domains isolated.
+    DomainIsolated { isolated_domains: Vec<FaultDomain> },
+}
+
+impl fmt::Display for FaultIsolationDegradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "healthy"),
+            Self::PartialDegradation { degraded_count } => {
+                write!(f, "partial-degradation({degraded_count})")
+            }
+            Self::DomainIsolated { isolated_domains } => {
+                let names: Vec<String> = isolated_domains.iter().map(|d| d.to_string()).collect();
+                write!(f, "isolated({})", names.join(","))
+            }
+        }
+    }
+}
+
+/// Log entry for fault isolation events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaultIsolationLogEntry {
+    /// Timestamp.
+    pub timestamp_us: u64,
+    /// Domain affected.
+    pub domain: FaultDomain,
+    /// Health transition.
+    pub from_health: DomainHealth,
+    /// New health state.
+    pub to_health: DomainHealth,
+    /// Description.
+    pub description: String,
+}
+
+/// Snapshot of the entire fault isolation manager.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaultIsolationSnapshot {
+    /// Per-domain states.
+    pub domains: Vec<FaultDomainState>,
+    /// Total faults across all domains.
+    pub total_faults: u64,
+    /// Total restarts across all domains.
+    pub total_restarts: u64,
+    /// Configuration.
+    pub config: FaultIsolationConfig,
+}
+
+/// The fault isolation manager: tracks domain health, enforces
+/// crash-only contracts, and prevents blast-radius expansion.
+pub struct FaultIsolationManager {
+    config: FaultIsolationConfig,
+    states: std::collections::HashMap<FaultDomain, FaultDomainState>,
+    history: Vec<FaultEvent>,
+}
+
+impl FaultIsolationManager {
+    /// Create a new manager with the given config.
+    pub fn new(config: FaultIsolationConfig) -> Self {
+        let mut states = std::collections::HashMap::new();
+        for domain in FaultDomain::ALL {
+            states.insert(*domain, FaultDomainState {
+                domain: *domain,
+                health: DomainHealth::Healthy,
+                total_faults: 0,
+                total_restarts: 0,
+                consecutive_failures: 0,
+                last_fault_us: 0,
+                last_restart_us: 0,
+            });
+        }
+        Self { config, states, history: Vec::new() }
+    }
+
+    /// Record a fault in a domain.
+    pub fn record_fault(&mut self, domain: FaultDomain, description: String, timestamp_us: u64) {
+        let contract = self.contract_for(domain);
+        let max_restarts = contract.max_restarts;
+        let auto_isolate = self.config.auto_isolate;
+
+        let state = self.states.get_mut(&domain).unwrap();
+        state.total_faults += 1;
+        state.consecutive_failures += 1;
+        state.last_fault_us = timestamp_us;
+
+        if auto_isolate && state.consecutive_failures > max_restarts {
+            state.health = DomainHealth::Isolated;
+        } else {
+            state.health = DomainHealth::Crashed;
+        }
+
+        let event = FaultEvent {
+            domain,
+            timestamp_us,
+            description,
+            recovery_attempted: false,
+            recovery_succeeded: false,
+        };
+
+        if self.history.len() >= self.config.max_history {
+            self.history.remove(0);
+        }
+        self.history.push(event);
+    }
+
+    /// Attempt restart of a crashed domain.
+    pub fn attempt_restart(&mut self, domain: FaultDomain, timestamp_us: u64) -> bool {
+        let contract = self.contract_for(domain);
+        let state = self.states.get_mut(&domain).unwrap();
+        match state.health {
+            DomainHealth::Crashed => {
+                // Enforce cooldown.
+                if state.last_restart_us > 0
+                    && timestamp_us.saturating_sub(state.last_restart_us) < contract.restart_cooldown_us
+                {
+                    return false;
+                }
+                state.health = DomainHealth::Restarting;
+                state.total_restarts += 1;
+                state.last_restart_us = timestamp_us;
+                true
+            }
+            DomainHealth::Isolated => false,
+            _ => false,
+        }
+    }
+
+    /// Mark restart as complete (success).
+    pub fn restart_succeeded(&mut self, domain: FaultDomain) {
+        let state = self.states.get_mut(&domain).unwrap();
+        if state.health == DomainHealth::Restarting {
+            state.health = DomainHealth::Healthy;
+            state.consecutive_failures = 0;
+        }
+    }
+
+    /// Mark restart as failed.
+    pub fn restart_failed(&mut self, domain: FaultDomain, timestamp_us: u64) {
+        let contract = self.contract_for(domain);
+        let auto_isolate = self.config.auto_isolate;
+        let state = self.states.get_mut(&domain).unwrap();
+        if state.health == DomainHealth::Restarting {
+            state.consecutive_failures += 1;
+            if auto_isolate && state.consecutive_failures > contract.max_restarts {
+                state.health = DomainHealth::Isolated;
+            } else {
+                state.health = DomainHealth::Crashed;
+            }
+            state.last_fault_us = timestamp_us;
+        }
+    }
+
+    /// Manually mark a domain as degraded.
+    pub fn mark_degraded(&mut self, domain: FaultDomain) {
+        let state = self.states.get_mut(&domain).unwrap();
+        if state.health == DomainHealth::Healthy {
+            state.health = DomainHealth::Degraded;
+        }
+    }
+
+    /// Manually un-isolate a domain (operator intervention).
+    pub fn un_isolate(&mut self, domain: FaultDomain) {
+        let state = self.states.get_mut(&domain).unwrap();
+        if state.health == DomainHealth::Isolated {
+            state.health = DomainHealth::Crashed;
+            state.consecutive_failures = 0;
+        }
+    }
+
+    /// Get the health of a domain.
+    pub fn domain_health(&self, domain: FaultDomain) -> DomainHealth {
+        self.states.get(&domain).map_or(DomainHealth::Healthy, |s| s.health)
+    }
+
+    /// Get the state of a domain.
+    pub fn domain_state(&self, domain: FaultDomain) -> Option<&FaultDomainState> {
+        self.states.get(&domain)
+    }
+
+    /// Check if any domains are isolated.
+    pub fn has_isolated_domains(&self) -> bool {
+        self.states.values().any(|s| s.health == DomainHealth::Isolated)
+    }
+
+    /// List isolated domains.
+    pub fn isolated_domains(&self) -> Vec<FaultDomain> {
+        self.states.values()
+            .filter(|s| s.health == DomainHealth::Isolated)
+            .map(|s| s.domain)
+            .collect()
+    }
+
+    /// Get the crash-only contract for a domain.
+    fn contract_for(&self, domain: FaultDomain) -> CrashOnlyContract {
+        self.config.contracts.iter()
+            .find(|c| c.domain == domain)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Get a snapshot.
+    pub fn snapshot(&self) -> FaultIsolationSnapshot {
+        let domains: Vec<FaultDomainState> = FaultDomain::ALL.iter()
+            .filter_map(|d| self.states.get(d).cloned())
+            .collect();
+        let total_faults = domains.iter().map(|d| d.total_faults).sum();
+        let total_restarts = domains.iter().map(|d| d.total_restarts).sum();
+        FaultIsolationSnapshot {
+            domains,
+            total_faults,
+            total_restarts,
+            config: self.config.clone(),
+        }
+    }
+
+    /// Detect degradation.
+    pub fn detect_degradation(&self) -> FaultIsolationDegradation {
+        let isolated: Vec<FaultDomain> = self.isolated_domains();
+        if !isolated.is_empty() {
+            return FaultIsolationDegradation::DomainIsolated { isolated_domains: isolated };
+        }
+        let degraded_count = self.states.values()
+            .filter(|s| s.health == DomainHealth::Degraded || s.health == DomainHealth::Crashed || s.health == DomainHealth::Restarting)
+            .count();
+        if degraded_count > 0 {
+            return FaultIsolationDegradation::PartialDegradation { degraded_count };
+        }
+        FaultIsolationDegradation::Healthy
+    }
+
+    /// Create a log entry.
+    pub fn log_entry(
+        &self,
+        domain: FaultDomain,
+        from_health: DomainHealth,
+        to_health: DomainHealth,
+        description: String,
+        timestamp_us: u64,
+    ) -> FaultIsolationLogEntry {
+        FaultIsolationLogEntry { timestamp_us, domain, from_health, to_health, description }
+    }
+
+    /// Fault history.
+    pub fn fault_history(&self) -> &[FaultEvent] {
+        &self.history
+    }
+
+    /// Reset all domains to healthy.
+    pub fn reset(&mut self) {
+        for state in self.states.values_mut() {
+            state.health = DomainHealth::Healthy;
+            state.total_faults = 0;
+            state.total_restarts = 0;
+            state.consecutive_failures = 0;
+            state.last_fault_us = 0;
+            state.last_restart_us = 0;
+        }
+        self.history.clear();
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -23487,5 +23908,272 @@ mod tests {
         for s in &summaries {
             assert!(s.verdict.is_pass());
         }
+    }
+
+    // ── F1: Fault Domain Isolation Tests ─────────────────────────
+
+    #[test]
+    fn test_fault_domain_all() {
+        assert_eq!(FaultDomain::ALL.len(), 5);
+    }
+
+    #[test]
+    fn test_fault_domain_display() {
+        assert_eq!(FaultDomain::Scheduler.to_string(), "scheduler");
+        assert_eq!(FaultDomain::Budget.to_string(), "budget");
+        assert_eq!(FaultDomain::Recovery.to_string(), "recovery");
+        assert_eq!(FaultDomain::Io.to_string(), "io");
+        assert_eq!(FaultDomain::Storage.to_string(), "storage");
+    }
+
+    #[test]
+    fn test_fault_domain_serde() {
+        for d in FaultDomain::ALL {
+            let json = serde_json::to_string(d).unwrap();
+            let back: FaultDomain = serde_json::from_str(&json).unwrap();
+            assert_eq!(*d, back);
+        }
+    }
+
+    #[test]
+    fn test_domain_health_display() {
+        assert_eq!(DomainHealth::Healthy.to_string(), "healthy");
+        assert_eq!(DomainHealth::Degraded.to_string(), "degraded");
+        assert_eq!(DomainHealth::Crashed.to_string(), "crashed");
+        assert_eq!(DomainHealth::Restarting.to_string(), "restarting");
+        assert_eq!(DomainHealth::Isolated.to_string(), "isolated");
+    }
+
+    #[test]
+    fn test_domain_health_serde() {
+        for h in [DomainHealth::Healthy, DomainHealth::Degraded, DomainHealth::Crashed, DomainHealth::Restarting, DomainHealth::Isolated] {
+            let json = serde_json::to_string(&h).unwrap();
+            let back: DomainHealth = serde_json::from_str(&json).unwrap();
+            assert_eq!(h, back);
+        }
+    }
+
+    #[test]
+    fn test_crash_only_contract_default() {
+        let c = CrashOnlyContract::default();
+        assert_eq!(c.max_restarts, 3);
+        assert!(c.checkpoint_on_crash);
+    }
+
+    #[test]
+    fn test_crash_only_contract_serde() {
+        let c = CrashOnlyContract {
+            domain: FaultDomain::Io,
+            max_restarts: 5,
+            restart_cooldown_us: 50_000,
+            checkpoint_on_crash: false,
+            restart_timeout_us: 1_000_000,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let back: CrashOnlyContract = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, back);
+    }
+
+    #[test]
+    fn test_fault_event_serde() {
+        let ev = FaultEvent {
+            domain: FaultDomain::Storage,
+            timestamp_us: 12345,
+            description: "disk full".to_string(),
+            recovery_attempted: true,
+            recovery_succeeded: false,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: FaultEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn test_fault_isolation_manager_new() {
+        let mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        for d in FaultDomain::ALL {
+            assert_eq!(mgr.domain_health(*d), DomainHealth::Healthy);
+        }
+        assert!(!mgr.has_isolated_domains());
+    }
+
+    #[test]
+    fn test_record_fault_transitions_to_crashed() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Scheduler, "test fault".to_string(), 100);
+        assert_eq!(mgr.domain_health(FaultDomain::Scheduler), DomainHealth::Crashed);
+        assert_eq!(mgr.domain_state(FaultDomain::Scheduler).unwrap().total_faults, 1);
+    }
+
+    #[test]
+    fn test_record_fault_auto_isolates() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        // Default max_restarts is 3, so 4th fault triggers isolation.
+        for i in 0..4 {
+            mgr.record_fault(FaultDomain::Scheduler, format!("fault {i}"), (i + 1) * 100);
+        }
+        assert_eq!(mgr.domain_health(FaultDomain::Scheduler), DomainHealth::Isolated);
+        assert!(mgr.has_isolated_domains());
+    }
+
+    #[test]
+    fn test_attempt_restart_success() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Budget, "test".to_string(), 100);
+        assert!(mgr.attempt_restart(FaultDomain::Budget, 200_000));
+        assert_eq!(mgr.domain_health(FaultDomain::Budget), DomainHealth::Restarting);
+    }
+
+    #[test]
+    fn test_attempt_restart_cooldown_enforced() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Budget, "test".to_string(), 100);
+        assert!(mgr.attempt_restart(FaultDomain::Budget, 200_000));
+        mgr.restart_failed(FaultDomain::Budget, 200_001);
+        // Too soon — cooldown not elapsed.
+        assert!(!mgr.attempt_restart(FaultDomain::Budget, 200_002));
+    }
+
+    #[test]
+    fn test_restart_succeeded_resets_failures() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Io, "err".to_string(), 100);
+        mgr.attempt_restart(FaultDomain::Io, 200_000);
+        mgr.restart_succeeded(FaultDomain::Io);
+        assert_eq!(mgr.domain_health(FaultDomain::Io), DomainHealth::Healthy);
+        assert_eq!(mgr.domain_state(FaultDomain::Io).unwrap().consecutive_failures, 0);
+    }
+
+    #[test]
+    fn test_restart_failed_increments_failures() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Io, "err".to_string(), 100);
+        mgr.attempt_restart(FaultDomain::Io, 200_000);
+        mgr.restart_failed(FaultDomain::Io, 200_001);
+        assert_eq!(mgr.domain_health(FaultDomain::Io), DomainHealth::Crashed);
+        assert_eq!(mgr.domain_state(FaultDomain::Io).unwrap().consecutive_failures, 2);
+    }
+
+    #[test]
+    fn test_mark_degraded() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.mark_degraded(FaultDomain::Storage);
+        assert_eq!(mgr.domain_health(FaultDomain::Storage), DomainHealth::Degraded);
+    }
+
+    #[test]
+    fn test_un_isolate() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        for i in 0..4 {
+            mgr.record_fault(FaultDomain::Recovery, format!("f{i}"), i * 100);
+        }
+        assert_eq!(mgr.domain_health(FaultDomain::Recovery), DomainHealth::Isolated);
+        mgr.un_isolate(FaultDomain::Recovery);
+        assert_eq!(mgr.domain_health(FaultDomain::Recovery), DomainHealth::Crashed);
+    }
+
+    #[test]
+    fn test_fault_isolation_snapshot() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Scheduler, "test".to_string(), 100);
+        let snap = mgr.snapshot();
+        assert_eq!(snap.total_faults, 1);
+        assert_eq!(snap.domains.len(), 5);
+    }
+
+    #[test]
+    fn test_fault_isolation_snapshot_serde() {
+        let mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        let snap = mgr.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: FaultIsolationSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn test_fault_isolation_degradation_healthy() {
+        let mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        assert_eq!(mgr.detect_degradation(), FaultIsolationDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_fault_isolation_degradation_partial() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Scheduler, "x".to_string(), 100);
+        let deg = mgr.detect_degradation();
+        let is_partial = matches!(deg, FaultIsolationDegradation::PartialDegradation { .. });
+        assert!(is_partial);
+    }
+
+    #[test]
+    fn test_fault_isolation_degradation_isolated() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        for i in 0..4 {
+            mgr.record_fault(FaultDomain::Io, format!("f{i}"), i * 100);
+        }
+        let deg = mgr.detect_degradation();
+        let is_isolated = matches!(deg, FaultIsolationDegradation::DomainIsolated { .. });
+        assert!(is_isolated);
+    }
+
+    #[test]
+    fn test_fault_isolation_degradation_display() {
+        assert_eq!(FaultIsolationDegradation::Healthy.to_string(), "healthy");
+        let pd = FaultIsolationDegradation::PartialDegradation { degraded_count: 2 };
+        assert!(pd.to_string().contains("partial-degradation"));
+        let di = FaultIsolationDegradation::DomainIsolated { isolated_domains: vec![FaultDomain::Io] };
+        assert!(di.to_string().contains("io"));
+    }
+
+    #[test]
+    fn test_fault_isolation_degradation_serde() {
+        let variants: Vec<FaultIsolationDegradation> = vec![
+            FaultIsolationDegradation::Healthy,
+            FaultIsolationDegradation::PartialDegradation { degraded_count: 2 },
+            FaultIsolationDegradation::DomainIsolated { isolated_domains: vec![FaultDomain::Scheduler] },
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: FaultIsolationDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn test_fault_isolation_log_entry_serde() {
+        let entry = FaultIsolationLogEntry {
+            timestamp_us: 100,
+            domain: FaultDomain::Budget,
+            from_health: DomainHealth::Healthy,
+            to_health: DomainHealth::Crashed,
+            description: "budget exceeded".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: FaultIsolationLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn test_fault_history_capped() {
+        let cfg = FaultIsolationConfig {
+            max_history: 3,
+            ..Default::default()
+        };
+        let mut mgr = FaultIsolationManager::new(cfg);
+        for i in 0..5 {
+            mgr.record_fault(FaultDomain::Scheduler, format!("f{i}"), i * 100);
+        }
+        assert_eq!(mgr.fault_history().len(), 3);
+    }
+
+    #[test]
+    fn test_fault_isolation_reset() {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Scheduler, "x".to_string(), 100);
+        mgr.reset();
+        for d in FaultDomain::ALL {
+            assert_eq!(mgr.domain_health(*d), DomainHealth::Healthy);
+        }
+        assert!(mgr.fault_history().is_empty());
     }
 }
