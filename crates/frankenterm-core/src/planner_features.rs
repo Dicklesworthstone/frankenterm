@@ -799,6 +799,186 @@ pub fn solve_assignments(
     }
 }
 
+// ── Decision explainability (ft-1i2ge.2.6) ──────────────────────────────────
+
+/// Human-readable explanation for why a bead was selected or rejected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionExplanation {
+    pub bead_id: String,
+    pub outcome: DecisionOutcome,
+    pub summary: String,
+    pub factors: Vec<ExplanationFactor>,
+}
+
+/// Whether this bead was assigned or rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionOutcome {
+    Assigned,
+    Rejected,
+}
+
+/// A single factor contributing to the decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplanationFactor {
+    pub dimension: String,
+    pub value: f64,
+    pub description: String,
+    pub polarity: FactorPolarity,
+}
+
+/// Whether a factor contributed positively or negatively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactorPolarity {
+    Positive,
+    Negative,
+    Neutral,
+}
+
+/// Full explainability report for a decision cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplainabilityReport {
+    pub cycle_id: u64,
+    pub explanations: Vec<DecisionExplanation>,
+}
+
+impl ExplainabilityReport {
+    /// Get explanation for a specific bead.
+    #[must_use]
+    pub fn get(&self, bead_id: &str) -> Option<&DecisionExplanation> {
+        self.explanations.iter().find(|e| e.bead_id == bead_id)
+    }
+}
+
+/// Generate explainability payloads from an assignment set and scorer report.
+#[must_use]
+pub fn explain_decisions(
+    cycle_id: u64,
+    scorer_report: &ScorerReport,
+    assignment_set: &AssignmentSet,
+) -> ExplainabilityReport {
+    let mut explanations = Vec::new();
+
+    // Explain assignments.
+    for assignment in &assignment_set.assignments {
+        if let Some(scored) = scorer_report
+            .scored
+            .iter()
+            .find(|s| s.bead_id == assignment.bead_id)
+        {
+            let factors = build_factors_for_scored(scored);
+            let summary = format!(
+                "Assigned to {} (rank #{}, score {:.3})",
+                assignment.agent_id, assignment.rank, scored.final_score
+            );
+            explanations.push(DecisionExplanation {
+                bead_id: assignment.bead_id.clone(),
+                outcome: DecisionOutcome::Assigned,
+                summary,
+                factors,
+            });
+        }
+    }
+
+    // Explain rejections.
+    for rejected in &assignment_set.rejected {
+        let scored = scorer_report
+            .scored
+            .iter()
+            .find(|s| s.bead_id == rejected.bead_id);
+
+        let mut factors = scored
+            .map(|s| build_factors_for_scored(s))
+            .unwrap_or_default();
+
+        for reason in &rejected.reasons {
+            factors.push(ExplanationFactor {
+                dimension: "rejection".to_string(),
+                value: 0.0,
+                description: format_rejection_reason(reason),
+                polarity: FactorPolarity::Negative,
+            });
+        }
+
+        let reason_str: Vec<String> = rejected
+            .reasons
+            .iter()
+            .map(format_rejection_reason)
+            .collect();
+        let summary = format!(
+            "Rejected (score {:.3}): {}",
+            rejected.score,
+            reason_str.join("; ")
+        );
+
+        explanations.push(DecisionExplanation {
+            bead_id: rejected.bead_id.clone(),
+            outcome: DecisionOutcome::Rejected,
+            summary,
+            factors,
+        });
+    }
+
+    ExplainabilityReport {
+        cycle_id,
+        explanations,
+    }
+}
+
+fn build_factors_for_scored(scored: &ScoredCandidate) -> Vec<ExplanationFactor> {
+    vec![
+        ExplanationFactor {
+            dimension: "composite_score".to_string(),
+            value: scored.feature_composite,
+            description: format!("Feature composite score: {:.3}", scored.feature_composite),
+            polarity: if scored.feature_composite >= 0.5 {
+                FactorPolarity::Positive
+            } else {
+                FactorPolarity::Neutral
+            },
+        },
+        ExplanationFactor {
+            dimension: "effort_penalty".to_string(),
+            value: scored.effort_penalty,
+            description: format!("Effort penalty: -{:.3}", scored.effort_penalty),
+            polarity: if scored.effort_penalty > 0.0 {
+                FactorPolarity::Negative
+            } else {
+                FactorPolarity::Neutral
+            },
+        },
+        ExplanationFactor {
+            dimension: "tag_multiplier".to_string(),
+            value: scored.tag_multiplier,
+            description: if scored.tag_multiplier > 1.0 {
+                format!("Tag bonus: x{:.2}", scored.tag_multiplier)
+            } else {
+                "No tag bonus".to_string()
+            },
+            polarity: if scored.tag_multiplier > 1.0 {
+                FactorPolarity::Positive
+            } else {
+                FactorPolarity::Neutral
+            },
+        },
+    ]
+}
+
+fn format_rejection_reason(reason: &RejectionReason) -> String {
+    match reason {
+        RejectionReason::NoCapacity => "No agent has spare capacity".to_string(),
+        RejectionReason::ConflictWithAssigned { conflicting_bead_id } => {
+            format!("Conflicts with assigned bead {}", conflicting_bead_id)
+        }
+        RejectionReason::SafetyGateDenied { gate_name } => {
+            format!("Denied by safety gate: {}", gate_name)
+        }
+        RejectionReason::BelowScoreThreshold => "Score below minimum threshold".to_string(),
+        RejectionReason::AlreadyAssigned => "Already assigned to another agent".to_string(),
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2039,5 +2219,386 @@ mod tests {
             let back: RejectionReason = serde_json::from_str(&json).unwrap();
             assert_eq!(&back, reason);
         }
+    }
+
+    // ── Explainability tests (ft-1i2ge.2.6) ─────────────────────────────────
+
+    #[test]
+    fn explain_empty_inputs() {
+        let scorer = ScorerReport {
+            scored: Vec::new(),
+            ranked_ids: Vec::new(),
+            config_used: ScorerConfig::default(),
+        };
+        let assignment_set = AssignmentSet {
+            assignments: Vec::new(),
+            rejected: Vec::new(),
+            solver_config: SolverConfig::default(),
+        };
+        let report = explain_decisions(1, &scorer, &assignment_set);
+        assert_eq!(report.cycle_id, 1);
+        assert!(report.explanations.is_empty());
+    }
+
+    #[test]
+    fn explain_single_assignment() {
+        let scored = scored_report(&[("b1", 0.8)]);
+        let agents = vec![ready_agent("a1")];
+        let config = SolverConfig::default();
+        let assignments = solve_assignments(&scored, &agents, &config);
+        assert_eq!(assignments.assignment_count(), 1);
+
+        let report = explain_decisions(42, &scored, &assignments);
+        assert_eq!(report.cycle_id, 42);
+        assert_eq!(report.explanations.len(), 1);
+
+        let expl = &report.explanations[0];
+        assert_eq!(expl.bead_id, "b1");
+        assert_eq!(expl.outcome, DecisionOutcome::Assigned);
+        assert!(expl.summary.contains("Assigned to a1"));
+        assert!(expl.summary.contains("rank #1"));
+        assert!(!expl.factors.is_empty());
+    }
+
+    #[test]
+    fn explain_single_rejection_no_capacity() {
+        let scored = scored_report(&[("b1", 0.8), ("b2", 0.6), ("b3", 0.4)]);
+        let agents = vec![{
+            let mut a = ready_agent("a1");
+            a.max_parallel_assignments = 1;
+            a
+        }];
+        let config = SolverConfig::default();
+        let assignments = solve_assignments(&scored, &agents, &config);
+
+        let report = explain_decisions(10, &scored, &assignments);
+        let rejected_expls: Vec<_> = report
+            .explanations
+            .iter()
+            .filter(|e| e.outcome == DecisionOutcome::Rejected)
+            .collect();
+        assert!(rejected_expls.len() >= 2);
+        for expl in &rejected_expls {
+            assert!(expl.summary.contains("Rejected"));
+            assert!(expl
+                .factors
+                .iter()
+                .any(|f| f.dimension == "rejection" && f.polarity == FactorPolarity::Negative));
+        }
+    }
+
+    #[test]
+    fn explain_rejection_below_threshold() {
+        let scored = scored_report(&[("b1", 0.01)]);
+        let agents = vec![ready_agent("a1")];
+        let config = SolverConfig {
+            min_score: 0.5,
+            ..SolverConfig::default()
+        };
+        let assignments = solve_assignments(&scored, &agents, &config);
+        assert_eq!(assignments.rejected.len(), 1);
+
+        let report = explain_decisions(5, &scored, &assignments);
+        let expl = &report.explanations[0];
+        assert_eq!(expl.outcome, DecisionOutcome::Rejected);
+        assert!(expl.summary.contains("below minimum threshold"));
+    }
+
+    #[test]
+    fn explain_rejection_conflict() {
+        let scored = scored_report(&[("b1", 0.9), ("b2", 0.7)]);
+        let agents = vec![ready_agent("a1")];
+        let config = SolverConfig {
+            conflicts: vec![ConflictPair {
+                bead_a: "b1".to_string(),
+                bead_b: "b2".to_string(),
+            }],
+            ..SolverConfig::default()
+        };
+        let assignments = solve_assignments(&scored, &agents, &config);
+
+        let report = explain_decisions(6, &scored, &assignments);
+        let rejected: Vec<_> = report
+            .explanations
+            .iter()
+            .filter(|e| e.outcome == DecisionOutcome::Rejected)
+            .collect();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].bead_id, "b2");
+        assert!(rejected[0].summary.contains("Conflicts with assigned bead"));
+    }
+
+    #[test]
+    fn explain_rejection_safety_gate() {
+        let scored = scored_report(&[("b1", 0.9)]);
+        let agents = vec![ready_agent("a1")];
+        let config = SolverConfig {
+            safety_gates: vec![SafetyGate {
+                name: "deploy-freeze".to_string(),
+                denied_bead_ids: vec!["b1".to_string()],
+            }],
+            ..SolverConfig::default()
+        };
+        let assignments = solve_assignments(&scored, &agents, &config);
+
+        let report = explain_decisions(7, &scored, &assignments);
+        let expl = &report.explanations[0];
+        assert_eq!(expl.outcome, DecisionOutcome::Rejected);
+        assert!(expl.summary.contains("deploy-freeze"));
+    }
+
+    #[test]
+    fn explain_factors_positive_composite() {
+        let scored = scored_report(&[("b1", 0.9)]);
+        let agents = vec![ready_agent("a1")];
+        let assignments = solve_assignments(&scored, &agents, &SolverConfig::default());
+
+        let report = explain_decisions(8, &scored, &assignments);
+        let expl = &report.explanations[0];
+        let composite_factor = expl
+            .factors
+            .iter()
+            .find(|f| f.dimension == "composite_score")
+            .unwrap();
+        assert_eq!(composite_factor.polarity, FactorPolarity::Positive);
+        assert!(composite_factor.value > 0.0);
+    }
+
+    #[test]
+    fn explain_factors_effort_penalty() {
+        let inputs = vec![ScorerInput {
+            features: PlannerFeatureVector {
+                bead_id: "b1".to_string(),
+                impact: 0.8,
+                urgency: 0.8,
+                risk: 0.2,
+                fit: 0.8,
+                confidence: 0.9,
+            },
+            effort: Some(EffortBucket::Epic),
+            tags: Vec::new(),
+        }];
+        let config = ScorerConfig::default();
+        let scored = score_candidates(&inputs, &config);
+        let agents = vec![ready_agent("a1")];
+        let assignments = solve_assignments(&scored, &agents, &SolverConfig::default());
+
+        let report = explain_decisions(9, &scored, &assignments);
+        let expl = &report.explanations[0];
+        let effort_factor = expl
+            .factors
+            .iter()
+            .find(|f| f.dimension == "effort_penalty")
+            .unwrap();
+        assert_eq!(effort_factor.polarity, FactorPolarity::Negative);
+        assert!(effort_factor.value > 0.0);
+    }
+
+    #[test]
+    fn explain_factors_tag_bonus() {
+        let inputs = vec![ScorerInput {
+            features: PlannerFeatureVector {
+                bead_id: "b1".to_string(),
+                impact: 0.8,
+                urgency: 0.8,
+                risk: 0.2,
+                fit: 0.8,
+                confidence: 0.9,
+            },
+            effort: None,
+            tags: vec!["safety".to_string()],
+        }];
+        let config = ScorerConfig::default();
+        let scored = score_candidates(&inputs, &config);
+        let agents = vec![ready_agent("a1")];
+        let assignments = solve_assignments(&scored, &agents, &SolverConfig::default());
+
+        let report = explain_decisions(10, &scored, &assignments);
+        let expl = &report.explanations[0];
+        let tag_factor = expl
+            .factors
+            .iter()
+            .find(|f| f.dimension == "tag_multiplier")
+            .unwrap();
+        assert_eq!(tag_factor.polarity, FactorPolarity::Positive);
+        assert!(tag_factor.value > 1.0);
+    }
+
+    #[test]
+    fn explain_mixed_assigned_and_rejected() {
+        let scored = scored_report(&[("b1", 0.9), ("b2", 0.01)]);
+        let agents = vec![ready_agent("a1")];
+        let config = SolverConfig {
+            min_score: 0.05,
+            ..SolverConfig::default()
+        };
+        let assignments = solve_assignments(&scored, &agents, &config);
+
+        let report = explain_decisions(11, &scored, &assignments);
+        assert_eq!(report.explanations.len(), 2);
+
+        let assigned: Vec<_> = report
+            .explanations
+            .iter()
+            .filter(|e| e.outcome == DecisionOutcome::Assigned)
+            .collect();
+        let rejected: Vec<_> = report
+            .explanations
+            .iter()
+            .filter(|e| e.outcome == DecisionOutcome::Rejected)
+            .collect();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(assigned[0].bead_id, "b1");
+        assert_eq!(rejected[0].bead_id, "b2");
+    }
+
+    #[test]
+    fn explain_get_by_bead_id() {
+        let scored = scored_report(&[("b1", 0.9), ("b2", 0.5)]);
+        let agents = vec![ready_agent("a1")];
+        let assignments = solve_assignments(&scored, &agents, &SolverConfig::default());
+        let report = explain_decisions(12, &scored, &assignments);
+
+        assert!(report.get("b1").is_some());
+        assert!(report.get("b2").is_some());
+        assert!(report.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn explain_decision_outcome_serde() {
+        let outcomes = vec![DecisionOutcome::Assigned, DecisionOutcome::Rejected];
+        for outcome in &outcomes {
+            let json = serde_json::to_string(outcome).unwrap();
+            let back: DecisionOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, outcome);
+        }
+    }
+
+    #[test]
+    fn explain_factor_polarity_serde() {
+        let polarities = vec![
+            FactorPolarity::Positive,
+            FactorPolarity::Negative,
+            FactorPolarity::Neutral,
+        ];
+        for polarity in &polarities {
+            let json = serde_json::to_string(polarity).unwrap();
+            let back: FactorPolarity = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, polarity);
+        }
+    }
+
+    #[test]
+    fn explain_report_serde_roundtrip() {
+        let scored = scored_report(&[("b1", 0.9), ("b2", 0.01)]);
+        let agents = vec![ready_agent("a1")];
+        let config = SolverConfig {
+            min_score: 0.05,
+            ..SolverConfig::default()
+        };
+        let assignments = solve_assignments(&scored, &agents, &config);
+        let report = explain_decisions(99, &scored, &assignments);
+
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ExplainabilityReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cycle_id, 99);
+        assert_eq!(back.explanations.len(), report.explanations.len());
+        for (orig, rt) in report.explanations.iter().zip(back.explanations.iter()) {
+            assert_eq!(orig.bead_id, rt.bead_id);
+            assert_eq!(orig.outcome, rt.outcome);
+            assert_eq!(orig.factors.len(), rt.factors.len());
+        }
+    }
+
+    #[test]
+    fn explain_format_rejection_all_variants() {
+        let cases = vec![
+            (RejectionReason::NoCapacity, "spare capacity"),
+            (
+                RejectionReason::ConflictWithAssigned {
+                    conflicting_bead_id: "x".to_string(),
+                },
+                "Conflicts with",
+            ),
+            (
+                RejectionReason::SafetyGateDenied {
+                    gate_name: "freeze".to_string(),
+                },
+                "safety gate",
+            ),
+            (RejectionReason::BelowScoreThreshold, "below minimum"),
+            (RejectionReason::AlreadyAssigned, "Already assigned"),
+        ];
+        for (reason, expected_substring) in cases {
+            let formatted = format_rejection_reason(&reason);
+            assert!(
+                formatted.contains(expected_substring),
+                "Expected '{}' in '{}'",
+                expected_substring,
+                formatted
+            );
+        }
+    }
+
+    #[test]
+    fn explain_factors_count_three_per_scored() {
+        let scored = scored_report(&[("b1", 0.8)]);
+        let agents = vec![ready_agent("a1")];
+        let assignments = solve_assignments(&scored, &agents, &SolverConfig::default());
+        let report = explain_decisions(13, &scored, &assignments);
+        let expl = &report.explanations[0];
+        // Each scored candidate produces 3 factors: composite, effort, tag
+        assert_eq!(expl.factors.len(), 3);
+        let dims: Vec<&str> = expl.factors.iter().map(|f| f.dimension.as_str()).collect();
+        assert!(dims.contains(&"composite_score"));
+        assert!(dims.contains(&"effort_penalty"));
+        assert!(dims.contains(&"tag_multiplier"));
+    }
+
+    #[test]
+    fn explain_rejected_has_rejection_factor_plus_scored_factors() {
+        let scored = scored_report(&[("b1", 0.9), ("b2", 0.7)]);
+        let agents = vec![ready_agent("a1")];
+        let config = SolverConfig {
+            conflicts: vec![ConflictPair {
+                bead_a: "b1".to_string(),
+                bead_b: "b2".to_string(),
+            }],
+            ..SolverConfig::default()
+        };
+        let assignments = solve_assignments(&scored, &agents, &config);
+        let report = explain_decisions(14, &scored, &assignments);
+
+        let rejected_expl = report.get("b2").unwrap();
+        assert_eq!(rejected_expl.outcome, DecisionOutcome::Rejected);
+        // 3 scored factors + 1 rejection factor
+        assert_eq!(rejected_expl.factors.len(), 4);
+        assert!(rejected_expl
+            .factors
+            .iter()
+            .any(|f| f.dimension == "rejection"));
+    }
+
+    #[test]
+    fn explain_multiple_rejection_reasons() {
+        // Force both below-threshold and no-capacity
+        let scored = scored_report(&[("b1", 0.01)]);
+        let config = SolverConfig {
+            min_score: 0.5,
+            ..SolverConfig::default()
+        };
+        // No agents → no capacity
+        let assignments = solve_assignments(&scored, &[], &config);
+        let report = explain_decisions(15, &scored, &assignments);
+        let expl = &report.explanations[0];
+        assert_eq!(expl.outcome, DecisionOutcome::Rejected);
+        // Should have rejection factors
+        let rejection_factors: Vec<_> = expl
+            .factors
+            .iter()
+            .filter(|f| f.dimension == "rejection")
+            .collect();
+        assert!(!rejection_factors.is_empty());
     }
 }
