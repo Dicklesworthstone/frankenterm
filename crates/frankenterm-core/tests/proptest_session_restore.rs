@@ -43,7 +43,7 @@ use frankenterm_core::session_retention::CleanupResult;
 // ────────────────────────────────────────────────────────────────────
 
 /// Create a temporary SQLite database with the session persistence schema.
-/// Returns (db_path, connection). The tempdir is leaked so it persists.
+/// Returns (db_path, connection). The tempdir path is persisted for test use.
 fn setup_test_db() -> (String, Connection) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db").to_string_lossy().to_string();
@@ -91,7 +91,7 @@ fn setup_test_db() -> (String, Connection) {
     )
     .unwrap();
 
-    std::mem::forget(dir);
+    let _ = dir.keep();
     (db_path, conn)
 }
 

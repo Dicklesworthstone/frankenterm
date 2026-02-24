@@ -27,9 +27,34 @@ pub enum Action {
 impl Action {
     #[inline(always)]
     pub fn from_u16(v: u16) -> Self {
-        unsafe { core::mem::transmute(v) }
+        ACTION_BY_U16
+            .get(usize::from(v))
+            .copied()
+            .unwrap_or_else(|| panic!("invalid Action discriminant: {v}"))
     }
 }
+
+const ACTION_BY_U16: [Action; 19] = [
+    Action::None,
+    Action::Ignore,
+    Action::Print,
+    Action::Execute,
+    Action::Clear,
+    Action::Collect,
+    Action::Param,
+    Action::EscDispatch,
+    Action::CsiDispatch,
+    Action::Hook,
+    Action::Put,
+    Action::Unhook,
+    Action::OscStart,
+    Action::OscPut,
+    Action::OscEnd,
+    Action::Utf8,
+    Action::ApcStart,
+    Action::ApcPut,
+    Action::ApcEnd,
+];
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 #[repr(u16)]
@@ -57,9 +82,32 @@ pub enum State {
 impl State {
     #[inline(always)]
     pub fn from_u16(v: u16) -> Self {
-        unsafe { core::mem::transmute(v) }
+        STATE_BY_U16
+            .get(usize::from(v))
+            .copied()
+            .unwrap_or_else(|| panic!("invalid State discriminant: {v}"))
     }
 }
+
+const STATE_BY_U16: [State; 17] = [
+    State::Ground,
+    State::Escape,
+    State::EscapeIntermediate,
+    State::CsiEntry,
+    State::CsiParam,
+    State::CsiIntermediate,
+    State::CsiIgnore,
+    State::DcsEntry,
+    State::DcsParam,
+    State::DcsIntermediate,
+    State::DcsPassthrough,
+    State::DcsIgnore,
+    State::OscString,
+    State::SosPmString,
+    State::ApcString,
+    State::Anywhere,
+    State::Utf8Sequence,
+];
 
 #[cfg(test)]
 mod tests {
@@ -96,6 +144,12 @@ mod tests {
             let action = Action::from_u16(v);
             assert_eq!(action as u16, v);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid Action discriminant")]
+    fn action_from_u16_invalid_panics() {
+        let _ = Action::from_u16(19);
     }
 
     #[test]
@@ -150,6 +204,12 @@ mod tests {
             let state = State::from_u16(v);
             assert_eq!(state as u16, v);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid State discriminant")]
+    fn state_from_u16_invalid_panics() {
+        let _ = State::from_u16(17);
     }
 
     #[test]

@@ -139,7 +139,7 @@ fn setup_db() -> (String, Connection) {
     )
     .unwrap();
 
-    std::mem::forget(dir);
+    let _ = dir.keep();
     (db_path, conn)
 }
 

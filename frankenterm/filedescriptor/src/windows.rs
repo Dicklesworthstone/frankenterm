@@ -218,9 +218,8 @@ impl AsRawHandle for OwnedHandle {
 
 impl IntoRawHandle for OwnedHandle {
     fn into_raw_handle(self) -> RawHandle {
-        let handle = self.handle;
-        std::mem::forget(self);
-        handle
+        let this = std::mem::ManuallyDrop::new(self);
+        this.handle
     }
 }
 
@@ -497,7 +496,7 @@ pub fn socketpair_impl() -> Result<(FileDescriptor, FileDescriptor)> {
     unsafe {
         if bind(
             s.as_raw_handle() as _,
-            std::mem::transmute(&in_addr),
+            &in_addr as *const SOCKADDR_IN as *const _,
             std::mem::size_of_val(&in_addr) as _,
         ) != 0
         {
@@ -510,7 +509,7 @@ pub fn socketpair_impl() -> Result<(FileDescriptor, FileDescriptor)> {
     unsafe {
         if getsockname(
             s.as_raw_handle() as _,
-            std::mem::transmute(&mut in_addr),
+            &mut in_addr as *mut SOCKADDR_IN as *mut _,
             &mut addr_len,
         ) != 0
         {
@@ -529,7 +528,7 @@ pub fn socketpair_impl() -> Result<(FileDescriptor, FileDescriptor)> {
     unsafe {
         if connect(
             client.as_raw_handle() as _,
-            std::mem::transmute(&in_addr),
+            &in_addr as *const SOCKADDR_IN as *const _,
             addr_len,
         ) != 0
         {

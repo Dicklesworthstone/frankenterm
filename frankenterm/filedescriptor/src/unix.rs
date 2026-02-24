@@ -76,9 +76,8 @@ impl AsRawFd for OwnedHandle {
 
 impl IntoRawFd for OwnedHandle {
     fn into_raw_fd(self) -> RawFd {
-        let fd = self.handle;
-        std::mem::forget(self);
-        fd
+        let this = std::mem::ManuallyDrop::new(self);
+        this.handle
     }
 }
 

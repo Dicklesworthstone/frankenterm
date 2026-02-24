@@ -18,7 +18,6 @@ use crate::color::{ColorAttribute, PaletteIndex};
 use crate::image::ImageCell;
 use alloc::sync::Arc;
 use core::hash::{Hash, Hasher};
-use core::mem;
 use finl_unicode::grapheme_clusters::Graphemes;
 pub use frankenterm_char_props::emoji::Presentation;
 use frankenterm_char_props::emoji_variation::WCWIDTH_TABLE;
@@ -169,7 +168,7 @@ macro_rules! bitfield {
     ($getter:ident, $setter:ident, $enum:ident, $bitmask:expr, $bitshift:expr) => {
         #[inline]
         pub fn $getter(&self) -> $enum {
-            unsafe { mem::transmute(((self.attributes >> $bitshift) & $bitmask) as u8) }
+            <$enum as BitfieldEnumDecode>::from_bits(((self.attributes >> $bitshift) & $bitmask) as u8)
         }
 
         #[inline]
@@ -181,6 +180,10 @@ macro_rules! bitfield {
             self
         }
     };
+}
+
+trait BitfieldEnumDecode {
+    fn from_bits(bits: u8) -> Self;
 }
 
 /// Describes the semantic "type" of the cell.
@@ -195,6 +198,64 @@ pub enum SemanticType {
     Output = 0,
     Input = 1,
     Prompt = 2,
+}
+
+impl BitfieldEnumDecode for Intensity {
+    fn from_bits(bits: u8) -> Self {
+        match bits {
+            0 => Self::Normal,
+            1 => Self::Bold,
+            2 => Self::Half,
+            _ => Self::Normal,
+        }
+    }
+}
+
+impl BitfieldEnumDecode for Underline {
+    fn from_bits(bits: u8) -> Self {
+        match bits {
+            0 => Self::None,
+            1 => Self::Single,
+            2 => Self::Double,
+            3 => Self::Curly,
+            4 => Self::Dotted,
+            5 => Self::Dashed,
+            _ => Self::None,
+        }
+    }
+}
+
+impl BitfieldEnumDecode for Blink {
+    fn from_bits(bits: u8) -> Self {
+        match bits {
+            0 => Self::None,
+            1 => Self::Slow,
+            2 => Self::Rapid,
+            _ => Self::None,
+        }
+    }
+}
+
+impl BitfieldEnumDecode for SemanticType {
+    fn from_bits(bits: u8) -> Self {
+        match bits {
+            0 => Self::Output,
+            1 => Self::Input,
+            2 => Self::Prompt,
+            _ => Self::Output,
+        }
+    }
+}
+
+impl BitfieldEnumDecode for VerticalAlign {
+    fn from_bits(bits: u8) -> Self {
+        match bits {
+            0 => Self::BaseLine,
+            1 => Self::SuperScript,
+            2 => Self::SubScript,
+            _ => Self::BaseLine,
+        }
+    }
 }
 
 impl Default for SemanticType {
@@ -1432,6 +1493,18 @@ mod test {
         a.set_vertical_align(VerticalAlign::SubScript);
         assert_eq!(a.vertical_align(), VerticalAlign::SubScript);
         a.set_vertical_align(VerticalAlign::BaseLine);
+        assert_eq!(a.vertical_align(), VerticalAlign::BaseLine);
+    }
+
+    #[test]
+    fn bitfield_invalid_enum_values_fall_back_to_defaults() {
+        let mut a = CellAttributes::blank();
+        a.attributes = (3 << 0) | (6 << 2) | (3 << 5) | (3 << 13) | (3 << 15);
+
+        assert_eq!(a.intensity(), Intensity::Normal);
+        assert_eq!(a.underline(), Underline::None);
+        assert_eq!(a.blink(), Blink::None);
+        assert_eq!(a.semantic_type(), SemanticType::Output);
         assert_eq!(a.vertical_align(), VerticalAlign::BaseLine);
     }
 
