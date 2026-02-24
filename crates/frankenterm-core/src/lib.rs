@@ -46,6 +46,7 @@
 
 pub mod accounts;
 pub mod adaptive_radix_tree;
+pub mod aegis_backpressure;
 pub mod agent_correlator;
 #[cfg(feature = "agent-detection")]
 pub mod agent_detection;
