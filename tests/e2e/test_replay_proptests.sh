@@ -11,8 +11,24 @@ json_log="$LOG_DIR/${run_id}.jsonl"
 raw_dir="$LOG_DIR/${run_id}_raw"
 mkdir -p "$raw_dir"
 
-cargo_home="${CARGO_HOME:-/tmp/cargo-home-replay-proptests}"
-cargo_target_dir="${CARGO_TARGET_DIR:-$ROOT_DIR/target-replay-proptests-${run_id}}"
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+cargo_target_base="${CARGO_TARGET_DIR:-$ROOT_DIR/target-replay-proptests}"
+
+with_run_id_suffix() {
+  local path_base="$1"
+  if [[ "$path_base" == *"${run_id}"* ]]; then
+    echo "$path_base"
+    return
+  fi
+  echo "${path_base}-${run_id}"
+}
+
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  cargo_target_dir="$(with_run_id_suffix "$cargo_target_base")"
+else
+  cargo_target_dir="$cargo_target_base"
+fi
+mkdir -p "$cargo_home" "$cargo_target_dir"
 
 prop_cases="${PROPTEST_CASES:-100}"
 if [[ "$prop_cases" =~ ^[0-9]+$ ]] && (( prop_cases < 100 )); then
@@ -22,7 +38,9 @@ if ! [[ "$prop_cases" =~ ^[0-9]+$ ]]; then
   prop_cases=100
 fi
 
-total_properties=20
+determinism_properties=16
+diff_properties=6
+total_properties=$((determinism_properties + diff_properties))
 pass_properties=0
 fail_properties=0
 total_cases=$((prop_cases * total_properties))
@@ -100,7 +118,7 @@ run_prop_suite() {
 
   fail_properties=$((fail_properties + property_count))
   reason_code="$(classify_reason_code "${stderr_file}")"
-  grep -Ei 'seed|proptest' "${stderr_file}" >"${seed_file}" || true
+  cat "${stdout_file}" "${stderr_file}" | grep -Ei 'seed|proptest-regressions|minimal failing input' >"${seed_file}" || true
   if [[ ! -s "${seed_file}" ]]; then
     echo "no_proptest_seed_detected" >"${seed_file}"
   fi
@@ -112,8 +130,8 @@ run_prop_suite() {
 suite_started_ms="$(now_ms)"
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${scenario_id}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"suite.start\",\"inputs\":{\"total_properties\":${total_properties},\"prop_cases\":${prop_cases}},\"outcome\":\"running\",\"reason_code\":null,\"error_code\":null,\"artifact_path\":\"${json_log#$ROOT_DIR/}\"}"
 
-run_prop_suite "determinism" "proptest_replay_determinism" 15 "suite.determinism" || suite_status=1
-run_prop_suite "diff" "proptest_replay_diff" 5 "suite.diff" || suite_status=1
+run_prop_suite "determinism" "proptest_replay_determinism" "${determinism_properties}" "suite.determinism" || suite_status=1
+run_prop_suite "diff" "proptest_replay_diff" "${diff_properties}" "suite.diff" || suite_status=1
 
 status="pass"
 reason_code="all_scenarios_passed"
