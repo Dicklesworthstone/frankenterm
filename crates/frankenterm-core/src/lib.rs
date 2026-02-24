@@ -240,6 +240,7 @@ pub mod replay_scenario_matrix;
 pub mod replay_shadow_rollout;
 pub mod replay_test_orchestrator;
 pub mod replay_post_incident;
+pub mod replay_usability_pilot;
 pub mod replay_merge;
 pub mod replay_provenance;
 pub mod replay_side_effect_barrier;
