@@ -859,4 +859,440 @@ mod tests {
                 .contains(&BeadResolverReasonCode::PartialGraphData)
         );
     }
+
+    // -------------------------------------------------------------------------
+    // Readiness resolver — extended coverage (ft-1i2ge.2.1)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn readiness_empty_input() {
+        let report = resolve_bead_readiness(&[]);
+        assert!(report.candidates.is_empty());
+        assert!(report.ready_ids.is_empty());
+        assert!(report.degraded_reason_codes.is_empty());
+        assert_eq!(report.ready_count(), 0);
+    }
+
+    #[test]
+    fn readiness_single_open_issue_is_ready() {
+        let issues = vec![sample_detail("solo", BeadStatus::Open, 1, &[])];
+        let report = resolve_bead_readiness(&issues);
+        assert_eq!(report.ready_count(), 1);
+        assert_eq!(report.ready_ids, vec!["solo"]);
+        let c = &report.candidates[0];
+        assert!(c.ready);
+        assert_eq!(c.blocker_count, 0);
+        assert!(c.blocker_ids.is_empty());
+        assert_eq!(c.transitive_unblock_count, 0);
+        assert_eq!(c.critical_path_depth_hint, 0);
+    }
+
+    #[test]
+    fn readiness_single_in_progress_is_ready() {
+        let issues = vec![sample_detail("wip", BeadStatus::InProgress, 0, &[])];
+        let report = resolve_bead_readiness(&issues);
+        assert_eq!(report.ready_count(), 1);
+        assert_eq!(report.ready_ids, vec!["wip"]);
+    }
+
+    #[test]
+    fn readiness_non_actionable_statuses_excluded_from_candidates() {
+        let issues = vec![
+            sample_detail("blocked", BeadStatus::Blocked, 1, &[]),
+            sample_detail("deferred", BeadStatus::Deferred, 2, &[]),
+            sample_detail("closed", BeadStatus::Closed, 0, &[]),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        assert!(report.candidates.is_empty());
+        assert!(report.ready_ids.is_empty());
+    }
+
+    #[test]
+    fn readiness_open_blocker_prevents_readiness() {
+        let issues = vec![
+            sample_detail("blocker", BeadStatus::Open, 0, &[]),
+            sample_detail("blocked", BeadStatus::Open, 1, &[("blocker", "blocks")]),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        let blocked = report.candidates.iter().find(|c| c.id == "blocked").unwrap();
+        assert!(!blocked.ready);
+        assert_eq!(blocked.blocker_count, 1);
+        assert_eq!(blocked.blocker_ids, vec!["blocker".to_string()]);
+        // blocker itself is ready
+        let blocker = report.candidates.iter().find(|c| c.id == "blocker").unwrap();
+        assert!(blocker.ready);
+    }
+
+    #[test]
+    fn readiness_in_progress_blocker_still_blocks() {
+        let issues = vec![
+            sample_detail("dep", BeadStatus::InProgress, 0, &[]),
+            sample_detail("a", BeadStatus::Open, 1, &[("dep", "blocks")]),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        let a = report.candidates.iter().find(|c| c.id == "a").unwrap();
+        assert!(!a.ready);
+        assert_eq!(a.blocker_count, 1);
+    }
+
+    #[test]
+    fn readiness_multiple_blockers_all_must_close() {
+        let issues = vec![
+            sample_detail("d1", BeadStatus::Closed, 0, &[]),
+            sample_detail("d2", BeadStatus::Open, 0, &[]),
+            sample_detail("d3", BeadStatus::Closed, 0, &[]),
+            sample_detail(
+                "target",
+                BeadStatus::Open,
+                1,
+                &[("d1", "blocks"), ("d2", "blocks"), ("d3", "blocks")],
+            ),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        let target = report.candidates.iter().find(|c| c.id == "target").unwrap();
+        assert!(!target.ready, "d2 is still open");
+        assert_eq!(target.blocker_count, 1);
+        assert_eq!(target.blocker_ids, vec!["d2".to_string()]);
+    }
+
+    #[test]
+    fn readiness_all_blockers_closed_means_ready() {
+        let issues = vec![
+            sample_detail("d1", BeadStatus::Closed, 0, &[]),
+            sample_detail("d2", BeadStatus::Closed, 0, &[]),
+            sample_detail(
+                "target",
+                BeadStatus::Open,
+                1,
+                &[("d1", "blocks"), ("d2", "blocks")],
+            ),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        let target = report.candidates.iter().find(|c| c.id == "target").unwrap();
+        assert!(target.ready);
+        assert_eq!(target.blocker_count, 0);
+    }
+
+    #[test]
+    fn readiness_parent_child_mixed_with_blocking_edge() {
+        // parent-child should not block, but the "blocks" edge should
+        let issues = vec![
+            sample_detail("parent", BeadStatus::Open, 0, &[]),
+            sample_detail("dep", BeadStatus::Open, 0, &[]),
+            sample_detail(
+                "child",
+                BeadStatus::Open,
+                1,
+                &[("parent", "parent-child"), ("dep", "blocks")],
+            ),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        let child = report.candidates.iter().find(|c| c.id == "child").unwrap();
+        assert!(!child.ready, "dep blocks");
+        assert_eq!(child.blocker_count, 1);
+        assert_eq!(child.blocker_ids, vec!["dep".to_string()]);
+    }
+
+    #[test]
+    fn readiness_diamond_dependency_graph() {
+        // Diamond: A depends on B and C, both depend on D
+        //   D (open) -> B (open) -> A (open)
+        //   D (open) -> C (open) -> A (open)
+        let issues = vec![
+            sample_detail("D", BeadStatus::Open, 0, &[]),
+            sample_detail("B", BeadStatus::Open, 1, &[("D", "blocks")]),
+            sample_detail("C", BeadStatus::Open, 1, &[("D", "blocks")]),
+            sample_detail("A", BeadStatus::Open, 2, &[("B", "blocks"), ("C", "blocks")]),
+        ];
+        let report = resolve_bead_readiness(&issues);
+
+        let d = report.candidates.iter().find(|c| c.id == "D").unwrap();
+        assert!(d.ready);
+        assert_eq!(d.transitive_unblock_count, 3); // B, C, A
+
+        let a = report.candidates.iter().find(|c| c.id == "A").unwrap();
+        assert!(!a.ready);
+        assert_eq!(a.blocker_count, 2);
+    }
+
+    #[test]
+    fn readiness_cycle_detected_sets_degraded_flag() {
+        // A depends on B, B depends on A (cycle)
+        let issues = vec![
+            sample_detail("A", BeadStatus::Open, 0, &[("B", "blocks")]),
+            sample_detail("B", BeadStatus::Open, 0, &[("A", "blocks")]),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        // Both blocked by each other
+        for c in &report.candidates {
+            assert!(!c.ready);
+            assert!(
+                c.degraded_reasons
+                    .contains(&BeadResolverReasonCode::CyclicDependencyGraph),
+                "candidate {} missing cycle degraded reason",
+                c.id
+            );
+        }
+        assert!(
+            report
+                .degraded_reason_codes
+                .contains(&BeadResolverReasonCode::CyclicDependencyGraph)
+        );
+    }
+
+    #[test]
+    fn readiness_three_node_cycle() {
+        // A -> B -> C -> A
+        let issues = vec![
+            sample_detail("A", BeadStatus::Open, 0, &[("C", "blocks")]),
+            sample_detail("B", BeadStatus::Open, 0, &[("A", "blocks")]),
+            sample_detail("C", BeadStatus::Open, 0, &[("B", "blocks")]),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        assert!(
+            report
+                .degraded_reason_codes
+                .contains(&BeadResolverReasonCode::CyclicDependencyGraph)
+        );
+    }
+
+    #[test]
+    fn readiness_candidates_sorted_by_priority_then_id() {
+        let issues = vec![
+            sample_detail("z", BeadStatus::Open, 2, &[]),
+            sample_detail("a", BeadStatus::Open, 2, &[]),
+            sample_detail("m", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        let ids: Vec<&str> = report.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["m", "b", "a", "z"]);
+    }
+
+    #[test]
+    fn readiness_ready_ids_sorted() {
+        let issues = vec![
+            sample_detail("z", BeadStatus::Open, 0, &[]),
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("m", BeadStatus::Open, 0, &[]),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        assert_eq!(report.ready_ids, vec!["a", "m", "z"]);
+    }
+
+    #[test]
+    fn readiness_transitive_chain_depth() {
+        // Linear chain: A -> B -> C -> D -> E
+        let issues = vec![
+            sample_detail("A", BeadStatus::Open, 0, &[]),
+            sample_detail("B", BeadStatus::Open, 1, &[("A", "blocks")]),
+            sample_detail("C", BeadStatus::Open, 2, &[("B", "blocks")]),
+            sample_detail("D", BeadStatus::Open, 3, &[("C", "blocks")]),
+            sample_detail("E", BeadStatus::Open, 4, &[("D", "blocks")]),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        let a = report.candidates.iter().find(|c| c.id == "A").unwrap();
+        assert_eq!(a.critical_path_depth_hint, 4); // 4 levels deep
+        assert_eq!(a.transitive_unblock_count, 4); // B, C, D, E
+    }
+
+    #[test]
+    fn readiness_multiple_missing_deps() {
+        let issues = vec![sample_detail(
+            "a",
+            BeadStatus::Open,
+            0,
+            &[("ghost1", "blocks"), ("ghost2", "blocks")],
+        )];
+        let report = resolve_bead_readiness(&issues);
+        let a = &report.candidates[0];
+        assert!(!a.ready);
+        assert_eq!(a.blocker_count, 2);
+        assert!(
+            a.degraded_reasons
+                .contains(&BeadResolverReasonCode::MissingDependencyNode)
+        );
+    }
+
+    #[test]
+    fn readiness_mixed_missing_and_present_deps() {
+        let issues = vec![
+            sample_detail("present", BeadStatus::Closed, 0, &[]),
+            sample_detail(
+                "a",
+                BeadStatus::Open,
+                0,
+                &[("present", "blocks"), ("missing", "blocks")],
+            ),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        let a = &report.candidates[0];
+        assert!(!a.ready);
+        assert_eq!(a.blocker_count, 1); // only "missing" blocks
+        assert!(
+            a.degraded_reasons
+                .contains(&BeadResolverReasonCode::MissingDependencyNode)
+        );
+    }
+
+    #[test]
+    fn readiness_from_summary_degraded_detail() {
+        let summary = sample_bead("partial", BeadStatus::Open, 1);
+        let detail = BeadIssueDetail::from_summary(summary);
+        assert_eq!(
+            detail.ingest_warning,
+            Some(BeadResolverReasonCode::PartialGraphData)
+        );
+        assert!(detail.dependencies.is_empty());
+        assert!(detail.dependents.is_empty());
+        assert!(detail.parent.is_none());
+    }
+
+    #[test]
+    fn readiness_issue_detail_is_actionable() {
+        assert!(sample_detail("a", BeadStatus::Open, 0, &[]).is_actionable());
+        assert!(sample_detail("b", BeadStatus::InProgress, 0, &[]).is_actionable());
+        assert!(!sample_detail("c", BeadStatus::Blocked, 0, &[]).is_actionable());
+        assert!(!sample_detail("d", BeadStatus::Deferred, 0, &[]).is_actionable());
+        assert!(!sample_detail("e", BeadStatus::Closed, 0, &[]).is_actionable());
+    }
+
+    #[test]
+    fn readiness_dependency_ref_blocks_readiness() {
+        let blocking = BeadDependencyRef {
+            id: "x".to_string(),
+            title: None,
+            status: None,
+            priority: None,
+            dependency_type: Some("blocks".to_string()),
+        };
+        assert!(blocking.blocks_readiness());
+
+        let parent_child = BeadDependencyRef {
+            id: "y".to_string(),
+            title: None,
+            status: None,
+            priority: None,
+            dependency_type: Some("parent-child".to_string()),
+        };
+        assert!(!parent_child.blocks_readiness());
+
+        let no_type = BeadDependencyRef {
+            id: "z".to_string(),
+            title: None,
+            status: None,
+            priority: None,
+            dependency_type: None,
+        };
+        assert!(no_type.blocks_readiness(), "None type should block by default");
+    }
+
+    #[test]
+    fn readiness_report_serde_roundtrip() {
+        let issues = vec![
+            sample_detail("dep", BeadStatus::Closed, 0, &[]),
+            sample_detail("a", BeadStatus::Open, 1, &[("dep", "blocks")]),
+            sample_detail("b", BeadStatus::Open, 0, &[("missing", "blocks")]),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        let json = serde_json::to_string(&report).unwrap();
+        let back: BeadReadinessReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ready_ids, report.ready_ids);
+        assert_eq!(back.candidates.len(), report.candidates.len());
+        assert_eq!(back.degraded_reason_codes, report.degraded_reason_codes);
+    }
+
+    #[test]
+    fn readiness_candidate_serde_roundtrip() {
+        let candidate = BeadReadyCandidate {
+            id: "test".to_string(),
+            title: "Test Bead".to_string(),
+            status: BeadStatus::Open,
+            priority: 1,
+            blocker_count: 2,
+            blocker_ids: vec!["x".to_string(), "y".to_string()],
+            transitive_unblock_count: 5,
+            critical_path_depth_hint: 3,
+            ready: false,
+            degraded_reasons: vec![BeadResolverReasonCode::MissingDependencyNode],
+        };
+        let json = serde_json::to_string(&candidate).unwrap();
+        let back: BeadReadyCandidate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, "test");
+        assert_eq!(back.blocker_count, 2);
+        assert_eq!(back.transitive_unblock_count, 5);
+        assert_eq!(back.critical_path_depth_hint, 3);
+        assert!(!back.ready);
+        assert_eq!(back.degraded_reasons.len(), 1);
+    }
+
+    #[test]
+    fn readiness_wide_fan_out_transitive_count() {
+        // root -> a, b, c, d, e (5 direct children)
+        let issues = vec![
+            sample_detail("root", BeadStatus::Open, 0, &[]),
+            sample_detail("a", BeadStatus::Open, 1, &[("root", "blocks")]),
+            sample_detail("b", BeadStatus::Open, 1, &[("root", "blocks")]),
+            sample_detail("c", BeadStatus::Open, 1, &[("root", "blocks")]),
+            sample_detail("d", BeadStatus::Open, 1, &[("root", "blocks")]),
+            sample_detail("e", BeadStatus::Open, 1, &[("root", "blocks")]),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        let root = report.candidates.iter().find(|c| c.id == "root").unwrap();
+        assert!(root.ready);
+        assert_eq!(root.transitive_unblock_count, 5);
+        assert_eq!(root.critical_path_depth_hint, 1);
+    }
+
+    #[test]
+    fn readiness_closed_issues_not_in_candidates_but_resolve_deps() {
+        // dep is closed, a depends on it — a should be ready
+        // dep itself should NOT appear in candidates
+        let issues = vec![
+            sample_detail("dep", BeadStatus::Closed, 0, &[]),
+            sample_detail("a", BeadStatus::Open, 1, &[("dep", "blocks")]),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].id, "a");
+        assert!(report.candidates[0].ready);
+    }
+
+    #[test]
+    fn readiness_deduplicates_blocker_ids() {
+        // Same dep listed twice should be deduped
+        let issues = vec![
+            sample_detail("dep", BeadStatus::Open, 0, &[]),
+            sample_detail(
+                "a",
+                BeadStatus::Open,
+                1,
+                &[("dep", "blocks"), ("dep", "blocks")],
+            ),
+        ];
+        let report = resolve_bead_readiness(&issues);
+        let a = report.candidates.iter().find(|c| c.id == "a").unwrap();
+        assert_eq!(a.blocker_count, 1);
+        assert_eq!(a.blocker_ids, vec!["dep".to_string()]);
+    }
+
+    #[test]
+    fn readiness_reason_code_ordering() {
+        // Verify enum ordering is stable for sort (follows declaration order)
+        assert!(BeadResolverReasonCode::MissingDependencyNode < BeadResolverReasonCode::CyclicDependencyGraph);
+        assert!(BeadResolverReasonCode::CyclicDependencyGraph < BeadResolverReasonCode::PartialGraphData);
+    }
+
+    #[test]
+    fn readiness_reason_code_serde_roundtrip() {
+        for code in [
+            BeadResolverReasonCode::MissingDependencyNode,
+            BeadResolverReasonCode::CyclicDependencyGraph,
+            BeadResolverReasonCode::PartialGraphData,
+        ] {
+            let json = serde_json::to_string(&code).unwrap();
+            let back: BeadResolverReasonCode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, code);
+        }
+    }
 }
