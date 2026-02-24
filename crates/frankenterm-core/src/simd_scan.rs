@@ -107,22 +107,26 @@ fn prefer_fast_path() -> bool {
 }
 
 /// Hybrid scan: vectorized `memchr` for newline counting + scalar ANSI state
-/// machine. This avoids the ANSI-heavy regression that a pure `memchr2` approach
-/// suffers (dense escape sequences cause the gap-processing loop to scan nearly
-/// every byte, adding vectorized-search overhead on top of the scalar work).
+/// machine from the first ESC onward.
 ///
-/// Trade-off: two passes over the data, but the `memchr` newline pass is so fast
-/// (~5-6 GiB/s on aarch64) that it's negligible compared to the scalar pass.
+/// For ESC-free inputs (common for plain logs), this short-circuits and returns
+/// `ansi_byte_count = 0` without a scalar byte walk.
 #[must_use]
 fn scan_newlines_and_ansi_memchr(bytes: &[u8]) -> OutputScanMetrics {
     // Pass 1: vectorized newline count (memchr uses NEON/SSE/AVX internally).
     let newline_count = memchr::memchr_iter(b'\n', bytes).count();
 
-    // Pass 2: scalar ANSI state machine — sequential state tracking has no
-    // known vectorization shortcut.
+    let Some(first_esc) = memchr::memchr(0x1b, bytes) else {
+        return OutputScanMetrics {
+            newline_count,
+            ansi_byte_count: 0,
+        };
+    };
+
+    // Pass 2: scalar ANSI state machine from the first ESC onward.
     let mut ansi_byte_count = 0usize;
     let mut in_escape = false;
-    for &b in bytes {
+    for &b in &bytes[first_esc..] {
         if b == 0x1b {
             in_escape = true;
             ansi_byte_count += 1;
@@ -148,6 +152,17 @@ fn scan_newlines_and_ansi_memchr_with_state(
     // Keep newline count on the vectorized fast path.
     let newline_count = memchr::memchr_iter(b'\n', bytes).count();
 
+    // Fast path for the dominant case: no escape carry and no ESC in this
+    // chunk. We only need UTF-8 carry-state updates.
+    if !state.in_escape && memchr::memchr(0x1b, bytes).is_none() {
+        state.pending_utf8_continuations =
+            scan_utf8_pending_only(bytes, state.pending_utf8_continuations);
+        return OutputScanMetrics {
+            newline_count,
+            ansi_byte_count: 0,
+        };
+    }
+
     let mut ansi_byte_count = 0usize;
     let mut in_escape = state.in_escape;
     let mut pending_utf8 = state.pending_utf8_continuations;
@@ -172,6 +187,19 @@ fn scan_newlines_and_ansi_memchr_with_state(
         newline_count,
         ansi_byte_count,
     }
+}
+
+#[inline]
+fn scan_utf8_pending_only(bytes: &[u8], initial_pending: u8) -> u8 {
+    if initial_pending == 0 && bytes.is_ascii() {
+        return 0;
+    }
+
+    let mut pending = initial_pending;
+    for &b in bytes {
+        update_utf8_pending(&mut pending, b);
+    }
+    pending
 }
 
 #[must_use]
@@ -318,6 +346,30 @@ mod tests {
             let fast = scan_newlines_and_ansi_memchr(&data);
             let scalar = scan_newlines_and_ansi_scalar(&data);
             prop_assert_eq!(fast, scalar);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        #[test]
+        fn stateful_fast_path_matches_scalar_for_random_bytes_and_state(
+            data in proptest::collection::vec(any::<u8>(), 0..4096),
+            in_escape in any::<bool>(),
+            pending in 0_u8..4,
+        ) {
+            let initial = OutputScanState {
+                in_escape,
+                pending_utf8_continuations: pending,
+            };
+            let mut fast_state = initial;
+            let mut scalar_state = initial;
+
+            let fast = scan_newlines_and_ansi_memchr_with_state(&data, &mut fast_state);
+            let scalar = scan_newlines_and_ansi_scalar_with_state(&data, &mut scalar_state);
+
+            prop_assert_eq!(fast, scalar);
+            prop_assert_eq!(fast_state, scalar_state);
         }
     }
 
@@ -650,5 +702,35 @@ mod tests {
             ansi_byte_count: left_scan.ansi_byte_count + right_scan.ansi_byte_count,
         };
         assert_eq!(stitched, scan_newlines_and_ansi(b"ok\xf0\x9f\x99\x82\n"));
+    }
+
+    #[test]
+    fn stateful_esc_free_fast_path_matches_scalar_with_pending_utf8() {
+        let data = b"plain ascii log line\nanother line";
+        let initial = OutputScanState {
+            in_escape: false,
+            pending_utf8_continuations: 1,
+        };
+
+        let mut fast_state = initial;
+        let mut scalar_state = initial;
+
+        let fast = scan_newlines_and_ansi_memchr_with_state(data, &mut fast_state);
+        let scalar = scan_newlines_and_ansi_scalar_with_state(data, &mut scalar_state);
+
+        assert_eq!(fast, scalar);
+        assert_eq!(fast_state, scalar_state);
+    }
+
+    #[test]
+    fn stateful_esc_free_ascii_clears_invalid_utf8_pending() {
+        let mut state = OutputScanState {
+            in_escape: false,
+            pending_utf8_continuations: 2,
+        };
+
+        let _ = scan_newlines_and_ansi_with_state(b"A", &mut state);
+        assert_eq!(state.pending_utf8_continuations, 0);
+        assert!(!state.in_escape);
     }
 }

@@ -18,7 +18,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::simd_scan::{
-    OutputScanMetrics, OutputScanState, scan_newlines_and_ansi, scan_newlines_and_ansi_with_state,
+    scan_newlines_and_ansi, scan_newlines_and_ansi_with_state, OutputScanMetrics, OutputScanState,
 };
 
 // =============================================================================
@@ -784,6 +784,32 @@ proptest! {
         };
 
         prop_assert_eq!(stitched, scan_newlines_and_ansi(bytes));
+        prop_assert!(!state.has_partial_utf8());
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(220))]
+
+    #[test]
+    fn ansi_boundary_splits_preserve_metrics(
+        data in arb_text_with_ansi(48),
+        split_points in proptest::collection::vec(0_usize..4097, 0..32),
+    ) {
+        let boundaries = build_sorted_split_points(data.len(), split_points);
+        let mut state = OutputScanState::default();
+        let mut streaming = OutputScanMetrics::default();
+
+        for window in boundaries.windows(2) {
+            let start = window[0];
+            let end = window[1];
+            let metrics = scan_newlines_and_ansi_with_state(&data[start..end], &mut state);
+            streaming.newline_count += metrics.newline_count;
+            streaming.ansi_byte_count += metrics.ansi_byte_count;
+        }
+
+        prop_assert_eq!(streaming, scan_newlines_and_ansi(&data));
+        prop_assert!(!state.in_escape);
         prop_assert!(!state.has_partial_utf8());
     }
 }

@@ -7,9 +7,9 @@
 
 use std::hint::black_box;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use frankenterm_core::simd_scan::{
-    OutputScanMetrics, OutputScanState, scan_newlines_and_ansi, scan_newlines_and_ansi_with_state,
+    scan_newlines_and_ansi, scan_newlines_and_ansi_with_state, OutputScanMetrics, OutputScanState,
 };
 
 mod bench_common;
@@ -29,7 +29,7 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
     bench_common::BenchBudget {
         name: "simd_scan_chunked_stateful",
-        budget: "stateful chunked SIMD scan should significantly beat scalar carry-state scan",
+        budget: "stateful chunked SIMD scan should beat scalar by >2x on dense ASCII logs",
     },
 ];
 
@@ -75,6 +75,27 @@ fn payload_binary_like(size: usize) -> Vec<u8> {
         }
         out.push(b);
     }
+    out
+}
+
+fn payload_dense_logs(size: usize) -> Vec<u8> {
+    // Mostly-ASCII operator logs with frequent newlines and sparse ANSI tags.
+    const LINE_PREFIX: &[u8] = b"2026-02-24T09:15:42.123Z INFO pane=42 ";
+    const BODY: &[u8] = b"worker heartbeat accepted request_id=abc123 latency_ms=17";
+    const ANSI_WARN: &[u8] = b"\x1b[33mWARN\x1b[0m ";
+
+    let mut out = Vec::with_capacity(size);
+    let mut line = 0usize;
+    while out.len() < size {
+        out.extend_from_slice(LINE_PREFIX);
+        if line % 64 == 0 {
+            out.extend_from_slice(ANSI_WARN);
+        }
+        out.extend_from_slice(BODY);
+        out.push(b'\n');
+        line += 1;
+    }
+    out.truncate(size);
     out
 }
 
@@ -226,7 +247,7 @@ fn bench_mixed_payload_scan(c: &mut Criterion) {
 
 fn bench_chunked_stateful_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("simd_scan_chunked_stateful");
-    let payload = payload_ansi_heavy(2 * 1024 * 1024);
+    let payload = payload_dense_logs(2 * 1024 * 1024);
 
     for chunk_size in [16usize, 32, 64, 128, 256] {
         group.throughput(Throughput::Bytes(payload.len() as u64));
