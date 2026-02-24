@@ -34,11 +34,9 @@ fn arb_monotonic_targets() -> impl Strategy<Value = (f64, f64, f64, f64)> {
     (1.0..1_000_000.0_f64).prop_flat_map(|base| {
         let p50 = base;
         (Just(p50), p50..=(p50 * 10.0)).prop_flat_map(move |(p50, p95)| {
-            (Just(p50), Just(p95), p95..=(p95 * 10.0)).prop_flat_map(
-                move |(p50, p95, p99)| {
-                    (Just(p50), Just(p95), Just(p99), p99..=(p99 * 10.0))
-                },
-            )
+            (Just(p50), Just(p95), p95..=(p95 * 10.0)).prop_flat_map(move |(p50, p95, p99)| {
+                (Just(p50), Just(p95), Just(p99), p99..=(p99 * 10.0))
+            })
         })
     })
 }
@@ -3940,7 +3938,13 @@ proptest! {
 
 // ── D4: Calibration Harness Property Tests ────────────────────
 
-fn make_cal_result(scenario: CalibrationScenario, fpr: f64, miss: f64, delay: f64, loss: f64) -> CalibrationResult {
+fn make_cal_result(
+    scenario: CalibrationScenario,
+    fpr: f64,
+    miss: f64,
+    delay: f64,
+    loss: f64,
+) -> CalibrationResult {
     CalibrationResult {
         scenario,
         false_positive_rate: fpr,
@@ -4091,5 +4095,249 @@ proptest! {
         }
         let avg = harness.avg_fpr();
         prop_assert!((avg - fpr).abs() < 1e-10, "avg_fpr {} != expected {}", avg, fpr);
+    }
+}
+
+// ── E1: Formal Spec Pack Property Tests ────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Scheduler capacity invariant: holds iff actual <= capacity.
+    #[test]
+    fn scheduler_capacity_bound_holds_iff(
+        capacity in 1_usize..200,
+        actual in 0_usize..300,
+    ) {
+        let inv = SchedulerInvariant::CapacityBound {
+            lane: SchedulerLane::Input,
+            capacity,
+            actual,
+        };
+        prop_assert_eq!(inv.holds(), actual <= capacity);
+    }
+
+    /// Scheduler conservation: holds iff total == sum.
+    #[test]
+    fn scheduler_conservation_holds_iff(
+        total in 0_u64..1000,
+        lane_sum in 0_u64..1000,
+    ) {
+        let inv = SchedulerInvariant::ConservationOfWork { total_admitted: total, lane_sum };
+        prop_assert_eq!(inv.holds(), total == lane_sum);
+    }
+
+    /// Scheduler epoch monotonicity: holds iff current >= previous.
+    #[test]
+    fn scheduler_epoch_mono_holds_iff(
+        prev in 0_u64..1000,
+        curr in 0_u64..1000,
+    ) {
+        let inv = SchedulerInvariant::EpochMonotonicity { previous: prev, current: curr };
+        prop_assert_eq!(inv.holds(), curr >= prev);
+    }
+
+    /// Budget percentile monotonicity: holds iff p50 <= p95 <= p99 <= p999.
+    #[test]
+    fn budget_percentile_mono_holds_iff(
+        p50 in 0.0_f64..1000.0,
+        p95 in 0.0_f64..1000.0,
+        p99 in 0.0_f64..1000.0,
+        p999 in 0.0_f64..1000.0,
+    ) {
+        let inv = BudgetInvariant::PercentileMonotonicity {
+            stage: LatencyStage::PtyCapture,
+            p50, p95, p99, p999,
+        };
+        let expected = p50 <= p95 && p95 <= p99 && p99 <= p999;
+        prop_assert_eq!(inv.holds(), expected);
+    }
+
+    /// Budget non-negative: holds iff min_target >= 0.
+    #[test]
+    fn budget_nonneg_holds_iff(
+        min_target in -100.0_f64..100.0,
+    ) {
+        let inv = BudgetInvariant::NonNegativeTargets {
+            stage: LatencyStage::StorageWrite,
+            min_target,
+        };
+        prop_assert_eq!(inv.holds(), min_target >= 0.0);
+    }
+
+    /// Budget overflow bound: holds iff overflows <= total.
+    #[test]
+    fn budget_overflow_bound_holds_iff(
+        overflows in 0_u64..200,
+        total in 0_u64..200,
+    ) {
+        let inv = BudgetInvariant::OverflowBound {
+            overflow_count: overflows,
+            total_observations: total,
+        };
+        prop_assert_eq!(inv.holds(), overflows <= total);
+    }
+
+    /// Recovery cooldown: holds iff consecutive_ok >= required.
+    #[test]
+    fn recovery_cooldown_holds_iff(
+        ok in 0_u64..100,
+        required in 0_u64..100,
+    ) {
+        let inv = RecoveryInvariant::CooldownEnforced {
+            consecutive_ok: ok,
+            cooldown_required: required,
+        };
+        prop_assert_eq!(inv.holds(), ok >= required);
+    }
+
+    /// Recovery escalation count monotonic: holds iff current >= previous.
+    #[test]
+    fn recovery_esc_count_mono_holds_iff(
+        prev in 0_u64..100,
+        curr in 0_u64..100,
+    ) {
+        let inv = RecoveryInvariant::EscalationCountMonotonic { previous: prev, current: curr };
+        prop_assert_eq!(inv.holds(), curr >= prev);
+    }
+
+    /// Checker total_checks increments on every check.
+    #[test]
+    fn checker_total_checks_increments(
+        n in 1_u32..50,
+    ) {
+        let mut checker = InvariantChecker::with_defaults();
+        for i in 0..n {
+            checker.check_scheduler(
+                &SchedulerInvariant::EpochMonotonicity { previous: 0, current: i as u64 },
+                i as u64,
+            );
+        }
+        prop_assert_eq!(checker.total_checks(), n as u64);
+    }
+
+    /// Checker satisfied + violations == total_checks.
+    #[test]
+    fn checker_satisfied_plus_violations_eq_total(
+        good in 0_u32..20,
+        bad in 0_u32..20,
+    ) {
+        let mut checker = InvariantChecker::with_defaults();
+        for i in 0..good {
+            checker.check_scheduler(
+                &SchedulerInvariant::EpochMonotonicity { previous: 0, current: i as u64 + 1 },
+                i as u64,
+            );
+        }
+        for i in 0..bad {
+            checker.check_scheduler(
+                &SchedulerInvariant::CapacityBound {
+                    lane: SchedulerLane::Input,
+                    capacity: 1,
+                    actual: 10 + i as usize,
+                },
+                100 + i as u64,
+            );
+        }
+        prop_assert_eq!(
+            checker.total_satisfied() + checker.total_violations(),
+            checker.total_checks()
+        );
+    }
+
+    /// Checker violation rate is in [0, 1].
+    #[test]
+    fn checker_violation_rate_bounded(
+        good in 0_u32..20,
+        bad in 0_u32..20,
+    ) {
+        let mut checker = InvariantChecker::with_defaults();
+        for i in 0..good {
+            checker.check_scheduler(
+                &SchedulerInvariant::EpochMonotonicity { previous: 0, current: i as u64 + 1 },
+                i as u64,
+            );
+        }
+        for i in 0..bad {
+            checker.check_scheduler(
+                &SchedulerInvariant::CapacityBound {
+                    lane: SchedulerLane::Input,
+                    capacity: 1,
+                    actual: 10 + i as usize,
+                },
+                100 + i as u64,
+            );
+        }
+        let rate = checker.violation_rate();
+        if checker.total_checks() > 0 {
+            prop_assert!(rate >= 0.0 && rate <= 1.0, "rate {} out of bounds", rate);
+        }
+    }
+
+    /// Checker reset clears all state.
+    #[test]
+    fn checker_reset_clears(
+        n in 1_u32..30,
+    ) {
+        let mut checker = InvariantChecker::with_defaults();
+        for i in 0..n {
+            checker.check_scheduler(
+                &SchedulerInvariant::EpochMonotonicity { previous: 0, current: i as u64 },
+                i as u64,
+            );
+        }
+        checker.reset();
+        prop_assert_eq!(checker.total_checks(), 0);
+        prop_assert_eq!(checker.total_violations(), 0);
+        prop_assert_eq!(checker.total_satisfied(), 0);
+        prop_assert_eq!(checker.recent_results(100).len(), 0);
+    }
+
+    /// Invariant domain serde roundtrip.
+    #[test]
+    fn invariant_domain_serde_roundtrip(
+        variant in 0_u8..4,
+    ) {
+        let domain = match variant {
+            0 => InvariantDomain::Scheduler,
+            1 => InvariantDomain::Budget,
+            2 => InvariantDomain::Recovery,
+            _ => InvariantDomain::Composition,
+        };
+        let json = serde_json::to_string(&domain).unwrap();
+        let back: InvariantDomain = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(domain, back);
+    }
+
+    /// Invariant severity serde roundtrip.
+    #[test]
+    fn invariant_severity_serde_roundtrip(
+        variant in 0_u8..3,
+    ) {
+        let sev = match variant {
+            0 => InvariantSeverity::Info,
+            1 => InvariantSeverity::Warning,
+            _ => InvariantSeverity::Critical,
+        };
+        let json = serde_json::to_string(&sev).unwrap();
+        let back: InvariantSeverity = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(sev, back);
+    }
+
+    /// Checker degradation serde roundtrip.
+    #[test]
+    fn checker_degradation_serde_roundtrip(
+        variant in 0_u8..3,
+        violations in 0_u64..100,
+        total in 1_u64..200,
+    ) {
+        let deg = match variant {
+            0 => InvariantCheckerDegradation::Healthy,
+            1 => InvariantCheckerDegradation::ViolationsDetected { violations, total },
+            _ => InvariantCheckerDegradation::HighViolationRate { violations, total },
+        };
+        let json = serde_json::to_string(&deg).unwrap();
+        let back: InvariantCheckerDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(deg, back);
     }
 }
