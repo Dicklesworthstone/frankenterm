@@ -11858,6 +11858,162 @@ impl ReplayCanonicalizer {
     }
 }
 
+// ── E3 Impl: Bridge methods and convenience API ───────────────────
+
+impl ReplayCanonicalizer {
+    /// Canonicalize and compare two model-checker trace outputs directly.
+    pub fn compare_mc_traces(
+        &mut self,
+        a: &[TraceStep],
+        b: &[TraceStep],
+        seed: u64,
+    ) -> ReplayComparisonResult {
+        let ta = self.upgrade_trace(a, "mc-a".to_string(), seed);
+        let tb = self.upgrade_trace(b, "mc-b".to_string(), seed);
+        self.compare(&ta, &tb)
+    }
+
+    /// Check replay determinism: run canonicalize twice on the same trace
+    /// and verify the output is identical (self-consistency check).
+    pub fn verify_determinism(&mut self, trace: &DeterministicTrace) -> bool {
+        let c1 = self.canonicalize(trace);
+        let c2 = self.canonicalize(trace);
+        c1.entries.iter().zip(c2.entries.iter())
+            .all(|(a, b)| a.fingerprint == b.fingerprint && a.seq == b.seq && a.timestamp_us == b.timestamp_us)
+    }
+
+    /// Extract a sub-trace containing only entries in the given domain.
+    pub fn filter_by_domain(
+        &self,
+        trace: &DeterministicTrace,
+        domain: InvariantDomain,
+    ) -> DeterministicTrace {
+        let entries: Vec<TraceEntry> = trace.entries.iter()
+            .filter(|e| e.domain == domain)
+            .cloned()
+            .enumerate()
+            .map(|(i, mut e)| { e.seq = i as u64; e })
+            .collect();
+        DeterministicTrace {
+            version: trace.version,
+            trace_id: format!("{}-{}", trace.trace_id, domain),
+            seed: trace.seed,
+            entries,
+            created_at_us: trace.created_at_us,
+            duration_us: trace.duration_us,
+        }
+    }
+
+    /// Extract the causal dependency chain for a given entry.
+    pub fn causal_chain(
+        &self,
+        trace: &DeterministicTrace,
+        entry_seq: u64,
+    ) -> Vec<u64> {
+        let mut chain = Vec::new();
+        let mut current = Some(entry_seq);
+        let index: std::collections::HashMap<u64, &TraceEntry> =
+            trace.entries.iter().map(|e| (e.seq, e)).collect();
+        while let Some(seq) = current {
+            chain.push(seq);
+            current = index.get(&seq).and_then(|e| e.causal_parent);
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Compute per-domain entry counts.
+    pub fn domain_histogram(
+        &self,
+        trace: &DeterministicTrace,
+    ) -> std::collections::HashMap<String, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for entry in &trace.entries {
+            *counts.entry(entry.domain.to_string()).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// Find entries whose fingerprint appears exactly once (unique actions).
+    pub fn unique_fingerprints(
+        &self,
+        trace: &DeterministicTrace,
+    ) -> Vec<u64> {
+        let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for entry in &trace.entries {
+            *counts.entry(entry.fingerprint).or_insert(0) += 1;
+        }
+        trace.entries.iter()
+            .filter(|e| counts.get(&e.fingerprint) == Some(&1))
+            .map(|e| e.seq)
+            .collect()
+    }
+
+    /// Merge two traces interleaving by timestamp (union merge).
+    pub fn merge_traces(
+        &mut self,
+        a: &DeterministicTrace,
+        b: &DeterministicTrace,
+    ) -> DeterministicTrace {
+        let mut entries: Vec<TraceEntry> = a.entries.iter()
+            .chain(b.entries.iter())
+            .cloned()
+            .collect();
+        entries.sort_by(|x, y| x.timestamp_us.cmp(&y.timestamp_us).then(x.seq.cmp(&y.seq)));
+        for (i, entry) in entries.iter_mut().enumerate() {
+            entry.seq = i as u64;
+        }
+        let duration = entries.last().map_or(0, |e| e.timestamp_us)
+            .saturating_sub(a.created_at_us.min(b.created_at_us));
+        DeterministicTrace {
+            version: TraceFormatVersion::V2,
+            trace_id: format!("{}-{}", a.trace_id, b.trace_id),
+            seed: a.seed ^ b.seed,
+            entries,
+            created_at_us: a.created_at_us.min(b.created_at_us),
+            duration_us: duration,
+        }
+    }
+
+    /// Slice a trace to entries within a time window.
+    pub fn time_window(
+        &self,
+        trace: &DeterministicTrace,
+        start_us: u64,
+        end_us: u64,
+    ) -> DeterministicTrace {
+        let entries: Vec<TraceEntry> = trace.entries.iter()
+            .filter(|e| e.timestamp_us >= start_us && e.timestamp_us <= end_us)
+            .cloned()
+            .enumerate()
+            .map(|(i, mut e)| { e.seq = i as u64; e })
+            .collect();
+        DeterministicTrace {
+            version: trace.version,
+            trace_id: format!("{}-window", trace.trace_id),
+            seed: trace.seed,
+            entries,
+            created_at_us: start_us,
+            duration_us: end_us.saturating_sub(start_us),
+        }
+    }
+
+    /// Total comparisons performed.
+    pub fn total_comparisons(&self) -> u64 {
+        self.comparisons_made
+    }
+
+    /// Total traces processed.
+    pub fn total_traces(&self) -> u64 {
+        self.traces_processed
+    }
+
+    /// Access the current config.
+    pub fn config(&self) -> &CanonicalizerConfig {
+        &self.config
+    }
+}
+
 /// Map a TraceAction to its primary InvariantDomain.
 fn action_domain(action: &TraceAction) -> InvariantDomain {
     match action {
