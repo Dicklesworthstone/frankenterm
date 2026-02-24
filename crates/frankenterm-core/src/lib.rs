@@ -226,6 +226,7 @@ pub mod replay_fault_injection;
 pub mod replay_fixture_harvest;
 pub mod replay_guardrails;
 pub mod replay_performance;
+pub mod replay_risk_scoring;
 pub mod replay_scenario_matrix;
 pub mod replay_merge;
 pub mod replay_provenance;
