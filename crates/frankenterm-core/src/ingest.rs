@@ -22,10 +22,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::config::PaneFilterConfig;
+use crate::config::{PaneFilterConfig, TraumaGuardConfig};
 use crate::error::Result;
 use crate::storage::{Gap, PaneRecord, Segment, StorageHandle};
-use crate::trauma_guard::{TraumaDecision, TraumaState};
+use crate::trauma_guard::{TraumaDecision, TraumaState, hash_command};
 use crate::wezterm::{PaneInfo, stable_hash};
 
 // =============================================================================
@@ -626,6 +626,8 @@ pub struct PaneRegistry {
     cursors: HashMap<u64, PaneCursor>,
     /// Per-pane trauma guard state (recent command + error-signature history)
     trauma_states: HashMap<u64, TraumaState>,
+    /// Runtime trauma guard tuning and enablement.
+    trauma_guard_config: TraumaGuardConfig,
     /// Pane filter configuration (cached)
     filter_config: PaneFilterConfig,
 }
@@ -645,6 +647,7 @@ impl PaneRegistry {
             uuid_index: HashMap::new(),
             cursors: HashMap::new(),
             trauma_states: HashMap::new(),
+            trauma_guard_config: TraumaGuardConfig::default(),
             filter_config: PaneFilterConfig::default(),
         }
     }
@@ -652,11 +655,21 @@ impl PaneRegistry {
     /// Create a registry with filter configuration
     #[must_use]
     pub fn with_filter(filter_config: PaneFilterConfig) -> Self {
+        Self::with_filter_and_trauma(filter_config, TraumaGuardConfig::default())
+    }
+
+    /// Create a registry with filter and trauma-guard configuration.
+    #[must_use]
+    pub fn with_filter_and_trauma(
+        filter_config: PaneFilterConfig,
+        trauma_guard_config: TraumaGuardConfig,
+    ) -> Self {
         Self {
             entries: HashMap::new(),
             uuid_index: HashMap::new(),
             cursors: HashMap::new(),
             trauma_states: HashMap::new(),
+            trauma_guard_config,
             filter_config,
         }
     }
@@ -664,6 +677,21 @@ impl PaneRegistry {
     /// Update the filter configuration
     pub fn set_filter(&mut self, filter_config: PaneFilterConfig) {
         self.filter_config = filter_config;
+    }
+
+    /// Update trauma-guard tuning and apply it to tracked panes.
+    pub fn set_trauma_guard_config(&mut self, trauma_guard_config: TraumaGuardConfig) {
+        if self.trauma_guard_config == trauma_guard_config {
+            return;
+        }
+        self.trauma_guard_config = trauma_guard_config;
+
+        // Reinitialize per-pane state to deterministically apply the new thresholds.
+        // This intentionally drops prior loop history across live panes on config change.
+        let trauma_state_config = self.trauma_guard_config.to_trauma_config();
+        for state in self.trauma_states.values_mut() {
+            *state = TraumaState::with_config(trauma_state_config.clone());
+        }
     }
 
     /// Set or update a runtime capture priority override for a pane.
@@ -794,7 +822,10 @@ impl PaneRegistry {
                 let entry = PaneEntry::new(pane, fingerprint, observation);
                 self.uuid_index.insert(entry.pane_uuid.clone(), pane_id);
                 self.entries.insert(pane_id, entry);
-                self.trauma_states.insert(pane_id, TraumaState::new());
+                self.trauma_states.insert(
+                    pane_id,
+                    TraumaState::with_config(self.trauma_guard_config.to_trauma_config()),
+                );
 
                 // Only create cursor if observed
                 if self
@@ -944,7 +975,21 @@ impl PaneRegistry {
             ));
         }
 
-        let state = self.trauma_states.entry(pane_id).or_default();
+        if !self.trauma_guard_config.enabled {
+            return Ok(TraumaDecision {
+                should_intervene: false,
+                reason_code: None,
+                command_hash: hash_command(command),
+                repeat_count: 0,
+                recurring_signatures: Vec::new(),
+            });
+        }
+
+        let trauma_state_config = self.trauma_guard_config.to_trauma_config();
+        let state = self
+            .trauma_states
+            .entry(pane_id)
+            .or_insert_with(|| TraumaState::with_config(trauma_state_config));
         Ok(state.record_command_result(timestamp_ms, command, error_signatures))
     }
 
@@ -2942,6 +2987,64 @@ mod tests {
         assert!(!second.should_intervene);
         assert!(third.should_intervene);
         assert_eq!(third.reason_code.as_deref(), Some("recurring_failure_loop"));
+    }
+
+    #[test]
+    fn record_trauma_command_result_skips_intervention_when_disabled() {
+        let trauma_guard = crate::config::TraumaGuardConfig {
+            enabled: false,
+            ..crate::config::TraumaGuardConfig::default()
+        };
+        let mut registry =
+            PaneRegistry::with_filter_and_trauma(PaneFilterConfig::default(), trauma_guard);
+        registry.discovery_tick(vec![make_pane(1, "bash", Some("/home"))]);
+
+        let signatures = vec!["core.codex:error_loop".to_string()];
+        let first = registry
+            .record_trauma_command_result(1, 1_000, "cargo test", &signatures)
+            .unwrap();
+        let second = registry
+            .record_trauma_command_result(1, 1_100, "cargo test", &signatures)
+            .unwrap();
+        let third = registry
+            .record_trauma_command_result(1, 1_200, "cargo test", &signatures)
+            .unwrap();
+
+        assert!(!first.should_intervene);
+        assert!(!second.should_intervene);
+        assert!(!third.should_intervene);
+        assert_eq!(third.reason_code, None);
+    }
+
+    #[test]
+    fn set_trauma_guard_config_reloads_thresholds() {
+        let mut registry = PaneRegistry::new();
+        registry.discovery_tick(vec![make_pane(1, "bash", Some("/home"))]);
+
+        let signatures = vec!["core.codex:error_loop".to_string()];
+        let _ = registry
+            .record_trauma_command_result(1, 1_000, "cargo test", &signatures)
+            .unwrap();
+        let _ = registry
+            .record_trauma_command_result(1, 1_100, "cargo test", &signatures)
+            .unwrap();
+
+        registry.set_trauma_guard_config(crate::config::TraumaGuardConfig {
+            max_consecutive_failures: 2,
+            ..crate::config::TraumaGuardConfig::default()
+        });
+
+        let first_after_reload = registry
+            .record_trauma_command_result(1, 1_200, "cargo test", &signatures)
+            .unwrap();
+        let second_after_reload = registry
+            .record_trauma_command_result(1, 1_300, "cargo test", &signatures)
+            .unwrap();
+
+        assert!(!first_after_reload.should_intervene);
+        assert_eq!(first_after_reload.repeat_count, 1);
+        assert!(second_after_reload.should_intervene);
+        assert_eq!(second_after_reload.repeat_count, 2);
     }
 
     #[test]

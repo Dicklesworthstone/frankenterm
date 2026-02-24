@@ -31,7 +31,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::backpressure::BackpressureConfig;
 use crate::config::{
     CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig, PatternsConfig,
-    SnapshotConfig, SnapshotSchedulingMode,
+    SnapshotConfig, SnapshotSchedulingMode, TraumaGuardConfig,
 };
 use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
@@ -251,6 +251,8 @@ pub struct RuntimeConfig {
     pub checkpoint_interval_secs: u32,
     /// Optional Unix socket path for native WezTerm events
     pub native_event_socket: Option<PathBuf>,
+    /// Trauma guard tuning for per-pane loop detection.
+    pub trauma_guard: TraumaGuardConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -271,6 +273,7 @@ impl Default for RuntimeConfig {
             retention_max_mb: 0,
             checkpoint_interval_secs: 60,
             native_event_socket: None,
+            trauma_guard: TraumaGuardConfig::default(),
         }
     }
 }
@@ -903,7 +906,10 @@ impl ObservationRuntime {
         storage: StorageHandle,
         pattern_engine: Arc<RwLock<PatternEngine>>,
     ) -> Self {
-        let registry = PaneRegistry::with_filter(config.pane_filter.clone());
+        let registry = PaneRegistry::with_filter_and_trauma(
+            config.pane_filter.clone(),
+            config.trauma_guard.clone(),
+        );
         let metrics = Arc::new(RuntimeMetrics::default());
         metrics.started_at.set(epoch_ms_u64());
 
@@ -921,6 +927,7 @@ impl ObservationRuntime {
             patterns: config.patterns.clone(),
             workflows_enabled: vec![],
             auto_run_allowlist: vec![],
+            trauma_guard: config.trauma_guard.clone(),
         };
         let (config_tx, config_rx) = watch::channel(hot_config);
 
@@ -1040,7 +1047,7 @@ impl ObservationRuntime {
             None
         };
 
-        // Spawn relay task from multi-producer ingress into SPSC persistence queue.
+        // Spawn relay task from multi-producer ingress into SPMC persistence queue.
         let relay_handle = self.spawn_capture_relay_task(capture_ingress_rx, capture_ring_tx);
 
         // Spawn persistence and detection task
@@ -1638,6 +1645,7 @@ impl ObservationRuntime {
 
         task::spawn(async move {
             let mut current_interval = initial_interval;
+            let mut trauma_guard = config_rx.borrow().trauma_guard.clone();
 
             loop {
                 // Wait for interval, checking shutdown periodically to ensure responsiveness
@@ -1670,6 +1678,16 @@ impl ObservationRuntime {
                             "Discovery interval updated via hot reload"
                         );
                         current_interval = new_interval;
+                    }
+                    if new_config.trauma_guard != trauma_guard {
+                        info!(
+                            old = ?trauma_guard,
+                            new = ?new_config.trauma_guard,
+                            "Trauma guard config updated via hot reload"
+                        );
+                        trauma_guard = new_config.trauma_guard.clone();
+                        let mut reg = registry.write().await;
+                        reg.set_trauma_guard_config(trauma_guard.clone());
                     }
                 }
 
@@ -2213,7 +2231,7 @@ impl ObservationRuntime {
     /// Spawn relay task from capture ingress to lock-free SPMC persistence queue.
     ///
     /// Capture producers (tailers/native handlers) write into a bounded MPSC.
-    /// This task is the sole producer for the SPSC ring consumed by persistence.
+    /// This task is the sole producer for the SPMC ring consumed by persistence.
     fn spawn_capture_relay_task(
         &self,
         mut capture_ingress_rx: mpsc::Receiver<CaptureEvent>,
@@ -2729,7 +2747,7 @@ pub struct RuntimeHandle {
     pub discovery: JoinHandle<()>,
     /// Capture task handle
     pub capture: JoinHandle<()>,
-    /// Relay task handle (capture ingress -> SPSC persistence queue)
+    /// Relay task handle (capture ingress -> SPMC persistence queue)
     pub relay: JoinHandle<()>,
     /// Native events listener task handle (optional)
     pub native_events: Option<JoinHandle<()>>,
@@ -3419,6 +3437,7 @@ mod tests {
     use crate::replay_capture::{CaptureAdapter, CaptureConfig, CollectingCaptureSink};
     use crate::runtime_compat::CompatRuntime;
     use crate::storage::PaneRecord;
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
     fn run_async_test<F>(future: F)
@@ -3736,6 +3755,100 @@ mod tests {
                     )
                 }),
                 "expected decision provenance marker for pattern detection"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_spmc_handoff_preserves_exact_output_checksum() {
+        run_async_test(async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let engine = PatternEngine::new();
+
+            let mut config = RuntimeConfig::default();
+            config.discovery_interval = Duration::from_millis(20);
+            config.capture_interval = Duration::from_millis(20);
+            config.min_capture_interval = Duration::from_millis(10);
+            config.channel_buffer = 4;
+
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(0).await;
+            let wezterm_handle: WeztermHandle = mock.clone();
+
+            let mut runtime =
+                ObservationRuntime::new(config, storage, Arc::new(RwLock::new(engine)))
+                    .with_wezterm_handle(wezterm_handle);
+
+            let handle = runtime.start().await.expect("runtime should start");
+            let storage = Arc::clone(&handle.storage);
+
+            // Wait for discovery to register pane + cursor before injecting output.
+            sleep(Duration::from_millis(120)).await;
+
+            let expected_chunks: Vec<String> = (0..48)
+                .map(|idx| format!("burst-{idx:03}:{}\n", "x".repeat(48)))
+                .collect();
+            let expected_output = expected_chunks.concat();
+            for chunk in &expected_chunks {
+                mock.inject_output(0, chunk).await.expect("inject output");
+            }
+
+            // Allow at least one capture cycle to ingest burst output.
+            sleep(Duration::from_millis(200)).await;
+
+            let summary = handle.shutdown_with_summary().await;
+            assert!(
+                summary.clean,
+                "shutdown should complete cleanly: {:?}",
+                summary.warnings
+            );
+
+            let (segments, gaps) = {
+                let storage = storage.lock().await;
+                let segments = storage
+                    .get_segments(0, 2048)
+                    .await
+                    .expect("read persisted segments");
+                let gaps = storage.get_gaps().await.expect("read persisted gaps");
+                (segments, gaps)
+            };
+
+            assert!(
+                !segments.is_empty(),
+                "expected persisted output segments for pane 0"
+            );
+
+            let mut ordered_segments = segments;
+            ordered_segments.sort_by_key(|segment| segment.seq);
+            for pair in ordered_segments.windows(2) {
+                assert_eq!(
+                    pair[1].seq,
+                    pair[0].seq + 1,
+                    "segment sequence must stay contiguous across SPMC handoff"
+                );
+            }
+
+            let actual_output = ordered_segments
+                .iter()
+                .fold(String::new(), |mut acc, segment| {
+                    acc.push_str(&segment.content);
+                    acc
+                });
+            let expected_sha256 = format!("{:x}", Sha256::digest(expected_output.as_bytes()));
+            let actual_sha256 = format!("{:x}", Sha256::digest(actual_output.as_bytes()));
+
+            assert_eq!(
+                actual_output, expected_output,
+                "reconstructed persisted output must exactly match injected burst"
+            );
+            assert_eq!(
+                actual_sha256, expected_sha256,
+                "SHA-256 isomorphism proof failed for persisted output"
+            );
+            assert!(
+                gaps.is_empty(),
+                "expected no ingest gaps for deterministic mock burst, found: {gaps:?}"
             );
         });
     }
