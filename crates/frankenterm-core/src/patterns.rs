@@ -2636,6 +2636,16 @@ impl PatternEngine {
     pub fn pack_for_rule(&self, rule_id: &str) -> Option<&str> {
         self.library.pack_for_rule(rule_id)
     }
+
+    /// Return a canonical JSON representation of the rule definition for hashing.
+    #[must_use]
+    pub fn rule_definition_text(&self, rule_id: &str) -> Option<String> {
+        self.library
+            .rules()
+            .iter()
+            .find(|rule| rule.id == rule_id)
+            .and_then(|rule| serde_json::to_string(rule).ok())
+    }
 }
 
 #[cfg(test)]
@@ -2667,6 +2677,25 @@ mod tests {
         }
         // Non-existent rule should return None
         assert!(engine.pack_for_rule("nonexistent.rule.id").is_none());
+    }
+
+    #[test]
+    fn rule_definition_text_returns_canonical_json() {
+        let engine = PatternEngine::new();
+        let _ = engine.detect("warmup");
+        let first_rule = engine.rules().first().expect("builtin rules exist");
+        let text = engine
+            .rule_definition_text(&first_rule.id)
+            .expect("rule definition should be available");
+        let parsed: RuleDef = serde_json::from_str(&text).expect("valid rule json");
+        assert_eq!(parsed.id, first_rule.id);
+    }
+
+    #[test]
+    fn rule_definition_text_missing_rule_returns_none() {
+        let engine = PatternEngine::new();
+        let _ = engine.detect("warmup");
+        assert!(engine.rule_definition_text("does.not.exist").is_none());
     }
 
     #[test]

@@ -2272,6 +2272,7 @@ impl ObservationRuntime {
         let mut current_patterns = self.config.patterns.clone();
         let patterns_root = self.config.patterns_root.clone();
         let registry = Arc::clone(&registry);
+        let replay_capture = self.replay_capture.clone();
 
         task::spawn(async move {
             // Process events until producer is closed and the ring is drained.
@@ -2379,7 +2380,7 @@ impl ObservationRuntime {
                         }
 
                         // Run pattern detection on the content
-                        let detections = {
+                        let (detections, rule_definition_by_id) = {
                             let mut ctx = {
                                 let mut contexts = detection_contexts.write().await;
                                 contexts.remove(&pane_id).unwrap_or_else(|| {
@@ -2395,16 +2396,32 @@ impl ObservationRuntime {
                                 ctx.tail_buffer.clear();
                             }
 
-                            let detections = {
+                            let (detections, rule_definition_by_id) = {
                                 let engine = pattern_engine.read().await;
-                                engine.detect_with_context(&content, &mut ctx)
+                                let detections = engine.detect_with_context(&content, &mut ctx);
+                                let rule_definition_by_id = if replay_capture.is_some() {
+                                    detections
+                                        .iter()
+                                        .map(|detection| {
+                                            (
+                                                detection.rule_id.clone(),
+                                                engine
+                                                    .rule_definition_text(&detection.rule_id)
+                                                    .unwrap_or_else(|| detection.rule_id.clone()),
+                                            )
+                                        })
+                                        .collect::<HashMap<_, _>>()
+                                } else {
+                                    HashMap::new()
+                                };
+                                (detections, rule_definition_by_id)
                             };
 
                             {
                                 let mut contexts = detection_contexts.write().await;
                                 contexts.insert(pane_id, ctx);
                             }
-                            detections
+                            (detections, rule_definition_by_id)
                         };
 
                         if !detections.is_empty() {
@@ -2423,6 +2440,40 @@ impl ObservationRuntime {
 
                             // Persist each detection as an event
                             for detection in detections {
+                                if let Some(adapter) = replay_capture.as_ref() {
+                                    let rule_definition_text = rule_definition_by_id
+                                        .get(&detection.rule_id)
+                                        .map_or(detection.rule_id.as_str(), String::as_str);
+                                    let decision_output = serde_json::to_value(&detection)
+                                        .unwrap_or_else(|_| {
+                                            serde_json::json!({
+                                                "rule_id": detection.rule_id,
+                                                "event_type": detection.event_type,
+                                            })
+                                        });
+                                    let occurred_at_ms = if captured_at >= 0 {
+                                        captured_at as u64
+                                    } else {
+                                        epoch_ms_u64()
+                                    };
+                                    let decision_event = crate::replay_capture::DecisionEvent::new(
+                                        crate::replay_capture::DecisionType::PatternMatch,
+                                        pane_id,
+                                        detection.rule_id.clone(),
+                                        rule_definition_text,
+                                        &content,
+                                        decision_output,
+                                        Some(format!("segment:{}", persisted.segment.id)),
+                                        Some(detection.confidence),
+                                        occurred_at_ms,
+                                    );
+                                    adapter.capture_decision(
+                                        crate::recording::RecorderEventSource::WeztermMux,
+                                        None,
+                                        decision_event,
+                                    );
+                                }
+
                                 if let Some(ref manager) = recording {
                                     if let Err(err) =
                                         manager.record_event(pane_id, &detection, captured_at).await
@@ -3633,7 +3684,7 @@ mod tests {
 
             // Wait for discovery to register pane + cursor before injecting output.
             sleep(Duration::from_millis(120)).await;
-            mock.inject_output(0, "replay event line\n")
+            mock.inject_output(0, "Usage limit reached for all Pro models\n")
                 .await
                 .expect("inject output");
             sleep(Duration::from_millis(150)).await;
@@ -3663,6 +3714,17 @@ mod tests {
             assert!(
                 events.iter().all(|event| !event.event_id.is_empty()),
                 "all replay events must have deterministic event_id values"
+            );
+            assert!(
+                events.iter().any(|event| {
+                    matches!(
+                        &event.payload,
+                        RecorderEventPayload::ControlMarker { details, .. }
+                            if details.get("decision_type")
+                                == Some(&serde_json::json!("pattern_match"))
+                    )
+                }),
+                "expected decision provenance marker for pattern detection"
             );
         });
     }

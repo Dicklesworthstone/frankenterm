@@ -1896,7 +1896,7 @@ static SECRET_PATTERNS: &[SecretPattern] = &[
 /// assert!(output.contains("[REDACTED]"));
 /// assert!(!output.contains("sk-abc"));
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Redactor {
     /// Whether to include pattern names in redaction markers (for debugging)
     include_pattern_names: bool,
@@ -3243,6 +3243,8 @@ pub struct PolicyGatedInjector<C = crate::wezterm::WeztermClient> {
     storage: Option<crate::storage::StorageHandle>,
     /// Optional ingress tap for flight recorder capture (ft-oegrb.2.2)
     ingress_tap: Option<crate::recording::SharedIngressTap>,
+    /// Optional replay capture adapter for policy decision provenance.
+    decision_capture: Option<crate::replay_capture::SharedCaptureAdapter>,
 }
 
 impl<C> PolicyGatedInjector<C>
@@ -3257,6 +3259,7 @@ where
             client,
             storage: None,
             ingress_tap: None,
+            decision_capture: None,
         }
     }
 
@@ -3275,6 +3278,7 @@ where
             client,
             storage: Some(storage),
             ingress_tap: None,
+            decision_capture: None,
         }
     }
 
@@ -3286,6 +3290,11 @@ where
     /// Set the ingress tap for flight recorder capture.
     pub fn set_ingress_tap(&mut self, tap: crate::recording::SharedIngressTap) {
         self.ingress_tap = Some(tap);
+    }
+
+    /// Set the replay capture adapter for policy decision provenance.
+    pub fn set_decision_capture(&mut self, capture: crate::replay_capture::SharedCaptureAdapter) {
+        self.decision_capture = Some(capture);
     }
 
     /// Create with a permissive policy engine (for testing)
@@ -3454,6 +3463,39 @@ where
         // Authorize
         let decision = self.engine.authorize(&input);
 
+        if let Some(adapter) = self.decision_capture.as_ref() {
+            let input_text = serde_json::to_string(&input).unwrap_or_else(|_| {
+                format!(
+                    "action={};pane_id={};actor={}",
+                    action.as_str(),
+                    pane_id,
+                    actor.as_str()
+                )
+            });
+            let output = serde_json::to_value(&decision).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "decision": decision.as_str(),
+                    "rule_id": decision.rule_id(),
+                })
+            });
+            let decision_event = crate::replay_capture::DecisionEvent::new(
+                crate::replay_capture::DecisionType::PolicyEvaluation,
+                pane_id,
+                decision.rule_id().unwrap_or("policy.default_allow"),
+                &decision_definition_text(&decision),
+                &input_text,
+                output,
+                workflow_id.map(|id| format!("workflow_execution:{id}")),
+                None,
+                crate::recording::epoch_ms_now(),
+            );
+            adapter.capture_decision(
+                crate::recording::actor_to_source(actor),
+                workflow_id.map(String::from),
+                decision_event,
+            );
+        }
+
         // Build the injection result
         let mut result = match &decision {
             PolicyDecision::Allow { .. } => {
@@ -3593,6 +3635,31 @@ where
     pub fn redact(&self, text: &str) -> String {
         self.engine.redact_secrets(text)
     }
+}
+
+fn decision_definition_text(decision: &PolicyDecision) -> String {
+    let mut segments = Vec::new();
+    if let Some(rule_id) = decision.rule_id() {
+        segments.push(format!("rule_id={rule_id}"));
+    } else {
+        segments.push("rule_id=policy.default_allow".to_string());
+    }
+    segments.push(format!("decision={}", decision.as_str()));
+    if let Some(ctx) = decision.context() {
+        if let Some(determining) = &ctx.determining_rule {
+            segments.push(format!("determining_rule={determining}"));
+        }
+        let matched_rules: Vec<&str> = ctx
+            .rules_evaluated
+            .iter()
+            .filter(|rule| rule.matched)
+            .map(|rule| rule.rule_id.as_str())
+            .collect();
+        if !matched_rules.is_empty() {
+            segments.push(format!("matched={}", matched_rules.join(",")));
+        }
+    }
+    segments.join("|")
 }
 
 async fn find_workflow_start_action_id(
@@ -3807,6 +3874,42 @@ mod tests {
             panic!("Native mode should not call external dcg runner");
         });
         assert!(matches!(outcome, CommandGateOutcome::Allow));
+    }
+
+    #[tokio::test]
+    async fn injector_emits_policy_decision_to_replay_capture() {
+        let sink = std::sync::Arc::new(crate::replay_capture::CollectingCaptureSink::new());
+        let adapter = std::sync::Arc::new(crate::replay_capture::CaptureAdapter::new(
+            sink.clone(),
+            crate::replay_capture::CaptureConfig::default(),
+        ));
+
+        let mut injector = PolicyGatedInjector::new(
+            PolicyEngine::strict(),
+            crate::wezterm::default_wezterm_handle(),
+        );
+        injector.set_decision_capture(adapter);
+
+        let mut caps = PaneCapabilities::prompt();
+        caps.alt_screen = Some(true);
+
+        let result = injector
+            .send_text(1, "echo hi", ActorKind::Robot, &caps, None)
+            .await;
+        assert!(
+            matches!(result, InjectionResult::Denied { .. }),
+            "expected deny when alt_screen is active"
+        );
+
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 1);
+        match &events[0].payload {
+            crate::recording::RecorderEventPayload::ControlMarker { details, .. } => {
+                assert_eq!(details["decision_type"], "policy_evaluation");
+                assert_eq!(details["rule_id"], "policy.alt_screen");
+            }
+            other => panic!("expected control marker, got {other:?}"),
+        }
     }
 
     // ========================================================================

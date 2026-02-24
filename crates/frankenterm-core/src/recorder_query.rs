@@ -34,7 +34,9 @@ use crate::recorder_audit::{
     AuthzDecision,
 };
 use crate::recorder_retention::SensitivityTier;
-use crate::recording::{RecorderEvent, RecorderEventPayload, RecorderEventSource};
+use crate::recording::{
+    RecorderEvent, RecorderEventPayload, RecorderEventSource, RecorderRedactionLevel,
+};
 
 // =============================================================================
 // Query request
@@ -889,9 +891,11 @@ fn extract_text(payload: &RecorderEventPayload) -> Option<&str> {
 fn classify_event_sensitivity(event: &RecorderEvent) -> SensitivityTier {
     match &event.payload {
         RecorderEventPayload::IngressText { redaction, .. }
-        | RecorderEventPayload::EgressOutput { redaction, .. } => {
-            SensitivityTier::classify(*redaction, false)
-        }
+        | RecorderEventPayload::EgressOutput { redaction, .. } => match redaction {
+            RecorderRedactionLevel::None => SensitivityTier::T1Standard,
+            RecorderRedactionLevel::Partial => SensitivityTier::T2Sensitive,
+            RecorderRedactionLevel::Full => SensitivityTier::T3Restricted,
+        },
         RecorderEventPayload::ControlMarker { .. }
         | RecorderEventPayload::LifecycleMarker { .. } => SensitivityTier::T1Standard,
     }
@@ -1032,9 +1036,9 @@ mod tests {
     use crate::policy::ActorKind;
     use crate::recorder_audit::AuditLogConfig;
     use crate::recording::{
-        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEventCausality, RecorderEventPayload,
-        RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind,
-        RecorderTextEncoding,
+        RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
+        RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
+        RECORDER_EVENT_SCHEMA_VERSION_V1,
     };
 
     // -----------------------------------------------------------------------
