@@ -60,6 +60,7 @@ pub mod ars_fst;
 pub mod ars_blast_radius;
 pub mod ars_drift;
 pub mod ars_evolve;
+pub mod ars_explain;
 pub mod ars_intercept;
 pub mod ars_replay;
 pub mod ars_secret_scan;

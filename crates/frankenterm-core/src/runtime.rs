@@ -880,6 +880,8 @@ pub struct ObservationRuntime {
     event_bus: Option<Arc<EventBus>>,
     /// Optional recording manager for capturing session recordings
     recording: Option<Arc<RecordingManager>>,
+    /// Optional replay capture adapter for recorder event extraction.
+    replay_capture: Option<crate::replay_capture::SharedCaptureAdapter>,
     /// Optional snapshot engine configuration for session persistence
     snapshot_config: Option<SnapshotConfig>,
     /// Heartbeat registry for watchdog monitoring
@@ -936,6 +938,7 @@ impl ObservationRuntime {
             config_rx,
             event_bus: None,
             recording: None,
+            replay_capture: None,
             snapshot_config: None,
             heartbeats: Arc::new(HeartbeatRegistry::new()),
             scheduler_snapshot: Arc::new(RwLock::new(crate::tailer::SchedulerSnapshot::default())),
@@ -957,6 +960,16 @@ impl ObservationRuntime {
     #[must_use]
     pub fn with_recording_manager(mut self, recording: Arc<RecordingManager>) -> Self {
         self.recording = Some(recording);
+        self
+    }
+
+    /// Set a replay capture adapter for deterministic replay event extraction.
+    #[must_use]
+    pub fn with_replay_capture_adapter(
+        mut self,
+        replay_capture: crate::replay_capture::SharedCaptureAdapter,
+    ) -> Self {
+        self.replay_capture = Some(replay_capture);
         self
     }
 
@@ -1617,6 +1630,7 @@ impl ObservationRuntime {
         let mut config_rx = self.config_rx.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
         let wezterm = Arc::clone(&self.wezterm_handle);
+        let replay_capture = self.replay_capture.clone();
 
         task::spawn(async move {
             let mut current_interval = initial_interval;
@@ -1744,6 +1758,27 @@ impl ObservationRuntime {
                                     next_seq = next_seq,
                                     "Started observing pane"
                                 );
+
+                                if let Some(adapter) = replay_capture.as_ref() {
+                                    adapter.capture_lifecycle(
+                                        pane_id,
+                                        crate::recording::RecorderLifecyclePhase::PaneOpened,
+                                        None,
+                                        serde_json::json!({
+                                            "domain": entry.info.domain_name,
+                                            "title": entry.info.title,
+                                            "cwd": entry.info.cwd,
+                                        }),
+                                    );
+                                    adapter.capture_lifecycle(
+                                        pane_id,
+                                        crate::recording::RecorderLifecyclePhase::CaptureStarted,
+                                        None,
+                                        serde_json::json!({
+                                            "reason": "observation_started",
+                                        }),
+                                    );
+                                }
                             } else if let Some(reason) = entry.observation.ignore_reason() {
                                 info!(
                                     pane_id = pane_id,
@@ -1763,6 +1798,25 @@ impl ObservationRuntime {
                             {
                                 let mut contexts = detection_contexts.write().await;
                                 contexts.remove(pane_id);
+                            }
+
+                            if let Some(adapter) = replay_capture.as_ref() {
+                                adapter.capture_lifecycle(
+                                    *pane_id,
+                                    crate::recording::RecorderLifecyclePhase::CaptureStopped,
+                                    Some("pane_closed".to_string()),
+                                    serde_json::json!({
+                                        "reason": "pane_closed",
+                                    }),
+                                );
+                                adapter.capture_lifecycle(
+                                    *pane_id,
+                                    crate::recording::RecorderLifecyclePhase::PaneClosed,
+                                    Some("pane_closed".to_string()),
+                                    serde_json::json!({
+                                        "reason": "pane_closed",
+                                    }),
+                                );
                             }
 
                             debug!(pane_id = pane_id, "Stopped observing pane (closed)");
@@ -1815,6 +1869,7 @@ impl ObservationRuntime {
         let heartbeats = Arc::clone(&self.heartbeats);
         let wezterm_handle = Arc::clone(&self.wezterm_handle);
         let scheduler_snapshot = Arc::clone(&self.scheduler_snapshot);
+        let replay_capture = self.replay_capture.clone();
 
         // Create tailer config from runtime config
         // Capture overlap_size for use in the async block (not hot-reloadable)
@@ -1842,6 +1897,12 @@ impl ObservationRuntime {
                 source,
                 initial_budget,
             );
+
+            if let Some(adapter) = replay_capture {
+                let egress_tap: crate::recording::SharedEgressTap = adapter.clone();
+                supervisor.set_egress_tap(egress_tap);
+                supervisor.set_global_sequence(adapter.global_sequence_handle());
+            }
 
             // Cache hot-reloadable pane priority config for scheduling.
             let mut pane_priorities = config_rx.borrow().pane_priorities.clone();
@@ -3292,6 +3353,8 @@ fn detection_to_stored_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recording::RecorderEventPayload;
+    use crate::replay_capture::{CaptureAdapter, CaptureConfig, CollectingCaptureSink};
     use crate::runtime_compat::CompatRuntime;
     use crate::storage::PaneRecord;
     use tempfile::TempDir;
@@ -3531,6 +3594,75 @@ mod tests {
                 summary.warnings.is_empty(),
                 "shutdown should not emit warnings for mock lifecycle: {:?}",
                 summary.warnings
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_emits_replay_capture_events_when_adapter_is_enabled() {
+        run_async_test(async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let engine = PatternEngine::new();
+
+            let mut config = RuntimeConfig::default();
+            config.discovery_interval = Duration::from_millis(25);
+            config.capture_interval = Duration::from_millis(25);
+            config.min_capture_interval = Duration::from_millis(10);
+            config.channel_buffer = 64;
+
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(0).await;
+            let wezterm_handle: WeztermHandle = mock.clone();
+
+            let sink = Arc::new(CollectingCaptureSink::new());
+            let replay_adapter = Arc::new(CaptureAdapter::new(
+                sink.clone(),
+                CaptureConfig {
+                    session_id: Some("runtime-replay-test".to_string()),
+                    ..Default::default()
+                },
+            ));
+
+            let mut runtime =
+                ObservationRuntime::new(config, storage, Arc::new(RwLock::new(engine)))
+                    .with_wezterm_handle(wezterm_handle)
+                    .with_replay_capture_adapter(replay_adapter);
+
+            let handle = runtime.start().await.expect("runtime should start");
+
+            // Wait for discovery to register pane + cursor before injecting output.
+            sleep(Duration::from_millis(120)).await;
+            mock.inject_output(0, "replay event line\n")
+                .await
+                .expect("inject output");
+            sleep(Duration::from_millis(150)).await;
+
+            let summary = handle.shutdown_with_summary().await;
+            assert!(
+                summary.clean,
+                "shutdown should complete cleanly: {:?}",
+                summary.warnings
+            );
+
+            let events = sink.recorder_events();
+            assert!(
+                events.iter().any(|event| matches!(
+                    event.payload,
+                    RecorderEventPayload::EgressOutput { .. }
+                )),
+                "expected at least one egress replay event"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event.payload,
+                    RecorderEventPayload::LifecycleMarker { .. }
+                )),
+                "expected lifecycle replay markers"
+            );
+            assert!(
+                events.iter().all(|event| !event.event_id.is_empty()),
+                "all replay events must have deterministic event_id values"
             );
         });
     }
