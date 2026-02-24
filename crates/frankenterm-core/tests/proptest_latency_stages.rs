@@ -3585,4 +3585,204 @@ proptest! {
         }
         prop_assert!(model.log_odds() < peak, "Decay should reduce log_odds");
     }
+
+    // ── D2: E-Process Drift Detector Property Tests ───────────────
+
+    /// E-value must always be nonneg (it's exp(log_e)).
+    #[test]
+    fn eprocess_e_value_nonneg(
+        values in proptest::collection::vec(-100.0_f64..100.0, 1..50),
+    ) {
+        let mut det = EProcessDetector::with_defaults();
+        for (i, &v) in values.iter().enumerate() {
+            det.observe(v, i as u64 * 100);
+        }
+        prop_assert!(det.e_value() >= 0.0, "e_value must be nonneg");
+    }
+
+    /// Total observations count must equal the number of observe() calls.
+    #[test]
+    fn eprocess_observation_count(
+        n in 1_usize..100,
+    ) {
+        let mut det = EProcessDetector::with_defaults();
+        for i in 0..n {
+            det.observe(1.0, i as u64 * 100);
+        }
+        prop_assert_eq!(det.total_observations(), n as u64);
+    }
+
+    /// Under null (all observations at null_mean), e-value stays exactly 1
+    /// because LR = 1 + lambda * 0 = 1 for each observation.
+    #[test]
+    fn eprocess_null_e_value_one(
+        n in 1_usize..50,
+        null_mean in -10.0_f64..10.0,
+    ) {
+        let mut det = EProcessDetector::new(EProcessConfig {
+            kind: EProcessKind::Mixture,
+            observable: DriftObservable::Latency,
+            alpha: 0.05,
+            warning_fraction: 0.5,
+            lambda: 0.1,
+            null_mean,
+            max_history: 100,
+            warmup: 0,
+            auto_reset: true,
+        });
+        for i in 0..n {
+            det.observe(null_mean, i as u64 * 100);
+        }
+        let diff = (det.e_value() - 1.0).abs();
+        prop_assert!(diff < 1e-9, "Under null, e_value should be 1.0, got {}", det.e_value());
+    }
+
+    /// Running mean converges to the true mean of identical observations.
+    #[test]
+    fn eprocess_running_mean_converges(
+        value in -100.0_f64..100.0,
+        n in 1_usize..50,
+    ) {
+        let mut det = EProcessDetector::with_defaults();
+        for i in 0..n {
+            det.observe(value, i as u64 * 100);
+        }
+        let diff = (det.running_mean() - value).abs();
+        prop_assert!(diff < 1e-9, "Mean should be {} but got {}", value, det.running_mean());
+    }
+
+    /// Alarm count is monotonically nondecreasing.
+    #[test]
+    fn eprocess_alarm_count_monotonic(
+        values in proptest::collection::vec(-5.0_f64..20.0, 2..80),
+    ) {
+        let mut det = EProcessDetector::new(EProcessConfig {
+            kind: EProcessKind::Mixture,
+            observable: DriftObservable::Latency,
+            alpha: 0.05,
+            warning_fraction: 0.5,
+            lambda: 0.3,
+            null_mean: 0.0,
+            max_history: 200,
+            warmup: 0,
+            auto_reset: true,
+        });
+        let mut prev_alarms = 0_u64;
+        for (i, &v) in values.iter().enumerate() {
+            det.observe(v, i as u64 * 100);
+            let curr = det.alarm_count();
+            prop_assert!(curr >= prev_alarms, "Alarm count decreased: {} -> {}", prev_alarms, curr);
+            prev_alarms = curr;
+        }
+    }
+
+    /// Reset restores detector to initial state.
+    #[test]
+    fn eprocess_reset_restores(
+        values in proptest::collection::vec(-10.0_f64..10.0, 1..30),
+    ) {
+        let mut det = EProcessDetector::with_defaults();
+        for (i, &v) in values.iter().enumerate() {
+            det.observe(v, i as u64 * 100);
+        }
+        det.reset();
+        prop_assert_eq!(det.total_observations(), 0);
+        prop_assert_eq!(det.alarm_count(), 0);
+        prop_assert_eq!(det.warning_count(), 0);
+        prop_assert_eq!(det.history_len(), 0);
+        let e_diff = (det.e_value() - 1.0).abs();
+        prop_assert!(e_diff < 1e-10, "After reset, e_value should be 1.0");
+    }
+
+    /// History length is bounded by max_history.
+    #[test]
+    fn eprocess_history_bounded(
+        n in 1_usize..100,
+        max_hist in 1_usize..20,
+    ) {
+        let mut det = EProcessDetector::new(EProcessConfig {
+            kind: EProcessKind::Mixture,
+            observable: DriftObservable::Latency,
+            alpha: 0.05,
+            warning_fraction: 0.5,
+            lambda: 0.1,
+            null_mean: 0.0,
+            max_history: max_hist,
+            warmup: 0,
+            auto_reset: true,
+        });
+        for i in 0..n {
+            det.observe(1.0, i as u64 * 100);
+        }
+        prop_assert!(det.history_len() <= max_hist, "History {} > max {}", det.history_len(), max_hist);
+    }
+
+    /// EProcessKind serde roundtrip.
+    #[test]
+    fn eprocess_kind_serde(
+        variant in 0_u8..3,
+    ) {
+        let kind = match variant {
+            0 => EProcessKind::CusumLike,
+            1 => EProcessKind::Mixture,
+            _ => EProcessKind::ConfidenceSequence,
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EProcessKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(kind, back);
+    }
+
+    /// DriftAlertLevel serde roundtrip.
+    #[test]
+    fn eprocess_alert_level_serde(
+        variant in 0_u8..3,
+    ) {
+        let level = match variant {
+            0 => DriftAlertLevel::None,
+            1 => DriftAlertLevel::Warning,
+            _ => DriftAlertLevel::Alarm,
+        };
+        let json = serde_json::to_string(&level).unwrap();
+        let back: DriftAlertLevel = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(level, back);
+    }
+
+    /// EProcessDegradation serde roundtrip.
+    #[test]
+    fn eprocess_degradation_serde(
+        variant in 0_u8..3,
+        alarm_count in 0_u64..100,
+    ) {
+        let degradation = match variant {
+            0 => EProcessDegradation::Healthy,
+            1 => EProcessDegradation::DriftSuspected { e_value: 5.0, running_mean: 2.5 },
+            _ => EProcessDegradation::DriftDetected { e_value: 25.0, alarm_count },
+        };
+        let json = serde_json::to_string(&degradation).unwrap();
+        let back: EProcessDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(degradation, back);
+    }
+
+    /// Alarm rate is always in [0, 1].
+    #[test]
+    fn eprocess_alarm_rate_bounded(
+        values in proptest::collection::vec(-5.0_f64..20.0, 1..80),
+    ) {
+        let mut det = EProcessDetector::new(EProcessConfig {
+            kind: EProcessKind::CusumLike,
+            observable: DriftObservable::Latency,
+            alpha: 0.05,
+            warning_fraction: 0.5,
+            lambda: 0.3,
+            null_mean: 0.0,
+            max_history: 200,
+            warmup: 0,
+            auto_reset: true,
+        });
+        for (i, &v) in values.iter().enumerate() {
+            det.observe(v, i as u64 * 100);
+        }
+        let rate = det.alarm_rate();
+        prop_assert!(rate >= 0.0 && rate <= 1.0, "Alarm rate {} out of [0,1]", rate);
+    }
 }
