@@ -218,6 +218,7 @@ pub mod recorder_storage;
 pub mod recording;
 pub mod replay;
 pub mod replay_capture;
+pub mod replay_checkpoint;
 pub mod replay_fixture_harvest;
 pub mod replay_performance;
 pub mod replay_merge;
