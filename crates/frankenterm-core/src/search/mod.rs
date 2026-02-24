@@ -46,7 +46,10 @@ pub use reranker::{PassthroughReranker, RerankError, Reranker, ScoredDoc};
 pub use vector_index::{FtviIndex, FtviRecord, FtviWriter, write_ftvi_vec};
 
 #[cfg(feature = "semantic-search")]
-pub use fastembed_embedder::FastEmbedEmbedder;
+pub use fastembed_embedder::{
+    FastEmbedConfig, FastEmbedEmbedder, FastEmbedInitResult, best_available_embedder,
+    try_init_fastembed,
+};
 #[cfg(feature = "semantic-search")]
 pub use model_registry::{ModelInfo, ModelRegistry};
 #[cfg(feature = "semantic-search")]

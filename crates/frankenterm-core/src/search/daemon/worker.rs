@@ -37,6 +37,7 @@ impl EmbedWorker {
     /// Supported model selectors:
     /// - `None`, `""`, `"hash"`, `"fnv1a-hash"` => default hash embedder
     /// - `"fnv1a-hash-<dimension>"` => hash embedder with explicit dimension
+    /// - `"fastembed"`, `"fastembed-<model>"` => FastEmbed ONNX embedder (requires `semantic-search` feature)
     pub fn process(&self, request: &EmbedRequest) -> Result<EmbedResponse, String> {
         let started = Instant::now();
         let embedder = build_embedder(request.model.as_deref())?;
@@ -55,9 +56,11 @@ impl EmbedWorker {
     }
 }
 
-fn build_embedder(model: Option<&str>) -> Result<HashEmbedder, String> {
+fn build_embedder(model: Option<&str>) -> Result<Box<dyn Embedder>, String> {
     match model.map(str::trim) {
-        None | Some("") | Some("hash") | Some("fnv1a-hash") => Ok(HashEmbedder::default()),
+        None | Some("") | Some("hash") | Some("fnv1a-hash") => {
+            Ok(Box::new(HashEmbedder::default()))
+        }
         Some(raw) => {
             if let Some(dim_raw) = raw.strip_prefix("fnv1a-hash-") {
                 let dim = dim_raw
@@ -66,11 +69,52 @@ fn build_embedder(model: Option<&str>) -> Result<HashEmbedder, String> {
                 if dim == 0 {
                     return Err("hash embedder dimension must be > 0".to_string());
                 }
-                return Ok(HashEmbedder::new(dim));
+                return Ok(Box::new(HashEmbedder::new(dim)));
+            }
+            // FastEmbed ONNX models (requires semantic-search feature).
+            #[cfg(feature = "semantic-search")]
+            {
+                if raw == "fastembed" || raw.starts_with("fastembed-") {
+                    return build_fastembed_embedder(raw);
+                }
             }
             Err(format!("unsupported embed model: {raw}"))
         }
     }
+}
+
+/// Build a FastEmbed embedder from a model selector string.
+///
+/// Supported selectors:
+/// - `"fastembed"` → default model (BGESmallENV15)
+/// - `"fastembed-bge-small"` → BGESmallENV15
+/// - `"fastembed-bge-base"` → BGEBaseENV15
+/// - `"fastembed-bge-large"` → BGELargeENV15
+/// - `"fastembed-minilm-l6"` → AllMiniLML6V2
+/// - `"fastembed-minilm-l12"` → AllMiniLML12V2
+#[cfg(feature = "semantic-search")]
+fn build_fastembed_embedder(selector: &str) -> Result<Box<dyn Embedder>, String> {
+    use crate::search::fastembed_embedder::{EmbeddingModel, FastEmbedConfig, FastEmbedEmbedder};
+
+    let model = match selector {
+        "fastembed" | "fastembed-bge-small" => EmbeddingModel::BGESmallENV15,
+        "fastembed-bge-base" => EmbeddingModel::BGEBaseENV15,
+        "fastembed-bge-large" => EmbeddingModel::BGELargeENV15,
+        "fastembed-minilm-l6" => EmbeddingModel::AllMiniLML6V2,
+        "fastembed-minilm-l12" => EmbeddingModel::AllMiniLML12V2,
+        other => {
+            return Err(format!(
+                "unknown fastembed model selector: '{}'. \
+                 Supported: fastembed, fastembed-bge-small, fastembed-bge-base, \
+                 fastembed-bge-large, fastembed-minilm-l6, fastembed-minilm-l12",
+                other
+            ));
+        }
+    };
+
+    let config = FastEmbedConfig::default().with_model(model);
+    let emb = FastEmbedEmbedder::try_new(config).map_err(|e| e.to_string())?;
+    Ok(Box::new(emb))
 }
 
 #[cfg(test)]
@@ -110,7 +154,7 @@ mod tests {
     fn process_rejects_unknown_model() {
         let worker = EmbedWorker::new(3);
         let err = worker
-            .process(&req(3, "ignored", Some("fastembed-e5-large")))
+            .process(&req(3, "ignored", Some("openai-ada-002")))
             .unwrap_err();
         assert!(err.contains("unsupported embed model"));
         assert_eq!(worker.processed(), 0);
@@ -207,20 +251,28 @@ mod tests {
 
     #[test]
     fn build_embedder_zero_dimension_err() {
-        let err = build_embedder(Some("fnv1a-hash-0")).unwrap_err();
-        assert!(err.contains("must be > 0"));
+        let result = build_embedder(Some("fnv1a-hash-0"));
+        assert!(result.is_err());
+        assert!(result.err().unwrap().contains("must be > 0"));
     }
 
     #[test]
     fn build_embedder_non_numeric_dimension_err() {
-        let err = build_embedder(Some("fnv1a-hash-abc")).unwrap_err();
-        assert!(err.contains("invalid hash embedder dimension"));
+        let result = build_embedder(Some("fnv1a-hash-abc"));
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .contains("invalid hash embedder dimension")
+        );
     }
 
     #[test]
     fn build_embedder_unsupported_model_err() {
-        let err = build_embedder(Some("openai-ada-002")).unwrap_err();
-        assert!(err.contains("unsupported embed model"));
+        let result = build_embedder(Some("openai-ada-002"));
+        assert!(result.is_err());
+        assert!(result.err().unwrap().contains("unsupported embed model"));
     }
 
     #[test]
