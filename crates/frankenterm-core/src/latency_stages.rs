@@ -9561,6 +9561,70 @@ impl CalibrationHarness {
             degradation: self.detect_degradation(),
         }
     }
+
+    // ── D4 Impl: Bridge Methods and Convenience API ────────────────
+
+    /// Submit a batch of results and evaluate.
+    pub fn submit_batch(&mut self, results: Vec<CalibrationResult>) -> PromotionVerdict {
+        for r in results {
+            self.submit(r);
+        }
+        self.evaluate()
+    }
+
+    /// Average false positive rate across all results.
+    pub fn avg_fpr(&self) -> f64 {
+        if self.results.is_empty() {
+            return 0.0;
+        }
+        self.results.iter().map(|r| r.false_positive_rate).sum::<f64>() / self.results.len() as f64
+    }
+
+    /// Average miss rate across all results.
+    pub fn avg_miss_rate(&self) -> f64 {
+        if self.results.is_empty() {
+            return 0.0;
+        }
+        self.results.iter().map(|r| r.miss_rate).sum::<f64>() / self.results.len() as f64
+    }
+
+    /// Average detection delay across all results.
+    pub fn avg_detection_delay(&self) -> f64 {
+        if self.results.is_empty() {
+            return 0.0;
+        }
+        self.results.iter().map(|r| r.detection_delay).sum::<f64>() / self.results.len() as f64
+    }
+
+    /// Passing count.
+    pub fn passing_count(&self) -> usize {
+        self.results.iter().filter(|r| r.passes_gate).count()
+    }
+
+    /// Failing count.
+    pub fn failing_count(&self) -> usize {
+        self.results.iter().filter(|r| !r.passes_gate).count()
+    }
+
+    /// Whether the harness has approved promotion.
+    pub fn is_approved(&self) -> bool {
+        self.last_verdict == PromotionVerdict::Approved
+    }
+
+    /// Set max FPR gate.
+    pub fn set_max_fpr(&mut self, fpr: f64) {
+        self.config.max_fpr = fpr;
+    }
+
+    /// Set strict mode.
+    pub fn set_strict(&mut self, strict: bool) {
+        self.config.strict = strict;
+    }
+
+    /// Results by scenario.
+    pub fn results_for_scenario(&self, scenario: CalibrationScenario) -> Vec<&CalibrationResult> {
+        self.results.iter().filter(|r| r.scenario == scenario).collect()
+    }
 }
 
 /// Degradation status for the calibration harness.
@@ -16548,5 +16612,107 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         let back: CalibrationResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result.scenario, back.scenario);
+    }
+
+    // ── D4 Impl Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_calibration_submit_batch() {
+        let mut harness = CalibrationHarness::with_defaults();
+        let batch = vec![
+            make_passing_result(CalibrationScenario::Nominal),
+            make_passing_result(CalibrationScenario::GradualDrift),
+            make_passing_result(CalibrationScenario::AbruptShift),
+            make_passing_result(CalibrationScenario::NoisyBaseline),
+            make_passing_result(CalibrationScenario::PostStressRecovery),
+        ];
+        let verdict = harness.submit_batch(batch);
+        assert_eq!(verdict, PromotionVerdict::Approved);
+        assert_eq!(harness.total_runs(), 5);
+    }
+
+    #[test]
+    fn test_calibration_avg_fpr() {
+        let mut harness = CalibrationHarness::with_defaults();
+        assert_eq!(harness.avg_fpr(), 0.0);
+        harness.submit(make_passing_result(CalibrationScenario::Nominal));
+        assert!(harness.avg_fpr() > 0.0);
+    }
+
+    #[test]
+    fn test_calibration_avg_miss_rate() {
+        let mut harness = CalibrationHarness::with_defaults();
+        harness.submit(make_passing_result(CalibrationScenario::Nominal));
+        assert!(harness.avg_miss_rate() > 0.0);
+    }
+
+    #[test]
+    fn test_calibration_avg_detection_delay() {
+        let mut harness = CalibrationHarness::with_defaults();
+        harness.submit(make_passing_result(CalibrationScenario::Nominal));
+        assert!(harness.avg_detection_delay() > 0.0);
+    }
+
+    #[test]
+    fn test_calibration_passing_failing_counts() {
+        let mut harness = CalibrationHarness::with_defaults();
+        harness.submit(make_passing_result(CalibrationScenario::Nominal));
+        harness.submit(make_failing_result(CalibrationScenario::AbruptShift));
+        harness.evaluate();
+        assert_eq!(harness.passing_count(), 1);
+        assert_eq!(harness.failing_count(), 1);
+    }
+
+    #[test]
+    fn test_calibration_is_approved() {
+        let mut harness = CalibrationHarness::with_defaults();
+        assert!(!harness.is_approved());
+        let scenarios = [
+            CalibrationScenario::Nominal,
+            CalibrationScenario::GradualDrift,
+            CalibrationScenario::AbruptShift,
+            CalibrationScenario::NoisyBaseline,
+            CalibrationScenario::PostStressRecovery,
+        ];
+        for s in &scenarios {
+            harness.submit(make_passing_result(*s));
+        }
+        harness.evaluate();
+        assert!(harness.is_approved());
+    }
+
+    #[test]
+    fn test_calibration_set_max_fpr() {
+        let mut harness = CalibrationHarness::with_defaults();
+        harness.set_max_fpr(0.001);
+        harness.submit(make_passing_result(CalibrationScenario::Nominal)); // fpr=0.01 > 0.001
+        harness.evaluate();
+        assert!(!harness.is_approved());
+    }
+
+    #[test]
+    fn test_calibration_set_strict() {
+        let mut harness = CalibrationHarness::with_defaults();
+        harness.set_strict(false);
+        // Submit 5 passing + 1 failing
+        for _ in 0..5 {
+            harness.submit(make_passing_result(CalibrationScenario::Nominal));
+        }
+        harness.submit(make_failing_result(CalibrationScenario::AbruptShift));
+        let verdict = harness.evaluate();
+        // Non-strict: 5 >= min_passing_scenarios=5, so Approved
+        assert_eq!(verdict, PromotionVerdict::Approved);
+    }
+
+    #[test]
+    fn test_calibration_results_for_scenario() {
+        let mut harness = CalibrationHarness::with_defaults();
+        harness.submit(make_passing_result(CalibrationScenario::Nominal));
+        harness.submit(make_passing_result(CalibrationScenario::Nominal));
+        harness.submit(make_passing_result(CalibrationScenario::AbruptShift));
+        let nominal = harness.results_for_scenario(CalibrationScenario::Nominal);
+        assert_eq!(nominal.len(), 2);
+        let abrupt = harness.results_for_scenario(CalibrationScenario::AbruptShift);
+        assert_eq!(abrupt.len(), 1);
     }
 }
