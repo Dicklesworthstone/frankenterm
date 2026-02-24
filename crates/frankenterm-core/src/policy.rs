@@ -31,6 +31,7 @@ use crate::config::{
     CommandGateConfig, DcgDenyPolicy, DcgMode, PolicyRule, PolicyRuleDecision, PolicyRuleMatch,
     PolicyRulesConfig,
 };
+use crate::trauma_guard::TraumaDecision;
 // ============================================================================
 // Action Kinds
 // ============================================================================
@@ -920,6 +921,9 @@ pub struct PolicyInput {
     /// Raw command text for SendText safety gating (not serialized)
     #[serde(skip)]
     pub command_text: Option<String>,
+    /// Optional Trauma Guard decision context for command-loop protection.
+    #[serde(skip)]
+    pub trauma_decision: Option<TraumaDecision>,
     /// Pane title for rule matching (if available)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_title: Option<String>,
@@ -944,6 +948,7 @@ impl PolicyInput {
             text_summary: None,
             workflow_id: None,
             command_text: None,
+            trauma_decision: None,
             pane_title: None,
             pane_cwd: None,
             agent_type: None,
@@ -989,6 +994,13 @@ impl PolicyInput {
     #[must_use]
     pub fn with_command_text(mut self, text: impl Into<String>) -> Self {
         self.command_text = Some(text.into());
+        self
+    }
+
+    /// Attach Trauma Guard decision metadata for this command evaluation.
+    #[must_use]
+    pub fn with_trauma_decision(mut self, decision: TraumaDecision) -> Self {
+        self.trauma_decision = Some(decision);
         self
     }
 
@@ -1069,6 +1081,20 @@ impl DecisionContext {
             ctx.add_evidence("command_candidate", is_command_candidate(text).to_string());
         } else {
             ctx.add_evidence("command_text_present", "false");
+        }
+
+        if let Some(decision) = input.trauma_decision.as_ref() {
+            ctx.add_evidence("trauma_decision_present", "true");
+            ctx.add_evidence(
+                "trauma_should_intervene",
+                decision.should_intervene.to_string(),
+            );
+            if let Some(reason_code) = decision.reason_code.as_deref() {
+                ctx.add_evidence("trauma_reason_code", reason_code.to_string());
+            }
+            ctx.add_evidence("trauma_repeat_count", decision.repeat_count.to_string());
+        } else {
+            ctx.add_evidence("trauma_decision_present", "false");
         }
 
         ctx
@@ -1290,8 +1316,9 @@ struct CommandRule {
     reason: &'static str,
 }
 
-static RM_RF_ROOT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\brm\s+-(rf|fr)\s+(/|~/?)\*?(\s|$)").expect("rm -rf root regex"));
+static RM_RF_ROOT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\brm\s+-(rf|fr)\s+(/|~/?)\*?(\s|$)").expect("rm -rf root regex")
+});
 static RM_RF_GENERIC: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\brm\s+-(rf|fr)\s+").expect("rm -rf regex"));
 static GIT_RESET_HARD: LazyLock<Regex> =
@@ -1451,6 +1478,16 @@ const COMMAND_TOKENS: &[&str] = &[
     "halt",
     "poweroff",
     "init",
+    // Command prefixes
+    "nohup",
+    "time",
+    "watch",
+    "timeout",
+    "stdbuf",
+    "unbuffer",
+    "strace",
+    "ltrace",
+    "taskset",
     // Package managers
     "pip",
     "pip3",
@@ -1462,6 +1499,10 @@ const COMMAND_TOKENS: &[&str] = &[
 fn first_nonempty_line(text: &str) -> Option<&str> {
     text.lines().find(|line| !line.trim().is_empty())
 }
+
+const TRAUMA_BYPASS_ENV: &str = "FT_BYPASS_TRAUMA";
+const TRAUMA_LOOP_BLOCK_RULE_ID: &str = "policy.trauma_guard.loop_block";
+const TRAUMA_FEEDBACK_PREFIX: &str = "[ft::TraumaGuard]";
 
 /// Determine whether the text looks like a shell command
 #[must_use]
@@ -1545,6 +1586,61 @@ pub fn is_command_candidate(text: &str) -> bool {
         || trimmed.contains('`')
 }
 
+#[must_use]
+fn has_trauma_bypass_prefix(text: &str) -> bool {
+    let Some(line) = first_nonempty_line(text) else {
+        return false;
+    };
+
+    let mut trimmed = line.trim_start();
+    if let Some(stripped) = trimmed.strip_prefix('$') {
+        trimmed = stripped.trim_start();
+    }
+
+    for token in trimmed.split_whitespace() {
+        let cleaned = token.trim_end_matches(|ch| matches!(ch, ';' | '&' | '|'));
+        let Some((key, value)) = cleaned.split_once('=') else {
+            break;
+        };
+        if !is_shell_identifier(key) {
+            break;
+        }
+        if key == TRAUMA_BYPASS_ENV && value == "1" {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[must_use]
+fn trauma_feedback_comment(decision: &PolicyDecision) -> Option<String> {
+    if decision.rule_id() != Some(TRAUMA_LOOP_BLOCK_RULE_ID) {
+        return None;
+    }
+
+    let reason = decision
+        .reason()
+        .unwrap_or("recurring failure loop detected");
+    let normalized_reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    Some(format!(
+        "# {TRAUMA_FEEDBACK_PREFIX} EXECUTION BLOCKED: {normalized_reason}. Next: fix-forward (edit code/tests) or prefix with {TRAUMA_BYPASS_ENV}=1 once."
+    ))
+}
+
+#[must_use]
+fn is_shell_identifier(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 #[derive(Debug)]
 enum DcgDecision {
     Allow,
@@ -1601,7 +1697,26 @@ where
 
     let mut worst_outcome: Option<CommandGateOutcome> = None;
 
+    let mut logical_lines = Vec::new();
+    let mut current_logical_line = String::new();
+
     for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.ends_with('\\') {
+            current_logical_line.push_str(&trimmed[..trimmed.len() - 1]);
+            current_logical_line.push(' ');
+        } else {
+            current_logical_line.push_str(line);
+            logical_lines.push(current_logical_line.clone());
+            current_logical_line.clear();
+        }
+    }
+    if !current_logical_line.is_empty() {
+        logical_lines.push(current_logical_line);
+    }
+
+    for line_ref in &logical_lines {
+        let line = line_ref.as_str();
         if line.trim().is_empty() {
             continue;
         }
@@ -2230,6 +2345,8 @@ pub struct PolicyEngine {
     require_prompt_active: bool,
     /// Command safety gate configuration
     command_gate: CommandGateConfig,
+    /// Whether trauma-guard intervention is enabled.
+    trauma_guard_enabled: bool,
     /// Custom policy rules configuration
     policy_rules: PolicyRulesConfig,
     /// Risk scoring configuration
@@ -2248,6 +2365,7 @@ impl PolicyEngine {
             rate_limiter: RateLimiter::new(rate_limit_per_pane, rate_limit_global),
             require_prompt_active,
             command_gate: CommandGateConfig::default(),
+            trauma_guard_enabled: true,
             policy_rules: PolicyRulesConfig::default(),
             risk_config: RiskConfig::default(),
         }
@@ -2269,6 +2387,13 @@ impl PolicyEngine {
     #[must_use]
     pub fn with_command_gate_config(mut self, command_gate: CommandGateConfig) -> Self {
         self.command_gate = command_gate;
+        self
+    }
+
+    /// Enable or disable trauma-guard intervention.
+    #[must_use]
+    pub fn with_trauma_guard_enabled(mut self, enabled: bool) -> Self {
+        self.trauma_guard_enabled = enabled;
         self
     }
 
@@ -2763,6 +2888,68 @@ impl PolicyEngine {
         // Command safety gate for SendText
         if matches!(input.action, ActionKind::SendText) {
             if let Some(text) = input.command_text.as_deref() {
+                if let Some(trauma_decision) = input.trauma_decision.as_ref() {
+                    if !self.trauma_guard_enabled {
+                        context.record_rule(
+                            "policy.trauma_guard",
+                            false,
+                            None,
+                            Some("trauma guard disabled by config".to_string()),
+                        );
+                    } else if trauma_decision.should_intervene {
+                        if has_trauma_bypass_prefix(text) {
+                            context.record_rule(
+                                "policy.trauma_guard",
+                                false,
+                                None,
+                                Some("bypass requested via FT_BYPASS_TRAUMA=1".to_string()),
+                            );
+                        } else {
+                            let reason = trauma_decision
+                                .reason_code
+                                .as_deref()
+                                .map_or_else(
+                                    || {
+                                        format!(
+                                            "Trauma Guard blocked command after {} repeated failures",
+                                            trauma_decision.repeat_count
+                                        )
+                                    },
+                                    |reason_code| {
+                                        format!(
+                                            "Trauma Guard blocked command ({reason_code}) after {} repeated failures. Prefix with FT_BYPASS_TRAUMA=1 to override once.",
+                                            trauma_decision.repeat_count
+                                        )
+                                    },
+                                );
+                            let rule_id = "policy.trauma_guard.loop_block".to_string();
+                            context.record_rule(
+                                rule_id.clone(),
+                                true,
+                                Some("deny"),
+                                Some(reason.clone()),
+                            );
+                            context.set_determining_rule(rule_id.clone());
+                            return PolicyDecision::deny_with_rule(reason, rule_id)
+                                .with_context(context);
+                        }
+                    } else {
+                        context.record_rule(
+                            "policy.trauma_guard",
+                            false,
+                            None,
+                            Some("trauma guard allow".to_string()),
+                        );
+                    }
+                } else {
+                    context.record_rule(
+                        "policy.trauma_guard",
+                        false,
+                        None,
+                        Some("no trauma decision".to_string()),
+                    );
+                }
+
                 match evaluate_command_gate(text, &self.command_gate) {
                     CommandGateOutcome::Allow => {
                         context.record_rule(
@@ -3358,6 +3545,27 @@ where
         &self.engine
     }
 
+    /// Inject a synthetic Trauma Guard feedback line into the pane when the
+    /// deny decision originated from the trauma loop interceptor.
+    async fn maybe_inject_trauma_feedback(&self, pane_id: u64, decision: &PolicyDecision) {
+        let Some(feedback) = trauma_feedback_comment(decision) else {
+            return;
+        };
+
+        if let Err(error) = self
+            .client
+            .send_text_with_options(pane_id, &feedback, true, false)
+            .await
+        {
+            tracing::warn!(
+                pane_id,
+                rule_id = ?decision.rule_id(),
+                error = %error,
+                "Failed to inject synthetic trauma guard feedback"
+            );
+        }
+    }
+
     /// Send text to a pane with policy gating
     ///
     /// This is the primary method for sending text. It:
@@ -3579,13 +3787,16 @@ where
                     },
                 }
             }
-            PolicyDecision::Deny { .. } => InjectionResult::Denied {
-                decision,
-                summary,
-                pane_id,
-                action,
-                audit_action_id: None,
-            },
+            PolicyDecision::Deny { .. } => {
+                self.maybe_inject_trauma_feedback(pane_id, &decision).await;
+                InjectionResult::Denied {
+                    decision,
+                    summary,
+                    pane_id,
+                    action,
+                    audit_action_id: None,
+                }
+            }
             PolicyDecision::RequireApproval { .. } => InjectionResult::RequiresApproval {
                 decision,
                 summary,
@@ -3809,6 +4020,36 @@ mod tests {
     }
 
     #[test]
+    fn trauma_bypass_prefix_detection() {
+        assert!(has_trauma_bypass_prefix("FT_BYPASS_TRAUMA=1 cargo test"));
+        assert!(has_trauma_bypass_prefix(
+            "FOO=bar FT_BYPASS_TRAUMA=1 cargo test -p core"
+        ));
+        assert!(!has_trauma_bypass_prefix("FT_BYPASS_TRAUMA=0 cargo test"));
+        assert!(!has_trauma_bypass_prefix("cargo test FT_BYPASS_TRAUMA=1"));
+    }
+
+    #[test]
+    fn trauma_feedback_comment_only_for_loop_block_rule() {
+        let trauma = PolicyDecision::deny_with_rule(
+            "Trauma Guard blocked command (recurring_failure_loop)",
+            TRAUMA_LOOP_BLOCK_RULE_ID,
+        );
+        let non_trauma = PolicyDecision::deny_with_rule("alt screen active", "policy.alt_screen");
+
+        let comment = trauma_feedback_comment(&trauma);
+        assert!(comment.is_some(), "expected trauma feedback comment");
+        let comment = comment.unwrap_or_default();
+        assert!(comment.contains(TRAUMA_FEEDBACK_PREFIX));
+        assert!(comment.contains("FT_BYPASS_TRAUMA=1"));
+
+        assert!(
+            trauma_feedback_comment(&non_trauma).is_none(),
+            "non-trauma deny should not emit trauma feedback"
+        );
+    }
+
+    #[test]
     fn command_gate_blocks_rm_rf_root() {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
@@ -3841,6 +4082,68 @@ mod tests {
             .with_pane(1)
             .with_capabilities(PaneCapabilities::prompt())
             .with_command_text("please review the diff and proceed");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn command_gate_trauma_blocks_without_bypass() {
+        let mut engine = PolicyEngine::permissive();
+        let trauma = TraumaDecision {
+            should_intervene: true,
+            reason_code: Some("recurring_failure_loop".to_string()),
+            command_hash: 42,
+            repeat_count: 3,
+            recurring_signatures: vec!["core.codex:error_loop".to_string()],
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("cargo test -p core")
+            .with_trauma_decision(trauma);
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some("policy.trauma_guard.loop_block"));
+    }
+
+    #[test]
+    fn command_gate_trauma_disabled_skips_trauma_block() {
+        let mut engine = PolicyEngine::permissive().with_trauma_guard_enabled(false);
+        let trauma = TraumaDecision {
+            should_intervene: true,
+            reason_code: Some("recurring_failure_loop".to_string()),
+            command_hash: 42,
+            repeat_count: 3,
+            recurring_signatures: vec!["core.codex:error_loop".to_string()],
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("git status")
+            .with_trauma_decision(trauma);
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+        assert_ne!(decision.rule_id(), Some("policy.trauma_guard.loop_block"));
+    }
+
+    #[test]
+    fn command_gate_trauma_bypass_allows_command_gate_path() {
+        let mut engine = PolicyEngine::permissive();
+        let trauma = TraumaDecision {
+            should_intervene: true,
+            reason_code: Some("recurring_failure_loop".to_string()),
+            command_hash: 42,
+            repeat_count: 3,
+            recurring_signatures: vec!["core.codex:error_loop".to_string()],
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("FT_BYPASS_TRAUMA=1 git status")
+            .with_trauma_decision(trauma);
 
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
@@ -3955,6 +4258,51 @@ mod tests {
             }
             other => panic!("expected control marker, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn e2e_trauma_guard_deny_injects_synthetic_feedback() {
+        let injector = PolicyGatedInjector::permissive(crate::wezterm::MockWezterm::new());
+        let _pane = injector.client.add_default_pane(1).await;
+        let decision = PolicyDecision::deny_with_rule(
+            "Trauma Guard blocked command (recurring_failure_loop)",
+            TRAUMA_LOOP_BLOCK_RULE_ID,
+        );
+
+        injector.maybe_inject_trauma_feedback(1, &decision).await;
+
+        let pane = injector
+            .client
+            .pane_state(1)
+            .await
+            .expect("pane 1 should exist");
+        assert!(
+            pane.content.contains(TRAUMA_FEEDBACK_PREFIX),
+            "synthetic trauma feedback should be injected into pane content"
+        );
+        assert!(
+            pane.content.contains("EXECUTION BLOCKED"),
+            "feedback should include explicit block wording"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_non_trauma_deny_does_not_inject_synthetic_feedback() {
+        let injector = PolicyGatedInjector::permissive(crate::wezterm::MockWezterm::new());
+        let _pane = injector.client.add_default_pane(1).await;
+        let decision = PolicyDecision::deny_with_rule("alt screen active", "policy.alt_screen");
+
+        injector.maybe_inject_trauma_feedback(1, &decision).await;
+
+        let pane = injector
+            .client
+            .pane_state(1)
+            .await
+            .expect("pane 1 should exist");
+        assert!(
+            pane.content.is_empty(),
+            "non-trauma deny should not inject trauma feedback"
+        );
     }
 
     // ========================================================================
