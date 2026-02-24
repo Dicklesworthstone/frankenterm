@@ -315,15 +315,17 @@ impl<T: Clone> SpmcProducer<T> {
         let last = self.shared.queues.len() - 1;
 
         for idx in 0..last {
-            if self.shared.queues[idx].push(value.clone()).is_err() {
-                panic!("SPMC queue should have capacity after precheck");
-            }
+            assert!(
+                self.shared.queues[idx].push(value.clone()).is_ok(),
+                "SPMC queue should have capacity after precheck"
+            );
             self.shared.not_empty[idx].notify_one();
         }
 
-        if self.shared.queues[last].push(value).is_err() {
-            panic!("SPMC queue should have capacity after precheck");
-        }
+        assert!(
+            self.shared.queues[last].push(value).is_ok(),
+            "SPMC queue should have capacity after precheck"
+        );
         self.shared.not_empty[last].notify_one();
     }
 }
@@ -787,7 +789,8 @@ mod tests {
 
     #[tokio::test]
     async fn spmc_broadcasts_to_all_consumers_in_order() {
-        let (tx, mut consumers) = spmc_channel(8, 2);
+        // Keep enough headroom so this test validates ordering, not backpressure.
+        let (tx, mut consumers) = spmc_channel(16, 2);
         let rx0 = consumers.remove(0);
         let rx1 = consumers.remove(0);
 
