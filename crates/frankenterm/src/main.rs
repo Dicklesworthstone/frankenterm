@@ -1945,6 +1945,58 @@ enum ReplayCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Run a decision-diff comparison between baseline and candidate traces
+    #[command(after_help = r#"EXAMPLES:
+    ft replay diff --baseline baseline.ftreplay --candidate candidate.ftreplay
+    ft replay diff --baseline baseline.ftreplay --candidate candidate.ftreplay --output report.json --format json
+    ft replay diff --baseline baseline.ftreplay --candidate candidate.ftreplay --robot
+    ft replay diff --baseline b.ftreplay --candidate c.ftreplay --budget regression_budget.toml
+"#)]
+    Diff {
+        /// Baseline trace file
+        #[arg(long)]
+        baseline: PathBuf,
+
+        /// Candidate trace file
+        #[arg(long)]
+        candidate: PathBuf,
+
+        /// Output file (stdout if not specified)
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Report format: human, json, markdown, csv
+        #[arg(long, default_value = "human")]
+        format: String,
+
+        /// Regression budget TOML file
+        #[arg(long)]
+        budget: Option<PathBuf>,
+
+        /// Machine-readable JSON output (equivalent to --format json)
+        #[arg(long)]
+        robot: bool,
+
+        /// Time tolerance for shifted detection in ms
+        #[arg(long, default_value = "100")]
+        tolerance_ms: u64,
+    },
+
+    /// Inspect a replay artifact: print metadata, event count, integrity status
+    #[command(after_help = r#"EXAMPLES:
+    ft replay inspect trace.ftreplay
+    ft replay inspect trace.ftreplay --json
+"#)]
+    Inspect {
+        /// Trace file to inspect
+        #[arg()]
+        file: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -9708,6 +9760,7 @@ async fn run_distributed_agent(
         retention_max_mb: config.storage.retention_max_mb,
         checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
         native_event_socket,
+        trauma_guard: config.safety.trauma_guard.clone(),
     };
 
     let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine)
@@ -10317,6 +10370,7 @@ async fn run_watcher(
         retention_max_mb: config.storage.retention_max_mb,
         checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
         native_event_socket,
+        trauma_guard: config.safety.trauma_guard.clone(),
     };
 
     // Create and start the observation runtime (with event bus for workflow integration)
@@ -23346,6 +23400,127 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         println!("[{status}] {} ({reason})", entry.source_path);
                     }
                 }
+            }
+        }
+
+        Some(Commands::Replay {
+            command:
+                Some(ReplayCommands::Diff {
+                    baseline,
+                    candidate,
+                    output,
+                    format,
+                    budget,
+                    robot,
+                    tolerance_ms,
+                }),
+            ..
+        }) => {
+            use frankenterm_core::replay_cli::{DiffRunner, ReplayOutputMode};
+            use frankenterm_core::replay_decision_diff::DiffConfig;
+            use frankenterm_core::replay_guardrails_gate::RegressionBudget;
+
+            // Determine output mode.
+            let output_mode = if robot {
+                ReplayOutputMode::Robot
+            } else {
+                ReplayOutputMode::Human
+            };
+
+            // Determine report format.
+            let _report_format = if robot {
+                "json"
+            } else {
+                &format
+            };
+
+            // Load budget if provided.
+            let regression_budget = if let Some(budget_path) = &budget {
+                let toml_str = std::fs::read_to_string(budget_path).map_err(|e| {
+                    anyhow::anyhow!("Failed to read budget file '{}': {e}", budget_path.display())
+                })?;
+                RegressionBudget::from_toml(&toml_str)
+                    .map_err(|e| anyhow::anyhow!("Invalid budget TOML: {e}"))?
+            } else {
+                RegressionBudget::default()
+            };
+
+            // For now, read baseline and candidate as JSONL files of DecisionEvents.
+            let baseline_data = std::fs::read_to_string(&baseline).map_err(|e| {
+                anyhow::anyhow!("Failed to read baseline '{}': {e}", baseline.display())
+            })?;
+            let candidate_data = std::fs::read_to_string(&candidate).map_err(|e| {
+                anyhow::anyhow!("Failed to read candidate '{}': {e}", candidate.display())
+            })?;
+
+            let baseline_events: Vec<frankenterm_core::replay_decision_graph::DecisionEvent> =
+                serde_json::from_str(&baseline_data).map_err(|e| {
+                    anyhow::anyhow!("Failed to parse baseline events: {e}")
+                })?;
+            let candidate_events: Vec<frankenterm_core::replay_decision_graph::DecisionEvent> =
+                serde_json::from_str(&candidate_data).map_err(|e| {
+                    anyhow::anyhow!("Failed to parse candidate events: {e}")
+                })?;
+
+            let config = DiffConfig {
+                time_tolerance_ms: tolerance_ms,
+                ..Default::default()
+            };
+
+            let runner = DiffRunner::with_budget(regression_budget);
+            let result = runner.run(&baseline_events, &candidate_events, &config);
+
+            let meta = frankenterm_core::replay_report::ReportMeta {
+                replay_run_id: String::new(),
+                artifact_path: baseline.display().to_string(),
+                override_path: candidate.display().to_string(),
+                replay_duration_ms: 0,
+                total_events: (baseline_events.len() + candidate_events.len()) as u64,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            };
+
+            let report_str = runner.format_result(&result, output_mode, &meta);
+
+            if let Some(output_path) = &output {
+                std::fs::write(output_path, &report_str).map_err(|e| {
+                    anyhow::anyhow!("Failed to write output '{}': {e}", output_path.display())
+                })?;
+                eprintln!("Report written to {}", output_path.display());
+            } else {
+                print!("{}", report_str);
+            }
+
+            std::process::exit(result.exit_code.code());
+        }
+
+        Some(Commands::Replay {
+            command:
+                Some(ReplayCommands::Inspect {
+                    file,
+                    json: as_json,
+                }),
+            ..
+        }) => {
+            use frankenterm_core::replay_cli::InspectResult;
+
+            let data = std::fs::read_to_string(&file).map_err(|e| {
+                anyhow::anyhow!("Failed to read trace '{}': {e}", file.display())
+            })?;
+
+            let events: Vec<frankenterm_core::replay_decision_graph::DecisionEvent> =
+                serde_json::from_str(&data).map_err(|e| {
+                    anyhow::anyhow!("Failed to parse trace events: {e}")
+                })?;
+
+            let result = InspectResult::from_events(&file.display().to_string(), &events);
+
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                print!("{}", result.render_human());
             }
         }
 

@@ -219,6 +219,7 @@ pub mod recording;
 pub mod replay;
 pub mod replay_capture;
 pub mod replay_checkpoint;
+pub mod replay_cli;
 pub mod replay_counterfactual;
 pub mod replay_decision_diff;
 pub mod replay_decision_graph;
