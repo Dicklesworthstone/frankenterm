@@ -14515,6 +14515,66 @@ impl QoEGuardrail {
     pub fn to_invariant_domain() -> InvariantDomain {
         InvariantDomain::Composition
     }
+
+    // ── F5 Impl: Bridge methods ──
+
+    /// Number of SLOs currently being tracked.
+    pub fn slo_count(&self) -> usize {
+        self.config.slos.len()
+    }
+
+    /// Number of SLOs currently met.
+    pub fn met_count(&self) -> usize {
+        self.evaluate_all().iter()
+            .filter(|(_, v)| matches!(v, SLOVerdict::Met { .. }))
+            .count()
+    }
+
+    /// Number of SLOs currently breached.
+    pub fn breach_count(&self) -> usize {
+        self.evaluate_all().iter()
+            .filter(|(_, v)| matches!(v, SLOVerdict::Breached { .. }))
+            .count()
+    }
+
+    /// SLO compliance rate (met / evaluable).
+    pub fn compliance_rate(&self) -> f64 {
+        let verdicts = self.evaluate_all();
+        let evaluable = verdicts.iter()
+            .filter(|(_, v)| !matches!(v, SLOVerdict::InsufficientData { .. }))
+            .count();
+        if evaluable == 0 { return 1.0; }
+        let met = verdicts.iter()
+            .filter(|(_, v)| matches!(v, SLOVerdict::Met { .. }))
+            .count();
+        met as f64 / evaluable as f64
+    }
+
+    /// Record a batch of measurements for a single metric.
+    pub fn record_batch(&mut self, metric: QoEMetric, values: &[f64], start_us: u64) {
+        for (i, v) in values.iter().enumerate() {
+            self.record(QoEMeasurement {
+                metric,
+                value: *v,
+                timestamp_us: start_us + i as u64,
+            });
+        }
+    }
+
+    /// Get the current percentile value for a metric (None if insufficient data).
+    pub fn current_percentile(&self, metric: QoEMetric, percentile: f64) -> Option<f64> {
+        let window = self.windows.get(&metric)?;
+        if window.len() < self.config.min_samples { return None; }
+        let mut sorted = window.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((percentile * sorted.len() as f64) as usize).min(sorted.len() - 1);
+        Some(sorted[idx])
+    }
+
+    /// Whether all SLOs are met (or insufficient data).
+    pub fn all_slos_met(&self) -> bool {
+        self.evaluate_all().iter().all(|(_, v)| !matches!(v, SLOVerdict::Breached { .. }))
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -27409,5 +27469,97 @@ mod tests {
     #[test]
     fn test_qoe_to_invariant_domain() {
         assert_eq!(QoEGuardrail::to_invariant_domain(), InvariantDomain::Composition);
+    }
+
+    // ── F5 Impl: Bridge method tests ──
+
+    #[test]
+    fn test_qoe_slo_count() {
+        let guard = QoEGuardrail::new(QoEGuardrailConfig::default());
+        assert_eq!(guard.slo_count(), 4);
+    }
+
+    #[test]
+    fn test_qoe_met_and_breach_count() {
+        let cfg = QoEGuardrailConfig {
+            slos: vec![
+                QoESLO { metric: QoEMetric::InputToPaint, target: 20_000.0, percentile: 0.95, description: "x".to_string() },
+                QoESLO { metric: QoEMetric::FrameJitter, target: 100.0, percentile: 0.95, description: "y".to_string() },
+            ],
+            window_size: 100,
+            min_samples: 5,
+        };
+        let mut guard = QoEGuardrail::new(cfg);
+        for i in 0..10 {
+            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10_000.0, timestamp_us: i });
+            guard.record(QoEMeasurement { metric: QoEMetric::FrameJitter, value: 5_000.0, timestamp_us: i });
+        }
+        assert_eq!(guard.met_count(), 1); // InputToPaint met.
+        assert_eq!(guard.breach_count(), 1); // FrameJitter breached.
+    }
+
+    #[test]
+    fn test_qoe_compliance_rate() {
+        let cfg = QoEGuardrailConfig {
+            slos: vec![
+                QoESLO { metric: QoEMetric::InputToPaint, target: 20_000.0, percentile: 0.95, description: "x".to_string() },
+                QoESLO { metric: QoEMetric::FrameJitter, target: 100.0, percentile: 0.95, description: "y".to_string() },
+            ],
+            window_size: 100,
+            min_samples: 5,
+        };
+        let mut guard = QoEGuardrail::new(cfg);
+        for i in 0..10 {
+            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10_000.0, timestamp_us: i });
+            guard.record(QoEMeasurement { metric: QoEMetric::FrameJitter, value: 5_000.0, timestamp_us: i });
+        }
+        assert!((guard.compliance_rate() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_qoe_record_batch() {
+        let cfg = QoEGuardrailConfig { min_samples: 1, ..Default::default() };
+        let mut guard = QoEGuardrail::new(cfg);
+        guard.record_batch(QoEMetric::InputToPaint, &[100.0, 200.0, 300.0], 1000);
+        assert_eq!(guard.total_measurements(), 3);
+        assert_eq!(guard.window_len(QoEMetric::InputToPaint), 3);
+    }
+
+    #[test]
+    fn test_qoe_current_percentile() {
+        let cfg = QoEGuardrailConfig { min_samples: 5, window_size: 100, ..Default::default() };
+        let mut guard = QoEGuardrail::new(cfg);
+        // Not enough data.
+        assert!(guard.current_percentile(QoEMetric::InputToPaint, 0.50).is_none());
+        for i in 0..10 {
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: (i + 1) as f64 * 1000.0,
+                timestamp_us: i,
+            });
+        }
+        let p50 = guard.current_percentile(QoEMetric::InputToPaint, 0.50).unwrap();
+        assert!(p50 > 0.0);
+    }
+
+    #[test]
+    fn test_qoe_all_slos_met() {
+        let cfg = QoEGuardrailConfig {
+            slos: vec![QoESLO {
+                metric: QoEMetric::InputToPaint,
+                target: 20_000.0,
+                percentile: 0.95,
+                description: "x".to_string(),
+            }],
+            window_size: 100,
+            min_samples: 5,
+        };
+        let mut guard = QoEGuardrail::new(cfg);
+        // Insufficient data — no breach → all_slos_met.
+        assert!(guard.all_slos_met());
+        for i in 0..10 {
+            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10_000.0, timestamp_us: i });
+        }
+        assert!(guard.all_slos_met());
     }
 }
