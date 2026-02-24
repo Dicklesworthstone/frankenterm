@@ -566,6 +566,239 @@ pub fn score_candidates(inputs: &[ScorerInput], config: &ScorerConfig) -> Scorer
     }
 }
 
+// ── Deterministic planner solver (ft-1i2ge.2.5) ─────────────────────────────
+
+/// Why a candidate was not assigned.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionReason {
+    /// No agent has spare capacity.
+    NoCapacity,
+    /// Candidate conflicts with an already-assigned bead (e.g. same resource).
+    ConflictWithAssigned { conflicting_bead_id: String },
+    /// Safety gate denied this candidate.
+    SafetyGateDenied { gate_name: String },
+    /// Candidate's score was below the minimum threshold.
+    BelowScoreThreshold,
+    /// Candidate was already assigned to another agent in this round.
+    AlreadyAssigned,
+}
+
+/// A single assignment: bead → agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Assignment {
+    pub bead_id: String,
+    pub agent_id: String,
+    pub score: f64,
+    pub rank: usize,
+}
+
+/// A candidate that was rejected with reasons.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectedCandidate {
+    pub bead_id: String,
+    pub score: f64,
+    pub reasons: Vec<RejectionReason>,
+}
+
+/// Safety gate that can deny candidates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafetyGate {
+    pub name: String,
+    /// Bead ids that this gate denies.
+    pub denied_bead_ids: Vec<String>,
+}
+
+/// Conflict declaration: two beads that cannot be assigned simultaneously.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictPair {
+    pub bead_a: String,
+    pub bead_b: String,
+}
+
+/// Configuration for the planner solver.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolverConfig {
+    /// Minimum score to consider for assignment.
+    pub min_score: f64,
+    /// Maximum beads to assign per round.
+    pub max_assignments: usize,
+    /// Safety gates to apply.
+    #[serde(default)]
+    pub safety_gates: Vec<SafetyGate>,
+    /// Conflict pairs: beads that cannot be co-assigned.
+    #[serde(default)]
+    pub conflicts: Vec<ConflictPair>,
+}
+
+impl Default for SolverConfig {
+    fn default() -> Self {
+        Self {
+            min_score: 0.05,
+            max_assignments: 10,
+            safety_gates: Vec::new(),
+            conflicts: Vec::new(),
+        }
+    }
+}
+
+/// Result of the planner solver.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssignmentSet {
+    pub assignments: Vec<Assignment>,
+    pub rejected: Vec<RejectedCandidate>,
+    pub solver_config: SolverConfig,
+}
+
+impl AssignmentSet {
+    /// Number of assignments made.
+    #[must_use]
+    pub fn assignment_count(&self) -> usize {
+        self.assignments.len()
+    }
+
+    /// Get assignment for a specific bead.
+    #[must_use]
+    pub fn get_assignment(&self, bead_id: &str) -> Option<&Assignment> {
+        self.assignments.iter().find(|a| a.bead_id == bead_id)
+    }
+
+    /// Get rejection for a specific bead.
+    #[must_use]
+    pub fn get_rejection(&self, bead_id: &str) -> Option<&RejectedCandidate> {
+        self.rejected.iter().find(|r| r.bead_id == bead_id)
+    }
+}
+
+/// Run the deterministic planner solver.
+///
+/// Takes a scored candidate list and available agents, then greedily assigns
+/// beads to agents in score order, respecting capacity, conflicts, and safety gates.
+#[must_use]
+pub fn solve_assignments(
+    scored: &ScorerReport,
+    agents: &[MissionAgentCapabilityProfile],
+    config: &SolverConfig,
+) -> AssignmentSet {
+    // Track remaining capacity per agent.
+    let mut remaining_capacity: HashMap<String, u32> = agents
+        .iter()
+        .filter(|a| {
+            matches!(
+                a.availability,
+                MissionAgentAvailability::Ready | MissionAgentAvailability::Degraded { .. }
+            )
+        })
+        .map(|a| {
+            let cap = a.effective_capacity().saturating_sub(a.current_load);
+            (a.agent_id.clone(), cap)
+        })
+        .collect();
+
+    // Build safety gate denial set.
+    let denied: HashMap<String, Vec<String>> = config
+        .safety_gates
+        .iter()
+        .flat_map(|gate| {
+            gate.denied_bead_ids
+                .iter()
+                .map(move |id| (id.clone(), gate.name.clone()))
+        })
+        .fold(HashMap::new(), |mut acc, (id, gate_name)| {
+            acc.entry(id).or_default().push(gate_name);
+            acc
+        });
+
+    let mut assignments: Vec<Assignment> = Vec::new();
+    let mut rejected: Vec<RejectedCandidate> = Vec::new();
+    let mut assigned_bead_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    for candidate in &scored.scored {
+        if assignments.len() >= config.max_assignments {
+            break;
+        }
+
+        let mut reasons: Vec<RejectionReason> = Vec::new();
+
+        // Check score threshold.
+        if candidate.final_score < config.min_score {
+            reasons.push(RejectionReason::BelowScoreThreshold);
+        }
+
+        // Check safety gates.
+        if let Some(gate_names) = denied.get(&candidate.bead_id) {
+            for gate_name in gate_names {
+                reasons.push(RejectionReason::SafetyGateDenied {
+                    gate_name: gate_name.clone(),
+                });
+            }
+        }
+
+        // Check conflicts with already-assigned beads.
+        for conflict in &config.conflicts {
+            if conflict.bead_a == candidate.bead_id
+                && assigned_bead_ids.contains(&conflict.bead_b)
+            {
+                reasons.push(RejectionReason::ConflictWithAssigned {
+                    conflicting_bead_id: conflict.bead_b.clone(),
+                });
+            }
+            if conflict.bead_b == candidate.bead_id
+                && assigned_bead_ids.contains(&conflict.bead_a)
+            {
+                reasons.push(RejectionReason::ConflictWithAssigned {
+                    conflicting_bead_id: conflict.bead_a.clone(),
+                });
+            }
+        }
+
+        if !reasons.is_empty() {
+            rejected.push(RejectedCandidate {
+                bead_id: candidate.bead_id.clone(),
+                score: candidate.final_score,
+                reasons,
+            });
+            continue;
+        }
+
+        // Find best available agent (most spare capacity, deterministic tie-break).
+        let best_agent = remaining_capacity
+            .iter()
+            .filter(|(_, cap)| **cap > 0)
+            .max_by(|(id_a, cap_a), (id_b, cap_b)| {
+                cap_a.cmp(cap_b).then_with(|| id_b.cmp(id_a)) // higher cap first, then alphabetical
+            })
+            .map(|(id, _)| id.clone());
+
+        match best_agent {
+            Some(agent_id) => {
+                *remaining_capacity.get_mut(&agent_id).unwrap() -= 1;
+                assigned_bead_ids.insert(candidate.bead_id.clone());
+                assignments.push(Assignment {
+                    bead_id: candidate.bead_id.clone(),
+                    agent_id,
+                    score: candidate.final_score,
+                    rank: assignments.len() + 1,
+                });
+            }
+            None => {
+                rejected.push(RejectedCandidate {
+                    bead_id: candidate.bead_id.clone(),
+                    score: candidate.final_score,
+                    reasons: vec![RejectionReason::NoCapacity],
+                });
+            }
+        }
+    }
+
+    AssignmentSet {
+        assignments,
+        rejected,
+        solver_config: config.clone(),
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1460,5 +1693,351 @@ mod tests {
         let safe = report.get("safe").unwrap();
         assert!(risky.feature_composite < safe.feature_composite);
         assert!(risky.final_score < safe.final_score);
+    }
+
+    // ── Solver (ft-1i2ge.2.5) ───────────────────────────────────────────
+
+    fn scored_report(ids_scores: &[(&str, f64)]) -> ScorerReport {
+        let scored: Vec<ScoredCandidate> = ids_scores
+            .iter()
+            .enumerate()
+            .map(|(i, (id, score))| ScoredCandidate {
+                bead_id: id.to_string(),
+                final_score: *score,
+                feature_composite: *score,
+                effort_penalty: 0.0,
+                tag_multiplier: 1.0,
+                below_confidence_threshold: false,
+                rank: i + 1,
+            })
+            .collect();
+        let ranked_ids = scored.iter().map(|s| s.bead_id.clone()).collect();
+        ScorerReport {
+            scored,
+            ranked_ids,
+            config_used: ScorerConfig::default(),
+        }
+    }
+
+    #[test]
+    fn solver_empty_input() {
+        let scored = scored_report(&[]);
+        let agents = vec![ready_agent("a1")];
+        let result = solve_assignments(&scored, &agents, &SolverConfig::default());
+        assert!(result.assignments.is_empty());
+        assert!(result.rejected.is_empty());
+    }
+
+    #[test]
+    fn solver_single_assignment() {
+        let scored = scored_report(&[("b1", 0.8)]);
+        let agents = vec![ready_agent("a1")];
+        let result = solve_assignments(&scored, &agents, &SolverConfig::default());
+        assert_eq!(result.assignment_count(), 1);
+        let a = &result.assignments[0];
+        assert_eq!(a.bead_id, "b1");
+        assert_eq!(a.agent_id, "a1");
+        assert_eq!(a.rank, 1);
+    }
+
+    #[test]
+    fn solver_respects_capacity() {
+        // Agent has capacity 2, 3 beads scored
+        let scored = scored_report(&[("b1", 0.9), ("b2", 0.7), ("b3", 0.5)]);
+        let agents = vec![ready_agent("a1")]; // max_parallel = 2, current_load = 0
+        let result = solve_assignments(&scored, &agents, &SolverConfig::default());
+        assert_eq!(result.assignment_count(), 2);
+        assert_eq!(result.rejected.len(), 1);
+        let rej = &result.rejected[0];
+        assert_eq!(rej.bead_id, "b3");
+        assert!(rej.reasons.contains(&RejectionReason::NoCapacity));
+    }
+
+    #[test]
+    fn solver_spreads_across_agents() {
+        let scored = scored_report(&[("b1", 0.9), ("b2", 0.7)]);
+        let agents = vec![
+            MissionAgentCapabilityProfile {
+                agent_id: "a1".to_string(),
+                capabilities: vec![],
+                lane_affinity: Vec::new(),
+                current_load: 0,
+                max_parallel_assignments: 1,
+                availability: MissionAgentAvailability::Ready,
+            },
+            MissionAgentCapabilityProfile {
+                agent_id: "a2".to_string(),
+                capabilities: vec![],
+                lane_affinity: Vec::new(),
+                current_load: 0,
+                max_parallel_assignments: 1,
+                availability: MissionAgentAvailability::Ready,
+            },
+        ];
+        let result = solve_assignments(&scored, &agents, &SolverConfig::default());
+        assert_eq!(result.assignment_count(), 2);
+        let agent_ids: Vec<&str> = result.assignments.iter().map(|a| a.agent_id.as_str()).collect();
+        assert!(agent_ids.contains(&"a1"));
+        assert!(agent_ids.contains(&"a2"));
+    }
+
+    #[test]
+    fn solver_below_score_threshold_rejected() {
+        let scored = scored_report(&[("low", 0.01)]);
+        let agents = vec![ready_agent("a1")];
+        let config = SolverConfig {
+            min_score: 0.05,
+            ..SolverConfig::default()
+        };
+        let result = solve_assignments(&scored, &agents, &config);
+        assert_eq!(result.assignment_count(), 0);
+        let rej = &result.rejected[0];
+        assert_eq!(rej.bead_id, "low");
+        assert!(rej.reasons.contains(&RejectionReason::BelowScoreThreshold));
+    }
+
+    #[test]
+    fn solver_safety_gate_denies() {
+        let scored = scored_report(&[("dangerous", 0.9), ("safe", 0.8)]);
+        let agents = vec![ready_agent("a1")];
+        let config = SolverConfig {
+            safety_gates: vec![SafetyGate {
+                name: "no-dangerous".to_string(),
+                denied_bead_ids: vec!["dangerous".to_string()],
+            }],
+            ..SolverConfig::default()
+        };
+        let result = solve_assignments(&scored, &agents, &config);
+        assert_eq!(result.assignment_count(), 1);
+        assert_eq!(result.assignments[0].bead_id, "safe");
+        let rej = result.get_rejection("dangerous").unwrap();
+        assert!(matches!(
+            &rej.reasons[0],
+            RejectionReason::SafetyGateDenied { gate_name } if gate_name == "no-dangerous"
+        ));
+    }
+
+    #[test]
+    fn solver_conflict_pair_prevents_coassignment() {
+        let scored = scored_report(&[("x", 0.9), ("y", 0.8)]);
+        let agents = vec![ready_agent("a1")]; // capacity 2
+        let config = SolverConfig {
+            conflicts: vec![ConflictPair {
+                bead_a: "x".to_string(),
+                bead_b: "y".to_string(),
+            }],
+            ..SolverConfig::default()
+        };
+        let result = solve_assignments(&scored, &agents, &config);
+        assert_eq!(result.assignment_count(), 1);
+        assert_eq!(result.assignments[0].bead_id, "x");
+        let rej = result.get_rejection("y").unwrap();
+        assert!(matches!(
+            &rej.reasons[0],
+            RejectionReason::ConflictWithAssigned { conflicting_bead_id } if conflicting_bead_id == "x"
+        ));
+    }
+
+    #[test]
+    fn solver_max_assignments_limit() {
+        let scored = scored_report(&[("b1", 0.9), ("b2", 0.8), ("b3", 0.7)]);
+        let agents = vec![ready_agent("a1")]; // capacity 2
+        let config = SolverConfig {
+            max_assignments: 1,
+            ..SolverConfig::default()
+        };
+        let result = solve_assignments(&scored, &agents, &config);
+        assert_eq!(result.assignment_count(), 1);
+    }
+
+    #[test]
+    fn solver_offline_agents_skipped() {
+        let scored = scored_report(&[("b1", 0.9)]);
+        let agents = vec![MissionAgentCapabilityProfile {
+            agent_id: "offline".to_string(),
+            capabilities: vec![],
+            lane_affinity: Vec::new(),
+            current_load: 0,
+            max_parallel_assignments: 5,
+            availability: MissionAgentAvailability::Offline {
+                reason_code: "unreachable".to_string(),
+            },
+        }];
+        let result = solve_assignments(&scored, &agents, &SolverConfig::default());
+        assert_eq!(result.assignment_count(), 0);
+        assert!(result.rejected[0]
+            .reasons
+            .contains(&RejectionReason::NoCapacity));
+    }
+
+    #[test]
+    fn solver_paused_agents_skipped() {
+        let scored = scored_report(&[("b1", 0.9)]);
+        let agents = vec![MissionAgentCapabilityProfile {
+            agent_id: "paused".to_string(),
+            capabilities: vec![],
+            lane_affinity: Vec::new(),
+            current_load: 0,
+            max_parallel_assignments: 5,
+            availability: MissionAgentAvailability::Paused {
+                reason_code: "manual_pause".to_string(),
+            },
+        }];
+        let result = solve_assignments(&scored, &agents, &SolverConfig::default());
+        assert_eq!(result.assignment_count(), 0);
+    }
+
+    #[test]
+    fn solver_degraded_agents_used() {
+        let scored = scored_report(&[("b1", 0.9)]);
+        let agents = vec![MissionAgentCapabilityProfile {
+            agent_id: "degraded".to_string(),
+            capabilities: vec![],
+            lane_affinity: Vec::new(),
+            current_load: 0,
+            max_parallel_assignments: 4,
+            availability: MissionAgentAvailability::Degraded {
+                reason_code: "slow".to_string(),
+                max_parallel_assignments: 1,
+            },
+        }];
+        let result = solve_assignments(&scored, &agents, &SolverConfig::default());
+        assert_eq!(result.assignment_count(), 1);
+        assert_eq!(result.assignments[0].agent_id, "degraded");
+    }
+
+    #[test]
+    fn solver_fully_loaded_agent_skipped() {
+        let scored = scored_report(&[("b1", 0.9)]);
+        let agents = vec![MissionAgentCapabilityProfile {
+            agent_id: "full".to_string(),
+            capabilities: vec![],
+            lane_affinity: Vec::new(),
+            current_load: 2,
+            max_parallel_assignments: 2,
+            availability: MissionAgentAvailability::Ready,
+        }];
+        let result = solve_assignments(&scored, &agents, &SolverConfig::default());
+        assert_eq!(result.assignment_count(), 0);
+    }
+
+    #[test]
+    fn solver_assignment_ranks_sequential() {
+        let scored = scored_report(&[("b1", 0.9), ("b2", 0.7), ("b3", 0.5)]);
+        let agents = vec![
+            ready_agent("a1"),
+            ready_agent("a2"),
+            ready_agent("a3"),
+        ];
+        let result = solve_assignments(&scored, &agents, &SolverConfig::default());
+        for (i, a) in result.assignments.iter().enumerate() {
+            assert_eq!(a.rank, i + 1);
+        }
+    }
+
+    #[test]
+    fn solver_no_agents_rejects_all() {
+        let scored = scored_report(&[("b1", 0.9)]);
+        let result = solve_assignments(&scored, &[], &SolverConfig::default());
+        assert_eq!(result.assignment_count(), 0);
+        assert_eq!(result.rejected.len(), 1);
+    }
+
+    #[test]
+    fn solver_deterministic_agent_selection() {
+        // Two agents with equal capacity — should pick deterministically
+        let scored = scored_report(&[("b1", 0.9)]);
+        let agents = vec![
+            MissionAgentCapabilityProfile {
+                agent_id: "alpha".to_string(),
+                capabilities: vec![],
+                lane_affinity: Vec::new(),
+                current_load: 0,
+                max_parallel_assignments: 1,
+                availability: MissionAgentAvailability::Ready,
+            },
+            MissionAgentCapabilityProfile {
+                agent_id: "beta".to_string(),
+                capabilities: vec![],
+                lane_affinity: Vec::new(),
+                current_load: 0,
+                max_parallel_assignments: 1,
+                availability: MissionAgentAvailability::Ready,
+            },
+        ];
+        let r1 = solve_assignments(&scored, &agents, &SolverConfig::default());
+        let r2 = solve_assignments(&scored, &agents, &SolverConfig::default());
+        assert_eq!(r1.assignments[0].agent_id, r2.assignments[0].agent_id);
+    }
+
+    #[test]
+    fn solver_get_assignment_and_rejection() {
+        let scored = scored_report(&[("assigned", 0.9), ("rejected", 0.01)]);
+        let agents = vec![ready_agent("a1")];
+        let config = SolverConfig {
+            min_score: 0.05,
+            ..SolverConfig::default()
+        };
+        let result = solve_assignments(&scored, &agents, &config);
+        assert!(result.get_assignment("assigned").is_some());
+        assert!(result.get_assignment("rejected").is_none());
+        assert!(result.get_rejection("rejected").is_some());
+        assert!(result.get_rejection("assigned").is_none());
+    }
+
+    #[test]
+    fn solver_config_serde_roundtrip() {
+        let config = SolverConfig {
+            min_score: 0.1,
+            max_assignments: 5,
+            safety_gates: vec![SafetyGate {
+                name: "test".to_string(),
+                denied_bead_ids: vec!["x".to_string()],
+            }],
+            conflicts: vec![ConflictPair {
+                bead_a: "a".to_string(),
+                bead_b: "b".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: SolverConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.min_score, 0.1);
+        assert_eq!(back.safety_gates.len(), 1);
+        assert_eq!(back.conflicts.len(), 1);
+    }
+
+    #[test]
+    fn solver_assignment_set_serde_roundtrip() {
+        let scored = scored_report(&[("b1", 0.9), ("b2", 0.01)]);
+        let agents = vec![ready_agent("a1")];
+        let config = SolverConfig {
+            min_score: 0.05,
+            ..SolverConfig::default()
+        };
+        let result = solve_assignments(&scored, &agents, &config);
+        let json = serde_json::to_string(&result).unwrap();
+        let back: AssignmentSet = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.assignment_count(), 1);
+        assert_eq!(back.rejected.len(), 1);
+    }
+
+    #[test]
+    fn solver_rejection_reason_serde_roundtrip() {
+        let reasons = vec![
+            RejectionReason::NoCapacity,
+            RejectionReason::ConflictWithAssigned {
+                conflicting_bead_id: "x".to_string(),
+            },
+            RejectionReason::SafetyGateDenied {
+                gate_name: "gate1".to_string(),
+            },
+            RejectionReason::BelowScoreThreshold,
+            RejectionReason::AlreadyAssigned,
+        ];
+        for reason in &reasons {
+            let json = serde_json::to_string(reason).unwrap();
+            let back: RejectionReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, reason);
+        }
     }
 }
