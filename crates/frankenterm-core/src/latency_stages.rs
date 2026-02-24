@@ -11218,6 +11218,118 @@ pub struct ModelCheckerLogEntry {
     pub degradation: ModelCheckerDegradation,
 }
 
+// ── E2 Impl: Model Checker Bridge Methods ────────────────────────
+
+impl ModelChecker {
+    /// Run a sequence of steps with scheduler invariant checks.
+    pub fn run_scheduler_scenario(
+        &mut self,
+        checker: &mut InvariantChecker,
+        actions: &[(TraceAction, Vec<SchedulerInvariant>)],
+        start_us: u64,
+    ) -> ModelCheckVerdict {
+        for (i, (action, invariants)) in actions.iter().enumerate() {
+            let ts = start_us + i as u64;
+            let results = checker.check_scheduler_batch(invariants, ts);
+            let violated = self.step(action.clone(), &results, ts);
+            if violated && !self.config.exhaustive {
+                return self.verdict();
+            }
+            if self.should_stop() {
+                break;
+            }
+        }
+        self.verdict()
+    }
+
+    /// Run a sequence of steps with budget invariant checks.
+    pub fn run_budget_scenario(
+        &mut self,
+        checker: &mut InvariantChecker,
+        actions: &[(TraceAction, Vec<BudgetInvariant>)],
+        start_us: u64,
+    ) -> ModelCheckVerdict {
+        for (i, (action, invariants)) in actions.iter().enumerate() {
+            let ts = start_us + i as u64;
+            let results = checker.check_budget_batch(invariants, ts);
+            let violated = self.step(action.clone(), &results, ts);
+            if violated && !self.config.exhaustive {
+                return self.verdict();
+            }
+            if self.should_stop() {
+                break;
+            }
+        }
+        self.verdict()
+    }
+
+    /// Run a sequence of steps with recovery invariant checks.
+    pub fn run_recovery_scenario(
+        &mut self,
+        checker: &mut InvariantChecker,
+        actions: &[(TraceAction, Vec<RecoveryInvariant>)],
+        start_us: u64,
+    ) -> ModelCheckVerdict {
+        for (i, (action, invariants)) in actions.iter().enumerate() {
+            let ts = start_us + i as u64;
+            let results = checker.check_recovery_batch(invariants, ts);
+            let violated = self.step(action.clone(), &results, ts);
+            if violated && !self.config.exhaustive {
+                return self.verdict();
+            }
+            if self.should_stop() {
+                break;
+            }
+        }
+        self.verdict()
+    }
+
+    /// Get counterexamples for a specific domain.
+    pub fn counterexamples_by_domain(&self, domain: InvariantDomain) -> Vec<&Counterexample> {
+        self.counterexamples
+            .iter()
+            .filter(|cx| cx.domain == domain)
+            .collect()
+    }
+
+    /// Get the shortest counterexample (fewest trace steps).
+    pub fn shortest_counterexample(&self) -> Option<&Counterexample> {
+        self.counterexamples.iter().min_by_key(|cx| cx.trace.len())
+    }
+
+    /// Get unique violated predicate IDs.
+    pub fn violated_predicates(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut preds = Vec::new();
+        for cx in &self.counterexamples {
+            if seen.insert(cx.predicate_id.clone()) {
+                preds.push(cx.predicate_id.clone());
+            }
+        }
+        preds
+    }
+
+    /// Access the inner invariant checker.
+    pub fn inner_checker(&self) -> &InvariantChecker {
+        &self.checker
+    }
+
+    /// Mutably access the inner invariant checker.
+    pub fn inner_checker_mut(&mut self) -> &mut InvariantChecker {
+        &mut self.checker
+    }
+
+    /// Current trace length.
+    pub fn current_trace_len(&self) -> usize {
+        self.current_trace.len()
+    }
+
+    /// Get the exploration strategy.
+    pub fn strategy(&self) -> ExplorationStrategy {
+        self.config.strategy
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -20381,5 +20493,235 @@ mod tests {
         assert_eq!(mc.counterexamples()[0].trace.len(), 3);
         assert_eq!(mc.states_explored(), 3);
         assert_eq!(mc.max_depth_reached(), 3);
+    }
+
+    // ── E2 Impl: Bridge Method Tests ──────────────────────────────
+
+    #[test]
+    fn test_mc_run_scheduler_scenario_no_violation() {
+        let mut mc = ModelChecker::with_defaults();
+        let mut checker = InvariantChecker::with_defaults();
+        let actions = vec![
+            (
+                TraceAction::EpochAdvance { new_epoch: 1 },
+                vec![SchedulerInvariant::EpochMonotonicity {
+                    previous: 0,
+                    current: 1,
+                }],
+            ),
+            (
+                TraceAction::EpochAdvance { new_epoch: 2 },
+                vec![SchedulerInvariant::EpochMonotonicity {
+                    previous: 1,
+                    current: 2,
+                }],
+            ),
+        ];
+        let verdict = mc.run_scheduler_scenario(&mut checker, &actions, 1000);
+        let is_no_violation =
+            matches!(verdict, ModelCheckVerdict::NoViolation { .. });
+        assert!(is_no_violation);
+    }
+
+    #[test]
+    fn test_mc_run_scheduler_scenario_with_violation() {
+        let mut mc = ModelChecker::with_defaults();
+        let mut checker = InvariantChecker::with_defaults();
+        let actions = vec![
+            (
+                TraceAction::EpochAdvance { new_epoch: 1 },
+                vec![SchedulerInvariant::CapacityBound {
+                    lane: SchedulerLane::Input,
+                    capacity: 100,
+                    actual: 50,
+                }],
+            ),
+            (
+                TraceAction::SchedulerAdmit {
+                    lane: SchedulerLane::Input,
+                    cost_us: 10.0,
+                },
+                vec![SchedulerInvariant::CapacityBound {
+                    lane: SchedulerLane::Input,
+                    capacity: 5,
+                    actual: 20,
+                }],
+            ),
+        ];
+        let verdict = mc.run_scheduler_scenario(&mut checker, &actions, 2000);
+        let is_violations =
+            matches!(verdict, ModelCheckVerdict::ViolationsFound { .. });
+        assert!(is_violations);
+    }
+
+    #[test]
+    fn test_mc_run_budget_scenario() {
+        let mut mc = ModelChecker::with_defaults();
+        let mut checker = InvariantChecker::with_defaults();
+        let actions = vec![(
+            TraceAction::ObserveLatency {
+                stage: LatencyStage::PtyCapture,
+                latency_us: 100.0,
+            },
+            vec![BudgetInvariant::NonNegativeTargets {
+                stage: LatencyStage::PtyCapture,
+                min_target: 50.0,
+            }],
+        )];
+        let verdict = mc.run_budget_scenario(&mut checker, &actions, 3000);
+        let is_no_violation =
+            matches!(verdict, ModelCheckVerdict::NoViolation { .. });
+        assert!(is_no_violation);
+    }
+
+    #[test]
+    fn test_mc_run_recovery_scenario() {
+        let mut mc = ModelChecker::with_defaults();
+        let mut checker = InvariantChecker::with_defaults();
+        let actions = vec![(
+            TraceAction::RecoveryStep {
+                level_before: MitigationLevel::Degrade,
+                level_after: MitigationLevel::Defer,
+            },
+            vec![RecoveryInvariant::LevelInRange {
+                level: MitigationLevel::Defer,
+            }],
+        )];
+        let verdict = mc.run_recovery_scenario(&mut checker, &actions, 4000);
+        let is_no_violation =
+            matches!(verdict, ModelCheckVerdict::NoViolation { .. });
+        assert!(is_no_violation);
+    }
+
+    #[test]
+    fn test_mc_counterexamples_by_domain() {
+        let mut mc = ModelChecker::new(ModelCheckerConfig {
+            exhaustive: true,
+            ..Default::default()
+        });
+        let sched_result = InvariantCheckResult {
+            predicate_id: "sched.x".to_string(),
+            domain: InvariantDomain::Scheduler,
+            severity: InvariantSeverity::Critical,
+            outcome: InvariantOutcome::Violated {
+                counterexample: "a".to_string(),
+            },
+            eval_time_us: 0,
+            timestamp_us: 0,
+        };
+        mc.step(TraceAction::EpochAdvance { new_epoch: 1 }, &[sched_result], 0);
+        mc.new_trace();
+        let budget_result = InvariantCheckResult {
+            predicate_id: "budget.y".to_string(),
+            domain: InvariantDomain::Budget,
+            severity: InvariantSeverity::Critical,
+            outcome: InvariantOutcome::Violated {
+                counterexample: "b".to_string(),
+            },
+            eval_time_us: 0,
+            timestamp_us: 1,
+        };
+        mc.step(TraceAction::EpochAdvance { new_epoch: 2 }, &[budget_result], 1);
+        assert_eq!(mc.counterexamples_by_domain(InvariantDomain::Scheduler).len(), 1);
+        assert_eq!(mc.counterexamples_by_domain(InvariantDomain::Budget).len(), 1);
+        assert_eq!(mc.counterexamples_by_domain(InvariantDomain::Recovery).len(), 0);
+    }
+
+    #[test]
+    fn test_mc_shortest_counterexample() {
+        let mut mc = ModelChecker::new(ModelCheckerConfig {
+            exhaustive: true,
+            ..Default::default()
+        });
+        let bad = InvariantCheckResult {
+            predicate_id: "test".to_string(),
+            domain: InvariantDomain::Scheduler,
+            severity: InvariantSeverity::Critical,
+            outcome: InvariantOutcome::Violated {
+                counterexample: "x".to_string(),
+            },
+            eval_time_us: 0,
+            timestamp_us: 0,
+        };
+        let ok = InvariantCheckResult {
+            predicate_id: "test2".to_string(),
+            domain: InvariantDomain::Scheduler,
+            severity: InvariantSeverity::Info,
+            outcome: InvariantOutcome::Satisfied,
+            eval_time_us: 0,
+            timestamp_us: 0,
+        };
+        // Trace 1: 3 steps then violation
+        mc.step(TraceAction::EpochAdvance { new_epoch: 1 }, &[ok.clone()], 0);
+        mc.step(TraceAction::EpochAdvance { new_epoch: 2 }, &[ok.clone()], 1);
+        mc.step(TraceAction::EpochAdvance { new_epoch: 3 }, &[bad.clone()], 2);
+        mc.new_trace();
+        // Trace 2: 1 step then violation
+        mc.step(TraceAction::EpochAdvance { new_epoch: 4 }, &[bad], 3);
+        let shortest = mc.shortest_counterexample().unwrap();
+        assert_eq!(shortest.trace.len(), 1);
+    }
+
+    #[test]
+    fn test_mc_violated_predicates() {
+        let mut mc = ModelChecker::new(ModelCheckerConfig {
+            exhaustive: true,
+            ..Default::default()
+        });
+        let r1 = InvariantCheckResult {
+            predicate_id: "a.x".to_string(),
+            domain: InvariantDomain::Scheduler,
+            severity: InvariantSeverity::Critical,
+            outcome: InvariantOutcome::Violated {
+                counterexample: "x".to_string(),
+            },
+            eval_time_us: 0,
+            timestamp_us: 0,
+        };
+        let r2 = InvariantCheckResult {
+            predicate_id: "b.y".to_string(),
+            domain: InvariantDomain::Budget,
+            severity: InvariantSeverity::Critical,
+            outcome: InvariantOutcome::Violated {
+                counterexample: "y".to_string(),
+            },
+            eval_time_us: 0,
+            timestamp_us: 1,
+        };
+        mc.step(TraceAction::EpochAdvance { new_epoch: 1 }, &[r1], 0);
+        mc.new_trace();
+        mc.step(TraceAction::EpochAdvance { new_epoch: 2 }, &[r2], 1);
+        let preds = mc.violated_predicates();
+        assert_eq!(preds.len(), 2);
+        assert!(preds.contains(&"a.x".to_string()));
+        assert!(preds.contains(&"b.y".to_string()));
+    }
+
+    #[test]
+    fn test_mc_inner_checker() {
+        let mc = ModelChecker::with_defaults();
+        assert_eq!(mc.inner_checker().total_checks(), 0);
+    }
+
+    #[test]
+    fn test_mc_current_trace_len() {
+        let mut mc = ModelChecker::with_defaults();
+        assert_eq!(mc.current_trace_len(), 0);
+        let ok = InvariantCheckResult {
+            predicate_id: "test".to_string(),
+            domain: InvariantDomain::Scheduler,
+            severity: InvariantSeverity::Info,
+            outcome: InvariantOutcome::Satisfied,
+            eval_time_us: 0,
+            timestamp_us: 0,
+        };
+        mc.step(TraceAction::EpochAdvance { new_epoch: 1 }, &[ok], 0);
+        assert_eq!(mc.current_trace_len(), 1);
+    }
+
+    #[test]
+    fn test_mc_strategy() {
+        let mc = ModelChecker::with_defaults();
+        assert_eq!(mc.strategy(), ExplorationStrategy::RandomWalk);
     }
 }
