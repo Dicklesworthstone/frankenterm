@@ -184,6 +184,8 @@ pub mod memory_pressure;
 pub mod merkle_tree;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+#[cfg(feature = "subprocess-bridge")]
+pub mod mission_loop;
 pub mod network_observer;
 pub mod notifications;
 pub mod orphan_reaper;
