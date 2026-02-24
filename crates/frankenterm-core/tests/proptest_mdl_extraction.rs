@@ -77,15 +77,22 @@ fn arb_window_with_success(
 
 fn arb_config() -> impl Strategy<Value = MdlConfig> {
     (
-        5..100usize,       // max_window_size
-        1..5usize,         // min_window_size
-        10..500usize,      // max_candidates
-        1..10u32,          // compression_level
-        0.0..1.0f64,       // min_confidence
-        prop::bool::ANY,   // include_context_failures
+        5..100usize,     // max_window_size
+        1..5usize,       // min_window_size
+        10..500usize,    // max_candidates
+        1..10u32,        // compression_level
+        0.0..1.0f64,     // min_confidence
+        prop::bool::ANY, // include_context_failures
     )
         .prop_map(
-            |(max_window_size, min_window_size, max_candidates, compression_level, min_confidence, include_context_failures)| {
+            |(
+                max_window_size,
+                min_window_size,
+                max_candidates,
+                compression_level,
+                min_confidence,
+                include_context_failures,
+            )| {
                 MdlConfig {
                     max_window_size,
                     min_window_size,

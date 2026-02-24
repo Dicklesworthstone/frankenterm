@@ -7,12 +7,11 @@ use proptest::prelude::*;
 
 use std::collections::HashMap;
 
-use frankenterm_core::ars_intercept::{
-    ArsInterceptor, ContextBounds, ContextGateResult, FallbackReason,
-    InterceptConfig, InterceptDecision, InterceptStats, PaneContext,
-    evaluate_context_gate,
-};
 use frankenterm_core::ars_fst::FstMatch;
+use frankenterm_core::ars_intercept::{
+    ArsInterceptor, ContextBounds, ContextGateResult, FallbackReason, InterceptConfig,
+    InterceptDecision, InterceptStats, PaneContext, evaluate_context_gate,
+};
 
 // =============================================================================
 // Strategies

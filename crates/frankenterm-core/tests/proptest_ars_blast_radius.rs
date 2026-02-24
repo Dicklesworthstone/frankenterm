@@ -8,8 +8,8 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 
 use frankenterm_core::ars_blast_radius::{
-    BlastDecision, BlastRadiusConfig, BlastRadiusController, BlastStats,
-    DenyReason, MaturityTier, ReflexState,
+    BlastDecision, BlastRadiusConfig, BlastRadiusController, BlastStats, DenyReason, MaturityTier,
+    ReflexState,
 };
 
 // =============================================================================
@@ -26,43 +26,42 @@ fn arb_tier() -> impl Strategy<Value = MaturityTier> {
 
 fn arb_config() -> impl Strategy<Value = BlastRadiusConfig> {
     (
-        1.0..100.0f64,  // swarm_rate
-        1.0..20.0f64,   // swarm_burst
-        1.0..100.0f64,  // cluster_rate
-        1.0..20.0f64,   // cluster_burst
-        1.0..50.0f64,   // incubating_rate
-        1.0..10.0f64,   // incubating_burst
-        1.0..100.0f64,  // graduated_rate
-        1.0..20.0f64,   // graduated_burst
+        1.0..100.0f64, // swarm_rate
+        1.0..20.0f64,  // swarm_burst
+        1.0..100.0f64, // cluster_rate
+        1.0..20.0f64,  // cluster_burst
+        1.0..50.0f64,  // incubating_rate
+        1.0..10.0f64,  // incubating_burst
+        1.0..100.0f64, // graduated_rate
+        1.0..20.0f64,  // graduated_burst
     )
-        .prop_map(
-            |(sr, sb, cr, cb, ir, ib, gr, gb)| BlastRadiusConfig {
-                swarm_rate_per_min: sr,
-                swarm_burst: sb,
-                cluster_rate_per_min: cr,
-                cluster_burst: cb,
-                incubating_rate_per_min: ir,
-                incubating_burst: ib,
-                graduated_rate_per_min: gr,
-                graduated_burst: gb,
-                veteran_rate_per_min: gr * 2.0,
-                veteran_burst: gb * 2.0,
-                graduation_threshold: 5,
-                veteran_threshold: 20,
-                demotion_failure_count: 3,
-            },
-        )
+        .prop_map(|(sr, sb, cr, cb, ir, ib, gr, gb)| BlastRadiusConfig {
+            swarm_rate_per_min: sr,
+            swarm_burst: sb,
+            cluster_rate_per_min: cr,
+            cluster_burst: cb,
+            incubating_rate_per_min: ir,
+            incubating_burst: ib,
+            graduated_rate_per_min: gr,
+            graduated_burst: gb,
+            veteran_rate_per_min: gr * 2.0,
+            veteran_burst: gb * 2.0,
+            graduation_threshold: 5,
+            veteran_threshold: 20,
+            demotion_failure_count: 3,
+        })
 }
 
 fn arb_reflex_state() -> impl Strategy<Value = ReflexState> {
-    (arb_tier(), 0..100u64, 0..50u64, 0..10u64, "[a-z]{2,6}")
-        .prop_map(|(tier, successes, failures, consec, cluster)| ReflexState {
+    (arb_tier(), 0..100u64, 0..50u64, 0..10u64, "[a-z]{2,6}").prop_map(
+        |(tier, successes, failures, consec, cluster)| ReflexState {
             tier,
             successes,
             failures,
             consecutive_failures: consec,
             cluster_id: cluster,
-        })
+        },
+    )
 }
 
 // =============================================================================

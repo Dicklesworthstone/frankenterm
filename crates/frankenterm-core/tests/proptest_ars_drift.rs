@@ -6,8 +6,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::ars_drift::{
-    ArsDriftDetector, ArsDriftStats, DriftAction,
-    DriftVerdict, EValueConfig, EValueMonitor,
+    ArsDriftDetector, ArsDriftStats, DriftAction, DriftVerdict, EValueConfig, EValueMonitor,
 };
 
 // =============================================================================
@@ -16,28 +15,29 @@ use frankenterm_core::ars_drift::{
 
 fn arb_config() -> impl Strategy<Value = EValueConfig> {
     (
-        0.001..0.2f64,    // alpha
-        3..20usize,       // min_calibration
-        20..200usize,     // calibration_window
-        0.001..0.5f64,    // min_lambda
-        0.5..0.99f64,     // max_lambda
-        0.95..1.0f64,     // decay
+        0.001..0.2f64, // alpha
+        3..20usize,    // min_calibration
+        20..200usize,  // calibration_window
+        0.001..0.5f64, // min_lambda
+        0.5..0.99f64,  // max_lambda
+        0.95..1.0f64,  // decay
     )
-        .prop_map(|(alpha, min_cal, cal_win, min_l, max_l, decay)| EValueConfig {
-            alpha,
-            min_calibration: min_cal,
-            calibration_window: cal_win,
-            min_lambda: min_l,
-            max_lambda: max_l,
-            decay,
-            auto_reset_on_drift: true,
-        })
+        .prop_map(
+            |(alpha, min_cal, cal_win, min_l, max_l, decay)| EValueConfig {
+                alpha,
+                min_calibration: min_cal,
+                calibration_window: cal_win,
+                min_lambda: min_l,
+                max_lambda: max_l,
+                decay,
+                auto_reset_on_drift: true,
+            },
+        )
 }
 
 fn arb_outcome_sequence(min: usize, max: usize) -> impl Strategy<Value = Vec<bool>> {
     prop::collection::vec(prop::bool::ANY, min..=max)
 }
-
 
 // =============================================================================
 // Calibration invariants

@@ -39,33 +39,40 @@ fn arb_snapshot_trigger() -> impl Strategy<Value = SnapshotTrigger> {
             observation_index: idx,
             posterior_probability: prob,
         }),
-        (arb_shell_transition(), proptest::option::of(any::<i32>()))
-            .prop_map(|(t, ec)| SnapshotTrigger::Osc133Boundary {
+        (arb_shell_transition(), proptest::option::of(any::<i32>())).prop_map(|(t, ec)| {
+            SnapshotTrigger::Osc133Boundary {
                 transition: t,
                 exit_code: ec,
-            }),
+            }
+        }),
         "[a-z]{1,20}".prop_map(|reason| SnapshotTrigger::Manual { reason }),
     ]
 }
 
 fn arb_snapshot_env() -> impl Strategy<Value = SnapshotEnv> {
-    proptest::collection::hash_map("[A-Z_]{1,10}", "[a-z0-9]{1,20}", 0..5)
-        .prop_map(|vars| SnapshotEnv {
+    proptest::collection::hash_map("[A-Z_]{1,10}", "[a-z0-9]{1,20}", 0..5).prop_map(|vars| {
+        SnapshotEnv {
             vars,
             redacted_count: 0,
-        })
+        }
+    })
 }
 
 fn arb_output_features() -> impl Strategy<Value = SnapshotOutputFeatures> {
-    (0.0f64..1000.0, 0.0f64..100000.0, 0.0f64..8.0, 0.0f64..1.0, 0.0f64..1.0).prop_map(
-        |(rate, bytes, ent, unique, ansi)| SnapshotOutputFeatures {
+    (
+        0.0f64..1000.0,
+        0.0f64..100000.0,
+        0.0f64..8.0,
+        0.0f64..1.0,
+        0.0f64..1.0,
+    )
+        .prop_map(|(rate, bytes, ent, unique, ansi)| SnapshotOutputFeatures {
             output_rate: rate,
             byte_rate: bytes,
             entropy: ent,
             unique_line_ratio: unique,
             ansi_density: ansi,
-        },
-    )
+        })
 }
 
 fn arb_context_snapshot() -> impl Strategy<Value = ContextSnapshot> {

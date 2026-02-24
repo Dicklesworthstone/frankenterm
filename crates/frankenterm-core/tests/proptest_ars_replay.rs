@@ -6,8 +6,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::ars_replay::{
-    FailReason, HistoricalIncident, ReplayAssessment, ReplayConfig,
-    ReplayHarness, ReplayStats, ReplayVerdict,
+    FailReason, HistoricalIncident, ReplayAssessment, ReplayConfig, ReplayHarness, ReplayStats,
+    ReplayVerdict,
 };
 
 // =============================================================================

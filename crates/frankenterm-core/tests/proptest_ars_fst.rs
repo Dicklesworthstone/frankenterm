@@ -8,8 +8,8 @@ use proptest::prelude::*;
 use std::collections::HashSet;
 
 use frankenterm_core::ars_fst::{
-    FstCompiler, FstConfig, FstError, FstIndex, FstStats,
-    TriggerEntry, minhash_to_key, key_to_minhash,
+    FstCompiler, FstConfig, FstError, FstIndex, FstStats, TriggerEntry, key_to_minhash,
+    minhash_to_key,
 };
 
 // =============================================================================
@@ -21,13 +21,14 @@ fn arb_key() -> impl Strategy<Value = Vec<u8>> {
 }
 
 fn arb_entry() -> impl Strategy<Value = TriggerEntry> {
-    (arb_key(), 0..10000u64, 0..100u32, "[a-z]{2,8}")
-        .prop_map(|(key, reflex_id, priority, cluster)| TriggerEntry {
+    (arb_key(), 0..10000u64, 0..100u32, "[a-z]{2,8}").prop_map(
+        |(key, reflex_id, priority, cluster)| TriggerEntry {
             key,
             reflex_id,
             priority,
             cluster_id: cluster,
-        })
+        },
+    )
 }
 
 fn arb_entries(min: usize, max: usize) -> impl Strategy<Value = Vec<TriggerEntry>> {

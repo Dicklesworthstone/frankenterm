@@ -8,8 +8,8 @@ use proptest::prelude::*;
 use std::collections::BTreeMap;
 
 use frankenterm_core::ars_evidence::{
-    EvidenceBuilder, EvidenceCategory, EvidenceConfig,
-    EvidenceLedger, EvidenceValue, EvidenceVerdict, LedgerDigest,
+    EvidenceBuilder, EvidenceCategory, EvidenceConfig, EvidenceLedger, EvidenceValue,
+    EvidenceVerdict, LedgerDigest,
 };
 
 // =============================================================================
@@ -49,7 +49,15 @@ fn arb_payload() -> impl Strategy<Value = BTreeMap<String, EvidenceValue>> {
     prop::collection::btree_map("[a-z]{2,8}", arb_evidence_value(), 0..5)
 }
 
-fn arb_entry_params() -> impl Strategy<Value = (EvidenceCategory, u64, String, BTreeMap<String, EvidenceValue>, EvidenceVerdict)> {
+fn arb_entry_params() -> impl Strategy<
+    Value = (
+        EvidenceCategory,
+        u64,
+        String,
+        BTreeMap<String, EvidenceValue>,
+        EvidenceVerdict,
+    ),
+> {
     (
         arb_category(),
         1..1_000_000u64,

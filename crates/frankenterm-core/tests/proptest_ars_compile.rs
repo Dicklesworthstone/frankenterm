@@ -57,8 +57,7 @@ fn arb_command_text() -> impl Strategy<Value = String> {
     "[a-z]{3,10}( [a-z0-9_./-]{1,10}){0,3}"
 }
 
-fn arb_input_params(
-) -> impl Strategy<Value = (Vec<String>, u64, EvidenceVerdict)> {
+fn arb_input_params() -> impl Strategy<Value = (Vec<String>, u64, EvidenceVerdict)> {
     (
         prop::collection::vec(arb_command_text(), 1..5),
         500..60000u64,

@@ -8,8 +8,8 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 
 use frankenterm_core::ars_evolve::{
-    CreationReason, EvolutionConfig, EvolutionEngine, EvolutionRequest,
-    EvolutionResult, EvolutionStats, ReflexVersion, VersionStatus,
+    CreationReason, EvolutionConfig, EvolutionEngine, EvolutionRequest, EvolutionResult,
+    EvolutionStats, ReflexVersion, VersionStatus,
 };
 
 // =============================================================================

@@ -6,8 +6,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::ars_secret_scan::{
-    ArsScanConfig, ArsSecretScanner, DetectionMethod, ScanStats, ScanVerdict,
-    shannon_entropy,
+    ArsScanConfig, ArsSecretScanner, DetectionMethod, ScanStats, ScanVerdict, shannon_entropy,
 };
 use frankenterm_core::mdl_extraction::CommandBlock;
 
@@ -67,28 +66,27 @@ fn arb_clean_window(min: usize, max: usize) -> impl Strategy<Value = Vec<Command
 
 fn arb_config() -> impl Strategy<Value = ArsScanConfig> {
     (
-        3.0..5.0f64,       // entropy_threshold
-        8..32usize,        // min_entropy_token_len
-        64..512usize,      // max_entropy_token_len
-        prop::bool::ANY,   // scan_output
-        prop::bool::ANY,   // entropy_detection_enabled
+        3.0..5.0f64,     // entropy_threshold
+        8..32usize,      // min_entropy_token_len
+        64..512usize,    // max_entropy_token_len
+        prop::bool::ANY, // scan_output
+        prop::bool::ANY, // entropy_detection_enabled
     )
-        .prop_map(|(entropy_threshold, min_len, max_len, scan_output, entropy_enabled)| {
-            ArsScanConfig {
+        .prop_map(
+            |(entropy_threshold, min_len, max_len, scan_output, entropy_enabled)| ArsScanConfig {
                 entropy_threshold,
                 min_entropy_token_len: min_len,
                 max_entropy_token_len: max_len,
                 scan_output,
                 entropy_detection_enabled: entropy_enabled,
                 extra_patterns: Vec::new(),
-            }
-        })
+            },
+        )
 }
 
 fn arb_printable_string(min: usize, max: usize) -> impl Strategy<Value = String> {
-    prop::collection::vec(32u8..127, min..=max).prop_map(|bytes| {
-        String::from_utf8(bytes).unwrap_or_default()
-    })
+    prop::collection::vec(32u8..127, min..=max)
+        .prop_map(|bytes| String::from_utf8(bytes).unwrap_or_default())
 }
 
 // =============================================================================

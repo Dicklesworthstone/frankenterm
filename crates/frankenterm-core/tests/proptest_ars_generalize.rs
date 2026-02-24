@@ -8,9 +8,8 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 
 use frankenterm_core::ars_generalize::{
-    GeneralizeConfig, GeneralizationResult, GeneralizationStats,
-    GeneralizedCommand, Generalizer, PacBayesianBound, ParamKind,
-    TemplateVar,
+    GeneralizationResult, GeneralizationStats, GeneralizeConfig, GeneralizedCommand, Generalizer,
+    PacBayesianBound, ParamKind, TemplateVar,
 };
 use frankenterm_core::mdl_extraction::CommandBlock;
 
@@ -89,30 +88,28 @@ fn make_cmd_block(index: u32, command: String) -> CommandBlock {
 
 fn arb_config() -> impl Strategy<Value = GeneralizeConfig> {
     (
-        2..10usize,       // min_param_len
-        1..16usize,       // max_params_per_command
-        4..64usize,       // max_total_params
-        0.1..10.0f64,     // pac_prior_weight
-        0.01..0.5f64,     // pac_confidence_delta
-        prop::bool::ANY,  // detect_file_paths
-        prop::bool::ANY,  // detect_line_numbers
-        prop::bool::ANY,  // detect_identifiers
-        prop::bool::ANY,  // detect_numerics
+        2..10usize,      // min_param_len
+        1..16usize,      // max_params_per_command
+        4..64usize,      // max_total_params
+        0.1..10.0f64,    // pac_prior_weight
+        0.01..0.5f64,    // pac_confidence_delta
+        prop::bool::ANY, // detect_file_paths
+        prop::bool::ANY, // detect_line_numbers
+        prop::bool::ANY, // detect_identifiers
+        prop::bool::ANY, // detect_numerics
     )
         .prop_map(
-            |(min_len, max_per, max_total, prior, delta, fp, ln, id, nu)| {
-                GeneralizeConfig {
-                    min_param_len: min_len,
-                    max_params_per_command: max_per,
-                    max_total_params: max_total,
-                    pac_prior_weight: prior,
-                    pac_confidence_delta: delta,
-                    detect_file_paths: fp,
-                    detect_line_numbers: ln,
-                    detect_identifiers: id,
-                    detect_numerics: nu,
-                    custom_safety_patterns: HashMap::new(),
-                }
+            |(min_len, max_per, max_total, prior, delta, fp, ln, id, nu)| GeneralizeConfig {
+                min_param_len: min_len,
+                max_params_per_command: max_per,
+                max_total_params: max_total,
+                pac_prior_weight: prior,
+                pac_confidence_delta: delta,
+                detect_file_paths: fp,
+                detect_line_numbers: ln,
+                detect_identifiers: id,
+                detect_numerics: nu,
+                custom_safety_patterns: HashMap::new(),
             },
         )
 }

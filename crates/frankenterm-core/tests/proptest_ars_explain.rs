@@ -80,13 +80,16 @@ fn arb_replay_section() -> impl Strategy<Value = ReplaySection> {
 }
 
 fn arb_blast_section() -> impl Strategy<Value = BlastSection> {
-    (any::<bool>(), arb_maturity(), proptest::option::of("[a-z]{3,8}")).prop_map(
-        |(allowed, tier, deny_reason)| BlastSection {
+    (
+        any::<bool>(),
+        arb_maturity(),
+        proptest::option::of("[a-z]{3,8}"),
+    )
+        .prop_map(|(allowed, tier, deny_reason)| BlastSection {
             allowed,
             tier,
             deny_reason,
-        },
-    )
+        })
 }
 
 fn arb_evidence_section() -> impl Strategy<Value = EvidenceSection> {

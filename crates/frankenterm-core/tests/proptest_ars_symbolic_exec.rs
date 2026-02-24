@@ -6,8 +6,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::ars_symbolic_exec::{
-    SafetyVerdict, SymExecConfig, SymbolicExecutor, ViolationCategory,
-    parse_commands, path_within_boundary, resolve_path, tokenize,
+    SafetyVerdict, SymExecConfig, SymbolicExecutor, ViolationCategory, parse_commands,
+    path_within_boundary, resolve_path, tokenize,
 };
 use frankenterm_core::mdl_extraction::CommandBlock;
 
@@ -64,17 +64,15 @@ fn make_cmd_block(index: u32, command: String) -> CommandBlock {
 fn arb_config() -> impl Strategy<Value = SymExecConfig> {
     (
         arb_cwd(),
-        8..64usize,         // max_path_depth
-        prop::bool::ANY,    // allow_unparseable
+        8..64usize,      // max_path_depth
+        prop::bool::ANY, // allow_unparseable
     )
-        .prop_map(|(cwd, max_path_depth, allow_unparseable)| {
-            SymExecConfig {
-                cwd,
-                max_path_depth,
-                allow_unparseable,
-                extra_banned_binaries: Vec::new(),
-                extra_safe_binaries: Vec::new(),
-            }
+        .prop_map(|(cwd, max_path_depth, allow_unparseable)| SymExecConfig {
+            cwd,
+            max_path_depth,
+            allow_unparseable,
+            extra_banned_binaries: Vec::new(),
+            extra_safe_binaries: Vec::new(),
         })
 }
 

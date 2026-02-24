@@ -71,19 +71,15 @@ fn arb_drift_snapshot() -> impl Strategy<Value = DriftSnapshot> {
 }
 
 fn arb_evidence_summary() -> impl Strategy<Value = EvidenceSummary> {
-    (
-        0..50usize,
-        any::<bool>(),
-        arb_verdict(),
-        "[a-f0-9]{8,16}",
-    )
-        .prop_map(|(entry_count, is_complete, verdict, root_hash)| EvidenceSummary {
+    (0..50usize, any::<bool>(), arb_verdict(), "[a-f0-9]{8,16}").prop_map(
+        |(entry_count, is_complete, verdict, root_hash)| EvidenceSummary {
             entry_count,
             is_complete,
             overall_verdict: verdict,
             root_hash,
             categories: vec!["ChangeDetection".to_string()],
-        })
+        },
+    )
 }
 
 fn arb_record(id: u64) -> impl Strategy<Value = ReflexRecord> {

@@ -6,8 +6,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::ars_timeout::{
-    DurationStats, TimeoutCalculator, TimeoutConfig, TimeoutDecision,
-    TimeoutMethod, TimeoutTracker,
+    DurationStats, TimeoutCalculator, TimeoutConfig, TimeoutDecision, TimeoutMethod, TimeoutTracker,
 };
 
 // =============================================================================
@@ -20,14 +19,14 @@ fn arb_positive_durations(min: usize, max: usize) -> impl Strategy<Value = Vec<f
 
 fn arb_timeout_config() -> impl Strategy<Value = TimeoutConfig> {
     (
-        1.0..100.0f64,    // cost_hang
-        0.1..50.0f64,     // cost_premature_kill
-        100..2000u64,     // min_timeout_ms
+        1.0..100.0f64,      // cost_hang
+        0.1..50.0f64,       // cost_premature_kill
+        100..2000u64,       // min_timeout_ms
         10_000..120_000u64, // max_timeout_ms
-        1000..10_000u64,  // default_timeout_ms
-        1..10usize,       // min_observations
-        1.0..3.0f64,      // safety_multiplier
-        0.8..0.999f64,    // fallback_percentile
+        1000..10_000u64,    // default_timeout_ms
+        1..10usize,         // min_observations
+        1.0..3.0f64,        // safety_multiplier
+        0.8..0.999f64,      // fallback_percentile
     )
         .prop_map(
             |(ch, cp, min_t, max_t, def_t, min_obs, safety, perc)| TimeoutConfig {
