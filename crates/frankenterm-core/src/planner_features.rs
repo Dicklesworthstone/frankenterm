@@ -1289,6 +1289,295 @@ fn count_flips(history: &[bool]) -> u32 {
         .count() as u32
 }
 
+// ── Multi-objective mission profiles (ft-1i2ge.2.9) ─────────────────────────
+
+/// Named mission profile that defines operational priorities.
+///
+/// Each profile tunes weights, thresholds, and governor parameters to
+/// optimize for a specific operational goal without code changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionProfileKind {
+    /// Default balanced profile.
+    Balanced,
+    /// Prioritize safety: risk weight high, safety bonus amplified, aggressive cooldown.
+    SafetyFirst,
+    /// Maximize throughput: lower thresholds, less cooldown, impact-heavy weights.
+    Throughput,
+    /// Focus on urgent/stale work: urgency weight dominant, starvation boost aggressive.
+    UrgencyDriven,
+    /// Conservative: high confidence threshold, long cooldown, minimal starvation boost.
+    Conservative,
+}
+
+/// Complete mission profile: scorer config + governor config + extraction config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionProfile {
+    pub kind: MissionProfileKind,
+    pub name: String,
+    pub description: String,
+    pub scorer_config: ScorerConfig,
+    pub governor_config: GovernorConfig,
+    pub extraction_config: PlannerExtractionConfig,
+}
+
+impl MissionProfile {
+    /// Create a profile from a named kind.
+    #[must_use]
+    pub fn from_kind(kind: MissionProfileKind) -> Self {
+        match kind {
+            MissionProfileKind::Balanced => Self::balanced(),
+            MissionProfileKind::SafetyFirst => Self::safety_first(),
+            MissionProfileKind::Throughput => Self::throughput(),
+            MissionProfileKind::UrgencyDriven => Self::urgency_driven(),
+            MissionProfileKind::Conservative => Self::conservative(),
+        }
+    }
+
+    /// Balanced default profile.
+    #[must_use]
+    pub fn balanced() -> Self {
+        Self {
+            kind: MissionProfileKind::Balanced,
+            name: "Balanced".to_string(),
+            description: "Default balanced weighting across all dimensions".to_string(),
+            scorer_config: ScorerConfig::default(),
+            governor_config: GovernorConfig::default(),
+            extraction_config: PlannerExtractionConfig::default(),
+        }
+    }
+
+    /// Safety-first profile: risk and confidence dominate, aggressive cooldown.
+    #[must_use]
+    pub fn safety_first() -> Self {
+        Self {
+            kind: MissionProfileKind::SafetyFirst,
+            name: "Safety First".to_string(),
+            description: "Prioritize risk avoidance and high confidence".to_string(),
+            scorer_config: ScorerConfig {
+                weights: PlannerWeights {
+                    impact: 0.15,
+                    urgency: 0.10,
+                    risk: 0.35,
+                    fit: 0.15,
+                    confidence: 0.25,
+                },
+                safety_bonus: 1.30,
+                regression_bonus: 1.20,
+                min_confidence_threshold: 0.3,
+                ..ScorerConfig::default()
+            },
+            governor_config: GovernorConfig {
+                reassignment_cooldown_cycles: 5,
+                thrash_flip_threshold: 2,
+                thrash_penalty: 0.3,
+                ..GovernorConfig::default()
+            },
+            extraction_config: PlannerExtractionConfig::default(),
+        }
+    }
+
+    /// Throughput profile: impact-heavy, minimal cooldown, lower thresholds.
+    #[must_use]
+    pub fn throughput() -> Self {
+        Self {
+            kind: MissionProfileKind::Throughput,
+            name: "Throughput".to_string(),
+            description: "Maximize work completed per cycle".to_string(),
+            scorer_config: ScorerConfig {
+                weights: PlannerWeights {
+                    impact: 0.40,
+                    urgency: 0.20,
+                    risk: 0.10,
+                    fit: 0.25,
+                    confidence: 0.05,
+                },
+                safety_bonus: 1.05,
+                min_confidence_threshold: 0.05,
+                ..ScorerConfig::default()
+            },
+            governor_config: GovernorConfig {
+                reassignment_cooldown_cycles: 1,
+                starvation_threshold_cycles: 3,
+                starvation_boost_per_cycle: 0.03,
+                starvation_max_boost: 0.10,
+                thrash_flip_threshold: 5,
+                ..GovernorConfig::default()
+            },
+            extraction_config: PlannerExtractionConfig::default(),
+        }
+    }
+
+    /// Urgency-driven profile: staleness dominates, aggressive starvation boost.
+    #[must_use]
+    pub fn urgency_driven() -> Self {
+        Self {
+            kind: MissionProfileKind::UrgencyDriven,
+            name: "Urgency Driven".to_string(),
+            description: "Focus on time-sensitive and stale work".to_string(),
+            scorer_config: ScorerConfig {
+                weights: PlannerWeights {
+                    impact: 0.15,
+                    urgency: 0.45,
+                    risk: 0.10,
+                    fit: 0.15,
+                    confidence: 0.15,
+                },
+                ..ScorerConfig::default()
+            },
+            governor_config: GovernorConfig {
+                starvation_threshold_cycles: 2,
+                starvation_boost_per_cycle: 0.05,
+                starvation_max_boost: 0.25,
+                ..GovernorConfig::default()
+            },
+            extraction_config: PlannerExtractionConfig {
+                urgency_staleness_weight: 0.6,
+                urgency_priority_weight: 0.4,
+                ..PlannerExtractionConfig::default()
+            },
+        }
+    }
+
+    /// Conservative profile: high confidence bar, long cooldown, minimal starvation.
+    #[must_use]
+    pub fn conservative() -> Self {
+        Self {
+            kind: MissionProfileKind::Conservative,
+            name: "Conservative".to_string(),
+            description: "High bar for confidence, minimal churn".to_string(),
+            scorer_config: ScorerConfig {
+                weights: PlannerWeights {
+                    impact: 0.20,
+                    urgency: 0.15,
+                    risk: 0.25,
+                    fit: 0.15,
+                    confidence: 0.25,
+                },
+                min_confidence_threshold: 0.4,
+                ..ScorerConfig::default()
+            },
+            governor_config: GovernorConfig {
+                reassignment_cooldown_cycles: 6,
+                starvation_threshold_cycles: 10,
+                starvation_boost_per_cycle: 0.01,
+                starvation_max_boost: 0.08,
+                thrash_flip_threshold: 2,
+                thrash_penalty: 0.3,
+                ..GovernorConfig::default()
+            },
+            extraction_config: PlannerExtractionConfig::default(),
+        }
+    }
+}
+
+/// Utility policy tuner: adjusts profile weights based on runtime feedback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UtilityPolicyTuner {
+    /// Active profile.
+    pub active_profile: MissionProfile,
+    /// Override individual weight adjustments (additive, applied after profile).
+    pub weight_overrides: HashMap<String, f64>,
+    /// History of profile switches for audit.
+    pub switch_history: Vec<ProfileSwitch>,
+    /// Maximum switch history entries to retain.
+    pub max_history: usize,
+}
+
+/// Record of a profile switch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileSwitch {
+    pub cycle_id: u64,
+    pub from: MissionProfileKind,
+    pub to: MissionProfileKind,
+    pub reason: String,
+}
+
+impl UtilityPolicyTuner {
+    /// Create a tuner with the given profile.
+    #[must_use]
+    pub fn new(profile: MissionProfile) -> Self {
+        Self {
+            active_profile: profile,
+            weight_overrides: HashMap::new(),
+            switch_history: Vec::new(),
+            max_history: 50,
+        }
+    }
+
+    /// Switch to a different profile, recording the reason.
+    pub fn switch_profile(&mut self, cycle_id: u64, kind: MissionProfileKind, reason: &str) {
+        let old_kind = self.active_profile.kind;
+        if old_kind == kind {
+            return;
+        }
+        self.switch_history.push(ProfileSwitch {
+            cycle_id,
+            from: old_kind,
+            to: kind,
+            reason: reason.to_string(),
+        });
+        if self.switch_history.len() > self.max_history {
+            self.switch_history
+                .drain(0..self.switch_history.len() - self.max_history);
+        }
+        self.active_profile = MissionProfile::from_kind(kind);
+        self.weight_overrides.clear();
+    }
+
+    /// Apply a weight override (additive adjustment to a named dimension).
+    pub fn set_override(&mut self, dimension: &str, adjustment: f64) {
+        self.weight_overrides
+            .insert(dimension.to_string(), adjustment);
+    }
+
+    /// Remove a weight override.
+    pub fn clear_override(&mut self, dimension: &str) {
+        self.weight_overrides.remove(dimension);
+    }
+
+    /// Get the effective scorer config with overrides applied.
+    #[must_use]
+    pub fn effective_scorer_config(&self) -> ScorerConfig {
+        let mut config = self.active_profile.scorer_config.clone();
+        if let Some(&adj) = self.weight_overrides.get("impact") {
+            config.weights.impact = (config.weights.impact + adj).clamp(0.0, 1.0);
+        }
+        if let Some(&adj) = self.weight_overrides.get("urgency") {
+            config.weights.urgency = (config.weights.urgency + adj).clamp(0.0, 1.0);
+        }
+        if let Some(&adj) = self.weight_overrides.get("risk") {
+            config.weights.risk = (config.weights.risk + adj).clamp(0.0, 1.0);
+        }
+        if let Some(&adj) = self.weight_overrides.get("fit") {
+            config.weights.fit = (config.weights.fit + adj).clamp(0.0, 1.0);
+        }
+        if let Some(&adj) = self.weight_overrides.get("confidence") {
+            config.weights.confidence = (config.weights.confidence + adj).clamp(0.0, 1.0);
+        }
+        if let Some(&adj) = self.weight_overrides.get("effort") {
+            config.effort_weight = (config.effort_weight + adj).clamp(0.0, 1.0);
+        }
+        if let Some(&adj) = self.weight_overrides.get("min_confidence") {
+            config.min_confidence_threshold =
+                (config.min_confidence_threshold + adj).clamp(0.0, 1.0);
+        }
+        config
+    }
+
+    /// Get the effective governor config (currently no overrides supported).
+    #[must_use]
+    pub fn effective_governor_config(&self) -> GovernorConfig {
+        self.active_profile.governor_config.clone()
+    }
+
+    /// Get the effective extraction config (currently no overrides supported).
+    #[must_use]
+    pub fn effective_extraction_config(&self) -> PlannerExtractionConfig {
+        self.active_profile.extraction_config.clone()
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3327,5 +3616,302 @@ mod tests {
         let report = gov.evaluate(&candidates);
         let v = &report.verdicts[0];
         assert!(matches!(v.action, GovernorAction::BlockReassignment { .. }));
+    }
+
+    // ── Mission profile tests (ft-1i2ge.2.9) ────────────────────────────────
+
+    #[test]
+    fn profile_all_kinds_construct() {
+        let kinds = vec![
+            MissionProfileKind::Balanced,
+            MissionProfileKind::SafetyFirst,
+            MissionProfileKind::Throughput,
+            MissionProfileKind::UrgencyDriven,
+            MissionProfileKind::Conservative,
+        ];
+        for kind in kinds {
+            let profile = MissionProfile::from_kind(kind);
+            assert_eq!(profile.kind, kind);
+            assert!(!profile.name.is_empty());
+            assert!(!profile.description.is_empty());
+        }
+    }
+
+    #[test]
+    fn profile_balanced_is_default() {
+        let balanced = MissionProfile::balanced();
+        let default_scorer = ScorerConfig::default();
+        assert!((balanced.scorer_config.weights.impact - default_scorer.weights.impact).abs() < 1e-9);
+        assert!((balanced.scorer_config.weights.urgency - default_scorer.weights.urgency).abs() < 1e-9);
+    }
+
+    #[test]
+    fn profile_safety_first_prioritizes_risk() {
+        let safety = MissionProfile::safety_first();
+        let balanced = MissionProfile::balanced();
+        assert!(safety.scorer_config.weights.risk > balanced.scorer_config.weights.risk);
+        assert!(safety.scorer_config.weights.confidence > balanced.scorer_config.weights.confidence);
+        assert!(safety.scorer_config.safety_bonus > balanced.scorer_config.safety_bonus);
+        assert!(
+            safety.scorer_config.min_confidence_threshold
+                > balanced.scorer_config.min_confidence_threshold
+        );
+    }
+
+    #[test]
+    fn profile_throughput_prioritizes_impact() {
+        let throughput = MissionProfile::throughput();
+        let balanced = MissionProfile::balanced();
+        assert!(throughput.scorer_config.weights.impact > balanced.scorer_config.weights.impact);
+        assert!(
+            throughput.governor_config.reassignment_cooldown_cycles
+                < balanced.governor_config.reassignment_cooldown_cycles
+        );
+    }
+
+    #[test]
+    fn profile_urgency_driven_high_urgency_weight() {
+        let urgency = MissionProfile::urgency_driven();
+        assert!(urgency.scorer_config.weights.urgency >= 0.40);
+        assert!(
+            urgency.governor_config.starvation_threshold_cycles
+                <= GovernorConfig::default().starvation_threshold_cycles
+        );
+    }
+
+    #[test]
+    fn profile_conservative_high_confidence_bar() {
+        let conservative = MissionProfile::conservative();
+        assert!(conservative.scorer_config.min_confidence_threshold >= 0.3);
+        assert!(
+            conservative.governor_config.reassignment_cooldown_cycles
+                > GovernorConfig::default().reassignment_cooldown_cycles
+        );
+    }
+
+    #[test]
+    fn profile_all_weights_sum_to_one() {
+        let kinds = vec![
+            MissionProfileKind::Balanced,
+            MissionProfileKind::SafetyFirst,
+            MissionProfileKind::Throughput,
+            MissionProfileKind::UrgencyDriven,
+            MissionProfileKind::Conservative,
+        ];
+        for kind in kinds {
+            let profile = MissionProfile::from_kind(kind);
+            let total = profile.scorer_config.weights.total();
+            assert!(
+                (total - 1.0).abs() < 1e-9,
+                "{:?} weights sum to {} (expected 1.0)",
+                kind,
+                total
+            );
+        }
+    }
+
+    #[test]
+    fn profile_kind_serde_roundtrip() {
+        let kinds = vec![
+            MissionProfileKind::Balanced,
+            MissionProfileKind::SafetyFirst,
+            MissionProfileKind::Throughput,
+            MissionProfileKind::UrgencyDriven,
+            MissionProfileKind::Conservative,
+        ];
+        for kind in kinds {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: MissionProfileKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, kind);
+        }
+    }
+
+    #[test]
+    fn profile_full_serde_roundtrip() {
+        let profile = MissionProfile::safety_first();
+        let json = serde_json::to_string(&profile).unwrap();
+        let back: MissionProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, MissionProfileKind::SafetyFirst);
+        assert_eq!(back.name, "Safety First");
+        assert!(
+            (back.scorer_config.weights.risk - profile.scorer_config.weights.risk).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn tuner_new_default() {
+        let tuner = UtilityPolicyTuner::new(MissionProfile::balanced());
+        assert_eq!(tuner.active_profile.kind, MissionProfileKind::Balanced);
+        assert!(tuner.weight_overrides.is_empty());
+        assert!(tuner.switch_history.is_empty());
+    }
+
+    #[test]
+    fn tuner_switch_profile() {
+        let mut tuner = UtilityPolicyTuner::new(MissionProfile::balanced());
+        tuner.switch_profile(1, MissionProfileKind::SafetyFirst, "incident response");
+        assert_eq!(tuner.active_profile.kind, MissionProfileKind::SafetyFirst);
+        assert_eq!(tuner.switch_history.len(), 1);
+        assert_eq!(tuner.switch_history[0].from, MissionProfileKind::Balanced);
+        assert_eq!(tuner.switch_history[0].to, MissionProfileKind::SafetyFirst);
+        assert_eq!(tuner.switch_history[0].reason, "incident response");
+    }
+
+    #[test]
+    fn tuner_switch_same_profile_noop() {
+        let mut tuner = UtilityPolicyTuner::new(MissionProfile::balanced());
+        tuner.switch_profile(1, MissionProfileKind::Balanced, "no change");
+        assert!(tuner.switch_history.is_empty());
+    }
+
+    #[test]
+    fn tuner_switch_clears_overrides() {
+        let mut tuner = UtilityPolicyTuner::new(MissionProfile::balanced());
+        tuner.set_override("impact", 0.1);
+        assert_eq!(tuner.weight_overrides.len(), 1);
+        tuner.switch_profile(1, MissionProfileKind::Throughput, "test");
+        assert!(tuner.weight_overrides.is_empty());
+    }
+
+    #[test]
+    fn tuner_switch_history_bounded() {
+        let mut tuner = UtilityPolicyTuner::new(MissionProfile::balanced());
+        tuner.max_history = 3;
+        let profiles = vec![
+            MissionProfileKind::SafetyFirst,
+            MissionProfileKind::Throughput,
+            MissionProfileKind::UrgencyDriven,
+            MissionProfileKind::Conservative,
+            MissionProfileKind::Balanced,
+        ];
+        for (i, kind) in profiles.iter().enumerate() {
+            tuner.switch_profile(i as u64, *kind, "cycle");
+        }
+        assert!(tuner.switch_history.len() <= 3);
+    }
+
+    #[test]
+    fn tuner_override_impact() {
+        let mut tuner = UtilityPolicyTuner::new(MissionProfile::balanced());
+        let base_impact = tuner.effective_scorer_config().weights.impact;
+        tuner.set_override("impact", 0.1);
+        let effective = tuner.effective_scorer_config();
+        assert!((effective.weights.impact - (base_impact + 0.1)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tuner_override_clamp() {
+        let mut tuner = UtilityPolicyTuner::new(MissionProfile::balanced());
+        tuner.set_override("impact", 5.0); // would exceed 1.0
+        let effective = tuner.effective_scorer_config();
+        assert!(effective.weights.impact <= 1.0);
+
+        tuner.set_override("urgency", -5.0); // would go below 0.0
+        let effective = tuner.effective_scorer_config();
+        assert!(effective.weights.urgency >= 0.0);
+    }
+
+    #[test]
+    fn tuner_clear_override() {
+        let mut tuner = UtilityPolicyTuner::new(MissionProfile::balanced());
+        let base = tuner.effective_scorer_config().weights.impact;
+        tuner.set_override("impact", 0.1);
+        tuner.clear_override("impact");
+        let after = tuner.effective_scorer_config().weights.impact;
+        assert!((after - base).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tuner_override_effort() {
+        let mut tuner = UtilityPolicyTuner::new(MissionProfile::balanced());
+        let base = tuner.effective_scorer_config().effort_weight;
+        tuner.set_override("effort", 0.05);
+        let effective = tuner.effective_scorer_config();
+        assert!((effective.effort_weight - (base + 0.05)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tuner_override_min_confidence() {
+        let mut tuner = UtilityPolicyTuner::new(MissionProfile::balanced());
+        tuner.set_override("min_confidence", 0.2);
+        let effective = tuner.effective_scorer_config();
+        let base = MissionProfile::balanced()
+            .scorer_config
+            .min_confidence_threshold;
+        assert!((effective.min_confidence_threshold - (base + 0.2)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tuner_effective_governor() {
+        let tuner = UtilityPolicyTuner::new(MissionProfile::safety_first());
+        let gov = tuner.effective_governor_config();
+        assert_eq!(gov.reassignment_cooldown_cycles, 5);
+    }
+
+    #[test]
+    fn tuner_effective_extraction() {
+        let tuner = UtilityPolicyTuner::new(MissionProfile::urgency_driven());
+        let ext = tuner.effective_extraction_config();
+        assert!((ext.urgency_staleness_weight - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tuner_serde_roundtrip() {
+        let mut tuner = UtilityPolicyTuner::new(MissionProfile::balanced());
+        tuner.switch_profile(1, MissionProfileKind::Throughput, "test");
+        tuner.set_override("impact", 0.05);
+        let json = serde_json::to_string(&tuner).unwrap();
+        let back: UtilityPolicyTuner = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.active_profile.kind, MissionProfileKind::Throughput);
+        assert_eq!(back.switch_history.len(), 1);
+        assert!(back.weight_overrides.contains_key("impact"));
+    }
+
+    #[test]
+    fn profile_switch_serde_roundtrip() {
+        let switch = ProfileSwitch {
+            cycle_id: 42,
+            from: MissionProfileKind::Balanced,
+            to: MissionProfileKind::SafetyFirst,
+            reason: "incident".to_string(),
+        };
+        let json = serde_json::to_string(&switch).unwrap();
+        let back: ProfileSwitch = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cycle_id, 42);
+        assert_eq!(back.from, MissionProfileKind::Balanced);
+        assert_eq!(back.to, MissionProfileKind::SafetyFirst);
+    }
+
+    #[test]
+    fn tuner_multiple_overrides() {
+        let mut tuner = UtilityPolicyTuner::new(MissionProfile::balanced());
+        tuner.set_override("impact", 0.1);
+        tuner.set_override("risk", -0.05);
+        tuner.set_override("effort", 0.03);
+        let effective = tuner.effective_scorer_config();
+        let base = MissionProfile::balanced().scorer_config;
+        assert!((effective.weights.impact - (base.weights.impact + 0.1)).abs() < 1e-9);
+        assert!((effective.weights.risk - (base.weights.risk - 0.05)).abs() < 1e-9);
+        assert!((effective.effort_weight - (base.effort_weight + 0.03)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn profile_safety_higher_cooldown_than_throughput() {
+        let safety = MissionProfile::safety_first();
+        let throughput = MissionProfile::throughput();
+        assert!(
+            safety.governor_config.reassignment_cooldown_cycles
+                > throughput.governor_config.reassignment_cooldown_cycles
+        );
+    }
+
+    #[test]
+    fn profile_urgency_higher_starvation_boost_than_conservative() {
+        let urgency = MissionProfile::urgency_driven();
+        let conservative = MissionProfile::conservative();
+        assert!(
+            urgency.governor_config.starvation_max_boost
+                > conservative.governor_config.starvation_max_boost
+        );
     }
 }
