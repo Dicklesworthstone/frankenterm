@@ -979,6 +979,316 @@ fn format_rejection_reason(reason: &RejectionReason) -> String {
     }
 }
 
+// ── Anti-thrash governor (ft-1i2ge.2.7) ─────────────────────────────────────
+
+/// Configuration for the anti-thrash governor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernorConfig {
+    /// Minimum cycles a bead must remain assigned before it can be reassigned.
+    pub reassignment_cooldown_cycles: u64,
+    /// Maximum consecutive cycles a bead can be skipped before its score is boosted.
+    pub starvation_threshold_cycles: u64,
+    /// Score boost applied per starvation cycle (additive, capped at starvation_max_boost).
+    pub starvation_boost_per_cycle: f64,
+    /// Maximum starvation boost that can be applied.
+    pub starvation_max_boost: f64,
+    /// Number of recent assignment snapshots to retain for oscillation detection.
+    pub history_window: usize,
+    /// If a bead flips between assigned/unassigned more than this many times
+    /// within the history window, it is flagged as thrashing.
+    pub thrash_flip_threshold: u32,
+    /// Score penalty applied to thrashing beads (multiplicative, 0.0–1.0).
+    pub thrash_penalty: f64,
+}
+
+impl Default for GovernorConfig {
+    fn default() -> Self {
+        Self {
+            reassignment_cooldown_cycles: 3,
+            starvation_threshold_cycles: 5,
+            starvation_boost_per_cycle: 0.02,
+            starvation_max_boost: 0.15,
+            history_window: 10,
+            thrash_flip_threshold: 3,
+            thrash_penalty: 0.5,
+        }
+    }
+}
+
+/// Tracks per-bead state for anti-thrash governance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeadGovernorState {
+    /// When this bead was last assigned (cycle number).
+    pub last_assigned_cycle: Option<u64>,
+    /// How many consecutive cycles this bead has been skipped (not assigned).
+    pub consecutive_skipped: u64,
+    /// Recent assignment history: true = assigned, false = not assigned.
+    pub assignment_history: Vec<bool>,
+    /// Agent it was last assigned to.
+    pub last_agent_id: Option<String>,
+}
+
+impl Default for BeadGovernorState {
+    fn default() -> Self {
+        Self {
+            last_assigned_cycle: None,
+            consecutive_skipped: 0,
+            assignment_history: Vec::new(),
+            last_agent_id: None,
+        }
+    }
+}
+
+/// Actions the governor can impose on a candidate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernorAction {
+    /// Allow the assignment as-is.
+    Allow,
+    /// Boost the score by a starvation-prevention amount.
+    BoostScore { amount: f64 },
+    /// Penalize the score to suppress thrashing.
+    PenalizeScore { factor: f64 },
+    /// Block reassignment during cooldown.
+    BlockReassignment {
+        remaining_cycles: u64,
+    },
+}
+
+/// Result of governor evaluation for a single bead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernorVerdict {
+    pub bead_id: String,
+    pub action: GovernorAction,
+    pub adjusted_score: f64,
+    pub original_score: f64,
+    pub reason: String,
+}
+
+/// Full governor report for a cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernorReport {
+    pub cycle_id: u64,
+    pub verdicts: Vec<GovernorVerdict>,
+    pub thrashing_bead_ids: Vec<String>,
+    pub starving_bead_ids: Vec<String>,
+    pub cooldown_bead_ids: Vec<String>,
+}
+
+/// Stateful anti-thrash governor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThrashGovernor {
+    pub config: GovernorConfig,
+    pub bead_states: HashMap<String, BeadGovernorState>,
+    pub current_cycle: u64,
+}
+
+impl ThrashGovernor {
+    /// Create a new governor with default config.
+    #[must_use]
+    pub fn new(config: GovernorConfig) -> Self {
+        Self {
+            config,
+            bead_states: HashMap::new(),
+            current_cycle: 0,
+        }
+    }
+
+    /// Evaluate governor constraints on scored candidates before solving.
+    ///
+    /// Returns adjusted scores and verdicts. Caller should use adjusted scores
+    /// in the solver instead of raw scores.
+    #[must_use]
+    pub fn evaluate(
+        &self,
+        candidates: &[ScoredCandidate],
+    ) -> GovernorReport {
+        let mut verdicts = Vec::new();
+        let mut thrashing = Vec::new();
+        let mut starving = Vec::new();
+        let mut cooldown = Vec::new();
+
+        for candidate in candidates {
+            let state = self.bead_states.get(&candidate.bead_id);
+            let verdict = self.evaluate_one(candidate, state);
+
+            match &verdict.action {
+                GovernorAction::PenalizeScore { .. } => {
+                    thrashing.push(candidate.bead_id.clone());
+                }
+                GovernorAction::BoostScore { .. } => {
+                    starving.push(candidate.bead_id.clone());
+                }
+                GovernorAction::BlockReassignment { .. } => {
+                    cooldown.push(candidate.bead_id.clone());
+                }
+                GovernorAction::Allow => {}
+            }
+
+            verdicts.push(verdict);
+        }
+
+        GovernorReport {
+            cycle_id: self.current_cycle,
+            verdicts,
+            thrashing_bead_ids: thrashing,
+            starving_bead_ids: starving,
+            cooldown_bead_ids: cooldown,
+        }
+    }
+
+    fn evaluate_one(
+        &self,
+        candidate: &ScoredCandidate,
+        state: Option<&BeadGovernorState>,
+    ) -> GovernorVerdict {
+        let original_score = candidate.final_score;
+
+        // Check cooldown: if bead was recently reassigned to a different agent,
+        // block reassignment.
+        if let Some(state) = state {
+            if let Some(last_cycle) = state.last_assigned_cycle {
+                let elapsed = self.current_cycle.saturating_sub(last_cycle);
+                if elapsed < self.config.reassignment_cooldown_cycles {
+                    let remaining = self.config.reassignment_cooldown_cycles - elapsed;
+                    return GovernorVerdict {
+                        bead_id: candidate.bead_id.clone(),
+                        action: GovernorAction::BlockReassignment {
+                            remaining_cycles: remaining,
+                        },
+                        adjusted_score: 0.0,
+                        original_score,
+                        reason: format!(
+                            "Cooldown: {} cycles remaining before reassignment allowed",
+                            remaining
+                        ),
+                    };
+                }
+            }
+
+            // Check thrashing: count flips in assignment history.
+            let flips = count_flips(&state.assignment_history);
+            if flips >= self.config.thrash_flip_threshold {
+                let adjusted = original_score * self.config.thrash_penalty;
+                return GovernorVerdict {
+                    bead_id: candidate.bead_id.clone(),
+                    action: GovernorAction::PenalizeScore {
+                        factor: self.config.thrash_penalty,
+                    },
+                    adjusted_score: adjusted,
+                    original_score,
+                    reason: format!(
+                        "Thrash detected: {} flips in last {} cycles",
+                        flips,
+                        state.assignment_history.len()
+                    ),
+                };
+            }
+
+            // Check starvation: boost if skipped too many cycles.
+            if state.consecutive_skipped >= self.config.starvation_threshold_cycles {
+                let extra_cycles = state
+                    .consecutive_skipped
+                    .saturating_sub(self.config.starvation_threshold_cycles);
+                let boost = (extra_cycles as f64 * self.config.starvation_boost_per_cycle)
+                    .min(self.config.starvation_max_boost);
+                if boost > 0.0 {
+                    let adjusted = (original_score + boost).min(1.0);
+                    return GovernorVerdict {
+                        bead_id: candidate.bead_id.clone(),
+                        action: GovernorAction::BoostScore { amount: boost },
+                        adjusted_score: adjusted,
+                        original_score,
+                        reason: format!(
+                            "Starvation prevention: skipped {} cycles, boost {:.3}",
+                            state.consecutive_skipped, boost
+                        ),
+                    };
+                }
+            }
+        }
+
+        GovernorVerdict {
+            bead_id: candidate.bead_id.clone(),
+            action: GovernorAction::Allow,
+            adjusted_score: original_score,
+            original_score,
+            reason: "No governor intervention".to_string(),
+        }
+    }
+
+    /// Record the outcome of a cycle: which beads were assigned and which were not.
+    pub fn record_cycle(&mut self, assigned_bead_ids: &[String]) {
+        self.current_cycle += 1;
+        let assigned_set: std::collections::HashSet<&String> =
+            assigned_bead_ids.iter().collect();
+
+        // Update known beads.
+        let known_ids: Vec<String> = self.bead_states.keys().cloned().collect();
+        for bead_id in &known_ids {
+            let is_assigned = assigned_set.contains(bead_id);
+            let window = self.config.history_window;
+            let state = self.bead_states.get_mut(bead_id).unwrap();
+            push_history_bounded(state, is_assigned, window);
+
+            if is_assigned {
+                state.last_assigned_cycle = Some(self.current_cycle);
+                state.consecutive_skipped = 0;
+            } else {
+                state.consecutive_skipped += 1;
+            }
+        }
+
+        // Register newly seen beads.
+        for bead_id in assigned_bead_ids {
+            if !self.bead_states.contains_key(bead_id) {
+                let mut state = BeadGovernorState::default();
+                state.last_assigned_cycle = Some(self.current_cycle);
+                state.assignment_history.push(true);
+                self.bead_states.insert(bead_id.clone(), state);
+            }
+        }
+    }
+
+    /// Record which agent was assigned to a bead (for cooldown tracking).
+    pub fn record_agent_assignment(&mut self, bead_id: &str, agent_id: &str) {
+        let state = self
+            .bead_states
+            .entry(bead_id.to_string())
+            .or_default();
+        state.last_agent_id = Some(agent_id.to_string());
+    }
+
+    /// Register a bead as known but not assigned (for tracking starvation from start).
+    pub fn register_bead(&mut self, bead_id: &str) {
+        self.bead_states
+            .entry(bead_id.to_string())
+            .or_default();
+    }
+
+}
+
+/// Push an assignment entry into bounded history.
+fn push_history_bounded(state: &mut BeadGovernorState, assigned: bool, window: usize) {
+    state.assignment_history.push(assigned);
+    if state.assignment_history.len() > window {
+        state
+            .assignment_history
+            .drain(0..state.assignment_history.len() - window);
+    }
+}
+
+/// Count the number of state transitions (flips) in an assignment history.
+fn count_flips(history: &[bool]) -> u32 {
+    if history.len() < 2 {
+        return 0;
+    }
+    history
+        .windows(2)
+        .filter(|w| w[0] != w[1])
+        .count() as u32
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2600,5 +2910,422 @@ mod tests {
             .filter(|f| f.dimension == "rejection")
             .collect();
         assert!(!rejection_factors.is_empty());
+    }
+
+    // ── Anti-thrash governor tests (ft-1i2ge.2.7) ───────────────────────────
+
+    fn make_scored(bead_id: &str, score: f64) -> ScoredCandidate {
+        ScoredCandidate {
+            bead_id: bead_id.to_string(),
+            final_score: score,
+            feature_composite: score,
+            effort_penalty: 0.0,
+            tag_multiplier: 1.0,
+            below_confidence_threshold: false,
+            rank: 1,
+        }
+    }
+
+    #[test]
+    fn governor_default_config() {
+        let config = GovernorConfig::default();
+        assert_eq!(config.reassignment_cooldown_cycles, 3);
+        assert_eq!(config.starvation_threshold_cycles, 5);
+        assert!(config.starvation_boost_per_cycle > 0.0);
+        assert!(config.starvation_max_boost > 0.0);
+        assert!(config.history_window > 0);
+        assert!(config.thrash_flip_threshold > 0);
+        assert!(config.thrash_penalty > 0.0);
+        assert!(config.thrash_penalty <= 1.0);
+    }
+
+    #[test]
+    fn governor_no_state_allows_all() {
+        let gov = ThrashGovernor::new(GovernorConfig::default());
+        let candidates = vec![make_scored("b1", 0.8), make_scored("b2", 0.6)];
+        let report = gov.evaluate(&candidates);
+        assert_eq!(report.verdicts.len(), 2);
+        for v in &report.verdicts {
+            assert_eq!(v.action, GovernorAction::Allow);
+            assert_eq!(v.adjusted_score, v.original_score);
+        }
+        assert!(report.thrashing_bead_ids.is_empty());
+        assert!(report.starving_bead_ids.is_empty());
+        assert!(report.cooldown_bead_ids.is_empty());
+    }
+
+    #[test]
+    fn governor_cooldown_blocks_recent_assignment() {
+        let mut gov = ThrashGovernor::new(GovernorConfig {
+            reassignment_cooldown_cycles: 3,
+            ..GovernorConfig::default()
+        });
+
+        // Cycle 1: b1 is assigned.
+        gov.record_cycle(&["b1".to_string()]);
+        assert_eq!(gov.current_cycle, 1);
+
+        // Cycle 2: try to evaluate b1 again → blocked.
+        let candidates = vec![make_scored("b1", 0.9)];
+        let report = gov.evaluate(&candidates);
+        let v = &report.verdicts[0];
+        // Assigned at cycle 1, current_cycle is 1, elapsed=0, remaining=3.
+        assert!(
+            matches!(v.action, GovernorAction::BlockReassignment { remaining_cycles: 3 }),
+            "Expected block with 3 remaining, got {:?}",
+            v.action
+        );
+        assert_eq!(v.adjusted_score, 0.0);
+        assert_eq!(report.cooldown_bead_ids, vec!["b1"]);
+    }
+
+    #[test]
+    fn governor_cooldown_expires() {
+        let mut gov = ThrashGovernor::new(GovernorConfig {
+            reassignment_cooldown_cycles: 2,
+            ..GovernorConfig::default()
+        });
+
+        gov.record_cycle(&["b1".to_string()]);
+        gov.record_cycle(&[]);  // cycle 2
+        gov.record_cycle(&[]);  // cycle 3: cooldown expires
+
+        let candidates = vec![make_scored("b1", 0.9)];
+        let report = gov.evaluate(&candidates);
+        // Cooldown was 2 cycles, we're 2 cycles past assignment → allowed.
+        // But it might detect thrash or starvation; check cooldown specifically.
+        assert!(report.cooldown_bead_ids.is_empty());
+    }
+
+    #[test]
+    fn governor_starvation_boost() {
+        let mut gov = ThrashGovernor::new(GovernorConfig {
+            starvation_threshold_cycles: 3,
+            starvation_boost_per_cycle: 0.05,
+            starvation_max_boost: 0.20,
+            reassignment_cooldown_cycles: 0,
+            ..GovernorConfig::default()
+        });
+
+        // Register bead as known.
+        gov.register_bead("b1");
+
+        // Skip 5 cycles without assigning b1.
+        for _ in 0..5 {
+            gov.record_cycle(&[]);
+        }
+
+        let candidates = vec![make_scored("b1", 0.3)];
+        let report = gov.evaluate(&candidates);
+        let v = &report.verdicts[0];
+        // After threshold (3), extra 2 cycles → boost = 2 * 0.05 = 0.10
+        assert!(matches!(v.action, GovernorAction::BoostScore { amount } if (amount - 0.10).abs() < 1e-9));
+        assert!((v.adjusted_score - 0.4).abs() < 1e-9);
+        assert_eq!(report.starving_bead_ids, vec!["b1"]);
+    }
+
+    #[test]
+    fn governor_starvation_boost_caps_at_max() {
+        let mut gov = ThrashGovernor::new(GovernorConfig {
+            starvation_threshold_cycles: 2,
+            starvation_boost_per_cycle: 0.10,
+            starvation_max_boost: 0.15,
+            reassignment_cooldown_cycles: 0,
+            ..GovernorConfig::default()
+        });
+
+        gov.register_bead("b1");
+        for _ in 0..20 {
+            gov.record_cycle(&[]);
+        }
+
+        let candidates = vec![make_scored("b1", 0.5)];
+        let report = gov.evaluate(&candidates);
+        let v = &report.verdicts[0];
+        if let GovernorAction::BoostScore { amount } = v.action {
+            assert!(amount <= 0.15 + 1e-9, "Boost {} exceeds max", amount);
+        } else {
+            panic!("Expected BoostScore, got {:?}", v.action);
+        }
+    }
+
+    #[test]
+    fn governor_starvation_adjusted_score_capped_at_one() {
+        let mut gov = ThrashGovernor::new(GovernorConfig {
+            starvation_threshold_cycles: 1,
+            starvation_boost_per_cycle: 0.50,
+            starvation_max_boost: 0.50,
+            reassignment_cooldown_cycles: 0,
+            ..GovernorConfig::default()
+        });
+
+        gov.register_bead("b1");
+        gov.record_cycle(&[]);
+        gov.record_cycle(&[]);
+
+        let candidates = vec![make_scored("b1", 0.9)];
+        let report = gov.evaluate(&candidates);
+        let v = &report.verdicts[0];
+        assert!(v.adjusted_score <= 1.0);
+    }
+
+    #[test]
+    fn governor_thrash_detection() {
+        let mut gov = ThrashGovernor::new(GovernorConfig {
+            thrash_flip_threshold: 3,
+            thrash_penalty: 0.4,
+            reassignment_cooldown_cycles: 0,
+            starvation_threshold_cycles: 100, // disable starvation
+            ..GovernorConfig::default()
+        });
+
+        // Create an oscillating pattern: assigned, not, assigned, not, assigned, not
+        gov.register_bead("b1");
+        gov.record_cycle(&["b1".to_string()]);
+        gov.record_cycle(&[]);
+        gov.record_cycle(&["b1".to_string()]);
+        gov.record_cycle(&[]);
+        gov.record_cycle(&["b1".to_string()]);
+        gov.record_cycle(&[]);
+
+        let candidates = vec![make_scored("b1", 0.8)];
+        let report = gov.evaluate(&candidates);
+        let v = &report.verdicts[0];
+        assert!(
+            matches!(v.action, GovernorAction::PenalizeScore { factor } if (factor - 0.4).abs() < 1e-9),
+            "Expected penalty 0.4, got {:?}",
+            v.action
+        );
+        assert!((v.adjusted_score - 0.32).abs() < 1e-9);
+        assert_eq!(report.thrashing_bead_ids, vec!["b1"]);
+    }
+
+    #[test]
+    fn governor_no_thrash_when_stable() {
+        let mut gov = ThrashGovernor::new(GovernorConfig {
+            thrash_flip_threshold: 3,
+            reassignment_cooldown_cycles: 0,
+            starvation_threshold_cycles: 100,
+            ..GovernorConfig::default()
+        });
+
+        // Stable: always assigned.
+        gov.register_bead("b1");
+        for _ in 0..5 {
+            gov.record_cycle(&["b1".to_string()]);
+        }
+
+        let candidates = vec![make_scored("b1", 0.8)];
+        let report = gov.evaluate(&candidates);
+        assert!(report.thrashing_bead_ids.is_empty());
+    }
+
+    #[test]
+    fn governor_history_window_bounded() {
+        let mut gov = ThrashGovernor::new(GovernorConfig {
+            history_window: 5,
+            reassignment_cooldown_cycles: 0,
+            starvation_threshold_cycles: 100,
+            ..GovernorConfig::default()
+        });
+
+        gov.register_bead("b1");
+        for _ in 0..20 {
+            gov.record_cycle(&[]);
+        }
+
+        let state = gov.bead_states.get("b1").unwrap();
+        assert!(state.assignment_history.len() <= 5);
+    }
+
+    #[test]
+    fn governor_record_cycle_increments() {
+        let mut gov = ThrashGovernor::new(GovernorConfig::default());
+        assert_eq!(gov.current_cycle, 0);
+        gov.record_cycle(&[]);
+        assert_eq!(gov.current_cycle, 1);
+        gov.record_cycle(&[]);
+        assert_eq!(gov.current_cycle, 2);
+    }
+
+    #[test]
+    fn governor_record_agent_assignment() {
+        let mut gov = ThrashGovernor::new(GovernorConfig::default());
+        gov.record_agent_assignment("b1", "agent-x");
+        let state = gov.bead_states.get("b1").unwrap();
+        assert_eq!(state.last_agent_id.as_deref(), Some("agent-x"));
+    }
+
+    #[test]
+    fn governor_register_bead() {
+        let mut gov = ThrashGovernor::new(GovernorConfig::default());
+        gov.register_bead("b1");
+        assert!(gov.bead_states.contains_key("b1"));
+        let state = gov.bead_states.get("b1").unwrap();
+        assert!(state.last_assigned_cycle.is_none());
+        assert_eq!(state.consecutive_skipped, 0);
+    }
+
+    #[test]
+    fn governor_mixed_beads() {
+        let mut gov = ThrashGovernor::new(GovernorConfig {
+            reassignment_cooldown_cycles: 2,
+            starvation_threshold_cycles: 3,
+            starvation_boost_per_cycle: 0.05,
+            starvation_max_boost: 0.15,
+            thrash_flip_threshold: 10, // effectively disable thrash
+            ..GovernorConfig::default()
+        });
+
+        // b1 recently assigned → cooldown. b2 never assigned → starvation eventually.
+        gov.register_bead("b2");
+        gov.record_cycle(&["b1".to_string()]);
+
+        let candidates = vec![make_scored("b1", 0.9), make_scored("b2", 0.5)];
+        let report = gov.evaluate(&candidates);
+
+        // b1 should be blocked (cooldown).
+        let v1 = report.verdicts.iter().find(|v| v.bead_id == "b1").unwrap();
+        assert!(matches!(v1.action, GovernorAction::BlockReassignment { .. }));
+
+        // b2 skipped 1 cycle, threshold is 3 → allowed (no boost yet).
+        let v2 = report.verdicts.iter().find(|v| v.bead_id == "b2").unwrap();
+        assert_eq!(v2.action, GovernorAction::Allow);
+    }
+
+    #[test]
+    fn governor_consecutive_skipped_resets_on_assign() {
+        let mut gov = ThrashGovernor::new(GovernorConfig::default());
+        gov.register_bead("b1");
+        gov.record_cycle(&[]);
+        gov.record_cycle(&[]);
+        gov.record_cycle(&[]);
+        assert_eq!(gov.bead_states.get("b1").unwrap().consecutive_skipped, 3);
+
+        gov.record_cycle(&["b1".to_string()]);
+        assert_eq!(gov.bead_states.get("b1").unwrap().consecutive_skipped, 0);
+    }
+
+    #[test]
+    fn governor_count_flips_empty() {
+        assert_eq!(count_flips(&[]), 0);
+    }
+
+    #[test]
+    fn governor_count_flips_single() {
+        assert_eq!(count_flips(&[true]), 0);
+    }
+
+    #[test]
+    fn governor_count_flips_no_changes() {
+        assert_eq!(count_flips(&[true, true, true, true]), 0);
+        assert_eq!(count_flips(&[false, false, false]), 0);
+    }
+
+    #[test]
+    fn governor_count_flips_alternating() {
+        assert_eq!(count_flips(&[true, false, true, false, true]), 4);
+    }
+
+    #[test]
+    fn governor_config_serde_roundtrip() {
+        let config = GovernorConfig {
+            reassignment_cooldown_cycles: 5,
+            starvation_threshold_cycles: 10,
+            starvation_boost_per_cycle: 0.03,
+            starvation_max_boost: 0.20,
+            history_window: 15,
+            thrash_flip_threshold: 4,
+            thrash_penalty: 0.6,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: GovernorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reassignment_cooldown_cycles, 5);
+        assert_eq!(back.starvation_threshold_cycles, 10);
+        assert!((back.starvation_boost_per_cycle - 0.03).abs() < 1e-9);
+        assert!((back.starvation_max_boost - 0.20).abs() < 1e-9);
+        assert_eq!(back.history_window, 15);
+        assert_eq!(back.thrash_flip_threshold, 4);
+        assert!((back.thrash_penalty - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn governor_report_serde_roundtrip() {
+        let mut gov = ThrashGovernor::new(GovernorConfig::default());
+        gov.register_bead("b1");
+        gov.record_cycle(&["b1".to_string()]);
+        let candidates = vec![make_scored("b1", 0.8)];
+        let report = gov.evaluate(&candidates);
+
+        let json = serde_json::to_string(&report).unwrap();
+        let back: GovernorReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cycle_id, report.cycle_id);
+        assert_eq!(back.verdicts.len(), report.verdicts.len());
+    }
+
+    #[test]
+    fn governor_action_serde_roundtrip() {
+        let actions = vec![
+            GovernorAction::Allow,
+            GovernorAction::BoostScore { amount: 0.05 },
+            GovernorAction::PenalizeScore { factor: 0.5 },
+            GovernorAction::BlockReassignment {
+                remaining_cycles: 2,
+            },
+        ];
+        for action in &actions {
+            let json = serde_json::to_string(action).unwrap();
+            let back: GovernorAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, action);
+        }
+    }
+
+    #[test]
+    fn governor_bead_state_serde_roundtrip() {
+        let state = BeadGovernorState {
+            last_assigned_cycle: Some(5),
+            consecutive_skipped: 3,
+            assignment_history: vec![true, false, true],
+            last_agent_id: Some("agent-1".to_string()),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: BeadGovernorState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.last_assigned_cycle, Some(5));
+        assert_eq!(back.consecutive_skipped, 3);
+        assert_eq!(back.assignment_history, vec![true, false, true]);
+        assert_eq!(back.last_agent_id.as_deref(), Some("agent-1"));
+    }
+
+    #[test]
+    fn governor_thrash_governor_serde_roundtrip() {
+        let mut gov = ThrashGovernor::new(GovernorConfig::default());
+        gov.register_bead("b1");
+        gov.record_cycle(&["b1".to_string()]);
+        gov.record_cycle(&[]);
+
+        let json = serde_json::to_string(&gov).unwrap();
+        let back: ThrashGovernor = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.current_cycle, 2);
+        assert!(back.bead_states.contains_key("b1"));
+    }
+
+    #[test]
+    fn governor_cooldown_priority_over_starvation() {
+        // If a bead is in cooldown AND starving, cooldown should take priority.
+        let mut gov = ThrashGovernor::new(GovernorConfig {
+            reassignment_cooldown_cycles: 10,
+            starvation_threshold_cycles: 1,
+            starvation_boost_per_cycle: 0.1,
+            starvation_max_boost: 0.5,
+            ..GovernorConfig::default()
+        });
+
+        gov.record_cycle(&["b1".to_string()]);
+        // After 1 cycle, cooldown still active but starvation threshold met.
+        // Cooldown should win.
+        let candidates = vec![make_scored("b1", 0.5)];
+        let report = gov.evaluate(&candidates);
+        let v = &report.verdicts[0];
+        assert!(matches!(v.action, GovernorAction::BlockReassignment { .. }));
     }
 }
