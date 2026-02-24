@@ -198,6 +198,8 @@ pub mod pane_typestate;
 pub mod patterns;
 pub mod persistent_ds;
 pub mod plan;
+#[cfg(feature = "subprocess-bridge")]
+pub mod planner_features;
 pub mod policy;
 pub mod pool;
 pub mod priority;
