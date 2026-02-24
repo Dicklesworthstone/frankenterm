@@ -3785,4 +3785,154 @@ proptest! {
         let rate = det.alarm_rate();
         prop_assert!(rate >= 0.0 && rate <= 1.0, "Alarm rate {} out of [0,1]", rate);
     }
+
+    // ── D3: Expected-Loss Policy Controller Property Tests ────────
+
+    /// Action distribution always sums to ~1 (when decisions > 0).
+    #[test]
+    fn policy_distribution_sums_to_one(
+        n in 1_usize..20,
+    ) {
+        let mut ctrl = PolicyController::with_defaults();
+        for i in 0..n {
+            let mix = (i as f64) / (n as f64);
+            ctrl.decide([1.0 - mix, mix * 0.5, mix * 0.3, mix * 0.2], i as u64 * 100);
+        }
+        let dist = ctrl.action_distribution();
+        let sum: f64 = dist.iter().sum();
+        prop_assert!((sum - 1.0).abs() < 1e-9, "Distribution sums to {}, expected 1.0", sum);
+    }
+
+    /// Action counts always sum to total_decisions.
+    #[test]
+    fn policy_action_counts_sum(
+        n in 1_usize..30,
+    ) {
+        let mut ctrl = PolicyController::with_defaults();
+        for i in 0..n {
+            let mix = (i as f64) / (n as f64);
+            ctrl.decide([1.0 - mix, mix, 0.0, 0.0], i as u64 * 100);
+        }
+        let counts = ctrl.action_counts();
+        let sum: u64 = counts.iter().sum();
+        prop_assert_eq!(sum, ctrl.total_decisions());
+    }
+
+    /// Healthy dominance => Hold selected (with default loss matrix).
+    #[test]
+    fn policy_healthy_selects_hold(
+        p_healthy in 0.85_f64..1.0,
+    ) {
+        let mut ctrl = PolicyController::with_defaults();
+        let remainder = 1.0 - p_healthy;
+        let action = ctrl.decide([p_healthy, remainder * 0.5, remainder * 0.3, remainder * 0.2], 100);
+        prop_assert_eq!(action, PolicyAction::Hold);
+    }
+
+    /// Critical dominance => Shed selected.
+    #[test]
+    fn policy_critical_selects_shed(
+        p_critical in 0.7_f64..1.0,
+    ) {
+        let mut ctrl = PolicyController::with_defaults();
+        let remainder = 1.0 - p_critical;
+        let action = ctrl.decide([remainder * 0.1, remainder * 0.3, remainder * 0.6, p_critical], 100);
+        prop_assert_eq!(action, PolicyAction::Shed);
+    }
+
+    /// Critical floor ensures minimum critical probability.
+    #[test]
+    fn policy_critical_floor_enforced(
+        p0 in 0.0_f64..1.0,
+        p1 in 0.0_f64..1.0,
+        p2 in 0.0_f64..1.0,
+    ) {
+        let mut ctrl = PolicyController::with_defaults();
+        let total = p0 + p1 + p2 + 0.001; // tiny critical
+        let probs = [p0 / total, p1 / total, p2 / total, 0.001 / total];
+        ctrl.decide(probs, 100);
+        let recent = ctrl.recent_decisions(1);
+        prop_assert!(!recent.is_empty());
+        let actual_crit = recent[0].state_probs[3];
+        // Default critical_floor is 0.01
+        prop_assert!(actual_crit >= 0.01 - 1e-9,
+            "Critical prob {} < floor 0.01", actual_crit);
+    }
+
+    /// Reset restores initial state.
+    #[test]
+    fn policy_reset_restores(
+        n in 1_usize..20,
+    ) {
+        let mut ctrl = PolicyController::with_defaults();
+        for i in 0..n {
+            ctrl.decide([0.25, 0.25, 0.25, 0.25], i as u64 * 100);
+        }
+        ctrl.reset();
+        prop_assert_eq!(ctrl.total_decisions(), 0);
+        prop_assert_eq!(ctrl.current_action(), PolicyAction::Hold);
+        prop_assert_eq!(ctrl.hysteresis_count(), 0);
+        prop_assert_eq!(ctrl.decision_count(), 0);
+    }
+
+    /// PolicyAction serde roundtrip.
+    #[test]
+    fn policy_action_serde(
+        variant in 0_u8..4,
+    ) {
+        let action = match variant {
+            0 => PolicyAction::Hold,
+            1 => PolicyAction::Tighten,
+            2 => PolicyAction::Relax,
+            _ => PolicyAction::Shed,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let back: PolicyAction = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(action, back);
+    }
+
+    /// SystemState serde roundtrip.
+    #[test]
+    fn policy_state_serde(
+        variant in 0_u8..4,
+    ) {
+        let state = match variant {
+            0 => SystemState::Healthy,
+            1 => SystemState::Drifting,
+            2 => SystemState::Stressed,
+            _ => SystemState::Critical,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: SystemState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(state, back);
+    }
+
+    /// PolicyDegradation serde roundtrip.
+    #[test]
+    fn policy_degradation_serde(
+        variant in 0_u8..3,
+        decisions in 0_u64..100,
+    ) {
+        let degradation = match variant {
+            0 => PolicyDegradation::Healthy,
+            1 => PolicyDegradation::Tightening { expected_loss: 1.5 },
+            _ => PolicyDegradation::EmergencyShed { total_decisions: decisions, last_loss: 2.0 },
+        };
+        let json = serde_json::to_string(&degradation).unwrap();
+        let back: PolicyDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(degradation, back);
+    }
+
+    /// Expected loss is always nonneg (with nonneg loss matrix).
+    #[test]
+    fn policy_expected_loss_nonneg(
+        n in 1_usize..20,
+    ) {
+        let mut ctrl = PolicyController::with_defaults();
+        for i in 0..n {
+            let mix = (i as f64) / (n as f64);
+            ctrl.decide([1.0 - mix, mix * 0.5, mix * 0.3, mix * 0.2], i as u64 * 100);
+        }
+        prop_assert!(ctrl.last_expected_loss() >= 0.0);
+    }
 }
