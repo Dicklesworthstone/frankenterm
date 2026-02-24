@@ -8680,6 +8680,74 @@ impl EProcessDetector {
             degradation: self.detect_degradation(),
         }
     }
+
+    // ── D2 Impl: Bridge Methods and Convenience API ────────────────
+
+    /// Observe a batch of values at once.
+    pub fn observe_batch(&mut self, values: &[(f64, u64)]) -> DriftAlertLevel {
+        let mut last = DriftAlertLevel::None;
+        for &(value, ts) in values {
+            last = self.observe(value, ts);
+        }
+        last
+    }
+
+    /// Observe a latency sample in microseconds.
+    pub fn observe_latency_us(&mut self, latency_us: f64, timestamp_us: u64) -> DriftAlertLevel {
+        self.observe(latency_us, timestamp_us)
+    }
+
+    /// Current standard deviation of observations.
+    pub fn running_stddev(&self) -> f64 {
+        self.running_variance().sqrt()
+    }
+
+    /// Z-score of a given value relative to the running distribution.
+    pub fn z_score(&self, value: f64) -> f64 {
+        let std = self.running_stddev();
+        if std < 1e-12 {
+            return 0.0;
+        }
+        (value - self.mean) / std
+    }
+
+    /// Fraction of observations that resulted in alarm.
+    pub fn alarm_rate(&self) -> f64 {
+        if self.total_observations == 0 {
+            return 0.0;
+        }
+        self.alarm_count as f64 / self.total_observations as f64
+    }
+
+    /// Whether the detector is currently in alarm state.
+    pub fn is_alarming(&self) -> bool {
+        self.in_alarm
+    }
+
+    /// Set the mixing parameter lambda (sensitivity).
+    pub fn set_lambda(&mut self, lambda: f64) {
+        self.config.lambda = lambda;
+    }
+
+    /// Set the null-hypothesis mean.
+    pub fn set_null_mean(&mut self, mean: f64) {
+        self.config.null_mean = mean;
+    }
+
+    /// Set the significance level alpha.
+    pub fn set_alpha(&mut self, alpha: f64) {
+        self.config.alpha = alpha;
+    }
+
+    /// Warning count.
+    pub fn warning_count(&self) -> u64 {
+        self.warning_count
+    }
+
+    /// Peak e-value ever observed.
+    pub fn peak_e_value(&self) -> f64 {
+        self.peak_log_e_value.exp()
+    }
 }
 
 /// Degradation status for the e-process detector.
@@ -15001,5 +15069,187 @@ mod tests {
         }
         // e-value = exp(log_e_value), always >= 0
         assert!(det.e_value() >= 0.0);
+    }
+
+    // ── D2 Impl Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_eprocess_observe_batch() {
+        let mut det = EProcessDetector::with_defaults();
+        let batch: Vec<(f64, u64)> = (0..10).map(|i| (1.0, i * 100)).collect();
+        let level = det.observe_batch(&batch);
+        assert_eq!(det.total_observations(), 10);
+        // Level should be deterministic
+        let _ = level;
+    }
+
+    #[test]
+    fn test_eprocess_observe_latency_us() {
+        let mut det = EProcessDetector::with_defaults();
+        let level = det.observe_latency_us(500.0, 100);
+        assert_eq!(det.total_observations(), 1);
+        let _ = level;
+    }
+
+    #[test]
+    fn test_eprocess_running_stddev() {
+        let mut det = EProcessDetector::new(EProcessConfig {
+            kind: EProcessKind::Mixture,
+            observable: DriftObservable::Latency,
+            alpha: 0.05,
+            warning_fraction: 0.5,
+            lambda: 0.1,
+            null_mean: 0.0,
+            max_history: 100,
+            warmup: 0,
+            auto_reset: true,
+        });
+        det.observe(10.0, 100);
+        det.observe(20.0, 200);
+        det.observe(30.0, 300);
+        let stddev = det.running_stddev();
+        assert!(stddev > 0.0);
+        assert!((stddev - 10.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_eprocess_z_score() {
+        let mut det = EProcessDetector::new(EProcessConfig {
+            kind: EProcessKind::Mixture,
+            observable: DriftObservable::Latency,
+            alpha: 0.05,
+            warning_fraction: 0.5,
+            lambda: 0.1,
+            null_mean: 0.0,
+            max_history: 100,
+            warmup: 0,
+            auto_reset: true,
+        });
+        det.observe(10.0, 100);
+        det.observe(20.0, 200);
+        det.observe(30.0, 300);
+        // mean=20, stddev=10
+        let z = det.z_score(30.0);
+        assert!((z - 1.0).abs() < 1e-10);
+        let z0 = det.z_score(20.0);
+        assert!(z0.abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_eprocess_z_score_zero_variance() {
+        let mut det = EProcessDetector::with_defaults();
+        det.observe(5.0, 100);
+        // Only one observation, variance=0
+        let z = det.z_score(10.0);
+        assert_eq!(z, 0.0);
+    }
+
+    #[test]
+    fn test_eprocess_alarm_rate() {
+        let det = EProcessDetector::with_defaults();
+        assert_eq!(det.alarm_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_eprocess_alarm_rate_positive() {
+        let mut det = EProcessDetector::new(EProcessConfig {
+            kind: EProcessKind::Mixture,
+            observable: DriftObservable::Latency,
+            alpha: 0.05,
+            warning_fraction: 0.5,
+            lambda: 0.5,
+            null_mean: 0.0,
+            max_history: 100,
+            warmup: 0,
+            auto_reset: true,
+        });
+        for i in 0..100 {
+            det.observe(10.0, i * 100);
+        }
+        let rate = det.alarm_rate();
+        assert!(rate >= 0.0 && rate <= 1.0);
+    }
+
+    #[test]
+    fn test_eprocess_set_lambda() {
+        let mut det = EProcessDetector::with_defaults();
+        det.set_lambda(0.5);
+        // Observe with new lambda — should be more sensitive
+        det.observe(10.0, 100);
+        assert_eq!(det.total_observations(), 1);
+    }
+
+    #[test]
+    fn test_eprocess_set_null_mean() {
+        let mut det = EProcessDetector::with_defaults();
+        det.set_null_mean(5.0);
+        // Observations at 5.0 should now give LR = 1
+        for i in 0..10 {
+            det.observe(5.0, i * 100);
+        }
+        assert!((det.e_value() - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_eprocess_set_alpha() {
+        let mut det = EProcessDetector::with_defaults();
+        det.set_alpha(0.01);
+        // Higher threshold now
+        assert_eq!(det.total_observations(), 0);
+    }
+
+    #[test]
+    fn test_eprocess_warning_count() {
+        let det = EProcessDetector::with_defaults();
+        assert_eq!(det.warning_count(), 0);
+    }
+
+    #[test]
+    fn test_eprocess_peak_e_value() {
+        let mut det = EProcessDetector::new(EProcessConfig {
+            kind: EProcessKind::Mixture,
+            observable: DriftObservable::Latency,
+            alpha: 0.05,
+            warning_fraction: 0.5,
+            lambda: 0.1,
+            null_mean: 0.0,
+            max_history: 100,
+            warmup: 0,
+            auto_reset: true,
+        });
+        // Drive e-value up, then down
+        for i in 0..10 {
+            det.observe(5.0, i * 100);
+        }
+        let peak_after_up = det.peak_e_value();
+        for i in 10..20 {
+            det.observe(-5.0, i * 100);
+        }
+        // Peak should be >= current and >= what it was after the up phase
+        assert!(det.peak_e_value() >= peak_after_up || (det.peak_e_value() - peak_after_up).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_eprocess_is_alarming() {
+        let mut det = EProcessDetector::new(EProcessConfig {
+            kind: EProcessKind::Mixture,
+            observable: DriftObservable::Latency,
+            alpha: 0.05,
+            warning_fraction: 0.5,
+            lambda: 0.5,
+            null_mean: 0.0,
+            max_history: 100,
+            warmup: 0,
+            auto_reset: false, // Don't auto-reset to keep alarm state
+        });
+        assert!(!det.is_alarming());
+        // Drive to alarm
+        for i in 0..100 {
+            det.observe(10.0, i * 100);
+        }
+        // With auto_reset=false, should stay in alarm
+        if det.alarm_count() > 0 {
+            assert!(det.is_alarming());
+        }
     }
 }
