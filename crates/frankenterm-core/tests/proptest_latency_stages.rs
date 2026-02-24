@@ -6065,4 +6065,235 @@ proptest! {
         });
         prop_assert_eq!(matrix.missing_required().len(), (req_count - 1) as usize);
     }
+
+    // ── F5: QoE Guardrail Property Tests ──
+
+    /// QoEMetric serde roundtrip.
+    #[test]
+    fn qoe_metric_serde(idx in 0u32..4) {
+        let metric = match idx % 4 {
+            0 => QoEMetric::InputToPaint,
+            1 => QoEMetric::FrameJitter,
+            2 => QoEMetric::Smoothness,
+            _ => QoEMetric::KeystrokeEcho,
+        };
+        let json = serde_json::to_string(&metric).unwrap();
+        let back: QoEMetric = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(metric, back);
+    }
+
+    /// QoESLO serde roundtrip.
+    #[test]
+    fn qoe_slo_serde(target in 0.0f64..100_000.0, percentile in 0.0f64..1.0) {
+        let slo = QoESLO {
+            metric: QoEMetric::InputToPaint,
+            target,
+            percentile,
+            description: "test".to_string(),
+        };
+        let json = serde_json::to_string(&slo).unwrap();
+        let back: QoESLO = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.metric, slo.metric);
+        prop_assert_eq!(back.description, slo.description);
+        prop_assert!((back.target - slo.target).abs() < 1e-10);
+        prop_assert!((back.percentile - slo.percentile).abs() < 1e-10);
+    }
+
+    /// Recording increments total_measurements.
+    #[test]
+    fn qoe_record_increments(count in 1u32..50) {
+        let mut guard = QoEGuardrail::new(QoEGuardrailConfig::default());
+        for i in 0..count {
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: 10_000.0,
+                timestamp_us: i as u64,
+            });
+        }
+        prop_assert_eq!(guard.total_measurements(), count as u64);
+    }
+
+    /// Window eviction respects window_size.
+    #[test]
+    fn qoe_window_eviction(window_size in 5usize..50, count in 1u32..100) {
+        let cfg = QoEGuardrailConfig {
+            window_size,
+            min_samples: 1,
+            ..Default::default()
+        };
+        let mut guard = QoEGuardrail::new(cfg);
+        for i in 0..count {
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: i as f64,
+                timestamp_us: i as u64,
+            });
+        }
+        let len = guard.window_len(QoEMetric::InputToPaint);
+        prop_assert!(len <= window_size, "len={}, window_size={}", len, window_size);
+    }
+
+    /// SLO met when values are under target (latency metric).
+    #[test]
+    fn qoe_slo_met_when_under_target(target in 10_000.0f64..100_000.0) {
+        let cfg = QoEGuardrailConfig {
+            slos: vec![QoESLO {
+                metric: QoEMetric::InputToPaint,
+                target,
+                percentile: 0.95,
+                description: "x".to_string(),
+            }],
+            window_size: 100,
+            min_samples: 5,
+        };
+        let mut guard = QoEGuardrail::new(cfg);
+        for i in 0..20 {
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: target * 0.5, // Well under.
+                timestamp_us: i,
+            });
+        }
+        let verdict = guard.evaluate_slo(&guard.config().slos[0].clone());
+        let is_met = matches!(verdict, SLOVerdict::Met { .. });
+        prop_assert!(is_met);
+    }
+
+    /// SLO breached when values exceed target (latency metric).
+    #[test]
+    fn qoe_slo_breached_when_over_target(target in 1_000.0f64..50_000.0) {
+        let cfg = QoEGuardrailConfig {
+            slos: vec![QoESLO {
+                metric: QoEMetric::InputToPaint,
+                target,
+                percentile: 0.95,
+                description: "x".to_string(),
+            }],
+            window_size: 100,
+            min_samples: 5,
+        };
+        let mut guard = QoEGuardrail::new(cfg);
+        for i in 0..20 {
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: target * 2.0, // Well over.
+                timestamp_us: i,
+            });
+        }
+        let verdict = guard.evaluate_slo(&guard.config().slos[0].clone());
+        let is_breached = matches!(verdict, SLOVerdict::Breached { .. });
+        prop_assert!(is_breached);
+    }
+
+    /// Smoothness: higher is better.
+    #[test]
+    fn qoe_smoothness_polarity(target in 0.1f64..0.99) {
+        let cfg = QoEGuardrailConfig {
+            slos: vec![QoESLO {
+                metric: QoEMetric::Smoothness,
+                target,
+                percentile: 0.50,
+                description: "x".to_string(),
+            }],
+            window_size: 100,
+            min_samples: 5,
+        };
+        let mut guard = QoEGuardrail::new(cfg);
+        for i in 0..20 {
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::Smoothness,
+                value: 1.0, // Perfect smoothness.
+                timestamp_us: i,
+            });
+        }
+        let verdict = guard.evaluate_slo(&guard.config().slos[0].clone());
+        let is_met = matches!(verdict, SLOVerdict::Met { .. });
+        prop_assert!(is_met);
+    }
+
+    /// compliance_rate in [0.0, 1.0].
+    #[test]
+    fn qoe_compliance_rate_bounded(count in 0u32..30) {
+        let cfg = QoEGuardrailConfig {
+            slos: vec![QoESLO {
+                metric: QoEMetric::InputToPaint,
+                target: 20_000.0,
+                percentile: 0.95,
+                description: "x".to_string(),
+            }],
+            window_size: 100,
+            min_samples: 5,
+        };
+        let mut guard = QoEGuardrail::new(cfg);
+        for i in 0..count {
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: 10_000.0,
+                timestamp_us: i as u64,
+            });
+        }
+        let rate = guard.compliance_rate();
+        prop_assert!(rate >= 0.0 && rate <= 1.0, "rate={}", rate);
+    }
+
+    /// reset clears everything.
+    #[test]
+    fn qoe_reset_clears(count in 1u32..30) {
+        let mut guard = QoEGuardrail::new(QoEGuardrailConfig::default());
+        for i in 0..count {
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: 10_000.0,
+                timestamp_us: i as u64,
+            });
+        }
+        guard.reset();
+        prop_assert_eq!(guard.total_measurements(), 0);
+        prop_assert_eq!(guard.window_len(QoEMetric::InputToPaint), 0);
+    }
+
+    /// SLOVerdict serde roundtrip.
+    #[test]
+    fn slo_verdict_serde(idx in 0u32..3) {
+        let v = match idx % 3 {
+            0 => SLOVerdict::Met { measured: 10.0, target: 20.0 },
+            1 => SLOVerdict::Breached { measured: 30.0, target: 20.0 },
+            _ => SLOVerdict::InsufficientData { samples: 5, required: 30 },
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: SLOVerdict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(v, back);
+    }
+
+    /// QoEDegradation serde roundtrip.
+    #[test]
+    fn qoe_degradation_serde(idx in 0u32..3) {
+        let deg = match idx % 3 {
+            0 => QoEDegradation::Healthy,
+            1 => QoEDegradation::SLOBreach { breach_count: 2 },
+            _ => QoEDegradation::WarmingUp { samples: 10 },
+        };
+        let json = serde_json::to_string(&deg).unwrap();
+        let back: QoEDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(deg, back);
+    }
+
+    /// record_batch equivalent to individual records.
+    #[test]
+    fn qoe_record_batch_equivalent(count in 1u32..20) {
+        let cfg = QoEGuardrailConfig { min_samples: 1, ..Default::default() };
+        let values: Vec<f64> = (0..count).map(|i| (i + 1) as f64 * 100.0).collect();
+        let mut g1 = QoEGuardrail::new(cfg.clone());
+        let mut g2 = QoEGuardrail::new(cfg);
+        for (i, v) in values.iter().enumerate() {
+            g1.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: *v,
+                timestamp_us: 1000 + i as u64,
+            });
+        }
+        g2.record_batch(QoEMetric::InputToPaint, &values, 1000);
+        prop_assert_eq!(g1.total_measurements(), g2.total_measurements());
+        prop_assert_eq!(g1.window_len(QoEMetric::InputToPaint), g2.window_len(QoEMetric::InputToPaint));
+    }
 }
