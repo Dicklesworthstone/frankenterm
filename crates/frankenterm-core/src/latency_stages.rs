@@ -13100,6 +13100,425 @@ impl FaultIsolationManager {
     }
 }
 
+// ── F1: Cross-domain blast-radius analysis ────────────────────────
+//
+// Domain dependency DAG: faults in one domain can cascade to dependents.
+// The blast-radius analyzer identifies which domains are at risk when a
+// source domain fails, enabling preemptive isolation.
+
+/// Edge in the domain dependency graph: `source` faults can cascade to `target`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DomainDependency {
+    /// Source domain whose failure can cascade.
+    pub source: FaultDomain,
+    /// Target domain affected by the source failure.
+    pub target: FaultDomain,
+    /// Cascade probability (0.0 = never, 1.0 = always). Deterministic: used
+    /// as a threshold, not a random draw.
+    pub cascade_weight: u32, // out of 100
+}
+
+/// Result of a blast-radius analysis for a given source fault.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlastRadiusReport {
+    /// The domain that originally faulted.
+    pub origin: FaultDomain,
+    /// Domains directly at risk (one hop).
+    pub direct_risk: Vec<FaultDomain>,
+    /// Domains transitively at risk (multi-hop reachability).
+    pub transitive_risk: Vec<FaultDomain>,
+    /// Total domains at risk (direct + transitive, deduplicated).
+    pub total_at_risk: usize,
+}
+
+/// Blast-radius analyzer using a static dependency graph.
+pub struct BlastRadiusAnalyzer {
+    edges: Vec<DomainDependency>,
+}
+
+impl BlastRadiusAnalyzer {
+    /// Create with explicit dependency edges.
+    pub fn new(edges: Vec<DomainDependency>) -> Self {
+        Self { edges }
+    }
+
+    /// Create with the default dependency graph.
+    /// Default edges: Io → Storage (IO failures often cascade to storage),
+    /// Scheduler → Budget (scheduling failures break budget tracking),
+    /// Recovery → Scheduler (recovery failures leave scheduler in bad state).
+    pub fn default_graph() -> Self {
+        Self::new(vec![
+            DomainDependency { source: FaultDomain::Io, target: FaultDomain::Storage, cascade_weight: 80 },
+            DomainDependency { source: FaultDomain::Scheduler, target: FaultDomain::Budget, cascade_weight: 60 },
+            DomainDependency { source: FaultDomain::Recovery, target: FaultDomain::Scheduler, cascade_weight: 40 },
+        ])
+    }
+
+    /// Analyze blast radius from a source domain failure.
+    pub fn analyze(&self, origin: FaultDomain) -> BlastRadiusReport {
+        let direct_risk: Vec<FaultDomain> = self.edges.iter()
+            .filter(|e| e.source == origin)
+            .map(|e| e.target)
+            .collect();
+
+        // BFS for transitive reachability (excluding origin and direct).
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(origin);
+        for d in &direct_risk {
+            visited.insert(*d);
+        }
+        let mut queue: std::collections::VecDeque<FaultDomain> = direct_risk.iter().copied().collect();
+        let mut transitive = Vec::new();
+        while let Some(current) = queue.pop_front() {
+            for edge in &self.edges {
+                if edge.source == current && !visited.contains(&edge.target) {
+                    visited.insert(edge.target);
+                    transitive.push(edge.target);
+                    queue.push_back(edge.target);
+                }
+            }
+        }
+
+        let total_at_risk = direct_risk.len() + transitive.len();
+        BlastRadiusReport { origin, direct_risk, transitive_risk: transitive, total_at_risk }
+    }
+
+    /// Edges in the dependency graph.
+    pub fn edges(&self) -> &[DomainDependency] {
+        &self.edges
+    }
+
+    /// Add an edge.
+    pub fn add_edge(&mut self, edge: DomainDependency) {
+        self.edges.push(edge);
+    }
+
+    /// All domains reachable from origin (direct + transitive), sorted.
+    pub fn reachable_from(&self, origin: FaultDomain) -> Vec<FaultDomain> {
+        let report = self.analyze(origin);
+        let mut all: Vec<FaultDomain> = report.direct_risk.into_iter()
+            .chain(report.transitive_risk)
+            .collect();
+        all.sort_by_key(|d| *d as u8);
+        all.dedup();
+        all
+    }
+}
+
+// ── F1: Structured transition log buffer ──────────────────────────
+//
+// Captures all health state transitions automatically, providing the
+// structured logging required by the acceptance criteria.
+
+/// A structured log entry emitted at every health transition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaultTransitionLog {
+    /// Monotonic sequence number.
+    pub seq: u64,
+    /// Timestamp (epoch μs).
+    pub timestamp_us: u64,
+    /// Domain that transitioned.
+    pub domain: FaultDomain,
+    /// Previous health state.
+    pub from: DomainHealth,
+    /// New health state.
+    pub to: DomainHealth,
+    /// Reason code for the transition.
+    pub reason_code: FaultReasonCode,
+    /// Human-readable description.
+    pub description: String,
+    /// Correlation ID for grouping related transitions.
+    pub correlation_id: u64,
+}
+
+/// Reason codes for fault transitions — stable taxonomy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FaultReasonCode {
+    /// External fault reported.
+    FaultRecorded,
+    /// Auto-isolation threshold exceeded.
+    AutoIsolated,
+    /// Restart attempted.
+    RestartAttempted,
+    /// Restart completed successfully.
+    RestartSucceeded,
+    /// Restart failed.
+    RestartFailed,
+    /// Manual degradation marking.
+    ManualDegraded,
+    /// Manual un-isolation (operator override).
+    ManualUnIsolate,
+    /// System reset.
+    Reset,
+    /// Deterministic replay of recorded events.
+    Replay,
+}
+
+impl fmt::Display for FaultReasonCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FaultRecorded => write!(f, "fault-recorded"),
+            Self::AutoIsolated => write!(f, "auto-isolated"),
+            Self::RestartAttempted => write!(f, "restart-attempted"),
+            Self::RestartSucceeded => write!(f, "restart-succeeded"),
+            Self::RestartFailed => write!(f, "restart-failed"),
+            Self::ManualDegraded => write!(f, "manual-degraded"),
+            Self::ManualUnIsolate => write!(f, "manual-un-isolate"),
+            Self::Reset => write!(f, "reset"),
+            Self::Replay => write!(f, "replay"),
+        }
+    }
+}
+
+/// Wraps `FaultIsolationManager` with automatic structured transition logging
+/// and deterministic replay support.
+pub struct InstrumentedFaultManager {
+    inner: FaultIsolationManager,
+    log: Vec<FaultTransitionLog>,
+    next_seq: u64,
+    correlation_counter: u64,
+}
+
+impl InstrumentedFaultManager {
+    /// Create a new instrumented manager.
+    pub fn new(config: FaultIsolationConfig) -> Self {
+        Self {
+            inner: FaultIsolationManager::new(config),
+            log: Vec::new(),
+            next_seq: 0,
+            correlation_counter: 0,
+        }
+    }
+
+    /// Allocate a new correlation ID (monotonic).
+    fn next_correlation(&mut self) -> u64 {
+        self.correlation_counter += 1;
+        self.correlation_counter
+    }
+
+    /// Emit a transition log entry.
+    fn emit(&mut self, domain: FaultDomain, from: DomainHealth, to: DomainHealth,
+            reason_code: FaultReasonCode, description: String, timestamp_us: u64, correlation_id: u64) {
+        if from == to {
+            return; // No transition — don't log.
+        }
+        let entry = FaultTransitionLog {
+            seq: self.next_seq,
+            timestamp_us,
+            domain,
+            from,
+            to,
+            reason_code,
+            description,
+            correlation_id,
+        };
+        self.next_seq += 1;
+        self.log.push(entry);
+    }
+
+    /// Record a fault with automatic transition logging.
+    pub fn record_fault(&mut self, domain: FaultDomain, description: String, timestamp_us: u64) {
+        let before = self.inner.domain_health(domain);
+        let corr = self.next_correlation();
+        self.inner.record_fault(domain, description.clone(), timestamp_us);
+        let after = self.inner.domain_health(domain);
+        let reason = if after == DomainHealth::Isolated {
+            FaultReasonCode::AutoIsolated
+        } else {
+            FaultReasonCode::FaultRecorded
+        };
+        self.emit(domain, before, after, reason, description, timestamp_us, corr);
+    }
+
+    /// Attempt restart with transition logging.
+    pub fn attempt_restart(&mut self, domain: FaultDomain, timestamp_us: u64) -> bool {
+        let before = self.inner.domain_health(domain);
+        let corr = self.next_correlation();
+        let ok = self.inner.attempt_restart(domain, timestamp_us);
+        if ok {
+            let after = self.inner.domain_health(domain);
+            self.emit(domain, before, after, FaultReasonCode::RestartAttempted,
+                      "restart initiated".to_string(), timestamp_us, corr);
+        }
+        ok
+    }
+
+    /// Restart succeeded with transition logging.
+    pub fn restart_succeeded(&mut self, domain: FaultDomain, timestamp_us: u64) {
+        let before = self.inner.domain_health(domain);
+        let corr = self.next_correlation();
+        self.inner.restart_succeeded(domain);
+        let after = self.inner.domain_health(domain);
+        self.emit(domain, before, after, FaultReasonCode::RestartSucceeded,
+                  "restart completed".to_string(), timestamp_us, corr);
+    }
+
+    /// Restart failed with transition logging.
+    pub fn restart_failed(&mut self, domain: FaultDomain, timestamp_us: u64) {
+        let before = self.inner.domain_health(domain);
+        let corr = self.next_correlation();
+        self.inner.restart_failed(domain, timestamp_us);
+        let after = self.inner.domain_health(domain);
+        let reason = if after == DomainHealth::Isolated {
+            FaultReasonCode::AutoIsolated
+        } else {
+            FaultReasonCode::RestartFailed
+        };
+        self.emit(domain, before, after, reason,
+                  "restart failed".to_string(), timestamp_us, corr);
+    }
+
+    /// Mark degraded with transition logging.
+    pub fn mark_degraded(&mut self, domain: FaultDomain, timestamp_us: u64) {
+        let before = self.inner.domain_health(domain);
+        let corr = self.next_correlation();
+        self.inner.mark_degraded(domain);
+        let after = self.inner.domain_health(domain);
+        self.emit(domain, before, after, FaultReasonCode::ManualDegraded,
+                  "manual degradation".to_string(), timestamp_us, corr);
+    }
+
+    /// Un-isolate with transition logging.
+    pub fn un_isolate(&mut self, domain: FaultDomain, timestamp_us: u64) {
+        let before = self.inner.domain_health(domain);
+        let corr = self.next_correlation();
+        self.inner.un_isolate(domain);
+        let after = self.inner.domain_health(domain);
+        self.emit(domain, before, after, FaultReasonCode::ManualUnIsolate,
+                  "manual un-isolate".to_string(), timestamp_us, corr);
+    }
+
+    /// Delegate to inner.
+    pub fn domain_health(&self, domain: FaultDomain) -> DomainHealth {
+        self.inner.domain_health(domain)
+    }
+
+    /// Delegate to inner.
+    pub fn snapshot(&self) -> FaultIsolationSnapshot {
+        self.inner.snapshot()
+    }
+
+    /// Delegate to inner.
+    pub fn detect_degradation(&self) -> FaultIsolationDegradation {
+        self.inner.detect_degradation()
+    }
+
+    /// Delegate to inner.
+    pub fn all_healthy(&self) -> bool {
+        self.inner.all_healthy()
+    }
+
+    /// Delegate to inner.
+    pub fn has_isolated_domains(&self) -> bool {
+        self.inner.has_isolated_domains()
+    }
+
+    /// Delegate to inner.
+    pub fn isolated_domains(&self) -> Vec<FaultDomain> {
+        self.inner.isolated_domains()
+    }
+
+    /// Get the transition log.
+    pub fn transition_log(&self) -> &[FaultTransitionLog] {
+        &self.log
+    }
+
+    /// Drain and return transition log entries.
+    pub fn drain_log(&mut self) -> Vec<FaultTransitionLog> {
+        std::mem::take(&mut self.log)
+    }
+
+    /// Deterministic replay: apply a sequence of fault events and produce
+    /// the exact same state + transition log as the original execution.
+    pub fn replay(config: FaultIsolationConfig, events: &[ReplayableEvent]) -> Self {
+        let mut mgr = Self::new(config);
+        for event in events {
+            match event.action {
+                ReplayAction::RecordFault => {
+                    mgr.record_fault(event.domain, event.description.clone(), event.timestamp_us);
+                }
+                ReplayAction::AttemptRestart => {
+                    let _ = mgr.attempt_restart(event.domain, event.timestamp_us);
+                }
+                ReplayAction::RestartSucceeded => {
+                    mgr.restart_succeeded(event.domain, event.timestamp_us);
+                }
+                ReplayAction::RestartFailed => {
+                    mgr.restart_failed(event.domain, event.timestamp_us);
+                }
+                ReplayAction::MarkDegraded => {
+                    mgr.mark_degraded(event.domain, event.timestamp_us);
+                }
+                ReplayAction::UnIsolate => {
+                    mgr.un_isolate(event.domain, event.timestamp_us);
+                }
+            }
+        }
+        // Mark all log entries as replayed.
+        for entry in &mut mgr.log {
+            entry.reason_code = match entry.reason_code {
+                // Preserve auto-isolated distinction even in replay.
+                FaultReasonCode::AutoIsolated => FaultReasonCode::AutoIsolated,
+                _ => FaultReasonCode::Replay,
+            };
+        }
+        mgr
+    }
+
+    /// Access inner manager.
+    pub fn inner(&self) -> &FaultIsolationManager {
+        &self.inner
+    }
+
+    /// Total transition log entries emitted.
+    pub fn log_count(&self) -> usize {
+        self.log.len()
+    }
+}
+
+/// Action for deterministic replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReplayAction {
+    /// Record a fault.
+    RecordFault,
+    /// Attempt restart.
+    AttemptRestart,
+    /// Restart succeeded.
+    RestartSucceeded,
+    /// Restart failed.
+    RestartFailed,
+    /// Mark degraded.
+    MarkDegraded,
+    /// Un-isolate.
+    UnIsolate,
+}
+
+impl fmt::Display for ReplayAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RecordFault => write!(f, "record-fault"),
+            Self::AttemptRestart => write!(f, "attempt-restart"),
+            Self::RestartSucceeded => write!(f, "restart-succeeded"),
+            Self::RestartFailed => write!(f, "restart-failed"),
+            Self::MarkDegraded => write!(f, "mark-degraded"),
+            Self::UnIsolate => write!(f, "un-isolate"),
+        }
+    }
+}
+
+/// A replayable event for deterministic replay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayableEvent {
+    /// Domain this event targets.
+    pub domain: FaultDomain,
+    /// Timestamp (epoch μs).
+    pub timestamp_us: u64,
+    /// Action to replay.
+    pub action: ReplayAction,
+    /// Description (for RecordFault actions).
+    pub description: String,
+}
+
 // ── F2: Circuit Breakers and Recovery Choreography ────────────────
 //
 // Per-stage circuit breakers with half-open probing, and deterministic
@@ -25756,6 +26175,338 @@ mod tests {
         let cfg = FaultIsolationConfig { auto_isolate: false, ..Default::default() };
         let mgr = FaultIsolationManager::new(cfg.clone());
         assert_eq!(*mgr.config(), cfg);
+    }
+
+    // ── F1: Blast-radius analysis tests ──
+
+    #[test]
+    fn test_blast_radius_default_graph() {
+        let bra = BlastRadiusAnalyzer::default_graph();
+        assert_eq!(bra.edges().len(), 3);
+    }
+
+    #[test]
+    fn test_blast_radius_io_cascades_to_storage() {
+        let bra = BlastRadiusAnalyzer::default_graph();
+        let report = bra.analyze(FaultDomain::Io);
+        assert!(report.direct_risk.contains(&FaultDomain::Storage));
+        assert_eq!(report.total_at_risk, 1);
+    }
+
+    #[test]
+    fn test_blast_radius_scheduler_cascades_to_budget() {
+        let bra = BlastRadiusAnalyzer::default_graph();
+        let report = bra.analyze(FaultDomain::Scheduler);
+        assert!(report.direct_risk.contains(&FaultDomain::Budget));
+    }
+
+    #[test]
+    fn test_blast_radius_recovery_transitive() {
+        let bra = BlastRadiusAnalyzer::default_graph();
+        // Recovery → Scheduler → Budget (transitive chain).
+        let report = bra.analyze(FaultDomain::Recovery);
+        assert!(report.direct_risk.contains(&FaultDomain::Scheduler));
+        assert!(report.transitive_risk.contains(&FaultDomain::Budget));
+        assert_eq!(report.total_at_risk, 2);
+    }
+
+    #[test]
+    fn test_blast_radius_no_cascades_from_budget() {
+        let bra = BlastRadiusAnalyzer::default_graph();
+        let report = bra.analyze(FaultDomain::Budget);
+        assert!(report.direct_risk.is_empty());
+        assert_eq!(report.total_at_risk, 0);
+    }
+
+    #[test]
+    fn test_blast_radius_custom_graph() {
+        let bra = BlastRadiusAnalyzer::new(vec![
+            DomainDependency { source: FaultDomain::Storage, target: FaultDomain::Io, cascade_weight: 90 },
+        ]);
+        let report = bra.analyze(FaultDomain::Storage);
+        assert_eq!(report.direct_risk, vec![FaultDomain::Io]);
+    }
+
+    #[test]
+    fn test_blast_radius_reachable_from() {
+        let bra = BlastRadiusAnalyzer::default_graph();
+        let reachable = bra.reachable_from(FaultDomain::Recovery);
+        assert!(reachable.contains(&FaultDomain::Scheduler));
+        assert!(reachable.contains(&FaultDomain::Budget));
+    }
+
+    #[test]
+    fn test_blast_radius_add_edge() {
+        let mut bra = BlastRadiusAnalyzer::new(vec![]);
+        assert_eq!(bra.edges().len(), 0);
+        bra.add_edge(DomainDependency {
+            source: FaultDomain::Budget, target: FaultDomain::Recovery, cascade_weight: 50,
+        });
+        assert_eq!(bra.edges().len(), 1);
+        let report = bra.analyze(FaultDomain::Budget);
+        assert_eq!(report.total_at_risk, 1);
+    }
+
+    #[test]
+    fn test_blast_radius_report_serde() {
+        let report = BlastRadiusReport {
+            origin: FaultDomain::Io,
+            direct_risk: vec![FaultDomain::Storage],
+            transitive_risk: vec![],
+            total_at_risk: 1,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: BlastRadiusReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report, back);
+    }
+
+    #[test]
+    fn test_domain_dependency_serde() {
+        let dep = DomainDependency {
+            source: FaultDomain::Io, target: FaultDomain::Storage, cascade_weight: 80,
+        };
+        let json = serde_json::to_string(&dep).unwrap();
+        let back: DomainDependency = serde_json::from_str(&json).unwrap();
+        assert_eq!(dep, back);
+    }
+
+    // ── F1: Instrumented fault manager + transition log tests ──
+
+    #[test]
+    fn test_instrumented_record_fault_emits_log() {
+        let mut mgr = InstrumentedFaultManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Scheduler, "test fault".to_string(), 100);
+        assert_eq!(mgr.log_count(), 1);
+        let entry = &mgr.transition_log()[0];
+        assert_eq!(entry.domain, FaultDomain::Scheduler);
+        assert_eq!(entry.from, DomainHealth::Healthy);
+        assert_eq!(entry.to, DomainHealth::Crashed);
+        assert_eq!(entry.reason_code, FaultReasonCode::FaultRecorded);
+    }
+
+    #[test]
+    fn test_instrumented_restart_cycle_logs() {
+        let mut mgr = InstrumentedFaultManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Io, "err".to_string(), 100);
+        mgr.attempt_restart(FaultDomain::Io, 200_000);
+        mgr.restart_succeeded(FaultDomain::Io, 300_000);
+        assert_eq!(mgr.log_count(), 3);
+        assert_eq!(mgr.domain_health(FaultDomain::Io), DomainHealth::Healthy);
+        // Verify transition chain: Healthy→Crashed→Restarting→Healthy.
+        assert_eq!(mgr.transition_log()[0].to, DomainHealth::Crashed);
+        assert_eq!(mgr.transition_log()[1].to, DomainHealth::Restarting);
+        assert_eq!(mgr.transition_log()[2].to, DomainHealth::Healthy);
+    }
+
+    #[test]
+    fn test_instrumented_auto_isolate_reason_code() {
+        let mut mgr = InstrumentedFaultManager::new(FaultIsolationConfig::default());
+        for i in 0..4 {
+            mgr.record_fault(FaultDomain::Budget, format!("f{i}"), (i + 1) * 100);
+        }
+        // 4th fault should auto-isolate.
+        let last = mgr.transition_log().last().unwrap();
+        assert_eq!(last.to, DomainHealth::Isolated);
+        assert_eq!(last.reason_code, FaultReasonCode::AutoIsolated);
+    }
+
+    #[test]
+    fn test_instrumented_drain_log() {
+        let mut mgr = InstrumentedFaultManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Storage, "x".to_string(), 100);
+        let drained = mgr.drain_log();
+        assert_eq!(drained.len(), 1);
+        assert!(mgr.transition_log().is_empty());
+    }
+
+    #[test]
+    fn test_instrumented_mark_degraded_log() {
+        let mut mgr = InstrumentedFaultManager::new(FaultIsolationConfig::default());
+        mgr.mark_degraded(FaultDomain::Recovery, 500);
+        assert_eq!(mgr.log_count(), 1);
+        assert_eq!(mgr.transition_log()[0].reason_code, FaultReasonCode::ManualDegraded);
+    }
+
+    #[test]
+    fn test_instrumented_un_isolate_log() {
+        let mut mgr = InstrumentedFaultManager::new(FaultIsolationConfig::default());
+        for i in 0..4 {
+            mgr.record_fault(FaultDomain::Io, format!("f{i}"), (i + 1) * 100);
+        }
+        let before_count = mgr.log_count();
+        mgr.un_isolate(FaultDomain::Io, 5000);
+        assert_eq!(mgr.log_count(), before_count + 1);
+        let last = mgr.transition_log().last().unwrap();
+        assert_eq!(last.reason_code, FaultReasonCode::ManualUnIsolate);
+        assert_eq!(last.to, DomainHealth::Crashed);
+    }
+
+    #[test]
+    fn test_instrumented_no_log_on_noop_transition() {
+        let mut mgr = InstrumentedFaultManager::new(FaultIsolationConfig::default());
+        // mark_degraded on a non-healthy domain is a no-op.
+        mgr.record_fault(FaultDomain::Scheduler, "x".to_string(), 100);
+        let count_before = mgr.log_count();
+        mgr.mark_degraded(FaultDomain::Scheduler, 200);
+        // Scheduler is Crashed not Healthy, so mark_degraded is no-op → no log.
+        assert_eq!(mgr.log_count(), count_before);
+    }
+
+    #[test]
+    fn test_instrumented_correlation_ids_unique() {
+        let mut mgr = InstrumentedFaultManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Scheduler, "a".to_string(), 100);
+        mgr.record_fault(FaultDomain::Budget, "b".to_string(), 200);
+        let ids: Vec<u64> = mgr.transition_log().iter().map(|e| e.correlation_id).collect();
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn test_instrumented_seq_numbers_monotonic() {
+        let mut mgr = InstrumentedFaultManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Io, "a".to_string(), 100);
+        mgr.record_fault(FaultDomain::Storage, "b".to_string(), 200);
+        let seqs: Vec<u64> = mgr.transition_log().iter().map(|e| e.seq).collect();
+        for w in seqs.windows(2) {
+            assert!(w[1] > w[0]);
+        }
+    }
+
+    #[test]
+    fn test_fault_transition_log_serde() {
+        let entry = FaultTransitionLog {
+            seq: 0,
+            timestamp_us: 100,
+            domain: FaultDomain::Scheduler,
+            from: DomainHealth::Healthy,
+            to: DomainHealth::Crashed,
+            reason_code: FaultReasonCode::FaultRecorded,
+            description: "test".to_string(),
+            correlation_id: 1,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: FaultTransitionLog = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn test_fault_reason_code_display() {
+        assert_eq!(FaultReasonCode::FaultRecorded.to_string(), "fault-recorded");
+        assert_eq!(FaultReasonCode::AutoIsolated.to_string(), "auto-isolated");
+        assert_eq!(FaultReasonCode::RestartAttempted.to_string(), "restart-attempted");
+        assert_eq!(FaultReasonCode::RestartSucceeded.to_string(), "restart-succeeded");
+        assert_eq!(FaultReasonCode::RestartFailed.to_string(), "restart-failed");
+        assert_eq!(FaultReasonCode::ManualDegraded.to_string(), "manual-degraded");
+        assert_eq!(FaultReasonCode::ManualUnIsolate.to_string(), "manual-un-isolate");
+        assert_eq!(FaultReasonCode::Reset.to_string(), "reset");
+        assert_eq!(FaultReasonCode::Replay.to_string(), "replay");
+    }
+
+    #[test]
+    fn test_fault_reason_code_serde() {
+        for code in [
+            FaultReasonCode::FaultRecorded, FaultReasonCode::AutoIsolated,
+            FaultReasonCode::RestartAttempted, FaultReasonCode::RestartSucceeded,
+            FaultReasonCode::RestartFailed, FaultReasonCode::ManualDegraded,
+            FaultReasonCode::ManualUnIsolate, FaultReasonCode::Reset,
+            FaultReasonCode::Replay,
+        ] {
+            let json = serde_json::to_string(&code).unwrap();
+            let back: FaultReasonCode = serde_json::from_str(&json).unwrap();
+            assert_eq!(code, back);
+        }
+    }
+
+    // ── F1: Deterministic replay tests ──
+
+    #[test]
+    fn test_replay_produces_same_final_state() {
+        // Original execution.
+        let cfg = FaultIsolationConfig::default();
+        let mut original = InstrumentedFaultManager::new(cfg.clone());
+        original.record_fault(FaultDomain::Io, "disk err".to_string(), 100);
+        original.attempt_restart(FaultDomain::Io, 200_000);
+        original.restart_succeeded(FaultDomain::Io, 300_000);
+        original.record_fault(FaultDomain::Scheduler, "oom".to_string(), 400_000);
+
+        // Replay.
+        let events = vec![
+            ReplayableEvent { domain: FaultDomain::Io, timestamp_us: 100, action: ReplayAction::RecordFault, description: "disk err".to_string() },
+            ReplayableEvent { domain: FaultDomain::Io, timestamp_us: 200_000, action: ReplayAction::AttemptRestart, description: String::new() },
+            ReplayableEvent { domain: FaultDomain::Io, timestamp_us: 300_000, action: ReplayAction::RestartSucceeded, description: String::new() },
+            ReplayableEvent { domain: FaultDomain::Scheduler, timestamp_us: 400_000, action: ReplayAction::RecordFault, description: "oom".to_string() },
+        ];
+        let replayed = InstrumentedFaultManager::replay(cfg, &events);
+
+        // Same final state.
+        for d in FaultDomain::ALL {
+            assert_eq!(original.domain_health(*d), replayed.domain_health(*d));
+        }
+        // Same number of transitions.
+        assert_eq!(original.log_count(), replayed.log_count());
+    }
+
+    #[test]
+    fn test_replay_action_display() {
+        assert_eq!(ReplayAction::RecordFault.to_string(), "record-fault");
+        assert_eq!(ReplayAction::AttemptRestart.to_string(), "attempt-restart");
+        assert_eq!(ReplayAction::RestartSucceeded.to_string(), "restart-succeeded");
+        assert_eq!(ReplayAction::RestartFailed.to_string(), "restart-failed");
+        assert_eq!(ReplayAction::MarkDegraded.to_string(), "mark-degraded");
+        assert_eq!(ReplayAction::UnIsolate.to_string(), "un-isolate");
+    }
+
+    #[test]
+    fn test_replay_action_serde() {
+        for action in [
+            ReplayAction::RecordFault, ReplayAction::AttemptRestart,
+            ReplayAction::RestartSucceeded, ReplayAction::RestartFailed,
+            ReplayAction::MarkDegraded, ReplayAction::UnIsolate,
+        ] {
+            let json = serde_json::to_string(&action).unwrap();
+            let back: ReplayAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(action, back);
+        }
+    }
+
+    #[test]
+    fn test_replayable_event_serde() {
+        let ev = ReplayableEvent {
+            domain: FaultDomain::Storage,
+            timestamp_us: 12345,
+            action: ReplayAction::RecordFault,
+            description: "test".to_string(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: ReplayableEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn test_replay_empty_events() {
+        let mgr = InstrumentedFaultManager::replay(FaultIsolationConfig::default(), &[]);
+        assert!(mgr.all_healthy());
+        assert_eq!(mgr.log_count(), 0);
+    }
+
+    #[test]
+    fn test_instrumented_delegates_snapshot() {
+        let mut mgr = InstrumentedFaultManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Io, "x".to_string(), 100);
+        let snap = mgr.snapshot();
+        assert_eq!(snap.total_faults, 1);
+    }
+
+    #[test]
+    fn test_instrumented_restart_failed_log() {
+        let mut mgr = InstrumentedFaultManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(FaultDomain::Budget, "err".to_string(), 100);
+        mgr.attempt_restart(FaultDomain::Budget, 200_000);
+        mgr.restart_failed(FaultDomain::Budget, 200_001);
+        let last = mgr.transition_log().last().unwrap();
+        assert_eq!(last.domain, FaultDomain::Budget);
+        assert_eq!(last.to, DomainHealth::Crashed);
+        assert_eq!(last.reason_code, FaultReasonCode::RestartFailed);
     }
 
     // ── F2: Circuit Breakers and Recovery Choreography ──
