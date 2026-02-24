@@ -4545,3 +4545,372 @@ proptest! {
         prop_assert_eq!(verdict, back);
     }
 }
+
+// ── E3: Deterministic Trace v2 Strategies ─────────────────────────
+
+fn arb_invariant_domain() -> impl Strategy<Value = InvariantDomain> {
+    prop_oneof![
+        Just(InvariantDomain::Scheduler),
+        Just(InvariantDomain::Budget),
+        Just(InvariantDomain::Recovery),
+        Just(InvariantDomain::Composition),
+    ]
+}
+
+fn arb_scheduler_lane() -> impl Strategy<Value = SchedulerLane> {
+    prop_oneof![
+        Just(SchedulerLane::Input),
+        Just(SchedulerLane::Control),
+        Just(SchedulerLane::Bulk),
+    ]
+}
+
+fn arb_mitigation_level() -> impl Strategy<Value = MitigationLevel> {
+    prop_oneof![
+        Just(MitigationLevel::None),
+        Just(MitigationLevel::Defer),
+        Just(MitigationLevel::Degrade),
+        Just(MitigationLevel::Shed),
+        Just(MitigationLevel::Skip),
+    ]
+}
+
+fn arb_trace_action() -> impl Strategy<Value = TraceAction> {
+    prop_oneof![
+        (arb_stage(), 0.0_f64..1e6)
+            .prop_map(|(stage, latency_us)| TraceAction::ObserveLatency { stage, latency_us }),
+        (arb_scheduler_lane(), 0.0_f64..1e6)
+            .prop_map(|(lane, cost_us)| TraceAction::SchedulerAdmit { lane, cost_us }),
+        (arb_mitigation_level(), arb_mitigation_level()).prop_map(|(a, b)| {
+            TraceAction::RecoveryStep {
+                level_before: a,
+                level_after: b,
+            }
+        }),
+        (0_u64..1000).prop_map(|e| TraceAction::EpochAdvance { new_epoch: e }),
+        arb_invariant_domain().prop_map(|d| TraceAction::Reset { domain: d }),
+    ]
+}
+
+fn arb_canonical_ordering() -> impl Strategy<Value = CanonicalOrdering> {
+    prop_oneof![
+        Just(CanonicalOrdering::Temporal),
+        Just(CanonicalOrdering::DomainGrouped),
+        Just(CanonicalOrdering::Causal),
+    ]
+}
+
+fn arb_trace(max_entries: usize) -> impl Strategy<Value = DeterministicTrace> {
+    proptest::collection::vec(
+        (arb_trace_action(), arb_invariant_domain(), 0_u64..100_000),
+        0..max_entries,
+    )
+    .prop_map(|entries| {
+        let mut trace = DeterministicTrace::new_v2("prop".to_string(), 0, 0);
+        for (i, (action, domain, ts)) in entries.into_iter().enumerate() {
+            let parent = if i > 0 { Some((i - 1) as u64) } else { None };
+            trace.push(action, domain, ts, parent);
+        }
+        trace
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // ── E3: Trace format invariants ──────────────────────────────
+
+    /// TraceFormatVersion serde roundtrip.
+    #[test]
+    fn trace_format_version_serde_roundtrip(variant in 0_u8..2) {
+        let v = if variant == 0 { TraceFormatVersion::V1 } else { TraceFormatVersion::V2 };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: TraceFormatVersion = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(v, back);
+    }
+
+    /// CanonicalOrdering serde roundtrip.
+    #[test]
+    fn canonical_ordering_serde_roundtrip(ord in arb_canonical_ordering()) {
+        let json = serde_json::to_string(&ord).unwrap();
+        let back: CanonicalOrdering = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(ord, back);
+    }
+
+    /// TraceEntry fingerprint is deterministic for identical inputs.
+    #[test]
+    fn trace_fingerprint_deterministic(action in arb_trace_action(), domain in arb_invariant_domain()) {
+        let fp1 = TraceEntry::compute_fingerprint(&action, domain);
+        let fp2 = TraceEntry::compute_fingerprint(&action, domain);
+        prop_assert_eq!(fp1, fp2);
+    }
+
+    /// DeterministicTrace push assigns monotonic sequence numbers.
+    #[test]
+    fn trace_push_seq_monotonic(trace in arb_trace(20)) {
+        for (i, entry) in trace.entries.iter().enumerate() {
+            prop_assert_eq!(entry.seq, i as u64);
+        }
+    }
+
+    /// DeterministicTrace serde roundtrip.
+    #[test]
+    fn deterministic_trace_serde_roundtrip(trace in arb_trace(10)) {
+        let json = serde_json::to_string(&trace).unwrap();
+        let back: DeterministicTrace = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(trace.len(), back.len());
+        prop_assert_eq!(trace.version, back.version);
+        prop_assert_eq!(trace.seed, back.seed);
+        for (a, b) in trace.entries.iter().zip(back.entries.iter()) {
+            prop_assert_eq!(a.seq, b.seq);
+            prop_assert_eq!(a.fingerprint, b.fingerprint);
+        }
+    }
+
+    /// DeterministicTrace digest is deterministic.
+    #[test]
+    fn trace_digest_deterministic(trace in arb_trace(10)) {
+        let d1 = trace.digest();
+        let d2 = trace.digest();
+        prop_assert_eq!(d1, d2);
+    }
+
+    /// Canonicalization is idempotent: canonicalize(canonicalize(t)) == canonicalize(t).
+    #[test]
+    fn canonicalize_idempotent(
+        trace in arb_trace(15),
+        ordering in arb_canonical_ordering(),
+    ) {
+        let cfg = CanonicalizerConfig {
+            ordering,
+            strip_timestamps: false,
+            dedup_consecutive: false,
+            max_entries: 0,
+        };
+        let mut c = ReplayCanonicalizer::new(cfg);
+        let c1 = c.canonicalize(&trace);
+        let c2 = c.canonicalize(&c1);
+        prop_assert_eq!(c1.len(), c2.len());
+        for (a, b) in c1.entries.iter().zip(c2.entries.iter()) {
+            prop_assert_eq!(a.fingerprint, b.fingerprint);
+            prop_assert_eq!(a.seq, b.seq);
+        }
+    }
+
+    /// Canonicalization preserves entry count (without dedup/truncation).
+    #[test]
+    fn canonicalize_preserves_count(
+        trace in arb_trace(15),
+        ordering in arb_canonical_ordering(),
+    ) {
+        let cfg = CanonicalizerConfig {
+            ordering,
+            strip_timestamps: false,
+            dedup_consecutive: false,
+            max_entries: 0,
+        };
+        let mut c = ReplayCanonicalizer::new(cfg);
+        let canonical = c.canonicalize(&trace);
+        prop_assert_eq!(trace.len(), canonical.len());
+    }
+
+    /// max_entries truncates to at most that many entries.
+    #[test]
+    fn canonicalize_max_entries(
+        trace in arb_trace(20),
+        max in 1_usize..10,
+    ) {
+        let cfg = CanonicalizerConfig {
+            max_entries: max,
+            ..Default::default()
+        };
+        let mut c = ReplayCanonicalizer::new(cfg);
+        let canonical = c.canonicalize(&trace);
+        prop_assert!(canonical.len() <= max);
+    }
+
+    /// strip_timestamps zeros all timestamps.
+    #[test]
+    fn canonicalize_strip_timestamps(trace in arb_trace(10)) {
+        let cfg = CanonicalizerConfig {
+            strip_timestamps: true,
+            ..Default::default()
+        };
+        let mut c = ReplayCanonicalizer::new(cfg);
+        let canonical = c.canonicalize(&trace);
+        for entry in &canonical.entries {
+            prop_assert_eq!(entry.timestamp_us, 0);
+        }
+    }
+
+    /// dedup_consecutive never increases entry count.
+    #[test]
+    fn canonicalize_dedup_no_increase(trace in arb_trace(15)) {
+        let cfg = CanonicalizerConfig {
+            dedup_consecutive: true,
+            ..Default::default()
+        };
+        let mut c = ReplayCanonicalizer::new(cfg);
+        let canonical = c.canonicalize(&trace);
+        prop_assert!(canonical.len() <= trace.len());
+    }
+
+    /// Comparing a trace with itself yields Identical.
+    #[test]
+    fn compare_self_identical(trace in arb_trace(10)) {
+        let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let result = c.compare(&trace, &trace);
+        let is_ok = matches!(result, ReplayComparisonResult::Identical | ReplayComparisonResult::Isomorphic { .. });
+        prop_assert!(is_ok, "self-compare should be identical or isomorphic, got {}", result);
+    }
+
+    /// filter_by_domain only returns entries of that domain.
+    #[test]
+    fn filter_by_domain_correct(trace in arb_trace(15), domain in arb_invariant_domain()) {
+        let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let filtered = c.filter_by_domain(&trace, domain);
+        for entry in &filtered.entries {
+            prop_assert_eq!(entry.domain, domain);
+        }
+        // Count should match.
+        let expected = trace.entries.iter().filter(|e| e.domain == domain).count();
+        prop_assert_eq!(filtered.len(), expected);
+    }
+
+    /// causal_chain starts at a root (no parent) and ends at the requested seq.
+    #[test]
+    fn causal_chain_ends_at_target(trace in arb_trace(10)) {
+        if trace.is_empty() {
+            return Ok(());
+        }
+        let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let last_seq = trace.entries.last().unwrap().seq;
+        let chain = c.causal_chain(&trace, last_seq);
+        prop_assert!(!chain.is_empty());
+        prop_assert_eq!(*chain.last().unwrap(), last_seq);
+        // First entry in chain should have no parent.
+        let first_seq = chain[0];
+        let first_entry = trace.entries.iter().find(|e| e.seq == first_seq);
+        if let Some(entry) = first_entry {
+            prop_assert!(entry.causal_parent.is_none());
+        }
+    }
+
+    /// domain_histogram counts sum to trace length.
+    #[test]
+    fn domain_histogram_sum(trace in arb_trace(15)) {
+        let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let hist = c.domain_histogram(&trace);
+        let total: usize = hist.values().sum();
+        prop_assert_eq!(total, trace.len());
+    }
+
+    /// merge_traces preserves total entry count.
+    #[test]
+    fn merge_preserves_count(
+        a in arb_trace(8),
+        b in arb_trace(8),
+    ) {
+        let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let merged = c.merge_traces(&a, &b);
+        prop_assert_eq!(merged.len(), a.len() + b.len());
+    }
+
+    /// merge_traces output has monotonic seq.
+    #[test]
+    fn merge_seq_monotonic(
+        a in arb_trace(8),
+        b in arb_trace(8),
+    ) {
+        let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let merged = c.merge_traces(&a, &b);
+        for (i, entry) in merged.entries.iter().enumerate() {
+            prop_assert_eq!(entry.seq, i as u64);
+        }
+    }
+
+    /// time_window returns only entries in range.
+    #[test]
+    fn time_window_in_range(
+        trace in arb_trace(15),
+        start in 0_u64..50_000,
+        width in 1_u64..50_000,
+    ) {
+        let end = start + width;
+        let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let windowed = c.time_window(&trace, start, end);
+        for entry in &windowed.entries {
+            prop_assert!(entry.timestamp_us >= start);
+            prop_assert!(entry.timestamp_us <= end);
+        }
+    }
+
+    /// verify_determinism always returns true for any trace.
+    #[test]
+    fn verify_determinism_always_true(trace in arb_trace(10)) {
+        let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        prop_assert!(c.verify_determinism(&trace));
+    }
+
+    /// ReplayComparisonResult serde roundtrip.
+    #[test]
+    fn replay_comparison_result_serde(variant in 0_u8..3) {
+        let result = match variant {
+            0 => ReplayComparisonResult::Identical,
+            1 => ReplayComparisonResult::Isomorphic { reordered_count: 5 },
+            _ => ReplayComparisonResult::Divergent {
+                first_divergence_idx: 3,
+                description: "test".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ReplayComparisonResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(result, back);
+    }
+
+    /// CanonicalizerDegradation serde roundtrip.
+    #[test]
+    fn canonicalizer_degradation_serde(variant in 0_u8..3) {
+        let deg = match variant {
+            0 => CanonicalizerDegradation::Healthy,
+            1 => CanonicalizerDegradation::HighDedupRatio { ratio: 0.75 },
+            _ => CanonicalizerDegradation::HighVolume { entries_processed: 200_000 },
+        };
+        let json = serde_json::to_string(&deg).unwrap();
+        let back: CanonicalizerDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(deg, back);
+    }
+
+    /// CanonicalizerSnapshot serde roundtrip.
+    #[test]
+    fn canonicalizer_snapshot_serde(
+        tp in 0_u64..1000,
+        ep in 0_u64..10000,
+        ed in 0_u64..1000,
+        cm in 0_u64..100,
+    ) {
+        let snap = CanonicalizerSnapshot {
+            traces_processed: tp,
+            entries_processed: ep,
+            entries_deduped: ed,
+            comparisons_made: cm,
+            config: CanonicalizerConfig::default(),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: CanonicalizerSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap, back);
+    }
+
+    /// Reset clears all counters.
+    #[test]
+    fn canonicalizer_reset_clears(trace in arb_trace(10)) {
+        let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let _ = c.canonicalize(&trace);
+        c.reset();
+        let snap = c.snapshot();
+        prop_assert_eq!(snap.traces_processed, 0);
+        prop_assert_eq!(snap.entries_processed, 0);
+        prop_assert_eq!(snap.entries_deduped, 0);
+        prop_assert_eq!(snap.comparisons_made, 0);
+    }
+}
