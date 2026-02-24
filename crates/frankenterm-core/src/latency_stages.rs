@@ -13527,6 +13527,294 @@ impl BreakerManager {
     }
 }
 
+// ── F3: Immediate-Ack / Deferred-Completion UX Protocol ─────────
+
+/// Phase in the immediate-ack / deferred-completion protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AckPhase {
+    /// Fast path: produce an immediate user-visible acknowledgment.
+    ImmediateAck,
+    /// Slow path: deferred processing with progress tracking.
+    DeferredCompletion,
+}
+
+impl fmt::Display for AckPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ImmediateAck => write!(f, "immediate-ack"),
+            Self::DeferredCompletion => write!(f, "deferred-completion"),
+        }
+    }
+}
+
+/// Reason code for deferred-completion outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CompletionReason {
+    /// Completed successfully.
+    Success,
+    /// Timed out waiting for slow path.
+    Timeout,
+    /// Upstream stage failed (breaker tripped, storage error, etc.).
+    UpstreamFailure { stage: LatencyStage, detail: String },
+    /// Cancelled by user or system.
+    Cancelled { reason: String },
+}
+
+impl fmt::Display for CompletionReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Success => write!(f, "success"),
+            Self::Timeout => write!(f, "timeout"),
+            Self::UpstreamFailure { stage, detail } => write!(f, "upstream-failure({stage}: {detail})"),
+            Self::Cancelled { reason } => write!(f, "cancelled({reason})"),
+        }
+    }
+}
+
+/// Immediate-ack token: a lightweight receipt returned to the user on the fast path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AckToken {
+    /// Unique correlation ID linking ack to deferred completion.
+    pub correlation_id: u64,
+    /// Timestamp of ack generation (μs).
+    pub acked_at_us: u64,
+    /// The stage that produced the ack.
+    pub source_stage: LatencyStage,
+    /// Human-readable summary for display.
+    pub summary: String,
+}
+
+/// Deferred-completion result: delivered after slow-path processing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeferredResult {
+    /// Correlation ID matching the AckToken.
+    pub correlation_id: u64,
+    /// Completion timestamp (μs).
+    pub completed_at_us: u64,
+    /// Reason code.
+    pub reason: CompletionReason,
+    /// Wall-clock latency from ack to completion (μs).
+    pub deferred_latency_us: u64,
+    /// Optional explanation for the user (ft why style).
+    pub explanation: Option<String>,
+}
+
+/// Configuration for the ack/completion protocol.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AckProtocolConfig {
+    /// Max time to wait for immediate ack before downgrading (μs).
+    pub ack_deadline_us: u64,
+    /// Max time to wait for deferred completion (μs).
+    pub completion_deadline_us: u64,
+    /// Whether to show progress updates to user during deferred phase.
+    pub show_progress: bool,
+    /// Minimum interval between progress updates (μs).
+    pub progress_interval_us: u64,
+}
+
+impl Default for AckProtocolConfig {
+    fn default() -> Self {
+        Self {
+            ack_deadline_us: 50_000,        // 50ms — must feel instant.
+            completion_deadline_us: 5_000_000, // 5s — user patience limit.
+            show_progress: true,
+            progress_interval_us: 500_000,  // 500ms between updates.
+        }
+    }
+}
+
+/// Progress update during deferred phase.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgressUpdate {
+    /// Correlation ID.
+    pub correlation_id: u64,
+    /// Timestamp of progress report (μs).
+    pub timestamp_us: u64,
+    /// Fraction complete (0.0..=1.0).
+    pub fraction: f64,
+    /// Human-readable status message.
+    pub message: String,
+}
+
+/// Snapshot of the ack protocol manager.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AckProtocolSnapshot {
+    /// Total ack tokens issued.
+    pub total_acks: u64,
+    /// Total deferred completions.
+    pub total_completions: u64,
+    /// Total timeouts.
+    pub total_timeouts: u64,
+    /// Pending (acked but not completed).
+    pub pending_count: u64,
+}
+
+/// Degradation level for the protocol.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AckProtocolDegradation {
+    /// All requests completing within deadlines.
+    Healthy,
+    /// Some acks are slow (above ack_deadline).
+    AckSlow { slow_count: u64 },
+    /// Deferred completions timing out.
+    CompletionTimeout { timeout_count: u64 },
+}
+
+impl fmt::Display for AckProtocolDegradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "healthy"),
+            Self::AckSlow { slow_count } => write!(f, "ack-slow({slow_count})"),
+            Self::CompletionTimeout { timeout_count } => write!(f, "completion-timeout({timeout_count})"),
+        }
+    }
+}
+
+/// Log entry for ack protocol events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AckProtocolLogEntry {
+    /// Timestamp.
+    pub timestamp_us: u64,
+    /// Phase at which the event occurred.
+    pub phase: AckPhase,
+    /// Correlation ID.
+    pub correlation_id: u64,
+    /// Event description.
+    pub event: String,
+}
+
+/// Manages the immediate-ack / deferred-completion UX protocol.
+pub struct AckProtocolManager {
+    config: AckProtocolConfig,
+    next_correlation_id: u64,
+    /// Pending acks: correlation_id → AckToken.
+    pending: std::collections::HashMap<u64, AckToken>,
+    total_acks: u64,
+    total_completions: u64,
+    total_timeouts: u64,
+    total_cancellations: u64,
+    slow_ack_count: u64,
+}
+
+impl AckProtocolManager {
+    /// Create a new protocol manager.
+    pub fn new(config: AckProtocolConfig) -> Self {
+        Self {
+            config,
+            next_correlation_id: 1,
+            pending: std::collections::HashMap::new(),
+            total_acks: 0,
+            total_completions: 0,
+            total_timeouts: 0,
+            total_cancellations: 0,
+            slow_ack_count: 0,
+        }
+    }
+
+    /// Issue an immediate ack. Returns a token for the caller.
+    pub fn issue_ack(&mut self, stage: LatencyStage, summary: String, timestamp_us: u64) -> AckToken {
+        let cid = self.next_correlation_id;
+        self.next_correlation_id += 1;
+        let token = AckToken {
+            correlation_id: cid,
+            acked_at_us: timestamp_us,
+            source_stage: stage,
+            summary,
+        };
+        self.pending.insert(cid, token.clone());
+        self.total_acks += 1;
+        token
+    }
+
+    /// Complete a deferred operation. Returns the result with latency info.
+    pub fn complete(&mut self, correlation_id: u64, reason: CompletionReason, timestamp_us: u64) -> Option<DeferredResult> {
+        let token = self.pending.remove(&correlation_id)?;
+        let deferred_latency_us = timestamp_us.saturating_sub(token.acked_at_us);
+        let is_timeout = matches!(reason, CompletionReason::Timeout);
+        let is_cancel = matches!(reason, CompletionReason::Cancelled { .. });
+        if is_timeout {
+            self.total_timeouts += 1;
+        } else if is_cancel {
+            self.total_cancellations += 1;
+        }
+        self.total_completions += 1;
+        Some(DeferredResult {
+            correlation_id,
+            completed_at_us: timestamp_us,
+            reason,
+            deferred_latency_us,
+            explanation: None,
+        })
+    }
+
+    /// Record a slow ack (ack took longer than ack_deadline).
+    pub fn record_slow_ack(&mut self) {
+        self.slow_ack_count += 1;
+    }
+
+    /// Check for timed-out pending operations and complete them.
+    pub fn sweep_timeouts(&mut self, current_us: u64) -> Vec<DeferredResult> {
+        let deadline = self.config.completion_deadline_us;
+        let expired: Vec<u64> = self.pending.iter()
+            .filter(|(_, token)| current_us.saturating_sub(token.acked_at_us) >= deadline)
+            .map(|(cid, _)| *cid)
+            .collect();
+        let mut results = Vec::new();
+        for cid in expired {
+            if let Some(result) = self.complete(cid, CompletionReason::Timeout, current_us) {
+                results.push(result);
+            }
+        }
+        results
+    }
+
+    /// Number of pending (acked but not completed) operations.
+    pub fn pending_count(&self) -> u64 {
+        self.pending.len() as u64
+    }
+
+    /// Get a snapshot.
+    pub fn snapshot(&self) -> AckProtocolSnapshot {
+        AckProtocolSnapshot {
+            total_acks: self.total_acks,
+            total_completions: self.total_completions,
+            total_timeouts: self.total_timeouts,
+            pending_count: self.pending_count(),
+        }
+    }
+
+    /// Detect degradation.
+    pub fn detect_degradation(&self) -> AckProtocolDegradation {
+        if self.total_timeouts > 0 {
+            AckProtocolDegradation::CompletionTimeout { timeout_count: self.total_timeouts }
+        } else if self.slow_ack_count > 0 {
+            AckProtocolDegradation::AckSlow { slow_count: self.slow_ack_count }
+        } else {
+            AckProtocolDegradation::Healthy
+        }
+    }
+
+    /// Create a log entry.
+    pub fn log_entry(&self, phase: AckPhase, correlation_id: u64, event: String, timestamp_us: u64) -> AckProtocolLogEntry {
+        AckProtocolLogEntry { timestamp_us, phase, correlation_id, event }
+    }
+
+    /// Reset counters.
+    pub fn reset(&mut self) {
+        self.pending.clear();
+        self.total_acks = 0;
+        self.total_completions = 0;
+        self.total_timeouts = 0;
+        self.total_cancellations = 0;
+        self.slow_ack_count = 0;
+    }
+
+    /// Access config.
+    pub fn config(&self) -> &AckProtocolConfig {
+        &self.config
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -25220,5 +25508,293 @@ mod tests {
         let st = mgr.stage_state(LatencyStage::PtyCapture);
         assert!(st.is_some());
         assert_eq!(st.unwrap().state, BreakerState::Closed);
+    }
+
+    // ── F3: Immediate-Ack / Deferred-Completion UX Protocol ──
+
+    #[test]
+    fn test_ack_phase_display() {
+        assert_eq!(AckPhase::ImmediateAck.to_string(), "immediate-ack");
+        assert_eq!(AckPhase::DeferredCompletion.to_string(), "deferred-completion");
+    }
+
+    #[test]
+    fn test_ack_phase_serde() {
+        for phase in [AckPhase::ImmediateAck, AckPhase::DeferredCompletion] {
+            let json = serde_json::to_string(&phase).unwrap();
+            let back: AckPhase = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, phase);
+        }
+    }
+
+    #[test]
+    fn test_completion_reason_display() {
+        assert_eq!(CompletionReason::Success.to_string(), "success");
+        assert_eq!(CompletionReason::Timeout.to_string(), "timeout");
+        let up = CompletionReason::UpstreamFailure {
+            stage: LatencyStage::StorageWrite,
+            detail: "WAL full".to_string(),
+        };
+        assert!(up.to_string().contains("upstream-failure"));
+        let cancel = CompletionReason::Cancelled { reason: "user".to_string() };
+        assert!(cancel.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn test_completion_reason_serde() {
+        let reasons = vec![
+            CompletionReason::Success,
+            CompletionReason::Timeout,
+            CompletionReason::UpstreamFailure {
+                stage: LatencyStage::PatternDetection,
+                detail: "OOM".to_string(),
+            },
+            CompletionReason::Cancelled { reason: "test".to_string() },
+        ];
+        for r in reasons {
+            let json = serde_json::to_string(&r).unwrap();
+            let back: CompletionReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, r);
+        }
+    }
+
+    #[test]
+    fn test_ack_token_serde() {
+        let token = AckToken {
+            correlation_id: 42,
+            acked_at_us: 1000,
+            source_stage: LatencyStage::PtyCapture,
+            summary: "received input".to_string(),
+        };
+        let json = serde_json::to_string(&token).unwrap();
+        let back: AckToken = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, token);
+    }
+
+    #[test]
+    fn test_deferred_result_serde() {
+        let result = DeferredResult {
+            correlation_id: 42,
+            completed_at_us: 5000,
+            reason: CompletionReason::Success,
+            deferred_latency_us: 4000,
+            explanation: Some("Pattern matched".to_string()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: DeferredResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, result);
+    }
+
+    #[test]
+    fn test_ack_protocol_config_default() {
+        let cfg = AckProtocolConfig::default();
+        assert_eq!(cfg.ack_deadline_us, 50_000);
+        assert_eq!(cfg.completion_deadline_us, 5_000_000);
+        assert!(cfg.show_progress);
+        assert_eq!(cfg.progress_interval_us, 500_000);
+    }
+
+    #[test]
+    fn test_ack_protocol_config_serde() {
+        let cfg = AckProtocolConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: AckProtocolConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn test_progress_update_serde() {
+        let update = ProgressUpdate {
+            correlation_id: 7,
+            timestamp_us: 3000,
+            fraction: 0.5,
+            message: "halfway".to_string(),
+        };
+        let json = serde_json::to_string(&update).unwrap();
+        let back: ProgressUpdate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, update);
+    }
+
+    #[test]
+    fn test_ack_protocol_issue_ack() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let token = mgr.issue_ack(LatencyStage::PtyCapture, "got input".to_string(), 1000);
+        assert_eq!(token.correlation_id, 1);
+        assert_eq!(token.acked_at_us, 1000);
+        assert_eq!(token.source_stage, LatencyStage::PtyCapture);
+        assert_eq!(mgr.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_ack_protocol_issue_increments_ids() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let t1 = mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
+        let t2 = mgr.issue_ack(LatencyStage::StorageWrite, "b".to_string(), 200);
+        assert_eq!(t1.correlation_id, 1);
+        assert_eq!(t2.correlation_id, 2);
+        assert_eq!(mgr.pending_count(), 2);
+    }
+
+    #[test]
+    fn test_ack_protocol_complete_success() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let token = mgr.issue_ack(LatencyStage::PtyCapture, "x".to_string(), 1000);
+        let result = mgr.complete(token.correlation_id, CompletionReason::Success, 3000);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.deferred_latency_us, 2000);
+        assert_eq!(r.reason, CompletionReason::Success);
+        assert_eq!(mgr.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_ack_protocol_complete_unknown_id() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let result = mgr.complete(999, CompletionReason::Success, 1000);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_ack_protocol_sweep_timeouts() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        mgr.issue_ack(LatencyStage::PtyCapture, "x".to_string(), 1000);
+        // Before deadline.
+        let results = mgr.sweep_timeouts(4_000_000);
+        assert!(results.is_empty());
+        assert_eq!(mgr.pending_count(), 1);
+        // After deadline (5_000_000 default).
+        let results = mgr.sweep_timeouts(6_100_000);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].reason, CompletionReason::Timeout);
+        assert_eq!(mgr.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_ack_protocol_snapshot() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        mgr.issue_ack(LatencyStage::PtyCapture, "x".to_string(), 1000);
+        mgr.complete(1, CompletionReason::Success, 2000);
+        let snap = mgr.snapshot();
+        assert_eq!(snap.total_acks, 1);
+        assert_eq!(snap.total_completions, 1);
+        assert_eq!(snap.total_timeouts, 0);
+        assert_eq!(snap.pending_count, 0);
+    }
+
+    #[test]
+    fn test_ack_protocol_snapshot_serde() {
+        let snap = AckProtocolSnapshot {
+            total_acks: 10,
+            total_completions: 8,
+            total_timeouts: 2,
+            pending_count: 0,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: AckProtocolSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn test_ack_protocol_degradation_healthy() {
+        let mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        assert_eq!(mgr.detect_degradation(), AckProtocolDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_ack_protocol_degradation_slow_ack() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        mgr.record_slow_ack();
+        assert_eq!(mgr.detect_degradation(), AckProtocolDegradation::AckSlow { slow_count: 1 });
+    }
+
+    #[test]
+    fn test_ack_protocol_degradation_timeout() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        mgr.issue_ack(LatencyStage::PtyCapture, "x".to_string(), 1000);
+        mgr.sweep_timeouts(6_100_000);
+        let deg = mgr.detect_degradation();
+        assert_eq!(deg, AckProtocolDegradation::CompletionTimeout { timeout_count: 1 });
+    }
+
+    #[test]
+    fn test_ack_protocol_degradation_display() {
+        assert_eq!(AckProtocolDegradation::Healthy.to_string(), "healthy");
+        assert_eq!(AckProtocolDegradation::AckSlow { slow_count: 3 }.to_string(), "ack-slow(3)");
+        assert_eq!(AckProtocolDegradation::CompletionTimeout { timeout_count: 2 }.to_string(), "completion-timeout(2)");
+    }
+
+    #[test]
+    fn test_ack_protocol_degradation_serde() {
+        let cases = vec![
+            AckProtocolDegradation::Healthy,
+            AckProtocolDegradation::AckSlow { slow_count: 5 },
+            AckProtocolDegradation::CompletionTimeout { timeout_count: 3 },
+        ];
+        for deg in cases {
+            let json = serde_json::to_string(&deg).unwrap();
+            let back: AckProtocolDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, deg);
+        }
+    }
+
+    #[test]
+    fn test_ack_protocol_log_entry() {
+        let mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let entry = mgr.log_entry(AckPhase::ImmediateAck, 42, "ack issued".to_string(), 1000);
+        assert_eq!(entry.phase, AckPhase::ImmediateAck);
+        assert_eq!(entry.correlation_id, 42);
+    }
+
+    #[test]
+    fn test_ack_protocol_log_entry_serde() {
+        let entry = AckProtocolLogEntry {
+            timestamp_us: 1000,
+            phase: AckPhase::DeferredCompletion,
+            correlation_id: 7,
+            event: "completed".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: AckProtocolLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn test_ack_protocol_reset() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        mgr.issue_ack(LatencyStage::PtyCapture, "x".to_string(), 1000);
+        mgr.record_slow_ack();
+        mgr.reset();
+        assert_eq!(mgr.pending_count(), 0);
+        let snap = mgr.snapshot();
+        assert_eq!(snap.total_acks, 0);
+        assert_eq!(snap.total_completions, 0);
+        assert_eq!(snap.total_timeouts, 0);
+        assert_eq!(mgr.detect_degradation(), AckProtocolDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_ack_protocol_config_accessor() {
+        let cfg = AckProtocolConfig { ack_deadline_us: 100, ..Default::default() };
+        let mgr = AckProtocolManager::new(cfg.clone());
+        assert_eq!(*mgr.config(), cfg);
+    }
+
+    #[test]
+    fn test_ack_timeout_increments_counter() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 1000);
+        mgr.issue_ack(LatencyStage::StorageWrite, "b".to_string(), 1000);
+        mgr.sweep_timeouts(6_100_000);
+        assert_eq!(mgr.snapshot().total_timeouts, 2);
+    }
+
+    #[test]
+    fn test_ack_cancel_completes() {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let token = mgr.issue_ack(LatencyStage::PtyCapture, "x".to_string(), 1000);
+        let result = mgr.complete(token.correlation_id, CompletionReason::Cancelled { reason: "user".to_string() }, 2000);
+        assert!(result.is_some());
+        assert_eq!(mgr.pending_count(), 0);
+        assert_eq!(mgr.snapshot().total_completions, 1);
     }
 }
