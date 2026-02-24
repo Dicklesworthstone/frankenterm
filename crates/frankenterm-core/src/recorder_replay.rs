@@ -24,15 +24,26 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::event_id::{RecorderMergeKey, StreamKind};
 use crate::recorder_audit::{
     AccessTier, ActorIdentity, AuditEventBuilder, AuditEventType, AuditLog, AuditScope,
     AuthzDecision,
 };
 use crate::recorder_query::{QueryEventKind, QueryResultEvent};
+use crate::recording::{RecorderEvent, RecorderEventPayload};
 
 // =============================================================================
 // Replay configuration
 // =============================================================================
+
+/// Equivalence level for deterministic replay validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayEquivalenceLevel {
+    Structural,
+    Decision,
+    Full,
+}
 
 /// Configuration for a replay session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +66,9 @@ pub struct ReplayConfig {
     /// Event kinds to include (empty = all kinds).
     #[serde(default)]
     pub kind_filter: Vec<QueryEventKind>,
+    /// Equivalence gate used by deterministic replay validation.
+    #[serde(default = "default_equivalence_level")]
+    pub equivalence_level: ReplayEquivalenceLevel,
 }
 
 fn default_speed() -> f64 {
@@ -66,6 +80,9 @@ fn default_max_delay() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn default_equivalence_level() -> ReplayEquivalenceLevel {
+    ReplayEquivalenceLevel::Decision
+}
 
 impl Default for ReplayConfig {
     fn default() -> Self {
@@ -76,6 +93,7 @@ impl Default for ReplayConfig {
             include_markers: true,
             pane_filter: Vec::new(),
             kind_filter: Vec::new(),
+            equivalence_level: default_equivalence_level(),
         }
     }
 }
@@ -115,6 +133,13 @@ impl ReplayConfig {
     #[must_use]
     pub fn with_kinds(mut self, kinds: Vec<QueryEventKind>) -> Self {
         self.kind_filter = kinds;
+        self
+    }
+
+    /// Set equivalence level for deterministic replay validation.
+    #[must_use]
+    pub fn with_equivalence_level(mut self, level: ReplayEquivalenceLevel) -> Self {
+        self.equivalence_level = level;
         self
     }
 
@@ -192,6 +217,8 @@ pub enum ReplayError {
     },
     /// Session already completed.
     SessionCompleted,
+    /// Checkpoint state does not match scheduler bounds.
+    InvalidCheckpoint { cursor: usize, total_events: usize },
 }
 
 impl std::fmt::Display for ReplayError {
@@ -209,6 +236,14 @@ impl std::fmt::Display for ReplayError {
                 target_ms, min_ms, max_ms
             ),
             Self::SessionCompleted => write!(f, "replay session already completed"),
+            Self::InvalidCheckpoint {
+                cursor,
+                total_events,
+            } => write!(
+                f,
+                "invalid checkpoint cursor {} for scheduler with {} events",
+                cursor, total_events
+            ),
         }
     }
 }
@@ -655,15 +690,351 @@ impl ReplayBuilder {
 }
 
 // =============================================================================
+// Deterministic replay kernel (ft-og6q6.3.1)
+// =============================================================================
+
+/// Snapshot of virtual clock state for checkpoint/resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct VirtualClockSnapshot {
+    pub occurred_at_ms: u64,
+    pub recorded_at_ms: u64,
+    pub initialized: bool,
+}
+
+/// Trace-driven virtual clock.
+///
+/// The clock advances only when the scheduler processes a replay event.
+#[derive(Debug, Clone)]
+pub struct VirtualClock {
+    speed: f64,
+    snapshot: VirtualClockSnapshot,
+}
+
+impl VirtualClock {
+    pub fn new(speed: f64) -> Result<Self, ReplayError> {
+        if speed <= 0.0 && !speed.is_infinite() {
+            return Err(ReplayError::InvalidConfig(
+                "virtual clock speed must be positive or infinite".to_string(),
+            ));
+        }
+        Ok(Self {
+            speed,
+            snapshot: VirtualClockSnapshot::default(),
+        })
+    }
+
+    pub fn from_snapshot(speed: f64, snapshot: VirtualClockSnapshot) -> Result<Self, ReplayError> {
+        if speed <= 0.0 && !speed.is_infinite() {
+            return Err(ReplayError::InvalidConfig(
+                "virtual clock speed must be positive or infinite".to_string(),
+            ));
+        }
+        Ok(Self { speed, snapshot })
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> VirtualClockSnapshot {
+        self.snapshot
+    }
+
+    /// Advance clock to the next event and return replay delay for this step.
+    #[must_use]
+    pub fn advance_to_event(&mut self, event: &RecorderEvent, max_delay_ms: u64) -> Duration {
+        let delay = if !self.snapshot.initialized {
+            Duration::ZERO
+        } else {
+            let delta_ms = event
+                .recorded_at_ms
+                .saturating_sub(self.snapshot.recorded_at_ms);
+            let scaled_ms = if self.speed.is_infinite() {
+                0
+            } else {
+                (delta_ms as f64 / self.speed) as u64
+            };
+            Duration::from_millis(scaled_ms.min(max_delay_ms))
+        };
+
+        self.snapshot = VirtualClockSnapshot {
+            occurred_at_ms: event.occurred_at_ms,
+            recorded_at_ms: event.recorded_at_ms,
+            initialized: true,
+        };
+        delay
+    }
+}
+
+/// Logical route for event processing during deterministic replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayEngineRoute {
+    Pattern,
+    Workflow,
+    Policy,
+}
+
+/// Deterministic decision emitted for a replayed event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayDecisionRecord {
+    pub decision_id: String,
+    pub event_id: String,
+    pub pane_id: u64,
+    pub sequence: u64,
+    pub stream_kind: StreamKind,
+    pub engine_route: ReplayEngineRoute,
+    pub decision_path: String,
+    pub occurred_at_ms: u64,
+    pub recorded_at_ms: u64,
+}
+
+/// Per-step output from the deterministic scheduler.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayScheduleStep {
+    pub cursor: usize,
+    pub merge_recorded_at_ms: u64,
+    pub merge_pane_id: u64,
+    pub merge_stream_kind: StreamKind,
+    pub merge_sequence: u64,
+    pub merge_event_id: String,
+    pub delay_ms: u64,
+    pub clock: VirtualClockSnapshot,
+    pub decision: ReplayDecisionRecord,
+}
+
+/// Serializable scheduler state for checkpoint/resume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaySchedulerState {
+    pub cursor: usize,
+    pub clock: VirtualClockSnapshot,
+    pub decisions_emitted: usize,
+}
+
+/// Event-driven deterministic replay scheduler.
+#[derive(Debug)]
+pub struct ReplayScheduler {
+    events: Vec<RecorderEvent>,
+    config: ReplayConfig,
+    cursor: usize,
+    clock: VirtualClock,
+    decisions: Vec<ReplayDecisionRecord>,
+}
+
+impl ReplayScheduler {
+    /// Create a scheduler over timeline events sorted by `RecorderMergeKey`.
+    pub fn new(mut events: Vec<RecorderEvent>, config: ReplayConfig) -> Result<Self, ReplayError> {
+        config.validate()?;
+        if events.is_empty() {
+            return Err(ReplayError::EmptySession);
+        }
+
+        events.sort_by_key(RecorderMergeKey::from_event);
+
+        let clock = VirtualClock::new(config.speed)?;
+        Ok(Self {
+            events,
+            config,
+            cursor: 0,
+            clock,
+            decisions: Vec::new(),
+        })
+    }
+
+    /// Create a scheduler from a parsed `.ftreplay` artifact.
+    pub fn from_artifact(
+        artifact: crate::replay_fixture_harvest::FtreplayArtifact,
+        config: ReplayConfig,
+    ) -> Result<Self, ReplayError> {
+        Self::new(artifact.events, config)
+    }
+
+    #[must_use]
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    #[must_use]
+    pub fn total_events(&self) -> usize {
+        self.events.len()
+    }
+
+    #[must_use]
+    pub fn decisions(&self) -> &[ReplayDecisionRecord] {
+        &self.decisions
+    }
+
+    #[must_use]
+    pub fn checkpoint(&self) -> ReplaySchedulerState {
+        ReplaySchedulerState {
+            cursor: self.cursor,
+            clock: self.clock.snapshot(),
+            decisions_emitted: self.decisions.len(),
+        }
+    }
+
+    pub fn resume(&mut self, state: ReplaySchedulerState) -> Result<(), ReplayError> {
+        if state.cursor > self.events.len() {
+            return Err(ReplayError::InvalidCheckpoint {
+                cursor: state.cursor,
+                total_events: self.events.len(),
+            });
+        }
+        self.cursor = state.cursor;
+        self.clock = VirtualClock::from_snapshot(self.config.speed, state.clock)?;
+        if self.decisions.len() > state.decisions_emitted {
+            self.decisions.truncate(state.decisions_emitted);
+        }
+        Ok(())
+    }
+
+    /// Process one event and emit one deterministic scheduler step.
+    pub fn next_step(&mut self) -> Option<ReplayScheduleStep> {
+        while self.cursor < self.events.len() {
+            let cursor = self.cursor;
+            self.cursor += 1;
+
+            let event = &self.events[cursor];
+            if !self.passes_filters(event) {
+                continue;
+            }
+
+            let merge_key = RecorderMergeKey::from_event(event);
+            let delay = self
+                .clock
+                .advance_to_event(event, self.config.max_delay_ms)
+                .as_millis() as u64;
+
+            let decision = build_decision_record(event);
+            let step = ReplayScheduleStep {
+                cursor,
+                merge_recorded_at_ms: merge_key.recorded_at_ms,
+                merge_pane_id: merge_key.pane_id,
+                merge_stream_kind: merge_key.stream_kind,
+                merge_sequence: merge_key.sequence,
+                merge_event_id: merge_key.event_id.clone(),
+                delay_ms: delay,
+                clock: self.clock.snapshot(),
+                decision: decision.clone(),
+            };
+
+            self.decisions.push(decision);
+            return Some(step);
+        }
+        None
+    }
+
+    /// Process all remaining events.
+    pub fn run_to_completion(&mut self) -> Vec<ReplayScheduleStep> {
+        let mut steps = Vec::new();
+        while let Some(step) = self.next_step() {
+            steps.push(step);
+        }
+        steps
+    }
+
+    /// Stable newline-delimited JSON encoding of all emitted decisions.
+    pub fn decision_trace_bytes(&self) -> crate::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for decision in &self.decisions {
+            out.extend(serde_json::to_vec(decision)?);
+            out.push(b'\n');
+        }
+        Ok(out)
+    }
+
+    fn passes_filters(&self, event: &RecorderEvent) -> bool {
+        if !self.config.pane_filter.is_empty() && !self.config.pane_filter.contains(&event.pane_id)
+        {
+            return false;
+        }
+
+        let kind = query_kind_from_payload(&event.payload);
+        if !self.config.kind_filter.is_empty() && !self.config.kind_filter.contains(&kind) {
+            return false;
+        }
+
+        if !self.config.include_markers
+            && matches!(
+                kind,
+                QueryEventKind::ControlMarker | QueryEventKind::LifecycleMarker
+            )
+        {
+            return false;
+        }
+
+        if self.config.skip_empty {
+            match &event.payload {
+                RecorderEventPayload::IngressText { text, .. }
+                | RecorderEventPayload::EgressOutput { text, .. } => {
+                    if text.is_empty() {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        true
+    }
+}
+
+fn query_kind_from_payload(payload: &RecorderEventPayload) -> QueryEventKind {
+    match payload {
+        RecorderEventPayload::IngressText { .. } => QueryEventKind::IngressText,
+        RecorderEventPayload::EgressOutput { .. } => QueryEventKind::EgressOutput,
+        RecorderEventPayload::ControlMarker { .. } => QueryEventKind::ControlMarker,
+        RecorderEventPayload::LifecycleMarker { .. } => QueryEventKind::LifecycleMarker,
+    }
+}
+
+fn build_decision_record(event: &RecorderEvent) -> ReplayDecisionRecord {
+    let stream_kind = StreamKind::from_payload(&event.payload);
+    let (engine_route, decision_path) = match &event.payload {
+        RecorderEventPayload::IngressText { .. } | RecorderEventPayload::EgressOutput { .. } => {
+            (ReplayEngineRoute::Pattern, "pattern.evaluate")
+        }
+        RecorderEventPayload::ControlMarker { .. } => {
+            (ReplayEngineRoute::Policy, "policy.evaluate")
+        }
+        RecorderEventPayload::LifecycleMarker { .. } => {
+            (ReplayEngineRoute::Workflow, "workflow.evaluate")
+        }
+    };
+    let decision_id = format!(
+        "{}:{}:{}:{}",
+        event.event_id,
+        event.pane_id,
+        stream_kind.rank(),
+        event.sequence
+    );
+
+    ReplayDecisionRecord {
+        decision_id,
+        event_id: event.event_id.clone(),
+        pane_id: event.pane_id,
+        sequence: event.sequence,
+        stream_kind,
+        engine_route,
+        decision_path: decision_path.to_string(),
+        occurred_at_ms: event.occurred_at_ms,
+        recorded_at_ms: event.recorded_at_ms,
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
     use crate::policy::ActorKind;
     use crate::recorder_retention::SensitivityTier;
-    use crate::recording::RecorderEventSource;
+    use crate::recording::{
+        RecorderControlMarkerType, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
+        RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
+        RecorderSegmentKind, RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+    };
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -710,6 +1081,113 @@ mod tests {
             make_lifecycle(1, 3, 2500),
             make_text_event(1, 4, 3000, "cat file.txt"),
         ]
+    }
+
+    fn make_recorder_event(
+        pane_id: u64,
+        sequence: u64,
+        occurred_at_ms: u64,
+        recorded_at_ms: u64,
+        payload: RecorderEventPayload,
+    ) -> RecorderEvent {
+        RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            event_id: format!("evt-{pane_id}-{sequence}-{recorded_at_ms}"),
+            pane_id,
+            session_id: Some("session-1".to_string()),
+            workflow_id: None,
+            correlation_id: None,
+            source: RecorderEventSource::RobotMode,
+            occurred_at_ms,
+            recorded_at_ms,
+            sequence,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload,
+        }
+    }
+
+    fn make_recorder_ingress(
+        pane_id: u64,
+        sequence: u64,
+        occurred_at_ms: u64,
+        recorded_at_ms: u64,
+        text: &str,
+    ) -> RecorderEvent {
+        make_recorder_event(
+            pane_id,
+            sequence,
+            occurred_at_ms,
+            recorded_at_ms,
+            RecorderEventPayload::IngressText {
+                text: text.to_string(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                ingress_kind: RecorderIngressKind::SendText,
+            },
+        )
+    }
+
+    fn make_recorder_egress(
+        pane_id: u64,
+        sequence: u64,
+        occurred_at_ms: u64,
+        recorded_at_ms: u64,
+        text: &str,
+    ) -> RecorderEvent {
+        make_recorder_event(
+            pane_id,
+            sequence,
+            occurred_at_ms,
+            recorded_at_ms,
+            RecorderEventPayload::EgressOutput {
+                text: text.to_string(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                segment_kind: RecorderSegmentKind::Delta,
+                is_gap: false,
+            },
+        )
+    }
+
+    fn make_recorder_control(
+        pane_id: u64,
+        sequence: u64,
+        occurred_at_ms: u64,
+        recorded_at_ms: u64,
+    ) -> RecorderEvent {
+        make_recorder_event(
+            pane_id,
+            sequence,
+            occurred_at_ms,
+            recorded_at_ms,
+            RecorderEventPayload::ControlMarker {
+                control_marker_type: RecorderControlMarkerType::PolicyDecision,
+                details: json!({"decision": "allow"}),
+            },
+        )
+    }
+
+    fn make_recorder_lifecycle(
+        pane_id: u64,
+        sequence: u64,
+        occurred_at_ms: u64,
+        recorded_at_ms: u64,
+    ) -> RecorderEvent {
+        make_recorder_event(
+            pane_id,
+            sequence,
+            occurred_at_ms,
+            recorded_at_ms,
+            RecorderEventPayload::LifecycleMarker {
+                lifecycle_phase: RecorderLifecyclePhase::CaptureStarted,
+                reason: Some("start".to_string()),
+                details: json!({}),
+            },
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -952,11 +1430,9 @@ mod tests {
 
         let frames = session.collect_remaining();
         assert_eq!(frames.len(), 4); // 4 IngressText, 1 LifecycleMarker skipped.
-        assert!(
-            frames
-                .iter()
-                .all(|f| f.event.event_kind == QueryEventKind::IngressText)
-        );
+        assert!(frames
+            .iter()
+            .all(|f| f.event.event_kind == QueryEventKind::IngressText));
     }
 
     // -----------------------------------------------------------------------
@@ -1226,20 +1702,16 @@ mod tests {
     #[test]
     fn replay_error_display() {
         assert_eq!(ReplayError::EmptySession.to_string(), "no events to replay");
-        assert!(
-            ReplayError::InvalidConfig("bad".into())
-                .to_string()
-                .contains("bad")
-        );
-        assert!(
-            ReplayError::SeekOutOfRange {
-                target_ms: 50,
-                min_ms: 100,
-                max_ms: 200
-            }
+        assert!(ReplayError::InvalidConfig("bad".into())
             .to_string()
-            .contains("50")
-        );
+            .contains("bad"));
+        assert!(ReplayError::SeekOutOfRange {
+            target_ms: 50,
+            min_ms: 100,
+            max_ms: 200
+        }
+        .to_string()
+        .contains("50"));
     }
 
     #[test]
@@ -1282,6 +1754,7 @@ mod tests {
             include_markers: false,
             pane_filter: vec![1, 2, 3],
             kind_filter: vec![QueryEventKind::IngressText],
+            equivalence_level: ReplayEquivalenceLevel::Full,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ReplayConfig = serde_json::from_str(&json).unwrap();
@@ -1291,6 +1764,7 @@ mod tests {
         assert!(!deserialized.include_markers);
         assert_eq!(deserialized.pane_filter, vec![1, 2, 3]);
         assert_eq!(deserialized.kind_filter, vec![QueryEventKind::IngressText]);
+        assert_eq!(deserialized.equivalence_level, ReplayEquivalenceLevel::Full);
     }
 
     #[test]
@@ -1303,6 +1777,10 @@ mod tests {
         assert!(deserialized.include_markers);
         assert!(deserialized.pane_filter.is_empty());
         assert!(deserialized.kind_filter.is_empty());
+        assert_eq!(
+            deserialized.equivalence_level,
+            ReplayEquivalenceLevel::Decision
+        );
     }
 
     #[test]
@@ -1875,5 +2353,377 @@ mod tests {
         assert_eq!(frames[0].event.pane_id, 2);
         assert_eq!(frames[1].event.pane_id, 4);
         assert_eq!(session.stats().frames_skipped, 2);
+    }
+
+    #[test]
+    fn replay_config_default_equivalence_level_is_decision() {
+        assert_eq!(
+            ReplayConfig::default().equivalence_level,
+            ReplayEquivalenceLevel::Decision
+        );
+    }
+
+    #[test]
+    fn virtual_clock_speed_modes() {
+        let first = make_recorder_ingress(1, 0, 1000, 1000, "a");
+        let second = make_recorder_ingress(1, 1, 1500, 2000, "b");
+
+        let mut realtime = VirtualClock::new(1.0).unwrap();
+        assert_eq!(
+            realtime.advance_to_event(&first, 10_000),
+            Duration::from_millis(0)
+        );
+        assert_eq!(
+            realtime.advance_to_event(&second, 10_000),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(realtime.snapshot().occurred_at_ms, 1500);
+        assert_eq!(realtime.snapshot().recorded_at_ms, 2000);
+
+        let mut double = VirtualClock::new(2.0).unwrap();
+        let _ = double.advance_to_event(&first, 10_000);
+        assert_eq!(
+            double.advance_to_event(&second, 10_000),
+            Duration::from_millis(500)
+        );
+
+        let mut instant = VirtualClock::new(f64::INFINITY).unwrap();
+        let _ = instant.advance_to_event(&first, 10_000);
+        assert_eq!(
+            instant.advance_to_event(&second, 10_000),
+            Duration::from_millis(0)
+        );
+    }
+
+    #[test]
+    fn replay_scheduler_orders_by_merge_key() {
+        let events = vec![
+            make_recorder_ingress(1, 2, 1300, 1000, "ingress"),
+            make_recorder_control(1, 1, 1200, 1000),
+            make_recorder_lifecycle(1, 0, 1100, 1000),
+            make_recorder_egress(2, 0, 1400, 1000, "egress"),
+        ];
+
+        let mut scheduler = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
+        let steps = scheduler.run_to_completion();
+        let order: Vec<StreamKind> = steps.iter().map(|step| step.merge_stream_kind).collect();
+
+        assert_eq!(
+            order,
+            vec![
+                StreamKind::Lifecycle,
+                StreamKind::Control,
+                StreamKind::Ingress,
+                StreamKind::Egress
+            ]
+        );
+        assert_eq!(steps[0].merge_pane_id, 1);
+        assert_eq!(steps[3].merge_pane_id, 2);
+    }
+
+    #[test]
+    fn replay_scheduler_routes_events_to_expected_engines() {
+        let events = vec![
+            make_recorder_ingress(1, 0, 1000, 1000, "ingress"),
+            make_recorder_egress(1, 1, 1100, 1100, "egress"),
+            make_recorder_control(1, 2, 1200, 1200),
+            make_recorder_lifecycle(1, 3, 1300, 1300),
+        ];
+        let mut scheduler = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
+        let steps = scheduler.run_to_completion();
+        let routes: Vec<ReplayEngineRoute> = steps
+            .iter()
+            .map(|step| step.decision.engine_route)
+            .collect();
+
+        assert_eq!(
+            routes,
+            vec![
+                ReplayEngineRoute::Pattern,
+                ReplayEngineRoute::Pattern,
+                ReplayEngineRoute::Policy,
+                ReplayEngineRoute::Workflow
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_scheduler_respects_filters() {
+        let events = vec![
+            make_recorder_ingress(1, 0, 1000, 1000, "p1"),
+            make_recorder_ingress(2, 1, 1100, 1100, "p2"),
+            make_recorder_control(1, 2, 1200, 1200),
+        ];
+
+        let config = ReplayConfig::instant()
+            .with_panes(vec![1])
+            .with_kinds(vec![QueryEventKind::IngressText]);
+        let mut scheduler = ReplayScheduler::new(events, config).unwrap();
+        let steps = scheduler.run_to_completion();
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].decision.pane_id, 1);
+        assert_eq!(steps[0].decision.engine_route, ReplayEngineRoute::Pattern);
+    }
+
+    #[test]
+    fn replay_scheduler_skip_empty_and_marker_filtering() {
+        let events = vec![
+            make_recorder_ingress(1, 0, 1000, 1000, ""),
+            make_recorder_control(1, 1, 1100, 1100),
+            make_recorder_ingress(1, 2, 1200, 1200, "ok"),
+        ];
+        let config = ReplayConfig {
+            skip_empty: true,
+            include_markers: false,
+            ..ReplayConfig::instant()
+        };
+
+        let mut scheduler = ReplayScheduler::new(events, config).unwrap();
+        let steps = scheduler.run_to_completion();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].decision.sequence, 2);
+    }
+
+    #[test]
+    fn replay_scheduler_checkpoint_resume_round_trip() {
+        let events = vec![
+            make_recorder_ingress(1, 0, 1000, 1000, "a"),
+            make_recorder_ingress(1, 1, 1200, 1200, "b"),
+            make_recorder_control(1, 2, 1300, 1300),
+            make_recorder_lifecycle(1, 3, 1400, 1400),
+        ];
+        let config = ReplayConfig::default().with_speed(2.0);
+
+        let mut baseline = ReplayScheduler::new(events.clone(), config.clone()).unwrap();
+        let _ = baseline.next_step().unwrap();
+        let _ = baseline.next_step().unwrap();
+        let checkpoint = baseline.checkpoint();
+        let baseline_tail = baseline.run_to_completion();
+
+        let mut resumed = ReplayScheduler::new(events, config).unwrap();
+        resumed.resume(checkpoint).unwrap();
+        let resumed_tail = resumed.run_to_completion();
+
+        assert_eq!(baseline_tail, resumed_tail);
+    }
+
+    #[test]
+    fn replay_scheduler_rejects_invalid_checkpoint() {
+        let events = vec![make_recorder_ingress(1, 0, 1000, 1000, "a")];
+        let mut scheduler = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
+        let err = scheduler
+            .resume(ReplaySchedulerState {
+                cursor: 10,
+                clock: VirtualClockSnapshot::default(),
+                decisions_emitted: 0,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ReplayError::InvalidCheckpoint {
+                cursor: 10,
+                total_events: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn replay_scheduler_decision_trace_is_deterministic() {
+        let events = vec![
+            make_recorder_ingress(1, 0, 1000, 1000, "a"),
+            make_recorder_egress(2, 0, 1001, 1001, "b"),
+            make_recorder_control(1, 1, 1002, 1002),
+            make_recorder_lifecycle(1, 2, 1003, 1003),
+        ];
+
+        let mut first = ReplayScheduler::new(events.clone(), ReplayConfig::instant()).unwrap();
+        let _ = first.run_to_completion();
+        let first_bytes = first.decision_trace_bytes().unwrap();
+
+        let mut second = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
+        let _ = second.run_to_completion();
+        let second_bytes = second.decision_trace_bytes().unwrap();
+
+        assert_eq!(first_bytes, second_bytes);
+    }
+
+    #[test]
+    fn virtual_clock_rejects_non_positive_speed() {
+        let zero = VirtualClock::new(0.0).unwrap_err();
+        let negative = VirtualClock::new(-1.0).unwrap_err();
+        assert!(matches!(zero, ReplayError::InvalidConfig(_)));
+        assert!(matches!(negative, ReplayError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn virtual_clock_clamps_to_max_delay() {
+        let first = make_recorder_ingress(1, 0, 1000, 1000, "a");
+        let second = make_recorder_ingress(1, 1, 2000, 11_000, "b");
+
+        let mut clock = VirtualClock::new(1.0).unwrap();
+        let _ = clock.advance_to_event(&first, 50);
+        let delay = clock.advance_to_event(&second, 50);
+        assert_eq!(delay, Duration::from_millis(50));
+        assert_eq!(clock.snapshot().recorded_at_ms, 11_000);
+    }
+
+    #[test]
+    fn replay_scheduler_rejects_empty_event_list() {
+        let err = ReplayScheduler::new(Vec::new(), ReplayConfig::instant()).unwrap_err();
+        assert!(matches!(err, ReplayError::EmptySession));
+    }
+
+    #[test]
+    fn replay_scheduler_completion_is_idempotent() {
+        let events = vec![
+            make_recorder_ingress(1, 0, 1000, 1000, "a"),
+            make_recorder_ingress(1, 1, 1100, 1100, "b"),
+        ];
+        let mut scheduler = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
+        let first_run = scheduler.run_to_completion();
+        let second_run = scheduler.run_to_completion();
+        assert_eq!(first_run.len(), 2);
+        assert!(second_run.is_empty());
+        assert_eq!(scheduler.cursor(), scheduler.total_events());
+    }
+
+    #[test]
+    fn replay_scheduler_cursor_advances_when_events_filtered() {
+        let events = vec![
+            make_recorder_ingress(1, 0, 1000, 1000, "a"),
+            make_recorder_control(1, 1, 1100, 1100),
+            make_recorder_lifecycle(1, 2, 1200, 1200),
+        ];
+        let config = ReplayConfig::instant()
+            .with_panes(vec![2])
+            .with_kinds(vec![QueryEventKind::IngressText]);
+        let mut scheduler = ReplayScheduler::new(events, config).unwrap();
+        let step = scheduler.next_step();
+        assert!(step.is_none());
+        assert_eq!(scheduler.cursor(), scheduler.total_events());
+        assert!(scheduler.decisions().is_empty());
+    }
+
+    #[test]
+    fn replay_scheduler_resume_truncates_decision_buffer() {
+        let events = vec![
+            make_recorder_ingress(1, 0, 1000, 1000, "a"),
+            make_recorder_ingress(1, 1, 1100, 1100, "b"),
+            make_recorder_control(1, 2, 1200, 1200),
+        ];
+        let mut scheduler = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
+        let _ = scheduler.next_step().unwrap();
+        let _ = scheduler.next_step().unwrap();
+        assert_eq!(scheduler.decisions().len(), 2);
+
+        let mut checkpoint = scheduler.checkpoint();
+        checkpoint.decisions_emitted = 1;
+        scheduler.resume(checkpoint).unwrap();
+        assert_eq!(scheduler.decisions().len(), 1);
+        assert_eq!(scheduler.decisions()[0].sequence, 0);
+    }
+
+    #[test]
+    fn replay_scheduler_resume_allows_larger_decisions_emitted_hint() {
+        let events = vec![
+            make_recorder_ingress(1, 0, 1000, 1000, "a"),
+            make_recorder_control(1, 1, 1100, 1100),
+        ];
+        let mut scheduler = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
+        let _ = scheduler.next_step().unwrap();
+
+        let mut checkpoint = scheduler.checkpoint();
+        checkpoint.decisions_emitted = 10;
+        scheduler.resume(checkpoint).unwrap();
+        assert_eq!(scheduler.decisions().len(), 1);
+    }
+
+    #[test]
+    fn replay_scheduler_checkpoint_initial_state() {
+        let events = vec![make_recorder_ingress(1, 0, 1000, 1000, "a")];
+        let scheduler = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
+        let checkpoint = scheduler.checkpoint();
+        assert_eq!(checkpoint.cursor, 0);
+        assert_eq!(checkpoint.decisions_emitted, 0);
+        assert_eq!(checkpoint.clock, VirtualClockSnapshot::default());
+    }
+
+    #[test]
+    fn replay_scheduler_includes_markers_when_enabled() {
+        let events = vec![
+            make_recorder_control(1, 0, 1000, 1000),
+            make_recorder_lifecycle(1, 1, 1100, 1100),
+        ];
+        let config = ReplayConfig {
+            include_markers: true,
+            skip_empty: true,
+            ..ReplayConfig::instant()
+        };
+        let mut scheduler = ReplayScheduler::new(events, config).unwrap();
+        let steps = scheduler.run_to_completion();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].decision.engine_route, ReplayEngineRoute::Policy);
+        assert_eq!(steps[1].decision.engine_route, ReplayEngineRoute::Workflow);
+    }
+
+    #[test]
+    fn replay_scheduler_does_not_skip_empty_when_disabled() {
+        let events = vec![make_recorder_ingress(1, 0, 1000, 1000, "")];
+        let config = ReplayConfig {
+            skip_empty: false,
+            include_markers: false,
+            ..ReplayConfig::instant()
+        };
+        let mut scheduler = ReplayScheduler::new(events, config).unwrap();
+        let steps = scheduler.run_to_completion();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].decision.sequence, 0);
+    }
+
+    #[test]
+    fn replay_scheduler_trace_is_newline_delimited_json() {
+        let events = vec![
+            make_recorder_ingress(1, 0, 1000, 1000, "a"),
+            make_recorder_control(1, 1, 1100, 1100),
+        ];
+        let mut scheduler = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
+        let _ = scheduler.run_to_completion();
+        let trace = scheduler.decision_trace_bytes().unwrap();
+        assert!(!trace.is_empty());
+        assert_eq!(trace.last().copied(), Some(b'\n'));
+
+        let lines = String::from_utf8(trace).unwrap();
+        for line in lines.lines() {
+            let parsed: ReplayDecisionRecord = serde_json::from_str(line).unwrap();
+            assert!(!parsed.decision_id.is_empty());
+        }
+    }
+
+    #[test]
+    fn replay_scheduler_decision_ids_are_stable() {
+        let events = vec![
+            make_recorder_ingress(2, 3, 1000, 1000, "x"),
+            make_recorder_egress(2, 4, 1010, 1010, "y"),
+            make_recorder_control(2, 5, 1020, 1020),
+        ];
+
+        let mut first = ReplayScheduler::new(events.clone(), ReplayConfig::instant()).unwrap();
+        let _ = first.run_to_completion();
+        let first_ids: Vec<String> = first
+            .decisions()
+            .iter()
+            .map(|decision| decision.decision_id.clone())
+            .collect();
+
+        let mut second = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
+        let _ = second.run_to_completion();
+        let second_ids: Vec<String> = second
+            .decisions()
+            .iter()
+            .map(|decision| decision.decision_id.clone())
+            .collect();
+
+        assert_eq!(first_ids, second_ids);
     }
 }
