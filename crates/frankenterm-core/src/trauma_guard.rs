@@ -107,6 +107,9 @@ pub struct TraumaEvent {
     /// Sorted unique critical flags extracted from `command_tokens`.
     #[serde(default)]
     pub critical_flags: Vec<String>,
+    /// Mutation epoch snapshot used to reset loop counting after functional edits.
+    #[serde(default)]
+    pub mutation_epoch: u64,
     /// Canonicalized error signatures observed for this command.
     pub error_signatures: Vec<String>,
     /// Signatures that were considered recurring at this event.
@@ -165,6 +168,8 @@ pub struct TraumaState {
     signature_windows: HashMap<String, SlidingWindow>,
     recent_signatures: VecDeque<String>,
     signature_bloom: BloomFilter,
+    mutation_epoch: u64,
+    last_mutation_timestamp_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +178,7 @@ struct CommandFeatures {
     command_fingerprint: String,
     command_tokens: Vec<String>,
     critical_flags: Vec<String>,
+    mutation_epoch: u64,
 }
 
 impl Default for TraumaState {
@@ -201,6 +207,8 @@ impl TraumaState {
                 sanitized.bloom_fp_rate,
             ),
             config: sanitized,
+            mutation_epoch: 0,
+            last_mutation_timestamp_ms: None,
         }
     }
 
@@ -220,6 +228,21 @@ impl TraumaState {
     #[must_use]
     pub fn recent_events(&self) -> &VecDeque<TraumaEvent> {
         &self.history
+    }
+
+    /// Current mutation epoch.
+    ///
+    /// Each functional mutation increments the epoch and resets trailing-loop
+    /// matching for subsequent commands.
+    #[must_use]
+    pub const fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch
+    }
+
+    /// Timestamp of the most recent functional mutation, if recorded.
+    #[must_use]
+    pub const fn last_mutation_timestamp_ms(&self) -> Option<u64> {
+        self.last_mutation_timestamp_ms
     }
 
     /// Check whether a signature appears in recent-memory membership state.
@@ -257,6 +280,7 @@ impl TraumaState {
             command_fingerprint: command_features.command_fingerprint.clone(),
             command_tokens: command_features.command_tokens.clone(),
             critical_flags: command_features.critical_flags.clone(),
+            mutation_epoch: command_features.mutation_epoch,
             error_signatures: signatures.clone(),
             recurring_signatures: recurring_signatures.clone(),
         };
@@ -283,6 +307,20 @@ impl TraumaState {
     ) -> TraumaDecision {
         let signatures: Vec<String> = detections.iter().map(|d| d.rule_id.clone()).collect();
         self.record_command_result(timestamp_ms, command, &signatures)
+    }
+
+    /// Record a filesystem mutation event and update reset epoch when functional.
+    ///
+    /// Returns `true` when the mutation should reset loop counting (source/runtime
+    /// edits). Returns `false` for scratchpad/docs mutations (`.beads/`, `*.md`,
+    /// `*.txt`).
+    pub fn record_mutation(&mut self, timestamp_ms: u64, path: &str) -> bool {
+        if !is_functional_mutation_path(path) {
+            return false;
+        }
+        self.mutation_epoch = self.mutation_epoch.saturating_add(1);
+        self.last_mutation_timestamp_ms = Some(timestamp_ms);
+        true
     }
 
     fn record_signatures(&mut self, timestamp_ms: u64, signatures: &[String]) -> Vec<String> {
@@ -372,10 +410,15 @@ impl TraumaState {
             command_fingerprint,
             command_tokens,
             critical_flags,
+            mutation_epoch: self.mutation_epoch,
         }
     }
 
     fn is_trivial_variation(&self, command: &CommandFeatures, event: &TraumaEvent) -> bool {
+        if command.mutation_epoch != event.mutation_epoch {
+            return false;
+        }
+
         if command.command_hash == event.command_hash {
             return true;
         }
@@ -567,6 +610,26 @@ fn token_jaccard_similarity(left: &[String], right: &[String]) -> f64 {
     }
 }
 
+fn is_functional_mutation_path(path: &str) -> bool {
+    let normalized = path.trim().replace('\\', "/").to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    if normalized == ".beads"
+        || normalized.starts_with(".beads/")
+        || normalized.contains("/.beads/")
+    {
+        return false;
+    }
+
+    if normalized.ends_with(".md") || normalized.ends_with(".txt") {
+        return false;
+    }
+
+    true
+}
+
 fn fnv1a64(data: &[u8]) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x100000001b3;
@@ -675,6 +738,59 @@ mod tests {
         assert_eq!(second.repeat_count, 2);
         assert_eq!(third.repeat_count, 1);
         assert!(!third.should_intervene);
+    }
+
+    #[test]
+    fn source_mutation_resets_repeat_chain() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["core.codex:error_loop".to_string()];
+
+        let first = state.record_command_result(1_000, "cargo test -p foo", &signatures);
+        let second = state.record_command_result(1_100, "cargo test -p foo -v", &signatures);
+        let reset = state.record_mutation(1_150, "crates/frankenterm-core/src/lib.rs");
+        let third = state.record_command_result(1_200, "cargo test -p foo --verbose", &signatures);
+
+        assert!(reset);
+        assert_eq!(first.repeat_count, 1);
+        assert_eq!(second.repeat_count, 2);
+        assert_eq!(third.repeat_count, 1);
+        assert!(!third.should_intervene);
+        assert_eq!(state.mutation_epoch(), 1);
+        assert_eq!(state.last_mutation_timestamp_ms(), Some(1_150));
+    }
+
+    #[test]
+    fn scratchpad_mutation_does_not_reset_repeat_chain() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["core.codex:error_loop".to_string()];
+
+        let _ = state.record_command_result(2_000, "cargo test -p foo", &signatures);
+        let _ = state.record_command_result(2_100, "cargo test -p foo -v", &signatures);
+        let reset = state.record_mutation(2_150, ".beads/issues.jsonl");
+        let decision =
+            state.record_command_result(2_200, "cargo test -p foo --verbose", &signatures);
+
+        assert!(!reset);
+        assert_eq!(decision.repeat_count, 3);
+        assert!(decision.should_intervene);
+        assert_eq!(state.mutation_epoch(), 0);
+        assert_eq!(state.last_mutation_timestamp_ms(), None);
+    }
+
+    #[test]
+    fn docs_mutation_does_not_reset_repeat_chain() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["core.codex:error_loop".to_string()];
+
+        let _ = state.record_command_result(3_000, "cargo test -p foo", &signatures);
+        let _ = state.record_command_result(3_100, "cargo test -p foo -v", &signatures);
+        assert!(!state.record_mutation(3_150, "PLAN.md"));
+        assert!(!state.record_mutation(3_160, "notes/todo.txt"));
+        let decision =
+            state.record_command_result(3_200, "cargo test -p foo --verbose", &signatures);
+
+        assert_eq!(decision.repeat_count, 3);
+        assert!(decision.should_intervene);
     }
 
     #[test]
@@ -795,6 +911,36 @@ mod tests {
         assert!(!decision.should_intervene);
     }
 
+    #[test]
+    fn e2e_source_mutation_resets_loop_counter() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["core.codex:error_loop".to_string()];
+
+        let _ = state.record_command_result(40_000, "cargo test -p foo", &signatures);
+        let _ = state.record_command_result(40_100, "cargo test -p foo -v", &signatures);
+        assert!(state.record_mutation(40_150, "src/main.rs"));
+        let decision =
+            state.record_command_result(40_200, "cargo test -p foo --verbose", &signatures);
+
+        assert_eq!(decision.repeat_count, 1);
+        assert!(!decision.should_intervene);
+    }
+
+    #[test]
+    fn e2e_scratchpad_mutation_does_not_reset_loop_counter() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["core.codex:error_loop".to_string()];
+
+        let _ = state.record_command_result(50_000, "cargo test -p foo", &signatures);
+        let _ = state.record_command_result(50_100, "cargo test -p foo -v", &signatures);
+        assert!(!state.record_mutation(50_150, "AGENT_TODO.md"));
+        let decision =
+            state.record_command_result(50_200, "cargo test -p foo --verbose", &signatures);
+
+        assert_eq!(decision.repeat_count, 3);
+        assert!(decision.should_intervene);
+    }
+
     proptest! {
         #[test]
         fn proptest_signature_window_count_matches_recent_buckets(
@@ -846,6 +992,82 @@ mod tests {
         }
 
         #[test]
+        fn proptest_interleaved_command_error_stream_keeps_state_bounded(
+            events in prop::collection::vec(
+                (
+                    prop_oneof![
+                        Just("cargo test -p foo".to_string()),
+                        Just("cargo test -p foo --verbose".to_string()),
+                        Just("cargo clippy --workspace".to_string()),
+                        Just("npm run lint".to_string()),
+                        Just("python -m pytest tests/unit".to_string()),
+                    ],
+                    prop_oneof![
+                        Just(Vec::<String>::new()),
+                        Just(vec!["core.codex:error_loop".to_string()]),
+                        Just(vec!["core.codex:error_loop".to_string(), "core.codex:retry".to_string()]),
+                        Just(vec!["core.gemini:error".to_string()]),
+                    ],
+                    any::<bool>(),
+                ),
+                64..220
+            )
+        ) {
+            let mut config = test_config();
+            config.history_limit = 16;
+            config.signature_retention = 64;
+            config.bloom_capacity = 64;
+            let mut state = TraumaState::with_config(config);
+
+            let base_ts = 80_000_u64;
+            let step_ms = 50_u64;
+
+            for (idx, (command, signatures, trigger_mutation)) in events.iter().enumerate() {
+                let ts = base_ts + (idx as u64 * step_ms);
+
+                if *trigger_mutation {
+                    let mutation_path = if idx % 2 == 0 {
+                        "src/lib.rs"
+                    } else {
+                        "NOTES.md"
+                    };
+                    let _ = state.record_mutation(ts.saturating_sub(1), mutation_path);
+                }
+
+                let decision = state.record_command_result(ts, command, signatures);
+
+                prop_assert!(state.history_len() <= state.config().history_limit);
+                prop_assert!(decision.repeat_count <= state.history_len() as u64);
+                prop_assert!(
+                    decision
+                        .recurring_signatures
+                        .iter()
+                        .all(|sig| signatures.contains(sig))
+                );
+
+                if signatures.is_empty() {
+                    prop_assert_eq!(decision.repeat_count, 0);
+                    prop_assert!(!decision.should_intervene);
+                }
+            }
+
+            let now_ms = base_ts + (events.len() as u64 * step_ms);
+            let window_ms = state.config().signature_window.window_duration_ms;
+            for signature in ["core.codex:error_loop", "core.codex:retry", "core.gemini:error"] {
+                let expected = events
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, (_, signatures, _))| {
+                        let ts = base_ts + (*idx as u64 * step_ms);
+                        ts + window_ms > now_ms && signatures.iter().any(|sig| sig == signature)
+                    })
+                    .count() as u64;
+                let observed = state.signature_count(signature, now_ms);
+                prop_assert_eq!(observed, expected);
+            }
+        }
+
+        #[test]
         fn proptest_token_jaccard_similarity_is_symmetric(
             left in prop::collection::vec("[a-z\\-]{1,8}", 0..16),
             right in prop::collection::vec("[a-z\\-]{1,8}", 0..16),
@@ -856,6 +1078,15 @@ mod tests {
             let backward = token_jaccard_similarity(&right_tokens, &left_tokens);
             prop_assert!((forward - backward).abs() < f64::EPSILON);
             prop_assert!((0.0..=1.0).contains(&forward));
+        }
+
+        #[test]
+        fn proptest_functional_mutation_filter(
+            stem in "[a-z_]{1,12}",
+            ext in prop_oneof![Just("rs"), Just("toml"), Just("json"), Just("yaml")]
+        ) {
+            let path = format!("src/{stem}.{ext}");
+            prop_assert!(is_functional_mutation_path(&path));
         }
     }
 }
