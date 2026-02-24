@@ -1291,7 +1291,7 @@ struct CommandRule {
 }
 
 static RM_RF_ROOT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\brm\s+-(rf|fr)\s+(/|~)(\s|$)").expect("rm -rf root regex"));
+    LazyLock::new(|| Regex::new(r"(?i)\brm\s+-(rf|fr)\s+(/|~/?)\*?(\s|$)").expect("rm -rf root regex"));
 static RM_RF_GENERIC: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\brm\s+-(rf|fr)\s+").expect("rm -rf regex"));
 static GIT_RESET_HARD: LazyLock<Regex> =
@@ -1310,7 +1310,7 @@ static SQL_DESTRUCTIVE: LazyLock<Regex> = LazyLock::new(|| {
 
 static VAR_ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"^[a-zA-Z_][a-zA-Z0-9_]*=(?:'[^']*'|"[^"]*"|\$\([^)]*\)|`[^`]*`|\\.|[^\s])*(\s+|$)"#,
+        r#"^[a-zA-Z_][a-zA-Z0-9_]*=(?:'[^']*'|"[^"]*"|\$\([^)]*\)|`[^`]*`|\\.|[^\s;&|<>])*(\s+|$)"#,
     )
     .expect("var assign regex")
 });
@@ -1405,6 +1405,18 @@ const COMMAND_TOKENS: &[&str] = &[
     "xargs",
     "busybox",
     "openssl",
+    "time",
+    "nohup",
+    "nice",
+    "timeout",
+    "doas",
+    "su",
+    "stdbuf",
+    "taskset",
+    "ionice",
+    "strace",
+    "valgrind",
+    "watch",
     // Destructive / System utilities
     "mkfs",
     "shred",
@@ -3791,6 +3803,7 @@ mod tests {
         assert!(is_command_candidate("git status"));
         assert!(is_command_candidate("  $ rm -rf /tmp"));
         assert!(is_command_candidate("sudo git reset --hard"));
+        assert!(is_command_candidate("FOO=bar;rm -rf /tmp"));
         assert!(!is_command_candidate("Please check the logs"));
         assert!(!is_command_candidate("# commented command"));
     }
