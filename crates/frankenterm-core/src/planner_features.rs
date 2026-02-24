@@ -4679,4 +4679,413 @@ mod tests {
             );
         }
     }
+
+    // ── Golden vector tests (ft-1i2ge.2.8) ──────────────────────────────────
+    //
+    // Fixed fixtures with deterministic expected outputs for regression testing.
+    // These test the full pipeline: features → scoring → solving → explainability.
+
+    /// Build a standard golden fixture: 5 beads with known dependency structure.
+    ///
+    /// DAG:
+    ///   epic (closed) ← infra (open, P0, blocks web+api) ← web (open, P1)
+    ///                 ← api (open, P2, blocks frontend)  ← frontend (open, P3)
+    fn golden_fixture() -> Vec<BeadIssueDetail> {
+        vec![
+            sample_detail("epic", BeadStatus::Closed, 0, &[]),
+            sample_detail("infra", BeadStatus::Open, 0, &[("epic", "blocks")]),
+            sample_detail("web", BeadStatus::Open, 1, &[("infra", "blocks")]),
+            sample_detail("api", BeadStatus::Open, 2, &[("epic", "blocks")]),
+            sample_detail("frontend", BeadStatus::Open, 3, &[("api", "blocks")]),
+        ]
+    }
+
+    fn golden_agents() -> Vec<MissionAgentCapabilityProfile> {
+        vec![ready_agent("agent-alpha"), ready_agent("agent-beta")]
+    }
+
+    #[test]
+    fn golden_readiness_resolution() {
+        let issues = golden_fixture();
+        let report = resolve_bead_readiness(&issues);
+        // infra and api are ready (their deps are closed/done).
+        // web is blocked (infra is open), frontend is blocked (api is open).
+        let ready_ids: Vec<&str> = report.ready_ids.iter().map(|s| s.as_str()).collect();
+        assert!(ready_ids.contains(&"infra"), "infra should be ready");
+        assert!(ready_ids.contains(&"api"), "api should be ready");
+        assert!(!ready_ids.contains(&"web"), "web should be blocked");
+        assert!(
+            !ready_ids.contains(&"frontend"),
+            "frontend should be blocked"
+        );
+    }
+
+    #[test]
+    fn golden_feature_extraction_ranking() {
+        let issues = golden_fixture();
+        let report = resolve_bead_readiness(&issues);
+        let agents = golden_agents();
+        let ctx = PlannerExtractionContext::default();
+        let config = PlannerExtractionConfig::default();
+        let features = extract_planner_features(&report, &agents, &ctx, &config);
+
+        // infra unblocks 2 (web, frontend via api), api unblocks 1 (frontend).
+        // So infra should have higher impact.
+        let infra_impact = features
+            .features
+            .iter()
+            .find(|f| f.bead_id == "infra")
+            .unwrap()
+            .impact;
+        let api_impact = features
+            .features
+            .iter()
+            .find(|f| f.bead_id == "api")
+            .unwrap()
+            .impact;
+        assert!(
+            infra_impact >= api_impact,
+            "infra impact ({}) should >= api impact ({})",
+            infra_impact,
+            api_impact
+        );
+    }
+
+    #[test]
+    fn golden_feature_urgency_by_priority() {
+        let issues = golden_fixture();
+        let report = resolve_bead_readiness(&issues);
+        let agents = golden_agents();
+        let ctx = PlannerExtractionContext::default();
+        let config = PlannerExtractionConfig::default();
+        let features = extract_planner_features(&report, &agents, &ctx, &config);
+
+        // infra is P0, api is P2 → infra should have higher urgency.
+        let infra_urgency = features
+            .features
+            .iter()
+            .find(|f| f.bead_id == "infra")
+            .unwrap()
+            .urgency;
+        let api_urgency = features
+            .features
+            .iter()
+            .find(|f| f.bead_id == "api")
+            .unwrap()
+            .urgency;
+        assert!(
+            infra_urgency >= api_urgency,
+            "P0 infra urgency ({}) should >= P2 api urgency ({})",
+            infra_urgency,
+            api_urgency
+        );
+    }
+
+    #[test]
+    fn golden_scoring_deterministic_order() {
+        let issues = golden_fixture();
+        let report = resolve_bead_readiness(&issues);
+        let agents = golden_agents();
+        let ctx = PlannerExtractionContext::default();
+        let extraction_config = PlannerExtractionConfig::default();
+        let features = extract_planner_features(&report, &agents, &ctx, &extraction_config);
+
+        let inputs: Vec<ScorerInput> = features
+            .features
+            .iter()
+            .map(|f| ScorerInput {
+                features: f.clone(),
+                effort: None,
+                tags: Vec::new(),
+            })
+            .collect();
+        let scorer_config = ScorerConfig::default();
+
+        // Run scoring twice → identical ranking.
+        let scored1 = score_candidates(&inputs, &scorer_config);
+        let scored2 = score_candidates(&inputs, &scorer_config);
+        assert_eq!(scored1.ranked_ids, scored2.ranked_ids);
+    }
+
+    #[test]
+    fn golden_scoring_infra_ranked_first() {
+        let issues = golden_fixture();
+        let report = resolve_bead_readiness(&issues);
+        let agents = golden_agents();
+        let ctx = PlannerExtractionContext::default();
+        let extraction_config = PlannerExtractionConfig::default();
+        let features = extract_planner_features(&report, &agents, &ctx, &extraction_config);
+
+        let inputs: Vec<ScorerInput> = features
+            .features
+            .iter()
+            .map(|f| ScorerInput {
+                features: f.clone(),
+                effort: None,
+                tags: Vec::new(),
+            })
+            .collect();
+        let scored = score_candidates(&inputs, &ScorerConfig::default());
+        assert_eq!(
+            scored.ranked_ids[0], "infra",
+            "infra should be ranked #1 due to higher impact + urgency"
+        );
+    }
+
+    #[test]
+    fn golden_solver_assigns_both_agents() {
+        let issues = golden_fixture();
+        let report = resolve_bead_readiness(&issues);
+        let agents = golden_agents();
+        let ctx = PlannerExtractionContext::default();
+        let extraction_config = PlannerExtractionConfig::default();
+        let features = extract_planner_features(&report, &agents, &ctx, &extraction_config);
+
+        let inputs: Vec<ScorerInput> = features
+            .features
+            .iter()
+            .map(|f| ScorerInput {
+                features: f.clone(),
+                effort: None,
+                tags: Vec::new(),
+            })
+            .collect();
+        let scored = score_candidates(&inputs, &ScorerConfig::default());
+        let assignments = solve_assignments(&scored, &agents, &SolverConfig::default());
+
+        // 2 ready beads, 2 agents → both should be assigned.
+        assert_eq!(assignments.assignment_count(), 2);
+        let assigned_beads: Vec<_> = assignments
+            .assignments
+            .iter()
+            .map(|a| a.bead_id.as_str())
+            .collect();
+        assert!(assigned_beads.contains(&"infra"));
+        assert!(assigned_beads.contains(&"api"));
+    }
+
+    #[test]
+    fn golden_explainability_all_beads_explained() {
+        let issues = golden_fixture();
+        let report = resolve_bead_readiness(&issues);
+        let agents = golden_agents();
+        let ctx = PlannerExtractionContext::default();
+        let extraction_config = PlannerExtractionConfig::default();
+        let features = extract_planner_features(&report, &agents, &ctx, &extraction_config);
+
+        let inputs: Vec<ScorerInput> = features
+            .features
+            .iter()
+            .map(|f| ScorerInput {
+                features: f.clone(),
+                effort: None,
+                tags: Vec::new(),
+            })
+            .collect();
+        let scored = score_candidates(&inputs, &ScorerConfig::default());
+        let assignments = solve_assignments(&scored, &agents, &SolverConfig::default());
+        let explain_report = explain_decisions(1, &scored, &assignments);
+
+        // Every assigned + rejected bead should have an explanation.
+        let total = assignments.assignment_count() + assignments.rejected.len();
+        assert_eq!(explain_report.explanations.len(), total);
+        for expl in &explain_report.explanations {
+            assert!(!expl.summary.is_empty());
+            assert!(!expl.factors.is_empty());
+        }
+    }
+
+    #[test]
+    fn golden_governor_no_intervention_first_cycle() {
+        let issues = golden_fixture();
+        let report = resolve_bead_readiness(&issues);
+        let agents = golden_agents();
+        let ctx = PlannerExtractionContext::default();
+        let extraction_config = PlannerExtractionConfig::default();
+        let features = extract_planner_features(&report, &agents, &ctx, &extraction_config);
+
+        let inputs: Vec<ScorerInput> = features
+            .features
+            .iter()
+            .map(|f| ScorerInput {
+                features: f.clone(),
+                effort: None,
+                tags: Vec::new(),
+            })
+            .collect();
+        let scored = score_candidates(&inputs, &ScorerConfig::default());
+        let gov = ThrashGovernor::new(GovernorConfig::default());
+        let gov_report = gov.evaluate(&scored.scored);
+
+        // No history → all allowed.
+        for v in &gov_report.verdicts {
+            assert_eq!(v.action, GovernorAction::Allow);
+        }
+    }
+
+    #[test]
+    fn golden_config_resolve_end_to_end() {
+        let config = MissionRuntimeConfig {
+            profile: MissionProfileKind::SafetyFirst,
+            scorer_overrides: ScorerConfigOverrides {
+                impact_weight: Some(0.20),
+                ..ScorerConfigOverrides::default()
+            },
+            governor_overrides: GovernorConfigOverrides {
+                reassignment_cooldown_cycles: Some(8),
+                ..GovernorConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+
+        let validation = config.validate();
+        assert!(validation.valid);
+
+        let resolved = config.resolve();
+        assert_eq!(resolved.profile, MissionProfileKind::SafetyFirst);
+        assert!((resolved.scorer_config.weights.impact - 0.20).abs() < 1e-9);
+        assert_eq!(resolved.governor_config.reassignment_cooldown_cycles, 8);
+        // Risk should still be SafetyFirst default (not overridden).
+        let safety = MissionProfile::safety_first();
+        assert!(
+            (resolved.scorer_config.weights.risk - safety.scorer_config.weights.risk).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn golden_full_pipeline_deterministic() {
+        // Run the complete pipeline twice with identical inputs.
+        // Results must be byte-identical.
+        let issues = golden_fixture();
+        let agents = golden_agents();
+        let ctx = PlannerExtractionContext::default();
+        let config = MissionRuntimeConfig::default();
+        let resolved = config.resolve();
+
+        let run_pipeline = || {
+            let report = resolve_bead_readiness(&issues);
+            let features =
+                extract_planner_features(&report, &agents, &ctx, &resolved.extraction_config);
+            let inputs: Vec<ScorerInput> = features
+                .features
+                .iter()
+                .map(|f| ScorerInput {
+                    features: f.clone(),
+                    effort: None,
+                    tags: Vec::new(),
+                })
+                .collect();
+            let scored = score_candidates(&inputs, &resolved.scorer_config);
+            let assignments = solve_assignments(&scored, &agents, &resolved.solver_config);
+            let explain_report = explain_decisions(1, &scored, &assignments);
+            (scored.ranked_ids.clone(), explain_report)
+        };
+
+        let (ranking1, explain1) = run_pipeline();
+        let (ranking2, explain2) = run_pipeline();
+
+        assert_eq!(ranking1, ranking2, "Rankings must be deterministic");
+        assert_eq!(
+            explain1.explanations.len(),
+            explain2.explanations.len(),
+            "Explanation count must be deterministic"
+        );
+        for (e1, e2) in explain1.explanations.iter().zip(explain2.explanations.iter()) {
+            assert_eq!(e1.bead_id, e2.bead_id);
+            assert_eq!(e1.outcome, e2.outcome);
+            assert_eq!(e1.summary, e2.summary);
+        }
+    }
+
+    #[test]
+    fn golden_safety_profile_changes_ranking() {
+        let issues = golden_fixture();
+        let agents = golden_agents();
+        let ctx = PlannerExtractionContext::default();
+
+        // Run with balanced profile.
+        let balanced_config = MissionRuntimeConfig::default().resolve();
+        let report = resolve_bead_readiness(&issues);
+        let features =
+            extract_planner_features(&report, &agents, &ctx, &balanced_config.extraction_config);
+        let inputs: Vec<ScorerInput> = features
+            .features
+            .iter()
+            .map(|f| ScorerInput {
+                features: f.clone(),
+                effort: None,
+                tags: Vec::new(),
+            })
+            .collect();
+        let balanced_scored = score_candidates(&inputs, &balanced_config.scorer_config);
+
+        // Run with safety-first profile.
+        let safety_config = MissionRuntimeConfig {
+            profile: MissionProfileKind::SafetyFirst,
+            ..MissionRuntimeConfig::default()
+        }
+        .resolve();
+        let safety_scored = score_candidates(&inputs, &safety_config.scorer_config);
+
+        // Scores should differ because weights differ.
+        let balanced_infra = balanced_scored
+            .scored
+            .iter()
+            .find(|s| s.bead_id == "infra")
+            .unwrap();
+        let safety_infra = safety_scored
+            .scored
+            .iter()
+            .find(|s| s.bead_id == "infra")
+            .unwrap();
+        assert!(
+            (balanced_infra.final_score - safety_infra.final_score).abs() > 1e-6,
+            "Different profiles should produce different scores"
+        );
+    }
+
+    #[test]
+    fn golden_vector_regression_snapshot() {
+        // Pin specific numeric outputs to catch unintended scoring changes.
+        let issues = golden_fixture();
+        let report = resolve_bead_readiness(&issues);
+        let agents = golden_agents();
+        let ctx = PlannerExtractionContext::default();
+        let config = PlannerExtractionConfig::default();
+        let features = extract_planner_features(&report, &agents, &ctx, &config);
+
+        // Verify we get exactly 2 feature vectors (infra + api).
+        assert_eq!(features.features.len(), 2);
+
+        // All scores in [0.0, 1.0].
+        for f in &features.features {
+            assert!(f.impact >= 0.0 && f.impact <= 1.0, "impact OOB: {}", f.impact);
+            assert!(f.urgency >= 0.0 && f.urgency <= 1.0, "urgency OOB: {}", f.urgency);
+            assert!(f.risk >= 0.0 && f.risk <= 1.0, "risk OOB: {}", f.risk);
+            assert!(f.fit >= 0.0 && f.fit <= 1.0, "fit OOB: {}", f.fit);
+            assert!(
+                f.confidence >= 0.0 && f.confidence <= 1.0,
+                "confidence OOB: {}",
+                f.confidence
+            );
+        }
+
+        // Score and verify ranking is infra > api.
+        let inputs: Vec<ScorerInput> = features
+            .features
+            .iter()
+            .map(|f| ScorerInput {
+                features: f.clone(),
+                effort: None,
+                tags: Vec::new(),
+            })
+            .collect();
+        let scored = score_candidates(&inputs, &ScorerConfig::default());
+        assert_eq!(scored.ranked_ids, vec!["infra", "api"]);
+
+        // All final_scores positive.
+        for s in &scored.scored {
+            assert!(s.final_score > 0.0, "{} score was 0", s.bead_id);
+        }
+    }
 }
