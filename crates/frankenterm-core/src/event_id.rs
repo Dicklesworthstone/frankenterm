@@ -131,7 +131,7 @@ fn compute_payload_hash(payload: &RecorderEventPayload) -> String {
 /// Composite key for deterministic total ordering of recorder events during merge.
 ///
 /// Order: `recorded_at_ms` → `pane_id` → `stream_kind` rank → `sequence` → `event_id`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecorderMergeKey {
     pub recorded_at_ms: u64,
     pub pane_id: u64,
