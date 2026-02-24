@@ -245,6 +245,7 @@ pub mod secrets;
 pub mod segment_tree;
 pub mod self_stabilize;
 pub mod semantic_anomaly;
+pub mod semantic_anomaly_watchdog;
 pub mod semantic_quality;
 pub mod sequence_model;
 pub mod session_correlation;
