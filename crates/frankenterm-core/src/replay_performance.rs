@@ -616,11 +616,14 @@ mod tests {
         budgets.warning_regression_fraction = 0.10;
         budgets.blocking_regression_fraction = 0.25;
 
+        // Use values within budget (lower-is-better, budget=1.0).
+        // Regression = (0.88 - 0.80) / 0.80 = 0.10, exactly at threshold.
+        // The `>` comparison means exactly-at-threshold is Pass, not Warning.
         let row = classify_metric_result(
             &budgets,
             ReplayPerformanceMetric::CaptureOverheadMsPerEvent,
-            1.10,
-            Some(1.0),
+            0.88,
+            Some(0.80),
         );
         assert_eq!(row.status, ReplayPerformanceStatus::Pass);
         assert_eq!(row.reason_code, "regression_within_tolerance");
@@ -642,11 +645,14 @@ mod tests {
     #[test]
     fn classify_metric_blocking_when_regression_above_25_percent() {
         let budgets = ReplayPerformanceBudgets::default();
+        // Use values within budget (higher-is-better, budget=100K).
+        // current=100K passes budget (100K >= 100K). baseline=140K gives
+        // regression = (140K - 100K) / 140K ≈ 0.286 > 0.25 blocking threshold.
         let row = classify_metric_result(
             &budgets,
             ReplayPerformanceMetric::ReplayThroughputEventsPerSec,
-            70_000.0,
-            Some(100_000.0),
+            100_000.0,
+            Some(140_000.0),
         );
         assert_eq!(row.status, ReplayPerformanceStatus::Blocking);
         assert_eq!(row.reason_code, "regression_blocking");
