@@ -160,4 +160,4 @@ emit_log \
   "schema_pack_validated" \
   "none" \
   "$(basename "${STDOUT_FILE}")" \
-  "Mission noun schema pack validated with remote-only rch execution"
+  "Mission noun schema pack validated with deterministic execution and structured artifacts"

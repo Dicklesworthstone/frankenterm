@@ -21982,4 +21982,186 @@ mod tests {
         assert_eq!(canonical.version, TraceFormatVersion::V2);
         assert_eq!(canonical.seed, 42);
     }
+
+    // ── E3 Impl: Bridge method tests ─────────────────────────────
+
+    #[test]
+    fn test_compare_mc_traces_identical() {
+        let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let steps = vec![
+            TraceStep { step: 0, action: TraceAction::EpochAdvance { new_epoch: 1 }, check_results: vec![], timestamp_us: 10 },
+            TraceStep { step: 1, action: TraceAction::EpochAdvance { new_epoch: 2 }, check_results: vec![], timestamp_us: 20 },
+        ];
+        let result = c.compare_mc_traces(&steps, &steps, 42);
+        assert_eq!(result, ReplayComparisonResult::Identical);
+    }
+
+    #[test]
+    fn test_compare_mc_traces_divergent() {
+        let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let a = vec![
+            TraceStep { step: 0, action: TraceAction::EpochAdvance { new_epoch: 1 }, check_results: vec![], timestamp_us: 10 },
+        ];
+        let b = vec![
+            TraceStep { step: 0, action: TraceAction::EpochAdvance { new_epoch: 99 }, check_results: vec![], timestamp_us: 10 },
+        ];
+        let result = c.compare_mc_traces(&a, &b, 0);
+        let is_divergent = matches!(result, ReplayComparisonResult::Divergent { .. });
+        assert!(is_divergent);
+    }
+
+    #[test]
+    fn test_verify_determinism() {
+        let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 20, Some(0));
+        assert!(c.verify_determinism(&trace));
+    }
+
+    #[test]
+    fn test_filter_by_domain() {
+        let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        trace.push(TraceAction::SchedulerAdmit { lane: SchedulerLane::Input, cost_us: 5.0 }, InvariantDomain::Scheduler, 20, None);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 30, Some(0));
+
+        let filtered = c.filter_by_domain(&trace, InvariantDomain::Composition);
+        assert_eq!(filtered.len(), 2);
+        for e in &filtered.entries {
+            assert_eq!(e.domain, InvariantDomain::Composition);
+        }
+        // Seq numbers reassigned.
+        assert_eq!(filtered.entries[0].seq, 0);
+        assert_eq!(filtered.entries[1].seq, 1);
+    }
+
+    #[test]
+    fn test_filter_by_domain_empty() {
+        let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        let filtered = c.filter_by_domain(&trace, InvariantDomain::Recovery);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_causal_chain_no_parents() {
+        let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        let chain = c.causal_chain(&trace, 0);
+        assert_eq!(chain, vec![0]);
+    }
+
+    #[test]
+    fn test_causal_chain_with_parents() {
+        let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 20, Some(0));
+        trace.push(TraceAction::EpochAdvance { new_epoch: 3 }, InvariantDomain::Composition, 30, Some(1));
+        let chain = c.causal_chain(&trace, 2);
+        assert_eq!(chain, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_domain_histogram() {
+        let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        trace.push(TraceAction::SchedulerAdmit { lane: SchedulerLane::Input, cost_us: 5.0 }, InvariantDomain::Scheduler, 20, None);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 30, None);
+        let hist = c.domain_histogram(&trace);
+        assert_eq!(hist.get("Composition"), Some(&2));
+        assert_eq!(hist.get("Scheduler"), Some(&1));
+    }
+
+    #[test]
+    fn test_unique_fingerprints() {
+        let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 20, None);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 30, None);
+        let unique = c.unique_fingerprints(&trace);
+        // epoch 2 appears once, epoch 1 appears twice.
+        assert_eq!(unique.len(), 1);
+        assert_eq!(unique[0], 2); // seq of the epoch(2) entry
+    }
+
+    #[test]
+    fn test_merge_traces() {
+        let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let mut t1 = DeterministicTrace::new_v2("a".to_string(), 1, 0);
+        t1.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        t1.push(TraceAction::EpochAdvance { new_epoch: 3 }, InvariantDomain::Composition, 30, None);
+
+        let mut t2 = DeterministicTrace::new_v2("b".to_string(), 2, 0);
+        t2.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 20, None);
+
+        let merged = c.merge_traces(&t1, &t2);
+        assert_eq!(merged.len(), 3);
+        // Should be sorted by timestamp: 10, 20, 30.
+        assert_eq!(merged.entries[0].timestamp_us, 10);
+        assert_eq!(merged.entries[1].timestamp_us, 20);
+        assert_eq!(merged.entries[2].timestamp_us, 30);
+        // Seq reassigned.
+        assert_eq!(merged.entries[0].seq, 0);
+        assert_eq!(merged.entries[1].seq, 1);
+        assert_eq!(merged.entries[2].seq, 2);
+    }
+
+    #[test]
+    fn test_time_window() {
+        let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 20, None);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 3 }, InvariantDomain::Composition, 30, None);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 4 }, InvariantDomain::Composition, 40, None);
+
+        let windowed = c.time_window(&trace, 15, 35);
+        assert_eq!(windowed.len(), 2);
+        assert_eq!(windowed.entries[0].timestamp_us, 20);
+        assert_eq!(windowed.entries[1].timestamp_us, 30);
+    }
+
+    #[test]
+    fn test_time_window_empty() {
+        let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
+        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        let windowed = c.time_window(&trace, 100, 200);
+        assert!(windowed.is_empty());
+    }
+
+    #[test]
+    fn test_total_comparisons() {
+        let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        assert_eq!(c.total_comparisons(), 0);
+        let t = DeterministicTrace::new_v2("t".to_string(), 0, 0);
+        let _ = c.compare(&t, &t);
+        assert_eq!(c.total_comparisons(), 1);
+    }
+
+    #[test]
+    fn test_total_traces() {
+        let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
+        assert_eq!(c.total_traces(), 0);
+        let t = DeterministicTrace::new_v2("t".to_string(), 0, 0);
+        let _ = c.canonicalize(&t);
+        assert_eq!(c.total_traces(), 1);
+    }
+
+    #[test]
+    fn test_config_accessor() {
+        let cfg = CanonicalizerConfig {
+            ordering: CanonicalOrdering::Temporal,
+            ..Default::default()
+        };
+        let c = ReplayCanonicalizer::new(cfg.clone());
+        assert_eq!(*c.config(), cfg);
+    }
 }
