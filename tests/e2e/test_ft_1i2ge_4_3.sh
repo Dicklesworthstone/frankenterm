@@ -6,12 +6,12 @@ LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 mkdir -p "${LOG_DIR}"
 
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
-SCENARIO_ID="ft_1i2ge_4_1_policy_preflight"
-CORRELATION_ID="ft-1i2ge.4.1-${RUN_ID}"
-LOG_FILE="${LOG_DIR}/ft_1i2ge_4_1_${RUN_ID}.jsonl"
-STDOUT_FILE="${LOG_DIR}/ft_1i2ge_4_1_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/ft_1i2ge_4_1_${RUN_ID}.probe.log"
-LOG_FILE_REL="${LOG_FILE#${ROOT_DIR}/}"
+SCENARIO_ID="ft_1i2ge_4_3_approval_path_integration"
+CORRELATION_ID="ft-1i2ge.4.3-${RUN_ID}"
+LOG_FILE="${LOG_DIR}/ft_1i2ge_4_3_${RUN_ID}.jsonl"
+STDOUT_FILE="${LOG_DIR}/ft_1i2ge_4_3_${RUN_ID}.stdout.log"
+PROBE_FILE="${LOG_DIR}/ft_1i2ge_4_3_${RUN_ID}.probe.log"
+LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
 emit_log() {
   local outcome="$1"
@@ -25,7 +25,7 @@ emit_log() {
 
   jq -cn \
     --arg timestamp "${ts}" \
-    --arg component "mission_policy_preflight.e2e" \
+    --arg component "mission_approval_path.e2e" \
     --arg scenario_id "${SCENARIO_ID}" \
     --arg correlation_id "${CORRELATION_ID}" \
     --arg decision_path "${decision_path}" \
@@ -48,18 +48,18 @@ emit_log() {
     }' >> "${LOG_FILE}"
 }
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logging" >&2
+  exit 1
+fi
+
 emit_log \
   "started" \
   "script_init" \
   "none" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "mission policy preflight contract validation (plan-time + dispatch-time + denial feedback)"
-
-if ! command -v jq >/dev/null 2>&1; then
-  echo "jq is required for structured logging" >&2
-  exit 1
-fi
+  "mission approval-path durability and continuation contract checks"
 
 if ! command -v rch >/dev/null 2>&1; then
   emit_log \
@@ -93,7 +93,7 @@ if [[ ${probe_status} -ne 0 ]] || grep -q "✗" "${PROBE_FILE}"; then
   exit 1
 fi
 
-cmd_prefix="rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-4-1"
+cmd_prefix="rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-4-3"
 emit_log \
   "running" \
   "execution_preflight" \
@@ -103,24 +103,30 @@ emit_log \
   "offloading tests through rch workers"
 
 TEST_CMDS=(
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_plan_time_surfaces_structured_allow_and_deny_reasons -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_dispatch_time_requires_assignment_reference -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_dispatch_time_rejects_assignment_candidate_mismatch -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_require_approval_requires_canonical_reason -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_rejects_unknown_reason_code -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_dispatch_time_accepts_assignment_bound_denial_and_feedback -- --nocapture"
+  "cargo test -p frankenterm-core --lib mission_approval_request_transitions_to_pending_and_awaiting_approval -- --nocapture"
+  "cargo test -p frankenterm-core --lib mission_approval_request_is_idempotent_when_already_pending -- --nocapture"
+  "cargo test -p frankenterm-core --lib mission_approval_continuation_transitions_to_running -- --nocapture"
+  "cargo test -p frankenterm-core --lib mission_approval_continuation_is_idempotent_for_same_approval -- --nocapture"
+  "cargo test -p frankenterm-core --lib mission_approval_continuation_on_expired_state_uses_safe_fallback -- --nocapture"
+  "cargo test -p frankenterm-core --lib mission_expire_approval_is_idempotent_and_sets_canonical_failure_outcome -- --nocapture"
+  "cargo test -p frankenterm-core --lib mission_validate_requires_pending_assignment_when_awaiting_approval -- --nocapture"
+  "cargo test -p frankenterm-core --lib mission_validate_rejects_pending_assignment_outside_awaiting_state -- --nocapture"
 )
 
 : >"${STDOUT_FILE}"
 for test_cmd in "${TEST_CMDS[@]}"; do
-  decision_path="contract_surface"
-  reason_code="none"
-  if [[ "${test_cmd}" == *"rejects_"* ]] || [[ "${test_cmd}" == *"requires_"* ]]; then
-    decision_path="failure_injection_path"
-    reason_code="policy_preflight_rejection_checks"
-  elif [[ "${test_cmd}" == *"accepts_assignment_bound_denial_and_feedback"* ]]; then
+  decision_path="nominal_path"
+  reason_code="approval_state_contract_validation"
+
+  if [[ "${test_cmd}" == *"idempotent"* ]]; then
     decision_path="recovery_path"
-    reason_code="dispatch_feedback_validation"
+    reason_code="idempotent_continuation_validation"
+  elif [[ "${test_cmd}" == *"expired"* ]]; then
+    decision_path="failure_injection_path"
+    reason_code="approval_expired_safe_fallback"
+  elif [[ "${test_cmd}" == *"pending_assignment"* ]]; then
+    decision_path="failure_injection_path"
+    reason_code="lifecycle_approval_state_coherence"
   fi
 
   emit_log \
@@ -147,17 +153,19 @@ for test_cmd in "${TEST_CMDS[@]}"; do
       "cargo_test_failed" \
       "$(basename "${STDOUT_FILE}")" \
       "exit=${status}; command=${test_cmd}"
-    exit ${status}
+    exit "${status}"
   fi
 done
 
 required_markers=(
-  "mission_policy_preflight_plan_time_surfaces_structured_allow_and_deny_reasons ... ok"
-  "mission_policy_preflight_dispatch_time_requires_assignment_reference ... ok"
-  "mission_policy_preflight_dispatch_time_rejects_assignment_candidate_mismatch ... ok"
-  "mission_policy_preflight_require_approval_requires_canonical_reason ... ok"
-  "mission_policy_preflight_rejects_unknown_reason_code ... ok"
-  "mission_policy_preflight_dispatch_time_accepts_assignment_bound_denial_and_feedback ... ok"
+  "mission_approval_request_transitions_to_pending_and_awaiting_approval ... ok"
+  "mission_approval_request_is_idempotent_when_already_pending ... ok"
+  "mission_approval_continuation_transitions_to_running ... ok"
+  "mission_approval_continuation_is_idempotent_for_same_approval ... ok"
+  "mission_approval_continuation_on_expired_state_uses_safe_fallback ... ok"
+  "mission_expire_approval_is_idempotent_and_sets_canonical_failure_outcome ... ok"
+  "mission_validate_requires_pending_assignment_when_awaiting_approval ... ok"
+  "mission_validate_rejects_pending_assignment_outside_awaiting_state ... ok"
 )
 
 for marker in "${required_markers[@]}"; do
@@ -175,10 +183,10 @@ done
 
 emit_log \
   "passed" \
-  "plan_time_policy_preflight->dispatch_time_policy_preflight->planner_feedback_reason_codes" \
-  "policy_preflight_pipeline_validated" \
+  "approval_requested->awaiting_approval->approval_granted_or_expired_fallback->idempotent_continuation" \
+  "mission_approval_path_validated" \
   "none" \
   "$(basename "${STDOUT_FILE}")" \
-  "Mission policy preflight pipeline validated with deterministic deny/approval feedback contracts"
+  "Mission approval-path integration validated with durable state transitions and fallback behavior"
 
-echo "Mission policy preflight e2e passed. Logs: ${LOG_FILE_REL}"
+echo "Mission approval-path e2e passed. Logs: ${LOG_FILE_REL}"

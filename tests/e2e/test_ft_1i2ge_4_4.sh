@@ -6,11 +6,11 @@ LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 mkdir -p "${LOG_DIR}"
 
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
-SCENARIO_ID="ft_1i2ge_4_1_policy_preflight"
-CORRELATION_ID="ft-1i2ge.4.1-${RUN_ID}"
-LOG_FILE="${LOG_DIR}/ft_1i2ge_4_1_${RUN_ID}.jsonl"
-STDOUT_FILE="${LOG_DIR}/ft_1i2ge_4_1_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/ft_1i2ge_4_1_${RUN_ID}.probe.log"
+SCENARIO_ID="ft_1i2ge_4_4_rate_budget_safety_envelope"
+CORRELATION_ID="ft-1i2ge.4.4-${RUN_ID}"
+LOG_FILE="${LOG_DIR}/ft_1i2ge_4_4_${RUN_ID}.jsonl"
+STDOUT_FILE="${LOG_DIR}/ft_1i2ge_4_4_${RUN_ID}.stdout.log"
+PROBE_FILE="${LOG_DIR}/ft_1i2ge_4_4_${RUN_ID}.probe.log"
 LOG_FILE_REL="${LOG_FILE#${ROOT_DIR}/}"
 
 emit_log() {
@@ -25,7 +25,7 @@ emit_log() {
 
   jq -cn \
     --arg timestamp "${ts}" \
-    --arg component "mission_policy_preflight.e2e" \
+    --arg component "mission_safety_envelope.e2e" \
     --arg scenario_id "${SCENARIO_ID}" \
     --arg correlation_id "${CORRELATION_ID}" \
     --arg decision_path "${decision_path}" \
@@ -54,7 +54,7 @@ emit_log \
   "none" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "mission policy preflight contract validation (plan-time + dispatch-time + denial feedback)"
+  "mission safety envelope validation (assignment volume, risky budget, retry-storm limiter)"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required for structured logging" >&2
@@ -93,7 +93,7 @@ if [[ ${probe_status} -ne 0 ]] || grep -q "✗" "${PROBE_FILE}"; then
   exit 1
 fi
 
-cmd_prefix="rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-4-1"
+cmd_prefix="rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-4-4"
 emit_log \
   "running" \
   "execution_preflight" \
@@ -103,24 +103,18 @@ emit_log \
   "offloading tests through rch workers"
 
 TEST_CMDS=(
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_plan_time_surfaces_structured_allow_and_deny_reasons -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_dispatch_time_requires_assignment_reference -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_dispatch_time_rejects_assignment_candidate_mismatch -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_require_approval_requires_canonical_reason -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_rejects_unknown_reason_code -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_dispatch_time_accepts_assignment_bound_denial_and_feedback -- --nocapture"
+  "cargo test -p frankenterm-core --lib loop_envelope_limits_assignments_per_cycle -- --nocapture"
+  "cargo test -p frankenterm-core --lib loop_envelope_limits_risky_assignments_by_label -- --nocapture"
+  "cargo test -p frankenterm-core --lib loop_envelope_blocks_retry_storm_for_one_cycle -- --nocapture"
 )
 
 : >"${STDOUT_FILE}"
 for test_cmd in "${TEST_CMDS[@]}"; do
-  decision_path="contract_surface"
-  reason_code="none"
-  if [[ "${test_cmd}" == *"rejects_"* ]] || [[ "${test_cmd}" == *"requires_"* ]]; then
+  decision_path="nominal_path"
+  reason_code="envelope_policy_validation"
+  if [[ "${test_cmd}" == *"retry_storm"* ]]; then
     decision_path="failure_injection_path"
-    reason_code="policy_preflight_rejection_checks"
-  elif [[ "${test_cmd}" == *"accepts_assignment_bound_denial_and_feedback"* ]]; then
-    decision_path="recovery_path"
-    reason_code="dispatch_feedback_validation"
+    reason_code="retry_storm_backoff_validation"
   fi
 
   emit_log \
@@ -152,12 +146,9 @@ for test_cmd in "${TEST_CMDS[@]}"; do
 done
 
 required_markers=(
-  "mission_policy_preflight_plan_time_surfaces_structured_allow_and_deny_reasons ... ok"
-  "mission_policy_preflight_dispatch_time_requires_assignment_reference ... ok"
-  "mission_policy_preflight_dispatch_time_rejects_assignment_candidate_mismatch ... ok"
-  "mission_policy_preflight_require_approval_requires_canonical_reason ... ok"
-  "mission_policy_preflight_rejects_unknown_reason_code ... ok"
-  "mission_policy_preflight_dispatch_time_accepts_assignment_bound_denial_and_feedback ... ok"
+  "loop_envelope_limits_assignments_per_cycle ... ok"
+  "loop_envelope_limits_risky_assignments_by_label ... ok"
+  "loop_envelope_blocks_retry_storm_for_one_cycle ... ok"
 )
 
 for marker in "${required_markers[@]}"; do
@@ -175,10 +166,10 @@ done
 
 emit_log \
   "passed" \
-  "plan_time_policy_preflight->dispatch_time_policy_preflight->planner_feedback_reason_codes" \
-  "policy_preflight_pipeline_validated" \
+  "assignment_volume->risky_budget->retry_storm_backoff" \
+  "safety_envelope_validated" \
   "none" \
   "$(basename "${STDOUT_FILE}")" \
-  "Mission policy preflight pipeline validated with deterministic deny/approval feedback contracts"
+  "Mission safety envelope validated with deterministic limiter reason codes"
 
-echo "Mission policy preflight e2e passed. Logs: ${LOG_FILE_REL}"
+echo "Mission safety envelope e2e passed. Logs: ${LOG_FILE_REL}"

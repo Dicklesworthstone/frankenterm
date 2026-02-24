@@ -167,6 +167,34 @@ if ! command -v rch >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+  emit_log \
+    "failed" \
+    "suite_init" \
+    "jq --version" \
+    "preflight_jq" \
+    "jq_missing" \
+    "jq_not_found" \
+    "$(basename "${LOG_FILE}")" \
+    "jq is required for structured log emission and worker probe parsing"
+  exit 1
+fi
+
+if ! rch workers probe --all --json \
+  | jq -e '[.data[] | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length > 0' \
+    >/dev/null; then
+  emit_log \
+    "failed" \
+    "suite_init" \
+    "rch workers probe --all --json" \
+    "preflight_rch_workers" \
+    "rch_workers_unreachable" \
+    "remote_worker_unavailable" \
+    "$(basename "${LOG_FILE}")" \
+    "No reachable rch workers; aborting before cargo fallback can run locally"
+  exit 1
+fi
+
 run_target_test \
   "trivial_variation_loop" \
   "e2e_fuzzy_variation_loop_decision_is_deterministic" \
