@@ -9174,6 +9174,78 @@ impl PolicyController {
             degradation: self.detect_degradation(),
         }
     }
+
+    // ── D3 Impl: Bridge Methods and Convenience API ────────────────
+
+    /// Decide from hitch-risk model posterior directly.
+    ///
+    /// Maps HitchRiskLevel to state probabilities:
+    /// - Low: [0.9, 0.08, 0.01, 0.01]
+    /// - Elevated: [0.3, 0.5, 0.15, 0.05]
+    /// - High: [0.05, 0.15, 0.6, 0.2]
+    /// - Critical: [0.01, 0.04, 0.15, 0.8]
+    pub fn decide_from_risk(&mut self, level: HitchRiskLevel, timestamp_us: u64) -> PolicyAction {
+        let probs = match level {
+            HitchRiskLevel::Low => [0.9, 0.08, 0.01, 0.01],
+            HitchRiskLevel::Elevated => [0.3, 0.5, 0.15, 0.05],
+            HitchRiskLevel::High => [0.05, 0.15, 0.6, 0.2],
+            HitchRiskLevel::Critical => [0.01, 0.04, 0.15, 0.8],
+        };
+        self.decide(probs, timestamp_us)
+    }
+
+    /// Action distribution as fractions [hold, tighten, relax, shed].
+    pub fn action_distribution(&self) -> [f64; 4] {
+        if self.total_decisions == 0 {
+            return [0.0; 4];
+        }
+        let total = self.total_decisions as f64;
+        [
+            self.action_counts[0] as f64 / total,
+            self.action_counts[1] as f64 / total,
+            self.action_counts[2] as f64 / total,
+            self.action_counts[3] as f64 / total,
+        ]
+    }
+
+    /// Per-action counts.
+    pub fn action_counts(&self) -> [u64; 4] {
+        self.action_counts
+    }
+
+    /// Count of hysteresis suppressions.
+    pub fn hysteresis_count(&self) -> u64 {
+        self.hysteresis_count
+    }
+
+    /// Last expected loss.
+    pub fn last_expected_loss(&self) -> f64 {
+        self.last_expected_loss
+    }
+
+    /// Update the hysteresis threshold.
+    pub fn set_hysteresis(&mut self, h: f64) {
+        self.config.hysteresis = h;
+    }
+
+    /// Update the critical floor.
+    pub fn set_critical_floor(&mut self, floor: f64) {
+        self.config.critical_floor = floor;
+    }
+
+    /// Update a single loss matrix entry.
+    /// `state_idx` in 0..4 (Healthy/Drifting/Stressed/Critical),
+    /// `action_idx` in 0..4 (Hold/Tighten/Relax/Shed).
+    pub fn set_loss(&mut self, state_idx: usize, action_idx: usize, loss: f64) {
+        if state_idx < 4 && action_idx < 4 {
+            self.config.loss_matrix[state_idx * 4 + action_idx] = loss;
+        }
+    }
+
+    /// Number of stored decisions.
+    pub fn decision_count(&self) -> usize {
+        self.decisions.len()
+    }
 }
 
 /// Degradation status for the policy controller.
@@ -15846,5 +15918,100 @@ mod tests {
         ctrl.decide([0.0, 0.0, 0.0, 1.0], 100);
         let is_shed = matches!(ctrl.detect_degradation(), PolicyDegradation::EmergencyShed { .. });
         assert!(is_shed);
+    }
+
+    // ── D3 Impl Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_policy_decide_from_risk_low() {
+        let mut ctrl = PolicyController::with_defaults();
+        let action = ctrl.decide_from_risk(HitchRiskLevel::Low, 100);
+        assert_eq!(action, PolicyAction::Hold);
+    }
+
+    #[test]
+    fn test_policy_decide_from_risk_critical() {
+        let mut ctrl = PolicyController::with_defaults();
+        let action = ctrl.decide_from_risk(HitchRiskLevel::Critical, 100);
+        assert_eq!(action, PolicyAction::Shed);
+    }
+
+    #[test]
+    fn test_policy_decide_from_risk_elevated() {
+        let mut ctrl = PolicyController::with_defaults();
+        let action = ctrl.decide_from_risk(HitchRiskLevel::Elevated, 100);
+        assert_eq!(action, PolicyAction::Tighten);
+    }
+
+    #[test]
+    fn test_policy_action_distribution() {
+        let mut ctrl = PolicyController::with_defaults();
+        assert_eq!(ctrl.action_distribution(), [0.0; 4]);
+        ctrl.decide([1.0, 0.0, 0.0, 0.0], 100);
+        ctrl.decide([1.0, 0.0, 0.0, 0.0], 200);
+        let dist = ctrl.action_distribution();
+        let sum: f64 = dist.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_policy_action_counts() {
+        let mut ctrl = PolicyController::with_defaults();
+        ctrl.decide([1.0, 0.0, 0.0, 0.0], 100);
+        ctrl.decide([0.0, 0.0, 0.0, 1.0], 200);
+        let counts = ctrl.action_counts();
+        let total: u64 = counts.iter().sum();
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn test_policy_hysteresis_count() {
+        let ctrl = PolicyController::with_defaults();
+        assert_eq!(ctrl.hysteresis_count(), 0);
+    }
+
+    #[test]
+    fn test_policy_last_expected_loss() {
+        let mut ctrl = PolicyController::with_defaults();
+        assert_eq!(ctrl.last_expected_loss(), 0.0);
+        ctrl.decide([1.0, 0.0, 0.0, 0.0], 100);
+        // Hold in healthy => loss should be very small (critical floor adds a bit)
+        assert!(ctrl.last_expected_loss() >= 0.0);
+    }
+
+    #[test]
+    fn test_policy_set_hysteresis() {
+        let mut ctrl = PolicyController::with_defaults();
+        ctrl.set_hysteresis(0.2);
+        // Should affect future decisions
+        ctrl.decide([1.0, 0.0, 0.0, 0.0], 100);
+        assert_eq!(ctrl.total_decisions(), 1);
+    }
+
+    #[test]
+    fn test_policy_set_critical_floor() {
+        let mut ctrl = PolicyController::with_defaults();
+        ctrl.set_critical_floor(0.1);
+        ctrl.decide([1.0, 0.0, 0.0, 0.0], 100);
+        let recent = ctrl.recent_decisions(1);
+        // Critical floor should be at least 0.1
+        assert!(recent[0].state_probs[3] >= 0.1 - 1e-10);
+    }
+
+    #[test]
+    fn test_policy_set_loss() {
+        let mut ctrl = PolicyController::with_defaults();
+        ctrl.set_loss(0, 0, 100.0); // Make Hold very expensive when Healthy
+        let action = ctrl.decide([1.0, 0.0, 0.0, 0.0], 100);
+        // Now Hold should NOT be selected since it costs 100
+        assert_ne!(action, PolicyAction::Hold);
+    }
+
+    #[test]
+    fn test_policy_decision_count_tracks() {
+        let mut ctrl = PolicyController::with_defaults();
+        assert_eq!(ctrl.decision_count(), 0);
+        ctrl.decide([1.0, 0.0, 0.0, 0.0], 100);
+        assert_eq!(ctrl.decision_count(), 1);
     }
 }
