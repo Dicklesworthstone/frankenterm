@@ -15,7 +15,8 @@ use crate::plan::MissionAgentCapabilityProfile;
 use crate::planner_features::{
     extract_planner_features, score_candidates, solve_assignments, AssignmentSet,
     PlannerExtractionConfig, PlannerExtractionContext, PlannerExtractionReport,
-    PlannerFeatureVector, ScorerConfig, ScorerInput, ScorerReport, SolverConfig,
+    PlannerFeatureVector, RejectedCandidate, RejectionReason, ScorerConfig, ScorerInput,
+    ScorerReport, SolverConfig,
 };
 
 // ── Loop state ──────────────────────────────────────────────────────────────
@@ -36,6 +37,41 @@ pub enum MissionTrigger {
     ExternalSignal { source: String, payload: String },
 }
 
+/// Mission-level limiter envelope for assignment safety.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionSafetyEnvelopeConfig {
+    /// Hard cap on assignments emitted in a single evaluation cycle.
+    pub max_assignments_per_cycle: usize,
+    /// Hard cap on risky assignments emitted in a single evaluation cycle.
+    pub max_risky_assignments_per_cycle: usize,
+    /// Maximum consecutive cycles a bead can be assigned before forcing one backoff cycle.
+    pub max_consecutive_retries_per_bead: u32,
+    /// Label markers that classify a bead as risky.
+    #[serde(default = "default_risky_label_markers")]
+    pub risky_label_markers: Vec<String>,
+}
+
+fn default_risky_label_markers() -> Vec<String> {
+    vec![
+        "danger".to_string(),
+        "risky".to_string(),
+        "high-risk".to_string(),
+        "destructive".to_string(),
+        "approval".to_string(),
+    ]
+}
+
+impl Default for MissionSafetyEnvelopeConfig {
+    fn default() -> Self {
+        Self {
+            max_assignments_per_cycle: 10,
+            max_risky_assignments_per_cycle: 2,
+            max_consecutive_retries_per_bead: 3,
+            risky_label_markers: default_risky_label_markers(),
+        }
+    }
+}
+
 /// Configuration for the mission loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissionLoopConfig {
@@ -51,6 +87,9 @@ pub struct MissionLoopConfig {
     pub solver_config: SolverConfig,
     /// Whether to include blocked candidates in extraction (for analysis).
     pub include_blocked_in_extraction: bool,
+    /// Mission-level envelope caps for safety and anti-thrash behavior.
+    #[serde(default)]
+    pub safety_envelope: MissionSafetyEnvelopeConfig,
 }
 
 impl Default for MissionLoopConfig {
@@ -62,6 +101,7 @@ impl Default for MissionLoopConfig {
             scorer_config: ScorerConfig::default(),
             solver_config: SolverConfig::default(),
             include_blocked_in_extraction: false,
+            safety_envelope: MissionSafetyEnvelopeConfig::default(),
         }
     }
 }
@@ -102,6 +142,9 @@ pub struct MissionLoopState {
     pub last_decision: Option<MissionDecision>,
     pub total_assignments_made: u64,
     pub total_rejections: u64,
+    /// Consecutive assignment streaks by bead id (used for retry-storm limiting).
+    #[serde(default)]
+    pub retry_streaks: HashMap<String, u32>,
 }
 
 // ── Mission loop engine ─────────────────────────────────────────────────────
@@ -128,6 +171,7 @@ impl MissionLoop {
                 last_decision: None,
                 total_assignments_made: 0,
                 total_rejections: 0,
+                retry_streaks: HashMap::new(),
             },
         }
     }
@@ -261,6 +305,7 @@ impl MissionLoop {
         // Phase 4: Assignment solving.
         let assignment_set: AssignmentSet =
             solve_assignments(&scorer_report, agents, &self.config.solver_config);
+        let assignment_set = self.apply_safety_envelope(assignment_set, issues);
 
         // Update state.
         self.state.total_assignments_made += assignment_set.assignments.len() as u64;
@@ -279,6 +324,105 @@ impl MissionLoop {
 
         self.state.last_decision = Some(decision.clone());
         decision
+    }
+
+    fn apply_safety_envelope(
+        &mut self,
+        assignment_set: AssignmentSet,
+        issues: &[BeadIssueDetail],
+    ) -> AssignmentSet {
+        const GATE_MAX_ASSIGNMENTS: &str = "mission.envelope.max_assignments_per_cycle";
+        const GATE_MAX_RISKY_ASSIGNMENTS: &str = "mission.envelope.max_risky_assignments_per_cycle";
+        const GATE_RETRY_STORM: &str = "mission.envelope.retry_storm";
+
+        let mut kept_assignments = Vec::with_capacity(assignment_set.assignments.len());
+        let mut envelope_rejections: Vec<RejectedCandidate> = Vec::new();
+        let mut risky_assigned_count = 0usize;
+        let mut next_retry_streaks: HashMap<String, u32> = HashMap::new();
+
+        for mut assignment in assignment_set.assignments {
+            let previous_retry_streak = self
+                .state
+                .retry_streaks
+                .get(&assignment.bead_id)
+                .copied()
+                .unwrap_or(0);
+            let retry_limit = self.config.safety_envelope.max_consecutive_retries_per_bead;
+
+            if retry_limit > 0 && previous_retry_streak >= retry_limit {
+                envelope_rejections.push(RejectedCandidate {
+                    bead_id: assignment.bead_id.clone(),
+                    score: assignment.score,
+                    reasons: vec![RejectionReason::SafetyGateDenied {
+                        gate_name: GATE_RETRY_STORM.to_string(),
+                    }],
+                });
+                // Reset streak after one forced backoff cycle.
+                next_retry_streaks.insert(assignment.bead_id, 0);
+                continue;
+            }
+
+            let is_risky = self.is_risky_assignment(&assignment.bead_id, issues);
+            if kept_assignments.len() >= self.config.safety_envelope.max_assignments_per_cycle {
+                envelope_rejections.push(RejectedCandidate {
+                    bead_id: assignment.bead_id,
+                    score: assignment.score,
+                    reasons: vec![RejectionReason::SafetyGateDenied {
+                        gate_name: GATE_MAX_ASSIGNMENTS.to_string(),
+                    }],
+                });
+                continue;
+            }
+
+            if is_risky
+                && risky_assigned_count
+                    >= self.config.safety_envelope.max_risky_assignments_per_cycle
+            {
+                envelope_rejections.push(RejectedCandidate {
+                    bead_id: assignment.bead_id,
+                    score: assignment.score,
+                    reasons: vec![RejectionReason::SafetyGateDenied {
+                        gate_name: GATE_MAX_RISKY_ASSIGNMENTS.to_string(),
+                    }],
+                });
+                continue;
+            }
+
+            if is_risky {
+                risky_assigned_count += 1;
+            }
+
+            assignment.rank = kept_assignments.len() + 1;
+            next_retry_streaks.insert(
+                assignment.bead_id.clone(),
+                previous_retry_streak.saturating_add(1),
+            );
+            kept_assignments.push(assignment);
+        }
+
+        let mut rejected = assignment_set.rejected;
+        rejected.extend(envelope_rejections);
+        self.state.retry_streaks = next_retry_streaks;
+
+        AssignmentSet {
+            assignments: kept_assignments,
+            rejected,
+            solver_config: assignment_set.solver_config,
+        }
+    }
+
+    fn is_risky_assignment(&self, bead_id: &str, issues: &[BeadIssueDetail]) -> bool {
+        let Some(issue) = issues.iter().find(|issue| issue.id == bead_id) else {
+            return false;
+        };
+        issue.labels.iter().any(|label| {
+            let normalized_label = label.to_ascii_lowercase();
+            self.config
+                .safety_envelope
+                .risky_label_markers
+                .iter()
+                .any(|marker| normalized_label.contains(&marker.to_ascii_lowercase()))
+        })
     }
 }
 
@@ -318,6 +462,18 @@ mod tests {
             ingest_warning: None,
             extra: HashMap::new(),
         }
+    }
+
+    fn sample_detail_with_labels(
+        id: &str,
+        status: BeadStatus,
+        priority: u8,
+        dependency_ids: &[(&str, &str)],
+        labels: &[&str],
+    ) -> BeadIssueDetail {
+        let mut detail = sample_detail(id, status, priority, dependency_ids);
+        detail.labels = labels.iter().map(|label| (*label).to_string()).collect();
+        detail
     }
 
     fn ready_agent(agent_id: &str) -> MissionAgentCapabilityProfile {
@@ -529,6 +685,103 @@ mod tests {
     }
 
     #[test]
+    fn loop_envelope_limits_assignments_per_cycle() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            safety_envelope: MissionSafetyEnvelopeConfig {
+                max_assignments_per_cycle: 1,
+                max_risky_assignments_per_cycle: 10,
+                max_consecutive_retries_per_bead: 100,
+                ..MissionSafetyEnvelopeConfig::default()
+            },
+            ..MissionLoopConfig::default()
+        });
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+        ];
+        let agents = vec![ready_agent("a1"), ready_agent("a2")];
+        let ctx = PlannerExtractionContext::default();
+
+        let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+        assert_eq!(decision.assignment_set.assignment_count(), 1);
+        assert!(decision.assignment_set.rejected.iter().any(|rejected| {
+            rejected.reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    RejectionReason::SafetyGateDenied { gate_name }
+                    if gate_name == "mission.envelope.max_assignments_per_cycle"
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn loop_envelope_limits_risky_assignments_by_label() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            safety_envelope: MissionSafetyEnvelopeConfig {
+                max_assignments_per_cycle: 10,
+                max_risky_assignments_per_cycle: 1,
+                max_consecutive_retries_per_bead: 100,
+                risky_label_markers: vec!["danger".to_string()],
+            },
+            ..MissionLoopConfig::default()
+        });
+        let issues = vec![
+            sample_detail_with_labels("r1", BeadStatus::Open, 0, &[], &["dangerous"]),
+            sample_detail_with_labels("r2", BeadStatus::Open, 1, &[], &["danger-zone"]),
+            sample_detail_with_labels("r3", BeadStatus::Open, 2, &[], &["danger"]),
+        ];
+        let agents = vec![ready_agent("a1"), ready_agent("a2"), ready_agent("a3")];
+        let ctx = PlannerExtractionContext::default();
+
+        let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+        assert_eq!(decision.assignment_set.assignment_count(), 1);
+        assert!(decision.assignment_set.rejected.iter().any(|rejected| {
+            rejected.reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    RejectionReason::SafetyGateDenied { gate_name }
+                    if gate_name == "mission.envelope.max_risky_assignments_per_cycle"
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn loop_envelope_blocks_retry_storm_for_one_cycle() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            safety_envelope: MissionSafetyEnvelopeConfig {
+                max_assignments_per_cycle: 10,
+                max_risky_assignments_per_cycle: 10,
+                max_consecutive_retries_per_bead: 1,
+                ..MissionSafetyEnvelopeConfig::default()
+            },
+            ..MissionLoopConfig::default()
+        });
+        let issues = vec![sample_detail("retry", BeadStatus::Open, 0, &[])];
+        let agents = vec![ready_agent("a1")];
+        let ctx = PlannerExtractionContext::default();
+
+        let first = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+        assert_eq!(first.assignment_set.assignment_count(), 1);
+
+        let second = ml.evaluate(2000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+        assert_eq!(second.assignment_set.assignment_count(), 0);
+        assert!(second.assignment_set.rejected.iter().any(|rejected| {
+            rejected.reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    RejectionReason::SafetyGateDenied { gate_name }
+                    if gate_name == "mission.envelope.retry_storm"
+                )
+            })
+        }));
+
+        let third = ml.evaluate(3000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+        assert_eq!(third.assignment_set.assignment_count(), 1);
+    }
+
+    #[test]
     fn loop_last_decision_stored() {
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
         assert!(ml.state().last_decision.is_none());
@@ -555,10 +808,7 @@ mod tests {
 
         // Only blocker should be assigned, not blocked
         assert_eq!(decision.assignment_set.assignment_count(), 1);
-        assert_eq!(
-            decision.assignment_set.assignments[0].bead_id,
-            "blocker"
-        );
+        assert_eq!(decision.assignment_set.assignments[0].bead_id, "blocker");
     }
 
     #[test]
@@ -612,6 +862,10 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let back: MissionLoopConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.cadence_ms, config.cadence_ms);
+        assert_eq!(
+            back.safety_envelope.max_assignments_per_cycle,
+            config.safety_envelope.max_assignments_per_cycle
+        );
     }
 
     #[test]
@@ -662,10 +916,12 @@ mod tests {
             last_decision: None,
             total_assignments_made: 10,
             total_rejections: 3,
+            retry_streaks: HashMap::from([("bead-a".to_string(), 2)]),
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: MissionLoopState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.cycle_count, 5);
         assert_eq!(back.total_assignments_made, 10);
+        assert_eq!(back.retry_streaks.get("bead-a"), Some(&2));
     }
 }

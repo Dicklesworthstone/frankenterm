@@ -2795,7 +2795,11 @@ pub enum LedgerValidationError {
     /// Entry sequence is not monotonically increasing.
     NonMonotonicSequence { expected: u64, actual: u64 },
     /// Hash chain is broken (prev_hash doesn't match previous entry_hash).
-    BrokenHashChain { seq: u64, expected_prev: String, actual_prev: String },
+    BrokenHashChain {
+        seq: u64,
+        expected_prev: String,
+        actual_prev: String,
+    },
     /// Entry hash doesn't match recomputed content hash.
     TamperedEntry { seq: u64 },
     /// Genesis entry has non-empty prev_hash.
@@ -2803,16 +2807,27 @@ pub enum LedgerValidationError {
     /// Ledger is empty when entries were expected.
     EmptyLedger,
     /// Transaction ID mismatch within a single-tx ledger.
-    TxIdMismatch { seq: u64, expected: TxId, actual: TxId },
+    TxIdMismatch {
+        seq: u64,
+        expected: TxId,
+        actual: TxId,
+    },
 }
 
 impl fmt::Display for LedgerValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NonMonotonicSequence { expected, actual } => {
-                write!(f, "Non-monotonic ledger sequence: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "Non-monotonic ledger sequence: expected {expected}, got {actual}"
+                )
             }
-            Self::BrokenHashChain { seq, expected_prev, actual_prev } => {
+            Self::BrokenHashChain {
+                seq,
+                expected_prev,
+                actual_prev,
+            } => {
                 write!(f, "Broken hash chain at seq {seq}: expected prev {expected_prev}, got {actual_prev}")
             }
             Self::TamperedEntry { seq } => {
@@ -2820,8 +2835,15 @@ impl fmt::Display for LedgerValidationError {
             }
             Self::InvalidGenesis => f.write_str("Genesis entry must have empty prev_hash"),
             Self::EmptyLedger => f.write_str("Ledger is empty"),
-            Self::TxIdMismatch { seq, expected, actual } => {
-                write!(f, "Tx ID mismatch at seq {seq}: expected {expected}, got {actual}")
+            Self::TxIdMismatch {
+                seq,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "Tx ID mismatch at seq {seq}: expected {expected}, got {actual}"
+                )
             }
         }
     }
@@ -2982,16 +3004,14 @@ impl IntentLedger {
         self.entries
             .iter()
             .filter_map(|e| match &e.kind {
-                LedgerEntryKind::StateTransition { from, to, kind } => {
-                    Some(StateTimelineEntry {
-                        seq: e.seq,
-                        timestamp_ms: e.created_at_ms,
-                        from: from.clone(),
-                        to: to.clone(),
-                        kind: kind.clone(),
-                        correlation: e.correlation.clone(),
-                    })
-                }
+                LedgerEntryKind::StateTransition { from, to, kind } => Some(StateTimelineEntry {
+                    seq: e.seq,
+                    timestamp_ms: e.created_at_ms,
+                    from: from.clone(),
+                    to: to.clone(),
+                    kind: kind.clone(),
+                    correlation: e.correlation.clone(),
+                }),
                 _ => None,
             })
             .collect()
@@ -3085,8 +3105,8 @@ impl IntentLedger {
             if line.is_empty() {
                 continue;
             }
-            let entry: LedgerEntry = serde_json::from_str(line)
-                .map_err(|e| format!("line {}: {}", i + 1, e))?;
+            let entry: LedgerEntry =
+                serde_json::from_str(line).map_err(|e| format!("line {}: {}", i + 1, e))?;
             ledger.entries.push(entry);
         }
         Ok(ledger)
@@ -3488,6 +3508,147 @@ pub struct MissionDispatchContract {
     pub messaging: MissionMessagingRequirement,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edge_cases: Vec<MissionDispatchEdgeCase>,
+}
+
+/// Dispatch execution mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionDispatchMode {
+    DryRun,
+    Live,
+}
+
+/// Resolved dispatch target for one assignment execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionDispatchTarget {
+    pub assignment_id: AssignmentId,
+    pub candidate_id: CandidateActionId,
+    pub assignee: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bead_id: Option<String>,
+}
+
+/// Normalized live dispatch response envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MissionDispatchLiveResponse {
+    Delivered {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason_code: Option<String>,
+        completed_at_ms: i64,
+    },
+    Failed {
+        reason_code: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_code: Option<String>,
+        completed_at_ms: i64,
+    },
+}
+
+/// Final dispatch adapter output used by mission runtime/state reconciliation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionDispatchExecution {
+    pub mode: MissionDispatchMode,
+    pub target: MissionDispatchTarget,
+    pub mechanism: MissionDispatchMechanism,
+    pub outcome: Outcome,
+}
+
+/// Durable approval-path transition record for idempotent continuation/audit trails.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionApprovalTransitionRecord {
+    pub assignment_id: AssignmentId,
+    pub lifecycle_from: MissionLifecycleState,
+    pub lifecycle_to: MissionLifecycleState,
+    pub approval_from: ApprovalState,
+    pub approval_to: ApprovalState,
+    pub transition_kind: MissionLifecycleTransitionKind,
+    pub transitioned_at_ms: i64,
+    pub idempotent: bool,
+    pub reason_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+/// Runtime signal emitted by dispatch/runtime to report assignment execution results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MissionAssignmentSignalPayload {
+    Completed {
+        reason_code: String,
+        completed_at_ms: i64,
+    },
+    Failed {
+        reason_code: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_code: Option<String>,
+        completed_at_ms: i64,
+    },
+    TimedOut {
+        completed_at_ms: i64,
+    },
+}
+
+/// One assignment outcome signal used for deterministic reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionAssignmentSignal {
+    pub assignment_id: AssignmentId,
+    pub observed_at_ms: i64,
+    pub correlation_id: String,
+    pub payload: MissionAssignmentSignalPayload,
+}
+
+/// Drift record surfaced when incoming signals conflict with prior assignment state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionAssignmentStateDrift {
+    pub assignment_id: AssignmentId,
+    pub reason_code: String,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_outcome: Option<Outcome>,
+    pub incoming_outcome: Outcome,
+}
+
+/// Assignment reconciliation result for one ingested runtime signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionAssignmentReconciliationReport {
+    pub assignment_id: AssignmentId,
+    pub applied: bool,
+    pub out_of_order: bool,
+    pub lifecycle_from: MissionLifecycleState,
+    pub lifecycle_to: MissionLifecycleState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome_before: Option<Outcome>,
+    pub outcome_after: Outcome,
+    pub reason_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drift: Option<MissionAssignmentStateDrift>,
+}
+
+/// Active reservation lease snapshot used for mission-time conflict checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionReservationLease {
+    pub lease_id: String,
+    pub holder: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    pub exclusive: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+}
+
+impl MissionReservationLease {
+    #[must_use]
+    pub fn is_expired_at(&self, evaluated_at_ms: i64) -> bool {
+        self.expires_at_ms
+            .is_some_and(|expires_at_ms| expires_at_ms < evaluated_at_ms)
+    }
 }
 
 /// Current dispatch availability state for an execution agent.
@@ -4302,6 +4463,450 @@ impl Mission {
         Ok(())
     }
 
+    /// Mark an assignment as requiring approval and transition lifecycle into awaiting approval.
+    ///
+    /// This operation is idempotent when the assignment is already pending with the same
+    /// request metadata and the mission lifecycle is already `awaiting_approval`.
+    pub fn request_assignment_approval(
+        &mut self,
+        assignment_id: &AssignmentId,
+        requested_by: impl Into<String>,
+        requested_at_ms: i64,
+    ) -> Result<MissionApprovalTransitionRecord, MissionValidationError> {
+        let requested_by = requested_by.into();
+        let requested_by = requested_by.trim();
+        Self::validate_non_empty_field("approval.requested_by", requested_by)?;
+
+        let assignment_index =
+            self.find_assignment_index_by_id(assignment_id)
+                .ok_or_else(|| {
+                    MissionValidationError::UnknownAssignmentReference(assignment_id.clone())
+                })?;
+        let lifecycle_from = self.lifecycle_state;
+        let lifecycle_to = match lifecycle_from {
+            MissionLifecycleState::Dispatching | MissionLifecycleState::AwaitingApproval => {
+                MissionLifecycleState::AwaitingApproval
+            }
+            lifecycle_state => {
+                return Err(MissionValidationError::InvalidApprovalLifecycleState {
+                    assignment_id: assignment_id.clone(),
+                    action: "request_approval",
+                    lifecycle_state,
+                });
+            }
+        };
+        let transition_kind = MissionLifecycleTransitionKind::ApprovalRequested;
+
+        let approval_from = self.assignments[assignment_index].approval_state.clone();
+        match &approval_from {
+            ApprovalState::NotRequired | ApprovalState::Pending { .. } => {}
+            state => {
+                return Err(MissionValidationError::InvalidApprovalStateTransition {
+                    assignment_id: assignment_id.clone(),
+                    action: "request_approval",
+                    state: state.canonical_string(),
+                });
+            }
+        }
+
+        let approval_to = ApprovalState::Pending {
+            requested_by: requested_by.to_string(),
+            requested_at_ms,
+        };
+        let idempotent_state = approval_from == approval_to;
+        let idempotent_lifecycle = lifecycle_from == lifecycle_to;
+
+        if !idempotent_state {
+            self.assignments[assignment_index].approval_state = approval_to.clone();
+        }
+        self.assignments[assignment_index].updated_at_ms = Some(requested_at_ms);
+
+        if !idempotent_lifecycle {
+            self.transition_lifecycle(lifecycle_to, transition_kind, requested_at_ms)?;
+        } else {
+            self.updated_at_ms = Some(requested_at_ms);
+        }
+
+        Ok(MissionApprovalTransitionRecord {
+            assignment_id: assignment_id.clone(),
+            lifecycle_from,
+            lifecycle_to,
+            approval_from,
+            approval_to,
+            transition_kind,
+            transitioned_at_ms: requested_at_ms,
+            idempotent: idempotent_state && idempotent_lifecycle,
+            reason_code: MissionFailureCode::ApprovalRequired
+                .reason_code()
+                .to_string(),
+            error_code: Some(
+                MissionFailureCode::ApprovalRequired
+                    .error_code()
+                    .to_string(),
+            ),
+        })
+    }
+
+    /// Continue execution after approval and transition back into running state.
+    ///
+    /// If the approval has already expired, this method falls back to the canonical
+    /// expiration path and never resumes execution.
+    pub fn continue_assignment_after_approval(
+        &mut self,
+        assignment_id: &AssignmentId,
+        approved_by: impl Into<String>,
+        approved_at_ms: i64,
+        approval_code_hash: impl Into<String>,
+    ) -> Result<MissionApprovalTransitionRecord, MissionValidationError> {
+        let approved_by = approved_by.into();
+        let approved_by = approved_by.trim();
+        Self::validate_non_empty_field("approval.approved_by", approved_by)?;
+        let approval_code_hash = approval_code_hash.into();
+        let approval_code_hash = approval_code_hash.trim();
+        Self::validate_non_empty_field("approval.approval_code_hash", approval_code_hash)?;
+
+        let assignment_index =
+            self.find_assignment_index_by_id(assignment_id)
+                .ok_or_else(|| {
+                    MissionValidationError::UnknownAssignmentReference(assignment_id.clone())
+                })?;
+        let lifecycle_from = self.lifecycle_state;
+        let lifecycle_to = match lifecycle_from {
+            MissionLifecycleState::AwaitingApproval | MissionLifecycleState::Running => {
+                MissionLifecycleState::Running
+            }
+            lifecycle_state => {
+                return Err(MissionValidationError::InvalidApprovalLifecycleState {
+                    assignment_id: assignment_id.clone(),
+                    action: "continue_after_approval",
+                    lifecycle_state,
+                });
+            }
+        };
+        let transition_kind = MissionLifecycleTransitionKind::ApprovalGranted;
+
+        let approval_from = self.assignments[assignment_index].approval_state.clone();
+        if matches!(approval_from, ApprovalState::Expired { .. }) {
+            return self.expire_assignment_approval(assignment_id, approved_at_ms);
+        }
+        match &approval_from {
+            ApprovalState::Pending { .. } | ApprovalState::Approved { .. } => {}
+            state => {
+                return Err(MissionValidationError::InvalidApprovalStateTransition {
+                    assignment_id: assignment_id.clone(),
+                    action: "continue_after_approval",
+                    state: state.canonical_string(),
+                });
+            }
+        }
+
+        let approval_to = ApprovalState::Approved {
+            approved_by: approved_by.to_string(),
+            approved_at_ms,
+            approval_code_hash: approval_code_hash.to_string(),
+        };
+        let idempotent_state = approval_from == approval_to;
+        let idempotent_lifecycle = lifecycle_from == lifecycle_to;
+
+        if !idempotent_state {
+            self.assignments[assignment_index].approval_state = approval_to.clone();
+        }
+        self.assignments[assignment_index].updated_at_ms = Some(approved_at_ms);
+
+        if !idempotent_lifecycle {
+            self.transition_lifecycle(lifecycle_to, transition_kind, approved_at_ms)?;
+        } else {
+            self.updated_at_ms = Some(approved_at_ms);
+        }
+
+        Ok(MissionApprovalTransitionRecord {
+            assignment_id: assignment_id.clone(),
+            lifecycle_from,
+            lifecycle_to,
+            approval_from,
+            approval_to,
+            transition_kind,
+            transitioned_at_ms: approved_at_ms,
+            idempotent: idempotent_state && idempotent_lifecycle,
+            reason_code: "approval_granted".to_string(),
+            error_code: None,
+        })
+    }
+
+    /// Expire approval state and force safe fallback into failed lifecycle state.
+    ///
+    /// This method is idempotent when the assignment is already in canonical expired state,
+    /// has canonical failed outcome, and mission lifecycle is already `failed`.
+    pub fn expire_assignment_approval(
+        &mut self,
+        assignment_id: &AssignmentId,
+        expired_at_ms: i64,
+    ) -> Result<MissionApprovalTransitionRecord, MissionValidationError> {
+        let assignment_index =
+            self.find_assignment_index_by_id(assignment_id)
+                .ok_or_else(|| {
+                    MissionValidationError::UnknownAssignmentReference(assignment_id.clone())
+                })?;
+        let lifecycle_from = self.lifecycle_state;
+        let lifecycle_to = match lifecycle_from {
+            MissionLifecycleState::AwaitingApproval | MissionLifecycleState::Failed => {
+                MissionLifecycleState::Failed
+            }
+            lifecycle_state => {
+                return Err(MissionValidationError::InvalidApprovalLifecycleState {
+                    assignment_id: assignment_id.clone(),
+                    action: "expire_approval",
+                    lifecycle_state,
+                });
+            }
+        };
+        let transition_kind = MissionLifecycleTransitionKind::ApprovalExpired;
+
+        let approval_from = self.assignments[assignment_index].approval_state.clone();
+        match &approval_from {
+            ApprovalState::Pending { .. }
+            | ApprovalState::Approved { .. }
+            | ApprovalState::Expired { .. } => {}
+            state => {
+                return Err(MissionValidationError::InvalidApprovalStateTransition {
+                    assignment_id: assignment_id.clone(),
+                    action: "expire_approval",
+                    state: state.canonical_string(),
+                });
+            }
+        }
+
+        let failure_code = MissionFailureCode::ApprovalExpired;
+        let approval_to = ApprovalState::Expired {
+            expired_at_ms,
+            reason_code: failure_code.reason_code().to_string(),
+        };
+        let failed_outcome = Outcome::Failed {
+            reason_code: failure_code.reason_code().to_string(),
+            error_code: failure_code.error_code().to_string(),
+            completed_at_ms: expired_at_ms,
+        };
+        let idempotent_state = approval_from == approval_to;
+        let idempotent_outcome =
+            self.assignments[assignment_index].outcome.as_ref() == Some(&failed_outcome);
+        let idempotent_lifecycle = lifecycle_from == lifecycle_to;
+
+        if !idempotent_state {
+            self.assignments[assignment_index].approval_state = approval_to.clone();
+        }
+        if !idempotent_outcome {
+            self.assignments[assignment_index].outcome = Some(failed_outcome);
+        }
+        self.assignments[assignment_index].updated_at_ms = Some(expired_at_ms);
+
+        if !idempotent_lifecycle {
+            self.transition_lifecycle(lifecycle_to, transition_kind, expired_at_ms)?;
+        } else {
+            self.updated_at_ms = Some(expired_at_ms);
+        }
+
+        Ok(MissionApprovalTransitionRecord {
+            assignment_id: assignment_id.clone(),
+            lifecycle_from,
+            lifecycle_to,
+            approval_from,
+            approval_to,
+            transition_kind,
+            transitioned_at_ms: expired_at_ms,
+            idempotent: idempotent_state && idempotent_outcome && idempotent_lifecycle,
+            reason_code: failure_code.reason_code().to_string(),
+            error_code: Some(failure_code.error_code().to_string()),
+        })
+    }
+
+    /// Ingest runtime assignment outcomes and reconcile mission state deterministically.
+    ///
+    /// Reconciliation semantics:
+    /// - out-of-order signals (`observed_at_ms` older than assignment update timestamp) are ignored,
+    /// - duplicate signals are idempotent no-ops,
+    /// - newer conflicting signals apply and emit an explicit drift record.
+    pub fn reconcile_assignment_signal(
+        &mut self,
+        signal: &MissionAssignmentSignal,
+    ) -> Result<MissionAssignmentReconciliationReport, MissionValidationError> {
+        Self::validate_non_empty_field("assignment_signal.correlation_id", &signal.correlation_id)?;
+
+        let assignment_index = self
+            .find_assignment_index_by_id(&signal.assignment_id)
+            .ok_or_else(|| {
+                MissionValidationError::UnknownAssignmentReference(signal.assignment_id.clone())
+            })?;
+        let lifecycle_from = self.lifecycle_state;
+        let outcome_before = self.assignments[assignment_index].outcome.clone();
+        let outcome_after =
+            Self::normalize_assignment_signal_outcome(&signal.assignment_id, &signal.payload)?;
+
+        let baseline_ts = self.assignments[assignment_index]
+            .updated_at_ms
+            .unwrap_or(self.assignments[assignment_index].created_at_ms);
+        if signal.observed_at_ms < baseline_ts {
+            let drift = if outcome_before
+                .as_ref()
+                .is_some_and(|existing| existing != &outcome_after)
+            {
+                Some(MissionAssignmentStateDrift {
+                    assignment_id: signal.assignment_id.clone(),
+                    reason_code: MissionFailureCode::StaleState.reason_code().to_string(),
+                    summary: format!(
+                        "ignored_out_of_order_signal baseline_ts={} observed_at_ms={}",
+                        baseline_ts, signal.observed_at_ms
+                    ),
+                    previous_outcome: outcome_before.clone(),
+                    incoming_outcome: outcome_after.clone(),
+                })
+            } else {
+                None
+            };
+
+            return Ok(MissionAssignmentReconciliationReport {
+                assignment_id: signal.assignment_id.clone(),
+                applied: false,
+                out_of_order: true,
+                lifecycle_from,
+                lifecycle_to: lifecycle_from,
+                outcome_before,
+                outcome_after,
+                reason_code: MissionFailureCode::StaleState.reason_code().to_string(),
+                error_code: Some(MissionFailureCode::StaleState.error_code().to_string()),
+                drift,
+            });
+        }
+
+        let mut applied = false;
+        let mut drift = None;
+        if outcome_before.as_ref() != Some(&outcome_after) {
+            if let Some(previous_outcome) = &outcome_before {
+                drift = Some(MissionAssignmentStateDrift {
+                    assignment_id: signal.assignment_id.clone(),
+                    reason_code: "state_drift_detected".to_string(),
+                    summary: "incoming signal outcome differs from current assignment outcome"
+                        .to_string(),
+                    previous_outcome: Some(previous_outcome.clone()),
+                    incoming_outcome: outcome_after.clone(),
+                });
+            }
+            self.assignments[assignment_index].outcome = Some(outcome_after.clone());
+            applied = true;
+        }
+        self.assignments[assignment_index].updated_at_ms = Some(signal.observed_at_ms);
+
+        let mut lifecycle_to = self.lifecycle_state;
+        match &outcome_after {
+            Outcome::Success { .. } => {
+                let to_running = match lifecycle_to {
+                    MissionLifecycleState::Dispatching => Some((
+                        MissionLifecycleState::Running,
+                        MissionLifecycleTransitionKind::ExecutionStarted,
+                    )),
+                    MissionLifecycleState::RetryPending | MissionLifecycleState::Blocked => Some((
+                        MissionLifecycleState::Running,
+                        MissionLifecycleTransitionKind::RetryResumed,
+                    )),
+                    _ => None,
+                };
+                if let Some((state, kind)) = to_running {
+                    if mission_lifecycle_can_transition(lifecycle_to, state, kind) {
+                        self.transition_lifecycle(state, kind, signal.observed_at_ms)?;
+                        lifecycle_to = state;
+                    }
+                }
+
+                let all_assignments_success = self
+                    .assignments
+                    .iter()
+                    .all(|assignment| matches!(assignment.outcome, Some(Outcome::Success { .. })));
+                if all_assignments_success
+                    && mission_lifecycle_can_transition(
+                        lifecycle_to,
+                        MissionLifecycleState::Completed,
+                        MissionLifecycleTransitionKind::ExecutionSucceeded,
+                    )
+                {
+                    self.transition_lifecycle(
+                        MissionLifecycleState::Completed,
+                        MissionLifecycleTransitionKind::ExecutionSucceeded,
+                        signal.observed_at_ms,
+                    )?;
+                    lifecycle_to = MissionLifecycleState::Completed;
+                }
+            }
+            Outcome::Failed { reason_code, .. } => {
+                let transition_kind =
+                    if reason_code == MissionFailureCode::ApprovalDenied.reason_code() {
+                        MissionLifecycleTransitionKind::ApprovalDenied
+                    } else if reason_code == MissionFailureCode::ApprovalExpired.reason_code() {
+                        MissionLifecycleTransitionKind::ApprovalExpired
+                    } else {
+                        MissionLifecycleTransitionKind::ExecutionFailed
+                    };
+
+                if mission_lifecycle_can_transition(
+                    lifecycle_to,
+                    MissionLifecycleState::Failed,
+                    transition_kind,
+                ) {
+                    self.transition_lifecycle(
+                        MissionLifecycleState::Failed,
+                        transition_kind,
+                        signal.observed_at_ms,
+                    )?;
+                    lifecycle_to = MissionLifecycleState::Failed;
+                } else if lifecycle_to != MissionLifecycleState::Failed {
+                    drift = Some(MissionAssignmentStateDrift {
+                        assignment_id: signal.assignment_id.clone(),
+                        reason_code: "state_drift_detected".to_string(),
+                        summary: format!(
+                            "failed outcome could not transition lifecycle from {} via {}",
+                            lifecycle_to, transition_kind
+                        ),
+                        previous_outcome: outcome_before.clone(),
+                        incoming_outcome: outcome_after.clone(),
+                    });
+                }
+            }
+            Outcome::Cancelled { .. } => {
+                if mission_lifecycle_can_transition(
+                    lifecycle_to,
+                    MissionLifecycleState::Cancelled,
+                    MissionLifecycleTransitionKind::MissionCancelled,
+                ) {
+                    self.transition_lifecycle(
+                        MissionLifecycleState::Cancelled,
+                        MissionLifecycleTransitionKind::MissionCancelled,
+                        signal.observed_at_ms,
+                    )?;
+                    lifecycle_to = MissionLifecycleState::Cancelled;
+                }
+            }
+        }
+
+        if lifecycle_to == lifecycle_from {
+            self.updated_at_ms = Some(signal.observed_at_ms);
+        }
+
+        Ok(MissionAssignmentReconciliationReport {
+            assignment_id: signal.assignment_id.clone(),
+            applied,
+            out_of_order: false,
+            lifecycle_from,
+            lifecycle_to,
+            outcome_before,
+            outcome_after,
+            reason_code: if applied {
+                "signal_reconciled".to_string()
+            } else {
+                "signal_duplicate".to_string()
+            },
+            error_code: None,
+            drift,
+        })
+    }
+
     /// Evaluate policy preflight checks for mission candidate actions.
     ///
     /// This pipeline supports both:
@@ -4480,6 +5085,224 @@ impl Mission {
             messaging,
             edge_cases,
         })
+    }
+
+    /// Resolve concrete dispatch target (pane/agent/thread/bead) for an assignment.
+    pub fn resolve_dispatch_target(
+        &self,
+        assignment_id: &AssignmentId,
+    ) -> Result<MissionDispatchTarget, MissionValidationError> {
+        let (target, _) = self.dispatch_context_for_assignment(assignment_id)?;
+        Ok(target)
+    }
+
+    /// Produce a normalized dispatch execution envelope for dry-run mode.
+    pub fn dispatch_assignment_dry_run(
+        &self,
+        assignment_id: &AssignmentId,
+        completed_at_ms: i64,
+    ) -> Result<MissionDispatchExecution, MissionValidationError> {
+        let (target, mechanism) = self.dispatch_context_for_assignment(assignment_id)?;
+        Ok(MissionDispatchExecution {
+            mode: MissionDispatchMode::DryRun,
+            target,
+            mechanism,
+            outcome: Outcome::Success {
+                reason_code: "dispatch_dry_run".to_string(),
+                completed_at_ms,
+            },
+        })
+    }
+
+    /// Normalize a live dispatch response into canonical mission outcome contracts.
+    pub fn dispatch_assignment_live(
+        &self,
+        assignment_id: &AssignmentId,
+        response: MissionDispatchLiveResponse,
+    ) -> Result<MissionDispatchExecution, MissionValidationError> {
+        let (target, mechanism) = self.dispatch_context_for_assignment(assignment_id)?;
+        let outcome = match response {
+            MissionDispatchLiveResponse::Delivered {
+                reason_code,
+                completed_at_ms,
+            } => {
+                let reason_code = reason_code
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "dispatch_executed".to_string());
+                Outcome::Success {
+                    reason_code,
+                    completed_at_ms,
+                }
+            }
+            MissionDispatchLiveResponse::Failed {
+                reason_code,
+                error_code,
+                completed_at_ms,
+            } => {
+                let failure_code = Self::validate_failure_reason_code(
+                    assignment_id,
+                    MissionFailureContext::AssignmentOutcomeFailed,
+                    &reason_code,
+                )?;
+                let normalized_error_code = match error_code
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(actual_error_code) => {
+                        Self::validate_failure_error_code(
+                            assignment_id,
+                            MissionFailureContext::AssignmentOutcomeFailed,
+                            failure_code.reason_code(),
+                            actual_error_code,
+                            failure_code.error_code(),
+                        )?;
+                        actual_error_code.to_string()
+                    }
+                    None => failure_code.error_code().to_string(),
+                };
+                Outcome::Failed {
+                    reason_code: failure_code.reason_code().to_string(),
+                    error_code: normalized_error_code,
+                    completed_at_ms,
+                }
+            }
+        };
+
+        Ok(MissionDispatchExecution {
+            mode: MissionDispatchMode::Live,
+            target,
+            mechanism,
+            outcome,
+        })
+    }
+
+    /// Evaluate reservation feasibility + ownership before dispatch-time execution.
+    ///
+    /// Emits canonical dispatch-time preflight outcomes so planner/dispatcher can:
+    /// - block on conflicting external leases held by another assignee,
+    /// - fail fast when reservation intent has already expired,
+    /// - continue when no conflicts exist or leases belong to the same assignee.
+    pub fn evaluate_reservation_feasibility(
+        &self,
+        leases: &[MissionReservationLease],
+        evaluated_at_ms: i64,
+    ) -> Result<MissionPolicyPreflightReport, MissionValidationError> {
+        let mut checks = Vec::with_capacity(self.assignments.len());
+
+        for assignment in &self.assignments {
+            let mut check = MissionPolicyPreflightCheck {
+                candidate_id: assignment.candidate_id.clone(),
+                assignment_id: Some(assignment.assignment_id.clone()),
+                decision: MissionPolicyDecisionKind::Allow,
+                reason_code: None,
+                rule_id: Some("reservation.feasibility".to_string()),
+                context: None,
+            };
+
+            if let Some(intent) = &assignment.reservation_intent {
+                if intent
+                    .expires_at_ms
+                    .is_some_and(|expires_at_ms| expires_at_ms < evaluated_at_ms)
+                {
+                    check.decision = MissionPolicyDecisionKind::Deny;
+                    check.reason_code =
+                        Some(MissionFailureCode::StaleState.reason_code().to_string());
+                    check.context = Some(format!(
+                        "reservation_intent_expired reservation_id={} remediation=refresh_reservations_then_retry escalation=human",
+                        intent.reservation_id.0
+                    ));
+                    checks.push(check);
+                    continue;
+                }
+
+                let mut conflicting_holders = BTreeSet::new();
+                let mut conflicting_paths = BTreeSet::new();
+                let mut conflicting_lease_ids = BTreeSet::new();
+
+                for lease in leases {
+                    if !lease.exclusive || lease.is_expired_at(evaluated_at_ms) {
+                        continue;
+                    }
+                    if lease.holder.trim() == assignment.assignee.trim() {
+                        continue;
+                    }
+                    if intent.paths.iter().any(|intent_path| {
+                        lease.paths.iter().any(|lease_path| {
+                            Self::reservation_paths_overlap(intent_path, lease_path)
+                        })
+                    }) {
+                        conflicting_holders.insert(lease.holder.clone());
+                        conflicting_lease_ids.insert(lease.lease_id.clone());
+                        for intent_path in &intent.paths {
+                            for lease_path in &lease.paths {
+                                if Self::reservation_paths_overlap(intent_path, lease_path) {
+                                    conflicting_paths.insert(intent_path.clone());
+                                    conflicting_paths.insert(lease_path.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !conflicting_holders.is_empty() {
+                    check.decision = MissionPolicyDecisionKind::Deny;
+                    check.reason_code = Some(
+                        MissionFailureCode::ReservationConflict
+                            .reason_code()
+                            .to_string(),
+                    );
+                    check.context = Some(format!(
+                        "conflict_holders={} conflict_paths={} lease_ids={} recommendation=coordinate_or_wait escalation=human",
+                        conflicting_holders.into_iter().collect::<Vec<_>>().join("|"),
+                        conflicting_paths.into_iter().collect::<Vec<_>>().join("|"),
+                        conflicting_lease_ids.into_iter().collect::<Vec<_>>().join("|")
+                    ));
+                }
+            }
+
+            checks.push(check);
+        }
+
+        self.evaluate_policy_preflight(MissionPolicyPreflightStage::DispatchTime, &checks)
+    }
+
+    fn reservation_paths_overlap(intent_path: &str, lease_path: &str) -> bool {
+        let intent_path = intent_path.trim();
+        let lease_path = lease_path.trim();
+        if intent_path.is_empty() || lease_path.is_empty() {
+            return false;
+        }
+        Self::wildcard_path_match(intent_path, lease_path)
+            || Self::wildcard_path_match(lease_path, intent_path)
+    }
+
+    fn wildcard_path_match(pattern: &str, value: &str) -> bool {
+        let pattern = pattern.as_bytes();
+        let value = value.as_bytes();
+        let mut dp = vec![vec![false; value.len() + 1]; pattern.len() + 1];
+        dp[0][0] = true;
+
+        for i in 1..=pattern.len() {
+            if pattern[i - 1] == b'*' {
+                dp[i][0] = dp[i - 1][0];
+            }
+        }
+
+        for i in 1..=pattern.len() {
+            for j in 1..=value.len() {
+                dp[i][j] = match pattern[i - 1] {
+                    b'*' => dp[i - 1][j] || dp[i][j - 1],
+                    b'?' => dp[i - 1][j - 1],
+                    byte => dp[i - 1][j - 1] && byte == value[j - 1],
+                };
+            }
+        }
+
+        dp[pattern.len()][value.len()]
     }
 
     /// Evaluate assignment suitability for one candidate against agent capability profiles.
@@ -4741,10 +5564,133 @@ impl Mission {
         }
     }
 
+    fn pane_id_for_mechanism(mechanism: &MissionDispatchMechanism) -> Option<u64> {
+        match mechanism {
+            MissionDispatchMechanism::RobotSend { pane_id, .. } => Some(*pane_id),
+            MissionDispatchMechanism::RobotWaitFor {
+                pane_id, condition, ..
+            } => pane_id.or(match condition {
+                WaitCondition::Pattern { pane_id, .. }
+                | WaitCondition::PaneIdle { pane_id, .. }
+                | WaitCondition::StableTail { pane_id, .. } => *pane_id,
+                WaitCondition::External { .. } => None,
+            }),
+            MissionDispatchMechanism::RobotRunWorkflow { .. }
+            | MissionDispatchMechanism::InternalLockAcquire { .. }
+            | MissionDispatchMechanism::InternalLockRelease { .. }
+            | MissionDispatchMechanism::InternalStoreData { .. }
+            | MissionDispatchMechanism::InternalMarkEventHandled { .. }
+            | MissionDispatchMechanism::InternalValidateApproval { .. }
+            | MissionDispatchMechanism::InternalNestedPlan { .. }
+            | MissionDispatchMechanism::InternalCustom { .. } => None,
+        }
+    }
+
+    fn dispatch_context_for_assignment(
+        &self,
+        assignment_id: &AssignmentId,
+    ) -> Result<(MissionDispatchTarget, MissionDispatchMechanism), MissionValidationError> {
+        let assignment = self
+            .find_assignment_by_id(assignment_id)
+            .ok_or_else(|| {
+                MissionValidationError::UnknownAssignmentReference(assignment_id.clone())
+            })?
+            .clone();
+        if assignment.assignee.trim().is_empty() {
+            return Err(MissionValidationError::EmptyAssignee(
+                assignment.assignment_id.clone(),
+            ));
+        }
+
+        let contract = self.dispatch_contract_for_candidate(&assignment.candidate_id)?;
+        let mechanism = contract.mechanism;
+        let pane_id = Self::pane_id_for_mechanism(&mechanism);
+        let target = MissionDispatchTarget {
+            assignment_id: assignment.assignment_id.clone(),
+            candidate_id: assignment.candidate_id.clone(),
+            assignee: assignment.assignee.trim().to_string(),
+            pane_id,
+            thread_id: contract.messaging.thread_id,
+            bead_id: contract.messaging.bead_id,
+        };
+
+        Ok((target, mechanism))
+    }
+
     fn find_assignment_by_id(&self, assignment_id: &AssignmentId) -> Option<&Assignment> {
         self.assignments
             .iter()
             .find(|assignment| assignment.assignment_id == *assignment_id)
+    }
+
+    fn find_assignment_index_by_id(&self, assignment_id: &AssignmentId) -> Option<usize> {
+        self.assignments
+            .iter()
+            .position(|assignment| assignment.assignment_id == *assignment_id)
+    }
+
+    fn normalize_assignment_signal_outcome(
+        assignment_id: &AssignmentId,
+        payload: &MissionAssignmentSignalPayload,
+    ) -> Result<Outcome, MissionValidationError> {
+        match payload {
+            MissionAssignmentSignalPayload::Completed {
+                reason_code,
+                completed_at_ms,
+            } => {
+                let reason_code = reason_code.trim();
+                let reason_code = if reason_code.is_empty() {
+                    "dispatch_executed".to_string()
+                } else {
+                    reason_code.to_string()
+                };
+                Ok(Outcome::Success {
+                    reason_code,
+                    completed_at_ms: *completed_at_ms,
+                })
+            }
+            MissionAssignmentSignalPayload::Failed {
+                reason_code,
+                error_code,
+                completed_at_ms,
+            } => {
+                let failure_code = Self::validate_failure_reason_code(
+                    assignment_id,
+                    MissionFailureContext::AssignmentOutcomeFailed,
+                    reason_code,
+                )?;
+                let normalized_error_code = match error_code
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(actual_error_code) => {
+                        Self::validate_failure_error_code(
+                            assignment_id,
+                            MissionFailureContext::AssignmentOutcomeFailed,
+                            failure_code.reason_code(),
+                            actual_error_code,
+                            failure_code.error_code(),
+                        )?;
+                        actual_error_code.to_string()
+                    }
+                    None => failure_code.error_code().to_string(),
+                };
+                Ok(Outcome::Failed {
+                    reason_code: failure_code.reason_code().to_string(),
+                    error_code: normalized_error_code,
+                    completed_at_ms: *completed_at_ms,
+                })
+            }
+            MissionAssignmentSignalPayload::TimedOut { completed_at_ms } => {
+                let failure_code = MissionFailureCode::DispatchError;
+                Ok(Outcome::Failed {
+                    reason_code: failure_code.reason_code().to_string(),
+                    error_code: failure_code.error_code().to_string(),
+                    completed_at_ms: *completed_at_ms,
+                })
+            }
+        }
     }
 
     fn normalize_non_empty_unique(
@@ -4804,8 +5750,20 @@ impl Mission {
         let has_cancelled = assignments
             .iter()
             .any(|assignment| matches!(assignment.outcome, Some(Outcome::Cancelled { .. })));
+        let has_pending_approval = assignments
+            .iter()
+            .any(|assignment| matches!(assignment.approval_state, ApprovalState::Pending { .. }));
 
         match lifecycle_state {
+            MissionLifecycleState::AwaitingApproval if !has_pending_approval => {
+                Err(MissionValidationError::AwaitingApprovalWithoutPendingAssignment)
+            }
+            state
+                if has_pending_approval
+                    && !matches!(state, MissionLifecycleState::AwaitingApproval) =>
+            {
+                Err(MissionValidationError::PendingApprovalOutsideAwaitingState { state })
+            }
             MissionLifecycleState::Completed if !has_success => Err(
                 MissionValidationError::TerminalStateWithoutMatchingOutcome {
                     state: lifecycle_state,
@@ -5061,6 +6019,20 @@ pub enum MissionValidationError {
         state: MissionLifecycleState,
         expected_outcome: String,
     },
+    AwaitingApprovalWithoutPendingAssignment,
+    PendingApprovalOutsideAwaitingState {
+        state: MissionLifecycleState,
+    },
+    InvalidApprovalStateTransition {
+        assignment_id: AssignmentId,
+        action: &'static str,
+        state: String,
+    },
+    InvalidApprovalLifecycleState {
+        assignment_id: AssignmentId,
+        action: &'static str,
+        lifecycle_state: MissionLifecycleState,
+    },
     EmptyFailureReasonCode {
         assignment_id: AssignmentId,
         context: MissionFailureContext,
@@ -5204,6 +6176,39 @@ impl fmt::Display for MissionValidationError {
                 write!(
                     f,
                     "Mission lifecycle state {state} requires at least one '{expected_outcome}' assignment outcome"
+                )
+            }
+            Self::AwaitingApprovalWithoutPendingAssignment => {
+                f.write_str(
+                    "Mission lifecycle state awaiting_approval requires at least one pending approval assignment",
+                )
+            }
+            Self::PendingApprovalOutsideAwaitingState { state } => {
+                write!(
+                    f,
+                    "Mission has pending approval assignment(s) but lifecycle state is {state} (expected awaiting_approval)"
+                )
+            }
+            Self::InvalidApprovalStateTransition {
+                assignment_id,
+                action,
+                state,
+            } => {
+                write!(
+                    f,
+                    "Approval action '{action}' is invalid for assignment {} in state '{state}'",
+                    assignment_id.0
+                )
+            }
+            Self::InvalidApprovalLifecycleState {
+                assignment_id,
+                action,
+                lifecycle_state,
+            } => {
+                write!(
+                    f,
+                    "Approval action '{action}' is invalid for assignment {} while mission lifecycle is {lifecycle_state}",
+                    assignment_id.0
                 )
             }
             Self::EmptyFailureReasonCode {
@@ -7091,6 +8096,260 @@ mod tests {
     }
 
     #[test]
+    fn mission_approval_request_transitions_to_pending_and_awaiting_approval() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Dispatching;
+        mission.assignments[0].approval_state = ApprovalState::NotRequired;
+        mission.assignments[0].outcome = None;
+        mission.assignments[0].updated_at_ms = None;
+
+        let record = mission
+            .request_assignment_approval(
+                &AssignmentId("assignment:a".to_string()),
+                "operator-human",
+                1_704_000_010_000,
+            )
+            .unwrap();
+
+        assert_eq!(record.lifecycle_from, MissionLifecycleState::Dispatching);
+        assert_eq!(record.lifecycle_to, MissionLifecycleState::AwaitingApproval);
+        assert_eq!(
+            record.transition_kind,
+            MissionLifecycleTransitionKind::ApprovalRequested
+        );
+        assert_eq!(
+            record.reason_code,
+            MissionFailureCode::ApprovalRequired.reason_code()
+        );
+        assert_eq!(
+            record.error_code.as_deref(),
+            Some(MissionFailureCode::ApprovalRequired.error_code())
+        );
+        assert!(!record.idempotent);
+        assert_eq!(
+            mission.lifecycle_state,
+            MissionLifecycleState::AwaitingApproval
+        );
+        assert!(matches!(
+            mission.assignments[0].approval_state,
+            ApprovalState::Pending {
+                ref requested_by,
+                requested_at_ms
+            } if requested_by == "operator-human" && requested_at_ms == 1_704_000_010_000
+        ));
+    }
+
+    #[test]
+    fn mission_approval_request_is_idempotent_when_already_pending() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::AwaitingApproval;
+        mission.assignments[0].approval_state = ApprovalState::Pending {
+            requested_by: "operator-human".to_string(),
+            requested_at_ms: 1_704_000_010_100,
+        };
+        mission.assignments[0].outcome = None;
+
+        let record = mission
+            .request_assignment_approval(
+                &AssignmentId("assignment:a".to_string()),
+                "operator-human",
+                1_704_000_010_100,
+            )
+            .unwrap();
+
+        assert!(record.idempotent);
+        assert_eq!(
+            mission.lifecycle_state,
+            MissionLifecycleState::AwaitingApproval
+        );
+        assert!(mission.validate().is_ok());
+    }
+
+    #[test]
+    fn mission_approval_continuation_transitions_to_running() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::AwaitingApproval;
+        mission.assignments[0].approval_state = ApprovalState::Pending {
+            requested_by: "operator-human".to_string(),
+            requested_at_ms: 1_704_000_010_200,
+        };
+        mission.assignments[0].outcome = None;
+        mission.assignments[0].updated_at_ms = None;
+
+        let record = mission
+            .continue_assignment_after_approval(
+                &AssignmentId("assignment:a".to_string()),
+                "operator-human",
+                1_704_000_010_300,
+                "sha256:new-approval",
+            )
+            .unwrap();
+
+        assert_eq!(
+            record.lifecycle_from,
+            MissionLifecycleState::AwaitingApproval
+        );
+        assert_eq!(record.lifecycle_to, MissionLifecycleState::Running);
+        assert_eq!(
+            record.transition_kind,
+            MissionLifecycleTransitionKind::ApprovalGranted
+        );
+        assert_eq!(record.reason_code, "approval_granted");
+        assert!(record.error_code.is_none());
+        assert!(!record.idempotent);
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Running);
+        assert!(matches!(
+            mission.assignments[0].approval_state,
+            ApprovalState::Approved {
+                ref approved_by,
+                approved_at_ms,
+                ref approval_code_hash
+            } if approved_by == "operator-human"
+                && approved_at_ms == 1_704_000_010_300
+                && approval_code_hash == "sha256:new-approval"
+        ));
+        assert!(mission.validate().is_ok());
+    }
+
+    #[test]
+    fn mission_approval_continuation_is_idempotent_for_same_approval() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        mission.assignments[0].approval_state = ApprovalState::Approved {
+            approved_by: "operator-human".to_string(),
+            approved_at_ms: 1_704_000_010_400,
+            approval_code_hash: "sha256:stable".to_string(),
+        };
+        mission.assignments[0].outcome = None;
+
+        let record = mission
+            .continue_assignment_after_approval(
+                &AssignmentId("assignment:a".to_string()),
+                "operator-human",
+                1_704_000_010_400,
+                "sha256:stable",
+            )
+            .unwrap();
+
+        assert!(record.idempotent);
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Running);
+        assert!(mission.validate().is_ok());
+    }
+
+    #[test]
+    fn mission_approval_continuation_on_expired_state_uses_safe_fallback() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::AwaitingApproval;
+        mission.assignments[0].approval_state = ApprovalState::Expired {
+            expired_at_ms: 1_704_000_010_500,
+            reason_code: MissionFailureCode::ApprovalExpired
+                .reason_code()
+                .to_string(),
+        };
+        mission.assignments[0].outcome = None;
+
+        let record = mission
+            .continue_assignment_after_approval(
+                &AssignmentId("assignment:a".to_string()),
+                "operator-human",
+                1_704_000_010_600,
+                "sha256:new",
+            )
+            .unwrap();
+
+        assert_eq!(
+            record.transition_kind,
+            MissionLifecycleTransitionKind::ApprovalExpired
+        );
+        assert_eq!(
+            record.reason_code,
+            MissionFailureCode::ApprovalExpired.reason_code()
+        );
+        assert_eq!(
+            record.error_code.as_deref(),
+            Some(MissionFailureCode::ApprovalExpired.error_code())
+        );
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Failed);
+        assert!(matches!(
+            mission.assignments[0].outcome,
+            Some(Outcome::Failed {
+                ref reason_code,
+                ref error_code,
+                completed_at_ms
+            }) if reason_code == MissionFailureCode::ApprovalExpired.reason_code()
+                && error_code == MissionFailureCode::ApprovalExpired.error_code()
+                && completed_at_ms == 1_704_000_010_600
+        ));
+        assert!(mission.validate().is_ok());
+    }
+
+    #[test]
+    fn mission_expire_approval_is_idempotent_and_sets_canonical_failure_outcome() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::AwaitingApproval;
+        mission.assignments[0].approval_state = ApprovalState::Pending {
+            requested_by: "operator-human".to_string(),
+            requested_at_ms: 1_704_000_010_700,
+        };
+        mission.assignments[0].outcome = None;
+
+        let first = mission
+            .expire_assignment_approval(
+                &AssignmentId("assignment:a".to_string()),
+                1_704_000_010_800,
+            )
+            .unwrap();
+        assert!(!first.idempotent);
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Failed);
+
+        let second = mission
+            .expire_assignment_approval(
+                &AssignmentId("assignment:a".to_string()),
+                1_704_000_010_800,
+            )
+            .unwrap();
+        assert!(second.idempotent);
+        assert!(mission.validate().is_ok());
+    }
+
+    #[test]
+    fn mission_validate_requires_pending_assignment_when_awaiting_approval() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::AwaitingApproval;
+        mission.assignments[0].approval_state = ApprovalState::Approved {
+            approved_by: "operator-human".to_string(),
+            approved_at_ms: 1_704_000_000_220,
+            approval_code_hash: "sha256:abcd".to_string(),
+        };
+        mission.assignments[0].outcome = None;
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::AwaitingApprovalWithoutPendingAssignment
+        ));
+    }
+
+    #[test]
+    fn mission_validate_rejects_pending_assignment_outside_awaiting_state() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Dispatching;
+        mission.assignments[0].approval_state = ApprovalState::Pending {
+            requested_by: "operator-human".to_string(),
+            requested_at_ms: 1_704_000_010_900,
+        };
+        mission.assignments[0].outcome = None;
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::PendingApprovalOutsideAwaitingState {
+                state: MissionLifecycleState::Dispatching
+            }
+        ));
+    }
+
+    #[test]
     fn mission_validate_rejects_empty_candidate_id_with_field_path() {
         let mut mission = sample_mission();
         mission.candidates[0].candidate_id = CandidateActionId(" ".to_string());
@@ -7708,6 +8967,123 @@ mod tests {
     }
 
     #[test]
+    fn mission_reservation_feasibility_denies_conflicting_lease_and_returns_feedback() {
+        let mission = sample_mission();
+        let report = mission
+            .evaluate_reservation_feasibility(
+                &[MissionReservationLease {
+                    lease_id: "lease:xyz".to_string(),
+                    holder: "other-agent".to_string(),
+                    paths: vec!["crates/frankenterm-core/src/plan.rs".to_string()],
+                    exclusive: true,
+                    expires_at_ms: Some(1_704_000_999_999),
+                }],
+                1_704_000_000_500,
+            )
+            .unwrap();
+
+        assert!(report.has_denials());
+        assert_eq!(
+            report.planner_feedback_reason_codes,
+            vec![MissionFailureCode::ReservationConflict
+                .reason_code()
+                .to_string()]
+        );
+
+        let denial = report
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.decision == MissionPolicyDecisionKind::Deny)
+            .expect("expected denial outcome");
+        assert_eq!(
+            denial.reason_code.as_deref(),
+            Some(MissionFailureCode::ReservationConflict.reason_code())
+        );
+        assert_eq!(
+            denial.error_code.as_deref(),
+            Some(MissionFailureCode::ReservationConflict.error_code())
+        );
+        assert!(denial
+            .context
+            .as_deref()
+            .unwrap_or_default()
+            .contains("recommendation=coordinate_or_wait"));
+    }
+
+    #[test]
+    fn mission_reservation_feasibility_allows_same_holder_or_expired_lease() {
+        let mission = sample_mission();
+        let report = mission
+            .evaluate_reservation_feasibility(
+                &[
+                    MissionReservationLease {
+                        lease_id: "lease:same-owner".to_string(),
+                        holder: "executor-agent-1".to_string(),
+                        paths: vec!["crates/frankenterm-core/src/plan.rs".to_string()],
+                        exclusive: true,
+                        expires_at_ms: Some(1_704_000_999_999),
+                    },
+                    MissionReservationLease {
+                        lease_id: "lease:expired".to_string(),
+                        holder: "other-agent".to_string(),
+                        paths: vec!["crates/frankenterm-core/src/plan.rs".to_string()],
+                        exclusive: true,
+                        expires_at_ms: Some(1_703_999_999_999),
+                    },
+                ],
+                1_704_000_000_500,
+            )
+            .unwrap();
+
+        assert!(!report.has_denials());
+        assert!(report.planner_feedback_reason_codes.is_empty());
+    }
+
+    #[test]
+    fn mission_reservation_feasibility_marks_expired_intent_as_stale_state() {
+        let mut mission = sample_mission();
+        mission.assignments[0]
+            .reservation_intent
+            .as_mut()
+            .expect("reservation intent")
+            .expires_at_ms = Some(1_703_999_999_999);
+
+        let report = mission
+            .evaluate_reservation_feasibility(&[], 1_704_000_000_500)
+            .unwrap();
+
+        assert!(report.has_denials());
+        assert_eq!(
+            report.planner_feedback_reason_codes,
+            vec![MissionFailureCode::StaleState.reason_code().to_string()]
+        );
+        assert_eq!(
+            report.outcomes[0].reason_code.as_deref(),
+            Some(MissionFailureCode::StaleState.reason_code())
+        );
+    }
+
+    #[test]
+    fn mission_reservation_paths_overlap_supports_wildcard_patterns() {
+        assert!(Mission::reservation_paths_overlap(
+            "crates/frankenterm-core/src/*.rs",
+            "crates/frankenterm-core/src/plan.rs"
+        ));
+        assert!(Mission::reservation_paths_overlap(
+            "crates/**",
+            "crates/frankenterm-core/src/plan.rs"
+        ));
+        assert!(Mission::reservation_paths_overlap(
+            "crates/frankenterm-core/src/plan.rs",
+            "crates/frankenterm-core/src/*.rs"
+        ));
+        assert!(!Mission::reservation_paths_overlap(
+            "docs/**/*.md",
+            "crates/frankenterm-core/src/plan.rs"
+        ));
+    }
+
+    #[test]
     fn mission_dispatch_contract_maps_candidate_to_robot_and_coordination_primitives() {
         let mission = sample_mission();
         let contract = mission
@@ -7848,6 +9224,364 @@ mod tests {
         assert!(matches!(
             err,
             MissionValidationError::UnknownCandidateReference(_)
+        ));
+    }
+
+    #[test]
+    fn mission_dispatch_adapter_resolves_target_with_pane_agent_and_thread() {
+        let mission = sample_mission();
+        let target = mission
+            .resolve_dispatch_target(&AssignmentId("assignment:a".to_string()))
+            .unwrap();
+
+        assert_eq!(target.assignment_id.0, "assignment:a");
+        assert_eq!(target.candidate_id.0, "candidate:a");
+        assert_eq!(target.assignee, "executor-agent-1");
+        assert_eq!(target.pane_id, Some(1));
+        assert_eq!(target.thread_id.as_deref(), Some("ft-1i2ge.1.1"));
+        assert_eq!(target.bead_id.as_deref(), Some("ft-1i2ge.1.1"));
+    }
+
+    #[test]
+    fn mission_dispatch_adapter_wait_for_target_resolves_pane_from_condition() {
+        let mut mission = sample_mission();
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:b".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::WaitFor {
+                pane_id: None,
+                condition: WaitCondition::Pattern {
+                    pane_id: Some(7),
+                    rule_id: "core.codex:done".to_string(),
+                },
+                timeout_ms: 2_500,
+            },
+            rationale: "Wait for done marker".to_string(),
+            score: Some(0.51),
+            created_at_ms: 1_704_000_001_000,
+        });
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("assignment:b".to_string()),
+            candidate_id: CandidateActionId("candidate:b".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "executor-agent-2".to_string(),
+            reservation_intent: None,
+            approval_state: ApprovalState::NotRequired,
+            outcome: None,
+            escalation: None,
+            created_at_ms: 1_704_000_001_100,
+            updated_at_ms: None,
+        });
+
+        let target = mission
+            .resolve_dispatch_target(&AssignmentId("assignment:b".to_string()))
+            .unwrap();
+        assert_eq!(target.pane_id, Some(7));
+        assert_eq!(target.assignee, "executor-agent-2");
+    }
+
+    #[test]
+    fn mission_dispatch_adapter_rejects_unknown_assignment() {
+        let mission = sample_mission();
+        let err = mission
+            .resolve_dispatch_target(&AssignmentId("assignment:missing".to_string()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::UnknownAssignmentReference(_)
+        ));
+    }
+
+    #[test]
+    fn mission_dispatch_adapter_dry_run_normalizes_success_outcome() {
+        let mission = sample_mission();
+        let execution = mission
+            .dispatch_assignment_dry_run(
+                &AssignmentId("assignment:a".to_string()),
+                1_704_000_002_000,
+            )
+            .unwrap();
+
+        assert_eq!(execution.mode, MissionDispatchMode::DryRun);
+        assert_eq!(execution.target.assignment_id.0, "assignment:a");
+        match execution.outcome {
+            Outcome::Success {
+                reason_code,
+                completed_at_ms,
+            } => {
+                assert_eq!(reason_code, "dispatch_dry_run");
+                assert_eq!(completed_at_ms, 1_704_000_002_000);
+            }
+            other => panic!("expected dry-run success outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mission_dispatch_adapter_live_success_defaults_reason_code() {
+        let mission = sample_mission();
+        let execution = mission
+            .dispatch_assignment_live(
+                &AssignmentId("assignment:a".to_string()),
+                MissionDispatchLiveResponse::Delivered {
+                    reason_code: None,
+                    completed_at_ms: 1_704_000_002_100,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(execution.mode, MissionDispatchMode::Live);
+        match execution.outcome {
+            Outcome::Success {
+                reason_code,
+                completed_at_ms,
+            } => {
+                assert_eq!(reason_code, "dispatch_executed");
+                assert_eq!(completed_at_ms, 1_704_000_002_100);
+            }
+            other => panic!("expected live success outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mission_dispatch_adapter_live_failure_normalizes_reason_and_error_code() {
+        let mission = sample_mission();
+        let execution = mission
+            .dispatch_assignment_live(
+                &AssignmentId("assignment:a".to_string()),
+                MissionDispatchLiveResponse::Failed {
+                    reason_code: MissionFailureCode::ReservationConflict
+                        .reason_code()
+                        .to_string(),
+                    error_code: None,
+                    completed_at_ms: 1_704_000_002_200,
+                },
+            )
+            .unwrap();
+
+        match execution.outcome {
+            Outcome::Failed {
+                reason_code,
+                error_code,
+                completed_at_ms,
+            } => {
+                assert_eq!(
+                    reason_code,
+                    MissionFailureCode::ReservationConflict.reason_code()
+                );
+                assert_eq!(
+                    error_code,
+                    MissionFailureCode::ReservationConflict.error_code()
+                );
+                assert_eq!(completed_at_ms, 1_704_000_002_200);
+            }
+            other => panic!("expected normalized live failure outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mission_dispatch_adapter_live_failure_rejects_unknown_reason_code() {
+        let mission = sample_mission();
+        let err = mission
+            .dispatch_assignment_live(
+                &AssignmentId("assignment:a".to_string()),
+                MissionDispatchLiveResponse::Failed {
+                    reason_code: "not_a_real_reason".to_string(),
+                    error_code: None,
+                    completed_at_ms: 1_704_000_002_250,
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            MissionValidationError::UnknownFailureReasonCode { .. }
+        ));
+    }
+
+    #[test]
+    fn mission_dispatch_adapter_live_failure_rejects_mismatched_error_code() {
+        let mission = sample_mission();
+        let err = mission
+            .dispatch_assignment_live(
+                &AssignmentId("assignment:a".to_string()),
+                MissionDispatchLiveResponse::Failed {
+                    reason_code: MissionFailureCode::RateLimited.reason_code().to_string(),
+                    error_code: Some(
+                        MissionFailureCode::ReservationConflict
+                            .error_code()
+                            .to_string(),
+                    ),
+                    completed_at_ms: 1_704_000_002_300,
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            MissionValidationError::MismatchedFailureErrorCode { .. }
+        ));
+    }
+
+    #[test]
+    fn mission_reconcile_assignment_signal_applies_success_and_completes() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Dispatching;
+        mission.assignments[0].outcome = None;
+        mission.assignments[0].approval_state = ApprovalState::NotRequired;
+        mission.assignments[0].updated_at_ms = Some(1_704_000_020_000);
+
+        let signal = MissionAssignmentSignal {
+            assignment_id: AssignmentId("assignment:a".to_string()),
+            observed_at_ms: 1_704_000_020_100,
+            correlation_id: "corr-c3-success".to_string(),
+            payload: MissionAssignmentSignalPayload::Completed {
+                reason_code: "dispatch_executed".to_string(),
+                completed_at_ms: 1_704_000_020_100,
+            },
+        };
+        let report = mission.reconcile_assignment_signal(&signal).unwrap();
+
+        assert!(report.applied);
+        assert!(!report.out_of_order);
+        assert_eq!(report.reason_code, "signal_reconciled");
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Completed);
+        assert!(matches!(
+            mission.assignments[0].outcome,
+            Some(Outcome::Success {
+                ref reason_code,
+                completed_at_ms
+            }) if reason_code == "dispatch_executed" && completed_at_ms == 1_704_000_020_100
+        ));
+        assert!(mission.validate().is_ok());
+    }
+
+    #[test]
+    fn mission_reconcile_assignment_signal_timeout_maps_to_dispatch_error_failure() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        mission.assignments[0].outcome = None;
+        mission.assignments[0].approval_state = ApprovalState::NotRequired;
+        mission.assignments[0].updated_at_ms = Some(1_704_000_020_200);
+
+        let signal = MissionAssignmentSignal {
+            assignment_id: AssignmentId("assignment:a".to_string()),
+            observed_at_ms: 1_704_000_020_300,
+            correlation_id: "corr-c3-timeout".to_string(),
+            payload: MissionAssignmentSignalPayload::TimedOut {
+                completed_at_ms: 1_704_000_020_300,
+            },
+        };
+        let report = mission.reconcile_assignment_signal(&signal).unwrap();
+
+        assert!(report.applied);
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Failed);
+        assert!(matches!(
+            mission.assignments[0].outcome,
+            Some(Outcome::Failed {
+                ref reason_code,
+                ref error_code,
+                completed_at_ms
+            }) if reason_code == MissionFailureCode::DispatchError.reason_code()
+                && error_code == MissionFailureCode::DispatchError.error_code()
+                && completed_at_ms == 1_704_000_020_300
+        ));
+    }
+
+    #[test]
+    fn mission_reconcile_assignment_signal_ignores_out_of_order_update() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        mission.assignments[0].outcome = Some(Outcome::Success {
+            reason_code: "already_done".to_string(),
+            completed_at_ms: 1_704_000_020_500,
+        });
+        mission.assignments[0].updated_at_ms = Some(1_704_000_020_500);
+
+        let signal = MissionAssignmentSignal {
+            assignment_id: AssignmentId("assignment:a".to_string()),
+            observed_at_ms: 1_704_000_020_400,
+            correlation_id: "corr-c3-old".to_string(),
+            payload: MissionAssignmentSignalPayload::Failed {
+                reason_code: MissionFailureCode::DispatchError.reason_code().to_string(),
+                error_code: None,
+                completed_at_ms: 1_704_000_020_400,
+            },
+        };
+        let report = mission.reconcile_assignment_signal(&signal).unwrap();
+
+        assert!(!report.applied);
+        assert!(report.out_of_order);
+        assert_eq!(
+            report.reason_code,
+            MissionFailureCode::StaleState.reason_code()
+        );
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Running);
+        assert!(matches!(
+            mission.assignments[0].outcome,
+            Some(Outcome::Success {
+                ref reason_code,
+                completed_at_ms
+            }) if reason_code == "already_done" && completed_at_ms == 1_704_000_020_500
+        ));
+    }
+
+    #[test]
+    fn mission_reconcile_assignment_signal_surfaces_drift_on_newer_conflict() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        mission.assignments[0].outcome = Some(Outcome::Success {
+            reason_code: "dispatch_executed".to_string(),
+            completed_at_ms: 1_704_000_020_600,
+        });
+        mission.assignments[0].updated_at_ms = Some(1_704_000_020_600);
+
+        let signal = MissionAssignmentSignal {
+            assignment_id: AssignmentId("assignment:a".to_string()),
+            observed_at_ms: 1_704_000_020_700,
+            correlation_id: "corr-c3-drift".to_string(),
+            payload: MissionAssignmentSignalPayload::Failed {
+                reason_code: MissionFailureCode::DispatchError.reason_code().to_string(),
+                error_code: None,
+                completed_at_ms: 1_704_000_020_700,
+            },
+        };
+        let report = mission.reconcile_assignment_signal(&signal).unwrap();
+
+        assert!(report.applied);
+        assert!(report.drift.is_some());
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Failed);
+        let drift = report.drift.unwrap();
+        assert_eq!(drift.reason_code, "state_drift_detected");
+        assert!(drift.previous_outcome.is_some());
+        assert!(matches!(
+            drift.incoming_outcome,
+            Outcome::Failed {
+                ref reason_code, ..
+            } if reason_code == MissionFailureCode::DispatchError.reason_code()
+        ));
+    }
+
+    #[test]
+    fn mission_reconcile_assignment_signal_rejects_unknown_failure_code() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        mission.assignments[0].outcome = None;
+
+        let signal = MissionAssignmentSignal {
+            assignment_id: AssignmentId("assignment:a".to_string()),
+            observed_at_ms: 1_704_000_020_800,
+            correlation_id: "corr-c3-bad-code".to_string(),
+            payload: MissionAssignmentSignalPayload::Failed {
+                reason_code: "not_a_real_reason".to_string(),
+                error_code: None,
+                completed_at_ms: 1_704_000_020_800,
+            },
+        };
+
+        let err = mission.reconcile_assignment_signal(&signal).unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::UnknownFailureReasonCode { .. }
         ));
     }
 
@@ -8726,7 +10460,10 @@ mod tests {
         let result = ledger.validate();
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, LedgerValidationError::TamperedEntry { seq: 2 }));
+        assert!(matches!(
+            err,
+            LedgerValidationError::TamperedEntry { seq: 2 }
+        ));
     }
 
     #[test]
@@ -8759,7 +10496,10 @@ mod tests {
         ledger.entries[1].entry_hash = ledger.entries[1].compute_hash();
 
         let err = ledger.validate().unwrap_err();
-        assert!(matches!(err, LedgerValidationError::BrokenHashChain { seq: 2, .. }));
+        assert!(matches!(
+            err,
+            LedgerValidationError::BrokenHashChain { seq: 2, .. }
+        ));
     }
 
     #[test]
@@ -8804,7 +10544,10 @@ mod tests {
         ledger.entries[0].entry_hash = ledger.entries[0].compute_hash();
 
         let err = ledger.validate().unwrap_err();
-        assert!(matches!(err, LedgerValidationError::TxIdMismatch { seq: 1, .. }));
+        assert!(matches!(
+            err,
+            LedgerValidationError::TxIdMismatch { seq: 1, .. }
+        ));
     }
 
     #[test]
@@ -8818,20 +10561,32 @@ mod tests {
         let mut ledger = test_ledger();
         let corr = LedgerCorrelation::empty();
 
-        ledger.append(1000, LedgerEntryKind::IntentRegistered {
-            summary: "tx".to_string(),
-            requested_by: "op".to_string(),
-        }, corr.clone());
-        ledger.append(2000, LedgerEntryKind::StateTransition {
-            from: MissionTxState::Draft,
-            to: MissionTxState::Planned,
-            kind: MissionTxTransitionKind::PlanCreated,
-        }, corr.clone());
-        ledger.append(3000, LedgerEntryKind::StateTransition {
-            from: MissionTxState::Planned,
-            to: MissionTxState::Prepared,
-            kind: MissionTxTransitionKind::PrepareSucceeded,
-        }, corr);
+        ledger.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "tx".to_string(),
+                requested_by: "op".to_string(),
+            },
+            corr.clone(),
+        );
+        ledger.append(
+            2000,
+            LedgerEntryKind::StateTransition {
+                from: MissionTxState::Draft,
+                to: MissionTxState::Planned,
+                kind: MissionTxTransitionKind::PlanCreated,
+            },
+            corr.clone(),
+        );
+        ledger.append(
+            3000,
+            LedgerEntryKind::StateTransition {
+                from: MissionTxState::Planned,
+                to: MissionTxState::Prepared,
+                kind: MissionTxTransitionKind::PrepareSucceeded,
+            },
+            corr,
+        );
 
         let transitions = ledger.entries_of_kind("state_transition");
         assert_eq!(transitions.len(), 2);
@@ -8847,12 +10602,16 @@ mod tests {
         let corr = LedgerCorrelation::empty();
 
         for ts in [1000, 2000, 3000, 4000, 5000] {
-            ledger.append(ts, LedgerEntryKind::ReceiptRecorded {
-                receipt_seq: ts as u64 / 1000,
-                state: MissionTxState::Draft,
-                reason_code: None,
-                error_code: None,
-            }, corr.clone());
+            ledger.append(
+                ts,
+                LedgerEntryKind::ReceiptRecorded {
+                    receipt_seq: ts as u64 / 1000,
+                    state: MissionTxState::Draft,
+                    reason_code: None,
+                    error_code: None,
+                },
+                corr.clone(),
+            );
         }
 
         let range = ledger.entries_in_range(2000, 4000);
@@ -8874,18 +10633,26 @@ mod tests {
             ..LedgerCorrelation::empty()
         };
 
-        ledger.append(1000, LedgerEntryKind::StepExecuted {
-            step_id: TxStepId("s1".to_string()),
-            ordinal: 1,
-            succeeded: true,
-            detail: "ok".to_string(),
-        }, corr_pane1);
-        ledger.append(2000, LedgerEntryKind::StepExecuted {
-            step_id: TxStepId("s2".to_string()),
-            ordinal: 2,
-            succeeded: true,
-            detail: "ok".to_string(),
-        }, corr_pane2);
+        ledger.append(
+            1000,
+            LedgerEntryKind::StepExecuted {
+                step_id: TxStepId("s1".to_string()),
+                ordinal: 1,
+                succeeded: true,
+                detail: "ok".to_string(),
+            },
+            corr_pane1,
+        );
+        ledger.append(
+            2000,
+            LedgerEntryKind::StepExecuted {
+                step_id: TxStepId("s2".to_string()),
+                ordinal: 2,
+                succeeded: true,
+                detail: "ok".to_string(),
+            },
+            corr_pane2,
+        );
 
         assert_eq!(ledger.entries_for_pane(1).len(), 1);
         assert_eq!(ledger.entries_for_pane(2).len(), 1);
@@ -8905,14 +10672,22 @@ mod tests {
             ..LedgerCorrelation::empty()
         };
 
-        ledger.append(1000, LedgerEntryKind::IntentRegistered {
-            summary: "a".to_string(),
-            requested_by: "alice".to_string(),
-        }, corr_a);
-        ledger.append(2000, LedgerEntryKind::IntentRegistered {
-            summary: "b".to_string(),
-            requested_by: "bob".to_string(),
-        }, corr_b);
+        ledger.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "a".to_string(),
+                requested_by: "alice".to_string(),
+            },
+            corr_a,
+        );
+        ledger.append(
+            2000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "b".to_string(),
+                requested_by: "bob".to_string(),
+            },
+            corr_b,
+        );
 
         assert_eq!(ledger.entries_for_agent("alice").len(), 1);
         assert_eq!(ledger.entries_for_agent("bob").len(), 1);
@@ -8926,25 +10701,37 @@ mod tests {
 
         assert_eq!(ledger.current_state(), MissionTxState::Draft); // default
 
-        ledger.append(1000, LedgerEntryKind::StateTransition {
-            from: MissionTxState::Draft,
-            to: MissionTxState::Planned,
-            kind: MissionTxTransitionKind::PlanCreated,
-        }, corr.clone());
+        ledger.append(
+            1000,
+            LedgerEntryKind::StateTransition {
+                from: MissionTxState::Draft,
+                to: MissionTxState::Planned,
+                kind: MissionTxTransitionKind::PlanCreated,
+            },
+            corr.clone(),
+        );
         assert_eq!(ledger.current_state(), MissionTxState::Planned);
 
-        ledger.append(2000, LedgerEntryKind::StateTransition {
-            from: MissionTxState::Planned,
-            to: MissionTxState::Prepared,
-            kind: MissionTxTransitionKind::PrepareSucceeded,
-        }, corr.clone());
+        ledger.append(
+            2000,
+            LedgerEntryKind::StateTransition {
+                from: MissionTxState::Planned,
+                to: MissionTxState::Prepared,
+                kind: MissionTxTransitionKind::PrepareSucceeded,
+            },
+            corr.clone(),
+        );
         assert_eq!(ledger.current_state(), MissionTxState::Prepared);
 
-        ledger.append(3000, LedgerEntryKind::StateTransition {
-            from: MissionTxState::Prepared,
-            to: MissionTxState::Committing,
-            kind: MissionTxTransitionKind::CommitStarted,
-        }, corr);
+        ledger.append(
+            3000,
+            LedgerEntryKind::StateTransition {
+                from: MissionTxState::Prepared,
+                to: MissionTxState::Committing,
+                kind: MissionTxTransitionKind::CommitStarted,
+            },
+            corr,
+        );
         assert_eq!(ledger.current_state(), MissionTxState::Committing);
     }
 
@@ -8953,25 +10740,41 @@ mod tests {
         let mut ledger = test_ledger();
         let corr = test_correlation();
 
-        ledger.append(1000, LedgerEntryKind::IntentRegistered {
-            summary: "tx".to_string(),
-            requested_by: "op".to_string(),
-        }, corr.clone());
-        ledger.append(2000, LedgerEntryKind::StateTransition {
-            from: MissionTxState::Draft,
-            to: MissionTxState::Planned,
-            kind: MissionTxTransitionKind::PlanCreated,
-        }, corr.clone());
-        ledger.append(3000, LedgerEntryKind::PreconditionEvaluated {
-            precondition_index: 0,
-            passed: true,
-            detail: "ok".to_string(),
-        }, corr.clone());
-        ledger.append(4000, LedgerEntryKind::StateTransition {
-            from: MissionTxState::Planned,
-            to: MissionTxState::Prepared,
-            kind: MissionTxTransitionKind::PrepareSucceeded,
-        }, corr);
+        ledger.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "tx".to_string(),
+                requested_by: "op".to_string(),
+            },
+            corr.clone(),
+        );
+        ledger.append(
+            2000,
+            LedgerEntryKind::StateTransition {
+                from: MissionTxState::Draft,
+                to: MissionTxState::Planned,
+                kind: MissionTxTransitionKind::PlanCreated,
+            },
+            corr.clone(),
+        );
+        ledger.append(
+            3000,
+            LedgerEntryKind::PreconditionEvaluated {
+                precondition_index: 0,
+                passed: true,
+                detail: "ok".to_string(),
+            },
+            corr.clone(),
+        );
+        ledger.append(
+            4000,
+            LedgerEntryKind::StateTransition {
+                from: MissionTxState::Planned,
+                to: MissionTxState::Prepared,
+                kind: MissionTxTransitionKind::PrepareSucceeded,
+            },
+            corr,
+        );
 
         let timeline = ledger.state_timeline();
         assert_eq!(timeline.len(), 2);
@@ -8988,26 +10791,35 @@ mod tests {
         let mut ledger = test_ledger();
         let corr = test_correlation();
 
-        ledger.append(1000, LedgerEntryKind::IntentRegistered {
-            summary: "test tx".to_string(),
-            requested_by: "op".to_string(),
-        }, corr.clone());
-        ledger.append(2000, LedgerEntryKind::StateTransition {
-            from: MissionTxState::Draft,
-            to: MissionTxState::Planned,
-            kind: MissionTxTransitionKind::PlanCreated,
-        }, corr.clone());
-        ledger.append(3000, LedgerEntryKind::OutcomeSealed {
-            outcome_kind: "committed".to_string(),
-            reason_code: None,
-            error_code: None,
-        }, corr);
+        ledger.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "test tx".to_string(),
+                requested_by: "op".to_string(),
+            },
+            corr.clone(),
+        );
+        ledger.append(
+            2000,
+            LedgerEntryKind::StateTransition {
+                from: MissionTxState::Draft,
+                to: MissionTxState::Planned,
+                kind: MissionTxTransitionKind::PlanCreated,
+            },
+            corr.clone(),
+        );
+        ledger.append(
+            3000,
+            LedgerEntryKind::OutcomeSealed {
+                outcome_kind: "committed".to_string(),
+                reason_code: None,
+                error_code: None,
+            },
+            corr,
+        );
 
         let jsonl = ledger.to_jsonl();
-        let restored = IntentLedger::from_jsonl(
-            TxId("tx-test-001".to_string()),
-            &jsonl,
-        ).unwrap();
+        let restored = IntentLedger::from_jsonl(TxId("tx-test-001".to_string()), &jsonl).unwrap();
 
         assert_eq!(restored.len(), ledger.len());
         for (orig, rest) in ledger.entries().iter().zip(restored.entries().iter()) {
@@ -9025,10 +10837,14 @@ mod tests {
         let mut ledger = test_ledger();
         let corr = LedgerCorrelation::empty();
 
-        ledger.append(1000, LedgerEntryKind::IntentRegistered {
-            summary: "tx".to_string(),
-            requested_by: "op".to_string(),
-        }, corr);
+        ledger.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "tx".to_string(),
+                requested_by: "op".to_string(),
+            },
+            corr,
+        );
 
         let json = serde_json::to_string(&ledger).unwrap();
         let restored: IntentLedger = serde_json::from_str(&json).unwrap();
@@ -9097,11 +10913,7 @@ mod tests {
         {
             let mut rec = LedgerRecorder::new(&mut ledger, corr);
             rec.record_intent(1000, "Apply updates", "operator");
-            rec.record_plan(
-                2000,
-                &TxPlanId("plan-1".to_string()),
-                2, 1, 1,
-            );
+            rec.record_plan(2000, &TxPlanId("plan-1".to_string()), 2, 1, 1);
             rec.record_precondition(3000, 0, true, "prompt active");
             rec.record_transition(
                 4000,
@@ -9115,16 +10927,8 @@ mod tests {
                 MissionTxState::Prepared,
                 MissionTxTransitionKind::PrepareSucceeded,
             );
-            rec.record_step(
-                6000,
-                &TxStepId("s1".to_string()),
-                1, true, "acquired lock",
-            );
-            rec.record_step(
-                7000,
-                &TxStepId("s2".to_string()),
-                2, true, "sent text",
-            );
+            rec.record_step(6000, &TxStepId("s1".to_string()), 1, true, "acquired lock");
+            rec.record_step(7000, &TxStepId("s2".to_string()), 2, true, "sent text");
             rec.record_transition(
                 8000,
                 MissionTxState::Prepared,
@@ -9179,7 +10983,9 @@ mod tests {
             rec.record_step(
                 5000,
                 &TxStepId("s1".to_string()),
-                1, false, "partial failure",
+                1,
+                false,
+                "partial failure",
             );
             rec.record_transition(
                 6000,
@@ -9190,7 +10996,8 @@ mod tests {
             rec.record_compensation(
                 7000,
                 &TxStepId("s1".to_string()),
-                true, "rolled back step 1",
+                true,
+                "rolled back step 1",
             );
             rec.record_transition(
                 8000,
@@ -9198,12 +11005,7 @@ mod tests {
                 MissionTxState::RolledBack,
                 MissionTxTransitionKind::CompensationSucceeded,
             );
-            rec.record_outcome(
-                9000,
-                "rolled_back",
-                Some("commit_partial"),
-                Some("FTX2007"),
-            );
+            rec.record_outcome(9000, "rolled_back", Some("commit_partial"), Some("FTX2007"));
         }
 
         assert_eq!(ledger.len(), 9);
@@ -9217,14 +11019,22 @@ mod tests {
         let mut l2 = test_ledger();
         let corr = LedgerCorrelation::empty();
 
-        l1.append(1000, LedgerEntryKind::IntentRegistered {
-            summary: "tx".to_string(),
-            requested_by: "op".to_string(),
-        }, corr.clone());
-        l2.append(1000, LedgerEntryKind::IntentRegistered {
-            summary: "tx".to_string(),
-            requested_by: "op".to_string(),
-        }, corr);
+        l1.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "tx".to_string(),
+                requested_by: "op".to_string(),
+            },
+            corr.clone(),
+        );
+        l2.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "tx".to_string(),
+                requested_by: "op".to_string(),
+            },
+            corr,
+        );
 
         assert_eq!(
             l1.entry_at(1).unwrap().entry_hash,
@@ -9235,10 +11045,14 @@ mod tests {
     #[test]
     fn ledger_entry_at_zero_returns_none() {
         let mut ledger = test_ledger();
-        ledger.append(1000, LedgerEntryKind::IntentRegistered {
-            summary: "tx".to_string(),
-            requested_by: "op".to_string(),
-        }, LedgerCorrelation::empty());
+        ledger.append(
+            1000,
+            LedgerEntryKind::IntentRegistered {
+                summary: "tx".to_string(),
+                requested_by: "op".to_string(),
+            },
+            LedgerCorrelation::empty(),
+        );
 
         assert!(ledger.entry_at(0).is_none());
         assert!(ledger.entry_at(1).is_some());
@@ -9323,10 +11137,7 @@ mod tests {
 
     #[test]
     fn ledger_jsonl_bad_line_returns_error() {
-        let result = IntentLedger::from_jsonl(
-            TxId("tx-1".to_string()),
-            "not valid json",
-        );
+        let result = IntentLedger::from_jsonl(TxId("tx-1".to_string()), "not valid json");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("line 1"));
     }

@@ -203,6 +203,8 @@ pub mod plan;
 #[cfg(feature = "subprocess-bridge")]
 pub mod planner_features;
 #[cfg(feature = "subprocess-bridge")]
+pub mod tx_idempotency;
+#[cfg(feature = "subprocess-bridge")]
 pub mod tx_plan_compiler;
 pub mod policy;
 pub mod pool;
