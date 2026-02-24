@@ -3935,4 +3935,161 @@ proptest! {
         }
         prop_assert!(ctrl.last_expected_loss() >= 0.0);
     }
+
+}
+
+// ── D4: Calibration Harness Property Tests ────────────────────
+
+fn make_cal_result(scenario: CalibrationScenario, fpr: f64, miss: f64, delay: f64, loss: f64) -> CalibrationResult {
+    CalibrationResult {
+        scenario,
+        false_positive_rate: fpr,
+        miss_rate: miss,
+        detection_delay: delay,
+        mean_expected_loss: loss,
+        passes_gate: false,
+        observation_count: 1000,
+        timestamp_us: 12345,
+    }
+}
+
+proptest! {
+    /// All-passing strict => Approved.
+    #[test]
+    fn calibration_all_pass_approved(
+        n in 5_usize..10,
+    ) {
+        let mut harness = CalibrationHarness::with_defaults();
+        for i in 0..n {
+            let scenario = match i % 5 {
+                0 => CalibrationScenario::Nominal,
+                1 => CalibrationScenario::GradualDrift,
+                2 => CalibrationScenario::AbruptShift,
+                3 => CalibrationScenario::NoisyBaseline,
+                _ => CalibrationScenario::PostStressRecovery,
+            };
+            harness.submit(make_cal_result(scenario, 0.01, 0.02, 5.0, 1.0));
+        }
+        let verdict = harness.evaluate();
+        prop_assert_eq!(verdict, PromotionVerdict::Approved);
+    }
+
+    /// One failure in strict mode => Rejected.
+    #[test]
+    fn calibration_one_fail_strict_rejected(
+        n_pass in 5_usize..10,
+    ) {
+        let mut harness = CalibrationHarness::with_defaults();
+        for _ in 0..n_pass {
+            harness.submit(make_cal_result(CalibrationScenario::Nominal, 0.01, 0.02, 5.0, 1.0));
+        }
+        harness.submit(make_cal_result(CalibrationScenario::AbruptShift, 0.2, 0.3, 100.0, 10.0));
+        let verdict = harness.evaluate();
+        prop_assert_eq!(verdict, PromotionVerdict::Rejected);
+    }
+
+    /// passing_count + failing_count == result_count.
+    #[test]
+    fn calibration_counts_sum(
+        n_pass in 0_usize..10,
+        n_fail in 0_usize..5,
+    ) {
+        let mut harness = CalibrationHarness::with_defaults();
+        for _ in 0..n_pass {
+            harness.submit(make_cal_result(CalibrationScenario::Nominal, 0.01, 0.02, 5.0, 1.0));
+        }
+        for _ in 0..n_fail {
+            harness.submit(make_cal_result(CalibrationScenario::AbruptShift, 0.2, 0.3, 100.0, 10.0));
+        }
+        harness.evaluate();
+        let total = harness.passing_count() + harness.failing_count();
+        prop_assert_eq!(total, harness.result_count());
+    }
+
+    /// Reset clears everything.
+    #[test]
+    fn calibration_reset_restores(
+        n in 1_usize..10,
+    ) {
+        let mut harness = CalibrationHarness::with_defaults();
+        for _ in 0..n {
+            harness.submit(make_cal_result(CalibrationScenario::Nominal, 0.01, 0.02, 5.0, 1.0));
+        }
+        harness.reset();
+        prop_assert_eq!(harness.total_runs(), 0);
+        prop_assert_eq!(harness.result_count(), 0);
+    }
+
+    /// Empty harness => Rejected.
+    #[test]
+    fn calibration_empty_rejected(
+        _dummy in 0_u8..1,
+    ) {
+        let mut harness = CalibrationHarness::with_defaults();
+        let verdict = harness.evaluate();
+        prop_assert_eq!(verdict, PromotionVerdict::Rejected);
+    }
+
+    /// CalibrationScenario serde roundtrip.
+    #[test]
+    fn calibration_scenario_serde(
+        variant in 0_u8..5,
+    ) {
+        let scenario = match variant {
+            0 => CalibrationScenario::Nominal,
+            1 => CalibrationScenario::GradualDrift,
+            2 => CalibrationScenario::AbruptShift,
+            3 => CalibrationScenario::NoisyBaseline,
+            _ => CalibrationScenario::PostStressRecovery,
+        };
+        let json = serde_json::to_string(&scenario).unwrap();
+        let back: CalibrationScenario = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(scenario, back);
+    }
+
+    /// PromotionVerdict serde roundtrip.
+    #[test]
+    fn calibration_verdict_serde(
+        variant in 0_u8..3,
+    ) {
+        let verdict = match variant {
+            0 => PromotionVerdict::Approved,
+            1 => PromotionVerdict::ConditionalHold,
+            _ => PromotionVerdict::Rejected,
+        };
+        let json = serde_json::to_string(&verdict).unwrap();
+        let back: PromotionVerdict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(verdict, back);
+    }
+
+    /// CalibrationDegradation serde roundtrip.
+    #[test]
+    fn calibration_degradation_serde(
+        variant in 0_u8..3,
+        passing in 0_usize..10,
+        total in 1_usize..20,
+    ) {
+        let degradation = match variant {
+            0 => CalibrationDegradation::Healthy,
+            1 => CalibrationDegradation::GateMarginal { passing, total },
+            _ => CalibrationDegradation::GateFailed { failing: passing.min(total), total },
+        };
+        let json = serde_json::to_string(&degradation).unwrap();
+        let back: CalibrationDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(degradation, back);
+    }
+
+    /// Average FPR is bounded by individual FPRs.
+    #[test]
+    fn calibration_avg_fpr_bounded(
+        fpr in 0.0_f64..0.5,
+        n in 1_usize..10,
+    ) {
+        let mut harness = CalibrationHarness::with_defaults();
+        for _ in 0..n {
+            harness.submit(make_cal_result(CalibrationScenario::Nominal, fpr, 0.01, 5.0, 1.0));
+        }
+        let avg = harness.avg_fpr();
+        prop_assert!((avg - fpr).abs() < 1e-10, "avg_fpr {} != expected {}", avg, fpr);
+    }
 }
