@@ -5113,3 +5113,189 @@ proptest! {
         prop_assert_eq!(summary, back);
     }
 }
+
+// ── F1: Fault Domain Isolation Strategies ─────────────────────────
+
+fn arb_fault_domain() -> impl Strategy<Value = FaultDomain> {
+    prop_oneof![
+        Just(FaultDomain::Scheduler),
+        Just(FaultDomain::Budget),
+        Just(FaultDomain::Recovery),
+        Just(FaultDomain::Io),
+        Just(FaultDomain::Storage),
+    ]
+}
+
+fn arb_domain_health() -> impl Strategy<Value = DomainHealth> {
+    prop_oneof![
+        Just(DomainHealth::Healthy),
+        Just(DomainHealth::Degraded),
+        Just(DomainHealth::Crashed),
+        Just(DomainHealth::Restarting),
+        Just(DomainHealth::Isolated),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // ── F1: Fault isolation property tests ───────────────────────
+
+    /// FaultDomain serde roundtrip.
+    #[test]
+    fn fault_domain_serde_roundtrip(domain in arb_fault_domain()) {
+        let json = serde_json::to_string(&domain).unwrap();
+        let back: FaultDomain = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(domain, back);
+    }
+
+    /// DomainHealth serde roundtrip.
+    #[test]
+    fn domain_health_serde_roundtrip(health in arb_domain_health()) {
+        let json = serde_json::to_string(&health).unwrap();
+        let back: DomainHealth = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(health, back);
+    }
+
+    /// CrashOnlyContract serde roundtrip.
+    #[test]
+    fn crash_only_contract_serde(
+        domain in arb_fault_domain(),
+        max_restarts in 1_u32..10,
+        cooldown in 1_u64..1_000_000,
+    ) {
+        let contract = CrashOnlyContract {
+            domain,
+            max_restarts,
+            restart_cooldown_us: cooldown,
+            checkpoint_on_crash: true,
+            restart_timeout_us: 5_000_000,
+        };
+        let json = serde_json::to_string(&contract).unwrap();
+        let back: CrashOnlyContract = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(contract, back);
+    }
+
+    /// FaultEvent serde roundtrip.
+    #[test]
+    fn fault_event_serde(domain in arb_fault_domain(), ts in 0_u64..100_000) {
+        let ev = FaultEvent {
+            domain,
+            timestamp_us: ts,
+            description: "test".to_string(),
+            recovery_attempted: false,
+            recovery_succeeded: false,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: FaultEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(ev, back);
+    }
+
+    /// Recording faults increments total_faults.
+    #[test]
+    fn record_fault_increments_total(
+        domain in arb_fault_domain(),
+        n in 1_usize..5,
+    ) {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        for i in 0..n {
+            mgr.record_fault(domain, format!("f{i}"), (i as u64 + 1) * 100);
+        }
+        prop_assert_eq!(mgr.domain_faults(domain), n as u64);
+        prop_assert_eq!(mgr.total_faults(), n as u64);
+    }
+
+    /// After recording a fault, domain is no longer healthy.
+    #[test]
+    fn fault_makes_unhealthy(domain in arb_fault_domain()) {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(domain, "test".to_string(), 100);
+        prop_assert_ne!(mgr.domain_health(domain), DomainHealth::Healthy);
+        prop_assert!(!mgr.all_healthy());
+    }
+
+    /// healthy_count + unhealthy_count == 5 (total domains).
+    #[test]
+    fn healthy_unhealthy_sum(domain in arb_fault_domain()) {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(domain, "x".to_string(), 100);
+        prop_assert_eq!(mgr.healthy_count() + mgr.unhealthy_count(), 5);
+    }
+
+    /// Auto-isolation triggers after max_restarts+1 consecutive failures.
+    #[test]
+    fn auto_isolation_threshold(
+        domain in arb_fault_domain(),
+        max_restarts in 1_u32..5,
+    ) {
+        let contracts: Vec<CrashOnlyContract> = FaultDomain::ALL.iter().map(|d| {
+            CrashOnlyContract { domain: *d, max_restarts, ..Default::default() }
+        }).collect();
+        let cfg = FaultIsolationConfig { contracts, auto_isolate: true, max_history: 100 };
+        let mut mgr = FaultIsolationManager::new(cfg);
+
+        // Record exactly max_restarts faults → should be Crashed, not Isolated.
+        for i in 0..max_restarts {
+            mgr.record_fault(domain, format!("f{i}"), (i as u64 + 1) * 100);
+        }
+        prop_assert_ne!(mgr.domain_health(domain), DomainHealth::Isolated);
+
+        // One more → should trigger isolation.
+        mgr.record_fault(domain, "final".to_string(), (max_restarts as u64 + 1) * 100);
+        prop_assert_eq!(mgr.domain_health(domain), DomainHealth::Isolated);
+    }
+
+    /// Restart success resets consecutive failures.
+    #[test]
+    fn restart_success_resets(domain in arb_fault_domain()) {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(domain, "test".to_string(), 100);
+        let restarted = mgr.attempt_restart(domain, 200_000);
+        prop_assert!(restarted);
+        mgr.restart_succeeded(domain);
+        prop_assert_eq!(mgr.domain_health(domain), DomainHealth::Healthy);
+    }
+
+    /// Reset clears all state.
+    #[test]
+    fn reset_clears_all(domain in arb_fault_domain()) {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(domain, "test".to_string(), 100);
+        mgr.reset();
+        prop_assert!(mgr.all_healthy());
+        prop_assert_eq!(mgr.total_faults(), 0);
+        prop_assert!(mgr.fault_history().is_empty());
+    }
+
+    /// FaultIsolationDegradation serde roundtrip.
+    #[test]
+    fn fault_isolation_degradation_serde(variant in 0_u8..3) {
+        let deg = match variant {
+            0 => FaultIsolationDegradation::Healthy,
+            1 => FaultIsolationDegradation::PartialDegradation { degraded_count: 2 },
+            _ => FaultIsolationDegradation::DomainIsolated { isolated_domains: vec![FaultDomain::Io] },
+        };
+        let json = serde_json::to_string(&deg).unwrap();
+        let back: FaultIsolationDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(deg, back);
+    }
+
+    /// FaultIsolationSnapshot serde roundtrip.
+    #[test]
+    fn fault_isolation_snapshot_serde(domain in arb_fault_domain()) {
+        let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
+        mgr.record_fault(domain, "x".to_string(), 100);
+        let snap = mgr.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: FaultIsolationSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap, back);
+    }
+
+    /// to_invariant_domain maps consistently.
+    #[test]
+    fn to_invariant_domain_deterministic(domain in arb_fault_domain()) {
+        let id1 = FaultIsolationManager::to_invariant_domain(domain);
+        let id2 = FaultIsolationManager::to_invariant_domain(domain);
+        prop_assert_eq!(id1, id2);
+    }
+}
