@@ -874,18 +874,15 @@ impl CommandGuard {
                 continue;
             }
 
-            // Check safe patterns first (whitelist).
-            let is_safe = pack
-                .safe_rules
-                .iter()
-                .any(|safe| safe.pattern.is_match(command));
-            if is_safe {
-                continue;
+            // Remove safe patterns (whitelist) from the command before checking destructive ones.
+            let mut check_command = command.to_string();
+            for safe in pack.safe_rules {
+                check_command = safe.pattern.replace_all(&check_command, "").to_string();
             }
 
             // Check destructive patterns.
             for rule in pack.destructive_rules {
-                if rule.pattern.is_match(command) {
+                if rule.pattern.is_match(&check_command) {
                     let rule_id = rule.id.to_string();
                     let pack_name = pack.id.to_string();
                     let reason = rule.reason.to_string();
@@ -981,18 +978,15 @@ pub fn evaluate_stateless(command: &str) -> Option<(String, String, String, Vec<
             continue;
         }
 
-        // Safe patterns first.
-        if pack
-            .safe_rules
-            .iter()
-            .any(|safe| safe.pattern.is_match(command))
-        {
-            continue;
+        // Safe patterns first - replace them with empty string so they don't trigger destructive matches.
+        let mut check_command = command.to_string();
+        for safe in pack.safe_rules {
+            check_command = safe.pattern.replace_all(&check_command, "").to_string();
         }
 
         // Destructive patterns.
         for rule in pack.destructive_rules {
-            if rule.pattern.is_match(command) {
+            if rule.pattern.is_match(&check_command) {
                 return Some((
                     rule.id.to_string(),
                     pack.id.to_string(),
