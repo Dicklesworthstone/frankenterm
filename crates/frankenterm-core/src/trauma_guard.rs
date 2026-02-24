@@ -14,10 +14,27 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
 
 use crate::bloom_filter::BloomFilter;
+use crate::edit_distance::jaro_winkler_str;
 use crate::patterns::Detection;
 use crate::sliding_window::{SlidingWindow, SlidingWindowConfig};
 
 const REASON_RECURRING_FAILURE_LOOP: &str = "recurring_failure_loop";
+const DEFAULT_COMMAND_SIMILARITY_THRESHOLD: f64 = 0.88;
+const DEFAULT_TOKEN_JACCARD_THRESHOLD: f64 = 0.60;
+const DEFAULT_EXECUTION_PREFIXES: &[&str] =
+    &["cargo", "npm run", "npm", "python", "python3", "node", "go"];
+const DEFAULT_CRITICAL_FLAGS: &[&str] = &[
+    "--all",
+    "--all-targets",
+    "--workspace",
+    "--lib",
+    "--bins",
+    "--tests",
+    "--benches",
+    "--release",
+    "-p",
+    "--package",
+];
 
 /// Configuration for [`TraumaState`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +52,16 @@ pub struct TraumaConfig {
     pub bloom_fp_rate: f64,
     /// Maximum signatures retained for Bloom filter rebuilds.
     pub signature_retention: usize,
+    /// Minimum character-level similarity to treat commands as trivial variations.
+    pub command_similarity_threshold: f64,
+    /// Minimum token-level Jaccard similarity for trivial-variation matching.
+    pub token_jaccard_threshold: f64,
+    /// Strip common execution prefixes (e.g. `cargo`, `npm run`) before matching.
+    pub strip_execution_prefixes: bool,
+    /// Common execution prefixes stripped when `strip_execution_prefixes = true`.
+    pub execution_prefixes: Vec<String>,
+    /// Flags considered semantic intent pivots. Mismatches break the repeat chain.
+    pub critical_flags: Vec<String>,
 }
 
 impl Default for TraumaConfig {
@@ -49,6 +76,17 @@ impl Default for TraumaConfig {
             bloom_capacity: 512,
             bloom_fp_rate: 0.01,
             signature_retention: 512,
+            command_similarity_threshold: DEFAULT_COMMAND_SIMILARITY_THRESHOLD,
+            token_jaccard_threshold: DEFAULT_TOKEN_JACCARD_THRESHOLD,
+            strip_execution_prefixes: true,
+            execution_prefixes: DEFAULT_EXECUTION_PREFIXES
+                .iter()
+                .map(|prefix| (*prefix).to_string())
+                .collect(),
+            critical_flags: DEFAULT_CRITICAL_FLAGS
+                .iter()
+                .map(|flag| (*flag).to_string())
+                .collect(),
         }
     }
 }
@@ -60,6 +98,15 @@ pub struct TraumaEvent {
     pub timestamp_ms: u64,
     /// Deterministic hash of the executed command.
     pub command_hash: u64,
+    /// Token-aware normalized command fingerprint for fuzzy matching.
+    #[serde(default)]
+    pub command_fingerprint: String,
+    /// Sorted unique command tokens used for Jaccard similarity.
+    #[serde(default)]
+    pub command_tokens: Vec<String>,
+    /// Sorted unique critical flags extracted from `command_tokens`.
+    #[serde(default)]
+    pub critical_flags: Vec<String>,
     /// Canonicalized error signatures observed for this command.
     pub error_signatures: Vec<String>,
     /// Signatures that were considered recurring at this event.
@@ -118,6 +165,14 @@ pub struct TraumaState {
     signature_windows: HashMap<String, SlidingWindow>,
     recent_signatures: VecDeque<String>,
     signature_bloom: BloomFilter,
+}
+
+#[derive(Debug, Clone)]
+struct CommandFeatures {
+    command_hash: u64,
+    command_fingerprint: String,
+    command_tokens: Vec<String>,
+    critical_flags: Vec<String>,
 }
 
 impl Default for TraumaState {
@@ -191,20 +246,24 @@ impl TraumaState {
         command: &str,
         error_signatures: &[String],
     ) -> TraumaDecision {
-        let command_hash = hash_command(command);
+        let command_features = self.command_features(command);
+        let command_hash = command_features.command_hash;
         let signatures = normalize_signatures(error_signatures);
         let recurring_signatures = self.record_signatures(timestamp_ms, &signatures);
 
         let event = TraumaEvent {
             timestamp_ms,
             command_hash,
+            command_fingerprint: command_features.command_fingerprint.clone(),
+            command_tokens: command_features.command_tokens.clone(),
+            critical_flags: command_features.critical_flags.clone(),
             error_signatures: signatures.clone(),
             recurring_signatures: recurring_signatures.clone(),
         };
         self.history.push_back(event);
         self.trim_history();
 
-        let repeat_count = self.trailing_repeat_count(command_hash, &signatures);
+        let repeat_count = self.trailing_repeat_count(&command_features, &signatures);
         let should_intervene =
             !recurring_signatures.is_empty() && repeat_count >= self.config.loop_threshold;
 
@@ -258,7 +317,7 @@ impl TraumaState {
         recurring
     }
 
-    fn trailing_repeat_count(&self, command_hash: u64, signatures: &[String]) -> u64 {
+    fn trailing_repeat_count(&self, command: &CommandFeatures, signatures: &[String]) -> u64 {
         if signatures.is_empty() {
             return 0;
         }
@@ -267,7 +326,7 @@ impl TraumaState {
         let mut count = 0_u64;
 
         for event in self.history.iter().rev() {
-            if event.command_hash != command_hash || event.error_signatures.is_empty() {
+            if event.error_signatures.is_empty() {
                 break;
             }
 
@@ -279,10 +338,64 @@ impl TraumaState {
                 break;
             }
 
+            if !self.is_trivial_variation(command, event) {
+                break;
+            }
+
             count = count.saturating_add(1);
         }
 
         count
+    }
+
+    fn command_features(&self, command: &str) -> CommandFeatures {
+        let command_hash = hash_command(command);
+        let normalized = normalize_command_text(command);
+
+        let stripped = if self.config.strip_execution_prefixes {
+            strip_execution_prefix(&normalized, &self.config.execution_prefixes)
+        } else {
+            normalized.clone()
+        };
+
+        let command_fingerprint = if stripped.is_empty() {
+            normalized
+        } else {
+            stripped
+        };
+
+        let command_tokens = tokenize_command(&command_fingerprint);
+        let critical_flags = extract_critical_flags(&command_tokens, &self.config.critical_flags);
+
+        CommandFeatures {
+            command_hash,
+            command_fingerprint,
+            command_tokens,
+            critical_flags,
+        }
+    }
+
+    fn is_trivial_variation(&self, command: &CommandFeatures, event: &TraumaEvent) -> bool {
+        if command.command_hash == event.command_hash {
+            return true;
+        }
+
+        if command.command_fingerprint.is_empty() || event.command_fingerprint.is_empty() {
+            return false;
+        }
+
+        if has_critical_flag_conflict(&command.critical_flags, &event.critical_flags) {
+            return false;
+        }
+
+        let edit_similarity =
+            jaro_winkler_str(&command.command_fingerprint, &event.command_fingerprint);
+        if edit_similarity < self.config.command_similarity_threshold {
+            return false;
+        }
+
+        let token_similarity = token_jaccard_similarity(&command.command_tokens, &event.command_tokens);
+        token_similarity >= self.config.token_jaccard_threshold
     }
 
     fn trim_history(&mut self) {
@@ -326,7 +439,42 @@ fn sanitize_config(mut config: TraumaConfig) -> TraumaConfig {
         config.bloom_fp_rate = TraumaConfig::default().bloom_fp_rate;
     }
 
+    if !(0.0..=1.0).contains(&config.command_similarity_threshold) {
+        config.command_similarity_threshold = DEFAULT_COMMAND_SIMILARITY_THRESHOLD;
+    }
+    if !(0.0..=1.0).contains(&config.token_jaccard_threshold) {
+        config.token_jaccard_threshold = DEFAULT_TOKEN_JACCARD_THRESHOLD;
+    }
+
+    if config.execution_prefixes.is_empty() {
+        config.execution_prefixes = DEFAULT_EXECUTION_PREFIXES
+            .iter()
+            .map(|prefix| (*prefix).to_string())
+            .collect();
+    }
+    config.execution_prefixes = sanitize_list(config.execution_prefixes);
+    config.execution_prefixes.sort_by(|left, right| right.len().cmp(&left.len()));
+
+    if config.critical_flags.is_empty() {
+        config.critical_flags = DEFAULT_CRITICAL_FLAGS
+            .iter()
+            .map(|flag| (*flag).to_string())
+            .collect();
+    }
+    config.critical_flags = sanitize_list(config.critical_flags);
+
     config
+}
+
+fn sanitize_list(values: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = values
+        .into_iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn normalize_signatures(signatures: &[String]) -> Vec<String> {
@@ -338,6 +486,82 @@ fn normalize_signatures(signatures: &[String]) -> Vec<String> {
     normalized.sort();
     normalized.dedup();
     normalized
+}
+
+fn normalize_command_text(command: &str) -> String {
+    command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn strip_execution_prefix(command: &str, execution_prefixes: &[String]) -> String {
+    for prefix in execution_prefixes {
+        if command == prefix {
+            return String::new();
+        }
+
+        if let Some(rest) = command.strip_prefix(prefix) {
+            if let Some(stripped) = rest.strip_prefix(' ') {
+                return stripped.to_string();
+            }
+        }
+    }
+
+    command.to_string()
+}
+
+fn tokenize_command(command: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = command
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|ch: char| {
+                    matches!(
+                        ch,
+                        ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\''
+                    )
+                })
+                .to_string()
+        })
+        .filter(|token| !token.is_empty())
+        .collect();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn extract_critical_flags(tokens: &[String], critical_flags: &[String]) -> Vec<String> {
+    let mut flags: Vec<String> = tokens
+        .iter()
+        .filter(|token| critical_flags.binary_search(token).is_ok())
+        .cloned()
+        .collect();
+    flags.sort();
+    flags.dedup();
+    flags
+}
+
+fn has_critical_flag_conflict(left: &[String], right: &[String]) -> bool {
+    (!left.is_empty() || !right.is_empty()) && left != right
+}
+
+fn token_jaccard_similarity(left: &[String], right: &[String]) -> f64 {
+    if left.is_empty() && right.is_empty() {
+        return 1.0;
+    }
+
+    let left_set: HashSet<&str> = left.iter().map(String::as_str).collect();
+    let right_set: HashSet<&str> = right.iter().map(String::as_str).collect();
+
+    let intersection = left_set.intersection(&right_set).count();
+    let union = left_set.union(&right_set).count();
+    if union == 0 {
+        1.0
+    } else {
+        intersection as f64 / union as f64
+    }
 }
 
 fn fnv1a64(data: &[u8]) -> u64 {
@@ -368,6 +592,23 @@ mod tests {
             bloom_capacity: 128,
             bloom_fp_rate: 0.01,
             signature_retention: 128,
+            command_similarity_threshold: 0.82,
+            token_jaccard_threshold: 0.50,
+            strip_execution_prefixes: true,
+            execution_prefixes: vec![
+                "cargo".to_string(),
+                "npm run".to_string(),
+                "npm".to_string(),
+                "python".to_string(),
+            ],
+            critical_flags: vec![
+                "--all".to_string(),
+                "--workspace".to_string(),
+                "--lib".to_string(),
+                "--tests".to_string(),
+                "--benches".to_string(),
+                "-p".to_string(),
+            ],
         }
     }
 
@@ -399,6 +640,50 @@ mod tests {
             Some(REASON_RECURRING_FAILURE_LOOP)
         );
         assert_eq!(third.repeat_count, 3);
+    }
+
+    #[test]
+    fn fuzzy_variations_intervene_after_threshold() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["core.codex:error_loop".to_string()];
+
+        let first = state.record_command_result(1_000, "cargo test -p foo", &signatures);
+        let second = state.record_command_result(1_100, "cargo test -p foo -v", &signatures);
+        let third = state.record_command_result(1_200, "cargo test -p foo --verbose", &signatures);
+
+        assert!(!first.should_intervene);
+        assert!(!second.should_intervene);
+        assert!(third.should_intervene);
+        assert_eq!(first.repeat_count, 1);
+        assert_eq!(second.repeat_count, 2);
+        assert_eq!(third.repeat_count, 3);
+    }
+
+    #[test]
+    fn semantic_flag_change_breaks_repeat_chain() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["core.codex:error_loop".to_string()];
+
+        let first = state.record_command_result(1_000, "cargo test --lib", &signatures);
+        let second = state.record_command_result(1_100, "cargo test --lib -v", &signatures);
+        let third = state.record_command_result(1_200, "cargo test --all", &signatures);
+
+        assert_eq!(first.repeat_count, 1);
+        assert_eq!(second.repeat_count, 2);
+        assert_eq!(third.repeat_count, 1);
+        assert!(!third.should_intervene);
+    }
+
+    #[test]
+    fn prefix_stripping_links_equivalent_commands() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["core.codex:error_loop".to_string()];
+
+        let first = state.record_command_result(1_000, "cargo test -p foo", &signatures);
+        let second = state.record_command_result(1_100, "test -p foo", &signatures);
+
+        assert_eq!(first.repeat_count, 1);
+        assert_eq!(second.repeat_count, 2);
     }
 
     #[test]
@@ -459,6 +744,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn e2e_fuzzy_variation_loop_decision_is_deterministic() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["core.codex:error_loop".to_string()];
+        let commands = [
+            "cargo test -p foo",
+            "cargo test -p foo -v",
+            "cargo test -p foo --verbose",
+            "cargo test -p foo --verbose --color=always",
+        ];
+
+        let decisions: Vec<TraumaDecision> = commands
+            .iter()
+            .enumerate()
+            .map(|(idx, command)| {
+                state.record_command_result(20_000 + (idx as u64 * 100), command, &signatures)
+            })
+            .collect();
+
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|decision| decision.should_intervene)
+                .collect::<Vec<bool>>(),
+            vec![false, false, true, true]
+        );
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|decision| decision.repeat_count)
+                .collect::<Vec<u64>>(),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn e2e_semantic_change_resets_loop_and_recovers() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["core.codex:error_loop".to_string()];
+
+        let _ = state.record_command_result(30_000, "cargo test --lib", &signatures);
+        let _ = state.record_command_result(30_100, "cargo test --lib -v", &signatures);
+        let decision = state.record_command_result(30_200, "cargo test --all", &signatures);
+
+        assert_eq!(decision.repeat_count, 1);
+        assert!(!decision.should_intervene);
+    }
+
     proptest! {
         #[test]
         fn proptest_signature_window_count_matches_recent_buckets(
@@ -507,6 +840,19 @@ mod tests {
                 false_positives <= 64,
                 "false positives too high: {false_positives} / {queries}"
             );
+        }
+
+        #[test]
+        fn proptest_token_jaccard_similarity_is_symmetric(
+            left in prop::collection::vec("[a-z\\-]{1,8}", 0..16),
+            right in prop::collection::vec("[a-z\\-]{1,8}", 0..16),
+        ) {
+            let left_tokens = tokenize_command(&left.join(" "));
+            let right_tokens = tokenize_command(&right.join(" "));
+            let forward = token_jaccard_similarity(&left_tokens, &right_tokens);
+            let backward = token_jaccard_similarity(&right_tokens, &left_tokens);
+            prop_assert!((forward - backward).abs() < f64::EPSILON);
+            prop_assert!((0.0..=1.0).contains(&forward));
         }
     }
 }
