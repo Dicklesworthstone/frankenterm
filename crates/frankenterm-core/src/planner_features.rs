@@ -388,6 +388,184 @@ fn extract_confidence(
     confidence.clamp(0.0, 1.0)
 }
 
+// ── Multi-factor scoring function (ft-1i2ge.2.4) ────────────────────────────
+
+/// Effort estimate bucket for a bead task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffortBucket {
+    /// < 30 min
+    Trivial,
+    /// 30 min – 2 hours
+    Small,
+    /// 2 – 8 hours
+    Medium,
+    /// 8 – 24 hours
+    Large,
+    /// > 24 hours
+    Epic,
+}
+
+impl EffortBucket {
+    /// Normalized effort score (0.0 = trivial, 1.0 = epic).
+    #[must_use]
+    pub fn score(&self) -> f64 {
+        match self {
+            Self::Trivial => 0.0,
+            Self::Small => 0.25,
+            Self::Medium => 0.5,
+            Self::Large => 0.75,
+            Self::Epic => 1.0,
+        }
+    }
+}
+
+/// Input to the multi-factor scorer for a single candidate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScorerInput {
+    pub features: PlannerFeatureVector,
+    /// Optional effort estimate (if not supplied, defaults to Medium).
+    pub effort: Option<EffortBucket>,
+    /// Optional label-based tags that may influence scoring (e.g. "safety", "regression").
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Configuration for the multi-factor scorer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScorerConfig {
+    pub weights: PlannerWeights,
+    /// Weight for the effort dimension (lower effort = higher score).
+    pub effort_weight: f64,
+    /// Bonus multiplier for safety-tagged beads (applied to final score).
+    pub safety_bonus: f64,
+    /// Bonus multiplier for regression-tagged beads.
+    pub regression_bonus: f64,
+    /// Minimum confidence threshold: candidates below this get score = 0.
+    pub min_confidence_threshold: f64,
+    /// Deterministic tie-breaking: when scores differ by less than this, use bead_id ordering.
+    pub tie_break_epsilon: f64,
+}
+
+impl Default for ScorerConfig {
+    fn default() -> Self {
+        Self {
+            weights: PlannerWeights::default(),
+            effort_weight: 0.10,
+            safety_bonus: 1.15,
+            regression_bonus: 1.10,
+            min_confidence_threshold: 0.1,
+            tie_break_epsilon: 0.001,
+        }
+    }
+}
+
+/// Scored candidate with breakdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoredCandidate {
+    pub bead_id: String,
+    pub final_score: f64,
+    pub feature_composite: f64,
+    pub effort_penalty: f64,
+    pub tag_multiplier: f64,
+    pub below_confidence_threshold: bool,
+    pub rank: usize,
+}
+
+/// Output of the multi-factor scoring pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScorerReport {
+    pub scored: Vec<ScoredCandidate>,
+    pub ranked_ids: Vec<String>,
+    pub config_used: ScorerConfig,
+}
+
+impl ScorerReport {
+    /// Get a scored candidate by bead id.
+    #[must_use]
+    pub fn get(&self, bead_id: &str) -> Option<&ScoredCandidate> {
+        self.scored.iter().find(|s| s.bead_id == bead_id)
+    }
+
+    /// Top-N ranked bead ids.
+    #[must_use]
+    pub fn top_n(&self, n: usize) -> Vec<String> {
+        self.ranked_ids.iter().take(n).cloned().collect()
+    }
+}
+
+/// Run the multi-factor scorer on a set of planner inputs.
+///
+/// Produces a deterministically-ranked list of scored candidates.
+/// Candidates below the confidence threshold get score = 0.
+#[must_use]
+pub fn score_candidates(inputs: &[ScorerInput], config: &ScorerConfig) -> ScorerReport {
+    let mut scored: Vec<ScoredCandidate> = inputs
+        .iter()
+        .map(|input| {
+            let feature_composite = input.features.composite_score_with_weights(&config.weights);
+            let effort = input.effort.unwrap_or(EffortBucket::Medium);
+            // Effort penalty: high effort reduces score.
+            let effort_penalty = config.effort_weight * effort.score();
+
+            // Tag multiplier: safety and regression tags boost score.
+            let mut tag_multiplier = 1.0_f64;
+            for tag in &input.tags {
+                match tag.as_str() {
+                    "safety" | "policy" => tag_multiplier = tag_multiplier.max(config.safety_bonus),
+                    "regression" | "bug" => {
+                        tag_multiplier = tag_multiplier.max(config.regression_bonus)
+                    }
+                    _ => {}
+                }
+            }
+
+            let below_threshold = input.features.confidence < config.min_confidence_threshold;
+
+            let final_score = if below_threshold {
+                0.0
+            } else {
+                ((feature_composite - effort_penalty) * tag_multiplier).clamp(0.0, 1.0)
+            };
+
+            ScoredCandidate {
+                bead_id: input.features.bead_id.clone(),
+                final_score,
+                feature_composite,
+                effort_penalty,
+                tag_multiplier,
+                below_confidence_threshold: below_threshold,
+                rank: 0, // filled in after sort
+            }
+        })
+        .collect();
+
+    // Sort: highest score first. Deterministic tie-break by bead_id.
+    scored.sort_by(|a, b| {
+        let diff = (a.final_score - b.final_score).abs();
+        if diff < config.tie_break_epsilon {
+            a.bead_id.cmp(&b.bead_id)
+        } else {
+            b.final_score
+                .partial_cmp(&a.final_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+    });
+
+    // Assign ranks (1-based).
+    for (i, candidate) in scored.iter_mut().enumerate() {
+        candidate.rank = i + 1;
+    }
+
+    let ranked_ids: Vec<String> = scored.iter().map(|s| s.bead_id.clone()).collect();
+
+    ScorerReport {
+        scored,
+        ranked_ids,
+        config_used: config.clone(),
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -964,5 +1142,323 @@ mod tests {
         let result = extract_planner_features(&report, &agents, &ctx, &config);
         assert!(result.get("a").is_some());
         assert!(result.get("nonexistent").is_none());
+    }
+
+    // ── Multi-factor scorer (ft-1i2ge.2.4) ──────────────────────────────
+
+    fn make_fv(id: &str, impact: f64, urgency: f64, risk: f64, fit: f64, confidence: f64) -> PlannerFeatureVector {
+        PlannerFeatureVector {
+            bead_id: id.to_string(),
+            impact,
+            urgency,
+            risk,
+            fit,
+            confidence,
+        }
+    }
+
+    fn make_input(fv: PlannerFeatureVector, effort: Option<EffortBucket>, tags: Vec<&str>) -> ScorerInput {
+        ScorerInput {
+            features: fv,
+            effort,
+            tags: tags.into_iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn scorer_empty_input() {
+        let report = score_candidates(&[], &ScorerConfig::default());
+        assert!(report.scored.is_empty());
+        assert!(report.ranked_ids.is_empty());
+    }
+
+    #[test]
+    fn scorer_single_candidate() {
+        let fv = make_fv("a", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let inputs = vec![make_input(fv, None, vec![])];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        assert_eq!(report.scored.len(), 1);
+        assert_eq!(report.scored[0].bead_id, "a");
+        assert_eq!(report.scored[0].rank, 1);
+        assert!(report.scored[0].final_score > 0.0);
+    }
+
+    #[test]
+    fn scorer_effort_reduces_score() {
+        let fv_easy = make_fv("easy", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let fv_hard = make_fv("hard", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let inputs = vec![
+            make_input(fv_easy, Some(EffortBucket::Trivial), vec![]),
+            make_input(fv_hard, Some(EffortBucket::Epic), vec![]),
+        ];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        let easy = report.get("easy").unwrap();
+        let hard = report.get("hard").unwrap();
+        assert!(
+            easy.final_score > hard.final_score,
+            "easy={} should beat hard={}",
+            easy.final_score,
+            hard.final_score
+        );
+    }
+
+    #[test]
+    fn scorer_safety_tag_boosts() {
+        let fv_safe = make_fv("safe", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let fv_norm = make_fv("norm", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let inputs = vec![
+            make_input(fv_safe, None, vec!["safety"]),
+            make_input(fv_norm, None, vec![]),
+        ];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        let safe = report.get("safe").unwrap();
+        let norm = report.get("norm").unwrap();
+        assert!(
+            safe.final_score > norm.final_score,
+            "safe={} should beat norm={}",
+            safe.final_score,
+            norm.final_score
+        );
+    }
+
+    #[test]
+    fn scorer_regression_tag_boosts() {
+        let fv_reg = make_fv("reg", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let fv_norm = make_fv("norm", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let inputs = vec![
+            make_input(fv_reg, None, vec!["regression"]),
+            make_input(fv_norm, None, vec![]),
+        ];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        let reg = report.get("reg").unwrap();
+        let norm = report.get("norm").unwrap();
+        assert!(reg.final_score > norm.final_score);
+    }
+
+    #[test]
+    fn scorer_below_confidence_gets_zero() {
+        let fv = make_fv("low-conf", 1.0, 1.0, 0.0, 1.0, 0.05);
+        let inputs = vec![make_input(fv, None, vec![])];
+        let config = ScorerConfig::default(); // threshold = 0.1
+        let report = score_candidates(&inputs, &config);
+        let c = &report.scored[0];
+        assert!((c.final_score - 0.0).abs() < 1e-10);
+        assert!(c.below_confidence_threshold);
+    }
+
+    #[test]
+    fn scorer_above_confidence_not_zeroed() {
+        let fv = make_fv("ok-conf", 1.0, 1.0, 0.0, 1.0, 0.5);
+        let inputs = vec![make_input(fv, None, vec![])];
+        let config = ScorerConfig::default();
+        let report = score_candidates(&inputs, &config);
+        let c = &report.scored[0];
+        assert!(c.final_score > 0.0);
+        assert!(!c.below_confidence_threshold);
+    }
+
+    #[test]
+    fn scorer_deterministic_tie_break_by_id() {
+        let fv_a = make_fv("alpha", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let fv_z = make_fv("zeta", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let inputs = vec![
+            make_input(fv_z, Some(EffortBucket::Medium), vec![]),
+            make_input(fv_a, Some(EffortBucket::Medium), vec![]),
+        ];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        // Same score => alphabetical tie-break
+        assert_eq!(report.ranked_ids[0], "alpha");
+        assert_eq!(report.ranked_ids[1], "zeta");
+    }
+
+    #[test]
+    fn scorer_ranks_are_one_based() {
+        let inputs = vec![
+            make_input(make_fv("a", 1.0, 1.0, 0.0, 1.0, 1.0), None, vec![]),
+            make_input(make_fv("b", 0.0, 0.0, 0.0, 1.0, 1.0), None, vec![]),
+        ];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        assert_eq!(report.scored[0].rank, 1);
+        assert_eq!(report.scored[1].rank, 2);
+    }
+
+    #[test]
+    fn scorer_final_score_clamped() {
+        // Even with safety bonus * high composite, score should not exceed 1.0
+        let fv = make_fv("boost", 1.0, 1.0, 0.0, 1.0, 1.0);
+        let inputs = vec![make_input(fv, Some(EffortBucket::Trivial), vec!["safety"])];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        assert!(report.scored[0].final_score <= 1.0);
+    }
+
+    #[test]
+    fn scorer_report_top_n() {
+        let inputs = vec![
+            make_input(make_fv("a", 1.0, 1.0, 0.0, 1.0, 1.0), None, vec![]),
+            make_input(make_fv("b", 0.5, 0.5, 0.0, 1.0, 1.0), None, vec![]),
+            make_input(make_fv("c", 0.0, 0.0, 0.0, 1.0, 1.0), None, vec![]),
+        ];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        assert_eq!(report.top_n(2), vec!["a", "b"]);
+        assert_eq!(report.top_n(5).len(), 3); // only 3 available
+    }
+
+    #[test]
+    fn scorer_report_get() {
+        let inputs = vec![make_input(
+            make_fv("target", 0.5, 0.5, 0.0, 1.0, 1.0),
+            None,
+            vec![],
+        )];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        assert!(report.get("target").is_some());
+        assert!(report.get("missing").is_none());
+    }
+
+    #[test]
+    fn scorer_effort_buckets_ordered() {
+        let buckets = [
+            EffortBucket::Trivial,
+            EffortBucket::Small,
+            EffortBucket::Medium,
+            EffortBucket::Large,
+            EffortBucket::Epic,
+        ];
+        for window in buckets.windows(2) {
+            assert!(
+                window[0].score() < window[1].score(),
+                "{:?} ({}) should be less than {:?} ({})",
+                window[0],
+                window[0].score(),
+                window[1],
+                window[1].score()
+            );
+        }
+    }
+
+    #[test]
+    fn scorer_effort_bucket_serde_roundtrip() {
+        for bucket in [
+            EffortBucket::Trivial,
+            EffortBucket::Small,
+            EffortBucket::Medium,
+            EffortBucket::Large,
+            EffortBucket::Epic,
+        ] {
+            let json = serde_json::to_string(&bucket).unwrap();
+            let back: EffortBucket = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, bucket);
+        }
+    }
+
+    #[test]
+    fn scorer_config_serde_roundtrip() {
+        let config = ScorerConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ScorerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, config);
+    }
+
+    #[test]
+    fn scorer_report_serde_roundtrip() {
+        let inputs = vec![
+            make_input(make_fv("a", 0.5, 0.5, 0.0, 1.0, 1.0), None, vec!["safety"]),
+            make_input(make_fv("b", 0.3, 0.3, 0.1, 0.8, 0.9), Some(EffortBucket::Large), vec![]),
+        ];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ScorerReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ranked_ids, report.ranked_ids);
+        assert_eq!(back.scored.len(), 2);
+    }
+
+    #[test]
+    fn scorer_policy_tag_same_as_safety() {
+        let fv_policy = make_fv("policy", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let fv_safety = make_fv("safety", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let config = ScorerConfig::default();
+        let r1 = score_candidates(
+            &[make_input(fv_policy, None, vec!["policy"])],
+            &config,
+        );
+        let r2 = score_candidates(
+            &[make_input(fv_safety, None, vec!["safety"])],
+            &config,
+        );
+        assert!((r1.scored[0].final_score - r2.scored[0].final_score).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scorer_bug_tag_same_as_regression() {
+        let fv_bug = make_fv("bug", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let fv_reg = make_fv("reg", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let config = ScorerConfig::default();
+        let r1 = score_candidates(
+            &[make_input(fv_bug, None, vec!["bug"])],
+            &config,
+        );
+        let r2 = score_candidates(
+            &[make_input(fv_reg, None, vec!["regression"])],
+            &config,
+        );
+        assert!((r1.scored[0].final_score - r2.scored[0].final_score).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scorer_multiple_tags_uses_max_bonus() {
+        // Both safety and regression tags: should use whichever bonus is higher
+        let fv = make_fv("multi", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let inputs = vec![make_input(fv.clone(), None, vec!["safety", "regression"])];
+        let config = ScorerConfig::default();
+        let report = score_candidates(&inputs, &config);
+
+        // safety_bonus (1.15) > regression_bonus (1.10), so multiplier = 1.15
+        let c = &report.scored[0];
+        assert!((c.tag_multiplier - 1.15).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scorer_unknown_tag_ignored() {
+        let fv_tagged = make_fv("tagged", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let fv_plain = make_fv("plain", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let inputs_tagged = vec![make_input(fv_tagged, None, vec!["unknown-tag"])];
+        let inputs_plain = vec![make_input(fv_plain, None, vec![])];
+        let config = ScorerConfig::default();
+        let r1 = score_candidates(&inputs_tagged, &config);
+        let r2 = score_candidates(&inputs_plain, &config);
+        assert!((r1.scored[0].final_score - r2.scored[0].final_score).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scorer_breakdown_components_match() {
+        let fv = make_fv("check", 0.8, 0.6, 0.1, 0.9, 0.95);
+        let inputs = vec![make_input(fv, Some(EffortBucket::Small), vec!["safety"])];
+        let config = ScorerConfig::default();
+        let report = score_candidates(&inputs, &config);
+        let c = &report.scored[0];
+
+        // Verify effort_penalty = effort_weight * effort_score = 0.10 * 0.25 = 0.025
+        assert!((c.effort_penalty - 0.025).abs() < 1e-10);
+        // Verify tag_multiplier = safety_bonus = 1.15
+        assert!((c.tag_multiplier - 1.15).abs() < 1e-10);
+        // final_score = clamp((composite - penalty) * multiplier, 0, 1)
+        let expected = ((c.feature_composite - c.effort_penalty) * c.tag_multiplier).clamp(0.0, 1.0);
+        assert!((c.final_score - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scorer_high_risk_reduces_composite() {
+        // High risk candidate should score lower than low risk
+        let fv_risky = make_fv("risky", 0.5, 0.5, 0.9, 1.0, 1.0);
+        let fv_safe = make_fv("safe", 0.5, 0.5, 0.0, 1.0, 1.0);
+        let inputs = vec![
+            make_input(fv_risky, None, vec![]),
+            make_input(fv_safe, None, vec![]),
+        ];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        let risky = report.get("risky").unwrap();
+        let safe = report.get("safe").unwrap();
+        assert!(risky.feature_composite < safe.feature_composite);
+        assert!(risky.final_score < safe.final_score);
     }
 }
