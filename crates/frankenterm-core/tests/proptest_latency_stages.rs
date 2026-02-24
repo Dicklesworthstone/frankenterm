@@ -4341,3 +4341,207 @@ proptest! {
         prop_assert_eq!(deg, back);
     }
 }
+
+// ── E2: Model-Checking Harness Property Tests ──────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Model checker states_explored increments on each step.
+    #[test]
+    fn mc_states_explored_increments(
+        n in 1_u32..30,
+    ) {
+        let mut mc = ModelChecker::with_defaults();
+        let ok = InvariantCheckResult {
+            predicate_id: "test".to_string(),
+            domain: InvariantDomain::Scheduler,
+            severity: InvariantSeverity::Info,
+            outcome: InvariantOutcome::Satisfied,
+            eval_time_us: 0,
+            timestamp_us: 0,
+        };
+        for i in 0..n {
+            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, &[ok.clone()], i as u64);
+        }
+        prop_assert_eq!(mc.states_explored(), n as u64);
+    }
+
+    /// Counterexample count is monotonically non-decreasing across steps.
+    #[test]
+    fn mc_counterexample_count_monotonic(
+        n_ok in 0_u32..10,
+        n_bad in 0_u32..5,
+    ) {
+        let config = ModelCheckerConfig {
+            exhaustive: true,
+            max_counterexamples: 100,
+            ..Default::default()
+        };
+        let mut mc = ModelChecker::new(config);
+        let ok = InvariantCheckResult {
+            predicate_id: "test".to_string(),
+            domain: InvariantDomain::Scheduler,
+            severity: InvariantSeverity::Info,
+            outcome: InvariantOutcome::Satisfied,
+            eval_time_us: 0,
+            timestamp_us: 0,
+        };
+        let bad = InvariantCheckResult {
+            predicate_id: "test".to_string(),
+            domain: InvariantDomain::Scheduler,
+            severity: InvariantSeverity::Critical,
+            outcome: InvariantOutcome::Violated { counterexample: "x".to_string() },
+            eval_time_us: 0,
+            timestamp_us: 0,
+        };
+        let mut prev_count = 0_usize;
+        for i in 0..n_ok {
+            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, &[ok.clone()], i as u64);
+            let count = mc.counterexample_count();
+            prop_assert!(count >= prev_count);
+            prev_count = count;
+        }
+        for i in 0..n_bad {
+            mc.new_trace();
+            mc.step(TraceAction::EpochAdvance { new_epoch: 100 + i as u64 }, &[bad.clone()], 100 + i as u64);
+            let count = mc.counterexample_count();
+            prop_assert!(count >= prev_count);
+            prev_count = count;
+        }
+    }
+
+    /// Reset clears all model checker state.
+    #[test]
+    fn mc_reset_clears(
+        n in 1_u32..20,
+    ) {
+        let config = ModelCheckerConfig {
+            exhaustive: true,
+            max_counterexamples: 100,
+            ..Default::default()
+        };
+        let mut mc = ModelChecker::new(config);
+        let bad = InvariantCheckResult {
+            predicate_id: "test".to_string(),
+            domain: InvariantDomain::Budget,
+            severity: InvariantSeverity::Critical,
+            outcome: InvariantOutcome::Violated { counterexample: "x".to_string() },
+            eval_time_us: 0,
+            timestamp_us: 0,
+        };
+        for i in 0..n {
+            mc.new_trace();
+            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, &[bad.clone()], i as u64);
+        }
+        mc.reset();
+        prop_assert_eq!(mc.states_explored(), 0);
+        prop_assert_eq!(mc.counterexample_count(), 0);
+        prop_assert_eq!(mc.max_depth_reached(), 0);
+    }
+
+    /// No-violation verdict when all steps satisfy invariants.
+    #[test]
+    fn mc_all_ok_no_violation(
+        n in 1_u32..20,
+    ) {
+        let mut mc = ModelChecker::with_defaults();
+        let ok = InvariantCheckResult {
+            predicate_id: "test".to_string(),
+            domain: InvariantDomain::Scheduler,
+            severity: InvariantSeverity::Info,
+            outcome: InvariantOutcome::Satisfied,
+            eval_time_us: 0,
+            timestamp_us: 0,
+        };
+        for i in 0..n {
+            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, &[ok.clone()], i as u64);
+        }
+        let is_nv = matches!(mc.verdict(), ModelCheckVerdict::NoViolation { .. });
+        prop_assert!(is_nv);
+    }
+
+    /// Violated predicates dedup is correct.
+    #[test]
+    fn mc_violated_predicates_unique(
+        n in 1_u32..10,
+        pred_id in 0_u8..3,
+    ) {
+        let config = ModelCheckerConfig {
+            exhaustive: true,
+            max_counterexamples: 100,
+            ..Default::default()
+        };
+        let mut mc = ModelChecker::new(config);
+        let pred = match pred_id {
+            0 => "a.x",
+            1 => "b.y",
+            _ => "c.z",
+        };
+        let bad = InvariantCheckResult {
+            predicate_id: pred.to_string(),
+            domain: InvariantDomain::Scheduler,
+            severity: InvariantSeverity::Critical,
+            outcome: InvariantOutcome::Violated { counterexample: "x".to_string() },
+            eval_time_us: 0,
+            timestamp_us: 0,
+        };
+        for i in 0..n {
+            mc.new_trace();
+            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, &[bad.clone()], i as u64);
+        }
+        let preds = mc.violated_predicates();
+        // All the same predicate, so only 1 unique
+        prop_assert_eq!(preds.len(), 1);
+        prop_assert_eq!(preds[0].clone(), pred);
+    }
+
+    /// Model checker degradation serde roundtrip.
+    #[test]
+    fn mc_degradation_serde_roundtrip(
+        variant in 0_u8..3,
+        count in 0_usize..20,
+        states in 0_u64..1000,
+    ) {
+        let deg = match variant {
+            0 => ModelCheckerDegradation::Healthy,
+            1 => ModelCheckerDegradation::ViolationsFound { count },
+            _ => ModelCheckerDegradation::HighViolationRate { count, states },
+        };
+        let json = serde_json::to_string(&deg).unwrap();
+        let back: ModelCheckerDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(deg, back);
+    }
+
+    /// Exploration strategy serde roundtrip.
+    #[test]
+    fn mc_strategy_serde_roundtrip(
+        variant in 0_u8..3,
+    ) {
+        let strat = match variant {
+            0 => ExplorationStrategy::BreadthFirst,
+            1 => ExplorationStrategy::RandomWalk,
+            _ => ExplorationStrategy::Guided,
+        };
+        let json = serde_json::to_string(&strat).unwrap();
+        let back: ExplorationStrategy = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(strat, back);
+    }
+
+    /// ModelCheckVerdict serde roundtrip.
+    #[test]
+    fn mc_verdict_serde_roundtrip(
+        variant in 0_u8..3,
+        states in 0_u64..1000,
+        depth in 0_u64..100,
+    ) {
+        let verdict = match variant {
+            0 => ModelCheckVerdict::NoViolation { states_explored: states, depth_reached: depth },
+            1 => ModelCheckVerdict::ViolationsFound { counterexamples: vec![] },
+            _ => ModelCheckVerdict::Incomplete { states_explored: states, reason: "budget".to_string() },
+        };
+        let json = serde_json::to_string(&verdict).unwrap();
+        let back: ModelCheckVerdict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(verdict, back);
+    }
+}
