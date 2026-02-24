@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-use crate::tx_plan_compiler::{CompensationKind, StepRisk, TxPlan, TxStep};
+use crate::tx_plan_compiler::{StepRisk, TxPlan};
 
 // ── Idempotency Key ──────────────────────────────────────────────────────────
 

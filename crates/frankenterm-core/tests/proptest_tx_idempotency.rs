@@ -6,7 +6,7 @@
 #![cfg(feature = "subprocess-bridge")]
 
 use frankenterm_core::tx_idempotency::*;
-use frankenterm_core::tx_plan_compiler::*;
+use frankenterm_core::tx_plan_compiler::{compile_tx_plan, CompilerConfig, PlannerAssignment, StepRisk, TxPlan};
 use proptest::prelude::*;
 
 // ── Strategies ───────────────────────────────────────────────────────────────
@@ -43,15 +43,6 @@ fn arb_step_outcome() -> impl Strategy<Value = StepOutcome> {
             reason: "already done".to_string(),
         }),
         Just(StepOutcome::Pending),
-    ]
-}
-
-fn arb_step_risk() -> impl Strategy<Value = StepRisk> {
-    prop_oneof![
-        Just(StepRisk::Low),
-        Just(StepRisk::Medium),
-        Just(StepRisk::High),
-        Just(StepRisk::Critical),
     ]
 }
 
