@@ -4,19 +4,32 @@
 //! Orchestrates the full planner pipeline:
 //!   readiness → features → scoring → solving → decisions
 //!
+//! ## Conflict Detection (ft-1i2ge.4.5)
+//!
+//! After assignment solving and safety envelope enforcement, the loop can
+//! detect assignment conflicts across two dimensions:
+//!
+//! - **File reservation overlaps**: Two assignments targeting overlapping
+//!   file paths (using wildcard-aware path matching).
+//! - **Concurrent bead claims**: Multiple agents assigned the same bead
+//!   in the same cycle, or a bead already claimed by an active agent.
+//!
+//! Detected conflicts produce structured `DeconflictionMessage` payloads
+//! that the caller dispatches via agent mail or other coordination channels.
+//!
 //! The loop is synchronous and deterministic — it does not spawn threads
 //! or use async. The caller drives the loop by calling `tick()` or `trigger()`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use crate::beads_types::{BeadIssueDetail, BeadReadinessReport};
 use crate::plan::MissionAgentCapabilityProfile;
 use crate::planner_features::{
-    extract_planner_features, score_candidates, solve_assignments, AssignmentSet,
+    extract_planner_features, score_candidates, solve_assignments, Assignment, AssignmentSet,
     PlannerExtractionConfig, PlannerExtractionContext, PlannerExtractionReport,
-    PlannerFeatureVector, RejectedCandidate, RejectionReason, ScorerConfig, ScorerInput,
-    ScorerReport, SolverConfig,
+    RejectedCandidate, RejectionReason, ScorerConfig, ScorerInput, ScorerReport, SolverConfig,
 };
 
 // ── Loop state ──────────────────────────────────────────────────────────────
@@ -61,6 +74,14 @@ fn default_risky_label_markers() -> Vec<String> {
     ]
 }
 
+fn default_metrics_workspace_label() -> String {
+    "default".to_string()
+}
+
+fn default_metrics_track_label() -> String {
+    "mission".to_string()
+}
+
 impl Default for MissionSafetyEnvelopeConfig {
     fn default() -> Self {
         Self {
@@ -68,6 +89,166 @@ impl Default for MissionSafetyEnvelopeConfig {
             max_risky_assignments_per_cycle: 2,
             max_consecutive_retries_per_bead: 3,
             risky_label_markers: default_risky_label_markers(),
+        }
+    }
+}
+
+/// Dimension labels for mission metrics segmentation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionMetricsLabels {
+    #[serde(default = "default_metrics_workspace_label")]
+    pub workspace: String,
+    #[serde(default = "default_metrics_track_label")]
+    pub track: String,
+}
+
+impl Default for MissionMetricsLabels {
+    fn default() -> Self {
+        Self {
+            workspace: default_metrics_workspace_label(),
+            track: default_metrics_track_label(),
+        }
+    }
+}
+
+/// Mission metrics instrumentation configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionMetricsConfig {
+    /// Enable or disable mission metrics collection.
+    pub enabled: bool,
+    /// Maximum retained cycle samples (bounded memory/overhead).
+    pub max_samples: usize,
+    /// Segmentation labels carried with each sample.
+    #[serde(default)]
+    pub labels: MissionMetricsLabels,
+}
+
+impl Default for MissionMetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_samples: 256,
+            labels: MissionMetricsLabels::default(),
+        }
+    }
+}
+
+// ── Conflict detection (ft-1i2ge.4.5) ──────────────────────────────────────
+
+/// Strategy for auto-resolving assignment conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeconflictionStrategy {
+    /// Higher-priority (lower numeric value) assignment wins.
+    PriorityWins,
+    /// First claim (earlier timestamp) wins.
+    FirstClaimWins,
+    /// Surface to operator for manual resolution.
+    ManualResolution,
+}
+
+/// The kind of detected assignment conflict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictType {
+    /// Two assignments touch overlapping file paths.
+    FileReservationOverlap,
+    /// Multiple agents assigned the same bead in one cycle.
+    ConcurrentBeadClaim,
+    /// An assignment targets a bead already actively claimed.
+    ActiveClaimCollision,
+}
+
+/// How a conflict was resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictResolution {
+    /// Auto-resolved: winner keeps assignment, loser is rejected.
+    AutoResolved {
+        winner_agent: String,
+        loser_agent: String,
+        strategy: DeconflictionStrategy,
+    },
+    /// Deferred: both assignments held, retry after specified time.
+    Deferred { retry_after_ms: i64 },
+    /// Requires manual operator resolution.
+    PendingManualResolution,
+}
+
+/// A detected assignment conflict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssignmentConflict {
+    pub conflict_id: String,
+    pub conflict_type: ConflictType,
+    pub involved_agents: Vec<String>,
+    pub involved_beads: Vec<String>,
+    pub conflicting_paths: Vec<String>,
+    pub detected_at_ms: i64,
+    pub resolution: ConflictResolution,
+    pub reason_code: String,
+    pub error_code: String,
+}
+
+/// A deconfliction message to be dispatched via agent mail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeconflictionMessage {
+    pub recipient: String,
+    pub subject: String,
+    pub body: String,
+    pub thread_id: String,
+    pub importance: String,
+    pub conflict_id: String,
+}
+
+/// Report from a conflict detection pass.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictDetectionReport {
+    pub cycle_id: u64,
+    pub detected_at_ms: i64,
+    pub conflicts: Vec<AssignmentConflict>,
+    pub messages: Vec<DeconflictionMessage>,
+    pub auto_resolved_count: usize,
+    pub pending_resolution_count: usize,
+}
+
+/// Known reservation held by an agent (for conflict detection input).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnownReservation {
+    pub holder: String,
+    pub paths: Vec<String>,
+    pub exclusive: bool,
+    pub bead_id: Option<String>,
+    pub expires_at_ms: Option<i64>,
+}
+
+/// Known active claim on a bead (for active-claim collision detection).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveBeadClaim {
+    pub bead_id: String,
+    pub agent_id: String,
+    pub claimed_at_ms: i64,
+}
+
+/// Configuration for conflict detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictDetectionConfig {
+    /// Enable conflict detection. When disabled, `detect_conflicts` is a no-op.
+    pub enabled: bool,
+    /// Maximum conflicts to surface per cycle (prevents flood).
+    pub max_conflicts_per_cycle: usize,
+    /// Strategy for auto-resolving detected conflicts.
+    pub strategy: DeconflictionStrategy,
+    /// Whether to include deconfliction messages in the report.
+    pub generate_messages: bool,
+}
+
+impl Default for ConflictDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_conflicts_per_cycle: 20,
+            strategy: DeconflictionStrategy::PriorityWins,
+            generate_messages: true,
         }
     }
 }
@@ -90,6 +271,12 @@ pub struct MissionLoopConfig {
     /// Mission-level envelope caps for safety and anti-thrash behavior.
     #[serde(default)]
     pub safety_envelope: MissionSafetyEnvelopeConfig,
+    /// Mission-level instrumentation and rate metrics.
+    #[serde(default)]
+    pub metrics: MissionMetricsConfig,
+    /// Conflict detection and deconfliction messaging.
+    #[serde(default)]
+    pub conflict_detection: ConflictDetectionConfig,
 }
 
 impl Default for MissionLoopConfig {
@@ -102,6 +289,8 @@ impl Default for MissionLoopConfig {
             solver_config: SolverConfig::default(),
             include_blocked_in_extraction: false,
             safety_envelope: MissionSafetyEnvelopeConfig::default(),
+            metrics: MissionMetricsConfig::default(),
+            conflict_detection: ConflictDetectionConfig::default(),
         }
     }
 }
@@ -133,6 +322,43 @@ pub struct ScorerSummary {
     pub top_scored_bead: Option<String>,
 }
 
+/// Aggregate mission metrics counters retained in loop state.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MissionMetricsTotals {
+    pub cycles: u64,
+    pub assignments: u64,
+    pub rejections: u64,
+    pub conflict_rejections: u64,
+    pub policy_denials: u64,
+    pub unblocked_transitions: u64,
+    pub planner_churn_events: u64,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub assignments_by_agent: HashMap<String, u64>,
+}
+
+/// Per-cycle mission metrics sample.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionCycleMetricsSample {
+    pub cycle_id: u64,
+    pub timestamp_ms: i64,
+    pub evaluation_latency_ms: u64,
+    pub assignments: usize,
+    pub rejections: usize,
+    pub conflict_rejections: usize,
+    pub policy_denials: usize,
+    pub unblocked_transitions: usize,
+    pub planner_churn_events: usize,
+    pub throughput_assignments_per_minute: f64,
+    pub unblock_velocity_per_minute: f64,
+    pub conflict_rate: f64,
+    pub planner_churn_rate: f64,
+    pub policy_deny_rate: f64,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub assignments_by_agent: HashMap<String, u64>,
+    pub workspace_label: String,
+    pub track_label: String,
+}
+
 /// Snapshot of the loop's internal state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissionLoopState {
@@ -145,6 +371,27 @@ pub struct MissionLoopState {
     /// Consecutive assignment streaks by bead id (used for retry-storm limiting).
     #[serde(default)]
     pub retry_streaks: HashMap<String, u32>,
+    /// Bounded per-cycle metrics samples.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics_history: Vec<MissionCycleMetricsSample>,
+    /// Aggregate totals over all evaluated cycles.
+    #[serde(default)]
+    pub metrics_totals: MissionMetricsTotals,
+    /// Previous cycle ready set for unblock velocity accounting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_ready_ids: Vec<String>,
+    /// Previous cycle assignment map for planner churn accounting.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub previous_assignment_by_bead: HashMap<String, String>,
+    /// Conflict history from recent detection passes (bounded).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_history: Vec<AssignmentConflict>,
+    /// Total conflicts detected across all cycles.
+    #[serde(default)]
+    pub total_conflicts_detected: u64,
+    /// Total auto-resolved conflicts.
+    #[serde(default)]
+    pub total_conflicts_auto_resolved: u64,
 }
 
 // ── Mission loop engine ─────────────────────────────────────────────────────
@@ -172,6 +419,13 @@ impl MissionLoop {
                 total_assignments_made: 0,
                 total_rejections: 0,
                 retry_streaks: HashMap::new(),
+                metrics_history: Vec::new(),
+                metrics_totals: MissionMetricsTotals::default(),
+                previous_ready_ids: Vec::new(),
+                previous_assignment_by_bead: HashMap::new(),
+                conflict_history: Vec::new(),
+                total_conflicts_detected: 0,
+                total_conflicts_auto_resolved: 0,
             },
         }
     }
@@ -186,6 +440,12 @@ impl MissionLoop {
     #[must_use]
     pub fn state(&self) -> &MissionLoopState {
         &self.state
+    }
+
+    /// Latest recorded mission metrics sample.
+    #[must_use]
+    pub fn latest_metrics(&self) -> Option<&MissionCycleMetricsSample> {
+        self.state.metrics_history.last()
     }
 
     /// Enqueue a trigger event for the next evaluation.
@@ -247,6 +507,8 @@ impl MissionLoop {
         agents: &[MissionAgentCapabilityProfile],
         context: &PlannerExtractionContext,
     ) -> MissionDecision {
+        let eval_started = Instant::now();
+        let previous_evaluation_ms = self.state.last_evaluation_ms;
         self.state.cycle_count += 1;
         let cycle_id = self.state.cycle_count;
 
@@ -312,6 +574,16 @@ impl MissionLoop {
         self.state.total_rejections += assignment_set.rejected.len() as u64;
         self.state.last_evaluation_ms = Some(current_ms);
         self.state.pending_triggers.clear();
+        let evaluation_latency_ms =
+            eval_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        self.record_cycle_metrics(
+            cycle_id,
+            current_ms,
+            previous_evaluation_ms,
+            &readiness,
+            &assignment_set,
+            evaluation_latency_ms,
+        );
 
         let decision = MissionDecision {
             cycle_id,
@@ -424,6 +696,740 @@ impl MissionLoop {
                 .any(|marker| normalized_label.contains(&marker.to_ascii_lowercase()))
         })
     }
+
+    fn record_cycle_metrics(
+        &mut self,
+        cycle_id: u64,
+        current_ms: i64,
+        previous_evaluation_ms: Option<i64>,
+        readiness: &BeadReadinessReport,
+        assignment_set: &AssignmentSet,
+        evaluation_latency_ms: u64,
+    ) {
+        if !self.config.metrics.enabled {
+            return;
+        }
+
+        let mut assignments_by_agent: HashMap<String, u64> = HashMap::new();
+        for assignment in &assignment_set.assignments {
+            *assignments_by_agent
+                .entry(assignment.agent_id.clone())
+                .or_insert(0) += 1;
+        }
+
+        let conflict_rejections = assignment_set
+            .rejected
+            .iter()
+            .filter(|rejected| {
+                rejected
+                    .reasons
+                    .iter()
+                    .any(|reason| matches!(reason, RejectionReason::ConflictWithAssigned { .. }))
+            })
+            .count();
+
+        let policy_denials = assignment_set
+            .rejected
+            .iter()
+            .filter(|rejected| {
+                rejected
+                    .reasons
+                    .iter()
+                    .any(|reason| matches!(reason, RejectionReason::SafetyGateDenied { .. }))
+            })
+            .count();
+
+        let current_assignment_by_bead: HashMap<String, String> = assignment_set
+            .assignments
+            .iter()
+            .map(|assignment| (assignment.bead_id.clone(), assignment.agent_id.clone()))
+            .collect();
+
+        let previous_assignment_keys: HashSet<&String> =
+            self.state.previous_assignment_by_bead.keys().collect();
+        let current_assignment_keys: HashSet<&String> = current_assignment_by_bead.keys().collect();
+        let union_assignment_keys: HashSet<&String> = previous_assignment_keys
+            .union(&current_assignment_keys)
+            .copied()
+            .collect();
+        let planner_churn_events = union_assignment_keys
+            .iter()
+            .filter(|bead_id| {
+                self.state.previous_assignment_by_bead.get(**bead_id)
+                    != current_assignment_by_bead.get(**bead_id)
+            })
+            .count();
+        let planner_churn_denominator = union_assignment_keys.len();
+
+        let previous_ready_ids: HashSet<&String> = self.state.previous_ready_ids.iter().collect();
+        let current_ready_ids: HashSet<&String> = readiness.ready_ids.iter().collect();
+        let unblocked_transitions = if previous_evaluation_ms.is_none() {
+            0
+        } else {
+            current_ready_ids
+                .difference(&previous_ready_ids)
+                .copied()
+                .count()
+        };
+
+        let interval_ms = previous_evaluation_ms
+            .and_then(|last| {
+                if current_ms > last {
+                    Some((current_ms - last) as u64)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let throughput_assignments_per_minute = if interval_ms > 0 {
+            (assignment_set.assignments.len() as f64) * 60_000.0 / interval_ms as f64
+        } else {
+            assignment_set.assignments.len() as f64
+        };
+        let unblock_velocity_per_minute = if interval_ms > 0 {
+            (unblocked_transitions as f64) * 60_000.0 / interval_ms as f64
+        } else {
+            0.0
+        };
+
+        let total_considered = assignment_set.assignments.len() + assignment_set.rejected.len();
+        let conflict_rate = if total_considered > 0 {
+            conflict_rejections as f64 / total_considered as f64
+        } else {
+            0.0
+        };
+        let policy_deny_rate = if assignment_set.rejected.is_empty() {
+            0.0
+        } else {
+            policy_denials as f64 / assignment_set.rejected.len() as f64
+        };
+        let planner_churn_rate = if planner_churn_denominator > 0 {
+            planner_churn_events as f64 / planner_churn_denominator as f64
+        } else {
+            0.0
+        };
+
+        let sample = MissionCycleMetricsSample {
+            cycle_id,
+            timestamp_ms: current_ms,
+            evaluation_latency_ms,
+            assignments: assignment_set.assignments.len(),
+            rejections: assignment_set.rejected.len(),
+            conflict_rejections,
+            policy_denials,
+            unblocked_transitions,
+            planner_churn_events,
+            throughput_assignments_per_minute,
+            unblock_velocity_per_minute,
+            conflict_rate,
+            planner_churn_rate,
+            policy_deny_rate,
+            assignments_by_agent: assignments_by_agent.clone(),
+            workspace_label: self.config.metrics.labels.workspace.clone(),
+            track_label: self.config.metrics.labels.track.clone(),
+        };
+
+        self.state.metrics_totals.cycles = self.state.metrics_totals.cycles.saturating_add(1);
+        self.state.metrics_totals.assignments = self
+            .state
+            .metrics_totals
+            .assignments
+            .saturating_add(assignment_set.assignments.len() as u64);
+        self.state.metrics_totals.rejections = self
+            .state
+            .metrics_totals
+            .rejections
+            .saturating_add(assignment_set.rejected.len() as u64);
+        self.state.metrics_totals.conflict_rejections = self
+            .state
+            .metrics_totals
+            .conflict_rejections
+            .saturating_add(conflict_rejections as u64);
+        self.state.metrics_totals.policy_denials = self
+            .state
+            .metrics_totals
+            .policy_denials
+            .saturating_add(policy_denials as u64);
+        self.state.metrics_totals.unblocked_transitions = self
+            .state
+            .metrics_totals
+            .unblocked_transitions
+            .saturating_add(unblocked_transitions as u64);
+        self.state.metrics_totals.planner_churn_events = self
+            .state
+            .metrics_totals
+            .planner_churn_events
+            .saturating_add(planner_churn_events as u64);
+
+        for (agent_id, assignment_count) in assignments_by_agent {
+            *self
+                .state
+                .metrics_totals
+                .assignments_by_agent
+                .entry(agent_id)
+                .or_insert(0) += assignment_count;
+        }
+
+        let max_samples = self.config.metrics.max_samples.max(1);
+        if self.state.metrics_history.len() >= max_samples {
+            self.state.metrics_history.remove(0);
+        }
+        self.state.metrics_history.push(sample);
+        self.state.previous_ready_ids = readiness.ready_ids.clone();
+        self.state.previous_assignment_by_bead = current_assignment_by_bead;
+    }
+
+    // ── Conflict detection (ft-1i2ge.4.5) ──────────────────────────────────
+
+    /// Detect assignment conflicts across file reservations and bead claims.
+    ///
+    /// This should be called after `evaluate()` with the current set of known
+    /// reservations and active claims. The report contains structured conflict
+    /// descriptions and ready-to-send deconfliction messages.
+    pub fn detect_conflicts(
+        &mut self,
+        assignment_set: &AssignmentSet,
+        known_reservations: &[KnownReservation],
+        active_claims: &[ActiveBeadClaim],
+        current_ms: i64,
+        issues: &[BeadIssueDetail],
+    ) -> ConflictDetectionReport {
+        let config = &self.config.conflict_detection;
+        if !config.enabled {
+            return ConflictDetectionReport {
+                cycle_id: self.state.cycle_count,
+                detected_at_ms: current_ms,
+                conflicts: Vec::new(),
+                messages: Vec::new(),
+                auto_resolved_count: 0,
+                pending_resolution_count: 0,
+            };
+        }
+
+        let mut conflicts = Vec::new();
+        let max = config.max_conflicts_per_cycle;
+
+        // Phase 1: Detect file reservation overlaps between assignments and
+        // existing reservations.
+        self.detect_reservation_overlaps(
+            assignment_set,
+            known_reservations,
+            current_ms,
+            &mut conflicts,
+            max,
+            issues,
+        );
+
+        // Phase 2: Detect concurrent bead claims (same bead assigned to
+        // multiple agents in this cycle).
+        if conflicts.len() < max {
+            self.detect_concurrent_bead_claims(
+                assignment_set,
+                current_ms,
+                &mut conflicts,
+                max,
+                issues,
+            );
+        }
+
+        // Phase 3: Detect collisions with active bead claims from previous
+        // cycles / external state.
+        if conflicts.len() < max {
+            self.detect_active_claim_collisions(
+                assignment_set,
+                active_claims,
+                current_ms,
+                &mut conflicts,
+                max,
+                issues,
+            );
+        }
+
+        // Generate deconfliction messages.
+        let messages = if config.generate_messages {
+            conflicts
+                .iter()
+                .flat_map(|c| generate_conflict_messages(c))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let auto_resolved_count = conflicts
+            .iter()
+            .filter(|c| matches!(c.resolution, ConflictResolution::AutoResolved { .. }))
+            .count();
+        let pending_resolution_count = conflicts
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.resolution,
+                    ConflictResolution::PendingManualResolution
+                        | ConflictResolution::Deferred { .. }
+                )
+            })
+            .count();
+
+        // Update state totals.
+        self.state.total_conflicts_detected += conflicts.len() as u64;
+        self.state.total_conflicts_auto_resolved += auto_resolved_count as u64;
+
+        // Append to conflict history (bounded).
+        let history_max = self.config.conflict_detection.max_conflicts_per_cycle * 4;
+        for conflict in &conflicts {
+            if self.state.conflict_history.len() >= history_max {
+                self.state.conflict_history.remove(0);
+            }
+            self.state.conflict_history.push(conflict.clone());
+        }
+
+        ConflictDetectionReport {
+            cycle_id: self.state.cycle_count,
+            detected_at_ms: current_ms,
+            conflicts,
+            messages,
+            auto_resolved_count,
+            pending_resolution_count,
+        }
+    }
+
+    /// Latest conflict detection report summary.
+    #[must_use]
+    pub fn conflict_stats(&self) -> (u64, u64) {
+        (
+            self.state.total_conflicts_detected,
+            self.state.total_conflicts_auto_resolved,
+        )
+    }
+
+    fn detect_reservation_overlaps(
+        &self,
+        assignment_set: &AssignmentSet,
+        known_reservations: &[KnownReservation],
+        current_ms: i64,
+        conflicts: &mut Vec<AssignmentConflict>,
+        max: usize,
+        issues: &[BeadIssueDetail],
+    ) {
+        // For each assignment, check if any known exclusive reservation
+        // from a *different* agent overlaps with the assignment's likely
+        // file surface (derived from bead labels/paths).
+        for assignment in &assignment_set.assignments {
+            if conflicts.len() >= max {
+                break;
+            }
+            // Derive file paths for this assignment from bead labels or
+            // reservations that share the same bead_id.
+            let assignment_paths: Vec<String> = known_reservations
+                .iter()
+                .filter(|r| {
+                    r.bead_id.as_deref() == Some(assignment.bead_id.as_str())
+                        && r.holder == assignment.agent_id
+                })
+                .flat_map(|r| r.paths.clone())
+                .collect();
+
+            if assignment_paths.is_empty() {
+                continue;
+            }
+
+            for reservation in known_reservations {
+                if conflicts.len() >= max {
+                    break;
+                }
+                // Skip non-exclusive, expired, or same-agent reservations.
+                if !reservation.exclusive {
+                    continue;
+                }
+                if reservation.holder == assignment.agent_id {
+                    continue;
+                }
+                if let Some(exp) = reservation.expires_at_ms {
+                    if exp <= current_ms {
+                        continue;
+                    }
+                }
+
+                let overlapping: Vec<String> = assignment_paths
+                    .iter()
+                    .filter(|p| {
+                        reservation
+                            .paths
+                            .iter()
+                            .any(|rp| paths_overlap(p, rp))
+                    })
+                    .cloned()
+                    .collect();
+
+                if !overlapping.is_empty() {
+                    let resolution = resolve_conflict(
+                        self.config.conflict_detection.strategy,
+                        &assignment.agent_id,
+                        &reservation.holder,
+                        assignment.score,
+                        0.0, // existing reservation holder has no score context
+                        &assignment.bead_id,
+                        reservation.bead_id.as_deref().unwrap_or("unknown"),
+                        issues,
+                    );
+
+                    let conflict_id = format!(
+                        "conflict-res-{}-{}-{}",
+                        self.state.cycle_count, assignment.bead_id, reservation.holder
+                    );
+                    conflicts.push(AssignmentConflict {
+                        conflict_id,
+                        conflict_type: ConflictType::FileReservationOverlap,
+                        involved_agents: vec![
+                            assignment.agent_id.clone(),
+                            reservation.holder.clone(),
+                        ],
+                        involved_beads: {
+                            let mut beads = vec![assignment.bead_id.clone()];
+                            if let Some(ref bid) = reservation.bead_id {
+                                if !beads.contains(bid) {
+                                    beads.push(bid.clone());
+                                }
+                            }
+                            beads
+                        },
+                        conflicting_paths: overlapping,
+                        detected_at_ms: current_ms,
+                        resolution,
+                        reason_code: "reservation_overlap".to_string(),
+                        error_code: "FTM2001".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn detect_concurrent_bead_claims(
+        &self,
+        assignment_set: &AssignmentSet,
+        current_ms: i64,
+        conflicts: &mut Vec<AssignmentConflict>,
+        max: usize,
+        issues: &[BeadIssueDetail],
+    ) {
+        // Group assignments by bead_id.
+        let mut by_bead: HashMap<&str, Vec<&Assignment>> = HashMap::new();
+        for assignment in &assignment_set.assignments {
+            by_bead
+                .entry(assignment.bead_id.as_str())
+                .or_default()
+                .push(assignment);
+        }
+
+        for (bead_id, bead_agents) in &by_bead {
+            if bead_agents.len() <= 1 || conflicts.len() >= max {
+                continue;
+            }
+            // Multiple agents assigned to the same bead — conflict.
+
+            // Auto-resolve: highest score wins.
+            let winner = bead_agents
+                .iter()
+                .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap();
+            let losers: Vec<&str> = bead_agents
+                .iter()
+                .filter(|a| a.agent_id != winner.agent_id)
+                .map(|a| a.agent_id.as_str())
+                .collect();
+
+            for loser in &losers {
+                if conflicts.len() >= max {
+                    break;
+                }
+                let loser_score = bead_agents
+                    .iter()
+                    .find(|a| a.agent_id == *loser)
+                    .map(|a| a.score)
+                    .unwrap_or(0.0);
+
+                let resolution = resolve_conflict(
+                    self.config.conflict_detection.strategy,
+                    &winner.agent_id,
+                    loser,
+                    winner.score,
+                    loser_score,
+                    bead_id,
+                    bead_id,
+                    issues,
+                );
+
+                let conflict_id = format!(
+                    "conflict-bead-{}-{}-{}",
+                    self.state.cycle_count, bead_id, loser
+                );
+                conflicts.push(AssignmentConflict {
+                    conflict_id,
+                    conflict_type: ConflictType::ConcurrentBeadClaim,
+                    involved_agents: vec![winner.agent_id.clone(), loser.to_string()],
+                    involved_beads: vec![bead_id.to_string()],
+                    conflicting_paths: Vec::new(),
+                    detected_at_ms: current_ms,
+                    resolution,
+                    reason_code: "concurrent_bead_claim".to_string(),
+                    error_code: "FTM2002".to_string(),
+                });
+            }
+        }
+    }
+
+    fn detect_active_claim_collisions(
+        &self,
+        assignment_set: &AssignmentSet,
+        active_claims: &[ActiveBeadClaim],
+        current_ms: i64,
+        conflicts: &mut Vec<AssignmentConflict>,
+        max: usize,
+        issues: &[BeadIssueDetail],
+    ) {
+        for assignment in &assignment_set.assignments {
+            if conflicts.len() >= max {
+                break;
+            }
+            // Check if the bead is already claimed by a different agent.
+            if let Some(existing) = active_claims
+                .iter()
+                .find(|c| c.bead_id == assignment.bead_id && c.agent_id != assignment.agent_id)
+            {
+                let resolution = resolve_conflict(
+                    self.config.conflict_detection.strategy,
+                    &assignment.agent_id,
+                    &existing.agent_id,
+                    assignment.score,
+                    0.0,
+                    &assignment.bead_id,
+                    &existing.bead_id,
+                    issues,
+                );
+
+                let conflict_id = format!(
+                    "conflict-active-{}-{}-{}",
+                    self.state.cycle_count, assignment.bead_id, existing.agent_id
+                );
+                conflicts.push(AssignmentConflict {
+                    conflict_id,
+                    conflict_type: ConflictType::ActiveClaimCollision,
+                    involved_agents: vec![
+                        assignment.agent_id.clone(),
+                        existing.agent_id.clone(),
+                    ],
+                    involved_beads: vec![assignment.bead_id.clone()],
+                    conflicting_paths: Vec::new(),
+                    detected_at_ms: current_ms,
+                    resolution,
+                    reason_code: "active_claim_collision".to_string(),
+                    error_code: "FTM2003".to_string(),
+                });
+            }
+        }
+    }
+}
+
+// ── Free functions for conflict resolution ──────────────────────────────────
+
+/// Check if two file paths overlap (bidirectional wildcard matching).
+fn paths_overlap(a: &str, b: &str) -> bool {
+    // Exact match.
+    if a == b {
+        return true;
+    }
+    // One is a prefix of the other (directory containment).
+    let a_norm = a.trim_end_matches('/');
+    let b_norm = b.trim_end_matches('/');
+    if a_norm.starts_with(b_norm) || b_norm.starts_with(a_norm) {
+        // Check boundary: must be at a `/` or end.
+        let (shorter, longer) = if a_norm.len() <= b_norm.len() {
+            (a_norm, b_norm)
+        } else {
+            (b_norm, a_norm)
+        };
+        if longer.len() == shorter.len() {
+            return true;
+        }
+        let next_char = longer.as_bytes().get(shorter.len());
+        if next_char == Some(&b'/') {
+            return true;
+        }
+    }
+    // Wildcard matching (bidirectional).
+    wildcard_match(a, b) || wildcard_match(b, a)
+}
+
+/// Simple wildcard path matching: `*` matches any sequence, `?` matches one char.
+fn wildcard_match(pattern: &str, candidate: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let c: Vec<char> = candidate.chars().collect();
+    let (pn, cn) = (p.len(), c.len());
+
+    // DP: dp[i][j] = pattern[0..i] matches candidate[0..j]
+    let mut dp = vec![vec![false; cn + 1]; pn + 1];
+    dp[0][0] = true;
+
+    // Leading `*` in pattern can match empty.
+    for i in 1..=pn {
+        if p[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        } else {
+            break;
+        }
+    }
+
+    for i in 1..=pn {
+        for j in 1..=cn {
+            if p[i - 1] == '*' {
+                // `*` matches zero chars (dp[i-1][j]) or one more char (dp[i][j-1]).
+                dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+            } else if p[i - 1] == '?' || p[i - 1] == c[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1];
+            }
+        }
+    }
+
+    dp[pn][cn]
+}
+
+/// Resolve a conflict using the configured strategy.
+fn resolve_conflict(
+    strategy: DeconflictionStrategy,
+    agent_a: &str,
+    agent_b: &str,
+    score_a: f64,
+    score_b: f64,
+    bead_a: &str,
+    bead_b: &str,
+    issues: &[BeadIssueDetail],
+) -> ConflictResolution {
+    match strategy {
+        DeconflictionStrategy::PriorityWins => {
+            // Lower priority number = higher priority.
+            let pri_a = issues
+                .iter()
+                .find(|i| i.id == bead_a)
+                .map(|i| i.priority)
+                .unwrap_or(u8::MAX);
+            let pri_b = issues
+                .iter()
+                .find(|i| i.id == bead_b)
+                .map(|i| i.priority)
+                .unwrap_or(u8::MAX);
+
+            if pri_a < pri_b || (pri_a == pri_b && score_a >= score_b) {
+                ConflictResolution::AutoResolved {
+                    winner_agent: agent_a.to_string(),
+                    loser_agent: agent_b.to_string(),
+                    strategy,
+                }
+            } else {
+                ConflictResolution::AutoResolved {
+                    winner_agent: agent_b.to_string(),
+                    loser_agent: agent_a.to_string(),
+                    strategy,
+                }
+            }
+        }
+        DeconflictionStrategy::FirstClaimWins => {
+            // Agent B is the existing holder — they win.
+            ConflictResolution::AutoResolved {
+                winner_agent: agent_b.to_string(),
+                loser_agent: agent_a.to_string(),
+                strategy,
+            }
+        }
+        DeconflictionStrategy::ManualResolution => ConflictResolution::PendingManualResolution,
+    }
+}
+
+/// Generate deconfliction messages for a conflict.
+fn generate_conflict_messages(conflict: &AssignmentConflict) -> Vec<DeconflictionMessage> {
+    let mut messages = Vec::new();
+
+    let conflict_desc = match conflict.conflict_type {
+        ConflictType::FileReservationOverlap => {
+            format!(
+                "File reservation overlap on: {}",
+                conflict.conflicting_paths.join(", ")
+            )
+        }
+        ConflictType::ConcurrentBeadClaim => {
+            format!(
+                "Concurrent claim on bead(s): {}",
+                conflict.involved_beads.join(", ")
+            )
+        }
+        ConflictType::ActiveClaimCollision => {
+            format!(
+                "Collision with active claim on bead(s): {}",
+                conflict.involved_beads.join(", ")
+            )
+        }
+    };
+
+    let resolution_desc = match &conflict.resolution {
+        ConflictResolution::AutoResolved {
+            winner_agent,
+            loser_agent,
+            strategy,
+        } => {
+            format!(
+                "Auto-resolved ({:?}): **{}** retains assignment, **{}** should yield.",
+                strategy, winner_agent, loser_agent
+            )
+        }
+        ConflictResolution::Deferred { retry_after_ms } => {
+            format!(
+                "Deferred: both assignments held. Retry after {}ms.",
+                retry_after_ms
+            )
+        }
+        ConflictResolution::PendingManualResolution => {
+            "Pending manual resolution by operator.".to_string()
+        }
+    };
+
+    let body = format!(
+        "**Conflict detected** ({})\n\n{}\n\nBeads: {}\nAgents: {}\n\n**Resolution:** {}\n\nReason: `{}` | Error: `{}`",
+        conflict.conflict_id,
+        conflict_desc,
+        conflict.involved_beads.join(", "),
+        conflict.involved_agents.join(", "),
+        resolution_desc,
+        conflict.reason_code,
+        conflict.error_code,
+    );
+
+    let thread_id = conflict
+        .involved_beads
+        .first()
+        .cloned()
+        .unwrap_or_else(|| conflict.conflict_id.clone());
+
+    // Send to all involved agents.
+    for agent in &conflict.involved_agents {
+        messages.push(DeconflictionMessage {
+            recipient: agent.clone(),
+            subject: format!(
+                "[conflict] {} on {}",
+                conflict.reason_code,
+                conflict.involved_beads.join(", ")
+            ),
+            body: body.clone(),
+            thread_id: thread_id.clone(),
+            importance: match conflict.conflict_type {
+                ConflictType::FileReservationOverlap => "high".to_string(),
+                ConflictType::ConcurrentBeadClaim => "high".to_string(),
+                ConflictType::ActiveClaimCollision => "normal".to_string(),
+            },
+            conflict_id: conflict.conflict_id.clone(),
+        });
+    }
+
+    messages
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -685,6 +1691,149 @@ mod tests {
     }
 
     #[test]
+    fn loop_metrics_capture_labels_latency_and_throughput() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            metrics: MissionMetricsConfig {
+                enabled: true,
+                max_samples: 8,
+                labels: MissionMetricsLabels {
+                    workspace: "ws-main".to_string(),
+                    track: "f1-mission".to_string(),
+                },
+            },
+            ..MissionLoopConfig::default()
+        });
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+        ];
+        let agents = vec![ready_agent("agent-a"), ready_agent("agent-b")];
+        let ctx = PlannerExtractionContext::default();
+
+        ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+        ml.evaluate(7000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        let latest = ml.latest_metrics().expect("metrics sample must exist");
+        assert_eq!(latest.workspace_label, "ws-main");
+        assert_eq!(latest.track_label, "f1-mission");
+        assert_eq!(ml.state().metrics_totals.cycles, 2);
+        assert!(latest.throughput_assignments_per_minute >= 0.0);
+        assert!(!latest.assignments_by_agent.is_empty());
+    }
+
+    #[test]
+    fn loop_metrics_track_unblock_velocity_from_state_transitions() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let mut issues = vec![
+            sample_detail("blocker", BeadStatus::Open, 0, &[]),
+            sample_detail("blocked", BeadStatus::Open, 1, &[("blocker", "blocks")]),
+        ];
+        let agents = vec![ready_agent("agent-a")];
+        let ctx = PlannerExtractionContext::default();
+
+        ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+        issues[0].status = BeadStatus::Closed;
+        ml.evaluate(7000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        let latest = ml.latest_metrics().expect("metrics sample must exist");
+        assert_eq!(latest.unblocked_transitions, 1);
+        assert!(latest.unblock_velocity_per_minute > 0.0);
+    }
+
+    #[test]
+    fn loop_metrics_capture_conflict_and_policy_deny_rates() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            solver_config: SolverConfig {
+                min_score: 0.0,
+                max_assignments: 10,
+                safety_gates: vec![crate::planner_features::SafetyGate {
+                    name: "deny-c".to_string(),
+                    denied_bead_ids: vec!["c".to_string()],
+                }],
+                conflicts: vec![crate::planner_features::ConflictPair {
+                    bead_a: "a".to_string(),
+                    bead_b: "b".to_string(),
+                }],
+            },
+            ..MissionLoopConfig::default()
+        });
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+            sample_detail("c", BeadStatus::Open, 2, &[]),
+        ];
+        let agents = vec![ready_agent("agent-a"), ready_agent("agent-b")];
+        let ctx = PlannerExtractionContext::default();
+
+        ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        let latest = ml.latest_metrics().expect("metrics sample must exist");
+        assert!(latest.conflict_rejections >= 1);
+        assert!(latest.policy_denials >= 1);
+        assert!(latest.conflict_rate > 0.0);
+        assert!(latest.policy_deny_rate > 0.0);
+    }
+
+    #[test]
+    fn loop_metrics_track_planner_churn_when_assignments_change() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let agents = vec![ready_agent("agent-a")];
+        let ctx = PlannerExtractionContext::default();
+
+        let cycle_one_issues = vec![sample_detail("a", BeadStatus::Open, 0, &[])];
+        ml.evaluate(
+            1000,
+            MissionTrigger::ManualTrigger {
+                reason: "cycle-one".to_string(),
+            },
+            &cycle_one_issues,
+            &agents,
+            &ctx,
+        );
+
+        let cycle_two_issues = vec![
+            sample_detail("a", BeadStatus::Closed, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 0, &[]),
+        ];
+        ml.evaluate(
+            7000,
+            MissionTrigger::ManualTrigger {
+                reason: "cycle-two".to_string(),
+            },
+            &cycle_two_issues,
+            &agents,
+            &ctx,
+        );
+
+        let latest = ml.latest_metrics().expect("metrics sample must exist");
+        assert!(latest.planner_churn_events > 0);
+        assert!(latest.planner_churn_rate > 0.0);
+    }
+
+    #[test]
+    fn loop_metrics_history_is_bounded_by_configured_sampling_limit() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            metrics: MissionMetricsConfig {
+                enabled: true,
+                max_samples: 2,
+                labels: MissionMetricsLabels::default(),
+            },
+            ..MissionLoopConfig::default()
+        });
+        let issues = vec![sample_detail("a", BeadStatus::Open, 0, &[])];
+        let agents = vec![ready_agent("agent-a")];
+        let ctx = PlannerExtractionContext::default();
+
+        ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+        ml.evaluate(7000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+        ml.evaluate(13_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        assert_eq!(ml.state().metrics_history.len(), 2);
+        assert_eq!(ml.state().metrics_history[0].cycle_id, 2);
+        assert_eq!(ml.state().metrics_history[1].cycle_id, 3);
+    }
+
+    #[test]
     fn loop_envelope_limits_assignments_per_cycle() {
         let mut ml = MissionLoop::new(MissionLoopConfig {
             safety_envelope: MissionSafetyEnvelopeConfig {
@@ -866,6 +2015,11 @@ mod tests {
             back.safety_envelope.max_assignments_per_cycle,
             config.safety_envelope.max_assignments_per_cycle
         );
+        assert_eq!(back.metrics.max_samples, config.metrics.max_samples);
+        assert_eq!(
+            back.metrics.labels.workspace,
+            config.metrics.labels.workspace
+        );
     }
 
     #[test]
@@ -917,11 +2071,788 @@ mod tests {
             total_assignments_made: 10,
             total_rejections: 3,
             retry_streaks: HashMap::from([("bead-a".to_string(), 2)]),
+            metrics_history: vec![MissionCycleMetricsSample {
+                cycle_id: 5,
+                timestamp_ms: 1000,
+                evaluation_latency_ms: 2,
+                assignments: 1,
+                rejections: 1,
+                conflict_rejections: 1,
+                policy_denials: 1,
+                unblocked_transitions: 0,
+                planner_churn_events: 1,
+                throughput_assignments_per_minute: 10.0,
+                unblock_velocity_per_minute: 0.0,
+                conflict_rate: 0.5,
+                planner_churn_rate: 1.0,
+                policy_deny_rate: 1.0,
+                assignments_by_agent: HashMap::from([("agent-a".to_string(), 1)]),
+                workspace_label: "default".to_string(),
+                track_label: "mission".to_string(),
+            }],
+            metrics_totals: MissionMetricsTotals {
+                cycles: 5,
+                assignments: 10,
+                rejections: 3,
+                conflict_rejections: 1,
+                policy_denials: 1,
+                unblocked_transitions: 2,
+                planner_churn_events: 4,
+                assignments_by_agent: HashMap::from([("agent-a".to_string(), 10)]),
+            },
+            previous_ready_ids: vec!["bead-a".to_string()],
+            previous_assignment_by_bead: HashMap::from([(
+                "bead-a".to_string(),
+                "agent-a".to_string(),
+            )]),
+            conflict_history: vec![AssignmentConflict {
+                conflict_id: "c1".to_string(),
+                conflict_type: ConflictType::ConcurrentBeadClaim,
+                involved_agents: vec!["a1".to_string(), "a2".to_string()],
+                involved_beads: vec!["bead-x".to_string()],
+                conflicting_paths: Vec::new(),
+                detected_at_ms: 999,
+                resolution: ConflictResolution::AutoResolved {
+                    winner_agent: "a1".to_string(),
+                    loser_agent: "a2".to_string(),
+                    strategy: DeconflictionStrategy::PriorityWins,
+                },
+                reason_code: "concurrent_bead_claim".to_string(),
+                error_code: "FTM2002".to_string(),
+            }],
+            total_conflicts_detected: 1,
+            total_conflicts_auto_resolved: 1,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: MissionLoopState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.cycle_count, 5);
         assert_eq!(back.total_assignments_made, 10);
         assert_eq!(back.retry_streaks.get("bead-a"), Some(&2));
+        assert_eq!(back.metrics_history.len(), 1);
+        assert_eq!(back.metrics_totals.cycles, 5);
+        assert_eq!(
+            back.previous_assignment_by_bead
+                .get("bead-a")
+                .map(String::as_str),
+            Some("agent-a")
+        );
+        assert_eq!(back.conflict_history.len(), 1);
+        assert_eq!(back.total_conflicts_detected, 1);
+        assert_eq!(back.total_conflicts_auto_resolved, 1);
+    }
+
+    // ── Conflict detection tests (ft-1i2ge.4.5) ────────────────────────────
+
+    fn make_assignment(bead_id: &str, agent_id: &str, score: f64) -> Assignment {
+        Assignment {
+            bead_id: bead_id.to_string(),
+            agent_id: agent_id.to_string(),
+            score,
+            rank: 1,
+        }
+    }
+
+    fn make_assignment_set(assignments: Vec<Assignment>) -> AssignmentSet {
+        AssignmentSet {
+            assignments,
+            rejected: Vec::new(),
+            solver_config: SolverConfig::default(),
+        }
+    }
+
+    fn make_reservation(
+        holder: &str,
+        paths: &[&str],
+        bead_id: Option<&str>,
+    ) -> KnownReservation {
+        KnownReservation {
+            holder: holder.to_string(),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            exclusive: true,
+            bead_id: bead_id.map(|b| b.to_string()),
+            expires_at_ms: Some(999_999),
+        }
+    }
+
+    fn make_active_claim(bead_id: &str, agent_id: &str) -> ActiveBeadClaim {
+        ActiveBeadClaim {
+            bead_id: bead_id.to_string(),
+            agent_id: agent_id.to_string(),
+            claimed_at_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn conflict_detection_disabled_returns_empty() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            conflict_detection: ConflictDetectionConfig {
+                enabled: false,
+                ..ConflictDetectionConfig::default()
+            },
+            ..MissionLoopConfig::default()
+        });
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let reservations = vec![make_reservation("agent2", &["src/a.rs"], Some("b"))];
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &[]);
+        assert!(report.conflicts.is_empty());
+        assert!(report.messages.is_empty());
+        assert_eq!(report.auto_resolved_count, 0);
+    }
+
+    #[test]
+    fn conflict_detection_no_overlaps_clean() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let reservations = vec![
+            make_reservation("agent1", &["src/a.rs"], Some("a")),
+            make_reservation("agent2", &["src/b.rs"], Some("b")),
+        ];
+        let issues = vec![sample_detail("a", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
+        assert!(report.conflicts.is_empty());
+    }
+
+    #[test]
+    fn conflict_detection_reservation_overlap_detected() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        // agent1's bead "a" wants src/plan.rs, but agent2 already has it reserved.
+        let reservations = vec![
+            make_reservation("agent1", &["src/plan.rs"], Some("a")),
+            make_reservation("agent2", &["src/plan.rs"], Some("b")),
+        ];
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+        ];
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(
+            report.conflicts[0].conflict_type,
+            ConflictType::FileReservationOverlap
+        );
+        assert_eq!(report.conflicts[0].reason_code, "reservation_overlap");
+        assert_eq!(report.conflicts[0].error_code, "FTM2001");
+        assert!(report.conflicts[0]
+            .conflicting_paths
+            .contains(&"src/plan.rs".to_string()));
+        assert!(report.conflicts[0]
+            .involved_agents
+            .contains(&"agent1".to_string()));
+        assert!(report.conflicts[0]
+            .involved_agents
+            .contains(&"agent2".to_string()));
+    }
+
+    #[test]
+    fn conflict_detection_expired_reservation_ignored() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let reservations = vec![
+            make_reservation("agent1", &["src/plan.rs"], Some("a")),
+            KnownReservation {
+                holder: "agent2".to_string(),
+                paths: vec!["src/plan.rs".to_string()],
+                exclusive: true,
+                bead_id: Some("b".to_string()),
+                expires_at_ms: Some(4000), // expired before current_ms=5000
+            },
+        ];
+        let issues = vec![sample_detail("a", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
+        assert!(report.conflicts.is_empty());
+    }
+
+    #[test]
+    fn conflict_detection_non_exclusive_reservation_ignored() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let reservations = vec![
+            make_reservation("agent1", &["src/plan.rs"], Some("a")),
+            KnownReservation {
+                holder: "agent2".to_string(),
+                paths: vec!["src/plan.rs".to_string()],
+                exclusive: false, // not exclusive
+                bead_id: Some("b".to_string()),
+                expires_at_ms: Some(999_999),
+            },
+        ];
+        let issues = vec![sample_detail("a", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
+        assert!(report.conflicts.is_empty());
+    }
+
+    #[test]
+    fn conflict_detection_same_agent_reservation_no_conflict() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        // Same agent holds both reservations — no conflict.
+        let reservations = vec![
+            make_reservation("agent1", &["src/plan.rs"], Some("a")),
+            make_reservation("agent1", &["src/plan.rs"], Some("b")),
+        ];
+        let issues = vec![sample_detail("a", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
+        assert!(report.conflicts.is_empty());
+    }
+
+    #[test]
+    fn conflict_detection_concurrent_bead_claim() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        // Two agents assigned to the same bead in one cycle.
+        let aset = make_assignment_set(vec![
+            make_assignment("bead-x", "agent1", 1.0),
+            make_assignment("bead-x", "agent2", 0.5),
+        ]);
+        let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(
+            report.conflicts[0].conflict_type,
+            ConflictType::ConcurrentBeadClaim
+        );
+        assert_eq!(report.conflicts[0].reason_code, "concurrent_bead_claim");
+        assert_eq!(report.conflicts[0].error_code, "FTM2002");
+    }
+
+    #[test]
+    fn conflict_detection_concurrent_claim_auto_resolves_highest_score() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![
+            make_assignment("bead-x", "agent1", 0.3),
+            make_assignment("bead-x", "agent2", 0.9),
+        ]);
+        let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
+        assert_eq!(report.conflicts.len(), 1);
+        // Same priority, so higher score wins.
+        match &report.conflicts[0].resolution {
+            ConflictResolution::AutoResolved {
+                winner_agent,
+                loser_agent,
+                ..
+            } => {
+                assert_eq!(winner_agent, "agent2");
+                assert_eq!(loser_agent, "agent1");
+            }
+            other => panic!("Expected AutoResolved, got {:?}", other),
+        }
+        assert_eq!(report.auto_resolved_count, 1);
+    }
+
+    #[test]
+    fn conflict_detection_active_claim_collision() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("bead-x", "agent1", 1.0)]);
+        let active = vec![make_active_claim("bead-x", "agent2")];
+        let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &[], &active, 5000, &issues);
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(
+            report.conflicts[0].conflict_type,
+            ConflictType::ActiveClaimCollision
+        );
+        assert_eq!(report.conflicts[0].reason_code, "active_claim_collision");
+        assert_eq!(report.conflicts[0].error_code, "FTM2003");
+    }
+
+    #[test]
+    fn conflict_detection_active_claim_same_agent_no_conflict() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("bead-x", "agent1", 1.0)]);
+        // Same agent already holds the bead — that's fine.
+        let active = vec![make_active_claim("bead-x", "agent1")];
+        let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &[], &active, 5000, &issues);
+        assert!(report.conflicts.is_empty());
+    }
+
+    #[test]
+    fn conflict_detection_generates_messages() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![
+            make_assignment("bead-x", "agent1", 1.0),
+            make_assignment("bead-x", "agent2", 0.5),
+        ]);
+        let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
+        assert!(!report.messages.is_empty());
+        // Each conflict sends to all involved agents.
+        assert_eq!(report.messages.len(), 2); // 1 conflict × 2 agents
+        let recipients: Vec<&str> = report.messages.iter().map(|m| m.recipient.as_str()).collect();
+        assert!(recipients.contains(&"agent1"));
+        assert!(recipients.contains(&"agent2"));
+    }
+
+    #[test]
+    fn conflict_detection_messages_disabled() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            conflict_detection: ConflictDetectionConfig {
+                generate_messages: false,
+                ..ConflictDetectionConfig::default()
+            },
+            ..MissionLoopConfig::default()
+        });
+        let aset = make_assignment_set(vec![
+            make_assignment("bead-x", "agent1", 1.0),
+            make_assignment("bead-x", "agent2", 0.5),
+        ]);
+        let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
+        assert_eq!(report.conflicts.len(), 1);
+        assert!(report.messages.is_empty());
+    }
+
+    #[test]
+    fn conflict_detection_manual_resolution_strategy() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            conflict_detection: ConflictDetectionConfig {
+                strategy: DeconflictionStrategy::ManualResolution,
+                ..ConflictDetectionConfig::default()
+            },
+            ..MissionLoopConfig::default()
+        });
+        let aset = make_assignment_set(vec![
+            make_assignment("bead-x", "agent1", 1.0),
+            make_assignment("bead-x", "agent2", 0.5),
+        ]);
+        let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(
+            report.conflicts[0].resolution,
+            ConflictResolution::PendingManualResolution
+        );
+        assert_eq!(report.pending_resolution_count, 1);
+        assert_eq!(report.auto_resolved_count, 0);
+    }
+
+    #[test]
+    fn conflict_detection_first_claim_wins_strategy() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            conflict_detection: ConflictDetectionConfig {
+                strategy: DeconflictionStrategy::FirstClaimWins,
+                ..ConflictDetectionConfig::default()
+            },
+            ..MissionLoopConfig::default()
+        });
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let reservations = vec![
+            make_reservation("agent1", &["src/plan.rs"], Some("a")),
+            make_reservation("agent2", &["src/plan.rs"], Some("b")),
+        ];
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+        ];
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
+        assert_eq!(report.conflicts.len(), 1);
+        // FirstClaimWins: agent2 (existing holder) wins.
+        match &report.conflicts[0].resolution {
+            ConflictResolution::AutoResolved {
+                winner_agent,
+                loser_agent,
+                ..
+            } => {
+                assert_eq!(winner_agent, "agent2");
+                assert_eq!(loser_agent, "agent1");
+            }
+            other => panic!("Expected AutoResolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn conflict_detection_priority_wins_lower_value_wins() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            conflict_detection: ConflictDetectionConfig {
+                strategy: DeconflictionStrategy::PriorityWins,
+                ..ConflictDetectionConfig::default()
+            },
+            ..MissionLoopConfig::default()
+        });
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 0.5)]);
+        let reservations = vec![
+            make_reservation("agent1", &["src/plan.rs"], Some("a")),
+            make_reservation("agent2", &["src/plan.rs"], Some("b")),
+        ];
+        // "a" has priority 0 (higher), "b" has priority 2 (lower).
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 2, &[]),
+        ];
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
+        assert_eq!(report.conflicts.len(), 1);
+        match &report.conflicts[0].resolution {
+            ConflictResolution::AutoResolved {
+                winner_agent,
+                loser_agent,
+                ..
+            } => {
+                // agent1's bead "a" has P0, agent2's bead "b" has P2 → agent1 wins.
+                assert_eq!(winner_agent, "agent1");
+                assert_eq!(loser_agent, "agent2");
+            }
+            other => panic!("Expected AutoResolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn conflict_detection_max_conflicts_per_cycle_bounded() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            conflict_detection: ConflictDetectionConfig {
+                max_conflicts_per_cycle: 1,
+                ..ConflictDetectionConfig::default()
+            },
+            ..MissionLoopConfig::default()
+        });
+        // Create 3 potential conflicts.
+        let aset = make_assignment_set(vec![
+            make_assignment("a", "agent1", 1.0),
+            make_assignment("b", "agent2", 0.9),
+            make_assignment("c", "agent3", 0.8),
+        ]);
+        let active = vec![
+            make_active_claim("a", "agent-x"),
+            make_active_claim("b", "agent-y"),
+            make_active_claim("c", "agent-z"),
+        ];
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+            sample_detail("c", BeadStatus::Open, 2, &[]),
+        ];
+        let report = ml.detect_conflicts(&aset, &[], &active, 5000, &issues);
+        assert_eq!(report.conflicts.len(), 1); // bounded
+    }
+
+    #[test]
+    fn conflict_detection_updates_state_totals() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        assert_eq!(ml.state().total_conflicts_detected, 0);
+        assert_eq!(ml.state().total_conflicts_auto_resolved, 0);
+
+        let aset = make_assignment_set(vec![
+            make_assignment("bead-x", "agent1", 1.0),
+            make_assignment("bead-x", "agent2", 0.5),
+        ]);
+        let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
+        ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
+
+        assert_eq!(ml.state().total_conflicts_detected, 1);
+        assert_eq!(ml.state().total_conflicts_auto_resolved, 1);
+        assert_eq!(ml.state().conflict_history.len(), 1);
+    }
+
+    #[test]
+    fn conflict_detection_history_bounded() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            conflict_detection: ConflictDetectionConfig {
+                max_conflicts_per_cycle: 2,
+                ..ConflictDetectionConfig::default()
+            },
+            ..MissionLoopConfig::default()
+        });
+        let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
+        // Run multiple cycles with conflicts.
+        for i in 0..10u64 {
+            let aset = make_assignment_set(vec![
+                make_assignment("bead-x", "agent1", 1.0),
+                make_assignment("bead-x", "agent2", 0.5),
+            ]);
+            ml.state.cycle_count = i;
+            ml.detect_conflicts(&aset, &[], &[], (i * 1000) as i64, &issues);
+        }
+        // History is bounded: max_conflicts_per_cycle * 4 = 8.
+        assert!(ml.state().conflict_history.len() <= 8);
+    }
+
+    #[test]
+    fn conflict_detection_conflict_stats_accessor() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let (detected, resolved) = ml.conflict_stats();
+        assert_eq!(detected, 0);
+        assert_eq!(resolved, 0);
+
+        let aset = make_assignment_set(vec![
+            make_assignment("bead-x", "agent1", 1.0),
+            make_assignment("bead-x", "agent2", 0.5),
+        ]);
+        let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
+        ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
+
+        let (detected, resolved) = ml.conflict_stats();
+        assert_eq!(detected, 1);
+        assert_eq!(resolved, 1);
+    }
+
+    #[test]
+    fn conflict_detection_multiple_types_in_one_cycle() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        // agent1 has reservation overlap AND concurrent bead claim.
+        let aset = make_assignment_set(vec![
+            make_assignment("a", "agent1", 1.0),
+            make_assignment("b", "agent1", 0.8),
+            make_assignment("b", "agent3", 0.3),
+        ]);
+        let reservations = vec![
+            make_reservation("agent1", &["src/plan.rs"], Some("a")),
+            make_reservation("agent2", &["src/plan.rs"], Some("c")),
+        ];
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+            sample_detail("c", BeadStatus::Open, 2, &[]),
+        ];
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
+        // Should detect both: reservation overlap + concurrent bead claim.
+        assert!(report.conflicts.len() >= 2);
+        let types: Vec<&ConflictType> = report.conflicts.iter().map(|c| &c.conflict_type).collect();
+        assert!(types.contains(&&ConflictType::FileReservationOverlap));
+        assert!(types.contains(&&ConflictType::ConcurrentBeadClaim));
+    }
+
+    #[test]
+    fn conflict_detection_wildcard_path_overlap() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let reservations = vec![
+            make_reservation("agent1", &["src/mission_loop.rs"], Some("a")),
+            make_reservation("agent2", &["src/*.rs"], Some("b")),
+        ];
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+        ];
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(
+            report.conflicts[0].conflict_type,
+            ConflictType::FileReservationOverlap
+        );
+    }
+
+    #[test]
+    fn conflict_detection_directory_containment_overlap() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let reservations = vec![
+            make_reservation("agent1", &["src/plan.rs"], Some("a")),
+            make_reservation("agent2", &["src/"], Some("b")),
+        ];
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+        ];
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
+        assert_eq!(report.conflicts.len(), 1);
+    }
+
+    #[test]
+    fn conflict_detection_deconfliction_message_content() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let reservations = vec![
+            make_reservation("agent1", &["src/plan.rs"], Some("a")),
+            make_reservation("agent2", &["src/plan.rs"], Some("b")),
+        ];
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+        ];
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
+        assert!(!report.messages.is_empty());
+        let msg = &report.messages[0];
+        assert!(msg.subject.contains("reservation_overlap"));
+        assert!(msg.body.contains("Conflict detected"));
+        assert!(msg.body.contains("FTM2001"));
+        assert_eq!(msg.importance, "high");
+    }
+
+    #[test]
+    fn conflict_detection_report_serde_roundtrip() {
+        let report = ConflictDetectionReport {
+            cycle_id: 5,
+            detected_at_ms: 5000,
+            conflicts: vec![AssignmentConflict {
+                conflict_id: "c1".to_string(),
+                conflict_type: ConflictType::FileReservationOverlap,
+                involved_agents: vec!["a1".to_string(), "a2".to_string()],
+                involved_beads: vec!["bead-a".to_string()],
+                conflicting_paths: vec!["src/plan.rs".to_string()],
+                detected_at_ms: 5000,
+                resolution: ConflictResolution::AutoResolved {
+                    winner_agent: "a1".to_string(),
+                    loser_agent: "a2".to_string(),
+                    strategy: DeconflictionStrategy::PriorityWins,
+                },
+                reason_code: "reservation_overlap".to_string(),
+                error_code: "FTM2001".to_string(),
+            }],
+            messages: vec![DeconflictionMessage {
+                recipient: "a2".to_string(),
+                subject: "conflict".to_string(),
+                body: "test".to_string(),
+                thread_id: "bead-a".to_string(),
+                importance: "high".to_string(),
+                conflict_id: "c1".to_string(),
+            }],
+            auto_resolved_count: 1,
+            pending_resolution_count: 0,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ConflictDetectionReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cycle_id, 5);
+        assert_eq!(back.conflicts.len(), 1);
+        assert_eq!(back.messages.len(), 1);
+        assert_eq!(back.auto_resolved_count, 1);
+    }
+
+    #[test]
+    fn conflict_type_serde_roundtrip() {
+        let types = vec![
+            ConflictType::FileReservationOverlap,
+            ConflictType::ConcurrentBeadClaim,
+            ConflictType::ActiveClaimCollision,
+        ];
+        for ct in &types {
+            let json = serde_json::to_string(ct).unwrap();
+            let back: ConflictType = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, ct);
+        }
+    }
+
+    #[test]
+    fn deconfliction_strategy_serde_roundtrip() {
+        let strategies = vec![
+            DeconflictionStrategy::PriorityWins,
+            DeconflictionStrategy::FirstClaimWins,
+            DeconflictionStrategy::ManualResolution,
+        ];
+        for s in &strategies {
+            let json = serde_json::to_string(s).unwrap();
+            let back: DeconflictionStrategy = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, s);
+        }
+    }
+
+    #[test]
+    fn conflict_resolution_serde_roundtrip() {
+        let resolutions = vec![
+            ConflictResolution::AutoResolved {
+                winner_agent: "w".to_string(),
+                loser_agent: "l".to_string(),
+                strategy: DeconflictionStrategy::PriorityWins,
+            },
+            ConflictResolution::Deferred {
+                retry_after_ms: 5000,
+            },
+            ConflictResolution::PendingManualResolution,
+        ];
+        for r in &resolutions {
+            let json = serde_json::to_string(r).unwrap();
+            let back: ConflictResolution = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, r);
+        }
+    }
+
+    #[test]
+    fn conflict_detection_config_serde_roundtrip() {
+        let config = ConflictDetectionConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ConflictDetectionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.enabled, config.enabled);
+        assert_eq!(
+            back.max_conflicts_per_cycle,
+            config.max_conflicts_per_cycle
+        );
+        assert_eq!(back.strategy, config.strategy);
+        assert_eq!(back.generate_messages, config.generate_messages);
+    }
+
+    #[test]
+    fn paths_overlap_exact_match() {
+        assert!(paths_overlap("src/plan.rs", "src/plan.rs"));
+    }
+
+    #[test]
+    fn paths_overlap_no_match() {
+        assert!(!paths_overlap("src/plan.rs", "src/mission_loop.rs"));
+    }
+
+    #[test]
+    fn paths_overlap_directory_containment() {
+        assert!(paths_overlap("src/", "src/plan.rs"));
+        assert!(paths_overlap("src/plan.rs", "src/"));
+    }
+
+    #[test]
+    fn paths_overlap_wildcard() {
+        assert!(paths_overlap("src/*.rs", "src/plan.rs"));
+        assert!(paths_overlap("src/plan.rs", "src/*.rs"));
+    }
+
+    #[test]
+    fn paths_overlap_no_false_prefix() {
+        // "src/plan" is a prefix of "src/planner.rs" but NOT a directory boundary.
+        assert!(!paths_overlap("src/plan", "src/planner.rs"));
+    }
+
+    #[test]
+    fn wildcard_match_basic() {
+        assert!(wildcard_match("*.rs", "plan.rs"));
+        assert!(wildcard_match("src/*", "src/plan.rs"));
+        assert!(wildcard_match("src/?.rs", "src/a.rs"));
+        assert!(!wildcard_match("src/?.rs", "src/ab.rs"));
+    }
+
+    #[test]
+    fn wildcard_match_complex() {
+        assert!(wildcard_match("**/plan.rs", "crates/core/src/plan.rs"));
+        assert!(wildcard_match("src/*.rs", "src/mission_loop.rs"));
+        assert!(!wildcard_match("src/*.rs", "tests/foo.rs"));
+    }
+
+    #[test]
+    fn loop_config_with_conflict_detection_serde_roundtrip() {
+        let config = MissionLoopConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: MissionLoopConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.conflict_detection.enabled,
+            config.conflict_detection.enabled
+        );
+        assert_eq!(
+            back.conflict_detection.max_conflicts_per_cycle,
+            config.conflict_detection.max_conflicts_per_cycle
+        );
+    }
+
+    #[test]
+    fn conflict_detection_three_agents_same_bead() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![
+            make_assignment("bead-x", "agent1", 1.0),
+            make_assignment("bead-x", "agent2", 0.5),
+            make_assignment("bead-x", "agent3", 0.3),
+        ]);
+        let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
+        // Two conflicts: agent2 vs winner and agent3 vs winner.
+        assert_eq!(report.conflicts.len(), 2);
+        assert!(report
+            .conflicts
+            .iter()
+            .all(|c| c.conflict_type == ConflictType::ConcurrentBeadClaim));
+    }
+
+    #[test]
+    fn conflict_detection_message_thread_id_uses_bead() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let active = vec![make_active_claim("a", "agent2")];
+        let issues = vec![sample_detail("a", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &[], &active, 5000, &issues);
+        assert!(!report.messages.is_empty());
+        assert_eq!(report.messages[0].thread_id, "a");
     }
 }
