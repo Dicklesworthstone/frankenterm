@@ -43,6 +43,31 @@ impl OutputScanMetrics {
     }
 }
 
+/// Cross-chunk scan carry state.
+///
+/// This allows callers that process output in chunks to preserve parser state
+/// when ANSI escapes or UTF-8 code points span chunk boundaries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutputScanState {
+    /// True if previous chunk ended inside an ANSI escape sequence.
+    pub in_escape: bool,
+    /// Number of UTF-8 continuation bytes still expected.
+    pub pending_utf8_continuations: u8,
+}
+
+impl OutputScanState {
+    /// Whether the current chunk boundary splits a UTF-8 code point.
+    #[must_use]
+    pub fn has_partial_utf8(self) -> bool {
+        self.pending_utf8_continuations > 0
+    }
+
+    /// Reset carry state.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Scan output bytes for newline and ANSI escape density metrics.
 #[must_use]
 pub fn scan_newlines_and_ansi(bytes: &[u8]) -> OutputScanMetrics {
@@ -50,6 +75,22 @@ pub fn scan_newlines_and_ansi(bytes: &[u8]) -> OutputScanMetrics {
         scan_newlines_and_ansi_memchr(bytes)
     } else {
         scan_newlines_and_ansi_scalar(bytes)
+    }
+}
+
+/// Scan output bytes while preserving ANSI/UTF-8 boundary state.
+///
+/// Use this for chunked processing where segment boundaries may cut through
+/// ANSI escape sequences or UTF-8 code points.
+#[must_use]
+pub fn scan_newlines_and_ansi_with_state(
+    bytes: &[u8],
+    state: &mut OutputScanState,
+) -> OutputScanMetrics {
+    if prefer_fast_path() {
+        scan_newlines_and_ansi_memchr_with_state(bytes, state)
+    } else {
+        scan_newlines_and_ansi_scalar_with_state(bytes, state)
     }
 }
 
@@ -100,6 +141,40 @@ fn scan_newlines_and_ansi_memchr(bytes: &[u8]) -> OutputScanMetrics {
 }
 
 #[must_use]
+fn scan_newlines_and_ansi_memchr_with_state(
+    bytes: &[u8],
+    state: &mut OutputScanState,
+) -> OutputScanMetrics {
+    // Keep newline count on the vectorized fast path.
+    let newline_count = memchr::memchr_iter(b'\n', bytes).count();
+
+    let mut ansi_byte_count = 0usize;
+    let mut in_escape = state.in_escape;
+    let mut pending_utf8 = state.pending_utf8_continuations;
+    for &b in bytes {
+        if b == 0x1b {
+            in_escape = true;
+            ansi_byte_count += 1;
+        } else if in_escape {
+            ansi_byte_count += 1;
+            if (0x40..=0x7E).contains(&b) && b != b'[' {
+                in_escape = false;
+            }
+        }
+
+        update_utf8_pending(&mut pending_utf8, b);
+    }
+
+    state.in_escape = in_escape;
+    state.pending_utf8_continuations = pending_utf8;
+
+    OutputScanMetrics {
+        newline_count,
+        ansi_byte_count,
+    }
+}
+
+#[must_use]
 pub(crate) fn scan_newlines_and_ansi_scalar(bytes: &[u8]) -> OutputScanMetrics {
     let mut newline_count = 0usize;
     let mut ansi_byte_count = 0usize;
@@ -125,6 +200,76 @@ pub(crate) fn scan_newlines_and_ansi_scalar(bytes: &[u8]) -> OutputScanMetrics {
         newline_count,
         ansi_byte_count,
     }
+}
+
+#[must_use]
+fn scan_newlines_and_ansi_scalar_with_state(
+    bytes: &[u8],
+    state: &mut OutputScanState,
+) -> OutputScanMetrics {
+    let mut newline_count = 0usize;
+    let mut ansi_byte_count = 0usize;
+    let mut in_escape = state.in_escape;
+    let mut pending_utf8 = state.pending_utf8_continuations;
+
+    for &b in bytes {
+        if b == b'\n' {
+            newline_count += 1;
+        }
+
+        if b == 0x1b {
+            in_escape = true;
+            ansi_byte_count += 1;
+        } else if in_escape {
+            ansi_byte_count += 1;
+            if (0x40..=0x7E).contains(&b) && b != b'[' {
+                in_escape = false;
+            }
+        }
+
+        update_utf8_pending(&mut pending_utf8, b);
+    }
+
+    state.in_escape = in_escape;
+    state.pending_utf8_continuations = pending_utf8;
+
+    OutputScanMetrics {
+        newline_count,
+        ansi_byte_count,
+    }
+}
+
+#[inline]
+fn update_utf8_pending(pending: &mut u8, byte: u8) {
+    if *pending == 0 {
+        if byte < 0x80 {
+            return;
+        }
+
+        *pending = match byte {
+            0xC2..=0xDF => 1,
+            0xE0..=0xEF => 2,
+            0xF0..=0xF4 => 3,
+            _ => 0,
+        };
+        return;
+    }
+
+    if *pending > 0 {
+        if (byte & 0b1100_0000) == 0b1000_0000 {
+            *pending -= 1;
+            return;
+        }
+        // Invalid continuation - reset and treat this byte as a fresh lead byte.
+        *pending = 0;
+    }
+
+    *pending = match byte {
+        0xC2..=0xDF => 1,
+        0xE0..=0xEF => 2,
+        0xF0..=0xF4 => 3,
+        _ => 0,
+    };
 }
 
 #[cfg(test)]
@@ -461,5 +606,49 @@ mod tests {
         // 0 is 0x30, not in range, stays. m is 0x6D, in range, terminates.
         // So ANSI bytes: ESC, [, 1, \n, 0, m = 6
         assert_eq!(scan.ansi_byte_count, 6);
+    }
+
+    #[test]
+    fn stateful_scan_tracks_escape_across_chunk_boundary() {
+        let full = b"\x1b[31mred\x1b[0m";
+        let mut state = OutputScanState::default();
+
+        let left = scan_newlines_and_ansi_with_state(b"\x1b[31", &mut state);
+        assert_eq!(left.ansi_byte_count, 4);
+        assert!(state.in_escape);
+        assert!(!state.has_partial_utf8());
+
+        let right = scan_newlines_and_ansi_with_state(b"mred\x1b[0m", &mut state);
+        assert_eq!(right.ansi_byte_count, 5);
+        assert!(!state.in_escape);
+        assert!(!state.has_partial_utf8());
+
+        let stitched = OutputScanMetrics {
+            newline_count: left.newline_count + right.newline_count,
+            ansi_byte_count: left.ansi_byte_count + right.ansi_byte_count,
+        };
+        assert_eq!(stitched, scan_newlines_and_ansi(full));
+    }
+
+    #[test]
+    fn stateful_scan_tracks_partial_utf8_across_chunks() {
+        let mut state = OutputScanState::default();
+        let left = b"ok\xf0\x9f";
+        let right = b"\x99\x82\n";
+
+        let left_scan = scan_newlines_and_ansi_with_state(left, &mut state);
+        assert_eq!(left_scan.newline_count, 0);
+        assert!(state.has_partial_utf8());
+        assert_eq!(state.pending_utf8_continuations, 2);
+
+        let right_scan = scan_newlines_and_ansi_with_state(right, &mut state);
+        assert_eq!(right_scan.newline_count, 1);
+        assert!(!state.has_partial_utf8());
+
+        let stitched = OutputScanMetrics {
+            newline_count: left_scan.newline_count + right_scan.newline_count,
+            ansi_byte_count: left_scan.ansi_byte_count + right_scan.ansi_byte_count,
+        };
+        assert_eq!(stitched, scan_newlines_and_ansi(b"ok\xf0\x9f\x99\x82\n"));
     }
 }

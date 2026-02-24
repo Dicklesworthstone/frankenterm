@@ -17,7 +17,9 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::simd_scan::{OutputScanMetrics, scan_newlines_and_ansi};
+use frankenterm_core::simd_scan::{
+    OutputScanMetrics, OutputScanState, scan_newlines_and_ansi, scan_newlines_and_ansi_with_state,
+};
 
 // =============================================================================
 // Strategies
@@ -68,6 +70,15 @@ fn arb_text_with_ansi(max_segments: usize) -> impl Strategy<Value = Vec<u8>> {
         1..max_segments,
     )
     .prop_map(|segments| segments.into_iter().flatten().collect())
+}
+
+fn build_sorted_split_points(len: usize, mut points: Vec<usize>) -> Vec<usize> {
+    points.retain(|p| *p <= len);
+    points.push(0);
+    points.push(len);
+    points.sort_unstable();
+    points.dedup();
+    points
 }
 
 // =============================================================================
@@ -720,5 +731,59 @@ proptest! {
             "left {} + right {} != full {}",
             left.newline_count, right.newline_count, full.newline_count
         );
+    }
+}
+
+// =============================================================================
+// Stateful SIMD scan properties: chunk-boundary fidelity
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(250))]
+
+    #[test]
+    fn streaming_scan_matches_full_scan_on_arbitrary_chunks(
+        data in arb_bytes(4096),
+        split_points in proptest::collection::vec(0_usize..4097, 0..24),
+    ) {
+        let boundaries = build_sorted_split_points(data.len(), split_points);
+        let mut state = OutputScanState::default();
+        let mut streaming = OutputScanMetrics::default();
+
+        for window in boundaries.windows(2) {
+            let start = window[0];
+            let end = window[1];
+            let metrics = scan_newlines_and_ansi_with_state(&data[start..end], &mut state);
+            streaming.newline_count += metrics.newline_count;
+            streaming.ansi_byte_count += metrics.ansi_byte_count;
+        }
+
+        let full = scan_newlines_and_ansi(&data);
+        prop_assert_eq!(streaming, full);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn utf8_boundary_splits_preserve_metrics(
+        text in ".{0,1024}",
+        split in 0_usize..1025,
+    ) {
+        let bytes = text.as_bytes();
+        let split = split.min(bytes.len());
+        let (left, right) = bytes.split_at(split);
+
+        let mut state = OutputScanState::default();
+        let left_scan = scan_newlines_and_ansi_with_state(left, &mut state);
+        let right_scan = scan_newlines_and_ansi_with_state(right, &mut state);
+        let stitched = OutputScanMetrics {
+            newline_count: left_scan.newline_count + right_scan.newline_count,
+            ansi_byte_count: left_scan.ansi_byte_count + right_scan.ansi_byte_count,
+        };
+
+        prop_assert_eq!(stitched, scan_newlines_and_ansi(bytes));
+        prop_assert!(!state.has_partial_utf8());
     }
 }

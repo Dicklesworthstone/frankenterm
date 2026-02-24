@@ -8,7 +8,9 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::simd_scan::{OutputScanMetrics, scan_newlines_and_ansi};
+use frankenterm_core::simd_scan::{
+    OutputScanMetrics, OutputScanState, scan_newlines_and_ansi, scan_newlines_and_ansi_with_state,
+};
 
 mod bench_common;
 
@@ -24,6 +26,10 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "simd_scan_mixed_payload",
         budget: "stable scan throughput across plain/ansi/binary payload classes",
+    },
+    bench_common::BenchBudget {
+        name: "simd_scan_chunked_stateful",
+        budget: "stateful chunked SIMD scan should significantly beat scalar carry-state scan",
     },
 ];
 
@@ -99,6 +105,57 @@ fn scalar_scan_reference(bytes: &[u8]) -> OutputScanMetrics {
     }
 }
 
+#[derive(Default)]
+struct ScalarState {
+    in_escape: bool,
+    pending_utf8_continuations: u8,
+}
+
+fn scalar_scan_reference_with_state(bytes: &[u8], state: &mut ScalarState) -> OutputScanMetrics {
+    let mut newline_count = 0usize;
+    let mut ansi_byte_count = 0usize;
+    let mut in_escape = state.in_escape;
+    let mut pending_utf8 = state.pending_utf8_continuations;
+
+    for &b in bytes {
+        if b == b'\n' {
+            newline_count += 1;
+        }
+
+        if b == 0x1b {
+            in_escape = true;
+            ansi_byte_count += 1;
+        } else if in_escape {
+            ansi_byte_count += 1;
+            if (0x40..=0x7E).contains(&b) && b != b'[' {
+                in_escape = false;
+            }
+        }
+
+        if pending_utf8 > 0 {
+            if (b & 0b1100_0000) == 0b1000_0000 {
+                pending_utf8 -= 1;
+                continue;
+            }
+        }
+
+        pending_utf8 = match b {
+            0xC2..=0xDF => 1,
+            0xE0..=0xEF => 2,
+            0xF0..=0xF4 => 3,
+            _ => 0,
+        };
+    }
+
+    state.in_escape = in_escape;
+    state.pending_utf8_continuations = pending_utf8;
+
+    OutputScanMetrics {
+        newline_count,
+        ansi_byte_count,
+    }
+}
+
 fn bench_newline_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("simd_scan_newline");
 
@@ -167,6 +224,51 @@ fn bench_mixed_payload_scan(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_chunked_stateful_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("simd_scan_chunked_stateful");
+    let payload = payload_ansi_heavy(2 * 1024 * 1024);
+
+    for chunk_size in [16usize, 32, 64, 128, 256] {
+        group.throughput(Throughput::Bytes(payload.len() as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("fast_stateful", chunk_size),
+            &chunk_size,
+            |b, &chunk| {
+                b.iter(|| {
+                    let mut state = OutputScanState::default();
+                    let mut total = OutputScanMetrics::default();
+                    for piece in payload.chunks(chunk) {
+                        let m = scan_newlines_and_ansi_with_state(black_box(piece), &mut state);
+                        total.newline_count += m.newline_count;
+                        total.ansi_byte_count += m.ansi_byte_count;
+                    }
+                    black_box(total);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("scalar_stateful", chunk_size),
+            &chunk_size,
+            |b, &chunk| {
+                b.iter(|| {
+                    let mut state = ScalarState::default();
+                    let mut total = OutputScanMetrics::default();
+                    for piece in payload.chunks(chunk) {
+                        let m = scalar_scan_reference_with_state(black_box(piece), &mut state);
+                        total.newline_count += m.newline_count;
+                        total.ansi_byte_count += m.ansi_byte_count;
+                    }
+                    black_box(total);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("simd_scan", BUDGETS);
     Criterion::default().configure_from_args()
@@ -175,6 +277,6 @@ fn bench_config() -> Criterion {
 criterion_group!(
     name = benches;
     config = bench_config();
-    targets = bench_newline_scan, bench_ansi_heavy_scan, bench_mixed_payload_scan
+    targets = bench_newline_scan, bench_ansi_heavy_scan, bench_mixed_payload_scan, bench_chunked_stateful_scan
 );
 criterion_main!(benches);
