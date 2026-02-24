@@ -1,6 +1,6 @@
 //! Property-based tests for semantic anomaly detection.
 //!
-//! Bead: ft-344j8.8
+//! Beads: ft-344j8.8 (conformal prediction), ft-344j8.9 (entropy gating)
 //!
 //! Validates:
 //! 1. dot_product_simd: matches naive dot product for arbitrary vectors
@@ -33,12 +33,23 @@
 //! 28. SemanticAnomalyDetector: Z-score shock has positive distance and z_score
 //! 29. SemanticAnomalyDetector: stable identical inputs produce no shocks
 //! 30. SortedCalibrationBuffer: count_geq(min_score) == len after inserting only that value
+//! 31. EntropyGate: constant data always skipped
+//! 32. EntropyGate: uniform random data always passes
+//! 33. EntropyGate: should_embed consistent with decision variant
+//! 34. EntropyGate: statistics add up (evaluated = passed + skipped + bypassed + disabled)
+//! 35. EntropyGateConfig: serde roundtrip preserves all fields
+//! 36. EntropyGateSnapshot: serde roundtrip preserves all fields
+//! 37. EntropyGate: skip_ratio in [0, 1]
+//! 38. EntropyGate: disabled gate always returns Disabled
+//! 39. EntropyGate: average_entropy in [0, 8] for measured segments
+//! 40. EntropyGate: short segments always bypassed
 
 use proptest::prelude::*;
 use proptest::collection::vec as arb_vec;
 
 use frankenterm_core::semantic_anomaly::{
     ConformalAnomalyConfig, ConformalAnomalyDetector, ConformalAnomalySnapshot, ConformalShock,
+    EntropyGate, EntropyGateConfig, EntropyGateDecision, EntropyGateSnapshot,
     SemanticAnomalyConfig, SemanticAnomalyDetector, SortedCalibrationBuffer, dot_product_simd,
     normalize_simd,
 };
@@ -613,5 +624,213 @@ proptest! {
         }
         // Identical inputs should produce very few (if any) shocks.
         prop_assert!(shocks <= 3, "shocks={shocks} too many for identical inputs");
+    }
+}
+
+// =============================================================================
+// Entropy gate properties
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // 31. Constant data always skipped
+    #[test]
+    fn prop_entropy_gate_constant_skipped(byte_val in 0_u8..=255) {
+        let mut gate = EntropyGate::new(EntropyGateConfig {
+            min_entropy_bits_per_byte: 2.0,
+            min_segment_bytes: 4,
+            enabled: true,
+        });
+        let segment = vec![byte_val; 200];
+        let decision = gate.evaluate(&segment);
+        let is_skip = matches!(decision, EntropyGateDecision::Skip { .. });
+        prop_assert!(is_skip, "Constant byte {byte_val} should be skipped, got {decision:?}");
+        prop_assert!(!decision.should_embed());
+    }
+
+    // 32. Uniform random data always passes
+    #[test]
+    fn prop_entropy_gate_uniform_passes(repeats in 2_usize..10) {
+        let mut gate = EntropyGate::new(EntropyGateConfig {
+            min_entropy_bits_per_byte: 2.0,
+            min_segment_bytes: 4,
+            enabled: true,
+        });
+        // All 256 byte values repeated → entropy ≈ 8.0
+        let mut segment = Vec::with_capacity(256 * repeats);
+        for _ in 0..repeats {
+            for b in 0..=255u8 {
+                segment.push(b);
+            }
+        }
+        let decision = gate.evaluate(&segment);
+        let is_pass = matches!(decision, EntropyGateDecision::Pass { .. });
+        prop_assert!(is_pass, "Uniform data should pass, got {decision:?}");
+        prop_assert!(decision.should_embed());
+    }
+
+    // 33. should_embed consistent with decision variant
+    #[test]
+    fn prop_entropy_gate_should_embed_consistent(
+        enabled in proptest::bool::ANY,
+        len in 0_usize..200,
+        byte_val in 0_u8..=255,
+    ) {
+        let mut gate = EntropyGate::new(EntropyGateConfig {
+            min_entropy_bits_per_byte: 2.0,
+            min_segment_bytes: 16,
+            enabled,
+        });
+        let segment = vec![byte_val; len];
+        let decision = gate.evaluate(&segment);
+        match &decision {
+            EntropyGateDecision::Skip { .. } => {
+                prop_assert!(!decision.should_embed());
+            }
+            EntropyGateDecision::Pass { .. }
+            | EntropyGateDecision::Bypass { .. }
+            | EntropyGateDecision::Disabled => {
+                prop_assert!(decision.should_embed());
+            }
+        }
+    }
+
+    // 34. Statistics add up
+    #[test]
+    fn prop_entropy_gate_stats_add_up(
+        segments in arb_vec(arb_vec(0_u8..=255, 0..100), 1..50),
+    ) {
+        let mut gate = EntropyGate::new(EntropyGateConfig {
+            min_entropy_bits_per_byte: 2.0,
+            min_segment_bytes: 8,
+            enabled: true,
+        });
+        for seg in &segments {
+            gate.evaluate(seg);
+        }
+        let total = gate.total_evaluated();
+        let sum = gate.total_passed() + gate.total_skipped() + gate.total_bypassed();
+        prop_assert_eq!(total, sum, "total={} != passed+skipped+bypassed={}", total, sum);
+    }
+
+    // 35. EntropyGateConfig serde roundtrip
+    #[test]
+    fn prop_entropy_gate_config_serde(
+        threshold in 0.0_f64..8.0,
+        min_bytes in 1_usize..1000,
+        enabled in proptest::bool::ANY,
+    ) {
+        let config = EntropyGateConfig {
+            min_entropy_bits_per_byte: threshold,
+            min_segment_bytes: min_bytes,
+            enabled,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let round: EntropyGateConfig = serde_json::from_str(&json).unwrap();
+        let t_ok = (round.min_entropy_bits_per_byte - threshold).abs() < 1e-10;
+        prop_assert!(t_ok, "threshold mismatch");
+        prop_assert_eq!(round.min_segment_bytes, min_bytes);
+        prop_assert_eq!(round.enabled, enabled);
+    }
+
+    // 36. EntropyGateSnapshot serde roundtrip
+    #[test]
+    fn prop_entropy_gate_snapshot_serde(
+        total_eval in 0_u64..10000,
+        total_pass in 0_u64..5000,
+        total_skip in 0_u64..5000,
+        total_bypass in 0_u64..2000,
+    ) {
+        let snap = EntropyGateSnapshot {
+            enabled: true,
+            threshold: 2.0,
+            min_segment_bytes: 16,
+            total_evaluated: total_eval,
+            total_passed: total_pass,
+            total_skipped: total_skip,
+            total_bypassed: total_bypass,
+            average_entropy: 4.0,
+            skip_ratio: 0.3,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let round: EntropyGateSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(round.total_evaluated, total_eval);
+        prop_assert_eq!(round.total_passed, total_pass);
+        prop_assert_eq!(round.total_skipped, total_skip);
+        prop_assert_eq!(round.total_bypassed, total_bypass);
+    }
+
+    // 37. skip_ratio in [0, 1]
+    #[test]
+    fn prop_entropy_gate_skip_ratio_bounded(
+        segments in arb_vec(arb_vec(0_u8..=255, 0..50), 1..30),
+    ) {
+        let mut gate = EntropyGate::new(EntropyGateConfig {
+            min_entropy_bits_per_byte: 2.0,
+            min_segment_bytes: 4,
+            enabled: true,
+        });
+        for seg in &segments {
+            gate.evaluate(seg);
+        }
+        let ratio = gate.skip_ratio();
+        prop_assert!(ratio >= 0.0, "ratio={ratio} < 0");
+        prop_assert!(ratio <= 1.0, "ratio={ratio} > 1");
+    }
+
+    // 38. Disabled gate always returns Disabled
+    #[test]
+    fn prop_entropy_gate_disabled_always_disabled(
+        len in 0_usize..200,
+        byte_val in 0_u8..=255,
+    ) {
+        let mut gate = EntropyGate::new(EntropyGateConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let segment = vec![byte_val; len];
+        let decision = gate.evaluate(&segment);
+        let is_disabled = matches!(decision, EntropyGateDecision::Disabled);
+        prop_assert!(is_disabled, "Disabled gate should return Disabled, got {decision:?}");
+    }
+
+    // 39. Average entropy in [0, 8] for measured segments
+    #[test]
+    fn prop_entropy_gate_avg_entropy_bounded(
+        segments in arb_vec(arb_vec(0_u8..=255, 20..100), 5..30),
+    ) {
+        let mut gate = EntropyGate::new(EntropyGateConfig {
+            min_entropy_bits_per_byte: 2.0,
+            min_segment_bytes: 4,
+            enabled: true,
+        });
+        for seg in &segments {
+            gate.evaluate(seg);
+        }
+        let avg = gate.average_entropy();
+        prop_assert!(avg >= 0.0, "avg={avg} < 0");
+        prop_assert!(avg <= 8.0, "avg={avg} > 8");
+    }
+
+    // 40. Short segments always bypassed
+    #[test]
+    fn prop_entropy_gate_short_bypassed(
+        min_bytes in 10_usize..50,
+        len in 0_usize..10,
+        byte_val in 0_u8..=255,
+    ) {
+        if len >= min_bytes {
+            return Ok(());
+        }
+        let mut gate = EntropyGate::new(EntropyGateConfig {
+            min_segment_bytes: min_bytes,
+            enabled: true,
+            ..Default::default()
+        });
+        let segment = vec![byte_val; len];
+        let decision = gate.evaluate(&segment);
+        let is_bypass = matches!(decision, EntropyGateDecision::Bypass { .. });
+        prop_assert!(is_bypass, "Short segment (len={len} < min={min_bytes}) should bypass, got {decision:?}");
     }
 }

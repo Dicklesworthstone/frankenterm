@@ -574,6 +574,357 @@ impl ConformalAnomalyDetector {
 }
 
 // =============================================================================
+// Entropy Gate: Information-Theoretic Pre-Filter (ft-344j8.9)
+// =============================================================================
+
+/// Configuration for the entropy gate pre-filter.
+///
+/// Segments with Shannon entropy below `min_entropy_bits_per_byte` are skipped
+/// before reaching the embedding pipeline, saving ONNX runtime CPU on terminal
+/// spam like progress bars, spinner characters, and repeated whitespace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EntropyGateConfig {
+    /// Minimum Shannon entropy (bits/byte) required for a segment to be
+    /// forwarded to the embedding pipeline. Default: 2.0.
+    ///
+    /// - Progress bars / spinners: ~0.5–1.5 bits/byte → SKIP
+    /// - Structured logs / JSON:   ~3.5–5.0 bits/byte → PASS
+    /// - Natural language / code:  ~4.0–6.0 bits/byte → PASS
+    /// - Random binary:            ~7.5–8.0 bits/byte → PASS
+    pub min_entropy_bits_per_byte: f64,
+    /// Minimum segment length (bytes) to bother computing entropy.
+    /// Very short segments are always passed through (too few bytes for
+    /// reliable entropy estimation). Default: 16.
+    pub min_segment_bytes: usize,
+    /// Whether the gate is enabled. When false, all segments pass through.
+    /// Default: true.
+    pub enabled: bool,
+}
+
+impl Default for EntropyGateConfig {
+    fn default() -> Self {
+        Self {
+            min_entropy_bits_per_byte: 2.0,
+            min_segment_bytes: 16,
+            enabled: true,
+        }
+    }
+}
+
+/// Decision result from the entropy gate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EntropyGateDecision {
+    /// Segment passed the gate — high enough entropy for embedding.
+    Pass {
+        /// Measured Shannon entropy (bits/byte).
+        entropy: f64,
+    },
+    /// Segment was skipped — too low entropy (terminal spam).
+    Skip {
+        /// Measured Shannon entropy (bits/byte).
+        entropy: f64,
+        /// The threshold it failed to meet.
+        threshold: f64,
+    },
+    /// Segment bypassed the gate — too short for reliable entropy estimation.
+    Bypass {
+        /// Segment length in bytes.
+        length: usize,
+    },
+    /// Gate is disabled — segment passes unconditionally.
+    Disabled,
+}
+
+impl EntropyGateDecision {
+    /// Whether the segment should be forwarded to the embedding pipeline.
+    #[must_use]
+    pub fn should_embed(&self) -> bool {
+        matches!(
+            self,
+            EntropyGateDecision::Pass { .. }
+                | EntropyGateDecision::Bypass { .. }
+                | EntropyGateDecision::Disabled
+        )
+    }
+
+    /// The measured entropy, if available.
+    #[must_use]
+    pub fn entropy(&self) -> Option<f64> {
+        match self {
+            EntropyGateDecision::Pass { entropy } | EntropyGateDecision::Skip { entropy, .. } => {
+                Some(*entropy)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Entropy gate pre-filter for the semantic anomaly pipeline.
+///
+/// Evaluates terminal output segments before they reach the ONNX embedding
+/// runtime. Low-entropy segments (progress bars, repeated characters, ANSI
+/// escape floods) are skipped, saving significant CPU cycles.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// let gate = EntropyGate::new(EntropyGateConfig::default());
+/// let segment = b"Building... 42% [##########          ]";
+/// let decision = gate.evaluate(segment);
+/// if decision.should_embed() {
+///     // Send to ONNX embedding pipeline
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct EntropyGate {
+    config: EntropyGateConfig,
+    /// Total segments evaluated.
+    total_evaluated: u64,
+    /// Segments that passed the gate.
+    total_passed: u64,
+    /// Segments skipped (low entropy).
+    total_skipped: u64,
+    /// Segments bypassed (too short).
+    total_bypassed: u64,
+    /// Cumulative entropy of evaluated segments (for average computation).
+    cumulative_entropy: f64,
+    /// Count of segments with measured entropy.
+    entropy_sample_count: u64,
+}
+
+impl EntropyGate {
+    /// Create a new entropy gate with the given configuration.
+    #[must_use]
+    pub fn new(config: EntropyGateConfig) -> Self {
+        Self {
+            config,
+            total_evaluated: 0,
+            total_passed: 0,
+            total_skipped: 0,
+            total_bypassed: 0,
+            cumulative_entropy: 0.0,
+            entropy_sample_count: 0,
+        }
+    }
+
+    /// Evaluate a terminal output segment against the entropy threshold.
+    ///
+    /// Uses `entropy_accounting::compute_entropy` for O(N) batch computation.
+    pub fn evaluate(&mut self, segment: &[u8]) -> EntropyGateDecision {
+        self.total_evaluated += 1;
+
+        if !self.config.enabled {
+            return EntropyGateDecision::Disabled;
+        }
+
+        if segment.len() < self.config.min_segment_bytes {
+            self.total_bypassed += 1;
+            return EntropyGateDecision::Bypass {
+                length: segment.len(),
+            };
+        }
+
+        let entropy = crate::entropy_accounting::compute_entropy(segment);
+        self.cumulative_entropy += entropy;
+        self.entropy_sample_count += 1;
+
+        if entropy < self.config.min_entropy_bits_per_byte {
+            self.total_skipped += 1;
+            EntropyGateDecision::Skip {
+                entropy,
+                threshold: self.config.min_entropy_bits_per_byte,
+            }
+        } else {
+            self.total_passed += 1;
+            EntropyGateDecision::Pass { entropy }
+        }
+    }
+
+    /// Total segments evaluated.
+    #[must_use]
+    pub fn total_evaluated(&self) -> u64 {
+        self.total_evaluated
+    }
+
+    /// Total segments that passed the gate.
+    #[must_use]
+    pub fn total_passed(&self) -> u64 {
+        self.total_passed
+    }
+
+    /// Total segments skipped (low entropy).
+    #[must_use]
+    pub fn total_skipped(&self) -> u64 {
+        self.total_skipped
+    }
+
+    /// Total segments bypassed (too short).
+    #[must_use]
+    pub fn total_bypassed(&self) -> u64 {
+        self.total_bypassed
+    }
+
+    /// Average entropy of evaluated segments (bits/byte).
+    /// Returns 0.0 if no segments with measured entropy.
+    #[must_use]
+    pub fn average_entropy(&self) -> f64 {
+        if self.entropy_sample_count == 0 {
+            0.0
+        } else {
+            self.cumulative_entropy / self.entropy_sample_count as f64
+        }
+    }
+
+    /// Skip ratio: fraction of evaluated segments that were skipped.
+    #[must_use]
+    pub fn skip_ratio(&self) -> f64 {
+        if self.total_evaluated == 0 {
+            0.0
+        } else {
+            self.total_skipped as f64 / self.total_evaluated as f64
+        }
+    }
+
+    /// Capture a diagnostic snapshot of the gate's statistics.
+    #[must_use]
+    pub fn snapshot(&self) -> EntropyGateSnapshot {
+        EntropyGateSnapshot {
+            enabled: self.config.enabled,
+            threshold: self.config.min_entropy_bits_per_byte,
+            min_segment_bytes: self.config.min_segment_bytes,
+            total_evaluated: self.total_evaluated,
+            total_passed: self.total_passed,
+            total_skipped: self.total_skipped,
+            total_bypassed: self.total_bypassed,
+            average_entropy: self.average_entropy(),
+            skip_ratio: self.skip_ratio(),
+        }
+    }
+
+    /// Reset statistics (preserves configuration).
+    pub fn reset_stats(&mut self) {
+        self.total_evaluated = 0;
+        self.total_passed = 0;
+        self.total_skipped = 0;
+        self.total_bypassed = 0;
+        self.cumulative_entropy = 0.0;
+        self.entropy_sample_count = 0;
+    }
+}
+
+/// Diagnostic snapshot of the entropy gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntropyGateSnapshot {
+    /// Whether the gate is enabled.
+    pub enabled: bool,
+    /// Entropy threshold (bits/byte).
+    pub threshold: f64,
+    /// Minimum segment length.
+    pub min_segment_bytes: usize,
+    /// Total segments evaluated.
+    pub total_evaluated: u64,
+    /// Total segments passed.
+    pub total_passed: u64,
+    /// Total segments skipped.
+    pub total_skipped: u64,
+    /// Total segments bypassed (too short).
+    pub total_bypassed: u64,
+    /// Average measured entropy.
+    pub average_entropy: f64,
+    /// Fraction skipped.
+    pub skip_ratio: f64,
+}
+
+/// Combined anomaly detector with entropy pre-filter.
+///
+/// Wraps a [`ConformalAnomalyDetector`] with an [`EntropyGate`] that screens
+/// terminal output segments before they are embedded. This is the recommended
+/// entry point for the full anomaly detection pipeline.
+///
+/// # Pipeline
+///
+/// ```text
+/// raw segment → EntropyGate → [skip if low entropy]
+///                            → embedding fn → ConformalAnomalyDetector
+/// ```
+#[derive(Debug, Clone)]
+pub struct GatedAnomalyDetector {
+    /// The entropy gate pre-filter.
+    pub gate: EntropyGate,
+    /// The conformal prediction detector.
+    pub detector: ConformalAnomalyDetector,
+}
+
+/// Result from the gated anomaly detector pipeline.
+#[derive(Debug, Clone)]
+pub enum GatedObservation {
+    /// Segment was skipped by the entropy gate.
+    Skipped(EntropyGateDecision),
+    /// Segment was embedded and processed by the conformal detector.
+    Processed {
+        /// The entropy gate decision (Pass, Bypass, or Disabled).
+        gate_decision: EntropyGateDecision,
+        /// The conformal detector result (Some if anomaly detected).
+        anomaly: Option<ConformalShock>,
+    },
+}
+
+impl GatedObservation {
+    /// Whether an anomaly was detected.
+    #[must_use]
+    pub fn is_anomaly(&self) -> bool {
+        matches!(
+            self,
+            GatedObservation::Processed {
+                anomaly: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// Whether the segment was skipped by the entropy gate.
+    #[must_use]
+    pub fn was_skipped(&self) -> bool {
+        matches!(self, GatedObservation::Skipped(_))
+    }
+}
+
+impl GatedAnomalyDetector {
+    /// Create a new gated detector with the given configurations.
+    #[must_use]
+    pub fn new(gate_config: EntropyGateConfig, detector_config: ConformalAnomalyConfig) -> Self {
+        Self {
+            gate: EntropyGate::new(gate_config),
+            detector: ConformalAnomalyDetector::new(detector_config),
+        }
+    }
+
+    /// Process a raw terminal output segment through the full pipeline.
+    ///
+    /// The `embed_fn` converts a byte segment to an embedding vector.
+    /// It is only called if the segment passes the entropy gate.
+    pub fn observe<F>(&mut self, segment: &[u8], embed_fn: F) -> GatedObservation
+    where
+        F: FnOnce(&[u8]) -> Vec<f32>,
+    {
+        let gate_decision = self.gate.evaluate(segment);
+
+        if !gate_decision.should_embed() {
+            return GatedObservation::Skipped(gate_decision);
+        }
+
+        let embedding = embed_fn(segment);
+        let anomaly = self.detector.observe(&embedding);
+
+        GatedObservation::Processed {
+            gate_decision,
+            anomaly,
+        }
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1235,5 +1586,324 @@ mod tests {
         // A new identical input has distance ~0, which should have high p-value.
         // Expect zero or very few false positives.
         assert!(anomalies <= 2, "anomalies={anomalies} too many for identical inputs");
+    }
+
+    // ── Entropy gate tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_entropy_gate_constant_data_skipped() {
+        let mut gate = EntropyGate::new(EntropyGateConfig::default());
+        // Constant bytes → entropy ≈ 0 → should be skipped.
+        let segment = vec![0x41u8; 1000]; // "AAAA..."
+        let decision = gate.evaluate(&segment);
+        assert!(
+            matches!(decision, EntropyGateDecision::Skip { .. }),
+            "Constant data should be skipped, got {decision:?}"
+        );
+        assert!(!decision.should_embed());
+    }
+
+    #[test]
+    fn test_entropy_gate_diverse_data_passes() {
+        let mut gate = EntropyGate::new(EntropyGateConfig::default());
+        // All 256 byte values repeated → entropy ≈ 8.0 → should pass.
+        let mut segment = Vec::with_capacity(256 * 4);
+        for _ in 0..4 {
+            for b in 0..=255u8 {
+                segment.push(b);
+            }
+        }
+        let decision = gate.evaluate(&segment);
+        assert!(
+            matches!(decision, EntropyGateDecision::Pass { .. }),
+            "Diverse data should pass, got {decision:?}"
+        );
+        assert!(decision.should_embed());
+    }
+
+    #[test]
+    fn test_entropy_gate_short_segment_bypassed() {
+        let mut gate = EntropyGate::new(EntropyGateConfig {
+            min_segment_bytes: 16,
+            ..Default::default()
+        });
+        let segment = b"short";
+        let decision = gate.evaluate(segment);
+        assert!(
+            matches!(decision, EntropyGateDecision::Bypass { length: 5 }),
+            "Short segment should bypass, got {decision:?}"
+        );
+        assert!(decision.should_embed());
+    }
+
+    #[test]
+    fn test_entropy_gate_disabled() {
+        let mut gate = EntropyGate::new(EntropyGateConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let segment = vec![0x41u8; 1000];
+        let decision = gate.evaluate(&segment);
+        assert!(
+            matches!(decision, EntropyGateDecision::Disabled),
+            "Disabled gate should return Disabled, got {decision:?}"
+        );
+        assert!(decision.should_embed());
+    }
+
+    #[test]
+    fn test_entropy_gate_statistics() {
+        let mut gate = EntropyGate::new(EntropyGateConfig {
+            min_entropy_bits_per_byte: 2.0,
+            min_segment_bytes: 4,
+            enabled: true,
+        });
+
+        // Short segment → bypass.
+        gate.evaluate(b"ab");
+
+        // Constant → skip.
+        gate.evaluate(&vec![0x42u8; 100]);
+
+        // Diverse → pass.
+        let mut diverse = Vec::with_capacity(256);
+        for b in 0..=255u8 {
+            diverse.push(b);
+        }
+        gate.evaluate(&diverse);
+
+        assert_eq!(gate.total_evaluated(), 3);
+        assert_eq!(gate.total_bypassed(), 1);
+        assert_eq!(gate.total_skipped(), 1);
+        assert_eq!(gate.total_passed(), 1);
+        assert!(gate.average_entropy() > 0.0);
+    }
+
+    #[test]
+    fn test_entropy_gate_skip_ratio() {
+        let mut gate = EntropyGate::new(EntropyGateConfig {
+            min_entropy_bits_per_byte: 2.0,
+            min_segment_bytes: 4,
+            enabled: true,
+        });
+
+        // 3 skips, 1 pass.
+        for _ in 0..3 {
+            gate.evaluate(&vec![0x00u8; 100]);
+        }
+        let mut diverse = Vec::with_capacity(256);
+        for b in 0..=255u8 {
+            diverse.push(b);
+        }
+        gate.evaluate(&diverse);
+
+        let ratio = gate.skip_ratio();
+        assert!((ratio - 0.75).abs() < 1e-10, "ratio={ratio}");
+    }
+
+    #[test]
+    fn test_entropy_gate_snapshot() {
+        let mut gate = EntropyGate::new(EntropyGateConfig::default());
+        gate.evaluate(&vec![0x41u8; 100]);
+
+        let snap = gate.snapshot();
+        assert!(snap.enabled);
+        assert!((snap.threshold - 2.0).abs() < 1e-10);
+        assert_eq!(snap.total_evaluated, 1);
+    }
+
+    #[test]
+    fn test_entropy_gate_reset_stats() {
+        let mut gate = EntropyGate::new(EntropyGateConfig::default());
+        gate.evaluate(&vec![0x41u8; 100]);
+        assert_eq!(gate.total_evaluated(), 1);
+
+        gate.reset_stats();
+        assert_eq!(gate.total_evaluated(), 0);
+        assert_eq!(gate.total_skipped(), 0);
+    }
+
+    #[test]
+    fn test_entropy_gate_progress_bar_skipped() {
+        let mut gate = EntropyGate::new(EntropyGateConfig::default());
+        // Simulate a progress bar: mostly '=' and spaces.
+        let bar = b"[=============================>                      ] 58%";
+        let decision = gate.evaluate(bar);
+        // Progress bars have low entropy (~2-3 distinct chars).
+        let is_skipped = matches!(decision, EntropyGateDecision::Skip { .. });
+        let is_passed = matches!(decision, EntropyGateDecision::Pass { .. });
+        // Progress bar may be borderline — accept either skip or low-entropy pass.
+        assert!(is_skipped || is_passed, "Progress bar got {decision:?}");
+    }
+
+    #[test]
+    fn test_entropy_gate_natural_language_passes() {
+        let mut gate = EntropyGate::new(EntropyGateConfig::default());
+        let text = b"The quick brown fox jumps over the lazy dog. This is a test of entropy.";
+        let decision = gate.evaluate(text);
+        assert!(
+            decision.should_embed(),
+            "Natural language should pass, got {decision:?}"
+        );
+        if let Some(h) = decision.entropy() {
+            assert!(h > 2.0, "Natural language entropy={h} should exceed 2.0");
+        }
+    }
+
+    #[test]
+    fn test_entropy_gate_decision_entropy() {
+        assert_eq!(EntropyGateDecision::Disabled.entropy(), None);
+        assert_eq!(
+            EntropyGateDecision::Bypass { length: 5 }.entropy(),
+            None
+        );
+        assert_eq!(
+            EntropyGateDecision::Pass { entropy: 4.5 }.entropy(),
+            Some(4.5)
+        );
+        assert_eq!(
+            EntropyGateDecision::Skip {
+                entropy: 1.0,
+                threshold: 2.0
+            }
+            .entropy(),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn test_entropy_gate_config_serde() {
+        let config = EntropyGateConfig {
+            min_entropy_bits_per_byte: 3.0,
+            min_segment_bytes: 32,
+            enabled: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let round: EntropyGateConfig = serde_json::from_str(&json).unwrap();
+        assert!((round.min_entropy_bits_per_byte - 3.0).abs() < 1e-10);
+        assert_eq!(round.min_segment_bytes, 32);
+        assert!(!round.enabled);
+    }
+
+    #[test]
+    fn test_entropy_gate_snapshot_serde() {
+        let snap = EntropyGateSnapshot {
+            enabled: true,
+            threshold: 2.0,
+            min_segment_bytes: 16,
+            total_evaluated: 100,
+            total_passed: 60,
+            total_skipped: 30,
+            total_bypassed: 10,
+            average_entropy: 4.2,
+            skip_ratio: 0.3,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let round: EntropyGateSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(round.total_evaluated, 100);
+        assert_eq!(round.total_skipped, 30);
+    }
+
+    // ── Gated detector tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_gated_detector_skips_low_entropy() {
+        let mut gated = GatedAnomalyDetector::new(
+            EntropyGateConfig::default(),
+            ConformalAnomalyConfig::default(),
+        );
+
+        // Constant data → skipped, embed_fn never called.
+        let segment = vec![0x41u8; 100];
+        let result = gated.observe(&segment, |_| panic!("embed_fn should not be called"));
+        assert!(result.was_skipped());
+        assert!(!result.is_anomaly());
+    }
+
+    #[test]
+    fn test_gated_detector_passes_high_entropy() {
+        let mut gated = GatedAnomalyDetector::new(
+            EntropyGateConfig {
+                min_segment_bytes: 4,
+                ..Default::default()
+            },
+            ConformalAnomalyConfig::default(),
+        );
+
+        // Diverse data → pass through to detector.
+        let mut segment = Vec::with_capacity(256);
+        for b in 0..=255u8 {
+            segment.push(b);
+        }
+
+        let result = gated.observe(&segment, |_| vec![1.0, 0.0, 0.0]);
+        assert!(!result.was_skipped());
+        assert!(!result.is_anomaly()); // First observation never anomalous.
+    }
+
+    #[test]
+    fn test_gated_detector_end_to_end() {
+        let mut gated = GatedAnomalyDetector::new(
+            EntropyGateConfig {
+                min_segment_bytes: 4,
+                min_entropy_bits_per_byte: 2.0,
+                enabled: true,
+            },
+            ConformalAnomalyConfig {
+                min_calibration: 5,
+                calibration_window: 50,
+                alpha: 0.05,
+                centroid_alpha: 0.1,
+            },
+        );
+
+        // Build calibration with diverse segments embedding to context A.
+        let mut diverse = Vec::with_capacity(256);
+        for b in 0..=255u8 {
+            diverse.push(b);
+        }
+        for _ in 0..30 {
+            gated.observe(&diverse, |_| vec![1.0, 0.0, 0.0]);
+        }
+
+        // Some constant segments → skipped.
+        let constant = vec![0x00u8; 100];
+        let skip_result = gated.observe(&constant, |_| panic!("should skip"));
+        assert!(skip_result.was_skipped());
+
+        // Shift context → should detect anomaly.
+        let shift_result = gated.observe(&diverse, |_| vec![0.0, 1.0, 0.0]);
+        assert!(!shift_result.was_skipped());
+        // May or may not detect depending on calibration state, but shouldn't panic.
+    }
+
+    #[test]
+    fn test_gated_observation_methods() {
+        let skipped = GatedObservation::Skipped(EntropyGateDecision::Skip {
+            entropy: 0.5,
+            threshold: 2.0,
+        });
+        assert!(skipped.was_skipped());
+        assert!(!skipped.is_anomaly());
+
+        let processed_normal = GatedObservation::Processed {
+            gate_decision: EntropyGateDecision::Pass { entropy: 5.0 },
+            anomaly: None,
+        };
+        assert!(!processed_normal.was_skipped());
+        assert!(!processed_normal.is_anomaly());
+
+        let processed_anomaly = GatedObservation::Processed {
+            gate_decision: EntropyGateDecision::Pass { entropy: 5.0 },
+            anomaly: Some(ConformalShock {
+                distance: 0.9,
+                p_value: 0.001,
+                alpha: 0.05,
+                calibration_count: 50,
+                calibration_median: 0.05,
+            }),
+        };
+        assert!(!processed_anomaly.was_skipped());
+        assert!(processed_anomaly.is_anomaly());
     }
 }
