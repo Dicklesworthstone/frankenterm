@@ -1642,6 +1642,226 @@ impl fmt::Display for MissionFailureContext {
     }
 }
 
+/// Mission policy preflight stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionPolicyPreflightStage {
+    PlanTime,
+    DispatchTime,
+}
+
+impl fmt::Display for MissionPolicyPreflightStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlanTime => f.write_str("plan_time"),
+            Self::DispatchTime => f.write_str("dispatch_time"),
+        }
+    }
+}
+
+/// Normalized policy decision kind used by mission preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionPolicyDecisionKind {
+    Allow,
+    Deny,
+    RequireApproval,
+}
+
+impl fmt::Display for MissionPolicyDecisionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Allow => f.write_str("allow"),
+            Self::Deny => f.write_str("deny"),
+            Self::RequireApproval => f.write_str("require_approval"),
+        }
+    }
+}
+
+/// One policy preflight check produced by policy/rule evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionPolicyPreflightCheck {
+    pub candidate_id: CandidateActionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<AssignmentId>,
+    pub decision: MissionPolicyDecisionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+}
+
+/// Structured preflight outcome for one candidate/assignment check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionPolicyPreflightOutcome {
+    pub stage: MissionPolicyPreflightStage,
+    pub candidate_id: CandidateActionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<AssignmentId>,
+    pub action_type: String,
+    pub decision: MissionPolicyDecisionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub human_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+}
+
+/// Full mission preflight report consumed by planner/dispatcher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionPolicyPreflightReport {
+    pub stage: MissionPolicyPreflightStage,
+    pub outcomes: Vec<MissionPolicyPreflightOutcome>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planner_feedback_reason_codes: Vec<String>,
+}
+
+impl MissionPolicyPreflightReport {
+    /// Returns true when at least one policy denial occurred.
+    #[must_use]
+    pub fn has_denials(&self) -> bool {
+        self.outcomes
+            .iter()
+            .any(|outcome| outcome.decision == MissionPolicyDecisionKind::Deny)
+    }
+
+    /// Returns true when at least one check requested human approval.
+    #[must_use]
+    pub fn requires_approval(&self) -> bool {
+        self.outcomes
+            .iter()
+            .any(|outcome| outcome.decision == MissionPolicyDecisionKind::RequireApproval)
+    }
+}
+
+// ============================================================================
+// Mission Dispatch Mapping Contract
+// ============================================================================
+
+/// Concrete dispatch surface used for a candidate action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mechanism", rename_all = "snake_case")]
+pub enum MissionDispatchMechanism {
+    RobotSend {
+        pane_id: u64,
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        paste_mode: Option<bool>,
+    },
+    RobotWaitFor {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u64>,
+        condition: WaitCondition,
+        timeout_ms: u64,
+    },
+    RobotRunWorkflow {
+        workflow_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        params: Option<serde_json::Value>,
+    },
+    InternalLockAcquire {
+        lock_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+    InternalLockRelease {
+        lock_name: String,
+    },
+    InternalStoreData {
+        key: String,
+        value: serde_json::Value,
+    },
+    InternalMarkEventHandled {
+        event_id: i64,
+    },
+    InternalValidateApproval {
+        approval_code: String,
+    },
+    InternalNestedPlan {
+        plan_hash: String,
+    },
+    InternalCustom {
+        action_type: String,
+        payload: serde_json::Value,
+    },
+}
+
+impl MissionDispatchMechanism {
+    /// Human-readable primitive family used by this mechanism.
+    #[must_use]
+    pub const fn primitive_family(&self) -> &'static str {
+        match self {
+            Self::RobotSend { .. } | Self::RobotWaitFor { .. } | Self::RobotRunWorkflow { .. } => {
+                "robot"
+            }
+            Self::InternalLockAcquire { .. }
+            | Self::InternalLockRelease { .. }
+            | Self::InternalStoreData { .. }
+            | Self::InternalMarkEventHandled { .. }
+            | Self::InternalValidateApproval { .. }
+            | Self::InternalNestedPlan { .. }
+            | Self::InternalCustom { .. } => "internal_plan",
+        }
+    }
+}
+
+/// File-reservation requirements to execute a mapped dispatch action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionReservationRequirement {
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intents: Vec<ReservationIntent>,
+}
+
+/// Messaging and issue-tracking requirements around mission dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionMessagingRequirement {
+    pub requires_agent_mail: bool,
+    pub requires_beads_update: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bead_id: Option<String>,
+}
+
+/// Explicit edge-case contract to keep dispatch behavior predictable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MissionDispatchEdgeCase {
+    MissingPane {
+        pane_id: u64,
+        reason_code: String,
+        error_code: String,
+        remediation: String,
+    },
+    StaleBeadState {
+        bead_id: String,
+        reason_code: String,
+        error_code: String,
+        remediation: String,
+    },
+}
+
+/// Mapping from mission candidate action to concrete control-plane primitives.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionDispatchContract {
+    pub candidate_id: CandidateActionId,
+    pub mechanism: MissionDispatchMechanism,
+    pub reservation: MissionReservationRequirement,
+    pub messaging: MissionMessagingRequirement,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edge_cases: Vec<MissionDispatchEdgeCase>,
+}
+
 /// Escalation severity for operator routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1743,6 +1963,261 @@ impl Assignment {
     }
 }
 
+/// Mission lifecycle state machine for planner->dispatcher->operator flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionLifecycleState {
+    #[default]
+    Planning,
+    Planned,
+    Dispatching,
+    AwaitingApproval,
+    Running,
+    RetryPending,
+    Blocked,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl MissionLifecycleState {
+    /// Returns true when mission is in terminal state.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+impl fmt::Display for MissionLifecycleState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Planning => f.write_str("planning"),
+            Self::Planned => f.write_str("planned"),
+            Self::Dispatching => f.write_str("dispatching"),
+            Self::AwaitingApproval => f.write_str("awaiting_approval"),
+            Self::Running => f.write_str("running"),
+            Self::RetryPending => f.write_str("retry_pending"),
+            Self::Blocked => f.write_str("blocked"),
+            Self::Completed => f.write_str("completed"),
+            Self::Failed => f.write_str("failed"),
+            Self::Cancelled => f.write_str("cancelled"),
+        }
+    }
+}
+
+/// Transition intent for mission lifecycle movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionLifecycleTransitionKind {
+    PlanFinalized,
+    DispatchStarted,
+    ApprovalRequested,
+    ApprovalGranted,
+    ApprovalDenied,
+    ApprovalExpired,
+    ExecutionStarted,
+    ExecutionBlocked,
+    RetryScheduled,
+    RetryResumed,
+    ExecutionSucceeded,
+    ExecutionFailed,
+    MissionCancelled,
+}
+
+impl fmt::Display for MissionLifecycleTransitionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlanFinalized => f.write_str("plan_finalized"),
+            Self::DispatchStarted => f.write_str("dispatch_started"),
+            Self::ApprovalRequested => f.write_str("approval_requested"),
+            Self::ApprovalGranted => f.write_str("approval_granted"),
+            Self::ApprovalDenied => f.write_str("approval_denied"),
+            Self::ApprovalExpired => f.write_str("approval_expired"),
+            Self::ExecutionStarted => f.write_str("execution_started"),
+            Self::ExecutionBlocked => f.write_str("execution_blocked"),
+            Self::RetryScheduled => f.write_str("retry_scheduled"),
+            Self::RetryResumed => f.write_str("retry_resumed"),
+            Self::ExecutionSucceeded => f.write_str("execution_succeeded"),
+            Self::ExecutionFailed => f.write_str("execution_failed"),
+            Self::MissionCancelled => f.write_str("mission_cancelled"),
+        }
+    }
+}
+
+/// One legal lifecycle transition edge in the mission transition table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissionLifecycleTransitionRule {
+    pub from: MissionLifecycleState,
+    pub to: MissionLifecycleState,
+    pub kind: MissionLifecycleTransitionKind,
+}
+
+const MISSION_LIFECYCLE_TRANSITION_RULES: [MissionLifecycleTransitionRule; 29] = [
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Planning,
+        to: MissionLifecycleState::Planned,
+        kind: MissionLifecycleTransitionKind::PlanFinalized,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Planning,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::MissionCancelled,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Planned,
+        to: MissionLifecycleState::Dispatching,
+        kind: MissionLifecycleTransitionKind::DispatchStarted,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Planned,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::MissionCancelled,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Dispatching,
+        to: MissionLifecycleState::AwaitingApproval,
+        kind: MissionLifecycleTransitionKind::ApprovalRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Dispatching,
+        to: MissionLifecycleState::Running,
+        kind: MissionLifecycleTransitionKind::ExecutionStarted,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Dispatching,
+        to: MissionLifecycleState::Blocked,
+        kind: MissionLifecycleTransitionKind::ExecutionBlocked,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Dispatching,
+        to: MissionLifecycleState::RetryPending,
+        kind: MissionLifecycleTransitionKind::RetryScheduled,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Dispatching,
+        to: MissionLifecycleState::Failed,
+        kind: MissionLifecycleTransitionKind::ExecutionFailed,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Dispatching,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::MissionCancelled,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::AwaitingApproval,
+        to: MissionLifecycleState::Running,
+        kind: MissionLifecycleTransitionKind::ApprovalGranted,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::AwaitingApproval,
+        to: MissionLifecycleState::Failed,
+        kind: MissionLifecycleTransitionKind::ApprovalDenied,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::AwaitingApproval,
+        to: MissionLifecycleState::Failed,
+        kind: MissionLifecycleTransitionKind::ApprovalExpired,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::AwaitingApproval,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::MissionCancelled,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Running,
+        to: MissionLifecycleState::Completed,
+        kind: MissionLifecycleTransitionKind::ExecutionSucceeded,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Running,
+        to: MissionLifecycleState::Failed,
+        kind: MissionLifecycleTransitionKind::ExecutionFailed,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Running,
+        to: MissionLifecycleState::Blocked,
+        kind: MissionLifecycleTransitionKind::ExecutionBlocked,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Running,
+        to: MissionLifecycleState::RetryPending,
+        kind: MissionLifecycleTransitionKind::RetryScheduled,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Running,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::MissionCancelled,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Blocked,
+        to: MissionLifecycleState::RetryPending,
+        kind: MissionLifecycleTransitionKind::RetryScheduled,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Blocked,
+        to: MissionLifecycleState::Running,
+        kind: MissionLifecycleTransitionKind::RetryResumed,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Blocked,
+        to: MissionLifecycleState::Failed,
+        kind: MissionLifecycleTransitionKind::ExecutionFailed,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Blocked,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::MissionCancelled,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::RetryPending,
+        to: MissionLifecycleState::Dispatching,
+        kind: MissionLifecycleTransitionKind::RetryResumed,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::RetryPending,
+        to: MissionLifecycleState::Running,
+        kind: MissionLifecycleTransitionKind::RetryResumed,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::RetryPending,
+        to: MissionLifecycleState::Failed,
+        kind: MissionLifecycleTransitionKind::ExecutionFailed,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::RetryPending,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::MissionCancelled,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Failed,
+        to: MissionLifecycleState::RetryPending,
+        kind: MissionLifecycleTransitionKind::RetryScheduled,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Failed,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::MissionCancelled,
+    },
+];
+
+/// Returns canonical mission lifecycle transition table.
+#[must_use]
+pub const fn mission_lifecycle_transition_table() -> &'static [MissionLifecycleTransitionRule] {
+    &MISSION_LIFECYCLE_TRANSITION_RULES
+}
+
+/// Returns whether a lifecycle transition is legal.
+#[must_use]
+pub fn mission_lifecycle_can_transition(
+    from: MissionLifecycleState,
+    to: MissionLifecycleState,
+    kind: MissionLifecycleTransitionKind,
+) -> bool {
+    mission_lifecycle_transition_table()
+        .iter()
+        .any(|rule| rule.from == from && rule.to == to && rule.kind == kind)
+}
+
 /// Canonical mission object for planner/dispatcher/operator orchestration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mission {
@@ -1751,6 +2226,8 @@ pub struct Mission {
     pub title: String,
     pub workspace_id: String,
     pub ownership: MissionOwnership,
+    #[serde(default)]
+    pub lifecycle_state: MissionLifecycleState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<MissionProvenance>,
     pub created_at_ms: i64,
@@ -1778,6 +2255,7 @@ impl Mission {
             title: title.into(),
             workspace_id: workspace_id.into(),
             ownership,
+            lifecycle_state: MissionLifecycleState::Planning,
             provenance: None,
             created_at_ms,
             updated_at_ms: None,
@@ -1803,6 +2281,7 @@ impl Mission {
             format!("title={}", self.title),
             format!("workspace_id={}", self.workspace_id),
             format!("ownership={}", self.ownership.canonical_string()),
+            format!("lifecycle_state={}", self.lifecycle_state),
             format!("created_at_ms={}", self.created_at_ms),
             format!(
                 "updated_at_ms={}",
@@ -1889,8 +2368,351 @@ impl Mission {
             }
             Self::validate_assignment_failure_contract(assignment)?;
         }
+        Self::validate_lifecycle_outcome_coherence(self.lifecycle_state, &self.assignments)?;
 
         Ok(())
+    }
+
+    /// Apply one lifecycle transition to this mission.
+    pub fn transition_lifecycle(
+        &mut self,
+        to: MissionLifecycleState,
+        kind: MissionLifecycleTransitionKind,
+        transitioned_at_ms: i64,
+    ) -> Result<(), MissionValidationError> {
+        let from = self.lifecycle_state;
+        if !mission_lifecycle_can_transition(from, to, kind) {
+            return Err(MissionValidationError::InvalidLifecycleTransition { from, to, kind });
+        }
+
+        self.lifecycle_state = to;
+        self.updated_at_ms = Some(transitioned_at_ms);
+        Ok(())
+    }
+
+    /// Evaluate policy preflight checks for mission candidate actions.
+    ///
+    /// This pipeline supports both:
+    /// - plan-time checks (candidate-level, before assignment dispatch)
+    /// - dispatch-time checks (assignment-bound, just before execution)
+    pub fn evaluate_policy_preflight(
+        &self,
+        stage: MissionPolicyPreflightStage,
+        checks: &[MissionPolicyPreflightCheck],
+    ) -> Result<MissionPolicyPreflightReport, MissionValidationError> {
+        let mut outcomes = Vec::with_capacity(checks.len());
+        let mut planner_feedback_reason_codes = Vec::new();
+
+        for check in checks {
+            let candidate = self
+                .candidates
+                .iter()
+                .find(|candidate| candidate.candidate_id == check.candidate_id)
+                .ok_or_else(|| {
+                    MissionValidationError::UnknownCandidateReference(check.candidate_id.clone())
+                })?;
+
+            let assignment_id = match (stage, &check.assignment_id) {
+                (MissionPolicyPreflightStage::DispatchTime, None) => {
+                    return Err(MissionValidationError::MissingDispatchPreflightAssignment {
+                        candidate_id: check.candidate_id.clone(),
+                    });
+                }
+                (_, Some(assignment_id)) => {
+                    let assignment =
+                        self.find_assignment_by_id(assignment_id).ok_or_else(|| {
+                            MissionValidationError::UnknownAssignmentReference(
+                                assignment_id.clone(),
+                            )
+                        })?;
+                    if assignment.candidate_id != check.candidate_id {
+                        return Err(
+                            MissionValidationError::PreflightAssignmentCandidateMismatch {
+                                assignment_id: assignment.assignment_id.clone(),
+                                assignment_candidate_id: assignment.candidate_id.clone(),
+                                check_candidate_id: check.candidate_id.clone(),
+                            },
+                        );
+                    }
+                    Some(assignment.assignment_id.clone())
+                }
+                (_, None) => None,
+            };
+
+            let mut outcome = MissionPolicyPreflightOutcome {
+                stage,
+                candidate_id: check.candidate_id.clone(),
+                assignment_id,
+                action_type: candidate.action.action_type_name().to_string(),
+                decision: check.decision,
+                reason_code: None,
+                error_code: None,
+                human_hint: None,
+                machine_hint: None,
+                rule_id: check.rule_id.clone(),
+                context: check.context.clone(),
+            };
+
+            match check.decision {
+                MissionPolicyDecisionKind::Allow => {}
+                MissionPolicyDecisionKind::Deny | MissionPolicyDecisionKind::RequireApproval => {
+                    let failure_code = Self::resolve_preflight_reason_code(stage, check)?;
+                    if check.decision == MissionPolicyDecisionKind::RequireApproval
+                        && failure_code != MissionFailureCode::ApprovalRequired
+                    {
+                        return Err(
+                            MissionValidationError::UnexpectedPolicyPreflightReasonCode {
+                                candidate_id: check.candidate_id.clone(),
+                                stage,
+                                decision: check.decision,
+                                expected_reason_code: MissionFailureCode::ApprovalRequired
+                                    .reason_code()
+                                    .to_string(),
+                                actual_reason_code: failure_code.reason_code().to_string(),
+                            },
+                        );
+                    }
+
+                    outcome.reason_code = Some(failure_code.reason_code().to_string());
+                    outcome.error_code = Some(failure_code.error_code().to_string());
+                    outcome.human_hint = Some(failure_code.human_hint().to_string());
+                    outcome.machine_hint = Some(failure_code.machine_hint().to_string());
+                    planner_feedback_reason_codes.push(failure_code.reason_code().to_string());
+                }
+            }
+
+            outcomes.push(outcome);
+        }
+
+        planner_feedback_reason_codes.sort();
+        planner_feedback_reason_codes.dedup();
+
+        Ok(MissionPolicyPreflightReport {
+            stage,
+            outcomes,
+            planner_feedback_reason_codes,
+        })
+    }
+
+    /// Build a concrete dispatch mapping contract for a candidate action.
+    ///
+    /// The mapping explicitly ties a planner candidate to:
+    /// - execution surface (robot/internal)
+    /// - reservation requirements (Agent Mail file intents)
+    /// - messaging requirements (Agent Mail thread + Beads issue linkage)
+    /// - canonical edge-case envelopes (missing pane / stale bead state)
+    pub fn dispatch_contract_for_candidate(
+        &self,
+        candidate_id: &CandidateActionId,
+    ) -> Result<MissionDispatchContract, MissionValidationError> {
+        let candidate = self
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == *candidate_id)
+            .ok_or_else(|| MissionValidationError::UnknownCandidateReference(candidate_id.clone()))?;
+
+        let reservation_intents = self
+            .assignments
+            .iter()
+            .filter(|assignment| assignment.candidate_id == *candidate_id)
+            .filter_map(|assignment| assignment.reservation_intent.clone())
+            .collect::<Vec<_>>();
+
+        let reservation = MissionReservationRequirement {
+            required: !reservation_intents.is_empty(),
+            intents: reservation_intents,
+        };
+
+        let (bead_id, thread_id) = if let Some(provenance) = &self.provenance {
+            let bead_id = provenance.bead_id.clone();
+            let thread_id = provenance.thread_id.clone().or_else(|| bead_id.clone());
+            (bead_id, thread_id)
+        } else {
+            (None, None)
+        };
+
+        let messaging = MissionMessagingRequirement {
+            requires_agent_mail: thread_id.is_some(),
+            requires_beads_update: bead_id.is_some(),
+            thread_id,
+            bead_id,
+        };
+
+        let mut edge_cases = Vec::new();
+        if let Some(pane_id) = Self::candidate_target_pane_id(&candidate.action) {
+            edge_cases.push(MissionDispatchEdgeCase::MissingPane {
+                pane_id,
+                reason_code: MissionFailureCode::StaleState.reason_code().to_string(),
+                error_code: MissionFailureCode::StaleState.error_code().to_string(),
+                remediation: "Refresh pane inventory with `ft robot state` before dispatch."
+                    .to_string(),
+            });
+        }
+        if let Some(bead_id) = &messaging.bead_id {
+            edge_cases.push(MissionDispatchEdgeCase::StaleBeadState {
+                bead_id: bead_id.clone(),
+                reason_code: MissionFailureCode::StaleState.reason_code().to_string(),
+                error_code: MissionFailureCode::StaleState.error_code().to_string(),
+                remediation:
+                    "Re-sync beads state (`br sync --import-only`) before status/comment updates."
+                        .to_string(),
+            });
+        }
+
+        Ok(MissionDispatchContract {
+            candidate_id: candidate.candidate_id.clone(),
+            mechanism: Self::dispatch_mechanism_for_action(&candidate.action),
+            reservation,
+            messaging,
+            edge_cases,
+        })
+    }
+
+    fn dispatch_mechanism_for_action(action: &StepAction) -> MissionDispatchMechanism {
+        match action {
+            StepAction::SendText {
+                pane_id,
+                text,
+                paste_mode,
+            } => MissionDispatchMechanism::RobotSend {
+                pane_id: *pane_id,
+                text: text.clone(),
+                paste_mode: *paste_mode,
+            },
+            StepAction::WaitFor {
+                pane_id,
+                condition,
+                timeout_ms,
+            } => MissionDispatchMechanism::RobotWaitFor {
+                pane_id: *pane_id,
+                condition: condition.clone(),
+                timeout_ms: *timeout_ms,
+            },
+            StepAction::RunWorkflow {
+                workflow_id,
+                params,
+            } => MissionDispatchMechanism::RobotRunWorkflow {
+                workflow_id: workflow_id.clone(),
+                params: params.clone(),
+            },
+            StepAction::AcquireLock {
+                lock_name,
+                timeout_ms,
+            } => MissionDispatchMechanism::InternalLockAcquire {
+                lock_name: lock_name.clone(),
+                timeout_ms: *timeout_ms,
+            },
+            StepAction::ReleaseLock { lock_name } => MissionDispatchMechanism::InternalLockRelease {
+                lock_name: lock_name.clone(),
+            },
+            StepAction::StoreData { key, value } => MissionDispatchMechanism::InternalStoreData {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            StepAction::MarkEventHandled { event_id } => {
+                MissionDispatchMechanism::InternalMarkEventHandled {
+                    event_id: *event_id,
+                }
+            }
+            StepAction::ValidateApproval { approval_code } => {
+                MissionDispatchMechanism::InternalValidateApproval {
+                    approval_code: approval_code.clone(),
+                }
+            }
+            StepAction::NestedPlan { plan } => MissionDispatchMechanism::InternalNestedPlan {
+                plan_hash: plan.compute_hash(),
+            },
+            StepAction::Custom {
+                action_type,
+                payload,
+            } => MissionDispatchMechanism::InternalCustom {
+                action_type: action_type.clone(),
+                payload: payload.clone(),
+            },
+        }
+    }
+
+    fn candidate_target_pane_id(action: &StepAction) -> Option<u64> {
+        match action {
+            StepAction::SendText { pane_id, .. } => Some(*pane_id),
+            StepAction::WaitFor {
+                pane_id, condition, ..
+            } => pane_id.or(match condition {
+                WaitCondition::Pattern { pane_id, .. }
+                | WaitCondition::PaneIdle { pane_id, .. }
+                | WaitCondition::StableTail { pane_id, .. } => *pane_id,
+                WaitCondition::External { .. } => None,
+            }),
+            _ => None,
+        }
+    }
+
+    fn find_assignment_by_id(&self, assignment_id: &AssignmentId) -> Option<&Assignment> {
+        self.assignments
+            .iter()
+            .find(|assignment| assignment.assignment_id == *assignment_id)
+    }
+
+    fn resolve_preflight_reason_code(
+        stage: MissionPolicyPreflightStage,
+        check: &MissionPolicyPreflightCheck,
+    ) -> Result<MissionFailureCode, MissionValidationError> {
+        let reason_code = check
+            .reason_code
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default();
+        if reason_code.is_empty() {
+            return Err(MissionValidationError::MissingPolicyPreflightReasonCode {
+                candidate_id: check.candidate_id.clone(),
+                stage,
+                decision: check.decision,
+            });
+        }
+        MissionFailureCode::from_reason_code(reason_code).ok_or_else(|| {
+            MissionValidationError::UnknownPolicyPreflightReasonCode {
+                candidate_id: check.candidate_id.clone(),
+                stage,
+                reason_code: reason_code.to_string(),
+            }
+        })
+    }
+
+    fn validate_lifecycle_outcome_coherence(
+        lifecycle_state: MissionLifecycleState,
+        assignments: &[Assignment],
+    ) -> Result<(), MissionValidationError> {
+        let has_success = assignments
+            .iter()
+            .any(|assignment| matches!(assignment.outcome, Some(Outcome::Success { .. })));
+        let has_failed = assignments
+            .iter()
+            .any(|assignment| matches!(assignment.outcome, Some(Outcome::Failed { .. })));
+        let has_cancelled = assignments
+            .iter()
+            .any(|assignment| matches!(assignment.outcome, Some(Outcome::Cancelled { .. })));
+
+        match lifecycle_state {
+            MissionLifecycleState::Completed if !has_success => Err(
+                MissionValidationError::TerminalStateWithoutMatchingOutcome {
+                    state: lifecycle_state,
+                    expected_outcome: "success".to_string(),
+                },
+            ),
+            MissionLifecycleState::Failed if !has_failed => Err(
+                MissionValidationError::TerminalStateWithoutMatchingOutcome {
+                    state: lifecycle_state,
+                    expected_outcome: "failed".to_string(),
+                },
+            ),
+            MissionLifecycleState::Cancelled if !has_cancelled => Err(
+                MissionValidationError::TerminalStateWithoutMatchingOutcome {
+                    state: lifecycle_state,
+                    expected_outcome: "cancelled".to_string(),
+                },
+            ),
+            _ => Ok(()),
+        }
     }
 
     fn validate_assignment_failure_contract(
@@ -2042,8 +2864,43 @@ pub enum MissionValidationError {
     DuplicateCandidateId(CandidateActionId),
     DuplicateAssignmentId(AssignmentId),
     UnknownCandidateReference(CandidateActionId),
+    UnknownAssignmentReference(AssignmentId),
     EmptyAssignee(AssignmentId),
     EmptyReservationPaths(ReservationIntentId),
+    MissingDispatchPreflightAssignment {
+        candidate_id: CandidateActionId,
+    },
+    PreflightAssignmentCandidateMismatch {
+        assignment_id: AssignmentId,
+        assignment_candidate_id: CandidateActionId,
+        check_candidate_id: CandidateActionId,
+    },
+    MissingPolicyPreflightReasonCode {
+        candidate_id: CandidateActionId,
+        stage: MissionPolicyPreflightStage,
+        decision: MissionPolicyDecisionKind,
+    },
+    UnknownPolicyPreflightReasonCode {
+        candidate_id: CandidateActionId,
+        stage: MissionPolicyPreflightStage,
+        reason_code: String,
+    },
+    UnexpectedPolicyPreflightReasonCode {
+        candidate_id: CandidateActionId,
+        stage: MissionPolicyPreflightStage,
+        decision: MissionPolicyDecisionKind,
+        expected_reason_code: String,
+        actual_reason_code: String,
+    },
+    InvalidLifecycleTransition {
+        from: MissionLifecycleState,
+        to: MissionLifecycleState,
+        kind: MissionLifecycleTransitionKind,
+    },
+    TerminalStateWithoutMatchingOutcome {
+        state: MissionLifecycleState,
+        expected_outcome: String,
+    },
     EmptyFailureReasonCode {
         assignment_id: AssignmentId,
         context: MissionFailureContext,
@@ -2098,9 +2955,80 @@ impl fmt::Display for MissionValidationError {
             Self::UnknownCandidateReference(id) => {
                 write!(f, "Assignment references unknown candidate ID: {}", id.0)
             }
+            Self::UnknownAssignmentReference(id) => {
+                write!(f, "Unknown assignment ID: {}", id.0)
+            }
             Self::EmptyAssignee(id) => write!(f, "Assignment has empty assignee: {}", id.0),
             Self::EmptyReservationPaths(id) => {
                 write!(f, "Reservation intent has empty paths: {}", id.0)
+            }
+            Self::MissingDispatchPreflightAssignment { candidate_id } => {
+                write!(
+                    f,
+                    "Dispatch-time policy preflight requires assignment_id for candidate {}",
+                    candidate_id.0
+                )
+            }
+            Self::PreflightAssignmentCandidateMismatch {
+                assignment_id,
+                assignment_candidate_id,
+                check_candidate_id,
+            } => {
+                write!(
+                    f,
+                    "Policy preflight assignment {} targets candidate {}, but check references candidate {}",
+                    assignment_id.0, assignment_candidate_id.0, check_candidate_id.0
+                )
+            }
+            Self::MissingPolicyPreflightReasonCode {
+                candidate_id,
+                stage,
+                decision,
+            } => {
+                write!(
+                    f,
+                    "Missing preflight reason code for candidate {} at stage {stage} decision {decision}",
+                    candidate_id.0
+                )
+            }
+            Self::UnknownPolicyPreflightReasonCode {
+                candidate_id,
+                stage,
+                reason_code,
+            } => {
+                write!(
+                    f,
+                    "Unknown preflight reason code '{reason_code}' for candidate {} at stage {stage}",
+                    candidate_id.0
+                )
+            }
+            Self::UnexpectedPolicyPreflightReasonCode {
+                candidate_id,
+                stage,
+                decision,
+                expected_reason_code,
+                actual_reason_code,
+            } => {
+                write!(
+                    f,
+                    "Invalid preflight reason code '{actual_reason_code}' for candidate {} at stage {stage} decision {decision}; expected '{expected_reason_code}'",
+                    candidate_id.0
+                )
+            }
+            Self::InvalidLifecycleTransition { from, to, kind } => {
+                write!(
+                    f,
+                    "Illegal mission lifecycle transition {from} -> {to} via {kind}"
+                )
+            }
+            Self::TerminalStateWithoutMatchingOutcome {
+                state,
+                expected_outcome,
+            } => {
+                write!(
+                    f,
+                    "Mission lifecycle state {state} requires at least one '{expected_outcome}' assignment outcome"
+                )
             }
             Self::EmptyFailureReasonCode {
                 assignment_id,
@@ -3712,6 +4640,7 @@ mod tests {
             created_at_ms: 1_704_000_000_210,
             updated_at_ms: Some(1_704_000_000_705),
         });
+        mission.lifecycle_state = MissionLifecycleState::Completed;
         mission
     }
 
@@ -3773,6 +4702,149 @@ mod tests {
         assert!(matches!(
             err,
             MissionValidationError::EmptyReservationPaths(_)
+        ));
+    }
+
+    #[test]
+    fn mission_lifecycle_transition_table_contains_required_branches() {
+        assert!(mission_lifecycle_can_transition(
+            MissionLifecycleState::Planning,
+            MissionLifecycleState::Planned,
+            MissionLifecycleTransitionKind::PlanFinalized
+        ));
+        assert!(mission_lifecycle_can_transition(
+            MissionLifecycleState::Dispatching,
+            MissionLifecycleState::Blocked,
+            MissionLifecycleTransitionKind::ExecutionBlocked
+        ));
+        assert!(mission_lifecycle_can_transition(
+            MissionLifecycleState::AwaitingApproval,
+            MissionLifecycleState::Failed,
+            MissionLifecycleTransitionKind::ApprovalExpired
+        ));
+        assert!(mission_lifecycle_can_transition(
+            MissionLifecycleState::Blocked,
+            MissionLifecycleState::RetryPending,
+            MissionLifecycleTransitionKind::RetryScheduled
+        ));
+        assert!(mission_lifecycle_can_transition(
+            MissionLifecycleState::Running,
+            MissionLifecycleState::Cancelled,
+            MissionLifecycleTransitionKind::MissionCancelled
+        ));
+    }
+
+    #[test]
+    fn mission_lifecycle_happy_path_reaches_completed() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Planning;
+        mission.updated_at_ms = None;
+
+        mission
+            .transition_lifecycle(
+                MissionLifecycleState::Planned,
+                MissionLifecycleTransitionKind::PlanFinalized,
+                1_704_000_001_000,
+            )
+            .unwrap();
+        mission
+            .transition_lifecycle(
+                MissionLifecycleState::Dispatching,
+                MissionLifecycleTransitionKind::DispatchStarted,
+                1_704_000_001_100,
+            )
+            .unwrap();
+        mission
+            .transition_lifecycle(
+                MissionLifecycleState::Running,
+                MissionLifecycleTransitionKind::ExecutionStarted,
+                1_704_000_001_200,
+            )
+            .unwrap();
+        mission
+            .transition_lifecycle(
+                MissionLifecycleState::Completed,
+                MissionLifecycleTransitionKind::ExecutionSucceeded,
+                1_704_000_001_300,
+            )
+            .unwrap();
+
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Completed);
+        assert!(mission.validate().is_ok());
+    }
+
+    #[test]
+    fn mission_lifecycle_retry_and_unblock_paths_are_supported() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Dispatching;
+
+        mission
+            .transition_lifecycle(
+                MissionLifecycleState::Blocked,
+                MissionLifecycleTransitionKind::ExecutionBlocked,
+                1_704_000_002_100,
+            )
+            .unwrap();
+        mission
+            .transition_lifecycle(
+                MissionLifecycleState::RetryPending,
+                MissionLifecycleTransitionKind::RetryScheduled,
+                1_704_000_002_200,
+            )
+            .unwrap();
+        mission
+            .transition_lifecycle(
+                MissionLifecycleState::Dispatching,
+                MissionLifecycleTransitionKind::RetryResumed,
+                1_704_000_002_300,
+            )
+            .unwrap();
+        mission
+            .transition_lifecycle(
+                MissionLifecycleState::Running,
+                MissionLifecycleTransitionKind::ExecutionStarted,
+                1_704_000_002_400,
+            )
+            .unwrap();
+        mission
+            .transition_lifecycle(
+                MissionLifecycleState::Completed,
+                MissionLifecycleTransitionKind::ExecutionSucceeded,
+                1_704_000_002_500,
+            )
+            .unwrap();
+
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Completed);
+        assert!(mission.validate().is_ok());
+    }
+
+    #[test]
+    fn mission_lifecycle_invalid_transition_is_rejected() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Planning;
+
+        let err = mission
+            .transition_lifecycle(
+                MissionLifecycleState::Completed,
+                MissionLifecycleTransitionKind::ExecutionSucceeded,
+                1_704_000_003_000,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::InvalidLifecycleTransition { .. }
+        ));
+    }
+
+    #[test]
+    fn mission_validate_rejects_terminal_state_without_matching_outcome() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Failed;
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::TerminalStateWithoutMatchingOutcome { .. }
         ));
     }
 
@@ -3865,6 +4937,7 @@ mod tests {
     #[test]
     fn mission_validate_accepts_recoverable_failure_contract() {
         let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Failed;
         mission.assignments[0].outcome = Some(Outcome::Failed {
             reason_code: MissionFailureCode::ReservationConflict
                 .reason_code()
@@ -3936,6 +5009,375 @@ mod tests {
                 context: MissionFailureContext::AssignmentEscalation,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn mission_policy_preflight_plan_time_surfaces_structured_allow_and_deny_reasons() {
+        let mut mission = sample_mission();
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:b".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::WaitFor {
+                pane_id: Some(2),
+                condition: WaitCondition::Pattern {
+                    pane_id: Some(2),
+                    rule_id: "core.codex:done".to_string(),
+                },
+                timeout_ms: 5_000,
+            },
+            rationale: "Observe completion signal".to_string(),
+            score: Some(0.44),
+            created_at_ms: 1_704_000_000_333,
+        });
+
+        let report = mission
+            .evaluate_policy_preflight(
+                MissionPolicyPreflightStage::PlanTime,
+                &[
+                    MissionPolicyPreflightCheck {
+                        candidate_id: CandidateActionId("candidate:a".to_string()),
+                        assignment_id: None,
+                        decision: MissionPolicyDecisionKind::Allow,
+                        reason_code: None,
+                        rule_id: Some("policy.default_allow".to_string()),
+                        context: Some("safe pane state".to_string()),
+                    },
+                    MissionPolicyPreflightCheck {
+                        candidate_id: CandidateActionId("candidate:b".to_string()),
+                        assignment_id: None,
+                        decision: MissionPolicyDecisionKind::Deny,
+                        reason_code: Some(
+                            MissionFailureCode::PolicyDenied.reason_code().to_string(),
+                        ),
+                        rule_id: Some("policy.prompt_required".to_string()),
+                        context: Some("prompt not active".to_string()),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(report.stage, MissionPolicyPreflightStage::PlanTime);
+        assert_eq!(report.outcomes.len(), 2);
+        assert!(report.has_denials());
+        assert!(!report.requires_approval());
+        assert_eq!(
+            report.planner_feedback_reason_codes,
+            vec![MissionFailureCode::PolicyDenied.reason_code().to_string()]
+        );
+
+        let deny_outcome = report
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.decision == MissionPolicyDecisionKind::Deny)
+            .unwrap();
+        assert_eq!(
+            deny_outcome.reason_code.as_deref(),
+            Some(MissionFailureCode::PolicyDenied.reason_code())
+        );
+        assert_eq!(
+            deny_outcome.error_code.as_deref(),
+            Some(MissionFailureCode::PolicyDenied.error_code())
+        );
+        assert!(
+            deny_outcome
+                .human_hint
+                .as_deref()
+                .unwrap()
+                .contains("Policy denied")
+        );
+        assert_eq!(deny_outcome.action_type, "wait_for");
+    }
+
+    #[test]
+    fn mission_policy_preflight_dispatch_time_requires_assignment_reference() {
+        let mission = sample_mission();
+        let err = mission
+            .evaluate_policy_preflight(
+                MissionPolicyPreflightStage::DispatchTime,
+                &[MissionPolicyPreflightCheck {
+                    candidate_id: CandidateActionId("candidate:a".to_string()),
+                    assignment_id: None,
+                    decision: MissionPolicyDecisionKind::Allow,
+                    reason_code: None,
+                    rule_id: None,
+                    context: None,
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::MissingDispatchPreflightAssignment { .. }
+        ));
+    }
+
+    #[test]
+    fn mission_policy_preflight_dispatch_time_rejects_assignment_candidate_mismatch() {
+        let mut mission = sample_mission();
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:b".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::SendText {
+                pane_id: 2,
+                text: "/status".to_string(),
+                paste_mode: Some(false),
+            },
+            rationale: "Check status".to_string(),
+            score: Some(0.12),
+            created_at_ms: 1_704_000_000_444,
+        });
+        let err = mission
+            .evaluate_policy_preflight(
+                MissionPolicyPreflightStage::DispatchTime,
+                &[MissionPolicyPreflightCheck {
+                    candidate_id: CandidateActionId("candidate:b".to_string()),
+                    assignment_id: Some(AssignmentId("assignment:a".to_string())),
+                    decision: MissionPolicyDecisionKind::Allow,
+                    reason_code: None,
+                    rule_id: None,
+                    context: None,
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::PreflightAssignmentCandidateMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn mission_policy_preflight_require_approval_requires_canonical_reason() {
+        let mission = sample_mission();
+        let err = mission
+            .evaluate_policy_preflight(
+                MissionPolicyPreflightStage::PlanTime,
+                &[MissionPolicyPreflightCheck {
+                    candidate_id: CandidateActionId("candidate:a".to_string()),
+                    assignment_id: None,
+                    decision: MissionPolicyDecisionKind::RequireApproval,
+                    reason_code: Some(MissionFailureCode::DispatchError.reason_code().to_string()),
+                    rule_id: Some("policy.destructive_action".to_string()),
+                    context: Some("high-risk operation".to_string()),
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::UnexpectedPolicyPreflightReasonCode {
+                decision: MissionPolicyDecisionKind::RequireApproval,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mission_policy_preflight_rejects_unknown_reason_code() {
+        let mission = sample_mission();
+        let err = mission
+            .evaluate_policy_preflight(
+                MissionPolicyPreflightStage::PlanTime,
+                &[MissionPolicyPreflightCheck {
+                    candidate_id: CandidateActionId("candidate:a".to_string()),
+                    assignment_id: None,
+                    decision: MissionPolicyDecisionKind::Deny,
+                    reason_code: Some("unknown_preflight_reason".to_string()),
+                    rule_id: None,
+                    context: None,
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::UnknownPolicyPreflightReasonCode { .. }
+        ));
+    }
+
+    #[test]
+    fn mission_policy_preflight_dispatch_time_accepts_assignment_bound_denial_and_feedback() {
+        let mission = sample_mission();
+        let report = mission
+            .evaluate_policy_preflight(
+                MissionPolicyPreflightStage::DispatchTime,
+                &[MissionPolicyPreflightCheck {
+                    candidate_id: CandidateActionId("candidate:a".to_string()),
+                    assignment_id: Some(AssignmentId("assignment:a".to_string())),
+                    decision: MissionPolicyDecisionKind::Deny,
+                    reason_code: Some(
+                        MissionFailureCode::ReservationConflict
+                            .reason_code()
+                            .to_string(),
+                    ),
+                    rule_id: Some("policy.pane_reserved".to_string()),
+                    context: Some("file reservation held by another actor".to_string()),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(report.stage, MissionPolicyPreflightStage::DispatchTime);
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(report.has_denials());
+        assert_eq!(
+            report.planner_feedback_reason_codes,
+            vec![
+                MissionFailureCode::ReservationConflict
+                    .reason_code()
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            report.outcomes[0].assignment_id.as_ref().unwrap().0,
+            "assignment:a"
+        );
+        assert_eq!(
+            report.outcomes[0].reason_code.as_deref(),
+            Some(MissionFailureCode::ReservationConflict.reason_code())
+        );
+        assert_eq!(
+            report.outcomes[0].error_code.as_deref(),
+            Some(MissionFailureCode::ReservationConflict.error_code())
+        );
+    }
+
+    #[test]
+    fn mission_dispatch_contract_maps_candidate_to_robot_and_coordination_primitives() {
+        let mission = sample_mission();
+        let contract = mission
+            .dispatch_contract_for_candidate(&CandidateActionId("candidate:a".to_string()))
+            .unwrap();
+
+        assert_eq!(contract.candidate_id.0, "candidate:a");
+        match &contract.mechanism {
+            MissionDispatchMechanism::RobotSend {
+                pane_id,
+                text,
+                paste_mode,
+            } => {
+                assert_eq!(*pane_id, 1);
+                assert_eq!(text, "/retry");
+                assert_eq!(*paste_mode, Some(false));
+            }
+            other => panic!("expected RobotSend mapping, got {other:?}"),
+        }
+
+        assert!(contract.reservation.required);
+        assert_eq!(contract.reservation.intents.len(), 1);
+        assert_eq!(
+            contract.reservation.intents[0].paths,
+            vec!["crates/frankenterm-core/src/plan.rs".to_string()]
+        );
+
+        assert!(contract.messaging.requires_agent_mail);
+        assert!(contract.messaging.requires_beads_update);
+        assert_eq!(
+            contract.messaging.thread_id.as_deref(),
+            Some("ft-1i2ge.1.1")
+        );
+        assert_eq!(contract.messaging.bead_id.as_deref(), Some("ft-1i2ge.1.1"));
+
+        assert!(contract.edge_cases.iter().any(|edge| {
+            matches!(
+                edge,
+                MissionDispatchEdgeCase::MissingPane {
+                    pane_id,
+                    reason_code,
+                    error_code,
+                    ..
+                } if *pane_id == 1
+                    && reason_code == MissionFailureCode::StaleState.reason_code()
+                    && error_code == MissionFailureCode::StaleState.error_code()
+            )
+        }));
+        assert!(contract.edge_cases.iter().any(|edge| {
+            matches!(
+                edge,
+                MissionDispatchEdgeCase::StaleBeadState {
+                    bead_id,
+                    reason_code,
+                    error_code,
+                    ..
+                } if bead_id == "ft-1i2ge.1.1"
+                    && reason_code == MissionFailureCode::StaleState.reason_code()
+                    && error_code == MissionFailureCode::StaleState.error_code()
+            )
+        }));
+    }
+
+    #[test]
+    fn mission_dispatch_contract_maps_wait_for_to_robot_wait_for() {
+        let mut mission = sample_mission();
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:b".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::WaitFor {
+                pane_id: Some(2),
+                condition: WaitCondition::Pattern {
+                    pane_id: Some(2),
+                    rule_id: "core.codex:usage_reached".to_string(),
+                },
+                timeout_ms: 15_000,
+            },
+            rationale: "Wait for usage event".to_string(),
+            score: Some(0.5),
+            created_at_ms: 1_704_000_000_777,
+        });
+
+        let contract = mission
+            .dispatch_contract_for_candidate(&CandidateActionId("candidate:b".to_string()))
+            .unwrap();
+
+        match &contract.mechanism {
+            MissionDispatchMechanism::RobotWaitFor {
+                pane_id,
+                condition,
+                timeout_ms,
+            } => {
+                assert_eq!(*pane_id, Some(2));
+                assert_eq!(*timeout_ms, 15_000);
+                assert!(matches!(
+                    condition,
+                    WaitCondition::Pattern {
+                        pane_id: Some(2),
+                        rule_id
+                    } if rule_id == "core.codex:usage_reached"
+                ));
+            }
+            other => panic!("expected RobotWaitFor mapping, got {other:?}"),
+        }
+
+        assert!(!contract.reservation.required);
+        assert!(contract.reservation.intents.is_empty());
+        assert!(contract.edge_cases.iter().any(
+            |edge| matches!(edge, MissionDispatchEdgeCase::MissingPane { pane_id, .. } if *pane_id == 2)
+        ));
+    }
+
+    #[test]
+    fn mission_dispatch_contract_without_provenance_disables_beads_and_mail_requirements() {
+        let mut mission = sample_mission();
+        mission.provenance = None;
+
+        let contract = mission
+            .dispatch_contract_for_candidate(&CandidateActionId("candidate:a".to_string()))
+            .unwrap();
+
+        assert!(!contract.messaging.requires_agent_mail);
+        assert!(!contract.messaging.requires_beads_update);
+        assert!(contract.messaging.thread_id.is_none());
+        assert!(contract.messaging.bead_id.is_none());
+        assert!(!contract.edge_cases.iter().any(
+            |edge| matches!(edge, MissionDispatchEdgeCase::StaleBeadState { .. })
+        ));
+    }
+
+    #[test]
+    fn mission_dispatch_contract_rejects_unknown_candidate() {
+        let mission = sample_mission();
+        let err = mission
+            .dispatch_contract_for_candidate(&CandidateActionId("candidate:missing".to_string()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::UnknownCandidateReference(_)
         ));
     }
 
