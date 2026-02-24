@@ -682,9 +682,15 @@ mod tests {
             panic!();
         };
 
-        assert_eq!(engine.get_version(v2).unwrap().status, VersionStatus::Incubating);
+        assert_eq!(
+            engine.get_version(v2).unwrap().status,
+            VersionStatus::Incubating
+        );
         assert!(engine.promote(v2));
-        assert_eq!(engine.get_version(v2).unwrap().status, VersionStatus::Active);
+        assert_eq!(
+            engine.get_version(v2).unwrap().status,
+            VersionStatus::Active
+        );
     }
 
     #[test]
@@ -700,7 +706,10 @@ mod tests {
         let mut engine = make_engine();
         let v1 = engine.register_original("c1", vec![1], vec!["a".into()], 1000);
         assert!(engine.deprecate(v1));
-        assert_eq!(engine.get_version(v1).unwrap().status, VersionStatus::Deprecated);
+        assert_eq!(
+            engine.get_version(v1).unwrap().status,
+            VersionStatus::Deprecated
+        );
     }
 
     #[test]
@@ -708,7 +717,10 @@ mod tests {
         let mut engine = make_engine();
         let v1 = engine.register_original("c1", vec![1], vec!["a".into()], 1000);
         assert!(engine.disable(v1));
-        assert_eq!(engine.get_version(v1).unwrap().status, VersionStatus::Disabled);
+        assert_eq!(
+            engine.get_version(v1).unwrap().status,
+            VersionStatus::Disabled
+        );
     }
 
     // ---- Active / deprecated queries ----
@@ -764,7 +776,9 @@ mod tests {
             parent_version: Some(1),
             parent_reflex_id: Some(0),
             status: VersionStatus::Incubating,
-            creation_reason: CreationReason::DriftEvolution { parent_reflex_id: 0 },
+            creation_reason: CreationReason::DriftEvolution {
+                parent_reflex_id: 0,
+            },
             created_at_ms: 1000,
         };
         let json = serde_json::to_string(&v).unwrap();
@@ -790,9 +804,13 @@ mod tests {
     fn creation_reason_serde_roundtrip() {
         let reasons = vec![
             CreationReason::Original,
-            CreationReason::DriftEvolution { parent_reflex_id: 1 },
+            CreationReason::DriftEvolution {
+                parent_reflex_id: 1,
+            },
             CreationReason::OperatorEdit,
-            CreationReason::Merge { source_ids: vec![1, 2] },
+            CreationReason::Merge {
+                source_ids: vec![1, 2],
+            },
         ];
         for reason in reasons {
             let json = serde_json::to_string(&reason).unwrap();
@@ -812,7 +830,10 @@ mod tests {
             EvolutionResult::ParentNotFound { reflex_id: 1 },
             EvolutionResult::AlreadyDeprecated { reflex_id: 1 },
             EvolutionResult::EmptyCommands,
-            EvolutionResult::LineageTooDeep { depth: 5, max_depth: 3 },
+            EvolutionResult::LineageTooDeep {
+                depth: 5,
+                max_depth: 3,
+            },
         ];
         for result in results {
             let json = serde_json::to_string(&result).unwrap();
@@ -827,10 +848,7 @@ mod tests {
             total_reflexes: 10,
             total_evolutions: 5,
             total_deprecations: 3,
-            by_status: HashMap::from([
-                ("Active".to_string(), 5),
-                ("Deprecated".to_string(), 3),
-            ]),
+            by_status: HashMap::from([("Active".to_string(), 5), ("Deprecated".to_string(), 3)]),
             max_lineage_depth: 2,
         };
         let json = serde_json::to_string(&stats).unwrap();

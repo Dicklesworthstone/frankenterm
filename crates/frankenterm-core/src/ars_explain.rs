@@ -148,7 +148,10 @@ impl ReplaySection {
     /// Create from a ReplayAssessment.
     pub fn from_assessment(assessment: &ReplayAssessment) -> Self {
         match assessment {
-            ReplayAssessment::Validated { pass_rate, incidents } => Self {
+            ReplayAssessment::Validated {
+                pass_rate,
+                incidents,
+            } => Self {
                 pass_rate: *pass_rate,
                 incidents: *incidents,
                 validated: true,
@@ -164,7 +167,10 @@ impl ReplaySection {
                 validated: false,
                 note: reason.clone(),
             },
-            ReplayAssessment::InsufficientData { available, required } => Self {
+            ReplayAssessment::InsufficientData {
+                available,
+                required,
+            } => Self {
                 pass_rate: 0.0,
                 incidents: *available,
                 validated: false,
@@ -175,11 +181,7 @@ impl ReplaySection {
 
     /// Status label.
     pub fn status_label(&self) -> &'static str {
-        if self.validated {
-            "PASS"
-        } else {
-            "FAIL"
-        }
+        if self.validated { "PASS" } else { "FAIL" }
     }
 }
 
@@ -213,11 +215,7 @@ impl BlastSection {
 
     /// Status label.
     pub fn status_label(&self) -> &'static str {
-        if self.allowed {
-            "Allow"
-        } else {
-            "Deny"
-        }
+        if self.allowed { "Allow" } else { "Deny" }
     }
 }
 
@@ -357,11 +355,7 @@ pub fn render_card(card: &EvidenceCard) -> String {
     // Timeline.
     if !card.timeline.is_empty() {
         lines.push(format!("├{}┤", border));
-        let events: Vec<String> = card
-            .timeline
-            .iter()
-            .map(|e| e.label.clone())
-            .collect();
+        let events: Vec<String> = card.timeline.iter().map(|e| e.label.clone()).collect();
         let timeline_str = format!(" Timeline: {}", events.join(" -> "));
         // Truncate if too long.
         let truncated = if timeline_str.len() > width - 2 {

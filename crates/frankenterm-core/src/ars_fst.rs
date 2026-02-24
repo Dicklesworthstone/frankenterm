@@ -569,12 +569,7 @@ impl TriggerBuilder {
     }
 
     /// Add a literal string trigger.
-    pub fn add_literal(
-        &mut self,
-        trigger: &str,
-        cluster_id: &str,
-        priority: u32,
-    ) -> ReflexId {
+    pub fn add_literal(&mut self, trigger: &str, cluster_id: &str, priority: u32) -> ReflexId {
         let id = self.next_id;
         self.next_id += 1;
         self.entries.push(TriggerEntry {
@@ -587,12 +582,7 @@ impl TriggerBuilder {
     }
 
     /// Add a MinHash signature trigger.
-    pub fn add_minhash(
-        &mut self,
-        signature: &[u64],
-        cluster_id: &str,
-        priority: u32,
-    ) -> ReflexId {
+    pub fn add_minhash(&mut self, signature: &[u64], cluster_id: &str, priority: u32) -> ReflexId {
         let id = self.next_id;
         self.next_id += 1;
         self.entries.push(TriggerEntry {
@@ -695,11 +685,7 @@ mod tests {
             ..Default::default()
         };
         let compiler = FstCompiler::new(config);
-        let entries = vec![
-            entry("a", 1, 0),
-            entry("b", 2, 0),
-            entry("c", 3, 0),
-        ];
+        let entries = vec![entry("a", 1, 0), entry("b", 2, 0), entry("c", 3, 0)];
         let err = compiler.compile(&entries).unwrap_err();
         let is_too_many = matches!(err, FstError::TooManyEntries { .. });
         assert!(is_too_many);
@@ -770,10 +756,7 @@ mod tests {
     #[test]
     fn prefix_search_partial_match() {
         let compiler = FstCompiler::with_defaults();
-        let entries = vec![
-            entry("err", 1, 0),
-            entry("error: not found", 2, 1),
-        ];
+        let entries = vec![entry("err", 1, 0), entry("error: not found", 2, 1)];
         let index = compiler.compile(&entries).unwrap();
 
         let matches = index.prefix_search(b"error: timeout");
@@ -872,10 +855,7 @@ mod tests {
             ..Default::default()
         };
         let compiler = FstCompiler::new(config);
-        let entries = vec![
-            entry("abc", 1, 5),
-            entry("abc", 2, 1),
-        ];
+        let entries = vec![entry("abc", 1, 5), entry("abc", 2, 1)];
         let index = compiler.compile(&entries).unwrap();
         // Both inserted; last one wins in the trie.
         assert_eq!(index.len(), 2);
@@ -932,12 +912,8 @@ mod tests {
     fn handle_swap_updates_index() {
         let compiler = FstCompiler::with_defaults();
 
-        let idx1 = compiler
-            .compile(&[entry("old", 1, 0)])
-            .unwrap();
-        let idx2 = compiler
-            .compile(&[entry("new", 2, 0)])
-            .unwrap();
+        let idx1 = compiler.compile(&[entry("old", 1, 0)]).unwrap();
+        let idx2 = compiler.compile(&[entry("new", 2, 0)]).unwrap();
 
         let handle = FstHandle::new(idx1);
         assert!(handle.lookup(b"old").is_some());
@@ -1015,11 +991,7 @@ mod tests {
     #[test]
     fn stats_entry_count_correct() {
         let compiler = FstCompiler::with_defaults();
-        let entries = vec![
-            entry("a", 1, 0),
-            entry("b", 2, 0),
-            entry("c", 3, 0),
-        ];
+        let entries = vec![entry("a", 1, 0), entry("b", 2, 0), entry("c", 3, 0)];
         let index = compiler.compile(&entries).unwrap();
         assert_eq!(index.stats().entry_count, 3);
     }
@@ -1035,10 +1007,7 @@ mod tests {
     #[test]
     fn stats_total_key_bytes_correct() {
         let compiler = FstCompiler::with_defaults();
-        let entries = vec![
-            entry("abc", 1, 0),
-            entry("defg", 2, 0),
-        ];
+        let entries = vec![entry("abc", 1, 0), entry("defg", 2, 0)];
         let index = compiler.compile(&entries).unwrap();
         assert_eq!(index.stats().total_key_bytes, 7);
     }
@@ -1049,12 +1018,16 @@ mod tests {
     fn error_display() {
         assert!(FstError::EmptyInput.to_string().contains("no entries"));
         assert!(FstError::EmptyKey.to_string().contains("empty key"));
-        assert!(FstError::KeyTooLong { len: 10, max: 5 }
-            .to_string()
-            .contains("key too long"));
-        assert!(FstError::TooManyEntries { count: 10, max: 5 }
-            .to_string()
-            .contains("too many entries"));
+        assert!(
+            FstError::KeyTooLong { len: 10, max: 5 }
+                .to_string()
+                .contains("key too long")
+        );
+        assert!(
+            FstError::TooManyEntries { count: 10, max: 5 }
+                .to_string()
+                .contains("too many entries")
+        );
     }
 
     // ---- Serde roundtrips ----

@@ -102,13 +102,9 @@ impl Default for CompileConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CompileError {
     /// An operator has locked a manual YAML for this cluster.
-    OperatorLocked {
-        cluster_id: String,
-    },
+    OperatorLocked { cluster_id: String },
     /// The evidence ledger rejects this reflex.
-    EvidenceRejected {
-        reason: String,
-    },
+    EvidenceRejected { reason: String },
     /// A template variable failed safety validation.
     UnsafeParameter {
         variable: String,
@@ -116,19 +112,11 @@ pub enum CompileError {
         safety_regex: String,
     },
     /// Too many steps would be generated.
-    TooManySteps {
-        count: usize,
-        max: usize,
-    },
+    TooManySteps { count: usize, max: usize },
     /// Total SendText payload exceeds limit.
-    TextTooLong {
-        total: usize,
-        max: usize,
-    },
+    TextTooLong { total: usize, max: usize },
     /// Missing required bindings for template variables.
-    MissingBindings {
-        missing: Vec<String>,
-    },
+    MissingBindings { missing: Vec<String> },
     /// No commands to compile.
     EmptyCommands,
 }
@@ -147,10 +135,7 @@ impl std::fmt::Display for CompileError {
                 value,
                 safety_regex,
             } => {
-                write!(
-                    f,
-                    "unsafe param {variable}={value} (regex: {safety_regex})"
-                )
+                write!(f, "unsafe param {variable}={value} (regex: {safety_regex})")
             }
             Self::TooManySteps { count, max } => {
                 write!(f, "too many steps: {count} > {max}")
@@ -264,8 +249,7 @@ impl ArsCompiler {
             return Err(CompileError::EvidenceRejected {
                 reason: format!(
                     "ledger verdict is Reject ({} entries, complete={})",
-                    input.evidence_digest.entry_count,
-                    input.evidence_digest.is_complete,
+                    input.evidence_digest.entry_count, input.evidence_digest.is_complete,
                 ),
             });
         }
@@ -426,7 +410,10 @@ impl ArsCompiler {
             workflow_schema_version: self.config.schema_version,
             name: format!("ars-{}", input.cluster_id),
             description: input.description.clone(),
-            triggers: input.trigger.as_ref().map_or_else(Vec::new, |t| vec![t.clone()]),
+            triggers: input
+                .trigger
+                .as_ref()
+                .map_or_else(Vec::new, |t| vec![t.clone()]),
             steps,
             on_failure,
         };
@@ -834,7 +821,9 @@ mod tests {
         let compiler = ArsCompiler::with_defaults();
         let cmd = test_templated_command();
         let mut input = test_input(vec![cmd]);
-        input.bindings.insert("file_0".to_string(), "lib/utils.rs".to_string());
+        input
+            .bindings
+            .insert("file_0".to_string(), "lib/utils.rs".to_string());
 
         let output = compiler.compile(&input).unwrap();
         assert!(output.is_instantiated);
@@ -914,7 +903,8 @@ mod tests {
         let input = test_input(vec![test_command("echo ok", 0)]);
         let output = compiler.compile(&input).unwrap();
         let last = output.descriptor.steps.last().unwrap();
-        let is_evidence = matches!(last, DescriptorStep::Log { id, .. } if id.starts_with("ars_evidence"));
+        let is_evidence =
+            matches!(last, DescriptorStep::Log { id, .. } if id.starts_with("ars_evidence"));
         assert!(is_evidence);
     }
 
@@ -990,7 +980,9 @@ mod tests {
         let cmd = test_templated_command();
         let mut input = test_input(vec![cmd]);
         // Inject unsafe value (semicolon = shell injection).
-        input.bindings.insert("file_0".to_string(), "foo;rm -rf /".to_string());
+        input
+            .bindings
+            .insert("file_0".to_string(), "foo;rm -rf /".to_string());
 
         let err = compiler.compile(&input).unwrap_err();
         let is_unsafe = matches!(err, CompileError::UnsafeParameter { .. });
@@ -1069,11 +1061,10 @@ mod tests {
         let input = test_input(vec![test_command("echo ok", 0)]);
         let output = compiler.compile(&input).unwrap();
 
-        let has_snapshot = output
-            .descriptor
-            .steps
-            .iter()
-            .any(|s| matches!(s, DescriptorStep::Log { id, .. } if id.starts_with("ars_snapshot")));
+        let has_snapshot =
+            output.descriptor.steps.iter().any(
+                |s| matches!(s, DescriptorStep::Log { id, .. } if id.starts_with("ars_snapshot")),
+            );
         assert!(!has_snapshot);
     }
 
@@ -1106,11 +1097,10 @@ mod tests {
         let input = test_input(vec![test_command("echo ok", 0)]);
         let output = compiler.compile(&input).unwrap();
 
-        let has_evidence = output
-            .descriptor
-            .steps
-            .iter()
-            .any(|s| matches!(s, DescriptorStep::Log { id, .. } if id.starts_with("ars_evidence")));
+        let has_evidence =
+            output.descriptor.steps.iter().any(
+                |s| matches!(s, DescriptorStep::Log { id, .. } if id.starts_with("ars_evidence")),
+            );
         assert!(!has_evidence);
     }
 
@@ -1172,7 +1162,10 @@ mod tests {
         let output = compiler.compile(&input).unwrap();
 
         assert_eq!(output.descriptor.triggers.len(), 1);
-        assert_eq!(output.descriptor.triggers[0].event_types[0], "error.detected");
+        assert_eq!(
+            output.descriptor.triggers[0].event_types[0],
+            "error.detected"
+        );
     }
 
     #[test]
@@ -1227,7 +1220,7 @@ mod tests {
             .build();
 
         assert_eq!(input.timeout.timeout_ms, 5000); // default timeout
-        assert!(!input.evidence_digest.is_complete);  // default digest
+        assert!(!input.evidence_digest.is_complete); // default digest
     }
 
     #[test]
@@ -1269,7 +1262,10 @@ mod tests {
 
     #[test]
     fn safety_accepts_identifier() {
-        assert!(matches_safety_regex("MyStruct_v2", "^[a-zA-Z_][a-zA-Z0-9_]*$"));
+        assert!(matches_safety_regex(
+            "MyStruct_v2",
+            "^[a-zA-Z_][a-zA-Z0-9_]*$"
+        ));
     }
 
     #[test]
@@ -1493,7 +1489,10 @@ mod tests {
         let compiler = ArsCompiler::with_defaults();
         let input = test_input(vec![test_command("echo ok", 0)]);
         let output = compiler.compile(&input).unwrap();
-        assert_eq!(output.descriptor.description, Some("A test reflex".to_string()));
+        assert_eq!(
+            output.descriptor.description,
+            Some("A test reflex".to_string())
+        );
     }
 
     #[test]

@@ -101,10 +101,7 @@ pub enum ReplayVerdict {
         reason: FailReason,
     },
     /// Cannot determine — insufficient data.
-    Inconclusive {
-        incident_id: String,
-        reason: String,
-    },
+    Inconclusive { incident_id: String, reason: String },
 }
 
 impl ReplayVerdict {
@@ -171,7 +168,11 @@ pub enum ReplayAssessment {
     /// Reflex is validated — safe to promote.
     Validated { pass_rate: f64, incidents: usize },
     /// Reflex failed validation — should not promote.
-    Rejected { pass_rate: f64, incidents: usize, reason: String },
+    Rejected {
+        pass_rate: f64,
+        incidents: usize,
+        reason: String,
+    },
     /// Insufficient historical data — cannot validate.
     InsufficientData { available: usize, required: usize },
 }
@@ -583,7 +584,10 @@ mod tests {
         let incidents = make_incidents(2);
 
         let session = harness.validate(1, &["cmd".into()], &incidents, 1000);
-        let is_insuf = matches!(session.assessment, ReplayAssessment::InsufficientData { .. });
+        let is_insuf = matches!(
+            session.assessment,
+            ReplayAssessment::InsufficientData { .. }
+        );
         assert!(is_insuf);
     }
 

@@ -86,10 +86,7 @@ impl EValueConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DriftVerdict {
     /// No drift detected — e-value below threshold.
-    NoDrift {
-        e_value: f64,
-        null_rate: f64,
-    },
+    NoDrift { e_value: f64, null_rate: f64 },
     /// Drift detected — e-value exceeded 1/α.
     Drifted {
         e_value: f64,
@@ -405,11 +402,7 @@ impl ArsDriftDetector {
 
     /// Observe an execution outcome for a reflex.
     /// Returns a drift event if drift was detected.
-    pub fn observe(
-        &mut self,
-        reflex_id: ReflexId,
-        success: bool,
-    ) -> Option<ArsDriftEvent> {
+    pub fn observe(&mut self, reflex_id: ReflexId, success: bool) -> Option<ArsDriftEvent> {
         self.total_observations += 1;
         let outcome = if success { 1.0 } else { 0.0 };
 
@@ -455,7 +448,11 @@ impl ArsDriftDetector {
     /// Get statistics.
     pub fn stats(&self) -> ArsDriftStats {
         let calibrated = self.monitors.values().filter(|m| m.is_calibrated()).count();
-        let drifted = self.monitors.values().filter(|m| m.drift_count() > 0).count();
+        let drifted = self
+            .monitors
+            .values()
+            .filter(|m| m.drift_count() > 0)
+            .count();
         ArsDriftStats {
             total_observations: self.total_observations,
             total_drifts: self.total_drifts,

@@ -127,10 +127,7 @@ pub enum ContextGateResult {
     /// Context matches requirements.
     Pass,
     /// CWD doesn't match required prefix.
-    CwdMismatch {
-        required: String,
-        actual: String,
-    },
+    CwdMismatch { required: String, actual: String },
     /// Missing or mismatched environment variable.
     EnvMismatch {
         key: String,
@@ -138,10 +135,7 @@ pub enum ContextGateResult {
         actual: Option<String>,
     },
     /// Shell type doesn't match.
-    ShellMismatch {
-        required: String,
-        actual: String,
-    },
+    ShellMismatch { required: String, actual: String },
     /// Pane dimensions too small.
     DimensionMismatch {
         min_cols: u16,
@@ -226,9 +220,7 @@ pub enum InterceptDecision {
         priority: u32,
     },
     /// Fall back to LLM processing.
-    FallbackToLlm {
-        reason: FallbackReason,
-    },
+    FallbackToLlm { reason: FallbackReason },
     /// Interception is disabled.
     Disabled,
 }
@@ -239,28 +231,15 @@ pub enum FallbackReason {
     /// No matching reflex in the FST.
     NoMatch,
     /// Match found but context gate failed.
-    ContextFailed {
-        gate_result: ContextGateResult,
-    },
+    ContextFailed { gate_result: ContextGateResult },
     /// Match priority exceeds threshold.
-    PriorityTooLow {
-        priority: u32,
-        threshold: u32,
-    },
+    PriorityTooLow { priority: u32, threshold: u32 },
     /// Pane is in cooldown period.
-    Cooldown {
-        remaining_ms: u64,
-    },
+    Cooldown { remaining_ms: u64 },
     /// Maximum concurrent executions reached.
-    ConcurrencyLimit {
-        current: u32,
-        max: u32,
-    },
+    ConcurrencyLimit { current: u32, max: u32 },
     /// FST lookup timed out.
-    Timeout {
-        elapsed_ms: u64,
-        max_ms: u64,
-    },
+    Timeout { elapsed_ms: u64, max_ms: u64 },
 }
 
 // =============================================================================
@@ -393,9 +372,7 @@ impl ArsInterceptor {
                     "context gate failed"
                 );
                 return InterceptDecision::FallbackToLlm {
-                    reason: FallbackReason::ContextFailed {
-                        gate_result: gate,
-                    },
+                    reason: FallbackReason::ContextFailed { gate_result: gate },
                 };
             }
         }

@@ -522,8 +522,7 @@ fn standard_normal_cdf(x: f64) -> f64 {
     let t4 = t3 * t;
     let t5 = t4 * t;
 
-    let poly = 0.319_381_530 * t - 0.356_563_782 * t2 + 1.781_477_937 * t3
-        - 1.821_255_978 * t4
+    let poly = 0.319_381_530 * t - 0.356_563_782 * t2 + 1.781_477_937 * t3 - 1.821_255_978 * t4
         + 1.330_274_429 * t5;
 
     let pdf = (-abs_x * abs_x / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt();
@@ -605,7 +604,12 @@ mod tests {
         for x in [0.5, 1.0, 1.5, 2.0, 3.0] {
             let lo = standard_normal_cdf(-x);
             let hi = standard_normal_cdf(x);
-            assert!((lo + hi - 1.0).abs() < 1e-6, "CDF({}) + CDF({}) should be 1", -x, x);
+            assert!(
+                (lo + hi - 1.0).abs() < 1e-6,
+                "CDF({}) + CDF({}) should be 1",
+                -x,
+                x
+            );
         }
     }
 
@@ -727,7 +731,11 @@ mod tests {
         let stats = DurationStats::from_durations(&[100.0, 200.0, 300.0]).unwrap();
         for t in [50.0, 100.0, 200.0, 500.0, 1000.0] {
             let sum = stats.cdf(t) + stats.survival(t);
-            assert!((sum - 1.0).abs() < 1e-10, "CDF + survival should be 1 at t={}", t);
+            assert!(
+                (sum - 1.0).abs() < 1e-10,
+                "CDF + survival should be 1 at t={}",
+                t
+            );
         }
     }
 

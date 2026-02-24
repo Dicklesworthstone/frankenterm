@@ -89,10 +89,7 @@ impl ReflexManifest {
 
     /// Filter entries by tier.
     pub fn by_tier(&self, tier: MaturityTier) -> Vec<&ManifestEntry> {
-        self.entries
-            .values()
-            .filter(|e| e.tier == tier)
-            .collect()
+        self.entries.values().filter(|e| e.tier == tier).collect()
     }
 }
 
@@ -584,7 +581,9 @@ impl ReflexStore {
 
     /// Serialize a single record to JSON string.
     pub fn serialize_record(&self, id: ReflexId) -> Option<Result<String, serde_json::Error>> {
-        self.records.get(&id).map(|r| serde_json::to_string_pretty(r))
+        self.records
+            .get(&id)
+            .map(|r| serde_json::to_string_pretty(r))
     }
 
     /// Serialize blacklist to JSON string.
@@ -748,9 +747,13 @@ mod tests {
     #[test]
     fn manifest_by_status() {
         let mut m = ReflexManifest::new();
-        for (i, status) in [VersionStatus::Active, VersionStatus::Deprecated, VersionStatus::Active]
-            .iter()
-            .enumerate()
+        for (i, status) in [
+            VersionStatus::Active,
+            VersionStatus::Deprecated,
+            VersionStatus::Active,
+        ]
+        .iter()
+        .enumerate()
         {
             m.upsert(ManifestEntry {
                 reflex_id: i as u64,
@@ -774,9 +777,13 @@ mod tests {
     #[test]
     fn manifest_by_tier() {
         let mut m = ReflexManifest::new();
-        for (i, tier) in [MaturityTier::Incubating, MaturityTier::Graduated, MaturityTier::Incubating]
-            .iter()
-            .enumerate()
+        for (i, tier) in [
+            MaturityTier::Incubating,
+            MaturityTier::Graduated,
+            MaturityTier::Incubating,
+        ]
+        .iter()
+        .enumerate()
         {
             m.upsert(ManifestEntry {
                 reflex_id: i as u64,
@@ -1104,7 +1111,9 @@ mod tests {
         let entry = BlacklistEntry {
             reflex_id: 5,
             cluster_id: "c1".to_string(),
-            reason: BlacklistReason::EValueCollapse { final_e_value: 0.001 },
+            reason: BlacklistReason::EValueCollapse {
+                final_e_value: 0.001,
+            },
             blacklisted_at_ms: 1000,
             final_e_value: 0.001,
             final_failures: 7,

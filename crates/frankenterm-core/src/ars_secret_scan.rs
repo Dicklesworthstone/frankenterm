@@ -193,10 +193,7 @@ impl ArsSecretScanner {
         }
 
         if findings.is_empty() {
-            debug!(
-                commands = commands.len(),
-                "ARS secret scan: clean"
-            );
+            debug!(commands = commands.len(), "ARS secret scan: clean");
             ScanVerdict::Clean
         } else {
             warn!(
@@ -235,7 +232,10 @@ impl ArsSecretScanner {
         for mat in self.automaton.find_iter(text) {
             let pattern_idx = mat.pattern().as_usize();
             let (pattern_name, detection_method) = if pattern_idx < self.extra_pattern_offset {
-                (self.pattern_names[pattern_idx].0, DetectionMethod::PatternMatch)
+                (
+                    self.pattern_names[pattern_idx].0,
+                    DetectionMethod::PatternMatch,
+                )
             } else {
                 ("custom_pattern", DetectionMethod::PatternMatch)
             };
@@ -272,7 +272,9 @@ impl ArsSecretScanner {
         findings: &mut Vec<ScanFinding>,
     ) {
         // Split on whitespace and common delimiters.
-        for token in text.split(|c: char| c.is_whitespace() || c == '=' || c == ':' || c == '"' || c == '\'') {
+        for token in
+            text.split(|c: char| c.is_whitespace() || c == '=' || c == ':' || c == '"' || c == '\'')
+        {
             let len = token.len();
             if len < self.config.min_entropy_token_len || len > self.config.max_entropy_token_len {
                 continue;
@@ -300,7 +302,10 @@ impl ArsSecretScanner {
                         source: source.to_string(),
                         byte_offset: 0, // Approximate; not byte-exact for tokens.
                         match_len: len,
-                        context_redacted: format!("[HIGH_ENTROPY len={} entropy={:.2}]", len, entropy),
+                        context_redacted: format!(
+                            "[HIGH_ENTROPY len={} entropy={:.2}]",
+                            len, entropy
+                        ),
                         detection_method: DetectionMethod::EntropyThreshold,
                         entropy: Some(entropy),
                     });
@@ -603,7 +608,11 @@ mod tests {
     #[test]
     fn entropy_moderate_for_english() {
         let e = shannon_entropy("the quick brown fox jumps over");
-        assert!(e > 2.0 && e < 4.5, "english entropy should be 2-4.5, got {}", e);
+        assert!(
+            e > 2.0 && e < 4.5,
+            "english entropy should be 2-4.5, got {}",
+            e
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -664,7 +673,11 @@ mod tests {
     #[test]
     fn detects_openai_key_in_command() {
         let scanner = default_scanner();
-        let cmds = vec![make_cmd(0, "export OPENAI_API_KEY=sk-abc123456789", Some(0))];
+        let cmds = vec![make_cmd(
+            0,
+            "export OPENAI_API_KEY=sk-abc123456789",
+            Some(0),
+        )];
         let verdict = scanner.scan_commands(&cmds);
         assert!(verdict.is_contaminated());
     }
@@ -672,7 +685,11 @@ mod tests {
     #[test]
     fn detects_github_token_in_command() {
         let scanner = default_scanner();
-        let cmds = vec![make_cmd(0, "git clone https://ghp_token123456@github.com/repo", Some(0))];
+        let cmds = vec![make_cmd(
+            0,
+            "git clone https://ghp_token123456@github.com/repo",
+            Some(0),
+        )];
         let verdict = scanner.scan_commands(&cmds);
         assert!(verdict.is_contaminated());
     }
@@ -680,7 +697,11 @@ mod tests {
     #[test]
     fn detects_aws_key_in_command() {
         let scanner = default_scanner();
-        let cmds = vec![make_cmd(0, "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE", Some(0))];
+        let cmds = vec![make_cmd(
+            0,
+            "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+            Some(0),
+        )];
         let verdict = scanner.scan_commands(&cmds);
         assert!(verdict.is_contaminated());
     }
@@ -688,7 +709,11 @@ mod tests {
     #[test]
     fn detects_stripe_key() {
         let scanner = default_scanner();
-        let cmds = vec![make_cmd(0, "curl -H 'Authorization: Bearer sk_live_abc123'", Some(0))];
+        let cmds = vec![make_cmd(
+            0,
+            "curl -H 'Authorization: Bearer sk_live_abc123'",
+            Some(0),
+        )];
         let verdict = scanner.scan_commands(&cmds);
         assert!(verdict.is_contaminated());
     }
@@ -740,7 +765,11 @@ mod tests {
     #[test]
     fn detects_slack_token() {
         let scanner = default_scanner();
-        let cmds = vec![make_cmd(0, "export SLACK_TOKEN=xoxb-1234567890-abc", Some(0))];
+        let cmds = vec![make_cmd(
+            0,
+            "export SLACK_TOKEN=xoxb-1234567890-abc",
+            Some(0),
+        )];
         let verdict = scanner.scan_commands(&cmds);
         assert!(verdict.is_contaminated());
     }
@@ -844,7 +873,10 @@ mod tests {
         let verdict = scanner.scan_commands(&cmds);
         assert!(verdict.is_contaminated());
         if let ScanVerdict::Contaminated(c) = &verdict {
-            let has_entropy = c.findings.iter().any(|f| f.detection_method == DetectionMethod::EntropyThreshold);
+            let has_entropy = c
+                .findings
+                .iter()
+                .any(|f| f.detection_method == DetectionMethod::EntropyThreshold);
             assert!(has_entropy, "should have entropy-based detection");
         }
     }
@@ -868,7 +900,10 @@ mod tests {
         match &verdict {
             ScanVerdict::Clean => {} // fine
             ScanVerdict::Contaminated(c) => {
-                let has_entropy = c.findings.iter().any(|f| f.detection_method == DetectionMethod::EntropyThreshold);
+                let has_entropy = c
+                    .findings
+                    .iter()
+                    .any(|f| f.detection_method == DetectionMethod::EntropyThreshold);
                 assert!(!has_entropy, "entropy detection should be disabled");
             }
         }
@@ -889,7 +924,11 @@ mod tests {
         let verdict = scanner.scan_commands(&cmds);
         assert!(verdict.is_contaminated());
         if let ScanVerdict::Contaminated(c) = &verdict {
-            assert!(c.findings.len() >= 3, "should find at least 3 findings, got {}", c.findings.len());
+            assert!(
+                c.findings.len() >= 3,
+                "should find at least 3 findings, got {}",
+                c.findings.len()
+            );
         }
     }
 
@@ -1036,7 +1075,11 @@ mod tests {
             ..Default::default()
         };
         let scanner = ArsSecretScanner::new(config);
-        let cmds = vec![make_cmd(0, "export KEY=CUSTOM_SECRET_PREFIX_abc123", Some(0))];
+        let cmds = vec![make_cmd(
+            0,
+            "export KEY=CUSTOM_SECRET_PREFIX_abc123",
+            Some(0),
+        )];
         let verdict = scanner.scan_commands(&cmds);
         assert!(verdict.is_contaminated());
     }
@@ -1070,7 +1113,10 @@ mod tests {
 
     #[test]
     fn detection_method_serde() {
-        for method in [DetectionMethod::PatternMatch, DetectionMethod::EntropyThreshold] {
+        for method in [
+            DetectionMethod::PatternMatch,
+            DetectionMethod::EntropyThreshold,
+        ] {
             let json = serde_json::to_string(&method).unwrap();
             let decoded: DetectionMethod = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, method);

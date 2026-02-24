@@ -346,7 +346,10 @@ impl GeneralizationResult {
     #[must_use]
     pub fn is_safe(&self) -> bool {
         !self.all_variables.is_empty()
-            && self.all_variables.iter().all(|v| !v.safety_regex.is_empty())
+            && self
+                .all_variables
+                .iter()
+                .all(|v| !v.safety_regex.is_empty())
             && self.pac_bound.is_trustworthy
     }
 }
@@ -470,11 +473,7 @@ impl Generalizer {
 
             for param in sorted_detections {
                 let counter = var_counters.entry(param.kind).or_insert(0);
-                let var_name = format!(
-                    "{}_{}",
-                    param.kind.template_prefix(),
-                    *counter
-                );
+                let var_name = format!("{}_{}", param.kind.template_prefix(), *counter);
                 *counter += 1;
 
                 let placeholder = format!("{{{{cap.{}}}}}", var_name);
@@ -598,11 +597,10 @@ impl Generalizer {
             while let Some(pos) = command[search_from..].find(num_str.as_str()) {
                 let offset = search_from + pos;
                 // Ensure it's a whole number (not part of a larger token).
-                let before_ok = offset == 0
-                    || !command.as_bytes()[offset - 1].is_ascii_digit();
+                let before_ok = offset == 0 || !command.as_bytes()[offset - 1].is_ascii_digit();
                 let after_end = offset + num_str.len();
-                let after_ok = after_end >= command.len()
-                    || !command.as_bytes()[after_end].is_ascii_digit();
+                let after_ok =
+                    after_end >= command.len() || !command.as_bytes()[after_end].is_ascii_digit();
 
                 if before_ok && after_ok {
                     params.push(DetectedParam {
@@ -643,8 +641,8 @@ impl Generalizer {
             // Find in command.
             if let Some(offset) = command.find(ident.as_str()) {
                 // Verify it's a word boundary.
-                let before_ok = offset == 0
-                    || !command.as_bytes()[offset - 1].is_ascii_alphanumeric();
+                let before_ok =
+                    offset == 0 || !command.as_bytes()[offset - 1].is_ascii_alphanumeric();
                 let after_end = offset + ident.len();
                 let after_ok = after_end >= command.len()
                     || !command.as_bytes()[after_end].is_ascii_alphanumeric();
@@ -681,11 +679,10 @@ impl Generalizer {
                 continue;
             }
             if let Some(offset) = command.find(num_str.as_str()) {
-                let before_ok = offset == 0
-                    || !command.as_bytes()[offset - 1].is_ascii_digit();
+                let before_ok = offset == 0 || !command.as_bytes()[offset - 1].is_ascii_digit();
                 let after_end = offset + num_str.len();
-                let after_ok = after_end >= command.len()
-                    || !command.as_bytes()[after_end].is_ascii_digit();
+                let after_ok =
+                    after_end >= command.len() || !command.as_bytes()[after_end].is_ascii_digit();
 
                 if before_ok && after_ok {
                     params.push(DetectedParam {
@@ -883,31 +880,91 @@ fn is_path_start(b: u8) -> bool {
 
 /// Check if a byte can be part of a file path.
 fn is_path_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric()
-        || b == b'/'
-        || b == b'.'
-        || b == b'_'
-        || b == b'-'
-        || b == b'~'
+    b.is_ascii_alphanumeric() || b == b'/' || b == b'.' || b == b'_' || b == b'-' || b == b'~'
 }
 
 /// Check if a string is a common shell/programming keyword (not a parameter).
 fn is_common_keyword(s: &str) -> bool {
     matches!(
         s,
-        "error" | "warning" | "note" | "help" | "info" | "debug"
-        | "Error" | "Warning" | "Note" | "Help" | "Info" | "Debug"
-        | "for" | "while" | "if" | "else" | "then" | "do" | "done"
-        | "case" | "esac" | "function" | "return" | "exit"
-        | "true" | "false" | "null" | "None" | "nil"
-        | "let" | "const" | "var" | "mut" | "pub" | "fn"
-        | "use" | "mod" | "impl" | "trait" | "struct" | "enum"
-        | "async" | "await" | "match" | "self" | "super" | "crate"
-        | "import" | "from" | "class" | "def" | "with" | "try"
-        | "except" | "finally" | "raise" | "yield" | "pass"
-        | "and" | "not" | "the" | "that" | "this" | "has" | "was"
-        | "are" | "were" | "been" | "have" | "had" | "can" | "could"
-        | "should" | "would" | "will" | "shall" | "may" | "might"
+        "error"
+            | "warning"
+            | "note"
+            | "help"
+            | "info"
+            | "debug"
+            | "Error"
+            | "Warning"
+            | "Note"
+            | "Help"
+            | "Info"
+            | "Debug"
+            | "for"
+            | "while"
+            | "if"
+            | "else"
+            | "then"
+            | "do"
+            | "done"
+            | "case"
+            | "esac"
+            | "function"
+            | "return"
+            | "exit"
+            | "true"
+            | "false"
+            | "null"
+            | "None"
+            | "nil"
+            | "let"
+            | "const"
+            | "var"
+            | "mut"
+            | "pub"
+            | "fn"
+            | "use"
+            | "mod"
+            | "impl"
+            | "trait"
+            | "struct"
+            | "enum"
+            | "async"
+            | "await"
+            | "match"
+            | "self"
+            | "super"
+            | "crate"
+            | "import"
+            | "from"
+            | "class"
+            | "def"
+            | "with"
+            | "try"
+            | "except"
+            | "finally"
+            | "raise"
+            | "yield"
+            | "pass"
+            | "and"
+            | "not"
+            | "the"
+            | "that"
+            | "this"
+            | "has"
+            | "was"
+            | "are"
+            | "were"
+            | "been"
+            | "have"
+            | "had"
+            | "can"
+            | "could"
+            | "should"
+            | "would"
+            | "will"
+            | "shall"
+            | "may"
+            | "might"
     )
 }
 
@@ -942,21 +999,20 @@ fn matches_safety_regex(value: &str, pattern: &str) -> bool {
         r"^[a-zA-Z0-9_./-]+$" => {
             !value.is_empty()
                 && value.bytes().all(|b| {
-                    b.is_ascii_alphanumeric()
-                        || b == b'_'
-                        || b == b'.'
-                        || b == b'/'
-                        || b == b'-'
+                    b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'/' || b == b'-'
                 })
         }
         r"^[0-9]+$" => !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
         r"^[a-zA-Z_][a-zA-Z0-9_]*$" => {
             !value.is_empty()
                 && (value.as_bytes()[0].is_ascii_alphabetic() || value.as_bytes()[0] == b'_')
-                && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
         }
         r"^[0-9]+(\.[0-9]+)?$" => {
-            !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            !value.is_empty()
+                && value.bytes().all(|b| b.is_ascii_digit() || b == b'.')
                 && value.matches('.').count() <= 1
                 && !value.starts_with('.')
                 && !value.ends_with('.')
@@ -1261,55 +1317,115 @@ mod tests {
 
     #[test]
     fn safety_regex_file_path_accepts_valid() {
-        assert!(matches_safety_regex("src/main.rs", ParamKind::FilePath.safety_regex()));
-        assert!(matches_safety_regex("lib/utils.ts", ParamKind::FilePath.safety_regex()));
-        assert!(matches_safety_regex("README.md", ParamKind::FilePath.safety_regex()));
+        assert!(matches_safety_regex(
+            "src/main.rs",
+            ParamKind::FilePath.safety_regex()
+        ));
+        assert!(matches_safety_regex(
+            "lib/utils.ts",
+            ParamKind::FilePath.safety_regex()
+        ));
+        assert!(matches_safety_regex(
+            "README.md",
+            ParamKind::FilePath.safety_regex()
+        ));
     }
 
     #[test]
     fn safety_regex_file_path_rejects_injection() {
-        assert!(!matches_safety_regex("src; rm -rf /", ParamKind::FilePath.safety_regex()));
-        assert!(!matches_safety_regex("file$(whoami)", ParamKind::FilePath.safety_regex()));
-        assert!(!matches_safety_regex("file`id`", ParamKind::FilePath.safety_regex()));
+        assert!(!matches_safety_regex(
+            "src; rm -rf /",
+            ParamKind::FilePath.safety_regex()
+        ));
+        assert!(!matches_safety_regex(
+            "file$(whoami)",
+            ParamKind::FilePath.safety_regex()
+        ));
+        assert!(!matches_safety_regex(
+            "file`id`",
+            ParamKind::FilePath.safety_regex()
+        ));
     }
 
     #[test]
     fn safety_regex_line_number_accepts_digits() {
-        assert!(matches_safety_regex("42", ParamKind::LineNumber.safety_regex()));
-        assert!(matches_safety_regex("1000", ParamKind::LineNumber.safety_regex()));
+        assert!(matches_safety_regex(
+            "42",
+            ParamKind::LineNumber.safety_regex()
+        ));
+        assert!(matches_safety_regex(
+            "1000",
+            ParamKind::LineNumber.safety_regex()
+        ));
     }
 
     #[test]
     fn safety_regex_line_number_rejects_non_digits() {
-        assert!(!matches_safety_regex("42a", ParamKind::LineNumber.safety_regex()));
-        assert!(!matches_safety_regex("", ParamKind::LineNumber.safety_regex()));
+        assert!(!matches_safety_regex(
+            "42a",
+            ParamKind::LineNumber.safety_regex()
+        ));
+        assert!(!matches_safety_regex(
+            "",
+            ParamKind::LineNumber.safety_regex()
+        ));
     }
 
     #[test]
     fn safety_regex_identifier_accepts_valid() {
-        assert!(matches_safety_regex("MyStruct", ParamKind::Identifier.safety_regex()));
-        assert!(matches_safety_regex("foo_bar", ParamKind::Identifier.safety_regex()));
-        assert!(matches_safety_regex("_private", ParamKind::Identifier.safety_regex()));
+        assert!(matches_safety_regex(
+            "MyStruct",
+            ParamKind::Identifier.safety_regex()
+        ));
+        assert!(matches_safety_regex(
+            "foo_bar",
+            ParamKind::Identifier.safety_regex()
+        ));
+        assert!(matches_safety_regex(
+            "_private",
+            ParamKind::Identifier.safety_regex()
+        ));
     }
 
     #[test]
     fn safety_regex_identifier_rejects_invalid() {
-        assert!(!matches_safety_regex("123abc", ParamKind::Identifier.safety_regex()));
-        assert!(!matches_safety_regex("foo bar", ParamKind::Identifier.safety_regex()));
+        assert!(!matches_safety_regex(
+            "123abc",
+            ParamKind::Identifier.safety_regex()
+        ));
+        assert!(!matches_safety_regex(
+            "foo bar",
+            ParamKind::Identifier.safety_regex()
+        ));
     }
 
     #[test]
     fn safety_regex_numeric_accepts_valid() {
-        assert!(matches_safety_regex("42", ParamKind::Numeric.safety_regex()));
+        assert!(matches_safety_regex(
+            "42",
+            ParamKind::Numeric.safety_regex()
+        ));
         // Decimal numbers handled by the fallback match arm.
-        assert!(matches_safety_regex("314", ParamKind::Numeric.safety_regex()));
+        assert!(matches_safety_regex(
+            "314",
+            ParamKind::Numeric.safety_regex()
+        ));
     }
 
     #[test]
     fn safety_regex_numeric_rejects_invalid() {
-        assert!(!matches_safety_regex("3.14.15", ParamKind::Numeric.safety_regex()));
-        assert!(!matches_safety_regex(".5", ParamKind::Numeric.safety_regex()));
-        assert!(!matches_safety_regex("5.", ParamKind::Numeric.safety_regex()));
+        assert!(!matches_safety_regex(
+            "3.14.15",
+            ParamKind::Numeric.safety_regex()
+        ));
+        assert!(!matches_safety_regex(
+            ".5",
+            ParamKind::Numeric.safety_regex()
+        ));
+        assert!(!matches_safety_regex(
+            "5.",
+            ParamKind::Numeric.safety_regex()
+        ));
     }
 
     #[test]
@@ -1340,8 +1456,7 @@ mod tests {
         let error = "error at line 42";
         let detections = gzr.detect_params(&[cmd], error);
         assert!(!detections.is_empty());
-        let all_params: Vec<&DetectedParam> =
-            detections.iter().flat_map(|(_, p)| p).collect();
+        let all_params: Vec<&DetectedParam> = detections.iter().flat_map(|(_, p)| p).collect();
         let has_line = all_params.iter().any(|p| p.kind == ParamKind::LineNumber);
         assert!(has_line, "should detect line number, got {:?}", all_params);
     }
@@ -1377,7 +1492,10 @@ mod tests {
             .flat_map(|(_, p)| p)
             .filter(|p| p.kind == ParamKind::FilePath)
             .collect();
-        assert!(file_params.is_empty(), "a.rs is too short for min_param_len=10");
+        assert!(
+            file_params.is_empty(),
+            "a.rs is too short for min_param_len=10"
+        );
     }
 
     // =========================================================================
@@ -1447,7 +1565,10 @@ mod tests {
     fn pac_bound_perfect_match() {
         let bound = PacBayesianBound::perfect(100, 0.05);
         assert_eq!(bound.empirical_risk, 0.0);
-        assert!(bound.risk_bound < 0.5, "100 perfect matches should give low bound");
+        assert!(
+            bound.risk_bound < 0.5,
+            "100 perfect matches should give low bound"
+        );
         assert!(bound.risk_bound >= 0.0);
     }
 
@@ -1541,7 +1662,10 @@ mod tests {
     #[test]
     fn kl_divergence_positive() {
         let kl = kl_bernoulli(0.8, 0.5);
-        assert!(kl > 0.0, "KL should be positive for different distributions");
+        assert!(
+            kl > 0.0,
+            "KL should be positive for different distributions"
+        );
     }
 
     #[test]
@@ -1695,7 +1819,10 @@ mod tests {
             params_detected: 1,
             commands_generalized: 1,
         };
-        assert!(!result.is_safe(), "should not be safe with untrustworthy bound");
+        assert!(
+            !result.is_safe(),
+            "should not be safe with untrustworthy bound"
+        );
     }
 
     // =========================================================================
@@ -1870,7 +1997,10 @@ mod tests {
             let instantiated = gc.instantiate(&values);
             assert!(instantiated.is_some(), "valid values should instantiate");
             let text = instantiated.unwrap();
-            assert!(!text.contains("{{cap."), "all placeholders should be replaced");
+            assert!(
+                !text.contains("{{cap."),
+                "all placeholders should be replaced"
+            );
         }
     }
 

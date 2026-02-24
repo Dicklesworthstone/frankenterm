@@ -276,12 +276,12 @@ impl FederationEvent {
 
     fn kind_color(&self) -> u32 {
         match self.kind {
-            FederationEventKind::ReflexExported => 0x00CC00,   // green
-            FederationEventKind::ReflexEvolved => 0x0066FF,    // blue
-            FederationEventKind::ReflexPruned => 0xFF3300,     // red
-            FederationEventKind::DriftDetected => 0xFFAA00,    // orange
-            FederationEventKind::TierPromotion => 0x9900FF,    // purple
-            FederationEventKind::ReflexImported => 0x00CCCC,   // teal
+            FederationEventKind::ReflexExported => 0x00CC00, // green
+            FederationEventKind::ReflexEvolved => 0x0066FF,  // blue
+            FederationEventKind::ReflexPruned => 0xFF3300,   // red
+            FederationEventKind::DriftDetected => 0xFFAA00,  // orange
+            FederationEventKind::TierPromotion => 0x9900FF,  // purple
+            FederationEventKind::ReflexImported => 0x00CCCC, // teal
         }
     }
 }
@@ -395,8 +395,7 @@ impl FederationEngine {
 
             // Get full record for export.
             if let Some(record) = store.get(entry.reflex_id) {
-                let export =
-                    ReflexExport::from_record(record, &self.config.swarm_id, now_ms);
+                let export = ReflexExport::from_record(record, &self.config.swarm_id, now_ms);
                 self.export_log.push(ExportLogEntry {
                     reflex_id: export.reflex_id,
                     cluster_id: export.cluster_id.clone(),
@@ -430,11 +429,7 @@ impl FederationEngine {
     }
 
     /// Import a reflex export from another swarm (validation only, no I/O).
-    pub fn import(
-        &mut self,
-        export: &ReflexExport,
-        now_ms: u64,
-    ) -> ImportResult {
+    pub fn import(&mut self, export: &ReflexExport, now_ms: u64) -> ImportResult {
         // Reject self-imports.
         if export.swarm_id == self.config.swarm_id {
             return ImportResult::SelfImport;

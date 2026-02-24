@@ -72,47 +72,128 @@ impl Default for SymExecConfig {
 /// Binaries that are unconditionally banned in ARS reflexes.
 const BANNED_BINARIES: &[&str] = &[
     // Filesystem destruction
-    "mkfs", "mkfs.ext4", "mkfs.xfs", "mkfs.btrfs", "mkfs.vfat",
-    "mke2fs", "mkswap", "fdisk", "gdisk", "parted",
+    "mkfs",
+    "mkfs.ext4",
+    "mkfs.xfs",
+    "mkfs.btrfs",
+    "mkfs.vfat",
+    "mke2fs",
+    "mkswap",
+    "fdisk",
+    "gdisk",
+    "parted",
     // Raw disk access
     "dd",
     // Privilege escalation
-    "sudo", "su", "doas", "pkexec",
+    "sudo",
+    "su",
+    "doas",
+    "pkexec",
     // Dangerous system commands
-    "shutdown", "reboot", "halt", "poweroff", "init",
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
+    "init",
     // Network attacks
-    "nmap", "masscan",
+    "nmap",
+    "masscan",
     // Kernel manipulation
-    "insmod", "rmmod", "modprobe",
+    "insmod",
+    "rmmod",
+    "modprobe",
     // Container escape
-    "nsenter", "unshare",
+    "nsenter",
+    "unshare",
     // Format string / injection vectors
     "eval",
 ];
 
 /// Binaries that are always safe (read-only or output-only).
 const SAFE_BINARIES: &[&str] = &[
-    "echo", "printf", "cat", "head", "tail", "less", "more",
-    "ls", "dir", "stat", "file", "wc", "sort", "uniq",
-    "grep", "egrep", "fgrep", "rg", "ag", "ack",
+    "echo",
+    "printf",
+    "cat",
+    "head",
+    "tail",
+    "less",
+    "more",
+    "ls",
+    "dir",
+    "stat",
+    "file",
+    "wc",
+    "sort",
+    "uniq",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "ag",
+    "ack",
     "find", // safe unless combined with -exec rm
-    "which", "whereis", "type", "command",
-    "pwd", "whoami", "id", "hostname", "uname",
-    "date", "cal", "uptime", "env", "printenv",
-    "true", "false", "test",
-    "git", "cargo", "npm", "yarn", "pnpm", "bun",
-    "make", "cmake", "meson", "ninja",
-    "python", "python3", "ruby", "node", "deno",
-    "rustc", "rustfmt", "clippy-driver",
-    "man", "info", "help",
-    "diff", "cmp", "comm",
-    "tee", "tr", "cut", "paste", "join",
-    "sed", "awk", "perl",
-    "jq", "yq", "xq",
-    "curl", "wget", "http", // network but read-only
-    "ssh", "scp", "rsync",
-    "docker", "podman", // container management
-    "kubectl", "helm",
+    "which",
+    "whereis",
+    "type",
+    "command",
+    "pwd",
+    "whoami",
+    "id",
+    "hostname",
+    "uname",
+    "date",
+    "cal",
+    "uptime",
+    "env",
+    "printenv",
+    "true",
+    "false",
+    "test",
+    "git",
+    "cargo",
+    "npm",
+    "yarn",
+    "pnpm",
+    "bun",
+    "make",
+    "cmake",
+    "meson",
+    "ninja",
+    "python",
+    "python3",
+    "ruby",
+    "node",
+    "deno",
+    "rustc",
+    "rustfmt",
+    "clippy-driver",
+    "man",
+    "info",
+    "help",
+    "diff",
+    "cmp",
+    "comm",
+    "tee",
+    "tr",
+    "cut",
+    "paste",
+    "join",
+    "sed",
+    "awk",
+    "perl",
+    "jq",
+    "yq",
+    "xq",
+    "curl",
+    "wget",
+    "http", // network but read-only
+    "ssh",
+    "scp",
+    "rsync",
+    "docker",
+    "podman", // container management
+    "kubectl",
+    "helm",
 ];
 
 /// Flags on `rm` that make it catastrophic.
@@ -350,11 +431,7 @@ pub fn parse_commands(tokens: &[ShellToken]) -> Vec<ParsedCommand> {
     commands
 }
 
-fn build_command(
-    words: &[String],
-    subs: &[String],
-    piped: bool,
-) -> Option<ParsedCommand> {
+fn build_command(words: &[String], subs: &[String], piped: bool) -> Option<ParsedCommand> {
     if words.is_empty() {
         return None;
     }
@@ -524,8 +601,7 @@ impl SymbolicExecutor {
             banned_set.insert(extra.clone());
         }
 
-        let mut safe_set: HashSet<String> =
-            SAFE_BINARIES.iter().map(|s| s.to_string()).collect();
+        let mut safe_set: HashSet<String> = SAFE_BINARIES.iter().map(|s| s.to_string()).collect();
         for extra in &config.extra_safe_binaries {
             safe_set.insert(extra.clone());
         }
@@ -611,9 +687,7 @@ impl SymbolicExecutor {
                     violations.push(SafetyViolation {
                         block_index: cmd.index,
                         category: ViolationCategory::OpaqueSubstitution,
-                        description: format!(
-                            "Subcommand substitution detected: $({sub})"
-                        ),
+                        description: format!("Subcommand substitution detected: $({sub})"),
                         evidence: sub.clone(),
                     });
                 }
@@ -621,13 +695,12 @@ impl SymbolicExecutor {
 
             // Check banned binaries.
             if self.banned_set.contains(&parsed_cmd.binary) {
-                let category = if ["sudo", "su", "doas", "pkexec"]
-                    .contains(&parsed_cmd.binary.as_str())
-                {
-                    ViolationCategory::PrivilegeEscalation
-                } else {
-                    ViolationCategory::BannedBinary
-                };
+                let category =
+                    if ["sudo", "su", "doas", "pkexec"].contains(&parsed_cmd.binary.as_str()) {
+                        ViolationCategory::PrivilegeEscalation
+                    } else {
+                        ViolationCategory::BannedBinary
+                    };
 
                 violations.push(SafetyViolation {
                     block_index: cmd.index,
@@ -721,9 +794,10 @@ impl SymbolicExecutor {
         cmd: &ParsedCommand,
         violations: &mut Vec<SafetyViolation>,
     ) {
-        let has_dangerous_mode = cmd.args.iter().any(|a| {
-            CHMOD_DANGEROUS_PATTERNS.iter().any(|p| a.contains(p))
-        });
+        let has_dangerous_mode = cmd
+            .args
+            .iter()
+            .any(|a| CHMOD_DANGEROUS_PATTERNS.iter().any(|p| a.contains(p)));
 
         if !has_dangerous_mode {
             return;
@@ -741,10 +815,7 @@ impl SymbolicExecutor {
                 violations.push(SafetyViolation {
                     block_index,
                     category: ViolationCategory::PathTraversal,
-                    description: format!(
-                        "chmod 777 on path outside CWD: {}",
-                        resolved.display()
-                    ),
+                    description: format!("chmod 777 on path outside CWD: {}", resolved.display()),
                     evidence: arg.clone(),
                 });
             }
@@ -808,10 +879,7 @@ fn is_fork_bomb(cmd: &str) -> bool {
 
 /// Heuristic: does this string look like a filesystem path?
 fn looks_like_path(s: &str) -> bool {
-    s.contains('/')
-        || s.contains("..")
-        || s.starts_with('~')
-        || s.starts_with('.')
+    s.contains('/') || s.contains("..") || s.starts_with('~') || s.starts_with('.')
 }
 
 // =============================================================================
@@ -925,7 +993,11 @@ mod tests {
     fn tokenize_subshell() {
         let input = "echo $(whoami)";
         let tokens = tokenize(input);
-        assert!(tokens.iter().any(|t| matches!(t, ShellToken::Substitution(_))));
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, ShellToken::Substitution(_)))
+        );
     }
 
     #[test]
@@ -1086,7 +1158,11 @@ mod tests {
         let verdict = exec.analyze(&cmds);
         assert!(verdict.is_unsafe());
         if let SafetyVerdict::Unsafe(v) = &verdict {
-            assert!(v.violations.iter().any(|v| v.category == ViolationCategory::BannedBinary));
+            assert!(
+                v.violations
+                    .iter()
+                    .any(|v| v.category == ViolationCategory::BannedBinary)
+            );
         }
     }
 
@@ -1104,7 +1180,11 @@ mod tests {
         let verdict = exec.analyze(&cmds);
         assert!(verdict.is_unsafe());
         if let SafetyVerdict::Unsafe(v) = &verdict {
-            assert!(v.violations.iter().any(|v| v.category == ViolationCategory::PrivilegeEscalation));
+            assert!(
+                v.violations
+                    .iter()
+                    .any(|v| v.category == ViolationCategory::PrivilegeEscalation)
+            );
         }
     }
 
@@ -1126,7 +1206,11 @@ mod tests {
         let verdict = exec.analyze(&cmds);
         assert!(verdict.is_unsafe());
         if let SafetyVerdict::Unsafe(v) = &verdict {
-            assert!(v.violations.iter().any(|v| v.category == ViolationCategory::PathTraversal));
+            assert!(
+                v.violations
+                    .iter()
+                    .any(|v| v.category == ViolationCategory::PathTraversal)
+            );
         }
     }
 
@@ -1137,7 +1221,11 @@ mod tests {
         let verdict = exec.analyze(&cmds);
         assert!(verdict.is_unsafe());
         if let SafetyVerdict::Unsafe(v) = &verdict {
-            assert!(v.violations.iter().any(|v| v.category == ViolationCategory::UnboundedDeletion));
+            assert!(
+                v.violations
+                    .iter()
+                    .any(|v| v.category == ViolationCategory::UnboundedDeletion)
+            );
         }
     }
 
@@ -1167,7 +1255,11 @@ mod tests {
         let verdict = exec.analyze(&cmds);
         assert!(verdict.is_unsafe());
         if let SafetyVerdict::Unsafe(v) = &verdict {
-            assert!(v.violations.iter().any(|v| v.category == ViolationCategory::ResourceExhaustion));
+            assert!(
+                v.violations
+                    .iter()
+                    .any(|v| v.category == ViolationCategory::ResourceExhaustion)
+            );
         }
     }
 

@@ -197,9 +197,7 @@ impl ReflexState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlastDecision {
     /// Execution allowed.
-    Allow {
-        tier: MaturityTier,
-    },
+    Allow { tier: MaturityTier },
     /// Execution denied — rate limited.
     Deny {
         reason: DenyReason,
@@ -249,10 +247,7 @@ pub struct BlastRadiusController {
 impl BlastRadiusController {
     /// Create a controller with the given configuration.
     pub fn new(config: BlastRadiusConfig) -> Self {
-        let swarm_bucket = TokenBucket::new(
-            config.swarm_burst,
-            config.swarm_rate_per_min / 60.0,
-        );
+        let swarm_bucket = TokenBucket::new(config.swarm_burst, config.swarm_rate_per_min / 60.0);
         Self {
             config,
             swarm_bucket,
@@ -300,12 +295,15 @@ impl BlastRadiusController {
         }
 
         // 2. Per-cluster check.
-        let cluster_bucket = self.cluster_buckets.entry(cluster_id.clone()).or_insert_with(|| {
-            TokenBucket::new(
-                self.config.cluster_burst,
-                self.config.cluster_rate_per_min / 60.0,
-            )
-        });
+        let cluster_bucket = self
+            .cluster_buckets
+            .entry(cluster_id.clone())
+            .or_insert_with(|| {
+                TokenBucket::new(
+                    self.config.cluster_burst,
+                    self.config.cluster_rate_per_min / 60.0,
+                )
+            });
         if !cluster_bucket.try_acquire(1, now_ms) {
             // Return the swarm token (compensate).
             // Note: exact return isn't possible with the existing API, so we accept slight drift.
@@ -318,9 +316,10 @@ impl BlastRadiusController {
 
         // 3. Per-reflex check (rate depends on tier).
         let (rate, burst) = self.tier_rate(tier);
-        let reflex_bucket = self.reflex_buckets.entry(reflex_id).or_insert_with(|| {
-            TokenBucket::new(burst, rate / 60.0)
-        });
+        let reflex_bucket = self
+            .reflex_buckets
+            .entry(reflex_id)
+            .or_insert_with(|| TokenBucket::new(burst, rate / 60.0));
         if !reflex_bucket.try_acquire(1, now_ms) {
             self.total_denied += 1;
             return BlastDecision::Deny {
@@ -374,10 +373,7 @@ impl BlastRadiusController {
                 self.config.graduated_rate_per_min,
                 self.config.graduated_burst,
             ),
-            MaturityTier::Veteran => (
-                self.config.veteran_rate_per_min,
-                self.config.veteran_burst,
-            ),
+            MaturityTier::Veteran => (self.config.veteran_rate_per_min, self.config.veteran_burst),
         }
     }
 
@@ -550,7 +546,12 @@ mod tests {
         let mut ctrl = default_controller();
         ctrl.register_reflex(1, "c1");
         let decision = ctrl.check(1, 1000);
-        assert_eq!(decision, BlastDecision::Allow { tier: MaturityTier::Incubating });
+        assert_eq!(
+            decision,
+            BlastDecision::Allow {
+                tier: MaturityTier::Incubating
+            }
+        );
     }
 
     #[test]
@@ -566,9 +567,9 @@ mod tests {
     #[test]
     fn reflex_rate_limited_after_burst() {
         let config = BlastRadiusConfig {
-            incubating_rate_per_min: 6.0,   // 0.1/sec
-            incubating_burst: 2.0,          // max 2 burst
-            swarm_rate_per_min: 600.0,      // high so it doesn't interfere
+            incubating_rate_per_min: 6.0, // 0.1/sec
+            incubating_burst: 2.0,        // max 2 burst
+            swarm_rate_per_min: 600.0,    // high so it doesn't interfere
             swarm_burst: 100.0,
             cluster_rate_per_min: 600.0,
             cluster_burst: 100.0,
@@ -585,7 +586,10 @@ mod tests {
         let d = ctrl.check(1, 1002);
         let is_reflex_limit = matches!(
             d,
-            BlastDecision::Deny { reason: DenyReason::ReflexLimit { .. }, .. }
+            BlastDecision::Deny {
+                reason: DenyReason::ReflexLimit { .. },
+                ..
+            }
         );
         assert!(is_reflex_limit);
     }
@@ -608,7 +612,10 @@ mod tests {
         let d = ctrl.check(1, 1001);
         let is_swarm_limit = matches!(
             d,
-            BlastDecision::Deny { reason: DenyReason::SwarmLimit, .. }
+            BlastDecision::Deny {
+                reason: DenyReason::SwarmLimit,
+                ..
+            }
         );
         assert!(is_swarm_limit);
     }
@@ -631,7 +638,10 @@ mod tests {
         let d = ctrl.check(1, 1001);
         let is_cluster_limit = matches!(
             d,
-            BlastDecision::Deny { reason: DenyReason::ClusterLimit { .. }, .. }
+            BlastDecision::Deny {
+                reason: DenyReason::ClusterLimit { .. },
+                ..
+            }
         );
         assert!(is_cluster_limit);
     }
@@ -639,7 +649,7 @@ mod tests {
     #[test]
     fn rate_replenishes_over_time() {
         let config = BlastRadiusConfig {
-            incubating_rate_per_min: 60.0,   // 1/sec
+            incubating_rate_per_min: 60.0, // 1/sec
             incubating_burst: 1.0,
             swarm_rate_per_min: 6000.0,
             swarm_burst: 100.0,
@@ -756,7 +766,11 @@ mod tests {
 
     #[test]
     fn maturity_tier_serde_roundtrip() {
-        for tier in [MaturityTier::Incubating, MaturityTier::Graduated, MaturityTier::Veteran] {
+        for tier in [
+            MaturityTier::Incubating,
+            MaturityTier::Graduated,
+            MaturityTier::Veteran,
+        ] {
             let json = serde_json::to_string(&tier).unwrap();
             let decoded: MaturityTier = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, tier);
@@ -805,7 +819,10 @@ mod tests {
             total_denied: 3,
             registered_reflexes: 5,
             cluster_count: 2,
-            tier_counts: HashMap::from([("Incubating".to_string(), 3), ("Graduated".to_string(), 2)]),
+            tier_counts: HashMap::from([
+                ("Incubating".to_string(), 3),
+                ("Graduated".to_string(), 2),
+            ]),
         };
         let json = serde_json::to_string(&stats).unwrap();
         let decoded: BlastStats = serde_json::from_str(&json).unwrap();

@@ -365,10 +365,17 @@ impl EvidenceLedger {
             .iter()
             .all(|req| categories.contains(req));
 
-        let overall_verdict = if self.entries.iter().any(|e| e.verdict == EvidenceVerdict::Reject)
+        let overall_verdict = if self
+            .entries
+            .iter()
+            .any(|e| e.verdict == EvidenceVerdict::Reject)
         {
             EvidenceVerdict::Reject
-        } else if self.entries.iter().all(|e| e.verdict == EvidenceVerdict::Support) {
+        } else if self
+            .entries
+            .iter()
+            .all(|e| e.verdict == EvidenceVerdict::Support)
+        {
             EvidenceVerdict::Support
         } else {
             EvidenceVerdict::Neutral
@@ -422,7 +429,9 @@ impl EvidenceLedger {
     /// Check if any entry has a Reject verdict.
     #[must_use]
     pub fn has_rejection(&self) -> bool {
-        self.entries.iter().any(|e| e.verdict == EvidenceVerdict::Reject)
+        self.entries
+            .iter()
+            .any(|e| e.verdict == EvidenceVerdict::Reject)
     }
 }
 
@@ -472,9 +481,18 @@ impl EvidenceBuilder {
         is_changepoint: bool,
     ) -> &mut Self {
         let mut payload = BTreeMap::new();
-        payload.insert("bayes_factor".to_string(), EvidenceValue::Number(bayes_factor));
-        payload.insert("run_length".to_string(), EvidenceValue::Number(run_length as f64));
-        payload.insert("is_changepoint".to_string(), EvidenceValue::Bool(is_changepoint));
+        payload.insert(
+            "bayes_factor".to_string(),
+            EvidenceValue::Number(bayes_factor),
+        );
+        payload.insert(
+            "run_length".to_string(),
+            EvidenceValue::Number(run_length as f64),
+        );
+        payload.insert(
+            "is_changepoint".to_string(),
+            EvidenceValue::Bool(is_changepoint),
+        );
 
         let verdict = if is_changepoint {
             EvidenceVerdict::Support
@@ -612,7 +630,10 @@ impl EvidenceBuilder {
     ) -> &mut Self {
         let mut payload = BTreeMap::new();
         payload.insert("risk_bound".to_string(), EvidenceValue::Number(risk_bound));
-        payload.insert("is_trustworthy".to_string(), EvidenceValue::Bool(is_trustworthy));
+        payload.insert(
+            "is_trustworthy".to_string(),
+            EvidenceValue::Bool(is_trustworthy),
+        );
         payload.insert(
             "params_count".to_string(),
             EvidenceValue::Number(params_count as f64),
@@ -646,14 +667,26 @@ impl EvidenceBuilder {
         is_data_driven: bool,
     ) -> &mut Self {
         let mut payload = BTreeMap::new();
-        payload.insert("timeout_ms".to_string(), EvidenceValue::Number(timeout_ms as f64));
-        payload.insert("expected_loss".to_string(), EvidenceValue::Number(expected_loss));
-        payload.insert("is_data_driven".to_string(), EvidenceValue::Bool(is_data_driven));
+        payload.insert(
+            "timeout_ms".to_string(),
+            EvidenceValue::Number(timeout_ms as f64),
+        );
+        payload.insert(
+            "expected_loss".to_string(),
+            EvidenceValue::Number(expected_loss),
+        );
+        payload.insert(
+            "is_data_driven".to_string(),
+            EvidenceValue::Bool(is_data_driven),
+        );
 
         self.ledger.append(
             EvidenceCategory::TimeoutCalc,
             timestamp_us,
-            format!("Dynamic timeout: {}ms, loss={:.3}", timeout_ms, expected_loss),
+            format!(
+                "Dynamic timeout: {}ms, loss={:.3}",
+                timeout_ms, expected_loss
+            ),
             payload,
             EvidenceVerdict::Support,
         );
@@ -738,7 +771,10 @@ mod tests {
 
     #[test]
     fn category_display() {
-        assert_eq!(format!("{}", EvidenceCategory::ChangeDetection), "change_detection");
+        assert_eq!(
+            format!("{}", EvidenceCategory::ChangeDetection),
+            "change_detection"
+        );
         assert_eq!(format!("{}", EvidenceCategory::SafetyProof), "safety_proof");
     }
 
@@ -1160,16 +1196,44 @@ mod tests {
     #[test]
     fn hash_is_deterministic() {
         let payload = BTreeMap::new();
-        let h1 = compute_entry_hash(0, &EvidenceCategory::ChangeDetection, 1000, "test", &payload, "prev");
-        let h2 = compute_entry_hash(0, &EvidenceCategory::ChangeDetection, 1000, "test", &payload, "prev");
+        let h1 = compute_entry_hash(
+            0,
+            &EvidenceCategory::ChangeDetection,
+            1000,
+            "test",
+            &payload,
+            "prev",
+        );
+        let h2 = compute_entry_hash(
+            0,
+            &EvidenceCategory::ChangeDetection,
+            1000,
+            "test",
+            &payload,
+            "prev",
+        );
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn hash_changes_with_input() {
         let payload = BTreeMap::new();
-        let h1 = compute_entry_hash(0, &EvidenceCategory::ChangeDetection, 1000, "test", &payload, "prev");
-        let h2 = compute_entry_hash(1, &EvidenceCategory::ChangeDetection, 1000, "test", &payload, "prev");
+        let h1 = compute_entry_hash(
+            0,
+            &EvidenceCategory::ChangeDetection,
+            1000,
+            "test",
+            &payload,
+            "prev",
+        );
+        let h2 = compute_entry_hash(
+            1,
+            &EvidenceCategory::ChangeDetection,
+            1000,
+            "test",
+            &payload,
+            "prev",
+        );
         assert_ne!(h1, h2);
     }
 
