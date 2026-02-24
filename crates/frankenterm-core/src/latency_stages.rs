@@ -10612,6 +10612,220 @@ pub struct InvariantCheckerLogEntry {
     pub degradation: InvariantCheckerDegradation,
 }
 
+// ── E1 Impl: Bridge Methods and Convenience API ──────────────────
+
+impl InvariantChecker {
+    /// Check a batch of scheduler invariants, returning all results.
+    pub fn check_scheduler_batch(
+        &mut self,
+        invariants: &[SchedulerInvariant],
+        timestamp_us: u64,
+    ) -> Vec<InvariantCheckResult> {
+        invariants
+            .iter()
+            .map(|inv| self.check_scheduler(inv, timestamp_us))
+            .collect()
+    }
+
+    /// Check a batch of budget invariants, returning all results.
+    pub fn check_budget_batch(
+        &mut self,
+        invariants: &[BudgetInvariant],
+        timestamp_us: u64,
+    ) -> Vec<InvariantCheckResult> {
+        invariants
+            .iter()
+            .map(|inv| self.check_budget(inv, timestamp_us))
+            .collect()
+    }
+
+    /// Check a batch of recovery invariants, returning all results.
+    pub fn check_recovery_batch(
+        &mut self,
+        invariants: &[RecoveryInvariant],
+        timestamp_us: u64,
+    ) -> Vec<InvariantCheckResult> {
+        invariants
+            .iter()
+            .map(|inv| self.check_recovery(inv, timestamp_us))
+            .collect()
+    }
+
+    /// Extract and check scheduler invariants from a `SchedulerSnapshot`.
+    pub fn check_from_scheduler_snapshot(
+        &mut self,
+        snap: &SchedulerSnapshot,
+        config: &LaneSchedulerConfig,
+        timestamp_us: u64,
+    ) -> Vec<InvariantCheckResult> {
+        let mut results = Vec::new();
+        // Check capacity bounds for each lane
+        for ls in &snap.lanes {
+            let capacity = match ls.lane {
+                SchedulerLane::Input => config.input_queue_capacity,
+                SchedulerLane::Control => config.control_queue_capacity,
+                SchedulerLane::Bulk => config.bulk_queue_capacity,
+            };
+            let inv = SchedulerInvariant::CapacityBound {
+                lane: ls.lane,
+                capacity,
+                actual: ls.depth,
+            };
+            results.push(self.check_scheduler(&inv, timestamp_us));
+        }
+        // Check conservation of work
+        let lane_sum: u64 = snap.lanes.iter().map(|ls| ls.total_admitted).sum();
+        let total = snap.total_items_processed;
+        let inv = SchedulerInvariant::ConservationOfWork {
+            total_admitted: total,
+            lane_sum,
+        };
+        results.push(self.check_scheduler(&inv, timestamp_us));
+        results
+    }
+
+    /// Extract and check budget invariants from an `EnforcerSnapshot`.
+    pub fn check_from_enforcer_snapshot(
+        &mut self,
+        snap: &EnforcerSnapshot,
+        timestamp_us: u64,
+    ) -> Vec<InvariantCheckResult> {
+        let mut results = Vec::new();
+        // Check overflow bound
+        let inv = BudgetInvariant::OverflowBound {
+            overflow_count: snap.total_overflows,
+            total_observations: snap.total_observations,
+        };
+        results.push(self.check_budget(&inv, timestamp_us));
+        // Check overflow bound per stage
+        let total_overflows: u64 = snap.stages.iter().map(|s| s.overflow_count).sum();
+        let inv = BudgetInvariant::OverflowBound {
+            overflow_count: total_overflows,
+            total_observations: snap.total_observations,
+        };
+        results.push(self.check_budget(&inv, timestamp_us));
+        results
+    }
+
+    /// Extract and check recovery invariants from a `StageEnforcementState`.
+    pub fn check_from_enforcement_state(
+        &mut self,
+        state: &StageEnforcementState,
+        previous_state: &StageEnforcementState,
+        recovery_protocol: &RecoveryProtocol,
+        timestamp_us: u64,
+    ) -> Vec<InvariantCheckResult> {
+        let mut results = Vec::new();
+        // Escalation count monotonicity
+        let inv = RecoveryInvariant::EscalationCountMonotonic {
+            previous: previous_state.escalation_count,
+            current: state.escalation_count,
+        };
+        results.push(self.check_recovery(&inv, timestamp_us));
+        // Recovery count monotonicity
+        let inv = RecoveryInvariant::RecoveryCountMonotonic {
+            previous: previous_state.recovery_count,
+            current: state.recovery_count,
+        };
+        results.push(self.check_recovery(&inv, timestamp_us));
+        // Level in range
+        let inv = RecoveryInvariant::LevelInRange {
+            level: state.current_level,
+        };
+        results.push(self.check_recovery(&inv, timestamp_us));
+        // If recovery happened (level decreased), check gradual de-escalation
+        if state.current_level < previous_state.current_level && recovery_protocol.gradual {
+            let inv = RecoveryInvariant::GradualDeescalation {
+                previous_level: previous_state.current_level,
+                recovered_level: state.current_level,
+            };
+            results.push(self.check_recovery(&inv, timestamp_us));
+        }
+        // If recovery happened, check cooldown
+        if state.current_level < previous_state.current_level {
+            let inv = RecoveryInvariant::CooldownEnforced {
+                consecutive_ok: state.consecutive_ok,
+                cooldown_required: recovery_protocol.cooldown_observations,
+            };
+            results.push(self.check_recovery(&inv, timestamp_us));
+        }
+        results
+    }
+
+    /// Run all domain checks and return true only if zero violations found.
+    pub fn all_satisfied(&self) -> bool {
+        self.total_violations == 0
+    }
+
+    /// Count violations in a specific domain.
+    pub fn violation_count_by_domain(&self, domain: InvariantDomain) -> usize {
+        self.results
+            .iter()
+            .filter(|r| r.domain == domain && r.violated())
+            .count()
+    }
+
+    /// Get the most recent violation (if any).
+    pub fn last_violation(&self) -> Option<&InvariantCheckResult> {
+        self.results.iter().rev().find(|r| r.violated())
+    }
+
+    /// Check whether a specific predicate has ever been violated.
+    pub fn predicate_ever_violated(&self, predicate_id: &str) -> bool {
+        self.results
+            .iter()
+            .any(|r| r.predicate_id == predicate_id && r.violated())
+    }
+
+    /// Get pass rate for a specific predicate (0.0–1.0, NaN if never checked).
+    pub fn predicate_pass_rate(&self, predicate_id: &str) -> f64 {
+        let matching: Vec<_> = self
+            .results
+            .iter()
+            .filter(|r| r.predicate_id == predicate_id)
+            .collect();
+        if matching.is_empty() {
+            return f64::NAN;
+        }
+        let passed = matching.iter().filter(|r| r.passed()).count();
+        passed as f64 / matching.len() as f64
+    }
+
+    /// Get all unique predicate IDs that have been checked.
+    pub fn checked_predicates(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut predicates = Vec::new();
+        for r in &self.results {
+            if seen.insert(r.predicate_id.clone()) {
+                predicates.push(r.predicate_id.clone());
+            }
+        }
+        predicates
+    }
+
+    /// Summary of checks grouped by domain.
+    pub fn domain_summary(&self) -> Vec<(InvariantDomain, u64, u64)> {
+        let domains = [
+            InvariantDomain::Scheduler,
+            InvariantDomain::Budget,
+            InvariantDomain::Recovery,
+            InvariantDomain::Composition,
+        ];
+        domains
+            .iter()
+            .map(|d| {
+                let total = self.results.iter().filter(|r| r.domain == *d).count() as u64;
+                let violations = self
+                    .results
+                    .iter()
+                    .filter(|r| r.domain == *d && r.violated())
+                    .count() as u64;
+                (*d, total, violations)
+            })
+            .collect()
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -18386,16 +18600,20 @@ mod tests {
 
     #[test]
     fn test_budget_invariant_non_negative_targets() {
-        assert!(BudgetInvariant::NonNegativeTargets {
-            stage: LatencyStage::EventEmission,
-            min_target: 0.0,
-        }
-        .holds());
-        assert!(!BudgetInvariant::NonNegativeTargets {
-            stage: LatencyStage::EventEmission,
-            min_target: -1.0,
-        }
-        .holds());
+        assert!(
+            BudgetInvariant::NonNegativeTargets {
+                stage: LatencyStage::EventEmission,
+                min_target: 0.0,
+            }
+            .holds()
+        );
+        assert!(
+            !BudgetInvariant::NonNegativeTargets {
+                stage: LatencyStage::EventEmission,
+                min_target: -1.0,
+            }
+            .holds()
+        );
     }
 
     #[test]
@@ -18436,34 +18654,42 @@ mod tests {
 
     #[test]
     fn test_budget_invariant_escalation_monotonicity() {
-        assert!(BudgetInvariant::EscalationMonotonicity {
-            stage: LatencyStage::PatternDetection,
-            previous_level: MitigationLevel::None,
-            current_level: MitigationLevel::Defer,
-        }
-        .holds());
-        assert!(!BudgetInvariant::EscalationMonotonicity {
-            stage: LatencyStage::PatternDetection,
-            previous_level: MitigationLevel::Shed,
-            current_level: MitigationLevel::Defer,
-        }
-        .holds());
+        assert!(
+            BudgetInvariant::EscalationMonotonicity {
+                stage: LatencyStage::PatternDetection,
+                previous_level: MitigationLevel::None,
+                current_level: MitigationLevel::Defer,
+            }
+            .holds()
+        );
+        assert!(
+            !BudgetInvariant::EscalationMonotonicity {
+                stage: LatencyStage::PatternDetection,
+                previous_level: MitigationLevel::Shed,
+                current_level: MitigationLevel::Defer,
+            }
+            .holds()
+        );
     }
 
     #[test]
     fn test_budget_invariant_aggregate_ceiling() {
-        assert!(BudgetInvariant::AggregateCeiling {
-            percentile: Percentile::P99,
-            aggregate_us: 1000.0,
-            stage_sum_us: 900.0,
-        }
-        .holds());
-        assert!(!BudgetInvariant::AggregateCeiling {
-            percentile: Percentile::P99,
-            aggregate_us: 800.0,
-            stage_sum_us: 900.0,
-        }
-        .holds());
+        assert!(
+            BudgetInvariant::AggregateCeiling {
+                percentile: Percentile::P99,
+                aggregate_us: 1000.0,
+                stage_sum_us: 900.0,
+            }
+            .holds()
+        );
+        assert!(
+            !BudgetInvariant::AggregateCeiling {
+                percentile: Percentile::P99,
+                aggregate_us: 800.0,
+                stage_sum_us: 900.0,
+            }
+            .holds()
+        );
     }
 
     #[test]
@@ -18500,38 +18726,48 @@ mod tests {
 
     #[test]
     fn test_recovery_invariant_cooldown_enforced() {
-        assert!(RecoveryInvariant::CooldownEnforced {
-            consecutive_ok: 20,
-            cooldown_required: 20,
-        }
-        .holds());
-        assert!(!RecoveryInvariant::CooldownEnforced {
-            consecutive_ok: 19,
-            cooldown_required: 20,
-        }
-        .holds());
+        assert!(
+            RecoveryInvariant::CooldownEnforced {
+                consecutive_ok: 20,
+                cooldown_required: 20,
+            }
+            .holds()
+        );
+        assert!(
+            !RecoveryInvariant::CooldownEnforced {
+                consecutive_ok: 19,
+                cooldown_required: 20,
+            }
+            .holds()
+        );
     }
 
     #[test]
     fn test_recovery_invariant_timeout_recovery() {
-        assert!(RecoveryInvariant::TimeoutRecovery {
-            degraded_duration_us: 40_000_000,
-            max_duration_us: 30_000_000,
-            recovery_triggered: true,
-        }
-        .holds());
-        assert!(!RecoveryInvariant::TimeoutRecovery {
-            degraded_duration_us: 40_000_000,
-            max_duration_us: 30_000_000,
-            recovery_triggered: false,
-        }
-        .holds());
-        assert!(RecoveryInvariant::TimeoutRecovery {
-            degraded_duration_us: 10_000_000,
-            max_duration_us: 30_000_000,
-            recovery_triggered: false,
-        }
-        .holds());
+        assert!(
+            RecoveryInvariant::TimeoutRecovery {
+                degraded_duration_us: 40_000_000,
+                max_duration_us: 30_000_000,
+                recovery_triggered: true,
+            }
+            .holds()
+        );
+        assert!(
+            !RecoveryInvariant::TimeoutRecovery {
+                degraded_duration_us: 40_000_000,
+                max_duration_us: 30_000_000,
+                recovery_triggered: false,
+            }
+            .holds()
+        );
+        assert!(
+            RecoveryInvariant::TimeoutRecovery {
+                degraded_duration_us: 10_000_000,
+                max_duration_us: 30_000_000,
+                recovery_triggered: false,
+            }
+            .holds()
+        );
     }
 
     #[test]
@@ -18765,19 +19001,12 @@ mod tests {
             300,
         );
         assert_eq!(
-            checker
-                .results_by_domain(InvariantDomain::Scheduler)
-                .len(),
+            checker.results_by_domain(InvariantDomain::Scheduler).len(),
             1
         );
+        assert_eq!(checker.results_by_domain(InvariantDomain::Budget).len(), 1);
         assert_eq!(
-            checker.results_by_domain(InvariantDomain::Budget).len(),
-            1
-        );
-        assert_eq!(
-            checker
-                .results_by_domain(InvariantDomain::Recovery)
-                .len(),
+            checker.results_by_domain(InvariantDomain::Recovery).len(),
             1
         );
         assert_eq!(
@@ -19043,5 +19272,323 @@ mod tests {
         let s = format!("{r}");
         assert!(s.contains("SATISFIED"));
         assert!(s.contains("42"));
+    }
+
+    // ── E1 Impl: Bridge Method Tests ──────────────────────────────
+
+    #[test]
+    fn test_checker_batch_scheduler() {
+        let mut checker = InvariantChecker::with_defaults();
+        let invs = vec![
+            SchedulerInvariant::EpochMonotonicity {
+                previous: 0,
+                current: 5,
+            },
+            SchedulerInvariant::CapacityBound {
+                lane: SchedulerLane::Input,
+                capacity: 100,
+                actual: 50,
+            },
+            SchedulerInvariant::CapacityBound {
+                lane: SchedulerLane::Bulk,
+                capacity: 10,
+                actual: 20,
+            },
+        ];
+        let results = checker.check_scheduler_batch(&invs, 1000);
+        assert_eq!(results.len(), 3);
+        assert!(results[0].passed());
+        assert!(results[1].passed());
+        assert!(results[2].violated());
+        assert_eq!(checker.total_checks(), 3);
+    }
+
+    #[test]
+    fn test_checker_batch_budget() {
+        let mut checker = InvariantChecker::with_defaults();
+        let invs = vec![
+            BudgetInvariant::NonNegativeTargets {
+                stage: LatencyStage::PatternDetection,
+                min_target: 10.0,
+            },
+            BudgetInvariant::OverflowBound {
+                overflow_count: 5,
+                total_observations: 100,
+            },
+        ];
+        let results = checker.check_budget_batch(&invs, 2000);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.passed()));
+    }
+
+    #[test]
+    fn test_checker_batch_recovery() {
+        let mut checker = InvariantChecker::with_defaults();
+        let invs = vec![
+            RecoveryInvariant::LevelInRange {
+                level: MitigationLevel::Defer,
+            },
+            RecoveryInvariant::EscalationCountMonotonic {
+                previous: 3,
+                current: 5,
+            },
+        ];
+        let results = checker.check_recovery_batch(&invs, 3000);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.passed()));
+    }
+
+    #[test]
+    fn test_checker_all_satisfied() {
+        let mut checker = InvariantChecker::with_defaults();
+        checker.check_scheduler(
+            &SchedulerInvariant::EpochMonotonicity {
+                previous: 0,
+                current: 1,
+            },
+            0,
+        );
+        assert!(checker.all_satisfied());
+        checker.check_scheduler(
+            &SchedulerInvariant::CapacityBound {
+                lane: SchedulerLane::Input,
+                capacity: 1,
+                actual: 10,
+            },
+            1,
+        );
+        assert!(!checker.all_satisfied());
+    }
+
+    #[test]
+    fn test_checker_violation_count_by_domain() {
+        let mut checker = InvariantChecker::with_defaults();
+        checker.check_scheduler(
+            &SchedulerInvariant::CapacityBound {
+                lane: SchedulerLane::Input,
+                capacity: 1,
+                actual: 10,
+            },
+            0,
+        );
+        checker.check_budget(
+            &BudgetInvariant::NonNegativeTargets {
+                stage: LatencyStage::PatternDetection,
+                min_target: -1.0,
+            },
+            1,
+        );
+        checker.check_budget(
+            &BudgetInvariant::NonNegativeTargets {
+                stage: LatencyStage::PatternDetection,
+                min_target: 5.0,
+            },
+            2,
+        );
+        assert_eq!(
+            checker.violation_count_by_domain(InvariantDomain::Scheduler),
+            1
+        );
+        assert_eq!(
+            checker.violation_count_by_domain(InvariantDomain::Budget),
+            1
+        );
+        assert_eq!(
+            checker.violation_count_by_domain(InvariantDomain::Recovery),
+            0
+        );
+    }
+
+    #[test]
+    fn test_checker_last_violation() {
+        let mut checker = InvariantChecker::with_defaults();
+        assert!(checker.last_violation().is_none());
+        checker.check_scheduler(
+            &SchedulerInvariant::CapacityBound {
+                lane: SchedulerLane::Input,
+                capacity: 1,
+                actual: 10,
+            },
+            100,
+        );
+        checker.check_scheduler(
+            &SchedulerInvariant::EpochMonotonicity {
+                previous: 0,
+                current: 1,
+            },
+            200,
+        );
+        let last = checker.last_violation().unwrap();
+        assert_eq!(last.predicate_id, "scheduler.capacity_bound");
+    }
+
+    #[test]
+    fn test_checker_predicate_ever_violated() {
+        let mut checker = InvariantChecker::with_defaults();
+        checker.check_scheduler(
+            &SchedulerInvariant::EpochMonotonicity {
+                previous: 0,
+                current: 1,
+            },
+            0,
+        );
+        assert!(!checker.predicate_ever_violated("scheduler.epoch_monotonicity"));
+        checker.check_scheduler(
+            &SchedulerInvariant::EpochMonotonicity {
+                previous: 5,
+                current: 1,
+            },
+            1,
+        );
+        assert!(checker.predicate_ever_violated("scheduler.epoch_monotonicity"));
+    }
+
+    #[test]
+    fn test_checker_predicate_pass_rate() {
+        let mut checker = InvariantChecker::with_defaults();
+        assert!(checker.predicate_pass_rate("nonexistent").is_nan());
+        for _ in 0..3 {
+            checker.check_scheduler(
+                &SchedulerInvariant::EpochMonotonicity {
+                    previous: 0,
+                    current: 1,
+                },
+                0,
+            );
+        }
+        checker.check_scheduler(
+            &SchedulerInvariant::EpochMonotonicity {
+                previous: 5,
+                current: 1,
+            },
+            1,
+        );
+        let rate = checker.predicate_pass_rate("scheduler.epoch_monotonicity");
+        assert!((rate - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_checker_checked_predicates() {
+        let mut checker = InvariantChecker::with_defaults();
+        checker.check_scheduler(
+            &SchedulerInvariant::EpochMonotonicity {
+                previous: 0,
+                current: 1,
+            },
+            0,
+        );
+        checker.check_budget(
+            &BudgetInvariant::NonNegativeTargets {
+                stage: LatencyStage::PatternDetection,
+                min_target: 1.0,
+            },
+            1,
+        );
+        checker.check_scheduler(
+            &SchedulerInvariant::EpochMonotonicity {
+                previous: 0,
+                current: 2,
+            },
+            2,
+        );
+        let preds = checker.checked_predicates();
+        assert_eq!(preds.len(), 2);
+        assert!(preds.contains(&"scheduler.epoch_monotonicity".to_string()));
+        assert!(preds.contains(&"budget.non_negative_targets".to_string()));
+    }
+
+    #[test]
+    fn test_checker_domain_summary() {
+        let mut checker = InvariantChecker::with_defaults();
+        checker.check_scheduler(
+            &SchedulerInvariant::EpochMonotonicity {
+                previous: 0,
+                current: 1,
+            },
+            0,
+        );
+        checker.check_scheduler(
+            &SchedulerInvariant::CapacityBound {
+                lane: SchedulerLane::Input,
+                capacity: 1,
+                actual: 10,
+            },
+            1,
+        );
+        checker.check_budget(
+            &BudgetInvariant::NonNegativeTargets {
+                stage: LatencyStage::PatternDetection,
+                min_target: 5.0,
+            },
+            2,
+        );
+        let summary = checker.domain_summary();
+        assert_eq!(summary.len(), 4);
+        // Scheduler: 2 checks, 1 violation
+        let sched = summary
+            .iter()
+            .find(|(d, _, _)| *d == InvariantDomain::Scheduler)
+            .unwrap();
+        assert_eq!(sched.1, 2);
+        assert_eq!(sched.2, 1);
+        // Budget: 1 check, 0 violations
+        let budget = summary
+            .iter()
+            .find(|(d, _, _)| *d == InvariantDomain::Budget)
+            .unwrap();
+        assert_eq!(budget.1, 1);
+        assert_eq!(budget.2, 0);
+    }
+
+    #[test]
+    fn test_checker_from_enforcement_state_monotonic() {
+        let mut checker = InvariantChecker::with_defaults();
+        let prev = StageEnforcementState {
+            current_level: MitigationLevel::Degrade,
+            consecutive_ok: 0,
+            last_escalation_us: 1000,
+            escalation_count: 3,
+            recovery_count: 1,
+        };
+        let curr = StageEnforcementState {
+            current_level: MitigationLevel::Degrade,
+            consecutive_ok: 5,
+            last_escalation_us: 1000,
+            escalation_count: 3,
+            recovery_count: 1,
+        };
+        let protocol = RecoveryProtocol::default();
+        let results =
+            checker.check_from_enforcement_state(&curr, &prev, &protocol, 5000);
+        // Should check: escalation_count_mono, recovery_count_mono, level_in_range
+        // No recovery happened (same level), so no gradual or cooldown checks
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.passed()));
+    }
+
+    #[test]
+    fn test_checker_from_enforcement_state_recovery() {
+        let mut checker = InvariantChecker::with_defaults();
+        let prev = StageEnforcementState {
+            current_level: MitigationLevel::Degrade,
+            consecutive_ok: 0,
+            last_escalation_us: 1000,
+            escalation_count: 3,
+            recovery_count: 1,
+        };
+        // Gradual recovery: Degrade -> Defer (one step down)
+        let curr = StageEnforcementState {
+            current_level: MitigationLevel::Defer,
+            consecutive_ok: 25, // > 20 cooldown
+            last_escalation_us: 1000,
+            escalation_count: 3,
+            recovery_count: 2,
+        };
+        let protocol = RecoveryProtocol::default();
+        let results =
+            checker.check_from_enforcement_state(&curr, &prev, &protocol, 6000);
+        // escalation_count_mono, recovery_count_mono, level_in_range, gradual_deescalation, cooldown_enforced
+        assert_eq!(results.len(), 5);
+        assert!(results.iter().all(|r| r.passed()));
     }
 }
