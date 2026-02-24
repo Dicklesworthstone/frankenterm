@@ -1533,6 +1533,12 @@ pub struct SafetyConfig {
     /// Command safety gate configuration
     pub command_gate: CommandGateConfig,
 
+    /// Trauma guard tuning for recurring failure loop detection.
+    pub trauma_guard: TraumaGuardConfig,
+
+    /// Semantic anomaly shock response configuration.
+    pub semantic_shock: SemanticShockSafetyConfig,
+
     /// Custom policy rules (allow/deny/require_approval)
     pub rules: PolicyRulesConfig,
 }
@@ -1549,8 +1555,110 @@ impl Default for SafetyConfig {
             redaction: RedactionConfig::default(),
             reservations: ReservationConfig::default(),
             command_gate: CommandGateConfig::default(),
+            trauma_guard: TraumaGuardConfig::default(),
+            semantic_shock: SemanticShockSafetyConfig::default(),
             rules: PolicyRulesConfig::default(),
         }
+    }
+}
+
+/// Configuration for the semantic anomaly shock response system.
+///
+/// Controls how conformal prediction anomalies are surfaced to the operator
+/// and whether they should pause agent command execution.
+///
+/// ```toml
+/// [safety.semantic_shock]
+/// enabled = true
+/// action = "alert"           # "alert" or "pause"
+/// p_value_threshold = 0.01
+/// auto_clear_seconds = 300
+/// notification_cooldown_seconds = 30
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SemanticShockSafetyConfig {
+    /// Enable/disable the semantic shock response system.
+    pub enabled: bool,
+    /// Action on shock: "alert" (notify only) or "pause" (revoke command privileges).
+    pub action: String,
+    /// Maximum p-value to trigger a shock response.
+    pub p_value_threshold: f64,
+    /// Maximum active shocks per pane before oldest are evicted.
+    pub max_shocks_per_pane: usize,
+    /// Auto-clear shocks older than this many seconds. 0 = never.
+    pub auto_clear_seconds: u64,
+    /// Minimum time between notifications for the same pane (seconds).
+    pub notification_cooldown_seconds: u64,
+}
+
+impl Default for SemanticShockSafetyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            action: "alert".to_string(),
+            p_value_threshold: 0.01,
+            max_shocks_per_pane: 10,
+            auto_clear_seconds: 300,
+            notification_cooldown_seconds: 30,
+        }
+    }
+}
+
+impl SemanticShockSafetyConfig {
+    /// Convert to the runtime config type.
+    #[must_use]
+    pub fn to_runtime_config(&self) -> crate::semantic_shock_response::SemanticShockConfig {
+        use crate::semantic_shock_response::ShockAction;
+        crate::semantic_shock_response::SemanticShockConfig {
+            enabled: self.enabled,
+            action: match self.action.as_str() {
+                "pause" => ShockAction::Pause,
+                _ => ShockAction::Alert,
+            },
+            p_value_threshold: self.p_value_threshold,
+            max_shocks_per_pane: self.max_shocks_per_pane,
+            auto_clear_seconds: self.auto_clear_seconds,
+            notification_cooldown_seconds: self.notification_cooldown_seconds,
+        }
+    }
+}
+
+/// Trauma guard tuning for loop-intervention sensitivity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TraumaGuardConfig {
+    /// Enable/disable trauma guard intervention.
+    pub enabled: bool,
+    /// Number of consecutive recurring failures required to trigger intervention.
+    pub max_consecutive_failures: u32,
+    /// Minimum command similarity required for recurrence matching (0.0..=1.0).
+    pub similarity_threshold: f64,
+    /// Maximum history window size retained per pane.
+    pub window_size: usize,
+}
+
+impl Default for TraumaGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_consecutive_failures: 3,
+            similarity_threshold: 0.88,
+            window_size: 128,
+        }
+    }
+}
+
+impl TraumaGuardConfig {
+    /// Convert safety trauma-guard tuning into runtime trauma-state config.
+    #[must_use]
+    pub fn to_trauma_config(&self) -> crate::trauma_guard::TraumaConfig {
+        let mut config = crate::trauma_guard::TraumaConfig::default();
+        config.loop_threshold = u64::from(self.max_consecutive_failures.max(1));
+        config.command_similarity_threshold = self.similarity_threshold;
+        config.history_limit = self.window_size.max(1);
+        config.signature_retention = config.signature_retention.max(config.history_limit);
+        config
     }
 }
 
@@ -2974,6 +3082,10 @@ pub struct HotReloadableConfig {
     pub workflows_enabled: Vec<String>,
     /// Auto-run allowlist
     pub auto_run_allowlist: Vec<String>,
+
+    // Safety
+    /// Trauma guard tuning.
+    pub trauma_guard: TraumaGuardConfig,
 }
 
 impl HotReloadableConfig {
@@ -2993,6 +3105,7 @@ impl HotReloadableConfig {
             patterns: config.patterns.clone(),
             workflows_enabled: config.workflows.enabled.clone(),
             auto_run_allowlist: config.workflows.auto_run_allowlist.clone(),
+            trauma_guard: config.safety.trauma_guard.clone(),
         }
     }
 }
@@ -3250,6 +3363,56 @@ impl Config {
                 name: "workflows.auto_run_allowlist".to_string(),
                 old_value: format!("{:?}", self.workflows.auto_run_allowlist),
                 new_value: format!("{:?}", new_config.workflows.auto_run_allowlist),
+            });
+        }
+
+        if self.safety.trauma_guard.enabled != new_config.safety.trauma_guard.enabled {
+            changes.push(HotReloadChange {
+                name: "safety.trauma_guard.enabled".to_string(),
+                old_value: self.safety.trauma_guard.enabled.to_string(),
+                new_value: new_config.safety.trauma_guard.enabled.to_string(),
+            });
+        }
+
+        if self.safety.trauma_guard.max_consecutive_failures
+            != new_config.safety.trauma_guard.max_consecutive_failures
+        {
+            changes.push(HotReloadChange {
+                name: "safety.trauma_guard.max_consecutive_failures".to_string(),
+                old_value: self
+                    .safety
+                    .trauma_guard
+                    .max_consecutive_failures
+                    .to_string(),
+                new_value: new_config
+                    .safety
+                    .trauma_guard
+                    .max_consecutive_failures
+                    .to_string(),
+            });
+        }
+
+        if (self.safety.trauma_guard.similarity_threshold
+            - new_config.safety.trauma_guard.similarity_threshold)
+            .abs()
+            > f64::EPSILON
+        {
+            changes.push(HotReloadChange {
+                name: "safety.trauma_guard.similarity_threshold".to_string(),
+                old_value: self.safety.trauma_guard.similarity_threshold.to_string(),
+                new_value: new_config
+                    .safety
+                    .trauma_guard
+                    .similarity_threshold
+                    .to_string(),
+            });
+        }
+
+        if self.safety.trauma_guard.window_size != new_config.safety.trauma_guard.window_size {
+            changes.push(HotReloadChange {
+                name: "safety.trauma_guard.window_size".to_string(),
+                old_value: self.safety.trauma_guard.window_size.to_string(),
+                new_value: new_config.safety.trauma_guard.window_size.to_string(),
             });
         }
 
@@ -4009,6 +4172,22 @@ retention_days = 7
         // Defaults for unspecified
         assert_eq!(config.ingest.poll_interval_ms, 200);
         assert_eq!(config.workflows.max_concurrent, 3);
+    }
+
+    #[test]
+    fn safety_trauma_guard_toml_parses() {
+        let toml = r#"
+[safety.trauma_guard]
+enabled = false
+max_consecutive_failures = 6
+similarity_threshold = 0.91
+window_size = 256
+"#;
+        let config = Config::from_toml(toml).expect("Failed to parse");
+        assert!(!config.safety.trauma_guard.enabled);
+        assert_eq!(config.safety.trauma_guard.max_consecutive_failures, 6);
+        assert!((config.safety.trauma_guard.similarity_threshold - 0.91).abs() < f64::EPSILON);
+        assert_eq!(config.safety.trauma_guard.window_size, 256);
     }
 
     #[test]
@@ -4774,6 +4953,44 @@ max_bytes_per_sec = 1048576
     }
 
     #[test]
+    fn hot_reload_allows_trauma_guard_change() {
+        let config1 = Config::default();
+        let mut config2 = Config::default();
+        config2.safety.trauma_guard.enabled = false;
+        config2.safety.trauma_guard.max_consecutive_failures = 7;
+        config2.safety.trauma_guard.similarity_threshold = 0.93;
+        config2.safety.trauma_guard.window_size = 222;
+
+        let result = config1.diff_for_hot_reload(&config2);
+
+        assert!(result.allowed);
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.name == "safety.trauma_guard.enabled")
+        );
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.name == "safety.trauma_guard.max_consecutive_failures")
+        );
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.name == "safety.trauma_guard.similarity_threshold")
+        );
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.name == "safety.trauma_guard.window_size")
+        );
+    }
+
+    #[test]
     fn hot_reload_forbids_db_path_change() {
         let config1 = Config::default();
         let mut config2 = Config::default();
@@ -4919,6 +5136,10 @@ max_bytes_per_sec = 1048576
         config.ingest.budgets.max_captures_per_sec = 25;
         config.storage.retention_days = 45;
         config.patterns.packs = vec!["builtin:core".to_string()];
+        config.safety.trauma_guard.enabled = false;
+        config.safety.trauma_guard.max_consecutive_failures = 5;
+        config.safety.trauma_guard.similarity_threshold = 0.9;
+        config.safety.trauma_guard.window_size = 222;
 
         let hot = config.hot_reloadable();
 
@@ -4928,6 +5149,10 @@ max_bytes_per_sec = 1048576
         assert_eq!(hot.capture_budgets.max_captures_per_sec, 25);
         assert_eq!(hot.retention_days, 45);
         assert_eq!(hot.patterns.packs, vec!["builtin:core".to_string()]);
+        assert!(!hot.trauma_guard.enabled);
+        assert_eq!(hot.trauma_guard.max_consecutive_failures, 5);
+        assert!((hot.trauma_guard.similarity_threshold - 0.9).abs() < f64::EPSILON);
+        assert_eq!(hot.trauma_guard.window_size, 222);
     }
 
     #[test]
@@ -6346,6 +6571,29 @@ mode = "periodic"
         assert!(cg.enabled);
         assert_eq!(cg.dcg_mode, DcgMode::Native);
         assert_eq!(cg.dcg_deny_policy, DcgDenyPolicy::RequireApproval);
+    }
+
+    #[test]
+    fn trauma_guard_config_default_values() {
+        let tg = TraumaGuardConfig::default();
+        assert!(tg.enabled);
+        assert_eq!(tg.max_consecutive_failures, 3);
+        assert!((tg.similarity_threshold - 0.88).abs() < f64::EPSILON);
+        assert_eq!(tg.window_size, 128);
+    }
+
+    #[test]
+    fn trauma_guard_config_maps_to_runtime_trauma_config() {
+        let tg = TraumaGuardConfig {
+            enabled: true,
+            max_consecutive_failures: 5,
+            similarity_threshold: 0.91,
+            window_size: 200,
+        };
+        let runtime = tg.to_trauma_config();
+        assert_eq!(runtime.loop_threshold, 5);
+        assert!((runtime.command_similarity_threshold - 0.91).abs() < f64::EPSILON);
+        assert_eq!(runtime.history_limit, 200);
     }
 
     #[test]
