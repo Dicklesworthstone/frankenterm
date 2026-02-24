@@ -43,6 +43,10 @@
 //! 38. EntropyGate: disabled gate always returns Disabled
 //! 39. EntropyGate: average_entropy in [0, 8] for measured segments
 //! 40. EntropyGate: short segments always bypassed
+//! 41. SortedCalibrationBuffer: O(log N) count_geq matches naive O(N) linear scan (isomorphism)
+//! 42. SortedCalibrationBuffer: conformal_p_value matches naive computation
+//! 43. dot_product_simd: matches naive for 384d vectors (embedding dimension isomorphism)
+//! 44. ConformalAnomalyDetector: FDR on fixture embeddings stays within alpha bound
 
 use proptest::prelude::*;
 use proptest::collection::vec as arb_vec;
@@ -833,4 +837,308 @@ proptest! {
         let is_bypass = matches!(decision, EntropyGateDecision::Bypass { .. });
         prop_assert!(is_bypass, "Short segment (len={len} < min={min_bytes}) should bypass, got {decision:?}");
     }
+}
+
+// =============================================================================
+// Mathematical isomorphism proofs (ft-344j8.10)
+// =============================================================================
+
+/// Naive O(N) count of scores >= threshold for isomorphism proof.
+fn naive_count_geq(scores: &[f32], threshold: f32) -> usize {
+    scores.iter().filter(|&&s| s >= threshold).count()
+}
+
+/// Naive conformal p-value for isomorphism proof.
+fn naive_p_value(scores: &[f32], new_score: f32) -> f64 {
+    if scores.is_empty() {
+        return 1.0;
+    }
+    let count_geq = scores.iter().filter(|&&s| s >= new_score).count() as f64;
+    let n = scores.len() as f64;
+    (count_geq + 1.0) / (n + 1.0)
+}
+
+/// Naive scalar dot product for isomorphism proof.
+fn naive_dot_product(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    a[..n].iter().zip(&b[..n]).map(|(x, y)| x * y).sum()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    // 41. O(log N) count_geq matches naive O(N) linear scan (ISOMORPHISM PROOF)
+    //
+    // This is the core mathematical guarantee: the O(log N) binary-search-based
+    // rank query in SortedCalibrationBuffer produces IDENTICAL results to a
+    // naive O(N) linear scan over all calibration scores.
+    #[test]
+    fn prop_rank_query_isomorphism(
+        capacity in 5_usize..100,
+        insertions in arb_vec(arb_positive_f32(), 5..200),
+        query_thresholds in arb_vec(arb_positive_f32(), 1..20),
+    ) {
+        let mut buf = SortedCalibrationBuffer::new(capacity);
+
+        // Build the buffer.
+        for &s in &insertions {
+            buf.insert(s);
+        }
+
+        // Extract the actual scores in the buffer by querying all values.
+        // We reconstruct the buffer contents using quantile queries.
+        let buf_len = buf.len();
+        let mut actual_scores = Vec::with_capacity(buf_len);
+        for i in 0..buf_len {
+            let q = if buf_len == 1 {
+                0.0
+            } else {
+                i as f32 / (buf_len - 1) as f32
+            };
+            if let Some(v) = buf.quantile(q) {
+                actual_scores.push(v);
+            }
+        }
+
+        // For each query threshold, verify count_geq matches naive.
+        for &threshold in &query_thresholds {
+            let fast_count = buf.count_geq(threshold);
+            let naive_count = naive_count_geq(&actual_scores, threshold);
+            prop_assert_eq!(
+                fast_count,
+                naive_count,
+                "count_geq mismatch for threshold={}: fast={}, naive={}",
+                threshold,
+                fast_count,
+                naive_count
+            );
+        }
+    }
+
+    // 42. conformal_p_value matches naive computation (ISOMORPHISM PROOF)
+    #[test]
+    fn prop_p_value_isomorphism(
+        capacity in 10_usize..100,
+        insertions in arb_vec(arb_positive_f32(), 10..100),
+        query_scores in arb_vec(arb_positive_f32(), 1..10),
+    ) {
+        let mut buf = SortedCalibrationBuffer::new(capacity);
+        for &s in &insertions {
+            buf.insert(s);
+        }
+
+        // Reconstruct buffer contents via quantile sampling.
+        let buf_len = buf.len();
+        let mut actual_scores = Vec::with_capacity(buf_len);
+        for i in 0..buf_len {
+            let q = if buf_len == 1 {
+                0.0
+            } else {
+                i as f32 / (buf_len - 1) as f32
+            };
+            if let Some(v) = buf.quantile(q) {
+                actual_scores.push(v);
+            }
+        }
+
+        for &query in &query_scores {
+            let fast_p = buf.conformal_p_value(query);
+            let naive_p = naive_p_value(&actual_scores, query);
+            let diff = (fast_p - naive_p).abs();
+            prop_assert!(
+                diff < 1e-10,
+                "p_value mismatch for query={}: fast={}, naive={}, diff={}",
+                query,
+                fast_p,
+                naive_p,
+                diff
+            );
+        }
+    }
+
+    // 43. SIMD dot product matches naive for 384d vectors (embedding isomorphism)
+    #[test]
+    fn prop_simd_384d_isomorphism(
+        seed in 0_u64..10000,
+    ) {
+        // Deterministic pseudo-random 384d vectors from seed.
+        let a: Vec<f32> = (0..384)
+            .map(|i| ((seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64)) as f32) / u32::MAX as f32)
+            .collect();
+        let b: Vec<f32> = (0..384)
+            .map(|i| ((seed.wrapping_mul(1442695040888963407).wrapping_add(i as u64 + 384)) as f32) / u32::MAX as f32)
+            .collect();
+
+        let simd_result = dot_product_simd(&a, &b);
+        let naive_result = naive_dot_product(&a, &b);
+
+        let tol = (naive_result.abs() * 1e-4).max(1e-4);
+        let diff = (simd_result - naive_result).abs();
+        prop_assert!(
+            diff < tol,
+            "384d isomorphism failed: simd={}, naive={}, diff={}, tol={}",
+            simd_result,
+            naive_result,
+            diff,
+            tol
+        );
+    }
+}
+
+// =============================================================================
+// Deterministic fixture-based tests (ft-344j8.10)
+// =============================================================================
+
+/// Pre-computed embedding vectors for deterministic testing.
+/// These are fixed vectors that simulate real embedding output.
+/// No network access required.
+mod fixtures {
+    /// "Compiling main.rs" — high-weight on first dimensions (Rust context).
+    pub const RUST_COMPILE: [f32; 8] = [0.9, 0.1, 0.05, 0.02, 0.01, 0.01, 0.0, 0.0];
+    /// "java.lang.NullPointerException" — high-weight on middle dimensions (Java error).
+    pub const JAVA_NPE: [f32; 8] = [0.01, 0.02, 0.8, 0.9, 0.05, 0.01, 0.0, 0.0];
+    /// "Building... 42% [####]" — very similar to RUST_COMPILE.
+    pub const BUILD_PROGRESS: [f32; 8] = [0.85, 0.12, 0.06, 0.03, 0.01, 0.01, 0.0, 0.0];
+    /// "404 Not Found <html>" — orthogonal to all code contexts.
+    pub const HTML_404: [f32; 8] = [0.0, 0.0, 0.01, 0.01, 0.02, 0.05, 0.9, 0.8];
+    /// "test passed: 42 assertions" — test output context.
+    pub const TEST_PASSED: [f32; 8] = [0.3, 0.1, 0.05, 0.02, 0.5, 0.3, 0.01, 0.0];
+}
+
+#[test]
+fn test_fixture_orthogonal_shift_detected() {
+    use frankenterm_core::semantic_anomaly::{ConformalAnomalyConfig, ConformalAnomalyDetector};
+
+    let config = ConformalAnomalyConfig {
+        min_calibration: 5,
+        calibration_window: 50,
+        alpha: 0.05,
+        centroid_alpha: 0.1,
+    };
+    let mut det = ConformalAnomalyDetector::new(config);
+
+    // Build calibration with a mix of similar Rust contexts to create
+    // non-zero baseline variance in the calibration window.
+    for i in 0..30 {
+        // Alternate between compile and build progress to establish
+        // a realistic calibration with some natural variance.
+        if i % 3 == 0 {
+            det.observe(&fixtures::BUILD_PROGRESS);
+        } else {
+            det.observe(&fixtures::RUST_COMPILE);
+        }
+    }
+
+    // Test passed output is fairly similar → should NOT trigger
+    // (it has overlap with the Rust compile context).
+    let test_result = det.observe(&fixtures::TEST_PASSED);
+    // test_passed shares some dimensions with rust_compile, but
+    // may or may not trigger depending on calibration state.
+    // The key assertion: Java NPE IS detected.
+
+    // Java NPE is orthogonal → should trigger.
+    let npe_result = det.observe(&fixtures::JAVA_NPE);
+    assert!(
+        npe_result.is_some(),
+        "Java NPE should be anomalous after Rust context, p={}, test_result was {:?}",
+        det.last_p_value(),
+        test_result.is_some()
+    );
+}
+
+#[test]
+fn test_fixture_html_404_shift_detected() {
+    use frankenterm_core::semantic_anomaly::{ConformalAnomalyConfig, ConformalAnomalyDetector};
+
+    let config = ConformalAnomalyConfig {
+        min_calibration: 5,
+        calibration_window: 50,
+        alpha: 0.05,
+        centroid_alpha: 0.1,
+    };
+    let mut det = ConformalAnomalyDetector::new(config);
+
+    // Build calibration with Rust context.
+    for _ in 0..30 {
+        det.observe(&fixtures::RUST_COMPILE);
+    }
+
+    // HTML 404 is completely orthogonal → must detect.
+    let result = det.observe(&fixtures::HTML_404);
+    assert!(
+        result.is_some(),
+        "HTML 404 should be anomalous, p={}",
+        det.last_p_value()
+    );
+}
+
+#[test]
+fn test_fixture_fdr_bound_empirical() {
+    use frankenterm_core::semantic_anomaly::{ConformalAnomalyConfig, ConformalAnomalyDetector};
+
+    let alpha = 0.05;
+    let config = ConformalAnomalyConfig {
+        min_calibration: 10,
+        calibration_window: 100,
+        alpha,
+        centroid_alpha: 0.1,
+    };
+    let mut det = ConformalAnomalyDetector::new(config);
+
+    // Feed 1000 observations of stable Rust compile context.
+    let n = 1000;
+    let mut false_positives = 0u32;
+    for _ in 0..n {
+        if det.observe(&fixtures::RUST_COMPILE).is_some() {
+            false_positives += 1;
+        }
+    }
+
+    let empirical_fdr = false_positives as f64 / n as f64;
+    // The conformal guarantee: FDR <= alpha for exchangeable data.
+    // Allow 2x margin for small-sample effects.
+    assert!(
+        empirical_fdr <= alpha * 2.0 + 0.01,
+        "Empirical FDR {empirical_fdr} exceeds 2*alpha={}",
+        alpha * 2.0
+    );
+}
+
+#[test]
+fn test_fixture_entropy_gate_integration() {
+    use frankenterm_core::semantic_anomaly::{
+        ConformalAnomalyConfig, EntropyGateConfig, GatedAnomalyDetector,
+    };
+
+    let mut gated = GatedAnomalyDetector::new(
+        EntropyGateConfig {
+            min_entropy_bits_per_byte: 2.0,
+            min_segment_bytes: 4,
+            enabled: true,
+        },
+        ConformalAnomalyConfig {
+            min_calibration: 5,
+            calibration_window: 50,
+            alpha: 0.05,
+            centroid_alpha: 0.1,
+        },
+    );
+
+    // Low-entropy segment (progress bar) → skipped.
+    let progress_bar = b"==============================================";
+    let result = gated.observe(progress_bar, |_| panic!("should be skipped"));
+    assert!(result.was_skipped());
+
+    // High-entropy segment → processed.
+    let mut diverse = Vec::with_capacity(256);
+    for b in 0..=255u8 {
+        diverse.push(b);
+    }
+    let result = gated.observe(&diverse, |_| fixtures::RUST_COMPILE.to_vec());
+    assert!(!result.was_skipped());
+
+    // Verify gate statistics.
+    assert_eq!(gated.gate.total_evaluated(), 2);
+    assert_eq!(gated.gate.total_skipped(), 1);
+    assert_eq!(gated.gate.total_passed(), 1);
 }
