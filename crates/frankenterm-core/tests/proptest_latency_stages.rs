@@ -5824,4 +5824,245 @@ proptest! {
         let back: AckProtocolSnapshot = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(snap, back);
     }
+
+    // ── F4: Validation Matrix Property Tests ──
+
+    /// ScenarioCategory serde roundtrip.
+    #[test]
+    fn scenario_category_serde(idx in 0u32..4) {
+        let cat = match idx % 4 {
+            0 => ScenarioCategory::E2E,
+            1 => ScenarioCategory::Chaos,
+            2 => ScenarioCategory::Soak,
+            _ => ScenarioCategory::Performance,
+        };
+        let json = serde_json::to_string(&cat).unwrap();
+        let back: ScenarioCategory = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(cat, back);
+    }
+
+    /// ScenarioVerdict serde roundtrip.
+    #[test]
+    fn scenario_verdict_serde(idx in 0u32..4) {
+        let v = match idx % 4 {
+            0 => ScenarioVerdict::Pass,
+            1 => ScenarioVerdict::Fail,
+            2 => ScenarioVerdict::Skip,
+            _ => ScenarioVerdict::Flaky,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: ScenarioVerdict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(v, back);
+    }
+
+    /// Adding scenarios increments count.
+    #[test]
+    fn add_scenario_increments(count in 1u32..10) {
+        let mut matrix = ValidationMatrix::new();
+        for i in 0..count {
+            matrix.add_scenario(MatrixScenario {
+                scenario_id: format!("s{i}"),
+                category: ScenarioCategory::E2E,
+                description: "test".to_string(),
+                stages: vec![],
+                domain: InvariantDomain::Scheduler,
+                required_for_promotion: false,
+            });
+        }
+        prop_assert_eq!(matrix.scenario_count(), count as usize);
+    }
+
+    /// Recording results increments count.
+    #[test]
+    fn record_result_increments(count in 1u32..10) {
+        let mut matrix = ValidationMatrix::new();
+        for i in 0..count {
+            matrix.record_result(ScenarioResult {
+                scenario_id: format!("s{i}"),
+                verdict: ScenarioVerdict::Pass,
+                duration_us: 100,
+                failure_message: None,
+                artifacts: vec![],
+            });
+        }
+        prop_assert_eq!(matrix.result_count(), count as usize);
+    }
+
+    /// pass_rate is in [0.0, 1.0].
+    #[test]
+    fn pass_rate_bounded(pass_count in 0u32..10, fail_count in 0u32..10) {
+        let mut matrix = ValidationMatrix::new();
+        for i in 0..pass_count {
+            matrix.record_result(ScenarioResult {
+                scenario_id: format!("p{i}"), verdict: ScenarioVerdict::Pass,
+                duration_us: 100, failure_message: None, artifacts: vec![],
+            });
+        }
+        for i in 0..fail_count {
+            matrix.record_result(ScenarioResult {
+                scenario_id: format!("f{i}"), verdict: ScenarioVerdict::Fail,
+                duration_us: 100, failure_message: None, artifacts: vec![],
+            });
+        }
+        let rate = matrix.pass_rate();
+        prop_assert!(rate >= 0.0 && rate <= 1.0, "rate={}", rate);
+    }
+
+    /// flaky_rate is in [0.0, 1.0].
+    #[test]
+    fn flaky_rate_bounded(flaky_count in 0u32..10, pass_count in 0u32..10) {
+        let mut matrix = ValidationMatrix::new();
+        for i in 0..flaky_count {
+            matrix.record_result(ScenarioResult {
+                scenario_id: format!("fl{i}"), verdict: ScenarioVerdict::Flaky,
+                duration_us: 100, failure_message: None, artifacts: vec![],
+            });
+        }
+        for i in 0..pass_count {
+            matrix.record_result(ScenarioResult {
+                scenario_id: format!("p{i}"), verdict: ScenarioVerdict::Pass,
+                duration_us: 100, failure_message: None, artifacts: vec![],
+            });
+        }
+        let rate = matrix.flaky_rate();
+        prop_assert!(rate >= 0.0 && rate <= 1.0, "rate={}", rate);
+    }
+
+    /// pass + fail + skip + flaky counts equal total results.
+    #[test]
+    fn snapshot_counts_sum(
+        pass in 0u32..5, fail in 0u32..5, skip in 0u32..5, flaky in 0u32..5,
+    ) {
+        let mut matrix = ValidationMatrix::new();
+        for i in 0..pass {
+            matrix.record_result(ScenarioResult {
+                scenario_id: format!("p{i}"), verdict: ScenarioVerdict::Pass,
+                duration_us: 100, failure_message: None, artifacts: vec![],
+            });
+        }
+        for i in 0..fail {
+            matrix.record_result(ScenarioResult {
+                scenario_id: format!("f{i}"), verdict: ScenarioVerdict::Fail,
+                duration_us: 100, failure_message: None, artifacts: vec![],
+            });
+        }
+        for i in 0..skip {
+            matrix.record_result(ScenarioResult {
+                scenario_id: format!("s{i}"), verdict: ScenarioVerdict::Skip,
+                duration_us: 100, failure_message: None, artifacts: vec![],
+            });
+        }
+        for i in 0..flaky {
+            matrix.record_result(ScenarioResult {
+                scenario_id: format!("fl{i}"), verdict: ScenarioVerdict::Flaky,
+                duration_us: 100, failure_message: None, artifacts: vec![],
+            });
+        }
+        let snap = matrix.snapshot();
+        let sum = snap.pass_count + snap.fail_count + snap.skip_count + snap.flaky_count;
+        prop_assert_eq!(sum, matrix.result_count() as u64);
+    }
+
+    /// reset_results clears all results.
+    #[test]
+    fn reset_results_clears(count in 1u32..10) {
+        let mut matrix = ValidationMatrix::new();
+        for i in 0..count {
+            matrix.record_result(ScenarioResult {
+                scenario_id: format!("s{i}"), verdict: ScenarioVerdict::Pass,
+                duration_us: 100, failure_message: None, artifacts: vec![],
+            });
+        }
+        matrix.reset_results();
+        prop_assert_eq!(matrix.result_count(), 0);
+    }
+
+    /// Gate with passing required scenario passes.
+    #[test]
+    fn gate_passes_with_required(stage in arb_stage()) {
+        let _ = stage; // Just use for proptest generation.
+        let mut matrix = ValidationMatrix::new();
+        matrix.add_gate(PromotionGate {
+            name: "test".to_string(),
+            required_scenarios: vec!["s1".to_string()],
+            min_pass_rate: 0.0,
+            max_flaky_count: 100,
+        });
+        matrix.record_result(ScenarioResult {
+            scenario_id: "s1".to_string(), verdict: ScenarioVerdict::Pass,
+            duration_us: 100, failure_message: None, artifacts: vec![],
+        });
+        prop_assert!(matrix.check_gate("test"));
+    }
+
+    /// Gate with failing required scenario fails.
+    #[test]
+    fn gate_fails_with_failed_required(stage in arb_stage()) {
+        let _ = stage;
+        let mut matrix = ValidationMatrix::new();
+        matrix.add_gate(PromotionGate {
+            name: "test".to_string(),
+            required_scenarios: vec!["s1".to_string()],
+            min_pass_rate: 0.0,
+            max_flaky_count: 100,
+        });
+        matrix.record_result(ScenarioResult {
+            scenario_id: "s1".to_string(), verdict: ScenarioVerdict::Fail,
+            duration_us: 100, failure_message: None, artifacts: vec![],
+        });
+        prop_assert!(!matrix.check_gate("test"));
+    }
+
+    /// MatrixSnapshot serde roundtrip.
+    #[test]
+    fn matrix_snapshot_serde_roundtrip(
+        total in 0u64..100, pass in 0u64..100, fail in 0u64..100,
+    ) {
+        let snap = MatrixSnapshot {
+            total_scenarios: total,
+            pass_count: pass,
+            fail_count: fail,
+            skip_count: 0,
+            flaky_count: 0,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: MatrixSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap, back);
+    }
+
+    /// MatrixDegradation serde roundtrip.
+    #[test]
+    fn matrix_degradation_serde_roundtrip(idx in 0u32..3) {
+        let deg = match idx % 3 {
+            0 => MatrixDegradation::Healthy,
+            1 => MatrixDegradation::FlakyDetected { flaky_count: 2 },
+            _ => MatrixDegradation::GateFailure { failed_scenarios: vec!["x".to_string()] },
+        };
+        let json = serde_json::to_string(&deg).unwrap();
+        let back: MatrixDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(deg, back);
+    }
+
+    /// missing_required tracks unresolved scenarios.
+    #[test]
+    fn missing_required_tracks(req_count in 1u32..5) {
+        let mut matrix = ValidationMatrix::new();
+        for i in 0..req_count {
+            matrix.add_scenario(MatrixScenario {
+                scenario_id: format!("r{i}"),
+                category: ScenarioCategory::E2E,
+                description: "req".to_string(),
+                stages: vec![],
+                domain: InvariantDomain::Scheduler,
+                required_for_promotion: true,
+            });
+        }
+        prop_assert_eq!(matrix.missing_required().len(), req_count as usize);
+        // Resolve one.
+        matrix.record_result(ScenarioResult {
+            scenario_id: "r0".to_string(), verdict: ScenarioVerdict::Pass,
+            duration_us: 100, failure_message: None, artifacts: vec![],
+        });
+        prop_assert_eq!(matrix.missing_required().len(), (req_count - 1) as usize);
+    }
 }
