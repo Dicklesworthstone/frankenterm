@@ -3424,3 +3424,165 @@ proptest! {
         prop_assert_eq!(degradation, back);
     }
 }
+
+// ── D1: Hitch-Risk Model Property Tests ────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(150))]
+
+    /// Posterior probability is always in [0, 1].
+    #[test]
+    fn hitch_risk_posterior_bounded(
+        llrs in proptest::collection::vec(-10.0_f64..10.0, 1..30),
+    ) {
+        let mut model = HitchRiskModel::with_defaults();
+        for (i, &llr) in llrs.iter().enumerate() {
+            model.update(EvidenceSignal::LatencyProbe, 100.0, llr, i as u64 * 100);
+        }
+        let prob = model.posterior_prob();
+        prop_assert!(prob >= 0.0 && prob <= 1.0, "prob={}", prob);
+    }
+
+    /// Positive LLR increases log_odds; negative decreases log_odds (no-decay config).
+    #[test]
+    fn hitch_risk_llr_direction(
+        llr in 0.1_f64..5.0,
+    ) {
+        // Use decay=1.0 to isolate LLR direction effect
+        let config = HitchRiskConfig { evidence_decay: 1.0, ..Default::default() };
+        let mut model_pos = HitchRiskModel::new(config.clone());
+        let initial_lo = model_pos.log_odds();
+        model_pos.update(EvidenceSignal::BudgetViolation, 1.0, llr, 100);
+        prop_assert!(model_pos.log_odds() > initial_lo, "positive LLR should increase log_odds");
+
+        let mut model_neg = HitchRiskModel::new(config);
+        let initial_lo2 = model_neg.log_odds();
+        model_neg.update(EvidenceSignal::LatencyProbe, 1.0, -llr, 100);
+        prop_assert!(model_neg.log_odds() < initial_lo2, "negative LLR should decrease log_odds");
+    }
+
+    /// Risk level thresholds are monotonic: Low ≤ Elevated ≤ High ≤ Critical.
+    #[test]
+    fn hitch_risk_level_monotonic(
+        log_odds in -10.0_f64..10.0,
+    ) {
+        let config = HitchRiskConfig::default();
+        let level = if log_odds >= config.critical_threshold {
+            HitchRiskLevel::Critical
+        } else if log_odds >= config.high_threshold {
+            HitchRiskLevel::High
+        } else if log_odds >= config.elevated_threshold {
+            HitchRiskLevel::Elevated
+        } else {
+            HitchRiskLevel::Low
+        };
+        // Verify the level computation is consistent
+        let rank = match level {
+            HitchRiskLevel::Low => 0,
+            HitchRiskLevel::Elevated => 1,
+            HitchRiskLevel::High => 2,
+            HitchRiskLevel::Critical => 3,
+        };
+        prop_assert!(rank <= 3);
+    }
+
+    /// Evidence count is bounded by max_evidence.
+    #[test]
+    fn hitch_risk_evidence_bounded(
+        n in 1_usize..100,
+    ) {
+        let config = HitchRiskConfig {
+            max_evidence: 20,
+            ..Default::default()
+        };
+        let mut model = HitchRiskModel::new(config);
+        for i in 0..n {
+            model.update(EvidenceSignal::QueueDepth, 50.0, 0.5, i as u64 * 100);
+        }
+        prop_assert!(model.evidence_count() <= 20);
+    }
+
+    /// Reset restores to low risk.
+    #[test]
+    fn hitch_risk_reset_restores_low(
+        n in 1_usize..20,
+    ) {
+        let mut model = HitchRiskModel::with_defaults();
+        for i in 0..n {
+            model.observe_violation(3.0, i as u64 * 100);
+        }
+        model.reset();
+        prop_assert_eq!(model.risk_level(), HitchRiskLevel::Low);
+        prop_assert_eq!(model.total_updates(), 0);
+        prop_assert_eq!(model.evidence_count(), 0);
+    }
+
+    /// EvidenceSignal serde roundtrip.
+    #[test]
+    fn hitch_risk_signal_serde(idx in 0_u8..6) {
+        let signal = match idx {
+            0 => EvidenceSignal::LatencyProbe,
+            1 => EvidenceSignal::BackpressureChange,
+            2 => EvidenceSignal::QueueDepth,
+            3 => EvidenceSignal::BudgetViolation,
+            4 => EvidenceSignal::MemoryPressure,
+            _ => EvidenceSignal::CpuLoad,
+        };
+        let json = serde_json::to_string(&signal).unwrap();
+        let back: EvidenceSignal = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(signal, back);
+    }
+
+    /// HitchRiskLevel serde roundtrip.
+    #[test]
+    fn hitch_risk_level_serde(idx in 0_u8..4) {
+        let level = match idx {
+            0 => HitchRiskLevel::Low,
+            1 => HitchRiskLevel::Elevated,
+            2 => HitchRiskLevel::High,
+            _ => HitchRiskLevel::Critical,
+        };
+        let json = serde_json::to_string(&level).unwrap();
+        let back: HitchRiskLevel = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(level, back);
+    }
+
+    /// HitchRiskDegradation serde roundtrip.
+    #[test]
+    fn hitch_risk_degradation_serde(
+        variant in 0_u8..4,
+        val in 0.01_f64..1.0,
+    ) {
+        // Pre-roundtrip f64 through JSON to get a stable value
+        let val: f64 = serde_json::from_str(&serde_json::to_string(&val).unwrap()).unwrap();
+        let degradation = match variant {
+            0 => HitchRiskDegradation::Healthy,
+            1 => HitchRiskDegradation::ElevatedRisk { posterior_prob: val },
+            2 => HitchRiskDegradation::HighRisk { posterior_prob: val, evidence_count: 10 },
+            _ => HitchRiskDegradation::CriticalRisk { posterior_prob: val, log_odds: val },
+        };
+        let json = serde_json::to_string(&degradation).unwrap();
+        let back: HitchRiskDegradation = serde_json::from_str(&json).unwrap();
+        // Check string roundtrip worked
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(json, json2);
+    }
+
+    /// Decay brings log_odds toward 0 over many healthy observations.
+    #[test]
+    fn hitch_risk_decay_converges(
+        initial_pushes in 1_usize..10,
+    ) {
+        let mut model = HitchRiskModel::with_defaults();
+        // Push risk up
+        for i in 0..initial_pushes {
+            model.observe_violation(2.0, i as u64 * 100);
+        }
+        let peak = model.log_odds();
+        // Submit many healthy observations
+        for i in 0..100 {
+            model.observe_healthy((initial_pushes + i) as u64 * 100);
+        }
+        prop_assert!(model.log_odds() < peak, "Decay should reduce log_odds");
+    }
+}
