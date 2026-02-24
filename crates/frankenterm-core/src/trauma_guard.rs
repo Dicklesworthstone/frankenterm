@@ -794,6 +794,15 @@ mod tests {
     }
 
     #[test]
+    fn mutation_filter_is_case_insensitive_and_cross_platform() {
+        assert!(!is_functional_mutation_path("   "));
+        assert!(!is_functional_mutation_path(r".beads\issues.jsonl"));
+        assert!(!is_functional_mutation_path(r"Docs\PLAN.MD"));
+        assert!(!is_functional_mutation_path(r"notes\todo.TXT"));
+        assert!(is_functional_mutation_path(r"src\main.RS"));
+    }
+
+    #[test]
     fn prefix_stripping_links_equivalent_commands() {
         let mut state = TraumaState::with_config(test_config());
         let signatures = vec!["core.codex:error_loop".to_string()];
@@ -1020,7 +1029,9 @@ mod tests {
             let mut state = TraumaState::with_config(config);
 
             let base_ts = 80_000_u64;
-            let step_ms = 50_u64;
+            let bucket_count = state.config().signature_window.n_buckets.max(1);
+            let step_ms =
+                (state.config().signature_window.window_duration_ms / bucket_count as u64).max(1);
 
             for (idx, (command, signatures, trigger_mutation)) in events.iter().enumerate() {
                 let ts = base_ts + (idx as u64 * step_ms);
@@ -1051,15 +1062,16 @@ mod tests {
                 }
             }
 
-            let now_ms = base_ts + (events.len() as u64 * step_ms);
-            let window_ms = state.config().signature_window.window_duration_ms;
+            let now_idx = events.len().saturating_sub(1);
+            let now_ms = base_ts + (now_idx as u64 * step_ms);
+            let buckets_in_window = state.config().signature_window.n_buckets;
             for signature in ["core.codex:error_loop", "core.codex:retry", "core.gemini:error"] {
                 let expected = events
                     .iter()
                     .enumerate()
                     .filter(|(idx, (_, signatures, _))| {
-                        let ts = base_ts + (*idx as u64 * step_ms);
-                        ts + window_ms > now_ms && signatures.iter().any(|sig| sig == signature)
+                        now_idx.saturating_sub(*idx) < buckets_in_window
+                            && signatures.iter().any(|sig| sig == signature)
                     })
                     .count() as u64;
                 let observed = state.signature_count(signature, now_ms);

@@ -16,12 +16,15 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::LazyLock;
 use thiserror::Error;
 
 const INDEX_STATE_FILENAME: &str = "index_state.json";
 const INDEX_FORMAT_VERSION: u32 = 1;
 const ONE_DAY_MS: i64 = 86_400_000;
 const DEFAULT_PROMPT_PATTERN: &str = r"^\s*[\w\-./:@~]+\s*[$#>]\s*$";
+
+static DEFAULT_PROMPT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(DEFAULT_PROMPT_PATTERN).unwrap());
 
 /// Logical document source used for filtering and diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -908,10 +911,7 @@ pub fn chunk_scrollback_lines(lines: &[ScrollbackLine], gap_ms: i64) -> Vec<Inde
         if current_lines.is_empty() {
             current_pane = line.pane_id;
             current_session.clone_from(&line.session_id);
-        } else if current_session.as_deref() != line.session_id.as_deref() {
-            current_session = None;
         }
-
         current_lines.push(line.text.clone());
         last_ts = Some(line.captured_at_ms);
     }
@@ -954,9 +954,13 @@ pub fn extract_command_output_blocks(
         return Vec::new();
     }
 
-    let prompt_regex = Regex::new(&config.prompt_pattern)
-        .ok()
-        .or_else(|| Regex::new(DEFAULT_PROMPT_PATTERN).ok());
+    let prompt_regex = if config.prompt_pattern == DEFAULT_PROMPT_PATTERN {
+        Some(DEFAULT_PROMPT_REGEX.clone())
+    } else {
+        Regex::new(&config.prompt_pattern)
+            .ok()
+            .or_else(|| Some(DEFAULT_PROMPT_REGEX.clone()))
+    };
     let mut docs = Vec::new();
     let mut current_lines: Vec<String> = Vec::new();
     let mut current_pane: Option<u64> = None;

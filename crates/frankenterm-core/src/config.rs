@@ -526,18 +526,35 @@ impl PaneFilterRule {
         }
         regex_pattern.push('$');
 
-        fancy_regex::Regex::new(&regex_pattern).is_ok_and(|re| re.is_match(value).unwrap_or(false))
+        Self::cached_regex_match(&regex_pattern, value)
     }
 
     /// Match title using substring or regex
     fn match_title(pattern: &str, title: &str) -> bool {
         pattern.strip_prefix("re:").map_or_else(
             || title.to_lowercase().contains(&pattern.to_lowercase()),
-            |regex_pat| {
-                fancy_regex::Regex::new(regex_pat)
-                    .is_ok_and(|re| re.is_match(title).unwrap_or(false))
-            },
+            |regex_pat| Self::cached_regex_match(regex_pat, title),
         )
+    }
+
+    thread_local! {
+        static REGEX_CACHE: std::cell::RefCell<crate::lru_cache::LruCache<String, fancy_regex::Regex>> =
+            std::cell::RefCell::new(crate::lru_cache::LruCache::new(256));
+    }
+
+    fn cached_regex_match(pattern: &str, value: &str) -> bool {
+        Self::REGEX_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(re) = cache.get(&pattern.to_string()) {
+                return re.is_match(value).unwrap_or(false);
+            }
+            if let Ok(re) = fancy_regex::Regex::new(pattern) {
+                let is_match = re.is_match(value).unwrap_or(false);
+                cache.put(pattern.to_string(), re);
+                return is_match;
+            }
+            false
+        })
     }
 
     /// Validate that this rule has at least one matcher and all patterns are valid

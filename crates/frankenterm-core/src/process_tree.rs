@@ -444,8 +444,8 @@ fn read_process_info(pid: u32) -> Option<RawProcessInfo> {
     let state = parse_macos_state(fields[2]);
     let rss_kb = fields[3].parse::<u64>().unwrap_or(0);
     // comm= gives the full path; extract basename.
-    let comm = fields[4];
-    let name = comm.rsplit('/').next().unwrap_or(comm).to_string();
+    let comm = fields[4..].join(" ");
+    let name = comm.rsplit('/').next().unwrap_or(&comm).to_string();
 
     // Get argv separately (ps -o args= gives the full command line).
     let argv = read_macos_argv(pid_val);
