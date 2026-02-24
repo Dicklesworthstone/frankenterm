@@ -1126,34 +1126,40 @@ SEE ALSO:
         command: RecordCommands,
     },
 
-    /// Replay a session recording
+    /// Replay a session recording or harvest replay fixtures
     #[command(after_help = r#"EXAMPLES:
     ft replay session.war                       Replay at normal speed
     ft replay session.war --speed 4             Replay at 4x speed
     ft replay session.war --from 1m30s          Start from 1m30s
     ft replay session.war --events-only         Show only event annotations
+    ft replay harvest --source-dir fixtures/incidents --output-dir fixtures/replay
 
 SEE ALSO:
     ft record list      List available recordings
     ft record export    Export to HTML or Asciinema"#)]
     Replay {
+        /// Optional replay subcommand
+        #[command(subcommand)]
+        command: Option<ReplayCommands>,
+
         /// Path to the .war recording file
-        file: PathBuf,
+        #[arg()]
+        file: Option<PathBuf>,
 
         /// Playback speed multiplier (0.5, 1, 2, 4)
-        #[arg(long, default_value = "1")]
+        #[arg(long, default_value = "1", requires = "file")]
         speed: f64,
 
         /// Start playback from this timestamp (e.g., "1m30s", "90s", "5000" for ms)
-        #[arg(long)]
+        #[arg(long, requires = "file")]
         from: Option<String>,
 
         /// Show only event annotations (skip terminal output)
-        #[arg(long)]
+        #[arg(long, requires = "file")]
         events_only: bool,
 
         /// Output as JSON (events and metadata)
-        #[arg(long)]
+        #[arg(long, requires = "file")]
         json: bool,
     },
 
@@ -1912,6 +1918,32 @@ enum RecordCommands {
         /// Additional regex patterns to redact
         #[arg(long = "redact-pattern")]
         redact_patterns: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReplayCommands {
+    /// Harvest replay fixtures from recorder exports and incident captures
+    #[command(after_help = r#"EXAMPLES:
+    ft replay harvest --source-dir fixtures/incidents --output-dir fixtures/replay
+    ft replay harvest --source-dir fixtures/runs --output-dir fixtures/replay --filter incident-only
+"#)]
+    Harvest {
+        /// Directory containing source capture files (.jsonl/.ndjson/.json/.ftreplay)
+        #[arg(long)]
+        source_dir: PathBuf,
+
+        /// Output directory for harvested .ftreplay artifacts + registry
+        #[arg(long)]
+        output_dir: PathBuf,
+
+        /// Source filter: all | incident-only
+        #[arg(long, default_value = "all")]
+        filter: String,
+
+        /// Output report as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -23268,6 +23300,57 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         },
 
         Some(Commands::Replay {
+            command:
+                Some(ReplayCommands::Harvest {
+                    source_dir,
+                    output_dir,
+                    filter,
+                    json: as_json,
+                }),
+            ..
+        }) => {
+            use frankenterm_core::replay_fixture_harvest::{HarvestPipeline, HarvestSourceFilter};
+
+            let source_filter = HarvestSourceFilter::from_cli_flag(&filter)?;
+            let pipeline = HarvestPipeline::default();
+            let report = pipeline.harvest_directory(&source_dir, &output_dir, source_filter)?;
+
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("Replay fixture harvest complete.");
+                println!("  Harvested: {}", report.harvested);
+                println!("  Skipped:   {}", report.skipped);
+                println!("  Errors:    {}", report.errors);
+                println!("  Events:    {}", report.total_events);
+                println!("  Output:    {}", output_dir.display());
+
+                if !report.entries.is_empty() {
+                    println!();
+                    for entry in &report.entries {
+                        let status = match entry.status {
+                            frankenterm_core::replay_fixture_harvest::HarvestEntryStatus::Harvested => {
+                                "harvested"
+                            }
+                            frankenterm_core::replay_fixture_harvest::HarvestEntryStatus::Skipped => {
+                                "skipped"
+                            }
+                            frankenterm_core::replay_fixture_harvest::HarvestEntryStatus::Error => {
+                                "error"
+                            }
+                        };
+                        let reason = entry.reason.as_deref().unwrap_or("-");
+                        println!("[{status}] {} ({reason})", entry.source_path);
+                    }
+                }
+            }
+        }
+
+        Some(Commands::Replay {
+            command: None,
             file,
             speed,
             from,
@@ -23277,6 +23360,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             use frankenterm_core::replay::{
                 CollectorSink, DecodedFrame, HeadlessSink, PlaybackSpeed, Player, Recording,
                 decode_frame,
+            };
+
+            let Some(file) = file else {
+                return Err(anyhow::anyhow!(
+                    "replay file is required (or use 'ft replay harvest ...')"
+                ));
             };
 
             let recording = Recording::load(&file).map_err(|e| {
