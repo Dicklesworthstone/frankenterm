@@ -14168,6 +14168,72 @@ impl ValidationMatrix {
     pub fn scenarios(&self) -> &[MatrixScenario] {
         &self.scenarios
     }
+
+    // ── F4 Impl: Bridge methods ──
+
+    /// Pass rate across all results (0.0..=1.0).
+    pub fn pass_rate(&self) -> f64 {
+        let total = self.results.len() as f64;
+        if total == 0.0 { return 1.0; }
+        let passes = self.results.iter().filter(|r| r.verdict == ScenarioVerdict::Pass).count() as f64;
+        passes / total
+    }
+
+    /// Flaky rate across all results (0.0..=1.0).
+    pub fn flaky_rate(&self) -> f64 {
+        let total = self.results.len() as f64;
+        if total == 0.0 { return 0.0; }
+        let flaky = self.results.iter().filter(|r| r.verdict == ScenarioVerdict::Flaky).count() as f64;
+        flaky / total
+    }
+
+    /// Mean duration across all pass results (μs).
+    pub fn mean_pass_duration_us(&self) -> f64 {
+        let passes: Vec<u64> = self.results.iter()
+            .filter(|r| r.verdict == ScenarioVerdict::Pass)
+            .map(|r| r.duration_us)
+            .collect();
+        if passes.is_empty() { return 0.0; }
+        passes.iter().sum::<u64>() as f64 / passes.len() as f64
+    }
+
+    /// Check all gates; returns list of gate names that pass.
+    pub fn passing_gates(&self) -> Vec<String> {
+        self.gates.iter()
+            .filter(|g| self.check_gate(&g.name))
+            .map(|g| g.name.clone())
+            .collect()
+    }
+
+    /// Check all gates; returns list of gate names that fail.
+    pub fn failing_gates(&self) -> Vec<String> {
+        self.gates.iter()
+            .filter(|g| !self.check_gate(&g.name))
+            .map(|g| g.name.clone())
+            .collect()
+    }
+
+    /// Get required scenarios that don't have a passing result.
+    pub fn missing_required(&self) -> Vec<String> {
+        self.scenarios.iter()
+            .filter(|s| s.required_for_promotion)
+            .filter(|s| {
+                self.latest_result(&s.scenario_id)
+                    .map_or(true, |r| r.verdict != ScenarioVerdict::Pass)
+            })
+            .map(|s| s.scenario_id.clone())
+            .collect()
+    }
+
+    /// All artifacts across all results.
+    pub fn all_artifacts(&self) -> Vec<String> {
+        self.results.iter().flat_map(|r| r.artifacts.clone()).collect()
+    }
+
+    /// Map to InvariantDomain.
+    pub fn to_invariant_domain() -> InvariantDomain {
+        InvariantDomain::Composition
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -26657,5 +26723,112 @@ mod tests {
         assert_eq!(matrix.results_for("s1").len(), 1);
         assert_eq!(matrix.results_for("s2").len(), 1);
         assert_eq!(matrix.results_for("s3").len(), 0);
+    }
+
+    // ── F4 Impl: Bridge method tests ──
+
+    #[test]
+    fn test_matrix_pass_rate_empty() {
+        let matrix = ValidationMatrix::new();
+        assert!((matrix.pass_rate() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_matrix_pass_rate() {
+        let mut matrix = ValidationMatrix::new();
+        matrix.record_result(ScenarioResult {
+            scenario_id: "s1".to_string(), verdict: ScenarioVerdict::Pass,
+            duration_us: 100, failure_message: None, artifacts: vec![],
+        });
+        matrix.record_result(ScenarioResult {
+            scenario_id: "s2".to_string(), verdict: ScenarioVerdict::Fail,
+            duration_us: 200, failure_message: None, artifacts: vec![],
+        });
+        assert!((matrix.pass_rate() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_matrix_flaky_rate() {
+        let mut matrix = ValidationMatrix::new();
+        matrix.record_result(ScenarioResult {
+            scenario_id: "s1".to_string(), verdict: ScenarioVerdict::Flaky,
+            duration_us: 100, failure_message: None, artifacts: vec![],
+        });
+        matrix.record_result(ScenarioResult {
+            scenario_id: "s2".to_string(), verdict: ScenarioVerdict::Pass,
+            duration_us: 200, failure_message: None, artifacts: vec![],
+        });
+        assert!((matrix.flaky_rate() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_matrix_mean_pass_duration() {
+        let mut matrix = ValidationMatrix::new();
+        matrix.record_result(ScenarioResult {
+            scenario_id: "s1".to_string(), verdict: ScenarioVerdict::Pass,
+            duration_us: 100, failure_message: None, artifacts: vec![],
+        });
+        matrix.record_result(ScenarioResult {
+            scenario_id: "s2".to_string(), verdict: ScenarioVerdict::Pass,
+            duration_us: 300, failure_message: None, artifacts: vec![],
+        });
+        assert!((matrix.mean_pass_duration_us() - 200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_matrix_passing_failing_gates() {
+        let mut matrix = ValidationMatrix::new();
+        matrix.add_gate(PromotionGate {
+            name: "canary".to_string(),
+            required_scenarios: vec!["s1".to_string()],
+            min_pass_rate: 0.5,
+            max_flaky_count: 10,
+        });
+        matrix.record_result(ScenarioResult {
+            scenario_id: "s1".to_string(), verdict: ScenarioVerdict::Pass,
+            duration_us: 100, failure_message: None, artifacts: vec![],
+        });
+        assert_eq!(matrix.passing_gates(), vec!["canary".to_string()]);
+        assert!(matrix.failing_gates().is_empty());
+    }
+
+    #[test]
+    fn test_matrix_missing_required() {
+        let mut matrix = ValidationMatrix::new();
+        matrix.add_scenario(MatrixScenario {
+            scenario_id: "req1".to_string(),
+            category: ScenarioCategory::E2E,
+            description: "required".to_string(),
+            stages: vec![],
+            domain: InvariantDomain::Scheduler,
+            required_for_promotion: true,
+        });
+        assert_eq!(matrix.missing_required(), vec!["req1".to_string()]);
+        matrix.record_result(ScenarioResult {
+            scenario_id: "req1".to_string(), verdict: ScenarioVerdict::Pass,
+            duration_us: 100, failure_message: None, artifacts: vec![],
+        });
+        assert!(matrix.missing_required().is_empty());
+    }
+
+    #[test]
+    fn test_matrix_all_artifacts() {
+        let mut matrix = ValidationMatrix::new();
+        matrix.record_result(ScenarioResult {
+            scenario_id: "s1".to_string(), verdict: ScenarioVerdict::Pass,
+            duration_us: 100, failure_message: None,
+            artifacts: vec!["a.json".to_string()],
+        });
+        matrix.record_result(ScenarioResult {
+            scenario_id: "s2".to_string(), verdict: ScenarioVerdict::Pass,
+            duration_us: 200, failure_message: None,
+            artifacts: vec!["b.json".to_string(), "c.json".to_string()],
+        });
+        assert_eq!(matrix.all_artifacts().len(), 3);
+    }
+
+    #[test]
+    fn test_matrix_to_invariant_domain() {
+        assert_eq!(ValidationMatrix::to_invariant_domain(), InvariantDomain::Composition);
     }
 }
