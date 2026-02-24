@@ -48,7 +48,7 @@ use crate::runtime_compat::{
     task::{self, JoinHandle},
     timeout, watch,
 };
-use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
+use crate::spsc_ring_buffer::{SpmcConsumer, SpmcProducer, spmc_channel};
 #[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
 use crate::storage::{MaintenanceRecord, StorageHandle, StoredEvent};
@@ -997,10 +997,14 @@ impl ObservationRuntime {
         // Stage 1 ingress: multi-producer capture tasks write into bounded MPSC.
         let (capture_ingress_tx, capture_ingress_rx) =
             mpsc::channel::<CaptureEvent>(self.config.channel_buffer);
-        // Stage 2 handoff: single relay task forwards ingress into lock-free SPSC
-        // consumed by the persistence task.
-        let (capture_ring_tx, capture_ring_rx) =
-            spsc_channel::<CaptureEvent>(self.config.channel_buffer);
+        // Stage 2 handoff: single relay task forwards ingress into lock-free SPMC.
+        // We currently register one persistence consumer; this keeps the hot path
+        // ready for additional lock-free consumers without changing producer semantics.
+        let (capture_ring_tx, mut capture_ring_consumers) =
+            spmc_channel::<CaptureEvent>(self.config.channel_buffer, 1);
+        let capture_ring_rx = capture_ring_consumers
+            .pop()
+            .expect("SPMC channel should provide one consumer");
 
         // Clone ingress sender for queue depth instrumentation before moving it.
         let capture_tx_probe = capture_ingress_tx.clone();
@@ -2206,14 +2210,14 @@ impl ObservationRuntime {
         })
     }
 
-    /// Spawn relay task from capture ingress to lock-free SPSC persistence queue.
+    /// Spawn relay task from capture ingress to lock-free SPMC persistence queue.
     ///
     /// Capture producers (tailers/native handlers) write into a bounded MPSC.
     /// This task is the sole producer for the SPSC ring consumed by persistence.
     fn spawn_capture_relay_task(
         &self,
         mut capture_ingress_rx: mpsc::Receiver<CaptureEvent>,
-        capture_ring_tx: SpscProducer<CaptureEvent>,
+        capture_ring_tx: SpmcProducer<CaptureEvent>,
     ) -> JoinHandle<()> {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
 
@@ -2256,7 +2260,7 @@ impl ObservationRuntime {
     /// Spawn the persistence and detection task.
     fn spawn_persistence_task(
         &self,
-        capture_rx: SpscConsumer<CaptureEvent>,
+        capture_rx: SpmcConsumer<CaptureEvent>,
         cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
         registry: Arc<RwLock<PaneRegistry>>,
     ) -> JoinHandle<()> {

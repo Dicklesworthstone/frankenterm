@@ -1,7 +1,10 @@
-//! Lock-free single-producer/single-consumer ring buffer channel.
+//! Lock-free ring buffer channels for hot-path capture fanout.
 //!
-//! This module provides a bounded async channel that is explicitly intended for
-//! one producer task and one consumer task. Internally it uses
+//! This module provides:
+//! - `channel`: bounded single-producer/single-consumer (SPSC)
+//! - `spmc_channel`: bounded single-producer/multi-consumer (SPMC) broadcast
+//!
+//! Internally it uses
 //! `crossbeam::queue::ArrayQueue`, which provides lock-free bounded queue
 //! operations without requiring unsafe code in this crate.
 
@@ -31,6 +34,58 @@ struct Shared<T> {
     closed: AtomicBool,
     not_empty: Notify,
     not_full: Notify,
+}
+
+/// Construct a bounded SPMC broadcast channel.
+///
+/// The producer is single-threaded; each consumer gets its own lock-free queue.
+/// A send succeeds only when *all* consumer queues can accept the value.
+///
+/// # Panics
+/// Panics when `capacity == 0` or `consumers == 0`.
+pub fn spmc_channel<T: Clone>(
+    capacity: usize,
+    consumers: usize,
+) -> (SpmcProducer<T>, Vec<SpmcConsumer<T>>) {
+    assert!(capacity > 0, "SPMC capacity must be > 0");
+    assert!(consumers > 0, "SPMC consumers must be > 0");
+
+    let shared = Arc::new(SpmcShared::new(capacity, consumers));
+    let mut receivers = Vec::with_capacity(consumers);
+    for consumer_idx in 0..consumers {
+        receivers.push(SpmcConsumer {
+            shared: Arc::clone(&shared),
+            consumer_idx,
+        });
+    }
+
+    (SpmcProducer { shared }, receivers)
+}
+
+struct SpmcShared<T> {
+    queues: Vec<ArrayQueue<T>>,
+    closed: AtomicBool,
+    not_empty: Vec<Notify>,
+    not_full: Vec<Notify>,
+}
+
+impl<T> SpmcShared<T> {
+    fn new(capacity: usize, consumers: usize) -> Self {
+        let mut queues = Vec::with_capacity(consumers);
+        let mut not_empty = Vec::with_capacity(consumers);
+        let mut not_full = Vec::with_capacity(consumers);
+        for _ in 0..consumers {
+            queues.push(ArrayQueue::new(capacity));
+            not_empty.push(Notify::new());
+            not_full.push(Notify::new());
+        }
+        Self {
+            queues,
+            closed: AtomicBool::new(false),
+            not_empty,
+            not_full,
+        }
+    }
 }
 
 impl<T> Shared<T> {
@@ -175,11 +230,183 @@ impl<T> SpscConsumer<T> {
     }
 }
 
+/// Producer side of the SPMC broadcast channel.
+pub struct SpmcProducer<T> {
+    shared: Arc<SpmcShared<T>>,
+}
+
+impl<T: Clone> SpmcProducer<T> {
+    /// Send a value to all consumers, waiting asynchronously if any consumer queue is full.
+    pub async fn send(&self, value: T) -> Result<(), T> {
+        loop {
+            if self.is_closed() {
+                return Err(value);
+            }
+
+            if let Some(full_idx) = self.first_full_queue() {
+                let notified = self.shared.not_full[full_idx].notified();
+                if self.shared.queues[full_idx].is_full() && !self.is_closed() {
+                    notified.await;
+                }
+                continue;
+            }
+
+            self.push_to_all(value);
+            return Ok(());
+        }
+    }
+
+    /// Try to send a value to all consumers without waiting.
+    pub fn try_send(&self, value: T) -> Result<(), T> {
+        if self.is_closed() || self.first_full_queue().is_some() {
+            return Err(value);
+        }
+        self.push_to_all(value);
+        Ok(())
+    }
+
+    /// Mark this channel as closed.
+    pub fn close(&self) {
+        if !self.shared.closed.swap(true, Ordering::AcqRel) {
+            for notify in &self.shared.not_empty {
+                notify.notify_waiters();
+            }
+            for notify in &self.shared.not_full {
+                notify.notify_waiters();
+            }
+        }
+    }
+
+    /// Returns true if the channel is closed.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
+    }
+
+    /// Returns the maximum queue depth across consumers.
+    #[must_use]
+    pub fn max_depth(&self) -> usize {
+        self.shared
+            .queues
+            .iter()
+            .map(ArrayQueue::len)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Queue capacity per consumer.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.shared.queues.first().map_or(0, ArrayQueue::capacity)
+    }
+
+    /// Number of registered consumers.
+    #[must_use]
+    pub fn consumer_count(&self) -> usize {
+        self.shared.queues.len()
+    }
+
+    fn first_full_queue(&self) -> Option<usize> {
+        self.shared.queues.iter().position(ArrayQueue::is_full)
+    }
+
+    fn push_to_all(&self, value: T) {
+        debug_assert!(!self.shared.queues.is_empty());
+        let last = self.shared.queues.len() - 1;
+
+        for idx in 0..last {
+            if self.shared.queues[idx].push(value.clone()).is_err() {
+                panic!("SPMC queue should have capacity after precheck");
+            }
+            self.shared.not_empty[idx].notify_one();
+        }
+
+        if self.shared.queues[last].push(value).is_err() {
+            panic!("SPMC queue should have capacity after precheck");
+        }
+        self.shared.not_empty[last].notify_one();
+    }
+}
+
+impl<T> Drop for SpmcProducer<T> {
+    fn drop(&mut self) {
+        if !self.shared.closed.swap(true, Ordering::AcqRel) {
+            for notify in &self.shared.not_empty {
+                notify.notify_waiters();
+            }
+            for notify in &self.shared.not_full {
+                notify.notify_waiters();
+            }
+        }
+    }
+}
+
+/// Consumer side of the SPMC broadcast channel.
+pub struct SpmcConsumer<T> {
+    shared: Arc<SpmcShared<T>>,
+    consumer_idx: usize,
+}
+
+impl<T> SpmcConsumer<T> {
+    /// Receive one value, waiting asynchronously until this consumer queue has data.
+    ///
+    /// Returns `None` once the channel is closed and this consumer queue is drained.
+    pub async fn recv(&self) -> Option<T> {
+        loop {
+            if let Some(value) = self.try_recv() {
+                return Some(value);
+            }
+
+            if self.is_closed() {
+                return None;
+            }
+
+            let notified = self.shared.not_empty[self.consumer_idx].notified();
+            if self.shared.queues[self.consumer_idx].is_empty() && !self.is_closed() {
+                notified.await;
+            }
+        }
+    }
+
+    /// Try to receive one value without waiting.
+    pub fn try_recv(&self) -> Option<T> {
+        let value = self.shared.queues[self.consumer_idx].pop();
+        if value.is_some() {
+            self.shared.not_full[self.consumer_idx].notify_one();
+        }
+        value
+    }
+
+    /// Returns true if the channel is closed.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
+    }
+
+    /// Current queue depth for this consumer.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.shared.queues[self.consumer_idx].len()
+    }
+
+    /// Queue capacity for this consumer.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.shared.queues[self.consumer_idx].capacity()
+    }
+
+    /// Index of this consumer in the channel.
+    #[must_use]
+    pub const fn consumer_index(&self) -> usize {
+        self.consumer_idx
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::channel;
+    use super::{channel, spmc_channel};
 
     #[tokio::test]
     async fn preserves_fifo_order() {
@@ -556,5 +783,86 @@ mod tests {
         assert_eq!(tx.depth(), rx.depth());
         rx.try_recv();
         assert_eq!(tx.depth(), rx.depth());
+    }
+
+    #[tokio::test]
+    async fn spmc_broadcasts_to_all_consumers_in_order() {
+        let (tx, mut consumers) = spmc_channel(8, 2);
+        let rx0 = consumers.remove(0);
+        let rx1 = consumers.remove(0);
+
+        for i in 0..10u32 {
+            tx.send(i).await.unwrap();
+        }
+
+        for i in 0..10u32 {
+            assert_eq!(rx0.recv().await, Some(i));
+            assert_eq!(rx1.recv().await, Some(i));
+        }
+    }
+
+    #[tokio::test]
+    async fn spmc_send_waits_for_slowest_consumer() {
+        let (tx, mut consumers) = spmc_channel(1, 2);
+        let rx0 = consumers.remove(0);
+        let rx1 = consumers.remove(0);
+
+        tx.send(1u32).await.unwrap();
+        let sender = crate::runtime_compat::task::spawn(async move { tx.send(2u32).await });
+
+        crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+        assert!(!sender.is_finished());
+
+        assert_eq!(rx0.recv().await, Some(1));
+        crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+        assert!(!sender.is_finished());
+
+        assert_eq!(rx1.recv().await, Some(1));
+        assert!(sender.await.unwrap().is_ok());
+
+        assert_eq!(rx0.recv().await, Some(2));
+        assert_eq!(rx1.recv().await, Some(2));
+    }
+
+    #[test]
+    fn spmc_try_send_fails_when_any_consumer_is_full() {
+        let (tx, mut consumers) = spmc_channel(1, 2);
+        let rx0 = consumers.remove(0);
+        let rx1 = consumers.remove(0);
+
+        assert!(tx.try_send(1u32).is_ok());
+        // Drain only one consumer; other queue remains full.
+        assert_eq!(rx0.try_recv(), Some(1));
+        assert_eq!(tx.try_send(2u32), Err(2));
+
+        // Once slow consumer drains, send can proceed.
+        assert_eq!(rx1.try_recv(), Some(1));
+        assert!(tx.try_send(2u32).is_ok());
+        assert_eq!(rx0.try_recv(), Some(2));
+        assert_eq!(rx1.try_recv(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn spmc_close_allows_drain_then_none() {
+        let (tx, consumers) = spmc_channel(2, 2);
+        tx.send(7u32).await.unwrap();
+        drop(tx);
+
+        for rx in consumers {
+            assert_eq!(rx.recv().await, Some(7));
+            assert_eq!(rx.recv().await, None);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "SPMC capacity must be > 0")]
+    fn spmc_zero_capacity_panics() {
+        let _ = spmc_channel::<u8>(0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "SPMC consumers must be > 0")]
+    fn spmc_zero_consumers_panics() {
+        let _ = spmc_channel::<u8>(8, 0);
     }
 }
