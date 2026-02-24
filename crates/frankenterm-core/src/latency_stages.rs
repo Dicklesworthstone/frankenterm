@@ -13100,6 +13100,327 @@ impl FaultIsolationManager {
     }
 }
 
+// ── F2: Circuit Breakers and Recovery Choreography ────────────────
+//
+// Per-stage circuit breakers with half-open probing, and deterministic
+// recovery choreography for coordinated subsystem restarts.
+
+/// Circuit breaker state for a latency stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BreakerState {
+    /// Normal operation — requests flow through.
+    Closed,
+    /// Tripped — requests are rejected immediately.
+    Open,
+    /// Probing — a limited number of requests are allowed through to test recovery.
+    HalfOpen,
+}
+
+impl fmt::Display for BreakerState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed => write!(f, "closed"),
+            Self::Open => write!(f, "open"),
+            Self::HalfOpen => write!(f, "half-open"),
+        }
+    }
+}
+
+/// Configuration for a stage circuit breaker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageBreakerConfig {
+    /// Failure count threshold to trip the breaker.
+    pub failure_threshold: u32,
+    /// Duration to stay open before transitioning to half-open (μs).
+    pub open_duration_us: u64,
+    /// Number of probe requests allowed in half-open state.
+    pub half_open_max_probes: u32,
+    /// Success count in half-open to close the breaker.
+    pub half_open_success_threshold: u32,
+}
+
+impl Default for StageBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            open_duration_us: 1_000_000,
+            half_open_max_probes: 3,
+            half_open_success_threshold: 2,
+        }
+    }
+}
+
+/// Per-stage breaker state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageBreakerState {
+    /// Stage this breaker guards.
+    pub stage: LatencyStage,
+    /// Current state.
+    pub state: BreakerState,
+    /// Consecutive failure count.
+    pub consecutive_failures: u32,
+    /// Timestamp when breaker was opened (0 if never).
+    pub opened_at_us: u64,
+    /// Probe count in current half-open window.
+    pub half_open_probes: u32,
+    /// Successful probes in half-open.
+    pub half_open_successes: u32,
+    /// Total trips.
+    pub total_trips: u64,
+    /// Total recoveries.
+    pub total_recoveries: u64,
+}
+
+/// A recovery step in a choreography sequence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryStep {
+    /// Stage being recovered.
+    pub stage: LatencyStage,
+    /// Step number in the sequence.
+    pub step_number: u32,
+    /// Action description.
+    pub action: String,
+    /// Whether this step requires all previous steps to succeed.
+    pub requires_prior_success: bool,
+    /// Timeout for this step (μs).
+    pub timeout_us: u64,
+}
+
+/// Recovery choreography outcome.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ChoreographyOutcome {
+    /// All stages recovered successfully.
+    FullRecovery,
+    /// Some stages recovered, others remain degraded.
+    PartialRecovery { recovered: Vec<LatencyStage>, failed: Vec<LatencyStage> },
+    /// Recovery was aborted (e.g., timeout, cascade failure).
+    Aborted { reason: String },
+}
+
+impl fmt::Display for ChoreographyOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FullRecovery => write!(f, "full-recovery"),
+            Self::PartialRecovery { recovered, failed } => {
+                write!(f, "partial({} ok, {} failed)", recovered.len(), failed.len())
+            }
+            Self::Aborted { reason } => write!(f, "aborted: {reason}"),
+        }
+    }
+}
+
+/// Snapshot of the circuit breaker manager.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BreakerManagerSnapshot {
+    /// Per-stage states.
+    pub stages: Vec<StageBreakerState>,
+    /// Total trips across all stages.
+    pub total_trips: u64,
+    /// Total recoveries across all stages.
+    pub total_recoveries: u64,
+}
+
+/// Degradation state for the breaker manager.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BreakerManagerDegradation {
+    /// All breakers closed.
+    Healthy,
+    /// Some breakers open or half-open.
+    BreakerTripped { open_count: usize },
+    /// Many breakers tripped — cascade risk.
+    CascadeRisk { open_count: usize },
+}
+
+impl fmt::Display for BreakerManagerDegradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "healthy"),
+            Self::BreakerTripped { open_count } => write!(f, "tripped({open_count})"),
+            Self::CascadeRisk { open_count } => write!(f, "cascade-risk({open_count})"),
+        }
+    }
+}
+
+/// Log entry for breaker events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BreakerLogEntry {
+    /// Timestamp.
+    pub timestamp_us: u64,
+    /// Stage affected.
+    pub stage: LatencyStage,
+    /// Previous state.
+    pub from_state: BreakerState,
+    /// New state.
+    pub to_state: BreakerState,
+    /// Reason for transition.
+    pub reason: String,
+}
+
+/// The circuit breaker manager for latency stages.
+pub struct BreakerManager {
+    config: StageBreakerConfig,
+    states: std::collections::HashMap<LatencyStage, StageBreakerState>,
+}
+
+impl BreakerManager {
+    /// Create a new breaker manager with the given config.
+    pub fn new(config: StageBreakerConfig) -> Self {
+        let mut states = std::collections::HashMap::new();
+        for stage in LatencyStage::PIPELINE_STAGES {
+            states.insert(*stage, StageBreakerState {
+                stage: *stage,
+                state: BreakerState::Closed,
+                consecutive_failures: 0,
+                opened_at_us: 0,
+                half_open_probes: 0,
+                half_open_successes: 0,
+                total_trips: 0,
+                total_recoveries: 0,
+            });
+        }
+        Self { config, states }
+    }
+
+    /// Record a failure for a stage.
+    pub fn record_failure(&mut self, stage: LatencyStage, timestamp_us: u64) {
+        let threshold = self.config.failure_threshold;
+        let state = self.states.get_mut(&stage).unwrap();
+        match state.state {
+            BreakerState::Closed => {
+                state.consecutive_failures += 1;
+                if state.consecutive_failures >= threshold {
+                    state.state = BreakerState::Open;
+                    state.opened_at_us = timestamp_us;
+                    state.total_trips += 1;
+                }
+            }
+            BreakerState::HalfOpen => {
+                // Probe failed — go back to open.
+                state.state = BreakerState::Open;
+                state.opened_at_us = timestamp_us;
+                state.half_open_probes = 0;
+                state.half_open_successes = 0;
+            }
+            BreakerState::Open => {
+                // Already open, no-op.
+            }
+        }
+    }
+
+    /// Record a success for a stage.
+    pub fn record_success(&mut self, stage: LatencyStage) {
+        let success_threshold = self.config.half_open_success_threshold;
+        let state = self.states.get_mut(&stage).unwrap();
+        match state.state {
+            BreakerState::Closed => {
+                state.consecutive_failures = 0;
+            }
+            BreakerState::HalfOpen => {
+                state.half_open_successes += 1;
+                if state.half_open_successes >= success_threshold {
+                    state.state = BreakerState::Closed;
+                    state.consecutive_failures = 0;
+                    state.half_open_probes = 0;
+                    state.half_open_successes = 0;
+                    state.total_recoveries += 1;
+                }
+            }
+            BreakerState::Open => {
+                // Shouldn't happen — requests blocked in open state.
+            }
+        }
+    }
+
+    /// Check if a request should be allowed through for a stage.
+    pub fn allow_request(&mut self, stage: LatencyStage, current_us: u64) -> bool {
+        let open_duration = self.config.open_duration_us;
+        let max_probes = self.config.half_open_max_probes;
+        let state = self.states.get_mut(&stage).unwrap();
+        match state.state {
+            BreakerState::Closed => true,
+            BreakerState::Open => {
+                // Check if enough time has passed to try half-open.
+                if current_us.saturating_sub(state.opened_at_us) >= open_duration {
+                    state.state = BreakerState::HalfOpen;
+                    state.half_open_probes = 1;
+                    state.half_open_successes = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+            BreakerState::HalfOpen => {
+                if state.half_open_probes < max_probes {
+                    state.half_open_probes += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Get the state of a stage's breaker.
+    pub fn breaker_state(&self, stage: LatencyStage) -> BreakerState {
+        self.states.get(&stage).map_or(BreakerState::Closed, |s| s.state)
+    }
+
+    /// Count of open (tripped) breakers.
+    pub fn open_count(&self) -> usize {
+        self.states.values().filter(|s| s.state == BreakerState::Open || s.state == BreakerState::HalfOpen).count()
+    }
+
+    /// Whether all breakers are closed.
+    pub fn all_closed(&self) -> bool {
+        self.states.values().all(|s| s.state == BreakerState::Closed)
+    }
+
+    /// Get a snapshot.
+    pub fn snapshot(&self) -> BreakerManagerSnapshot {
+        let stages: Vec<StageBreakerState> = LatencyStage::PIPELINE_STAGES.iter()
+            .filter_map(|s| self.states.get(s).cloned())
+            .collect();
+        let total_trips = stages.iter().map(|s| s.total_trips).sum();
+        let total_recoveries = stages.iter().map(|s| s.total_recoveries).sum();
+        BreakerManagerSnapshot { stages, total_trips, total_recoveries }
+    }
+
+    /// Detect degradation.
+    pub fn detect_degradation(&self) -> BreakerManagerDegradation {
+        let open_count = self.open_count();
+        if open_count == 0 {
+            BreakerManagerDegradation::Healthy
+        } else if open_count >= 3 {
+            BreakerManagerDegradation::CascadeRisk { open_count }
+        } else {
+            BreakerManagerDegradation::BreakerTripped { open_count }
+        }
+    }
+
+    /// Create a log entry.
+    pub fn log_entry(&self, stage: LatencyStage, from: BreakerState, to: BreakerState, reason: String, timestamp_us: u64) -> BreakerLogEntry {
+        BreakerLogEntry { timestamp_us, stage, from_state: from, to_state: to, reason }
+    }
+
+    /// Reset all breakers to closed.
+    pub fn reset(&mut self) {
+        for state in self.states.values_mut() {
+            state.state = BreakerState::Closed;
+            state.consecutive_failures = 0;
+            state.opened_at_us = 0;
+            state.half_open_probes = 0;
+            state.half_open_successes = 0;
+            state.total_trips = 0;
+            state.total_recoveries = 0;
+        }
+    }
+
+    /// Access config.
+    pub fn config(&self) -> &StageBreakerConfig {
+        &self.config
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -24279,5 +24600,396 @@ mod tests {
         let cfg = FaultIsolationConfig { auto_isolate: false, ..Default::default() };
         let mgr = FaultIsolationManager::new(cfg.clone());
         assert_eq!(*mgr.config(), cfg);
+    }
+
+    // ── F2: Circuit Breakers and Recovery Choreography ──
+
+    #[test]
+    fn test_breaker_state_display() {
+        assert_eq!(BreakerState::Closed.to_string(), "closed");
+        assert_eq!(BreakerState::Open.to_string(), "open");
+        assert_eq!(BreakerState::HalfOpen.to_string(), "half-open");
+    }
+
+    #[test]
+    fn test_breaker_state_serde() {
+        for state in [BreakerState::Closed, BreakerState::Open, BreakerState::HalfOpen] {
+            let json = serde_json::to_string(&state).unwrap();
+            let back: BreakerState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn test_stage_breaker_config_default() {
+        let cfg = StageBreakerConfig::default();
+        assert_eq!(cfg.failure_threshold, 5);
+        assert_eq!(cfg.open_duration_us, 1_000_000);
+        assert_eq!(cfg.half_open_max_probes, 3);
+        assert_eq!(cfg.half_open_success_threshold, 2);
+    }
+
+    #[test]
+    fn test_stage_breaker_config_serde() {
+        let cfg = StageBreakerConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: StageBreakerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn test_stage_breaker_state_serde() {
+        let sbs = StageBreakerState {
+            stage: LatencyStage::PtyCapture,
+            state: BreakerState::Open,
+            consecutive_failures: 5,
+            opened_at_us: 1000,
+            half_open_probes: 0,
+            half_open_successes: 0,
+            total_trips: 1,
+            total_recoveries: 0,
+        };
+        let json = serde_json::to_string(&sbs).unwrap();
+        let back: StageBreakerState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, sbs);
+    }
+
+    #[test]
+    fn test_recovery_step_serde() {
+        let step = RecoveryStep {
+            stage: LatencyStage::StorageWrite,
+            step_number: 1,
+            action: "flush WAL".to_string(),
+            requires_prior_success: true,
+            timeout_us: 500_000,
+        };
+        let json = serde_json::to_string(&step).unwrap();
+        let back: RecoveryStep = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, step);
+    }
+
+    #[test]
+    fn test_choreography_outcome_display() {
+        assert_eq!(ChoreographyOutcome::FullRecovery.to_string(), "full-recovery");
+        let partial = ChoreographyOutcome::PartialRecovery {
+            recovered: vec![LatencyStage::PtyCapture],
+            failed: vec![LatencyStage::StorageWrite, LatencyStage::EventEmission],
+        };
+        assert_eq!(partial.to_string(), "partial(1 ok, 2 failed)");
+        let aborted = ChoreographyOutcome::Aborted { reason: "timeout".to_string() };
+        assert_eq!(aborted.to_string(), "aborted: timeout");
+    }
+
+    #[test]
+    fn test_choreography_outcome_serde() {
+        let outcomes = vec![
+            ChoreographyOutcome::FullRecovery,
+            ChoreographyOutcome::PartialRecovery {
+                recovered: vec![LatencyStage::PtyCapture],
+                failed: vec![LatencyStage::StorageWrite],
+            },
+            ChoreographyOutcome::Aborted { reason: "cascade".to_string() },
+        ];
+        for o in outcomes {
+            let json = serde_json::to_string(&o).unwrap();
+            let back: ChoreographyOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, o);
+        }
+    }
+
+    #[test]
+    fn test_breaker_manager_new_all_closed() {
+        let mgr = BreakerManager::new(StageBreakerConfig::default());
+        assert!(mgr.all_closed());
+        assert_eq!(mgr.open_count(), 0);
+        for stage in LatencyStage::PIPELINE_STAGES {
+            assert_eq!(mgr.breaker_state(*stage), BreakerState::Closed);
+        }
+    }
+
+    #[test]
+    fn test_breaker_manager_failure_below_threshold() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        // Default threshold is 5. Record 4 failures — should stay closed.
+        for i in 0..4 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
+        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Closed);
+        assert!(mgr.all_closed());
+    }
+
+    #[test]
+    fn test_breaker_manager_failure_trips_breaker() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
+        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Open);
+        assert!(!mgr.all_closed());
+        assert_eq!(mgr.open_count(), 1);
+    }
+
+    #[test]
+    fn test_breaker_manager_open_blocks_requests() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
+        // Immediately after tripping, before open_duration passes, requests blocked.
+        assert!(!mgr.allow_request(LatencyStage::PtyCapture, 105));
+    }
+
+    #[test]
+    fn test_breaker_manager_open_to_half_open() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
+        // After open_duration (1_000_000 us), should transition to half-open.
+        assert!(mgr.allow_request(LatencyStage::PtyCapture, 1_000_200));
+        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::HalfOpen);
+    }
+
+    #[test]
+    fn test_breaker_manager_half_open_probe_limit() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
+        // Transition to half-open.
+        assert!(mgr.allow_request(LatencyStage::PtyCapture, 1_100_000));
+        // First probe consumed by the transition call. max_probes=3.
+        assert!(mgr.allow_request(LatencyStage::PtyCapture, 1_100_001));
+        assert!(mgr.allow_request(LatencyStage::PtyCapture, 1_100_002));
+        // Now at 3 probes — next should be blocked.
+        assert!(!mgr.allow_request(LatencyStage::PtyCapture, 1_100_003));
+    }
+
+    #[test]
+    fn test_breaker_manager_half_open_recovery() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
+        // Transition to half-open.
+        mgr.allow_request(LatencyStage::PtyCapture, 1_100_000);
+        // Record enough successes to close (threshold = 2).
+        mgr.record_success(LatencyStage::PtyCapture);
+        mgr.record_success(LatencyStage::PtyCapture);
+        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Closed);
+    }
+
+    #[test]
+    fn test_breaker_manager_half_open_failure_reopens() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
+        mgr.allow_request(LatencyStage::PtyCapture, 1_100_000);
+        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::HalfOpen);
+        mgr.record_failure(LatencyStage::PtyCapture, 1_200_000);
+        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Open);
+    }
+
+    #[test]
+    fn test_breaker_manager_success_resets_failures() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        mgr.record_failure(LatencyStage::PtyCapture, 100);
+        mgr.record_failure(LatencyStage::PtyCapture, 101);
+        mgr.record_success(LatencyStage::PtyCapture);
+        // After success, consecutive failures reset. Need 5 more to trip.
+        for i in 0..4 {
+            mgr.record_failure(LatencyStage::PtyCapture, 200 + i);
+        }
+        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Closed);
+    }
+
+    #[test]
+    fn test_breaker_manager_multiple_stages_independent() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
+        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Open);
+        assert_eq!(mgr.breaker_state(LatencyStage::StorageWrite), BreakerState::Closed);
+        assert_eq!(mgr.open_count(), 1);
+    }
+
+    #[test]
+    fn test_breaker_manager_snapshot() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
+        let snap = mgr.snapshot();
+        assert_eq!(snap.stages.len(), 8); // All pipeline stages.
+        assert_eq!(snap.total_trips, 1);
+        assert_eq!(snap.total_recoveries, 0);
+    }
+
+    #[test]
+    fn test_breaker_manager_snapshot_serde() {
+        let mgr = BreakerManager::new(StageBreakerConfig::default());
+        let snap = mgr.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: BreakerManagerSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn test_breaker_manager_degradation_healthy() {
+        let mgr = BreakerManager::new(StageBreakerConfig::default());
+        assert_eq!(mgr.detect_degradation(), BreakerManagerDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_breaker_manager_degradation_tripped() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
+        let deg = mgr.detect_degradation();
+        assert_eq!(deg, BreakerManagerDegradation::BreakerTripped { open_count: 1 });
+    }
+
+    #[test]
+    fn test_breaker_manager_degradation_cascade_risk() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        let stages = [LatencyStage::PtyCapture, LatencyStage::StorageWrite, LatencyStage::EventEmission];
+        for stage in stages {
+            for i in 0..5 {
+                mgr.record_failure(stage, 100 + i);
+            }
+        }
+        let deg = mgr.detect_degradation();
+        assert_eq!(deg, BreakerManagerDegradation::CascadeRisk { open_count: 3 });
+    }
+
+    #[test]
+    fn test_breaker_manager_degradation_display() {
+        assert_eq!(BreakerManagerDegradation::Healthy.to_string(), "healthy");
+        assert_eq!(BreakerManagerDegradation::BreakerTripped { open_count: 2 }.to_string(), "tripped(2)");
+        assert_eq!(BreakerManagerDegradation::CascadeRisk { open_count: 4 }.to_string(), "cascade-risk(4)");
+    }
+
+    #[test]
+    fn test_breaker_manager_degradation_serde() {
+        let cases = vec![
+            BreakerManagerDegradation::Healthy,
+            BreakerManagerDegradation::BreakerTripped { open_count: 1 },
+            BreakerManagerDegradation::CascadeRisk { open_count: 5 },
+        ];
+        for deg in cases {
+            let json = serde_json::to_string(&deg).unwrap();
+            let back: BreakerManagerDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, deg);
+        }
+    }
+
+    #[test]
+    fn test_breaker_log_entry() {
+        let mgr = BreakerManager::new(StageBreakerConfig::default());
+        let entry = mgr.log_entry(
+            LatencyStage::PtyCapture,
+            BreakerState::Closed,
+            BreakerState::Open,
+            "threshold exceeded".to_string(),
+            42_000,
+        );
+        assert_eq!(entry.timestamp_us, 42_000);
+        assert_eq!(entry.stage, LatencyStage::PtyCapture);
+        assert_eq!(entry.from_state, BreakerState::Closed);
+        assert_eq!(entry.to_state, BreakerState::Open);
+        assert_eq!(entry.reason, "threshold exceeded");
+    }
+
+    #[test]
+    fn test_breaker_log_entry_serde() {
+        let mgr = BreakerManager::new(StageBreakerConfig::default());
+        let entry = mgr.log_entry(
+            LatencyStage::StorageWrite,
+            BreakerState::Open,
+            BreakerState::HalfOpen,
+            "cooldown elapsed".to_string(),
+            100_000,
+        );
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: BreakerLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn test_breaker_manager_reset() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
+        assert!(!mgr.all_closed());
+        mgr.reset();
+        assert!(mgr.all_closed());
+        assert_eq!(mgr.open_count(), 0);
+        let snap = mgr.snapshot();
+        assert_eq!(snap.total_trips, 0);
+        assert_eq!(snap.total_recoveries, 0);
+    }
+
+    #[test]
+    fn test_breaker_manager_config_accessor() {
+        let cfg = StageBreakerConfig {
+            failure_threshold: 3,
+            open_duration_us: 500_000,
+            half_open_max_probes: 2,
+            half_open_success_threshold: 1,
+        };
+        let mgr = BreakerManager::new(cfg.clone());
+        assert_eq!(*mgr.config(), cfg);
+    }
+
+    #[test]
+    fn test_breaker_manager_custom_threshold() {
+        let cfg = StageBreakerConfig {
+            failure_threshold: 2,
+            ..Default::default()
+        };
+        let mut mgr = BreakerManager::new(cfg);
+        mgr.record_failure(LatencyStage::DeltaExtraction, 100);
+        assert_eq!(mgr.breaker_state(LatencyStage::DeltaExtraction), BreakerState::Closed);
+        mgr.record_failure(LatencyStage::DeltaExtraction, 101);
+        assert_eq!(mgr.breaker_state(LatencyStage::DeltaExtraction), BreakerState::Open);
+    }
+
+    #[test]
+    fn test_breaker_total_trips_accumulates() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        // Trip PtyCapture.
+        for i in 0..5 { mgr.record_failure(LatencyStage::PtyCapture, 100 + i); }
+        // Recover it.
+        mgr.allow_request(LatencyStage::PtyCapture, 1_200_000);
+        mgr.record_success(LatencyStage::PtyCapture);
+        mgr.record_success(LatencyStage::PtyCapture);
+        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Closed);
+        // Trip it again.
+        for i in 0..5 { mgr.record_failure(LatencyStage::PtyCapture, 2_000_000 + i); }
+        let snap = mgr.snapshot();
+        assert_eq!(snap.total_trips, 2);
+        assert_eq!(snap.total_recoveries, 1);
+    }
+
+    #[test]
+    fn test_closed_always_allows_request() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        for ts in 0..100 {
+            assert!(mgr.allow_request(LatencyStage::PtyCapture, ts));
+        }
+    }
+
+    #[test]
+    fn test_open_failure_is_noop() {
+        let mut mgr = BreakerManager::new(StageBreakerConfig::default());
+        for i in 0..5 { mgr.record_failure(LatencyStage::PtyCapture, 100 + i); }
+        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Open);
+        // Further failures while open are no-op.
+        mgr.record_failure(LatencyStage::PtyCapture, 200);
+        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Open);
     }
 }
