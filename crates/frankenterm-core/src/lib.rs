@@ -220,6 +220,7 @@ pub mod replay;
 pub mod replay_capture;
 pub mod replay_checkpoint;
 pub mod replay_counterfactual;
+pub mod replay_decision_diff;
 pub mod replay_decision_graph;
 pub mod replay_fault_injection;
 pub mod replay_fixture_harvest;
