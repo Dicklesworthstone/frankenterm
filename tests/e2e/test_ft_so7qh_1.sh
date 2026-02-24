@@ -11,6 +11,7 @@ CORRELATION_ID="ft-so7qh.1-${RUN_ID}"
 PANE_ID=1
 COMMAND_INPUT="cargo test"
 COMMAND_HASH="$(printf '%s' "${COMMAND_INPUT}" | cksum | awk '{print $1}')"
+TARGET_DIR="target-rch-ft-so7qh-1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_so7qh_1_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_so7qh_1_${RUN_ID}.stdout.log"
 
@@ -75,9 +76,10 @@ if ! command -v rch >/dev/null 2>&1; then
 fi
 
 TEST_CMD=(
+  env TMPDIR=/tmp
   rch exec --
-  env CARGO_TARGET_DIR=target-rch-ft-so7qh-1
-  cargo test -p frankenterm-core e2e_repeated_failure_loop_decision_is_deterministic -- --nocapture
+  env CARGO_TARGET_DIR="${TARGET_DIR}"
+  cargo test -p frankenterm-core --lib e2e_repeated_failure_loop_decision_is_deterministic -- --nocapture
 )
 
 emit_log \
@@ -107,6 +109,17 @@ if [[ ${status} -ne 0 ]]; then
   exit "${status}"
 fi
 
+if grep -q "\\[RCH\\] local" "${STDOUT_FILE}"; then
+  emit_log \
+    "failed" \
+    "offload_guard" \
+    "rch_local_fallback" \
+    "remote_offload_required" \
+    "$(basename "${STDOUT_FILE}")" \
+    "rch fell back to local execution; refusing CPU-intensive local run"
+  exit 1
+fi
+
 if ! grep -q "e2e_repeated_failure_loop_decision_is_deterministic ... ok" "${STDOUT_FILE}"; then
   emit_log \
     "failed" \
@@ -125,4 +138,3 @@ emit_log \
   "none" \
   "$(basename "${STDOUT_FILE}")" \
   "Deterministic intervention threshold validated"
-

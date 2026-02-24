@@ -6,12 +6,12 @@ LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 mkdir -p "${LOG_DIR}"
 
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
-SCENARIO_ID="ft_so7qh_2_fuzzy_command_matching"
-CORRELATION_ID="ft-so7qh.2-${RUN_ID}"
+SCENARIO_ID="ft_so7qh_6_comprehensive_trauma_validation"
+CORRELATION_ID="ft-so7qh.6-${RUN_ID}"
 PANE_ID=1
-TARGET_DIR="target-rch-ft-so7qh-2-${RUN_ID}"
+TARGET_DIR="target-rch-ft-so7qh-6-${RUN_ID}"
 
-LOG_FILE="${LOG_DIR}/ft_so7qh_2_${RUN_ID}.jsonl"
+LOG_FILE="${LOG_DIR}/ft_so7qh_6_${RUN_ID}.jsonl"
 
 emit_log() {
   local outcome="$1"
@@ -30,7 +30,7 @@ emit_log() {
 
   jq -cn \
     --arg timestamp "${ts}" \
-    --arg component "trauma_guard.e2e" \
+    --arg component "trauma_guard.validation.e2e" \
     --arg scenario_id "${SCENARIO_ID}:${scenario}" \
     --arg correlation_id "${CORRELATION_ID}" \
     --arg pane_id "${PANE_ID}" \
@@ -66,7 +66,7 @@ run_target_test() {
   local decision_path="$4"
   local success_reason="$5"
 
-  local stdout_file="${LOG_DIR}/ft_so7qh_2_${RUN_ID}_${scenario}.stdout.log"
+  local stdout_file="${LOG_DIR}/ft_so7qh_6_${RUN_ID}_${scenario}.stdout.log"
   local test_cmd=(
     env TMPDIR=/tmp
     rch exec --
@@ -140,19 +140,17 @@ run_target_test() {
     "none" \
     "$(basename "${stdout_file}")" \
     "test=${test_name}"
-
-  return 0
 }
 
 emit_log \
   "started" \
   "suite_init" \
-  "cargo test -p frankenterm-core trauma_guard fuzzy matching suite" \
+  "cargo test -p frankenterm-core trauma guard comprehensive suite" \
   "script_init" \
   "none" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "scenarios=2"
+  "scenarios=4"
 
 if ! command -v rch >/dev/null 2>&1; then
   emit_log \
@@ -167,26 +165,55 @@ if ! command -v rch >/dev/null 2>&1; then
   exit 1
 fi
 
-run_target_test \
-  "trivial_variation_loop" \
-  "e2e_fuzzy_variation_loop_decision_is_deterministic" \
-  "cargo test -p foo --verbose" \
-  "record_command_result->fuzzy_match->loop_intervention" \
-  "recurring_failure_loop"
+if ! rch workers probe --all --json \
+  | jq -e '[.data[] | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length > 0' \
+    >/dev/null; then
+  emit_log \
+    "failed" \
+    "suite_init" \
+    "rch workers probe --all --json" \
+    "preflight_rch_workers" \
+    "rch_workers_unreachable" \
+    "remote_worker_unavailable" \
+    "$(basename "${LOG_FILE}")" \
+    "No reachable rch workers; aborting before cargo fallback can run locally"
+  exit 1
+fi
 
 run_target_test \
-  "semantic_change_recovery" \
-  "e2e_semantic_change_resets_loop_and_recovers" \
-  "cargo test --all" \
-  "record_command_result->critical_flag_guard->allow_recovery" \
-  "semantic_change_resets_loop"
+  "compile_error_loop_block_and_feedback" \
+  "e2e_trauma_guard_deny_injects_synthetic_feedback" \
+  "cargo test -p core" \
+  "authorize->deny(policy.trauma_guard.loop_block)->inject_synthetic_feedback" \
+  "loop_block_feedback_injected"
+
+run_target_test \
+  "source_mutation_recovery" \
+  "e2e_source_mutation_resets_loop_counter" \
+  "cargo test -p foo --verbose" \
+  "record_mutation(source)->epoch_increment->counter_reset->allow" \
+  "source_mutation_resets_loop"
+
+run_target_test \
+  "markdown_mutation_ignored" \
+  "e2e_scratchpad_mutation_does_not_reset_loop_counter" \
+  "cargo test -p foo --verbose" \
+  "record_mutation(markdown)->ignored->loop_block" \
+  "scratchpad_ignore_still_blocks"
+
+run_target_test \
+  "bypass_override" \
+  "command_gate_trauma_bypass_allows_command_gate_path" \
+  "FT_BYPASS_TRAUMA=1 cargo test -p core" \
+  "authorize->trauma_guard_bypass->command_gate_allow" \
+  "bypass_override_allows"
 
 emit_log \
   "passed" \
   "suite_complete" \
-  "ft-so7qh.2" \
+  "ft-so7qh.6" \
   "suite_complete" \
   "all_scenarios_passed" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "scenarios=2"
+  "scenarios=4"

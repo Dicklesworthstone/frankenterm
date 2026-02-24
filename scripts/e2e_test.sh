@@ -516,6 +516,7 @@ SCENARIO_REGISTRY=(
     "input_latency_resize_storm|Validate typing/mouse/paste interaction latency during resize/font churn|true|cargo,jq|Protects user-perceived responsiveness under resize storms"
     "distributed_streaming|Validate distributed agent->aggregator streaming, persistence, and query/auth robustness|false|cargo,jq|Protects optional distributed mode end-to-end"
     "timeline_correlation|Validate timeline cross-pane correlation (aggregation, failover, temporal)|true|cargo,jq,sqlite3|Protects event correlation determinism"
+    "replay_capture_pipeline|Validate replay capture extraction/redaction/artifact/decision roundtrip with structured logs|false|cargo,jq,rch|Protects deterministic replay capture data plane"
 )
 
 list_scenarios() {
@@ -10778,6 +10779,43 @@ EOF
     return $result
 }
 
+run_scenario_replay_capture_pipeline() {
+    local scenario_dir="$1"
+    local case_name="replay_capture_pipeline"
+    local script_path="$PROJECT_ROOT/tests/e2e/test_replay_capture_pipeline.sh"
+    local scenario_stdout="$scenario_dir/${case_name}.stdout.log"
+    local pipeline_log_rel=""
+    local pipeline_log_abs=""
+
+    log_info "[$case_name] Step 1: running replay capture pipeline harness"
+    set +e
+    bash "$script_path" >"$scenario_stdout" 2>&1
+    local rc=$?
+    set -e
+
+    if [[ "$rc" -ne 0 ]]; then
+        log_fail "[$case_name] harness failed (exit=$rc)"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return "$rc"
+    fi
+
+    pipeline_log_rel=$(grep -Eo 'Logs: [^ ]+' "$scenario_stdout" | tail -n1 | sed 's/^Logs: //')
+    if [[ -n "$pipeline_log_rel" ]]; then
+        pipeline_log_abs="$PROJECT_ROOT/$pipeline_log_rel"
+        if [[ -f "$pipeline_log_abs" ]]; then
+            cp -f "$pipeline_log_abs" "$scenario_dir/" || true
+            while IFS= read -r artifact_rel; do
+                if [[ "$artifact_rel" == tests/e2e/logs/* && -f "$PROJECT_ROOT/$artifact_rel" ]]; then
+                    cp -f "$PROJECT_ROOT/$artifact_rel" "$scenario_dir/" || true
+                fi
+            done < <(jq -r '.artifact_path // empty' "$pipeline_log_abs" 2>/dev/null | sort -u)
+        fi
+    fi
+
+    log_pass "[$case_name] replay capture pipeline completed"
+    return 0
+}
+
 dispatch_scenario() {
     local name="$1"
     local scenario_dir="$2"
@@ -10896,6 +10934,9 @@ dispatch_scenario() {
         timeline_correlation)
             "$SCRIPT_DIR/e2e_timeline_correlation.sh" ${VERBOSE:+--verbose} || result=$?
             cp -r "$SCRIPT_DIR/../evidence/e2e/"*timeline* "$scenario_dir/" 2>/dev/null || true
+            ;;
+        replay_capture_pipeline)
+            run_scenario_replay_capture_pipeline "$scenario_dir" || result=$?
             ;;
         *)
             log_fail "Unknown scenario: $name"

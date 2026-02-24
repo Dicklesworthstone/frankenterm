@@ -8,7 +8,7 @@ mkdir -p "$LOG_DIR"
 run_id="replay_decision_capture_$(date -u +%Y%m%dT%H%M%SZ)"
 json_log="$LOG_DIR/${run_id}.jsonl"
 cargo_home="/tmp/cargo-home-replay-decision-e2e"
-cargo_target_dir="$ROOT_DIR/target-replay-decision-e2e-${run_id}"
+cargo_target_dir="${FT_REPLAY_CAPTURE_TARGET_DIR:-$ROOT_DIR/target-replay-decision-e2e-${run_id}}"
 
 now_ts() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"

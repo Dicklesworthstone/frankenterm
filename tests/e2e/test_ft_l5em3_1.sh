@@ -6,68 +6,63 @@ LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 mkdir -p "${LOG_DIR}"
 
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
-SCENARIO_ID="ft_so7qh_2_fuzzy_command_matching"
-CORRELATION_ID="ft-so7qh.2-${RUN_ID}"
-PANE_ID=1
-TARGET_DIR="target-rch-ft-so7qh-2-${RUN_ID}"
-
-LOG_FILE="${LOG_DIR}/ft_so7qh_2_${RUN_ID}.jsonl"
+SCENARIO_ID="ft_l5em3_1_spmc_ring_buffer"
+CORRELATION_ID="ft-l5em3.1-${RUN_ID}"
+PANE_ID=0
+TARGET_DIR="target-rch-ft-l5em3-1-${RUN_ID}"
+LOG_FILE="${LOG_DIR}/ft_l5em3_1_${RUN_ID}.jsonl"
 
 emit_log() {
-  local outcome="$1"
-  local scenario="$2"
-  local command_input="$3"
-  local decision_path="$4"
-  local reason_code="$5"
-  local error_code="$6"
-  local artifact_path="$7"
-  local input_summary="$8"
+  local status="$1"
+  local step="$2"
+  local decision_path="$3"
+  local reason_code="$4"
+  local error_code="$5"
+  local artifact_path="$6"
+  local details="$7"
   local ts
-  local command_hash
 
   ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-  command_hash="$(printf '%s' "${command_input}" | cksum | awk '{print $1}')"
 
   jq -cn \
     --arg timestamp "${ts}" \
-    --arg component "trauma_guard.e2e" \
-    --arg scenario_id "${SCENARIO_ID}:${scenario}" \
+    --arg component "aegis.spmc.e2e" \
+    --arg run_id "${RUN_ID}" \
+    --arg scenario_id "${SCENARIO_ID}" \
     --arg correlation_id "${CORRELATION_ID}" \
     --arg pane_id "${PANE_ID}" \
-    --arg command_hash "${command_hash}" \
+    --arg step "${step}" \
+    --arg status "${status}" \
     --arg decision_path "${decision_path}" \
-    --arg input_summary "${input_summary}" \
-    --arg outcome "${outcome}" \
     --arg reason_code "${reason_code}" \
-    --arg decision_reason "${reason_code}" \
     --arg error_code "${error_code}" \
     --arg artifact_path "${artifact_path}" \
+    --arg details "${details}" \
     '{
       timestamp: $timestamp,
       component: $component,
+      run_id: $run_id,
       scenario_id: $scenario_id,
       correlation_id: $correlation_id,
       pane_id: ($pane_id | tonumber),
-      command_hash: ($command_hash | tonumber),
+      step: $step,
+      status: $status,
       decision_path: $decision_path,
-      input_summary: $input_summary,
-      outcome: $outcome,
       reason_code: $reason_code,
-      decision_reason: $decision_reason,
       error_code: $error_code,
-      artifact_path: $artifact_path
+      artifact_path: $artifact_path,
+      details: $details
     }' >> "${LOG_FILE}"
 }
 
-run_target_test() {
-  local scenario="$1"
+run_test_step() {
+  local step="$1"
   local test_name="$2"
-  local command_input="$3"
-  local decision_path="$4"
-  local success_reason="$5"
+  local decision_path="$3"
+  local success_reason="$4"
 
-  local stdout_file="${LOG_DIR}/ft_so7qh_2_${RUN_ID}_${scenario}.stdout.log"
-  local test_cmd=(
+  local stdout_file="${LOG_DIR}/ft_l5em3_1_${RUN_ID}_${step}.stdout.log"
+  local cmd=(
     env TMPDIR=/tmp
     rch exec --
     env CARGO_TARGET_DIR="${TARGET_DIR}"
@@ -76,18 +71,17 @@ run_target_test() {
 
   emit_log \
     "running" \
-    "${scenario}" \
-    "${command_input}" \
+    "${step}" \
     "cargo_test" \
     "none" \
     "none" \
     "$(basename "${stdout_file}")" \
-    "Executing: ${test_cmd[*]}"
+    "Executing: ${cmd[*]}"
 
   set +e
   (
     cd "${ROOT_DIR}"
-    "${test_cmd[@]}"
+    "${cmd[@]}"
   ) 2>&1 | tee "${stdout_file}"
   local status=${PIPESTATUS[0]}
   set -e
@@ -95,21 +89,19 @@ run_target_test() {
   if grep -q "\\[RCH\\] local" "${stdout_file}"; then
     emit_log \
       "failed" \
-      "${scenario}" \
-      "${command_input}" \
+      "${step}" \
       "offload_guard" \
       "rch_local_fallback" \
-      "remote_offload_required" \
+      "offload_policy_violation" \
       "$(basename "${stdout_file}")" \
-      "rch fell back to local execution; refusing CPU-intensive local run"
+      "rch fell back to local execution; refusing local CPU-heavy test run"
     return 1
   fi
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
       "failed" \
-      "${scenario}" \
-      "${command_input}" \
+      "${step}" \
       "cargo_test" \
       "test_failure" \
       "cargo_test_failed" \
@@ -118,14 +110,13 @@ run_target_test() {
     return "${status}"
   fi
 
-  if ! grep -q "${test_name} ... ok" "${stdout_file}"; then
+  if ! grep -Eq "test .*${test_name} .*ok" "${stdout_file}"; then
     emit_log \
       "failed" \
-      "${scenario}" \
-      "${command_input}" \
+      "${step}" \
       "assertion_check" \
-      "unexpected_test_output" \
       "missing_success_marker" \
+      "unexpected_test_output" \
       "$(basename "${stdout_file}")" \
       "Expected success marker for ${test_name}"
     return 1
@@ -133,60 +124,69 @@ run_target_test() {
 
   emit_log \
     "passed" \
-    "${scenario}" \
-    "${command_input}" \
+    "${step}" \
     "${decision_path}" \
     "${success_reason}" \
     "none" \
     "$(basename "${stdout_file}")" \
     "test=${test_name}"
-
-  return 0
 }
 
 emit_log \
   "started" \
   "suite_init" \
-  "cargo test -p frankenterm-core trauma_guard fuzzy matching suite" \
   "script_init" \
   "none" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "scenarios=2"
+  "steps=4"
 
 if ! command -v rch >/dev/null 2>&1; then
   emit_log \
     "failed" \
     "suite_init" \
-    "rch exec -- cargo test ..." \
     "preflight_rch" \
     "rch_missing" \
     "rch_not_found" \
     "$(basename "${LOG_FILE}")" \
-    "rch must be installed for offloaded cargo execution"
+    "rch must be available for offloaded cargo execution"
   exit 1
 fi
 
-run_target_test \
-  "trivial_variation_loop" \
-  "e2e_fuzzy_variation_loop_decision_is_deterministic" \
-  "cargo test -p foo --verbose" \
-  "record_command_result->fuzzy_match->loop_intervention" \
-  "recurring_failure_loop"
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logs" >&2
+  exit 1
+fi
 
-run_target_test \
-  "semantic_change_recovery" \
-  "e2e_semantic_change_resets_loop_and_recovers" \
-  "cargo test --all" \
-  "record_command_result->critical_flag_guard->allow_recovery" \
-  "semantic_change_resets_loop"
+run_test_step \
+  "backpressure_wait" \
+  "spmc_send_waits_for_slowest_consumer" \
+  "send->wait_on_full->consumer_unblocks" \
+  "backpressure_enforced"
+
+run_test_step \
+  "backpressure_try_send" \
+  "spmc_try_send_fails_when_any_consumer_is_full" \
+  "try_send->full_queue->error" \
+  "nonblocking_backpressure_signal"
+
+run_test_step \
+  "drain_and_close" \
+  "spmc_close_allows_drain_then_none" \
+  "close->drain->none" \
+  "graceful_shutdown_semantics"
+
+run_test_step \
+  "runtime_handoff_checksum" \
+  "runtime_spmc_handoff_preserves_exact_output_checksum" \
+  "ingest->relay->persist->sha256_isomorphism" \
+  "exact_output_fidelity"
 
 emit_log \
   "passed" \
   "suite_complete" \
-  "ft-so7qh.2" \
   "suite_complete" \
-  "all_scenarios_passed" \
+  "all_steps_passed" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "scenarios=2"
+  "steps=4"

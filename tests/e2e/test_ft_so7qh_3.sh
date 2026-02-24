@@ -6,12 +6,12 @@ LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 mkdir -p "${LOG_DIR}"
 
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
-SCENARIO_ID="ft_so7qh_2_fuzzy_command_matching"
-CORRELATION_ID="ft-so7qh.2-${RUN_ID}"
+SCENARIO_ID="ft_so7qh_3_policy_gate_integration"
+CORRELATION_ID="ft-so7qh.3-${RUN_ID}"
 PANE_ID=1
-TARGET_DIR="target-rch-ft-so7qh-2-${RUN_ID}"
+TARGET_DIR="target-rch-ft-so7qh-3-${RUN_ID}"
 
-LOG_FILE="${LOG_DIR}/ft_so7qh_2_${RUN_ID}.jsonl"
+LOG_FILE="${LOG_DIR}/ft_so7qh_3_${RUN_ID}.jsonl"
 
 emit_log() {
   local outcome="$1"
@@ -66,7 +66,7 @@ run_target_test() {
   local decision_path="$4"
   local success_reason="$5"
 
-  local stdout_file="${LOG_DIR}/ft_so7qh_2_${RUN_ID}_${scenario}.stdout.log"
+  local stdout_file="${LOG_DIR}/ft_so7qh_3_${RUN_ID}_${scenario}.stdout.log"
   local test_cmd=(
     env TMPDIR=/tmp
     rch exec --
@@ -140,14 +140,12 @@ run_target_test() {
     "none" \
     "$(basename "${stdout_file}")" \
     "test=${test_name}"
-
-  return 0
 }
 
 emit_log \
   "started" \
   "suite_init" \
-  "cargo test -p frankenterm-core trauma_guard fuzzy matching suite" \
+  "cargo test -p frankenterm-core command gate trauma integration suite" \
   "script_init" \
   "none" \
   "none" \
@@ -168,23 +166,23 @@ if ! command -v rch >/dev/null 2>&1; then
 fi
 
 run_target_test \
-  "trivial_variation_loop" \
-  "e2e_fuzzy_variation_loop_decision_is_deterministic" \
-  "cargo test -p foo --verbose" \
-  "record_command_result->fuzzy_match->loop_intervention" \
-  "recurring_failure_loop"
+  "trauma_deny" \
+  "command_gate_trauma_blocks_without_bypass" \
+  "cargo test -p core" \
+  "authorize->trauma_guard->deny" \
+  "trauma_loop_block"
 
 run_target_test \
-  "semantic_change_recovery" \
-  "e2e_semantic_change_resets_loop_and_recovers" \
-  "cargo test --all" \
-  "record_command_result->critical_flag_guard->allow_recovery" \
-  "semantic_change_resets_loop"
+  "trauma_bypass" \
+  "command_gate_trauma_bypass_allows_command_gate_path" \
+  "FT_BYPASS_TRAUMA=1 git status" \
+  "authorize->trauma_guard_bypass->command_gate_allow" \
+  "trauma_bypass_allow"
 
 emit_log \
   "passed" \
   "suite_complete" \
-  "ft-so7qh.2" \
+  "ft-so7qh.3" \
   "suite_complete" \
   "all_scenarios_passed" \
   "none" \

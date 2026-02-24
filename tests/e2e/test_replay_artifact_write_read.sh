@@ -12,7 +12,7 @@ raw_dir="$LOG_DIR/${run_id}_raw"
 mkdir -p "$raw_dir"
 
 cargo_home="/tmp/cargo-home-replay-artifact-write-read"
-cargo_target_dir="$ROOT_DIR/target-replay-artifact-write-read-${run_id}"
+cargo_target_dir="${FT_REPLAY_CAPTURE_TARGET_DIR:-$ROOT_DIR/target-replay-artifact-write-read-${run_id}}"
 work_dir="$ROOT_DIR/tests/e2e/tmp/${run_id}"
 mkdir -p "$work_dir"
 

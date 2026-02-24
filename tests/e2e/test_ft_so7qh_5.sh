@@ -6,12 +6,12 @@ LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 mkdir -p "${LOG_DIR}"
 
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
-SCENARIO_ID="ft_so7qh_2_fuzzy_command_matching"
-CORRELATION_ID="ft-so7qh.2-${RUN_ID}"
+SCENARIO_ID="ft_so7qh_5_trauma_guard_config_tuning"
+CORRELATION_ID="ft-so7qh.5-${RUN_ID}"
 PANE_ID=1
-TARGET_DIR="target-rch-ft-so7qh-2-${RUN_ID}"
+TARGET_DIR="target-rch-ft-so7qh-5-${RUN_ID}"
 
-LOG_FILE="${LOG_DIR}/ft_so7qh_2_${RUN_ID}.jsonl"
+LOG_FILE="${LOG_DIR}/ft_so7qh_5_${RUN_ID}.jsonl"
 
 emit_log() {
   local outcome="$1"
@@ -30,7 +30,7 @@ emit_log() {
 
   jq -cn \
     --arg timestamp "${ts}" \
-    --arg component "trauma_guard.e2e" \
+    --arg component "trauma_guard.config.e2e" \
     --arg scenario_id "${SCENARIO_ID}:${scenario}" \
     --arg correlation_id "${CORRELATION_ID}" \
     --arg pane_id "${PANE_ID}" \
@@ -66,12 +66,15 @@ run_target_test() {
   local decision_path="$4"
   local success_reason="$5"
 
-  local stdout_file="${LOG_DIR}/ft_so7qh_2_${RUN_ID}_${scenario}.stdout.log"
+  local stdout_file="${LOG_DIR}/ft_so7qh_5_${RUN_ID}_${scenario}.stdout.log"
   local test_cmd=(
     env TMPDIR=/tmp
     rch exec --
     env CARGO_TARGET_DIR="${TARGET_DIR}"
-    cargo test -p frankenterm-core --lib "${test_name}" -- --nocapture
+    cargo test
+    -p frankenterm-core
+    --lib "${test_name}"
+    -- --nocapture
   )
 
   emit_log \
@@ -147,12 +150,12 @@ run_target_test() {
 emit_log \
   "started" \
   "suite_init" \
-  "cargo test -p frankenterm-core trauma_guard fuzzy matching suite" \
+  "cargo test -p frankenterm-core trauma guard config suite" \
   "script_init" \
   "none" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "scenarios=2"
+  "scenarios=3"
 
 if ! command -v rch >/dev/null 2>&1; then
   emit_log \
@@ -168,25 +171,32 @@ if ! command -v rch >/dev/null 2>&1; then
 fi
 
 run_target_test \
-  "trivial_variation_loop" \
-  "e2e_fuzzy_variation_loop_decision_is_deterministic" \
-  "cargo test -p foo --verbose" \
-  "record_command_result->fuzzy_match->loop_intervention" \
-  "recurring_failure_loop"
+  "config_parses_and_hot_reload_diff" \
+  "hot_reload_allows_trauma_guard_change" \
+  "[safety.trauma_guard] tuning parse + diff" \
+  "config.parse->hot_reload.diff" \
+  "trauma_guard_hot_reload_detected"
 
 run_target_test \
-  "semantic_change_recovery" \
-  "e2e_semantic_change_resets_loop_and_recovers" \
-  "cargo test --all" \
-  "record_command_result->critical_flag_guard->allow_recovery" \
-  "semantic_change_resets_loop"
+  "policy_disable_skips_block" \
+  "command_gate_trauma_disabled_skips_trauma_block" \
+  "FT_BYPASS_TRAUMA=0 git status" \
+  "policy.authorize->trauma_disabled->allow" \
+  "trauma_guard_disabled_allows"
+
+run_target_test \
+  "ingest_reload_thresholds" \
+  "set_trauma_guard_config_reloads_thresholds" \
+  "cargo test recurrence threshold update" \
+  "ingest.registry->set_trauma_guard_config->record_command_result" \
+  "runtime_reload_applied"
 
 emit_log \
   "passed" \
   "suite_complete" \
-  "ft-so7qh.2" \
+  "ft-so7qh.5" \
   "suite_complete" \
   "all_scenarios_passed" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "scenarios=2"
+  "scenarios=3"
