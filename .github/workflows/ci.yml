@@ -302,6 +302,20 @@ jobs:
       - name: Run benchmarks and check budgets
         run: scripts/check_bench_budgets.sh
 
+      - name: Run replay performance gates
+        run: scripts/check_replay_performance_gates.sh
+
+      - name: Refresh replay performance baseline candidate on main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          scripts/check_replay_performance_gates.sh \
+            --check \
+            --write-baseline \
+            --baseline-source ci_main_merge \
+            --criterion-dir target-replay-performance-gates/criterion \
+            --artifacts-dir target/replay-performance-gates \
+            --baseline-file target/replay-performance-gates/replay_performance_baseline.json
+
       - name: Upload benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -312,6 +326,9 @@ jobs:
             target/criterion/ft-bench-meta.jsonl
             target/criterion/ft-bench-manifest-*.json
             target/criterion/bench-output.log
+            target/replay-performance-gates/replay-performance-report.json
+            target/replay-performance-gates/replay_performance_baseline.json
+            target/replay-performance-gates/replay-performance-bench.log
           if-no-files-found: ignore
           retention-days: 14
 

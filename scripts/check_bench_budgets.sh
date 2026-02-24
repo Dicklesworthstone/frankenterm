@@ -72,6 +72,13 @@ declare -A BUDGETS=(
     ["fork_hardening/spsc_capture_path"]=150000000      # lock-free roundtrip path, ceiling 150ms
     ["fork_hardening/snapshot_capture_path"]=250000000  # full clone + diff capture paths, ceiling 250ms
     ["fork_hardening/telemetry_overhead"]=20000000      # scope timer overhead, ceiling 20ms
+
+    # Replay pipeline performance lanes (ft-og6q6.7.3)
+    ["replay_capture/capture_overhead_per_event"]=10000000         # contract <1ms/event, coarse ceiling 10ms
+    ["replay_kernel/instant_mode_20000_events"]=500000000          # contract >=100k eps for 20k batch, coarse ceiling 500ms
+    ["replay_kernel/artifact_read_stream_250000_events"]=2000000000 # contract >=500k eps, coarse ceiling 2s
+    ["replay_diff/diff_1000_divergences"]=5000000000               # contract <1s, coarse ceiling 5s
+    ["replay_diff/standard_report_generation"]=500000000           # contract <100ms, coarse ceiling 500ms
 )
 
 # --- Step 1: Run benchmarks (unless --check) ---------------------------------

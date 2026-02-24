@@ -179,6 +179,36 @@ pub const CI_BUDGETS: &[CiBudgetEntry] = &[
         max_median_ns: 20_000_000,
         note: "fork hardening telemetry overhead: ceiling 20ms",
     },
+    // Replay capture overhead: contract <1ms/event, coarse CI ceiling 10ms/event.
+    CiBudgetEntry {
+        group_prefix: "replay_capture/capture_overhead_per_event",
+        max_median_ns: 10_000_000,
+        note: "replay capture overhead: contract <1ms/event, coarse ceiling 10ms",
+    },
+    // Replay kernel throughput: 20k events in <=200ms => >=100k eps. Coarse CI ceiling 500ms.
+    CiBudgetEntry {
+        group_prefix: "replay_kernel/instant_mode_20000_events",
+        max_median_ns: 500_000_000,
+        note: "replay kernel instant throughput: coarse ceiling 500ms per 20k events",
+    },
+    // Artifact read stream: contract >=500k eps for 250k events (~<=500ms). Coarse CI ceiling 2s.
+    CiBudgetEntry {
+        group_prefix: "replay_kernel/artifact_read_stream_250000_events",
+        max_median_ns: 2_000_000_000,
+        note: "artifact stream read: coarse ceiling 2s per 250k events",
+    },
+    // Replay diff latency: contract <1s for 1000 divergences. Coarse CI ceiling 5s.
+    CiBudgetEntry {
+        group_prefix: "replay_diff/diff_1000_divergences",
+        max_median_ns: 5_000_000_000,
+        note: "replay diff latency: coarse ceiling 5s for 1000 divergences",
+    },
+    // Replay report generation: contract <100ms. Coarse CI ceiling 500ms.
+    CiBudgetEntry {
+        group_prefix: "replay_diff/standard_report_generation",
+        max_median_ns: 500_000_000,
+        note: "replay report generation: coarse ceiling 500ms",
+    },
 ];
 
 #[derive(Serialize)]

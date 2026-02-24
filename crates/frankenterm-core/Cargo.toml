@@ -125,6 +125,18 @@ name = "delta_extraction"
 harness = false
 
 [[bench]]
+name = "replay_capture"
+harness = false
+
+[[bench]]
+name = "replay_kernel"
+harness = false
+
+[[bench]]
+name = "replay_diff"
+harness = false
+
+[[bench]]
 name = "fts_query"
 harness = false
 
