@@ -158,7 +158,7 @@ pub struct DriftSnapshot {
 }
 
 /// Compact evidence summary for persistence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceSummary {
     pub entry_count: usize,
     pub is_complete: bool,
