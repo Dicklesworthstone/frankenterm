@@ -18,7 +18,9 @@ use proptest::prelude::*;
 use frankenterm_core::policy::ActorKind;
 use frankenterm_core::recorder_audit::{AccessTier, ActorIdentity};
 use frankenterm_core::recorder_query::QueryEventKind;
-use frankenterm_core::recorder_replay::{ReplayConfig, ReplaySession, ReplayState, ReplayStats};
+use frankenterm_core::recorder_replay::{
+    ReplayConfig, ReplayEquivalenceLevel, ReplaySession, ReplayState, ReplayStats,
+};
 use frankenterm_core::recorder_retention::SensitivityTier;
 use frankenterm_core::recording::RecorderEventSource;
 
@@ -85,6 +87,7 @@ fn arb_replay_config() -> impl Strategy<Value = ReplayConfig> {
                 include_markers,
                 pane_filter: Vec::new(),
                 kind_filter: Vec::new(),
+                equivalence_level: ReplayEquivalenceLevel::Decision,
             },
         )
 }

@@ -10099,7 +10099,7 @@ async fn run_watcher(
             tracing::info!("Notification pipeline disabled (no active senders)");
             None
         } else {
-            let mute_storage = Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+            let mute_storage = Arc::new(frankenterm_core::runtime_compat::RwLock::new(
                 storage.clone(),
             ));
             let mut pipeline = NotificationPipeline::with_mute_store(
