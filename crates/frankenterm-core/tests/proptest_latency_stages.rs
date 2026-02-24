@@ -5600,4 +5600,228 @@ proptest! {
         let back: ChoreographyOutcome = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(outcome, back);
     }
+
+    // ── F3: Immediate-Ack / Deferred-Completion Property Tests ──
+
+    /// AckPhase serde roundtrip.
+    #[test]
+    fn ack_phase_serde_roundtrip(idx in 0u32..2) {
+        let phase = if idx == 0 { AckPhase::ImmediateAck } else { AckPhase::DeferredCompletion };
+        let json = serde_json::to_string(&phase).unwrap();
+        let back: AckPhase = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(phase, back);
+    }
+
+    /// CompletionReason serde roundtrip.
+    #[test]
+    fn completion_reason_serde_roundtrip(idx in 0u32..4, stage in arb_stage()) {
+        let reason = match idx % 4 {
+            0 => CompletionReason::Success,
+            1 => CompletionReason::Timeout,
+            2 => CompletionReason::UpstreamFailure { stage, detail: "err".to_string() },
+            _ => CompletionReason::Cancelled { reason: "test".to_string() },
+        };
+        let json = serde_json::to_string(&reason).unwrap();
+        let back: CompletionReason = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(reason, back);
+    }
+
+    /// AckToken serde roundtrip.
+    #[test]
+    fn ack_token_serde_roundtrip(cid in 1u64..1000, ts in 0u64..10_000_000, stage in arb_stage()) {
+        let token = AckToken {
+            correlation_id: cid,
+            acked_at_us: ts,
+            source_stage: stage,
+            summary: "test".to_string(),
+        };
+        let json = serde_json::to_string(&token).unwrap();
+        let back: AckToken = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(token, back);
+    }
+
+    /// AckProtocolConfig serde roundtrip.
+    #[test]
+    fn ack_config_serde_roundtrip(
+        ack_dl in 1000u64..1_000_000,
+        comp_dl in 1_000_000u64..100_000_000,
+    ) {
+        let cfg = AckProtocolConfig {
+            ack_deadline_us: ack_dl,
+            completion_deadline_us: comp_dl,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: AckProtocolConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(cfg, back);
+    }
+
+    /// issue_ack increments total_acks and pending_count.
+    #[test]
+    fn issue_ack_increments_totals(count in 1u32..20, stage in arb_stage()) {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        for i in 0..count {
+            mgr.issue_ack(stage, format!("ack-{i}"), 100 + i as u64);
+        }
+        prop_assert_eq!(mgr.total_acks(), count as u64);
+        prop_assert_eq!(mgr.pending_count(), count as u64);
+    }
+
+    /// Correlation IDs are monotonically increasing.
+    #[test]
+    fn correlation_ids_monotonic(count in 2u32..20, stage in arb_stage()) {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let mut prev_id = 0u64;
+        for i in 0..count {
+            let token = mgr.issue_ack(stage, format!("ack-{i}"), 100 + i as u64);
+            let is_increasing = token.correlation_id > prev_id;
+            prop_assert!(is_increasing, "CID not monotonic");
+            prev_id = token.correlation_id;
+        }
+    }
+
+    /// Complete removes from pending.
+    #[test]
+    fn complete_removes_pending(stage in arb_stage()) {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let token = mgr.issue_ack(stage, "x".to_string(), 100);
+        prop_assert_eq!(mgr.pending_count(), 1);
+        mgr.complete(token.correlation_id, CompletionReason::Success, 200);
+        prop_assert_eq!(mgr.pending_count(), 0);
+        prop_assert_eq!(mgr.total_completions(), 1);
+    }
+
+    /// deferred_latency_us = completed_at - acked_at.
+    #[test]
+    fn deferred_latency_computed(
+        ack_ts in 100u64..1_000_000,
+        delta in 1u64..5_000_000,
+        stage in arb_stage(),
+    ) {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let token = mgr.issue_ack(stage, "x".to_string(), ack_ts);
+        let result = mgr.complete(token.correlation_id, CompletionReason::Success, ack_ts + delta).unwrap();
+        prop_assert_eq!(result.deferred_latency_us, delta);
+    }
+
+    /// sweep_timeouts only times out entries past completion_deadline.
+    #[test]
+    fn sweep_respects_deadline(
+        deadline in 100_000u64..10_000_000,
+        stage in arb_stage(),
+    ) {
+        let cfg = AckProtocolConfig {
+            completion_deadline_us: deadline,
+            ..Default::default()
+        };
+        let mut mgr = AckProtocolManager::new(cfg);
+        let ack_ts = 1000u64;
+        mgr.issue_ack(stage, "x".to_string(), ack_ts);
+        // Before deadline: no timeout.
+        let results = mgr.sweep_timeouts(ack_ts + deadline - 1);
+        prop_assert!(results.is_empty());
+        prop_assert_eq!(mgr.pending_count(), 1);
+        // At/after deadline: timeout.
+        let results = mgr.sweep_timeouts(ack_ts + deadline);
+        prop_assert_eq!(results.len(), 1);
+        prop_assert_eq!(mgr.pending_count(), 0);
+    }
+
+    /// completion_rate in [0.0, 1.0].
+    #[test]
+    fn completion_rate_bounded(ack_count in 1u32..20, complete_count in 0u32..20, stage in arb_stage()) {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        for i in 0..ack_count {
+            mgr.issue_ack(stage, format!("{i}"), 100 + i as u64);
+        }
+        let to_complete = complete_count.min(ack_count);
+        for cid in 1..=to_complete as u64 {
+            mgr.complete(cid, CompletionReason::Success, 10_000);
+        }
+        let rate = mgr.completion_rate();
+        prop_assert!(rate >= 0.0 && rate <= 1.0, "rate={}", rate);
+    }
+
+    /// timeout_rate in [0.0, 1.0].
+    #[test]
+    fn timeout_rate_bounded(count in 1u32..10, stage in arb_stage()) {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        for i in 0..count {
+            mgr.issue_ack(stage, format!("{i}"), 100 + i as u64);
+        }
+        mgr.sweep_timeouts(100_000_000);
+        let rate = mgr.timeout_rate();
+        prop_assert!(rate >= 0.0 && rate <= 1.0, "rate={}", rate);
+    }
+
+    /// reset clears everything.
+    #[test]
+    fn ack_reset_clears_all(count in 1u32..10, stage in arb_stage()) {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        for i in 0..count {
+            mgr.issue_ack(stage, format!("{i}"), 100 + i as u64);
+        }
+        mgr.record_slow_ack();
+        mgr.reset();
+        prop_assert_eq!(mgr.total_acks(), 0);
+        prop_assert_eq!(mgr.total_completions(), 0);
+        prop_assert_eq!(mgr.total_timeouts(), 0);
+        prop_assert_eq!(mgr.pending_count(), 0);
+        prop_assert_eq!(mgr.slow_ack_count(), 0);
+    }
+
+    /// issue_ack_checked detects slow acks.
+    #[test]
+    fn issue_ack_checked_slow_detection(
+        deadline in 100u64..100_000,
+        latency in 0u64..200_000,
+        stage in arb_stage(),
+    ) {
+        let cfg = AckProtocolConfig {
+            ack_deadline_us: deadline,
+            ..Default::default()
+        };
+        let mut mgr = AckProtocolManager::new(cfg);
+        let received_at = 1000u64;
+        mgr.issue_ack_checked(stage, "x".to_string(), received_at, received_at + latency);
+        if latency > deadline {
+            prop_assert_eq!(mgr.slow_ack_count(), 1);
+        } else {
+            prop_assert_eq!(mgr.slow_ack_count(), 0);
+        }
+    }
+
+    /// make_progress clamps fraction to [0.0, 1.0].
+    #[test]
+    fn make_progress_fraction_clamped(frac in -2.0f64..3.0, stage in arb_stage()) {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        let token = mgr.issue_ack(stage, "x".to_string(), 100);
+        let p = mgr.make_progress(token.correlation_id, frac, "msg".to_string(), 200).unwrap();
+        prop_assert!(p.fraction >= 0.0 && p.fraction <= 1.0, "fraction={}", p.fraction);
+    }
+
+    /// AckProtocolDegradation serde roundtrip.
+    #[test]
+    fn ack_degradation_serde(idx in 0u32..3) {
+        let deg = match idx % 3 {
+            0 => AckProtocolDegradation::Healthy,
+            1 => AckProtocolDegradation::AckSlow { slow_count: 5 },
+            _ => AckProtocolDegradation::CompletionTimeout { timeout_count: 3 },
+        };
+        let json = serde_json::to_string(&deg).unwrap();
+        let back: AckProtocolDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(deg, back);
+    }
+
+    /// AckProtocolSnapshot serde roundtrip.
+    #[test]
+    fn ack_snapshot_serde(stage in arb_stage()) {
+        let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
+        mgr.issue_ack(stage, "x".to_string(), 100);
+        mgr.complete(1, CompletionReason::Success, 200);
+        let snap = mgr.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: AckProtocolSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap, back);
+    }
 }
