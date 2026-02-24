@@ -10849,11 +10849,17 @@ pub struct TraceStep {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TraceAction {
     /// Observe a latency value at a stage.
-    ObserveLatency { stage: LatencyStage, latency_us: f64 },
+    ObserveLatency {
+        stage: LatencyStage,
+        latency_us: f64,
+    },
     /// Admit a work item to the scheduler.
     SchedulerAdmit { lane: SchedulerLane, cost_us: f64 },
     /// Trigger recovery at a stage.
-    RecoveryStep { level_before: MitigationLevel, level_after: MitigationLevel },
+    RecoveryStep {
+        level_before: MitigationLevel,
+        level_after: MitigationLevel,
+    },
     /// Advance the epoch.
     EpochAdvance { new_epoch: u64 },
     /// Reset a subsystem.
@@ -10869,7 +10875,10 @@ impl fmt::Display for TraceAction {
             Self::SchedulerAdmit { lane, cost_us } => {
                 write!(f, "admit({lane:?}, {cost_us:.1}μs)")
             }
-            Self::RecoveryStep { level_before, level_after } => {
+            Self::RecoveryStep {
+                level_before,
+                level_after,
+            } => {
                 write!(f, "recover({level_before} -> {level_after})")
             }
             Self::EpochAdvance { new_epoch } => write!(f, "epoch({new_epoch})"),
@@ -10968,23 +10977,44 @@ pub struct ModelCheckerSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModelCheckVerdict {
     /// No violations found within exploration bounds.
-    NoViolation { states_explored: u64, depth_reached: u64 },
+    NoViolation {
+        states_explored: u64,
+        depth_reached: u64,
+    },
     /// Violations found.
-    ViolationsFound { counterexamples: Vec<Counterexample> },
+    ViolationsFound {
+        counterexamples: Vec<Counterexample>,
+    },
     /// Exploration was terminated early (budget exhausted).
-    Incomplete { states_explored: u64, reason: String },
+    Incomplete {
+        states_explored: u64,
+        reason: String,
+    },
 }
 
 impl fmt::Display for ModelCheckVerdict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoViolation { states_explored, depth_reached } => {
-                write!(f, "NO_VIOLATION ({states_explored} states, depth {depth_reached})")
+            Self::NoViolation {
+                states_explored,
+                depth_reached,
+            } => {
+                write!(
+                    f,
+                    "NO_VIOLATION ({states_explored} states, depth {depth_reached})"
+                )
             }
             Self::ViolationsFound { counterexamples } => {
-                write!(f, "VIOLATIONS_FOUND ({} counterexamples)", counterexamples.len())
+                write!(
+                    f,
+                    "VIOLATIONS_FOUND ({} counterexamples)",
+                    counterexamples.len()
+                )
             }
-            Self::Incomplete { states_explored, reason } => {
+            Self::Incomplete {
+                states_explored,
+                reason,
+            } => {
                 write!(f, "INCOMPLETE ({states_explored} states): {reason}")
             }
         }
@@ -11452,7 +11482,13 @@ impl DeterministicTrace {
     }
 
     /// Append an entry, auto-assigning the next sequence number.
-    pub fn push(&mut self, action: TraceAction, domain: InvariantDomain, timestamp_us: u64, causal_parent: Option<u64>) {
+    pub fn push(
+        &mut self,
+        action: TraceAction,
+        domain: InvariantDomain,
+        timestamp_us: u64,
+        causal_parent: Option<u64>,
+    ) {
         let seq = self.entries.len() as u64;
         let fingerprint = TraceEntry::compute_fingerprint(&action, domain);
         self.entries.push(TraceEntry {
@@ -11486,7 +11522,11 @@ impl fmt::Display for DeterministicTrace {
         write!(
             f,
             "Trace[{}, id={}, seed={}, entries={}, duration={}μs]",
-            self.version, self.trace_id, self.seed, self.entries.len(), self.duration_us
+            self.version,
+            self.trace_id,
+            self.seed,
+            self.entries.len(),
+            self.duration_us
         )
     }
 }
@@ -11517,7 +11557,10 @@ impl fmt::Display for ReplayComparisonResult {
             Self::Isomorphic { reordered_count } => {
                 write!(f, "isomorphic ({reordered_count} reordered)")
             }
-            Self::Divergent { first_divergence_idx, description } => {
+            Self::Divergent {
+                first_divergence_idx,
+                description,
+            } => {
                 write!(f, "divergent at [{first_divergence_idx}]: {description}")
             }
         }
@@ -11648,10 +11691,7 @@ impl ReplayCanonicalizer {
         // Sort by the configured ordering.
         match self.config.ordering {
             CanonicalOrdering::Temporal => {
-                entries.sort_by(|a, b| {
-                    a.timestamp_us.cmp(&b.timestamp_us)
-                        .then(a.seq.cmp(&b.seq))
-                });
+                entries.sort_by(|a, b| a.timestamp_us.cmp(&b.timestamp_us).then(a.seq.cmp(&b.seq)));
             }
             CanonicalOrdering::DomainGrouped => {
                 entries.sort_by(|a, b| {
@@ -11699,7 +11739,11 @@ impl ReplayCanonicalizer {
     }
 
     /// Compare two traces for replay isomorphism.
-    pub fn compare(&mut self, a: &DeterministicTrace, b: &DeterministicTrace) -> ReplayComparisonResult {
+    pub fn compare(
+        &mut self,
+        a: &DeterministicTrace,
+        b: &DeterministicTrace,
+    ) -> ReplayComparisonResult {
         self.comparisons_made += 1;
 
         let ca = self.canonicalize(a);
@@ -11733,16 +11777,24 @@ impl ReplayCanonicalizer {
 
         if identical && first_diff.is_none() {
             // Check if the original ordering was the same.
-            let orig_same = a.entries.iter().zip(b.entries.iter())
+            let orig_same = a
+                .entries
+                .iter()
+                .zip(b.entries.iter())
                 .all(|(ea, eb)| ea.fingerprint == eb.fingerprint && ea.seq == eb.seq);
             if orig_same {
                 return ReplayComparisonResult::Identical;
             }
             // Same content after canonicalization but different original order.
-            let reordered = a.entries.iter().zip(b.entries.iter())
+            let reordered = a
+                .entries
+                .iter()
+                .zip(b.entries.iter())
                 .filter(|(ea, eb)| ea.seq != eb.seq || ea.fingerprint != eb.fingerprint)
                 .count();
-            return ReplayComparisonResult::Isomorphic { reordered_count: reordered };
+            return ReplayComparisonResult::Isomorphic {
+                reordered_count: reordered,
+            };
         }
 
         if let Some(idx) = first_diff {
@@ -11756,14 +11808,23 @@ impl ReplayCanonicalizer {
         }
 
         // Timestamps differ but content is isomorphic.
-        let reordered = a.entries.iter().zip(b.entries.iter())
+        let reordered = a
+            .entries
+            .iter()
+            .zip(b.entries.iter())
             .filter(|(ea, eb)| ea.timestamp_us != eb.timestamp_us)
             .count();
-        ReplayComparisonResult::Isomorphic { reordered_count: reordered }
+        ReplayComparisonResult::Isomorphic {
+            reordered_count: reordered,
+        }
     }
 
     /// Generate mismatch diagnostics between two traces.
-    pub fn diagnose_mismatches(&self, a: &DeterministicTrace, b: &DeterministicTrace) -> Vec<TraceMismatch> {
+    pub fn diagnose_mismatches(
+        &self,
+        a: &DeterministicTrace,
+        b: &DeterministicTrace,
+    ) -> Vec<TraceMismatch> {
         let mut mismatches = Vec::new();
         let max_len = a.entries.len().max(b.entries.len());
         for i in 0..max_len {
@@ -11773,10 +11834,7 @@ impl ReplayCanonicalizer {
                         canonical_idx: i,
                         expected_fingerprint: ea.fingerprint,
                         actual_fingerprint: Some(eb.fingerprint),
-                        explanation: format!(
-                            "expected {} but got {}",
-                            ea.action, eb.action
-                        ),
+                        explanation: format!("expected {} but got {}", ea.action, eb.action),
                     });
                 }
                 (Some(ea), None) => {
@@ -11802,7 +11860,12 @@ impl ReplayCanonicalizer {
     }
 
     /// Upgrade a v1 trace (from ModelChecker) to v2 format.
-    pub fn upgrade_trace(&mut self, steps: &[TraceStep], trace_id: String, seed: u64) -> DeterministicTrace {
+    pub fn upgrade_trace(
+        &mut self,
+        steps: &[TraceStep],
+        trace_id: String,
+        seed: u64,
+    ) -> DeterministicTrace {
         let mut trace = DeterministicTrace::new_v2(trace_id, seed, 0);
         for step in steps {
             let domain = action_domain(&step.action);
@@ -11839,7 +11902,13 @@ impl ReplayCanonicalizer {
     }
 
     /// Create a log entry for a canonicalization operation.
-    pub fn log_entry(&self, trace_id: &str, input_entries: usize, output_entries: usize, duration_us: u64) -> CanonicalizerLogEntry {
+    pub fn log_entry(
+        &self,
+        trace_id: &str,
+        input_entries: usize,
+        output_entries: usize,
+        duration_us: u64,
+    ) -> CanonicalizerLogEntry {
         CanonicalizerLogEntry {
             timestamp_us: self.entries_processed, // monotonic proxy
             trace_id: trace_id.to_string(),
@@ -11878,8 +11947,9 @@ impl ReplayCanonicalizer {
     pub fn verify_determinism(&mut self, trace: &DeterministicTrace) -> bool {
         let c1 = self.canonicalize(trace);
         let c2 = self.canonicalize(trace);
-        c1.entries.iter().zip(c2.entries.iter())
-            .all(|(a, b)| a.fingerprint == b.fingerprint && a.seq == b.seq && a.timestamp_us == b.timestamp_us)
+        c1.entries.iter().zip(c2.entries.iter()).all(|(a, b)| {
+            a.fingerprint == b.fingerprint && a.seq == b.seq && a.timestamp_us == b.timestamp_us
+        })
     }
 
     /// Extract a sub-trace containing only entries in the given domain.
@@ -11888,11 +11958,16 @@ impl ReplayCanonicalizer {
         trace: &DeterministicTrace,
         domain: InvariantDomain,
     ) -> DeterministicTrace {
-        let entries: Vec<TraceEntry> = trace.entries.iter()
+        let entries: Vec<TraceEntry> = trace
+            .entries
+            .iter()
             .filter(|e| e.domain == domain)
             .cloned()
             .enumerate()
-            .map(|(i, mut e)| { e.seq = i as u64; e })
+            .map(|(i, mut e)| {
+                e.seq = i as u64;
+                e
+            })
             .collect();
         DeterministicTrace {
             version: trace.version,
@@ -11905,11 +11980,7 @@ impl ReplayCanonicalizer {
     }
 
     /// Extract the causal dependency chain for a given entry.
-    pub fn causal_chain(
-        &self,
-        trace: &DeterministicTrace,
-        entry_seq: u64,
-    ) -> Vec<u64> {
+    pub fn causal_chain(&self, trace: &DeterministicTrace, entry_seq: u64) -> Vec<u64> {
         let mut chain = Vec::new();
         let mut current = Some(entry_seq);
         let index: std::collections::HashMap<u64, &TraceEntry> =
@@ -11935,15 +12006,14 @@ impl ReplayCanonicalizer {
     }
 
     /// Find entries whose fingerprint appears exactly once (unique actions).
-    pub fn unique_fingerprints(
-        &self,
-        trace: &DeterministicTrace,
-    ) -> Vec<u64> {
+    pub fn unique_fingerprints(&self, trace: &DeterministicTrace) -> Vec<u64> {
         let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
         for entry in &trace.entries {
             *counts.entry(entry.fingerprint).or_insert(0) += 1;
         }
-        trace.entries.iter()
+        trace
+            .entries
+            .iter()
             .filter(|e| counts.get(&e.fingerprint) == Some(&1))
             .map(|e| e.seq)
             .collect()
@@ -11955,15 +12025,15 @@ impl ReplayCanonicalizer {
         a: &DeterministicTrace,
         b: &DeterministicTrace,
     ) -> DeterministicTrace {
-        let mut entries: Vec<TraceEntry> = a.entries.iter()
-            .chain(b.entries.iter())
-            .cloned()
-            .collect();
+        let mut entries: Vec<TraceEntry> =
+            a.entries.iter().chain(b.entries.iter()).cloned().collect();
         entries.sort_by(|x, y| x.timestamp_us.cmp(&y.timestamp_us).then(x.seq.cmp(&y.seq)));
         for (i, entry) in entries.iter_mut().enumerate() {
             entry.seq = i as u64;
         }
-        let duration = entries.last().map_or(0, |e| e.timestamp_us)
+        let duration = entries
+            .last()
+            .map_or(0, |e| e.timestamp_us)
             .saturating_sub(a.created_at_us.min(b.created_at_us));
         DeterministicTrace {
             version: TraceFormatVersion::V2,
@@ -11982,11 +12052,16 @@ impl ReplayCanonicalizer {
         start_us: u64,
         end_us: u64,
     ) -> DeterministicTrace {
-        let entries: Vec<TraceEntry> = trace.entries.iter()
+        let entries: Vec<TraceEntry> = trace
+            .entries
+            .iter()
             .filter(|e| e.timestamp_us >= start_us && e.timestamp_us <= end_us)
             .cloned()
             .enumerate()
-            .map(|(i, mut e)| { e.seq = i as u64; e })
+            .map(|(i, mut e)| {
+                e.seq = i as u64;
+                e
+            })
             .collect();
         DeterministicTrace {
             version: trace.version,
@@ -12032,6 +12107,443 @@ fn domain_sort_key(domain: InvariantDomain) -> u8 {
         InvariantDomain::Budget => 1,
         InvariantDomain::Recovery => 2,
         InvariantDomain::Composition => 3,
+    }
+}
+
+// ── E4: Optimization Isomorphism Proof Gate ───────────────────────
+//
+// Golden artifact management, optimization proof gates, semantic drift
+// detection, and proof summary generation for CI integration.
+
+/// A golden artifact: a reference trace with checksum for regression checks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GoldenArtifact {
+    /// Unique identifier for this artifact (e.g., "scheduler-hot-path-v2").
+    pub artifact_id: String,
+    /// Version of the artifact (incremented on approved changes).
+    pub version: u64,
+    /// The reference trace.
+    pub trace: DeterministicTrace,
+    /// FNV-1a digest of the canonical trace.
+    pub checksum: u64,
+    /// Description of the optimization this artifact guards.
+    pub description: String,
+    /// Timestamp when this artifact was created/updated.
+    pub created_at_us: u64,
+}
+
+impl GoldenArtifact {
+    /// Create a new golden artifact from a trace.
+    pub fn new(artifact_id: String, trace: DeterministicTrace, description: String, created_at_us: u64) -> Self {
+        let checksum = trace.digest();
+        Self {
+            artifact_id,
+            version: 1,
+            trace,
+            checksum,
+            description,
+            created_at_us,
+        }
+    }
+
+    /// Verify that the stored checksum matches the trace digest.
+    pub fn verify_checksum(&self) -> bool {
+        self.trace.digest() == self.checksum
+    }
+
+    /// Update the golden artifact with a new trace (bumps version).
+    pub fn update(&mut self, trace: DeterministicTrace, created_at_us: u64) {
+        self.checksum = trace.digest();
+        self.trace = trace;
+        self.version += 1;
+        self.created_at_us = created_at_us;
+    }
+}
+
+impl fmt::Display for GoldenArtifact {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Golden[{} v{}, entries={}, checksum={:#x}]",
+            self.artifact_id, self.version, self.trace.len(), self.checksum
+        )
+    }
+}
+
+/// Verdict from an optimization proof gate check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProofGateVerdict {
+    /// Optimization preserves behavior exactly.
+    Equivalent,
+    /// Optimization preserves behavior under reordering (isomorphic).
+    IsomorphicEquivalent { reordered_count: usize },
+    /// Semantic drift detected — optimization changed behavior.
+    SemanticDrift {
+        /// Index of the first divergent entry.
+        first_divergence_idx: usize,
+        /// Mismatches found.
+        mismatches: Vec<TraceMismatch>,
+        /// Human-readable summary.
+        summary: String,
+    },
+    /// Checksum mismatch on golden artifact (corruption or tampering).
+    ChecksumFailure {
+        expected: u64,
+        actual: u64,
+    },
+}
+
+impl ProofGateVerdict {
+    /// Whether the verdict allows the optimization to proceed.
+    pub fn is_pass(&self) -> bool {
+        matches!(self, Self::Equivalent | Self::IsomorphicEquivalent { .. })
+    }
+
+    /// Whether the verdict blocks the optimization.
+    pub fn is_fail(&self) -> bool {
+        !self.is_pass()
+    }
+}
+
+impl fmt::Display for ProofGateVerdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Equivalent => write!(f, "PASS: equivalent"),
+            Self::IsomorphicEquivalent { reordered_count } => {
+                write!(f, "PASS: isomorphic ({reordered_count} reordered)")
+            }
+            Self::SemanticDrift { first_divergence_idx, mismatches, summary } => {
+                write!(
+                    f,
+                    "FAIL: semantic drift at [{first_divergence_idx}], {} mismatches: {summary}",
+                    mismatches.len()
+                )
+            }
+            Self::ChecksumFailure { expected, actual } => {
+                write!(f, "FAIL: checksum {expected:#x} != {actual:#x}")
+            }
+        }
+    }
+}
+
+/// Configuration for the proof gate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProofGateConfig {
+    /// Whether to allow isomorphic equivalence (reordered but same content).
+    pub allow_isomorphic: bool,
+    /// Maximum number of mismatches to report before truncating.
+    pub max_mismatches: usize,
+    /// Canonicalization config to use for comparisons.
+    pub canonicalizer_config: CanonicalizerConfig,
+}
+
+impl Default for ProofGateConfig {
+    fn default() -> Self {
+        Self {
+            allow_isomorphic: true,
+            max_mismatches: 50,
+            canonicalizer_config: CanonicalizerConfig::default(),
+        }
+    }
+}
+
+/// A proof summary for logging/CI output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProofSummary {
+    /// Artifact being checked.
+    pub artifact_id: String,
+    /// Golden version tested against.
+    pub golden_version: u64,
+    /// Verdict of the check.
+    pub verdict: ProofGateVerdict,
+    /// Number of entries in the candidate trace.
+    pub candidate_entries: usize,
+    /// Number of entries in the golden trace.
+    pub golden_entries: usize,
+    /// Duration of the proof check (μs).
+    pub check_duration_us: u64,
+    /// Timestamp of the check.
+    pub timestamp_us: u64,
+}
+
+impl fmt::Display for ProofSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Proof[{} v{}: {} ({}/{}e, {}μs)]",
+            self.artifact_id,
+            self.golden_version,
+            self.verdict,
+            self.candidate_entries,
+            self.golden_entries,
+            self.check_duration_us,
+        )
+    }
+}
+
+/// Snapshot of the proof gate state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProofGateSnapshot {
+    /// Total checks run.
+    pub checks_run: u64,
+    /// Total passes (equivalent or isomorphic).
+    pub passes: u64,
+    /// Total failures (drift or checksum).
+    pub failures: u64,
+    /// Number of golden artifacts stored.
+    pub artifacts_count: usize,
+    /// Configuration.
+    pub config: ProofGateConfig,
+}
+
+/// Degradation state for the proof gate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProofGateDegradation {
+    /// Operating normally.
+    Healthy,
+    /// High failure rate suggests unstable optimizations.
+    HighFailureRate { rate: f64 },
+    /// Many artifacts may slow down CI checks.
+    HighArtifactCount { count: usize },
+}
+
+impl fmt::Display for ProofGateDegradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "healthy"),
+            Self::HighFailureRate { rate } => write!(f, "high-failure-rate({rate:.2})"),
+            Self::HighArtifactCount { count } => write!(f, "high-artifact-count({count})"),
+        }
+    }
+}
+
+/// Log entry for proof gate operations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProofGateLogEntry {
+    /// Timestamp.
+    pub timestamp_us: u64,
+    /// Artifact checked.
+    pub artifact_id: String,
+    /// Pass or fail.
+    pub passed: bool,
+    /// Duration of check.
+    pub check_duration_us: u64,
+}
+
+/// The optimization isomorphism proof gate.
+pub struct ProofGate {
+    config: ProofGateConfig,
+    artifacts: Vec<GoldenArtifact>,
+    canonicalizer: ReplayCanonicalizer,
+    checks_run: u64,
+    passes: u64,
+    failures: u64,
+}
+
+impl ProofGate {
+    /// Create a new proof gate with the given config.
+    pub fn new(config: ProofGateConfig) -> Self {
+        let canonicalizer = ReplayCanonicalizer::new(config.canonicalizer_config.clone());
+        Self {
+            config,
+            artifacts: Vec::new(),
+            canonicalizer,
+            checks_run: 0,
+            passes: 0,
+            failures: 0,
+        }
+    }
+
+    /// Register a golden artifact.
+    pub fn register_golden(&mut self, artifact: GoldenArtifact) {
+        // Replace if same artifact_id exists.
+        if let Some(pos) = self.artifacts.iter().position(|a| a.artifact_id == artifact.artifact_id) {
+            self.artifacts[pos] = artifact;
+        } else {
+            self.artifacts.push(artifact);
+        }
+    }
+
+    /// Look up a golden artifact by ID.
+    pub fn get_golden(&self, artifact_id: &str) -> Option<&GoldenArtifact> {
+        self.artifacts.iter().find(|a| a.artifact_id == artifact_id)
+    }
+
+    /// Check a candidate trace against a golden artifact.
+    pub fn check(
+        &mut self,
+        artifact_id: &str,
+        candidate: &DeterministicTrace,
+        timestamp_us: u64,
+    ) -> ProofSummary {
+        self.checks_run += 1;
+
+        let golden = self.artifacts.iter().find(|a| a.artifact_id == artifact_id);
+        let golden = match golden {
+            Some(g) => g.clone(),
+            None => {
+                self.failures += 1;
+                return ProofSummary {
+                    artifact_id: artifact_id.to_string(),
+                    golden_version: 0,
+                    verdict: ProofGateVerdict::SemanticDrift {
+                        first_divergence_idx: 0,
+                        mismatches: vec![],
+                        summary: format!("golden artifact '{artifact_id}' not found"),
+                    },
+                    candidate_entries: candidate.len(),
+                    golden_entries: 0,
+                    check_duration_us: 0,
+                    timestamp_us,
+                };
+            }
+        };
+
+        // Verify golden checksum.
+        if !golden.verify_checksum() {
+            self.failures += 1;
+            return ProofSummary {
+                artifact_id: artifact_id.to_string(),
+                golden_version: golden.version,
+                verdict: ProofGateVerdict::ChecksumFailure {
+                    expected: golden.checksum,
+                    actual: golden.trace.digest(),
+                },
+                candidate_entries: candidate.len(),
+                golden_entries: golden.trace.len(),
+                check_duration_us: 0,
+                timestamp_us,
+            };
+        }
+
+        // Compare candidate with golden.
+        let comparison = self.canonicalizer.compare(&golden.trace, candidate);
+        let verdict = match comparison {
+            ReplayComparisonResult::Identical => ProofGateVerdict::Equivalent,
+            ReplayComparisonResult::Isomorphic { reordered_count } if self.config.allow_isomorphic => {
+                ProofGateVerdict::IsomorphicEquivalent { reordered_count }
+            }
+            ReplayComparisonResult::Isomorphic { reordered_count } => {
+                ProofGateVerdict::SemanticDrift {
+                    first_divergence_idx: 0,
+                    mismatches: vec![],
+                    summary: format!("isomorphic not allowed ({reordered_count} reordered)"),
+                }
+            }
+            ReplayComparisonResult::Divergent { first_divergence_idx, description } => {
+                let mut mismatches = self.canonicalizer.diagnose_mismatches(&golden.trace, candidate);
+                if mismatches.len() > self.config.max_mismatches {
+                    mismatches.truncate(self.config.max_mismatches);
+                }
+                ProofGateVerdict::SemanticDrift {
+                    first_divergence_idx,
+                    mismatches,
+                    summary: description,
+                }
+            }
+        };
+
+        let passed = verdict.is_pass();
+        if passed {
+            self.passes += 1;
+        } else {
+            self.failures += 1;
+        }
+
+        ProofSummary {
+            artifact_id: artifact_id.to_string(),
+            golden_version: golden.version,
+            verdict,
+            candidate_entries: candidate.len(),
+            golden_entries: golden.trace.len(),
+            check_duration_us: 0,
+            timestamp_us,
+        }
+    }
+
+    /// Check all registered golden artifacts against a set of candidates.
+    pub fn check_all(
+        &mut self,
+        candidates: &std::collections::HashMap<String, DeterministicTrace>,
+        timestamp_us: u64,
+    ) -> Vec<ProofSummary> {
+        let artifact_ids: Vec<String> = self.artifacts.iter().map(|a| a.artifact_id.clone()).collect();
+        let mut summaries = Vec::new();
+        for id in &artifact_ids {
+            if let Some(candidate) = candidates.get(id) {
+                summaries.push(self.check(id, candidate, timestamp_us));
+            }
+        }
+        summaries
+    }
+
+    /// Get a snapshot.
+    pub fn snapshot(&self) -> ProofGateSnapshot {
+        ProofGateSnapshot {
+            checks_run: self.checks_run,
+            passes: self.passes,
+            failures: self.failures,
+            artifacts_count: self.artifacts.len(),
+            config: self.config.clone(),
+        }
+    }
+
+    /// Detect degradation.
+    pub fn detect_degradation(&self) -> ProofGateDegradation {
+        if self.artifacts.len() > 100 {
+            return ProofGateDegradation::HighArtifactCount { count: self.artifacts.len() };
+        }
+        if self.checks_run > 0 {
+            let rate = self.failures as f64 / self.checks_run as f64;
+            if rate > 0.5 {
+                return ProofGateDegradation::HighFailureRate { rate };
+            }
+        }
+        ProofGateDegradation::Healthy
+    }
+
+    /// Create a log entry.
+    pub fn log_entry(&self, artifact_id: &str, passed: bool, check_duration_us: u64) -> ProofGateLogEntry {
+        ProofGateLogEntry {
+            timestamp_us: self.checks_run,
+            artifact_id: artifact_id.to_string(),
+            passed,
+            check_duration_us,
+        }
+    }
+
+    /// Number of registered artifacts.
+    pub fn artifact_count(&self) -> usize {
+        self.artifacts.len()
+    }
+
+    /// All artifact IDs.
+    pub fn artifact_ids(&self) -> Vec<String> {
+        self.artifacts.iter().map(|a| a.artifact_id.clone()).collect()
+    }
+
+    /// Reset counters (keeps artifacts).
+    pub fn reset_counters(&mut self) {
+        self.checks_run = 0;
+        self.passes = 0;
+        self.failures = 0;
+    }
+
+    /// Remove a golden artifact by ID.
+    pub fn remove_golden(&mut self, artifact_id: &str) -> bool {
+        let len_before = self.artifacts.len();
+        self.artifacts.retain(|a| a.artifact_id != artifact_id);
+        self.artifacts.len() < len_before
+    }
+
+    /// Access inner canonicalizer.
+    pub fn canonicalizer(&self) -> &ReplayCanonicalizer {
+        &self.canonicalizer
+    }
+
+    /// Access config.
+    pub fn config(&self) -> &ProofGateConfig {
+        &self.config
     }
 }
 
@@ -20767,8 +21279,7 @@ mod tests {
             recovery_count: 1,
         };
         let protocol = RecoveryProtocol::default();
-        let results =
-            checker.check_from_enforcement_state(&curr, &prev, &protocol, 5000);
+        let results = checker.check_from_enforcement_state(&curr, &prev, &protocol, 5000);
         // Should check: escalation_count_mono, recovery_count_mono, level_in_range
         // No recovery happened (same level), so no gradual or cooldown checks
         assert_eq!(results.len(), 3);
@@ -20794,8 +21305,7 @@ mod tests {
             recovery_count: 2,
         };
         let protocol = RecoveryProtocol::default();
-        let results =
-            checker.check_from_enforcement_state(&curr, &prev, &protocol, 6000);
+        let results = checker.check_from_enforcement_state(&curr, &prev, &protocol, 6000);
         // escalation_count_mono, recovery_count_mono, level_in_range, gradual_deescalation, cooldown_enforced
         assert_eq!(results.len(), 5);
         assert!(results.iter().all(|r| r.passed()));
@@ -20873,11 +21383,7 @@ mod tests {
             eval_time_us: 0,
             timestamp_us: 100,
         };
-        let violated = mc.step(
-            TraceAction::EpochAdvance { new_epoch: 1 },
-            &[result],
-            100,
-        );
+        let violated = mc.step(TraceAction::EpochAdvance { new_epoch: 1 }, &[result], 100);
         assert!(!violated);
         assert_eq!(mc.states_explored(), 1);
         assert_eq!(mc.counterexample_count(), 0);
@@ -20922,7 +21428,11 @@ mod tests {
             eval_time_us: 0,
             timestamp_us: 100,
         };
-        mc.step(TraceAction::EpochAdvance { new_epoch: 1 }, &[result.clone()], 100);
+        mc.step(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            &[result.clone()],
+            100,
+        );
         mc.step(TraceAction::EpochAdvance { new_epoch: 2 }, &[result], 200);
         assert_eq!(mc.states_explored(), 2);
         mc.new_trace();
@@ -21136,10 +21646,7 @@ mod tests {
 
     #[test]
     fn test_model_checker_degradation_display() {
-        assert_eq!(
-            ModelCheckerDegradation::Healthy.to_string(),
-            "healthy"
-        );
+        assert_eq!(ModelCheckerDegradation::Healthy.to_string(), "healthy");
         let vf = ModelCheckerDegradation::ViolationsFound { count: 3 };
         assert!(vf.to_string().contains("violations(3)"));
         let hr = ModelCheckerDegradation::HighViolationRate {
@@ -21173,8 +21680,16 @@ mod tests {
             eval_time_us: 0,
             timestamp_us: 0,
         };
-        mc.step(TraceAction::EpochAdvance { new_epoch: 1 }, &[ok.clone()], 100);
-        mc.step(TraceAction::EpochAdvance { new_epoch: 2 }, &[ok.clone()], 200);
+        mc.step(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            &[ok.clone()],
+            100,
+        );
+        mc.step(
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            &[ok.clone()],
+            200,
+        );
         let bad = InvariantCheckResult {
             predicate_id: "sched.cap".to_string(),
             domain: InvariantDomain::Scheduler,
@@ -21223,8 +21738,7 @@ mod tests {
             ),
         ];
         let verdict = mc.run_scheduler_scenario(&mut checker, &actions, 1000);
-        let is_no_violation =
-            matches!(verdict, ModelCheckVerdict::NoViolation { .. });
+        let is_no_violation = matches!(verdict, ModelCheckVerdict::NoViolation { .. });
         assert!(is_no_violation);
     }
 
@@ -21254,8 +21768,7 @@ mod tests {
             ),
         ];
         let verdict = mc.run_scheduler_scenario(&mut checker, &actions, 2000);
-        let is_violations =
-            matches!(verdict, ModelCheckVerdict::ViolationsFound { .. });
+        let is_violations = matches!(verdict, ModelCheckVerdict::ViolationsFound { .. });
         assert!(is_violations);
     }
 
@@ -21274,8 +21787,7 @@ mod tests {
             }],
         )];
         let verdict = mc.run_budget_scenario(&mut checker, &actions, 3000);
-        let is_no_violation =
-            matches!(verdict, ModelCheckVerdict::NoViolation { .. });
+        let is_no_violation = matches!(verdict, ModelCheckVerdict::NoViolation { .. });
         assert!(is_no_violation);
     }
 
@@ -21293,8 +21805,7 @@ mod tests {
             }],
         )];
         let verdict = mc.run_recovery_scenario(&mut checker, &actions, 4000);
-        let is_no_violation =
-            matches!(verdict, ModelCheckVerdict::NoViolation { .. });
+        let is_no_violation = matches!(verdict, ModelCheckVerdict::NoViolation { .. });
         assert!(is_no_violation);
     }
 
@@ -21314,7 +21825,11 @@ mod tests {
             eval_time_us: 0,
             timestamp_us: 0,
         };
-        mc.step(TraceAction::EpochAdvance { new_epoch: 1 }, &[sched_result], 0);
+        mc.step(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            &[sched_result],
+            0,
+        );
         mc.new_trace();
         let budget_result = InvariantCheckResult {
             predicate_id: "budget.y".to_string(),
@@ -21326,10 +21841,25 @@ mod tests {
             eval_time_us: 0,
             timestamp_us: 1,
         };
-        mc.step(TraceAction::EpochAdvance { new_epoch: 2 }, &[budget_result], 1);
-        assert_eq!(mc.counterexamples_by_domain(InvariantDomain::Scheduler).len(), 1);
-        assert_eq!(mc.counterexamples_by_domain(InvariantDomain::Budget).len(), 1);
-        assert_eq!(mc.counterexamples_by_domain(InvariantDomain::Recovery).len(), 0);
+        mc.step(
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            &[budget_result],
+            1,
+        );
+        assert_eq!(
+            mc.counterexamples_by_domain(InvariantDomain::Scheduler)
+                .len(),
+            1
+        );
+        assert_eq!(
+            mc.counterexamples_by_domain(InvariantDomain::Budget).len(),
+            1
+        );
+        assert_eq!(
+            mc.counterexamples_by_domain(InvariantDomain::Recovery)
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -21359,7 +21889,11 @@ mod tests {
         // Trace 1: 3 steps then violation
         mc.step(TraceAction::EpochAdvance { new_epoch: 1 }, &[ok.clone()], 0);
         mc.step(TraceAction::EpochAdvance { new_epoch: 2 }, &[ok.clone()], 1);
-        mc.step(TraceAction::EpochAdvance { new_epoch: 3 }, &[bad.clone()], 2);
+        mc.step(
+            TraceAction::EpochAdvance { new_epoch: 3 },
+            &[bad.clone()],
+            2,
+        );
         mc.new_trace();
         // Trace 2: 1 step then violation
         mc.step(TraceAction::EpochAdvance { new_epoch: 4 }, &[bad], 3);
@@ -21449,13 +21983,20 @@ mod tests {
     #[test]
     fn test_canonical_ordering_display() {
         assert_eq!(CanonicalOrdering::Temporal.to_string(), "temporal");
-        assert_eq!(CanonicalOrdering::DomainGrouped.to_string(), "domain-grouped");
+        assert_eq!(
+            CanonicalOrdering::DomainGrouped.to_string(),
+            "domain-grouped"
+        );
         assert_eq!(CanonicalOrdering::Causal.to_string(), "causal");
     }
 
     #[test]
     fn test_canonical_ordering_serde() {
-        for ord in [CanonicalOrdering::Temporal, CanonicalOrdering::DomainGrouped, CanonicalOrdering::Causal] {
+        for ord in [
+            CanonicalOrdering::Temporal,
+            CanonicalOrdering::DomainGrouped,
+            CanonicalOrdering::Causal,
+        ] {
             let json = serde_json::to_string(&ord).unwrap();
             let back: CanonicalOrdering = serde_json::from_str(&json).unwrap();
             assert_eq!(ord, back);
@@ -21550,8 +22091,18 @@ mod tests {
     #[test]
     fn test_deterministic_trace_digest_deterministic() {
         let mut trace = DeterministicTrace::new_v2("t1".to_string(), 0, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 20, Some(0));
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            InvariantDomain::Composition,
+            20,
+            Some(0),
+        );
         let d1 = trace.digest();
         let d2 = trace.digest();
         assert_eq!(d1, d2);
@@ -21560,9 +22111,19 @@ mod tests {
     #[test]
     fn test_deterministic_trace_digest_varies() {
         let mut t1 = DeterministicTrace::new_v2("a".to_string(), 0, 0);
-        t1.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        t1.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let mut t2 = DeterministicTrace::new_v2("b".to_string(), 0, 0);
-        t2.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 10, None);
+        t2.push(
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         assert_ne!(t1.digest(), t2.digest());
     }
 
@@ -21578,7 +22139,12 @@ mod tests {
     #[test]
     fn test_deterministic_trace_serde() {
         let mut trace = DeterministicTrace::new_v2("t1".to_string(), 99, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 100, None);
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            100,
+            None,
+        );
         let json = serde_json::to_string(&trace).unwrap();
         let back: DeterministicTrace = serde_json::from_str(&json).unwrap();
         assert_eq!(trace, back);
@@ -21642,16 +22208,20 @@ mod tests {
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
         // Insert out of causal order (timestamps swapped).
         trace.entries.push(TraceEntry {
-            seq: 1, timestamp_us: 200,
+            seq: 1,
+            timestamp_us: 200,
             action: TraceAction::EpochAdvance { new_epoch: 2 },
             domain: InvariantDomain::Composition,
-            causal_parent: Some(0), fingerprint: 1,
+            causal_parent: Some(0),
+            fingerprint: 1,
         });
         trace.entries.push(TraceEntry {
-            seq: 0, timestamp_us: 100,
+            seq: 0,
+            timestamp_us: 100,
             action: TraceAction::EpochAdvance { new_epoch: 1 },
             domain: InvariantDomain::Composition,
-            causal_parent: None, fingerprint: 2,
+            causal_parent: None,
+            fingerprint: 2,
         });
         let canonical = c.canonicalize(&trace);
         // Causal ordering sorts by seq.
@@ -21667,16 +22237,20 @@ mod tests {
         });
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
         trace.entries.push(TraceEntry {
-            seq: 0, timestamp_us: 200,
+            seq: 0,
+            timestamp_us: 200,
             action: TraceAction::EpochAdvance { new_epoch: 2 },
             domain: InvariantDomain::Composition,
-            causal_parent: None, fingerprint: 1,
+            causal_parent: None,
+            fingerprint: 1,
         });
         trace.entries.push(TraceEntry {
-            seq: 1, timestamp_us: 100,
+            seq: 1,
+            timestamp_us: 100,
             action: TraceAction::EpochAdvance { new_epoch: 1 },
             domain: InvariantDomain::Composition,
-            causal_parent: None, fingerprint: 2,
+            causal_parent: None,
+            fingerprint: 2,
         });
         let canonical = c.canonicalize(&trace);
         assert_eq!(canonical.entries[0].fingerprint, 2); // timestamp 100 first
@@ -21692,13 +22266,19 @@ mod tests {
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
         // Budget entry first, then scheduler.
         trace.push(
-            TraceAction::ObserveLatency { stage: LatencyStage::PtyCapture, latency_us: 10.0 },
+            TraceAction::ObserveLatency {
+                stage: LatencyStage::PtyCapture,
+                latency_us: 10.0,
+            },
             InvariantDomain::Budget,
             100,
             None,
         );
         trace.push(
-            TraceAction::SchedulerAdmit { lane: SchedulerLane::Input, cost_us: 5.0 },
+            TraceAction::SchedulerAdmit {
+                lane: SchedulerLane::Input,
+                cost_us: 5.0,
+            },
             InvariantDomain::Scheduler,
             50,
             None,
@@ -21716,7 +22296,12 @@ mod tests {
             ..Default::default()
         });
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 500, None);
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            500,
+            None,
+        );
         let canonical = c.canonicalize(&trace);
         assert_eq!(canonical.entries[0].timestamp_us, 0);
     }
@@ -21733,12 +22318,20 @@ mod tests {
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
         // Push same action twice (same fingerprint).
         trace.entries.push(TraceEntry {
-            seq: 0, timestamp_us: 100, action: action.clone(),
-            domain, causal_parent: None, fingerprint: fp,
+            seq: 0,
+            timestamp_us: 100,
+            action: action.clone(),
+            domain,
+            causal_parent: None,
+            fingerprint: fp,
         });
         trace.entries.push(TraceEntry {
-            seq: 1, timestamp_us: 200, action: action.clone(),
-            domain, causal_parent: Some(0), fingerprint: fp,
+            seq: 1,
+            timestamp_us: 200,
+            action: action.clone(),
+            domain,
+            causal_parent: Some(0),
+            fingerprint: fp,
         });
         let canonical = c.canonicalize(&trace);
         assert_eq!(canonical.len(), 1);
@@ -21753,7 +22346,12 @@ mod tests {
         });
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
         for i in 0..5 {
-            trace.push(TraceAction::EpochAdvance { new_epoch: i }, InvariantDomain::Composition, i * 10, None);
+            trace.push(
+                TraceAction::EpochAdvance { new_epoch: i },
+                InvariantDomain::Composition,
+                i * 10,
+                None,
+            );
         }
         let canonical = c.canonicalize(&trace);
         assert_eq!(canonical.len(), 2);
@@ -21763,7 +22361,12 @@ mod tests {
     fn test_canonicalizer_compare_identical() {
         let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut t1 = DeterministicTrace::new_v2("a".to_string(), 0, 0);
-        t1.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        t1.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let t2 = t1.clone();
         let result = c.compare(&t1, &t2);
         assert_eq!(result, ReplayComparisonResult::Identical);
@@ -21773,7 +22376,12 @@ mod tests {
     fn test_canonicalizer_compare_divergent_length() {
         let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut t1 = DeterministicTrace::new_v2("a".to_string(), 0, 0);
-        t1.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        t1.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let t2 = DeterministicTrace::new_v2("b".to_string(), 0, 0);
         let result = c.compare(&t1, &t2);
         let is_divergent = matches!(result, ReplayComparisonResult::Divergent { .. });
@@ -21784,9 +22392,19 @@ mod tests {
     fn test_canonicalizer_compare_divergent_content() {
         let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut t1 = DeterministicTrace::new_v2("a".to_string(), 0, 0);
-        t1.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        t1.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let mut t2 = DeterministicTrace::new_v2("b".to_string(), 0, 0);
-        t2.push(TraceAction::EpochAdvance { new_epoch: 99 }, InvariantDomain::Composition, 10, None);
+        t2.push(
+            TraceAction::EpochAdvance { new_epoch: 99 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let result = c.compare(&t1, &t2);
         let is_divergent = matches!(result, ReplayComparisonResult::Divergent { .. });
         assert!(is_divergent);
@@ -21796,7 +22414,12 @@ mod tests {
     fn test_canonicalizer_diagnose_mismatches_none() {
         let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut t1 = DeterministicTrace::new_v2("a".to_string(), 0, 0);
-        t1.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        t1.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let mismatches = c.diagnose_mismatches(&t1, &t1);
         assert!(mismatches.is_empty());
     }
@@ -21805,9 +22428,19 @@ mod tests {
     fn test_canonicalizer_diagnose_mismatches_found() {
         let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut t1 = DeterministicTrace::new_v2("a".to_string(), 0, 0);
-        t1.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        t1.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let mut t2 = DeterministicTrace::new_v2("b".to_string(), 0, 0);
-        t2.push(TraceAction::EpochAdvance { new_epoch: 99 }, InvariantDomain::Composition, 10, None);
+        t2.push(
+            TraceAction::EpochAdvance { new_epoch: 99 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let mismatches = c.diagnose_mismatches(&t1, &t2);
         assert_eq!(mismatches.len(), 1);
         assert_eq!(mismatches[0].canonical_idx, 0);
@@ -21817,7 +22450,12 @@ mod tests {
     fn test_canonicalizer_diagnose_missing_entry() {
         let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut t1 = DeterministicTrace::new_v2("a".to_string(), 0, 0);
-        t1.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        t1.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let t2 = DeterministicTrace::new_v2("b".to_string(), 0, 0);
         let mismatches = c.diagnose_mismatches(&t1, &t2);
         assert_eq!(mismatches.len(), 1);
@@ -21836,7 +22474,10 @@ mod tests {
             },
             TraceStep {
                 step: 1,
-                action: TraceAction::SchedulerAdmit { lane: SchedulerLane::Input, cost_us: 5.0 },
+                action: TraceAction::SchedulerAdmit {
+                    lane: SchedulerLane::Input,
+                    cost_us: 5.0,
+                },
                 check_results: vec![],
                 timestamp_us: 200,
             },
@@ -21853,7 +22494,12 @@ mod tests {
     fn test_canonicalizer_snapshot() {
         let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let _ = c.canonicalize(&trace);
         let snap = c.snapshot();
         assert_eq!(snap.traces_processed, 1);
@@ -21872,7 +22518,9 @@ mod tests {
         assert_eq!(CanonicalizerDegradation::Healthy.to_string(), "healthy");
         let high = CanonicalizerDegradation::HighDedupRatio { ratio: 0.75 };
         assert!(high.to_string().contains("high-dedup"));
-        let vol = CanonicalizerDegradation::HighVolume { entries_processed: 200_000 };
+        let vol = CanonicalizerDegradation::HighVolume {
+            entries_processed: 200_000,
+        };
         assert!(vol.to_string().contains("high-volume"));
     }
 
@@ -21881,7 +22529,9 @@ mod tests {
         let variants = vec![
             CanonicalizerDegradation::Healthy,
             CanonicalizerDegradation::HighDedupRatio { ratio: 0.8 },
-            CanonicalizerDegradation::HighVolume { entries_processed: 100 },
+            CanonicalizerDegradation::HighVolume {
+                entries_processed: 100,
+            },
         ];
         for v in variants {
             let json = serde_json::to_string(&v).unwrap();
@@ -21904,7 +22554,12 @@ mod tests {
     fn test_canonicalizer_reset() {
         let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let _ = c.canonicalize(&trace);
         assert_eq!(c.snapshot().traces_processed, 1);
         c.reset();
@@ -21913,11 +22568,37 @@ mod tests {
 
     #[test]
     fn test_action_domain_mapping() {
-        assert_eq!(action_domain(&TraceAction::ObserveLatency { stage: LatencyStage::PtyCapture, latency_us: 1.0 }), InvariantDomain::Budget);
-        assert_eq!(action_domain(&TraceAction::SchedulerAdmit { lane: SchedulerLane::Input, cost_us: 1.0 }), InvariantDomain::Scheduler);
-        assert_eq!(action_domain(&TraceAction::RecoveryStep { level_before: MitigationLevel::None, level_after: MitigationLevel::Defer }), InvariantDomain::Recovery);
-        assert_eq!(action_domain(&TraceAction::EpochAdvance { new_epoch: 1 }), InvariantDomain::Composition);
-        assert_eq!(action_domain(&TraceAction::Reset { domain: InvariantDomain::Recovery }), InvariantDomain::Recovery);
+        assert_eq!(
+            action_domain(&TraceAction::ObserveLatency {
+                stage: LatencyStage::PtyCapture,
+                latency_us: 1.0
+            }),
+            InvariantDomain::Budget
+        );
+        assert_eq!(
+            action_domain(&TraceAction::SchedulerAdmit {
+                lane: SchedulerLane::Input,
+                cost_us: 1.0
+            }),
+            InvariantDomain::Scheduler
+        );
+        assert_eq!(
+            action_domain(&TraceAction::RecoveryStep {
+                level_before: MitigationLevel::None,
+                level_after: MitigationLevel::Defer
+            }),
+            InvariantDomain::Recovery
+        );
+        assert_eq!(
+            action_domain(&TraceAction::EpochAdvance { new_epoch: 1 }),
+            InvariantDomain::Composition
+        );
+        assert_eq!(
+            action_domain(&TraceAction::Reset {
+                domain: InvariantDomain::Recovery
+            }),
+            InvariantDomain::Recovery
+        );
     }
 
     #[test]
@@ -21957,16 +22638,20 @@ mod tests {
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
         // Entries with seq 0,1 but timestamp order is reversed.
         trace.entries.push(TraceEntry {
-            seq: 0, timestamp_us: 200,
+            seq: 0,
+            timestamp_us: 200,
             action: TraceAction::EpochAdvance { new_epoch: 2 },
             domain: InvariantDomain::Composition,
-            causal_parent: None, fingerprint: 1,
+            causal_parent: None,
+            fingerprint: 1,
         });
         trace.entries.push(TraceEntry {
-            seq: 1, timestamp_us: 100,
+            seq: 1,
+            timestamp_us: 100,
             action: TraceAction::EpochAdvance { new_epoch: 1 },
             domain: InvariantDomain::Composition,
-            causal_parent: None, fingerprint: 2,
+            causal_parent: None,
+            fingerprint: 2,
         });
         let canonical = c.canonicalize(&trace);
         // After temporal sort, seq should be reassigned 0,1.
@@ -21989,8 +22674,18 @@ mod tests {
     fn test_compare_mc_traces_identical() {
         let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let steps = vec![
-            TraceStep { step: 0, action: TraceAction::EpochAdvance { new_epoch: 1 }, check_results: vec![], timestamp_us: 10 },
-            TraceStep { step: 1, action: TraceAction::EpochAdvance { new_epoch: 2 }, check_results: vec![], timestamp_us: 20 },
+            TraceStep {
+                step: 0,
+                action: TraceAction::EpochAdvance { new_epoch: 1 },
+                check_results: vec![],
+                timestamp_us: 10,
+            },
+            TraceStep {
+                step: 1,
+                action: TraceAction::EpochAdvance { new_epoch: 2 },
+                check_results: vec![],
+                timestamp_us: 20,
+            },
         ];
         let result = c.compare_mc_traces(&steps, &steps, 42);
         assert_eq!(result, ReplayComparisonResult::Identical);
@@ -21999,12 +22694,18 @@ mod tests {
     #[test]
     fn test_compare_mc_traces_divergent() {
         let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
-        let a = vec![
-            TraceStep { step: 0, action: TraceAction::EpochAdvance { new_epoch: 1 }, check_results: vec![], timestamp_us: 10 },
-        ];
-        let b = vec![
-            TraceStep { step: 0, action: TraceAction::EpochAdvance { new_epoch: 99 }, check_results: vec![], timestamp_us: 10 },
-        ];
+        let a = vec![TraceStep {
+            step: 0,
+            action: TraceAction::EpochAdvance { new_epoch: 1 },
+            check_results: vec![],
+            timestamp_us: 10,
+        }];
+        let b = vec![TraceStep {
+            step: 0,
+            action: TraceAction::EpochAdvance { new_epoch: 99 },
+            check_results: vec![],
+            timestamp_us: 10,
+        }];
         let result = c.compare_mc_traces(&a, &b, 0);
         let is_divergent = matches!(result, ReplayComparisonResult::Divergent { .. });
         assert!(is_divergent);
@@ -22014,8 +22715,18 @@ mod tests {
     fn test_verify_determinism() {
         let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 20, Some(0));
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            InvariantDomain::Composition,
+            20,
+            Some(0),
+        );
         assert!(c.verify_determinism(&trace));
     }
 
@@ -22023,9 +22734,27 @@ mod tests {
     fn test_filter_by_domain() {
         let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
-        trace.push(TraceAction::SchedulerAdmit { lane: SchedulerLane::Input, cost_us: 5.0 }, InvariantDomain::Scheduler, 20, None);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 30, Some(0));
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
+        trace.push(
+            TraceAction::SchedulerAdmit {
+                lane: SchedulerLane::Input,
+                cost_us: 5.0,
+            },
+            InvariantDomain::Scheduler,
+            20,
+            None,
+        );
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            InvariantDomain::Composition,
+            30,
+            Some(0),
+        );
 
         let filtered = c.filter_by_domain(&trace, InvariantDomain::Composition);
         assert_eq!(filtered.len(), 2);
@@ -22041,7 +22770,12 @@ mod tests {
     fn test_filter_by_domain_empty() {
         let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let filtered = c.filter_by_domain(&trace, InvariantDomain::Recovery);
         assert!(filtered.is_empty());
     }
@@ -22050,7 +22784,12 @@ mod tests {
     fn test_causal_chain_no_parents() {
         let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let chain = c.causal_chain(&trace, 0);
         assert_eq!(chain, vec![0]);
     }
@@ -22059,9 +22798,24 @@ mod tests {
     fn test_causal_chain_with_parents() {
         let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 20, Some(0));
-        trace.push(TraceAction::EpochAdvance { new_epoch: 3 }, InvariantDomain::Composition, 30, Some(1));
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            InvariantDomain::Composition,
+            20,
+            Some(0),
+        );
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 3 },
+            InvariantDomain::Composition,
+            30,
+            Some(1),
+        );
         let chain = c.causal_chain(&trace, 2);
         assert_eq!(chain, vec![0, 1, 2]);
     }
@@ -22070,9 +22824,27 @@ mod tests {
     fn test_domain_histogram() {
         let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
-        trace.push(TraceAction::SchedulerAdmit { lane: SchedulerLane::Input, cost_us: 5.0 }, InvariantDomain::Scheduler, 20, None);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 30, None);
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
+        trace.push(
+            TraceAction::SchedulerAdmit {
+                lane: SchedulerLane::Input,
+                cost_us: 5.0,
+            },
+            InvariantDomain::Scheduler,
+            20,
+            None,
+        );
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            InvariantDomain::Composition,
+            30,
+            None,
+        );
         let hist = c.domain_histogram(&trace);
         assert_eq!(hist.get("composition"), Some(&2));
         assert_eq!(hist.get("scheduler"), Some(&1));
@@ -22082,9 +22854,24 @@ mod tests {
     fn test_unique_fingerprints() {
         let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 20, None);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 30, None);
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            20,
+            None,
+        );
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            InvariantDomain::Composition,
+            30,
+            None,
+        );
         let unique = c.unique_fingerprints(&trace);
         // epoch 2 appears once, epoch 1 appears twice.
         assert_eq!(unique.len(), 1);
@@ -22095,11 +22882,26 @@ mod tests {
     fn test_merge_traces() {
         let mut c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut t1 = DeterministicTrace::new_v2("a".to_string(), 1, 0);
-        t1.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
-        t1.push(TraceAction::EpochAdvance { new_epoch: 3 }, InvariantDomain::Composition, 30, None);
+        t1.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
+        t1.push(
+            TraceAction::EpochAdvance { new_epoch: 3 },
+            InvariantDomain::Composition,
+            30,
+            None,
+        );
 
         let mut t2 = DeterministicTrace::new_v2("b".to_string(), 2, 0);
-        t2.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 20, None);
+        t2.push(
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            InvariantDomain::Composition,
+            20,
+            None,
+        );
 
         let merged = c.merge_traces(&t1, &t2);
         assert_eq!(merged.len(), 3);
@@ -22117,10 +22919,30 @@ mod tests {
     fn test_time_window() {
         let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition, 20, None);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 3 }, InvariantDomain::Composition, 30, None);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 4 }, InvariantDomain::Composition, 40, None);
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            InvariantDomain::Composition,
+            20,
+            None,
+        );
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 3 },
+            InvariantDomain::Composition,
+            30,
+            None,
+        );
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 4 },
+            InvariantDomain::Composition,
+            40,
+            None,
+        );
 
         let windowed = c.time_window(&trace, 15, 35);
         assert_eq!(windowed.len(), 2);
@@ -22132,7 +22954,12 @@ mod tests {
     fn test_time_window_empty() {
         let c = ReplayCanonicalizer::new(CanonicalizerConfig::default());
         let mut trace = DeterministicTrace::new_v2("t".to_string(), 0, 0);
-        trace.push(TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition, 10, None);
+        trace.push(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+            10,
+            None,
+        );
         let windowed = c.time_window(&trace, 100, 200);
         assert!(windowed.is_empty());
     }
@@ -22163,5 +22990,314 @@ mod tests {
         };
         let c = ReplayCanonicalizer::new(cfg.clone());
         assert_eq!(*c.config(), cfg);
+    }
+
+    // ── E4: Optimization Isomorphism Proof Gate Tests ────────────
+
+    fn make_golden_trace(entries: &[(u64, TraceAction, InvariantDomain)]) -> DeterministicTrace {
+        let mut trace = DeterministicTrace::new_v2("golden".to_string(), 42, 0);
+        for (ts, action, domain) in entries {
+            trace.push(action.clone(), *domain, *ts, None);
+        }
+        trace
+    }
+
+    #[test]
+    fn test_golden_artifact_new() {
+        let trace = make_golden_trace(&[
+            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
+        ]);
+        let ga = GoldenArtifact::new("test".to_string(), trace.clone(), "desc".to_string(), 0);
+        assert_eq!(ga.artifact_id, "test");
+        assert_eq!(ga.version, 1);
+        assert!(ga.verify_checksum());
+        assert_eq!(ga.checksum, trace.digest());
+    }
+
+    #[test]
+    fn test_golden_artifact_update() {
+        let t1 = make_golden_trace(&[
+            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
+        ]);
+        let mut ga = GoldenArtifact::new("test".to_string(), t1, "v1".to_string(), 0);
+        let t2 = make_golden_trace(&[
+            (20, TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition),
+        ]);
+        ga.update(t2.clone(), 100);
+        assert_eq!(ga.version, 2);
+        assert_eq!(ga.checksum, t2.digest());
+        assert!(ga.verify_checksum());
+    }
+
+    #[test]
+    fn test_golden_artifact_serde() {
+        let trace = make_golden_trace(&[
+            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
+        ]);
+        let ga = GoldenArtifact::new("test".to_string(), trace, "desc".to_string(), 0);
+        let json = serde_json::to_string(&ga).unwrap();
+        let back: GoldenArtifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(ga, back);
+    }
+
+    #[test]
+    fn test_golden_artifact_display() {
+        let trace = make_golden_trace(&[
+            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
+        ]);
+        let ga = GoldenArtifact::new("my-opt".to_string(), trace, "desc".to_string(), 0);
+        let s = ga.to_string();
+        assert!(s.contains("my-opt"));
+        assert!(s.contains("v1"));
+    }
+
+    #[test]
+    fn test_proof_gate_verdict_pass_fail() {
+        assert!(ProofGateVerdict::Equivalent.is_pass());
+        assert!(!ProofGateVerdict::Equivalent.is_fail());
+        assert!(ProofGateVerdict::IsomorphicEquivalent { reordered_count: 1 }.is_pass());
+        let drift = ProofGateVerdict::SemanticDrift {
+            first_divergence_idx: 0, mismatches: vec![], summary: "x".to_string(),
+        };
+        assert!(drift.is_fail());
+        let chk = ProofGateVerdict::ChecksumFailure { expected: 1, actual: 2 };
+        assert!(chk.is_fail());
+    }
+
+    #[test]
+    fn test_proof_gate_verdict_display() {
+        assert!(ProofGateVerdict::Equivalent.to_string().contains("PASS"));
+        let iso = ProofGateVerdict::IsomorphicEquivalent { reordered_count: 3 };
+        assert!(iso.to_string().contains("isomorphic"));
+        let drift = ProofGateVerdict::SemanticDrift {
+            first_divergence_idx: 5, mismatches: vec![], summary: "oops".to_string(),
+        };
+        assert!(drift.to_string().contains("FAIL"));
+    }
+
+    #[test]
+    fn test_proof_gate_verdict_serde() {
+        let verdicts = vec![
+            ProofGateVerdict::Equivalent,
+            ProofGateVerdict::IsomorphicEquivalent { reordered_count: 2 },
+            ProofGateVerdict::SemanticDrift {
+                first_divergence_idx: 0, mismatches: vec![], summary: "x".to_string(),
+            },
+            ProofGateVerdict::ChecksumFailure { expected: 1, actual: 2 },
+        ];
+        for v in verdicts {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: ProofGateVerdict = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn test_proof_gate_config_default() {
+        let cfg = ProofGateConfig::default();
+        assert!(cfg.allow_isomorphic);
+        assert_eq!(cfg.max_mismatches, 50);
+    }
+
+    #[test]
+    fn test_proof_summary_display() {
+        let summary = ProofSummary {
+            artifact_id: "test".to_string(),
+            golden_version: 1,
+            verdict: ProofGateVerdict::Equivalent,
+            candidate_entries: 10,
+            golden_entries: 10,
+            check_duration_us: 500,
+            timestamp_us: 0,
+        };
+        let s = summary.to_string();
+        assert!(s.contains("test"));
+        assert!(s.contains("PASS"));
+    }
+
+    #[test]
+    fn test_proof_summary_serde() {
+        let summary = ProofSummary {
+            artifact_id: "test".to_string(),
+            golden_version: 3,
+            verdict: ProofGateVerdict::Equivalent,
+            candidate_entries: 10,
+            golden_entries: 10,
+            check_duration_us: 500,
+            timestamp_us: 100,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: ProofSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(summary, back);
+    }
+
+    #[test]
+    fn test_proof_gate_register_and_get() {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        let trace = make_golden_trace(&[
+            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
+        ]);
+        let ga = GoldenArtifact::new("opt-1".to_string(), trace, "desc".to_string(), 0);
+        gate.register_golden(ga);
+        assert_eq!(gate.artifact_count(), 1);
+        assert!(gate.get_golden("opt-1").is_some());
+        assert!(gate.get_golden("opt-2").is_none());
+    }
+
+    #[test]
+    fn test_proof_gate_register_replaces() {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        let t1 = make_golden_trace(&[
+            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
+        ]);
+        let t2 = make_golden_trace(&[
+            (20, TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition),
+        ]);
+        gate.register_golden(GoldenArtifact::new("x".to_string(), t1, "v1".to_string(), 0));
+        gate.register_golden(GoldenArtifact::new("x".to_string(), t2, "v2".to_string(), 100));
+        assert_eq!(gate.artifact_count(), 1);
+        assert_eq!(gate.get_golden("x").unwrap().description, "v2");
+    }
+
+    #[test]
+    fn test_proof_gate_check_equivalent() {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        let trace = make_golden_trace(&[
+            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
+        ]);
+        gate.register_golden(GoldenArtifact::new("opt-1".to_string(), trace.clone(), "d".to_string(), 0));
+        let summary = gate.check("opt-1", &trace, 100);
+        assert_eq!(summary.verdict, ProofGateVerdict::Equivalent);
+        assert_eq!(gate.snapshot().passes, 1);
+    }
+
+    #[test]
+    fn test_proof_gate_check_divergent() {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        let golden = make_golden_trace(&[
+            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
+        ]);
+        gate.register_golden(GoldenArtifact::new("opt-1".to_string(), golden, "d".to_string(), 0));
+        let candidate = make_golden_trace(&[
+            (10, TraceAction::EpochAdvance { new_epoch: 99 }, InvariantDomain::Composition),
+        ]);
+        let summary = gate.check("opt-1", &candidate, 100);
+        assert!(summary.verdict.is_fail());
+        assert_eq!(gate.snapshot().failures, 1);
+    }
+
+    #[test]
+    fn test_proof_gate_check_missing_artifact() {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        let candidate = DeterministicTrace::new_v2("c".to_string(), 0, 0);
+        let summary = gate.check("nonexistent", &candidate, 100);
+        assert!(summary.verdict.is_fail());
+    }
+
+    #[test]
+    fn test_proof_gate_remove_golden() {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        let trace = make_golden_trace(&[(10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition)]);
+        gate.register_golden(GoldenArtifact::new("x".to_string(), trace, "d".to_string(), 0));
+        assert!(gate.remove_golden("x"));
+        assert_eq!(gate.artifact_count(), 0);
+        assert!(!gate.remove_golden("x"));
+    }
+
+    #[test]
+    fn test_proof_gate_artifact_ids() {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        let t = make_golden_trace(&[(10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition)]);
+        gate.register_golden(GoldenArtifact::new("a".to_string(), t.clone(), "d".to_string(), 0));
+        gate.register_golden(GoldenArtifact::new("b".to_string(), t, "d".to_string(), 0));
+        let ids = gate.artifact_ids();
+        assert!(ids.contains(&"a".to_string()));
+        assert!(ids.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn test_proof_gate_reset_counters() {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        let trace = make_golden_trace(&[(10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition)]);
+        gate.register_golden(GoldenArtifact::new("x".to_string(), trace.clone(), "d".to_string(), 0));
+        let _ = gate.check("x", &trace, 0);
+        gate.reset_counters();
+        let snap = gate.snapshot();
+        assert_eq!(snap.checks_run, 0);
+        assert_eq!(snap.passes, 0);
+        assert_eq!(snap.failures, 0);
+        assert_eq!(snap.artifacts_count, 1); // Artifacts preserved.
+    }
+
+    #[test]
+    fn test_proof_gate_snapshot_serde() {
+        let snap = ProofGateSnapshot {
+            checks_run: 10,
+            passes: 8,
+            failures: 2,
+            artifacts_count: 3,
+            config: ProofGateConfig::default(),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ProofGateSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn test_proof_gate_degradation_healthy() {
+        let gate = ProofGate::new(ProofGateConfig::default());
+        assert_eq!(gate.detect_degradation(), ProofGateDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_proof_gate_degradation_display() {
+        assert_eq!(ProofGateDegradation::Healthy.to_string(), "healthy");
+        let hfr = ProofGateDegradation::HighFailureRate { rate: 0.75 };
+        assert!(hfr.to_string().contains("high-failure-rate"));
+        let hac = ProofGateDegradation::HighArtifactCount { count: 200 };
+        assert!(hac.to_string().contains("high-artifact-count"));
+    }
+
+    #[test]
+    fn test_proof_gate_degradation_serde() {
+        let variants = vec![
+            ProofGateDegradation::Healthy,
+            ProofGateDegradation::HighFailureRate { rate: 0.8 },
+            ProofGateDegradation::HighArtifactCount { count: 150 },
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: ProofGateDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn test_proof_gate_log_entry() {
+        let gate = ProofGate::new(ProofGateConfig::default());
+        let entry = gate.log_entry("test", true, 500);
+        assert_eq!(entry.artifact_id, "test");
+        assert!(entry.passed);
+        assert_eq!(entry.check_duration_us, 500);
+    }
+
+    #[test]
+    fn test_proof_gate_log_entry_serde() {
+        let entry = ProofGateLogEntry {
+            timestamp_us: 100,
+            artifact_id: "opt-1".to_string(),
+            passed: true,
+            check_duration_us: 50,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: ProofGateLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn test_proof_gate_config_accessor() {
+        let cfg = ProofGateConfig { allow_isomorphic: false, ..Default::default() };
+        let gate = ProofGate::new(cfg.clone());
+        assert_eq!(*gate.config(), cfg);
     }
 }
