@@ -2,7 +2,7 @@
 //!
 //! This suite covers P-16 through P-20 for `ft-og6q6.7.2`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use frankenterm_core::differential_snapshot::BaseSnapshot;
 use frankenterm_core::session_pane_state::{PaneStateSnapshot, ScrollbackRef, TerminalState};
@@ -10,7 +10,7 @@ use frankenterm_core::session_topology::{
     PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot, TOPOLOGY_SCHEMA_VERSION,
 };
 use proptest::prelude::*;
-use proptest::test_runner::ProptestConfig;
+use proptest::prelude::ProptestConfig;
 
 fn proptest_cases() -> u32 {
     std::env::var("PROPTEST_CASES")
@@ -321,7 +321,7 @@ proptest! {
             prop_assert!(root_cause.is_some());
             let root_cause = root_cause.expect("checked above");
             prop_assert!(known_nodes.contains(root_cause.node_id.as_str()));
-            prop_assert_eq!(root_cause.node_id, divergence.node_id);
+            prop_assert_eq!(&root_cause.node_id, &divergence.node_id);
         }
     }
 
@@ -352,5 +352,17 @@ proptest! {
         if relaxed_outcome == BudgetOutcome::Fail {
             prop_assert_eq!(strict_outcome, BudgetOutcome::Fail);
         }
+    }
+
+    /// P-21: Topology-only changes remain warning-level topology divergences.
+    #[test]
+    fn p21_topology_only_change_is_warning(snapshot in arb_snapshot(8), delta in 1u64..=10_000u64) {
+        let mut topology_only = snapshot.clone();
+        topology_only.topology.captured_at = topology_only.topology.captured_at.saturating_add(delta);
+
+        let divergences = diff_snapshots(&snapshot, &topology_only);
+        prop_assert!(!divergences.is_empty());
+        prop_assert!(divergences.iter().all(|divergence| divergence.kind == DivergenceKind::TopologyChanged));
+        prop_assert!(divergences.iter().all(|divergence| divergence.severity == DivergenceSeverity::Warning));
     }
 }

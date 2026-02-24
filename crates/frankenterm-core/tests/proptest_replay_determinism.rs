@@ -17,7 +17,6 @@ use frankenterm_core::recording::{
 };
 use frankenterm_core::replay_capture::{DecisionEvent, DecisionType};
 use proptest::prelude::*;
-use proptest::test_runner::ProptestConfig;
 use serde_json::json;
 
 fn proptest_cases() -> u32 {
@@ -220,7 +219,7 @@ fn arb_decision_chain(max_len: usize) -> impl Strategy<Value = DecisionChain> {
         1..=max_len,
     )
     .prop_map(|rows| {
-        let mut event_ids = Vec::with_capacity(rows.len());
+        let mut event_ids: Vec<String> = Vec::with_capacity(rows.len());
         let mut decisions = Vec::with_capacity(rows.len());
 
         for (idx, (pane_id, decision_type, rule_id, input_text, timestamp_ms, confidence)) in
@@ -341,17 +340,21 @@ proptest! {
         prop_assert_eq!(baseline_merge_ids, permuted_merge_ids);
     }
 
-    /// P-03: Monotonic clock — `VirtualClock` never decreases during replay.
+    /// P-03: Monotonic clock — replay `recorded_at_ms` never decreases.
     #[test]
     fn p03_virtual_clock_monotonic(events in arb_replay_events(80)) {
         let mut scheduler = ReplayScheduler::new(events, ReplayConfig::default()).expect("scheduler should build");
         let steps = scheduler.run_to_completion();
 
+        for step in &steps {
+            prop_assert_eq!(step.clock.recorded_at_ms, step.decision.recorded_at_ms);
+            prop_assert_eq!(step.clock.occurred_at_ms, step.decision.occurred_at_ms);
+        }
+
         for pair in steps.windows(2) {
             let prev = &pair[0];
             let next = &pair[1];
             prop_assert!(prev.clock.recorded_at_ms <= next.clock.recorded_at_ms);
-            prop_assert!(prev.clock.occurred_at_ms <= next.clock.occurred_at_ms);
         }
     }
 
@@ -402,15 +405,16 @@ proptest! {
         prop_assert_eq!(total_events, processed + skipped);
     }
 
-    /// P-05: Sequence monotonicity — per-pane sequence numbers are strictly increasing.
+    /// P-05: Sequence monotonicity — per-(pane, stream) sequence numbers are strictly increasing.
     #[test]
     fn p05_per_pane_sequence_monotonic(events in arb_replay_events(80)) {
         let mut scheduler = ReplayScheduler::new(events, ReplayConfig::default()).expect("scheduler should build");
         let steps = scheduler.run_to_completion();
-        let mut last_seq: HashMap<u64, u64> = HashMap::new();
+        let mut last_seq: HashMap<(u64, StreamKind), u64> = HashMap::new();
 
         for step in steps {
-            if let Some(prev) = last_seq.insert(step.decision.pane_id, step.decision.sequence) {
+            let key = (step.decision.pane_id, step.decision.stream_kind);
+            if let Some(prev) = last_seq.insert(key, step.decision.sequence) {
                 prop_assert!(prev < step.decision.sequence);
             }
         }
@@ -455,7 +459,7 @@ proptest! {
 
         let first_bytes = first.decision_trace_bytes().expect("trace serialization should succeed");
         let second_bytes = second.decision_trace_bytes().expect("trace serialization should succeed");
-        prop_assert_eq!(first_bytes, second_bytes);
+        prop_assert_eq!(&first_bytes, &second_bytes);
         let newline_count = first_bytes.iter().filter(|byte| **byte == b'\n').count();
         prop_assert_eq!(newline_count, first.decisions().len());
     }
@@ -516,8 +520,8 @@ proptest! {
         let reversed_ids = run_merge_ids(reversed);
         let rotated_ids = run_merge_ids(rotated);
 
-        prop_assert_eq!(baseline, reversed_ids);
-        prop_assert_eq!(baseline, rotated_ids);
+        prop_assert_eq!(&baseline, &reversed_ids);
+        prop_assert_eq!(&baseline, &rotated_ids);
     }
 
     /// P-12: Default equivalence level remains decision-level.
