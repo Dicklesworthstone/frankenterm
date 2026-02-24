@@ -14236,6 +14236,287 @@ impl ValidationMatrix {
     }
 }
 
+// ── F5: Input-to-Paint QoE Guardrail Lane ──────────────────────────
+
+/// QoE metric kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum QoEMetric {
+    /// Input-to-first-paint latency (μs).
+    InputToPaint,
+    /// Frame-to-frame jitter (μs).
+    FrameJitter,
+    /// Smoothness score (0.0..=1.0, 1.0 = perfect).
+    Smoothness,
+    /// Keystroke echo latency (μs).
+    KeystrokeEcho,
+}
+
+impl fmt::Display for QoEMetric {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InputToPaint => write!(f, "input-to-paint"),
+            Self::FrameJitter => write!(f, "frame-jitter"),
+            Self::Smoothness => write!(f, "smoothness"),
+            Self::KeystrokeEcho => write!(f, "keystroke-echo"),
+        }
+    }
+}
+
+/// SLO target for a QoE metric.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QoESLO {
+    /// Metric being targeted.
+    pub metric: QoEMetric,
+    /// Target value (latency: max μs, smoothness: min score).
+    pub target: f64,
+    /// Percentile this target applies to (e.g., 0.95 for p95).
+    pub percentile: f64,
+    /// Human-readable description.
+    pub description: String,
+}
+
+/// A single QoE measurement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QoEMeasurement {
+    /// Metric.
+    pub metric: QoEMetric,
+    /// Measured value.
+    pub value: f64,
+    /// Timestamp (μs).
+    pub timestamp_us: u64,
+}
+
+/// QoE guardrail configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QoEGuardrailConfig {
+    /// SLO targets.
+    pub slos: Vec<QoESLO>,
+    /// Window size for rolling statistics (number of samples).
+    pub window_size: usize,
+    /// Minimum samples before SLO evaluation.
+    pub min_samples: usize,
+}
+
+impl Default for QoEGuardrailConfig {
+    fn default() -> Self {
+        Self {
+            slos: vec![
+                QoESLO {
+                    metric: QoEMetric::InputToPaint,
+                    target: 16_667.0, // 16.67ms = 60fps frame budget.
+                    percentile: 0.95,
+                    description: "p95 input-to-paint under 16.67ms".to_string(),
+                },
+                QoESLO {
+                    metric: QoEMetric::FrameJitter,
+                    target: 4_000.0, // 4ms max jitter.
+                    percentile: 0.99,
+                    description: "p99 frame jitter under 4ms".to_string(),
+                },
+                QoESLO {
+                    metric: QoEMetric::Smoothness,
+                    target: 0.90,
+                    percentile: 0.50,
+                    description: "median smoothness above 0.90".to_string(),
+                },
+                QoESLO {
+                    metric: QoEMetric::KeystrokeEcho,
+                    target: 50_000.0, // 50ms.
+                    percentile: 0.99,
+                    description: "p99 keystroke echo under 50ms".to_string(),
+                },
+            ],
+            window_size: 1000,
+            min_samples: 30,
+        }
+    }
+}
+
+/// SLO evaluation result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SLOVerdict {
+    /// Meeting the target.
+    Met { measured: f64, target: f64 },
+    /// Breaching the target.
+    Breached { measured: f64, target: f64 },
+    /// Not enough samples.
+    InsufficientData { samples: usize, required: usize },
+}
+
+impl fmt::Display for SLOVerdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Met { measured, target } => write!(f, "met({measured:.1}/{target:.1})"),
+            Self::Breached { measured, target } => write!(f, "breached({measured:.1}/{target:.1})"),
+            Self::InsufficientData { samples, required } => write!(f, "insufficient({samples}/{required})"),
+        }
+    }
+}
+
+/// Snapshot of the QoE guardrail.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QoEGuardrailSnapshot {
+    /// Per-SLO verdicts.
+    pub verdicts: Vec<(QoEMetric, SLOVerdict)>,
+    /// Total measurements recorded.
+    pub total_measurements: u64,
+    /// Number of SLO breaches.
+    pub breach_count: u64,
+}
+
+/// Degradation state for the guardrail.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum QoEDegradation {
+    /// All SLOs met.
+    Healthy,
+    /// Some SLOs breached.
+    SLOBreach { breach_count: u64 },
+    /// Not enough data to evaluate.
+    WarmingUp { samples: usize },
+}
+
+impl fmt::Display for QoEDegradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "healthy"),
+            Self::SLOBreach { breach_count } => write!(f, "slo-breach({breach_count})"),
+            Self::WarmingUp { samples } => write!(f, "warming-up({samples})"),
+        }
+    }
+}
+
+/// Log entry for QoE events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QoELogEntry {
+    /// Timestamp.
+    pub timestamp_us: u64,
+    /// Metric.
+    pub metric: QoEMetric,
+    /// Event description.
+    pub event: String,
+}
+
+/// Manages QoE guardrail measurements and SLO evaluation.
+pub struct QoEGuardrail {
+    config: QoEGuardrailConfig,
+    /// Per-metric rolling window of values.
+    windows: std::collections::HashMap<QoEMetric, Vec<f64>>,
+    total_measurements: u64,
+}
+
+impl QoEGuardrail {
+    /// Create a new guardrail.
+    pub fn new(config: QoEGuardrailConfig) -> Self {
+        Self {
+            config,
+            windows: std::collections::HashMap::new(),
+            total_measurements: 0,
+        }
+    }
+
+    /// Record a measurement.
+    pub fn record(&mut self, measurement: QoEMeasurement) {
+        let window = self.windows.entry(measurement.metric).or_default();
+        window.push(measurement.value);
+        if window.len() > self.config.window_size {
+            window.remove(0);
+        }
+        self.total_measurements += 1;
+    }
+
+    /// Evaluate a single SLO.
+    pub fn evaluate_slo(&self, slo: &QoESLO) -> SLOVerdict {
+        let window = match self.windows.get(&slo.metric) {
+            Some(w) => w,
+            None => return SLOVerdict::InsufficientData { samples: 0, required: self.config.min_samples },
+        };
+        if window.len() < self.config.min_samples {
+            return SLOVerdict::InsufficientData { samples: window.len(), required: self.config.min_samples };
+        }
+        let mut sorted = window.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((slo.percentile * sorted.len() as f64) as usize).min(sorted.len() - 1);
+        let measured = sorted[idx];
+        // For smoothness, higher is better (target is minimum).
+        // For latency/jitter, lower is better (target is maximum).
+        let is_met = match slo.metric {
+            QoEMetric::Smoothness => measured >= slo.target,
+            _ => measured <= slo.target,
+        };
+        if is_met {
+            SLOVerdict::Met { measured, target: slo.target }
+        } else {
+            SLOVerdict::Breached { measured, target: slo.target }
+        }
+    }
+
+    /// Evaluate all SLOs.
+    pub fn evaluate_all(&self) -> Vec<(QoEMetric, SLOVerdict)> {
+        self.config.slos.iter().map(|slo| (slo.metric, self.evaluate_slo(slo))).collect()
+    }
+
+    /// Get a snapshot.
+    pub fn snapshot(&self) -> QoEGuardrailSnapshot {
+        let verdicts = self.evaluate_all();
+        let breach_count = verdicts.iter()
+            .filter(|(_, v)| matches!(v, SLOVerdict::Breached { .. }))
+            .count() as u64;
+        QoEGuardrailSnapshot {
+            verdicts,
+            total_measurements: self.total_measurements,
+            breach_count,
+        }
+    }
+
+    /// Detect degradation.
+    pub fn detect_degradation(&self) -> QoEDegradation {
+        let total_samples: usize = self.windows.values().map(|w| w.len()).sum();
+        if total_samples < self.config.min_samples {
+            return QoEDegradation::WarmingUp { samples: total_samples };
+        }
+        let verdicts = self.evaluate_all();
+        let breach_count = verdicts.iter()
+            .filter(|(_, v)| matches!(v, SLOVerdict::Breached { .. }))
+            .count() as u64;
+        if breach_count > 0 {
+            QoEDegradation::SLOBreach { breach_count }
+        } else {
+            QoEDegradation::Healthy
+        }
+    }
+
+    /// Create a log entry.
+    pub fn log_entry(&self, metric: QoEMetric, event: String, timestamp_us: u64) -> QoELogEntry {
+        QoELogEntry { timestamp_us, metric, event }
+    }
+
+    /// Reset all windows.
+    pub fn reset(&mut self) {
+        self.windows.clear();
+        self.total_measurements = 0;
+    }
+
+    /// Total measurements recorded.
+    pub fn total_measurements(&self) -> u64 {
+        self.total_measurements
+    }
+
+    /// Window size for a metric.
+    pub fn window_len(&self, metric: QoEMetric) -> usize {
+        self.windows.get(&metric).map_or(0, |w| w.len())
+    }
+
+    /// Access config.
+    pub fn config(&self) -> &QoEGuardrailConfig {
+        &self.config
+    }
+
+    /// Map to InvariantDomain.
+    pub fn to_invariant_domain() -> InvariantDomain {
+        InvariantDomain::Composition
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -26830,5 +27111,303 @@ mod tests {
     #[test]
     fn test_matrix_to_invariant_domain() {
         assert_eq!(ValidationMatrix::to_invariant_domain(), InvariantDomain::Composition);
+    }
+
+    // ── F5: Input-to-Paint QoE Guardrail Lane ──
+
+    #[test]
+    fn test_qoe_metric_display() {
+        assert_eq!(QoEMetric::InputToPaint.to_string(), "input-to-paint");
+        assert_eq!(QoEMetric::FrameJitter.to_string(), "frame-jitter");
+        assert_eq!(QoEMetric::Smoothness.to_string(), "smoothness");
+        assert_eq!(QoEMetric::KeystrokeEcho.to_string(), "keystroke-echo");
+    }
+
+    #[test]
+    fn test_qoe_metric_serde() {
+        for m in [QoEMetric::InputToPaint, QoEMetric::FrameJitter, QoEMetric::Smoothness, QoEMetric::KeystrokeEcho] {
+            let json = serde_json::to_string(&m).unwrap();
+            let back: QoEMetric = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, m);
+        }
+    }
+
+    #[test]
+    fn test_qoe_slo_serde() {
+        let slo = QoESLO {
+            metric: QoEMetric::InputToPaint,
+            target: 16_667.0,
+            percentile: 0.95,
+            description: "p95 under 16.67ms".to_string(),
+        };
+        let json = serde_json::to_string(&slo).unwrap();
+        let back: QoESLO = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, slo);
+    }
+
+    #[test]
+    fn test_qoe_measurement_serde() {
+        let m = QoEMeasurement {
+            metric: QoEMetric::FrameJitter,
+            value: 2000.0,
+            timestamp_us: 42,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: QoEMeasurement = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn test_qoe_guardrail_config_default() {
+        let cfg = QoEGuardrailConfig::default();
+        assert_eq!(cfg.slos.len(), 4);
+        assert_eq!(cfg.window_size, 1000);
+        assert_eq!(cfg.min_samples, 30);
+    }
+
+    #[test]
+    fn test_qoe_guardrail_config_serde() {
+        let cfg = QoEGuardrailConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: QoEGuardrailConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn test_qoe_guardrail_record() {
+        let mut guard = QoEGuardrail::new(QoEGuardrailConfig::default());
+        guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10000.0, timestamp_us: 1 });
+        assert_eq!(guard.total_measurements(), 1);
+        assert_eq!(guard.window_len(QoEMetric::InputToPaint), 1);
+    }
+
+    #[test]
+    fn test_qoe_guardrail_window_eviction() {
+        let cfg = QoEGuardrailConfig { window_size: 3, min_samples: 1, ..Default::default() };
+        let mut guard = QoEGuardrail::new(cfg);
+        for i in 0..5 {
+            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: i as f64, timestamp_us: i });
+        }
+        assert_eq!(guard.window_len(QoEMetric::InputToPaint), 3);
+    }
+
+    #[test]
+    fn test_qoe_evaluate_slo_insufficient_data() {
+        let guard = QoEGuardrail::new(QoEGuardrailConfig::default());
+        let slo = &guard.config().slos[0];
+        let verdict = guard.evaluate_slo(slo);
+        assert!(matches!(verdict, SLOVerdict::InsufficientData { .. }));
+    }
+
+    #[test]
+    fn test_qoe_evaluate_slo_met() {
+        let cfg = QoEGuardrailConfig {
+            slos: vec![QoESLO {
+                metric: QoEMetric::InputToPaint,
+                target: 20_000.0,
+                percentile: 0.95,
+                description: "test".to_string(),
+            }],
+            window_size: 100,
+            min_samples: 5,
+        };
+        let mut guard = QoEGuardrail::new(cfg);
+        // Add 10 samples all under the target.
+        for i in 0..10 {
+            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10_000.0, timestamp_us: i });
+        }
+        let verdict = guard.evaluate_slo(&guard.config().slos[0].clone());
+        assert!(matches!(verdict, SLOVerdict::Met { .. }));
+    }
+
+    #[test]
+    fn test_qoe_evaluate_slo_breached() {
+        let cfg = QoEGuardrailConfig {
+            slos: vec![QoESLO {
+                metric: QoEMetric::InputToPaint,
+                target: 5_000.0,
+                percentile: 0.95,
+                description: "test".to_string(),
+            }],
+            window_size: 100,
+            min_samples: 5,
+        };
+        let mut guard = QoEGuardrail::new(cfg);
+        // Add samples above target.
+        for i in 0..10 {
+            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 20_000.0, timestamp_us: i });
+        }
+        let verdict = guard.evaluate_slo(&guard.config().slos[0].clone());
+        assert!(matches!(verdict, SLOVerdict::Breached { .. }));
+    }
+
+    #[test]
+    fn test_qoe_smoothness_higher_is_better() {
+        let cfg = QoEGuardrailConfig {
+            slos: vec![QoESLO {
+                metric: QoEMetric::Smoothness,
+                target: 0.9,
+                percentile: 0.50,
+                description: "median smoothness".to_string(),
+            }],
+            window_size: 100,
+            min_samples: 5,
+        };
+        let mut guard = QoEGuardrail::new(cfg);
+        for i in 0..10 {
+            guard.record(QoEMeasurement { metric: QoEMetric::Smoothness, value: 0.95, timestamp_us: i });
+        }
+        let verdict = guard.evaluate_slo(&guard.config().slos[0].clone());
+        assert!(matches!(verdict, SLOVerdict::Met { .. }));
+    }
+
+    #[test]
+    fn test_qoe_snapshot() {
+        let cfg = QoEGuardrailConfig { min_samples: 1, ..Default::default() };
+        let mut guard = QoEGuardrail::new(cfg);
+        guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10000.0, timestamp_us: 1 });
+        let snap = guard.snapshot();
+        assert_eq!(snap.total_measurements, 1);
+    }
+
+    #[test]
+    fn test_qoe_snapshot_serde() {
+        let snap = QoEGuardrailSnapshot {
+            verdicts: vec![(QoEMetric::InputToPaint, SLOVerdict::Met { measured: 10.0, target: 20.0 })],
+            total_measurements: 100,
+            breach_count: 0,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: QoEGuardrailSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn test_qoe_degradation_warming_up() {
+        let guard = QoEGuardrail::new(QoEGuardrailConfig::default());
+        let deg = guard.detect_degradation();
+        assert!(matches!(deg, QoEDegradation::WarmingUp { .. }));
+    }
+
+    #[test]
+    fn test_qoe_degradation_healthy() {
+        let cfg = QoEGuardrailConfig {
+            slos: vec![QoESLO {
+                metric: QoEMetric::InputToPaint,
+                target: 20_000.0,
+                percentile: 0.95,
+                description: "test".to_string(),
+            }],
+            window_size: 100,
+            min_samples: 5,
+        };
+        let mut guard = QoEGuardrail::new(cfg);
+        for i in 0..10 {
+            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10000.0, timestamp_us: i });
+        }
+        assert_eq!(guard.detect_degradation(), QoEDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_qoe_degradation_slo_breach() {
+        let cfg = QoEGuardrailConfig {
+            slos: vec![QoESLO {
+                metric: QoEMetric::InputToPaint,
+                target: 5_000.0,
+                percentile: 0.95,
+                description: "test".to_string(),
+            }],
+            window_size: 100,
+            min_samples: 5,
+        };
+        let mut guard = QoEGuardrail::new(cfg);
+        for i in 0..10 {
+            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 20000.0, timestamp_us: i });
+        }
+        let deg = guard.detect_degradation();
+        assert!(matches!(deg, QoEDegradation::SLOBreach { .. }));
+    }
+
+    #[test]
+    fn test_qoe_degradation_display() {
+        assert_eq!(QoEDegradation::Healthy.to_string(), "healthy");
+        assert_eq!(QoEDegradation::SLOBreach { breach_count: 2 }.to_string(), "slo-breach(2)");
+        assert_eq!(QoEDegradation::WarmingUp { samples: 5 }.to_string(), "warming-up(5)");
+    }
+
+    #[test]
+    fn test_qoe_degradation_serde() {
+        let cases = vec![
+            QoEDegradation::Healthy,
+            QoEDegradation::SLOBreach { breach_count: 3 },
+            QoEDegradation::WarmingUp { samples: 10 },
+        ];
+        for deg in cases {
+            let json = serde_json::to_string(&deg).unwrap();
+            let back: QoEDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, deg);
+        }
+    }
+
+    #[test]
+    fn test_qoe_slo_verdict_display() {
+        assert_eq!(SLOVerdict::Met { measured: 10.0, target: 20.0 }.to_string(), "met(10.0/20.0)");
+        assert_eq!(SLOVerdict::Breached { measured: 30.0, target: 20.0 }.to_string(), "breached(30.0/20.0)");
+        assert_eq!(SLOVerdict::InsufficientData { samples: 5, required: 30 }.to_string(), "insufficient(5/30)");
+    }
+
+    #[test]
+    fn test_qoe_slo_verdict_serde() {
+        let cases = vec![
+            SLOVerdict::Met { measured: 10.0, target: 20.0 },
+            SLOVerdict::Breached { measured: 30.0, target: 20.0 },
+            SLOVerdict::InsufficientData { samples: 5, required: 30 },
+        ];
+        for v in cases {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: SLOVerdict = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, v);
+        }
+    }
+
+    #[test]
+    fn test_qoe_log_entry() {
+        let guard = QoEGuardrail::new(QoEGuardrailConfig::default());
+        let entry = guard.log_entry(QoEMetric::InputToPaint, "spike".to_string(), 42);
+        assert_eq!(entry.metric, QoEMetric::InputToPaint);
+        assert_eq!(entry.timestamp_us, 42);
+    }
+
+    #[test]
+    fn test_qoe_log_entry_serde() {
+        let entry = QoELogEntry {
+            timestamp_us: 100,
+            metric: QoEMetric::FrameJitter,
+            event: "test".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: QoELogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn test_qoe_reset() {
+        let mut guard = QoEGuardrail::new(QoEGuardrailConfig::default());
+        guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10000.0, timestamp_us: 1 });
+        guard.reset();
+        assert_eq!(guard.total_measurements(), 0);
+        assert_eq!(guard.window_len(QoEMetric::InputToPaint), 0);
+    }
+
+    #[test]
+    fn test_qoe_config_accessor() {
+        let cfg = QoEGuardrailConfig { min_samples: 42, ..Default::default() };
+        let guard = QoEGuardrail::new(cfg.clone());
+        assert_eq!(*guard.config(), cfg);
+    }
+
+    #[test]
+    fn test_qoe_to_invariant_domain() {
+        assert_eq!(QoEGuardrail::to_invariant_domain(), InvariantDomain::Composition);
     }
 }
