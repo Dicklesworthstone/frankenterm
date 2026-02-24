@@ -228,6 +228,7 @@ pub mod replay_fault_injection;
 pub mod replay_fixture_harvest;
 pub mod replay_guardrails;
 pub mod replay_guardrails_gate;
+pub mod replay_guide;
 pub mod replay_mcp;
 pub mod replay_performance;
 pub mod replay_remediation;
