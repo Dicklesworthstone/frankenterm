@@ -221,6 +221,7 @@ pub mod replay_capture;
 pub mod replay_fixture_harvest;
 pub mod replay_performance;
 pub mod replay_merge;
+pub mod replay_provenance;
 pub mod replay_side_effect_barrier;
 pub mod reports;
 pub mod reservoir_sampler;
