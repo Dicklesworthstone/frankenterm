@@ -357,9 +357,10 @@ pub fn render_card(card: &EvidenceCard) -> String {
         lines.push(format!("├{}┤", border));
         let events: Vec<String> = card.timeline.iter().map(|e| e.label.clone()).collect();
         let timeline_str = format!(" Timeline: {}", events.join(" -> "));
-        // Truncate if too long.
-        let truncated = if timeline_str.len() > width - 2 {
-            format!("{}...", &timeline_str[..width - 5])
+        // Truncate if too long (safe for multi-byte UTF-8).
+        let truncated = if timeline_str.chars().count() > width - 2 {
+            let safe_slice: String = timeline_str.chars().take(width - 5).collect();
+            format!("{}...", safe_slice)
         } else {
             timeline_str
         };
@@ -374,10 +375,11 @@ pub fn render_card(card: &EvidenceCard) -> String {
 
 /// Pad a string to the right to fill `width` characters.
 fn pad_right(s: &str, width: usize) -> String {
-    if s.len() >= width {
-        s[..width].to_string()
+    let char_count = s.chars().count();
+    if char_count >= width {
+        s.chars().take(width).collect()
     } else {
-        format!("{}{}", s, " ".repeat(width - s.len()))
+        format!("{}{}", s, " ".repeat(width - char_count))
     }
 }
 

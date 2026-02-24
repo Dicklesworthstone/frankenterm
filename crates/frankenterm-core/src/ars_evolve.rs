@@ -407,8 +407,14 @@ impl EvolutionEngine {
 
     /// Check if `ancestor` is an ancestor of `descendant`.
     fn is_ancestor(&self, ancestor: ReflexId, descendant: ReflexId) -> bool {
-        let chain = self.lineage(descendant);
-        chain.contains(&ancestor)
+        let mut current = descendant;
+        while let Some(&parent) = self.lineage.get(&current) {
+            if parent == ancestor {
+                return true;
+            }
+            current = parent;
+        }
+        false
     }
 
     /// Get all active (usable) reflexes.
