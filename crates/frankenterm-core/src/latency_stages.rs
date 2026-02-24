@@ -12545,6 +12545,88 @@ impl ProofGate {
     pub fn config(&self) -> &ProofGateConfig {
         &self.config
     }
+
+    /// Check a candidate trace against a golden artifact built from
+    /// ModelChecker TraceSteps (v1→v2 upgrade + proof check).
+    pub fn check_from_mc_trace(
+        &mut self,
+        artifact_id: &str,
+        mc_steps: &[TraceStep],
+        seed: u64,
+        timestamp_us: u64,
+    ) -> ProofSummary {
+        let candidate = self.canonicalizer.upgrade_trace(mc_steps, "mc-candidate".to_string(), seed);
+        self.check(artifact_id, &candidate, timestamp_us)
+    }
+
+    /// Register a golden artifact from model-checker output.
+    pub fn register_golden_from_mc(
+        &mut self,
+        artifact_id: String,
+        mc_steps: &[TraceStep],
+        seed: u64,
+        description: String,
+        created_at_us: u64,
+    ) {
+        let trace = self.canonicalizer.upgrade_trace(mc_steps, artifact_id.clone(), seed);
+        let ga = GoldenArtifact::new(artifact_id, trace, description, created_at_us);
+        self.register_golden(ga);
+    }
+
+    /// Approve a semantic drift: update the golden artifact to the candidate trace.
+    pub fn approve_drift(
+        &mut self,
+        artifact_id: &str,
+        candidate: &DeterministicTrace,
+        created_at_us: u64,
+    ) -> bool {
+        if let Some(pos) = self.artifacts.iter().position(|a| a.artifact_id == artifact_id) {
+            self.artifacts[pos].update(candidate.clone(), created_at_us);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get all failing artifact IDs from the latest check_all results.
+    pub fn failing_artifacts(summaries: &[ProofSummary]) -> Vec<String> {
+        summaries.iter()
+            .filter(|s| s.verdict.is_fail())
+            .map(|s| s.artifact_id.clone())
+            .collect()
+    }
+
+    /// Get all passing artifact IDs from the latest check_all results.
+    pub fn passing_artifacts(summaries: &[ProofSummary]) -> Vec<String> {
+        summaries.iter()
+            .filter(|s| s.verdict.is_pass())
+            .map(|s| s.artifact_id.clone())
+            .collect()
+    }
+
+    /// Pass rate across a set of proof summaries.
+    pub fn pass_rate(summaries: &[ProofSummary]) -> f64 {
+        if summaries.is_empty() {
+            return 1.0;
+        }
+        let passes = summaries.iter().filter(|s| s.verdict.is_pass()).count();
+        passes as f64 / summaries.len() as f64
+    }
+
+    /// Total pass count.
+    pub fn total_passes(&self) -> u64 {
+        self.passes
+    }
+
+    /// Total failure count.
+    pub fn total_failures(&self) -> u64 {
+        self.failures
+    }
+
+    /// Total checks.
+    pub fn total_checks(&self) -> u64 {
+        self.checks_run
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -23299,5 +23381,111 @@ mod tests {
         let cfg = ProofGateConfig { allow_isomorphic: false, ..Default::default() };
         let gate = ProofGate::new(cfg.clone());
         assert_eq!(*gate.config(), cfg);
+    }
+
+    // ── E4 Impl: Bridge method tests ─────────────────────────────
+
+    #[test]
+    fn test_check_from_mc_trace() {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        let steps = vec![
+            TraceStep { step: 0, action: TraceAction::EpochAdvance { new_epoch: 1 }, check_results: vec![], timestamp_us: 10 },
+        ];
+        gate.register_golden_from_mc("mc-opt".to_string(), &steps, 42, "desc".to_string(), 0);
+        let summary = gate.check_from_mc_trace("mc-opt", &steps, 42, 100);
+        assert!(summary.verdict.is_pass());
+    }
+
+    #[test]
+    fn test_register_golden_from_mc() {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        let steps = vec![
+            TraceStep { step: 0, action: TraceAction::EpochAdvance { new_epoch: 5 }, check_results: vec![], timestamp_us: 100 },
+        ];
+        gate.register_golden_from_mc("mc-1".to_string(), &steps, 99, "mc golden".to_string(), 0);
+        assert_eq!(gate.artifact_count(), 1);
+        let ga = gate.get_golden("mc-1").unwrap();
+        assert_eq!(ga.trace.version, TraceFormatVersion::V2);
+        assert_eq!(ga.trace.len(), 1);
+    }
+
+    #[test]
+    fn test_approve_drift() {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        let t1 = make_golden_trace(&[(10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition)]);
+        gate.register_golden(GoldenArtifact::new("x".to_string(), t1, "v1".to_string(), 0));
+        let t2 = make_golden_trace(&[(20, TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition)]);
+        assert!(gate.approve_drift("x", &t2, 100));
+        assert_eq!(gate.get_golden("x").unwrap().version, 2);
+        assert!(!gate.approve_drift("nonexistent", &t2, 100));
+    }
+
+    #[test]
+    fn test_failing_passing_artifacts() {
+        let summaries = vec![
+            ProofSummary {
+                artifact_id: "a".to_string(), golden_version: 1,
+                verdict: ProofGateVerdict::Equivalent,
+                candidate_entries: 1, golden_entries: 1, check_duration_us: 0, timestamp_us: 0,
+            },
+            ProofSummary {
+                artifact_id: "b".to_string(), golden_version: 1,
+                verdict: ProofGateVerdict::SemanticDrift {
+                    first_divergence_idx: 0, mismatches: vec![], summary: "x".to_string(),
+                },
+                candidate_entries: 1, golden_entries: 1, check_duration_us: 0, timestamp_us: 0,
+            },
+        ];
+        assert_eq!(ProofGate::failing_artifacts(&summaries), vec!["b".to_string()]);
+        assert_eq!(ProofGate::passing_artifacts(&summaries), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn test_pass_rate() {
+        let summaries = vec![
+            ProofSummary {
+                artifact_id: "a".to_string(), golden_version: 1,
+                verdict: ProofGateVerdict::Equivalent,
+                candidate_entries: 1, golden_entries: 1, check_duration_us: 0, timestamp_us: 0,
+            },
+            ProofSummary {
+                artifact_id: "b".to_string(), golden_version: 1,
+                verdict: ProofGateVerdict::SemanticDrift {
+                    first_divergence_idx: 0, mismatches: vec![], summary: "x".to_string(),
+                },
+                candidate_entries: 1, golden_entries: 1, check_duration_us: 0, timestamp_us: 0,
+            },
+        ];
+        let rate = ProofGate::pass_rate(&summaries);
+        assert!((rate - 0.5).abs() < 1e-10);
+        assert!((ProofGate::pass_rate(&[]) - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_total_counters() {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        let trace = make_golden_trace(&[(10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition)]);
+        gate.register_golden(GoldenArtifact::new("x".to_string(), trace.clone(), "d".to_string(), 0));
+        let _ = gate.check("x", &trace, 0);
+        assert_eq!(gate.total_checks(), 1);
+        assert_eq!(gate.total_passes(), 1);
+        assert_eq!(gate.total_failures(), 0);
+    }
+
+    #[test]
+    fn test_check_all() {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        let t1 = make_golden_trace(&[(10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition)]);
+        let t2 = make_golden_trace(&[(20, TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition)]);
+        gate.register_golden(GoldenArtifact::new("a".to_string(), t1.clone(), "d".to_string(), 0));
+        gate.register_golden(GoldenArtifact::new("b".to_string(), t2.clone(), "d".to_string(), 0));
+        let mut candidates = std::collections::HashMap::new();
+        candidates.insert("a".to_string(), t1);
+        candidates.insert("b".to_string(), t2);
+        let summaries = gate.check_all(&candidates, 100);
+        assert_eq!(summaries.len(), 2);
+        for s in &summaries {
+            assert!(s.verdict.is_pass());
+        }
     }
 }
