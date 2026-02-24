@@ -9286,6 +9286,314 @@ pub struct PolicyControllerLogEntry {
     pub degradation: PolicyDegradation,
 }
 
+// ── D4: Calibration Harness and Promotion Gates ────────────────────
+
+/// Scenario class for calibration evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CalibrationScenario {
+    /// Steady-state, no anomalies.
+    Nominal,
+    /// Gradual drift over time.
+    GradualDrift,
+    /// Sudden regime change.
+    AbruptShift,
+    /// High-noise environment.
+    NoisyBaseline,
+    /// Recovery after a stress event.
+    PostStressRecovery,
+}
+
+impl std::fmt::Display for CalibrationScenario {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Nominal => write!(f, "nominal"),
+            Self::GradualDrift => write!(f, "gradual_drift"),
+            Self::AbruptShift => write!(f, "abrupt_shift"),
+            Self::NoisyBaseline => write!(f, "noisy_baseline"),
+            Self::PostStressRecovery => write!(f, "post_stress_recovery"),
+        }
+    }
+}
+
+/// Result of evaluating a detector/controller on one calibration scenario.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationResult {
+    /// Which scenario was run.
+    pub scenario: CalibrationScenario,
+    /// False positive rate (type I errors).
+    pub false_positive_rate: f64,
+    /// Miss rate (type II errors).
+    pub miss_rate: f64,
+    /// Detection delay in observations (for drift scenarios).
+    pub detection_delay: f64,
+    /// Mean expected loss over the scenario.
+    pub mean_expected_loss: f64,
+    /// Whether the result meets the promotion gate criteria.
+    pub passes_gate: bool,
+    /// Number of observations in the scenario.
+    pub observation_count: u64,
+    /// Timestamp when calibration was run.
+    pub timestamp_us: u64,
+}
+
+/// Promotion gate configuration.
+///
+/// A controller/detector update is only promoted to production if
+/// all gate criteria are met across all calibration scenarios.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromotionGateConfig {
+    /// Maximum allowed false positive rate.
+    pub max_fpr: f64,
+    /// Maximum allowed miss rate.
+    pub max_miss_rate: f64,
+    /// Maximum allowed detection delay (observations).
+    pub max_detection_delay: f64,
+    /// Maximum allowed mean expected loss.
+    pub max_expected_loss: f64,
+    /// Minimum number of scenarios that must pass.
+    pub min_passing_scenarios: usize,
+    /// Whether to require all scenarios to pass (strict mode).
+    pub strict: bool,
+}
+
+impl PromotionGateConfig {
+    /// Sensible defaults.
+    pub fn default_strict() -> Self {
+        Self {
+            max_fpr: 0.05,
+            max_miss_rate: 0.10,
+            max_detection_delay: 50.0,
+            max_expected_loss: 5.0,
+            min_passing_scenarios: 5,
+            strict: true,
+        }
+    }
+}
+
+/// Verdict of the promotion gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PromotionVerdict {
+    /// All gates passed — safe to promote.
+    Approved,
+    /// Some gates failed — review required.
+    ConditionalHold,
+    /// Critical gates failed — do not promote.
+    Rejected,
+}
+
+impl std::fmt::Display for PromotionVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Approved => write!(f, "approved"),
+            Self::ConditionalHold => write!(f, "conditional_hold"),
+            Self::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
+/// Snapshot of the calibration harness state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationSnapshot {
+    /// Total calibration runs.
+    pub total_runs: u64,
+    /// Results per scenario.
+    pub scenario_results: Vec<CalibrationResult>,
+    /// Overall verdict.
+    pub verdict: PromotionVerdict,
+    /// Number of passing scenarios.
+    pub passing_count: usize,
+    /// Number of failing scenarios.
+    pub failing_count: usize,
+}
+
+/// The calibration harness.
+///
+/// Evaluates detector/controller quality across scenario classes and
+/// gates promotions based on configurable thresholds.
+#[derive(Debug, Clone)]
+pub struct CalibrationHarness {
+    config: PromotionGateConfig,
+    /// Results from the most recent calibration run.
+    results: Vec<CalibrationResult>,
+    /// Total calibration runs ever.
+    total_runs: u64,
+    /// Last verdict.
+    last_verdict: PromotionVerdict,
+}
+
+impl CalibrationHarness {
+    /// Create a new harness.
+    pub fn new(config: PromotionGateConfig) -> Self {
+        Self {
+            config,
+            results: Vec::new(),
+            total_runs: 0,
+            last_verdict: PromotionVerdict::Rejected,
+        }
+    }
+
+    /// Create with strict defaults.
+    pub fn with_defaults() -> Self {
+        Self::new(PromotionGateConfig::default_strict())
+    }
+
+    /// Submit a calibration result and evaluate against gates.
+    pub fn submit(&mut self, result: CalibrationResult) {
+        self.total_runs += 1;
+        self.results.push(result);
+    }
+
+    /// Evaluate a single result against gate criteria.
+    fn evaluate_result(&self, result: &CalibrationResult) -> bool {
+        result.false_positive_rate <= self.config.max_fpr
+            && result.miss_rate <= self.config.max_miss_rate
+            && result.detection_delay <= self.config.max_detection_delay
+            && result.mean_expected_loss <= self.config.max_expected_loss
+    }
+
+    /// Compute the overall promotion verdict.
+    pub fn evaluate(&mut self) -> PromotionVerdict {
+        if self.results.is_empty() {
+            self.last_verdict = PromotionVerdict::Rejected;
+            return self.last_verdict;
+        }
+
+        let mut passing = 0_usize;
+        let mut failing = 0_usize;
+        for r in &mut self.results {
+            let passes = r.false_positive_rate <= self.config.max_fpr
+                && r.miss_rate <= self.config.max_miss_rate
+                && r.detection_delay <= self.config.max_detection_delay
+                && r.mean_expected_loss <= self.config.max_expected_loss;
+            r.passes_gate = passes;
+            if passes {
+                passing += 1;
+            } else {
+                failing += 1;
+            }
+        }
+
+        let verdict = if self.config.strict && failing > 0 {
+            PromotionVerdict::Rejected
+        } else if passing >= self.config.min_passing_scenarios {
+            PromotionVerdict::Approved
+        } else if passing > 0 {
+            PromotionVerdict::ConditionalHold
+        } else {
+            PromotionVerdict::Rejected
+        };
+
+        self.last_verdict = verdict;
+        verdict
+    }
+
+    /// Last computed verdict.
+    pub fn verdict(&self) -> PromotionVerdict {
+        self.last_verdict
+    }
+
+    /// Total calibration runs.
+    pub fn total_runs(&self) -> u64 {
+        self.total_runs
+    }
+
+    /// Number of results stored.
+    pub fn result_count(&self) -> usize {
+        self.results.len()
+    }
+
+    /// Snapshot of current state.
+    pub fn snapshot(&self) -> CalibrationSnapshot {
+        let passing = self.results.iter().filter(|r| r.passes_gate).count();
+        let failing = self.results.len() - passing;
+        CalibrationSnapshot {
+            total_runs: self.total_runs,
+            scenario_results: self.results.clone(),
+            verdict: self.last_verdict,
+            passing_count: passing,
+            failing_count: failing,
+        }
+    }
+
+    /// Human-readable status line.
+    pub fn status_line(&self) -> String {
+        let snap = self.snapshot();
+        format!(
+            "calibration[{}] runs={} pass={} fail={}",
+            snap.verdict, snap.total_runs, snap.passing_count, snap.failing_count,
+        )
+    }
+
+    /// Reset all results.
+    pub fn reset(&mut self) {
+        self.results.clear();
+        self.total_runs = 0;
+        self.last_verdict = PromotionVerdict::Rejected;
+    }
+
+    /// Clear results but keep total_runs count.
+    pub fn clear_results(&mut self) {
+        self.results.clear();
+        self.last_verdict = PromotionVerdict::Rejected;
+    }
+
+    /// Detect degradation.
+    pub fn detect_degradation(&self) -> CalibrationDegradation {
+        match self.last_verdict {
+            PromotionVerdict::Approved => CalibrationDegradation::Healthy,
+            PromotionVerdict::ConditionalHold => CalibrationDegradation::GateMarginal {
+                passing: self.results.iter().filter(|r| r.passes_gate).count(),
+                total: self.results.len(),
+            },
+            PromotionVerdict::Rejected => CalibrationDegradation::GateFailed {
+                failing: self.results.iter().filter(|r| !r.passes_gate).count(),
+                total: self.results.len(),
+            },
+        }
+    }
+
+    /// Generate structured log entry.
+    pub fn log_entry(&self) -> CalibrationLogEntry {
+        CalibrationLogEntry {
+            total_runs: self.total_runs,
+            result_count: self.results.len(),
+            verdict: self.last_verdict,
+            degradation: self.detect_degradation(),
+        }
+    }
+}
+
+/// Degradation status for the calibration harness.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum CalibrationDegradation {
+    Healthy,
+    GateMarginal { passing: usize, total: usize },
+    GateFailed { failing: usize, total: usize },
+}
+
+impl std::fmt::Display for CalibrationDegradation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "healthy"),
+            Self::GateMarginal { passing, total } => {
+                write!(f, "marginal({passing}/{total})")
+            }
+            Self::GateFailed { failing, total } => {
+                write!(f, "failed({failing}/{total})")
+            }
+        }
+    }
+}
+
+/// Structured log entry for the calibration harness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationLogEntry {
+    pub total_runs: u64,
+    pub result_count: usize,
+    pub verdict: PromotionVerdict,
+    pub degradation: CalibrationDegradation,
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -16013,5 +16321,232 @@ mod tests {
         assert_eq!(ctrl.decision_count(), 0);
         ctrl.decide([1.0, 0.0, 0.0, 0.0], 100);
         assert_eq!(ctrl.decision_count(), 1);
+    }
+
+    // ── D4: Calibration Harness Tests ─────────────────────────────
+
+    #[test]
+    fn test_calibration_scenario_display() {
+        assert_eq!(CalibrationScenario::Nominal.to_string(), "nominal");
+        assert_eq!(CalibrationScenario::GradualDrift.to_string(), "gradual_drift");
+        assert_eq!(CalibrationScenario::AbruptShift.to_string(), "abrupt_shift");
+        assert_eq!(CalibrationScenario::NoisyBaseline.to_string(), "noisy_baseline");
+        assert_eq!(CalibrationScenario::PostStressRecovery.to_string(), "post_stress_recovery");
+    }
+
+    #[test]
+    fn test_promotion_verdict_display() {
+        assert_eq!(PromotionVerdict::Approved.to_string(), "approved");
+        assert_eq!(PromotionVerdict::ConditionalHold.to_string(), "conditional_hold");
+        assert_eq!(PromotionVerdict::Rejected.to_string(), "rejected");
+    }
+
+    fn make_passing_result(scenario: CalibrationScenario) -> CalibrationResult {
+        CalibrationResult {
+            scenario,
+            false_positive_rate: 0.01,
+            miss_rate: 0.02,
+            detection_delay: 10.0,
+            mean_expected_loss: 1.0,
+            passes_gate: false,
+            observation_count: 1000,
+            timestamp_us: 12345,
+        }
+    }
+
+    fn make_failing_result(scenario: CalibrationScenario) -> CalibrationResult {
+        CalibrationResult {
+            scenario,
+            false_positive_rate: 0.2,
+            miss_rate: 0.3,
+            detection_delay: 100.0,
+            mean_expected_loss: 10.0,
+            passes_gate: false,
+            observation_count: 1000,
+            timestamp_us: 12345,
+        }
+    }
+
+    #[test]
+    fn test_calibration_initial_state() {
+        let harness = CalibrationHarness::with_defaults();
+        assert_eq!(harness.verdict(), PromotionVerdict::Rejected);
+        assert_eq!(harness.total_runs(), 0);
+        assert_eq!(harness.result_count(), 0);
+    }
+
+    #[test]
+    fn test_calibration_all_pass_approved() {
+        let mut harness = CalibrationHarness::with_defaults();
+        let scenarios = [
+            CalibrationScenario::Nominal,
+            CalibrationScenario::GradualDrift,
+            CalibrationScenario::AbruptShift,
+            CalibrationScenario::NoisyBaseline,
+            CalibrationScenario::PostStressRecovery,
+        ];
+        for s in &scenarios {
+            harness.submit(make_passing_result(*s));
+        }
+        let verdict = harness.evaluate();
+        assert_eq!(verdict, PromotionVerdict::Approved);
+    }
+
+    #[test]
+    fn test_calibration_one_fail_strict_rejected() {
+        let mut harness = CalibrationHarness::with_defaults();
+        harness.submit(make_passing_result(CalibrationScenario::Nominal));
+        harness.submit(make_passing_result(CalibrationScenario::GradualDrift));
+        harness.submit(make_passing_result(CalibrationScenario::AbruptShift));
+        harness.submit(make_passing_result(CalibrationScenario::NoisyBaseline));
+        harness.submit(make_failing_result(CalibrationScenario::PostStressRecovery));
+        let verdict = harness.evaluate();
+        assert_eq!(verdict, PromotionVerdict::Rejected);
+    }
+
+    #[test]
+    fn test_calibration_non_strict_conditional() {
+        let config = PromotionGateConfig {
+            max_fpr: 0.05,
+            max_miss_rate: 0.10,
+            max_detection_delay: 50.0,
+            max_expected_loss: 5.0,
+            min_passing_scenarios: 5,
+            strict: false,
+        };
+        let mut harness = CalibrationHarness::new(config);
+        for _ in 0..3 {
+            harness.submit(make_passing_result(CalibrationScenario::Nominal));
+        }
+        harness.submit(make_failing_result(CalibrationScenario::AbruptShift));
+        let verdict = harness.evaluate();
+        // 3 passing < 5 required, so ConditionalHold
+        assert_eq!(verdict, PromotionVerdict::ConditionalHold);
+    }
+
+    #[test]
+    fn test_calibration_empty_rejected() {
+        let mut harness = CalibrationHarness::with_defaults();
+        let verdict = harness.evaluate();
+        assert_eq!(verdict, PromotionVerdict::Rejected);
+    }
+
+    #[test]
+    fn test_calibration_reset() {
+        let mut harness = CalibrationHarness::with_defaults();
+        harness.submit(make_passing_result(CalibrationScenario::Nominal));
+        harness.reset();
+        assert_eq!(harness.total_runs(), 0);
+        assert_eq!(harness.result_count(), 0);
+    }
+
+    #[test]
+    fn test_calibration_clear_results() {
+        let mut harness = CalibrationHarness::with_defaults();
+        harness.submit(make_passing_result(CalibrationScenario::Nominal));
+        assert_eq!(harness.total_runs(), 1);
+        harness.clear_results();
+        assert_eq!(harness.result_count(), 0);
+        assert_eq!(harness.total_runs(), 1);
+    }
+
+    #[test]
+    fn test_calibration_snapshot() {
+        let mut harness = CalibrationHarness::with_defaults();
+        harness.submit(make_passing_result(CalibrationScenario::Nominal));
+        harness.evaluate();
+        let snap = harness.snapshot();
+        assert_eq!(snap.total_runs, 1);
+        assert_eq!(snap.scenario_results.len(), 1);
+    }
+
+    #[test]
+    fn test_calibration_status_line() {
+        let harness = CalibrationHarness::with_defaults();
+        let line = harness.status_line();
+        assert!(line.contains("calibration"));
+    }
+
+    #[test]
+    fn test_calibration_scenario_serde() {
+        for s in [CalibrationScenario::Nominal, CalibrationScenario::GradualDrift, CalibrationScenario::AbruptShift, CalibrationScenario::NoisyBaseline, CalibrationScenario::PostStressRecovery] {
+            let json = serde_json::to_string(&s).unwrap();
+            let back: CalibrationScenario = serde_json::from_str(&json).unwrap();
+            assert_eq!(s, back);
+        }
+    }
+
+    #[test]
+    fn test_promotion_verdict_serde() {
+        for v in [PromotionVerdict::Approved, PromotionVerdict::ConditionalHold, PromotionVerdict::Rejected] {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: PromotionVerdict = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn test_calibration_degradation_display() {
+        assert_eq!(CalibrationDegradation::Healthy.to_string(), "healthy");
+        let m = CalibrationDegradation::GateMarginal { passing: 3, total: 5 };
+        assert!(m.to_string().contains("3/5"));
+        let f = CalibrationDegradation::GateFailed { failing: 2, total: 5 };
+        assert!(f.to_string().contains("2/5"));
+    }
+
+    #[test]
+    fn test_calibration_degradation_serde() {
+        let variants = vec![
+            CalibrationDegradation::Healthy,
+            CalibrationDegradation::GateMarginal { passing: 3, total: 5 },
+            CalibrationDegradation::GateFailed { failing: 2, total: 5 },
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: CalibrationDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[test]
+    fn test_calibration_log_entry() {
+        let mut harness = CalibrationHarness::with_defaults();
+        harness.submit(make_passing_result(CalibrationScenario::Nominal));
+        harness.evaluate();
+        let entry = harness.log_entry();
+        assert_eq!(entry.total_runs, 1);
+    }
+
+    #[test]
+    fn test_calibration_detect_degradation_healthy() {
+        let mut harness = CalibrationHarness::with_defaults();
+        let scenarios = [
+            CalibrationScenario::Nominal,
+            CalibrationScenario::GradualDrift,
+            CalibrationScenario::AbruptShift,
+            CalibrationScenario::NoisyBaseline,
+            CalibrationScenario::PostStressRecovery,
+        ];
+        for s in &scenarios {
+            harness.submit(make_passing_result(*s));
+        }
+        harness.evaluate();
+        assert_eq!(harness.detect_degradation(), CalibrationDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_calibration_config_serde() {
+        let config = PromotionGateConfig::default_strict();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: PromotionGateConfig = serde_json::from_str(&json).unwrap();
+        assert!((config.max_fpr - back.max_fpr).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_calibration_result_serde() {
+        let result = make_passing_result(CalibrationScenario::Nominal);
+        let json = serde_json::to_string(&result).unwrap();
+        let back: CalibrationResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(result.scenario, back.scenario);
     }
 }
