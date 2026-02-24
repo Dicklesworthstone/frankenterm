@@ -842,7 +842,7 @@ mod tests {
     use crate::session_pane_state::AgentMetadata;
     use rusqlite::params;
 
-    fn setup_test_db() -> (String, Connection) {
+    fn setup_test_db() -> (String, Connection, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
         let conn = Connection::open(&db_path).unwrap();
@@ -890,9 +890,7 @@ mod tests {
         )
         .unwrap();
 
-        // Leak the tempdir so it persists through the test
-        std::mem::forget(dir);
-        (db_path, conn)
+        (db_path, conn, dir)
     }
 
     fn insert_session(conn: &Connection, session_id: &str, shutdown_clean: bool) {
@@ -938,7 +936,7 @@ mod tests {
 
     #[test]
     fn detect_no_unclean_sessions() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-abc", true);
 
         let candidates = find_unclean_sessions(&db_path).unwrap();
@@ -947,7 +945,7 @@ mod tests {
 
     #[test]
     fn detect_unclean_session() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-crash", false);
 
         let candidates = find_unclean_sessions(&db_path).unwrap();
@@ -957,7 +955,7 @@ mod tests {
 
     #[test]
     fn detect_picks_most_recent() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-old", false);
         insert_session(&conn, "sess-new", false);
 
@@ -979,7 +977,7 @@ mod tests {
 
     #[test]
     fn load_checkpoint_returns_none_for_no_checkpoints() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-no-cp", false);
 
         let result = load_latest_checkpoint(&db_path, "sess-no-cp").unwrap();
@@ -988,7 +986,7 @@ mod tests {
 
     #[test]
     fn load_checkpoint_with_pane_states() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-ok", false);
         let cp_id = insert_checkpoint(&conn, "sess-ok", 5000, 2);
         insert_pane_state(&conn, cp_id, 0, Some("/home/user"), Some("bash"));
@@ -1005,7 +1003,7 @@ mod tests {
 
     #[test]
     fn load_latest_checkpoint_picks_newest() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-multi", false);
         let old_cp = insert_checkpoint(&conn, "sess-multi", 1000, 1);
         let new_cp = insert_checkpoint(&conn, "sess-multi", 2000, 3);
@@ -1021,14 +1019,14 @@ mod tests {
 
     #[test]
     fn load_checkpoint_by_id_returns_none_for_missing_checkpoint() {
-        let (db_path, _conn) = setup_test_db();
+        let (db_path, _conn, _dir) = setup_test_db();
         let result = load_checkpoint_by_id(&db_path, 999).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn load_checkpoint_by_id_can_load_non_latest_checkpoint() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-multi-id", false);
         let old_cp = insert_checkpoint(&conn, "sess-multi-id", 1000, 1);
         let _new_cp = insert_checkpoint(&conn, "sess-multi-id", 2000, 2);
@@ -1045,7 +1043,7 @@ mod tests {
 
     #[test]
     fn mark_session_restored_sets_clean_flag() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-restore", false);
 
         mark_session_restored(&db_path, "sess-restore").unwrap();
@@ -1062,7 +1060,7 @@ mod tests {
 
     #[test]
     fn save_restore_checkpoint_records_mapping() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-map", false);
 
         let mut mapping = HashMap::new();
@@ -1121,7 +1119,7 @@ mod tests {
 
     #[test]
     fn session_restorer_detect_empty_db() {
-        let (db_path, _conn) = setup_test_db();
+        let (db_path, _conn, _dir) = setup_test_db();
         let restorer = SessionRestorer::new(Arc::new(db_path), SessionRestoreConfig::default());
         let result = restorer.detect().unwrap();
         assert!(result.is_none());
@@ -1129,7 +1127,7 @@ mod tests {
 
     #[test]
     fn session_restorer_detect_clean_sessions_only() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-clean-1", true);
         insert_session(&conn, "sess-clean-2", true);
 
@@ -1140,7 +1138,7 @@ mod tests {
 
     #[test]
     fn session_restorer_detect_finds_crash() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-clean", true);
         insert_session(&conn, "sess-crash", false);
 
@@ -1152,7 +1150,7 @@ mod tests {
 
     #[test]
     fn pane_state_parses_terminal_state_json() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-ts", false);
         let cp_id = insert_checkpoint(&conn, "sess-ts", 5000, 1);
         insert_pane_state(&conn, cp_id, 0, Some("/home"), None);
@@ -1222,7 +1220,7 @@ mod tests {
 
     #[test]
     fn pane_state_with_agent_metadata() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-agent", false);
         let cp_id = insert_checkpoint(&conn, "sess-agent", 5000, 1);
 
@@ -1250,14 +1248,14 @@ mod tests {
 
     #[test]
     fn list_sessions_empty() {
-        let (db_path, _conn) = setup_test_db();
+        let (db_path, _conn, _dir) = setup_test_db();
         let sessions = list_sessions(&db_path).unwrap();
         assert!(sessions.is_empty());
     }
 
     #[test]
     fn list_sessions_with_data() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-a", true);
         insert_session(&conn, "sess-b", false);
         let cp_id = insert_checkpoint(&conn, "sess-b", 2000, 3);
@@ -1279,14 +1277,14 @@ mod tests {
 
     #[test]
     fn show_session_not_found() {
-        let (db_path, _conn) = setup_test_db();
+        let (db_path, _conn, _dir) = setup_test_db();
         let result = show_session(&db_path, "nonexistent");
         assert!(matches!(result, Err(RestoreError::NoSessions)));
     }
 
     #[test]
     fn show_session_with_checkpoints() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-show", false);
         insert_checkpoint(&conn, "sess-show", 1000, 2);
         insert_checkpoint(&conn, "sess-show", 2000, 3);
@@ -1302,7 +1300,7 @@ mod tests {
 
     #[test]
     fn session_doctor_healthy() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-d", true);
         let cp_id = insert_checkpoint(&conn, "sess-d", 1000, 1);
         insert_pane_state(&conn, cp_id, 0, None, None);
@@ -1316,7 +1314,7 @@ mod tests {
 
     #[test]
     fn session_doctor_detects_unclean() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-crash1", false);
         insert_session(&conn, "sess-crash2", false);
         insert_session(&conn, "sess-clean", true);
@@ -1328,7 +1326,7 @@ mod tests {
 
     #[test]
     fn session_doctor_detects_orphans() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-o", true);
 
         // Insert an orphaned pane state (checkpoint_id 999 doesn't exist)
@@ -1345,7 +1343,7 @@ mod tests {
 
     #[test]
     fn delete_session_cascades() {
-        let (db_path, conn) = setup_test_db();
+        let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-del", false);
         let cp_id = insert_checkpoint(&conn, "sess-del", 1000, 2);
         insert_pane_state(&conn, cp_id, 0, None, None);
@@ -1373,7 +1371,7 @@ mod tests {
 
     #[test]
     fn delete_session_nonexistent() {
-        let (db_path, _conn) = setup_test_db();
+        let (db_path, _conn, _dir) = setup_test_db();
         let deleted = delete_session(&db_path, "nonexistent").unwrap();
         assert!(!deleted);
     }
