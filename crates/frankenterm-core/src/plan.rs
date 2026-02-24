@@ -561,6 +561,96 @@ pub enum StepAction {
     },
 }
 
+impl PartialEq for StepAction {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::SendText {
+                    pane_id: pane_a,
+                    text: text_a,
+                    paste_mode: paste_a,
+                },
+                Self::SendText {
+                    pane_id: pane_b,
+                    text: text_b,
+                    paste_mode: paste_b,
+                },
+            ) => pane_a == pane_b && text_a == text_b && paste_a == paste_b,
+            (
+                Self::WaitFor {
+                    pane_id: pane_a,
+                    condition: condition_a,
+                    timeout_ms: timeout_a,
+                },
+                Self::WaitFor {
+                    pane_id: pane_b,
+                    condition: condition_b,
+                    timeout_ms: timeout_b,
+                },
+            ) => pane_a == pane_b && condition_a == condition_b && timeout_a == timeout_b,
+            (
+                Self::AcquireLock {
+                    lock_name: lock_a,
+                    timeout_ms: timeout_a,
+                },
+                Self::AcquireLock {
+                    lock_name: lock_b,
+                    timeout_ms: timeout_b,
+                },
+            ) => lock_a == lock_b && timeout_a == timeout_b,
+            (Self::ReleaseLock { lock_name: lock_a }, Self::ReleaseLock { lock_name: lock_b }) => {
+                lock_a == lock_b
+            }
+            (
+                Self::StoreData {
+                    key: key_a,
+                    value: value_a,
+                },
+                Self::StoreData {
+                    key: key_b,
+                    value: value_b,
+                },
+            ) => key_a == key_b && value_a == value_b,
+            (
+                Self::RunWorkflow {
+                    workflow_id: workflow_a,
+                    params: params_a,
+                },
+                Self::RunWorkflow {
+                    workflow_id: workflow_b,
+                    params: params_b,
+                },
+            ) => workflow_a == workflow_b && params_a == params_b,
+            (
+                Self::MarkEventHandled { event_id: event_a },
+                Self::MarkEventHandled { event_id: event_b },
+            ) => event_a == event_b,
+            (
+                Self::ValidateApproval {
+                    approval_code: code_a,
+                },
+                Self::ValidateApproval {
+                    approval_code: code_b,
+                },
+            ) => code_a == code_b,
+            (Self::NestedPlan { plan: plan_a }, Self::NestedPlan { plan: plan_b }) => {
+                plan_a.compute_hash() == plan_b.compute_hash()
+            }
+            (
+                Self::Custom {
+                    action_type: action_a,
+                    payload: payload_a,
+                },
+                Self::Custom {
+                    action_type: action_b,
+                    payload: payload_b,
+                },
+            ) => action_a == action_b && payload_a == payload_b,
+            _ => false,
+        }
+    }
+}
+
 impl StepAction {
     /// Generate canonical string for hashing.
     #[must_use]
@@ -656,7 +746,7 @@ impl StepAction {
 // ============================================================================
 
 /// Condition to wait for.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WaitCondition {
     /// Wait for a pattern rule to match
@@ -1523,7 +1613,8 @@ impl MissionFailureCode {
                 error_code: "FTM1001",
                 terminality: MissionFailureTerminality::Terminal,
                 retryability: MissionFailureRetryability::Never,
-                human_hint: "Policy denied this action. Update policy or request operator override.",
+                human_hint:
+                    "Policy denied this action. Update policy or request operator override.",
                 machine_hint: "abort_and_request_policy_override",
             },
             Self::ReservationConflict => MissionFailureContract {
@@ -1531,7 +1622,8 @@ impl MissionFailureCode {
                 error_code: "FTM1002",
                 terminality: MissionFailureTerminality::NonTerminal,
                 retryability: MissionFailureRetryability::AfterStateRefresh,
-                human_hint: "Target paths are already reserved. Wait or coordinate with current owner.",
+                human_hint:
+                    "Target paths are already reserved. Wait or coordinate with current owner.",
                 machine_hint: "refresh_reservations_then_retry",
             },
             Self::RateLimited => MissionFailureContract {
@@ -1571,7 +1663,8 @@ impl MissionFailureCode {
                 error_code: "FTM1007",
                 terminality: MissionFailureTerminality::Terminal,
                 retryability: MissionFailureRetryability::Never,
-                human_hint: "Human operator denied execution. Revise mission scope before retrying.",
+                human_hint:
+                    "Human operator denied execution. Revise mission scope before retrying.",
                 machine_hint: "abort_and_open_revision_task",
             },
             Self::ApprovalExpired => MissionFailureContract {
@@ -1641,6 +1734,890 @@ impl fmt::Display for MissionFailureContext {
         }
     }
 }
+
+// ============================================================================
+// Mission Transaction Contract (Track H1)
+// ============================================================================
+
+/// Current schema version for transaction-domain mission contracts.
+pub const MISSION_TX_SCHEMA_VERSION: u32 = 1;
+
+/// Stable transaction identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TxId(pub String);
+
+impl fmt::Display for TxId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Stable transaction-plan identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TxPlanId(pub String);
+
+impl fmt::Display for TxPlanId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Stable transaction-step identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TxStepId(pub String);
+
+impl fmt::Display for TxStepId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Transaction lifecycle states for mission execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionTxState {
+    #[default]
+    Draft,
+    Planned,
+    Prepared,
+    Committing,
+    Committed,
+    Compensating,
+    RolledBack,
+    Failed,
+}
+
+impl MissionTxState {
+    /// Returns true when this state is terminal.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Committed | Self::RolledBack | Self::Failed)
+    }
+}
+
+impl fmt::Display for MissionTxState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Draft => f.write_str("draft"),
+            Self::Planned => f.write_str("planned"),
+            Self::Prepared => f.write_str("prepared"),
+            Self::Committing => f.write_str("committing"),
+            Self::Committed => f.write_str("committed"),
+            Self::Compensating => f.write_str("compensating"),
+            Self::RolledBack => f.write_str("rolled_back"),
+            Self::Failed => f.write_str("failed"),
+        }
+    }
+}
+
+/// Canonical transaction lifecycle transition kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionTxTransitionKind {
+    PlanCreated,
+    PrepareSucceeded,
+    PrepareDenied,
+    PrepareTimedOut,
+    CommitStarted,
+    CommitSucceeded,
+    CommitPartial,
+    CompensationStarted,
+    CompensationSucceeded,
+    CompensationFailed,
+    RollbackForced,
+    MarkFailed,
+}
+
+impl fmt::Display for MissionTxTransitionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlanCreated => f.write_str("plan_created"),
+            Self::PrepareSucceeded => f.write_str("prepare_succeeded"),
+            Self::PrepareDenied => f.write_str("prepare_denied"),
+            Self::PrepareTimedOut => f.write_str("prepare_timed_out"),
+            Self::CommitStarted => f.write_str("commit_started"),
+            Self::CommitSucceeded => f.write_str("commit_succeeded"),
+            Self::CommitPartial => f.write_str("commit_partial"),
+            Self::CompensationStarted => f.write_str("compensation_started"),
+            Self::CompensationSucceeded => f.write_str("compensation_succeeded"),
+            Self::CompensationFailed => f.write_str("compensation_failed"),
+            Self::RollbackForced => f.write_str("rollback_forced"),
+            Self::MarkFailed => f.write_str("mark_failed"),
+        }
+    }
+}
+
+/// One legal edge in the transaction lifecycle transition table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissionTxTransitionRule {
+    pub from: MissionTxState,
+    pub to: MissionTxState,
+    pub kind: MissionTxTransitionKind,
+}
+
+const MISSION_TX_TRANSITION_RULES: [MissionTxTransitionRule; 12] = [
+    MissionTxTransitionRule {
+        from: MissionTxState::Draft,
+        to: MissionTxState::Planned,
+        kind: MissionTxTransitionKind::PlanCreated,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Planned,
+        to: MissionTxState::Prepared,
+        kind: MissionTxTransitionKind::PrepareSucceeded,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Planned,
+        to: MissionTxState::Failed,
+        kind: MissionTxTransitionKind::PrepareDenied,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Planned,
+        to: MissionTxState::Failed,
+        kind: MissionTxTransitionKind::PrepareTimedOut,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Prepared,
+        to: MissionTxState::Committing,
+        kind: MissionTxTransitionKind::CommitStarted,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Committing,
+        to: MissionTxState::Committed,
+        kind: MissionTxTransitionKind::CommitSucceeded,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Committing,
+        to: MissionTxState::Compensating,
+        kind: MissionTxTransitionKind::CommitPartial,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Failed,
+        to: MissionTxState::Compensating,
+        kind: MissionTxTransitionKind::CompensationStarted,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Compensating,
+        to: MissionTxState::RolledBack,
+        kind: MissionTxTransitionKind::CompensationSucceeded,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Compensating,
+        to: MissionTxState::Failed,
+        kind: MissionTxTransitionKind::CompensationFailed,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Committed,
+        to: MissionTxState::Compensating,
+        kind: MissionTxTransitionKind::RollbackForced,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Committing,
+        to: MissionTxState::Failed,
+        kind: MissionTxTransitionKind::MarkFailed,
+    },
+];
+
+/// Returns canonical transaction lifecycle transition table.
+#[must_use]
+pub const fn mission_tx_transition_table() -> &'static [MissionTxTransitionRule] {
+    &MISSION_TX_TRANSITION_RULES
+}
+
+/// Returns whether a transaction lifecycle transition is legal.
+#[must_use]
+pub fn mission_tx_can_transition(
+    from: MissionTxState,
+    to: MissionTxState,
+    kind: MissionTxTransitionKind,
+) -> bool {
+    mission_tx_transition_table()
+        .iter()
+        .any(|rule| rule.from == from && rule.to == to && rule.kind == kind)
+}
+
+/// Canonical failure taxonomy for mission transaction execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionTxFailureCode {
+    PlanInvalid,
+    PreconditionFailed,
+    PrepareDenied,
+    PrepareTimeout,
+    CommitDenied,
+    CommitTimeout,
+    CommitPartial,
+    CompensationFailed,
+    RollbackForced,
+}
+
+/// Retry semantics for transaction failure handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionTxRetryability {
+    Never,
+    Immediate,
+    AfterBackoff,
+    AfterPlanRepair,
+    AfterStateRefresh,
+}
+
+impl MissionTxRetryability {
+    /// Returns true if automatic retry is permitted.
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+}
+
+/// Full remediation contract for one transaction failure code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissionTxFailureContract {
+    pub reason_code: &'static str,
+    pub error_code: &'static str,
+    pub retryability: MissionTxRetryability,
+    pub human_hint: &'static str,
+    pub machine_hint: &'static str,
+}
+
+impl MissionTxFailureCode {
+    const ALL: [Self; 9] = [
+        Self::PlanInvalid,
+        Self::PreconditionFailed,
+        Self::PrepareDenied,
+        Self::PrepareTimeout,
+        Self::CommitDenied,
+        Self::CommitTimeout,
+        Self::CommitPartial,
+        Self::CompensationFailed,
+        Self::RollbackForced,
+    ];
+
+    /// Return all canonical transaction failure codes.
+    #[must_use]
+    pub const fn all() -> [Self; 9] {
+        Self::ALL
+    }
+
+    /// Parse from normalized reason code.
+    #[must_use]
+    pub fn from_reason_code(reason_code: &str) -> Option<Self> {
+        match reason_code.trim() {
+            "plan_invalid" => Some(Self::PlanInvalid),
+            "precondition_failed" => Some(Self::PreconditionFailed),
+            "prepare_denied" => Some(Self::PrepareDenied),
+            "prepare_timeout" => Some(Self::PrepareTimeout),
+            "commit_denied" => Some(Self::CommitDenied),
+            "commit_timeout" => Some(Self::CommitTimeout),
+            "commit_partial" => Some(Self::CommitPartial),
+            "compensation_failed" => Some(Self::CompensationFailed),
+            "rollback_forced" => Some(Self::RollbackForced),
+            _ => None,
+        }
+    }
+
+    /// Return canonical metadata for this transaction failure code.
+    #[must_use]
+    pub const fn contract(self) -> MissionTxFailureContract {
+        match self {
+            Self::PlanInvalid => MissionTxFailureContract {
+                reason_code: "plan_invalid",
+                error_code: "FTX2001",
+                retryability: MissionTxRetryability::AfterPlanRepair,
+                human_hint: "Transaction plan is invalid; fix structure before retry.",
+                machine_hint: "rebuild_plan_and_revalidate",
+            },
+            Self::PreconditionFailed => MissionTxFailureContract {
+                reason_code: "precondition_failed",
+                error_code: "FTX2002",
+                retryability: MissionTxRetryability::AfterStateRefresh,
+                human_hint: "Preconditions failed; refresh state and retry if conditions recover.",
+                machine_hint: "refresh_preconditions_then_retry",
+            },
+            Self::PrepareDenied => MissionTxFailureContract {
+                reason_code: "prepare_denied",
+                error_code: "FTX2003",
+                retryability: MissionTxRetryability::Never,
+                human_hint: "Prepare phase was denied by policy or safety gate.",
+                machine_hint: "abort_and_request_operator_review",
+            },
+            Self::PrepareTimeout => MissionTxFailureContract {
+                reason_code: "prepare_timeout",
+                error_code: "FTX2004",
+                retryability: MissionTxRetryability::AfterBackoff,
+                human_hint: "Prepare phase timed out; retry after backoff.",
+                machine_hint: "schedule_backoff_then_retry_prepare",
+            },
+            Self::CommitDenied => MissionTxFailureContract {
+                reason_code: "commit_denied",
+                error_code: "FTX2005",
+                retryability: MissionTxRetryability::Never,
+                human_hint: "Commit was denied; do not retry without operator intervention.",
+                machine_hint: "abort_commit_and_require_override",
+            },
+            Self::CommitTimeout => MissionTxFailureContract {
+                reason_code: "commit_timeout",
+                error_code: "FTX2006",
+                retryability: MissionTxRetryability::AfterBackoff,
+                human_hint: "Commit timed out; retry with jitter or roll back.",
+                machine_hint: "retry_commit_with_jitter",
+            },
+            Self::CommitPartial => MissionTxFailureContract {
+                reason_code: "commit_partial",
+                error_code: "FTX2007",
+                retryability: MissionTxRetryability::AfterStateRefresh,
+                human_hint: "Commit partially applied; compensation path required.",
+                machine_hint: "run_compensation_plan",
+            },
+            Self::CompensationFailed => MissionTxFailureContract {
+                reason_code: "compensation_failed",
+                error_code: "FTX2008",
+                retryability: MissionTxRetryability::Immediate,
+                human_hint: "Compensation failed; immediate operator attention required.",
+                machine_hint: "escalate_and_retry_compensation",
+            },
+            Self::RollbackForced => MissionTxFailureContract {
+                reason_code: "rollback_forced",
+                error_code: "FTX2009",
+                retryability: MissionTxRetryability::AfterStateRefresh,
+                human_hint: "Rollback was forced after safety violation.",
+                machine_hint: "record_forced_rollback_and_reconcile",
+            },
+        }
+    }
+
+    /// Canonical reason code string.
+    #[must_use]
+    pub const fn reason_code(self) -> &'static str {
+        self.contract().reason_code
+    }
+
+    /// Canonical error code string.
+    #[must_use]
+    pub const fn error_code(self) -> &'static str {
+        self.contract().error_code
+    }
+
+    /// Retry contract for this failure code.
+    #[must_use]
+    pub const fn retryability(self) -> MissionTxRetryability {
+        self.contract().retryability
+    }
+
+    /// Human-readable remediation hint.
+    #[must_use]
+    pub const fn human_hint(self) -> &'static str {
+        self.contract().human_hint
+    }
+
+    /// Machine-readable remediation hint.
+    #[must_use]
+    pub const fn machine_hint(self) -> &'static str {
+        self.contract().machine_hint
+    }
+}
+
+/// Transaction intent envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxIntent {
+    pub tx_id: TxId,
+    pub requested_by: MissionActorRole,
+    pub summary: String,
+    pub correlation_id: String,
+    pub created_at_ms: i64,
+}
+
+/// One transaction precondition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TxPrecondition {
+    PromptActive {
+        pane_id: u64,
+    },
+    ReservationHeld {
+        reservation_id: ReservationIntentId,
+    },
+    ApprovalGranted {
+        approval_code_hash: String,
+    },
+    Custom {
+        key: String,
+        expected: serde_json::Value,
+    },
+}
+
+/// One transaction execution step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TxStep {
+    pub step_id: TxStepId,
+    pub ordinal: u32,
+    pub action: StepAction,
+}
+
+/// One compensation step tied to a forward execution step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TxCompensation {
+    pub for_step_id: TxStepId,
+    pub action: StepAction,
+}
+
+/// Transaction plan payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TxPlan {
+    pub plan_id: TxPlanId,
+    pub tx_id: TxId,
+    pub steps: Vec<TxStep>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preconditions: Vec<TxPrecondition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compensations: Vec<TxCompensation>,
+}
+
+/// Ordered receipt stream for transaction transitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxReceipt {
+    pub seq: u64,
+    pub state: MissionTxState,
+    pub emitted_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+/// Final transaction outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TxOutcome {
+    Pending,
+    Committed {
+        completed_at_ms: i64,
+        receipt_seq: u64,
+    },
+    RolledBack {
+        completed_at_ms: i64,
+        receipt_seq: u64,
+        reason_code: String,
+    },
+    Failed {
+        completed_at_ms: i64,
+        reason_code: String,
+        error_code: String,
+    },
+}
+
+impl TxOutcome {
+    #[must_use]
+    const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Committed { .. } => "committed",
+            Self::RolledBack { .. } => "rolled_back",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
+
+/// Structured transition log for transaction lifecycle events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTxTransitionLog {
+    pub timestamp_ms: i64,
+    pub component: String,
+    pub scenario_id: String,
+    pub correlation_id: String,
+    pub tx_id: TxId,
+    pub state_from: MissionTxState,
+    pub state_to: MissionTxState,
+    pub transition_kind: MissionTxTransitionKind,
+    pub decision_path: String,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    pub artifact_path: String,
+}
+
+impl MissionTxTransitionLog {
+    /// Validate mandatory structured log fields and reason/error-code coherence.
+    pub fn validate(&self) -> Result<(), MissionTxValidationError> {
+        for (field, value) in [
+            ("component", self.component.as_str()),
+            ("scenario_id", self.scenario_id.as_str()),
+            ("correlation_id", self.correlation_id.as_str()),
+            ("decision_path", self.decision_path.as_str()),
+            ("outcome", self.outcome.as_str()),
+            ("artifact_path", self.artifact_path.as_str()),
+            ("tx_id", self.tx_id.0.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(MissionTxValidationError::MissingTransitionLogField { field });
+            }
+        }
+
+        if !mission_tx_can_transition(self.state_from, self.state_to, self.transition_kind) {
+            return Err(MissionTxValidationError::IllegalLifecycleTransition {
+                from: self.state_from,
+                to: self.state_to,
+                kind: self.transition_kind,
+            });
+        }
+
+        if let Some(reason_code) = self.reason_code.as_deref() {
+            let failure_code =
+                MissionTxFailureCode::from_reason_code(reason_code).ok_or_else(|| {
+                    MissionTxValidationError::UnknownFailureReasonCode {
+                        reason_code: reason_code.to_string(),
+                    }
+                })?;
+            if let Some(error_code) = self.error_code.as_deref() {
+                if error_code.trim() != failure_code.error_code() {
+                    return Err(MissionTxValidationError::MismatchedFailureErrorCode {
+                        reason_code: reason_code.to_string(),
+                        expected_error_code: failure_code.error_code().to_string(),
+                        actual_error_code: error_code.to_string(),
+                    });
+                }
+            }
+        } else if self.error_code.is_some() {
+            return Err(MissionTxValidationError::MissingFailureReasonCode);
+        }
+
+        Ok(())
+    }
+}
+
+/// Transaction contract envelope (entities + state + receipts).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionTxContract {
+    pub tx_version: u32,
+    pub intent: TxIntent,
+    pub plan: TxPlan,
+    pub lifecycle_state: MissionTxState,
+    pub outcome: TxOutcome,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipts: Vec<TxReceipt>,
+}
+
+impl MissionTxContract {
+    /// Validate transaction contract structure, lifecycle, and invariants.
+    pub fn validate(&self) -> Result<(), MissionTxValidationError> {
+        if self.tx_version > MISSION_TX_SCHEMA_VERSION {
+            return Err(MissionTxValidationError::UnsupportedTxVersion {
+                version: self.tx_version,
+                max_supported: MISSION_TX_SCHEMA_VERSION,
+            });
+        }
+        if self.intent.summary.trim().is_empty() {
+            return Err(MissionTxValidationError::MissingIntentSummary);
+        }
+        if self.intent.correlation_id.trim().is_empty() {
+            return Err(MissionTxValidationError::MissingCorrelationId);
+        }
+        if self.plan.tx_id != self.intent.tx_id {
+            return Err(MissionTxValidationError::PlanIntentMismatch {
+                plan_tx_id: self.plan.tx_id.clone(),
+                intent_tx_id: self.intent.tx_id.clone(),
+            });
+        }
+        if self.plan.steps.is_empty() {
+            return Err(MissionTxValidationError::EmptyPlanSteps);
+        }
+
+        let mut step_ids = std::collections::HashSet::new();
+        for (index, step) in self.plan.steps.iter().enumerate() {
+            let expected = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            if step.ordinal != expected {
+                return Err(MissionTxValidationError::InvalidStepOrdinal {
+                    step_id: step.step_id.clone(),
+                    expected,
+                    actual: step.ordinal,
+                });
+            }
+            if !step_ids.insert(step.step_id.clone()) {
+                return Err(MissionTxValidationError::DuplicateStepId(
+                    step.step_id.clone(),
+                ));
+            }
+        }
+        for compensation in &self.plan.compensations {
+            if !step_ids.contains(&compensation.for_step_id) {
+                return Err(MissionTxValidationError::CompensationUnknownStep(
+                    compensation.for_step_id.clone(),
+                ));
+            }
+        }
+
+        let mut last_seq = 0_u64;
+        let mut has_seq = false;
+        let mut prepared_seen = false;
+        let mut commit_markers = 0_u32;
+        let mut commit_failure_seen = false;
+        let mut compensating_seen = false;
+        for receipt in &self.receipts {
+            if has_seq && receipt.seq <= last_seq {
+                return Err(MissionTxValidationError::NonMonotonicReceiptSequence {
+                    previous: last_seq,
+                    current: receipt.seq,
+                });
+            }
+            has_seq = true;
+            last_seq = receipt.seq;
+
+            match receipt.state {
+                MissionTxState::Prepared => prepared_seen = true,
+                MissionTxState::Committed => {
+                    commit_markers = commit_markers.saturating_add(1);
+                    if !prepared_seen {
+                        return Err(MissionTxValidationError::CommitWithoutPreparedReceipt);
+                    }
+                }
+                MissionTxState::Compensating => {
+                    compensating_seen = true;
+                }
+                MissionTxState::Draft
+                | MissionTxState::Planned
+                | MissionTxState::Committing
+                | MissionTxState::RolledBack
+                | MissionTxState::Failed => {}
+            }
+
+            if let Some(reason_code) = receipt.reason_code.as_deref() {
+                let failure =
+                    MissionTxFailureCode::from_reason_code(reason_code).ok_or_else(|| {
+                        MissionTxValidationError::UnknownFailureReasonCode {
+                            reason_code: reason_code.to_string(),
+                        }
+                    })?;
+                if failure == MissionTxFailureCode::CommitPartial {
+                    commit_failure_seen = true;
+                }
+                if let Some(error_code) = receipt.error_code.as_deref() {
+                    if error_code.trim() != failure.error_code() {
+                        return Err(MissionTxValidationError::MismatchedFailureErrorCode {
+                            reason_code: reason_code.to_string(),
+                            expected_error_code: failure.error_code().to_string(),
+                            actual_error_code: error_code.to_string(),
+                        });
+                    }
+                }
+            } else if receipt.error_code.is_some() {
+                return Err(MissionTxValidationError::MissingFailureReasonCode);
+            }
+        }
+        if commit_markers > 1 {
+            return Err(MissionTxValidationError::DoubleCommitMarker);
+        }
+        if compensating_seen && !commit_failure_seen {
+            return Err(MissionTxValidationError::CompensationWithoutCommitFailure);
+        }
+
+        match &self.outcome {
+            TxOutcome::Pending => {
+                if self.lifecycle_state.is_terminal() {
+                    return Err(MissionTxValidationError::OutcomeStateMismatch {
+                        state: self.lifecycle_state,
+                        outcome: TxOutcome::Pending.kind_name(),
+                    });
+                }
+            }
+            TxOutcome::Committed { .. } => {
+                if self.lifecycle_state != MissionTxState::Committed || commit_markers != 1 {
+                    return Err(MissionTxValidationError::OutcomeStateMismatch {
+                        state: self.lifecycle_state,
+                        outcome: TxOutcome::Committed {
+                            completed_at_ms: 0,
+                            receipt_seq: 0,
+                        }
+                        .kind_name(),
+                    });
+                }
+            }
+            TxOutcome::RolledBack { reason_code, .. } => {
+                if self.lifecycle_state != MissionTxState::RolledBack {
+                    return Err(MissionTxValidationError::OutcomeStateMismatch {
+                        state: self.lifecycle_state,
+                        outcome: TxOutcome::RolledBack {
+                            completed_at_ms: 0,
+                            receipt_seq: 0,
+                            reason_code: String::new(),
+                        }
+                        .kind_name(),
+                    });
+                }
+                if MissionTxFailureCode::from_reason_code(reason_code).is_none() {
+                    return Err(MissionTxValidationError::UnknownFailureReasonCode {
+                        reason_code: reason_code.clone(),
+                    });
+                }
+            }
+            TxOutcome::Failed {
+                reason_code,
+                error_code,
+                ..
+            } => {
+                if self.lifecycle_state != MissionTxState::Failed {
+                    return Err(MissionTxValidationError::OutcomeStateMismatch {
+                        state: self.lifecycle_state,
+                        outcome: TxOutcome::Failed {
+                            completed_at_ms: 0,
+                            reason_code: String::new(),
+                            error_code: String::new(),
+                        }
+                        .kind_name(),
+                    });
+                }
+                let failure_code =
+                    MissionTxFailureCode::from_reason_code(reason_code).ok_or_else(|| {
+                        MissionTxValidationError::UnknownFailureReasonCode {
+                            reason_code: reason_code.clone(),
+                        }
+                    })?;
+                if error_code.trim() != failure_code.error_code() {
+                    return Err(MissionTxValidationError::MismatchedFailureErrorCode {
+                        reason_code: reason_code.clone(),
+                        expected_error_code: failure_code.error_code().to_string(),
+                        actual_error_code: error_code.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Validation failures for mission transaction contracts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissionTxValidationError {
+    UnsupportedTxVersion {
+        version: u32,
+        max_supported: u32,
+    },
+    MissingIntentSummary,
+    MissingCorrelationId,
+    PlanIntentMismatch {
+        plan_tx_id: TxId,
+        intent_tx_id: TxId,
+    },
+    EmptyPlanSteps,
+    InvalidStepOrdinal {
+        step_id: TxStepId,
+        expected: u32,
+        actual: u32,
+    },
+    DuplicateStepId(TxStepId),
+    CompensationUnknownStep(TxStepId),
+    NonMonotonicReceiptSequence {
+        previous: u64,
+        current: u64,
+    },
+    CommitWithoutPreparedReceipt,
+    DoubleCommitMarker,
+    CompensationWithoutCommitFailure,
+    MissingFailureReasonCode,
+    UnknownFailureReasonCode {
+        reason_code: String,
+    },
+    MismatchedFailureErrorCode {
+        reason_code: String,
+        expected_error_code: String,
+        actual_error_code: String,
+    },
+    OutcomeStateMismatch {
+        state: MissionTxState,
+        outcome: &'static str,
+    },
+    MissingTransitionLogField {
+        field: &'static str,
+    },
+    IllegalLifecycleTransition {
+        from: MissionTxState,
+        to: MissionTxState,
+        kind: MissionTxTransitionKind,
+    },
+}
+
+impl fmt::Display for MissionTxValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedTxVersion {
+                version,
+                max_supported,
+            } => write!(
+                f,
+                "Unsupported transaction schema version {version}; max supported is {max_supported}"
+            ),
+            Self::MissingIntentSummary => f.write_str("Transaction intent summary is required"),
+            Self::MissingCorrelationId => f.write_str("Transaction correlation_id is required"),
+            Self::PlanIntentMismatch {
+                plan_tx_id,
+                intent_tx_id,
+            } => write!(
+                f,
+                "Transaction plan tx_id ({plan_tx_id}) does not match intent tx_id ({intent_tx_id})"
+            ),
+            Self::EmptyPlanSteps => f.write_str("Transaction plan must contain at least one step"),
+            Self::InvalidStepOrdinal {
+                step_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "Invalid step ordinal for {}: expected {}, got {}",
+                step_id, expected, actual
+            ),
+            Self::DuplicateStepId(step_id) => write!(f, "Duplicate transaction step ID: {step_id}"),
+            Self::CompensationUnknownStep(step_id) => {
+                write!(f, "Compensation references unknown step ID: {step_id}")
+            }
+            Self::NonMonotonicReceiptSequence { previous, current } => write!(
+                f,
+                "Transaction receipts must be monotonic: previous seq {}, current seq {}",
+                previous, current
+            ),
+            Self::CommitWithoutPreparedReceipt => {
+                f.write_str("Commit observed before a prepared receipt")
+            }
+            Self::DoubleCommitMarker => {
+                f.write_str("Multiple committed receipts detected for one transaction")
+            }
+            Self::CompensationWithoutCommitFailure => {
+                f.write_str("Compensation observed without a prior commit_partial failure marker")
+            }
+            Self::MissingFailureReasonCode => {
+                f.write_str("Failure error_code requires a matching reason_code")
+            }
+            Self::UnknownFailureReasonCode { reason_code } => {
+                write!(f, "Unknown transaction failure reason_code: {reason_code}")
+            }
+            Self::MismatchedFailureErrorCode {
+                reason_code,
+                expected_error_code,
+                actual_error_code,
+            } => write!(
+                f,
+                "Failure error_code mismatch for reason_code {}: expected {}, got {}",
+                reason_code, expected_error_code, actual_error_code
+            ),
+            Self::OutcomeStateMismatch { state, outcome } => write!(
+                f,
+                "Transaction lifecycle state {} is incompatible with outcome {}",
+                state, outcome
+            ),
+            Self::MissingTransitionLogField { field } => {
+                write!(f, "Transaction transition log missing field: {field}")
+            }
+            Self::IllegalLifecycleTransition { from, to, kind } => write!(
+                f,
+                "Illegal transaction lifecycle transition: {} -> {} ({})",
+                from, to, kind
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MissionTxValidationError {}
 
 /// Mission policy preflight stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1862,6 +2839,121 @@ pub struct MissionDispatchContract {
     pub edge_cases: Vec<MissionDispatchEdgeCase>,
 }
 
+/// Current dispatch availability state for an execution agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MissionAgentAvailability {
+    Ready,
+    Paused {
+        reason_code: String,
+    },
+    Degraded {
+        reason_code: String,
+        max_parallel_assignments: u32,
+    },
+    RateLimited {
+        reason_code: String,
+        retry_after_ms: i64,
+    },
+    Offline {
+        reason_code: String,
+    },
+}
+
+impl MissionAgentAvailability {
+    /// Canonical reason code for structured suitability output.
+    #[must_use]
+    pub fn reason_code(&self) -> Option<&str> {
+        match self {
+            Self::Ready => None,
+            Self::Paused { reason_code }
+            | Self::Degraded { reason_code, .. }
+            | Self::RateLimited { reason_code, .. }
+            | Self::Offline { reason_code } => Some(reason_code.as_str()),
+        }
+    }
+
+    /// Whether this state hard-blocks assignment regardless of capabilities.
+    #[must_use]
+    pub const fn hard_blocks_assignment(&self) -> bool {
+        matches!(
+            self,
+            Self::Paused { .. } | Self::RateLimited { .. } | Self::Offline { .. }
+        )
+    }
+}
+
+/// Capability/load profile used by mission dispatcher suitability scoring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionAgentCapabilityProfile {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lane_affinity: Vec<String>,
+    pub current_load: u32,
+    pub max_parallel_assignments: u32,
+    pub availability: MissionAgentAvailability,
+}
+
+impl MissionAgentCapabilityProfile {
+    /// Effective capacity after availability modifiers.
+    #[must_use]
+    pub fn effective_capacity(&self) -> u32 {
+        match self.availability {
+            MissionAgentAvailability::Degraded {
+                max_parallel_assignments,
+                ..
+            } => self.max_parallel_assignments.min(max_parallel_assignments),
+            _ => self.max_parallel_assignments,
+        }
+    }
+}
+
+/// Candidate-specific requirements for dispatcher assignment selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionAssignmentSuitabilityRequest {
+    pub candidate_id: CandidateActionId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preferred_capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane_affinity: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_agents: Vec<String>,
+    pub evaluated_at_ms: i64,
+}
+
+/// Per-agent suitability envelope emitted by dispatcher model evaluation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionAgentSuitability {
+    pub agent_id: String,
+    pub eligible: bool,
+    pub hard_constraints_satisfied: bool,
+    pub effective_capacity: u32,
+    pub score: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_required_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_preferred_capabilities: Vec<String>,
+}
+
+/// Dispatcher suitability report for one candidate requirement request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionAssignmentSuitabilityReport {
+    pub candidate_id: CandidateActionId,
+    pub evaluated_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane_affinity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evaluations: Vec<MissionAgentSuitability>,
+}
+
 /// Escalation severity for operator routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1981,6 +3073,25 @@ pub enum MissionLifecycleState {
 }
 
 impl MissionLifecycleState {
+    const ALL: [Self; 10] = [
+        Self::Planning,
+        Self::Planned,
+        Self::Dispatching,
+        Self::AwaitingApproval,
+        Self::Running,
+        Self::RetryPending,
+        Self::Blocked,
+        Self::Completed,
+        Self::Failed,
+        Self::Cancelled,
+    ];
+
+    /// Return all lifecycle states.
+    #[must_use]
+    pub const fn all() -> [Self; 10] {
+        Self::ALL
+    }
+
     /// Returns true when mission is in terminal state.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
@@ -2041,6 +3152,30 @@ impl fmt::Display for MissionLifecycleTransitionKind {
             Self::ExecutionFailed => f.write_str("execution_failed"),
             Self::MissionCancelled => f.write_str("mission_cancelled"),
         }
+    }
+}
+
+impl MissionLifecycleTransitionKind {
+    const ALL: [Self; 13] = [
+        Self::PlanFinalized,
+        Self::DispatchStarted,
+        Self::ApprovalRequested,
+        Self::ApprovalGranted,
+        Self::ApprovalDenied,
+        Self::ApprovalExpired,
+        Self::ExecutionStarted,
+        Self::ExecutionBlocked,
+        Self::RetryScheduled,
+        Self::RetryResumed,
+        Self::ExecutionSucceeded,
+        Self::ExecutionFailed,
+        Self::MissionCancelled,
+    ];
+
+    /// Return all lifecycle transition kinds.
+    #[must_use]
+    pub const fn all() -> [Self; 13] {
+        Self::ALL
     }
 }
 
@@ -2325,16 +3460,58 @@ impl Mission {
                 max_supported: MISSION_SCHEMA_VERSION,
             });
         }
+        Self::validate_non_empty_field("mission.mission_id", &self.mission_id.0)?;
         if self.title.trim().is_empty() {
             return Err(MissionValidationError::MissingTitle);
         }
         if self.workspace_id.trim().is_empty() {
             return Err(MissionValidationError::MissingWorkspaceId);
         }
+        if let Some(updated_at_ms) = self.updated_at_ms {
+            Self::validate_timestamp_order(
+                "mission.updated_at_ms",
+                self.created_at_ms,
+                updated_at_ms,
+            )?;
+        }
+        if let Some(provenance) = &self.provenance {
+            Self::validate_optional_non_empty_field(
+                "mission.provenance.bead_id",
+                provenance.bead_id.as_deref(),
+            )?;
+            Self::validate_optional_non_empty_field(
+                "mission.provenance.thread_id",
+                provenance.thread_id.as_deref(),
+            )?;
+            Self::validate_optional_non_empty_field(
+                "mission.provenance.source_command",
+                provenance.source_command.as_deref(),
+            )?;
+            Self::validate_optional_non_empty_field(
+                "mission.provenance.source_sha",
+                provenance.source_sha.as_deref(),
+            )?;
+        }
         self.ownership.validate()?;
 
         let mut candidate_ids = std::collections::HashSet::new();
-        for candidate in &self.candidates {
+        for (candidate_index, candidate) in self.candidates.iter().enumerate() {
+            Self::validate_non_empty_field(
+                format!("mission.candidates[{candidate_index}].candidate_id"),
+                &candidate.candidate_id.0,
+            )?;
+            Self::validate_non_empty_field(
+                format!("mission.candidates[{candidate_index}].rationale"),
+                &candidate.rationale,
+            )?;
+            if let Some(score) = candidate.score {
+                if !score.is_finite() {
+                    return Err(MissionValidationError::InvalidFieldValue {
+                        field_path: format!("mission.candidates[{candidate_index}].score"),
+                        message: "score must be finite".to_string(),
+                    });
+                }
+            }
             if !candidate_ids.insert(candidate.candidate_id.clone()) {
                 return Err(MissionValidationError::DuplicateCandidateId(
                     candidate.candidate_id.clone(),
@@ -2343,7 +3520,15 @@ impl Mission {
         }
 
         let mut assignment_ids = std::collections::HashSet::new();
-        for assignment in &self.assignments {
+        for (assignment_index, assignment) in self.assignments.iter().enumerate() {
+            Self::validate_non_empty_field(
+                format!("mission.assignments[{assignment_index}].assignment_id"),
+                &assignment.assignment_id.0,
+            )?;
+            Self::validate_non_empty_field(
+                format!("mission.assignments[{assignment_index}].candidate_id"),
+                &assignment.candidate_id.0,
+            )?;
             if !assignment_ids.insert(assignment.assignment_id.clone()) {
                 return Err(MissionValidationError::DuplicateAssignmentId(
                     assignment.assignment_id.clone(),
@@ -2359,12 +3544,88 @@ impl Mission {
                     assignment.assignment_id.clone(),
                 ));
             }
+            if let Some(updated_at_ms) = assignment.updated_at_ms {
+                Self::validate_timestamp_order(
+                    format!("mission.assignments[{assignment_index}].updated_at_ms"),
+                    assignment.created_at_ms,
+                    updated_at_ms,
+                )?;
+            }
+            match &assignment.approval_state {
+                ApprovalState::Pending {
+                    requested_at_ms, ..
+                } => {
+                    Self::validate_timestamp_order(
+                        format!(
+                            "mission.assignments[{assignment_index}].approval_state.pending.requested_at_ms"
+                        ),
+                        assignment.created_at_ms,
+                        *requested_at_ms,
+                    )?;
+                }
+                ApprovalState::Approved { approved_at_ms, .. } => {
+                    Self::validate_timestamp_order(
+                        format!(
+                            "mission.assignments[{assignment_index}].approval_state.approved.approved_at_ms"
+                        ),
+                        assignment.created_at_ms,
+                        *approved_at_ms,
+                    )?;
+                }
+                ApprovalState::Denied { denied_at_ms, .. } => {
+                    Self::validate_timestamp_order(
+                        format!(
+                            "mission.assignments[{assignment_index}].approval_state.denied.denied_at_ms"
+                        ),
+                        assignment.created_at_ms,
+                        *denied_at_ms,
+                    )?;
+                }
+                ApprovalState::Expired { expired_at_ms, .. } => {
+                    Self::validate_timestamp_order(
+                        format!(
+                            "mission.assignments[{assignment_index}].approval_state.expired.expired_at_ms"
+                        ),
+                        assignment.created_at_ms,
+                        *expired_at_ms,
+                    )?;
+                }
+                ApprovalState::NotRequired => {}
+            }
             if let Some(reservation_intent) = &assignment.reservation_intent {
                 if reservation_intent.paths.is_empty() {
                     return Err(MissionValidationError::EmptyReservationPaths(
                         reservation_intent.reservation_id.clone(),
                     ));
                 }
+                for (path_index, path) in reservation_intent.paths.iter().enumerate() {
+                    if path.trim().is_empty() {
+                        return Err(MissionValidationError::InvalidFieldValue {
+                            field_path: format!(
+                                "mission.assignments[{assignment_index}].reservation_intent.paths[{path_index}]"
+                            ),
+                            message: "path cannot be empty".to_string(),
+                        });
+                    }
+                }
+            }
+            if let Some(outcome) = &assignment.outcome {
+                let completed_at_ms = match outcome {
+                    Outcome::Success {
+                        completed_at_ms, ..
+                    }
+                    | Outcome::Failed {
+                        completed_at_ms, ..
+                    }
+                    | Outcome::Cancelled {
+                        completed_at_ms, ..
+                    } => *completed_at_ms,
+                };
+                Self::validate_timestamp_order(
+                    format!("mission.assignments[{assignment_index}].outcome.completed_at_ms"),
+                    assignment.created_at_ms,
+                    completed_at_ms,
+                )?;
             }
             Self::validate_assignment_failure_contract(assignment)?;
         }
@@ -2509,7 +3770,9 @@ impl Mission {
             .candidates
             .iter()
             .find(|candidate| candidate.candidate_id == *candidate_id)
-            .ok_or_else(|| MissionValidationError::UnknownCandidateReference(candidate_id.clone()))?;
+            .ok_or_else(|| {
+                MissionValidationError::UnknownCandidateReference(candidate_id.clone())
+            })?;
 
         let reservation_intents = self
             .assignments
@@ -2568,6 +3831,184 @@ impl Mission {
         })
     }
 
+    /// Evaluate assignment suitability for one candidate against agent capability profiles.
+    ///
+    /// This model enforces:
+    /// - hard constraints (`required_capabilities`, availability hard blocks, exclusions)
+    /// - soft preferences (`preferred_capabilities`, `lane_affinity`)
+    /// - load/capacity gating (`current_load` vs effective parallel capacity)
+    pub fn evaluate_assignment_suitability(
+        &self,
+        request: &MissionAssignmentSuitabilityRequest,
+        profiles: &[MissionAgentCapabilityProfile],
+    ) -> Result<MissionAssignmentSuitabilityReport, MissionValidationError> {
+        self.candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == request.candidate_id)
+            .ok_or_else(|| {
+                MissionValidationError::UnknownCandidateReference(request.candidate_id.clone())
+            })?;
+
+        let required_capabilities = Self::normalize_non_empty_unique(
+            "suitability_request.required_capabilities",
+            &request.required_capabilities,
+        )?;
+        let preferred_capabilities = Self::normalize_non_empty_unique(
+            "suitability_request.preferred_capabilities",
+            &request.preferred_capabilities,
+        )?;
+        let excluded_agents = Self::normalize_non_empty_unique(
+            "suitability_request.excluded_agents",
+            &request.excluded_agents,
+        )?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+        let lane_affinity = request
+            .lane_affinity
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if request.lane_affinity.is_some() && lane_affinity.is_none() {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "suitability_request.lane_affinity".to_string(),
+                message: "lane affinity must be non-empty when provided".to_string(),
+            });
+        }
+
+        let mut evaluations = Vec::with_capacity(profiles.len());
+        for (profile_index, profile) in profiles.iter().enumerate() {
+            Self::validate_non_empty_field(
+                format!("profiles[{profile_index}].agent_id"),
+                &profile.agent_id,
+            )?;
+            let normalized_capabilities = Self::normalize_non_empty_unique(
+                format!("profiles[{profile_index}].capabilities"),
+                &profile.capabilities,
+            )?;
+            let normalized_lanes = Self::normalize_non_empty_unique(
+                format!("profiles[{profile_index}].lane_affinity"),
+                &profile.lane_affinity,
+            )?;
+
+            let missing_required_capabilities = required_capabilities
+                .iter()
+                .filter(|required| !normalized_capabilities.contains(required))
+                .cloned()
+                .collect::<Vec<_>>();
+            let matched_preferred_capabilities = preferred_capabilities
+                .iter()
+                .filter(|preferred| normalized_capabilities.contains(preferred))
+                .cloned()
+                .collect::<Vec<_>>();
+            let lane_match = lane_affinity
+                .as_ref()
+                .is_some_and(|lane| normalized_lanes.contains(lane));
+            let effective_capacity = profile.effective_capacity();
+
+            let mut reason_codes = Vec::new();
+            let mut eligible = true;
+            let mut hard_constraints_satisfied = true;
+
+            if !missing_required_capabilities.is_empty() {
+                eligible = false;
+                hard_constraints_satisfied = false;
+                reason_codes.push("missing_required_capability".to_string());
+            }
+            if excluded_agents.contains(profile.agent_id.trim()) {
+                eligible = false;
+                hard_constraints_satisfied = false;
+                reason_codes.push("assignment_excluded".to_string());
+            }
+            if profile.availability.hard_blocks_assignment() {
+                eligible = false;
+                hard_constraints_satisfied = false;
+                let availability_reason = match profile.availability {
+                    MissionAgentAvailability::Paused { .. } => "agent_paused",
+                    MissionAgentAvailability::RateLimited { .. } => "agent_rate_limited",
+                    MissionAgentAvailability::Offline { .. } => "agent_offline",
+                    MissionAgentAvailability::Ready | MissionAgentAvailability::Degraded { .. } => {
+                        "agent_unavailable"
+                    }
+                };
+                reason_codes.push(availability_reason.to_string());
+            } else if matches!(
+                profile.availability,
+                MissionAgentAvailability::Degraded { .. }
+            ) {
+                reason_codes.push("agent_degraded".to_string());
+            }
+            if effective_capacity == 0 || profile.current_load >= effective_capacity {
+                eligible = false;
+                hard_constraints_satisfied = false;
+                reason_codes.push("agent_capacity_exhausted".to_string());
+            }
+
+            let utilization_penalty = if effective_capacity == 0 {
+                1.0
+            } else {
+                f64::from(profile.current_load) / f64::from(effective_capacity)
+            };
+            let mut score = if eligible {
+                1.0 - utilization_penalty
+            } else {
+                0.0
+            };
+            if eligible {
+                score += matched_preferred_capabilities.len() as f64 * 0.2;
+                if lane_match {
+                    score += 0.35;
+                }
+                if matches!(
+                    profile.availability,
+                    MissionAgentAvailability::Degraded { .. }
+                ) {
+                    score = (score - 0.15).max(0.0);
+                }
+            }
+
+            reason_codes.sort();
+            reason_codes.dedup();
+
+            evaluations.push(MissionAgentSuitability {
+                agent_id: profile.agent_id.trim().to_string(),
+                eligible,
+                hard_constraints_satisfied,
+                effective_capacity,
+                score,
+                reason_codes,
+                missing_required_capabilities,
+                matched_preferred_capabilities,
+            });
+        }
+
+        evaluations.sort_by(|left, right| {
+            use std::cmp::Ordering;
+            match (left.eligible, right.eligible) {
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                _ => right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| left.agent_id.cmp(&right.agent_id)),
+            }
+        });
+
+        let selected_agent = evaluations
+            .iter()
+            .find(|evaluation| evaluation.eligible)
+            .map(|evaluation| evaluation.agent_id.clone());
+
+        Ok(MissionAssignmentSuitabilityReport {
+            candidate_id: request.candidate_id.clone(),
+            evaluated_at_ms: request.evaluated_at_ms,
+            lane_affinity,
+            selected_agent,
+            evaluations,
+        })
+    }
+
     fn dispatch_mechanism_for_action(action: &StepAction) -> MissionDispatchMechanism {
         match action {
             StepAction::SendText {
@@ -2602,9 +4043,11 @@ impl Mission {
                 lock_name: lock_name.clone(),
                 timeout_ms: *timeout_ms,
             },
-            StepAction::ReleaseLock { lock_name } => MissionDispatchMechanism::InternalLockRelease {
-                lock_name: lock_name.clone(),
-            },
+            StepAction::ReleaseLock { lock_name } => {
+                MissionDispatchMechanism::InternalLockRelease {
+                    lock_name: lock_name.clone(),
+                }
+            }
             StepAction::StoreData { key, value } => MissionDispatchMechanism::InternalStoreData {
                 key: key.clone(),
                 value: value.clone(),
@@ -2651,6 +4094,25 @@ impl Mission {
         self.assignments
             .iter()
             .find(|assignment| assignment.assignment_id == *assignment_id)
+    }
+
+    fn normalize_non_empty_unique(
+        field_path: impl AsRef<str>,
+        values: &[String],
+    ) -> Result<Vec<String>, MissionValidationError> {
+        let field_path = field_path.as_ref();
+        let mut normalized = std::collections::BTreeSet::new();
+        for (index, value) in values.iter().enumerate() {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(MissionValidationError::InvalidFieldValue {
+                    field_path: format!("{field_path}[{index}]"),
+                    message: "value must be non-empty".to_string(),
+                });
+            }
+            normalized.insert(trimmed.to_string());
+        }
+        Ok(normalized.into_iter().collect())
     }
 
     fn resolve_preflight_reason_code(
@@ -2846,6 +4308,44 @@ impl Mission {
         }
         Ok(())
     }
+
+    fn validate_non_empty_field(
+        field_path: impl Into<String>,
+        value: &str,
+    ) -> Result<(), MissionValidationError> {
+        if value.trim().is_empty() {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: field_path.into(),
+                message: "value cannot be empty".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_optional_non_empty_field(
+        field_path: impl Into<String>,
+        value: Option<&str>,
+    ) -> Result<(), MissionValidationError> {
+        if let Some(value) = value {
+            Self::validate_non_empty_field(field_path, value)?;
+        }
+        Ok(())
+    }
+
+    fn validate_timestamp_order(
+        field_path: impl Into<String>,
+        created_at_ms: i64,
+        updated_at_ms: i64,
+    ) -> Result<(), MissionValidationError> {
+        if updated_at_ms < created_at_ms {
+            return Err(MissionValidationError::NonMonotonicTimestamp {
+                field_path: field_path.into(),
+                created_at_ms,
+                updated_at_ms,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Errors that can occur during mission schema validation.
@@ -2861,6 +4361,15 @@ pub enum MissionValidationError {
     DuplicateOwnershipActor(String),
     MissingTitle,
     MissingWorkspaceId,
+    InvalidFieldValue {
+        field_path: String,
+        message: String,
+    },
+    NonMonotonicTimestamp {
+        field_path: String,
+        created_at_ms: i64,
+        updated_at_ms: i64,
+    },
     DuplicateCandidateId(CandidateActionId),
     DuplicateAssignmentId(AssignmentId),
     UnknownCandidateReference(CandidateActionId),
@@ -2950,6 +4459,22 @@ impl fmt::Display for MissionValidationError {
             }
             Self::MissingTitle => f.write_str("Mission title cannot be empty"),
             Self::MissingWorkspaceId => f.write_str("Mission workspace_id cannot be empty"),
+            Self::InvalidFieldValue {
+                field_path,
+                message,
+            } => {
+                write!(f, "Invalid mission field '{field_path}': {message}")
+            }
+            Self::NonMonotonicTimestamp {
+                field_path,
+                created_at_ms,
+                updated_at_ms,
+            } => {
+                write!(
+                    f,
+                    "Non-monotonic timestamp for '{field_path}': updated_at_ms ({updated_at_ms}) is earlier than created_at_ms ({created_at_ms})"
+                )
+            }
             Self::DuplicateCandidateId(id) => write!(f, "Duplicate candidate ID: {}", id.0),
             Self::DuplicateAssignmentId(id) => write!(f, "Duplicate assignment ID: {}", id.0),
             Self::UnknownCandidateReference(id) => {
@@ -3155,6 +4680,7 @@ fn sha256_hex(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_plan_hash_determinism() {
@@ -4310,6 +5836,50 @@ mod tests {
     }
 
     #[test]
+    fn step_action_partial_eq_send_text_matches_all_fields() {
+        let a1 = StepAction::SendText {
+            pane_id: 7,
+            text: "/retry".into(),
+            paste_mode: Some(false),
+        };
+        let a2 = StepAction::SendText {
+            pane_id: 7,
+            text: "/retry".into(),
+            paste_mode: Some(false),
+        };
+        let a3 = StepAction::SendText {
+            pane_id: 7,
+            text: "/retry".into(),
+            paste_mode: Some(true),
+        };
+
+        assert_eq!(a1, a2);
+        assert_ne!(a1, a3);
+    }
+
+    #[test]
+    fn step_action_partial_eq_nested_plan_uses_plan_hash() {
+        let make_nested = |event_id: i64| StepAction::NestedPlan {
+            plan: Box::new(
+                ActionPlan::builder("nested", "ws")
+                    .add_step(StepPlan::new(
+                        1,
+                        StepAction::MarkEventHandled { event_id },
+                        "mark event",
+                    ))
+                    .build(),
+            ),
+        };
+
+        let a1 = make_nested(1);
+        let a2 = make_nested(1);
+        let a3 = make_nested(2);
+
+        assert_eq!(a1, a2);
+        assert_ne!(a1, a3);
+    }
+
+    #[test]
     fn step_action_wait_for_pane_none() {
         let a = StepAction::WaitFor {
             pane_id: None,
@@ -4837,6 +6407,95 @@ mod tests {
     }
 
     #[test]
+    fn mission_lifecycle_transition_conformance_matches_transition_table() {
+        for from in MissionLifecycleState::all() {
+            for to in MissionLifecycleState::all() {
+                for kind in MissionLifecycleTransitionKind::all() {
+                    let mut mission = sample_mission();
+                    mission.lifecycle_state = from;
+                    mission.updated_at_ms = None;
+
+                    let expected = mission_lifecycle_can_transition(from, to, kind);
+                    let result = mission.transition_lifecycle(to, kind, 1_704_000_004_000);
+
+                    if expected {
+                        assert!(
+                            result.is_ok(),
+                            "expected legal transition {from} -> {to} via {kind}"
+                        );
+                        assert_eq!(mission.lifecycle_state, to);
+                        assert_eq!(mission.updated_at_ms, Some(1_704_000_004_000));
+                    } else {
+                        let err = result.unwrap_err();
+                        assert_eq!(
+                            err,
+                            MissionValidationError::InvalidLifecycleTransition { from, to, kind },
+                            "expected rejection for illegal transition {from} -> {to} via {kind}"
+                        );
+                        assert_eq!(mission.lifecycle_state, from);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mission_validate_rejects_empty_candidate_id_with_field_path() {
+        let mut mission = sample_mission();
+        mission.candidates[0].candidate_id = CandidateActionId(" ".to_string());
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::InvalidFieldValue { field_path, .. }
+            if field_path == "mission.candidates[0].candidate_id"
+        ));
+    }
+
+    #[test]
+    fn mission_validate_rejects_non_finite_candidate_score() {
+        let mut mission = sample_mission();
+        mission.candidates[0].score = Some(f64::INFINITY);
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::InvalidFieldValue { field_path, .. }
+            if field_path == "mission.candidates[0].score"
+        ));
+    }
+
+    #[test]
+    fn mission_validate_rejects_non_monotonic_assignment_timestamps() {
+        let mut mission = sample_mission();
+        mission.assignments[0].updated_at_ms = Some(mission.assignments[0].created_at_ms - 1);
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::NonMonotonicTimestamp { field_path, .. }
+            if field_path == "mission.assignments[0].updated_at_ms"
+        ));
+    }
+
+    #[test]
+    fn mission_validate_rejects_empty_reservation_path_entry() {
+        let mut mission = sample_mission();
+        mission.assignments[0]
+            .reservation_intent
+            .as_mut()
+            .unwrap()
+            .paths = vec!["".to_string()];
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::InvalidFieldValue { field_path, .. }
+            if field_path == "mission.assignments[0].reservation_intent.paths[0]"
+        ));
+    }
+
+    #[test]
     fn mission_validate_rejects_terminal_state_without_matching_outcome() {
         let mut mission = sample_mission();
         mission.lifecycle_state = MissionLifecycleState::Failed;
@@ -4882,22 +6541,16 @@ mod tests {
             MissionFailureCode::PolicyDenied.retryability(),
             MissionFailureRetryability::Never
         );
-        assert!(
-            !MissionFailureCode::PolicyDenied
-                .retryability()
-                .is_retryable()
-        );
-        assert!(
-            !MissionFailureCode::ApprovalDenied
-                .retryability()
-                .is_retryable()
-        );
+        assert!(!MissionFailureCode::PolicyDenied
+            .retryability()
+            .is_retryable());
+        assert!(!MissionFailureCode::ApprovalDenied
+            .retryability()
+            .is_retryable());
         assert!(!MissionFailureCode::RateLimited.terminality().is_terminal());
-        assert!(
-            MissionFailureCode::RateLimited
-                .retryability()
-                .is_retryable()
-        );
+        assert!(MissionFailureCode::RateLimited
+            .retryability()
+            .is_retryable());
     }
 
     #[test]
@@ -5012,6 +6665,175 @@ mod tests {
         ));
     }
 
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn mission_contract_property_transition_conformance_matches_table(
+            from_index in 0_usize..10_usize,
+            to_index in 0_usize..10_usize,
+            kind_index in 0_usize..13_usize,
+            transition_ts in 1_704_200_000_000_i64..1_704_200_010_000_i64
+        ) {
+            let states = MissionLifecycleState::all();
+            let kinds = MissionLifecycleTransitionKind::all();
+            let from = states[from_index];
+            let to = states[to_index];
+            let kind = kinds[kind_index];
+
+            let mut mission = sample_mission();
+            mission.lifecycle_state = from;
+            mission.updated_at_ms = None;
+
+            let expected = mission_lifecycle_can_transition(from, to, kind);
+            let result = mission.transition_lifecycle(to, kind, transition_ts);
+            if expected {
+                prop_assert!(result.is_ok());
+                prop_assert_eq!(mission.lifecycle_state, to);
+                prop_assert_eq!(mission.updated_at_ms, Some(transition_ts));
+            } else {
+                let err = result.unwrap_err();
+                prop_assert_eq!(
+                    err,
+                    MissionValidationError::InvalidLifecycleTransition { from, to, kind },
+                );
+                prop_assert_eq!(mission.lifecycle_state, from);
+                prop_assert!(mission.updated_at_ms.is_none());
+            }
+        }
+
+        #[test]
+        fn mission_contract_property_duplicate_candidate_ids_are_rejected(
+            suffix in "[a-z0-9_]{1,12}"
+        ) {
+            let mut mission = sample_mission();
+            let duplicate_id = format!("candidate:{suffix}");
+            mission.candidates[0].candidate_id = CandidateActionId(duplicate_id.clone());
+            mission.assignments[0].candidate_id = CandidateActionId(duplicate_id.clone());
+            mission.candidates.push(CandidateAction {
+                candidate_id: CandidateActionId(duplicate_id.clone()),
+                requested_by: MissionActorRole::Planner,
+                action: StepAction::WaitFor {
+                    pane_id: Some(2),
+                    condition: WaitCondition::Pattern {
+                        pane_id: Some(2),
+                        rule_id: "core.codex:done".to_string(),
+                    },
+                    timeout_ms: 5_000,
+                },
+                rationale: "Duplicate ID property check".to_string(),
+                score: Some(0.11),
+                created_at_ms: 1_704_200_000_111,
+            });
+
+            let err = mission.validate().unwrap_err();
+            prop_assert!(matches!(
+                err,
+                MissionValidationError::DuplicateCandidateId(CandidateActionId(ref id))
+                if id == &duplicate_id
+            ));
+        }
+
+        #[test]
+        fn mission_contract_property_blank_provenance_fields_are_rejected(
+            field_selector in 0_usize..4_usize,
+            whitespace_len in 1_usize..6_usize
+        ) {
+            let mut mission = sample_mission();
+            let blank = " ".repeat(whitespace_len);
+            let provenance = mission.provenance.get_or_insert_with(MissionProvenance::default);
+            let expected_field_path = match field_selector {
+                0 => {
+                    provenance.bead_id = Some(blank);
+                    "mission.provenance.bead_id"
+                }
+                1 => {
+                    provenance.thread_id = Some(blank);
+                    "mission.provenance.thread_id"
+                }
+                2 => {
+                    provenance.source_command = Some(blank);
+                    "mission.provenance.source_command"
+                }
+                _ => {
+                    provenance.source_sha = Some(blank);
+                    "mission.provenance.source_sha"
+                }
+            };
+
+            let err = mission.validate().unwrap_err();
+            prop_assert!(matches!(
+                err,
+                MissionValidationError::InvalidFieldValue { ref field_path, .. }
+                if field_path == expected_field_path
+            ), "unexpected validation error: {:?}", err);
+        }
+
+        #[test]
+        fn mission_contract_property_failure_code_roundtrips_are_stable(
+            index in 0_usize..8_usize
+        ) {
+            let code = MissionFailureCode::all()[index];
+            let contract = code.contract();
+            prop_assert_eq!(
+                MissionFailureCode::from_reason_code(contract.reason_code),
+                Some(code),
+            );
+            prop_assert_eq!(
+                MissionFailureCode::from_error_code(contract.error_code),
+                Some(code),
+            );
+        }
+
+        #[test]
+        fn mission_contract_property_terminal_states_require_matching_outcomes(
+            state_selector in 0_usize..3_usize,
+            outcome_selector in 0_usize..4_usize
+        ) {
+            let mut mission = sample_mission();
+            let state = match state_selector {
+                0 => MissionLifecycleState::Completed,
+                1 => MissionLifecycleState::Failed,
+                _ => MissionLifecycleState::Cancelled,
+            };
+            mission.lifecycle_state = state;
+
+            mission.assignments[0].outcome = match outcome_selector {
+                0 => None,
+                1 => Some(Outcome::Success {
+                    reason_code: "property_success".to_string(),
+                    completed_at_ms: 1_704_200_000_901,
+                }),
+                2 => Some(Outcome::Failed {
+                    reason_code: MissionFailureCode::RateLimited.reason_code().to_string(),
+                    error_code: MissionFailureCode::RateLimited.error_code().to_string(),
+                    completed_at_ms: 1_704_200_000_902,
+                }),
+                _ => Some(Outcome::Cancelled {
+                    reason_code: "property_cancelled".to_string(),
+                    completed_at_ms: 1_704_200_000_903,
+                }),
+            };
+
+            let expected_valid = matches!(
+                (state, &mission.assignments[0].outcome),
+                (MissionLifecycleState::Completed, Some(Outcome::Success { .. }))
+                    | (MissionLifecycleState::Failed, Some(Outcome::Failed { .. }))
+                    | (MissionLifecycleState::Cancelled, Some(Outcome::Cancelled { .. }))
+            );
+            let result = mission.validate();
+            if expected_valid {
+                prop_assert!(result.is_ok());
+            } else {
+                let err = result.unwrap_err();
+                prop_assert!(matches!(
+                    err,
+                    MissionValidationError::TerminalStateWithoutMatchingOutcome { .. }
+                ), "unexpected validation error: {:?}", err);
+            }
+        }
+    }
+
     #[test]
     fn mission_policy_preflight_plan_time_surfaces_structured_allow_and_deny_reasons() {
         let mut mission = sample_mission();
@@ -5079,13 +6901,11 @@ mod tests {
             deny_outcome.error_code.as_deref(),
             Some(MissionFailureCode::PolicyDenied.error_code())
         );
-        assert!(
-            deny_outcome
-                .human_hint
-                .as_deref()
-                .unwrap()
-                .contains("Policy denied")
-        );
+        assert!(deny_outcome
+            .human_hint
+            .as_deref()
+            .unwrap()
+            .contains("Policy denied"));
         assert_eq!(deny_outcome.action_type, "wait_for");
     }
 
@@ -5218,11 +7038,9 @@ mod tests {
         assert!(report.has_denials());
         assert_eq!(
             report.planner_feedback_reason_codes,
-            vec![
-                MissionFailureCode::ReservationConflict
-                    .reason_code()
-                    .to_string()
-            ]
+            vec![MissionFailureCode::ReservationConflict
+                .reason_code()
+                .to_string()]
         );
         assert_eq!(
             report.outcomes[0].assignment_id.as_ref().unwrap().0,
@@ -5364,9 +7182,10 @@ mod tests {
         assert!(!contract.messaging.requires_beads_update);
         assert!(contract.messaging.thread_id.is_none());
         assert!(contract.messaging.bead_id.is_none());
-        assert!(!contract.edge_cases.iter().any(
-            |edge| matches!(edge, MissionDispatchEdgeCase::StaleBeadState { .. })
-        ));
+        assert!(!contract
+            .edge_cases
+            .iter()
+            .any(|edge| matches!(edge, MissionDispatchEdgeCase::StaleBeadState { .. })));
     }
 
     #[test]
@@ -5379,6 +7198,296 @@ mod tests {
             err,
             MissionValidationError::UnknownCandidateReference(_)
         ));
+    }
+
+    #[test]
+    fn mission_assignment_suitability_prefers_lane_and_soft_capabilities() {
+        let mission = sample_mission();
+        let request = MissionAssignmentSuitabilityRequest {
+            candidate_id: CandidateActionId("candidate:a".to_string()),
+            required_capabilities: vec!["robot.send".to_string()],
+            preferred_capabilities: vec!["retry".to_string(), "observability".to_string()],
+            lane_affinity: Some("mission-core".to_string()),
+            excluded_agents: Vec::new(),
+            evaluated_at_ms: 1_704_200_100_000,
+        };
+        let profiles = vec![
+            MissionAgentCapabilityProfile {
+                agent_id: "executor-agent-a".to_string(),
+                capabilities: vec!["robot.send".to_string(), "retry".to_string()],
+                lane_affinity: vec!["mission-core".to_string()],
+                current_load: 0,
+                max_parallel_assignments: 2,
+                availability: MissionAgentAvailability::Ready,
+            },
+            MissionAgentCapabilityProfile {
+                agent_id: "executor-agent-b".to_string(),
+                capabilities: vec!["robot.send".to_string(), "observability".to_string()],
+                lane_affinity: vec!["search-lane".to_string()],
+                current_load: 0,
+                max_parallel_assignments: 2,
+                availability: MissionAgentAvailability::Ready,
+            },
+        ];
+
+        let report = mission
+            .evaluate_assignment_suitability(&request, &profiles)
+            .unwrap();
+        assert_eq!(report.selected_agent.as_deref(), Some("executor-agent-a"));
+        assert_eq!(report.evaluations[0].agent_id, "executor-agent-a");
+        assert!(report.evaluations[0].eligible);
+        assert!(
+            report.evaluations[0].score > report.evaluations[1].score,
+            "lane affinity + soft preference should increase suitability"
+        );
+    }
+
+    #[test]
+    fn mission_assignment_suitability_rejects_paused_and_rate_limited_agents() {
+        let mission = sample_mission();
+        let request = MissionAssignmentSuitabilityRequest {
+            candidate_id: CandidateActionId("candidate:a".to_string()),
+            required_capabilities: vec!["robot.send".to_string()],
+            preferred_capabilities: Vec::new(),
+            lane_affinity: None,
+            excluded_agents: Vec::new(),
+            evaluated_at_ms: 1_704_200_100_100,
+        };
+        let profiles = vec![
+            MissionAgentCapabilityProfile {
+                agent_id: "paused-agent".to_string(),
+                capabilities: vec!["robot.send".to_string()],
+                lane_affinity: Vec::new(),
+                current_load: 0,
+                max_parallel_assignments: 1,
+                availability: MissionAgentAvailability::Paused {
+                    reason_code: "manual_pause".to_string(),
+                },
+            },
+            MissionAgentCapabilityProfile {
+                agent_id: "rate-agent".to_string(),
+                capabilities: vec!["robot.send".to_string()],
+                lane_affinity: Vec::new(),
+                current_load: 0,
+                max_parallel_assignments: 1,
+                availability: MissionAgentAvailability::RateLimited {
+                    reason_code: "rate_limited".to_string(),
+                    retry_after_ms: 1_704_200_200_000,
+                },
+            },
+            MissionAgentCapabilityProfile {
+                agent_id: "ready-agent".to_string(),
+                capabilities: vec!["robot.send".to_string()],
+                lane_affinity: Vec::new(),
+                current_load: 0,
+                max_parallel_assignments: 1,
+                availability: MissionAgentAvailability::Ready,
+            },
+        ];
+
+        let report = mission
+            .evaluate_assignment_suitability(&request, &profiles)
+            .unwrap();
+        assert_eq!(report.selected_agent.as_deref(), Some("ready-agent"));
+        let paused = report
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.agent_id == "paused-agent")
+            .unwrap();
+        assert!(!paused.eligible);
+        assert!(paused.reason_codes.contains(&"agent_paused".to_string()));
+        let rate_limited = report
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.agent_id == "rate-agent")
+            .unwrap();
+        assert!(!rate_limited.eligible);
+        assert!(rate_limited
+            .reason_codes
+            .contains(&"agent_rate_limited".to_string()));
+    }
+
+    #[test]
+    fn mission_assignment_suitability_enforces_assignment_exclusions() {
+        let mission = sample_mission();
+        let request = MissionAssignmentSuitabilityRequest {
+            candidate_id: CandidateActionId("candidate:a".to_string()),
+            required_capabilities: vec!["robot.send".to_string()],
+            preferred_capabilities: Vec::new(),
+            lane_affinity: None,
+            excluded_agents: vec!["executor-agent-a".to_string()],
+            evaluated_at_ms: 1_704_200_100_200,
+        };
+        let profiles = vec![
+            MissionAgentCapabilityProfile {
+                agent_id: "executor-agent-a".to_string(),
+                capabilities: vec!["robot.send".to_string()],
+                lane_affinity: Vec::new(),
+                current_load: 0,
+                max_parallel_assignments: 2,
+                availability: MissionAgentAvailability::Ready,
+            },
+            MissionAgentCapabilityProfile {
+                agent_id: "executor-agent-b".to_string(),
+                capabilities: vec!["robot.send".to_string()],
+                lane_affinity: Vec::new(),
+                current_load: 0,
+                max_parallel_assignments: 2,
+                availability: MissionAgentAvailability::Ready,
+            },
+        ];
+
+        let report = mission
+            .evaluate_assignment_suitability(&request, &profiles)
+            .unwrap();
+        assert_eq!(report.selected_agent.as_deref(), Some("executor-agent-b"));
+        let excluded = report
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.agent_id == "executor-agent-a")
+            .unwrap();
+        assert!(!excluded.eligible);
+        assert!(excluded
+            .reason_codes
+            .contains(&"assignment_excluded".to_string()));
+    }
+
+    #[test]
+    fn mission_assignment_suitability_handles_degraded_capacity_limits() {
+        let mission = sample_mission();
+        let request = MissionAssignmentSuitabilityRequest {
+            candidate_id: CandidateActionId("candidate:a".to_string()),
+            required_capabilities: vec!["robot.send".to_string()],
+            preferred_capabilities: Vec::new(),
+            lane_affinity: None,
+            excluded_agents: Vec::new(),
+            evaluated_at_ms: 1_704_200_100_300,
+        };
+        let profiles = vec![
+            MissionAgentCapabilityProfile {
+                agent_id: "degraded-full".to_string(),
+                capabilities: vec!["robot.send".to_string()],
+                lane_affinity: Vec::new(),
+                current_load: 1,
+                max_parallel_assignments: 4,
+                availability: MissionAgentAvailability::Degraded {
+                    reason_code: "degraded_latency".to_string(),
+                    max_parallel_assignments: 1,
+                },
+            },
+            MissionAgentCapabilityProfile {
+                agent_id: "degraded-open".to_string(),
+                capabilities: vec!["robot.send".to_string()],
+                lane_affinity: Vec::new(),
+                current_load: 0,
+                max_parallel_assignments: 4,
+                availability: MissionAgentAvailability::Degraded {
+                    reason_code: "degraded_latency".to_string(),
+                    max_parallel_assignments: 1,
+                },
+            },
+        ];
+
+        let report = mission
+            .evaluate_assignment_suitability(&request, &profiles)
+            .unwrap();
+        assert_eq!(report.selected_agent.as_deref(), Some("degraded-open"));
+        let degraded_full = report
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.agent_id == "degraded-full")
+            .unwrap();
+        assert!(!degraded_full.eligible);
+        assert!(degraded_full
+            .reason_codes
+            .contains(&"agent_capacity_exhausted".to_string()));
+        assert!(degraded_full
+            .reason_codes
+            .contains(&"agent_degraded".to_string()));
+    }
+
+    #[test]
+    fn mission_assignment_suitability_rejects_unknown_candidate() {
+        let mission = sample_mission();
+        let request = MissionAssignmentSuitabilityRequest {
+            candidate_id: CandidateActionId("candidate:missing".to_string()),
+            required_capabilities: Vec::new(),
+            preferred_capabilities: Vec::new(),
+            lane_affinity: None,
+            excluded_agents: Vec::new(),
+            evaluated_at_ms: 1_704_200_100_400,
+        };
+
+        let err = mission
+            .evaluate_assignment_suitability(&request, &[])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::UnknownCandidateReference(_)
+        ));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn mission_assignment_suitability_property_excluded_agents_never_selected(
+            exclusion_mask in 0_u8..8_u8
+        ) {
+            let mission = sample_mission();
+            let agent_ids = ["agent-a", "agent-b", "agent-c"];
+            let excluded_agents = agent_ids
+                .iter()
+                .enumerate()
+                .filter_map(|(index, agent_id)| {
+                    if (exclusion_mask & (1 << index)) != 0 {
+                        Some((*agent_id).to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let request = MissionAssignmentSuitabilityRequest {
+                candidate_id: CandidateActionId("candidate:a".to_string()),
+                required_capabilities: vec!["robot.send".to_string()],
+                preferred_capabilities: vec!["retry".to_string()],
+                lane_affinity: None,
+                excluded_agents: excluded_agents.clone(),
+                evaluated_at_ms: 1_704_200_200_100,
+            };
+            let profiles = agent_ids
+                .iter()
+                .map(|agent_id| MissionAgentCapabilityProfile {
+                    agent_id: (*agent_id).to_string(),
+                    capabilities: vec!["robot.send".to_string(), "retry".to_string()],
+                    lane_affinity: Vec::new(),
+                    current_load: 0,
+                    max_parallel_assignments: 1,
+                    availability: MissionAgentAvailability::Ready,
+                })
+                .collect::<Vec<_>>();
+
+            let report = mission
+                .evaluate_assignment_suitability(&request, &profiles)
+                .unwrap();
+            if let Some(selected_agent) = report.selected_agent {
+                prop_assert!(
+                    !excluded_agents.iter().any(|excluded| excluded == &selected_agent),
+                    "selected agent should never be excluded: {}",
+                    selected_agent
+                );
+            }
+            for excluded in excluded_agents {
+                let evaluation = report
+                    .evaluations
+                    .iter()
+                    .find(|evaluation| evaluation.agent_id == excluded)
+                    .unwrap();
+                prop_assert!(!evaluation.eligible);
+                prop_assert!(evaluation.reason_codes.iter().any(|reason| reason == "assignment_excluded"));
+            }
+        }
     }
 
     #[test]
@@ -5427,6 +7536,391 @@ mod tests {
         assert_eq!(first.compute_hash(), second.compute_hash());
         assert!(first.validate().is_ok());
         assert!(second.validate().is_ok());
+    }
+
+    fn sample_tx_contract() -> MissionTxContract {
+        MissionTxContract {
+            tx_version: MISSION_TX_SCHEMA_VERSION,
+            intent: TxIntent {
+                tx_id: TxId("tx:alpha".to_string()),
+                requested_by: MissionActorRole::Dispatcher,
+                summary: "Apply staged mission dispatch updates".to_string(),
+                correlation_id: "corr-tx-alpha".to_string(),
+                created_at_ms: 1_704_100_000_000,
+            },
+            plan: TxPlan {
+                plan_id: TxPlanId("tx-plan:alpha".to_string()),
+                tx_id: TxId("tx:alpha".to_string()),
+                steps: vec![
+                    TxStep {
+                        step_id: TxStepId("tx-step:prepare".to_string()),
+                        ordinal: 1,
+                        action: StepAction::AcquireLock {
+                            lock_name: "mission.tx.alpha".to_string(),
+                            timeout_ms: Some(2_000),
+                        },
+                    },
+                    TxStep {
+                        step_id: TxStepId("tx-step:commit".to_string()),
+                        ordinal: 2,
+                        action: StepAction::SendText {
+                            pane_id: 1,
+                            text: "/apply".to_string(),
+                            paste_mode: Some(false),
+                        },
+                    },
+                ],
+                preconditions: vec![TxPrecondition::PromptActive { pane_id: 1 }],
+                compensations: vec![TxCompensation {
+                    for_step_id: TxStepId("tx-step:commit".to_string()),
+                    action: StepAction::SendText {
+                        pane_id: 1,
+                        text: "/rollback".to_string(),
+                        paste_mode: Some(false),
+                    },
+                }],
+            },
+            lifecycle_state: MissionTxState::Committed,
+            outcome: TxOutcome::Committed {
+                completed_at_ms: 1_704_100_000_900,
+                receipt_seq: 4,
+            },
+            receipts: vec![
+                TxReceipt {
+                    seq: 1,
+                    state: MissionTxState::Planned,
+                    emitted_at_ms: 1_704_100_000_100,
+                    reason_code: None,
+                    error_code: None,
+                },
+                TxReceipt {
+                    seq: 2,
+                    state: MissionTxState::Prepared,
+                    emitted_at_ms: 1_704_100_000_200,
+                    reason_code: None,
+                    error_code: None,
+                },
+                TxReceipt {
+                    seq: 3,
+                    state: MissionTxState::Committing,
+                    emitted_at_ms: 1_704_100_000_300,
+                    reason_code: None,
+                    error_code: None,
+                },
+                TxReceipt {
+                    seq: 4,
+                    state: MissionTxState::Committed,
+                    emitted_at_ms: 1_704_100_000_900,
+                    reason_code: None,
+                    error_code: None,
+                },
+            ],
+        }
+    }
+
+    fn sample_tx_recovery_contract() -> MissionTxContract {
+        let mut contract = sample_tx_contract();
+        contract.lifecycle_state = MissionTxState::RolledBack;
+        contract.outcome = TxOutcome::RolledBack {
+            completed_at_ms: 1_704_100_001_100,
+            receipt_seq: 5,
+            reason_code: MissionTxFailureCode::RollbackForced
+                .reason_code()
+                .to_string(),
+        };
+        contract.receipts = vec![
+            TxReceipt {
+                seq: 1,
+                state: MissionTxState::Planned,
+                emitted_at_ms: 1_704_100_000_100,
+                reason_code: None,
+                error_code: None,
+            },
+            TxReceipt {
+                seq: 2,
+                state: MissionTxState::Prepared,
+                emitted_at_ms: 1_704_100_000_200,
+                reason_code: None,
+                error_code: None,
+            },
+            TxReceipt {
+                seq: 3,
+                state: MissionTxState::Committing,
+                emitted_at_ms: 1_704_100_000_300,
+                reason_code: None,
+                error_code: None,
+            },
+            TxReceipt {
+                seq: 4,
+                state: MissionTxState::Compensating,
+                emitted_at_ms: 1_704_100_001_000,
+                reason_code: Some(
+                    MissionTxFailureCode::CommitPartial
+                        .reason_code()
+                        .to_string(),
+                ),
+                error_code: Some(MissionTxFailureCode::CommitPartial.error_code().to_string()),
+            },
+            TxReceipt {
+                seq: 5,
+                state: MissionTxState::RolledBack,
+                emitted_at_ms: 1_704_100_001_100,
+                reason_code: Some(
+                    MissionTxFailureCode::RollbackForced
+                        .reason_code()
+                        .to_string(),
+                ),
+                error_code: Some(
+                    MissionTxFailureCode::RollbackForced
+                        .error_code()
+                        .to_string(),
+                ),
+            },
+        ];
+        contract
+    }
+
+    #[test]
+    fn mission_tx_failure_taxonomy_has_unique_reason_and_error_codes() {
+        let mut reason_codes = std::collections::HashSet::new();
+        let mut error_codes = std::collections::HashSet::new();
+
+        for code in MissionTxFailureCode::all() {
+            assert!(reason_codes.insert(code.reason_code()));
+            assert!(error_codes.insert(code.error_code()));
+            assert_eq!(
+                MissionTxFailureCode::from_reason_code(code.reason_code()),
+                Some(code)
+            );
+        }
+    }
+
+    #[test]
+    fn mission_tx_transition_table_rejects_illegal_edges() {
+        assert!(mission_tx_can_transition(
+            MissionTxState::Draft,
+            MissionTxState::Planned,
+            MissionTxTransitionKind::PlanCreated
+        ));
+        assert!(!mission_tx_can_transition(
+            MissionTxState::Draft,
+            MissionTxState::Committed,
+            MissionTxTransitionKind::CommitSucceeded
+        ));
+        assert!(!mission_tx_can_transition(
+            MissionTxState::Prepared,
+            MissionTxState::Committed,
+            MissionTxTransitionKind::CommitSucceeded
+        ));
+    }
+
+    #[test]
+    fn mission_tx_contract_accepts_happy_path() {
+        let contract = sample_tx_contract();
+        assert!(contract.validate().is_ok());
+    }
+
+    #[test]
+    fn mission_tx_contract_accepts_recovery_path_with_compensation() {
+        let contract = sample_tx_recovery_contract();
+        assert!(contract.validate().is_ok());
+    }
+
+    #[test]
+    fn mission_tx_contract_rejects_non_monotonic_receipts() {
+        let mut contract = sample_tx_contract();
+        contract.receipts[3].seq = 3;
+        let err = contract.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionTxValidationError::NonMonotonicReceiptSequence { .. }
+        ));
+    }
+
+    #[test]
+    fn mission_tx_contract_rejects_commit_without_prepared_receipt() {
+        let mut contract = sample_tx_contract();
+        contract
+            .receipts
+            .retain(|receipt| receipt.state != MissionTxState::Prepared);
+        let err = contract.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionTxValidationError::CommitWithoutPreparedReceipt
+        ));
+    }
+
+    #[test]
+    fn mission_tx_contract_rejects_double_commit_markers() {
+        let mut contract = sample_tx_contract();
+        contract.receipts.push(TxReceipt {
+            seq: 5,
+            state: MissionTxState::Committed,
+            emitted_at_ms: 1_704_100_000_901,
+            reason_code: None,
+            error_code: None,
+        });
+        let err = contract.validate().unwrap_err();
+        assert!(matches!(err, MissionTxValidationError::DoubleCommitMarker));
+    }
+
+    #[test]
+    fn mission_tx_contract_rejects_compensation_without_commit_failure_marker() {
+        let mut contract = sample_tx_contract();
+        contract.lifecycle_state = MissionTxState::RolledBack;
+        contract.outcome = TxOutcome::RolledBack {
+            completed_at_ms: 1_704_100_001_100,
+            receipt_seq: 5,
+            reason_code: MissionTxFailureCode::RollbackForced
+                .reason_code()
+                .to_string(),
+        };
+        contract.receipts.push(TxReceipt {
+            seq: 5,
+            state: MissionTxState::Compensating,
+            emitted_at_ms: 1_704_100_001_000,
+            reason_code: Some(
+                MissionTxFailureCode::RollbackForced
+                    .reason_code()
+                    .to_string(),
+            ),
+            error_code: Some(
+                MissionTxFailureCode::RollbackForced
+                    .error_code()
+                    .to_string(),
+            ),
+        });
+        let err = contract.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionTxValidationError::CompensationWithoutCommitFailure
+        ));
+    }
+
+    #[test]
+    fn mission_tx_contract_rejects_outcome_state_mismatch() {
+        let mut contract = sample_tx_contract();
+        contract.lifecycle_state = MissionTxState::Prepared;
+        let err = contract.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionTxValidationError::OutcomeStateMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn mission_tx_transition_log_enforces_structured_contract() {
+        let mut log = MissionTxTransitionLog {
+            timestamp_ms: 1_704_100_001_200,
+            component: "mission.tx".to_string(),
+            scenario_id: "tx_happy_path".to_string(),
+            correlation_id: "corr-tx-alpha".to_string(),
+            tx_id: TxId("tx:alpha".to_string()),
+            state_from: MissionTxState::Prepared,
+            state_to: MissionTxState::Committing,
+            transition_kind: MissionTxTransitionKind::CommitStarted,
+            decision_path: "prepared->committing".to_string(),
+            outcome: "ok".to_string(),
+            reason_code: None,
+            error_code: None,
+            artifact_path: "tests/evidence/tx_contract.log".to_string(),
+        };
+        assert!(log.validate().is_ok());
+
+        log.component.clear();
+        let err = log.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionTxValidationError::MissingTransitionLogField { field: "component" }
+        ));
+
+        log.component = "mission.tx".to_string();
+        log.reason_code = Some(
+            MissionTxFailureCode::CommitTimeout
+                .reason_code()
+                .to_string(),
+        );
+        log.error_code = Some(MissionTxFailureCode::CommitDenied.error_code().to_string());
+        let err = log.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionTxValidationError::MismatchedFailureErrorCode { .. }
+        ));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn mission_tx_contract_property_rejects_non_monotonic_receipt_suffix(
+            final_seq in 0_u64..=3_u64
+        ) {
+            let mut contract = sample_tx_contract();
+            contract.receipts[3].seq = final_seq;
+            let err = contract.validate().unwrap_err();
+            prop_assert!(matches!(
+                err,
+                MissionTxValidationError::NonMonotonicReceiptSequence { .. }
+            ), "expected NonMonotonicReceiptSequence, got {:?}", err);
+        }
+
+        #[test]
+        fn mission_tx_contract_property_rejects_duplicate_commit_markers(
+            extra_markers in 1_usize..6_usize
+        ) {
+            let mut contract = sample_tx_contract();
+            for offset in 0..extra_markers {
+                contract.receipts.push(TxReceipt {
+                    seq: 5 + u64::try_from(offset).unwrap_or(0),
+                    state: MissionTxState::Committed,
+                    emitted_at_ms: 1_704_100_000_910 + i64::try_from(offset).unwrap_or(0),
+                    reason_code: None,
+                    error_code: None,
+                });
+            }
+            let err = contract.validate().unwrap_err();
+            prop_assert!(matches!(err, MissionTxValidationError::DoubleCommitMarker));
+        }
+
+        #[test]
+        fn mission_tx_contract_property_enforces_single_terminal_outcome(
+            lifecycle_state in prop_oneof![
+                Just(MissionTxState::Draft),
+                Just(MissionTxState::Planned),
+                Just(MissionTxState::Prepared),
+                Just(MissionTxState::Committing),
+                Just(MissionTxState::Compensating),
+                Just(MissionTxState::RolledBack),
+                Just(MissionTxState::Failed),
+            ]
+        ) {
+            let mut contract = sample_tx_contract();
+            contract.lifecycle_state = lifecycle_state;
+            let err = contract.validate().unwrap_err();
+            prop_assert!(matches!(
+                err,
+                MissionTxValidationError::OutcomeStateMismatch { .. }
+            ), "expected OutcomeStateMismatch, got {:?}", err);
+        }
+
+        #[test]
+        fn mission_tx_contract_property_rejects_compensation_without_commit_partial_marker(
+            failure_index in 0_usize..8_usize
+        ) {
+            let mut contract = sample_tx_recovery_contract();
+            let non_partial_codes: Vec<MissionTxFailureCode> = MissionTxFailureCode::all()
+                .into_iter()
+                .filter(|code| *code != MissionTxFailureCode::CommitPartial)
+                .collect();
+            let failure_code = non_partial_codes[failure_index % non_partial_codes.len()];
+            contract.receipts[3].reason_code = Some(failure_code.reason_code().to_string());
+            contract.receipts[3].error_code = Some(failure_code.error_code().to_string());
+            let err = contract.validate().unwrap_err();
+            prop_assert!(matches!(
+                err,
+                MissionTxValidationError::CompensationWithoutCommitFailure
+            ));
+        }
     }
 
     #[test]
