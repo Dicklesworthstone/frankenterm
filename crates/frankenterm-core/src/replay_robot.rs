@@ -183,6 +183,10 @@ fn default_tolerance() -> u64 {
     100
 }
 
+fn default_suite_dir() -> String {
+    "tests/regression/replay/".into()
+}
+
 /// Response data for `replay.diff`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiffData {
@@ -208,6 +212,7 @@ pub struct DiffData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegressionSuiteRequest {
     /// Directory containing the regression suite.
+    #[serde(default = "default_suite_dir")]
     pub suite_dir: String,
     /// Budget TOML path (optional).
     #[serde(default)]
