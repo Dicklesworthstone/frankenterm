@@ -9,6 +9,7 @@ mod embedder;
 mod hash_embedder;
 mod hybrid_search;
 mod indexing;
+pub mod orchestrator;
 mod reranker;
 mod vector_index;
 

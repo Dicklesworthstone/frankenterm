@@ -80,7 +80,7 @@ fn dedupe_ranked_hits(items: &[(u64, f32)]) -> Vec<(u64, f32)> {
 }
 
 /// Metrics from two-tier blending.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TwoTierMetrics {
     pub tier1_count: usize,
     pub tier2_count: usize,
