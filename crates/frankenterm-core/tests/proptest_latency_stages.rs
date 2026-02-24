@@ -4913,4 +4913,203 @@ proptest! {
         prop_assert_eq!(snap.entries_deduped, 0);
         prop_assert_eq!(snap.comparisons_made, 0);
     }
+
+    // ── E4: Proof Gate Property Tests ────────────────────────────
+
+    /// GoldenArtifact checksum is always valid after creation.
+    #[test]
+    fn golden_checksum_valid_after_new(trace in arb_trace(10)) {
+        let ga = GoldenArtifact::new("test".to_string(), trace, "d".to_string(), 0);
+        prop_assert!(ga.verify_checksum());
+    }
+
+    /// GoldenArtifact checksum is valid after update.
+    #[test]
+    fn golden_checksum_valid_after_update(
+        t1 in arb_trace(8),
+        t2 in arb_trace(8),
+    ) {
+        let mut ga = GoldenArtifact::new("test".to_string(), t1, "v1".to_string(), 0);
+        ga.update(t2, 100);
+        prop_assert!(ga.verify_checksum());
+        prop_assert_eq!(ga.version, 2);
+    }
+
+    /// GoldenArtifact serde roundtrip preserves checksum validity.
+    #[test]
+    fn golden_serde_preserves_checksum(trace in arb_trace(8)) {
+        let ga = GoldenArtifact::new("test".to_string(), trace, "d".to_string(), 0);
+        let json = serde_json::to_string(&ga).unwrap();
+        let back: GoldenArtifact = serde_json::from_str(&json).unwrap();
+        prop_assert!(back.verify_checksum());
+        prop_assert_eq!(ga.checksum, back.checksum);
+    }
+
+    /// ProofGateVerdict serde roundtrip.
+    #[test]
+    fn proof_gate_verdict_serde_roundtrip(variant in 0_u8..4) {
+        let verdict = match variant {
+            0 => ProofGateVerdict::Equivalent,
+            1 => ProofGateVerdict::IsomorphicEquivalent { reordered_count: 5 },
+            2 => ProofGateVerdict::SemanticDrift {
+                first_divergence_idx: 3,
+                mismatches: vec![],
+                summary: "test".to_string(),
+            },
+            _ => ProofGateVerdict::ChecksumFailure { expected: 111, actual: 222 },
+        };
+        let json = serde_json::to_string(&verdict).unwrap();
+        let back: ProofGateVerdict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(verdict, back);
+    }
+
+    /// ProofGateVerdict is_pass/is_fail are mutually exclusive.
+    #[test]
+    fn proof_gate_verdict_pass_fail_exclusive(variant in 0_u8..4) {
+        let verdict = match variant {
+            0 => ProofGateVerdict::Equivalent,
+            1 => ProofGateVerdict::IsomorphicEquivalent { reordered_count: 1 },
+            2 => ProofGateVerdict::SemanticDrift {
+                first_divergence_idx: 0, mismatches: vec![], summary: "x".to_string(),
+            },
+            _ => ProofGateVerdict::ChecksumFailure { expected: 1, actual: 2 },
+        };
+        prop_assert_ne!(verdict.is_pass(), verdict.is_fail());
+    }
+
+    /// Checking same trace as golden yields pass.
+    #[test]
+    fn proof_gate_self_check_passes(trace in arb_trace(10)) {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        gate.register_golden(GoldenArtifact::new("test".to_string(), trace.clone(), "d".to_string(), 0));
+        let summary = gate.check("test", &trace, 0);
+        prop_assert!(summary.verdict.is_pass());
+    }
+
+    /// ProofGate counters are consistent.
+    #[test]
+    fn proof_gate_counters_consistent(
+        trace in arb_trace(8),
+        n_checks in 1_usize..5,
+    ) {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        gate.register_golden(GoldenArtifact::new("x".to_string(), trace.clone(), "d".to_string(), 0));
+        for _ in 0..n_checks {
+            let _ = gate.check("x", &trace, 0);
+        }
+        prop_assert_eq!(gate.total_checks(), n_checks as u64);
+        prop_assert_eq!(gate.total_passes() + gate.total_failures(), gate.total_checks());
+    }
+
+    /// pass_rate is in [0, 1].
+    #[test]
+    fn proof_gate_pass_rate_bounded(
+        n_pass in 0_usize..10,
+        n_fail in 0_usize..10,
+    ) {
+        let mut summaries = Vec::new();
+        for _ in 0..n_pass {
+            summaries.push(ProofSummary {
+                artifact_id: "a".to_string(), golden_version: 1,
+                verdict: ProofGateVerdict::Equivalent,
+                candidate_entries: 1, golden_entries: 1, check_duration_us: 0, timestamp_us: 0,
+            });
+        }
+        for _ in 0..n_fail {
+            summaries.push(ProofSummary {
+                artifact_id: "b".to_string(), golden_version: 1,
+                verdict: ProofGateVerdict::SemanticDrift {
+                    first_divergence_idx: 0, mismatches: vec![], summary: "x".to_string(),
+                },
+                candidate_entries: 1, golden_entries: 1, check_duration_us: 0, timestamp_us: 0,
+            });
+        }
+        let rate = ProofGate::pass_rate(&summaries);
+        prop_assert!(rate >= 0.0);
+        prop_assert!(rate <= 1.0);
+    }
+
+    /// ProofGateSnapshot serde roundtrip.
+    #[test]
+    fn proof_gate_snapshot_serde(
+        checks in 0_u64..1000,
+        passes in 0_u64..500,
+        failures in 0_u64..500,
+        count in 0_usize..50,
+    ) {
+        let snap = ProofGateSnapshot {
+            checks_run: checks,
+            passes,
+            failures,
+            artifacts_count: count,
+            config: ProofGateConfig::default(),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ProofGateSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap, back);
+    }
+
+    /// ProofGateDegradation serde roundtrip.
+    #[test]
+    fn proof_gate_degradation_serde(variant in 0_u8..3) {
+        let deg = match variant {
+            0 => ProofGateDegradation::Healthy,
+            1 => ProofGateDegradation::HighFailureRate { rate: 0.8 },
+            _ => ProofGateDegradation::HighArtifactCount { count: 200 },
+        };
+        let json = serde_json::to_string(&deg).unwrap();
+        let back: ProofGateDegradation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(deg, back);
+    }
+
+    /// approve_drift bumps version and preserves checksum.
+    #[test]
+    fn approve_drift_bumps_version(
+        t1 in arb_trace(5),
+        t2 in arb_trace(5),
+    ) {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        gate.register_golden(GoldenArtifact::new("x".to_string(), t1, "v1".to_string(), 0));
+        let approved = gate.approve_drift("x", &t2, 100);
+        prop_assert!(approved);
+        let ga = gate.get_golden("x").unwrap();
+        prop_assert_eq!(ga.version, 2);
+        prop_assert!(ga.verify_checksum());
+    }
+
+    /// reset_counters preserves artifact count.
+    #[test]
+    fn reset_counters_preserves_artifacts(trace in arb_trace(5)) {
+        let mut gate = ProofGate::new(ProofGateConfig::default());
+        gate.register_golden(GoldenArtifact::new("x".to_string(), trace.clone(), "d".to_string(), 0));
+        let _ = gate.check("x", &trace, 0);
+        gate.reset_counters();
+        prop_assert_eq!(gate.artifact_count(), 1);
+        prop_assert_eq!(gate.total_checks(), 0);
+    }
+
+    /// ProofSummary serde roundtrip.
+    #[test]
+    fn proof_summary_serde_roundtrip(variant in 0_u8..4) {
+        let verdict = match variant {
+            0 => ProofGateVerdict::Equivalent,
+            1 => ProofGateVerdict::IsomorphicEquivalent { reordered_count: 2 },
+            2 => ProofGateVerdict::SemanticDrift {
+                first_divergence_idx: 1, mismatches: vec![], summary: "t".to_string(),
+            },
+            _ => ProofGateVerdict::ChecksumFailure { expected: 10, actual: 20 },
+        };
+        let summary = ProofSummary {
+            artifact_id: "test".to_string(),
+            golden_version: 3,
+            verdict,
+            candidate_entries: 5,
+            golden_entries: 5,
+            check_duration_us: 100,
+            timestamp_us: 50,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: ProofSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(summary, back);
+    }
 }
