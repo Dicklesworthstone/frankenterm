@@ -2043,19 +2043,14 @@ impl InstrumentedEnforcer {
     /// Process a completed correlation context through the enforcer.
     ///
     /// Records each stage timing and returns per-stage results.
-    pub fn process_run(
-        &mut self,
-        ctx: &CorrelationContext,
-    ) -> Vec<ObservationResult> {
+    pub fn process_run(&mut self, ctx: &CorrelationContext) -> Vec<ObservationResult> {
         let mut results = Vec::with_capacity(ctx.timings.len());
         let mut any_overflow = false;
 
         for timing in &ctx.timings {
-            let result = self.enforcer.record(
-                timing.stage,
-                timing.latency_us,
-                &ctx.correlation_id,
-            );
+            let result = self
+                .enforcer
+                .record(timing.stage, timing.latency_us, &ctx.correlation_id);
             if result.overflow {
                 any_overflow = true;
             }
@@ -2422,7 +2417,13 @@ impl MitigationLevel {
     }
 
     /// All levels in escalation order.
-    pub const ALL: &[Self] = &[Self::None, Self::Defer, Self::Degrade, Self::Shed, Self::Skip];
+    pub const ALL: &[Self] = &[
+        Self::None,
+        Self::Defer,
+        Self::Degrade,
+        Self::Shed,
+        Self::Skip,
+    ];
 
     /// Numeric severity (0-4).
     pub fn severity(self) -> u8 {
@@ -2749,8 +2750,7 @@ impl RuntimeEnforcer {
             state.consecutive_ok += 1;
 
             // Check recovery conditions.
-            let cooldown_met =
-                state.consecutive_ok >= self.config.recovery.cooldown_observations;
+            let cooldown_met = state.consecutive_ok >= self.config.recovery.cooldown_observations;
             let timeout_met = now_us.saturating_sub(state.last_escalation_us)
                 >= self.config.recovery.max_degraded_duration_us;
 
@@ -2893,11 +2893,7 @@ impl RuntimeEnforcer {
             total_escalations: self.total_escalations(),
             total_recoveries: self.total_recoveries(),
             fully_recovered: self.is_fully_recovered(),
-            stage_states: self
-                .states
-                .iter()
-                .map(|(s, st)| (*s, st.clone()))
-                .collect(),
+            stage_states: self.states.iter().map(|(s, st)| (*s, st.clone())).collect(),
             base_snapshot: self.enforcer.snapshot(),
         }
     }
@@ -3270,7 +3266,8 @@ impl AdaptiveAllocator {
         // Update EWMA headroom for each observed stage.
         for pressure in pressures {
             if let Some(lane) = self.lanes.iter_mut().find(|l| l.stage == pressure.stage) {
-                lane.smoothed_headroom = lane.smoothed_headroom * (1.0 - self.config.pressure_alpha)
+                lane.smoothed_headroom = lane.smoothed_headroom
+                    * (1.0 - self.config.pressure_alpha)
                     + pressure.headroom * self.config.pressure_alpha;
                 if pressure.is_over_budget() {
                     lane.over_budget_epochs += 1;
@@ -3598,7 +3595,9 @@ impl AdaptiveAllocator {
             .count();
 
         if oscillating > self.lanes.len() / 2 {
-            return AllocatorDegradation::Oscillating { lane_count: oscillating };
+            return AllocatorDegradation::Oscillating {
+                lane_count: oscillating,
+            };
         }
 
         // Check conservation drift.
@@ -3617,7 +3616,9 @@ impl AdaptiveAllocator {
             .count();
 
         if at_floor > self.lanes.len() / 2 {
-            return AllocatorDegradation::FloorSaturation { lane_count: at_floor };
+            return AllocatorDegradation::FloorSaturation {
+                lane_count: at_floor,
+            };
         }
 
         AllocatorDegradation::Healthy
@@ -3745,10 +3746,7 @@ impl SchedulerLane {
                 LatencyStage::WorkflowDispatch,
                 LatencyStage::ActionExecution,
             ],
-            Self::Bulk => &[
-                LatencyStage::StorageWrite,
-                LatencyStage::PatternDetection,
-            ],
+            Self::Bulk => &[LatencyStage::StorageWrite, LatencyStage::PatternDetection],
         }
     }
 
@@ -3771,14 +3769,13 @@ impl fmt::Display for SchedulerLane {
 /// Map a pipeline stage to its scheduling lane.
 pub fn stage_to_lane(stage: LatencyStage) -> SchedulerLane {
     match stage {
-        LatencyStage::PtyCapture
-        | LatencyStage::DeltaExtraction
-        | LatencyStage::ApiResponse => SchedulerLane::Input,
+        LatencyStage::PtyCapture | LatencyStage::DeltaExtraction | LatencyStage::ApiResponse => {
+            SchedulerLane::Input
+        }
         LatencyStage::EventEmission
         | LatencyStage::WorkflowDispatch
         | LatencyStage::ActionExecution => SchedulerLane::Control,
-        LatencyStage::StorageWrite
-        | LatencyStage::PatternDetection => SchedulerLane::Bulk,
+        LatencyStage::StorageWrite | LatencyStage::PatternDetection => SchedulerLane::Bulk,
         // Aggregates don't schedule directly.
         LatencyStage::EndToEndCapture | LatencyStage::EndToEndAction => SchedulerLane::Bulk,
     }
@@ -3811,7 +3808,10 @@ pub enum AdmissionDecision {
     /// Item shed: queue overflow, item dropped.
     Shed,
     /// Item promoted: moved to higher-priority lane due to deadline pressure.
-    Promoted { from: SchedulerLane, to: SchedulerLane },
+    Promoted {
+        from: SchedulerLane,
+        to: SchedulerLane,
+    },
 }
 
 impl fmt::Display for AdmissionDecision {
@@ -3867,13 +3867,9 @@ impl LaneSchedulerConfig {
         let mut errors = Vec::new();
         let total_share = self.input_cpu_share + self.control_cpu_share + self.bulk_cpu_share;
         if total_share > 1.0 + 1e-6 {
-            errors.push(format!(
-                "CPU shares sum to {} (must be ≤ 1.0)",
-                total_share
-            ));
+            errors.push(format!("CPU shares sum to {} (must be ≤ 1.0)", total_share));
         }
-        if self.input_cpu_share < 0.0 || self.control_cpu_share < 0.0 || self.bulk_cpu_share < 0.0
-        {
+        if self.input_cpu_share < 0.0 || self.control_cpu_share < 0.0 || self.bulk_cpu_share < 0.0 {
             errors.push("CPU shares must be non-negative".into());
         }
         if self.input_pressure_threshold <= 0.0 || self.input_pressure_threshold > 1.0 {
@@ -4315,7 +4311,10 @@ pub enum SchedulerDegradation {
     /// Input lane experiencing starvation (critical).
     InputStarvation { depth: usize, deferred: u64 },
     /// Bulk lane heavily shed, few items completing.
-    BulkStarvation { shed_count: u64, completed_count: u64 },
+    BulkStarvation {
+        shed_count: u64,
+        completed_count: u64,
+    },
     /// Control lane backlog growing.
     ControlBacklog { depth: usize, capacity: usize },
 }
@@ -4587,10 +4586,7 @@ impl InputRing {
             total_dequeued: self.total_dequeued,
             total_dropped: self.total_dropped,
             backpressure: self.backpressure(),
-            head_seq: self
-                .peek()
-                .map(|i| i.seq)
-                .unwrap_or(self.next_seq),
+            head_seq: self.peek().map(|i| i.seq).unwrap_or(self.next_seq),
             tail_seq: self.next_seq,
             sojourn_mean_us: self.mean_sojourn_us(),
         }
@@ -5090,10 +5086,7 @@ impl PriorityInheritanceTracker {
         let snap = self.snapshot();
         format!(
             "pi_tracker held={} inherit={} violations={} chains={}",
-            held,
-            snap.total_inheritance_events,
-            snap.total_order_violations,
-            snap.active_chains,
+            held, snap.total_inheritance_events, snap.total_order_violations, snap.active_chains,
         )
     }
 
@@ -5128,9 +5121,7 @@ impl PriorityInheritanceTracker {
 
         // Also close open events that are past duration.
         for event in &mut self.events {
-            if event.released_us.is_none()
-                && now_us.saturating_sub(event.applied_us) > max_dur
-            {
+            if event.released_us.is_none() && now_us.saturating_sub(event.applied_us) > max_dur {
                 event.released_us = Some(now_us);
             }
         }
@@ -5192,7 +5183,11 @@ impl fmt::Display for InheritanceDegradation {
             Self::OrderViolationSpike {
                 total_violations,
                 threshold,
-            } => write!(f, "ORDER_VIOLATION_SPIKE({}/{})", total_violations, threshold),
+            } => write!(
+                f,
+                "ORDER_VIOLATION_SPIKE({}/{})",
+                total_violations, threshold
+            ),
         }
     }
 }
@@ -5439,11 +5434,7 @@ impl StarvationTracker {
                     count += 1;
                 }
             }
-            lane_state.windowed_share = if count > 0 {
-                sum / count as f64
-            } else {
-                0.0
-            };
+            lane_state.windowed_share = if count > 0 { sum / count as f64 } else { 0.0 };
             lane_state.windowed_completions = completions[i];
             lane_state.windowed_deferred = 0; // will be updated externally
 
@@ -5514,10 +5505,7 @@ impl StarvationTracker {
         let snap = self.snapshot();
         format!(
             "fairness gini={:.3} starving={} events={} epoch={}",
-            snap.gini_coefficient,
-            snap.any_starving,
-            snap.total_starvation_events,
-            self.epoch,
+            snap.gini_coefficient, snap.any_starving, snap.total_starvation_events, self.epoch,
         )
     }
 
@@ -5571,14 +5559,9 @@ pub enum FairnessDegradation {
     /// Everything is fine.
     Healthy,
     /// One or more lanes are starving.
-    LaneStarvation {
-        starving_lanes: Vec<SchedulerLane>,
-    },
+    LaneStarvation { starving_lanes: Vec<SchedulerLane> },
     /// Gini coefficient is too high — severe unfairness.
-    SevereUnfairness {
-        gini: f64,
-        threshold: f64,
-    },
+    SevereUnfairness { gini: f64, threshold: f64 },
     /// Force promotions are happening too frequently.
     PromotionStorm {
         events_in_window: u64,
@@ -5594,7 +5577,11 @@ impl fmt::Display for FairnessDegradation {
                 write!(f, "LANE_STARVATION({:?})", starving_lanes)
             }
             Self::SevereUnfairness { gini, threshold } => {
-                write!(f, "SEVERE_UNFAIRNESS(gini={:.3}/thresh={:.3})", gini, threshold)
+                write!(
+                    f,
+                    "SEVERE_UNFAIRNESS(gini={:.3}/thresh={:.3})",
+                    gini, threshold
+                )
             }
             Self::PromotionStorm {
                 events_in_window,
@@ -5978,7 +5965,10 @@ pub enum PoolDegradation {
     /// Pool is exhausted — allocations are failing.
     Exhausted { total_exhausted: u64 },
     /// Pool is fragmented — many blocks but high free count.
-    Fragmented { total_blocks: usize, free_count: usize },
+    Fragmented {
+        total_blocks: usize,
+        free_count: usize,
+    },
 }
 
 impl fmt::Display for PoolDegradation {
@@ -5988,7 +5978,12 @@ impl fmt::Display for PoolDegradation {
             Self::HighUtilization {
                 utilization,
                 threshold,
-            } => write!(f, "HIGH_UTIL({:.1}%/thresh={:.1}%)", utilization * 100.0, threshold * 100.0),
+            } => write!(
+                f,
+                "HIGH_UTIL({:.1}%/thresh={:.1}%)",
+                utilization * 100.0,
+                threshold * 100.0
+            ),
             Self::Exhausted { total_exhausted } => write!(f, "EXHAUSTED({})", total_exhausted),
             Self::Fragmented {
                 total_blocks,
@@ -6077,14 +6072,9 @@ pub struct IngestChunk {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ParseResult {
     /// Complete line(s) found — ready for downstream.
-    Complete {
-        lines: usize,
-        bytes_consumed: usize,
-    },
+    Complete { lines: usize, bytes_consumed: usize },
     /// Partial data — need more input.
-    Partial {
-        bytes_buffered: usize,
-    },
+    Partial { bytes_buffered: usize },
     /// Invalid/corrupt data detected.
     Invalid {
         bytes_skipped: usize,
@@ -6350,10 +6340,7 @@ pub enum IngestDegradation {
         total_bytes: u64,
     },
     /// Low zero-copy ratio — too much data is being copied.
-    LowZeroCopy {
-        ratio: f64,
-        threshold: f64,
-    },
+    LowZeroCopy { ratio: f64, threshold: f64 },
 }
 
 impl fmt::Display for IngestDegradation {
@@ -6369,7 +6356,12 @@ impl fmt::Display for IngestDegradation {
                 total_bytes,
             } => write!(f, "CORRUPT({}/{})", invalid_bytes, total_bytes),
             Self::LowZeroCopy { ratio, threshold } => {
-                write!(f, "LOW_ZC({:.1}%/thresh={:.1}%)", ratio * 100.0, threshold * 100.0)
+                write!(
+                    f,
+                    "LOW_ZC({:.1}%/thresh={:.1}%)",
+                    ratio * 100.0,
+                    threshold * 100.0
+                )
             }
         }
     }
@@ -6521,7 +6513,7 @@ impl Default for TierConfig {
         Self {
             tier: ScrollbackTier::Hot,
             max_bytes: 64 * 1024 * 1024, // 64 MiB
-            target_latency_us: 10,        // 10 µs
+            target_latency_us: 10,       // 10 µs
             compression_ratio: 1.0,
         }
     }
@@ -6545,8 +6537,8 @@ pub struct TierMigrationPolicy {
 impl Default for TierMigrationPolicy {
     fn default() -> Self {
         Self {
-            hot_to_warm_age_us: 60_000_000,      // 60 seconds
-            warm_to_cold_age_us: 600_000_000,     // 10 minutes
+            hot_to_warm_age_us: 60_000_000,   // 60 seconds
+            warm_to_cold_age_us: 600_000_000, // 10 minutes
             min_segment_bytes: 4096,
             pressure_threshold: 0.85,
             max_concurrent_migrations: 4,
@@ -6684,7 +6676,11 @@ impl TieredScrollbackManager {
 
     /// Record an access to a segment (updates last_accessed_us).
     pub fn touch(&mut self, segment_id: u64, now_us: u64) {
-        if let Some(seg) = self.segments.iter_mut().find(|s| s.segment_id == segment_id) {
+        if let Some(seg) = self
+            .segments
+            .iter_mut()
+            .find(|s| s.segment_id == segment_id)
+        {
             seg.last_accessed_us = now_us;
         }
     }
@@ -6864,9 +6860,15 @@ impl TieredScrollbackManager {
         self.segments.retain(|s| {
             if s.pane_id == pane_id {
                 match s.tier {
-                    ScrollbackTier::Hot => self.hot_bytes = self.hot_bytes.saturating_sub(s.byte_size),
-                    ScrollbackTier::Warm => self.warm_bytes = self.warm_bytes.saturating_sub(s.byte_size),
-                    ScrollbackTier::Cold => self.cold_bytes = self.cold_bytes.saturating_sub(s.byte_size),
+                    ScrollbackTier::Hot => {
+                        self.hot_bytes = self.hot_bytes.saturating_sub(s.byte_size)
+                    }
+                    ScrollbackTier::Warm => {
+                        self.warm_bytes = self.warm_bytes.saturating_sub(s.byte_size)
+                    }
+                    ScrollbackTier::Cold => {
+                        self.cold_bytes = self.cold_bytes.saturating_sub(s.byte_size)
+                    }
                 }
                 false
             } else {
@@ -6883,7 +6885,9 @@ impl TieredScrollbackManager {
     ) -> Vec<u64> {
         items
             .iter()
-            .map(|&(pane_id, byte_size, line_count)| self.ingest(pane_id, byte_size, line_count, now_us))
+            .map(|&(pane_id, byte_size, line_count)| {
+                self.ingest(pane_id, byte_size, line_count, now_us)
+            })
             .collect()
     }
 
@@ -6971,22 +6975,50 @@ impl TieredScrollbackManager {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ScrollbackDegradation {
     Healthy,
-    HotPressure { utilization: f64, threshold: f64 },
-    WarmPressure { utilization: f64, threshold: f64 },
-    MigrationBacklog { pending: usize, max_concurrent: usize },
+    HotPressure {
+        utilization: f64,
+        threshold: f64,
+    },
+    WarmPressure {
+        utilization: f64,
+        threshold: f64,
+    },
+    MigrationBacklog {
+        pending: usize,
+        max_concurrent: usize,
+    },
 }
 
 impl std::fmt::Display for ScrollbackDegradation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ScrollbackDegradation::Healthy => write!(f, "HEALTHY"),
-            ScrollbackDegradation::HotPressure { utilization, threshold } => {
-                write!(f, "HOT_PRESSURE({:.1}%/{:.1}%)", utilization * 100.0, threshold * 100.0)
+            ScrollbackDegradation::HotPressure {
+                utilization,
+                threshold,
+            } => {
+                write!(
+                    f,
+                    "HOT_PRESSURE({:.1}%/{:.1}%)",
+                    utilization * 100.0,
+                    threshold * 100.0
+                )
             }
-            ScrollbackDegradation::WarmPressure { utilization, threshold } => {
-                write!(f, "WARM_PRESSURE({:.1}%/{:.1}%)", utilization * 100.0, threshold * 100.0)
+            ScrollbackDegradation::WarmPressure {
+                utilization,
+                threshold,
+            } => {
+                write!(
+                    f,
+                    "WARM_PRESSURE({:.1}%/{:.1}%)",
+                    utilization * 100.0,
+                    threshold * 100.0
+                )
             }
-            ScrollbackDegradation::MigrationBacklog { pending, max_concurrent } => {
+            ScrollbackDegradation::MigrationBacklog {
+                pending,
+                max_concurrent,
+            } => {
                 write!(f, "MIGRATION_BACKLOG({}/{})", pending, max_concurrent)
             }
         }
@@ -7022,9 +7054,13 @@ impl TieredScrollbackManager {
             };
         }
         // Check if hot tier has many segments ready to migrate
-        let pending = self.segments.iter().filter(|s| {
-            s.tier == ScrollbackTier::Hot && s.byte_size >= self.policy.min_segment_bytes
-        }).count();
+        let pending = self
+            .segments
+            .iter()
+            .filter(|s| {
+                s.tier == ScrollbackTier::Hot && s.byte_size >= self.policy.min_segment_bytes
+            })
+            .count();
         if pending > self.policy.max_concurrent_migrations * 2 {
             return ScrollbackDegradation::MigrationBacklog {
                 pending,
@@ -7306,18 +7342,30 @@ impl TransportPolicy {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransportDegradation {
     Healthy,
-    HighCost { ewma_cost_us: f64, threshold_us: f64 },
-    ModeImbalance { dominant_mode: String, share: f64 },
+    HighCost {
+        ewma_cost_us: f64,
+        threshold_us: f64,
+    },
+    ModeImbalance {
+        dominant_mode: String,
+        share: f64,
+    },
 }
 
 impl std::fmt::Display for TransportDegradation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TransportDegradation::Healthy => write!(f, "HEALTHY"),
-            TransportDegradation::HighCost { ewma_cost_us, threshold_us } => {
+            TransportDegradation::HighCost {
+                ewma_cost_us,
+                threshold_us,
+            } => {
                 write!(f, "HIGH_COST({:.1}µs/{:.1}µs)", ewma_cost_us, threshold_us)
             }
-            TransportDegradation::ModeImbalance { dominant_mode, share } => {
+            TransportDegradation::ModeImbalance {
+                dominant_mode,
+                share,
+            } => {
                 write!(f, "MODE_IMBALANCE({}={:.1}%)", dominant_mode, share * 100.0)
             }
         }
@@ -7347,7 +7395,10 @@ impl TransportPolicy {
         }
         // Mode imbalance: any single mode > 95% of decisions (with 20+ decisions)
         if self.total_decisions >= 20 {
-            let max_count = self.local_count.max(self.compressed_count).max(self.bypass_count);
+            let max_count = self
+                .local_count
+                .max(self.compressed_count)
+                .max(self.bypass_count);
             let share = max_count as f64 / self.total_decisions as f64;
             if share > 0.95 {
                 let mode_name = if max_count == self.local_count {
@@ -7399,10 +7450,12 @@ impl TransportPolicy {
             TransportMode::Bypass => payload_bytes as f64 * cm.network_cost_per_byte_us,
             TransportMode::Compressed => {
                 let compress = payload_bytes as f64 * cm.compress_cost_per_byte_us;
-                let transfer =
-                    payload_bytes as f64 * cm.expected_compression_ratio * cm.network_cost_per_byte_us;
-                let decompress =
-                    payload_bytes as f64 * cm.expected_compression_ratio * cm.decompress_cost_per_byte_us;
+                let transfer = payload_bytes as f64
+                    * cm.expected_compression_ratio
+                    * cm.network_cost_per_byte_us;
+                let decompress = payload_bytes as f64
+                    * cm.expected_compression_ratio
+                    * cm.decompress_cost_per_byte_us;
                 compress + transfer + decompress
             }
         }
@@ -7553,10 +7606,10 @@ impl Default for TailLatencyConfig {
         Self {
             syscall_strategy: SyscallStrategy::Adaptive,
             max_batch_size: 64,
-            timer_precision_us: 1000,  // 1ms
+            timer_precision_us: 1000, // 1ms
             affinity: AffinityHint::Any,
-            p99_budget_us: 10_000,     // 10ms
-            p999_budget_us: 50_000,    // 50ms
+            p99_budget_us: 10_000,  // 10ms
+            p999_budget_us: 50_000, // 50ms
         }
     }
 }
@@ -7759,10 +7812,16 @@ impl std::fmt::Display for TailLatencyDegradation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TailLatencyDegradation::Healthy => write!(f, "HEALTHY"),
-            TailLatencyDegradation::P99Breach { observed_us, budget_us } => {
+            TailLatencyDegradation::P99Breach {
+                observed_us,
+                budget_us,
+            } => {
                 write!(f, "P99_BREACH({}µs/{}µs)", observed_us, budget_us)
             }
-            TailLatencyDegradation::P999Breach { observed_us, budget_us } => {
+            TailLatencyDegradation::P999Breach {
+                observed_us,
+                budget_us,
+            } => {
                 write!(f, "P999_BREACH({}µs/{}µs)", observed_us, budget_us)
             }
             TailLatencyDegradation::HighViolationRate { violations, total } => {
@@ -8122,9 +8181,17 @@ impl HitchRiskModel {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HitchRiskDegradation {
     Healthy,
-    ElevatedRisk { posterior_prob: f64 },
-    HighRisk { posterior_prob: f64, evidence_count: usize },
-    CriticalRisk { posterior_prob: f64, log_odds: f64 },
+    ElevatedRisk {
+        posterior_prob: f64,
+    },
+    HighRisk {
+        posterior_prob: f64,
+        evidence_count: usize,
+    },
+    CriticalRisk {
+        posterior_prob: f64,
+        log_odds: f64,
+    },
 }
 
 impl std::fmt::Display for HitchRiskDegradation {
@@ -8134,11 +8201,27 @@ impl std::fmt::Display for HitchRiskDegradation {
             HitchRiskDegradation::ElevatedRisk { posterior_prob } => {
                 write!(f, "ELEVATED({:.1}%)", posterior_prob * 100.0)
             }
-            HitchRiskDegradation::HighRisk { posterior_prob, evidence_count } => {
-                write!(f, "HIGH({:.1}%, {} evidence)", posterior_prob * 100.0, evidence_count)
+            HitchRiskDegradation::HighRisk {
+                posterior_prob,
+                evidence_count,
+            } => {
+                write!(
+                    f,
+                    "HIGH({:.1}%, {} evidence)",
+                    posterior_prob * 100.0,
+                    evidence_count
+                )
             }
-            HitchRiskDegradation::CriticalRisk { posterior_prob, log_odds } => {
-                write!(f, "CRITICAL({:.1}%, lo={:.2})", posterior_prob * 100.0, log_odds)
+            HitchRiskDegradation::CriticalRisk {
+                posterior_prob,
+                log_odds,
+            } => {
+                write!(
+                    f,
+                    "CRITICAL({:.1}%, lo={:.2})",
+                    posterior_prob * 100.0,
+                    log_odds
+                )
             }
         }
     }
@@ -8188,7 +8271,12 @@ impl HitchRiskModel {
 
     /// Quick convenience: submit a budget violation signal.
     pub fn observe_violation(&mut self, severity_llr: f64, timestamp_us: u64) {
-        self.update(EvidenceSignal::BudgetViolation, 1.0, severity_llr, timestamp_us);
+        self.update(
+            EvidenceSignal::BudgetViolation,
+            1.0,
+            severity_llr,
+            timestamp_us,
+        );
     }
 
     /// Quick convenience: submit a latency probe signal.
@@ -8203,7 +8291,10 @@ impl HitchRiskModel {
 
     /// Whether the model currently recommends mitigation.
     pub fn should_mitigate(&self) -> bool {
-        matches!(self.risk_level(), HitchRiskLevel::High | HitchRiskLevel::Critical)
+        matches!(
+            self.risk_level(),
+            HitchRiskLevel::High | HitchRiskLevel::Critical
+        )
     }
 
     /// Whether the model is in critical state.
@@ -8594,8 +8685,12 @@ impl EProcessDetector {
         let snap = self.snapshot();
         format!(
             "e-proc[{}] e={:.3} alert={} obs={} alarms={} mean={:.2}",
-            self.config.kind, snap.e_value, snap.alert_level,
-            snap.total_observations, snap.alarm_count, snap.running_mean,
+            self.config.kind,
+            snap.e_value,
+            snap.alert_level,
+            snap.total_observations,
+            snap.alarm_count,
+            snap.running_mean,
         )
     }
 
@@ -8754,14 +8849,8 @@ impl EProcessDetector {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum EProcessDegradation {
     Healthy,
-    DriftSuspected {
-        e_value: f64,
-        running_mean: f64,
-    },
-    DriftDetected {
-        e_value: f64,
-        alarm_count: u64,
-    },
+    DriftSuspected { e_value: f64, running_mean: f64 },
+    DriftDetected { e_value: f64, alarm_count: u64 },
 }
 
 impl std::fmt::Display for EProcessDegradation {
@@ -8771,7 +8860,10 @@ impl std::fmt::Display for EProcessDegradation {
             Self::DriftSuspected { e_value, .. } => {
                 write!(f, "drift_suspected(e={e_value:.3})")
             }
-            Self::DriftDetected { e_value, alarm_count } => {
+            Self::DriftDetected {
+                e_value,
+                alarm_count,
+            } => {
                 write!(f, "drift_detected(e={e_value:.3}, alarms={alarm_count})")
             }
         }
@@ -9110,8 +9202,10 @@ impl PolicyController {
     pub fn status_line(&self) -> String {
         format!(
             "policy[{}] decisions={} loss={:.3} hyst={}",
-            self.current_action, self.total_decisions,
-            self.last_expected_loss, self.hysteresis_count,
+            self.current_action,
+            self.total_decisions,
+            self.last_expected_loss,
+            self.hysteresis_count,
         )
     }
 
@@ -9268,8 +9362,14 @@ impl std::fmt::Display for PolicyDegradation {
             Self::Tightening { expected_loss } => {
                 write!(f, "tightening(loss={expected_loss:.3})")
             }
-            Self::EmergencyShed { total_decisions, last_loss } => {
-                write!(f, "emergency_shed(decisions={total_decisions}, loss={last_loss:.3})")
+            Self::EmergencyShed {
+                total_decisions,
+                last_loss,
+            } => {
+                write!(
+                    f,
+                    "emergency_shed(decisions={total_decisions}, loss={last_loss:.3})"
+                )
             }
         }
     }
@@ -9577,7 +9677,11 @@ impl CalibrationHarness {
         if self.results.is_empty() {
             return 0.0;
         }
-        self.results.iter().map(|r| r.false_positive_rate).sum::<f64>() / self.results.len() as f64
+        self.results
+            .iter()
+            .map(|r| r.false_positive_rate)
+            .sum::<f64>()
+            / self.results.len() as f64
     }
 
     /// Average miss rate across all results.
@@ -9623,7 +9727,10 @@ impl CalibrationHarness {
 
     /// Results by scenario.
     pub fn results_for_scenario(&self, scenario: CalibrationScenario) -> Vec<&CalibrationResult> {
-        self.results.iter().filter(|r| r.scenario == scenario).collect()
+        self.results
+            .iter()
+            .filter(|r| r.scenario == scenario)
+            .collect()
     }
 }
 
@@ -9658,6 +9765,853 @@ pub struct CalibrationLogEntry {
     pub degradation: CalibrationDegradation,
 }
 
+// ── E1: Formal Specification Pack ──────────────────────────────────
+//
+// Formal invariant predicates for the scheduler, budget enforcer, and
+// recovery protocol.  These types encode machine-checkable properties
+// that MUST hold across all reachable states.  The InvariantChecker
+// runtime validator evaluates them against live snapshots.
+
+// ── E1.1 Invariant Domain ─────────────────────────────────────────
+
+/// Domain to which a formal invariant belongs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InvariantDomain {
+    /// Scheduler lane invariants (admission, ordering, starvation).
+    Scheduler,
+    /// Budget enforcement invariants (monotonicity, overflow, percentile order).
+    Budget,
+    /// Recovery protocol invariants (cooldown, escalation, de-escalation).
+    Recovery,
+    /// Cross-domain composition invariants.
+    Composition,
+}
+
+impl fmt::Display for InvariantDomain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Scheduler => f.write_str("scheduler"),
+            Self::Budget => f.write_str("budget"),
+            Self::Recovery => f.write_str("recovery"),
+            Self::Composition => f.write_str("composition"),
+        }
+    }
+}
+
+/// Severity of a formal invariant.  Critical invariants abort execution;
+/// warning invariants emit diagnostics but continue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum InvariantSeverity {
+    /// Informational — log only.
+    Info,
+    /// Warning — emit diagnostic, continue.
+    Warning,
+    /// Critical — must abort or rollback.
+    Critical,
+}
+
+impl fmt::Display for InvariantSeverity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Info => f.write_str("info"),
+            Self::Warning => f.write_str("warning"),
+            Self::Critical => f.write_str("critical"),
+        }
+    }
+}
+
+// ── E1.2 Formal Invariant Predicate ──────────────────────────────
+
+/// A named, machine-checkable invariant predicate with domain and severity.
+///
+/// Each `FormalInvariant` encodes a single property that must hold.
+/// The `predicate_id` is a stable identifier (e.g. "scheduler.no_starvation")
+/// used for audit trails and counterexample references.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FormalInvariant {
+    /// Stable identifier (dot-separated, e.g. "budget.percentile_monotonic").
+    pub predicate_id: String,
+    /// Human-readable description of the property.
+    pub description: String,
+    /// Domain this invariant belongs to.
+    pub domain: InvariantDomain,
+    /// Severity when violated.
+    pub severity: InvariantSeverity,
+    /// Whether this invariant is a safety property (must always hold)
+    /// vs a liveness property (must eventually hold).
+    pub is_safety: bool,
+}
+
+impl fmt::Display for FormalInvariant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[{}:{}] {}",
+            self.domain, self.severity, self.predicate_id
+        )
+    }
+}
+
+// ── E1.3 Scheduler Invariants ────────────────────────────────────
+
+/// Formal invariants for the 3-lane scheduler.
+///
+/// These capture safety and liveness properties of the `LaneScheduler`:
+/// - No item is lost (admitted items are tracked)
+/// - Lane capacity is never exceeded
+/// - Starvation freedom (bounded wait)
+/// - Deterministic replay (same input → same schedule)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SchedulerInvariant {
+    /// Lane queue length never exceeds configured capacity.
+    CapacityBound {
+        lane: SchedulerLane,
+        capacity: usize,
+        actual: usize,
+    },
+    /// Total admitted items equals sum across all lanes.
+    ConservationOfWork { total_admitted: u64, lane_sum: u64 },
+    /// No lane has been starved beyond the max starvation threshold.
+    StarvationFreedom {
+        lane: SchedulerLane,
+        wait_epochs: u64,
+        max_epochs: u64,
+    },
+    /// Epoch counter is monotonically non-decreasing.
+    EpochMonotonicity { previous: u64, current: u64 },
+    /// Item IDs are strictly monotonically increasing.
+    ItemIdMonotonicity { previous: u64, current: u64 },
+    /// Determinism: identical input sequences produce identical decisions.
+    DeterministicReplay {
+        input_hash: u64,
+        expected_hash: u64,
+        actual_hash: u64,
+    },
+}
+
+impl SchedulerInvariant {
+    /// Check whether this invariant holds.
+    pub fn holds(&self) -> bool {
+        match self {
+            Self::CapacityBound {
+                capacity, actual, ..
+            } => *actual <= *capacity,
+            Self::ConservationOfWork {
+                total_admitted,
+                lane_sum,
+            } => total_admitted == lane_sum,
+            Self::StarvationFreedom {
+                wait_epochs,
+                max_epochs,
+                ..
+            } => wait_epochs <= max_epochs,
+            Self::EpochMonotonicity { previous, current } => current >= previous,
+            Self::ItemIdMonotonicity { previous, current } => {
+                current > previous || (*previous == 0 && *current == 0)
+            }
+            Self::DeterministicReplay {
+                expected_hash,
+                actual_hash,
+                ..
+            } => expected_hash == actual_hash,
+        }
+    }
+
+    /// The predicate ID for this invariant class.
+    pub fn predicate_id(&self) -> &'static str {
+        match self {
+            Self::CapacityBound { .. } => "scheduler.capacity_bound",
+            Self::ConservationOfWork { .. } => "scheduler.conservation_of_work",
+            Self::StarvationFreedom { .. } => "scheduler.starvation_freedom",
+            Self::EpochMonotonicity { .. } => "scheduler.epoch_monotonicity",
+            Self::ItemIdMonotonicity { .. } => "scheduler.item_id_monotonicity",
+            Self::DeterministicReplay { .. } => "scheduler.deterministic_replay",
+        }
+    }
+}
+
+impl fmt::Display for SchedulerInvariant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityBound {
+                lane,
+                capacity,
+                actual,
+            } => {
+                write!(f, "capacity_bound({lane:?}): {actual}/{capacity}")
+            }
+            Self::ConservationOfWork {
+                total_admitted,
+                lane_sum,
+            } => {
+                write!(f, "conservation: total={total_admitted}, sum={lane_sum}")
+            }
+            Self::StarvationFreedom {
+                lane,
+                wait_epochs,
+                max_epochs,
+            } => {
+                write!(f, "starvation({lane:?}): wait={wait_epochs}/{max_epochs}")
+            }
+            Self::EpochMonotonicity { previous, current } => {
+                write!(f, "epoch_mono: {previous} -> {current}")
+            }
+            Self::ItemIdMonotonicity { previous, current } => {
+                write!(f, "item_id_mono: {previous} -> {current}")
+            }
+            Self::DeterministicReplay {
+                input_hash,
+                expected_hash,
+                actual_hash,
+            } => {
+                write!(
+                    f,
+                    "determinism(input={input_hash:#x}): expected={expected_hash:#x}, actual={actual_hash:#x}"
+                )
+            }
+        }
+    }
+}
+
+// ── E1.4 Budget Invariants ───────────────────────────────────────
+
+/// Formal invariants for budget enforcement.
+///
+/// These capture correctness properties of `BudgetEnforcer` and `RuntimeEnforcer`:
+/// - Percentile targets are monotonically ordered (p50 ≤ p95 ≤ p99 ≤ p999)
+/// - Budget totals are non-negative
+/// - Observation counts are consistent
+/// - Enforcer escalation is monotonic within a single evaluation
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BudgetInvariant {
+    /// Percentile targets are monotonically non-decreasing for each stage.
+    PercentileMonotonicity {
+        stage: LatencyStage,
+        p50: f64,
+        p95: f64,
+        p99: f64,
+        p999: f64,
+    },
+    /// All budget targets are non-negative.
+    NonNegativeTargets {
+        stage: LatencyStage,
+        min_target: f64,
+    },
+    /// Total observation count matches per-stage sums.
+    ObservationConsistency { total: u64, per_stage_sum: u64 },
+    /// Overflow count never exceeds total observation count.
+    OverflowBound {
+        overflow_count: u64,
+        total_observations: u64,
+    },
+    /// Enforcer escalation within a single observation is monotonic
+    /// (never jumps down during a single evaluate call).
+    EscalationMonotonicity {
+        stage: LatencyStage,
+        previous_level: MitigationLevel,
+        current_level: MitigationLevel,
+    },
+    /// Aggregate budget ceiling is >= sum of stage budgets at each percentile.
+    AggregateCeiling {
+        percentile: Percentile,
+        aggregate_us: f64,
+        stage_sum_us: f64,
+    },
+}
+
+impl BudgetInvariant {
+    /// Check whether this invariant holds.
+    pub fn holds(&self) -> bool {
+        match self {
+            Self::PercentileMonotonicity {
+                p50,
+                p95,
+                p99,
+                p999,
+                ..
+            } => *p50 <= *p95 && *p95 <= *p99 && *p99 <= *p999,
+            Self::NonNegativeTargets { min_target, .. } => *min_target >= 0.0,
+            Self::ObservationConsistency {
+                total,
+                per_stage_sum,
+            } => total == per_stage_sum,
+            Self::OverflowBound {
+                overflow_count,
+                total_observations,
+            } => overflow_count <= total_observations,
+            Self::EscalationMonotonicity {
+                previous_level,
+                current_level,
+                ..
+            } => *current_level >= *previous_level,
+            Self::AggregateCeiling {
+                aggregate_us,
+                stage_sum_us,
+                ..
+            } => *aggregate_us >= *stage_sum_us || (*aggregate_us - *stage_sum_us).abs() < 1e-6,
+        }
+    }
+
+    /// The predicate ID for this invariant class.
+    pub fn predicate_id(&self) -> &'static str {
+        match self {
+            Self::PercentileMonotonicity { .. } => "budget.percentile_monotonicity",
+            Self::NonNegativeTargets { .. } => "budget.non_negative_targets",
+            Self::ObservationConsistency { .. } => "budget.observation_consistency",
+            Self::OverflowBound { .. } => "budget.overflow_bound",
+            Self::EscalationMonotonicity { .. } => "budget.escalation_monotonicity",
+            Self::AggregateCeiling { .. } => "budget.aggregate_ceiling",
+        }
+    }
+}
+
+impl fmt::Display for BudgetInvariant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PercentileMonotonicity {
+                stage,
+                p50,
+                p95,
+                p99,
+                p999,
+            } => {
+                write!(
+                    f,
+                    "pct_mono({stage}): p50={p50:.1} p95={p95:.1} p99={p99:.1} p999={p999:.1}"
+                )
+            }
+            Self::NonNegativeTargets { stage, min_target } => {
+                write!(f, "nonneg({stage}): min={min_target:.1}")
+            }
+            Self::ObservationConsistency {
+                total,
+                per_stage_sum,
+            } => {
+                write!(f, "obs_consistency: total={total}, sum={per_stage_sum}")
+            }
+            Self::OverflowBound {
+                overflow_count,
+                total_observations,
+            } => {
+                write!(f, "overflow_bound: {overflow_count}/{total_observations}")
+            }
+            Self::EscalationMonotonicity {
+                stage,
+                previous_level,
+                current_level,
+            } => {
+                write!(f, "esc_mono({stage}): {previous_level} -> {current_level}")
+            }
+            Self::AggregateCeiling {
+                percentile,
+                aggregate_us,
+                stage_sum_us,
+            } => {
+                write!(
+                    f,
+                    "agg_ceil({percentile}): agg={aggregate_us:.1} >= sum={stage_sum_us:.1}"
+                )
+            }
+        }
+    }
+}
+
+// ── E1.5 Recovery Invariants ─────────────────────────────────────
+
+/// Formal invariants for the recovery protocol state machine.
+///
+/// Recovery must satisfy:
+/// - Gradual de-escalation: each recovery step drops exactly one level
+/// - Cooldown enforcement: recovery only after sufficient consecutive-ok
+/// - Timeout enforcement: forced recovery after max_degraded_duration
+/// - No spurious escalation during recovery window
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RecoveryInvariant {
+    /// In gradual mode, recovery steps down exactly one MitigationLevel at a time.
+    GradualDeescalation {
+        previous_level: MitigationLevel,
+        recovered_level: MitigationLevel,
+    },
+    /// Recovery only occurs after consecutive_ok >= cooldown_observations.
+    CooldownEnforced {
+        consecutive_ok: u64,
+        cooldown_required: u64,
+    },
+    /// Forced recovery triggers after max_degraded_duration_us is exceeded.
+    TimeoutRecovery {
+        degraded_duration_us: u64,
+        max_duration_us: u64,
+        recovery_triggered: bool,
+    },
+    /// Escalation count is monotonically non-decreasing.
+    EscalationCountMonotonic { previous: u64, current: u64 },
+    /// Recovery count is monotonically non-decreasing.
+    RecoveryCountMonotonic { previous: u64, current: u64 },
+    /// Current mitigation level is within [None, Skip] range (valid enum range).
+    LevelInRange { level: MitigationLevel },
+}
+
+impl RecoveryInvariant {
+    /// Check whether this invariant holds.
+    pub fn holds(&self) -> bool {
+        match self {
+            Self::GradualDeescalation {
+                previous_level,
+                recovered_level,
+            } => {
+                previous_level.severity() > 0
+                    && recovered_level.severity() == previous_level.severity() - 1
+            }
+            Self::CooldownEnforced {
+                consecutive_ok,
+                cooldown_required,
+            } => consecutive_ok >= cooldown_required,
+            Self::TimeoutRecovery {
+                degraded_duration_us,
+                max_duration_us,
+                recovery_triggered,
+            } => {
+                if *degraded_duration_us > *max_duration_us {
+                    *recovery_triggered
+                } else {
+                    true // no constraint before timeout
+                }
+            }
+            Self::EscalationCountMonotonic { previous, current } => current >= previous,
+            Self::RecoveryCountMonotonic { previous, current } => current >= previous,
+            Self::LevelInRange { level } => level.severity() <= 4,
+        }
+    }
+
+    /// The predicate ID for this invariant class.
+    pub fn predicate_id(&self) -> &'static str {
+        match self {
+            Self::GradualDeescalation { .. } => "recovery.gradual_deescalation",
+            Self::CooldownEnforced { .. } => "recovery.cooldown_enforced",
+            Self::TimeoutRecovery { .. } => "recovery.timeout_recovery",
+            Self::EscalationCountMonotonic { .. } => "recovery.escalation_count_monotonic",
+            Self::RecoveryCountMonotonic { .. } => "recovery.recovery_count_monotonic",
+            Self::LevelInRange { .. } => "recovery.level_in_range",
+        }
+    }
+}
+
+impl fmt::Display for RecoveryInvariant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GradualDeescalation {
+                previous_level,
+                recovered_level,
+            } => {
+                write!(f, "gradual: {previous_level} -> {recovered_level}")
+            }
+            Self::CooldownEnforced {
+                consecutive_ok,
+                cooldown_required,
+            } => {
+                write!(f, "cooldown: {consecutive_ok}/{cooldown_required}")
+            }
+            Self::TimeoutRecovery {
+                degraded_duration_us,
+                max_duration_us,
+                recovery_triggered,
+            } => {
+                write!(
+                    f,
+                    "timeout: {degraded_duration_us}us/{max_duration_us}us triggered={recovery_triggered}"
+                )
+            }
+            Self::EscalationCountMonotonic { previous, current } => {
+                write!(f, "esc_mono: {previous} -> {current}")
+            }
+            Self::RecoveryCountMonotonic { previous, current } => {
+                write!(f, "rec_mono: {previous} -> {current}")
+            }
+            Self::LevelInRange { level } => {
+                write!(f, "level_range: {level}")
+            }
+        }
+    }
+}
+
+// ── E1.6 Invariant Check Result ──────────────────────────────────
+
+/// Outcome of evaluating a single formal invariant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum InvariantOutcome {
+    /// Invariant holds.
+    Satisfied,
+    /// Invariant violated with a counterexample description.
+    Violated { counterexample: String },
+    /// Could not be evaluated (insufficient data or timeout).
+    Inconclusive { reason: String },
+}
+
+impl fmt::Display for InvariantOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Satisfied => f.write_str("SATISFIED"),
+            Self::Violated { counterexample } => write!(f, "VIOLATED: {counterexample}"),
+            Self::Inconclusive { reason } => write!(f, "INCONCLUSIVE: {reason}"),
+        }
+    }
+}
+
+/// Result of checking one invariant, with timing and context.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InvariantCheckResult {
+    /// The predicate ID that was checked.
+    pub predicate_id: String,
+    /// Domain of the invariant.
+    pub domain: InvariantDomain,
+    /// Severity of the invariant.
+    pub severity: InvariantSeverity,
+    /// Check outcome.
+    pub outcome: InvariantOutcome,
+    /// Evaluation time in microseconds.
+    pub eval_time_us: u64,
+    /// Timestamp when the check was performed (epoch μs).
+    pub timestamp_us: u64,
+}
+
+impl InvariantCheckResult {
+    /// Whether the check passed.
+    pub fn passed(&self) -> bool {
+        self.outcome == InvariantOutcome::Satisfied
+    }
+
+    /// Whether the check found a violation.
+    pub fn violated(&self) -> bool {
+        matches!(self.outcome, InvariantOutcome::Violated { .. })
+    }
+}
+
+impl fmt::Display for InvariantCheckResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[{}:{}] {} ({}μs)",
+            self.domain, self.severity, self.outcome, self.eval_time_us
+        )
+    }
+}
+
+// ── E1.7 Invariant Checker ───────────────────────────────────────
+
+/// Configuration for the runtime invariant checker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InvariantCheckerConfig {
+    /// Maximum evaluation time per invariant (μs) before marking inconclusive.
+    pub max_eval_time_us: u64,
+    /// Whether to abort on critical violations.
+    pub abort_on_critical: bool,
+    /// Maximum results to retain in history.
+    pub max_history: usize,
+    /// Domains to check (empty = all).
+    pub enabled_domains: Vec<InvariantDomain>,
+}
+
+impl Default for InvariantCheckerConfig {
+    fn default() -> Self {
+        Self {
+            max_eval_time_us: 10_000, // 10ms
+            abort_on_critical: true,
+            max_history: 500,
+            enabled_domains: Vec::new(), // all
+        }
+    }
+}
+
+/// Runtime invariant checker that evaluates formal predicates against live state.
+///
+/// The checker maintains a registry of `FormalInvariant` definitions and
+/// evaluates `SchedulerInvariant`, `BudgetInvariant`, and `RecoveryInvariant`
+/// instances against them.  Results are stored for audit and diagnostics.
+#[derive(Debug, Clone)]
+pub struct InvariantChecker {
+    config: InvariantCheckerConfig,
+    invariants: Vec<FormalInvariant>,
+    results: Vec<InvariantCheckResult>,
+    total_checks: u64,
+    total_violations: u64,
+    total_satisfied: u64,
+}
+
+impl InvariantChecker {
+    /// Create a new checker with the given configuration.
+    pub fn new(config: InvariantCheckerConfig) -> Self {
+        Self {
+            config,
+            invariants: Vec::new(),
+            results: Vec::new(),
+            total_checks: 0,
+            total_violations: 0,
+            total_satisfied: 0,
+        }
+    }
+
+    /// Create a checker with default configuration.
+    pub fn with_defaults() -> Self {
+        Self::new(InvariantCheckerConfig::default())
+    }
+
+    /// Register a formal invariant definition.
+    pub fn register(&mut self, inv: FormalInvariant) {
+        self.invariants.push(inv);
+    }
+
+    /// Number of registered invariant definitions.
+    pub fn registered_count(&self) -> usize {
+        self.invariants.len()
+    }
+
+    /// Check a scheduler invariant.
+    pub fn check_scheduler(
+        &mut self,
+        inv: &SchedulerInvariant,
+        timestamp_us: u64,
+    ) -> InvariantCheckResult {
+        let holds = inv.holds();
+        let outcome = if holds {
+            InvariantOutcome::Satisfied
+        } else {
+            InvariantOutcome::Violated {
+                counterexample: format!("{inv}"),
+            }
+        };
+        self.record_result(
+            inv.predicate_id(),
+            InvariantDomain::Scheduler,
+            InvariantSeverity::Critical,
+            outcome,
+            timestamp_us,
+        )
+    }
+
+    /// Check a budget invariant.
+    pub fn check_budget(
+        &mut self,
+        inv: &BudgetInvariant,
+        timestamp_us: u64,
+    ) -> InvariantCheckResult {
+        let holds = inv.holds();
+        let outcome = if holds {
+            InvariantOutcome::Satisfied
+        } else {
+            InvariantOutcome::Violated {
+                counterexample: format!("{inv}"),
+            }
+        };
+        self.record_result(
+            inv.predicate_id(),
+            InvariantDomain::Budget,
+            InvariantSeverity::Critical,
+            outcome,
+            timestamp_us,
+        )
+    }
+
+    /// Check a recovery invariant.
+    pub fn check_recovery(
+        &mut self,
+        inv: &RecoveryInvariant,
+        timestamp_us: u64,
+    ) -> InvariantCheckResult {
+        let holds = inv.holds();
+        let outcome = if holds {
+            InvariantOutcome::Satisfied
+        } else {
+            InvariantOutcome::Violated {
+                counterexample: format!("{inv}"),
+            }
+        };
+        self.record_result(
+            inv.predicate_id(),
+            InvariantDomain::Recovery,
+            InvariantSeverity::Critical,
+            outcome,
+            timestamp_us,
+        )
+    }
+
+    fn record_result(
+        &mut self,
+        predicate_id: &str,
+        domain: InvariantDomain,
+        severity: InvariantSeverity,
+        outcome: InvariantOutcome,
+        timestamp_us: u64,
+    ) -> InvariantCheckResult {
+        let result = InvariantCheckResult {
+            predicate_id: predicate_id.to_string(),
+            domain,
+            severity,
+            outcome,
+            eval_time_us: 0, // filled by caller if instrumented
+            timestamp_us,
+        };
+        self.total_checks += 1;
+        if result.passed() {
+            self.total_satisfied += 1;
+        }
+        if result.violated() {
+            self.total_violations += 1;
+        }
+        if self.results.len() >= self.config.max_history {
+            self.results.remove(0);
+        }
+        self.results.push(result.clone());
+        result
+    }
+
+    /// Total checks performed.
+    pub fn total_checks(&self) -> u64 {
+        self.total_checks
+    }
+
+    /// Total violations found.
+    pub fn total_violations(&self) -> u64 {
+        self.total_violations
+    }
+
+    /// Total satisfied checks.
+    pub fn total_satisfied(&self) -> u64 {
+        self.total_satisfied
+    }
+
+    /// Violation rate (0.0–1.0).
+    pub fn violation_rate(&self) -> f64 {
+        if self.total_checks == 0 {
+            0.0
+        } else {
+            self.total_violations as f64 / self.total_checks as f64
+        }
+    }
+
+    /// Most recent results (up to `n`).
+    pub fn recent_results(&self, n: usize) -> &[InvariantCheckResult] {
+        let start = self.results.len().saturating_sub(n);
+        &self.results[start..]
+    }
+
+    /// Results filtered by domain.
+    pub fn results_by_domain(&self, domain: InvariantDomain) -> Vec<&InvariantCheckResult> {
+        self.results.iter().filter(|r| r.domain == domain).collect()
+    }
+
+    /// All violation results.
+    pub fn violations(&self) -> Vec<&InvariantCheckResult> {
+        self.results.iter().filter(|r| r.violated()).collect()
+    }
+
+    /// State snapshot.
+    pub fn snapshot(&self) -> InvariantCheckerSnapshot {
+        InvariantCheckerSnapshot {
+            total_checks: self.total_checks,
+            total_violations: self.total_violations,
+            total_satisfied: self.total_satisfied,
+            registered_count: self.invariants.len(),
+            history_len: self.results.len(),
+            violation_rate: self.violation_rate(),
+        }
+    }
+
+    /// Status line for display.
+    pub fn status_line(&self) -> String {
+        let snap = self.snapshot();
+        format!(
+            "invariants: checks={} ok={} violations={} rate={:.4}",
+            snap.total_checks, snap.total_satisfied, snap.total_violations, snap.violation_rate
+        )
+    }
+
+    /// Reset all state.
+    pub fn reset(&mut self) {
+        self.results.clear();
+        self.total_checks = 0;
+        self.total_violations = 0;
+        self.total_satisfied = 0;
+    }
+
+    /// Detect degradation in the invariant checker itself.
+    pub fn detect_degradation(&self) -> InvariantCheckerDegradation {
+        if self.total_checks == 0 {
+            return InvariantCheckerDegradation::Healthy;
+        }
+        let rate = self.violation_rate();
+        if rate > 0.1 {
+            InvariantCheckerDegradation::HighViolationRate {
+                violations: self.total_violations,
+                total: self.total_checks,
+            }
+        } else if rate > 0.0 {
+            InvariantCheckerDegradation::ViolationsDetected {
+                violations: self.total_violations,
+                total: self.total_checks,
+            }
+        } else {
+            InvariantCheckerDegradation::Healthy
+        }
+    }
+
+    /// Structured log entry.
+    pub fn log_entry(&self) -> InvariantCheckerLogEntry {
+        InvariantCheckerLogEntry {
+            total_checks: self.total_checks,
+            total_violations: self.total_violations,
+            total_satisfied: self.total_satisfied,
+            violation_rate: self.violation_rate(),
+            degradation: self.detect_degradation(),
+        }
+    }
+}
+
+/// State snapshot for the invariant checker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InvariantCheckerSnapshot {
+    pub total_checks: u64,
+    pub total_violations: u64,
+    pub total_satisfied: u64,
+    pub registered_count: usize,
+    pub history_len: usize,
+    pub violation_rate: f64,
+}
+
+/// Degradation state for the invariant checker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum InvariantCheckerDegradation {
+    /// No violations detected.
+    Healthy,
+    /// Some violations but rate is low (≤10%).
+    ViolationsDetected { violations: u64, total: u64 },
+    /// High violation rate (>10%).
+    HighViolationRate { violations: u64, total: u64 },
+}
+
+impl fmt::Display for InvariantCheckerDegradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => f.write_str("healthy"),
+            Self::ViolationsDetected { violations, total } => {
+                write!(f, "violations({violations}/{total})")
+            }
+            Self::HighViolationRate { violations, total } => {
+                write!(f, "high_rate({violations}/{total})")
+            }
+        }
+    }
+}
+
+/// Structured log entry for the invariant checker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvariantCheckerLogEntry {
+    pub total_checks: u64,
+    pub total_violations: u64,
+    pub total_satisfied: u64,
+    pub violation_rate: f64,
+    pub degradation: InvariantCheckerDegradation,
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -9669,9 +10623,11 @@ mod tests {
     #[test]
     fn test_pipeline_stages_complete() {
         assert_eq!(LatencyStage::PIPELINE_STAGES.len(), 8);
-        assert!(!LatencyStage::PIPELINE_STAGES
-            .iter()
-            .any(|s| s.is_aggregate()));
+        assert!(
+            !LatencyStage::PIPELINE_STAGES
+                .iter()
+                .any(|s| s.is_aggregate())
+        );
     }
 
     #[test]
@@ -9799,12 +10755,16 @@ mod tests {
             );
         }
         // Aggregates also have budgets.
-        assert!(budgets
-            .iter()
-            .any(|b| b.stage == LatencyStage::EndToEndCapture));
-        assert!(budgets
-            .iter()
-            .any(|b| b.stage == LatencyStage::EndToEndAction));
+        assert!(
+            budgets
+                .iter()
+                .any(|b| b.stage == LatencyStage::EndToEndCapture)
+        );
+        assert!(
+            budgets
+                .iter()
+                .any(|b| b.stage == LatencyStage::EndToEndAction)
+        );
     }
 
     #[test]
@@ -10050,9 +11010,11 @@ mod tests {
         let result = run.validate();
         assert!(result.is_err());
         let violations = result.unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, InvariantViolation::StageOrdering { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, InvariantViolation::StageOrdering { .. }))
+        );
     }
 
     #[test]
@@ -10063,9 +11025,11 @@ mod tests {
         let result = run.validate();
         assert!(result.is_err());
         let violations = result.unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, InvariantViolation::TimestampRegression { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, InvariantViolation::TimestampRegression { .. }))
+        );
     }
 
     #[test]
@@ -10075,9 +11039,11 @@ mod tests {
         let result = run.validate();
         assert!(result.is_err());
         let violations = result.unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, InvariantViolation::TotalMismatch { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, InvariantViolation::TotalMismatch { .. }))
+        );
     }
 
     #[test]
@@ -10087,9 +11053,11 @@ mod tests {
         let result = run.validate();
         assert!(result.is_err());
         let violations = result.unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, InvariantViolation::OverflowFlagMismatch { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, InvariantViolation::OverflowFlagMismatch { .. }))
+        );
     }
 
     // ── Workload Classes ──
@@ -10843,9 +11811,11 @@ mod tests {
             latency_us: 0.0,
         });
         let errors = ctx.validate();
-        assert!(errors
-            .iter()
-            .any(|e| matches!(e, InstrumentationError::ClockRegression { .. })));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, InstrumentationError::ClockRegression { .. }))
+        );
     }
 
     #[test]
@@ -10891,8 +11861,12 @@ mod tests {
     #[test]
     fn test_degradation_ordering() {
         assert!(InstrumentationDegradation::Full < InstrumentationDegradation::SkipOverhead);
-        assert!(InstrumentationDegradation::SkipOverhead < InstrumentationDegradation::SkipCorrelation);
-        assert!(InstrumentationDegradation::SkipCorrelation < InstrumentationDegradation::Passthrough);
+        assert!(
+            InstrumentationDegradation::SkipOverhead < InstrumentationDegradation::SkipCorrelation
+        );
+        assert!(
+            InstrumentationDegradation::SkipCorrelation < InstrumentationDegradation::Passthrough
+        );
     }
 
     #[test]
@@ -11394,9 +12368,9 @@ mod tests {
     fn test_runtime_enforcer_timeout_recovery() {
         let config = RuntimeEnforcerConfig {
             recovery: RecoveryProtocol {
-                cooldown_observations: 1000, // high, so cooldown won't trigger
+                cooldown_observations: 1000,    // high, so cooldown won't trigger
                 max_degraded_duration_us: 5000, // 5ms timeout
-                gradual: false, // jump to full
+                gradual: false,                 // jump to full
             },
             policy_constraints: vec![PolicyConstraint {
                 stage: LatencyStage::PatternDetection,
@@ -11489,7 +12463,11 @@ mod tests {
     fn test_allocator_config_default_valid() {
         let cfg = AdaptiveAllocatorConfig::default();
         let errors = cfg.validate();
-        assert!(errors.is_empty(), "default config should be valid: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "default config should be valid: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -11950,11 +12928,7 @@ mod tests {
         // Each donor should have donated at most max_adjustment_pct of its default.
         for adj in &d.adjustments {
             if adj.delta_us < 0.0 {
-                let lane = alloc
-                    .lanes()
-                    .iter()
-                    .find(|l| l.stage == adj.stage)
-                    .unwrap();
+                let lane = alloc.lanes().iter().find(|l| l.stage == adj.stage).unwrap();
                 let max_donate = lane.default_p95_us * cfg.max_adjustment_pct;
                 assert!(
                     (-adj.delta_us) <= max_donate + 1e-6,
@@ -12018,9 +12992,16 @@ mod tests {
         }
         let snap = enforcer.snapshot();
         let pressures = AdaptiveAllocator::pressures_from_snapshot(&snap);
-        let pty = pressures.iter().find(|p| p.stage == LatencyStage::PtyCapture).unwrap();
+        let pty = pressures
+            .iter()
+            .find(|p| p.stage == LatencyStage::PtyCapture)
+            .unwrap();
         // PtyCapture budget is 10000 p95, observed ~1000 → headroom > 0.
-        assert!(pty.headroom > 0.0, "expected positive headroom: {}", pty.headroom);
+        assert!(
+            pty.headroom > 0.0,
+            "expected positive headroom: {}",
+            pty.headroom
+        );
     }
 
     #[test]
@@ -12102,8 +13083,10 @@ mod tests {
     #[test]
     fn test_allocator_degradation_display() {
         assert_eq!(format!("{}", AllocatorDegradation::Healthy), "HEALTHY");
-        assert!(format!("{}", AllocatorDegradation::Oscillating { lane_count: 5 })
-            .contains("OSCILLATING"));
+        assert!(
+            format!("{}", AllocatorDegradation::Oscillating { lane_count: 5 })
+                .contains("OSCILLATING")
+        );
         assert!(
             format!(
                 "{}",
@@ -12112,8 +13095,11 @@ mod tests {
             .contains("CONSERVATION_DRIFT")
         );
         assert!(
-            format!("{}", AllocatorDegradation::FloorSaturation { lane_count: 4 })
-                .contains("FLOOR_SATURATION")
+            format!(
+                "{}",
+                AllocatorDegradation::FloorSaturation { lane_count: 4 }
+            )
+            .contains("FLOOR_SATURATION")
         );
     }
 
@@ -12237,21 +13223,49 @@ mod tests {
 
     #[test]
     fn test_stage_to_lane_mapping() {
-        assert_eq!(stage_to_lane(LatencyStage::PtyCapture), SchedulerLane::Input);
-        assert_eq!(stage_to_lane(LatencyStage::DeltaExtraction), SchedulerLane::Input);
-        assert_eq!(stage_to_lane(LatencyStage::ApiResponse), SchedulerLane::Input);
-        assert_eq!(stage_to_lane(LatencyStage::EventEmission), SchedulerLane::Control);
-        assert_eq!(stage_to_lane(LatencyStage::WorkflowDispatch), SchedulerLane::Control);
-        assert_eq!(stage_to_lane(LatencyStage::ActionExecution), SchedulerLane::Control);
-        assert_eq!(stage_to_lane(LatencyStage::StorageWrite), SchedulerLane::Bulk);
-        assert_eq!(stage_to_lane(LatencyStage::PatternDetection), SchedulerLane::Bulk);
+        assert_eq!(
+            stage_to_lane(LatencyStage::PtyCapture),
+            SchedulerLane::Input
+        );
+        assert_eq!(
+            stage_to_lane(LatencyStage::DeltaExtraction),
+            SchedulerLane::Input
+        );
+        assert_eq!(
+            stage_to_lane(LatencyStage::ApiResponse),
+            SchedulerLane::Input
+        );
+        assert_eq!(
+            stage_to_lane(LatencyStage::EventEmission),
+            SchedulerLane::Control
+        );
+        assert_eq!(
+            stage_to_lane(LatencyStage::WorkflowDispatch),
+            SchedulerLane::Control
+        );
+        assert_eq!(
+            stage_to_lane(LatencyStage::ActionExecution),
+            SchedulerLane::Control
+        );
+        assert_eq!(
+            stage_to_lane(LatencyStage::StorageWrite),
+            SchedulerLane::Bulk
+        );
+        assert_eq!(
+            stage_to_lane(LatencyStage::PatternDetection),
+            SchedulerLane::Bulk
+        );
     }
 
     #[test]
     fn test_scheduler_config_default_valid() {
         let cfg = LaneSchedulerConfig::default();
         let errors = cfg.validate();
-        assert!(errors.is_empty(), "default config should be valid: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "default config should be valid: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -12270,13 +13284,7 @@ mod tests {
     #[test]
     fn test_scheduler_admit_basic() {
         let mut sched = LaneScheduler::with_defaults();
-        let (item, decision) = sched.admit(
-            LatencyStage::PtyCapture,
-            100.0,
-            "test-1",
-            0,
-            1000,
-        );
+        let (item, decision) = sched.admit(LatencyStage::PtyCapture, 100.0, "test-1", 0, 1000);
         assert_eq!(item.lane, SchedulerLane::Input);
         assert_eq!(decision, AdmissionDecision::Admitted);
         assert_eq!(sched.lane_state(SchedulerLane::Input).depth, 1);
@@ -12298,13 +13306,7 @@ mod tests {
         assert!(sched.input_under_pressure());
 
         // Bulk item should be shed.
-        let (_item, decision) = sched.admit(
-            LatencyStage::StorageWrite,
-            1000.0,
-            "bulk-shed",
-            0,
-            0,
-        );
+        let (_item, decision) = sched.admit(LatencyStage::StorageWrite, 1000.0, "bulk-shed", 0, 0);
         assert_eq!(decision, AdmissionDecision::Shed);
     }
 
@@ -12651,7 +13653,9 @@ mod tests {
     fn test_input_ring_basic_enqueue_dequeue() {
         let mut ring = InputRing::with_defaults();
         assert!(ring.is_empty());
-        let seq = ring.enqueue(LatencyStage::PtyCapture, 100.0, "basic", 1000, 0).unwrap();
+        let seq = ring
+            .enqueue(LatencyStage::PtyCapture, 100.0, "basic", 1000, 0)
+            .unwrap();
         assert_eq!(seq, 1);
         assert_eq!(ring.len(), 1);
         let item = ring.dequeue(1100).unwrap();
@@ -12663,7 +13667,14 @@ mod tests {
     fn test_input_ring_fifo_order() {
         let mut ring = InputRing::with_defaults();
         for i in 0..5 {
-            ring.enqueue(LatencyStage::PtyCapture, 10.0, &format!("fifo-{}", i), i * 100, 0).unwrap();
+            ring.enqueue(
+                LatencyStage::PtyCapture,
+                10.0,
+                &format!("fifo-{}", i),
+                i * 100,
+                0,
+            )
+            .unwrap();
         }
         for i in 0..5 {
             let item = ring.dequeue(1000).unwrap();
@@ -12678,9 +13689,12 @@ mod tests {
             ..Default::default()
         };
         let mut ring = InputRing::new(cfg);
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "a", 0, 0).unwrap();
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "b", 0, 0).unwrap();
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "c", 0, 0).unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "a", 0, 0)
+            .unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "b", 0, 0)
+            .unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "c", 0, 0)
+            .unwrap();
         assert!(ring.is_full());
         let result = ring.enqueue(LatencyStage::PtyCapture, 10.0, "d", 0, 0);
         assert_eq!(result, Err(RingBackpressure::Full));
@@ -12695,13 +13709,17 @@ mod tests {
         };
         let mut ring = InputRing::new(cfg);
         assert_eq!(ring.backpressure(), RingBackpressure::Accept);
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "bp1", 0, 0).unwrap();
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "bp2", 0, 0).unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "bp1", 0, 0)
+            .unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "bp2", 0, 0)
+            .unwrap();
         assert_eq!(ring.backpressure(), RingBackpressure::Accept);
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "bp3", 0, 0).unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "bp3", 0, 0)
+            .unwrap();
         // 3/4 = 0.75 >= high_water_mark → SlowDown
         assert_eq!(ring.backpressure(), RingBackpressure::SlowDown);
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "bp4", 0, 0).unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "bp4", 0, 0)
+            .unwrap();
         assert_eq!(ring.backpressure(), RingBackpressure::Full);
     }
 
@@ -12712,11 +13730,15 @@ mod tests {
             ..Default::default()
         };
         let mut ring = InputRing::new(cfg);
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "w1", 0, 0).unwrap();
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "w2", 0, 0).unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "w1", 0, 0)
+            .unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "w2", 0, 0)
+            .unwrap();
         ring.dequeue(100).unwrap(); // remove w1
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "w3", 0, 0).unwrap();
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "w4", 0, 0).unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "w3", 0, 0)
+            .unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "w4", 0, 0)
+            .unwrap();
         assert_eq!(ring.len(), 3);
         // Should be w2, w3, w4 in FIFO order.
         assert_eq!(ring.dequeue(200).unwrap().seq, 2);
@@ -12728,7 +13750,8 @@ mod tests {
     fn test_input_ring_peek() {
         let mut ring = InputRing::with_defaults();
         assert!(ring.peek().is_none());
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "peek", 100, 0).unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "peek", 100, 0)
+            .unwrap();
         let peeked = ring.peek().unwrap();
         assert_eq!(peeked.seq, 1);
         assert_eq!(ring.len(), 1); // Peek doesn't remove.
@@ -12741,7 +13764,8 @@ mod tests {
             ..Default::default()
         };
         let mut ring = InputRing::new(cfg);
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "soj", 1000, 0).unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "soj", 1000, 0)
+            .unwrap();
         ring.dequeue(1500).unwrap(); // sojourn = 500us
         assert!((ring.mean_sojourn_us().unwrap() - 500.0).abs() < 1e-6);
     }
@@ -12749,7 +13773,8 @@ mod tests {
     #[test]
     fn test_input_ring_snapshot() {
         let mut ring = InputRing::with_defaults();
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "snap", 100, 0).unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "snap", 100, 0)
+            .unwrap();
         let snap = ring.snapshot();
         assert_eq!(snap.len, 1);
         assert_eq!(snap.total_enqueued, 1);
@@ -12782,8 +13807,10 @@ mod tests {
             ..Default::default()
         };
         let mut ring = InputRing::new(cfg);
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "a", 0, 0).unwrap();
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "b", 0, 0).unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "a", 0, 0)
+            .unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "b", 0, 0)
+            .unwrap();
         let _ = ring.enqueue(LatencyStage::PtyCapture, 10.0, "c", 0, 0); // dropped
         ring.dequeue(100).unwrap();
         // Invariant: enqueued = dequeued + len (dropped are separate rejection count)
@@ -12820,8 +13847,14 @@ mod tests {
     fn test_input_ring_drain() {
         let mut ring = InputRing::with_defaults();
         for i in 0..10 {
-            ring.enqueue(LatencyStage::PtyCapture, 10.0, &format!("d-{}", i), i * 100, 0)
-                .unwrap();
+            ring.enqueue(
+                LatencyStage::PtyCapture,
+                10.0,
+                &format!("d-{}", i),
+                i * 100,
+                0,
+            )
+            .unwrap();
         }
         let items = ring.drain(5, 2000);
         assert_eq!(items.len(), 5);
@@ -12846,9 +13879,12 @@ mod tests {
     fn test_input_ring_drain_expired() {
         let mut ring = InputRing::with_defaults();
         // Item with deadline=500, item with deadline=2000, item with no deadline.
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "exp", 100, 500).unwrap();
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "ok", 200, 2000).unwrap();
-        ring.enqueue(LatencyStage::PtyCapture, 10.0, "nodeadline", 300, 0).unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "exp", 100, 500)
+            .unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "ok", 200, 2000)
+            .unwrap();
+        ring.enqueue(LatencyStage::PtyCapture, 10.0, "nodeadline", 300, 0)
+            .unwrap();
 
         let expired = ring.drain_expired(1000);
         assert_eq!(expired.len(), 1);
@@ -12904,10 +13940,22 @@ mod tests {
 
     #[test]
     fn test_stage_to_priority_mapping() {
-        assert_eq!(stage_to_priority(LatencyStage::PtyCapture), Priority::Critical);
-        assert_eq!(stage_to_priority(LatencyStage::DeltaExtraction), Priority::Critical);
-        assert_eq!(stage_to_priority(LatencyStage::EventEmission), Priority::Elevated);
-        assert_eq!(stage_to_priority(LatencyStage::StorageWrite), Priority::Background);
+        assert_eq!(
+            stage_to_priority(LatencyStage::PtyCapture),
+            Priority::Critical
+        );
+        assert_eq!(
+            stage_to_priority(LatencyStage::DeltaExtraction),
+            Priority::Critical
+        );
+        assert_eq!(
+            stage_to_priority(LatencyStage::EventEmission),
+            Priority::Elevated
+        );
+        assert_eq!(
+            stage_to_priority(LatencyStage::StorageWrite),
+            Priority::Background
+        );
     }
 
     #[test]
@@ -12953,10 +14001,7 @@ mod tests {
         }
 
         // The holder's effective priority should now be Critical.
-        assert_eq!(
-            tracker.effective_priority("low"),
-            Some(Priority::Critical)
-        );
+        assert_eq!(tracker.effective_priority("low"), Some(Priority::Critical));
     }
 
     #[test]
@@ -12980,7 +14025,10 @@ mod tests {
         // Try to acquire StorageLock (index 0) — violates canonical order.
         let result = tracker.acquire(Resource::StorageLock, "task-1", Priority::Normal, 200);
         match result {
-            LockResult::OrderViolation { requested, held_after } => {
+            LockResult::OrderViolation {
+                requested,
+                held_after,
+            } => {
                 assert_eq!(requested, Resource::StorageLock);
                 assert_eq!(held_after, Resource::WorkflowLock);
             }
@@ -13057,10 +14105,7 @@ mod tests {
         tracker.acquire(Resource::PatternLock, "t1", Priority::Normal, 200);
 
         // Effective priority should be the max across all held locks.
-        assert_eq!(
-            tracker.effective_priority("t1"),
-            Some(Priority::Normal)
-        );
+        assert_eq!(tracker.effective_priority("t1"), Some(Priority::Normal));
     }
 
     #[test]
@@ -13176,10 +14221,7 @@ mod tests {
         tracker.acquire(Resource::StorageLock, "high", Priority::Critical, 50);
 
         // Before expiry.
-        assert_eq!(
-            tracker.effective_priority("low"),
-            Some(Priority::Critical)
-        );
+        assert_eq!(tracker.effective_priority("low"), Some(Priority::Critical));
 
         // After expiry (200us > 100us max).
         let expired = tracker.expire_stale_inheritance(200);
@@ -13212,20 +14254,47 @@ mod tests {
     #[test]
     fn test_pi_degradation_healthy() {
         let tracker = PriorityInheritanceTracker::with_defaults();
-        assert_eq!(tracker.detect_degradation(), InheritanceDegradation::Healthy);
+        assert_eq!(
+            tracker.detect_degradation(),
+            InheritanceDegradation::Healthy
+        );
     }
 
     #[test]
     fn test_pi_degradation_excessive_inheritance() {
         let mut tracker = PriorityInheritanceTracker::with_defaults();
         // Create 3 locks each with inheritance (>2 threshold).
-        for (i, resource) in [Resource::StorageLock, Resource::PatternLock, Resource::EventBusLock].iter().enumerate() {
-            tracker.acquire(*resource, &format!("low-{}", i), Priority::Background, i as u64 * 100);
-            tracker.acquire(*resource, &format!("high-{}", i), Priority::Critical, i as u64 * 100 + 50);
+        for (i, resource) in [
+            Resource::StorageLock,
+            Resource::PatternLock,
+            Resource::EventBusLock,
+        ]
+        .iter()
+        .enumerate()
+        {
+            tracker.acquire(
+                *resource,
+                &format!("low-{}", i),
+                Priority::Background,
+                i as u64 * 100,
+            );
+            tracker.acquire(
+                *resource,
+                &format!("high-{}", i),
+                Priority::Critical,
+                i as u64 * 100 + 50,
+            );
         }
         let degradation = tracker.detect_degradation();
-        let is_excessive = matches!(degradation, InheritanceDegradation::ExcessiveInheritance { .. });
-        assert!(is_excessive, "Expected ExcessiveInheritance, got {:?}", degradation);
+        let is_excessive = matches!(
+            degradation,
+            InheritanceDegradation::ExcessiveInheritance { .. }
+        );
+        assert!(
+            is_excessive,
+            "Expected ExcessiveInheritance, got {:?}",
+            degradation
+        );
     }
 
     #[test]
@@ -13238,8 +14307,15 @@ mod tests {
             tracker.release(Resource::WorkflowLock, "task", 300);
         }
         let degradation = tracker.detect_degradation();
-        let is_spike = matches!(degradation, InheritanceDegradation::OrderViolationSpike { .. });
-        assert!(is_spike, "Expected OrderViolationSpike, got {:?}", degradation);
+        let is_spike = matches!(
+            degradation,
+            InheritanceDegradation::OrderViolationSpike { .. }
+        );
+        assert!(
+            is_spike,
+            "Expected OrderViolationSpike, got {:?}",
+            degradation
+        );
     }
 
     #[test]
@@ -13256,9 +14332,18 @@ mod tests {
     fn test_inheritance_degradation_serde() {
         let variants = vec![
             InheritanceDegradation::Healthy,
-            InheritanceDegradation::ExcessiveInheritance { active_chains: 3, threshold: 2 },
-            InheritanceDegradation::HighContention { total_waiters: 10, threshold: 8 },
-            InheritanceDegradation::OrderViolationSpike { total_violations: 15, threshold: 10 },
+            InheritanceDegradation::ExcessiveInheritance {
+                active_chains: 3,
+                threshold: 2,
+            },
+            InheritanceDegradation::HighContention {
+                total_waiters: 10,
+                threshold: 8,
+            },
+            InheritanceDegradation::OrderViolationSpike {
+                total_violations: 15,
+                threshold: 10,
+            },
         ];
         for v in &variants {
             let json = serde_json::to_string(v).unwrap();
@@ -13285,7 +14370,10 @@ mod tests {
     #[test]
     fn test_inheritance_degradation_display() {
         assert_eq!(format!("{}", InheritanceDegradation::Healthy), "HEALTHY");
-        let exc = InheritanceDegradation::ExcessiveInheritance { active_chains: 3, threshold: 2 };
+        let exc = InheritanceDegradation::ExcessiveInheritance {
+            active_chains: 3,
+            threshold: 2,
+        };
         assert!(format!("{}", exc).contains("3/2"));
     }
 
@@ -13366,7 +14454,11 @@ mod tests {
             tracker.observe_epoch(&[3, 3, 3], &[0.333, 0.333, 0.334]);
         }
         let gini = tracker.gini_coefficient();
-        assert!(gini < 0.01, "Gini {} should be near 0 for equal shares", gini);
+        assert!(
+            gini < 0.01,
+            "Gini {} should be near 0 for equal shares",
+            gini
+        );
     }
 
     #[test]
@@ -13377,7 +14469,11 @@ mod tests {
             tracker.observe_epoch(&[10, 0, 0], &[0.9, 0.05, 0.05]);
         }
         let gini = tracker.gini_coefficient();
-        assert!(gini > 0.3, "Gini {} should be higher for unequal shares", gini);
+        assert!(
+            gini > 0.3,
+            "Gini {} should be higher for unequal shares",
+            gini
+        );
     }
 
     #[test]
@@ -13532,7 +14628,11 @@ mod tests {
         tracker.observe_epoch(&[5, 3, 0], &[0.5, 0.3, 0.0]);
         let degradation = tracker.detect_degradation();
         let is_starvation = matches!(degradation, FairnessDegradation::LaneStarvation { .. });
-        assert!(is_starvation, "Expected LaneStarvation, got {:?}", degradation);
+        assert!(
+            is_starvation,
+            "Expected LaneStarvation, got {:?}",
+            degradation
+        );
     }
 
     #[test]
@@ -13549,9 +14649,17 @@ mod tests {
     fn test_fairness_degradation_serde() {
         let variants = vec![
             FairnessDegradation::Healthy,
-            FairnessDegradation::LaneStarvation { starving_lanes: vec![SchedulerLane::Bulk] },
-            FairnessDegradation::SevereUnfairness { gini: 0.7, threshold: 0.5 },
-            FairnessDegradation::PromotionStorm { events_in_window: 10, threshold: 5 },
+            FairnessDegradation::LaneStarvation {
+                starving_lanes: vec![SchedulerLane::Bulk],
+            },
+            FairnessDegradation::SevereUnfairness {
+                gini: 0.7,
+                threshold: 0.5,
+            },
+            FairnessDegradation::PromotionStorm {
+                events_in_window: 10,
+                threshold: 5,
+            },
         ];
         for v in &variants {
             let json = serde_json::to_string(v).unwrap();
@@ -13578,7 +14686,10 @@ mod tests {
     #[test]
     fn test_fairness_degradation_display() {
         assert_eq!(format!("{}", FairnessDegradation::Healthy), "HEALTHY");
-        let storm = FairnessDegradation::PromotionStorm { events_in_window: 10, threshold: 5 };
+        let storm = FairnessDegradation::PromotionStorm {
+            events_in_window: 10,
+            threshold: 5,
+        };
         assert!(format!("{}", storm).contains("10/5"));
     }
 
@@ -13597,10 +14708,22 @@ mod tests {
 
     #[test]
     fn test_stage_to_domain_mapping() {
-        assert_eq!(stage_to_domain(LatencyStage::PtyCapture), MemoryDomain::PtyCapture);
-        assert_eq!(stage_to_domain(LatencyStage::StorageWrite), MemoryDomain::StorageWrite);
-        assert_eq!(stage_to_domain(LatencyStage::EventEmission), MemoryDomain::EventBus);
-        assert_eq!(stage_to_domain(LatencyStage::ApiResponse), MemoryDomain::Shared);
+        assert_eq!(
+            stage_to_domain(LatencyStage::PtyCapture),
+            MemoryDomain::PtyCapture
+        );
+        assert_eq!(
+            stage_to_domain(LatencyStage::StorageWrite),
+            MemoryDomain::StorageWrite
+        );
+        assert_eq!(
+            stage_to_domain(LatencyStage::EventEmission),
+            MemoryDomain::EventBus
+        );
+        assert_eq!(
+            stage_to_domain(LatencyStage::ApiResponse),
+            MemoryDomain::Shared
+        );
     }
 
     #[test]
@@ -13850,9 +14973,15 @@ mod tests {
     fn test_pool_degradation_serde() {
         let variants = vec![
             PoolDegradation::Healthy,
-            PoolDegradation::HighUtilization { utilization: 0.9, threshold: 0.85 },
+            PoolDegradation::HighUtilization {
+                utilization: 0.9,
+                threshold: 0.85,
+            },
             PoolDegradation::Exhausted { total_exhausted: 5 },
-            PoolDegradation::Fragmented { total_blocks: 100, free_count: 60 },
+            PoolDegradation::Fragmented {
+                total_blocks: 100,
+                free_count: 60,
+            },
         ];
         for v in &variants {
             let json = serde_json::to_string(v).unwrap();
@@ -14106,7 +15235,11 @@ mod tests {
         parser.feed(b"0123456789abcdef");
         let degradation = parser.detect_degradation();
         let is_high = matches!(degradation, IngestDegradation::HighBufferPressure { .. });
-        assert!(is_high, "Expected HighBufferPressure, got {:?}", degradation);
+        assert!(
+            is_high,
+            "Expected HighBufferPressure, got {:?}",
+            degradation
+        );
     }
 
     #[test]
@@ -14122,9 +15255,18 @@ mod tests {
     fn test_ingest_degradation_serde() {
         let variants = vec![
             IngestDegradation::Healthy,
-            IngestDegradation::HighBufferPressure { buffered_bytes: 100, max_line_bytes: 120 },
-            IngestDegradation::DataCorruption { invalid_bytes: 10, total_bytes: 200 },
-            IngestDegradation::LowZeroCopy { ratio: 0.3, threshold: 0.5 },
+            IngestDegradation::HighBufferPressure {
+                buffered_bytes: 100,
+                max_line_bytes: 120,
+            },
+            IngestDegradation::DataCorruption {
+                invalid_bytes: 10,
+                total_bytes: 200,
+            },
+            IngestDegradation::LowZeroCopy {
+                ratio: 0.3,
+                threshold: 0.5,
+            },
         ];
         for v in &variants {
             let json = serde_json::to_string(v).unwrap();
@@ -14150,7 +15292,10 @@ mod tests {
     #[test]
     fn test_ingest_degradation_display() {
         assert_eq!(format!("{}", IngestDegradation::Healthy), "HEALTHY");
-        let buf = IngestDegradation::HighBufferPressure { buffered_bytes: 100, max_line_bytes: 120 };
+        let buf = IngestDegradation::HighBufferPressure {
+            buffered_bytes: 100,
+            max_line_bytes: 120,
+        };
         assert!(format!("{}", buf).contains("100/120"));
     }
 
@@ -14232,9 +15377,24 @@ mod tests {
             pressure_threshold: 0.99,
             max_concurrent_migrations: 10,
         };
-        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1_000_000, target_latency_us: 10, compression_ratio: 1.0 };
-        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 1_000_000, target_latency_us: 500, compression_ratio: 1.0 };
-        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 10_000_000, target_latency_us: 10000, compression_ratio: 0.25 };
+        let hot = TierConfig {
+            tier: ScrollbackTier::Hot,
+            max_bytes: 1_000_000,
+            target_latency_us: 10,
+            compression_ratio: 1.0,
+        };
+        let warm = TierConfig {
+            tier: ScrollbackTier::Warm,
+            max_bytes: 1_000_000,
+            target_latency_us: 500,
+            compression_ratio: 1.0,
+        };
+        let cold = TierConfig {
+            tier: ScrollbackTier::Cold,
+            max_bytes: 10_000_000,
+            target_latency_us: 10000,
+            compression_ratio: 0.25,
+        };
         let mut mgr = TieredScrollbackManager::new(hot, warm, cold, policy);
 
         mgr.ingest(1, 500, 5, 0);
@@ -14256,16 +15416,31 @@ mod tests {
             pressure_threshold: 0.99,
             max_concurrent_migrations: 10,
         };
-        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1_000_000, target_latency_us: 10, compression_ratio: 1.0 };
-        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 1_000_000, target_latency_us: 500, compression_ratio: 1.0 };
-        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 10_000_000, target_latency_us: 10000, compression_ratio: 0.5 };
+        let hot = TierConfig {
+            tier: ScrollbackTier::Hot,
+            max_bytes: 1_000_000,
+            target_latency_us: 10,
+            compression_ratio: 1.0,
+        };
+        let warm = TierConfig {
+            tier: ScrollbackTier::Warm,
+            max_bytes: 1_000_000,
+            target_latency_us: 500,
+            compression_ratio: 1.0,
+        };
+        let cold = TierConfig {
+            tier: ScrollbackTier::Cold,
+            max_bytes: 10_000_000,
+            target_latency_us: 10000,
+            compression_ratio: 0.5,
+        };
         let mut mgr = TieredScrollbackManager::new(hot, warm, cold, policy);
 
         mgr.ingest(1, 1000, 10, 0);
-        mgr.migrate(200);  // hot→warm
+        mgr.migrate(200); // hot→warm
         assert_eq!(mgr.segment(0).unwrap().tier, ScrollbackTier::Warm);
 
-        mgr.migrate(800);  // warm→cold
+        mgr.migrate(800); // warm→cold
         let seg = mgr.segment(0).unwrap();
         assert_eq!(seg.tier, ScrollbackTier::Cold);
         assert!(seg.compressed);
@@ -14288,9 +15463,24 @@ mod tests {
 
     #[test]
     fn test_tiered_scrollback_utilization() {
-        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1000, target_latency_us: 10, compression_ratio: 1.0 };
-        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 5000, target_latency_us: 500, compression_ratio: 1.0 };
-        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 10000, target_latency_us: 10000, compression_ratio: 0.25 };
+        let hot = TierConfig {
+            tier: ScrollbackTier::Hot,
+            max_bytes: 1000,
+            target_latency_us: 10,
+            compression_ratio: 1.0,
+        };
+        let warm = TierConfig {
+            tier: ScrollbackTier::Warm,
+            max_bytes: 5000,
+            target_latency_us: 500,
+            compression_ratio: 1.0,
+        };
+        let cold = TierConfig {
+            tier: ScrollbackTier::Cold,
+            max_bytes: 10000,
+            target_latency_us: 10000,
+            compression_ratio: 0.25,
+        };
         let mut mgr = TieredScrollbackManager::new(hot, warm, cold, TierMigrationPolicy::default());
 
         mgr.ingest(1, 500, 5, 0);
@@ -14347,20 +15537,48 @@ mod tests {
 
     #[test]
     fn test_scrollback_degradation_hot_pressure() {
-        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1000, target_latency_us: 10, compression_ratio: 1.0 };
-        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 10000, target_latency_us: 500, compression_ratio: 1.0 };
-        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 100000, target_latency_us: 10000, compression_ratio: 0.25 };
-        let policy = TierMigrationPolicy { pressure_threshold: 0.8, ..Default::default() };
+        let hot = TierConfig {
+            tier: ScrollbackTier::Hot,
+            max_bytes: 1000,
+            target_latency_us: 10,
+            compression_ratio: 1.0,
+        };
+        let warm = TierConfig {
+            tier: ScrollbackTier::Warm,
+            max_bytes: 10000,
+            target_latency_us: 500,
+            compression_ratio: 1.0,
+        };
+        let cold = TierConfig {
+            tier: ScrollbackTier::Cold,
+            max_bytes: 100000,
+            target_latency_us: 10000,
+            compression_ratio: 0.25,
+        };
+        let policy = TierMigrationPolicy {
+            pressure_threshold: 0.8,
+            ..Default::default()
+        };
         let mut mgr = TieredScrollbackManager::new(hot, warm, cold, policy);
         mgr.ingest(1, 900, 10, 0);
-        let is_pressure = matches!(mgr.detect_degradation(), ScrollbackDegradation::HotPressure { .. });
-        assert!(is_pressure, "Expected HotPressure, got {:?}", mgr.detect_degradation());
+        let is_pressure = matches!(
+            mgr.detect_degradation(),
+            ScrollbackDegradation::HotPressure { .. }
+        );
+        assert!(
+            is_pressure,
+            "Expected HotPressure, got {:?}",
+            mgr.detect_degradation()
+        );
     }
 
     #[test]
     fn test_scrollback_degradation_display() {
         assert_eq!(format!("{}", ScrollbackDegradation::Healthy), "HEALTHY");
-        let hot = ScrollbackDegradation::HotPressure { utilization: 0.9, threshold: 0.85 };
+        let hot = ScrollbackDegradation::HotPressure {
+            utilization: 0.9,
+            threshold: 0.85,
+        };
         assert!(format!("{}", hot).contains("90.0%"));
     }
 
@@ -14393,9 +15611,18 @@ mod tests {
     fn test_scrollback_degradation_serde() {
         let variants = vec![
             ScrollbackDegradation::Healthy,
-            ScrollbackDegradation::HotPressure { utilization: 0.9, threshold: 0.85 },
-            ScrollbackDegradation::WarmPressure { utilization: 0.88, threshold: 0.85 },
-            ScrollbackDegradation::MigrationBacklog { pending: 10, max_concurrent: 4 },
+            ScrollbackDegradation::HotPressure {
+                utilization: 0.9,
+                threshold: 0.85,
+            },
+            ScrollbackDegradation::WarmPressure {
+                utilization: 0.88,
+                threshold: 0.85,
+            },
+            ScrollbackDegradation::MigrationBacklog {
+                pending: 10,
+                max_concurrent: 4,
+            },
         ];
         for v in &variants {
             let json = serde_json::to_string(v).unwrap();
@@ -14414,9 +15641,24 @@ mod tests {
 
     #[test]
     fn test_tiered_scrollback_pressure_migration() {
-        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1000, target_latency_us: 10, compression_ratio: 1.0 };
-        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 10000, target_latency_us: 500, compression_ratio: 1.0 };
-        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 100000, target_latency_us: 10000, compression_ratio: 0.25 };
+        let hot = TierConfig {
+            tier: ScrollbackTier::Hot,
+            max_bytes: 1000,
+            target_latency_us: 10,
+            compression_ratio: 1.0,
+        };
+        let warm = TierConfig {
+            tier: ScrollbackTier::Warm,
+            max_bytes: 10000,
+            target_latency_us: 500,
+            compression_ratio: 1.0,
+        };
+        let cold = TierConfig {
+            tier: ScrollbackTier::Cold,
+            max_bytes: 100000,
+            target_latency_us: 10000,
+            compression_ratio: 0.25,
+        };
         let policy = TierMigrationPolicy {
             hot_to_warm_age_us: 1_000_000_000, // Very long — won't trigger by age
             warm_to_cold_age_us: 1_000_000_000,
@@ -14442,9 +15684,24 @@ mod tests {
             pressure_threshold: 0.99,
             max_concurrent_migrations: 2,
         };
-        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1_000_000, target_latency_us: 10, compression_ratio: 1.0 };
-        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 1_000_000, target_latency_us: 500, compression_ratio: 1.0 };
-        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 10_000_000, target_latency_us: 10000, compression_ratio: 0.25 };
+        let hot = TierConfig {
+            tier: ScrollbackTier::Hot,
+            max_bytes: 1_000_000,
+            target_latency_us: 10,
+            compression_ratio: 1.0,
+        };
+        let warm = TierConfig {
+            tier: ScrollbackTier::Warm,
+            max_bytes: 1_000_000,
+            target_latency_us: 500,
+            compression_ratio: 1.0,
+        };
+        let cold = TierConfig {
+            tier: ScrollbackTier::Cold,
+            max_bytes: 10_000_000,
+            target_latency_us: 10000,
+            compression_ratio: 0.25,
+        };
         let mut mgr = TieredScrollbackManager::new(hot, warm, cold, policy);
         for i in 0..5 {
             mgr.ingest(i, 100, 1, 0);
@@ -14462,9 +15719,24 @@ mod tests {
             pressure_threshold: 0.99,
             max_concurrent_migrations: 10,
         };
-        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1_000_000, target_latency_us: 10, compression_ratio: 1.0 };
-        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 1_000_000, target_latency_us: 500, compression_ratio: 1.0 };
-        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 10_000_000, target_latency_us: 10000, compression_ratio: 0.25 };
+        let hot = TierConfig {
+            tier: ScrollbackTier::Hot,
+            max_bytes: 1_000_000,
+            target_latency_us: 10,
+            compression_ratio: 1.0,
+        };
+        let warm = TierConfig {
+            tier: ScrollbackTier::Warm,
+            max_bytes: 1_000_000,
+            target_latency_us: 500,
+            compression_ratio: 1.0,
+        };
+        let cold = TierConfig {
+            tier: ScrollbackTier::Cold,
+            max_bytes: 10_000_000,
+            target_latency_us: 10000,
+            compression_ratio: 0.25,
+        };
         let mut mgr = TieredScrollbackManager::new(hot, warm, cold, policy);
         mgr.ingest(1, 100, 1, 0); // Too small
         mgr.ingest(2, 600, 5, 0); // Large enough
@@ -14549,9 +15821,24 @@ mod tests {
 
     #[test]
     fn test_tiered_scrollback_evict_hot_to_target() {
-        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1000, target_latency_us: 10, compression_ratio: 1.0 };
-        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 10000, target_latency_us: 500, compression_ratio: 1.0 };
-        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 100000, target_latency_us: 10000, compression_ratio: 0.25 };
+        let hot = TierConfig {
+            tier: ScrollbackTier::Hot,
+            max_bytes: 1000,
+            target_latency_us: 10,
+            compression_ratio: 1.0,
+        };
+        let warm = TierConfig {
+            tier: ScrollbackTier::Warm,
+            max_bytes: 10000,
+            target_latency_us: 500,
+            compression_ratio: 1.0,
+        };
+        let cold = TierConfig {
+            tier: ScrollbackTier::Cold,
+            max_bytes: 100000,
+            target_latency_us: 10000,
+            compression_ratio: 0.25,
+        };
         let mut mgr = TieredScrollbackManager::new(hot, warm, cold, TierMigrationPolicy::default());
 
         mgr.ingest(1, 300, 10, 100);
@@ -14559,7 +15846,11 @@ mod tests {
         mgr.ingest(3, 300, 10, 300);
         // 900/1000 = 90%. Evict to 50%.
         let freed = mgr.evict_hot_to_target(0.5);
-        assert!(freed >= 400, "Should have freed enough to reach 50%: freed={}", freed);
+        assert!(
+            freed >= 400,
+            "Should have freed enough to reach 50%: freed={}",
+            freed
+        );
         assert!(mgr.hot_utilization() <= 0.51);
     }
 
@@ -14593,9 +15884,24 @@ mod tests {
 
     #[test]
     fn test_tiered_scrollback_cold_utilization() {
-        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1000, target_latency_us: 10, compression_ratio: 1.0 };
-        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 5000, target_latency_us: 500, compression_ratio: 1.0 };
-        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 10000, target_latency_us: 10000, compression_ratio: 0.5 };
+        let hot = TierConfig {
+            tier: ScrollbackTier::Hot,
+            max_bytes: 1000,
+            target_latency_us: 10,
+            compression_ratio: 1.0,
+        };
+        let warm = TierConfig {
+            tier: ScrollbackTier::Warm,
+            max_bytes: 5000,
+            target_latency_us: 500,
+            compression_ratio: 1.0,
+        };
+        let cold = TierConfig {
+            tier: ScrollbackTier::Cold,
+            max_bytes: 10000,
+            target_latency_us: 10000,
+            compression_ratio: 0.5,
+        };
         let policy = TierMigrationPolicy {
             hot_to_warm_age_us: 10,
             warm_to_cold_age_us: 100,
@@ -14605,8 +15911,8 @@ mod tests {
         };
         let mut mgr = TieredScrollbackManager::new(hot, warm, cold, policy);
         mgr.ingest(1, 2000, 20, 0);
-        mgr.migrate(50);   // hot→warm
-        mgr.migrate(200);  // warm→cold
+        mgr.migrate(50); // hot→warm
+        mgr.migrate(200); // warm→cold
         // 2000 * 0.5 = 1000 cold bytes, util = 1000/10000 = 0.1
         assert!((mgr.cold_utilization() - 0.1).abs() < 0.01);
     }
@@ -14620,9 +15926,24 @@ mod tests {
             pressure_threshold: 0.99,
             max_concurrent_migrations: 10,
         };
-        let hot = TierConfig { tier: ScrollbackTier::Hot, max_bytes: 1_000_000, target_latency_us: 10, compression_ratio: 1.0 };
-        let warm = TierConfig { tier: ScrollbackTier::Warm, max_bytes: 1_000_000, target_latency_us: 500, compression_ratio: 1.0 };
-        let cold = TierConfig { tier: ScrollbackTier::Cold, max_bytes: 10_000_000, target_latency_us: 10000, compression_ratio: 0.25 };
+        let hot = TierConfig {
+            tier: ScrollbackTier::Hot,
+            max_bytes: 1_000_000,
+            target_latency_us: 10,
+            compression_ratio: 1.0,
+        };
+        let warm = TierConfig {
+            tier: ScrollbackTier::Warm,
+            max_bytes: 1_000_000,
+            target_latency_us: 500,
+            compression_ratio: 1.0,
+        };
+        let cold = TierConfig {
+            tier: ScrollbackTier::Cold,
+            max_bytes: 10_000_000,
+            target_latency_us: 10000,
+            compression_ratio: 0.25,
+        };
         let mut mgr = TieredScrollbackManager::new(hot, warm, cold, policy);
         mgr.ingest(1, 500, 5, 0);
         mgr.ingest(2, 600, 6, 0);
@@ -14717,7 +16038,10 @@ mod tests {
         policy.record(200, TransportMode::Compressed, 2.0, 2.0, 200);
         policy.record(300, TransportMode::Bypass, 3.0, 3.0, 300);
         let snap = policy.snapshot();
-        assert_eq!(snap.local_count + snap.compressed_count + snap.bypass_count, snap.total_decisions);
+        assert_eq!(
+            snap.local_count + snap.compressed_count + snap.bypass_count,
+            snap.total_decisions
+        );
     }
 
     #[test]
@@ -14754,14 +16078,24 @@ mod tests {
         for i in 0..50 {
             policy.record(10000, TransportMode::Compressed, 200.0, 200.0, i * 100);
         }
-        let is_high = matches!(policy.detect_degradation(), TransportDegradation::HighCost { .. });
-        assert!(is_high, "Expected HighCost, got {:?}", policy.detect_degradation());
+        let is_high = matches!(
+            policy.detect_degradation(),
+            TransportDegradation::HighCost { .. }
+        );
+        assert!(
+            is_high,
+            "Expected HighCost, got {:?}",
+            policy.detect_degradation()
+        );
     }
 
     #[test]
     fn test_transport_degradation_display() {
         assert_eq!(format!("{}", TransportDegradation::Healthy), "HEALTHY");
-        let high = TransportDegradation::HighCost { ewma_cost_us: 150.0, threshold_us: 100.0 };
+        let high = TransportDegradation::HighCost {
+            ewma_cost_us: 150.0,
+            threshold_us: 100.0,
+        };
         assert!(format!("{}", high).contains("150.0"));
     }
 
@@ -14824,8 +16158,14 @@ mod tests {
     fn test_transport_degradation_serde() {
         let variants = vec![
             TransportDegradation::Healthy,
-            TransportDegradation::HighCost { ewma_cost_us: 150.0, threshold_us: 100.0 },
-            TransportDegradation::ModeImbalance { dominant_mode: "Local".to_string(), share: 0.98 },
+            TransportDegradation::HighCost {
+                ewma_cost_us: 150.0,
+                threshold_us: 100.0,
+            },
+            TransportDegradation::ModeImbalance {
+                dominant_mode: "Local".to_string(),
+                share: 0.98,
+            },
         ];
         for v in &variants {
             let json = serde_json::to_string(v).unwrap();
@@ -15028,10 +16368,17 @@ mod tests {
     #[test]
     fn test_tail_latency_wakeup_conservation() {
         let mut ctrl = TailLatencyController::with_defaults();
-        for _ in 0..10 { ctrl.record_wakeup(WakeupSource::Timer, 50); }
-        for _ in 0..5 { ctrl.record_wakeup(WakeupSource::IoEvent, 100); }
+        for _ in 0..10 {
+            ctrl.record_wakeup(WakeupSource::Timer, 50);
+        }
+        for _ in 0..5 {
+            ctrl.record_wakeup(WakeupSource::IoEvent, 100);
+        }
         let snap = ctrl.snapshot();
-        assert_eq!(snap.timer_wakeups + snap.io_wakeups + snap.signal_wakeups + snap.nudge_wakeups, snap.total_wakeups);
+        assert_eq!(
+            snap.timer_wakeups + snap.io_wakeups + snap.signal_wakeups + snap.nudge_wakeups,
+            snap.total_wakeups
+        );
     }
 
     #[test]
@@ -15048,7 +16395,9 @@ mod tests {
     fn test_tail_latency_p99() {
         let mut ctrl = TailLatencyController::with_defaults();
         // 100 samples: 99 at 100µs, 1 at 5000µs
-        for _ in 0..99 { ctrl.record_wakeup(WakeupSource::Timer, 100); }
+        for _ in 0..99 {
+            ctrl.record_wakeup(WakeupSource::Timer, 100);
+        }
         ctrl.record_wakeup(WakeupSource::Timer, 5000);
         let p99 = ctrl.p99_latency_us();
         // p99 of 100 samples → index 99 → should be 5000
@@ -15062,7 +16411,7 @@ mod tests {
             ..Default::default()
         };
         let mut ctrl = TailLatencyController::new(config);
-        ctrl.record_wakeup(WakeupSource::Timer, 500);  // OK
+        ctrl.record_wakeup(WakeupSource::Timer, 500); // OK
         ctrl.record_wakeup(WakeupSource::Timer, 1500); // Violation
         assert_eq!(ctrl.snapshot().budget_violations, 1);
     }
@@ -15093,14 +16442,24 @@ mod tests {
         };
         let mut ctrl = TailLatencyController::new(config);
         ctrl.record_wakeup(WakeupSource::Timer, 10000); // Exceeds p999
-        let is_breach = matches!(ctrl.detect_degradation(), TailLatencyDegradation::P999Breach { .. });
-        assert!(is_breach, "Expected P999Breach, got {:?}", ctrl.detect_degradation());
+        let is_breach = matches!(
+            ctrl.detect_degradation(),
+            TailLatencyDegradation::P999Breach { .. }
+        );
+        assert!(
+            is_breach,
+            "Expected P999Breach, got {:?}",
+            ctrl.detect_degradation()
+        );
     }
 
     #[test]
     fn test_tail_latency_degradation_display() {
         assert_eq!(format!("{}", TailLatencyDegradation::Healthy), "HEALTHY");
-        let breach = TailLatencyDegradation::P99Breach { observed_us: 15000, budget_us: 10000 };
+        let breach = TailLatencyDegradation::P99Breach {
+            observed_us: 15000,
+            budget_us: 10000,
+        };
         assert!(format!("{}", breach).contains("15000"));
     }
 
@@ -15153,9 +16512,18 @@ mod tests {
     fn test_tail_latency_degradation_serde() {
         let variants = vec![
             TailLatencyDegradation::Healthy,
-            TailLatencyDegradation::P99Breach { observed_us: 15000, budget_us: 10000 },
-            TailLatencyDegradation::P999Breach { observed_us: 60000, budget_us: 50000 },
-            TailLatencyDegradation::HighViolationRate { violations: 10, total: 100 },
+            TailLatencyDegradation::P99Breach {
+                observed_us: 15000,
+                budget_us: 10000,
+            },
+            TailLatencyDegradation::P999Breach {
+                observed_us: 60000,
+                budget_us: 50000,
+            },
+            TailLatencyDegradation::HighViolationRate {
+                violations: 10,
+                total: 100,
+            },
         ];
         for v in &variants {
             let json = serde_json::to_string(v).unwrap();
@@ -15217,9 +16585,15 @@ mod tests {
     #[test]
     fn test_tail_latency_wakeup_distribution() {
         let mut ctrl = TailLatencyController::with_defaults();
-        for _ in 0..6 { ctrl.record_wakeup(WakeupSource::Timer, 100); }
-        for _ in 0..3 { ctrl.record_wakeup(WakeupSource::IoEvent, 100); }
-        for _ in 0..1 { ctrl.record_wakeup(WakeupSource::Signal, 100); }
+        for _ in 0..6 {
+            ctrl.record_wakeup(WakeupSource::Timer, 100);
+        }
+        for _ in 0..3 {
+            ctrl.record_wakeup(WakeupSource::IoEvent, 100);
+        }
+        for _ in 0..1 {
+            ctrl.record_wakeup(WakeupSource::Signal, 100);
+        }
         let (t, io, s, n) = ctrl.wakeup_distribution();
         assert!((t - 0.6).abs() < 0.01);
         assert!((io - 0.3).abs() < 0.01);
@@ -15244,15 +16618,21 @@ mod tests {
             ..Default::default()
         };
         let mut ctrl = TailLatencyController::new(config);
-        for _ in 0..8 { ctrl.record_wakeup(WakeupSource::Timer, 50); }
-        for _ in 0..2 { ctrl.record_wakeup(WakeupSource::Timer, 200); }
+        for _ in 0..8 {
+            ctrl.record_wakeup(WakeupSource::Timer, 50);
+        }
+        for _ in 0..2 {
+            ctrl.record_wakeup(WakeupSource::Timer, 200);
+        }
         assert!((ctrl.violation_rate() - 0.2).abs() < 0.01);
     }
 
     #[test]
     fn test_tail_latency_within_budget() {
         let mut ctrl = TailLatencyController::with_defaults();
-        for _ in 0..10 { ctrl.record_wakeup(WakeupSource::Timer, 100); }
+        for _ in 0..10 {
+            ctrl.record_wakeup(WakeupSource::Timer, 100);
+        }
         assert!(ctrl.within_p99_budget());
         assert!(ctrl.within_p999_budget());
     }
@@ -15275,7 +16655,9 @@ mod tests {
     fn test_tail_latency_set_p99_budget() {
         let mut ctrl = TailLatencyController::with_defaults();
         ctrl.set_p99_budget(5000);
-        for _ in 0..10 { ctrl.record_wakeup(WakeupSource::Timer, 4000); }
+        for _ in 0..10 {
+            ctrl.record_wakeup(WakeupSource::Timer, 4000);
+        }
         assert!(ctrl.within_p99_budget());
     }
 
@@ -15407,16 +16789,22 @@ mod tests {
         let is_elevated_or_higher = matches!(
             model.detect_degradation(),
             HitchRiskDegradation::ElevatedRisk { .. }
-            | HitchRiskDegradation::HighRisk { .. }
-            | HitchRiskDegradation::CriticalRisk { .. }
+                | HitchRiskDegradation::HighRisk { .. }
+                | HitchRiskDegradation::CriticalRisk { .. }
         );
-        assert!(is_elevated_or_higher, "Got {:?}", model.detect_degradation());
+        assert!(
+            is_elevated_or_higher,
+            "Got {:?}",
+            model.detect_degradation()
+        );
     }
 
     #[test]
     fn test_hitch_risk_degradation_display() {
         assert_eq!(format!("{}", HitchRiskDegradation::Healthy), "HEALTHY");
-        let elev = HitchRiskDegradation::ElevatedRisk { posterior_prob: 0.75 };
+        let elev = HitchRiskDegradation::ElevatedRisk {
+            posterior_prob: 0.75,
+        };
         assert!(format!("{}", elev).contains("75.0%"));
     }
 
@@ -15436,7 +16824,9 @@ mod tests {
             risk_level: HitchRiskLevel::Elevated,
             evidence_count: 5,
             total_updates: 10,
-            degradation: HitchRiskDegradation::ElevatedRisk { posterior_prob: 0.818 },
+            degradation: HitchRiskDegradation::ElevatedRisk {
+                posterior_prob: 0.818,
+            },
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: HitchRiskLogEntry = serde_json::from_str(&json).unwrap();
@@ -15447,9 +16837,17 @@ mod tests {
     fn test_hitch_risk_degradation_serde() {
         let variants = vec![
             HitchRiskDegradation::Healthy,
-            HitchRiskDegradation::ElevatedRisk { posterior_prob: 0.7 },
-            HitchRiskDegradation::HighRisk { posterior_prob: 0.9, evidence_count: 20 },
-            HitchRiskDegradation::CriticalRisk { posterior_prob: 0.99, log_odds: 5.5 },
+            HitchRiskDegradation::ElevatedRisk {
+                posterior_prob: 0.7,
+            },
+            HitchRiskDegradation::HighRisk {
+                posterior_prob: 0.9,
+                evidence_count: 20,
+            },
+            HitchRiskDegradation::CriticalRisk {
+                posterior_prob: 0.99,
+                log_odds: 5.5,
+            },
         ];
         for v in &variants {
             let json = serde_json::to_string(v).unwrap();
@@ -15579,7 +16977,10 @@ mod tests {
     fn test_eprocess_kind_display() {
         assert_eq!(EProcessKind::CusumLike.to_string(), "cusum_like");
         assert_eq!(EProcessKind::Mixture.to_string(), "mixture");
-        assert_eq!(EProcessKind::ConfidenceSequence.to_string(), "confidence_seq");
+        assert_eq!(
+            EProcessKind::ConfidenceSequence.to_string(),
+            "confidence_seq"
+        );
     }
 
     #[test]
@@ -15834,7 +17235,11 @@ mod tests {
 
     #[test]
     fn test_eprocess_kind_serde() {
-        for kind in [EProcessKind::CusumLike, EProcessKind::Mixture, EProcessKind::ConfidenceSequence] {
+        for kind in [
+            EProcessKind::CusumLike,
+            EProcessKind::Mixture,
+            EProcessKind::ConfidenceSequence,
+        ] {
             let json = serde_json::to_string(&kind).unwrap();
             let back: EProcessKind = serde_json::from_str(&json).unwrap();
             assert_eq!(kind, back);
@@ -15843,7 +17248,13 @@ mod tests {
 
     #[test]
     fn test_drift_observable_serde() {
-        for obs in [DriftObservable::Latency, DriftObservable::Throughput, DriftObservable::ErrorRate, DriftObservable::QueueDepth, DriftObservable::ResourceUsage] {
+        for obs in [
+            DriftObservable::Latency,
+            DriftObservable::Throughput,
+            DriftObservable::ErrorRate,
+            DriftObservable::QueueDepth,
+            DriftObservable::ResourceUsage,
+        ] {
             let json = serde_json::to_string(&obs).unwrap();
             let back: DriftObservable = serde_json::from_str(&json).unwrap();
             assert_eq!(obs, back);
@@ -15852,7 +17263,11 @@ mod tests {
 
     #[test]
     fn test_drift_alert_level_serde() {
-        for level in [DriftAlertLevel::None, DriftAlertLevel::Warning, DriftAlertLevel::Alarm] {
+        for level in [
+            DriftAlertLevel::None,
+            DriftAlertLevel::Warning,
+            DriftAlertLevel::Alarm,
+        ] {
             let json = serde_json::to_string(&level).unwrap();
             let back: DriftAlertLevel = serde_json::from_str(&json).unwrap();
             assert_eq!(level, back);
@@ -15888,8 +17303,14 @@ mod tests {
     fn test_eprocess_degradation_serde() {
         let variants = vec![
             EProcessDegradation::Healthy,
-            EProcessDegradation::DriftSuspected { e_value: 5.0, running_mean: 2.5 },
-            EProcessDegradation::DriftDetected { e_value: 25.0, alarm_count: 3 },
+            EProcessDegradation::DriftSuspected {
+                e_value: 5.0,
+                running_mean: 2.5,
+            },
+            EProcessDegradation::DriftDetected {
+                e_value: 25.0,
+                alarm_count: 3,
+            },
         ];
         for v in &variants {
             let json = serde_json::to_string(v).unwrap();
@@ -16094,7 +17515,10 @@ mod tests {
             det.observe(-5.0, i * 100);
         }
         // Peak should be >= current and >= what it was after the up phase
-        assert!(det.peak_e_value() >= peak_after_up || (det.peak_e_value() - peak_after_up).abs() < 1e-10);
+        assert!(
+            det.peak_e_value() >= peak_after_up
+                || (det.peak_e_value() - peak_after_up).abs() < 1e-10
+        );
     }
 
     #[test]
@@ -16227,7 +17651,12 @@ mod tests {
 
     #[test]
     fn test_policy_action_serde() {
-        for action in [PolicyAction::Hold, PolicyAction::Tighten, PolicyAction::Relax, PolicyAction::Shed] {
+        for action in [
+            PolicyAction::Hold,
+            PolicyAction::Tighten,
+            PolicyAction::Relax,
+            PolicyAction::Shed,
+        ] {
             let json = serde_json::to_string(&action).unwrap();
             let back: PolicyAction = serde_json::from_str(&json).unwrap();
             assert_eq!(action, back);
@@ -16236,7 +17665,12 @@ mod tests {
 
     #[test]
     fn test_system_state_serde() {
-        for state in [SystemState::Healthy, SystemState::Drifting, SystemState::Stressed, SystemState::Critical] {
+        for state in [
+            SystemState::Healthy,
+            SystemState::Drifting,
+            SystemState::Stressed,
+            SystemState::Critical,
+        ] {
             let json = serde_json::to_string(&state).unwrap();
             let back: SystemState = serde_json::from_str(&json).unwrap();
             assert_eq!(state, back);
@@ -16248,7 +17682,10 @@ mod tests {
         assert_eq!(PolicyDegradation::Healthy.to_string(), "healthy");
         let t = PolicyDegradation::Tightening { expected_loss: 1.5 };
         assert!(t.to_string().contains("tightening"));
-        let e = PolicyDegradation::EmergencyShed { total_decisions: 5, last_loss: 2.0 };
+        let e = PolicyDegradation::EmergencyShed {
+            total_decisions: 5,
+            last_loss: 2.0,
+        };
         assert!(e.to_string().contains("emergency_shed"));
     }
 
@@ -16257,7 +17694,10 @@ mod tests {
         let variants = vec![
             PolicyDegradation::Healthy,
             PolicyDegradation::Tightening { expected_loss: 1.5 },
-            PolicyDegradation::EmergencyShed { total_decisions: 5, last_loss: 2.0 },
+            PolicyDegradation::EmergencyShed {
+                total_decisions: 5,
+                last_loss: 2.0,
+            },
         ];
         for v in &variants {
             let json = serde_json::to_string(v).unwrap();
@@ -16288,7 +17728,10 @@ mod tests {
         let mut ctrl = PolicyController::with_defaults();
         assert_eq!(ctrl.detect_degradation(), PolicyDegradation::Healthy);
         ctrl.decide([0.0, 0.0, 0.0, 1.0], 100);
-        let is_shed = matches!(ctrl.detect_degradation(), PolicyDegradation::EmergencyShed { .. });
+        let is_shed = matches!(
+            ctrl.detect_degradation(),
+            PolicyDegradation::EmergencyShed { .. }
+        );
         assert!(is_shed);
     }
 
@@ -16392,16 +17835,28 @@ mod tests {
     #[test]
     fn test_calibration_scenario_display() {
         assert_eq!(CalibrationScenario::Nominal.to_string(), "nominal");
-        assert_eq!(CalibrationScenario::GradualDrift.to_string(), "gradual_drift");
+        assert_eq!(
+            CalibrationScenario::GradualDrift.to_string(),
+            "gradual_drift"
+        );
         assert_eq!(CalibrationScenario::AbruptShift.to_string(), "abrupt_shift");
-        assert_eq!(CalibrationScenario::NoisyBaseline.to_string(), "noisy_baseline");
-        assert_eq!(CalibrationScenario::PostStressRecovery.to_string(), "post_stress_recovery");
+        assert_eq!(
+            CalibrationScenario::NoisyBaseline.to_string(),
+            "noisy_baseline"
+        );
+        assert_eq!(
+            CalibrationScenario::PostStressRecovery.to_string(),
+            "post_stress_recovery"
+        );
     }
 
     #[test]
     fn test_promotion_verdict_display() {
         assert_eq!(PromotionVerdict::Approved.to_string(), "approved");
-        assert_eq!(PromotionVerdict::ConditionalHold.to_string(), "conditional_hold");
+        assert_eq!(
+            PromotionVerdict::ConditionalHold.to_string(),
+            "conditional_hold"
+        );
         assert_eq!(PromotionVerdict::Rejected.to_string(), "rejected");
     }
 
@@ -16533,7 +17988,13 @@ mod tests {
 
     #[test]
     fn test_calibration_scenario_serde() {
-        for s in [CalibrationScenario::Nominal, CalibrationScenario::GradualDrift, CalibrationScenario::AbruptShift, CalibrationScenario::NoisyBaseline, CalibrationScenario::PostStressRecovery] {
+        for s in [
+            CalibrationScenario::Nominal,
+            CalibrationScenario::GradualDrift,
+            CalibrationScenario::AbruptShift,
+            CalibrationScenario::NoisyBaseline,
+            CalibrationScenario::PostStressRecovery,
+        ] {
             let json = serde_json::to_string(&s).unwrap();
             let back: CalibrationScenario = serde_json::from_str(&json).unwrap();
             assert_eq!(s, back);
@@ -16542,7 +18003,11 @@ mod tests {
 
     #[test]
     fn test_promotion_verdict_serde() {
-        for v in [PromotionVerdict::Approved, PromotionVerdict::ConditionalHold, PromotionVerdict::Rejected] {
+        for v in [
+            PromotionVerdict::Approved,
+            PromotionVerdict::ConditionalHold,
+            PromotionVerdict::Rejected,
+        ] {
             let json = serde_json::to_string(&v).unwrap();
             let back: PromotionVerdict = serde_json::from_str(&json).unwrap();
             assert_eq!(v, back);
@@ -16552,9 +18017,15 @@ mod tests {
     #[test]
     fn test_calibration_degradation_display() {
         assert_eq!(CalibrationDegradation::Healthy.to_string(), "healthy");
-        let m = CalibrationDegradation::GateMarginal { passing: 3, total: 5 };
+        let m = CalibrationDegradation::GateMarginal {
+            passing: 3,
+            total: 5,
+        };
         assert!(m.to_string().contains("3/5"));
-        let f = CalibrationDegradation::GateFailed { failing: 2, total: 5 };
+        let f = CalibrationDegradation::GateFailed {
+            failing: 2,
+            total: 5,
+        };
         assert!(f.to_string().contains("2/5"));
     }
 
@@ -16562,8 +18033,14 @@ mod tests {
     fn test_calibration_degradation_serde() {
         let variants = vec![
             CalibrationDegradation::Healthy,
-            CalibrationDegradation::GateMarginal { passing: 3, total: 5 },
-            CalibrationDegradation::GateFailed { failing: 2, total: 5 },
+            CalibrationDegradation::GateMarginal {
+                passing: 3,
+                total: 5,
+            },
+            CalibrationDegradation::GateFailed {
+                failing: 2,
+                total: 5,
+            },
         ];
         for v in &variants {
             let json = serde_json::to_string(v).unwrap();
@@ -16595,7 +18072,10 @@ mod tests {
             harness.submit(make_passing_result(*s));
         }
         harness.evaluate();
-        assert_eq!(harness.detect_degradation(), CalibrationDegradation::Healthy);
+        assert_eq!(
+            harness.detect_degradation(),
+            CalibrationDegradation::Healthy
+        );
     }
 
     #[test]
@@ -16714,5 +18194,854 @@ mod tests {
         assert_eq!(nominal.len(), 2);
         let abrupt = harness.results_for_scenario(CalibrationScenario::AbruptShift);
         assert_eq!(abrupt.len(), 1);
+    }
+
+    // ── E1: Formal Spec Pack Tests ────────────────────────────────
+
+    #[test]
+    fn test_invariant_domain_display() {
+        assert_eq!(InvariantDomain::Scheduler.to_string(), "scheduler");
+        assert_eq!(InvariantDomain::Budget.to_string(), "budget");
+        assert_eq!(InvariantDomain::Recovery.to_string(), "recovery");
+        assert_eq!(InvariantDomain::Composition.to_string(), "composition");
+    }
+
+    #[test]
+    fn test_invariant_severity_ordering() {
+        assert!(InvariantSeverity::Info < InvariantSeverity::Warning);
+        assert!(InvariantSeverity::Warning < InvariantSeverity::Critical);
+    }
+
+    #[test]
+    fn test_formal_invariant_display() {
+        let inv = FormalInvariant {
+            predicate_id: "budget.nonneg".to_string(),
+            description: "All targets non-negative".to_string(),
+            domain: InvariantDomain::Budget,
+            severity: InvariantSeverity::Critical,
+            is_safety: true,
+        };
+        let display = format!("{inv}");
+        assert!(display.contains("budget"));
+        assert!(display.contains("critical"));
+        assert!(display.contains("budget.nonneg"));
+    }
+
+    #[test]
+    fn test_scheduler_invariant_capacity_bound_holds() {
+        let inv = SchedulerInvariant::CapacityBound {
+            lane: SchedulerLane::Input,
+            capacity: 100,
+            actual: 50,
+        };
+        assert!(inv.holds());
+        assert_eq!(inv.predicate_id(), "scheduler.capacity_bound");
+    }
+
+    #[test]
+    fn test_scheduler_invariant_capacity_bound_violated() {
+        let inv = SchedulerInvariant::CapacityBound {
+            lane: SchedulerLane::Bulk,
+            capacity: 10,
+            actual: 15,
+        };
+        assert!(!inv.holds());
+    }
+
+    #[test]
+    fn test_scheduler_invariant_conservation_of_work() {
+        let good = SchedulerInvariant::ConservationOfWork {
+            total_admitted: 100,
+            lane_sum: 100,
+        };
+        assert!(good.holds());
+
+        let bad = SchedulerInvariant::ConservationOfWork {
+            total_admitted: 100,
+            lane_sum: 99,
+        };
+        assert!(!bad.holds());
+    }
+
+    #[test]
+    fn test_scheduler_invariant_starvation_freedom() {
+        let ok = SchedulerInvariant::StarvationFreedom {
+            lane: SchedulerLane::Control,
+            wait_epochs: 5,
+            max_epochs: 10,
+        };
+        assert!(ok.holds());
+
+        let starved = SchedulerInvariant::StarvationFreedom {
+            lane: SchedulerLane::Control,
+            wait_epochs: 11,
+            max_epochs: 10,
+        };
+        assert!(!starved.holds());
+    }
+
+    #[test]
+    fn test_scheduler_invariant_epoch_monotonicity() {
+        assert!(
+            SchedulerInvariant::EpochMonotonicity {
+                previous: 5,
+                current: 10
+            }
+            .holds()
+        );
+        assert!(
+            SchedulerInvariant::EpochMonotonicity {
+                previous: 5,
+                current: 5
+            }
+            .holds()
+        );
+        assert!(
+            !SchedulerInvariant::EpochMonotonicity {
+                previous: 10,
+                current: 5
+            }
+            .holds()
+        );
+    }
+
+    #[test]
+    fn test_scheduler_invariant_item_id_monotonicity() {
+        assert!(
+            SchedulerInvariant::ItemIdMonotonicity {
+                previous: 1,
+                current: 2
+            }
+            .holds()
+        );
+        assert!(
+            !SchedulerInvariant::ItemIdMonotonicity {
+                previous: 5,
+                current: 3
+            }
+            .holds()
+        );
+        assert!(
+            SchedulerInvariant::ItemIdMonotonicity {
+                previous: 0,
+                current: 0
+            }
+            .holds()
+        );
+    }
+
+    #[test]
+    fn test_scheduler_invariant_deterministic_replay() {
+        let good = SchedulerInvariant::DeterministicReplay {
+            input_hash: 0xABCD,
+            expected_hash: 0x1234,
+            actual_hash: 0x1234,
+        };
+        assert!(good.holds());
+
+        let bad = SchedulerInvariant::DeterministicReplay {
+            input_hash: 0xABCD,
+            expected_hash: 0x1234,
+            actual_hash: 0x5678,
+        };
+        assert!(!bad.holds());
+    }
+
+    #[test]
+    fn test_scheduler_invariant_display() {
+        let inv = SchedulerInvariant::CapacityBound {
+            lane: SchedulerLane::Input,
+            capacity: 100,
+            actual: 50,
+        };
+        let s = format!("{inv}");
+        assert!(s.contains("capacity_bound"));
+        assert!(s.contains("50/100"));
+    }
+
+    #[test]
+    fn test_budget_invariant_percentile_monotonicity_holds() {
+        let inv = BudgetInvariant::PercentileMonotonicity {
+            stage: LatencyStage::PatternDetection,
+            p50: 100.0,
+            p95: 200.0,
+            p99: 300.0,
+            p999: 400.0,
+        };
+        assert!(inv.holds());
+        assert_eq!(inv.predicate_id(), "budget.percentile_monotonicity");
+    }
+
+    #[test]
+    fn test_budget_invariant_percentile_monotonicity_violated() {
+        let inv = BudgetInvariant::PercentileMonotonicity {
+            stage: LatencyStage::PatternDetection,
+            p50: 300.0,
+            p95: 200.0,
+            p99: 100.0,
+            p999: 400.0,
+        };
+        assert!(!inv.holds());
+    }
+
+    #[test]
+    fn test_budget_invariant_non_negative_targets() {
+        assert!(BudgetInvariant::NonNegativeTargets {
+            stage: LatencyStage::EventEmission,
+            min_target: 0.0,
+        }
+        .holds());
+        assert!(!BudgetInvariant::NonNegativeTargets {
+            stage: LatencyStage::EventEmission,
+            min_target: -1.0,
+        }
+        .holds());
+    }
+
+    #[test]
+    fn test_budget_invariant_observation_consistency() {
+        assert!(
+            BudgetInvariant::ObservationConsistency {
+                total: 50,
+                per_stage_sum: 50
+            }
+            .holds()
+        );
+        assert!(
+            !BudgetInvariant::ObservationConsistency {
+                total: 50,
+                per_stage_sum: 49
+            }
+            .holds()
+        );
+    }
+
+    #[test]
+    fn test_budget_invariant_overflow_bound() {
+        assert!(
+            BudgetInvariant::OverflowBound {
+                overflow_count: 5,
+                total_observations: 10
+            }
+            .holds()
+        );
+        assert!(
+            !BudgetInvariant::OverflowBound {
+                overflow_count: 11,
+                total_observations: 10
+            }
+            .holds()
+        );
+    }
+
+    #[test]
+    fn test_budget_invariant_escalation_monotonicity() {
+        assert!(BudgetInvariant::EscalationMonotonicity {
+            stage: LatencyStage::PatternDetection,
+            previous_level: MitigationLevel::None,
+            current_level: MitigationLevel::Defer,
+        }
+        .holds());
+        assert!(!BudgetInvariant::EscalationMonotonicity {
+            stage: LatencyStage::PatternDetection,
+            previous_level: MitigationLevel::Shed,
+            current_level: MitigationLevel::Defer,
+        }
+        .holds());
+    }
+
+    #[test]
+    fn test_budget_invariant_aggregate_ceiling() {
+        assert!(BudgetInvariant::AggregateCeiling {
+            percentile: Percentile::P99,
+            aggregate_us: 1000.0,
+            stage_sum_us: 900.0,
+        }
+        .holds());
+        assert!(!BudgetInvariant::AggregateCeiling {
+            percentile: Percentile::P99,
+            aggregate_us: 800.0,
+            stage_sum_us: 900.0,
+        }
+        .holds());
+    }
+
+    #[test]
+    fn test_budget_invariant_display() {
+        let inv = BudgetInvariant::PercentileMonotonicity {
+            stage: LatencyStage::PatternDetection,
+            p50: 100.0,
+            p95: 200.0,
+            p99: 300.0,
+            p999: 400.0,
+        };
+        let s = format!("{inv}");
+        assert!(s.contains("pct_mono"));
+    }
+
+    #[test]
+    fn test_recovery_invariant_gradual_deescalation_holds() {
+        let inv = RecoveryInvariant::GradualDeescalation {
+            previous_level: MitigationLevel::Degrade,
+            recovered_level: MitigationLevel::Defer,
+        };
+        assert!(inv.holds());
+        assert_eq!(inv.predicate_id(), "recovery.gradual_deescalation");
+    }
+
+    #[test]
+    fn test_recovery_invariant_gradual_deescalation_violated() {
+        let inv = RecoveryInvariant::GradualDeescalation {
+            previous_level: MitigationLevel::Shed,
+            recovered_level: MitigationLevel::Defer,
+        };
+        assert!(!inv.holds());
+    }
+
+    #[test]
+    fn test_recovery_invariant_cooldown_enforced() {
+        assert!(RecoveryInvariant::CooldownEnforced {
+            consecutive_ok: 20,
+            cooldown_required: 20,
+        }
+        .holds());
+        assert!(!RecoveryInvariant::CooldownEnforced {
+            consecutive_ok: 19,
+            cooldown_required: 20,
+        }
+        .holds());
+    }
+
+    #[test]
+    fn test_recovery_invariant_timeout_recovery() {
+        assert!(RecoveryInvariant::TimeoutRecovery {
+            degraded_duration_us: 40_000_000,
+            max_duration_us: 30_000_000,
+            recovery_triggered: true,
+        }
+        .holds());
+        assert!(!RecoveryInvariant::TimeoutRecovery {
+            degraded_duration_us: 40_000_000,
+            max_duration_us: 30_000_000,
+            recovery_triggered: false,
+        }
+        .holds());
+        assert!(RecoveryInvariant::TimeoutRecovery {
+            degraded_duration_us: 10_000_000,
+            max_duration_us: 30_000_000,
+            recovery_triggered: false,
+        }
+        .holds());
+    }
+
+    #[test]
+    fn test_recovery_invariant_count_monotonicity() {
+        assert!(
+            RecoveryInvariant::EscalationCountMonotonic {
+                previous: 5,
+                current: 8
+            }
+            .holds()
+        );
+        assert!(
+            !RecoveryInvariant::EscalationCountMonotonic {
+                previous: 10,
+                current: 5
+            }
+            .holds()
+        );
+        assert!(
+            RecoveryInvariant::RecoveryCountMonotonic {
+                previous: 3,
+                current: 3
+            }
+            .holds()
+        );
+        assert!(
+            !RecoveryInvariant::RecoveryCountMonotonic {
+                previous: 5,
+                current: 2
+            }
+            .holds()
+        );
+    }
+
+    #[test]
+    fn test_recovery_invariant_level_in_range() {
+        for level in MitigationLevel::ALL {
+            assert!(RecoveryInvariant::LevelInRange { level: *level }.holds());
+        }
+    }
+
+    #[test]
+    fn test_recovery_invariant_display() {
+        let inv = RecoveryInvariant::GradualDeescalation {
+            previous_level: MitigationLevel::Degrade,
+            recovered_level: MitigationLevel::Defer,
+        };
+        let s = format!("{inv}");
+        assert!(s.contains("gradual"));
+    }
+
+    #[test]
+    fn test_invariant_outcome_display() {
+        assert_eq!(InvariantOutcome::Satisfied.to_string(), "SATISFIED");
+        let violated = InvariantOutcome::Violated {
+            counterexample: "bad state".to_string(),
+        };
+        assert!(violated.to_string().contains("VIOLATED"));
+        let inc = InvariantOutcome::Inconclusive {
+            reason: "timeout".to_string(),
+        };
+        assert!(inc.to_string().contains("INCONCLUSIVE"));
+    }
+
+    #[test]
+    fn test_invariant_check_result_passed_violated() {
+        let passed = InvariantCheckResult {
+            predicate_id: "test".to_string(),
+            domain: InvariantDomain::Scheduler,
+            severity: InvariantSeverity::Critical,
+            outcome: InvariantOutcome::Satisfied,
+            eval_time_us: 100,
+            timestamp_us: 1000,
+        };
+        assert!(passed.passed());
+        assert!(!passed.violated());
+
+        let failed = InvariantCheckResult {
+            predicate_id: "test".to_string(),
+            domain: InvariantDomain::Budget,
+            severity: InvariantSeverity::Warning,
+            outcome: InvariantOutcome::Violated {
+                counterexample: "x".to_string(),
+            },
+            eval_time_us: 50,
+            timestamp_us: 2000,
+        };
+        assert!(!failed.passed());
+        assert!(failed.violated());
+    }
+
+    #[test]
+    fn test_invariant_checker_new() {
+        let checker = InvariantChecker::with_defaults();
+        assert_eq!(checker.total_checks(), 0);
+        assert_eq!(checker.total_violations(), 0);
+        assert_eq!(checker.total_satisfied(), 0);
+        assert_eq!(checker.registered_count(), 0);
+        assert!((checker.violation_rate() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_invariant_checker_register() {
+        let mut checker = InvariantChecker::with_defaults();
+        checker.register(FormalInvariant {
+            predicate_id: "test.inv".to_string(),
+            description: "Test invariant".to_string(),
+            domain: InvariantDomain::Scheduler,
+            severity: InvariantSeverity::Critical,
+            is_safety: true,
+        });
+        assert_eq!(checker.registered_count(), 1);
+    }
+
+    #[test]
+    fn test_invariant_checker_check_scheduler_satisfied() {
+        let mut checker = InvariantChecker::with_defaults();
+        let inv = SchedulerInvariant::CapacityBound {
+            lane: SchedulerLane::Input,
+            capacity: 100,
+            actual: 50,
+        };
+        let result = checker.check_scheduler(&inv, 1000);
+        assert!(result.passed());
+        assert_eq!(checker.total_checks(), 1);
+        assert_eq!(checker.total_satisfied(), 1);
+        assert_eq!(checker.total_violations(), 0);
+    }
+
+    #[test]
+    fn test_invariant_checker_check_scheduler_violated() {
+        let mut checker = InvariantChecker::with_defaults();
+        let inv = SchedulerInvariant::CapacityBound {
+            lane: SchedulerLane::Bulk,
+            capacity: 10,
+            actual: 20,
+        };
+        let result = checker.check_scheduler(&inv, 2000);
+        assert!(result.violated());
+        assert_eq!(checker.total_violations(), 1);
+    }
+
+    #[test]
+    fn test_invariant_checker_check_budget() {
+        let mut checker = InvariantChecker::with_defaults();
+        let good = BudgetInvariant::NonNegativeTargets {
+            stage: LatencyStage::PatternDetection,
+            min_target: 10.0,
+        };
+        let result = checker.check_budget(&good, 3000);
+        assert!(result.passed());
+
+        let bad = BudgetInvariant::NonNegativeTargets {
+            stage: LatencyStage::PatternDetection,
+            min_target: -5.0,
+        };
+        let result = checker.check_budget(&bad, 4000);
+        assert!(result.violated());
+        assert_eq!(checker.total_checks(), 2);
+    }
+
+    #[test]
+    fn test_invariant_checker_check_recovery() {
+        let mut checker = InvariantChecker::with_defaults();
+        let inv = RecoveryInvariant::CooldownEnforced {
+            consecutive_ok: 25,
+            cooldown_required: 20,
+        };
+        let result = checker.check_recovery(&inv, 5000);
+        assert!(result.passed());
+    }
+
+    #[test]
+    fn test_invariant_checker_violation_rate() {
+        let mut checker = InvariantChecker::with_defaults();
+        for i in 0..7 {
+            let inv = SchedulerInvariant::CapacityBound {
+                lane: SchedulerLane::Input,
+                capacity: 100,
+                actual: i,
+            };
+            checker.check_scheduler(&inv, i as u64);
+        }
+        for i in 0..3 {
+            let inv = SchedulerInvariant::CapacityBound {
+                lane: SchedulerLane::Input,
+                capacity: 10,
+                actual: 20 + i,
+            };
+            checker.check_scheduler(&inv, 100 + i as u64);
+        }
+        assert_eq!(checker.total_checks(), 10);
+        assert!((checker.violation_rate() - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_invariant_checker_recent_results() {
+        let mut checker = InvariantChecker::with_defaults();
+        for i in 0..5 {
+            let inv = SchedulerInvariant::EpochMonotonicity {
+                previous: 0,
+                current: i,
+            };
+            checker.check_scheduler(&inv, i);
+        }
+        assert_eq!(checker.recent_results(3).len(), 3);
+        assert_eq!(checker.recent_results(10).len(), 5);
+    }
+
+    #[test]
+    fn test_invariant_checker_results_by_domain() {
+        let mut checker = InvariantChecker::with_defaults();
+        checker.check_scheduler(
+            &SchedulerInvariant::EpochMonotonicity {
+                previous: 0,
+                current: 1,
+            },
+            100,
+        );
+        checker.check_budget(
+            &BudgetInvariant::NonNegativeTargets {
+                stage: LatencyStage::PatternDetection,
+                min_target: 1.0,
+            },
+            200,
+        );
+        checker.check_recovery(
+            &RecoveryInvariant::LevelInRange {
+                level: MitigationLevel::None,
+            },
+            300,
+        );
+        assert_eq!(
+            checker
+                .results_by_domain(InvariantDomain::Scheduler)
+                .len(),
+            1
+        );
+        assert_eq!(
+            checker.results_by_domain(InvariantDomain::Budget).len(),
+            1
+        );
+        assert_eq!(
+            checker
+                .results_by_domain(InvariantDomain::Recovery)
+                .len(),
+            1
+        );
+        assert_eq!(
+            checker
+                .results_by_domain(InvariantDomain::Composition)
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_invariant_checker_violations_filter() {
+        let mut checker = InvariantChecker::with_defaults();
+        checker.check_scheduler(
+            &SchedulerInvariant::CapacityBound {
+                lane: SchedulerLane::Input,
+                capacity: 100,
+                actual: 50,
+            },
+            100,
+        );
+        checker.check_scheduler(
+            &SchedulerInvariant::CapacityBound {
+                lane: SchedulerLane::Input,
+                capacity: 10,
+                actual: 20,
+            },
+            200,
+        );
+        let violations = checker.violations();
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].violated());
+    }
+
+    #[test]
+    fn test_invariant_checker_snapshot() {
+        let mut checker = InvariantChecker::with_defaults();
+        for _ in 0..5 {
+            checker.check_scheduler(
+                &SchedulerInvariant::EpochMonotonicity {
+                    previous: 0,
+                    current: 1,
+                },
+                0,
+            );
+        }
+        let snap = checker.snapshot();
+        assert_eq!(snap.total_checks, 5);
+        assert_eq!(snap.total_satisfied, 5);
+        assert_eq!(snap.total_violations, 0);
+        assert_eq!(snap.history_len, 5);
+    }
+
+    #[test]
+    fn test_invariant_checker_status_line() {
+        let checker = InvariantChecker::with_defaults();
+        let line = checker.status_line();
+        assert!(line.contains("invariants:"));
+        assert!(line.contains("checks=0"));
+    }
+
+    #[test]
+    fn test_invariant_checker_reset() {
+        let mut checker = InvariantChecker::with_defaults();
+        for _ in 0..3 {
+            checker.check_scheduler(
+                &SchedulerInvariant::EpochMonotonicity {
+                    previous: 0,
+                    current: 1,
+                },
+                0,
+            );
+        }
+        assert_eq!(checker.total_checks(), 3);
+        checker.reset();
+        assert_eq!(checker.total_checks(), 0);
+        assert_eq!(checker.total_violations(), 0);
+        assert_eq!(checker.total_satisfied(), 0);
+        assert_eq!(checker.recent_results(10).len(), 0);
+    }
+
+    #[test]
+    fn test_invariant_checker_degradation_healthy() {
+        let checker = InvariantChecker::with_defaults();
+        assert_eq!(
+            checker.detect_degradation(),
+            InvariantCheckerDegradation::Healthy
+        );
+    }
+
+    #[test]
+    fn test_invariant_checker_degradation_violations_detected() {
+        let mut checker = InvariantChecker::with_defaults();
+        for i in 0..19 {
+            checker.check_scheduler(
+                &SchedulerInvariant::EpochMonotonicity {
+                    previous: 0,
+                    current: i,
+                },
+                i,
+            );
+        }
+        checker.check_scheduler(
+            &SchedulerInvariant::CapacityBound {
+                lane: SchedulerLane::Input,
+                capacity: 1,
+                actual: 5,
+            },
+            100,
+        );
+        match checker.detect_degradation() {
+            InvariantCheckerDegradation::ViolationsDetected {
+                violations, total, ..
+            } => {
+                assert_eq!(violations, 1);
+                assert_eq!(total, 20);
+            }
+            other => panic!("Expected ViolationsDetected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_invariant_checker_degradation_high_rate() {
+        let mut checker = InvariantChecker::with_defaults();
+        for i in 0..8 {
+            checker.check_scheduler(
+                &SchedulerInvariant::EpochMonotonicity {
+                    previous: 0,
+                    current: i,
+                },
+                i,
+            );
+        }
+        for _ in 0..2 {
+            checker.check_scheduler(
+                &SchedulerInvariant::CapacityBound {
+                    lane: SchedulerLane::Input,
+                    capacity: 1,
+                    actual: 5,
+                },
+                100,
+            );
+        }
+        match checker.detect_degradation() {
+            InvariantCheckerDegradation::HighViolationRate {
+                violations, total, ..
+            } => {
+                assert_eq!(violations, 2);
+                assert_eq!(total, 10);
+            }
+            other => panic!("Expected HighViolationRate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_invariant_checker_log_entry() {
+        let mut checker = InvariantChecker::with_defaults();
+        checker.check_scheduler(
+            &SchedulerInvariant::EpochMonotonicity {
+                previous: 0,
+                current: 1,
+            },
+            0,
+        );
+        let entry = checker.log_entry();
+        assert_eq!(entry.total_checks, 1);
+        assert_eq!(entry.total_satisfied, 1);
+        assert_eq!(entry.total_violations, 0);
+    }
+
+    #[test]
+    fn test_invariant_checker_history_cap() {
+        let config = InvariantCheckerConfig {
+            max_history: 5,
+            ..Default::default()
+        };
+        let mut checker = InvariantChecker::new(config);
+        for i in 0..10 {
+            checker.check_scheduler(
+                &SchedulerInvariant::EpochMonotonicity {
+                    previous: 0,
+                    current: i,
+                },
+                i,
+            );
+        }
+        assert_eq!(checker.recent_results(100).len(), 5);
+        assert_eq!(checker.total_checks(), 10);
+    }
+
+    #[test]
+    fn test_invariant_domain_serde() {
+        for domain in &[
+            InvariantDomain::Scheduler,
+            InvariantDomain::Budget,
+            InvariantDomain::Recovery,
+            InvariantDomain::Composition,
+        ] {
+            let json = serde_json::to_string(domain).unwrap();
+            let back: InvariantDomain = serde_json::from_str(&json).unwrap();
+            assert_eq!(*domain, back);
+        }
+    }
+
+    #[test]
+    fn test_invariant_severity_serde() {
+        for sev in &[
+            InvariantSeverity::Info,
+            InvariantSeverity::Warning,
+            InvariantSeverity::Critical,
+        ] {
+            let json = serde_json::to_string(sev).unwrap();
+            let back: InvariantSeverity = serde_json::from_str(&json).unwrap();
+            assert_eq!(*sev, back);
+        }
+    }
+
+    #[test]
+    fn test_invariant_checker_degradation_serde() {
+        let variants = vec![
+            InvariantCheckerDegradation::Healthy,
+            InvariantCheckerDegradation::ViolationsDetected {
+                violations: 3,
+                total: 100,
+            },
+            InvariantCheckerDegradation::HighViolationRate {
+                violations: 15,
+                total: 100,
+            },
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: InvariantCheckerDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[test]
+    fn test_invariant_checker_degradation_display() {
+        assert_eq!(InvariantCheckerDegradation::Healthy.to_string(), "healthy");
+        let det = InvariantCheckerDegradation::ViolationsDetected {
+            violations: 2,
+            total: 50,
+        };
+        assert!(det.to_string().contains("2/50"));
+        let high = InvariantCheckerDegradation::HighViolationRate {
+            violations: 10,
+            total: 50,
+        };
+        assert!(high.to_string().contains("high_rate"));
+    }
+
+    #[test]
+    fn test_invariant_check_result_display() {
+        let r = InvariantCheckResult {
+            predicate_id: "test.id".to_string(),
+            domain: InvariantDomain::Scheduler,
+            severity: InvariantSeverity::Critical,
+            outcome: InvariantOutcome::Satisfied,
+            eval_time_us: 42,
+            timestamp_us: 1000,
+        };
+        let s = format!("{r}");
+        assert!(s.contains("SATISFIED"));
+        assert!(s.contains("42"));
     }
 }

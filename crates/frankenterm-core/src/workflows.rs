@@ -5486,6 +5486,8 @@ pub struct WorkflowRunner {
     storage: Arc<crate::storage::StorageHandle>,
     /// Policy-gated injector for terminal input
     injector: PolicyInjectorHandle,
+    /// Optional replay capture adapter for decision provenance.
+    replay_capture: Option<crate::replay_capture::SharedCaptureAdapter>,
     /// Configuration
     config: WorkflowRunnerConfig,
 }
@@ -5505,8 +5507,19 @@ impl WorkflowRunner {
             lock_manager,
             storage,
             injector,
+            replay_capture: None,
             config,
         }
+    }
+
+    /// Attach a replay capture adapter for workflow step decision provenance.
+    #[must_use]
+    pub fn with_replay_capture_adapter(
+        mut self,
+        replay_capture: crate::replay_capture::SharedCaptureAdapter,
+    ) -> Self {
+        self.replay_capture = Some(replay_capture);
+        self
     }
 
     /// Get the lock manager.
@@ -5697,6 +5710,11 @@ impl WorkflowRunner {
             ctx.set_pane_meta(PaneMetadata::from_record(&record));
         }
 
+        if let Some(adapter) = self.replay_capture.as_ref() {
+            let mut injector = self.injector.lock().await;
+            injector.set_decision_capture(adapter.clone());
+        }
+
         // Plan-first execution: generate ActionPlan if workflow supports it (wa-upg.2.3)
         if let Some(plan) = workflow.to_action_plan(&ctx, execution_id) {
             tracing::info!(
@@ -5821,6 +5839,44 @@ impl WorkflowRunner {
             let verification_refs = build_verification_refs(&step_result, step_plan_ref);
             let step_error_code = step_error_code_from_result(&step_result);
             let log_step_result = redacted_step_result_for_logging(&step_result);
+
+            if let Some(adapter) = self.replay_capture.as_ref() {
+                let step_definition_text = steps
+                    .get(current_step)
+                    .and_then(|step| serde_json::to_string(step).ok())
+                    .unwrap_or_else(|| step_name.to_string());
+                let step_input = serde_json::json!({
+                    "workflow_name": workflow_name.as_str(),
+                    "execution_id": execution_id,
+                    "pane_id": pane_id,
+                    "step_index": current_step,
+                    "step_name": step_name,
+                    "trigger": ctx.trigger().cloned().unwrap_or(serde_json::Value::Null),
+                });
+                let step_input_text = serde_json::to_string(&step_input)
+                    .unwrap_or_else(|_| format!("workflow={workflow_name};step={current_step}"));
+                let step_output = serde_json::to_value(&log_step_result).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "result_type": result_type,
+                    })
+                });
+                let decision_event = crate::replay_capture::DecisionEvent::new(
+                    crate::replay_capture::DecisionType::WorkflowStep,
+                    pane_id,
+                    format!("workflow.{workflow_name}.step.{current_step}"),
+                    &step_definition_text,
+                    &step_input_text,
+                    step_output,
+                    Some(format!("workflow_execution:{execution_id}")),
+                    None,
+                    crate::recording::epoch_ms_now(),
+                );
+                adapter.capture_decision(
+                    crate::recording::RecorderEventSource::WorkflowEngine,
+                    Some(execution_id.to_string()),
+                    decision_event,
+                );
+            }
 
             // Build result data, enriching with plan information if available (wa-upg.2.3)
             let result_data = {
@@ -6688,6 +6744,7 @@ impl WorkflowRunner {
                                         storage,
                                         injector: Arc::clone(&self.injector),
                                         config,
+                                        replay_capture: self.replay_capture.clone(),
                                     };
 
                                     crate::runtime_compat::task::spawn(async move {
@@ -11696,6 +11753,99 @@ steps:
         assert_ne!(
             summary_json.get("decision").and_then(|v| v.as_str()),
             Some("allow")
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_runner_emits_step_and_policy_decision_capture_events() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "decision_capture_flow"
+steps:
+  - type: send_text
+    id: send_cmd
+    text: "echo hello"
+"#;
+        let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
+        let workflow: Arc<dyn Workflow> = Arc::new(DescriptorWorkflow::new(descriptor));
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("workflow_decision_capture.db")
+            .to_string_lossy()
+            .to_string();
+
+        let engine = WorkflowEngine::default();
+        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let injector = Arc::new(crate::runtime_compat::Mutex::new(
+            crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::strict(),
+                default_wezterm_handle(),
+            ),
+        ));
+
+        let sink = Arc::new(crate::replay_capture::CollectingCaptureSink::new());
+        let replay_adapter = Arc::new(crate::replay_capture::CaptureAdapter::new(
+            sink.clone(),
+            crate::replay_capture::CaptureConfig::default(),
+        ));
+
+        let runner = WorkflowRunner::new(
+            engine,
+            lock_manager,
+            Arc::clone(&storage),
+            injector,
+            WorkflowRunnerConfig::default(),
+        )
+        .with_replay_capture_adapter(replay_adapter);
+
+        let pane_id = 101u64;
+        create_test_pane(&storage, pane_id).await;
+        runner.register_workflow(Arc::clone(&workflow));
+
+        let execution_id = generate_workflow_id(workflow.name());
+        runner
+            .engine
+            .start_with_id(
+                &storage,
+                execution_id.clone(),
+                workflow.name(),
+                pane_id,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = runner
+            .run_workflow(pane_id, workflow, &execution_id, 0)
+            .await;
+        assert!(result.is_aborted(), "Expected policy-gated abort");
+
+        let events = sink.recorder_events();
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    &event.payload,
+                    crate::recording::RecorderEventPayload::ControlMarker { details, .. }
+                        if details.get("decision_type")
+                            == Some(&serde_json::json!("workflow_step"))
+                )
+            }),
+            "expected workflow_step decision provenance event"
+        );
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    &event.payload,
+                    crate::recording::RecorderEventPayload::ControlMarker { details, .. }
+                        if details.get("decision_type")
+                            == Some(&serde_json::json!("policy_evaluation"))
+                )
+            }),
+            "expected policy_evaluation decision provenance event"
         );
     }
 
