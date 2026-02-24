@@ -394,7 +394,8 @@ impl TraumaState {
             return false;
         }
 
-        let token_similarity = token_jaccard_similarity(&command.command_tokens, &event.command_tokens);
+        let token_similarity =
+            token_jaccard_similarity(&command.command_tokens, &event.command_tokens);
         token_similarity >= self.config.token_jaccard_threshold
     }
 
@@ -453,7 +454,9 @@ fn sanitize_config(mut config: TraumaConfig) -> TraumaConfig {
             .collect();
     }
     config.execution_prefixes = sanitize_list(config.execution_prefixes);
-    config.execution_prefixes.sort_by(|left, right| right.len().cmp(&left.len()));
+    config
+        .execution_prefixes
+        .sort_by(|left, right| right.len().cmp(&left.len()));
 
     if config.critical_flags.is_empty() {
         config.critical_flags = DEFAULT_CRITICAL_FLAGS
