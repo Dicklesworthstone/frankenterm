@@ -217,6 +217,7 @@ pub mod recorder_retention;
 pub mod recorder_storage;
 pub mod recording;
 pub mod replay;
+pub mod replay_artifact_registry;
 pub mod replay_capture;
 pub mod replay_checkpoint;
 pub mod replay_cli;

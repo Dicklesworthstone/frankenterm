@@ -1997,6 +1997,83 @@ enum ReplayCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Manage replay artifact registry (list/inspect/add/retire/prune)
+    #[command(subcommand, after_help = r#"EXAMPLES:
+    ft replay artifact list
+    ft replay artifact list --format json --tier T1
+    ft replay artifact inspect path/to/trace.ftreplay
+    ft replay artifact add path/to/trace.ftreplay --label auth_login
+    ft replay artifact retire path/to/trace.ftreplay --reason "replaced by v2"
+    ft replay artifact prune --dry-run --max-age-days 30
+"#)]
+    Artifact(ArtifactCommands),
+}
+
+#[derive(Subcommand)]
+enum ArtifactCommands {
+    /// List registered replay artifacts
+    List {
+        /// Output format: table or json
+        #[arg(long, default_value = "table")]
+        format: String,
+
+        /// Filter by sensitivity tier: T1, T2, T3
+        #[arg(long)]
+        tier: Option<String>,
+
+        /// Filter by status: active or retired
+        #[arg(long)]
+        status: Option<String>,
+    },
+
+    /// Inspect a registered artifact (verify integrity)
+    Inspect {
+        /// Artifact path (relative to registry base)
+        #[arg()]
+        path: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Register a new artifact in the manifest
+    Add {
+        /// Path to the artifact file
+        #[arg()]
+        path: String,
+
+        /// Human-readable label
+        #[arg(long, default_value = "unlabeled")]
+        label: String,
+
+        /// Sensitivity tier: T1 (default), T2, T3
+        #[arg(long, default_value = "T1")]
+        tier: String,
+    },
+
+    /// Mark an artifact as retired (does not delete the file)
+    Retire {
+        /// Artifact path
+        #[arg()]
+        path: String,
+
+        /// Reason for retirement
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Remove retired artifacts older than the retention period
+    Prune {
+        /// Only show what would be removed
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Maximum age in days for retired artifacts
+        #[arg(long, default_value = "30")]
+        max_age_days: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -23521,6 +23598,140 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 );
             } else {
                 print!("{}", result.render_human());
+            }
+        }
+
+        Some(Commands::Replay {
+            command: Some(ReplayCommands::Artifact(artifact_cmd)),
+            ..
+        }) => {
+            use frankenterm_core::replay_artifact_registry::{
+                ArtifactManifest, ArtifactRegistry, ArtifactSensitivityTier,
+                ArtifactStatus, ListFilter, PruneOptions,
+            };
+
+            // The manifest lives at tests/regression/replay/manifest.toml
+            let registry_base = std::env::current_dir()
+                .unwrap_or_default()
+                .join("tests/regression/replay");
+            let manifest_path = registry_base.join("manifest.toml");
+
+            let manifest = if manifest_path.exists() {
+                let toml_str = std::fs::read_to_string(&manifest_path).map_err(|e| {
+                    anyhow::anyhow!("Failed to read manifest '{}': {e}", manifest_path.display())
+                })?;
+                ArtifactManifest::from_toml(&toml_str)
+                    .map_err(|e| anyhow::anyhow!("Invalid manifest: {e}"))?
+            } else {
+                ArtifactManifest::new()
+            };
+
+            let mut registry = ArtifactRegistry::new(manifest, registry_base.clone());
+
+            match artifact_cmd {
+                ArtifactCommands::List { format, tier, status } => {
+                    let filter = ListFilter {
+                        tier: tier.as_deref().and_then(ArtifactSensitivityTier::from_str_arg),
+                        status: match status.as_deref() {
+                            Some("active") => Some(ArtifactStatus::Active),
+                            Some("retired") => Some(ArtifactStatus::Retired),
+                            _ => None,
+                        },
+                        label_prefix: None,
+                    };
+                    if format == "json" {
+                        println!("{}", registry.render_json(&filter).unwrap_or_else(|e| {
+                            format!("{{\"error\": \"{e}\"}}")
+                        }));
+                    } else {
+                        print!("{}", registry.render_table(&filter));
+                    }
+                }
+                ArtifactCommands::Inspect { path, json } => {
+                    match registry.inspect(&path) {
+                        Ok(detail) => {
+                            if json {
+                                println!("{}", serde_json::to_string_pretty(&detail)
+                                    .unwrap_or_else(|_| "{}".to_string()));
+                            } else {
+                                println!("Artifact: {}", detail.entry.path);
+                                println!("  Label:      {}", detail.entry.label);
+                                println!("  Tier:       {}", detail.entry.sensitivity_tier.as_str());
+                                println!("  Status:     {:?}", detail.entry.status);
+                                println!("  Events:     {}", detail.entry.event_count);
+                                println!("  Decisions:  {}", detail.entry.decision_count);
+                                println!("  Size:       {} bytes", detail.entry.size_bytes);
+                                println!("  SHA-256:    {}", detail.entry.sha256);
+                                println!("  Integrity:  {}", if detail.integrity_ok { "OK" } else { "MISMATCH" });
+                                println!("  File:       {}", if detail.file_exists { "present" } else { "MISSING" });
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                ArtifactCommands::Add { path, label, tier } => {
+                    let sensitivity = ArtifactSensitivityTier::from_str_arg(&tier)
+                        .unwrap_or(ArtifactSensitivityTier::T1);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    match registry.add(&path, &label, sensitivity, now_ms) {
+                        Ok(()) => {
+                            // Save manifest
+                            let toml_str = registry.manifest().to_toml()
+                                .map_err(|e| anyhow::anyhow!("Manifest serialize: {e}"))?;
+                            std::fs::create_dir_all(&registry_base).ok();
+                            std::fs::write(&manifest_path, &toml_str)
+                                .map_err(|e| anyhow::anyhow!("Write manifest: {e}"))?;
+                            println!("Added: {path}");
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                ArtifactCommands::Retire { path, reason } => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    match registry.retire(&path, &reason, now_ms) {
+                        Ok(()) => {
+                            let toml_str = registry.manifest().to_toml()
+                                .map_err(|e| anyhow::anyhow!("Manifest serialize: {e}"))?;
+                            std::fs::write(&manifest_path, &toml_str)
+                                .map_err(|e| anyhow::anyhow!("Write manifest: {e}"))?;
+                            println!("Retired: {path}");
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                ArtifactCommands::Prune { dry_run, max_age_days } => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let result = registry.prune(&PruneOptions {
+                        dry_run,
+                        max_age_days,
+                        now_ms,
+                    });
+                    print!("{}", result.render_human());
+                    if !dry_run && !result.pruned_paths.is_empty() {
+                        let toml_str = registry.manifest().to_toml()
+                            .map_err(|e| anyhow::anyhow!("Manifest serialize: {e}"))?;
+                        std::fs::write(&manifest_path, &toml_str)
+                            .map_err(|e| anyhow::anyhow!("Write manifest: {e}"))?;
+                    }
+                }
             }
         }
 
