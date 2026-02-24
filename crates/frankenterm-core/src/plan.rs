@@ -1404,6 +1404,244 @@ impl Outcome {
     }
 }
 
+/// Canonical failure reason taxonomy for mission assignments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionFailureCode {
+    PolicyDenied,
+    ReservationConflict,
+    RateLimited,
+    StaleState,
+    DispatchError,
+    ApprovalRequired,
+    ApprovalDenied,
+    ApprovalExpired,
+}
+
+/// Whether a failure terminates the current assignment path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionFailureTerminality {
+    Terminal,
+    NonTerminal,
+}
+
+impl MissionFailureTerminality {
+    /// Returns true when this failure is terminal.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Terminal)
+    }
+}
+
+/// Retry strategy contract for a mission failure code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionFailureRetryability {
+    Never,
+    Immediate,
+    AfterBackoff,
+    AfterStateRefresh,
+    AfterApprovalRefresh,
+}
+
+impl MissionFailureRetryability {
+    /// Returns true when automated retry is permitted.
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+}
+
+/// Full remediation contract for a mission failure code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissionFailureContract {
+    pub reason_code: &'static str,
+    pub error_code: &'static str,
+    pub terminality: MissionFailureTerminality,
+    pub retryability: MissionFailureRetryability,
+    pub human_hint: &'static str,
+    pub machine_hint: &'static str,
+}
+
+impl MissionFailureCode {
+    const ALL: [Self; 8] = [
+        Self::PolicyDenied,
+        Self::ReservationConflict,
+        Self::RateLimited,
+        Self::StaleState,
+        Self::DispatchError,
+        Self::ApprovalRequired,
+        Self::ApprovalDenied,
+        Self::ApprovalExpired,
+    ];
+
+    /// Return all canonical mission failure codes.
+    #[must_use]
+    pub const fn all() -> [Self; 8] {
+        Self::ALL
+    }
+
+    /// Parse from normalized reason code.
+    #[must_use]
+    pub fn from_reason_code(reason_code: &str) -> Option<Self> {
+        match reason_code.trim() {
+            "policy_denied" => Some(Self::PolicyDenied),
+            "reservation_conflict" => Some(Self::ReservationConflict),
+            "rate_limited" => Some(Self::RateLimited),
+            "stale_state" => Some(Self::StaleState),
+            "dispatch_error" => Some(Self::DispatchError),
+            "approval_required" => Some(Self::ApprovalRequired),
+            "approval_denied" => Some(Self::ApprovalDenied),
+            "approval_expired" => Some(Self::ApprovalExpired),
+            _ => None,
+        }
+    }
+
+    /// Parse from normalized error code.
+    #[must_use]
+    pub fn from_error_code(error_code: &str) -> Option<Self> {
+        match error_code.trim() {
+            "FTM1001" => Some(Self::PolicyDenied),
+            "FTM1002" => Some(Self::ReservationConflict),
+            "FTM1003" => Some(Self::RateLimited),
+            "FTM1004" => Some(Self::StaleState),
+            "FTM1005" => Some(Self::DispatchError),
+            "FTM1006" => Some(Self::ApprovalRequired),
+            "FTM1007" => Some(Self::ApprovalDenied),
+            "FTM1008" => Some(Self::ApprovalExpired),
+            _ => None,
+        }
+    }
+
+    /// Return canonical metadata for this failure code.
+    #[must_use]
+    pub const fn contract(self) -> MissionFailureContract {
+        match self {
+            Self::PolicyDenied => MissionFailureContract {
+                reason_code: "policy_denied",
+                error_code: "FTM1001",
+                terminality: MissionFailureTerminality::Terminal,
+                retryability: MissionFailureRetryability::Never,
+                human_hint: "Policy denied this action. Update policy or request operator override.",
+                machine_hint: "abort_and_request_policy_override",
+            },
+            Self::ReservationConflict => MissionFailureContract {
+                reason_code: "reservation_conflict",
+                error_code: "FTM1002",
+                terminality: MissionFailureTerminality::NonTerminal,
+                retryability: MissionFailureRetryability::AfterStateRefresh,
+                human_hint: "Target paths are already reserved. Wait or coordinate with current owner.",
+                machine_hint: "refresh_reservations_then_retry",
+            },
+            Self::RateLimited => MissionFailureContract {
+                reason_code: "rate_limited",
+                error_code: "FTM1003",
+                terminality: MissionFailureTerminality::NonTerminal,
+                retryability: MissionFailureRetryability::AfterBackoff,
+                human_hint: "Rate limit reached. Wait for reset before retrying.",
+                machine_hint: "apply_backoff_and_retry_after_window",
+            },
+            Self::StaleState => MissionFailureContract {
+                reason_code: "stale_state",
+                error_code: "FTM1004",
+                terminality: MissionFailureTerminality::NonTerminal,
+                retryability: MissionFailureRetryability::AfterStateRefresh,
+                human_hint: "Observed state is stale. Refresh pane/session state before retry.",
+                machine_hint: "refresh_runtime_state_then_retry",
+            },
+            Self::DispatchError => MissionFailureContract {
+                reason_code: "dispatch_error",
+                error_code: "FTM1005",
+                terminality: MissionFailureTerminality::NonTerminal,
+                retryability: MissionFailureRetryability::Immediate,
+                human_hint: "Dispatch failed due to transient control-plane error. Retry dispatch.",
+                machine_hint: "retry_dispatch_with_jitter",
+            },
+            Self::ApprovalRequired => MissionFailureContract {
+                reason_code: "approval_required",
+                error_code: "FTM1006",
+                terminality: MissionFailureTerminality::NonTerminal,
+                retryability: MissionFailureRetryability::AfterApprovalRefresh,
+                human_hint: "Human approval is required before execution can continue.",
+                machine_hint: "request_approval_and_pause",
+            },
+            Self::ApprovalDenied => MissionFailureContract {
+                reason_code: "approval_denied",
+                error_code: "FTM1007",
+                terminality: MissionFailureTerminality::Terminal,
+                retryability: MissionFailureRetryability::Never,
+                human_hint: "Human operator denied execution. Revise mission scope before retrying.",
+                machine_hint: "abort_and_open_revision_task",
+            },
+            Self::ApprovalExpired => MissionFailureContract {
+                reason_code: "approval_expired",
+                error_code: "FTM1008",
+                terminality: MissionFailureTerminality::NonTerminal,
+                retryability: MissionFailureRetryability::AfterApprovalRefresh,
+                human_hint: "Approval token expired. Request a fresh approval to continue.",
+                machine_hint: "renew_approval_then_retry",
+            },
+        }
+    }
+
+    /// Canonical reason code string.
+    #[must_use]
+    pub const fn reason_code(self) -> &'static str {
+        self.contract().reason_code
+    }
+
+    /// Canonical error code string.
+    #[must_use]
+    pub const fn error_code(self) -> &'static str {
+        self.contract().error_code
+    }
+
+    /// Terminality contract for this code.
+    #[must_use]
+    pub const fn terminality(self) -> MissionFailureTerminality {
+        self.contract().terminality
+    }
+
+    /// Retry contract for this code.
+    #[must_use]
+    pub const fn retryability(self) -> MissionFailureRetryability {
+        self.contract().retryability
+    }
+
+    /// Human-readable remediation hint.
+    #[must_use]
+    pub const fn human_hint(self) -> &'static str {
+        self.contract().human_hint
+    }
+
+    /// Machine-readable remediation hint.
+    #[must_use]
+    pub const fn machine_hint(self) -> &'static str {
+        self.contract().machine_hint
+    }
+}
+
+/// Field context for failure-code validation errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionFailureContext {
+    ApprovalDenied,
+    ApprovalExpired,
+    AssignmentOutcomeFailed,
+    AssignmentEscalation,
+}
+
+impl fmt::Display for MissionFailureContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ApprovalDenied => f.write_str("approval_denied"),
+            Self::ApprovalExpired => f.write_str("approval_expired"),
+            Self::AssignmentOutcomeFailed => f.write_str("assignment_outcome_failed"),
+            Self::AssignmentEscalation => f.write_str("assignment_escalation"),
+        }
+    }
+}
+
 /// Escalation severity for operator routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1649,8 +1887,141 @@ impl Mission {
                     ));
                 }
             }
+            Self::validate_assignment_failure_contract(assignment)?;
         }
 
+        Ok(())
+    }
+
+    fn validate_assignment_failure_contract(
+        assignment: &Assignment,
+    ) -> Result<(), MissionValidationError> {
+        match &assignment.approval_state {
+            ApprovalState::Denied { reason_code, .. } => {
+                Self::validate_failure_reason_code(
+                    &assignment.assignment_id,
+                    MissionFailureContext::ApprovalDenied,
+                    reason_code,
+                )?;
+            }
+            ApprovalState::Expired { reason_code, .. } => {
+                Self::validate_failure_reason_code(
+                    &assignment.assignment_id,
+                    MissionFailureContext::ApprovalExpired,
+                    reason_code,
+                )?;
+            }
+            ApprovalState::NotRequired
+            | ApprovalState::Pending { .. }
+            | ApprovalState::Approved { .. } => {}
+        }
+
+        if let Some(Outcome::Failed {
+            reason_code,
+            error_code,
+            ..
+        }) = &assignment.outcome
+        {
+            let failure_code = Self::validate_failure_reason_code(
+                &assignment.assignment_id,
+                MissionFailureContext::AssignmentOutcomeFailed,
+                reason_code,
+            )?;
+            Self::validate_failure_error_code(
+                &assignment.assignment_id,
+                MissionFailureContext::AssignmentOutcomeFailed,
+                reason_code,
+                error_code,
+                failure_code.error_code(),
+            )?;
+        }
+
+        if let Some(escalation) = &assignment.escalation {
+            if let Some(error_code) = escalation.error_code.as_deref() {
+                let failure_code = Self::validate_failure_reason_code(
+                    &assignment.assignment_id,
+                    MissionFailureContext::AssignmentEscalation,
+                    &escalation.reason_code,
+                )?;
+                Self::validate_failure_error_code(
+                    &assignment.assignment_id,
+                    MissionFailureContext::AssignmentEscalation,
+                    &escalation.reason_code,
+                    error_code,
+                    failure_code.error_code(),
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_failure_reason_code(
+        assignment_id: &AssignmentId,
+        context: MissionFailureContext,
+        reason_code: &str,
+    ) -> Result<MissionFailureCode, MissionValidationError> {
+        let normalized = reason_code.trim();
+        if normalized.is_empty() {
+            return Err(MissionValidationError::EmptyFailureReasonCode {
+                assignment_id: assignment_id.clone(),
+                context,
+            });
+        }
+
+        let failure_code = MissionFailureCode::from_reason_code(normalized).ok_or_else(|| {
+            MissionValidationError::UnknownFailureReasonCode {
+                assignment_id: assignment_id.clone(),
+                context,
+                reason_code: normalized.to_string(),
+            }
+        })?;
+
+        let expected_code = match context {
+            MissionFailureContext::ApprovalDenied => Some(MissionFailureCode::ApprovalDenied),
+            MissionFailureContext::ApprovalExpired => Some(MissionFailureCode::ApprovalExpired),
+            MissionFailureContext::AssignmentOutcomeFailed
+            | MissionFailureContext::AssignmentEscalation => None,
+        };
+
+        if let Some(expected_code) = expected_code {
+            if failure_code != expected_code {
+                return Err(MissionValidationError::UnexpectedFailureCodeForContext {
+                    assignment_id: assignment_id.clone(),
+                    context,
+                    expected_reason_code: expected_code.reason_code().to_string(),
+                    actual_reason_code: failure_code.reason_code().to_string(),
+                });
+            }
+        }
+
+        Ok(failure_code)
+    }
+
+    fn validate_failure_error_code(
+        assignment_id: &AssignmentId,
+        context: MissionFailureContext,
+        reason_code: &str,
+        error_code: &str,
+        expected_error_code: &str,
+    ) -> Result<(), MissionValidationError> {
+        let normalized = error_code.trim();
+        if normalized.is_empty() {
+            return Err(MissionValidationError::EmptyFailureErrorCode {
+                assignment_id: assignment_id.clone(),
+                context,
+                reason_code: reason_code.trim().to_string(),
+            });
+        }
+        if normalized != expected_error_code {
+            return Err(MissionValidationError::MismatchedFailureErrorCode {
+                assignment_id: assignment_id.clone(),
+                context,
+                reason_code: reason_code.trim().to_string(),
+                expected_error_code: expected_error_code.to_string(),
+                actual_error_code: normalized.to_string(),
+            });
+        }
         Ok(())
     }
 }
@@ -1658,8 +2029,13 @@ impl Mission {
 /// Errors that can occur during mission schema validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissionValidationError {
-    UnsupportedMissionVersion { version: u32, max_supported: u32 },
-    EmptyOwnershipActor { role: MissionActorRole },
+    UnsupportedMissionVersion {
+        version: u32,
+        max_supported: u32,
+    },
+    EmptyOwnershipActor {
+        role: MissionActorRole,
+    },
     DuplicateOwnershipActor(String),
     MissingTitle,
     MissingWorkspaceId,
@@ -1668,6 +2044,33 @@ pub enum MissionValidationError {
     UnknownCandidateReference(CandidateActionId),
     EmptyAssignee(AssignmentId),
     EmptyReservationPaths(ReservationIntentId),
+    EmptyFailureReasonCode {
+        assignment_id: AssignmentId,
+        context: MissionFailureContext,
+    },
+    UnknownFailureReasonCode {
+        assignment_id: AssignmentId,
+        context: MissionFailureContext,
+        reason_code: String,
+    },
+    UnexpectedFailureCodeForContext {
+        assignment_id: AssignmentId,
+        context: MissionFailureContext,
+        expected_reason_code: String,
+        actual_reason_code: String,
+    },
+    EmptyFailureErrorCode {
+        assignment_id: AssignmentId,
+        context: MissionFailureContext,
+        reason_code: String,
+    },
+    MismatchedFailureErrorCode {
+        assignment_id: AssignmentId,
+        context: MissionFailureContext,
+        reason_code: String,
+        expected_error_code: String,
+        actual_error_code: String,
+    },
 }
 
 impl fmt::Display for MissionValidationError {
@@ -1698,6 +2101,63 @@ impl fmt::Display for MissionValidationError {
             Self::EmptyAssignee(id) => write!(f, "Assignment has empty assignee: {}", id.0),
             Self::EmptyReservationPaths(id) => {
                 write!(f, "Reservation intent has empty paths: {}", id.0)
+            }
+            Self::EmptyFailureReasonCode {
+                assignment_id,
+                context,
+            } => {
+                write!(
+                    f,
+                    "Empty failure reason code for assignment {} ({context})",
+                    assignment_id.0
+                )
+            }
+            Self::UnknownFailureReasonCode {
+                assignment_id,
+                context,
+                reason_code,
+            } => {
+                write!(
+                    f,
+                    "Unknown failure reason code '{reason_code}' for assignment {} ({context})",
+                    assignment_id.0
+                )
+            }
+            Self::UnexpectedFailureCodeForContext {
+                assignment_id,
+                context,
+                expected_reason_code,
+                actual_reason_code,
+            } => {
+                write!(
+                    f,
+                    "Failure reason code '{actual_reason_code}' is invalid for assignment {} ({context}); expected '{expected_reason_code}'",
+                    assignment_id.0
+                )
+            }
+            Self::EmptyFailureErrorCode {
+                assignment_id,
+                context,
+                reason_code,
+            } => {
+                write!(
+                    f,
+                    "Empty failure error code for assignment {} ({context}) reason '{reason_code}'",
+                    assignment_id.0
+                )
+            }
+            Self::MismatchedFailureErrorCode {
+                assignment_id,
+                context,
+                reason_code,
+                expected_error_code,
+                actual_error_code,
+            } => {
+                write!(
+                    f,
+                    "Failure error code mismatch for assignment {} ({context}) reason '{reason_code}': expected '{expected_error_code}', got '{actual_error_code}'",
+                    assignment_id.0
+                )
             }
         }
     }
@@ -3313,6 +3773,169 @@ mod tests {
         assert!(matches!(
             err,
             MissionValidationError::EmptyReservationPaths(_)
+        ));
+    }
+
+    #[test]
+    fn mission_failure_taxonomy_catalog_has_unique_reason_and_error_codes() {
+        let mut reason_codes = std::collections::HashSet::new();
+        let mut error_codes = std::collections::HashSet::new();
+
+        for code in MissionFailureCode::all() {
+            let contract = code.contract();
+            assert!(reason_codes.insert(contract.reason_code));
+            assert!(error_codes.insert(contract.error_code));
+            assert_eq!(
+                MissionFailureCode::from_reason_code(contract.reason_code),
+                Some(code)
+            );
+            assert_eq!(
+                MissionFailureCode::from_error_code(contract.error_code),
+                Some(code)
+            );
+        }
+    }
+
+    #[test]
+    fn mission_failure_taxonomy_marks_retryability_and_hints() {
+        for code in MissionFailureCode::all() {
+            assert!(!code.human_hint().trim().is_empty());
+            assert!(!code.machine_hint().trim().is_empty());
+            assert!(!code.reason_code().trim().is_empty());
+            assert!(!code.error_code().trim().is_empty());
+        }
+
+        assert!(MissionFailureCode::PolicyDenied.terminality().is_terminal());
+        assert_eq!(
+            MissionFailureCode::PolicyDenied.retryability(),
+            MissionFailureRetryability::Never
+        );
+        assert!(
+            !MissionFailureCode::PolicyDenied
+                .retryability()
+                .is_retryable()
+        );
+        assert!(
+            !MissionFailureCode::ApprovalDenied
+                .retryability()
+                .is_retryable()
+        );
+        assert!(!MissionFailureCode::RateLimited.terminality().is_terminal());
+        assert!(
+            MissionFailureCode::RateLimited
+                .retryability()
+                .is_retryable()
+        );
+    }
+
+    #[test]
+    fn mission_validate_rejects_unknown_failure_reason_code() {
+        let mut mission = sample_mission();
+        mission.assignments[0].outcome = Some(Outcome::Failed {
+            reason_code: "unknown_failure".to_string(),
+            error_code: "FTM1999".to_string(),
+            completed_at_ms: 1_704_000_000_800,
+        });
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::UnknownFailureReasonCode { .. }
+        ));
+    }
+
+    #[test]
+    fn mission_validate_rejects_mismatched_failure_error_code() {
+        let mut mission = sample_mission();
+        mission.assignments[0].outcome = Some(Outcome::Failed {
+            reason_code: MissionFailureCode::RateLimited.reason_code().to_string(),
+            error_code: MissionFailureCode::ReservationConflict
+                .error_code()
+                .to_string(),
+            completed_at_ms: 1_704_000_000_800,
+        });
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::MismatchedFailureErrorCode { .. }
+        ));
+    }
+
+    #[test]
+    fn mission_validate_accepts_recoverable_failure_contract() {
+        let mut mission = sample_mission();
+        mission.assignments[0].outcome = Some(Outcome::Failed {
+            reason_code: MissionFailureCode::ReservationConflict
+                .reason_code()
+                .to_string(),
+            error_code: MissionFailureCode::ReservationConflict
+                .error_code()
+                .to_string(),
+            completed_at_ms: 1_704_000_000_800,
+        });
+
+        assert!(mission.validate().is_ok());
+    }
+
+    #[test]
+    fn mission_validate_requires_canonical_approval_denied_reason() {
+        let mut mission = sample_mission();
+        mission.assignments[0].approval_state = ApprovalState::Denied {
+            denied_by: "operator-human".to_string(),
+            denied_at_ms: 1_704_000_000_900,
+            reason_code: MissionFailureCode::PolicyDenied.reason_code().to_string(),
+        };
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::UnexpectedFailureCodeForContext {
+                context: MissionFailureContext::ApprovalDenied,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mission_validate_requires_canonical_approval_expired_reason() {
+        let mut mission = sample_mission();
+        mission.assignments[0].approval_state = ApprovalState::Expired {
+            expired_at_ms: 1_704_000_000_900,
+            reason_code: MissionFailureCode::ApprovalRequired
+                .reason_code()
+                .to_string(),
+        };
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::UnexpectedFailureCodeForContext {
+                context: MissionFailureContext::ApprovalExpired,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mission_validate_rejects_escalation_error_without_canonical_reason() {
+        let mut mission = sample_mission();
+        mission.assignments[0].escalation = Some(Escalation {
+            level: EscalationLevel::Human,
+            triggered_by: MissionActorRole::Dispatcher,
+            reason_code: "monitor_first".to_string(),
+            error_code: Some(MissionFailureCode::StaleState.error_code().to_string()),
+            summary: Some("Needs operator review".to_string()),
+            escalated_at_ms: 1_704_000_000_901,
+        });
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::UnknownFailureReasonCode {
+                context: MissionFailureContext::AssignmentEscalation,
+                ..
+            }
         ));
     }
 
