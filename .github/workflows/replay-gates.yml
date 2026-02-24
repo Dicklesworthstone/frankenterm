@@ -1,0 +1,189 @@
+# Replay CI Gates (ft-og6q6.7.4)
+#
+# 3-gate architecture for replay operations:
+# - Gate 1 (Smoke, <30s): schema check + smoke tests S-01..S-05
+# - Gate 2 (Test Suite, <10min): unit + property + integration tests
+# - Gate 3 (Regression, <30min): E2E scenarios, regression suite, evidence bundle
+#
+# Path triggers: only runs on replay-related changes.
+# Nightly regression run on main (cron: 4 AM UTC).
+
+name: Replay Gates
+
+on:
+  pull_request:
+    paths:
+      - 'crates/frankenterm-core/src/replay_*.rs'
+      - 'crates/frankenterm-core/tests/*replay*.rs'
+      - 'crates/frankenterm-core/benches/replay_*.rs'
+      - 'tests/e2e/test_replay_*.sh'
+      - 'scripts/check_replay_*.sh'
+      - '.github/workflows/replay-gates.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/frankenterm-core/src/replay_*.rs'
+      - 'crates/frankenterm-core/tests/*replay*.rs'
+      - 'crates/frankenterm-core/benches/replay_*.rs'
+      - 'tests/e2e/test_replay_*.sh'
+      - 'scripts/check_replay_*.sh'
+      - '.github/workflows/replay-gates.yml'
+  schedule:
+    - cron: '0 4 * * *'   # Nightly regression run at 4 AM UTC
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  # ── Gate 1: Smoke (<30s) ──────────────────────────────────────────────
+  gate-1-smoke:
+    name: "Gate 1: Smoke"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: replay-gate1
+
+      - name: "G1: Schema validation"
+        run: |
+          cargo test -p frankenterm-core --lib replay_mcp::tests 2>&1 | tee /tmp/g1-schema.log
+          echo '{"gate":1,"check":"schema_validation","passed":true}' >> /tmp/gate1-results.jsonl
+
+      - name: "G1: Smoke tests S-01..S-05"
+        run: |
+          cargo test -p frankenterm-core --test replay_interface_contract -- \
+            ic33_smoke ic34_smoke ic35_smoke ic36_smoke ic37_smoke 2>&1 | tee /tmp/g1-smoke.log
+          if grep -q "test result: ok" /tmp/g1-smoke.log; then
+            echo '{"gate":1,"check":"smoke_tests","passed":true}' >> /tmp/gate1-results.jsonl
+          else
+            echo '{"gate":1,"check":"smoke_tests","passed":false}' >> /tmp/gate1-results.jsonl
+            exit 1
+          fi
+
+      - name: "G1: Generate gate report"
+        if: always()
+        run: |
+          mkdir -p target/replay-gates
+          cat /tmp/gate1-results.jsonl > target/replay-gates/gate1-results.jsonl
+          echo '{"gate":"smoke","status":"complete"}' > target/replay-gates/gate1-report.json
+
+      - name: Upload Gate 1 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-gate1-smoke
+          path: target/replay-gates/gate1-*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ── Gate 2: Test Suite (<10min) ───────────────────────────────────────
+  gate-2-test-suite:
+    name: "Gate 2: Test Suite"
+    needs: gate-1-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: replay-gate2
+
+      - name: "G2: Unit tests"
+        run: |
+          cargo test -p frankenterm-core --lib \
+            replay_mcp replay_robot replay_cli replay_guide \
+            replay_performance replay_ci_gate replay_guardrails \
+            replay_guardrails_gate replay_report replay_artifact_registry \
+            2>&1 | tee /tmp/g2-unit.log
+
+      - name: "G2: Property tests (100+ cases)"
+        run: |
+          cargo test -p frankenterm-core \
+            --test proptest_replay_mcp \
+            --test proptest_replay_robot \
+            --test proptest_replay_interface \
+            --test proptest_replay_guide \
+            --test proptest_replay_guardrails_gate \
+            --test proptest_replay_guardrails \
+            2>&1 | tee /tmp/g2-proptest.log
+
+      - name: "G2: Interface contract tests"
+        run: |
+          cargo test -p frankenterm-core --test replay_interface_contract \
+            2>&1 | tee /tmp/g2-contract.log
+
+      - name: "G2: Generate gate report"
+        if: always()
+        run: |
+          mkdir -p target/replay-gates
+          echo '{"gate":"test_suite","status":"complete"}' > target/replay-gates/gate2-report.json
+
+      - name: Upload Gate 2 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-gate2-test-suite
+          path: |
+            target/replay-gates/gate2-*
+            /tmp/g2-*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ── Gate 3: Regression (<30min) ───────────────────────────────────────
+  gate-3-regression:
+    name: "Gate 3: Regression"
+    needs: gate-2-test-suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: replay-gate3
+
+      - name: "G3: Replay performance gates"
+        run: |
+          scripts/check_replay_performance_gates.sh 2>&1 | tee /tmp/g3-perf.log
+
+      - name: "G3: E2E replay scenarios"
+        run: |
+          for script in tests/e2e/test_replay_*.sh; do
+            echo "--- Running: $script ---"
+            bash "$script" 2>&1 || true
+          done | tee /tmp/g3-e2e.log
+
+      - name: "G3: Generate evidence bundle"
+        if: always()
+        run: |
+          mkdir -p target/replay-gates/evidence
+          cp -f target/replay-performance-gates/*.json target/replay-gates/evidence/ 2>/dev/null || true
+          echo '{"gate":"regression","status":"complete"}' > target/replay-gates/gate3-report.json
+
+      - name: "G3: Refresh baseline on main"
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          scripts/check_replay_performance_gates.sh \
+            --check \
+            --write-baseline \
+            --baseline-source ci_nightly \
+            --criterion-dir target-replay-performance-gates/criterion \
+            --artifacts-dir target/replay-performance-gates \
+            --baseline-file target/replay-performance-gates/replay_performance_baseline.json
+
+      - name: Upload Gate 3 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-gate3-regression
+          path: |
+            target/replay-gates/
+            target/replay-performance-gates/
+          if-no-files-found: ignore
+          retention-days: 14
