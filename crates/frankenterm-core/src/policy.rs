@@ -1413,6 +1413,38 @@ const COMMAND_TOKENS: &[&str] = &[
     "format",
     "mount",
     "umount",
+    // Additional cloud and orchestration tools
+    "terraform",
+    "pulumi",
+    "helm",
+    "gcloud",
+    "az",
+    "kustomize",
+    "podman",
+    "docker-compose",
+    // Additional database tools
+    "mongosh",
+    "redis-cli",
+    // Database destructive commands
+    "drop",
+    "truncate",
+    "delete",
+    "alter",
+    // System tools
+    "kill",
+    "killall",
+    "pkill",
+    "reboot",
+    "shutdown",
+    "halt",
+    "poweroff",
+    "init",
+    // Package managers
+    "pip",
+    "pip3",
+    "gem",
+    "brew",
+    "mke2fs",
 ];
 
 fn first_nonempty_line(text: &str) -> Option<&str> {
