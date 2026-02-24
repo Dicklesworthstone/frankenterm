@@ -298,9 +298,7 @@ impl MdlExtractor {
         };
 
         // Find the last successful command.
-        let last_success_idx = effective_window
-            .iter()
-            .rposition(CommandBlock::is_success);
+        let last_success_idx = effective_window.iter().rposition(CommandBlock::is_success);
 
         if last_success_idx.is_none() {
             return ExtractionResult {
@@ -475,10 +473,7 @@ impl MdlExtractor {
                 .iter()
                 .rposition(CommandBlock::is_failure)
             {
-                let with_context = vec![
-                    window[last_fail].clone(),
-                    window[last_success].clone(),
-                ];
+                let with_context = vec![window[last_fail].clone(), window[last_success].clone()];
                 candidates.push(with_context);
             }
         }

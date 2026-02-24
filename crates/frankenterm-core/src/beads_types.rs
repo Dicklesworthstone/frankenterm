@@ -327,7 +327,8 @@ pub fn resolve_bead_readiness(issues: &[BeadIssueDetail]) -> BeadReadinessReport
     candidates.sort_by_key(|c| (c.priority, c.id.clone()));
     ready_ids.sort();
 
-    let mut degraded_reason_codes: Vec<BeadResolverReasonCode> = global_degraded.into_iter().collect();
+    let mut degraded_reason_codes: Vec<BeadResolverReasonCode> =
+        global_degraded.into_iter().collect();
     degraded_reason_codes.sort();
 
     BeadReadinessReport {
@@ -360,7 +361,9 @@ fn compute_depth(
     } else {
         let mut max_child = 0usize;
         for child in children {
-            max_child = max_child.max(compute_depth(&child, downstream, memo, visiting, cycle_seen));
+            max_child = max_child.max(compute_depth(
+                &child, downstream, memo, visiting, cycle_seen,
+            ));
         }
         1 + max_child
     };
@@ -370,7 +373,10 @@ fn compute_depth(
     depth
 }
 
-fn count_transitive_descendants(issue_id: &str, downstream: &HashMap<String, Vec<String>>) -> usize {
+fn count_transitive_descendants(
+    issue_id: &str,
+    downstream: &HashMap<String, Vec<String>>,
+) -> usize {
     let mut seen: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = downstream.get(issue_id).cloned().unwrap_or_default();
 
@@ -825,12 +831,15 @@ mod tests {
         let a = report.candidates.iter().find(|c| c.id == "a").unwrap();
         assert!(!a.ready);
         assert_eq!(a.blocker_count, 1);
-        assert!(a
-            .degraded_reasons
-            .contains(&BeadResolverReasonCode::MissingDependencyNode));
-        assert!(report
-            .degraded_reason_codes
-            .contains(&BeadResolverReasonCode::MissingDependencyNode));
+        assert!(
+            a.degraded_reasons
+                .contains(&BeadResolverReasonCode::MissingDependencyNode)
+        );
+        assert!(
+            report
+                .degraded_reason_codes
+                .contains(&BeadResolverReasonCode::MissingDependencyNode)
+        );
     }
 
     #[test]
@@ -844,8 +853,10 @@ mod tests {
             .iter()
             .find(|candidate| candidate.id == "fallback")
             .unwrap();
-        assert!(fallback
-            .degraded_reasons
-            .contains(&BeadResolverReasonCode::PartialGraphData));
+        assert!(
+            fallback
+                .degraded_reasons
+                .contains(&BeadResolverReasonCode::PartialGraphData)
+        );
     }
 }

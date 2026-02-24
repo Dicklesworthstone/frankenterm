@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use tracing::{debug, warn};
 
 use crate::beads_types::{
-    resolve_bead_readiness, BeadIssueDetail, BeadReadinessReport, BeadStatusCounts, BeadSummary,
+    BeadIssueDetail, BeadReadinessReport, BeadStatusCounts, BeadSummary, resolve_bead_readiness,
 };
 use crate::subprocess_bridge::SubprocessBridge;
 
@@ -118,7 +118,10 @@ impl BeadsBridge {
     ///
     /// Returns an empty vec on any failure (fail-open).
     pub fn list_all_with_closed(&self) -> Vec<BeadSummary> {
-        match self.bridge.invoke(&["list", "--all", "--limit", "0", "--json"]) {
+        match self
+            .bridge
+            .invoke(&["list", "--all", "--limit", "0", "--json"])
+        {
             Ok(beads) => {
                 debug!(
                     bridge = "br",
@@ -161,8 +164,7 @@ impl BeadsBridge {
                     } else {
                         warn!(
                             bridge = "br",
-                            issue_id,
-                            "empty show result, using partial graph fallback"
+                            issue_id, "empty show result, using partial graph fallback"
                         );
                         details.push(BeadIssueDetail::from_summary(summary));
                     }
@@ -599,9 +601,11 @@ mod tests {
         let summary = sample_bead("fallback", BeadStatus::Open, 1);
         let detail = BeadIssueDetail::from_summary(summary);
         let report = resolve_bead_readiness(&[detail]);
-        assert!(report
-            .degraded_reason_codes
-            .contains(&BeadResolverReasonCode::PartialGraphData));
+        assert!(
+            report
+                .degraded_reason_codes
+                .contains(&BeadResolverReasonCode::PartialGraphData)
+        );
     }
 
     // -------------------------------------------------------------------------
