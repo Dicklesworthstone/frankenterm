@@ -48,6 +48,8 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 
 # File locking
 fs2.workspace = true
+flate2.workspace = true
+zstd.workspace = true
 
 base64 = "0.22.1"
 crossbeam.workspace = true

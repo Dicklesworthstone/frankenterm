@@ -2714,6 +2714,7 @@ dependencies = [
  "fastapi-rust",
  "fastembed",
  "fastmcp-rust",
+ "flate2",
  "fr-config",
  "fr-expire",
  "fr-persist",
@@ -2761,6 +2762,7 @@ dependencies = [
  "tracing-subscriber",
  "tru",
  "x509-parser",
+ "zstd 0.11.2+zstd.1.5.2",
 ]
 
 [[package]]
